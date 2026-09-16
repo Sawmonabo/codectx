@@ -1,0 +1,487 @@
+package ledger
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+// collect is the one goroutine that writes. It drains the bus into a batch and
+// commits the batch every flushInterval or every flushEvents, whichever comes
+// first, snapshotting the counters of every span still running as it goes so a
+// reader on another connection sees a live span advance. It exits when the bus
+// closes, after a last flush that also closes whatever is still open.
+//
+// Nothing here returns an error to a caller: the run has already happened, and
+// a ledger that cannot write must not take the run down with it. A failed
+// flush drops that batch and the next one carries on; the rows a reader is
+// missing are the honest consequence.
+func (l *Ledger) collect() {
+	defer close(l.done)
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	batch := make([]event, 0, flushEvents)
+	// running holds every span whose start has been written and whose end has
+	// not, so each flush can snapshot its counters. A span whose end event was
+	// dropped by a full bus stays here and is closed as interrupted at stop.
+	// A span that is only planned is not in it: nothing is counting yet, and a
+	// row waiting for work has nothing to snapshot.
+	running := map[*Span]struct{}{}
+	// sweep holds the runs that have ended and whose rows left 'planned' have
+	// not all been closed yet. A run stays here until a sweep comes back
+	// short, so one flush closes at most a batch of them and a run that
+	// planned thousands of units cannot hand a subscriber all of them at once.
+	sweep := map[*Run]struct{}{}
+
+	for {
+		select {
+		case e := <-l.bus:
+			if e.kind == eventFlush {
+				e.ack <- l.barrier(batch, running, sweep)
+				batch = batch[:0]
+				continue
+			}
+			batch = append(batch, e)
+			if len(batch) >= flushEvents {
+				_ = l.flush(batch, running, sweep)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			_ = l.flush(batch, running, sweep)
+			batch = batch[:0]
+		case <-l.quit:
+			// Take what is already buffered -- it was recorded before the
+			// stop -- and then finish. Anything published after this point
+			// finds a bus nobody drains and is dropped and counted, which is
+			// the same answer a full bus gives.
+			for {
+				select {
+				case e := <-l.bus:
+					if e.kind == eventFlush {
+						e.ack <- l.barrier(batch, running, sweep)
+						batch = batch[:0]
+						continue
+					}
+					batch = append(batch, e)
+					if len(batch) >= flushEvents {
+						_ = l.flush(batch, running, sweep)
+						batch = batch[:0]
+					}
+				default:
+					_ = l.flush(batch, running, sweep)
+					l.finalize(running)
+					return
+				}
+			}
+		}
+	}
+}
+
+// barrier is what a Flush waits on: the batch is written, and then the runs
+// that have ended are swept until none has a planned row left. One flush
+// closes at most a batch of them, so a run that planned more units than a
+// batch would otherwise answer a reader with rows still marked planned -- work
+// the run is finished with, shown as work waiting to begin.
+func (l *Ledger) barrier(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
+	err := l.flush(batch, running, sweep)
+	for err == nil && len(sweep) > 0 {
+		err = l.flush(nil, running, sweep)
+	}
+	return err
+}
+
+// flush writes one batch and the counter snapshot of every running span in one
+// transaction, then publishes the spans that finished in it. Subscribers are
+// called after the commit, so a subscriber never reports a row a reader could
+// not yet see.
+func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
+	now := time.Now()
+	if len(batch) == 0 && len(running) == 0 && len(sweep) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
+		return nil
+	}
+	ctx := context.Background()
+	var finished []SpanRow
+	var swept []*Run
+	err := l.writeTx(ctx, func(tx *sql.Tx) error {
+		for _, e := range batch {
+			if e.kind == eventFinish {
+				if !e.run.discarded.Load() {
+					sweep[e.run] = struct{}{}
+				}
+				continue
+			}
+			run := e.span.run
+			// A run whose rows have been deleted is not written again. The
+			// span's insert would otherwise recreate the run row through
+			// ensureRun -- or, worse, fail the foreign key and roll back the
+			// whole batch, losing the rows of every other run in it.
+			if run.discarded.Load() {
+				delete(running, e.span)
+				continue
+			}
+			if err := l.ensureRun(ctx, tx, run); err != nil {
+				return err
+			}
+			switch e.kind {
+			case eventStart:
+				outcome := OutcomeRunning
+				if e.planned {
+					outcome = OutcomePlanned
+				}
+				if err := insertSpan(ctx, tx, e.span, outcome); err != nil {
+					return err
+				}
+				if !e.planned {
+					running[e.span] = struct{}{}
+				}
+			case eventBegin:
+				if err := beginSpan(ctx, tx, e.span); err != nil {
+					return err
+				}
+				running[e.span] = struct{}{}
+			case eventEnd:
+				row, err := endSpan(ctx, tx, e)
+				if err != nil {
+					return err
+				}
+				delete(running, e.span)
+				finished = append(finished, row)
+			}
+		}
+		for span := range running {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE spans SET items_in = ?, items_out = ? WHERE run_id = ? AND seq = ?`,
+				span.In(), span.Out(), span.run.id, span.seq); err != nil {
+				return wrap("snapshot span counters", err)
+			}
+		}
+		// A run that has ended closes the rows nothing ever started, a batch per
+		// flush, and their endings join the batch's own on the way to the
+		// subscribers: one path ends every span.
+		for run := range sweep {
+			rows, more, err := sweepPlanned(ctx, tx, run)
+			if err != nil {
+				return err
+			}
+			finished = append(finished, rows...)
+			if !more {
+				swept = append(swept, run)
+			}
+		}
+		if err := l.refreshLiveness(ctx, tx, now); err != nil {
+			return err
+		}
+		return l.updateRuns(ctx, tx)
+	})
+	if err != nil {
+		// The sweep is left pending and the rows unpublished: the transaction
+		// that would have closed them rolled back, so the next flush does it
+		// again rather than announcing endings the file does not hold. The
+		// failure is returned for the barrier a caller may be waiting on and
+		// is otherwise nobody's: the run has already happened.
+		return err
+	}
+	for _, run := range swept {
+		delete(sweep, run)
+		l.retire(run)
+	}
+	for _, row := range finished {
+		l.notify(row)
+	}
+	return nil
+}
+
+// finalize is the last write of a stopping ledger: every span still open is
+// closed as interrupted -- it never finished, so it gets no finish time and no
+// wall, which would be a measurement nobody made -- and every run that did not
+// say how it ended is interrupted too.
+func (l *Ledger) finalize(running map[*Span]struct{}) {
+	ctx := context.Background()
+	now := time.Now()
+	var swept []SpanRow
+	l.finalErr = l.writeTx(ctx, func(tx *sql.Tx) error {
+		l.runsMu.Lock()
+		runs := append([]*Run(nil), l.runs...)
+		l.runsMu.Unlock()
+		for _, run := range runs {
+			run.mu.Lock()
+			if run.outcome == OutcomeRunning {
+				run.outcome = OutcomeInterrupted
+			}
+			if run.finished == nil {
+				finished := now
+				run.finished = &finished
+			}
+			run.mu.Unlock()
+			run.dirty.Store(true)
+			if err := l.ensureRun(ctx, tx, run); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE spans SET outcome = 'interrupted' WHERE run_id = ? AND outcome = 'running'`, run.id); err != nil {
+				return wrap("close open spans", err)
+			}
+			// A row still 'planned' when its run stops is work nothing ever
+			// started -- a run whose finish never reached the collector, or one
+			// that never finished at all. It is closed here by the same sweep
+			// the run's own end uses, a batch at a time, so the endings a
+			// stopping ledger discovers are published like every other.
+			for {
+				rows, more, err := sweepPlanned(ctx, tx, run)
+				if err != nil {
+					return err
+				}
+				swept = append(swept, rows...)
+				if !more {
+					break
+				}
+			}
+		}
+		return l.updateRuns(ctx, tx)
+	})
+	if l.finalErr == nil {
+		for _, row := range swept {
+			l.notify(row)
+		}
+	}
+	clear(running)
+}
+
+// sweepPlanned closes one batch of the rows a run left 'planned' and returns
+// them as the subscribers see them, plus whether the run may hold more. A
+// planned row is work nothing ever started: it is not interrupted -- no
+// measurement was cut off -- it was never admitted, and that is the reason it
+// carries. It gets no finish time and no wall, because nobody measured one.
+//
+// The batch is the collector's own flush batch, so the endings of a run that
+// planned thousands of units reach a subscriber at the rate every other ending
+// does instead of all at once.
+func sweepPlanned(ctx context.Context, tx *sql.Tx, run *Run) ([]SpanRow, bool, error) {
+	const query = `SELECT s.seq, p.seq, s.stage, s.scope_key, s.provider, s.started_at, s.items_in, s.items_out
+		FROM spans s LEFT JOIN spans p ON p.id = s.parent_id
+		WHERE s.run_id = ? AND s.outcome = 'planned' ORDER BY s.seq LIMIT ?`
+	rows, err := tx.QueryContext(ctx, query, run.id, flushEvents)
+	if err != nil {
+		return nil, false, wrap("find unadmitted spans", err)
+	}
+	var out []SpanRow
+	for rows.Next() {
+		row := SpanRow{RunID: run.idHex, Outcome: OutcomeUnavailable,
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ReasonNotAdmitted}
+		var parent sql.NullInt64
+		var started string
+		if err := rows.Scan(&row.Seq, &parent, &row.Stage, &row.ScopeKey, &row.Provider, &started,
+			&row.ItemsIn, &row.ItemsOut); err != nil {
+			rows.Close()
+			return nil, false, wrap("find unadmitted spans", err)
+		}
+		if parent.Valid {
+			seq := parent.Int64
+			row.ParentSeq = &seq
+		}
+		if row.StartedAt, err = parseTime(started); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		out = append(out, row)
+	}
+	// Closed before the updates: the transaction runs one statement at a time,
+	// so the page must be read out before a write on the same rows.
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, false, wrap("find unadmitted spans", err)
+	}
+	for _, row := range out {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE spans SET outcome = ?, diagnostic_code = ?, failure_json = ?
+			 WHERE run_id = ? AND seq = ?`,
+			string(OutcomeUnavailable), model.CodeProviderUnavailable, ReasonNotAdmitted,
+			run.id, row.Seq); err != nil {
+			return nil, false, wrap("close unadmitted spans", err)
+		}
+	}
+	return out, len(out) == flushEvents, nil
+}
+
+// ensureRun writes the run row the first time one of its spans is written, so
+// a span never arrives before the row it references and nothing on the run's
+// own goroutine ever waits for the database.
+func (l *Ledger) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.inserted {
+		return nil
+	}
+	expires := time.Now().Add(liveWindow)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(
+		run_id, kind, repository_id, generation_id, started_at, expires_at, finished_at, outcome,
+		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
+		events_dropped, process_peak_rss_bytes)
+		VALUES(?, ?, ?, NULL, ?, ?, NULL, 'running', 0, 0, 0, 0, 0, 0, 0, NULL)`,
+		run.id, string(run.kind), run.repo, formatTime(run.started), formatTime(expires)); err != nil {
+		return wrap("record the run", err)
+	}
+	run.inserted = true
+	run.expires = expires
+	return nil
+}
+
+// refreshLiveness renews the deadline of every live run whose stamp is running
+// out. It is the run's own claim that the process writing it is still there,
+// and it is a statement of its own rather than a column on the totals update:
+// the totals are written only when they move, and a run that is doing nothing
+// at this instant is no less alive for it.
+func (l *Ledger) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for _, run := range runs {
+		if !run.refreshDue(now) {
+			continue
+		}
+		expires := now.Add(liveWindow)
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
+			formatTime(expires), run.id); err != nil {
+			return wrap("refresh the run's liveness", err)
+		}
+		run.mu.Lock()
+		run.expires = expires
+		run.mu.Unlock()
+	}
+	return nil
+}
+
+// updateRuns writes every known run's current totals. It runs on each flush
+// because a live reader reads the run row as well as the spans: the counts a
+// run has reached are as much of the live view as the spans are.
+func (l *Ledger) updateRuns(ctx context.Context, tx *sql.Tx) error {
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for _, run := range runs {
+		run.mu.Lock()
+		inserted := run.inserted
+		run.mu.Unlock()
+		// The dirty flag is only cleared once there is a row to write it to,
+		// so totals reported before the run's first span are not lost.
+		if !inserted || !run.dirty.Swap(false) {
+			continue
+		}
+		run.mu.Lock()
+		var finished any
+		if run.finished != nil {
+			finished = formatTime(*run.finished)
+		}
+		var generation any
+		if run.generationID != nil {
+			generation = *run.generationID
+		}
+		var peak any
+		if run.totals.ProcessPeakRSSBytes != nil {
+			peak = int64(*run.totals.ProcessPeakRSSBytes)
+		}
+		t := run.totals
+		outcome := run.outcome
+		run.mu.Unlock()
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET
+			generation_id = ?, finished_at = ?, outcome = ?,
+			file_count = ?, source_bytes = ?, units_planned = ?, units_succeeded = ?,
+			units_failed = ?, units_subdivided = ?, events_dropped = ?, process_peak_rss_bytes = ?
+			WHERE run_id = ?`,
+			generation, finished, string(outcome),
+			t.FileCount, t.SourceBytes, t.UnitsPlanned, t.UnitsSucceeded,
+			t.UnitsFailed, t.UnitsSubdivided, run.dropped.Load(), peak, run.id); err != nil {
+			return wrap("update the run", err)
+		}
+	}
+	return nil
+}
+
+// insertSpan writes a span's start. The parent is resolved in SQL from the
+// parent's own ordinal: the bus is first-in-first-out and one goroutine drains
+// it, so a parent's row is always already there, and neither side ever holds a
+// row id. A span with no parent carries the ordinal -1, which no span can
+// have, so the subselect finds nothing and the column is null.
+func insertSpan(ctx context.Context, tx *sql.Tx, s *Span, outcome Outcome) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO spans(
+		run_id, parent_id, seq, stage, scope_key, provider, started_at, finished_at,
+		wall_ms, cpu_user_ms, cpu_sys_ms, cpu_unattributed, peak_rss_bytes, read_bytes, write_bytes,
+		items_in, items_out, outcome, diagnostic_code, failure_json)
+		VALUES(?, (SELECT id FROM spans WHERE run_id = ? AND seq = ?), ?, ?, ?, ?, ?, NULL,
+		NULL, NULL, NULL, '', NULL, NULL, NULL, ?, ?, ?, '', '')`,
+		s.run.id, s.run.id, s.parent, s.seq, s.stage, s.scopeKey, s.provider, formatTime(s.started),
+		s.In(), s.Out(), string(outcome))
+	return wrap("record a span", err)
+}
+
+// beginSpan moves a planned row to running and restamps its start, so the wall
+// the row ends with is the work's and not the wait's.
+func beginSpan(ctx context.Context, tx *sql.Tx, s *Span) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE spans SET outcome = 'running', started_at = ? WHERE run_id = ? AND seq = ?`,
+		formatTime(s.started), s.run.id, s.seq)
+	return wrap("begin a span", err)
+}
+
+// endSpan writes a span's end onto the row its start inserted and returns the
+// row as it now stands, for the subscribers.
+func endSpan(ctx context.Context, tx *sql.Tx, e event) (SpanRow, error) {
+	s := e.span
+	m := e.measured
+	finished := formatTime(e.endWall)
+	row := SpanRow{
+		RunID:           s.run.idHex,
+		Seq:             s.seq,
+		Stage:           s.stage,
+		ScopeKey:        s.scopeKey,
+		Provider:        s.provider,
+		StartedAt:       s.started,
+		ItemsIn:         s.In(),
+		ItemsOut:        s.Out(),
+		Outcome:         e.outcome,
+		CPUUnattributed: m.CPUUnattributed,
+		DiagnosticCode:  m.DiagnosticCode,
+		Failure:         m.Failure,
+		CPUUserMS:       m.CPUUserMS,
+		CPUSysMS:        m.CPUSysMS,
+		PeakRSSBytes:    m.PeakRSSBytes,
+		ReadBytes:       m.ReadBytes,
+		WriteBytes:      m.WriteBytes,
+	}
+	end := e.endWall
+	row.FinishedAt = &end
+	row.WallMS = e.wallMS
+	if s.parent >= 0 {
+		parent := s.parent
+		row.ParentSeq = &parent
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE spans SET
+		finished_at = ?, wall_ms = ?, cpu_user_ms = ?, cpu_sys_ms = ?, cpu_unattributed = ?,
+		peak_rss_bytes = ?, read_bytes = ?, write_bytes = ?, items_in = ?, items_out = ?,
+		outcome = ?, diagnostic_code = ?, failure_json = ?
+		WHERE run_id = ? AND seq = ?`,
+		finished, e.wallMS, nullInt(m.CPUUserMS), nullInt(m.CPUSysMS), m.CPUUnattributed,
+		nullBytes(m.PeakRSSBytes), nullBytes(m.ReadBytes), nullBytes(m.WriteBytes), row.ItemsIn, row.ItemsOut,
+		string(e.outcome), m.DiagnosticCode, m.Failure,
+		s.run.id, s.seq)
+	return row, wrap("close a span", err)
+}
+
+// nullInt and nullBytes render an absent measurement as SQL NULL rather than
+// as a zero: a column this process could not fill says so.
+func nullInt(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nullBytes(v *uint64) any {
+	if v == nil {
+		return nil
+	}
+	return int64(*v)
+}

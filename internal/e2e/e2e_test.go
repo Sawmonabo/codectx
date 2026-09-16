@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1269,6 +1270,37 @@ func TestE2EProductBoundary(t *testing.T) {
 
 		refreshEnv, refreshCode := s.run(t, "refresh")
 		result := data[model.IndexResult](t, refreshEnv, refreshCode)
+		// The run states what it did. A run that has just returned is
+		// finished, and its accounting has to say so: the collector holds a
+		// finished run in memory until its next write, so without the barrier
+		// the coordinator waits on, this reads as a run still going and its
+		// last stages are missing. `running` here is the failure mode --
+		// a completed index reported as live, with an incomplete stage list
+		// presented as the whole of it.
+		if result.Run == nil {
+			t.Fatalf("the refresh reported no run; the result carries no account of what it did")
+		}
+		if result.Run.Outcome == "running" || result.Run.FinishedAt == nil {
+			t.Errorf("the run the refresh reported is %q with finished_at %v: a run that has returned is over",
+				result.Run.Outcome, result.Run.FinishedAt)
+		}
+		// Activation is one of the last stages a run opens, so a result that
+		// carries it carries the stages that ended after the collector's last
+		// periodic write, and every row belongs to the run reported above and
+		// not to another run of the same process.
+		activated := false
+		for _, stage := range result.Stages {
+			if stage.RunID != result.Run.RunID {
+				t.Fatalf("a stage of run %s was reported under run %s", stage.RunID, result.Run.RunID)
+			}
+			if stage.Stage == "activation" {
+				activated = true
+			}
+		}
+		if !activated {
+			t.Errorf("the run reported %d stages and none of them is the activation it just performed",
+				len(result.Stages))
+		}
 		if result.Binding.GenerationID <= pinned.Binding.GenerationID {
 			t.Fatalf("the refresh published generation %d; the session is pinned to %d and a change was made",
 				result.Binding.GenerationID, pinned.Binding.GenerationID)
@@ -1493,5 +1525,80 @@ func mutateStore(t *testing.T, repo string) {
 	}
 	if err := os.WriteFile(path, append(after, mutationBody...), 0o600); err != nil {
 		t.Fatalf("mutate %s: %v", mutatedFile, err)
+	}
+}
+
+// TestE2EResourcesReportsAStoreWithNoLedger drives the most common state this
+// code will ever be in and the one nothing exercised: a store whose run ledger
+// is not there. A workspace indexed before the ledger existed, a first run
+// after an upgrade and a store whose ledger a sweep removed all reach it, and
+// every surface above ledger.OpenReader has an absent-ledger branch that no
+// test ran.
+//
+// Two failures are guarded, and both are silent. The report must still be
+// produced -- the resources block is the host's own measurements and does not
+// depend on any run having been recorded, so an absent ledger must not fail the
+// command. And it must render no run at all rather than a run of zeros: a row
+// reading `0s`, `0` files and `0` units is a run that never happened, and an
+// operator reading it cannot tell it from a run that did nothing.
+//
+// It is an end-to-end row rather than a unit one because the absent branch is
+// in the composition -- the workspace's ledger adapter -- and only a real store
+// with its ledger file removed puts it there.
+//
+// Mutation: in the workspace's run-ledger adapter, answer an unrecorded ledger
+// with an empty model.RunRecord instead of none.
+func TestE2EResourcesReportsAStoreWithNoLedger(t *testing.T) {
+	s := newSandbox(t)
+	indexEnv, indexCode := s.run(t, "index")
+	if !indexEnv.OK || indexCode != 0 {
+		t.Fatalf("index failed (exit %d): %+v", indexCode, indexEnv.Error)
+	}
+
+	// The ledger is removed the way a sweep or an older store leaves it: the
+	// file is simply not there. Its sidecars go with it, since a stale
+	// write-ahead log would describe a database that no longer exists.
+	var removed int
+	root := filepath.Join(s.Home, "data")
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasPrefix(d.Name(), "ledger.db") {
+			return nil
+		}
+		removed++
+		return os.Remove(path)
+	}); err != nil {
+		t.Fatalf("removing the run ledger: %v", err)
+	}
+	if removed == 0 {
+		t.Fatalf("the index recorded no ledger under %s, so this row proves nothing about its absence", root)
+	}
+
+	// runText fails the test on any non-zero exit, which is the first
+	// assertion: a store with no ledger still reports.
+	report := s.runText(t, "status", "--resources")
+	if !strings.Contains(report, "parent rss") {
+		t.Fatalf("the resources block is missing from a report over a store with no ledger:\n%s", report)
+	}
+	if strings.Contains(report, "\nrun\n") {
+		t.Fatalf("a store with no recorded run rendered a run table, which is a run that never happened:\n%s", report)
+	}
+
+	env, code := s.run(t, "status", "--resources")
+	// The command's payload wraps the status under "index", beside the tool
+	// report; only the status is asserted here.
+	status := data[struct {
+		Index model.IndexStatus `json:"index"`
+	}](t, env, code).Index
+	if status.Resources == nil {
+		t.Fatal("the report carries no resources block, though the block measures the host and not any run")
+	}
+	if status.Resources.Run != nil {
+		t.Fatalf("a store with no ledger answered with a run record: %+v", status.Resources.Run)
+	}
+	if len(status.Resources.Stages) != 0 {
+		t.Fatalf("a store with no ledger answered with %d stages", len(status.Resources.Stages))
 	}
 }

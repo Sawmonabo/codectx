@@ -12,11 +12,13 @@ the store · incremental per file · no lowered analysis limits · no omitted fa
 
 ```
 per file (the unit of caching and invalidation)
-  tree-sitter CST                 -- already built by the structural provider; reuse the same tree
+  tree-sitter CST                 -- built in the structural provider's own worker subprocess, which
+                                     owns every native object; the analysis runs INSIDE that worker,
+                                     because nothing but fact frames crosses the wire
   └─ per function (the unit of WORK and of MEMORY)
        normalise            CST subtree -> a fixed statement/expression vocabulary   [per-language]
        CFG                  over the normalised vocabulary                           [shared]
-       post-dominators      reversed CFG, Lengauer-Tarjan (gonum)                    [shared]
+       post-dominators      reversed, exit-augmented CFG; Cooper-Harvey-Kennedy       [shared]
        CDG                  dominance frontier of the reversed CFG (Ferrante 3.1.1)  [shared]
        def/use              write-site enumeration + read enumeration                [per-language]
        reaching defs        forward may-analysis, bitset worklist                     [shared]
@@ -96,24 +98,27 @@ native detail is an existing pattern, not new surface.
 | `control_depends_on` | native, all nine languages | strictly per-function; file-locality proven |
 | `data_flows_to` | native, all nine languages | intraprocedural; file-locality proven |
 | `reads` / `writes` | native **write-site enumeration**; target resolution only as far as a binding source carries it | no SCIP indexer sets a write role; syntax cannot resolve an assignment target (`10-reaching-defs-and-readswrites.md`, Unit 2) |
-| `calls` | **not the native engine's job.** SCIP where a profile applies; tree-sitter heuristics otherwise | the engine's `calls` is the one family that does not survive subdivision, and it is also the one that SCIP+LSP cannot fully replace on r3 today (`08-calls-without-the-engine.md`) |
+| `calls` | **native, in two later phases**: a static name join for the four frontends the engine gives no type recovery (C/C++, Go, Rust, Java), then type recovery for the ECMAScript family and Python | it is the last family and the only one that needs a project scope, so it is ordered last — but it is ported, not left behind (`15-requirements-audit.md`) |
 
-So the engine's remaining role after a complete native build is **`calls` for units no precise
-indexer covers** — which is a smaller, optional, already-degradable role, and it is the role the
-product already treats as a fallback (`00-synthesis.md` §3: "`calls` as a fallback where no SCIP
-profile applies"). Whether to keep it at all is a separate decision the pilot does not need to make.
+So there is **no residue**. The phase order leaves the engine owning `calls` for progressively fewer
+languages, and the last phase is a retirement gate with five simultaneous measured conditions rather
+than an open question (`15-requirements-audit.md`). Until that gate, `calls` for units no precise
+indexer covers is still the engine's, which is the role the product already treats as a fallback
+(`00-synthesis.md` §3: "`calls` as a fallback where no SCIP profile applies").
 
 ## Dependencies this adds
 
-Two, both permissively licensed, both pinnable, neither reaching the network at runtime
-(`09-native-building-blocks.md`): `gonum.org/v1/gonum/graph/flow` v0.17.0 (BSD-3, Lengauer-Tarjan)
-and, optionally and for the Go family only, `golang.org/x/tools` v0.50.0 (BSD-3, `go/ssa` +
-`go/callgraph`). The CST layer, cgo and all nine grammars are already pinned.
+**None for the shared core.** The dominator core is written in the repository rather than imported
+(`18-algorithms-dominance-and-dataflow.md` §1), so the analysis adds no module to `go.mod`. A Go-family
+compiler-precision call graph would optionally add `golang.org/x/tools` (BSD-3, `go/ssa` +
+`go/callgraph`); the highest version readable on this host is v0.49.0. The CST layer, cgo and the nine
+grammar registrations (from eight pinned grammar modules) are already pinned.
 
 ## What it deletes
 
-`internal/provider/dependence/neo4jcsv` — 3,446 non-test Go lines and 1,428 test lines
-(`01-product-anchors.md`) — plus the staging database, its 256 MiB cache, its scratch pool, its
+`internal/provider/dependence/neo4jcsv` — 4,874 lines of package source (3,446 non-test + 1,428 test),
+of which **339 relocate rather than die** (the fact-key comparator the oracle is built on), for a net
+credit of **4,535** (`15-requirements-audit.md`) — plus the staging database, its 256 MiB cache, its scratch pool, its
 exclusive lock, its retirement rule, the paced reclamation of its freed gigabytes, the six engine
 failure classes reverse-engineered from stderr, the per-family memory allowances, the heap-cap
 sizing, the OOM retry and the subdivision path (`04-requirements-and-engine-cost.md`). That is real

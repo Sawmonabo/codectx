@@ -570,3 +570,103 @@ func TestAdmissionLeavesTheQueueOnCancellation(t *testing.T) {
 		t.Fatalf("%d waiters and %d bytes left after a cancelled wait; want none", queued, used)
 	}
 }
+
+// TestChildAccountingReportsWhatTheChildActuallyCost protects the per-child
+// measurement the run accounting is built on: processor time and transferred
+// bytes that this platform CAN observe must arrive as real figures. A run that
+// reported them as unavailable, or as zero, would make every child in the
+// accounting look free, and a reader would have no way to tell an expensive
+// stage from a cheap one.
+func TestChildAccountingReportsWhatTheChildActuallyCost(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, dir := testRunner(t)
+
+	// 1 KiB per line, 1024 lines: exactly a mebibyte written into the child's
+	// own working directory, preceded by an arithmetic loop long enough to
+	// show up in a millisecond figure.
+	const wrote = 1 << 20
+	// The trailing idle is load-bearing, not padding: the byte counters are
+	// read by the tree sampler's periodic sweep, so the tree must still exist
+	// for at least one sweep after the last write or there is no process left
+	// to read them from and the figure would be whatever was true before the
+	// writes.
+	script := `i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done; ` +
+		`line=$(printf '%01023d' 0); j=0; ` +
+		`while [ $j -lt 1024 ]; do echo "$line"; j=$((j+1)); done > out.bin; ` +
+		`sleep 1`
+
+	result, err := runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", script},
+		Dir:            dir,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        90 * time.Second,
+		Grace:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("the child failed the run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0", result.ExitCode)
+	}
+
+	if result.CPUUnsampled {
+		t.Fatal("processor time is reported unavailable for a child this platform reaped")
+	}
+	cpu := result.CPUUserMillis + result.CPUSysMillis
+	if cpu <= 0 {
+		t.Errorf("the child consumed %d ms of processor time (user %d, system %d), want a measurable figure",
+			cpu, result.CPUUserMillis, result.CPUSysMillis)
+	}
+	// One single-threaded child cannot consume more processor time than the
+	// run lasted; a figure above that is a misread unit, not a measurement.
+	if wall := result.Duration.Milliseconds(); cpu > wall {
+		t.Errorf("the child consumed %d ms of processor time in a %d ms run", cpu, wall)
+	}
+
+	if !treeSampled {
+		t.Skip("this platform has no per-process byte counters, so the transferred bytes are absent by construction")
+	}
+	if result.IOUnsampled {
+		t.Fatal("transferred bytes are reported unavailable on a platform that counts them")
+	}
+	if result.WriteBytes < wrote {
+		t.Errorf("the tree is recorded as having written %d bytes; the child alone wrote %d",
+			result.WriteBytes, wrote)
+	}
+}
+
+// TestUnmeasuredChildAccountingIsAbsentNotZero protects Section 22's rule for
+// the same figures: where there is no measurement the Result must say so. A
+// caller cannot tell an observed zero from a missing observation, so a run that
+// never started a child and reported zero cost would be recorded as a stage
+// that genuinely ran for free.
+func TestUnmeasuredChildAccountingIsAbsentNotZero(t *testing.T) {
+	runner, dir := testRunner(t)
+
+	// A path that is not an approved executable: the run is rejected before any
+	// child exists, so nothing was reaped and no sweep ever happened.
+	result, err := runner.Run(context.Background(), Spec{
+		Path:           filepath.Join(dir, "no-such-tool"),
+		Dir:            dir,
+		MaxStdoutBytes: 16,
+		MaxStderrBytes: 16,
+		Timeout:        time.Second,
+		Grace:          time.Second,
+	})
+	if err == nil {
+		t.Fatal("a run of a path that is not an approved executable succeeded")
+	}
+	if !result.CPUUnsampled {
+		t.Errorf("processor time is reported as measured (%d/%d ms) for a child that never ran",
+			result.CPUUserMillis, result.CPUSysMillis)
+	}
+	if !result.IOUnsampled {
+		t.Errorf("transferred bytes are reported as measured (%d read, %d written) for a child that never ran",
+			result.ReadBytes, result.WriteBytes)
+	}
+	if !result.TreeUnsampled {
+		t.Error("the tree peak is reported as measured for a child that never ran")
+	}
+}

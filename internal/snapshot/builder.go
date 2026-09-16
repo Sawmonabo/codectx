@@ -287,8 +287,7 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 		"retries", b.notes.Retries, "submodules", b.notes.SubmoduleCount, "lfs_pointers", b.notes.LFSPointerCount,
 		"sparse_skipped", b.notes.SparseSkipped, "skipped_symlinks", b.notes.SkippedSymlinks,
 		"skipped_non_regular", b.notes.SkippedNonRegular, "excluded_tracked", b.notes.ExcludedTracked,
-		"long_paths", b.notes.LongPathCount, "bounds_exceeded", b.notes.BoundsExceeded,
-		"duration", time.Since(started))
+		"long_paths", b.notes.LongPathCount, "bounds_exceeded", b.notes.BoundsExceeded)
 	return snap, nil
 }
 

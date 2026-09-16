@@ -20,11 +20,14 @@ package lsp
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -71,7 +74,20 @@ type Options struct {
 	MaxOverlayBytes config.Limit
 	// MaxFrameBytes bounds one protocol message.
 	MaxFrameBytes int64
+	// Ledger is the process's run ledger -- the one the composition root
+	// opened, never a second one: the ledger file has a single collector, and
+	// a manager that opened its own would be a second writer on it. It may be
+	// nil, and then the manager records nothing, which is what a composition
+	// with no ledger (a report, which never holds the workspace lock) gets.
+	//
+	// The manager records into a run of its own rather than a generation's: a
+	// server start is lazy, pooled and shared between generations, so it
+	// belongs to none of them.
+	Ledger *ledger.Ledger
 }
+
+// stageServerStart is the stage a language server's start is recorded under.
+const stageServerStart = "server_start"
 
 // Package defaults for the bounds configuration does not name.
 const (
@@ -112,6 +128,12 @@ type Manager struct {
 	// server too, not only of the ones still holding a slot.
 	live   map[*server]struct{}
 	closed bool
+	// overlay is this process's overlay run, opened by the FIRST server start
+	// and deleted at Close. It is opened lazily and not at construction
+	// because a run with no span under it is never written until the ledger
+	// stops, and stopping would then write one row per process that never
+	// started a server -- the row this run exists to avoid leaving behind.
+	overlay *ledger.Run
 }
 
 // materialization is one snapshot's shared tree: ready is closed once the fill
@@ -441,6 +463,53 @@ func (m *Manager) untrack(s *server) {
 	m.mu.Unlock()
 }
 
+// overlayContext returns a context whose spans belong to this process's
+// overlay run, opening that run on the first call. repositoryID is the
+// repository the snapshot being served names, which is the only place the
+// manager can learn it without spelling the identity a second time.
+//
+// A ledger failure never fails a server start: the answer the server gives is
+// correct whatever the accounting did, so the failure is logged with its
+// diagnostic code and the start proceeds with a run that records nothing.
+func (m *Manager) overlayContext(ctx context.Context, repositoryID string) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.overlay == nil {
+		run, err := m.opts.Ledger.NewRun(ledger.KindOverlay, repositoryID)
+		if err != nil {
+			code := model.CodeInternal
+			var typed *model.Error
+			if errors.As(err, &typed) {
+				code = typed.Code
+			}
+			slog.Warn("language server starts are not being recorded in the run ledger",
+				"component", "lsp", "error_code", code, "error", err.Error())
+			return ctx
+		}
+		if run == nil {
+			return ctx
+		}
+		m.overlay = run
+	}
+	return m.overlay.Context(ctx)
+}
+
+// endOverlay ends this process's overlay run and removes it. An overlay run
+// belongs to no generation, so the retention that deletes a generation's runs
+// would never reach it: a process that exits cleanly takes its own row with it,
+// and the collection pass takes the rows of the processes that did not.
+func (m *Manager) endOverlay() error {
+	m.mu.Lock()
+	run := m.overlay
+	m.overlay = nil
+	m.mu.Unlock()
+	if run == nil {
+		return nil
+	}
+	run.Finish(ledger.OutcomeOK)
+	return m.opts.Ledger.DiscardRun(context.Background(), run)
+}
+
 // Close stops every server and refuses further opens. It returns once every
 // process tree is reaped and every materialization removed, including the
 // trees of servers that failed and were forgotten: those are stopped through
@@ -467,7 +536,8 @@ func (m *Manager) Close() error {
 	for _, s := range live {
 		s.stop()
 	}
-	return nil
+	// Last, once no start can still open a span under it.
+	return m.endOverlay()
 }
 
 // Servers reports how many servers are currently running or starting.

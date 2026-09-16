@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
@@ -67,6 +68,12 @@ type pool struct {
 	live   map[*worker]bool
 	closed bool
 	wg     sync.WaitGroup
+	// totals is the open structural-parse total of every run parsing through
+	// this pool, which is what a worker's span hangs off. It is keyed by the
+	// run and not held as one span because a deferred publication's tick runs
+	// units of its own, and its workers belong to its run rather than to
+	// whatever index run happens to be live.
+	totals map[*ledger.Run]*stageTotal
 
 	started, exited, parses, retries uint64
 }
@@ -86,6 +93,10 @@ type worker struct {
 	// result and runErr are written by the run goroutine before done closes.
 	result process.Result
 	runErr error
+	// span is this worker's place in the run ledger. It is opened where the
+	// process is started and ended in the run goroutine, which is where the
+	// child's measured cost first exists.
+	span *ledger.Span
 
 	// pid and rss are written by the goroutine driving the worker and read by
 	// stats from any goroutine, so both are atomic rather than guarded by the
@@ -118,9 +129,81 @@ func workerEnv() []string {
 
 func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, parseTTL time.Duration, memory int64) *pool {
 	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, parseTTL: parseTTL, memory: memory,
-		live: map[*worker]bool{}}
+		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{}}
 	p.cond = sync.NewCond(&p.mu)
 	return p
+}
+
+// enterStage opens the run's structural-parse total on the first unit that
+// parses under it, and counts this one in. The total is opened from the run
+// alone rather than from the caller's context: the workers under it outlive
+// the unit that started them.
+func (p *pool) enterStage(ctx context.Context) {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.totals[run]
+	if t == nil {
+		spanCtx, span := ledger.Start(run.Context(context.Background()), stageStructuralParse, "")
+		t = &stageTotal{ctx: spanCtx, span: span}
+		p.totals[run] = t
+	}
+	t.refs++
+}
+
+// leaveStage counts one unit out and ends the run's total when the last one
+// leaves. The caller drains the pool first, so the workers' own spans -- and
+// with them the child measurements the total's children carry -- are recorded
+// before the parent ends. A worker still busy for another run keeps its own
+// span and ends it where it exits.
+func (p *pool) leaveStage(ctx context.Context) {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	if t == nil {
+		p.mu.Unlock()
+		return
+	}
+	t.refs--
+	last := t.refs == 0
+	if last {
+		delete(p.totals, run)
+	}
+	p.mu.Unlock()
+	if last {
+		// The stage's own goroutines run beside everything else in the
+		// process, so the parent carries no processor time of its own: the
+		// measured cost of this stage is on its children, one per worker
+		// process.
+		t.span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	}
+}
+
+// count records one parsed file on the worker that parsed it and on its run's
+// total. This is why no file is a span: a worker's files are two atomic adds
+// on a span that already exists, and the total is the sum of its workers.
+func (p *pool) count(ctx context.Context, w *worker, ex *extraction) {
+	records := int64(len(ex.decls) + len(ex.imports) + len(ex.refs))
+	w.span.AddIn(1)
+	w.span.AddOut(records)
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	p.mu.Unlock()
+	if t == nil {
+		return
+	}
+	t.span.AddIn(1)
+	t.span.AddOut(records)
 }
 
 // newWorker builds one worker's plumbing. Nothing here can fail and nothing
@@ -307,9 +390,20 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		Stdout: w.childOut, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
 		Timeout: workerLifetime, Grace: workerGrace, MemoryReservationBytes: p.memory,
 	}
+	w.span = p.openWorkerSpan(ctx)
 	go func() {
 		defer p.wg.Done()
 		w.result, w.runErr = p.runner.Run(w.ctx, spec)
+		// The worker's cost is known here and nowhere earlier: the run has
+		// returned, so the child has been reaped and its processor time, tree
+		// peak and transferred bytes are on the result. The span is ended
+		// before done closes, so a drain that waits for the reap cannot return
+		// before this worker's cost has been recorded.
+		outcome := ledger.OutcomeOK
+		if w.runErr != nil {
+			outcome = ledger.OutcomeFailed
+		}
+		w.span.End(outcome, measured(w.result), w.runErr)
 		// Unblock any parent write or read: the worker cannot answer any more.
 		w.childIn.CloseWithError(errWorkerGone)
 		w.childOut.CloseWithError(errWorkerGone)
@@ -363,6 +457,27 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	}
 	w.pid.Store(int64(hello.PID))
 	return nil
+}
+
+// openWorkerSpan opens one worker's span under the total of the run that is
+// starting it, or, where that run is parsing outside a stage, under the run
+// itself. It is never opened under the caller's context: a pooled worker
+// serves the units that follow this one and is reaped long after this unit's
+// span has ended.
+func (p *pool) openWorkerSpan(ctx context.Context) *ledger.Span {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return nil
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	p.mu.Unlock()
+	parent := run.Context(context.Background())
+	if t != nil {
+		parent = t.ctx
+	}
+	_, span := ledger.Start(parent, stageStructuralParse, "")
+	return span
 }
 
 // watch cancels the worker when ctx ends or the deadline passes before the

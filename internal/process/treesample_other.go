@@ -5,9 +5,9 @@ package process
 import "time"
 
 // treeSampled is false here: no portable equivalent of /proc gives a running
-// process tree's resident memory. The runner reports the figure as unavailable
-// rather than as zero, so a caller never reads "no measurement" as "no memory"
-// (Section 22).
+// process tree's resident memory, nor its transferred bytes. The runner reports
+// both figures as unavailable rather than as zero, so a caller never reads "no
+// measurement" as "no memory" or as "moved nothing" (Section 22).
 const treeSampled = false
 
 // treeSampler is the inert form for platforms with no tree sampling. It starts
@@ -16,7 +16,9 @@ type treeSampler struct{}
 
 func startTreeSampler(int, time.Duration) *treeSampler { return nil }
 
-func (s *treeSampler) stopSampling() int64 { return 0 }
+// stopSampling returns the empty sample: nothing was observed, and its zero
+// ioSampled is what makes the runner report the byte figures as absent.
+func (s *treeSampler) stopSampling() treeSample { return treeSample{} }
 
 // cpuTicks is always zero here: with no tree sampling there is no CPU signal,
 // so the stall watchdog is left with the portable byte counters alone.

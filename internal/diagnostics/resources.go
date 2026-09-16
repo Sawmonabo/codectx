@@ -1,7 +1,9 @@
 package diagnostics
 
 import (
+	"cmp"
 	"context"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -60,10 +62,51 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
+	s.runLedger(ctx, &report)
 	if err := report.Validate(); err != nil {
 		return model.ResourceReport{}, err
 	}
 	return report, nil
+}
+
+// runLedger fills the run this repository last recorded and the stages it
+// spent its time in. The run is the live one where a run is going and
+// otherwise the one that produced the active generation, which is the ledger's
+// own choice and not a judgement made here: a status surface must never decide
+// for itself whether another process is still alive.
+//
+// The stages are ordered once, here, by wall descending with the run's own
+// ordinal breaking a tie. Ordering at assembly and not in each renderer is what
+// makes the table and the JSON the same rows in the same order; two surfaces of
+// one model that sorted separately could disagree about which stage cost the
+// most, and only one of them would be read.
+//
+// A ledger that cannot be read leaves the two rows absent and the report
+// succeeds, for the reason the store's sizes do: the host figures the sampler
+// produced are still true, and an unreadable accounting file must not suppress
+// the memory reading an operator is diagnosing a memory problem with.
+func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
+	if s.opts.Ledger == nil {
+		return
+	}
+	// A repository with no active pointer yet is asking about its most recent
+	// run, which is what a generation of zero means to the ledger; a store
+	// that cannot answer is the same question.
+	generation, err := s.opts.Store.ActiveGeneration(ctx, s.opts.Repo)
+	if err != nil {
+		generation = 0
+	}
+	run, stages, omitted, err := s.opts.Ledger.LatestRun(ctx, s.opts.Repo, generation)
+	if err != nil || run == nil {
+		return
+	}
+	slices.SortStableFunc(stages, func(a, b model.StageRecord) int {
+		if order := cmp.Compare(b.WallMS, a.WallMS); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Seq, b.Seq)
+	})
+	report.Run, report.Stages, report.StagesOmitted = run, stages, omitted
 }
 
 // scratchBytes discloses the disk the store's scratch pools hold, which is
