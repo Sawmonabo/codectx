@@ -19,15 +19,20 @@ reconstructed by hand from log timestamps. A person can do that with a terminal 
 agent driving the product over MCP cannot, and neither can a script, and neither can the product
 itself when asked why a run is taking a long time *while it is still taking it*.
 
-Six stages already log a duration, each in its own shape and none of them aggregated:
+What the product had instead, when this was decided, was scattered. Six stages each logged a
+duration, every one in its own shape and none of them aggregated:
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
 `internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:258` and
 `internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
-needs are already taken and thrown away: the child process tree's peak resident memory is sampled
-every 250 ms by `internal/process/treesample_linux.go:55` and reaches only the dependence
-provider's memory governor; the reaped child's `rusage` is reachable at
-`internal/process/runner.go:607` and is read by nothing at all; the tree's summed CPU
-ticks are kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
+needs were already being taken and thrown away: the child process tree's peak resident memory was
+sampled every 250 ms by `internal/process/treesample_linux.go:55` and reached only the dependence
+provider's memory governor; the reaped child's `rusage` was reachable at
+`internal/process/runner.go:607` and was read by nothing at all; the tree's summed CPU ticks were
+kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
+
+The decision below replaced all of it. Those six duration lines are gone, and each of those three
+measurements now has a reader, so this paragraph describes the state that motivated the decision and
+not the state of the tree.
 
 ## Decision
 
@@ -100,10 +105,12 @@ would spill or an exclusive writer waits ([ADR-0008](ADR-0008-ingestion-group.md
 until that commit, so a ledger inside it could not answer a question about a run in progress --
 which is half of the requirement.
 
-`Store.Activate` (`internal/storage/sqlite/units.go:1429`) holds an exclusive transaction around
-lexical compaction, the adjacency build and the lexical build (`:1484`, `:1590`, `:1596`). Any
-other writer on that file waits or fails busy for its duration, which is exactly the window an
-operator most wants the ledger to be answering in.
+`Store.Activate` (`internal/storage/sqlite/units.go:1429`) opens an exclusive transaction at
+`:1488` and holds it around the adjacency build and the lexical build (`:1590`, `:1596`). Lexical
+compaction runs just before that transaction (`:1484`) as its own bounded ingestion rather than
+inside it, so the exclusive window is narrower than the whole of activation -- and still wide enough
+to matter. Any other writer on that file waits or fails busy for its duration, which is exactly the
+window an operator most wants the ledger to be answering in.
 
 There is a third reason that is not about contention. The main schema's text is hashed into a
 fingerprint (`internal/storage/sqlite/schema.go:31`) that is folded into every analysis key
@@ -199,6 +206,31 @@ channel bound drops some and says so rather than slowing down; a stage whose CPU
 attributed reports none, so the CPU column has holes exactly where concurrency is; and the span
 tree is a public shape that the CLI, the MCP tool and the log all depend on, so changing it changes
 all four at once.
+
+### What it costs
+
+`TestLedgerCost` (`internal/bench/ledgercost_test.go`) indexes one generated corpus twice per
+repetition -- once with a recording ledger, once with the coordinator composed without one -- in
+child processes, swapping which arm runs first every repetition so neither arm is systematically
+the one that pays for what the other warmed. Six measured repetitions per arm, one discarded
+warm-up, on a host whose one-minute load average was 0.24 at the start and 0.49 at the end against
+the guard's threshold of 4.0.
+
+| measurement | without the ledger | with it | paired difference |
+| --- | --- | --- | --- |
+| the indexing call | median 994 ms (966..1007) | median 1034 ms (1015..1039) | **+45 ms**, every repetition the same sign |
+| the whole child process | median 1011 ms (988..1024) | median 1058 ms (1037..1063) | **+52 ms**, every repetition the same sign |
+| peak resident set of the tree | median 109.7 MiB (104.6..111.0) | median 108.3 MiB (106.6..113.2) | +1.0 MiB, **within noise** -- the sign is not stable |
+| `Ledger.Stop`, the final flush and join | 0 ms | 3 ms | +3 ms |
+
+The recording arm wrote about 518 spans per run. Read the wall figures as the absolute ones they
+are and not as the percentage: a second is short enough that opening the file, starting the
+collector and the closing flush are most of the 45 ms, and those are paid once per run whatever its
+length. A run of the reference repository's size pays the same fixed cost and a per-span cost on a
+few thousand more spans, against a wall of twenty-six minutes.
+
+The memory column is the one an operator asks about first, and the honest answer is that this
+measurement could not distinguish the ledger's cost from the noise of a 110 MiB process.
 
 ## Sources
 
