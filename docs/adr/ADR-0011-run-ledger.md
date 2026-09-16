@@ -144,6 +144,22 @@ say what it cost is not a diagnosable run, and a diagnostic that must be enabled
 happens is a diagnostic that is off when the problem happens. The cost is therefore measured rather
 than assumed, and a cost above the noise of a run is a defect to fix, not a knob to add.
 
+What it costs, measured. One cold index of the 124-file `corpusSmallReal` bench fixture, run with the
+ledger composed and with it absent, alternating, six measured repetitions per arm after a discarded
+warm-up, each repetition in its own process over its own data directory. The recorded arm wrote
+263-281 spans per run. Index wall: unrecorded median 1002 ms (range 954-1012), recorded median
+1039 ms (range 1005-1079); the paired per-repetition difference was +26.5 ms median, +2.6% of the
+unrecorded arm, spread +7.3 to +124.3 ms, positive in every repetition. Peak resident memory of the
+process tree: unrecorded median 110.1 MiB (range 105.6-113.5), recorded median 109.1 MiB (range
+104.7-112.5); the paired difference was -1.5 MiB median, spread -6.4 to +4.3 MiB, sign not stable,
+which is within noise. Flushing the last rows at stop cost 3-5 ms, outside the run.
+
+The wall figure is small, positive and at the edge of what the host it was taken on can resolve: the
+same measurement repeated gave paired medians from +1.7% to +12.2%, and the machine was never idle.
+It is recorded as a cost at the noise floor rather than cleared, and is to be re-measured on a quiet
+machine before it is either dismissed or treated as the defect a cost above noise would be. The
+figure is reproduced by `go test -run TestLedgerCost ./internal/bench`.
+
 ## Alternatives considered
 
 - **A table in the main store.** Steel-manned: one database, one retention path, no second file to
