@@ -1,0 +1,5 @@
+30064771072,CALL,1,,,x + 1,12,STATIC_DISPATCH,,2,<operator>.addition,<operator>.addition,26,31,1,,,,ANY
+30064771073,CALL,-1,,,helper = def helper(...),1,STATIC_DISPATCH,,1,<operator>.assignment,<operator>.assignment,0,33,1,,,,ANY
+30064771074,CALL,-1,,,f = helper,5,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,49,59,1,,,,ANY
+30064771075,CALL,1,,,f(i),12,DYNAMIC_DISPATCH,,6,<unknownFullName>,f,71,75,1,,,,ANY
+30064771076,CALL,-1,,,run = def run(...),1,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,33,76,2,,,,ANY
