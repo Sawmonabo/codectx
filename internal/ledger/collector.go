@@ -66,7 +66,8 @@ func (l *Ledger) collect() {
 // called after the commit, so a subscriber never reports a row a reader could
 // not yet see.
 func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
-	if len(batch) == 0 && len(running) == 0 && !l.anyDirty() {
+	now := time.Now()
+	if len(batch) == 0 && len(running) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
 		return
 	}
 	ctx := context.Background()
@@ -98,6 +99,9 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 				span.In(), span.Out(), span.run.id, span.seq); err != nil {
 				return wrap("snapshot span counters", err)
 			}
+		}
+		if err := l.refreshLiveness(ctx, tx, now); err != nil {
+			return err
 		}
 		return l.updateRuns(ctx, tx)
 	})
@@ -153,15 +157,42 @@ func (l *Ledger) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
 	if run.inserted {
 		return nil
 	}
+	expires := time.Now().Add(liveWindow)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(
-		run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
+		run_id, kind, repository_id, generation_id, started_at, expires_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
 		events_dropped, process_peak_rss_bytes)
-		VALUES(?, ?, ?, NULL, ?, NULL, 'running', 0, 0, 0, 0, 0, 0, 0, NULL)`,
-		run.id, string(run.kind), run.repo, formatTime(run.started)); err != nil {
+		VALUES(?, ?, ?, NULL, ?, ?, NULL, 'running', 0, 0, 0, 0, 0, 0, 0, NULL)`,
+		run.id, string(run.kind), run.repo, formatTime(run.started), formatTime(expires)); err != nil {
 		return wrap("record the run", err)
 	}
 	run.inserted = true
+	run.expires = expires
+	return nil
+}
+
+// refreshLiveness renews the deadline of every live run whose stamp is running
+// out. It is the run's own claim that the process writing it is still there,
+// and it is a statement of its own rather than a column on the totals update:
+// the totals are written only when they move, and a run that is doing nothing
+// at this instant is no less alive for it.
+func (l *Ledger) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for _, run := range runs {
+		if !run.refreshDue(now) {
+			continue
+		}
+		expires := now.Add(liveWindow)
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
+			formatTime(expires), run.id); err != nil {
+			return wrap("refresh the run's liveness", err)
+		}
+		run.mu.Lock()
+		run.expires = expires
+		run.mu.Unlock()
+	}
 	return nil
 }
 
