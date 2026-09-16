@@ -202,7 +202,7 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 	runtime.ReadMemStats(&before)
 	slog.Default().Info("packed lexical activation started", "generation", gen)
 	var segments int64
-	_, span := ledger.Start(ctx, stageLexicalBuild, "")
+	ctx, span := ledger.Start(ctx, stageLexicalBuild, "")
 	defer func() {
 		span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &segments}, err)
 		runtime.ReadMemStats(&after)
