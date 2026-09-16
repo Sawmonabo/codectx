@@ -47,7 +47,8 @@ type Spec struct {
 	Dir string
 	// Env is the complete child environment as KEY=VALUE pairs. It is never
 	// merged with the parent's environment; an empty Env means the child runs
-	// with no environment at all.
+	// with nothing but the UTF-8 locale the runner sets for every child (see
+	// locale.go), which the caller's own pairs come after and may override.
 	Env []string
 	// Stdin is the optional bounded input. At most MaxStdinBytes are copied --
 	// zero means no bound -- and the child's stdin is then closed, so a child
@@ -421,11 +422,11 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	cmd.Dir = spec.Dir
 	// An os/exec Cmd with a nil Env inherits the parent's environment. The
 	// child must never see it, so an empty allowlist is an empty environment,
-	// not an absent one. Do not "simplify" this to cmd.Env = spec.Env.
-	cmd.Env = spec.Env
-	if cmd.Env == nil {
-		cmd.Env = []string{}
-	}
+	// not an absent one -- and never a nil one, which is why the locale the
+	// product sets for every child is prepended rather than appended: it makes
+	// the slice non-nil whatever the caller passed, and leaves the caller's
+	// own variables last, where a child's runtime reads them.
+	cmd.Env = append(localeEnv(), spec.Env...)
 
 	job, err := newJobControl()
 	if err != nil {
