@@ -161,3 +161,8 @@ func SetLexPartBytes(n int) func() {
 	lexPartBytes = n
 	return func() { lexPartBytes = prev }
 }
+
+// Commits reports how many ingestion groups the store has committed, so a test
+// can prove a long cascade of writes reached the group's commit decision
+// between its steps rather than running as one unbounded transaction.
+func (s *Store) Commits() int64 { return s.commits.Load() }

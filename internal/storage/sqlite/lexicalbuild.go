@@ -176,7 +176,9 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 // buildLexical records the generation's segment set. It runs inside Activate's
 // transaction, after the packed adjacency and before the active pointer flips,
 // so a generation is published only with the structure every lexical query
-// reads.
+// reads. Whatever compaction was due ran before this call, each merge its own
+// ingestion call (compactGeneration), so this one records the set the merges
+// left and writes no packed bytes of its own.
 //
 // The set is DERIVED, never copied: it is the distinct segments the live rows
 // of the generation's member units point at, in segment-id order.
@@ -186,10 +188,9 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 // segments by that rule rather than by copying its set, and no segment can be
 // named beside the one that absorbed its documents.
 //
-// An activation therefore writes one row per segment, the visible-document
-// bitmap and whatever compaction was due, never a rewrite of the whole packed
-// structure: publishing a one-file delta costs the delta's own segment plus,
-// occasionally, one tier merge.
+// An activation therefore writes one row per segment and the visible-document
+// bitmap, never a rewrite of the whole packed structure: publishing a one-file
+// delta costs the delta's own segment plus, occasionally, one tier merge.
 func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	// ADR-0007 holds this pass to 5 % of the index wall clock. That bound is
 	// only checkable if the operator can see the pass on its own, so its start
@@ -201,12 +202,12 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	slog.Default().Info("packed lexical activation started", "generation", gen)
-	var segments, merges int64
+	var segments int64
 	defer func() {
 		runtime.ReadMemStats(&after)
 		slog.Default().Info("packed lexical activation finished",
 			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
-			"segments", segments, "merges", merges,
+			"segments", segments,
 			// Signed: a pass that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.
@@ -226,11 +227,6 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	if err != nil {
 		return err
 	}
-	ids, merges, err = compactSegments(ctx, tx, ids, live, stats)
-	if err != nil {
-		return err
-	}
-
 	var covered int64
 	for ord, id := range ids {
 		hidden := stats[id].docs - live[id]
