@@ -222,9 +222,30 @@ func data[T any](t *testing.T, env envelope, code int) T {
 // session. Nothing else in a row may take that lock while this is open.
 func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSession {
 	t.Helper()
-	session, closeSession := s.mcpServer(t, ctx)
+	session, _, closeSession := s.mcpServer(t, ctx)
 	t.Cleanup(closeSession)
 	return session
+}
+
+// serverLog is the running server's stderr, readable while it is still being
+// written. The buffer is guarded because the process writes it from the
+// exec.Cmd's own goroutine while a row polls it for the records the session
+// emits -- a watch's refreshes are reported there and nowhere else.
+type serverLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *serverLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *serverLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }
 
 // mcpServer is mcpSession with the extra `mcp serve` arguments a row needs and
@@ -234,20 +255,21 @@ func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSessi
 // workspace, and two of them is a different scenario from one.
 //
 // The close is idempotent, so a caller may end the session early and still let
-// the cleanup it registered run.
-func (s *sandbox) mcpServer(t *testing.T, ctx context.Context, extra ...string) (*mcp.ClientSession, func()) {
+// the cleanup it registered run. The server's stderr is returned with it: what
+// a watching session does between tool calls is reported there.
+func (s *sandbox) mcpServer(t *testing.T, ctx context.Context, extra ...string) (*mcp.ClientSession, *serverLog, func()) {
 	t.Helper()
-	var stderr bytes.Buffer
+	stderr := &serverLog{}
 	cmd := exec.Command(binary, append([]string{"mcp", "serve", "--repo", s.Repo}, extra...)...)
 	cmd.Env = s.Environ
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	client := mcp.NewClient(&mcp.Implementation{Name: "codectx-e2e", Version: "0.0.0-test"}, nil)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {
 		t.Fatalf("connect to `codectx mcp serve` over stdio: %v\nserver stderr:\n%s", err, stderr.String())
 	}
 	var once sync.Once
-	return session, func() {
+	return session, stderr, func() {
 		once.Do(func() {
 			if err := session.Close(); err != nil {
 				t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())

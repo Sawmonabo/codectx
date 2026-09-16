@@ -115,7 +115,7 @@ Four kinds of command, by what they may change:
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
 | **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
 | **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
-| **Both** | Held for each refresh, and for a watch | The refresh's own; its exploration tools write nothing | `mcp serve` |
+| **Both** | Held for each refresh and each watch beat, never between them | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
@@ -162,11 +162,19 @@ while another process holds the workspace is refused `CTX_WORKSPACE_BUSY` --
 that one tool call, not the session: every question-answering tool keeps
 answering throughout.
 
-A server started with `--watch` is the exception: its first pass takes the lock
-and it keeps it while it watches, because that session is already keeping the
-index fresh and a second process indexing the same workspace would be doing
-that work twice. A pass that cannot have the lock is logged and retried on the
-next interval; it never ends the session.
+A server started with `--watch` follows the same rule as a refresh: each beat
+that builds takes the lock and gives it back when that beat ends, so between
+beats the session owns nothing and your own `codectx index` runs. A beat that
+finds the workspace held by another process is skipped -- the debug record
+names the holder's pid and operation once for that episode, not once per beat
+-- and the next beat starts from whatever that process published, reusing its
+units rather than building them again. It never ends the session.
+
+The indexing row above is a different case, not an inconsistency: `codectx
+index` and `codectx watch` ARE the workspace's owner for their whole run, and
+they take the lock at startup and hold it to the end. The distinction is the
+session that also answers questions: `mcp serve` exists to be left running, so
+it owns the workspace only while it is actually building in it.
 
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by
