@@ -3,6 +3,7 @@ package graph
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -561,6 +562,84 @@ func TestExpiredPathLeaseSweepsTheRetainedState(t *testing.T) {
 // and long enough that an ordinary scheduling hiccup cannot expire it before
 // the stall does.
 const pathDeadlineProofTimeout = 150 * time.Millisecond
+
+// TestADeadlineInterruptedPathPageChargesEachEntryOnce holds the edge charge to
+// the entries a page actually took. The port reports a scan stopped from the
+// callback as the entry it last DELIVERED, and the resumed scan starts there,
+// so an entry charged before the stop decision is charged again by the page
+// that resumes -- a search with a finite edge budget then spends it on entries
+// it already paid for and stops converging. Both stops are therefore decided
+// before the charge: the page charges every entry it delivered except the one
+// it stopped on, which is the next page's first.
+//
+// The deadline is landed inside one node's list by the reader itself, after
+// exactly one relaxation batch, so the stop falls on a batch boundary -- where
+// the saved position is consistent with the buckets -- and never on a race.
+//
+// Mutation (charge `w.spent++`/`w.pageEdges++` before the deadline check, as
+// the code did when the check sat after the batch flush): the stopped entry is
+// charged by this page as well as the next and the cursor's edge count is one
+// too many.
+func TestADeadlineInterruptedPathPageChargesEachEntryOnce(t *testing.T) {
+	// `s` owns more than two relaxation batches of entries in this fixture, so
+	// the stall below lands inside its list rather than between two scans.
+	g := pathProofGraph(512)
+	delivered, fired := 0, false
+	reader := stallingPathGraph{MemoryGraph: g.reader(), delivered: &delivered,
+		after: adjacencyBatch, stall: 4 * pathDeadlineProofTimeout, fired: &fired}
+	e := pathPagingEngine(t, g, reader, t.TempDir(), newFixtureLeases(), 0)
+	e.limits.QueryTimeout = pathDeadlineProofTimeout
+
+	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: g.node("s"), To: g.node("t"),
+		Relations: []model.RelationKind{model.RelCalls, model.RelImports}})
+	if err != nil {
+		t.Fatalf("an expired deadline must end the page, not fail the request: %v", err)
+	}
+	if !fired {
+		t.Fatal("the reader never stalled; the page was not interrupted inside a scan")
+	}
+	if first.Meta.TruncationReason != pathReasonDeadline || first.Meta.NextCursor == "" {
+		t.Fatalf("want a deadline-truncated page with a continuation, got reason %q cursor %q",
+			first.Meta.TruncationReason, first.Meta.NextCursor)
+	}
+	payload, err := e.signer.Verify(first.Meta.NextCursor, pagination.PurposeCursor, e.now())
+	if err != nil {
+		t.Fatalf("verify cursor: %v", err)
+	}
+	var c pathCursor
+	if err := json.Unmarshal(payload, &c); err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	if want := int64(delivered - 1); c.Edges != want {
+		t.Fatalf("the page delivered %d entries and charged %d; it must charge %d -- every entry "+
+			"but the one it stopped on, which the next page charges", delivered, c.Edges, want)
+	}
+}
+
+// stallingPathGraph expires the search's deadline INSIDE one adjacency scan,
+// after a fixed number of delivered entries, and counts everything the port
+// hands the walk. slowPathGraph below stalls between scans, which is a
+// different stop: the port checks the context per owner and delivers nothing.
+type stallingPathGraph struct {
+	*MemoryGraph
+	delivered *int
+	after     int
+	stall     time.Duration
+	fired     *bool
+}
+
+func (s stallingPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
+	return s.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, func(e Edge) error {
+		*s.delivered++
+		if !*s.fired && *s.delivered > s.after {
+			*s.fired = true
+			time.Sleep(s.stall)
+		}
+		return fn(e)
+	})
+}
 
 // slowPathGraph is the deterministic deadline hook for the path search. The
 // traversal has one already (slowAdjacency, frontier_test.go), but it works by
