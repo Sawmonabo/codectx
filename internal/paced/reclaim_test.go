@@ -94,9 +94,12 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	if len(got) != windows {
 		t.Fatalf("the reclaimer waited %d times for %d windows; want one wait per window", len(got), windows)
 	}
+	// Each wait is the remainder of an interval since the host was last
+	// handed a window, which is the whole interval when nothing has taken a
+	// turn since and never more.
 	for i, d := range got {
-		if d != FreeInterval {
-			t.Fatalf("wait %d was %v; want %v", i, d, FreeInterval)
+		if d <= 0 || d > FreeInterval {
+			t.Fatalf("wait %d was %v; want a wait of at most one %v interval", i, d, FreeInterval)
 		}
 	}
 	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {

@@ -15,7 +15,10 @@
 // file or tree into a to-free set -- a rename frees nothing and costs a
 // directory entry -- and returns, and one reclaimer per process gives the
 // space back at FreeInterval per Window, on its own goroutine, for as long as
-// the process runs. The sets are on the disk, so a run that exits or crashes
+// the process runs. The rate is the host's: every charger in the process
+// waits under one lock, and the processes over one cache take their windows
+// in turn through a file at its root, so the disk is handed one window per
+// interval however many callers and however many runs are freeing. The sets are on the disk, so a run that exits or crashes
 // with removals queued leaves them for the next process to resume at the same
 // pace; nothing is ever freed faster because it is old. A path under no
 // registered set is freed in place, at the same pace.
