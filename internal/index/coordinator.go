@@ -212,7 +212,7 @@ func New(o Options) (*Coordinator, error) {
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
 		workers: workerCount(o.Config.Index.Workers),
-		sched:   plan.NewScheduler(o.Config.Resources.MaxConcurrentHeavy, dependence.ObserveMachine()),
+		sched:   plan.NewScheduler(dependence.ObserveMachine()),
 	}
 	if c.log == nil {
 		c.log = slog.Default()

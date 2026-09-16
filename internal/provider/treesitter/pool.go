@@ -40,8 +40,9 @@ const (
 var errWorkerGone = errors.New("treesitter: parser worker exited")
 
 // pool is the bounded lazy set of parser workers (Section 11.3, 23.4): at
-// most max live at once, started on demand, kept idle for idleTTL, recycled
-// when a lifetime bound approaches and torn down on cancellation.
+// most max live at once, started on demand, reused while there is parse work
+// in flight, drained when there is none, recycled when a lifetime bound
+// approaches and torn down on cancellation.
 //
 // max bounds live processes, not concurrent parses. A worker occupies its
 // place in live from before it is started until the runner has reaped it, so
@@ -55,7 +56,6 @@ type pool struct {
 	cmd      WorkerCommand
 	dir      string
 	max      int
-	idleTTL  time.Duration
 	parseTTL time.Duration
 	memory   int64
 
@@ -98,7 +98,6 @@ type worker struct {
 	bytesIn  int64
 	bytesOut int64
 	started  time.Time
-	timer    *time.Timer
 }
 
 // pprofDirEnv is the one variable a parser worker inherits, and only when the
@@ -117,8 +116,8 @@ func workerEnv() []string {
 	return nil
 }
 
-func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, idleTTL, parseTTL time.Duration, memory int64) *pool {
-	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, idleTTL: idleTTL, parseTTL: parseTTL, memory: memory,
+func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, parseTTL time.Duration, memory int64) *pool {
+	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, parseTTL: parseTTL, memory: memory,
 		live: map[*worker]bool{}}
 	p.cond = sync.NewCond(&p.mu)
 	return p
@@ -148,7 +147,6 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 		if n := len(p.idle); n > 0 {
 			w := p.idle[n-1]
 			p.idle = p.idle[:n-1]
-			w.timer.Stop()
 			p.mu.Unlock()
 			return w, nil
 		}
@@ -195,9 +193,10 @@ func (p *pool) wait(ctx context.Context) error {
 }
 
 // release returns a worker after a parse. A worker that is unhealthy or has
-// consumed its share of a lifetime bound is stopped; otherwise it goes idle
-// under a TTL timer. Its place in live is given up only when the process has
-// exited, which is what keeps live processes bounded.
+// consumed its share of a lifetime bound is stopped; otherwise it goes idle,
+// reusable by the next parse of this stage and stopped by the drain that
+// follows the last one. Its place in live is given up only when the process
+// has exited, which is what keeps live processes bounded.
 func (p *pool) release(w *worker, healthy bool) {
 	if !healthy || w.exhausted() {
 		w.stop(!healthy)
@@ -224,27 +223,41 @@ func (p *pool) release(w *worker, healthy bool) {
 		return
 	}
 	p.idle = append(p.idle, w)
-	w.timer = time.AfterFunc(p.idleTTL, func() { p.expire(w) })
 	p.cond.Broadcast()
 	p.mu.Unlock()
 }
 
-// expire retires an idle worker whose TTL elapsed, unless it was reacquired.
-func (p *pool) expire(w *worker) {
+// drain stops every worker nobody is using and returns once each has been
+// reaped. It is what ends the stage: a worker is warm for exactly as long as
+// there is parse work in flight, and no longer.
+//
+// There is no timer here and no setting. A timer would mean a resting machine
+// holds one process per core -- on a sixteen-core host about 320 MB -- for
+// however long the timer says, to save the milliseconds a re-execution of this
+// binary costs when the next refresh comes. That trade is the wrong way round
+// for a product whose whole posture is coexisting with the editor, the browser
+// and the agents the person is using at the time.
+//
+// Busy workers are untouched: they belong to a caller that is parsing, and the
+// caller returns them through release, which is what makes the drain that
+// follows the last one complete.
+func (p *pool) drain() {
 	p.mu.Lock()
-	i := -1
-	for j, x := range p.idle {
-		if x == w {
-			i = j
-		}
-	}
-	if i >= 0 {
-		p.idle = append(p.idle[:i], p.idle[i+1:]...)
-	}
+	idle := p.idle
+	p.idle = nil
 	p.mu.Unlock()
-	if i >= 0 {
-		w.stop(false)
+	// Stopped concurrently rather than one grace after another: an idle worker
+	// exits on the end of its stdin, and serialising sixteen of those would
+	// make the drain take sixteen graces in the worst case.
+	var stopping sync.WaitGroup
+	for _, w := range idle {
+		stopping.Add(1)
+		go func() {
+			defer stopping.Done()
+			w.stop(false)
+		}()
 	}
+	stopping.Wait()
 }
 
 // close stops every worker and waits for the runner to reap each one. An idle
@@ -270,7 +283,6 @@ func (p *pool) close() {
 	p.mu.Unlock()
 	var stopping sync.WaitGroup
 	for _, w := range idle {
-		w.timer.Stop()
 		stopping.Add(1)
 		go func() {
 			defer stopping.Done()
@@ -307,8 +319,7 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		// an external kill — and an exited worker is not reusable, so it leaves
 		// the idle list with the live map. Otherwise idle could outnumber live
 		// and the next caller would be handed a dead worker, spending on a
-		// certain errWorkerGone the one retry a real parse failure needs. Its
-		// TTL timer may still fire; expire finds nothing and does nothing.
+		// certain errWorkerGone the one retry a real parse failure needs.
 		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
 		p.exited++
 		p.cond.Broadcast()
@@ -566,7 +577,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 // value that cannot be measured is -1, never zero.
 type Stats struct {
 	// Processes is every worker process the runner has not yet reaped: busy,
-	// idle and shutting down alike. It never exceeds index.max_parser_workers.
+	// idle and shutting down alike. It never exceeds Options.MaxWorkers.
 	Processes int `json:"processes"`
 	// IdleWorkers is the reusable subset of Processes, and BusyWorkers the
 	// rest: parsing for a caller, or on their way out. The two are reported
