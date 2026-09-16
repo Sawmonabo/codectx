@@ -179,3 +179,17 @@ func (s *Store) LexicalSegments(ctx context.Context) (int64, error) {
 	})
 	return n, err
 }
+
+// LexicalPartsLive is the bound on the parts a reader's lexical part cache
+// holds at once, exported so the test that proves the bound is over the whole
+// cache asserts against the constant rather than a copy of it.
+func LexicalPartsLive() int { return lexPartsLive }
+
+// LexicalPartsPeak reports the most parts this session's lexical part cache
+// has held at once. A session that never opened one has held none.
+func (p *PostingSession) LexicalPartsPeak() int {
+	if p.lex == nil {
+		return 0
+	}
+	return p.lex.peak
+}
