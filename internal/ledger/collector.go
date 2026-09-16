@@ -85,10 +85,20 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	err := l.writeTx(ctx, func(tx *sql.Tx) error {
 		for _, e := range batch {
 			if e.kind == eventFinish {
-				sweep[e.run] = struct{}{}
+				if !e.run.discarded.Load() {
+					sweep[e.run] = struct{}{}
+				}
 				continue
 			}
 			run := e.span.run
+			// A run whose rows have been deleted is not written again. The
+			// span's insert would otherwise recreate the run row through
+			// ensureRun -- or, worse, fail the foreign key and roll back the
+			// whole batch, losing the rows of every other run in it.
+			if run.discarded.Load() {
+				delete(running, e.span)
+				continue
+			}
 			if err := l.ensureRun(ctx, tx, run); err != nil {
 				return err
 			}

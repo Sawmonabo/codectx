@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -183,11 +184,15 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
 	g.ledgerRun = c.newRun(ledger.KindIndex)
 	ctx = g.ledgerRun.Context(ctx)
+	// The reclaimer's own total when this run opened. What it gave back while
+	// the run was open is the difference, read at the finish.
+	freedBefore := paced.FreedBytes()
 	defer func() {
 		// Reported again at the finish so a pass that failed still states what
 		// it got through, not zeros. The publish path reports at activation as
 		// well, which is what a live reader sees while retention still runs.
 		g.report()
+		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 	}()
 	// The plan's whole-snapshot input run is a file under the work directory

@@ -21,6 +21,7 @@ const (
 	stageLexicalCompaction = "lexical_compaction"
 	stageAdjacency         = "adjacency"
 	stageLexicalBuild      = "lexical_build"
+	stageSeal              = "seal"
 )
 
 // spanOutcome is how an activation stage reports itself: a span that returned
@@ -1269,6 +1270,14 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
+	// The seal is a stage of its own: it is the validation of a whole unit,
+	// eight closure queries over everything the unit emitted, and it is the
+	// cost a provider's own spans do not carry. No processor time is
+	// attributed to it -- units seal while the other units of the run are
+	// still building, so the process-wide counters measure the run and not
+	// this -- and its scope is the unit's, so the row lines up with the unit
+	// span a reader sees it under.
+	ctx, span := ledger.Start(ctx, stageSeal, w.build.Spec.ScopeKey)
 	err := s.ingest(ctx, func(tx *sql.Tx) error {
 		if err := w.clipEvidence(ctx, tx); err != nil {
 			return err
@@ -1327,6 +1336,11 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		}
 		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey, false, Carry{})
 	})
+	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
+	} else {
+		span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	}
 	if err == nil {
 		w.done = true
 		if closeErr := w.closeStage(); closeErr != nil {
