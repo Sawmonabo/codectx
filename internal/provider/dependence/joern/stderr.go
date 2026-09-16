@@ -17,11 +17,13 @@ package joern
 //   - Definition-cap skips: an induced `--max-num-def 1` on a Python fixture
 //     produced paired WARN lines, `<method> has more than <n> definitions`
 //     and `Skipping.`, 13 of each, from `ReachingDefPass`.
-//   - Pass crash: `io.shiftleft.passes.CpgPassBase` logs
-//     `Pass %s failed in %.0f ms` with the throwable attached, at WARN. The
-//     format string and the log level were read out of the pinned payload's
-//     bytecode; the two reproductions are recorded in
-//     docs/research/10-round3-empirical.md Section 6.
+//   - Pass crash: the pass runner logs `Pass %s failed in %.0f ms` with the
+//     throwable attached, at WARN, and a pass that throws before it is timed
+//     is logged as `Pass %s failed` at ERROR instead. The format string and
+//     the log level were read out of the pinned payload's bytecode; the two
+//     reproductions are recorded in docs/research/10-round3-empirical.md
+//     Section 6, and the untimed form is recorded verbatim in
+//     testdata/linker-pass-crash.stderr.
 //   - Zero-exit helper crash: the orchestrator prints `Process exited with
 //     code <n>.` and still exits 0, having written a near-empty graph.
 
@@ -41,7 +43,8 @@ import (
 const (
 	markerOutOfMemory  = "OutOfMemoryError"
 	markerPassFailed   = "Pass"
-	markerFailedIn     = " failed in "
+	markerFailed       = " failed"
+	markerFailedIn     = markerFailed + " in "
 	markerHelperExited = "Process exited with code"
 	markerSkipping     = "Skipping."
 	markerOverDefs     = " has more than "
@@ -167,16 +170,27 @@ func stderrTail(b []byte, private []string) string {
 // that says which step wrote the file -- survives the reduction below.
 const privatePathName = "(private)"
 
-// failedPass extracts the analysis pass name from the engine's own
-// `Pass %s failed in %.0f ms` warning. The name is matched from the right,
-// because the log's own logger column is usually the same pass name and a
-// left-to-right search finds that instead.
+// failedPass extracts the analysis pass name from either of the two lines the
+// engine logs when a pass dies: `Pass <name> failed in <n> ms`, timed, and
+// `Pass <name> failed`, untimed, which is the one a pass that threw before it
+// could be timed leaves. Both are matched from the right of whatever precedes
+// `failed`, because the log's own logger column is usually the same pass name
+// and a left-to-right search finds that instead.
+//
+// Recognising only the timed form recorded an empty pass name for a real
+// crash, and an unnamed pass is the difference between a crash the product
+// knows reproduces and one it has to re-run to find out.
 func failedPass(line string) (string, bool) {
-	j := strings.Index(line, markerFailedIn)
-	if j < 0 {
+	head := strings.TrimRight(line, " \t\r")
+	switch j := strings.Index(head, markerFailedIn); {
+	case j >= 0:
+		head = head[:j]
+	case strings.HasSuffix(head, markerFailed):
+		head = head[:len(head)-len(markerFailed)]
+	default:
 		return "", false
 	}
-	fields := strings.Fields(line[:j])
+	fields := strings.Fields(head)
 	if len(fields) < 2 || fields[len(fields)-2] != markerPassFailed {
 		return "", false
 	}
