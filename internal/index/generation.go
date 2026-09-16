@@ -361,7 +361,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: runs, RunsOmitted: omitted,
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: g.c.disabledProviders(),
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
 }
 

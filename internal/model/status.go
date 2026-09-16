@@ -39,11 +39,19 @@ type IndexResult struct {
 	// UnitsCarried counts sealed units of a refreshing semantic scope carried
 	// into this generation as stale with provenance distance (Section 13.3);
 	// UnitsInvalidated counts previously reusable units this run had to rebuild.
-	UnitsCarried     int64            `json:"units_carried"`
-	UnitsInvalidated int64            `json:"units_invalidated"`
-	FilesParsed      int64            `json:"files_parsed"`
-	FilesCaptured    int64            `json:"files_captured"`
-	Runs             []ProviderResult `json:"runs"`
+	UnitsCarried     int64 `json:"units_carried"`
+	UnitsInvalidated int64 `json:"units_invalidated"`
+	FilesParsed      int64 `json:"files_parsed"`
+	FilesCaptured    int64 `json:"files_captured"`
+	// ProvidersDisabled names the providers this configuration turns off, in
+	// one stable order, and is absent when none is. A disabled provider is
+	// planned for nothing and therefore publishes no capability row at all:
+	// this is where a reader learns why there are none, once, instead of
+	// inferring it from a row per capability saying the work was not done.
+	// `unavailable` keeps its own meaning -- a provider that IS enabled and
+	// reached no output, with the reason it did not.
+	ProvidersDisabled []string         `json:"providers_disabled,omitempty"`
+	Runs              []ProviderResult `json:"runs"`
 	// RunsOmitted is how many runs this generation produced beyond the
 	// per-result ceiling Runs carries. Runs is a wire-sized page, not the
 	// total: a generation with more runs than one response may carry says so
@@ -106,6 +114,10 @@ func (r IndexResult) Validate() error {
 	if err := validateRunLedger("index_result", r.Run, r.Stages, r.StagesOmitted); err != nil {
 		return err
 	}
+	if err := boundStrings("index_result.providers_disabled", r.ProvidersDisabled,
+		MaxCapabilityStates, MaxIdentifierBytes); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -153,6 +165,10 @@ type IndexStatus struct {
 	// Resources is the Section 23 accounting block. It is nil on an ordinary
 	// status so a cheap call stays cheap; Task 20 populates it.
 	Resources *ResourceReport `json:"resources,omitempty"`
+	// ProvidersDisabled is what IndexResult.ProvidersDisabled is, reported by
+	// the same configuration on the same terms: the providers that are off,
+	// once, and absent when none is.
+	ProvidersDisabled []string `json:"providers_disabled,omitempty"`
 }
 
 // ResourceReport is the resource accounting Section 23 requires status to
@@ -372,6 +388,10 @@ func (s IndexStatus) Validate() error {
 		return err
 	}
 	if err := boundStrings("index_status.warnings", s.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := boundStrings("index_status.providers_disabled", s.ProvidersDisabled,
+		MaxCapabilityStates, MaxIdentifierBytes); err != nil {
 		return err
 	}
 	if s.Resources != nil {
