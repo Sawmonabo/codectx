@@ -690,6 +690,78 @@ back durability of those last commits at roughly 10 ms of fsync per commit;
 [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md) records why that is not the
 default.
 
+## The run ledger beside the store
+
+A workspace holds a second database, `ledger.db`, beside `codectx.db` in the
+same directory and under the same directory lock. It is what a run records
+about itself: how long each stage took, what it cost and what went through it
+([diagnostics](diagnostics.md#the-run-ledger),
+[ADR-0011](adr/ADR-0011-run-ledger.md)). It holds `runs`, one row per run, and
+`spans`, one row per stage, unit or part of a unit, keyed to its run and to
+its parent span. A third table holds a single row: the ledger's own schema
+fingerprint, which is that file's alone and never mixed with the store's.
+
+### Why it is not a table in the store
+
+Two properties of this store, both of them decisions taken for good reasons,
+make a table inside it useless for the thing the ledger exists to do.
+
+The ingestion group holds one transaction open for most of a run and commits
+when its page cache would spill or an exclusive writer waits
+([ADR-0008](adr/ADR-0008-ingestion-group.md)). Rows written through it are
+invisible to a second process until that commit, so a ledger inside it could
+not answer a question about a run that is still going -- which is half of what
+it is for.
+
+Activation holds an exclusive transaction around the adjacency build and the
+lexical build. Any other writer on that file waits or fails `busy` for its
+duration, which is exactly the window an operator most wants an answer in.
+
+There is a third reason that has nothing to do with contention: the store's
+schema text is hashed into a fingerprint that is folded into every analysis
+key, so adding a table there would re-key every analysis unit in the product
+and invalidate every cache. A diagnostic table is not worth that.
+
+### One writer, any number of readers
+
+The ledger has exactly one writer -- the collector goroutine of the process
+that holds the workspace lock -- and any number of read-only readers at any
+moment. It runs in WAL mode at `synchronous = normal`; a reader opens it with
+`query_only` set, so `status --resources` reads a run while that run writes,
+disturbs nothing, and cannot create the file in a workspace where no run has
+ever been recorded. A composition that only reports opens no ledger at all.
+
+### How a run says it is still alive
+
+A run row states a deadline its writer undertakes to renew while it lives, and
+the collector renews it on the flush it already performs. That is the only way
+a second process can tell a run still being written from one whose process
+died: a row that says `running` says nothing about whether anyone is still
+writing it, and probing a process id is neither portable nor free of races.
+The store already answers the same question the same way for the watch
+heartbeat, and a second mechanism for it would be one too many.
+
+A run whose deadline has elapsed reads `interrupted`, and so do the spans it
+left open. It is not given a finish time and not given a wall: nobody measured
+when it ended.
+
+### Retention
+
+A run's rows follow the generation they describe. When retention sweeps a
+generation out of the store, the same pass deletes that generation's runs from
+the ledger, and each run's spans go with it by cascade.
+
+Two kinds of run no generation will ever claim, so a second sweep reaches
+them, in the collection pass beside the store's own: the `overlay` run a
+process opens for work that belongs to no generation, such as starting a
+language server; and a run that ended without publishing anything, which the
+deferred publication produces on every tick that finds nothing to publish.
+Both sweeps skip any run whose writer is still renewing its deadline, so the
+pass can never delete a run another process is writing or one a status surface
+has just reported live. A process that exits cleanly forgets its own overlay
+run before it can be written, rather than deleting a row that its own
+collector might still insert behind the delete.
+
 ## The packed per-generation adjacency
 
 A generation publishes, beside its facts, a packed form of its own graph, and

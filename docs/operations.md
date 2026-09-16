@@ -303,6 +303,25 @@ and `CTX_SOURCE_INTEGRITY`:
 Open sessions, cursors and receipts do not survive a rebuild. That is correct:
 they cite a generation that no longer exists.
 
+## What a run cost, while it is still running
+
+`codectx status --resources` reports two things. One is the resource
+accounting block below. The other is the run ledger: the latest run for this
+repository and the cost of each of its stages, the run's own row first and the
+stages under it ordered by wall time, with the reason beneath any row that
+failed or reached no output. "Latest" is the run that is live if one is, and
+otherwise the run that produced the active generation.
+
+Add **`--follow`** and the whole report re-renders every second until you
+interrupt it. That is the live view from a second terminal while an index run
+is going in the first: it opens the ledger read-only, so it costs the run
+nothing. With `--json` it emits one complete envelope per second, each a whole
+snapshot rather than a delta, which is what a script tails.
+
+[The diagnostics page](diagnostics.md#the-run-ledger) says what a span is,
+which stages a run opens and how to read each column without being misled by
+an absent one.
+
 ## Unavailable metrics and unsupported platforms
 
 `codectx status --resources` reports the resource accounting block. **A metric
