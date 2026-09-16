@@ -315,6 +315,48 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 		assertEdgesOrdered(t, rest, full[len(full)-1:])
 	})
 
+	t.Run("a scan the context ends resumes past what it delivered", func(t *testing.T) {
+		// The port's OWN deadline check ends this scan, not the callback: the
+		// callback returns nil throughout and the context is cancelled under it.
+		// The position a reader reports there must be a boundary past the last
+		// DELIVERED entry -- report the delivered entry's own index instead and
+		// the resume hands that entry to the caller a second time, which a walk
+		// turns into an entity served twice.
+		//
+		// Where the cancellation is noticed is a reader's own business: the
+		// in-heap reader checks between owners, a reader that decodes from
+		// storage may notice mid-list. The invariant is the same either way and
+		// is asserted as one: what was delivered, followed by what the resume
+		// delivers, is exactly the uninterrupted scan.
+		owners := []graph.NodeRef{refs[Hub], refs[Leaf]}
+		slices.Sort(owners)
+		full := scan(t, g, owners, model.DirectionBoth, nil)
+
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		var delivered []edge
+		pos, err := g.Neighbours(cancelCtx, owners, model.DirectionBoth, nil, graph.EdgePos{},
+			func(e graph.Edge) error {
+				delivered = append(delivered, canonical(t, g, e))
+				cancel()
+				return nil
+			})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("a scan cancelled under the callback returned %v, want context.Canceled; "+
+				"this case proves nothing unless the reader itself ends the scan", err)
+		}
+		if len(delivered) == 0 || len(delivered) >= len(full) {
+			t.Fatalf("fixture degenerated: the cancelled scan delivered %d of %d entries; "+
+				"it must deliver some and leave some", len(delivered), len(full))
+		}
+
+		var rest []edge
+		if _, err := g.Neighbours(ctx, owners, model.DirectionBoth, nil, pos,
+			func(e graph.Edge) error { rest = append(rest, canonical(t, g, e)); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		assertEdgesOrdered(t, append(append([]edge(nil), delivered...), rest...), full)
+	})
+
 	t.Run("a node with no edges yields none", func(t *testing.T) {
 		got := scan(t, g, []graph.NodeRef{refs[Orphan]}, model.DirectionBoth, nil)
 		if len(got) != 0 {
