@@ -178,7 +178,6 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		c := o.Resume.Cursor
 		st = walkState{Level: c.Level, LevelState: c.LevelState, LevelPos: c.LevelPos,
 			RawBytes: c.RawBytes, LevelOffset: c.LevelOffset}
-		w.entryLevel = c.Level
 		switch c.LevelState {
 		case levelServing:
 			// The sorted run this leg serves out of.
@@ -227,13 +226,6 @@ type levelWalk struct {
 	group     NodeRef
 	groupID   model.NodeID
 	groupOpen bool
-	// entryLevel is the level this leg was RESUMED into, or zero. The files the
-	// cursor that named it resumes from are held for the whole page: a
-	// RETRYABLE failure later in this page tells the caller to present that
-	// same cursor again, and a walk that had already deleted them would answer
-	// CTX_STORAGE_CORRUPT -- or, where the deleted file is a frontier, report
-	// itself exhausted and serve a fraction of the answer as the whole of it.
-	entryLevel int
 }
 
 // run drives the pipeline until the walk stops: it is exhausted, it reached the
@@ -715,8 +707,21 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 	if err := w.sorted.finished(); err != nil {
 		return false, err
 	}
-	o.Retain.hold(levelFileName(sortedLevelPrefix, st.Level))
-	o.Retain.hold(levelFileName(admittedLevelPrefix, st.Level-1))
+	sorted, frontier := levelFileName(sortedLevelPrefix, st.Level), levelFileName(admittedLevelPrefix, st.Level-1)
+	if o.Mints {
+		o.Retain.hold(sorted)
+		o.Retain.hold(frontier)
+	} else if err := o.Retain.releaseLevel(sorted, frontier); err != nil {
+		// A leg that mints no cursor hands its caller nothing to present
+		// again, so there is nothing behind this level for a retry to resume
+		// from and the two files go now. Holding them here instead kept two
+		// files per level for the whole of a walk that runs to completion in
+		// one request -- the depth bound ships unlimited and this directory's
+		// bytes are not charged to the continuation budget, so it was a peak
+		// -disk regression with no bound on it. The files the leg's ENTRY
+		// cursor names are held, and releaseLevel leaves those alone.
+		return false, err
+	}
 	w.sorted = nil
 	st.Level, st.LevelState, st.LevelOffset = st.Level+1, levelCollecting, 0
 	return false, nil
@@ -1212,6 +1217,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		Budget:        b,
 		FrontierBytes: e.limits.FrontierBytes,
 		DeadlineStops: true,
+		Mints:         true,
 		Resume:        resume,
 		Retain:        retain,
 		Names:         names,

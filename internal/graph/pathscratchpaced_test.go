@@ -2,12 +2,37 @@ package graph
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
+
+// alone runs the caller in a child copy of the test binary with no other test
+// selected, and reports whether this call is that child.
+//
+// Registration is a process-wide, once-only act, so "this open path registers
+// the shim itself" is only observable in a process where nothing else has
+// registered. Run among its package's other tests the assertion below holds
+// whatever the open path does, which is no assertion at all: the child is
+// what gives it its meaning.
+func alone(t *testing.T, name string) bool {
+	t.Helper()
+	const marker = "CODECTX_PACED_REGISTRATION_CHILD"
+	if os.Getenv(marker) != "" {
+		return true
+	}
+	cmd := exec.Command(os.Args[0], "-test.run", "^"+name+"$", "-test.v")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the open path did not register the file-system shim: %v\n%s", err, out)
+	}
+	return false
+}
 
 // The requirement: the traversal scratch's writes are paced whatever else the
 // process has opened. It is the surface that spills gigabytes -- a search's
@@ -17,12 +42,14 @@ import (
 // A run that reaches a search on another path would then hand the kernel a
 // whole spill at once, which is the stall the shim exists to remove.
 //
-// The test opens the scratch on its own, as a package with no application
-// wiring does, and asserts the shim saw the writes.
-// Mutation: drop pacedvfs.Register() from pathScratch.open and run this test
-// alone (-run TestTheTraversalScratchIsPacedWithoutTheApplicationsWiring, so
-// no other test in the package registers first); no window is counted.
+// The test opens the scratch on its own in a process where nothing else has
+// opened a database -- see alone -- and asserts the shim saw the writes.
+// Mutation: drop pacedvfs.Register() from pathScratch.open; no window is
+// counted, and the whole package fails, not only this test under -run.
 func TestTheTraversalScratchIsPacedWithoutTheApplicationsWiring(t *testing.T) {
+	if !alone(t, "TestTheTraversalScratchIsPacedWithoutTheApplicationsWiring") {
+		return
+	}
 	ctx := context.Background()
 	s, err := openPathScratch(ctx, t.TempDir())
 	if err != nil {

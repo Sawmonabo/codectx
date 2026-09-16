@@ -15,13 +15,19 @@ func registrationError(rc int32) error {
 	return fmt.Errorf("paced: the engine refused the file system (result code %d)", rc)
 }
 
-// windows counts the waits issued so far, truncations the windows freed one
-// at a time, and logBytes the bytes written to a write-ahead log through this
-// file system.
+// windows counts the waits issued so far and logBytes the bytes written to a
+// write-ahead log through this file system. The space this file system frees
+// is not counted here: it goes to internal/paced, where every byte the
+// process gives back is counted once whatever released it.
 var (
-	windows     atomic.Int64
+	windows  atomic.Int64
+	logBytes atomic.Int64
+	// truncations counts the windowed steps a shortening took. Nothing
+	// discloses it -- what an operator reads is bytes, paced.FreedBytes --
+	// but whether a shortening stepped at all is the difference between
+	// freeing a window at a time and freeing in a burst, which the bytes
+	// alone cannot show.
 	truncations atomic.Int64
-	logBytes    atomic.Int64
 )
 
 // Windows reports how many window waits this file system has issued since the
@@ -31,12 +37,6 @@ var (
 // moves nothing here -- so a package that opens its own database asserts on it
 // rather than on the order its packages happened to initialize in.
 func Windows() int64 { return windows.Load() }
-
-// Truncations reports how many windows this file system has freed one at a
-// time since the process started. A run that reuses its space instead of
-// freeing it leaves this at zero, which is what the diagnostics disclose and
-// what the store's log test asserts.
-func Truncations() int64 { return truncations.Load() }
 
 // LogBytes reports the bytes written to a write-ahead log through this file
 // system since the process started. It is the store's spill signal: nothing

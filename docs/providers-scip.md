@@ -118,7 +118,10 @@ The import is three streaming passes over the index:
    minted. Edges are grouped on disk by relation identity and published with
    one evidence row per distinct occurrence range.
 
-The scratch directory is removed on every path.
+The spool is a surface of the shared scratch pool
+([storage](storage.md#the-scratch-pool)), so a second import of the same shape
+writes over the first one's bytes and frees nothing; the scratch directory
+around it is removed on every path.
 
 ## Delta import
 
@@ -630,4 +633,11 @@ the run was declared under.
 
 Materializations, manifests and outputs live under the provider's own work
 directory (`<work_dir>/profiles/<profile>/`) in a per-run directory that is
-removed on success, failure and cancellation.
+removed on success, failure and cancellation. Those removals return at once --
+the tree is renamed into the process's to-free set -- and the space is given
+back off the run's path, a window at a time
+([storage](storage.md#what-a-run-still-frees)). An indexer's tree is copies
+rather than links to the content store because the profile writes into the tree
+it was given: `scip-clang` normalizes its compile database there and
+`scip-java` writes its project configuration there, and a link would put those
+writes through to the published blob.

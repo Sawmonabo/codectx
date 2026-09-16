@@ -384,10 +384,7 @@ func (s *pathScratch) close() error {
 			// See retain: this surface holds a database whose rollback did
 			// not complete, so it leaves the pool instead of being handed to
 			// the next search.
-			if err := paced.Remove(s.lease.Path()); err != nil && !os.IsNotExist(err) {
-				errs = append(errs, err)
-			}
-			s.lease.Discard()
+			s.lease.Unusable()
 		} else {
 			s.lease.Release()
 		}

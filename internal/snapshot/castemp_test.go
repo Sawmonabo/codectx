@@ -69,8 +69,8 @@ func TestRecapturingPublishedContentFreesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCAS: %v", err)
 	}
-	// Larger than the pacing window, so a removal of this surface is visible
-	// as steps rather than as a single unlink the pacer does not count.
+	// Larger than the pacing window, so a removal of this surface would be
+	// unmistakable in the bytes freed rather than lost in rounding.
 	const size = paced.Window + 1<<20
 
 	first, err := c.Put(ctx, &pattern{left: size})
@@ -79,7 +79,7 @@ func TestRecapturingPublishedContentFreesNothing(t *testing.T) {
 	}
 
 	// The second capture finds the content published and stages it anyway.
-	before := paced.Steps()
+	before := paced.FreedBytes()
 	second, err := c.Put(ctx, &pattern{left: size})
 	if err != nil {
 		t.Fatalf("second capture: %v", err)
@@ -87,8 +87,8 @@ func TestRecapturingPublishedContentFreesNothing(t *testing.T) {
 	if second.Hash != first.Hash || second.Size != size {
 		t.Fatalf("the second capture recorded %s/%d, want %s/%d", second.Hash[:8], second.Size, first.Hash[:8], size)
 	}
-	if steps := paced.Steps() - before; steps != 0 {
-		t.Fatalf("re-capturing published content freed %d windows of disk; it must free none", steps)
+	if freed := paced.FreedBytes() - before; freed != 0 {
+		t.Fatalf("re-capturing published content freed %d bytes of disk; it must free none", freed)
 	}
 
 	pool := contentTemps(t, dataDir)

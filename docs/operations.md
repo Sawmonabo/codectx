@@ -8,6 +8,7 @@ is in [the threat model](threat-model.md).
 ## The first command to run
 
 ```
+codectx gc              # give the workspace's pooled scratch space back
 codectx doctor          # human summary
 codectx doctor --json   # one machine-stable envelope
 codectx doctor --deep   # runs the whole-database checks an ordinary run reports unverified
@@ -195,16 +196,33 @@ front with `CTX_RESOURCE_LIMIT` naming the key. `min_free_disk_bytes` is
 enforced against actual free space either way -- it protects the host's space
 rather than capping work.
 
+Most of the disk a workspace holds is not leftovers: it is the working files
+the store keeps and writes over instead of freeing, because freeing is the
+expensive act on this class of host
+([storage](storage.md#the-scratch-pool)). `codectx status --resources` reports
+it as `scratch_bytes`, and it only ever grows towards the workspace's working
+set.
+
 In order, when you are short on space:
 
 1. `codectx doctor` — the free-space and orphan-temporary checks say whether the
    space is being consumed by the store or by leftovers.
-2. `codectx tools gc` — reclaims tool-store staging and versions the lock no
+2. `codectx gc` — empties the workspace's scratch pools. It prints what each
+   pool holds, by what its surfaces were taken for, before it frees anything,
+   so you can judge the space before giving it back. There is no timer and no
+   threshold: this is the only thing that shrinks `scratch_bytes`.
+
+   The space is given back a window at a time, with a sync and a wait between
+   windows, which is slow on purpose. Freeing a large amount at once leaves a
+   virtualized host owing work it does not report, and about a minute later
+   every disk request on the machine waits for it. Even paced, a very large
+   collection can stall such a host for about a minute; the command says so.
+3. `codectx tools gc` — reclaims tool-store staging and versions the lock no
    longer names.
-3. Lower `index.retain_refs`, or set `index.max_retained_bytes`, and let the
+4. Lower `index.retain_refs`, or set `index.max_retained_bytes`, and let the
    next collection pass evict least-recently-used refs. The active ref is never
    evicted.
-4. Wait out the grace window, or re-run after it elapses: trashed blobs are not
+5. Wait out the grace window, or re-run after it elapses: trashed blobs are not
    reclaimed before their second reachability check.
 
 ## Rebuilding a workspace
@@ -262,6 +280,7 @@ reports `unavailable`. It never reports `0`.
 | Free disk bytes | measured, else `unavailable` | measured, else `unavailable` | measured, else `unavailable` | Reported by the OS for the data directory's filesystem. A filesystem that refuses to answer yields `unavailable`, not `0`. |
 | Unit reuse and parse counts | `unavailable` | `unavailable` | `unavailable` | Counted per indexing run and reported on that run's result, where `codectx index` prints them. They are **not** process-wide totals, and the resource block reports no figure rather than reporting `0` for a process that has indexed nothing this run. No platform differs. |
 | Pending watch events | measured while a watch is live, else `unavailable` | measured while a watch is live, else `unavailable` | measured while a watch is live, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row carrying its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. A second process reports the figure while that row is live. Once it expires — the watch was killed, or the machine went down — the figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. A watch running without filesystem notifications has no queue to count and publishes no figure. |
+| Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
 | Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |
 

@@ -100,7 +100,11 @@ func (s *Store) openLexicalStage(ctx context.Context) (*lexicalStage, error) {
 	}
 	stage, err := s.openStageSlot(ctx, lease.Path())
 	if err != nil {
-		lease.Release()
+		// Emptying the slot is the first thing openStageSlot does, so a
+		// failure here is the slot's own contents: an image a crash left
+		// mid-write whose DROP TABLE cannot run. Released, it would fail the
+		// next unit's seal the same way, and every seal after that.
+		lease.Unusable()
 		return nil, err
 	}
 	stage.lease = lease

@@ -969,13 +969,13 @@ func TestAPathSearchReusesOneSurfaceAndFreesNothing(t *testing.T) {
 		t.Fatalf("one search left %d surfaces in the pool, want the one it took: %v", len(pool), pool)
 	}
 
-	steps := paced.Steps()
+	freedBefore := paced.FreedBytes()
 	second, err := e.ShortestPath(context.Background(), req)
 	if err != nil {
 		t.Fatalf("second search: %v", err)
 	}
-	if freed := paced.Steps() - steps; freed != 0 {
-		t.Fatalf("the second search freed %d windows of disk; a search that reuses its surface frees none", freed)
+	if freed := paced.FreedBytes() - freedBefore; freed != 0 {
+		t.Fatalf("the second search freed %d bytes of disk; a search that reuses its surface frees none", freed)
 	}
 	if gotSeq, wantSeq := routeSequences(second), routeSequences(first); !reflect.DeepEqual(gotSeq, wantSeq) {
 		t.Fatalf("the second search answered %v from the reused surface; the first said %v", gotSeq, wantSeq)
