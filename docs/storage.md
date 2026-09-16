@@ -499,6 +499,21 @@ small files -- a materialized tree of thousands of source files -- is given
 back at the same rate as one large file, and a caller that frees in place
 spends the same windows as the reclaimer.
 
+The rate is the **host's**, because what the disk underneath does with a
+discard does not depend on how many callers asked. Every charger in a process
+waits under one lock, so the reclaimer's goroutine, the file system shim
+shortening a file the engine owns and a publication trimming its staging
+surface never hand the disk three windows at once. Across processes the turn
+is taken through a small lock file at the cache root: a window's turn is
+locking that file, waiting out whatever remains of the interval since the last
+recorded turn, recording this one and unlocking, so an index run and a query
+server over one cache free at the pace between them rather than at twice it.
+The remainder is clamped into one interval, because the recorded time is a
+wall clock written by another process and a clock adjustment must cost at most
+one interval rather than hang a run. A process with no cache root -- a
+standalone tool -- keeps the pace for itself alone, which is slower than it
+need be and never faster.
+
 A file the process may unlink but may not truncate -- every published blob is
 one, the store making its objects read-only at publication, and nothing bounds
 a blob's size -- reaches the unlink whole, so the unlink is what gives its

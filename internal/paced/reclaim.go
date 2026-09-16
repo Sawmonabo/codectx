@@ -1,6 +1,7 @@
 package paced
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,11 +13,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/fslock"
 )
 
 // FreeInterval is the wait between two freed windows. With Window it is the
-// rate at which this process gives disk space back: 8 MiB, a data sync, a
-// quarter of a second.
+// rate at which disk space is given back over one cache: 8 MiB, a data sync,
+// a quarter of a second. It is one rate for the host, not one per charger and
+// not one per process -- what the disk underneath does with a discard does not
+// depend on how many callers asked.
 //
 // It is measured, not chosen. On a machine whose root filesystem discards
 // freed blocks and whose disk is a sparse image on its host, freeing 5 GB in
@@ -84,11 +89,23 @@ type reclaimer struct {
 	stuck map[string]string
 	// started is set when the worker goroutine is running.
 	started bool
-	// spentMu guards spent, which the reclaimer's goroutine and any caller
-	// freeing in place both spend.
-	spentMu sync.Mutex
-	// spent is the bytes freed since the last wait, at most a window.
+	// paceMu is the one place in the process a window's turn is taken. Every
+	// charger holds it across its wait, so this process never hands the host
+	// two windows in one interval however many callers are freeing at once:
+	// the reclaimer's goroutine, the file system shim shortening a file the
+	// engine owns, a publication trimming its staging surface. The rate is a
+	// property of what the disk underneath does with a discard, so it is the
+	// HOST's, and a pace kept per charger would be N times it.
+	paceMu sync.Mutex
+	// spent is the bytes freed since the last wait, at most a window. It is
+	// guarded by paceMu, because spending it is what takes a turn.
 	spent int64
+	// paceRoot is the cache directory whose turn file the processes sharing
+	// this cache take their windows through, and turnFile is that file, open.
+	// Both are read under paceMu; paceRoot is written under mu.
+	paceRoot string
+	turnFile *os.File
+	turnAt   string
 	// seq names queued entries apart within one process.
 	seq atomic.Int64
 	// sleep is the wait between windows, replaced by tests with a clock that
@@ -125,6 +142,15 @@ func RegisterToFree(dir string, set func() (string, error)) {
 	dir = filepath.Clean(dir)
 	reclaim.mu.Lock()
 	defer reclaim.mu.Unlock()
+	// The outermost directory a store pools under is its cache root, and the
+	// cache root is where the processes sharing it take their turns. A store
+	// pools under several directories -- the cache itself, the continuation
+	// store's, a provider's work directory -- and every one of them is inside
+	// the cache, so the ancestor of the others is the one two processes over
+	// one cache will both arrive at.
+	if reclaim.paceRoot == "" || (under(reclaim.paceRoot, dir) && dir != reclaim.paceRoot) {
+		reclaim.paceRoot = dir
+	}
 	if _, ok := reclaim.sets[dir]; ok {
 		return
 	}
@@ -521,21 +547,89 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, dir *os.File) (int
 // parent, not the set at the top of the tree -- is synced here, which is the
 // journal commit that carries the freed extents with it.
 //
-// The budget is the process's, not one removal's: a caller freeing in place
-// and the reclaimer's own goroutine spend the same window, so two of them
-// never hand the disk two windows at once.
+// The budget is the host's, not one removal's and not one process's: every
+// charger waits under paceMu, and the processes over one cache take their
+// windows in turn through the file at its root, so no two of them ever hand
+// the disk two windows in one interval.
 func (r *reclaimer) charge(n int64, dir *os.File) {
-	r.spentMu.Lock()
+	r.paceMu.Lock()
+	defer r.paceMu.Unlock()
 	r.spent += n
-	waits := r.spent / Window
-	r.spent -= waits * Window
-	r.spentMu.Unlock()
-	for ; waits > 0; waits-- {
+	for r.spent >= Window {
+		r.spent -= Window
 		if dir != nil {
 			_ = dir.Sync()
 		}
-		r.sleep(FreeInterval)
+		r.takeTurn()
 	}
+}
+
+// paceFileName is the file at a cache root whose lock and recorded time are
+// how the processes over that cache take one window's turn at a time.
+const paceFileName = "free-pace.lock"
+
+// takeTurn waits until the host may be handed another window and records that
+// it has been. The record is on the disk at the cache root, under an
+// exclusive lock, so the turn is taken across processes and not only across
+// this one's chargers: two runs over one cache free at the pace between them,
+// not at twice it. The rate the measurement established is what the disk
+// underneath tolerates, and a disk does not care how many processes are
+// asking.
+//
+// The remainder is clamped into one interval. The recorded time is a wall
+// clock and comes from another process, so a clock adjustment, a record from
+// a machine-image restore or a torn write must cost at most one interval and
+// never hang a run.
+//
+// With no cache root -- a standalone tool, a process that has opened no store
+// -- there is nothing to share and the wait is the interval itself.
+func (r *reclaimer) takeTurn() {
+	f := r.turn()
+	if f == nil {
+		r.sleep(FreeInterval)
+		return
+	}
+	if err := fslock.Lock(f); err != nil {
+		r.sleep(FreeInterval)
+		return
+	}
+	defer fslock.Unlock(f)
+	wait := FreeInterval
+	var record [8]byte
+	if n, err := f.ReadAt(record[:], 0); err == nil && n == len(record) {
+		since := time.Since(time.Unix(0, int64(binary.BigEndian.Uint64(record[:]))))
+		wait = min(max(FreeInterval-since, 0), FreeInterval)
+	}
+	r.sleep(wait)
+	binary.BigEndian.PutUint64(record[:], uint64(time.Now().UnixNano()))
+	_, _ = f.WriteAt(record[:], 0)
+}
+
+// turn is the cache root's turn file, opened once. It reports nil when there
+// is no cache root, or when the file cannot be opened -- a read-only cache, a
+// directory already removed -- and the caller then keeps the pace for itself
+// alone, which is slower than it need be and never faster.
+//
+// The caller holds paceMu.
+func (r *reclaimer) turn() *os.File {
+	r.mu.Lock()
+	root := r.paceRoot
+	r.mu.Unlock()
+	if root == "" {
+		return nil
+	}
+	if r.turnFile != nil && r.turnAt == root {
+		return r.turnFile
+	}
+	f, err := os.OpenFile(filepath.Join(root, paceFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil
+	}
+	if r.turnFile != nil {
+		r.turnFile.Close()
+	}
+	r.turnFile, r.turnAt = f, root
+	return f
 }
 
 // A Stuck is one queued removal the reclaimer tried to make and could not,

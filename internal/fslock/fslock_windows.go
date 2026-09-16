@@ -24,6 +24,13 @@ func TryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// Lock takes an exclusive byte-range lock on the first byte of f, waiting for
+// whichever handle holds it to let it go.
+func Lock(f *os.File) error {
+	var ol windows.Overlapped
+	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ol)
+}
+
 // Unlock releases the lock TryLock took.
 func Unlock(f *os.File) error {
 	var ol windows.Overlapped

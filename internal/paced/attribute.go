@@ -61,9 +61,11 @@ func FreedBytes() int64 {
 // the shrink that trims a pooled surface, the engine's shim shortening a file
 // -- and makes that caller wait the pace those bytes owe before it goes on.
 //
-// The budget is the process's: bytes freed here and bytes freed by the
-// reclaimer spend the same windows, so a run cannot outrun the pace by
-// splitting its freeing across both.
+// The budget is the host's: bytes freed here and bytes freed by the
+// reclaimer spend the same windows under one lock, and the processes over one
+// cache take their windows in turn through a file at its root. A run cannot
+// outrun the pace by splitting its freeing across several chargers, and two
+// runs over one cache cannot outrun it by being two.
 func Freed(n int64) {
 	attribute("", n)
 	reclaim.charge(n, nil)
