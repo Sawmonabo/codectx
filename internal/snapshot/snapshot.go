@@ -45,8 +45,6 @@ const (
 	lockFileName       = "workspace.lock"
 	stagingPrefix      = "capture-"
 	materializePrefix  = "mat-"
-	casTmpDirName      = "tmp"
-	casTmpPrefix       = "put-"
 )
 
 // CASDir is the content-addressed store location under a data directory.
@@ -59,18 +57,19 @@ func StagingDir(dataDir string) string { return filepath.Join(dataDir, stagingDi
 func MaterializeDir(dataDir string) string { return filepath.Join(dataDir, materializeDirName) }
 
 // Sweep is startup recovery for this package's temporary state: staging
-// databases and unpublished CAS temporaries left by a crashed capture, and
-// materializations whose owning process is gone. The caller holds the
-// workspace lock, so no capture is in progress; a live materialization is
-// recognized by the lock its owner still holds and is left alone. A Repair
-// running outside the lock may lose its temporary to this sweep; CAS.publish
-// reports that as a retryable busy condition. A file that cannot be removed is
-// reported with the rest, never silently skipped.
+// databases left by a crashed capture, and materializations whose owning
+// process is gone. The caller holds the workspace lock, so no capture is in
+// progress; a live materialization is recognized by the lock its owner still
+// holds and is left alone. A file that cannot be removed is reported with the
+// rest, never silently skipped.
+//
+// A crashed capture's unpublished blob bytes are NOT swept: they sit in a
+// surface of the store's scratch pool, which the next run writes over rather
+// than freeing, and which nothing but an operator's collection empties.
 func Sweep(dataDir string) error {
 	var errs []error
 	for _, dir := range []struct{ path, prefix string }{
 		{StagingDir(dataDir), stagingPrefix},
-		{filepath.Join(CASDir(dataDir), casTmpDirName), casTmpPrefix},
 	} {
 		entries, err := os.ReadDir(dir.path)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {

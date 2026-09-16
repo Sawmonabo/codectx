@@ -71,6 +71,10 @@ const (
 	SortRun Purpose = "sort-run"
 	// LexicalStage is a lexical seal's staging database, one per seal slot.
 	LexicalStage Purpose = "lexical-stage"
+	// ContentTemp is the file a content-addressed store streams one blob
+	// into while it hashes it, before it knows whether the store already
+	// holds that content.
+	ContentTemp Purpose = "content-temp"
 )
 
 // dirName is the arena's own directory under the directory it serves.
@@ -357,33 +361,7 @@ func (a *Arena) createLocked(p Purpose) (string, error) {
 // free, at its current length, including the instances of processes that are
 // no longer running. It is what the resources block discloses as the space a
 // run keeps instead of freeing.
-func (a *Arena) Bytes() (int64, error) {
-	var total int64
-	err := filepath.WalkDir(a.root, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if !d.Type().IsRegular() || d.Name() == lockName {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		total += info.Size()
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return total, nil
-}
+func (a *Arena) Bytes() (int64, error) { return dirBytes(a.root) }
 
 // ErrInUse refuses to empty an arena while something holds a surface of it.
 var ErrInUse = errors.New("scratch arena in use")
@@ -429,9 +407,19 @@ func (a *Arena) Empty() (int64, error) {
 			return freed, err
 		}
 		// This instance's claim stays held: the process still owns it and
-		// will take surfaces again. Only its pooled files go.
-		for _, p := range []Purpose{SortRun, LexicalStage} {
-			if err := paced.RemoveAll(filepath.Join(dir, string(p))); err != nil {
+		// will take surfaces again. Only its pooled files go, and they are
+		// found by reading the instance rather than by naming the purposes,
+		// so a purpose added later is emptied by the same code that counted
+		// its bytes instead of being silently left behind and over-reported.
+		purposes, err := os.ReadDir(dir)
+		if err != nil {
+			return freed, err
+		}
+		for _, pe := range purposes {
+			if !pe.IsDir() {
+				continue
+			}
+			if err := paced.RemoveAll(filepath.Join(dir, pe.Name())); err != nil {
 				return freed, err
 			}
 		}
