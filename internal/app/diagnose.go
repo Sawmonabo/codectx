@@ -98,27 +98,32 @@ func (r storeReader) SuppliedIndexes(ctx context.Context, gen model.GenerationID
 // build failure, not a doctor check that quietly reports unavailable forever.
 var _ diagnostics.SuppliedIndexReader = storeReader{}
 
-// WatchHeartbeat restates (*sqlite.Store).WatchHeartbeat in the doctor's own
+// WatchHeartbeats restates (*sqlite.Store).WatchHeartbeats in the doctor's own
 // vocabulary. It is written rather than embedded for the same reason
 // SuppliedIndexes is: the result type differs, and an embedded forward with the
 // wrong signature would satisfy nothing, fail no build, and leave both the
 // `watch_heartbeat` check and the resource block's pending-event count
 // permanently absent with nothing to show for it.
 //
-// The `found` bit is carried through unchanged: absent and expired are the two
-// answers the check renders differently, and collapsing them here would lose
-// the distinction before it reaches the renderer.
-func (r storeReader) WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (diagnostics.WatchHeartbeat, bool, error) {
-	hb, found, err := r.Store.WatchHeartbeat(ctx, repo)
-	if err != nil || !found {
-		return diagnostics.WatchHeartbeat{}, false, err
+// Every row is carried through, expired ones included and in the order the
+// store read them: absent, live and expired are three answers the check renders
+// differently, and judging any of them here would lose the distinction before it
+// reaches the renderer.
+func (r storeReader) WatchHeartbeats(ctx context.Context, repo model.RepositoryID) ([]diagnostics.WatchHeartbeat, error) {
+	rows, err := r.Store.WatchHeartbeats(ctx, repo)
+	if err != nil {
+		return nil, err
 	}
-	return diagnostics.WatchHeartbeat{
-		WriterPID:     hb.WriterPID,
-		LastPassAt:    hb.LastPassAt,
-		PendingEvents: hb.PendingEvents,
-		ExpiresAt:     hb.ExpiresAt,
-	}, true, nil
+	out := make([]diagnostics.WatchHeartbeat, 0, len(rows))
+	for _, hb := range rows {
+		out = append(out, diagnostics.WatchHeartbeat{
+			WriterPID:     hb.WriterPID,
+			LastPassAt:    hb.LastPassAt,
+			PendingEvents: hb.PendingEvents,
+			ExpiresAt:     hb.ExpiresAt,
+		})
+	}
+	return out, nil
 }
 
 // The same compile-time assertion, for the same reason.

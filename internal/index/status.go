@@ -161,6 +161,11 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
 		FileCount: snap.FileCount, SourceBytes: snap.SourceBytes, Warnings: warnings,
 		ProvidersDisabled: disabledProviders(r.opts.Config)}
+	watchers, err := r.watchers(ctx)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	st.Watchers = watchers
 	if r.watch != nil {
 		r.watch.project(&st)
 	}
@@ -168,6 +173,38 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		r.retention.project(&st)
 	}
 	return st, nil
+}
+
+// watchers lists the watching processes whose heartbeat is live, freshest
+// deadline first (Section 13.2).
+//
+// It is read from the store and not from watchState, so it answers in a process
+// that is watching nothing: a `codectx status` in another terminal is exactly
+// the reader this list exists for, and it has no in-process watch to project.
+// A watcher that has completed no pass is listed with no pass time rather than
+// omitted -- a watch waiting for whichever process holds the workspace is
+// running, and dropping it would report the workspace as one no watch has ever
+// run in.
+//
+// A row past its writer's own deadline is left out: its process stopped
+// refreshing, and listing it would report a watch that is no longer running.
+// That the watch stopped is what the doctor's `watch_heartbeat` check reports;
+// this list states who is watching now.
+func (r *StatusReader) watchers(ctx context.Context) ([]model.WatchProcess, error) {
+	rows, err := r.opts.Store.WatchHeartbeats(ctx, r.opts.Repo)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var out []model.WatchProcess
+	for _, hb := range rows {
+		if !hb.Live(now) {
+			continue
+		}
+		out = append(out, model.WatchProcess{SessionID: hb.SessionID, PID: hb.WriterPID,
+			LastBeatAt: hb.BeatAt, LastPassAt: hb.LastPassAt, PendingEvents: hb.PendingEvents})
+	}
+	return out, nil
 }
 
 // coherence answers what the active generation is coherent with (Section
@@ -221,16 +258,23 @@ type watchState struct {
 	// again.
 	skipping   bool
 	reconciled time.Time
+	// watchSession is the identity of the watch this coordinator is running,
+	// minted by Watch and carried here because the beat is published from both
+	// the heartbeat ticker and the end of a reconciliation pass. It keys this
+	// watch's own heartbeat row, so a second watching process on this
+	// workspace keeps its own row rather than overwriting this one's.
+	watchSession string
 }
 
-// enter records one running watch and the notification source driving it, if
-// any. Concurrent watches over one coordinator are not a supported
-// composition, but the counter makes a second one visible rather than letting
-// the first one's exit report "watch off" while it still runs.
-func (w *watchState) enter(source *watch.Watcher) {
+// enter records one running watch, its session identity and the notification
+// source driving it, if any. Concurrent watches over one coordinator are not a
+// supported composition, but the counter makes a second one visible rather than
+// letting the first one's exit report "watch off" while it still runs.
+func (w *watchState) enter(source *watch.Watcher, session string) {
 	w.mu.Lock()
 	w.active++
 	w.skipping = false
+	w.watchSession = session
 	if source != nil {
 		w.source = source
 	}
@@ -242,8 +286,17 @@ func (w *watchState) leave() {
 	w.active--
 	if w.active == 0 {
 		w.source = nil
+		w.watchSession = ""
 	}
 	w.mu.Unlock()
+}
+
+// session is the identity of the watch running over this coordinator, which is
+// what its heartbeat row is keyed by.
+func (w *watchState) session() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.watchSession
 }
 
 // beginSkipping opens a held-lock episode and reports whether this beat is the
@@ -319,9 +372,9 @@ func (w *watchState) project(st *model.IndexStatus) {
 	}
 }
 
-// heartbeat is what this watch publishes for another process to read: when its
-// last pass completed and how many events are pending, both absent when nothing
-// measured them.
+// heartbeat is what this watch publishes for another process to read: which
+// watch it is, when its last pass completed and how many events are pending,
+// the latter two absent when nothing measured them.
 //
 // A watch that has completed no pass publishes neither figure. Until it owns
 // the workspace it has reconciled nothing, and the events its notification
@@ -330,18 +383,19 @@ func (w *watchState) project(st *model.IndexStatus) {
 // workspace is caught up while an index it is waiting behind is still running.
 // The row itself is still published, which is what keeps a watch that is
 // waiting distinguishable from a workspace where no watch has ever run.
-func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
+func (w *watchState) heartbeat() (session string, lastPass *time.Time, pending *int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	session = w.watchSession
 	// w.reconciled and not observe's merged time: the watcher marks itself
 	// reconciled on its own rescans and polling ticks, which happen whether or
 	// not this watch ever had the workspace. Only w.reconciled is a pass this
 	// coordinator completed while holding it.
 	if w.reconciled.IsZero() {
-		return nil, nil
+		return session, nil, nil
 	}
 	_, _, pending, at := w.observe()
-	return &at, pending
+	return session, &at, pending
 }
 
 // capabilityReport accumulates one generation's capability rows and publishes
