@@ -135,15 +135,15 @@ var _ diagnostics.WatchHeartbeatReader = storeReader{}
 type runLedger struct{ dir string }
 
 func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
-	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, error) {
+	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error) {
 	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
 	if err != nil || !recorded {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer reader.Close()
 	view, found, err := reader.LatestRun(ctx, string(repo), int64(generation))
 	if err != nil || !found {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	run := model.RunRecord{
 		RunID:               view.Run.RunID,
@@ -167,7 +167,7 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 	for _, span := range view.Spans {
 		stages = append(stages, stageRecord(span))
 	}
-	return &run, stages, nil
+	return &run, stages, view.SpansOmitted, nil
 }
 
 var _ diagnostics.RunLedger = runLedger{}
