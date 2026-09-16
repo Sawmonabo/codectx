@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
 // This is the whole test budget for the graph engine: one shared in-memory
@@ -955,12 +957,22 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("a walk of %d pages left %d live cursor leases, want 0; each holds a generation against retention until its TTL",
 						pages, live)
 				}
-				left, err := os.ReadDir(spoolDir)
+				entries, err := os.ReadDir(spoolDir)
 				if err != nil {
 					t.Fatalf("read spool dir: %v", err)
 				}
+				// The scratch pool beside the spools is not a leftover: it is
+				// the surfaces the store keeps and writes over, which an
+				// operator empties and a walk never frees.
+				pool := filepath.Base(scratch.Dir(spoolDir))
+				var left []string
+				for _, e := range entries {
+					if e.Name() != pool {
+						left = append(left, e.Name())
+					}
+				}
 				if len(left) != 0 {
-					t.Fatalf("a walk of %d pages left %d spool file(s) behind, want 0", pages, len(left))
+					t.Fatalf("a walk of %d pages left %d spool file(s) behind, want 0: %v", pages, len(left), left)
 				}
 			},
 		},
