@@ -324,7 +324,7 @@ func (s *ExternalSort[T]) spill() error {
 		s.err = internalErr("external sort run: " + err.Error())
 		return s.err
 	}
-	w := bufio.NewWriterSize(f, mergeBlockBytes)
+	w := bufio.NewWriterSize(paced.NewWriter(f), mergeBlockBytes)
 	for _, v := range s.buf {
 		if err := s.writeRecord(w, v); err != nil {
 			f.Close()
@@ -535,7 +535,7 @@ func (s *ExternalSort[T]) merge(out *os.File, runs []string, fold bool) (int64, 
 	}
 	heap.Init(h)
 	s.observe(len(h.items))
-	w := bufio.NewWriterSize(out, mergeBlockBytes)
+	w := bufio.NewWriterSize(paced.NewWriter(out), mergeBlockBytes)
 	var n int64
 	for h.Len() > 0 {
 		v, err := s.pop(h, readers)

@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // keyAlgebraVersion is the version of the fact-key pre-image below. It is the
@@ -272,7 +274,7 @@ func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
 	defer f.Close()
-	w := bufio.NewWriter(f)
+	w := bufio.NewWriter(paced.NewWriter(f))
 	if _, err := w.WriteString(keySetMagic + "\n"); err != nil {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
