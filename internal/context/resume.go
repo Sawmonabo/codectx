@@ -66,10 +66,22 @@ type checkpointState struct {
 	// Streams maps a stream's name to the run files it was checkpointed as,
 	// relative to the state directory so the directory stays relocatable
 	// across the adoption rename.
-	Streams map[string][]string `json:"streams"`
+	Streams map[string][]checkpointRun `json:"streams"`
 	// Scalars is the cross-pass state that is not a stream: the scope verdict,
 	// the completeness rows and the flags a later pass may only ever narrow.
 	Scalars checkpointScalars `json:"scalars"`
+}
+
+// A checkpointRun is one checkpointed run file: its name inside the state
+// directory, and the bytes of the file that are the run's.
+//
+// The length is persisted because a run file is a pooled scratch surface that
+// nothing truncates: the bytes past a run's own belong to whatever tenant held
+// the surface before it, and a resumed merge that read to end of file would
+// decode them as records of this compile.
+type checkpointRun struct {
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes"`
 }
 
 // checkpointScalars is the non-stream carry. Each field is bounded by something
@@ -149,7 +161,7 @@ func cursorExpired(msg string) error {
 	return &model.Error{Code: model.CodeCursorInvalid, Message: msg}
 }
 
-// checkpointRun persists an ALREADY-SORTED, already-folded stream into dir
+// checkpointSortedRun persists an ALREADY-SORTED, already-folded stream into dir
 // under the given name and answers the run files it became, relative to dir.
 //
 // It replays the run through a fresh external sort rooted in dir and detaches
@@ -165,9 +177,9 @@ func cursorExpired(msg string) error {
 //
 // A nil run checkpoints as no files, which restores as no stream. That is the
 // honest encoding of a carry slot a boundary does not have live yet.
-func checkpointRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T],
+func checkpointSortedRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T],
 	compare func(a, b T) int, sizeOf func(T) int64,
-) ([]string, error) {
+) ([]checkpointRun, error) {
 	if run == nil {
 		return nil, nil
 	}
@@ -187,23 +199,23 @@ func checkpointRun[T any](dir, name string, runBytes int64, run *pagination.Sort
 // The detached files are written wherever the sort was rooted, which is the
 // compile's sort area, so they are MOVED into dir here. Both are inside the
 // store's own spool area, so the move is a same-filesystem rename.
-func checkpointSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]string, error) {
+func checkpointSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]checkpointRun, error) {
 	if sorter == nil {
 		return nil, nil
 	}
-	runs, err := sorter.Detach()
+	refs, err := sorter.DetachTo(dir, checkpointRunName(name))
 	if err != nil {
 		return nil, err
 	}
-	return moveRuns(dir, name, runs)
+	return checkpointRuns(refs), nil
 }
 
-// checkpointStream is the shared body of checkpointRun: it drains a record
+// checkpointStream is the shared body of checkpointSortedRun: it drains a record
 // sequence into a fresh sort rooted in dir and detaches the runs it spilled.
 func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T) error) error,
 	compare func(a, b T) int, sizeOf func(T) int64,
-) ([]string, error) {
-	sorter, err := pagination.NewExternalSort(dir, checkpointPrefix(name), 0,
+) ([]checkpointRun, error) {
+	sorter, err := pagination.NewExternalSort(dir, 0,
 		encodeRecord[T], decodeRecord[T], compare)
 	if err != nil {
 		return nil, err
@@ -213,20 +225,18 @@ func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T)
 		sorter.Close()
 		return nil, err
 	}
-	// Detach spills the pending buffer, so a stream that fit one buffer still
+	// DetachTo spills the pending buffer, so a stream that fit one buffer still
 	// becomes a file: a checkpoint has to survive the process, and an in-heap
-	// run does not.
-	runs, err := sorter.Detach()
+	// run does not. It names them in DETACH order, which is load-bearing: the
+	// merge that adopts them breaks ties by run index, so the index a run is
+	// stored under is what reproduces the single stable sort this stream
+	// already is.
+	refs, err := sorter.DetachTo(dir, checkpointRunName(name))
 	if err != nil {
 		sorter.Close()
 		return nil, err
 	}
-	// Renamed into DETACH order, never listed by their os.CreateTemp suffix:
-	// the merge that adopts these runs breaks ties by run index, so the index a
-	// run is stored under is what reproduces the single stable sort this stream
-	// already is. The files are already inside dir, so the rename only fixes
-	// their names.
-	return moveRuns(dir, name, runs)
+	return checkpointRuns(refs), nil
 }
 
 // restoreRun adopts a checkpointed ALREADY-FOLDED stream and answers it as a
@@ -235,7 +245,7 @@ func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T)
 //
 // The restored sort is registered with the compile's sort area, so the merged
 // output is removed on every exit path exactly as a freshly computed run is.
-func restoreRun[T any](s *compileSorts, dir, name string, runs []string,
+func restoreRun[T any](s *compileSorts, dir, name string, runs []checkpointRun,
 	compare func(a, b T) int, sizeOf func(T) int64,
 ) (*pagination.SortedRun[T], error) {
 	sorter, err := restoreSort(s, dir, name, runs, compare, sizeOf)
@@ -254,7 +264,7 @@ func restoreRun[T any](s *compileSorts, dir, name string, runs []string,
 // empty stream -- and pagination.SortedRun.Each reads a nil run as an empty one
 // without complaint (extsort.go:662), so answering nil here would turn a
 // restore that lost a stream into a plan that is silently short of it.
-func restoreSort[T any](s *compileSorts, dir, name string, runs []string,
+func restoreSort[T any](s *compileSorts, dir, name string, runs []checkpointRun,
 	compare func(a, b T) int, sizeOf func(T) int64,
 ) (*pagination.ExternalSort[T], error) {
 	if len(runs) == 0 {
@@ -264,7 +274,7 @@ func restoreSort[T any](s *compileSorts, dir, name string, runs []string,
 	if err != nil {
 		return nil, err
 	}
-	sorter, err := pagination.AdoptRuns(dir, checkpointPrefix(name), 0, abs,
+	sorter, err := pagination.AdoptRuns(dir, 0, abs,
 		encodeRecord[T], decodeRecord[T], compare)
 	if err != nil {
 		return nil, err
@@ -273,47 +283,36 @@ func restoreSort[T any](s *compileSorts, dir, name string, runs []string,
 	return sorter, nil
 }
 
-// checkpointPrefix namespaces one stream's run files inside the state
+// checkpointRunName names the i-th run of one stream inside the state
 // directory, so two streams of one checkpoint never share a name and a resume
-// can tell them apart by inspection.
-func checkpointPrefix(name string) string { return "ctx-resume-" + name + "-" }
+// can tell them apart by inspection. The "run" infix keeps the name out of any
+// namespace another writer in the directory draws from.
+func checkpointRunName(stream string) func(i int) string {
+	return func(i int) string { return "ctx-resume-" + stream + "-run" + strconv.Itoa(i) }
+}
+
+// checkpointRuns records what a detached sort moved into the state directory.
+func checkpointRuns(refs []pagination.RunRef) []checkpointRun {
+	runs := make([]checkpointRun, 0, len(refs))
+	for _, ref := range refs {
+		runs = append(runs, checkpointRun{Name: filepath.Base(ref.Path), Bytes: ref.Bytes})
+	}
+	return runs
+}
 
 // absoluteRuns resolves stored names back against the state directory and
 // refuses any name that escapes it. The names come from a file inside a
 // directory a cursor named, so they are validated rather than trusted: a
 // traversing name would otherwise let a crafted state file point the merge at a
 // file outside the store.
-func absoluteRuns(dir string, runs []string) ([]string, error) {
-	out := make([]string, 0, len(runs))
+func absoluteRuns(dir string, runs []checkpointRun) ([]pagination.RunRef, error) {
+	out := make([]pagination.RunRef, 0, len(runs))
 	for _, r := range runs {
-		if r == "" || filepath.IsAbs(r) || r != filepath.Clean(r) ||
-			strings.HasPrefix(r, "..") || strings.ContainsRune(r, filepath.Separator) {
+		if r.Name == "" || filepath.IsAbs(r.Name) || r.Name != filepath.Clean(r.Name) ||
+			strings.HasPrefix(r.Name, "..") || strings.ContainsRune(r.Name, filepath.Separator) {
 			return nil, cursorExpired("the continuation state names a run outside its directory")
 		}
-		out = append(out, filepath.Join(dir, r))
-	}
-	return out, nil
-}
-
-// moveRuns renames detached run files into the state directory under this
-// stream's prefix, NUMBERED BY DETACH ORDER, and answers their names relative
-// to it. The index is load-bearing and not cosmetic: pagination's merge breaks
-// ties by run index, so storing runs in arrival order is what makes the resumed
-// merge reproduce the order the interrupted stream was in -- which matters for
-// every comparator that is not total (lessScoredPkg orders on Pkg alone).
-// The "run" infix keeps a target name out of the namespace os.CreateTemp draws
-// the source suffixes from, so a rename can never land on a run not moved yet. A failure part way
-// through leaves the already-moved files in the directory, which the lease
-// reclaims: the caller's answer is an uninterrupted compile or an error, never
-// a checkpoint that names files it does not have.
-func moveRuns(dir, name string, runs []string) ([]string, error) {
-	out := make([]string, 0, len(runs))
-	for i, r := range runs {
-		base := checkpointPrefix(name) + "run" + strconv.Itoa(i)
-		if err := os.Rename(r, filepath.Join(dir, base)); err != nil {
-			return nil, &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
-		}
-		out = append(out, base)
+		out = append(out, pagination.RunRef{Path: filepath.Join(dir, r.Name), Bytes: r.Bytes})
 	}
 	return out, nil
 }
@@ -420,22 +419,22 @@ func missingStream(name string) error {
 		Message: "context checkpoint: the boundary has no " + name + " stream"}
 }
 
-// cpRun is checkpointRun with the boundary's own liveness check: a stream
+// cpRun is checkpointSortedRun with the boundary's own liveness check: a stream
 // passStreams lists must be live, because an absent one and an EMPTY one both
 // checkpoint as no files and only this check tells them apart.
 func cpRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T],
 	compare func(a, b T) int, sizeOf func(T) int64,
-) ([]string, error) {
+) ([]checkpointRun, error) {
 	if run == nil {
 		return nil, missingStream(name)
 	}
-	return checkpointRun(dir, name, runBytes, run, compare, sizeOf)
+	return checkpointSortedRun(dir, name, runBytes, run, compare, sizeOf)
 }
 
 // cpSort is checkpointSort with the boundary's own liveness check, the
 // pre-fold counterpart of cpRun: checkpointSort answers no files for a nil
 // sorter, which a restore would read as an empty stream rather than a lost one.
-func cpSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]string, error) {
+func cpSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]checkpointRun, error) {
 	if sorter == nil {
 		return nil, missingStream(name)
 	}
@@ -445,7 +444,7 @@ func cpSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]stri
 // checkpointIngest persists one of P-A's four pre-fold sorts. They live on the
 // halted seed sink rather than on st, because they are one pass's working set
 // and not a finished stream any later pass reads.
-func (st *compileState) checkpointIngest(dir, name string) ([]string, error) {
+func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, error) {
 	if st.ingest == nil {
 		return nil, missingStream(name)
 	}
@@ -466,7 +465,7 @@ func (st *compileState) checkpointIngest(dir, name string) ([]string, error) {
 // is a switch over names rather than a loop over an interface: streamEdges is
 // the compile's one PRE-fold carry and is the only case that uses
 // checkpointSort.
-func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]string, error) {
+func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]checkpointRun, error) {
 	switch name {
 	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
 		return st.checkpointIngest(dir, name)
@@ -541,7 +540,7 @@ func (st *compileState) measuredRun(name string) *pagination.SortedRun[candRec] 
 // restoreStream adopts ONE named stream back into st. It mirrors
 // checkpointStream case for case; streamEdges is the one that re-attaches its
 // fold, because it is the one that was checkpointed PRE-fold.
-func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []string) error {
+func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []checkpointRun) error {
 	var err error
 	switch name {
 	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
@@ -717,7 +716,7 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 	state := checkpointState{
 		Pass:        st.pass,
 		RequestHash: requestHash,
-		Streams:     make(map[string][]string, len(names)),
+		Streams:     make(map[string][]checkpointRun, len(names)),
 		Scalars:     scalars,
 	}
 	fail := func(err error) (string, error) {

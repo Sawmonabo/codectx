@@ -1,8 +1,10 @@
 package context
 
 import (
+	"io/fs"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -297,6 +299,14 @@ func TestFoldsAreOrderIndependent(t *testing.T) {
 // leaves no run file behind in the store's shared sort area. It also exercises
 // the sort area end to end -- the byte-budgeted run buffer, lessEntityID and
 // foldMinSeq -- because a release path that never spilled would prove nothing.
+//
+// "Released" means given back to the scratch pool, not removed: the files stay
+// at their high-water length for the next compile to write over, because
+// freeing them is what stalls the host. So the assertion is that the sort area
+// holds NOTHING OUTSIDE THE POOL, and that a second compile of the same work
+// takes the pooled surfaces again instead of growing the pool. A compile that
+// leaked a run would leave it loose in the area; one that leaked a LEASE would
+// grow the pool on the second pass.
 func TestCompileSortsReleaseEveryRun(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -361,13 +371,76 @@ func TestCompileSortsReleaseEveryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
-	if len(left) != 0 {
-		t.Fatalf("the sort area still holds %d file(s) after release: %v", len(left), left)
+	for _, e := range left {
+		if e.Name() != "scratch" {
+			t.Fatalf("the sort area holds %s outside the scratch pool after release", e.Name())
+		}
+	}
+	pooled := pooledRunFiles(t, dir)
+	if pooled == 0 {
+		t.Fatal("the compile left no pooled run file; it never spilled and proves nothing")
+	}
+
+	// The same compile again: every surface comes from the pool, so the pool
+	// does not grow.
+	again, err := newCompileSorts(cfg, dir)
+	if err != nil {
+		t.Fatalf("newCompileSorts: %v", err)
+	}
+	resorter, err := newSort(again, "cand", lessEntityID, sizeOfCand)
+	if err != nil {
+		t.Fatalf("newSort: %v", err)
+	}
+	resorter = resorter.WithFold(foldMinSeq)
+	for c := range copies {
+		for e := range entities {
+			rec := candRec{
+				Seq:        int64(c*entities + e),
+				NodeID:     model.NodeID("node-" + string(rune('a'+e%26)) + itoa(e)),
+				PathFinal:  "internal/context/" + itoa(e) + ".go",
+				PathAtRank: "internal/context/" + itoa(e) + ".go",
+				Reasons:    []string{"a reason long enough to make the run buffer mean something at all"},
+			}
+			if err := resorter.Add(rec); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+	}
+	rerun, err := resorter.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	trackRun(again, rerun)
+	if err := again.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := pooledRunFiles(t, dir); got != pooled {
+		t.Fatalf("the pool grew from %d to %d run files over an identical second compile: a lease was leaked", pooled, got)
 	}
 
 	if _, err := newCompileSorts(cfg, ""); err == nil {
 		t.Fatal("newCompileSorts accepted an empty sort directory; ruling C5 requires the store's own")
 	}
+}
+
+// pooledRunFiles counts the sort-run surfaces the scratch pool under dir holds,
+// across every instance directory in it.
+func pooledRunFiles(t *testing.T, dir string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(filepath.Join(dir, "scratch"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && filepath.Base(filepath.Dir(path)) == "sort-run" {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the scratch pool: %v", err)
+	}
+	return n
 }
 
 // itoa keeps the fixture readable without pulling strconv into the file for one

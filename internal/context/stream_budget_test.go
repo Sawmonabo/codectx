@@ -352,7 +352,7 @@ func excludedRun(xs []model.ExcludedContextEntry) (*pagination.SortedRun[model.E
 		return nil, func() {}, err
 	}
 	release := func() { os.RemoveAll(dir) }
-	sorter, err := pagination.NewExternalSort(dir, "excluded-", 0,
+	sorter, err := pagination.NewExternalSort(dir, 0,
 		encodeRecord[model.ExcludedContextEntry], decodeRecord[model.ExcludedContextEntry], lessExcludedOrdinal)
 	if err != nil {
 		release()

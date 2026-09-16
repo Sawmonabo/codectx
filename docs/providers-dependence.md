@@ -520,7 +520,9 @@ in memory and a larger one spills once to a temporary file under the data
 directory's `tmp/`. [ADR-0009](adr/ADR-0009-import-staging.md) records the
 measurements and the alternatives.
 
-A staging file is created once and reused. An import takes a slot in the
+A staging file is created once and reused — the same rule the rest of the
+store follows for every working file it writes for its own later reading (see
+[the scratch pool](storage.md#the-scratch-pool)). An import takes a slot in the
 scratch directory, empties the slot's file by dropping its tables -- which
 returns their pages to the file's own free list, with automatic vacuuming off,
 so the file never shrinks -- and gives the slot back when it ends. Dropping is
@@ -538,7 +540,19 @@ machine about a minute later, unobservably.
 
 Materializations, graphs not selected for the cache and exports are removed on
 every termination path; the importer's staging files are emptied and reused
-instead, and only the sweep below removes them. All of them
+instead, and only the sweep below removes them.
+
+Those three are removed rather than pooled, and the reason is the content, not
+the disk. An export and a graph are written by the engine, which chooses their
+layout and their length, so nothing this product writes can be laid over them
+and a stale one left in place would be read back as this run's output. A
+materialization is this unit's own files: copying the whole snapshot and
+pruning "spent the time and the disk of every sibling project, and left another
+unit's source inside this unit's private tree", so one tree shared between units
+reinstates exactly that, and an analyzer writes into the tree it was given. What
+those removals cost is volume rather than a burst — every one of them is
+windowed, a sync per step — and each is accounted in the resources block's
+`freed_by_purpose` as `analyzer-output` or `materialization`. All of them
 live under the provider's own private roots — `<data_dir>/dependence/runs/` for
 the per-run directories and `<data_dir>/dependence/scratch/` for the staging
 databases — never under the system temp directory: the staging database holds

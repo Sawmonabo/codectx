@@ -4,13 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 
 	"modernc.org/sqlite"
 
-	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
 // A unit's lexical staging. Every token instance the unit publishes is written
@@ -21,13 +20,21 @@ import (
 // time, and a staging table inside it would be a random-keyed insert into a
 // b-tree far larger than the writer's page cache (ADR-0009).
 //
-// Nothing here is durable. The file is private to one unit, single-writer and
-// deleted at seal, at Abandon and at Fail; losing it to a crash loses only a
+// Nothing here is durable. The database is private to one building unit and
+// single-writer while that unit holds it; losing it to a crash loses only a
 // unit that is not sealed and therefore does not exist. Its writes reach the
 // disk through the process's paced file system like every other connection's
-// (ADR-0008), and its removal frees the file one window at a time through
-// internal/paced, so a unit that staged gigabytes does not hand the filesystem
-// every freed extent at once.
+// (ADR-0008).
+//
+// The FILE outlives the unit. It is a slot of the store's scratch pool: a unit
+// takes a slot at its first batch, empties its tables so it stages into a
+// database with no rows, and gives the slot back at seal, at Abandon and at
+// Fail. The engine recycles the emptied pages from its own free list and
+// auto_vacuum stays off, so the file keeps its high-water length and the next
+// unit writes over it. Nothing is freed for the life of the store: a unit that
+// staged gigabytes and removed them handed the filesystem every one of those
+// extents at once, and on a host that discards freed blocks that stalls every
+// writer on the machine for about a minute.
 
 // lexicalStageCacheKiB is the staging database's page cache. It is the buffer
 // the engine sorts the seal-time read in, so a unit whose vocabulary fits it is
@@ -56,13 +63,14 @@ const stageOrderedRead = `SELECT t.term, d.doc_id, t.col, t.n
 	FROM unit_terms t JOIN batch_docs d ON d.batch = t.batch AND d.doc = t.doc
 	ORDER BY t.term, d.doc_id, t.col`
 
-// lexicalStage is one building unit's staging database.
+// lexicalStage is one building unit's staging database: the slot it holds and
+// the connection it stages through.
 type lexicalStage struct {
-	db   *sql.DB
-	path string
-	stmt map[string]*sql.Stmt
-	inTx bool
-	rows int64
+	db    *sql.DB
+	lease *scratch.Lease
+	stmt  map[string]*sql.Stmt
+	inTx  bool
+	rows  int64
 	// batch is the PutSearchUnits call the rows being staged belong to. A
 	// document number is only unique inside one tokenizer pass, so the batch
 	// is half of its key.
@@ -73,33 +81,34 @@ type lexicalStage struct {
 // not the rows it can hold.
 const stageCommitEvery = 200_000
 
-// stageDirName is the directory under the data directory that holds the
-// engine's temporary files; a unit's staging database joins them there, so the
-// staging shares the disk the operator gave the data rather than a system
-// temporary directory that may be a memory filesystem.
-const stageDirName = "tmp"
+// stageEmpty drops whatever the slot's previous tenant staged. Dropping the
+// tables rather than deleting their rows is one statement whatever the slot
+// holds, and it returns every page to the database's free list for this unit
+// to fill again; auto_vacuum is off, so the file does not shrink and nothing
+// is handed back to the filesystem.
+const stageEmpty = `DROP TABLE IF EXISTS unit_terms;
+DROP TABLE IF EXISTS batch_docs;
+`
 
-// stageDir is the directory a unit's staging database lives in.
-func (s *Store) stageDir() string { return filepath.Join(filepath.Dir(s.path), stageDirName) }
-
-// stagePath is the staging database of the unit with row id unitRow. It is
-// named from the row id alone, so the collection of a dead unit can remove that
-// unit's file without touching a staging another process is still writing.
-func (s *Store) stagePath(unitRow int64) string {
-	return filepath.Join(s.stageDir(), "lexical-"+strconv.FormatInt(unitRow, 10)+".db")
-}
-
-// openLexicalStage creates the staging database of the unit with row id
-// unitRow, replacing any file a previous, abandoned attempt left behind.
-func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalStage, error) {
-	dir := s.stageDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, internal("lexical staging directory: " + err.Error())
-	}
-	path := s.stagePath(unitRow)
-	if err := paced.Remove(path); err != nil && !os.IsNotExist(err) {
+// openLexicalStage takes a staging slot from the store's scratch pool and
+// empties it, so the unit stages into a database with no rows in a file that
+// already has its pages.
+func (s *Store) openLexicalStage(ctx context.Context) (*lexicalStage, error) {
+	lease, err := scratch.For(filepath.Dir(s.path)).Take(scratch.LexicalStage)
+	if err != nil {
 		return nil, internal("lexical staging: " + err.Error())
 	}
+	stage, err := s.openStageSlot(ctx, lease.Path())
+	if err != nil {
+		lease.Release()
+		return nil, err
+	}
+	stage.lease = lease
+	return stage, nil
+}
+
+// openStageSlot opens one slot's database and empties it.
+func (s *Store) openStageSlot(ctx context.Context, path string) (*lexicalStage, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)",
 		"locking_mode(EXCLUSIVE)", "cache_size(-" + strconv.Itoa(lexicalStageCacheKiB) + ")"} {
@@ -113,12 +122,11 @@ func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalSt
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if _, err := db.ExecContext(ctx, stageSchema); err != nil {
+	if _, err := db.ExecContext(ctx, stageEmpty+stageSchema); err != nil {
 		db.Close()
-		paced.Remove(path)
 		return nil, wrap("lexical staging", err)
 	}
-	return &lexicalStage{db: db, path: path, stmt: map[string]*sql.Stmt{}}, nil
+	return &lexicalStage{db: db, stmt: map[string]*sql.Stmt{}}, nil
 }
 
 // exec runs one reused statement inside the staging transaction, opening the
@@ -191,8 +199,10 @@ func (g *lexicalStage) docCount(ctx context.Context) (int64, error) {
 	return n, wrap("lexical staging", err)
 }
 
-// close releases the staging and deletes its file. It is called at seal, at
-// Abandon and at Fail, and is safe to call twice.
+// close gives the staging slot back to the pool, with its file at the length
+// this unit left it. It is called at seal, at Abandon and at Fail, and is safe
+// to call twice. Nothing is removed: the next unit to stage takes this slot
+// and empties its tables.
 func (g *lexicalStage) close() error {
 	if g.db == nil {
 		return nil
@@ -202,8 +212,9 @@ func (g *lexicalStage) close() error {
 	}
 	err := g.db.Close()
 	g.db = nil
-	if rmErr := paced.Remove(g.path); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
-		err = rmErr
+	if g.lease != nil {
+		g.lease.Release()
+		g.lease = nil
 	}
 	if err != nil {
 		return internal("lexical staging: " + err.Error())

@@ -522,7 +522,6 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	defer im.close()
 	var open opener
 	var err error
-	workDir := p.workDir
 	if strings.HasPrefix(req.Unit.ScopeKey, scopeProfile) {
 		prof, err := p.profileFor(ctx, req.Unit.ScopeKey)
 		if err != nil {
@@ -540,8 +539,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if err != nil {
 			return Report{}, internal("scip run directory: " + err.Error())
 		}
-		defer paced.RemoveAll(runDir)
-		workDir = runDir
+		defer paced.RemoveAllFor(paced.Materialization, runDir)
 		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir, &im.seen)
 		if err != nil {
 			return Report{}, err
@@ -567,7 +565,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		im.seen.note(limitIndexBytes, fv.Size)
 		im.indexHash, open = fv.ContentHash, p.fileOpener(req.Content, fv)
 	}
-	if im.sc, err = openScratch(ctx, workDir); err != nil {
+	if im.sc, err = openScratch(ctx, p.workDir); err != nil {
 		return Report{}, im.decorate(err)
 	}
 	defer im.sc.close()

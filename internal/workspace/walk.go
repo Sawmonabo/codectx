@@ -546,7 +546,7 @@ func (w *walker) readDir(rel string) (run entryRun, retained int, err error) {
 			return nil
 		}
 		if sorter == nil {
-			s, err := pagination.NewExternalSort[entry](w.sortDir(), "walk-", bufN,
+			s, err := pagination.NewExternalSort[entry](w.sortDir(), bufN,
 				encodeEntry, decodeEntry, func(a, b entry) int { return cmp.Compare(a.sortKey, b.sortKey) })
 			if err != nil {
 				return err

@@ -495,7 +495,7 @@ func sweepPrivate(dataDir string) {
 func (r *runDir) path(name string) string { return filepath.Join(r.root, name) }
 
 func (r *runDir) close(req provider.UnitRequest) {
-	if err := paced.RemoveAll(r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.RemoveAllFor(paced.Materialization, r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence run directory was not removed", "component", component,
 			"run", string(req.Run), "error", err)
 	}
@@ -629,7 +629,7 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	source, graph string, extra []string) (Outcome, error) {
 
-	_ = paced.Remove(graph)
+	_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	timeout, err := remaining(ctx)
 	if err != nil {
 		return Outcome{}, err
@@ -740,7 +740,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	if err != nil {
 		return ImportReport{}, err
 	}
-	if err := paced.RemoveAll(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.RemoveAllFor(paced.AnalyzerOutput, dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
 	}
 	return report, nil
@@ -817,7 +817,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		}
 		total = merge(total, report)
 		admitted++
-		_ = paced.Remove(graph)
+		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
 		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, res).

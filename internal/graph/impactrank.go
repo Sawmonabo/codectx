@@ -359,7 +359,7 @@ func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total 
 func (e *Engine) rankPairs(ctx context.Context,
 	emit func(add func(pairRecord) error) error,
 	stats *rankStats) (*pagination.SortedRun[pairRecord], error) {
-	byKey, err := e.newPairSort("graphpairkey-", lessByPairKey)
+	byKey, err := e.newPairSort(lessByPairKey)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +396,7 @@ func (e *Engine) rankPairs(ctx context.Context,
 	if err := ctx.Err(); err != nil {
 		return nil, typedContextError(ctx, err)
 	}
-	byPair, err := e.newPairSort("graphpair-", lessByPair)
+	byPair, err := e.newPairSort(lessByPair)
 	if err != nil {
 		return nil, err
 	}
@@ -417,9 +417,9 @@ func (e *Engine) rankPairs(ctx context.Context,
 // -- the same number Limits.FrontierBytes carries into the engine -- so one
 // query's structures are all charged against the one admission it was granted
 // rather than against a second key that could oversubscribe it.
-func (e *Engine) newPairSort(prefix string,
+func (e *Engine) newPairSort(
 	compare func(a, b pairRecord) int) (*pagination.ExternalSort[pairRecord], error) {
-	sorter, err := pagination.NewExternalSort(e.pairSortDir(), prefix, 0,
+	sorter, err := pagination.NewExternalSort(e.pairSortDir(), 0,
 		encodePairRecord, decodePairRecord, compare)
 	if err != nil {
 		return nil, err

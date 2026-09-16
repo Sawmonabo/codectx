@@ -149,9 +149,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// leaves the directory as the previous page committed it, so the retry
 	// resumes from the pre-page state rather than from a page torn in half.
 	//
-	// A FRESH search has no such obligation: no cursor names its directory
-	// yet, nothing can adopt it, and close() removing it is the only way it
-	// does not leak.
+	// A FRESH search has no such obligation: no cursor names its surface yet
+	// and nothing can adopt it, so close() gives it straight back to the pool
+	// for the next query to write over.
 	defer func() {
 		if resume != nil && !terminalOutcome(err) {
 			// A rollback that itself failed leaves retain() holding the
@@ -1084,10 +1084,11 @@ func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, 
 	return out, capped, nil
 }
 
-// scratchDir is where a path search puts its state file: beside the
-// continuation spools of the same store, so an operator has one place to look
-// for a query's temporary bytes. An engine with no spool store falls back to
-// the system temporary directory, which openPathScratch creates privately.
+// scratchDir is the directory whose scratch pool a path search takes its state
+// file from: the one holding the continuation spools of the same store, so an
+// operator has one place to look for a query's working bytes. An engine with
+// no spool store has no pool and falls back to the system temporary
+// directory, which openPathScratch creates privately.
 func (e *Engine) scratchDir() string {
 	if e.spools == nil {
 		return ""

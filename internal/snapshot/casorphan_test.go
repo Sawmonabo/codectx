@@ -80,10 +80,6 @@ func TestSweepOrphansKeepsEverythingButUnnamedSettledContent(t *testing.T) {
 	if has, err := c.Has(orphan); err != nil || has {
 		t.Errorf("orphan %s survived (present %v, err %v)", orphan[:8], has, err)
 	}
-	// <cas>/tmp belongs to snapshot.Sweep; the bucket filter must not reach it.
-	if _, err := os.Stat(c.tmp); err != nil {
-		t.Errorf("the CAS temporary directory did not survive the sweep: %v", err)
-	}
 }
 
 // TestSweepOrphansRemovesNothingWhenTheIndexCannotAnswer pins the direction of

@@ -621,8 +621,6 @@ type compileSorts struct {
 	// with, so the compile's peak heap is a function of it and the fan-in cap
 	// rather than of the candidate count.
 	runBytes int64
-	// prefix namespaces this compile's run files inside the shared directory.
-	prefix string
 	// release holds one closer per opened sort and sorted run, newest first.
 	release []func() error
 	// observed holds one row per sort this compile opened, in open order, so a
@@ -690,7 +688,6 @@ func newCompileSorts(cfg config.Config, sortDir string) (*compileSorts, error) {
 	return &compileSorts{
 		dir:      sortDir,
 		runBytes: pagination.SortRunBytes(admission.Value()),
-		prefix:   "ctx-compile-",
 	}, nil
 }
 
@@ -730,7 +727,7 @@ func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	if s == nil {
 		return nil, argumentInvalid("a context compile sort requires an open sort area")
 	}
-	sorter, err := pagination.NewExternalSort(s.dir, s.prefix+name+"-", 0,
+	sorter, err := pagination.NewExternalSort(s.dir, 0,
 		encodeRecord[T], decodeRecord[T], compare)
 	if err != nil {
 		return nil, err

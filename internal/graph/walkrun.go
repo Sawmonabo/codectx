@@ -178,7 +178,7 @@ func (e *Engine) rankImpact(ctx context.Context, retain *retainedWalk,
 // has been read and a pass-2 resume would otherwise have nothing to read.
 func (e *Engine) foldImpactPass(ctx context.Context, retain *retainedWalk,
 	prog rankProgress, stats *rankStats) (rankProgress, error) {
-	pass1, err := e.openImpactSort(retain, "graph-impact-fold-", lessByNode, prog.Runs)
+	pass1, err := e.openImpactSort(retain, lessByNode, prog.Runs)
 	if err != nil {
 		return prog, err
 	}
@@ -235,7 +235,7 @@ func (e *Engine) foldImpactPass(ctx context.Context, retain *retainedWalk,
 // rankImpactPass is pass 2: the folded records in ruling P1's served order.
 func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
 	prog rankProgress, stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
-	pass2, err := e.openImpactSort(retain, "graph-impact-rank-", lessByRank, prog.Runs)
+	pass2, err := e.openImpactSort(retain, lessByRank, prog.Runs)
 	if err != nil {
 		return nil, err
 	}
@@ -269,8 +269,8 @@ func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
 // own run budget, continuing the runs an interrupted request left when there
 // are any. New runs still spill into the engine's sort directory; only the runs
 // an interruption hands over live in the retained state.
-func (e *Engine) openImpactSort(retain *retainedWalk, prefix string,
-	compare func(a, b impactRecord) int, runs []string) (*pagination.ExternalSort[impactRecord], error) {
+func (e *Engine) openImpactSort(retain *retainedWalk,
+	compare func(a, b impactRecord) int, runs []retainedRun) (*pagination.ExternalSort[impactRecord], error) {
 	dir := e.walkScratchDir()
 	var (
 		sorter *pagination.ExternalSort[impactRecord]
@@ -280,10 +280,10 @@ func (e *Engine) openImpactSort(retain *retainedWalk, prefix string,
 		if e.probe != nil {
 			e.probe.AdoptedRuns += len(runs)
 		}
-		sorter, err = pagination.AdoptRuns(dir, prefix, 0, retain.runPaths(runs),
+		sorter, err = pagination.AdoptRuns(dir, 0, retain.runRefs(runs),
 			encodeImpactRecord, decodeImpactRecord, compare)
 	} else {
-		sorter, err = pagination.NewExternalSort(dir, prefix, 0,
+		sorter, err = pagination.NewExternalSort(dir, 0,
 			encodeImpactRecord, decodeImpactRecord, compare)
 	}
 	if err != nil {
@@ -340,23 +340,25 @@ func (e *Engine) rankInterrupted(ctx context.Context, added int) error {
 // continuation is never minted for it, so state it left behind would be state
 // nothing ever adopts.
 //
-// The runs and the count are written in ONE manifest, and Runs is the Detach
+// The runs and the count are written in ONE manifest, and Runs is the DetachTo
 // return verbatim rather than an append to what was adopted -- an adopting sort
-// spills after the runs it took over, so its own Detach already returns both.
+// spills after the runs it took over, so its own DetachTo already returns both.
 func (e *Engine) detachRankPass(retain *retainedWalk, sorter *pagination.ExternalSort[impactRecord],
 	pass int, seen int64, cause error) error {
 	if !isRankDeadline(cause) {
 		return cause
 	}
-	spilled, err := sorter.Detach()
+	dir, err := retain.home.ensure()
 	if err != nil {
 		return err
 	}
-	names, err := retain.adoptRunFiles(spilled)
+	spilled, err := sorter.DetachTo(dir, retainRunName)
 	if err != nil {
 		return err
 	}
-	if err := retain.setRankProgress(rankProgress{Pass: pass, Runs: names, Added: seen}); err != nil {
+	if err := retain.setRankProgress(rankProgress{
+		Pass: pass, Runs: retainRuns(spilled), Added: seen,
+	}); err != nil {
 		return err
 	}
 	return cause

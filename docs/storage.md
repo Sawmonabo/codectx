@@ -489,7 +489,8 @@ host-side work the machine can neither observe nor wait for, and about a minute
 later some request in flight waits a minute for it. So a run reuses space and
 frees almost nothing: it frees the leftovers of a dead run at its start, and
 what it does free is windowed. The bytes a process has freed are reported in the
-resources block as `freed_bytes`. At activation and abort the
+resources block as `freed_bytes`, and what the freeing was for as
+`freed_by_purpose`. At activation and abort the
 writer's page cache is released to the process, so a long-lived server does
 not keep a run's working set resident. The engine's temporary files -- the
 spill files of a sort larger than its cache, a statement journal past its
@@ -497,6 +498,53 @@ memory threshold, a temporary table too large for memory -- are created
 under `<data_dir>/tmp`, which the process names at start-up, so they live on
 the disk the user gave the data and never on a memory-backed system temp
 directory.
+### The scratch pool
+
+Freeing is the expensive act, so the working files a store writes for its own
+later reading are not freed at all. They are taken from a **scratch pool** under
+the directory they belong to and given back to it: an external sort's runs and
+its merged output, a lexical seal's staging database, the surface a blob is
+streamed into while it is hashed, a shortest-path search's state, an index
+import's symbol spool. `Take` hands out an existing file of the asked-for
+purpose, opened for overwrite at offset zero and **never truncated**, or creates
+one; `Release` returns it for the next taker. A file keeps whatever length its
+largest tenant gave it, and re-indexing an unchanged repository or answering a
+second query of the same shape therefore frees nothing at all.
+
+Because nothing truncates, **the file's length is not the data's length**. Every
+tenant carries its own logical length — a header, a record count, a byte count
+it recorded when it wrote — and never learns it from the file: a sort run is
+read through a limited reader over the byte count it recorded, a staged blob is
+trimmed to the length its record states before it is published, and a database
+surface is emptied by dropping its tables, which returns their pages to the
+database's own free list without giving the filesystem anything back.
+
+A pool is per process. It lives under a numbered instance directory the process
+claims with an exclusive lock held for as long as it runs, so no two live
+processes ever share a surface — several readers serve pages from one data
+directory at once, and a search's state file is not a thing two of them may
+each hold. A process that exits leaves its instance unlocked and the next
+process claims it and takes over its files: an abandoned pool is **inherited**,
+never accumulated and never swept.
+
+The disk the pools hold is reported in the resources block as `scratch_bytes`,
+and it is the other half of `freed_bytes`: what would have been freed and
+re-created over and over is space the store is holding instead. It shrinks only
+when an operator asks for the pools to be emptied — there is no timer, no size
+threshold and no configuration key, because reuse has no knob. Emptying skips
+any instance a live process still holds, and reports what it did not empty for
+that reason rather than reporting a smaller figure.
+
+Outputs of foreign writers are outside the pool and are the only frees a run
+makes. An indexer's index file and a dependence engine's export have a layout
+and a length this product does not choose, so they cannot be written over and
+are removed — windowed, and accounted to `freed_by_purpose` as
+`analyzer-output`. So is a materialized source tree (`materialization`): a unit
+materializes only its own files, and an analyzer writes into the tree it was
+given, so one tree cannot be handed to the next unit. State a run left for a
+caller that never came back is removed by the sweep that reclaims its lease
+(`lease-reclamation`), not by the run.
+
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.
 
@@ -604,11 +652,12 @@ the whole segment set behind it.
 
 **Where a segment comes from.** A document is tokenised exactly once, by the
 pass that counts its tokens as it is put. That pass stages one row per
-`(term, document, column)` group in a staging database of the unit's own, under
-the data directory's `tmp` — appended in arrival order, durability off, no index
-during the load. At seal, one ordered read of that staging is folded into the
-unit's segment, and the staging is deleted; it is also deleted when the unit is
-abandoned or failed. That ordered read is the only `ORDER BY` any plan of this
+`(term, document, column)` group in a **staging slot** taken from the data
+directory's scratch pool — appended in arrival order, durability off, no index
+during the load. The slot is emptied on the way in by dropping its tables, so it
+never carries the rows of the unit before it, and it is given back to the pool
+at seal, and on an abandoned or failed unit too. It is not deleted: the next
+unit writes over it. That ordered read is the only `ORDER BY` any plan of this
 store issues, and it runs over one unit's rows in a database of its own, so no
 sorter over the corpus ever exists. A unit that publishes no document folds no
 segment.
@@ -685,10 +734,11 @@ deleted in the same transaction as the generation or the unit that released it �
 which is exact because both tests are read off the documents themselves, so a
 segment every one of whose documents a carry chain has dropped, and one a merge
 has emptied by re-pointing its rows, both stop being reachable. A build that died
-before its seal is collected the same way, and its staging database is removed
-with it; the `tmp` directory is never swept on its own, because several processes
-may share one data directory and a live build's staging is indistinguishable from
-a dead one's.
+before its seal is collected the same way. Its staging slot is **not** removed
+with it: the slot is a pooled surface rather than a file of that unit's, so
+collection has nothing per-unit to find and therefore no way to reach a live
+build's slot — which matters because several processes may share one data
+directory and a live build's staging was indistinguishable from a dead one's.
 
 A **phrase** keeps the live posting path. The packed form stores counts, not
 offsets, and a phrase has to test adjacency; storing offsets would put a second
