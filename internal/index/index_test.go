@@ -1002,11 +1002,11 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	}
 	t.Cleanup(func() { c.Close() })
 
-	// The heartbeat row is keyed by the repository, so the repository must
-	// exist before a watch can publish anything about it.
-	if err := f.store.EnsureRepository(ctx, c.Repository(), f.repoDir); err != nil {
-		t.Fatalf("EnsureRepository: %v", err)
-	}
+	// Nothing has ever indexed this workspace, so no repository row exists yet.
+	// The watch must still be able to say it is here: the heartbeat is keyed by
+	// the repository, and a watch that could not record the identity would have
+	// every beat refused by the foreign key and an operator asking whether this
+	// workspace is watched would be told nothing is.
 
 	watchCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)

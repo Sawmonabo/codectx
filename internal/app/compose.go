@@ -1012,9 +1012,11 @@ func (s *stack) collect(ctx context.Context) {
 // leaves nothing to release twice; the release a caller is handed runs its
 // decrement exactly once however often the caller calls it; and the mutex is
 // held across the whole acquisition, so two tool calls racing to be the first
-// builder produce one lock and one recovery. LockWorkspace locks per open
-// file, so two acquisitions in one process would BOTH succeed and the second
-// would be a lock nobody closes.
+// builder produce one lock and one recovery. A second acquisition in this
+// process would not quietly succeed beside the first -- the advisory lock is
+// per open file description, so it is refused CTX_WORKSPACE_BUSY like any
+// other process's -- which is why nesting has to be counted rather than left
+// to each operation to take for itself.
 func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()

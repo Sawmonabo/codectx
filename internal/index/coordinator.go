@@ -458,6 +458,16 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 				"component", component, "repository_id", string(c.repo))
 		}
 	}()
+	// The heartbeat row names this repository, and on a workspace nothing has
+	// ever indexed there is no repository row for it to name: every beat would
+	// be refused by the foreign key and logged, and a second process asking
+	// whether a watch covers this workspace would be told nothing does. The
+	// identity is recorded here, before the first beat, by the same call the
+	// build path makes -- a watch IS the owner of this workspace for as long as
+	// it runs, and it has the lock to say so.
+	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
+		return err
+	}
 	// Evaluated now and deferred as its result: the beat starts here and the
 	// withdrawal it returns runs when this watch ends.
 	defer c.beatHeartbeat(ctx)()
