@@ -891,6 +891,15 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 			continue
 		}
 		if n == 0 {
+			if b.full {
+				// The first relation of this batch did not fit the page this
+				// one had already partly filled, so the batch consumed
+				// nothing. offset still names the batch's start, which is
+				// exactly where the relation deferred here sits: the loop's
+				// own `!b.full` exit arrives one iteration early and the next
+				// page reads it once.
+				break
+			}
 			return nil, nil, false, false, internalErr("graph: a reference page consumed no relation and cannot advance")
 		}
 		// The page filled part way through this batch, so the next one begins

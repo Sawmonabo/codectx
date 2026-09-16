@@ -326,9 +326,9 @@ type pairRollup struct {
 	// resolved, keyed by its surrogate. Its bound is the number of DISTINCT
 	// CONTAINERS the walk touched -- packages and modules -- and never the
 	// number of nodes or edges it visited: a container is hydrated once per
-	// walk however many of its members the walk admits, which is what turned
-	// the old rollup's per-batch re-hydration of the same few packages into 93
-	// per cent of a large walk. A repository has orders of magnitude fewer
+	// walk however many of its members the walk admits, so the same few
+	// packages are never re-hydrated batch after batch. A repository has
+	// orders of magnitude fewer
 	// packages than symbols, so the cache is a page-sized structure by
 	// construction.
 	labels map[NodeRef]containerLabel
@@ -371,12 +371,11 @@ func (p *pairRollup) Visit(_ frontierState, e Edge) error {
 //
 // The resolution is two ARRAY reads on the pinned reader -- the endpoints'
 // container surrogates and the batch's evidence counts -- and never a
-// containment traversal. ADR-0005 states why: the old rollup
-// re-read the incoming `contains` edges of every endpoint of every batch and
-// re-hydrated the same handful of container nodes over a thousand batches,
-// which is where 93 per cent of a large walk's wall clock went. The container
-// of a node is a per-generation side array now, so a batch costs one indexed
-// read per array whatever the fan-out of its endpoints.
+// containment traversal, which is the point of ADR-0005: reading the incoming
+// `contains` edges of every endpoint of every batch would re-hydrate the same
+// handful of container nodes over a thousand batches. The container of a node
+// is a per-generation side array, so a batch costs one indexed read per array
+// whatever the fan-out of its endpoints.
 func (p *pairRollup) flush() error {
 	if len(p.batch) == 0 {
 		return nil
@@ -520,9 +519,12 @@ func (p *pairRollup) evidenceCounts(rels []RelRef) (map[RelRef]int64, error) {
 
 // hydrate reads the canonical id and the reported label of every container the
 // cache is missing, in batched round trips, and records them. A container the
-// generation publishes no node for is recorded as absent rather than retried
-// on the next batch, so one unpublishable container cannot cost one read per
-// batch for the rest of the walk.
+// generation publishes no node for records NOTHING and is looked up again by
+// the next batch that names it: caching it as absent would need an entry the
+// cache cannot tell from a real label, and containerLabels reads a present
+// entry as a nameable container, so an unpublishable one would enter the
+// answer as a pair with no id and no path. A re-read of the few surrogates in
+// that state is a cost; a labelless pair is a wrong answer.
 func (p *pairRollup) hydrate(reader GraphReader, missing map[NodeRef]bool) error {
 	if len(missing) == 0 {
 		return nil
@@ -631,30 +633,6 @@ func (e *Engine) rollupInto(ctx context.Context, meta *model.QueryMeta,
 		stats.observe(sink.peak)
 	}
 	return nil
-}
-
-// evidenceCounts counts the evidence records backing each relation, in bounded
-// batches. A container relation legitimately carries none, which is why a zero
-// evidence count is a valid pair and a zero pair count is not.
-func (e *Engine) evidenceCounts(ctx context.Context, ids []model.RelationID) (map[model.RelationID]int64, error) {
-	out := make(map[model.RelationID]int64, len(ids))
-	for _, batch := range impactChunkRelations(dedupeRelations(append([]model.RelationID(nil), ids...))) {
-		got, err := e.adjacency.EvidenceFor(ctx, batch, model.MaxRelationsPerPath)
-		if err != nil {
-			return nil, err
-		}
-		for id, ev := range got {
-			out[id] = int64(len(ev))
-		}
-	}
-	return out, nil
-}
-
-// isContainerKind reports whether a node kind can be the target of a rollup.
-// Only packages and modules qualify: rolling up to a file or a directory would
-// answer a different question than the one Section 14.3 asks.
-func isContainerKind(k model.NodeKind) bool {
-	return k == model.NodePackage || k == model.NodeModule
 }
 
 // packageLabel is the path-shaped name a rollup reports for a container. A
