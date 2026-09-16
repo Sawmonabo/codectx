@@ -73,3 +73,63 @@ func TestTheOutputPacerIsNotBlockedByANamedPipeAmongTheOutputs(t *testing.T) {
 		t.Fatal("the pacer handed no window to the disk: it skipped the regular output beside the pipe")
 	}
 }
+
+// The requirement: Stop's stated contract -- the caller's outputs are on the
+// disk when it returns -- holds on a platform with no range writeback, where
+// the file's own sync is the only call that can honour it. A range write that
+// reports false must therefore not advance the offset the pacer believes it
+// has handed over, or the final sweep finds nothing left to owe and syncs
+// nothing, and a child's whole output stays in the page cache for the kernel's
+// flusher to submit in one burst -- the stall the pacer exists to remove.
+//
+// Mutation: advance the offset on the failure (o.sent[path] = end before the
+// break) and the final sweep returns at end == sent: nothing is synced and the
+// writer's whole output is still dirty when Stop returns.
+func TestStopHandsTheOutputsOverWhereThePlatformHasNoRangeWriteback(t *testing.T) {
+	dir := t.TempDir()
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		t.Fatal(err)
+	}
+	if fs.Type == tmpfsMagic {
+		t.Skip("the temporary directory is memory-backed; nothing is ever written back from it")
+	}
+	// The platform this runs on has range writeback; the contract under test
+	// is the one where it does not, so the fallback is forced.
+	restore := writeRange
+	writeRange = func(int, int64, int64) bool { return false }
+	defer func() { writeRange = restore }()
+
+	const size = 24 << 20
+	path := filepath.Join(dir, "stream")
+	writeOutput(t, path, size)
+
+	o := StartOutputs([]string{dir})
+	// Several polls hand over nothing: without range writeback there is no
+	// window to submit, and a sync on every poll would be a policy nobody
+	// asked for.
+	time.Sleep(4 * outputPoll)
+
+	o.Stop()
+
+	// What is still dirty when Stop returns is what a truncate cancels: the
+	// kernel drops those pages instead of writing them, and counts the bytes.
+	cancelledBefore := procIO(t, "cancelled_write_bytes")
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cancelled := procIO(t, "cancelled_write_bytes") - cancelledBefore
+	t.Logf("still dirty when the pacer stopped %d MiB of %d", cancelled>>20, size>>20)
+	if cancelled > size/4 {
+		t.Fatalf("%d MiB of a %d MiB output were still in the page cache when the pacer stopped; "+
+			"Stop returned before the writer's bytes reached the disk", cancelled>>20, size>>20)
+	}
+	if o.sent[path] != size {
+		t.Fatalf("the pacer believes it handed over %d bytes of a %d byte output", o.sent[path], size)
+	}
+}
