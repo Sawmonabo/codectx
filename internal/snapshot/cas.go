@@ -20,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -30,7 +31,13 @@ import (
 // which verify the bytes they expose against it.
 type CAS struct {
 	dir string
-	tmp string
+	// arena is where a put's temporary comes from. A capture streams every
+	// file in the workspace through one of these before it can know whether
+	// the store already holds that content, so a re-index of an unchanged
+	// repository used to write the whole repository into temporaries and then
+	// free every one of them. Taking the temporary from the pool instead
+	// makes that pass free nothing at all.
+	arena *scratch.Arena
 }
 
 // OpenCAS opens or creates the store at dir (0700).
@@ -38,11 +45,12 @@ func OpenCAS(dir string) (*CAS, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, invalid("the CAS directory must be an absolute path")
 	}
-	tmp := filepath.Join(dir, casTmpDirName)
-	if err := os.MkdirAll(tmp, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, ioError("CAS directory", err)
 	}
-	return &CAS{dir: dir, tmp: tmp}, nil
+	// The pool belongs to the data directory, not to the CAS inside it, so
+	// one arena serves the whole store and reports one figure.
+	return &CAS{dir: dir, arena: scratch.For(filepath.Dir(dir))}, nil
 }
 
 // path derives the blob location from a validated digest and nothing else.
@@ -147,6 +155,7 @@ type Batch struct {
 // so the flush can fsync it without reopening: on Windows a read-only handle
 // cannot be flushed at all.
 type staged struct {
+	lease *scratch.Lease
 	f     *os.File
 	final string
 	hash  string
@@ -186,7 +195,7 @@ func (b *Batch) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) 
 
 // put stages one blob, flushing the group first when the window is full.
 func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
-	rec, tmp, final, err := b.c.stage(ctx, r, want)
+	rec, lease, tmp, final, err := b.c.stage(ctx, r, want)
 	if err != nil {
 		return model.BlobRecord{}, err
 	}
@@ -205,19 +214,19 @@ func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRe
 		// The identical blob is already staged in this group and will be
 		// published and synced by the same flush, before the same barrier.
 		tmp.Close()
-		paced.Remove(tmp.Name())
+		lease.Release()
 		return rec, nil
 	}
 	dir := filepath.Dir(final)
 	if _, ok := b.dirty[dir]; !ok {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			tmp.Close()
-			paced.Remove(tmp.Name())
+			lease.Release()
 			return model.BlobRecord{}, ioError("CAS bucket", err)
 		}
 		b.dirty[dir] = struct{}{}
 	}
-	b.open = append(b.open, staged{f: tmp, final: final, hash: rec.Hash, size: rec.Size})
+	b.open = append(b.open, staged{lease: lease, f: tmp, final: final, hash: rec.Hash, size: rec.Size})
 	b.pending[rec.Hash] = struct{}{}
 	if len(b.open) >= b.window {
 		if err := b.flush(ctx); err != nil {
@@ -253,7 +262,7 @@ func (b *Batch) Barrier(ctx context.Context) error {
 func (b *Batch) Discard() {
 	for i := range b.open {
 		b.open[i].f.Close()
-		paced.Remove(b.open[i].f.Name())
+		b.open[i].lease.Release()
 	}
 	b.open = b.open[:0]
 	clear(b.pending)
@@ -271,13 +280,26 @@ func (b *Batch) flush(ctx context.Context) error {
 	group := b.open
 	b.open = b.open[:0]
 	clear(b.pending)
+	published := make([]bool, len(group))
 	defer func() {
-		// Whatever happened, no descriptor and no temporary outlives the
-		// group. A Close after a successful Close and a Remove after a rename
-		// both fail harmlessly.
+		// Whatever happened, no descriptor and no pooled surface outlives the
+		// group. A Close after a successful Close fails harmlessly.
+		//
+		// A surface that was NOT published still holds only this batch's own
+		// bytes, so it goes back to the pool and frees nothing. A surface that
+		// WAS published is a second name for the object now in the bucket: its
+		// blocks belong to the store from here on, so the pool gives up the
+		// slot and only the temporary's directory entry goes. That unlink must
+		// not be paced, because pacing a removal empties the file first and
+		// the file is the published blob.
 		for i := range group {
 			group[i].f.Close()
-			paced.Remove(group[i].f.Name())
+			if !published[i] {
+				group[i].lease.Release()
+				continue
+			}
+			os.Remove(group[i].lease.Path())
+			group[i].lease.Discard()
 		}
 	}()
 	if err := ctx.Err(); err != nil {
@@ -301,6 +323,14 @@ func (b *Batch) flush(ctx context.Context) error {
 		if errs[i] != nil {
 			return ioError("CAS sync", errs[i])
 		}
+		// The pool never truncates, so the surface may still carry the tail
+		// of a larger blob staged into it earlier. The published object is
+		// this file, and a reader proves an object by its length, so the tail
+		// goes before the object exists -- a window at a time, and only the
+		// excess over what this blob wrote.
+		if err := paced.Shrink(s.f.Name(), s.size); err != nil {
+			return ioError("CAS trim", err)
+		}
 		if err := s.f.Chmod(0o400); err != nil {
 			return ioError("CAS chmod", err)
 		}
@@ -310,6 +340,7 @@ func (b *Batch) flush(ctx context.Context) error {
 		if err := b.c.publish(s.f.Name(), s.final, s.size); err != nil {
 			return err
 		}
+		published[i] = true
 		if b.onSync != nil {
 			b.onSync(s.hash)
 		}
@@ -317,52 +348,54 @@ func (b *Batch) flush(ctx context.Context) error {
 	return nil
 }
 
-// stage streams r into a private temporary while computing the whole-file
+// stage streams r into a surface of the store's scratch pool while computing
+// the whole-file
 // digest, the 64-KiB block digests and the sparse line checkpoints in one pass
-// (source.BuildIndex). When want is set, content hashing to anything else is
-// discarded unpublished and reported as an integrity failure. Content already
-// published under the same digest is durable by construction, so the temporary
-// is dropped and a nil file returned: the caller has nothing to sync. The
-// returned record is what the caller persists with storage.PutBlob before any
-// manifest names it.
-func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *os.File, string, error) {
+// digests and the sparse line checkpoints in one pass (source.BuildIndex).
+// When want is set, content hashing to anything else is discarded unpublished
+// and reported as an integrity failure. Content already published under the
+// same digest is durable by construction, so the surface goes straight back
+// to the pool and a nil file is returned: the caller has nothing to sync and
+// nothing was freed. The returned record is what the caller persists with
+// storage.PutBlob before any manifest names it.
+func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *scratch.Lease, *os.File, string, error) {
 	if err := ctx.Err(); err != nil {
-		return model.BlobRecord{}, nil, "", model.Canceled(err)
+		return model.BlobRecord{}, nil, nil, "", model.Canceled(err)
 	}
-	tmp, err := os.CreateTemp(c.tmp, casTmpPrefix+"*")
+	lease, tmp, err := c.arena.TakeFile(scratch.ContentTemp)
 	if err != nil {
-		return model.BlobRecord{}, nil, "", ioError("CAS temporary file", err)
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS temporary file", err)
 	}
 	keep := false
 	defer func() {
 		if !keep {
 			tmp.Close()
-			paced.Remove(tmp.Name())
+			lease.Release()
 		}
 	}()
 
 	idx, err := source.BuildIndex(io.TeeReader(r, tmp))
 	if err != nil {
-		return model.BlobRecord{}, nil, "", ioError("CAS write", err)
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS write", err)
 	}
 	if want != "" && idx.ContentHash != want {
-		return model.BlobRecord{}, nil, "", integrity("reconstructed content hashes to a different digest than the manifest records")
+		return model.BlobRecord{}, nil, nil, "", integrity("reconstructed content hashes to a different digest than the manifest records")
 	}
 	rec := recordOf(idx)
 	final, err := c.path(rec.Hash)
 	if err != nil {
-		return model.BlobRecord{}, nil, "", err
+		return model.BlobRecord{}, nil, nil, "", err
 	}
 	if _, err := os.Lstat(final); err == nil {
 		if err := c.checkExisting(final, rec.Size); err != nil {
-			return model.BlobRecord{}, nil, "", err
+			return model.BlobRecord{}, nil, nil, "", err
 		}
-		return rec, nil, final, nil
+		return rec, nil, nil, final, nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return model.BlobRecord{}, nil, "", ioError("CAS stat", err)
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS stat", err)
 	}
 	keep = true
-	return rec, tmp, final, nil
+	return rec, lease, tmp, final, nil
 }
 
 // publish links tmp to final atomically. An existing final is the same
@@ -370,8 +403,11 @@ func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRe
 // checked. A filesystem without hard links falls back to a rename, attempted
 // only while final is absent; a publisher racing into that window replaces
 // the object with byte-identical content, which changes nothing a reader can
-// observe. A temporary that vanished is the startup sweep running without the
-// workspace lock held here (Repair): retryable, not corruption.
+// observe.
+//
+// tmp is a surface of the store's scratch pool. Nothing sweeps that pool, so
+// unlike the private temporary this replaced, it cannot be taken away between
+// the write and the link.
 func (c *CAS) publish(tmp, final string, size int64) error {
 	err := os.Link(tmp, final)
 	if err == nil {
@@ -383,22 +419,10 @@ func (c *CAS) publish(tmp, final string, size int64) error {
 	if _, statErr := os.Lstat(final); statErr == nil {
 		return c.checkExisting(final, size)
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return sweptTemporary()
-	}
 	if err := os.Rename(tmp, final); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return sweptTemporary()
-		}
 		return ioError("CAS publish", err)
 	}
 	return nil
-}
-
-func sweptTemporary() error {
-	return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
-		Message:     "the object's temporary file was removed by a concurrent recovery sweep before publication",
-		Remediation: "retry; run repair under the workspace lock to exclude the sweep"}
 }
 
 func (c *CAS) checkExisting(final string, size int64) error {

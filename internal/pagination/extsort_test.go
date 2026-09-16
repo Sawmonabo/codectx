@@ -73,7 +73,7 @@ func TestAdoptRunsResumesAnInterruptedSortIdentically(t *testing.T) {
 	const bufRecords = 5 // 40 runs over 200 records, so collapse() really runs
 	const interruptAfter = 83
 
-	whole, err := NewExternalSort(t.TempDir(), "whole-", bufRecords,
+	whole, err := NewExternalSort(t.TempDir(), bufRecords,
 		encodeResume, decodeResume, compareResume)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
@@ -93,7 +93,7 @@ func TestAdoptRunsResumesAnInterruptedSortIdentically(t *testing.T) {
 	want := collectResume(t, wholeRun)
 
 	dir := t.TempDir()
-	first, err := NewExternalSort(dir, "resume-", bufRecords,
+	first, err := NewExternalSort(dir, bufRecords,
 		encodeResume, decodeResume, compareResume)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
@@ -104,25 +104,30 @@ func TestAdoptRunsResumesAnInterruptedSortIdentically(t *testing.T) {
 			t.Fatalf("Add: %v", err)
 		}
 	}
-	runs, err := first.Detach()
+	state := t.TempDir()
+	runs, err := first.DetachTo(state, func(i int) string { return "run" + strconv.Itoa(i) })
 	if err != nil {
-		t.Fatalf("Detach: %v", err)
+		t.Fatalf("DetachTo: %v", err)
 	}
 	if len(runs) == 0 {
-		t.Fatalf("Detach returned no runs; the interruption would have nothing to resume from")
+		t.Fatalf("DetachTo returned no runs; the interruption would have nothing to resume from")
 	}
 	// Ownership moved: the interrupted sort's own Close must not remove the
 	// runs the continuation is going to adopt.
 	if err := first.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	for _, name := range runs {
-		if _, err := os.Stat(name); err != nil {
-			t.Fatalf("detached run %s was removed by the detached sort: %v", name, err)
+	for _, ref := range runs {
+		st, err := os.Stat(ref.Path)
+		if err != nil {
+			t.Fatalf("detached run %s was removed by the detached sort: %v", ref.Path, err)
+		}
+		if ref.Bytes <= 0 || ref.Bytes > st.Size() {
+			t.Fatalf("detached run %s recorded %d bytes of a %d-byte file", ref.Path, ref.Bytes, st.Size())
 		}
 	}
 
-	second, err := AdoptRuns(dir, "resume-", bufRecords, runs,
+	second, err := AdoptRuns(state, bufRecords, runs,
 		encodeResume, decodeResume, compareResume)
 	if err != nil {
 		t.Fatalf("AdoptRuns: %v", err)
@@ -153,5 +158,76 @@ func TestAdoptRunsResumesAnInterruptedSortIdentically(t *testing.T) {
 	if secondRun.Len() != wholeRun.Len() {
 		t.Fatalf("resumed SortedRun.Len is %d, the uninterrupted one %d",
 			secondRun.Len(), wholeRun.Len())
+	}
+}
+
+// TestAPooledRunFileNeverYieldsThePreviousTenantsRecords is the invariant the
+// scratch pool makes load-bearing. A run file is taken from the pool and never
+// truncated, so a short run written into a surface a long run left behind has
+// the long run's bytes sitting right after its own. A reader that stopped at
+// end of file instead of at the run's recorded length would decode those bytes
+// as records of THIS sort and merge them into the answer: a query served
+// records from a previous, unrelated query, which no error would report.
+//
+// Both halves are covered, because both read run files: the merge (the k-way
+// read of the spilled runs) and SortedRun.Each (the re-readable walk of the
+// merged output).
+func TestAPooledRunFileNeverYieldsThePreviousTenantsRecords(t *testing.T) {
+	dir := t.TempDir()
+	// A small run buffer so both sorts really spill and really merge.
+	const bufRecords = 4
+
+	long, err := NewExternalSort(dir, bufRecords, encodeResume, decodeResume, compareResume)
+	if err != nil {
+		t.Fatalf("NewExternalSort: %v", err)
+	}
+	for i := range 200 {
+		if err := long.Add(resumeRecord{Key: 1000 + i, Payload: "the previous tenant's record"}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	longRun, err := long.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	if long.SpilledRuns() == 0 {
+		t.Fatal("the long sort did not spill; the pool would hold no surface to inherit")
+	}
+	// Both the runs and the merged output go back to the pool, at length.
+	if err := longRun.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := long.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	short, err := NewExternalSort(dir, bufRecords, encodeResume, decodeResume, compareResume)
+	if err != nil {
+		t.Fatalf("NewExternalSort: %v", err)
+	}
+	const shortCount = 9
+	for i := range shortCount {
+		if err := short.Add(resumeRecord{Key: i, Payload: "mine"}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	shortRun, err := short.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	defer shortRun.Close()
+	defer short.Close()
+
+	got := collectResume(t, shortRun)
+	if len(got) != shortCount {
+		t.Fatalf("the sort answered %d records, want %d: it read past its own runs into the bytes the pool's previous tenant left", len(got), shortCount)
+	}
+	for _, r := range got {
+		if r.Payload != "mine" {
+			t.Fatalf("the sort answered a record of the pool's previous tenant: %+v", r)
+		}
+	}
+	if shortRun.Len() != shortCount {
+		t.Fatalf("SortedRun.Len is %d, want %d", shortRun.Len(), shortCount)
 	}
 }

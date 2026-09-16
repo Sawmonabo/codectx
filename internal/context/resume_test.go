@@ -81,9 +81,9 @@ func TestCheckpointedRunRestoresIdenticallyAfterSpilling(t *testing.T) {
 		t.Fatalf("fixture folded to %d packages, want %d", len(want), packages)
 	}
 
-	files, err := checkpointRun(stateDir, "pkg-count", sorts.runBytes, run, lessPkg, sizeOfPkgCount)
+	files, err := checkpointSortedRun(stateDir, "pkg-count", sorts.runBytes, run, lessPkg, sizeOfPkgCount)
 	if err != nil {
-		t.Fatalf("checkpointRun: %v", err)
+		t.Fatalf("checkpointSortedRun: %v", err)
 	}
 	if len(files) < 2 {
 		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))
@@ -153,8 +153,12 @@ func TestCheckpointedSortKeepsItsFoldAcrossTheInterruption(t *testing.T) {
 		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))
 	}
 	for _, f := range files {
-		if _, err := os.Stat(filepath.Join(stateDir, f)); err != nil {
+		st, err := os.Stat(filepath.Join(stateDir, f.Name))
+		if err != nil {
 			t.Fatalf("checkpointed run is not in the state directory: %v", err)
+		}
+		if f.Bytes <= 0 || f.Bytes > st.Size() {
+			t.Fatalf("checkpointed run %s recorded %d bytes of a %d-byte file", f.Name, f.Bytes, st.Size())
 		}
 	}
 
@@ -190,7 +194,8 @@ func TestCheckpointedSortKeepsItsFoldAcrossTheInterruption(t *testing.T) {
 func TestCheckpointStateRefusesAnEscapingRunName(t *testing.T) {
 	sorts, stateDir := resumeArea(t)
 	for _, name := range []string{"../escape", "sub/run", "/abs/run", ""} {
-		if _, err := restoreSort(sorts, stateDir, "x", []string{name}, lessPkg, sizeOfPkgCount); err == nil {
+		runs := []checkpointRun{{Name: name, Bytes: 1}}
+		if _, err := restoreSort(sorts, stateDir, "x", runs, lessPkg, sizeOfPkgCount); err == nil {
 			t.Fatalf("run name %q was accepted", name)
 		}
 	}
@@ -201,7 +206,7 @@ func TestCheckpointStateRefusesAnEscapingRunName(t *testing.T) {
 func TestCheckpointStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	st := checkpointState{Pass: 4, RequestHash: "sha256:abc",
-		Streams: map[string][]string{"ranked": {"ctx-resume-ranked-0"}},
+		Streams: map[string][]checkpointRun{"ranked": {{Name: "ctx-resume-ranked-run0", Bytes: 512}}},
 		Scalars: checkpointScalars{ScopeComplete: true, ReasonsDropped: 7}}
 	if err := writeCheckpointState(dir, st); err != nil {
 		t.Fatalf("write: %v", err)
@@ -212,7 +217,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 	}
 	if got.Pass != 4 || got.RequestHash != "sha256:abc" ||
 		got.Scalars.ReasonsDropped != 7 || !got.Scalars.ScopeComplete ||
-		len(got.Streams["ranked"]) != 1 {
+		len(got.Streams["ranked"]) != 1 || got.Streams["ranked"][0].Bytes != 512 {
 		t.Fatalf("state round-tripped as %+v", got)
 	}
 	if _, err := readCheckpointState(t.TempDir()); err == nil {
@@ -258,9 +263,9 @@ func TestACheckpointedRunKeepsItsArrivalOrderUnderANonTotalComparator(t *testing
 		t.Fatalf("drain: %v", err)
 	}
 
-	files, err := checkpointRun(stateDir, "scored", sorts.runBytes, run, lessScoredPkg, sizeOfScored)
+	files, err := checkpointSortedRun(stateDir, "scored", sorts.runBytes, run, lessScoredPkg, sizeOfScored)
 	if err != nil {
-		t.Fatalf("checkpointRun: %v", err)
+		t.Fatalf("checkpointSortedRun: %v", err)
 	}
 	if len(files) < 2 {
 		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))

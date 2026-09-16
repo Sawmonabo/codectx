@@ -85,7 +85,7 @@ func (m *Materialization) Close() error {
 		return nil
 	}
 	m.once.Do(func() {
-		if err := paced.RemoveAll(m.root); err != nil {
+		if err := paced.RemoveAllFor(paced.Materialization, m.root); err != nil {
 			m.err = ioError("materialization cleanup", err)
 		}
 		if m.owner != nil {
@@ -232,7 +232,7 @@ func sweepMaterializations(dir string) error {
 			}
 			continue
 		}
-		if err := paced.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := paced.RemoveAllFor(paced.Materialization, filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
 		fslock.Unlock(f)

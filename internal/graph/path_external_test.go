@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
 // pathGraph is a standalone adjacency built from an explicit edge list, so a
@@ -358,15 +361,20 @@ func pathPagingEngine(t *testing.T, g *pathGraph, reader GraphReader, dir string
 
 // retainedDirs counts the state directories the spool store is holding. Zero is
 // the only acceptable number once a search has ended.
+//
+// The scratch pool is not one of them: a search's working database is a
+// surface the store keeps and the next search writes over, so it is there
+// before the first query and after the last one by design.
 func retainedDirs(t *testing.T, dir string) int {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
+	pool := filepath.Base(scratch.Dir(dir))
 	n := 0
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && e.Name() != pool {
 			n++
 		}
 	}
@@ -897,5 +905,92 @@ func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
 	if !slices.Equal(canonical, reversed) {
 		t.Fatalf("the equal-cost tie settled on the surrogate order\n canonical: %v\n reversed:  %v",
 			canonical, reversed)
+	}
+}
+
+// pathSurfaces is every surface of the store's path-search pool, with its
+// current length.
+func pathSurfaces(t *testing.T, dir string) map[string]int64 {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(scratch.Dir(dir), "*", "path-search", "*"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	out := map[string]int64{}
+	for _, m := range matches {
+		st, err := os.Stat(m)
+		if err != nil {
+			t.Fatalf("stat %s: %v", m, err)
+		}
+		out[m] = st.Size()
+	}
+	return out
+}
+
+// TestAPathSearchReusesOneSurfaceAndFreesNothing is why the search's state is
+// pooled.
+//
+// A shortest-path search holds its settled set, its parent edges and its cost
+// buckets in a database on disk, and it used to create that database per query
+// and remove it when the page ended. A store answering path queries therefore
+// handed the filesystem one search's worth of deallocation per query, for
+// ever. On a host that discards freed blocks under a sparse virtual disk that
+// stalls every writer on the machine for about a minute, a minute later.
+//
+// The surface is taken from the store's pool and given back at its length.
+// The second search must answer from the same surface, free nothing -- which
+// the paced step count reports, a step being one window of disk handed back --
+// and leave the surface no smaller than the first search left it.
+//
+// Mutation: empty the surface with CREATE TABLE IF NOT EXISTS instead of
+// dropping the tables first and the second search fails outright, because the
+// schema it re-applies collides with the one already in the surface. The
+// silent form of that bug -- a surface whose settled set and parent edges
+// survive into the next search, which then serves the previous query's routes
+// -- is what the route comparison below catches.
+func TestAPathSearchReusesOneSurfaceAndFreesNothing(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+	dir := t.TempDir()
+	e := pathPagingEngine(t, g, g.reader(), dir, newFixtureLeases(), 0)
+	req := model.PathRequest{GenerationID: 1, From: from, To: to, Relations: kinds}
+
+	first, err := e.ShortestPath(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first search: %v", err)
+	}
+	if first.Meta.Truncated || len(first.Paths) == 0 {
+		t.Fatalf("the first search must be a complete answer: truncated=%v paths=%d",
+			first.Meta.Truncated, len(first.Paths))
+	}
+	pool := pathSurfaces(t, e.scratchDir())
+	if len(pool) != 1 {
+		t.Fatalf("one search left %d surfaces in the pool, want the one it took: %v", len(pool), pool)
+	}
+
+	steps := paced.Steps()
+	second, err := e.ShortestPath(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second search: %v", err)
+	}
+	if freed := paced.Steps() - steps; freed != 0 {
+		t.Fatalf("the second search freed %d windows of disk; a search that reuses its surface frees none", freed)
+	}
+	if gotSeq, wantSeq := routeSequences(second), routeSequences(first); !reflect.DeepEqual(gotSeq, wantSeq) {
+		t.Fatalf("the second search answered %v from the reused surface; the first said %v", gotSeq, wantSeq)
+	}
+	after := pathSurfaces(t, e.scratchDir())
+	if len(after) != 1 {
+		t.Fatalf("the second search left %d surfaces, want the one it reused: %v", len(after), after)
+	}
+	for path, n := range after {
+		was, ok := pool[path]
+		if !ok {
+			t.Fatalf("the second search took a new surface %s instead of the pooled %v", path, pool)
+		}
+		if n < was {
+			t.Fatalf("pooled surface %s shrank from %d to %d bytes: it was emptied rather than reused", path, was, n)
+		}
 	}
 }

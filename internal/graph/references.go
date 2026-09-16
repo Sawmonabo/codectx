@@ -656,7 +656,7 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	if err != nil {
 		return nil, err
 	}
-	sorter, err := pagination.NewExternalSort(e.walkScratchDir(), "refs-", 0,
+	sorter, err := pagination.NewExternalSort(e.walkScratchDir(), 0,
 		encodeReferenceRelation, decodeReferenceRelation,
 		func(a, b referenceRelation) int { return cmp.Compare(a.ID, b.ID) })
 	if err != nil {

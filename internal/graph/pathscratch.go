@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 )
@@ -46,12 +47,27 @@ import (
 // KiB rather than pages and is therefore a byte ceiling rather than a
 // page-size-dependent one.
 type pathScratch struct {
+	// path is the database file. It is a surface of the store's scratch pool
+	// for a fresh search and a file inside retained cursor state for a
+	// resumed one.
+	path string
+	// lease is held while path is a pooled surface, and nil otherwise.
+	lease *scratch.Lease
+	// parent is the directory the pool is under, which detach mints the
+	// retained directory in.
+	parent string
+	// dir is set only when this page owns a directory outright -- retained
+	// cursor state it reopened, or the private temporary of an engine with no
+	// spool store. close removes it; a pooled surface is released instead.
 	dir string
 	db  *sql.DB
 	tx  *sql.Tx
 	// retained marks state reopened from a previous page's retention. The
 	// engine reads it to decide whether the search is being seeded or resumed.
 	retained bool
+	// broken marks a database whose rollback did not complete, which close
+	// must remove rather than pool. See retain.
+	broken bool
 }
 
 // pathScratchJournalFresh and pathScratchJournalRetained are the journal modes
@@ -84,6 +100,26 @@ const (
 // truncated answer, so it is not a scale limit and takes no configuration key.
 const pathScratchCacheKiB = 4096
 
+// pathScratchFile is the database's name inside a retained search's directory,
+// which is what a continuation names and a later page reopens.
+const pathScratchFile = "path.db"
+
+// pathScratchEmpty is run before the schema on a pooled surface. The surface
+// is never truncated -- that is the point of pooling it -- so it arrives
+// holding the previous search's database, and a CREATE TABLE IF NOT EXISTS
+// would leave that search's settled set, parent edges and cost buckets in
+// place for this one to answer from. Dropping the tables returns their pages
+// to the database's own free list, which this search writes over, and gives
+// the filesystem nothing back.
+const pathScratchEmpty = `
+DROP TABLE IF EXISTS settled;
+DROP TABLE IF EXISTS parent;
+DROP TABLE IF EXISTS bucket;
+DROP TABLE IF EXISTS reach;
+DROP TABLE IF EXISTS pending;
+DROP TABLE IF EXISTS progress;
+`
+
 const pathScratchSchema = `
 CREATE TABLE settled(node TEXT PRIMARY KEY, dist INTEGER NOT NULL, depth INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE parent(node TEXT NOT NULL, rel TEXT NOT NULL, frm TEXT NOT NULL, kind TEXT NOT NULL,
@@ -114,34 +150,36 @@ INSERT INTO progress(k, expand_after, depth_pruned) VALUES(0, '', 0);
 // edge budget, and the depth-pruned flag, which is an answer-level disclosure
 // that must survive the page that discovered it.
 
-// openPathScratch creates the search's database in a fresh private directory
-// under parent.
+// openPathScratch opens the search's database on a surface of the store's
+// scratch pool under parent, emptied of whatever the search before it left
+// and never truncated. A search used to create its database and remove it at
+// the end of the page, so a store answering path queries handed the
+// filesystem one search's worth of deallocation per query, over and over. On
+// a host that discards freed blocks under a sparse image that stalls every
+// writer on the machine.
+//
+// An engine with no spool store has nowhere to pool: the system temporary
+// directory then holds the ONE directory this search owns and close() removes.
 func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
-	// An engine with no spool store has no directory of its own; the system
-	// temporary directory then holds the ONE directory this search owns and
-	// close() removes. Creating a second, outer directory here would leave one
-	// behind per query, because close() removes only what s.dir names.
-	var (
-		dir string
-		err error
-	)
+	s := &pathScratch{parent: parent}
 	if parent == "" {
-		dir, err = os.MkdirTemp("", "codectx-path-")
-	} else {
-		if err = os.MkdirAll(parent, 0o700); err != nil {
+		dir, err := os.MkdirTemp("", "codectx-path-")
+		if err != nil {
 			return nil, internalErr("path scratch directory: " + err.Error())
 		}
-		dir, err = os.MkdirTemp(parent, "path-")
+		s.dir, s.path = dir, filepath.Join(dir, pathScratchFile)
+	} else {
+		lease, err := scratch.For(parent).Take(scratch.PathSearch)
+		if err != nil {
+			return nil, internalErr("path scratch surface: " + err.Error())
+		}
+		s.lease, s.path = lease, lease.Path()
 	}
-	if err != nil {
-		return nil, internalErr("path scratch directory: " + err.Error())
-	}
-	s := &pathScratch{dir: dir}
 	if err := s.open(ctx, pathScratchJournalFresh); err != nil {
 		s.close()
 		return nil, err
 	}
-	if _, err := s.db.ExecContext(ctx, pathScratchSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, pathScratchEmpty+pathScratchSchema); err != nil {
 		s.close()
 		return nil, internalErr("path scratch schema: " + err.Error())
 	}
@@ -155,7 +193,7 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 // schema is NOT re-applied: the tables, and everything the earlier pages put
 // in them, are the point.
 func reopenPathScratch(ctx context.Context, dir string) (*pathScratch, error) {
-	s := &pathScratch{dir: dir, retained: true}
+	s := &pathScratch{dir: dir, path: filepath.Join(dir, pathScratchFile), retained: true}
 	if err := s.open(ctx, pathScratchJournalRetained); err != nil {
 		s.close()
 		return nil, err
@@ -176,7 +214,7 @@ func (s *pathScratch) open(ctx context.Context, journal string) error {
 		"cache_size(-" + strconv.Itoa(pathScratchCacheKiB) + ")"} {
 		q.Add("_pragma", p)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(s.dir, "path.db"), RawQuery: q.Encode()}).String()
+	dsn := (&url.URL{Scheme: "file", Path: s.path, RawQuery: q.Encode()}).String()
 	// The shim is registered here, in the path that opens the file, rather
 	// than relied on to have been registered by whatever ran first: a
 	// traversal's scratch is the surface that spills gigabytes, and "every
@@ -223,16 +261,33 @@ func (s *pathScratch) begin(ctx context.Context) error {
 	return nil
 }
 
-// detach COMMITS the page's writes, closes the database and hands the caller
-// the directory, which is now the caller's to retain. close() afterwards is a
-// no-op on the directory, so the ordinary defer cannot remove state a
+// detach COMMITS the page's writes and hands the caller a directory holding
+// the search's database, which is now the caller's to retain. close()
+// afterwards is a no-op on it, so the ordinary defer cannot remove state a
 // continuation was just minted for.
+//
+// A pooled surface is COPIED out rather than handed over, with VACUUM INTO.
+// Two reasons, and the surface goes back to the pool either way. The pool
+// never truncates, so the surface carries the high-water length of every
+// search that has used it, and the continuation store charges what it adopts
+// against a shared budget: handing it the surface would refuse continuations
+// on the size of past queries rather than of this one. And a surface the pool
+// gave up would have to be created again for the next query, which is the
+// freeing this design exists to remove. The copy is the size of this search's
+// live pages, which is what a non-pooled search would have written anyway.
 func (s *pathScratch) detach() (string, error) {
 	if s.tx != nil {
 		err := s.tx.Commit()
 		s.tx = nil
 		if err != nil {
 			return "", internalErr("path scratch commit: " + err.Error())
+		}
+	}
+	dir := s.dir
+	if s.lease != nil {
+		var err error
+		if dir, err = s.copyOut(); err != nil {
+			return "", err
 		}
 	}
 	if s.db != nil {
@@ -242,8 +297,28 @@ func (s *pathScratch) detach() (string, error) {
 			return "", internalErr("path scratch close: " + err.Error())
 		}
 	}
-	dir := s.dir
-	s.dir = ""
+	if s.lease != nil {
+		s.lease.Release()
+		s.lease = nil
+	}
+	s.dir, s.path = "", ""
+	return dir, nil
+}
+
+// copyOut writes the committed search into a fresh directory beside the pool
+// and returns it. The caller is mid-detach, so a failure leaves the surface
+// leased for close() to release.
+func (s *pathScratch) copyOut() (string, error) {
+	dir, err := os.MkdirTemp(s.parent, "path-")
+	if err != nil {
+		return "", internalErr("path scratch retention directory: " + err.Error())
+	}
+	// Uncancellable by construction: this is the detach path, which the
+	// engine already drives on a context stripped of its deadline.
+	if _, err := s.db.Exec("VACUUM INTO ?", filepath.Join(dir, pathScratchFile)); err != nil {
+		_ = paced.RemoveAll(dir)
+		return "", internalErr("path scratch retention copy: " + err.Error())
+	}
 	return dir, nil
 }
 
@@ -272,16 +347,24 @@ func (s *pathScratch) retain() error {
 	}
 	if rollback != nil {
 		// The undo did not complete, so what is on disk is not the state the
-		// cursor names. s.dir is deliberately LEFT set: the caller's close()
-		// then removes it, and the retry is refused with CTX_CURSOR_INVALID
-		// rather than resumed from a half-rolled-back search.
+		// cursor names. s.dir and s.lease are deliberately LEFT set: the
+		// caller's close() then discards the state, and the retry is refused
+		// with CTX_CURSOR_INVALID rather than resumed from a half-rolled-back
+		// search. A pooled surface in that condition is REMOVED rather than
+		// released -- close knows the difference -- because a database whose
+		// rollback did not finish is one SQLite calls likely corrupt, and
+		// handing it to the next query is a wrong answer rather than a slow
+		// one.
+		s.broken = true
 		return internalErr("path scratch retain: " + rollback.Error())
 	}
-	s.dir = ""
+	s.dir, s.lease = "", nil
 	return nil
 }
 
-// close discards the transaction and removes the directory. It is safe to call
+// close discards the transaction and gives the search's state back. A pooled
+// surface goes back to the pool at its length, so an ordinary query frees
+// nothing; a directory this page owns outright is removed. It is safe to call
 // more than once and is what makes the state a scratch file rather than a leak.
 func (s *pathScratch) close() error {
 	if s == nil {
@@ -295,12 +378,29 @@ func (s *pathScratch) close() error {
 		s.db.Close()
 		s.db = nil
 	}
-	if s.dir != "" {
-		err := paced.RemoveAll(s.dir)
-		s.dir = ""
-		if err != nil {
-			return internalErr("path scratch cleanup: " + err.Error())
+	var errs []error
+	if s.lease != nil {
+		if s.broken {
+			// See retain: this surface holds a database whose rollback did
+			// not complete, so it leaves the pool instead of being handed to
+			// the next search.
+			if err := paced.Remove(s.lease.Path()); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+			s.lease.Discard()
+		} else {
+			s.lease.Release()
 		}
+		s.lease, s.path = nil, ""
+	}
+	if s.dir != "" {
+		if err := paced.RemoveAll(s.dir); err != nil {
+			errs = append(errs, err)
+		}
+		s.dir, s.path = "", ""
+	}
+	if err := errors.Join(errs...); err != nil {
+		return internalErr("path scratch cleanup: " + err.Error())
 	}
 	return nil
 }

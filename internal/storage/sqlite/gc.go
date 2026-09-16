@@ -4,11 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // gcBatchUnits bounds one collection transaction.
@@ -288,18 +286,16 @@ func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
 // transaction per batch, until the query returns nothing.
 //
-// It is also where a crashed build's lexical staging file goes. A unit that
-// died between its first documents and its seal left a staging database under
-// the data directory that nothing else will ever read; the directory is NOT
-// swept blindly, because several processes may share one data directory and a
-// live build's staging looks exactly like a dead one's. Here the unit is
-// already known dead -- its rows are being deleted -- so its file is named
-// exactly, and it is removed after the transaction commits: a rolled-back batch
-// leaves the unit and its staging both intact.
+// It touches no staging database. A lexical staging is a SLOT of the store's
+// scratch pool, not a file of the unit that staged into it: a crashed build's
+// slot is taken by the next unit that stages and emptied, and the pool itself
+// is inherited whole by the next process. There is no per-unit staging file to
+// collect, which is also what keeps collection away from the slot a live build
+// is writing -- several processes may share one data directory, and a live
+// build's staging would look exactly like a dead one's.
 func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
 	for {
 		var deleted int
-		var gone []int64
 		err := s.write(ctx, func(tx *sql.Tx) error {
 			rows, err := tx.QueryContext(ctx, query, arg, gcBatchUnits)
 			if err != nil {
@@ -323,7 +319,7 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 					return err
 				}
 			}
-			deleted, gone = len(ids), ids
+			deleted = len(ids)
 			// The deleted units' search_units rows cascaded away with them, so
 			// the segments no row points at and no generation names go in the
 			// same transaction.
@@ -331,11 +327,6 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 		})
 		if err != nil {
 			return err
-		}
-		for _, id := range gone {
-			if rmErr := paced.Remove(s.stagePath(id)); rmErr != nil && !os.IsNotExist(rmErr) {
-				return internal("lexical staging: " + rmErr.Error())
-			}
 		}
 		if deleted == 0 {
 			return nil

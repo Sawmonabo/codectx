@@ -534,10 +534,10 @@ type rankProgress struct {
 	// pass-2 resume with nothing yet added has no runs and no offset to tell
 	// it apart from a pass-1 resume.
 	Pass int `json:"pass"`
-	// Runs are the adopted runs' names WITHIN this directory. They are base
-	// names, never paths: the directory is renamed when the spool store adopts
-	// it, so a stored absolute path would name a file that no longer exists.
-	Runs []string `json:"runs,omitempty"`
+	// Runs are the adopted runs WITHIN this directory. Each is a base name,
+	// never a path: the directory is renamed when the spool store adopts it,
+	// so a stored absolute path would name a file that no longer exists.
+	Runs []retainedRun `json:"runs,omitempty"`
 	// Added is how many records of that pass's input the runs already hold,
 	// counted from the front of the input in replay order.
 	Added int64 `json:"added"`
@@ -582,41 +582,42 @@ func (w *retainedWalk) setRankProgress(p rankProgress) error {
 	return nil
 }
 
-// adoptRunFiles moves the runs a detached sort handed over into this directory
-// and returns their names there. Ownership moves with them, exactly as
-// pagination.Detach states: the sort that adopts them removes them.
-func (w *retainedWalk) adoptRunFiles(paths []string) ([]string, error) {
-	dir, err := w.home.ensure()
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(paths))
-	for i, from := range paths {
-		// The name is the run's INDEX, not its source name. Detach returns the
-		// runs this sort adopted followed by the ones it spilled itself, in
-		// that order and never reordered (pagination.AdoptRuns), so index i
-		// names the same run across any number of interruptions -- and a run
-		// already sitting at that name is the one being re-detached and is left
-		// where it is rather than renamed onto itself.
-		name := fmt.Sprintf("run-%06d", i)
-		to := filepath.Join(dir, name)
-		if from != to {
-			if err := os.Rename(from, to); err != nil {
-				return nil, internalErr("graph: retaining an interrupted sort run: " + err.Error())
-			}
-		}
-		names = append(names, name)
-	}
-	return names, nil
+// A retainedRun is one interrupted sort run kept in this directory: its name
+// here, and the bytes of the file that are the run's.
+//
+// The length is persisted because a run file is a pooled scratch surface that
+// nothing truncates: the bytes past a run's own belong to whatever tenant held
+// the surface before it, and a resumed merge that read to end of file would
+// decode them as records of this walk.
+type retainedRun struct {
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes"`
 }
 
-// runPaths resolves manifest names against the directory's CURRENT location.
-func (w *retainedWalk) runPaths(names []string) []string {
-	paths := make([]string, 0, len(names))
-	for _, name := range names {
-		paths = append(paths, filepath.Join(w.home.path, name))
+// retainRunName is the name the run with the given index takes in this
+// directory. The name is the run's INDEX, not its source name: DetachTo hands
+// over the runs the sort adopted followed by the ones it spilled itself, in
+// that order and never reordered (pagination.AdoptRuns), so index i names the
+// same run across any number of interruptions -- and a run already sitting at
+// that name is the one being re-detached, which DetachTo leaves where it is.
+func retainRunName(i int) string { return fmt.Sprintf("run-%06d", i) }
+
+// retainRuns records what a detached sort moved into this directory.
+func retainRuns(refs []pagination.RunRef) []retainedRun {
+	runs := make([]retainedRun, 0, len(refs))
+	for _, ref := range refs {
+		runs = append(runs, retainedRun{Name: filepath.Base(ref.Path), Bytes: ref.Bytes})
 	}
-	return paths
+	return runs
+}
+
+// runRefs resolves manifest entries against the directory's CURRENT location.
+func (w *retainedWalk) runRefs(runs []retainedRun) []pagination.RunRef {
+	refs := make([]pagination.RunRef, 0, len(runs))
+	for _, r := range runs {
+		refs = append(refs, pagination.RunRef{Path: filepath.Join(w.home.path, r.Name), Bytes: r.Bytes})
+	}
+	return refs
 }
 
 // openFolded opens the retained pass-2 input for append, truncating whatever an
@@ -832,8 +833,7 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 	if err != nil {
 		return 0, err
 	}
-	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "admitsort"),
-		levelFileName(admittedLevelPrefix, level), 0,
+	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "admitsort"), 0,
 		func(fs frontierState) ([]byte, error) { return encodeFrontierState(fs), nil },
 		decodeFrontierState,
 		func(a, b frontierState) int { return cmp.Compare(a.Node, b.Node) })

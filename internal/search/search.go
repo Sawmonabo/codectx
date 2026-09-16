@@ -534,7 +534,7 @@ func (s *Service) resumedPage(ctx context.Context, reader *sqlite.PinnedReader, 
 // once: the ordered run lives in the sort directory, which
 // resources.max_temp_bytes deliberately does not bound (pagination.Spools.SortDir).
 func (s *Service) orderSpool(ctx context.Context, c *searchCursor) error {
-	sorter, err := newScoredSort(s.spools.SortDir(), "searchrank-", s.runBytes, cmpScored)
+	sorter, err := newScoredSort(s.spools.SortDir(), s.runBytes, cmpScored)
 	if err != nil {
 		return err
 	}

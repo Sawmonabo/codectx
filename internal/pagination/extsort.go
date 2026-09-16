@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
 // External sort — a disk-backed sort for a sequence too long to hold in heap.
@@ -74,14 +76,40 @@ func SortRunBytes(queryMemoryBytes int64) int64 {
 	return minSortRunBytes
 }
 
+// A RunRef names one spilled run outside the sort that wrote it: where the
+// file is, and how many bytes of it are that run's.
+//
+// The length is not decoration. A run file is taken from the scratch arena and
+// is never truncated, so the bytes past a run's own are whatever the file's
+// previous tenant left. A reader that stopped at end of file instead of at
+// Bytes would decode the previous tenant's records as this run's and merge
+// them into the answer.
+type RunRef struct {
+	// Path is the run file.
+	Path string
+	// Bytes is the run's logical length: its records occupy exactly this many
+	// bytes from offset zero.
+	Bytes int64
+}
+
+// runFile is one run the sort holds. A run the sort spilled itself is a
+// surface leased from the arena and goes back to the pool when the sort is
+// done with it; a run ADOPTED from a continuation is a file in that
+// continuation's state directory, owned by whoever adopts it and removed when
+// it has been consumed.
+type runFile struct {
+	lease *scratch.Lease
+	path  string
+	bytes int64
+}
+
 // ExternalSort accumulates records and answers them in sorted order. Records
 // are encoded with Encode and compared with Compare; both must be pure, and
 // Compare must be a total order, or the merged output is not sorted.
 //
 // It is not safe for concurrent use: one sort belongs to one producer.
 type ExternalSort[T any] struct {
-	dir     string
-	prefix  string
+	arena   *scratch.Arena
 	encode  func(T) ([]byte, error)
 	decode  func([]byte) (T, error)
 	compare func(a, b T) int
@@ -97,11 +125,11 @@ type ExternalSort[T any] struct {
 
 	buf      []T
 	bufBytes int64
-	runs     []string
+	runs     []runFile
 	count    int64
 	// spilled counts the runs this sort has written out of its buffer, and it
 	// only ever grows. It is a CUMULATIVE count and not len(runs) because
-	// Sorted consumes the runs and clears that slice (removeRuns), so an
+	// Sorted consumes the runs and clears that slice (releaseRuns), so an
 	// observation taken after a sort was read would report zero for a sort
 	// that spilled repeatedly. Runs produced by collapse are not counted:
 	// those are fan-in artefacts of the merge, not buffer pressure, and the
@@ -117,10 +145,12 @@ type ExternalSort[T any] struct {
 	err         error
 }
 
-// NewExternalSort opens a sort whose spill files live under dir (created 0700)
-// and are named with prefix. bufRecords is the run buffer size; zero takes
+// NewExternalSort opens a sort whose runs are taken from the scratch arena of
+// dir (created 0700) and given back to it when the sort is done, so a second
+// sort in the same place writes over the first's files instead of creating
+// and freeing its own. bufRecords is the run buffer size; zero takes
 // RunBufferRecords.
-func NewExternalSort[T any](dir, prefix string, bufRecords int,
+func NewExternalSort[T any](dir string, bufRecords int,
 	encode func(T) ([]byte, error), decode func([]byte) (T, error), compare func(a, b T) int,
 ) (*ExternalSort[T], error) {
 	if dir == "" || encode == nil || decode == nil || compare == nil {
@@ -132,7 +162,7 @@ func NewExternalSort[T any](dir, prefix string, bufRecords int,
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, internalErr("external sort directory: " + err.Error())
 	}
-	return &ExternalSort[T]{dir: dir, prefix: prefix, encode: encode, decode: decode,
+	return &ExternalSort[T]{arena: scratch.For(dir), encode: encode, decode: decode,
 		compare: compare, bufN: bufRecords, buf: make([]T, 0, bufRecords)}, nil
 }
 
@@ -155,75 +185,106 @@ func NewExternalSort[T any](dir, prefix string, bufRecords int,
 //     the fold, which runs exactly once left to right over the fully ordered
 //     stream (WithFold) -- produces byte-identical output to one uninterrupted
 //     sort of the same arrival sequence.
-//   - CODEC AND ORDER FUNCTIONS. dir, prefix, encode, decode and compare must
+//   - CODEC AND ORDER FUNCTIONS. dir, encode, decode and compare must
 //     be the ones the interrupted sort used, and the fold, if it had one, must
 //     be re-applied with WithFold. A divergent comparator merges without error
 //     into an answer that is not sorted, and nothing here can detect that.
-//   - OWNERSHIP. This sort now owns the adopted files: Sorted removes them with
-//     its own runs, and so does Close. The interrupted sort released them in
-//     Detach and must not remove them.
+//   - OWNERSHIP. This sort now owns the adopted files: Sorted removes them
+//     when it has consumed them, and so does Close. They are files of the
+//     continuation's state directory, not surfaces of this process's scratch
+//     pool, so they are removed rather than released -- their reclamation is
+//     the lease's, which is the one free the design allows. The interrupted
+//     sort handed them over in DetachTo and must not remove them.
 //   - MEMORY. Unchanged. Adopted runs are opened only by the merge, so peak
 //     live records is still the run buffer or MaxSortFanIn, never the length of
 //     the sequence however many pages it took to build.
 //   - Len counts only what is Added here; see Len.
 //
-// Each adopted path must name a readable file, and no path may repeat -- a
-// repeat would merge one run's records twice. Either is a typed error rather
-// than a quietly short or doubled answer. A record inside an adopted run is
-// guarded on read by the same per-record ceiling every run file is (runReader).
-func AdoptRuns[T any](dir, prefix string, bufRecords int, runs []string,
+// Each adopted ref must name a readable file and carry the run's byte length,
+// and no path may repeat -- a repeat would merge one run's records twice. Each
+// is a typed error rather than a quietly short or doubled answer. A ref whose
+// length exceeds the file it names is refused here rather than read as a short
+// record later. A record inside an adopted run is guarded on read by the same
+// per-record ceiling every run file is (runReader).
+func AdoptRuns[T any](dir string, bufRecords int, runs []RunRef,
 	encode func(T) ([]byte, error), decode func([]byte) (T, error), compare func(a, b T) int,
 ) (*ExternalSort[T], error) {
-	s, err := NewExternalSort(dir, prefix, bufRecords, encode, decode, compare)
+	s, err := NewExternalSort(dir, bufRecords, encode, decode, compare)
 	if err != nil {
 		return nil, err
 	}
 	seen := make(map[string]struct{}, len(runs))
-	for _, name := range runs {
-		if name == "" {
+	for _, ref := range runs {
+		if ref.Path == "" {
 			return nil, internalErr("external sort: an adopted run has no path")
 		}
-		if _, dup := seen[name]; dup {
+		if _, dup := seen[ref.Path]; dup {
 			return nil, internalErr("external sort: an adopted run is named twice")
 		}
-		seen[name] = struct{}{}
-		if _, err := os.Stat(name); err != nil {
+		seen[ref.Path] = struct{}{}
+		st, err := os.Stat(ref.Path)
+		if err != nil {
 			return nil, internalErr("external sort adopted run: " + err.Error())
 		}
+		if ref.Bytes < 0 || ref.Bytes > st.Size() {
+			return nil, internalErr("external sort adopted run: its recorded length is not inside the file")
+		}
+		s.runs = append(s.runs, runFile{path: ref.Path, bytes: ref.Bytes})
 	}
-	s.runs = slices.Clone(runs)
 	// An adopted run was spilled by the sort this one continues, so the
 	// continuation reports the interrupted sort's spills plus its own.
 	s.spilled = len(s.runs)
 	return s, nil
 }
 
-// Detach ends this sort WITHOUT producing an answer and hands its spilled runs
-// to whoever will resume them through AdoptRuns. It is the interruption half of
-// that constructor: a producer stopped by a page deadline calls it, persists
-// the returned paths in its continuation state, and the next page adopts them.
+// DetachTo ends this sort WITHOUT producing an answer and moves its spilled
+// runs into dir, where the i-th run takes the name name(i). It is the
+// interruption half of AdoptRuns: a producer stopped by a page deadline calls
+// it, persists the returned refs in its continuation state, and the next page
+// adopts them.
 //
 // The pending run buffer is spilled first, so the returned runs hold every
-// record Added -- a deadline never costs the records that had not reached a run
-// file yet.
+// record Added -- a deadline never costs the records that had not reached a
+// run file yet.
 //
-// OWNERSHIP MOVES with the paths: this sort does not remove them, so the
-// caller's deferred Close is safe and the resumed sort (or, if the caller
-// abandons the continuation, the caller itself) is what removes them. The sort
-// is finished afterwards: a later Add or Sorted fails rather than answering the
+// It MOVES the files rather than answering their paths because a run the sort
+// spilled is a surface of the scratch pool, and a pool surface that is still
+// leased cannot be handed to a continuation that outlives the request: the
+// move takes the file out of the pool, and the slot it leaves is forgotten
+// (Lease.Discard) instead of being handed to the next taker with nothing in
+// it. A run that was already adopted -- already in dir under its own name --
+// is left exactly where it is.
+//
+// OWNERSHIP MOVES with the refs: the resumed sort (or, if the caller abandons
+// the continuation, the lease that owns dir) is what removes them. The sort is
+// finished afterwards: a later Add or Sorted fails rather than answering the
 // subset that is left.
-func (s *ExternalSort[T]) Detach() ([]string, error) {
+func (s *ExternalSort[T]) DetachTo(dir string, name func(i int) string) ([]RunRef, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
 	if err := s.spill(); err != nil {
 		return nil, err
 	}
-	runs := s.runs
+	refs := make([]RunRef, 0, len(s.runs))
+	for i, r := range s.runs {
+		to := filepath.Join(dir, name(i))
+		if r.path != to {
+			if err := os.Rename(r.path, to); err != nil {
+				return nil, internalErr("external sort detach: " + err.Error())
+			}
+		}
+		// The file is out of the pool either way: a spilled run was just
+		// renamed out of it, and an adopted run was never in it.
+		if r.lease != nil {
+			r.lease.Discard()
+		}
+		refs = append(refs, RunRef{Path: to, Bytes: r.bytes})
+	}
 	s.runs = nil
 	s.buf, s.bufBytes = nil, 0
 	s.err = internalErr("this external sort was detached; its runs belong to the sort that adopts them")
-	return runs, nil
+	return refs, nil
 }
 
 // WithFold sets the fold that collapses records the comparator reports as
@@ -319,7 +380,7 @@ func (s *ExternalSort[T]) spill() error {
 		return nil
 	}
 	slices.SortStableFunc(s.buf, s.compare)
-	f, err := os.CreateTemp(s.dir, s.prefix+"run-*")
+	lease, f, err := s.arena.TakeFile(scratch.SortRun)
 	if err != nil {
 		s.err = internalErr("external sort run: " + err.Error())
 		return s.err
@@ -327,27 +388,36 @@ func (s *ExternalSort[T]) spill() error {
 	w := bufio.NewWriterSize(paced.NewWriter(f), mergeBlockBytes)
 	for _, v := range s.buf {
 		if err := s.writeRecord(w, v); err != nil {
-			f.Close()
-			paced.Remove(f.Name())
+			lease.Release()
 			s.err = err
 			return err
 		}
 	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		paced.Remove(f.Name())
-		s.err = internalErr("external sort run: " + err.Error())
-		return s.err
+	n, err := flushRun(w, f)
+	if err != nil {
+		lease.Release()
+		s.err = err
+		return err
 	}
-	if err := f.Close(); err != nil {
-		paced.Remove(f.Name())
-		s.err = internalErr("external sort run: " + err.Error())
-		return s.err
-	}
-	s.runs = append(s.runs, f.Name())
+	s.runs = append(s.runs, runFile{lease: lease, path: lease.Path(), bytes: n})
 	s.spilled++
 	s.buf, s.bufBytes = s.buf[:0], 0
 	return nil
+}
+
+// flushRun ends one run: it drains the buffer and answers the run's logical
+// length, which is where the file's offset now stands. Nothing is truncated,
+// so this number -- not the file's size -- is what every later read of the run
+// must stop at.
+func flushRun(w *bufio.Writer, f *os.File) (int64, error) {
+	if err := w.Flush(); err != nil {
+		return 0, internalErr("external sort run: " + err.Error())
+	}
+	n, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, internalErr("external sort run: " + err.Error())
+	}
+	return n, nil
 }
 
 // maxSortRecordBytes bounds one encoded sort record before its buffer is
@@ -407,22 +477,22 @@ func (s *ExternalSort[T]) Sorted() (*SortedRun[T], error) {
 	if err := s.collapse(); err != nil {
 		return nil, err
 	}
-	out, err := os.CreateTemp(s.dir, s.prefix+"sorted-*")
+	lease, out, err := s.arena.TakeFile(scratch.SortRun)
 	if err != nil {
-		s.removeRuns()
+		s.releaseRuns()
 		return nil, internalErr("external sort output: " + err.Error())
 	}
 	n, err := s.merge(out, s.runs, s.fold != nil)
-	closeErr := out.Close()
-	s.removeRuns()
-	if err == nil && closeErr != nil {
-		err = internalErr("external sort output: " + closeErr.Error())
+	bytes, flushErr := out.Seek(0, io.SeekCurrent)
+	s.releaseRuns()
+	if err == nil && flushErr != nil {
+		err = internalErr("external sort output: " + flushErr.Error())
 	}
 	if err != nil {
-		paced.Remove(out.Name())
+		lease.Release()
 		return nil, err
 	}
-	return &SortedRun[T]{path: out.Name(), decode: s.decode, count: n}, nil
+	return &SortedRun[T]{lease: lease, path: lease.Path(), bytes: bytes, decode: s.decode, count: n}, nil
 }
 
 // foldBuffer collapses equal neighbours of an already-ordered buffer. It is
@@ -461,7 +531,7 @@ func (s *ExternalSort[T]) foldBuffer(buf []T) ([]T, error) {
 // run set plus the one run currently being written.
 func (s *ExternalSort[T]) collapse() error {
 	for len(s.runs) > MaxSortFanIn {
-		next := make([]string, 0, (len(s.runs)+MaxSortFanIn-1)/MaxSortFanIn)
+		next := make([]runFile, 0, (len(s.runs)+MaxSortFanIn-1)/MaxSortFanIn)
 		for i := 0; i < len(s.runs); i += MaxSortFanIn {
 			group := s.runs[i:min(i+MaxSortFanIn, len(s.runs))]
 			if len(group) == 1 {
@@ -470,7 +540,7 @@ func (s *ExternalSort[T]) collapse() error {
 			}
 			merged, err := s.mergeToRun(group)
 			if err != nil {
-				// Everything still on disk stays on s.runs so removeRuns and
+				// Everything still on disk stays on s.runs so releaseRuns and
 				// Close clean it up: the merged outputs so far, and the groups
 				// this pass has not reached.
 				s.runs = append(next, s.runs[i:]...)
@@ -486,31 +556,31 @@ func (s *ExternalSort[T]) collapse() error {
 // mergeToRun merges one group into a single new run and removes the group.
 // A collapse pass never folds: the fold runs exactly once, over the fully
 // ordered final stream (WithFold).
-func (s *ExternalSort[T]) mergeToRun(group []string) (string, error) {
-	f, err := os.CreateTemp(s.dir, s.prefix+"run-*")
+func (s *ExternalSort[T]) mergeToRun(group []runFile) (runFile, error) {
+	lease, f, err := s.arena.TakeFile(scratch.SortRun)
 	if err != nil {
-		return "", internalErr("external sort run: " + err.Error())
+		return runFile{}, internalErr("external sort run: " + err.Error())
 	}
 	_, err = s.merge(f, group, false)
-	closeErr := f.Close()
-	if err == nil && closeErr != nil {
-		err = internalErr("external sort run: " + closeErr.Error())
+	n, seekErr := f.Seek(0, io.SeekCurrent)
+	if err == nil && seekErr != nil {
+		err = internalErr("external sort run: " + seekErr.Error())
 	}
 	if err != nil {
-		paced.Remove(f.Name())
-		return "", err
+		lease.Release()
+		return runFile{}, err
 	}
-	for _, name := range group {
-		paced.Remove(name)
+	for _, r := range group {
+		releaseRun(r)
 	}
-	return f.Name(), nil
+	return runFile{lease: lease, path: lease.Path(), bytes: n}, nil
 }
 
 // merge is the k-way merge over runs: one open reader and one heap entry per
 // run, so the merge holds len(runs) records and len(runs) read blocks whatever
 // the runs hold, and collapse keeps len(runs) at MaxSortFanIn. It returns how
 // many records it wrote, which is fewer than it read when fold is set.
-func (s *ExternalSort[T]) merge(out *os.File, runs []string, fold bool) (int64, error) {
+func (s *ExternalSort[T]) merge(out *os.File, runs []runFile, fold bool) (int64, error) {
 	readers := make([]*runReader[T], 0, len(runs))
 	defer func() {
 		for _, r := range readers {
@@ -518,12 +588,13 @@ func (s *ExternalSort[T]) merge(out *os.File, runs []string, fold bool) (int64, 
 		}
 	}()
 	h := &mergeHeap[T]{compare: s.compare}
-	for i, name := range runs {
-		f, err := os.Open(name)
+	for i, run := range runs {
+		f, err := os.Open(run.path)
 		if err != nil {
 			return 0, internalErr("external sort run: " + err.Error())
 		}
-		r := &runReader[T]{file: f, br: bufio.NewReaderSize(f, mergeBlockBytes), decode: s.decode, run: i}
+		r := &runReader[T]{file: f, br: bufio.NewReaderSize(io.LimitReader(f, run.bytes), mergeBlockBytes),
+			decode: s.decode, run: i}
 		readers = append(readers, r)
 		v, ok, err := r.next()
 		if err != nil {
@@ -583,18 +654,32 @@ func (s *ExternalSort[T]) pop(h *mergeHeap[T], readers []*runReader[T]) (T, erro
 	return it.value, nil
 }
 
-func (s *ExternalSort[T]) removeRuns() {
-	for _, name := range s.runs {
-		paced.Remove(name)
+// releaseRun ends the sort's hold on one run. A run the sort spilled goes back
+// to the scratch pool with its bytes intact, for the next sort in this
+// directory to write over; a run adopted from a continuation is that
+// continuation's file and is removed, which is the lease reclamation the
+// design allows.
+func releaseRun(r runFile) {
+	if r.lease != nil {
+		r.lease.Release()
+		return
+	}
+	paced.Remove(r.path)
+}
+
+func (s *ExternalSort[T]) releaseRuns() {
+	for _, r := range s.runs {
+		releaseRun(r)
 	}
 	s.runs = nil
 	s.buf, s.bufBytes = nil, 0
 }
 
 // Close releases everything the sort holds without producing an answer. It is
-// safe after Sorted, which already removed the runs.
+// safe after Sorted, which already gave the runs back, and after DetachTo,
+// which handed them over.
 func (s *ExternalSort[T]) Close() error {
-	s.removeRuns()
+	s.releaseRuns()
 	return nil
 }
 
@@ -663,8 +748,14 @@ func (h *mergeHeap[T]) Pop() any {
 // reopens the file per call -- which is what lets one caller fold a digest over
 // the sequence and another stream the same sequence again later.
 type SortedRun[T any] struct {
-	mem    []T
-	path   string
+	mem   []T
+	lease *scratch.Lease
+	path  string
+	// bytes is the merged output's logical length. The file is a pooled
+	// scratch surface that nothing truncated, so its records end here and the
+	// bytes after them belong to whichever tenant held the surface before:
+	// every read stops at this offset, never at end of file.
+	bytes  int64
 	decode func([]byte) (T, error)
 	count  int64
 	closed bool
@@ -705,7 +796,8 @@ func (r *SortedRun[T]) Each(yield func(T) error) error {
 		return internalErr("external sort output: " + err.Error())
 	}
 	defer f.Close()
-	rr := &runReader[T]{file: f, br: bufio.NewReaderSize(f, mergeBlockBytes), decode: r.decode}
+	rr := &runReader[T]{file: f, br: bufio.NewReaderSize(io.LimitReader(f, r.bytes), mergeBlockBytes),
+		decode: r.decode}
 	for {
 		v, ok, err := rr.next()
 		if err != nil || !ok {
@@ -717,20 +809,19 @@ func (r *SortedRun[T]) Each(yield func(T) error) error {
 	}
 }
 
-// Close removes the run's backing file. A run held in heap has none.
+// Close gives the run's backing surface back to the scratch pool, keeping its
+// bytes for the next sort in the same directory to write over. It frees
+// nothing. A run held in heap has no file.
 func (r *SortedRun[T]) Close() error {
 	if r == nil || r.closed {
 		return nil
 	}
 	r.closed = true
 	r.mem = nil
-	path := r.path
-	r.path = ""
-	if path == "" {
-		return nil
-	}
-	if err := paced.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return internalErr("external sort output: " + err.Error())
+	r.path, r.bytes = "", 0
+	if r.lease != nil {
+		r.lease.Release()
+		r.lease = nil
 	}
 	return nil
 }
@@ -743,10 +834,15 @@ func (r *SortedRun[T]) Close() error {
 // is a decision rather than an oversight. resources.max_temp_bytes bounds
 // continuation state: bytes that outlive the request that wrote them and pin a
 // generation against retention until a lease expires. A sort run is sized by
-// the match count and is created and removed inside one request, so charging
+// the match count and is taken and given back inside one request, so charging
 // it there would silently repurpose the key -- one query's ranking could
 // exhaust the budget another query's continuation needs, and an operator
 // raising it to hold more pages would instead be raising how wide a query a
-// single request may rank. Sweep and diskBytes still see the files, so runs
-// are reported and reclaimed as real disk exactly as a spool is.
+// single request may rank.
+//
+// Runs live in the directory's scratch pool, which Sweep and diskBytes do not
+// touch: neither the budget nor the sweep reaches a name outside the spool
+// prefix, and a pooled surface must survive the sweep of a dead lease because
+// the next request is going to write over it. What the pool holds is disclosed
+// as scratch disk instead, and an operator gives it back by emptying it.
 func (s *Spools) SortDir() string { return s.dir }
