@@ -8,9 +8,13 @@ import (
 )
 
 // A Purpose names what a removal was for. The set is small and closed on
-// purpose: these are the only reasons this product gives disk back during a
-// run, and an operator reading the resources block should be able to tell at a
-// glance that none of them is a working file the run will need again.
+// purpose: an operator reading the resources block should be able to tell at a
+// glance that none of the labelled removals is a working file the run will
+// need again.
+//
+// It is the set of removals this product labels, not the set it makes. A
+// removal with no purpose here is not a removal that did not happen -- see
+// FreedByPurpose on what Steps counts that this does not.
 type Purpose string
 
 const (
