@@ -86,8 +86,9 @@ func overviewRelationKinds() []model.RelationKind {
 //
 // Depth is inclusive and 0-based: a root container is depth 0, and a request
 // asking for depth 2 receives depths 0, 1 and 2. A zero Depth means the
-// engine's configured MaxDepth, never "unlimited", exactly as every other
-// bound on this engine.
+// engine's configured MaxDepth, exactly as every other bound on this engine:
+// zero on the request is never "unlimited", but the configured bound it falls
+// back to is unlimited by default (docs/queries.md).
 func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page model.Page[model.OverviewItem], err error) {
 	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
