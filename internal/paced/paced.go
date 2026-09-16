@@ -15,7 +15,10 @@
 // file or tree into a to-free set -- a rename frees nothing and costs a
 // directory entry -- and returns, and one reclaimer per process gives the
 // space back at FreeInterval per Window, on its own goroutine, for as long as
-// the process runs. The sets are on the disk, so a run that exits or crashes
+// the process runs. The rate is the host's: every charger in the process
+// waits under one lock, and the processes over one cache take their windows
+// in turn through a file at its root, so the disk is handed one window per
+// interval however many callers and however many runs are freeing. The sets are on the disk, so a run that exits or crashes
 // with removals queued leaves them for the next process to resume at the same
 // pace; nothing is ever freed faster because it is old. A path under no
 // registered set is freed in place, at the same pace.
@@ -103,6 +106,14 @@ func Shrink(path string, size int64) error {
 		return err
 	}
 	defer f.Close()
+	return ShrinkFile(f, size)
+}
+
+// ShrinkFile is Shrink on a file the caller already holds open: the frontier
+// bitset cleared at a level transition, a tool payload reset before a retry.
+// Reopening by name to shrink would race whoever renamed it in the meantime,
+// and the caller's own descriptor is the file it means.
+func ShrinkFile(f *os.File, size int64) error {
 	st, err := f.Stat()
 	if err != nil {
 		return err

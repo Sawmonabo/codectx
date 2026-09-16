@@ -1,6 +1,7 @@
 package paced
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,11 +13,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/fslock"
 )
 
 // FreeInterval is the wait between two freed windows. With Window it is the
-// rate at which this process gives disk space back: 8 MiB, a data sync, a
-// quarter of a second.
+// rate at which disk space is given back over one cache: 8 MiB, a data sync,
+// a quarter of a second. It is one rate for the host, not one per charger and
+// not one per process -- what the disk underneath does with a discard does not
+// depend on how many callers asked.
 //
 // It is measured, not chosen. On a machine whose root filesystem discards
 // freed blocks and whose disk is a sparse image on its host, freeing 5 GB in
@@ -72,16 +77,35 @@ type reclaimer struct {
 	// resolved is the to-free set of each registered directory, once its
 	// resolver has run.
 	resolved map[string]string
-	// idle is set when the worker has looked at every set and found nothing.
-	// Drain waits for it.
+	// idle is set when the worker has looked at every set and found nothing
+	// it can free. Drain waits for it.
 	idle bool
+	// stuck holds the queued entries the reclaimer has tried and failed to
+	// free, with the reason, keyed by the entry's path. An entry here is
+	// passed over so that everything queued behind it still goes, and it is
+	// dropped -- and so retried -- at the next wake. It is what keeps a
+	// removal nothing can make from stopping every other removal in the
+	// process, and from spending a core retrying itself.
+	stuck map[string]string
 	// started is set when the worker goroutine is running.
 	started bool
-	// spentMu guards spent, which the reclaimer's goroutine and any caller
-	// freeing in place both spend.
-	spentMu sync.Mutex
-	// spent is the bytes freed since the last wait, at most a window.
+	// paceMu is the one place in the process a window's turn is taken. Every
+	// charger holds it across its wait, so this process never hands the host
+	// two windows in one interval however many callers are freeing at once:
+	// the reclaimer's goroutine, the file system shim shortening a file the
+	// engine owns, a publication trimming its staging surface. The rate is a
+	// property of what the disk underneath does with a discard, so it is the
+	// HOST's, and a pace kept per charger would be N times it.
+	paceMu sync.Mutex
+	// spent is the bytes freed since the last wait, at most a window. It is
+	// guarded by paceMu, because spending it is what takes a turn.
 	spent int64
+	// paceRoot is the cache directory whose turn file the processes sharing
+	// this cache take their windows through, and turnFile is that file, open.
+	// Both are read under paceMu; paceRoot is written under mu.
+	paceRoot string
+	turnFile *os.File
+	turnAt   string
 	// seq names queued entries apart within one process.
 	seq atomic.Int64
 	// sleep is the wait between windows, replaced by tests with a clock that
@@ -95,6 +119,7 @@ func newReclaimer() *reclaimer {
 	r := &reclaimer{
 		sets:     map[string]func() (string, error){},
 		resolved: map[string]string{},
+		stuck:    map[string]string{},
 		sleep:    time.Sleep,
 	}
 	r.cond = sync.NewCond(&r.mu)
@@ -117,6 +142,15 @@ func RegisterToFree(dir string, set func() (string, error)) {
 	dir = filepath.Clean(dir)
 	reclaim.mu.Lock()
 	defer reclaim.mu.Unlock()
+	// The outermost directory a store pools under is its cache root, and the
+	// cache root is where the processes sharing it take their turns. A store
+	// pools under several directories -- the cache itself, the continuation
+	// store's, a provider's work directory -- and every one of them is inside
+	// the cache, so the ancestor of the others is the one two processes over
+	// one cache will both arrive at.
+	if reclaim.paceRoot == "" || (under(reclaim.paceRoot, dir) && dir != reclaim.paceRoot) {
+		reclaim.paceRoot = dir
+	}
 	if _, ok := reclaim.sets[dir]; ok {
 		return
 	}
@@ -263,6 +297,12 @@ func (r *reclaimer) wake() {
 
 func (r *reclaimer) wakeLocked() {
 	r.idle = false
+	// A wake is new work, and the entry that could not be freed a moment ago
+	// may be freeable now -- the process holding it open has exited, the
+	// mount is writable again, the directory above it has been made
+	// writable. Retrying it here is what the reclaimer does instead of
+	// retrying it in a loop: once per wake, never in a spin.
+	clear(r.stuck)
 	r.cond.Broadcast()
 }
 
@@ -294,18 +334,38 @@ func (r *reclaimer) work() {
 		}
 		// A failure to free one entry must not stop the reclaimer: the
 		// remaining entries are other callers' space. It stays named in the
-		// set and is retried at the next wake, and the next start after that.
-		_ = r.freeEntry(entry, purpose)
+		// set, is recorded with its reason so an operator can read what is
+		// stuck and why, and is passed over until the next wake.
+		//
+		// An entry that is gone from the disk is not stuck whatever was
+		// returned: freeing a file shrinks it before unlinking it, and a
+		// shrink that failed is still reported although the unlink that
+		// followed succeeded. Naming it would disclose an entry that no
+		// longer exists and does not hold a byte.
+		if err := r.freeEntry(entry, purpose); err != nil {
+			if _, gone := os.Lstat(entry); gone != nil {
+				continue
+			}
+			r.mu.Lock()
+			r.stuck[entry] = err.Error()
+			r.mu.Unlock()
+		}
 	}
 }
 
-// nextEntry names one queued removal, in the order the sets and their
-// purposes read. It reports false when every set is empty.
+// nextEntry names one queued removal the reclaimer has not already failed on,
+// in the order the sets and their purposes read. It reports false when every
+// set holds nothing but entries this pass could not free, which is when the
+// worker has nothing left to do and goes to sleep.
 func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 	r.mu.Lock()
 	sets := make([]string, 0, len(r.resolved))
 	for _, set := range r.resolved {
 		sets = append(sets, set)
+	}
+	stuck := make(map[string]bool, len(r.stuck))
+	for path := range r.stuck {
+		stuck[path] = true
 	}
 	r.mu.Unlock()
 	sort.Strings(sets)
@@ -323,7 +383,11 @@ func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 				continue
 			}
 			for _, e := range entries {
-				return filepath.Join(set, pe.Name(), e.Name()), purposeByName[pe.Name()], true
+				path := filepath.Join(set, pe.Name(), e.Name())
+				if stuck[path] {
+					continue
+				}
+				return path, purposeByName[pe.Name()], true
 			}
 		}
 	}
@@ -333,17 +397,24 @@ func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 // freeEntry gives one queued file or tree back to the filesystem at the pace,
 // attributing every byte it releases to the purpose the removal named.
 func (r *reclaimer) freeEntry(path string, p Purpose) error {
-	set, err := os.Open(filepath.Dir(filepath.Dir(path)))
+	// The directory the entry itself will leave, which is the one whose
+	// commit carries the entry's own removal.
+	parent, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	defer set.Close()
-	return r.freeTree(path, p, set)
+	defer parent.Close()
+	return r.freeTree(path, p, parent)
 }
 
 // freeTree frees one path, depth first: a directory's children are freed
 // before the directory itself, so nothing is unlinked while it still holds
-// space.
+// space. parent is the directory holding path, open, because that is the
+// directory whose journal commit carries this removal's freed extents to the
+// device -- the wait the pace makes would otherwise be a wait for a free that
+// had not left the filesystem yet. Descending opens each directory in turn,
+// so a nested file's free is committed by a sync of the directory IT leaves,
+// not of the set at the top of the tree.
 //
 // A tree removal is never all-or-nothing. One child that cannot be freed --
 // a device error, a read-only mount, a file another process is executing --
@@ -351,7 +422,7 @@ func (r *reclaimer) freeEntry(path string, p Purpose) error {
 // that can go goes, and the first failure is reported once the walk is over.
 // Leaving the whole tree because of one file is the leak a removal exists to
 // prevent.
-func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
+func (r *reclaimer) freeTree(path string, p Purpose, parent *os.File) error {
 	st, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -364,12 +435,17 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		if err != nil {
 			return err
 		}
+		here, err := os.Open(path)
+		if err != nil {
+			return err
+		}
 		var first error
 		for _, e := range entries {
-			if err := r.freeTree(filepath.Join(path, e.Name()), p, set); err != nil && first == nil {
+			if err := r.freeTree(filepath.Join(path, e.Name()), p, here); err != nil && first == nil {
 				first = err
 			}
 		}
+		here.Close()
 		if err := os.Remove(path); err != nil && first == nil {
 			first = err
 		}
@@ -379,7 +455,7 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		// A symbolic link, a socket or a device holds no blocks of its own.
 		return os.Remove(path)
 	}
-	return r.freeFile(path, st.Size(), p, set)
+	return r.freeFile(path, st, p, parent)
 }
 
 // freeFile empties one regular file a window at a time and then unlinks it.
@@ -390,13 +466,34 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 // truncation or with the unlink: a thousand small files freed at once cost
 // the filesystem what one large file of the same bytes costs, and the
 // measurement that set FreeInterval counted bytes, not calls.
-func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) error {
+//
+// The bytes an unlink will release are charged BEFORE the unlink, never
+// after. Emptying a file needs write on the file and unlinking it needs write
+// only on the directory, so a file the process may remove but may not
+// truncate reaches the unlink at its full length -- every published blob is
+// one of those, being made read-only at publication, and nothing bounds a
+// blob's size. Charging after the unlink would hand the host that whole
+// length in one act and wait for it afterwards, which is the burst the pace
+// exists to prevent: the wait has to come first, so the length is given back
+// over its own size's worth of windows and the unlink is the last thing that
+// happens.
+//
+// Attribution goes the other way: the counter is credited only once the name
+// is actually gone, so what an operator reads as given back is never bytes
+// that are still on the disk.
+func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, dir *os.File) error {
+	size := st.Size()
 	var shrinkErr error
-	if size > Window {
-		var left int64
-		left, shrinkErr = r.empty(path, size, p, set)
-		size = left
+	switch {
+	case !shrinkable(st):
+		// Another name reaches this object, so unlinking this one gives
+		// nothing back: the object and its blocks stay. There is nothing to
+		// pace and nothing to attribute.
+		size = 0
+	case size > Window:
+		size, shrinkErr = r.empty(path, size, p, dir)
 	}
+	r.charge(size, dir)
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -404,17 +501,20 @@ func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) e
 		return err
 	}
 	attribute(p, size)
-	r.charge(size, set)
 	return shrinkErr
 }
 
 // empty truncates one regular file towards zero a window at a time, syncing
 // its data and charging the pace after each window, and reports the length
-// left on it. A file the process may unlink but may not truncate is left
-// whole, at its full length, for the unlink to free: pacing is how a removal
-// is performed, never whether it is allowed. Its bytes are charged all the
-// same. So is a file another name still reaches: see shrinkable.
-func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int64, error) {
+// the unlink that follows will still have to give back. A file the process
+// may unlink but may not truncate is left whole, at its full length, for the
+// unlink to free: pacing is how a removal is performed, never whether it is
+// allowed, and its full length is what the unlink then owes the pace.
+//
+// A file another name still reaches is left whole too, and owes nothing: the
+// object outlives this name, so the unlink gives no blocks back and a wait
+// for them would be a wait for nothing. See shrinkable.
+func (r *reclaimer) empty(path string, size int64, p Purpose, dir *os.File) (int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	switch {
 	case err == nil:
@@ -429,7 +529,7 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 		return size, err
 	}
 	if !shrinkable(st) {
-		return size, nil
+		return 0, nil
 	}
 	cur := size
 	for cur > 0 {
@@ -442,7 +542,7 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 		}
 		steps.Add(1)
 		attribute(p, cur-next)
-		r.charge(cur-next, set)
+		r.charge(cur-next, dir)
 		cur = next
 	}
 	return 0, nil
@@ -452,38 +552,147 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 // window of them has been spent. Freed extents reach the device when the
 // filesystem journals the change, so a wait with nothing synced would be a
 // wait for nothing: the truncation path has already synced the file's data,
-// and for an unlink the directory the entry left is synced here, which is the
+// and for an unlink the directory the entry leaves -- dir, the file's own
+// parent, not the set at the top of the tree -- is synced here, which is the
 // journal commit that carries the freed extents with it.
 //
-// The budget is the process's, not one removal's: a caller freeing in place
-// and the reclaimer's own goroutine spend the same window, so two of them
-// never hand the disk two windows at once.
-func (r *reclaimer) charge(n int64, set *os.File) {
-	r.spentMu.Lock()
+// The budget is the host's, not one removal's and not one process's: every
+// charger waits under paceMu, and the processes over one cache take their
+// windows in turn through the file at its root, so no two of them ever hand
+// the disk two windows in one interval.
+func (r *reclaimer) charge(n int64, dir *os.File) {
+	r.paceMu.Lock()
+	defer r.paceMu.Unlock()
 	r.spent += n
-	waits := r.spent / Window
-	r.spent -= waits * Window
-	r.spentMu.Unlock()
-	for ; waits > 0; waits-- {
-		if set != nil {
-			_ = set.Sync()
+	for r.spent >= Window {
+		r.spent -= Window
+		if dir != nil {
+			_ = dir.Sync()
 		}
-		r.sleep(FreeInterval)
+		r.takeTurn()
 	}
 }
 
-// Drain frees everything queued and returns when the sets are empty. It is
-// what an operator's request to give the space back waits on; nothing on a
-// run's path calls it.
-func Drain() {
-	reclaim.mu.Lock()
-	defer reclaim.mu.Unlock()
-	if !reclaim.started {
+// paceFileName is the file at a cache root whose lock and recorded time are
+// how the processes over that cache take one window's turn at a time.
+const paceFileName = "free-pace.lock"
+
+// takeTurn waits until the host may be handed another window and records that
+// it has been. The record is on the disk at the cache root, under an
+// exclusive lock, so the turn is taken across processes and not only across
+// this one's chargers: two runs over one cache free at the pace between them,
+// not at twice it. The rate the measurement established is what the disk
+// underneath tolerates, and a disk does not care how many processes are
+// asking.
+//
+// The remainder is clamped into one interval. The recorded time is a wall
+// clock and comes from another process, so a clock adjustment, a record from
+// a machine-image restore or a torn write must cost at most one interval and
+// never hang a run.
+//
+// With no cache root -- a standalone tool, a process that has opened no store
+// -- there is nothing to share and the wait is the interval itself.
+func (r *reclaimer) takeTurn() {
+	f := r.turn()
+	if f == nil {
+		r.sleep(FreeInterval)
 		return
 	}
-	for !reclaim.idle {
-		reclaim.cond.Wait()
+	if err := fslock.Lock(f); err != nil {
+		r.sleep(FreeInterval)
+		return
 	}
+	defer fslock.Unlock(f)
+	wait := FreeInterval
+	var record [8]byte
+	if n, err := f.ReadAt(record[:], 0); err == nil && n == len(record) {
+		since := time.Since(time.Unix(0, int64(binary.BigEndian.Uint64(record[:]))))
+		wait = min(max(FreeInterval-since, 0), FreeInterval)
+	}
+	r.sleep(wait)
+	binary.BigEndian.PutUint64(record[:], uint64(time.Now().UnixNano()))
+	_, _ = f.WriteAt(record[:], 0)
+}
+
+// turn is the cache root's turn file, opened once. It reports nil when there
+// is no cache root, or when the file cannot be opened -- a read-only cache, a
+// directory already removed -- and the caller then keeps the pace for itself
+// alone, which is slower than it need be and never faster.
+//
+// The caller holds paceMu.
+func (r *reclaimer) turn() *os.File {
+	r.mu.Lock()
+	root := r.paceRoot
+	r.mu.Unlock()
+	if root == "" {
+		return nil
+	}
+	if r.turnFile != nil && r.turnAt == root {
+		return r.turnFile
+	}
+	f, err := os.OpenFile(filepath.Join(root, paceFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil
+	}
+	if r.turnFile != nil {
+		r.turnFile.Close()
+	}
+	r.turnFile, r.turnAt = f, root
+	return f
+}
+
+// A Stuck is one queued removal the reclaimer tried to make and could not,
+// and the reason it could not. The space it holds is still counted by
+// PendingFreeBytes, so a figure that stops going down is never left without
+// an explanation beside it.
+type Stuck struct {
+	// Entry names the queued removal inside its to-free set: the purpose it
+	// was removed for and the name the rename gave it. The set's own path is
+	// left off, because what an operator needs is which removal is stuck, not
+	// where this process happens to keep its scratch.
+	Entry string
+	// Reason is what the filesystem said.
+	Reason string
+}
+
+// Drain frees everything queued and returns when nothing is left that can be
+// freed, reporting what could not be. It is what an operator's request to
+// give the space back waits on; nothing on a run's path calls it.
+//
+// It returns rather than waiting for the impossible: a queued removal the
+// filesystem refuses -- a directory the process may not write, a file a
+// device error will not release -- would otherwise hold the request open for
+// the life of the process while everything behind it went unfreed.
+func Drain() []Stuck {
+	reclaim.mu.Lock()
+	if reclaim.started {
+		for !reclaim.idle {
+			reclaim.cond.Wait()
+		}
+	}
+	reclaim.mu.Unlock()
+	return StuckFrees()
+}
+
+// StuckFrees is every queued removal the reclaimer has tried and failed to
+// make since its last wake, with the reason. It is disclosed beside
+// PendingFreeBytes: that figure alone says space is waiting, and this says
+// which of it is waiting on something that will not resolve itself.
+func StuckFrees() []Stuck {
+	reclaim.mu.Lock()
+	out := make([]Stuck, 0, len(reclaim.stuck))
+	for path, reason := range reclaim.stuck {
+		out = append(out, Stuck{Entry: entryName(path), Reason: reason})
+	}
+	reclaim.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Entry < out[j].Entry })
+	return out
+}
+
+// entryName is a queued entry's purpose directory and name, which is all of
+// its path that means anything outside this process.
+func entryName(path string) string {
+	return filepath.Join(filepath.Base(filepath.Dir(path)), filepath.Base(path))
 }
 
 // PendingFreeBytes is the disk held by everything renamed into a to-free set

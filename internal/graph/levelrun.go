@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 
@@ -359,11 +358,12 @@ func (c *levelCollector) finishResident(out *retainFile) error {
 // same ceiling the resident run was, so a level that did not fit in heap is
 // ordered without ever being held there.
 func (c *levelCollector) finishSpilled(ctx context.Context, out *retainFile) error {
-	dir, err := c.w.home.ensure()
-	if err != nil {
+	// The retained directory must exist before the level is written into it;
+	// the sort's runs come from the store's pool, not from here.
+	if _, err := c.w.home.ensure(); err != nil {
 		return err
 	}
-	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "levelsort"), 0,
+	sorter, err := pagination.NewExternalSort(c.w.pool, 0,
 		func(r levelRecord) ([]byte, error) { return encodeLevelRecord(r), nil },
 		decodeLevelRecord, compareLevelRecord)
 	if err != nil {

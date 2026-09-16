@@ -21,6 +21,19 @@ func TryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// Lock takes an exclusive advisory lock on f, waiting for whichever
+// descriptor holds it to let it go. It is what a turn-taking protocol needs
+// and TryLock cannot give: a caller that must have the lock, and whose only
+// alternative to waiting is retrying in a loop.
+func Lock(f *os.File) error {
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+}
+
 // Unlock releases the lock TryLock took.
 func Unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

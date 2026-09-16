@@ -499,6 +499,31 @@ small files -- a materialized tree of thousands of source files -- is given
 back at the same rate as one large file, and a caller that frees in place
 spends the same windows as the reclaimer.
 
+The rate is the **host's**, because what the disk underneath does with a
+discard does not depend on how many callers asked. Every charger in a process
+waits under one lock, so the reclaimer's goroutine, the file system shim
+shortening a file the engine owns and a publication trimming its staging
+surface never hand the disk three windows at once. Across processes the turn
+is taken through a small lock file at the cache root: a window's turn is
+locking that file, waiting out whatever remains of the interval since the last
+recorded turn, recording this one and unlocking, so an index run and a query
+server over one cache free at the pace between them rather than at twice it.
+The remainder is clamped into one interval, because the recorded time is a
+wall clock written by another process and a clock adjustment must cost at most
+one interval rather than hang a run. A process with no cache root -- a
+standalone tool -- keeps the pace for itself alone, which is slower than it
+need be and never faster.
+
+A file the process may unlink but may not truncate -- every published blob is
+one, the store making its objects read-only at publication, and nothing bounds
+a blob's size -- reaches the unlink whole, so the unlink is what gives its
+whole length back in one act. Those bytes are therefore charged **before** the
+unlink: the removal waits its own size's worth of windows and the unlink is
+the last thing that happens, rather than the first. A file another name still
+reaches owes nothing either way, because unlinking one of an object's names
+gives no blocks back; it is neither paced nor counted until the last name
+goes.
+
 The to-free sets are on the disk, inside the pool instance the process claims,
 so a run that exits or crashes with removals queued leaves them for the next
 process to take over and finish at the same pace. Nothing is ever freed faster
@@ -512,6 +537,16 @@ same counter, split by what the removal was for, so the two cannot disagree.
 rename and the release the space belongs to neither the pool nor the freed
 total, and reporting only the other two would leave it invisible.
 
+A queued removal the filesystem refuses -- a device error, a read-only mount, a
+directory a failed child left without write permission -- is passed over rather
+than retried, so the removals queued behind it are still given back, and it is
+retried the next time something is queued. It is named, with the reason, in
+`stuck_frees` beside `pending_free_bytes`: that figure climbing and never
+falling is either a run removing faster than the pace gives back, which
+resolves itself, or a removal nothing can make, which does not, and only the
+list beside it tells the two apart. The request that empties the pools reports
+the same list rather than waiting for a removal that will never succeed.
+
 At activation and abort the writer's page cache is released to the process, so
 a long-lived server does not keep a run's working set resident.
 
@@ -524,8 +559,14 @@ creates nor frees a file of the size it just spilled. The engine sees an empty
 file: the shim keeps that tenant's own length for the surface and answers
 reads, the file size and truncations from it, so a read past what this sort
 wrote is the short read a file system gives at the end of a file rather than
-the previous sort's records, and the engine shortening its temporary back to
-zero is a reset of that length rather than a free. With no pool named -- a
+the previous sort's records. A write PAST that length -- a temporary
+database's pager writes each page where the page belongs, not in order --
+zeroes what it skipped, so a read below the length and above what this tenant
+wrote is the hole a file system would give rather than the previous sort's
+records. Those zeroes are real writes and a gap is as wide as the offset the
+pager jumped to, so the fill waits a window at a time like every other write
+through the shim rather than handing the disk the whole gap at once. The engine shortening its temporary back to zero is a reset of that
+length rather than a free. With no pool named -- a
 process that opens no store -- the engine creates its own under
 `<data_dir>/tmp`, which the process names at start-up, so they live on the disk
 the user gave the data and never on a memory-backed system temp directory.
@@ -587,22 +628,36 @@ a smaller figure.
 
 ### What a run still frees
 
-Everything below goes through the reclaimer: renamed aside, given back a
-window at a time with a data sync and a wait between windows, charged to one
-budget and counted in `freed_bytes`. This is the whole list.
+Everything below is given back a window at a time, with a data sync and a wait
+between windows, charged to one budget and counted in `freed_bytes`. The two
+halves differ in who waits. A **removal** is renamed aside and freed by the
+reclaimer, off the run's path. An **in-place** free is a truncation of a file
+the caller keeps, or an unlink the caller must have completed when it returns,
+so it happens where it is asked for and the caller waits the windows it spends
+-- at the same rate, never faster.
 
-| What | Why it is not pooled | Purpose |
-| --- | --- | --- |
-| An indexer's index file, a dependence engine's export directory | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
-| A materialized source tree | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
-| A published blob a retention sweep collected, and an orphan the sweep found | The object is content the store no longer names | — |
-| The trim of a staged blob before it is published | The published object is that file and a reader proves it by its length | — |
-| A walk's retained level files and its retained directory | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
-| A continuation's spool and a retained search directory a lease reclaimed | State a run left for a caller that never came back | `lease-reclamation` |
-| Sort runs a sort adopted from a continuation | They are that continuation's files, not the pool's | — |
-| A capture's staging database | It belongs to exactly one capture | — |
-| The engine's journals, and the log when a checkpoint truncates it | The engine chooses when they exist | — |
-| The pools themselves, on `codectx gc` | An operator asked | `scratch-collection` |
+| What | How | Why it is not pooled | Purpose |
+| --- | --- | --- | --- |
+| An indexer's index file, a dependence engine's export directory | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
+| A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
+| A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
+| The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
+| The staging name of a blob that has just been published | In place, freeing nothing | Two names of one object; the object stays and the unlink gives no blocks back | — |
+| A walk's retained level files and its retained directory | Removal | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
+| A retained level cut back to the byte count a resumed cursor carried | In place | The file goes on being appended to, so there is nothing to rename away | — |
+| A walk's frontier set cleared at a level transition | In place | The set is rebuilt into the same file for the next level | — |
+| A continuation's spool and a retained search directory a lease reclaimed | Removal | State a run left for a caller that never came back | `lease-reclamation` |
+| Sort runs a sort adopted from a continuation | Removal | They are that continuation's files, not the pool's | — |
+| A capture's staging database | Removal | It belongs to exactly one capture | — |
+| A dependence import's key set, emptied before the next is written over it | In place | The file keeps its name across imports | — |
+| A tool payload reset before a download is retried | In place | The staging file is written again from the start | — |
+| The engine's journals, and the log when a checkpoint truncates it | In place | The engine's own delete is waiting on it, so it must be empty when the call returns | — |
+| The pools themselves, on `codectx gc` | Removal | An operator asked | `scratch-collection` |
+
+The list is enforced, not narrated: a test walks the source tree and fails on
+any `os.Remove`, `os.RemoveAll`, `os.Truncate` or file `Truncate` outside the
+pacing package that is neither routed through it nor written down beside it
+with its reason.
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.

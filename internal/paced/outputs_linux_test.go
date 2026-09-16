@@ -133,3 +133,33 @@ func TestStopHandsTheOutputsOverWhereThePlatformHasNoRangeWriteback(t *testing.T
 		t.Fatalf("the pacer believes it handed over %d bytes of a %d byte output", o.sent[path], size)
 	}
 }
+
+// The requirement: a child's output that lands in a subdirectory is paced
+// like any other. Nothing makes a foreign writer's output directory flat --
+// the layout is the writer's, and a subdirectory may appear part way through
+// the run -- so a sweep that read only the top level would leave the whole
+// output in the page cache for the kernel to submit in one burst, which is
+// the stall the pacer exists to remove, with the pacer running beside it and
+// reporting nothing amiss.
+//
+// Mutation: read the named directory one level deep again (skip entries that
+// are directories instead of walking into them) and not one window of the
+// nested output is handed to the disk.
+func TestAChildWritingIntoASubdirectoryIsPacedTheSameWay(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "part", "deeper")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const windows = 4
+	writeOutput(t, filepath.Join(nested, "stream"), windows*Window)
+
+	before := OutputWindows()
+	o := StartOutputs([]string{dir})
+	o.Stop()
+
+	if got := OutputWindows() - before; got < windows {
+		t.Fatalf("a %d-window output under a subdirectory was handed to the disk in %d window(s); "+
+			"an output the sweep never reaches is one the kernel submits in a burst", windows, got)
+	}
+}

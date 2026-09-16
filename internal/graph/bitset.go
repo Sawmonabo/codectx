@@ -395,7 +395,10 @@ func (b *pagedBitset) clear() error {
 	if err != nil {
 		return err
 	}
-	if err := f.Truncate(0); err != nil {
+	// Emptied at the pace: this happens at every level transition and the
+	// set is as large as the generation's surrogate range, so cleared in one
+	// act it is a burst of freed blocks on the walk's own path.
+	if err := paced.ShrinkFile(f, 0); err != nil {
 		return bitsetErr(err)
 	}
 	return b.writeManifest()
