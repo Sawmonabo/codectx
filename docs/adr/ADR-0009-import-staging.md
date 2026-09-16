@@ -85,11 +85,11 @@ The staging is written the way a bulk load writes, and nothing else:
    so a table smaller than it is ordered without a spill file and a larger
    one spills once, sequentially, to a temporary file under the data
    directory.
-6. **Paced writeback.** The staging file is paced to disk the way the
-   store's log is (ADR-0008): every hundred milliseconds the kernel is
-   asked to begin writing its dirty pages, through the shared
-   `internal/writeback` package, so an import hands the disk its pages
-   steadily rather than in bursts at each commit.
+6. **Bounded writes in flight.** The staging file reaches the disk the way
+   every file the engine writes does (ADR-0008, decision 5 as amended):
+   through the process's paced file system, one window in flight and at
+   most two dirty, so an import hands the disk its pages at the disk's own
+   rate rather than in bursts at each commit.
 7. **Engine temporary files under the data directory.** The process sets
    the engine's temporary directory to `<data_dir>/tmp` at start-up
    ([PRAGMA temp_store_directory](https://sqlite.org/pragma.html#pragma_temp_store_directory)),
@@ -147,7 +147,7 @@ CSV counterpart: locations, identities, node facts and occurrences.
 ## Consequences
 
 - An import's staging writes are a small constant times its export and are
-  sequential and paced; `TestImportWritesAreProportionalToTheExport` holds
+  sequential and bounded in flight; `TestImportWritesAreProportionalToTheExport` holds
   the bound at 8× under a 2 MiB cache and requires the published digest to
   match a reference import when one is named.
 - Node ids that are not integers are refused as a malformed export, with a
