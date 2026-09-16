@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/cli"
+	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
@@ -109,5 +111,94 @@ func TestGCEmptiesThePoolsAndSaysWhatTheyHeld(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); statErr == nil {
 		t.Fatalf("the pooled surface %s survived the collection: the command reported space it did not give back", path)
+	}
+}
+
+// The requirement: the collection has to name what it left behind. A pool
+// instance a running process owns is skipped -- emptying it would take the
+// working files out from under that run -- and the whole of it is skipped,
+// which on a machine running an index beside the request is most of the disk
+// the report just said was held. Unnamed, "12 GB held, 200 MB freed" reads as
+// the command having quietly failed, and an operator with no reason for the
+// difference has nothing to act on.
+//
+// Mutation: drop the LeftAlone entry (leave the instance skipped silently in
+// Arena.Empty) and the report shows the shortfall with nothing to explain it.
+func TestGCNamesTheInstancesALiveRunOwns(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	isolateUserDirs(t, "")
+	dir := t.TempDir()
+
+	run := func(args ...string) (string, error) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		root := cli.NewRoot(build, &stdout, &stderr)
+		err := cli.Execute(context.Background(), build, root, args)
+		if stderr.Len() != 0 {
+			t.Errorf("stderr = %q, want empty", stderr.String())
+		}
+		return stdout.String(), err
+	}
+	if _, err := run("init", dir, "--json"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	ws, err := app.OpenWorkspaceForReport(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+	data := ws.DataDir()
+	if err := ws.Close(); err != nil {
+		t.Fatalf("close workspace: %v", err)
+	}
+
+	// An instance of the pool that another run owns: its claim is held, and
+	// it holds a surface with bytes in it. A whole-file lock conflicts
+	// between descriptors, so a second open here is another owner as far as
+	// the claim is concerned.
+	const held = 128 << 10
+	owned := filepath.Join(scratch.Dir(data), "9")
+	if err := os.MkdirAll(filepath.Join(owned, string(scratch.SortRun)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(owned, string(scratch.SortRun), "0"), make([]byte, held), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := os.OpenFile(filepath.Join(owned, "owner.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claim.Close()
+	if taken, err := fslock.TryLock(claim); err != nil || !taken {
+		t.Fatalf("the claim on the instance a live run owns could not be held: %v", err)
+	}
+	defer fslock.Unlock(claim)
+
+	out, err := run("gc", "--repo", dir, "--json")
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	var env struct {
+		Data model.ScratchCollection `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("gc did not emit one envelope: %v (%q)", err, out)
+	}
+	var named []model.UntouchedInstance
+	for _, p := range env.Data.Pools {
+		named = append(named, p.LeftAlone...)
+	}
+	if len(named) != 1 || named[0].Instance != "9" {
+		t.Fatalf("gc reported %d bytes held and %d freed and named %v as left alone; "+
+			"the instance a live run owns is the whole of the difference and the operator is told nothing about it",
+			env.Data.HeldBytes, env.Data.FreedBytes, named)
+	}
+	if named[0].HeldBytes < held {
+		t.Fatalf("the instance left alone is reported holding %d bytes of %d", named[0].HeldBytes, held)
+	}
+	if named[0].Reason == "" {
+		t.Fatal("the instance left alone carries no reason, so an operator cannot tell a skipped pool from a failed collection")
+	}
+	if _, err := os.Stat(filepath.Join(owned, string(scratch.SortRun), "0")); err != nil {
+		t.Fatalf("the surface of a live run's instance did not survive the collection: %v", err)
 	}
 }

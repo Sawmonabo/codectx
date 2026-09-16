@@ -537,44 +537,77 @@ var ErrInUse = errors.New("scratch arena in use")
 // returns the bytes it freed.
 //
 // It refuses while any lease of this arena is outstanding, because removing a
+// A Collection is what one request to empty an arena did: the bytes it gave
+// back, and every queued removal the reclaimer could not make. A removal that
+// cannot be made still holds its space, so a collection that reports only its
+// freed bytes would leave the difference unexplained.
+type Collection struct {
+	FreedBytes int64
+	Stuck      []paced.Stuck
+	// LeftAlone names the instances this collection did not touch because a
+	// live process holds their claim, and what each of them is holding. An
+	// instance is a whole pool, so a collection that reported only its freed
+	// bytes would read as having emptied everything it counted.
+	LeftAlone []Untouched
+}
+
+// An Untouched is one instance a collection left exactly as it was.
+type Untouched struct {
+	// Instance is the instance directory's own name inside the pool.
+	Instance string
+	// HeldBytes is the disk that instance is holding.
+	HeldBytes int64
+	// Reason is why it was left.
+	Reason string
+}
+
 // surface a tenant is writing would corrupt that tenant's work, and it leaves
 // alone the instance of any other process that is still running.
-func (a *Arena) Empty() (int64, error) {
+func (a *Arena) Empty() (Collection, error) {
 	// The claim, and with it the to-free set, is resolved before the arena is
 	// locked: the removals below reach it through the reclaimer.
 	instance, err := a.claim()
 	if err != nil {
-		return 0, err
+		return Collection{}, err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if n := len(a.held); n > 0 {
-		return 0, fmt.Errorf("%w: %d surfaces are leased", ErrInUse, n)
+		return Collection{}, fmt.Errorf("%w: %d surfaces are leased", ErrInUse, n)
 	}
 	entries, err := os.ReadDir(a.root)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
+			return Collection{}, nil
 		}
-		return 0, err
+		return Collection{}, err
 	}
-	var freed int64
+	var out Collection
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		dir := filepath.Join(a.root, e.Name())
 		if dir != instance {
-			free, err := a.emptyIdleLocked(dir)
+			free, idle, err := a.emptyIdleLocked(dir)
 			if err != nil {
-				return freed, err
+				return out, err
 			}
-			freed += free
+			if !idle {
+				held, err := dirBytes(dir)
+				if err != nil {
+					return out, err
+				}
+				out.LeftAlone = append(out.LeftAlone, Untouched{Instance: e.Name(), HeldBytes: held,
+					Reason: "a running process holds this instance and its surfaces are that run's working files"})
+				continue
+			}
+			out.FreedBytes += free
 			continue
 		}
 		n, err := dirBytes(dir)
 		if err != nil {
-			return freed, err
+			return out, err
 		}
 		// This instance's claim stays held: the process still owns it and
 		// will take surfaces again. Only its pooled files go, and they are
@@ -583,52 +616,55 @@ func (a *Arena) Empty() (int64, error) {
 		// its bytes instead of being silently left behind and over-reported.
 		purposes, err := os.ReadDir(dir)
 		if err != nil {
-			return freed, err
+			return out, err
 		}
 		for _, pe := range purposes {
 			if !pe.IsDir() || paced.IsToFreeDir(pe.Name()) {
 				continue
 			}
 			if err := paced.RemoveAllFor(paced.ScratchCollection, filepath.Join(dir, pe.Name())); err != nil {
-				return freed, err
+				return out, err
 			}
 		}
-		freed += n
+		out.FreedBytes += n
 		a.free, a.next, a.swept = map[Purpose][]string{}, map[Purpose]int{}, map[Purpose]bool{}
 	}
 	// The removals above renamed the pools into the to-free set and returned;
 	// the space is given back by the one reclaimer, at the one pace, and this
 	// is the only caller in the product that waits for it, because it is the
-	// only one an operator asked for.
-	paced.Drain()
-	return freed, nil
+	// only one an operator asked for. It returns what it could not free
+	// rather than waiting on it, so a removal the filesystem refuses is
+	// reported to the operator instead of holding the request open.
+	out.Stuck = paced.Drain()
+	return out, nil
 }
 
 // emptyIdleLocked removes one instance directory if no live process holds its
-// claim, and reports the bytes it freed. An instance a running process owns is
-// left exactly as it is.
-func (a *Arena) emptyIdleLocked(dir string) (int64, error) {
+// claim, and reports the bytes it freed and whether it was idle. An instance
+// a running process owns is left exactly as it is, and reported as left:
+// emptying it would take the working files out from under that run.
+func (a *Arena) emptyIdleLocked(dir string) (int64, bool, error) {
 	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer f.Close()
 	held, err := fslock.TryLock(f)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if !held {
-		return 0, nil
+		return 0, false, nil
 	}
 	defer fslock.Unlock(f)
 	n, err := dirBytes(dir)
 	if err != nil {
-		return 0, err
+		return 0, true, err
 	}
 	if err := paced.RemoveAllFor(paced.ScratchCollection, dir); err != nil {
-		return 0, err
+		return 0, true, err
 	}
-	return n, nil
+	return n, true, nil
 }
 
 // dirBytes is the length of every regular file under dir except the claims
