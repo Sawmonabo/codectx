@@ -210,13 +210,9 @@ func (r *StatusReader) coherence(ctx context.Context, snap model.Snapshot) (mode
 // without one the only coverage is periodic reconciliation, which is never
 // complete notification coverage, and what is reported is exactly that.
 type watchState struct {
-	mu     sync.Mutex
-	active int
-	source *watch.Watcher
-	// release gives back the cross-process workspace lock this watch holds
-	// while it watches. It is nil until the first pass takes it, and nil again
-	// once the loop has given it back.
-	release    func() error
+	mu         sync.Mutex
+	active     int
+	source     *watch.Watcher
 	reconciled time.Time
 }
 
