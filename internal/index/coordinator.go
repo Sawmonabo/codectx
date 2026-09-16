@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -346,6 +347,13 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 	}
 	if err := req.Validate(); err != nil {
 		return model.IndexResult{}, err
+	}
+	// Said once, at the start of the run the operator asked for, and never on
+	// a watch-driven refresh, which would repeat it on every batch: what is
+	// off is a property of the configuration, not of the pass.
+	if disabled := c.disabledProviders(); len(disabled) > 0 {
+		c.log.Info("providers disabled by configuration: "+strings.Join(disabled, ", "),
+			"component", component, "repository_id", string(c.repo))
 	}
 	c.run.Lock()
 	defer c.run.Unlock()
