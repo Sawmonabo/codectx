@@ -18,8 +18,27 @@ CREATE TABLE runs (
     -- in the index store's own file, so no foreign key can state it here.
     generation_id INTEGER CHECK(generation_id IS NULL OR generation_id > 0),
     started_at TEXT NOT NULL,
+    -- The deadline the run's own collector promised to refresh before, and the
+    -- only evidence that the process writing this run is still alive. The
+    -- writer states it and renews it on the flush it already performs; a
+    -- reader compares it to the clock and never derives the window itself,
+    -- because the two need not be the same build or the same configuration and
+    -- a reader that computed the window would grant or deny liveness the
+    -- writer never promised. An elapsed stamp means the writer stopped
+    -- refreshing, which is the only signal of process death that works on
+    -- every platform this product supports: a pid can be reused, and probing
+    -- one is neither portable nor race-free.
+    --
+    -- Without it a process that died without stopping its ledger would leave
+    -- its run 'running' for ever, and every later reader would be shown that
+    -- dead run instead of the run that produced the active generation --
+    -- precisely after the crash an operator is investigating.
+    expires_at TEXT NOT NULL,
     -- Null while the run is live. It is set when the collector stops, which is
-    -- also when any span still open is closed as interrupted.
+    -- also when any span still open is closed as interrupted. It stays null on
+    -- a run whose writer died: nobody measured when that run ended, and a
+    -- reader judges it interrupted from the elapsed stamp rather than from a
+    -- finish time this product would have to invent.
     finished_at TEXT CHECK(finished_at IS NOT NULL OR outcome = 'running'),
     outcome TEXT NOT NULL CHECK(outcome IN ('running','ok','failed','subdivided','reused','skipped','interrupted')),
     file_count INTEGER NOT NULL CHECK(file_count >= 0),

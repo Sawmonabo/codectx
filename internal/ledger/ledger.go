@@ -25,6 +25,16 @@ const (
 	// reader's view of a running span can be.
 	flushInterval = 250 * time.Millisecond
 	flushEvents   = 256
+	// liveWindow is how far ahead of itself a run's collector stamps the
+	// liveness deadline it publishes on the run row, and so how long after a
+	// process dies its run still reads as live. It is a multiple of the flush
+	// interval rather than a duration chosen on its own: the collector renews
+	// the stamp on the flush it already performs, and the window has only to
+	// cover the longest a flush can legitimately be late -- a write waiting up
+	// to busyTimeout for the single writer that retention also takes, and a
+	// subscriber running on the collector's own goroutine. A hundred and
+	// twenty intervals is thirty seconds, six times that wait.
+	liveWindow = 120 * flushInterval
 )
 
 // eventKind distinguishes the two things a run's goroutine tells the collector.
@@ -97,8 +107,11 @@ type Run struct {
 	// writes nothing at all rather than rewriting rows that have not moved.
 	dirty atomic.Bool
 
-	mu           sync.Mutex
-	started      time.Time
+	mu      sync.Mutex
+	started time.Time
+	// expires is the liveness deadline last written to the run row, held here
+	// so the collector renews it before it lapses rather than on every flush.
+	expires      time.Time
 	generationID *int64
 	outcome      Outcome
 	finished     *time.Time
@@ -225,6 +238,32 @@ func (l *Ledger) publish(e event) {
 		e.span.run.dropped.Add(1)
 		e.span.run.dirty.Store(true)
 	}
+}
+
+// refreshDue reports whether this run's published liveness deadline is close
+// enough to lapsing that the collector should renew it on this flush. Renewing
+// at half the window leaves a whole window of slack for a late flush, and
+// leaves an idle live run writing twice a window instead of four times a
+// second. A run that has ended publishes nothing further: its outcome, not its
+// stamp, is what a reader then judges it by.
+func (r *Run) refreshDue(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inserted && r.outcome == OutcomeRunning && !now.Before(r.expires.Add(-liveWindow/2))
+}
+
+// anyRefreshDue reports whether any run's liveness deadline needs renewing, so
+// a flush with nothing else to do still keeps a live run's claim current.
+func (l *Ledger) anyRefreshDue(now time.Time) bool {
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for _, run := range runs {
+		if run.refreshDue(now) {
+			return true
+		}
+	}
+	return false
 }
 
 // anyDirty reports whether any run row has moved since the last flush wrote
