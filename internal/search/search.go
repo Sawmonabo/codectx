@@ -309,6 +309,12 @@ func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, ru
 		if !h.full() {
 			return nil
 		}
+		if !reader.Continuable() {
+			// This process cannot retain a continuation, so the walk stops
+			// spooling here and the page in hand is the whole answer.
+			w.unretainable = true
+			return nil
+		}
 		return w.start(ctx, h.items)
 	})
 	if err != nil {
@@ -323,6 +329,14 @@ func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, ru
 	spool, err := w.close(ctx)
 	if err != nil {
 		return nil, "", false, "", err
+	}
+	if w.unretainable {
+		// Same shape as the budget refusal below, for a different cause: the
+		// hits of page 1 are in hand and refusing to serve them because this
+		// process holds no writer would be the refusal the scale posture
+		// forbids.
+		dropped := int(total) - len(hits)
+		return hits, "", true, noContinuationReason(dropped), nil
 	}
 	if w.dropped {
 		// A spool budget that is already full must end THIS page, never the
@@ -369,6 +383,11 @@ type rawWriter struct {
 	now     time.Time
 	lease   string
 	spool   *pagination.Spool
+	// unretainable records that this process cannot hold a continuation at all
+	// -- it opened the store read-only, so it can write neither the cursor
+	// lease nor the spool. Unlike dropped it is known before the first spool
+	// write is attempted, so nothing is written and nothing is released.
+	unretainable bool
 	// dropped records that the shared spool budget refused a record. The walk
 	// continues -- the count of candidates is what the truncation reason names
 	// -- but nothing further is written and the answer carries no continuation.
@@ -377,7 +396,7 @@ type rawWriter struct {
 
 // started reports whether the spool has been opened, or opening it has already
 // been given up on.
-func (w *rawWriter) started() bool { return w.spool != nil || w.dropped }
+func (w *rawWriter) started() bool { return w.spool != nil || w.dropped || w.unretainable }
 
 // start opens the spool and writes every candidate the heap holds.
 func (w *rawWriter) start(ctx context.Context, held []scored) error {
@@ -866,6 +885,17 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // were served but the remainder could not be written to the query spool. It
 // names the number of hits that were dropped, which is the fact a caller needs
 // to decide whether to narrow the query or to wait and retry.
+// noContinuationReason is the reason a caller sees when the page was served by
+// a process that changes nothing: a continuation would need a cursor lease and
+// a spool, both writes, and this process holds no writer connection. It names
+// the hits beyond the page so the caller can narrow the query rather than look
+// for a token that is not coming.
+func noContinuationReason(dropped int) string {
+	return "this answer was served by a process that writes nothing, so " + strconv.Itoa(dropped) +
+		" further ranked hits are not reachable and this answer has no continuation; " +
+		"narrow the query, or re-run it when no index run holds the workspace"
+}
+
 func spoolBudgetFullReason(dropped int) string {
 	return "the shared query spool ran out of disk budget, so " + strconv.Itoa(dropped) +
 		" further ranked hits were dropped and this answer has no continuation; " +

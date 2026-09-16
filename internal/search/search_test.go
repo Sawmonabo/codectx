@@ -70,6 +70,7 @@ type fixture struct {
 	t       *testing.T
 	ctx     context.Context
 	store   *sqlite.Store
+	dbPath  string
 	repo    model.RepositoryID
 	gen     model.GenerationID
 	binding model.Binding
@@ -84,13 +85,14 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{})
+	dbPath := filepath.Join(dir, "codectx.db")
+	st, err := sqlite.Open(ctx, dbPath, sqlite.Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
 
-	f := &fixture{t: t, ctx: ctx, store: st, repo: model.RepositoryID(model.H("search-fixture", "1")),
+	f := &fixture{t: t, ctx: ctx, store: st, dbPath: dbPath, repo: model.RepositoryID(model.H("search-fixture", "1")),
 		nodes: map[string]model.NodeID{}, files: map[string]model.FileID{}}
 	if err := st.EnsureRepository(ctx, f.repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
@@ -287,6 +289,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
+		{"fix/a_writerless_process_serves_one_page_and_mints_no_cursor", legReadOnlyServesOnePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
 		// FX-H-G rows
@@ -1433,6 +1436,45 @@ func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
 	}
 	if !strings.Contains(page.Meta.TruncationReason, "spool") {
 		t.Errorf("truncation reason = %q, want the dropped tail named", page.Meta.TruncationReason)
+	}
+}
+
+// legReadOnlyServesOnePage proves the rule a continuation cannot break: a
+// process that opened the store read-only -- which is how `codectx search`
+// answers while another process is indexing -- can write neither the cursor
+// lease nor the spool a continuation is made of, so it must serve the page it
+// has and say the answer stops there. Minting a token it could not honour would
+// hand the caller a continuation that fails on use, which is worse than an
+// answer that admits it is partial.
+//
+// Mutation: make PinnedReader.Continuable report true unconditionally, and this
+// leg fails with CTX_INTERNAL out of the lease the read-only store refuses.
+func legReadOnlyServesOnePage(t *testing.T, f *fixture) {
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("read-only Open: %v", err)
+	}
+	t.Cleanup(func() { ro.Close() })
+	opts := f.opts
+	opts.Store = ro
+	opts.Leases = pagination.NewLeases(ro, pagination.DefaultCursorTTL)
+	s := newService(t, opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	page, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless process failed the query instead of answering it: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("page 1 served %d hits, want the 1 it had in hand", len(page.Items))
+	}
+	if page.Meta.NextCursor != "" {
+		t.Error("a process that cannot write a spool still minted a continuation")
+	}
+	if !page.Meta.Truncated {
+		t.Fatal("an answer with an unreachable tail did not report itself truncated")
+	}
+	if !strings.Contains(page.Meta.TruncationReason, "writes nothing") {
+		t.Errorf("truncation reason = %q, want the cause named", page.Meta.TruncationReason)
 	}
 }
 

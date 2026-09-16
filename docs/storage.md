@@ -421,6 +421,37 @@ ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
 
+## A second process reading while a run writes
+
+A process that only answers questions opens the store with **no writer
+connection at all**. Nothing it does can wait on the ingestion group another
+process holds, and nothing it does can delay that group: the reader pool is
+`query_only`, it reads a write-ahead log snapshot, and a log reader never waits
+on a writer.
+
+That is not the default it looks like. A read-only command performed two
+writes before it read anything, and both were `_txlock=immediate` on the single
+writer connection, so both queued behind a run's group and were refused
+`database is busy` after `storage.busy_timeout`:
+
+* **the schema check at open**, which ran the fingerprint comparison inside a
+  write transaction because the same call creates the schema in an empty cache;
+* **the retention lease** every pinned generation inserted.
+
+Opened without a writer, the fingerprint is compared on the reader pool -- the
+same comparison, and a cache with no tables is reported as the workspace that
+was never built rather than as a fingerprint that failed to match -- and the
+pin takes no lease. A lease retains a generation against collection, and the
+**active** generation is the one generation collection never accepts, so on the
+active generation the lease retained nothing. Such a process therefore pins only
+the active generation; a superseded generation named explicitly is refused,
+because that is the case a lease does protect and this process cannot take one.
+
+Every mutating entry point on such a store refuses with `CTX_INTERNAL`: it is
+reachable only by composing a command that changes the workspace with the
+composition that cannot, which is a defect in this binary and not an operator
+state.
+
 ## How an index run commits
 
 Every write an index run makes -- the snapshot's blobs and file rows, each
