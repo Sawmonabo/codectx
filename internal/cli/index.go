@@ -562,7 +562,16 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 // will start, whatever the ledger goes on publishing. That is what keeps these
 // lines and the result off each other on one writer, and keeps a stage that
 // finishes late out of the single --json envelope.
-func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (stop func()) {
+//
+// Only the stages of the run THIS command opened are printed. The rows arrive
+// from every run this process records -- a late seal tick's deferred run is
+// recorded while an index runs -- and its stages printed into this command's
+// output would be read as this command's work.
+//
+// The run's id is looked up per row and never captured once: a subscription is
+// made before the run exists, so an id read at subscribe time is not there yet
+// and a filter holding it would drop every line of the run it is following.
+func progressiveStages(cmd *cobra.Command, args []string, ws stageSource) (stop func()) {
 	machine := jsonRequested(cmd, args)
 	// A --json consumer's stdout carries the one envelope and nothing else, so
 	// the progressive lines take the stderr channel the refresh lines already
@@ -576,10 +585,23 @@ func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (st
 	// result below on the same writer.
 	var mu sync.Mutex
 	var done bool
+	// Latched under the same mutex the rows are rendered under, and only once
+	// the run exists: an absent id is not remembered as an answer.
+	var runID string
+	following := func(id string) bool {
+		if runID == "" {
+			current, ok := ws.IndexRunID()
+			if !ok || current == "" {
+				return false
+			}
+			runID = current
+		}
+		return id == runID
+	}
 	ws.Spans(func(row model.StageRecord) {
 		mu.Lock()
 		defer mu.Unlock()
-		if done || row.ParentSeq != nil {
+		if done || row.ParentSeq != nil || !following(row.RunID) {
 			return
 		}
 		if machine {
@@ -596,6 +618,15 @@ func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (st
 		done = true
 		mu.Unlock()
 	}
+}
+
+// stageSource is what a progressive line needs of the workspace: the finished
+// stages of every run this process records, and which of those runs is the one
+// this command opened. It is an interface so the filter above can be exercised
+// over both runs without a workspace and a real index behind it.
+type stageSource interface {
+	Spans(func(model.StageRecord))
+	IndexRunID() (string, bool)
 }
 
 // stageProgressScope is the scope a progressive line names, with the separator
