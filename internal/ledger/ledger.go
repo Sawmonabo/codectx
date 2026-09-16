@@ -441,14 +441,49 @@ func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 	})
 }
 
-// OverlayRuns lists the overlay runs the file still holds, so the caller that
-// knows which processes are alive can hand the rest to DeleteOverlayRuns.
+// notLive is the negation of the liveness judgement LatestRun makes: a run is
+// live while it says 'running' and the deadline its own writer published has
+// not elapsed. Every sweep uses this same expression with the same bound clock
+// reading, so what a reader is told is alive and what a sweep is willing to
+// delete can never disagree -- the one bug that would matter here is deleting
+// the record of a process another surface has just called live.
+const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
+
+// DeleteRunsWithoutGeneration removes the runs no generation will ever reach:
+// a run that ended without publishing anything -- a tick that found nothing to
+// publish never attaches a generation -- and one whose process died before it
+// could. DeleteRuns is keyed by generation, so those rows have no other way
+// out, and the ticks that produce them are periodic: without this pass they
+// accumulate without bound.
+//
+// It deletes only runs that are not live: a run that has not reached its
+// generation yet is exactly what a run in progress looks like. One pass
+// deletes at most a page, because it is called periodically and the next pass
+// takes the rest.
+func (l *Ledger) DeleteRunsWithoutGeneration(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	return l.writeTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE run_id IN (
+			SELECT run_id FROM runs WHERE generation_id IS NULL AND `+notLive+
+			` ORDER BY started_at LIMIT ?)`, formatTime(time.Now()), model.MaxRecordsPerResult)
+		return wrap("delete runs without a generation", err)
+	})
+}
+
+// OverlayRuns lists the overlay runs whose writer is gone: an overlay run that
+// finished, and one whose process died without stopping its ledger and whose
+// published deadline has since elapsed. A live overlay run -- another process
+// serving a language server right now -- is never listed, so the caller can
+// hand everything it gets straight to DeleteOverlayRuns.
 func (l *Ledger) OverlayRuns(ctx context.Context) ([]string, error) {
 	if l == nil {
 		return nil, nil
 	}
 	var ids []string
-	rows, err := l.db.QueryContext(ctx, `SELECT run_id FROM runs WHERE kind = 'overlay' ORDER BY started_at LIMIT ?`, model.MaxRecordsPerResult)
+	rows, err := l.db.QueryContext(ctx, `SELECT run_id FROM runs WHERE kind = 'overlay' AND `+notLive+
+		` ORDER BY started_at LIMIT ?`, formatTime(time.Now()), model.MaxRecordsPerResult)
 	if err != nil {
 		return nil, wrap("overlay runs", err)
 	}
