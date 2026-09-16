@@ -170,13 +170,15 @@ func (r *PinnedReader) SearchStats(ctx context.Context) (documents, tokens int64
 }
 
 // DocumentFrequency returns, per term in order, how many visible documents
-// contain it; the caller caps len(terms) at resources.max_query_terms.
+// contain it. It bounds the term count itself at nothing: a term is one binary
+// search over the generation's term directory, which reads one fixed-width
+// entry and one term text per probe and frees both, so the whole call costs
+// one int64 per term on top of the slice the caller already holds. How many
+// terms one request may carry is the search tier's decision, under
+// resources.max_query_terms.
 func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([]int64, error) {
 	if len(terms) == 0 {
 		return nil, invalid("document frequency needs at least one term")
-	}
-	if len(terms) > model.MaxFilterValues {
-		return nil, invalid("document frequency asked for %d terms, limit %d", len(terms), model.MaxFilterValues)
 	}
 	x, err := r.openLexical(ctx)
 	if err != nil {

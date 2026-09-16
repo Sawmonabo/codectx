@@ -110,6 +110,49 @@ func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 	}
 }
 
+// A query is bounded by resources.max_query_terms, which is unlimited by
+// default, and the reader must answer however many terms one arrives with: a
+// bound of its own here refuses an ordinary query outright, and a partial
+// answer would score the terms it dropped as if the corpus did not carry them.
+// This asks for more terms than any filter list may hold and requires the one
+// call to agree, term for term, with the same terms asked for one at a time.
+func TestDocumentFrequencyAnswersEveryTermOfAWideQuery(t *testing.T) {
+	f, r, _, dbPath := packedLexicalFixture(t)
+	flushed(t, f.s)
+	indexed := vocabularyTerms(t, openRawDB(t, dbPath))
+	if len(indexed) == 0 {
+		t.Fatal("the fixture indexed no term; the comparison below would prove nothing")
+	}
+	terms := append([]string(nil), indexed...)
+	for i := 0; len(terms) <= model.MaxFilterValues; i++ {
+		terms = append(terms, fmt.Sprintf("wordnodocumentcarries%d", i))
+	}
+
+	got, err := r.DocumentFrequency(f.ctx, terms)
+	if err != nil {
+		t.Fatalf("DocumentFrequency(%d terms): %v", len(terms), err)
+	}
+	if len(got) != len(terms) {
+		t.Fatalf("DocumentFrequency answered %d frequencies for %d terms", len(got), len(terms))
+	}
+	var carried int
+	for i, term := range terms {
+		one, err := r.DocumentFrequency(f.ctx, []string{term})
+		if err != nil {
+			t.Fatalf("DocumentFrequency(%q): %v", term, err)
+		}
+		if got[i] != one[0] {
+			t.Fatalf("term %q is %d in the %d-term answer and %d on its own", term, got[i], len(terms), one[0])
+		}
+		if one[0] > 0 {
+			carried++
+		}
+	}
+	if carried == 0 {
+		t.Fatalf("every one of the %d terms answered zero; the agreement above proves nothing", len(terms))
+	}
+}
+
 // occurrenceStream is the contract both the packed and the live stream answer;
 // the test drains either through it so one comparison covers both.
 type occurrenceStream interface {
