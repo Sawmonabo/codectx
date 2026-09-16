@@ -1011,6 +1011,45 @@ func (w *retainedWalk) applyFrontier(file *retainFile) error {
 	return w.frontier.sync()
 }
 
+// committed reports whether this level's TRANSITION has already run: the
+// admitted file is written once, last, by writeAdmitted, so its existence is
+// the committed decision of the level.
+func (w *retainedWalk) committed(level int) (bool, error) {
+	_, err := os.Stat(openRetainFile(w.home, levelFileName(admittedLevelPrefix, level)).path())
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, internalErr("graph: the admitted level: " + err.Error())
+}
+
+// alignFrontier restores the invariant every served level depends on: while
+// level is being served, the frontier bitset is THAT level's admitted set --
+// which is what closeGroup charges the visited budget from and what the next
+// level's scan applies the direction rule against.
+//
+// The bitset is rebuilt in place at every transition, so a leg that resumes
+// into a level whose SUCCESSOR has since committed finds the successor's
+// admissions there instead. Nothing else can disturb it: levels commit in
+// order, so the frontier is this level's unless admitted.<level+1> exists, and
+// the rebuild is skipped whenever it does not.
+func (w *retainedWalk) alignFrontier(level int) error {
+	stale, err := w.committed(level + 1)
+	if err != nil || !stale {
+		return err
+	}
+	file := openRetainFile(w.home, levelFileName(admittedLevelPrefix, level))
+	if err := w.frontier.clear(); err != nil {
+		return err
+	}
+	if err := w.applyAdmitted(file, w.frontier); err != nil {
+		return err
+	}
+	return w.frontier.sync()
+}
+
 // hasFrontier reports whether the level admitted anything. An empty level is
 // an exhausted walk: nothing it could expand was admitted.
 func (w *retainedWalk) hasFrontier(level int) (bool, error) {
