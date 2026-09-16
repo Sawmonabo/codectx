@@ -128,6 +128,19 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 // Coordinator is the index coordinator over this workspace.
 func (w *Workspace) Coordinator() *index.Coordinator { return w.coord }
 
+// Spans registers fn to be called with every stage of this workspace's run as
+// it finishes. It is how a command prints progressive lines and how the MCP
+// server reports progress, and it is the ONLY way to reach the composed run
+// ledger's stream: a caller that opened its own ledger would be a second
+// writer on a file whose whole design rests on there being one, and would
+// contend with the run it is reporting on.
+//
+// fn runs on a goroutine of the workspace's own, fed by a bounded queue the
+// collector never waits on, so a slow subscriber costs rows and never paces
+// the run being measured. A workspace that composed no ledger -- a report
+// holds no lock and records nothing -- registers nothing and calls fn never.
+func (w *Workspace) Spans(fn func(model.StageRecord)) { w.s.spans.subscribe(fn) }
+
 // Resolver is the managed-toolchain resolver this workspace resolves analyzers
 // through, and ToolStore is the store it reads. A report renders them; nothing
 // else reaches for a tool outside a provider.

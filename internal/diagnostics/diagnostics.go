@@ -115,8 +115,10 @@ type WorkspaceProber interface {
 }
 
 // RunLedger is the read surface the resource block needs from the run ledger:
-// the latest run recorded for this repository and one page of its stages, as
-// the model carries them.
+// the latest run recorded for this repository, one page of its stages as the
+// model carries them, and whether the run holds more stages than that page --
+// a page that dropped rows must say so, or a partial account of a run reads as
+// the whole of it.
 //
 // It is stated here as a narrow interface for the same reason StoreReader is:
 // this package must not import the ledger any more than it imports the store,
@@ -124,7 +126,7 @@ type WorkspaceProber interface {
 // answer for a workspace that has recorded no run, which is what a reader of a
 // cache built before anything was instrumented sees.
 type RunLedger interface {
-	LatestRun(ctx context.Context, repo model.RepositoryID, generation model.GenerationID) (*model.RunRecord, []model.StageRecord, error)
+	LatestRun(ctx context.Context, repo model.RepositoryID, generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error)
 }
 
 // Options are the dependencies of a Service. Every field is required except

@@ -75,7 +75,7 @@ func TestRunningStageNeverRendersLikeAFinishedOne(t *testing.T) {
 func TestTableAndJSONReportTheSameRows(t *testing.T) {
 	run, stages := ledgerFixture()
 	var b strings.Builder
-	writeRunLedger(&b, run, stages)
+	writeRunLedger(&b, run, stages, 0)
 	table := b.String()
 
 	raw, err := json.Marshal(struct {
@@ -171,5 +171,65 @@ func TestFollowEmitsOneWholeEnvelopePerInterval(t *testing.T) {
 		if !env.OK || env.Command != "status" || env.Data.Index.Binding.GenerationID != 7 {
 			t.Fatalf("envelope %d is not a whole snapshot: %+v", i, env)
 		}
+	}
+}
+
+// TestTruncatedStagesPageSaysHowManyItDropped guards the invariant a bounded
+// response rests on: a page that dropped rows never presents itself as the
+// whole list. A run records one span per stage and one per unit, so a large
+// repository's run outruns the per-result ceiling; an operator reading the
+// shares and the costliest stage off a silently short table would be reading a
+// list that is missing rows and could not tell.
+//
+// Both human surfaces are checked -- the status table and the index completion
+// block -- against the same number the envelope carries, because a count that
+// reached --json alone would leave the operator reading the terminal with the
+// defect this closes.
+//
+// Mutation: drop the omitted count at the truncation site (return 0 from
+// Reader.spans, or stop passing it into the two renderers).
+func TestTruncatedStagesPageSaysHowManyItDropped(t *testing.T) {
+	run, stages := ledgerFixture()
+	const omitted = 417
+
+	var table strings.Builder
+	writeRunLedger(&table, run, stages, omitted)
+	var completion strings.Builder
+	writeIndexRunLedger(&completion, run, stages, omitted)
+
+	for surface, rendered := range map[string]string{
+		"the status table":           table.String(),
+		"the index completion block": completion.String(),
+	} {
+		if !strings.Contains(rendered, "417") {
+			t.Fatalf("%s dropped %d stages and does not say how many:\n%s", surface, omitted, rendered)
+		}
+		if !strings.Contains(rendered, "omitted") {
+			t.Fatalf("%s names the number %d without saying it is stages it left out:\n%s",
+				surface, omitted, rendered)
+		}
+	}
+
+	// The same figure on the machine surface, read back off the wire rather
+	// than off the value that was rendered.
+	raw, err := json.Marshal(model.ResourceReport{Run: run, Stages: stages, StagesOmitted: omitted})
+	if err != nil {
+		t.Fatalf("marshal the report: %v", err)
+	}
+	var decoded model.ResourceReport
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode the report: %v", err)
+	}
+	if decoded.StagesOmitted != omitted {
+		t.Fatalf("--json reports %d omitted stages, the table was given %d",
+			decoded.StagesOmitted, omitted)
+	}
+
+	// A full page that dropped nothing says nothing, so "omitted" in the
+	// output always means rows are actually missing.
+	var whole strings.Builder
+	writeRunLedger(&whole, run, stages, 0)
+	if strings.Contains(whole.String(), "omitted") {
+		t.Fatalf("a page that dropped nothing claims it omitted stages:\n%s", whole.String())
 	}
 }

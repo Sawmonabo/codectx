@@ -118,7 +118,12 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 				Context: svc,
 				Config:  cfg,
 				Build:   build,
-				Logger:  log,
+				// The server reports progress and logs stages from the one run
+				// ledger this workspace composed. It never opens a ledger of
+				// its own: the file has a single writer, and a second one would
+				// contend with the very run these notifications describe.
+				Spans:  ws.Spans,
+				Logger: log,
 			})
 			if err != nil {
 				return err
