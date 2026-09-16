@@ -568,10 +568,12 @@ type containerCounts struct{ files, symbols, bytes int64 }
 // hydrated in batches, never one node at a time, and the whole page shares one
 // cumulative edge budget.
 //
-// A container tree that outruns that budget REFUSES with CTX_RESOURCE_LIMIT.
-// Nothing here can be reported instead: the counts already accumulated are
-// short by an unknown amount, and a page flag naming no container would leave
-// every number on it indistinguishable from a measured one.
+// A container whose children the budget could not be counted within is OMITTED
+// from the map this returns, and the page is marked truncated with a notice
+// naming the bound. Reporting its short totals is what is refused: the counts
+// accumulated for it are under by an unknown amount and would read as the
+// shape of a small container, while an omitted container is a missing
+// measurement the caller can see and page past.
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts,
 	map[model.NodeID]bool, error) {

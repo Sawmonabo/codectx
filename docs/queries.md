@@ -513,9 +513,11 @@ container are its canonical qualified name with any quoting the provider spelled
 the scope with removed, and `name` also drops the trailing separator: a Go
 package that is stored as a backquoted, slash-terminated scope is reported as
 `github.com/owner/repo/internal/x`, not as the scope string. A container whose
-children could not be counted inside the query's edge budget is **refused** with
-`CTX_RESOURCE_LIMIT` rather than reported with short totals — an under-counted
-package reads as the repository's shape, not as an incomplete answer.
+children could not be counted inside the query's edge budget is **omitted** from
+the page, which is marked truncated and carries a notice naming
+`max_graph_edges`, rather than reported with short totals — an under-counted
+package reads as the repository's shape, while a missing one is visible as the
+incomplete answer it is.
 
 The repository is named either as a positional path — the Section 18.1 spelling
 — or with `--repo`. Naming it both ways is **refused** rather than resolved to
