@@ -183,12 +183,14 @@ type scored struct {
 // qualified_name_prefix that range-scans a corpus-sized slice of node_ids
 // costs disk in this fold and one page of stored nodes upstream.
 //
-// TWO PASSES ARE NECESSARY, not a shortcut. fold sets ScoreMicros = max(a, b)
-// and score is cmpScored's second key, so a fold MOVES its survivor's rank: two
-// records with one deduplication key can sit arbitrarily far apart in rank
-// order and folding equal-ranked neighbours would be wrong. Pass 1 sorts by
-// the deduplication key and folds; pass 2 sorts the folded stream by rank with
-// no fold.
+// THE FOLD CANNOT BE A RANKING PASS, and this one is not a shortcut around
+// that. fold sets ScoreMicros = max(a, b) and score is cmpScored's second key,
+// so a fold MOVES its survivor's rank: two records with one deduplication key
+// can sit arbitrarily far apart in rank order and folding equal-ranked
+// neighbours would be wrong. This pass therefore sorts by the deduplication
+// key and folds, and nothing here orders by rank -- the page that is served
+// takes its order from the bounded heap, and the remainder from the one
+// ranking sort a continuation runs (deduped, below).
 type collector struct {
 	dir       string
 	runBytes  int64

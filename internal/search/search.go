@@ -607,26 +607,25 @@ func (s *Service) releaseLease(ctx context.Context, id string) {
 	}
 }
 
-// hitFacts is everything about one candidate that the bounded ranking struct
-// deliberately does not carry: the hit as it will be served, and the byte
-// interval its source range is hydrated from. It is recorded once per distinct
-// deduplication key, so it costs one entry per distinct result rather than one
-// per candidate.
+// hitFacts groups the servable facts of one candidate for the collector's add:
+// the hit as it will be served, and the byte interval its source range is
+// hydrated from. They travel on the candidate itself, so this is an argument
+// group and nothing holds one.
 type hitFacts struct {
 	hit  model.SearchHit
 	span *model.ByteRange
 }
 
-// rank runs every tier for one request, folds the candidates and returns the
-// whole ranked answer with its source ranges hydrated.
+// rank runs every tier for one request and folds the candidates into the
+// distinct set, which it answers as a disk-backed sorted run in
+// deduplication-key order together with the answer-level truncation.
 //
-// The whole answer is hydrated, not just the first page, because every hit
-// that is not served now is spooled and will be served by a continuation that
-// has no byte intervals left to hydrate from -- a spool record is a SearchHit.
-// Hydration is therefore paid once per distinct result, but never for the
-// whole answer at once: it is paid ONE CHUNK AT A TIME, in pageFrom for the
-// page that is served and in tailOf for the remainder as it streams into the
-// continuation spool.
+// It neither ranks nor hydrates. Rank order is settled downstream, by the
+// bounded page heap for the page that is served and by one external sort over
+// the raw spool on the first continuation. Hydration is paid ONE PAGE AT A
+// TIME by whichever request serves that page, out of the byte interval each
+// record carries with it -- a spool record is a scored candidate, span
+// included, so a continuation hydrates its own page from the same facts.
 func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest, filter hitFilter) (*pagination.SortedRun[scored], bool, string, error) {
 	c, err := newCollector(s.spools.SortDir(), s.runBytes)
 	if err != nil {
