@@ -230,14 +230,14 @@ definition cap makes rare.
 
 ## Memory
 
-There is **no default memory ceiling**. A reservation orders and serializes
-work; it never refuses it.
+There is **no memory ceiling**. A reservation orders work; it never refuses
+it.
 
 ```text
 reservation = heap cap + per-family resident allowance + helper allowance
 heap cap    = clamp(unit_memory_floor_bytes,
                     unit source bytes x per-family estimate,
-                    machine-derived allocation, unit_memory_ceiling_bytes)
+                    machine-derived allocation)
 allocation  = min(MemAvailable - base footprint - safety margin,
                   MemAvailable / 2)
 ```
@@ -282,12 +282,14 @@ allocation  = min(MemAvailable - base footprint - safety margin,
   the store reports as one. While the child writes it, the runner hands the
   export to the disk one window at a time, so it reaches the disk as it is
   written rather than as one burst when the kernel's flusher wakes.
-* `unit_memory_ceiling_bytes = 0` means machine-derived. Only an explicit
-  non-zero value rejects a unit before it runs.
+* Nothing rejects a unit for the memory it asks for. There is no setting that
+  can, and the machine-derived allocation only sizes the cap.
 * On a host that does not publish available memory, the allocation is reported
-  as unavailable, not as zero: the unit's own estimate stands and only an
-  explicit ceiling bounds it. Inventing a bound there would be a default
-  memory ceiling by another name.
+  as unavailable, not as zero: the unit's own estimate stands as its cap.
+  Inventing a bound there would be a default memory ceiling by another name.
+  Admission still has a finite bound on such a host — the scheduler stands in a
+  conservative allocation for the observation the platform withheld — because a
+  gate with no bound is not a gate.
 * Out of memory is retried **exactly once**, at the machine-derived
   allocation, and only when more memory is actually available: the allocation
   must exceed the cap that failed, **and** the analyzer tree's observed peak on
@@ -296,9 +298,10 @@ allocation  = min(MemAvailable - base footprint - safety margin,
   succeeded. Where the platform does not sample the tree peak, only the first
   condition applies; an unsampled peak is absent, never zero.
 * Units are never split for memory and no analysis limit is ever lowered to
-  make one fit. `max_concurrent_heavy_analyzers` (default 1) and the summed
-  reservations are the coordinator's scheduling inputs; the provider exposes
-  the reservation and runs what it is given.
+  make one fit. The summed reservations against the machine-derived allocation
+  are the whole of the coordinator's scheduling input — there is no count of
+  analyzers — and the provider exposes the reservation and runs what it is
+  given.
 * What each unit was reserved, capped and observed to peak at is disclosed
   per unit in the `status --resources` accounting block. It is process
   accounting rather than a capability detail: an observed peak differs on

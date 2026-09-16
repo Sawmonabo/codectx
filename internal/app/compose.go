@@ -99,24 +99,24 @@ const parserWorkerReservationBytes int64 = 256 << 20
 // batch is a decision, not a default.
 const collectorBatchLimit = 200
 
-// sharedRunnerHeadroom is how many children beyond the heavy-analyzer budget
-// the shared runner admits: Git plumbing and a SCIP indexer run alongside a
-// heavy analyzer, and at `max_concurrent_heavy_analyzers = 1` a single shared
-// slot would let one graph engine run starve every Git command for the length
-// of a whole unit. The tree-sitter workers and the language servers do not
-// count here at all: each has its own runner for the same reason (ledger 111,
-// 126).
-const sharedRunnerHeadroom = 2
+// smallestChildReservationBytes is the smallest memory reservation any child
+// of a runner presents. It exists only to turn the runner's byte budget into
+// the concurrency count process.Limits also wants: the most children that
+// could ever fit an allocation is that allocation divided by this, so the
+// derived count is the byte bound restated and can never be what refuses a
+// child. It is deliberately below every real reservation -- the smallest heap
+// cap a heavy analyzer is given -- so the division over-counts rather than
+// under-counts.
+const smallestChildReservationBytes int64 = 768 << 20
 
-// unobservedChildMemoryBudget is the shared runner's memory budget on a host
-// that does not report available memory. It is not a ceiling on a child: the
-// runner's budget is admission accounting, and a reservation larger than it is
-// refused before the process starts. It is sized above the largest fixed
-// reservation the pinned analyzer profiles issue, so on an unmeasurable host
-// every profile can still start; where the host does report memory, the
-// machine-derived allocation replaces it and a run larger than the machine is
-// refused, which is the Section 23.3 admission discipline.
-const unobservedChildMemoryBudget int64 = 8 << 30
+// childSlots is that division: how many children of the smallest possible size
+// fit the budget, never below one.
+func childSlots(budget int64) int {
+	if n := budget / smallestChildReservationBytes; n > 1 {
+		return int(n)
+	}
+	return 1
+}
 
 // openMode selects what the composition takes and what it may write.
 type openMode uint8
@@ -189,7 +189,7 @@ type stack struct {
 	// name. It is built once per stack rather than per request so every cursor
 	// in the process retains its generation for the same configured window.
 	leases *pagination.Leases
-	// gate is the process-scoped max_concurrent_graph_queries semaphore. One
+	// gate is the process-scoped traversal semaphore, sized from the cores. One
 	// graph engine is built per request, so the bound cannot live on the engine.
 	gate *graphGate
 	// repo, search and coverage are set by openQueries once the coordinator has
@@ -370,48 +370,29 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
-	s.gate = newGraphGate(cfg.Resources.MaxConcurrentGraphQueries)
+	s.gate = newGraphGate()
 
-	// The analyzer runners are budgeted from what their children reserve, not
-	// from resources.base_memory_budget_bytes: that setting budgets this
-	// process's own footprint. Using it as a runner budget refused every
-	// language server and every graph-engine run at admission, before the
-	// process existed, because one server reserves several times the whole base
-	// budget (measured on this repository; the lane report carries the output).
-	//
-	// It is read here instead as what it actually is, and this is its first
-	// runtime reader: the machine-derived allocation subtracts THIS process's
-	// footprint from available memory before handing the rest to children, and
-	// resources.base_memory_budget_bytes is the configured size of exactly that
-	// footprint. Passing the constant instead would budget children against a
-	// figure the operator cannot change while validation goes on checking their
-	// reservations against the one they can.
-	baseFootprint := cfg.Resources.BaseMemoryBudgetBytes
-	if baseFootprint <= 0 {
-		// Validation refuses a non-positive value, so this guards a Config
-		// built in code rather than loaded. A zero footprint would hand the
-		// whole machine to children.
-		baseFootprint = dependence.DefaultBaseFootprintBytes
-	}
-	childMemory := dependence.ObserveMachine().Allocation(
-		baseFootprint, dependence.DefaultSafetyMarginBytes)
-	if childMemory <= 0 {
-		childMemory = unobservedChildMemoryBudget
-	}
+	// One observation of the machine, one allocation, and every heavy child of
+	// this process -- graph engine runs, SCIP indexers, language servers --
+	// admitted against it by the sum of what they reserve. Nothing here is a
+	// count of children and nothing is configurable: the allocation is
+	// available memory less this process's own footprint and the safety
+	// margin, never more than the share of the machine the product takes.
+	childMemory := dependence.ObserveMachine().SchedulingAllocation()
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its
 	// unlimited default of 0: the runner reads a non-positive disk budget as
 	// unlimited and admits every reservation, so the default never refuses a
 	// child at admission. Only a value the operator set refuses one, and it
 	// says so with resources.max_temp_bytes named in the error.
 	shared, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     maxInt(1, cfg.Resources.MaxConcurrentHeavy) + sharedRunnerHeadroom,
+		MaxConcurrent:     childSlots(childMemory),
 		MemoryBudgetBytes: childMemory,
 		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
 	})
 	if err != nil {
 		return nil, err
 	}
-	parserWorkers := maxInt(1, cfg.Index.MaxParserWorkers)
+	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
 		MemoryBudgetBytes: int64(parserWorkers) * parserWorkerReservationBytes,
@@ -420,19 +401,23 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
-	// A language server's reservation is a property of the pinned definition,
-	// so the server runner is budgeted from the definitions themselves rather
-	// than from a number here that would drift the moment one is re-pinned.
-	maxServers := maxInt(1, cfg.Providers.LSP.MaxServers)
+	// Language servers are admitted against the same allocation as every other
+	// heavy child; the manager is the gate that decides which ones run, and it
+	// can stop an idle server to make room, which a runner cannot. The runner's
+	// own budget therefore only has to be wide enough never to refuse a server
+	// the manager admitted: the allocation, or one largest pinned definition
+	// where the allocation is smaller than that, since a server larger than the
+	// whole allocation runs alone rather than not at all.
 	var serverMemory, serverDisk int64
 	for _, def := range lsp.Definitions() {
 		serverMemory = maxInt64(serverMemory, def.MemoryBudgetBytes)
 		serverDisk = maxInt64(serverDisk, def.DiskBudgetBytes)
 	}
+	serverBudget := maxInt64(childMemory, serverMemory)
 	servers, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     maxServers,
-		MemoryBudgetBytes: int64(maxServers) * serverMemory,
-		DiskBudgetBytes:   int64(maxServers) * serverDisk,
+		MaxConcurrent:     childSlots(serverBudget),
+		MemoryBudgetBytes: serverBudget,
+		DiskBudgetBytes:   int64(childSlots(serverBudget)) * serverDisk,
 	})
 	if err != nil {
 		return nil, err
@@ -476,7 +461,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Languages:           cfg.Providers.TreeSitter.Languages,
 		MaxWorkers:          parserWorkers,
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
 		MaxEvidencePerFact:  evidenceClip(cfg),
@@ -532,9 +516,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.lsp, err = lsp.New(lsp.Options{
 		Runner:                 servers,
 		DataDir:                s.dataDir,
-		MaxServers:             maxServers,
+		AllocationBytes:        childMemory,
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
-		RequestTimeout:         cfg.Providers.LSP.RequestTimeout.Std(),
+		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
 		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
 	}); err != nil {
@@ -664,18 +648,17 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 		if backend, err = joern.New(ctx, locator, runner); err == nil {
 			var p *dependence.Provider
 			p, err = dependence.New(backend, dependence.Options{
-				DataDir:                s.dataDir,
-				Timeout:                s.cfg.Providers.Dependence.Timeout.Std(),
-				StallTimeout:           s.cfg.Providers.Dependence.StallTimeout.Std(),
-				CacheBytes:             s.cfg.Providers.Dependence.CacheBytes,
-				UnitMemoryFloorBytes:   s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
-				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,
-				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily,
-				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
-				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
-				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
-				StagingCacheKiB:        s.cfg.Providers.Dependence.StagingCacheKiB,
-				MaxEvidencePerFact:     evidenceClip(s.cfg),
+				DataDir:              s.dataDir,
+				Timeout:              s.cfg.Providers.Dependence.Timeout.Std(),
+				StallTimeout:         s.cfg.Providers.Dependence.StallTimeout.Std(),
+				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
+				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
+				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
+				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
+				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,
+				MaxExportFiles:       s.cfg.Providers.Dependence.MaxExportFiles,
+				StagingCacheKiB:      s.cfg.Providers.Dependence.StagingCacheKiB,
+				MaxEvidencePerFact:   evidenceClip(s.cfg),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
@@ -1216,13 +1199,6 @@ func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, str
 	// The reported path is the resolver's own, so the report can never name a
 	// store other than the one it read.
 	return res, res.StoreDir(), nil
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func maxInt64(a, b int64) int64 {

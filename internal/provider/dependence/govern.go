@@ -3,10 +3,10 @@ package dependence
 // Memory governance for one unit (Section 11.6, ruling of
 // docs/research/00-synthesis.md Section 8).
 //
-// There is no default memory ceiling. A reservation is a scheduling input,
-// not a refusal: the coordinator uses it to order units and to decide whether
-// a second heavy analyzer fits, and only an explicit non-zero user
-// `unit_memory_ceiling_bytes` ever rejects a unit before it runs. Splitting a
+// There is no memory ceiling at all. A reservation is a scheduling input and
+// never a refusal: the scheduler sums it against the one machine-derived
+// allocation to decide when a unit runs, and nothing rejects a unit before it
+// runs for the memory it asks for. Splitting a
 // unit for memory is never done — it costs more than half of the resolved
 // calls on a project that is split (research Section 8) — and no analysis
 // limit is ever lowered to make a unit fit.
@@ -23,7 +23,7 @@ package dependence
 import (
 	"strconv"
 
-	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/config"
 )
 
 const (
@@ -37,15 +37,20 @@ const (
 // `providers.dependence.unit_memory_floor_bytes`.
 const DefaultUnitMemoryFloorBytes int64 = 768 * miB
 
-// DefaultBaseFootprintBytes is what the machine-derived allocation subtracts
-// for this process and its base index before handing the rest to an analyzer,
-// and DefaultSafetyMarginBytes is the headroom left for transient allocation
-// and RSS variation (Section 23.3: degrade concurrency before coverage, and
+// DefaultSafetyMarginBytes is the headroom the machine-derived allocation
+// leaves for transient allocation and resident-set variation on top of
+// config.BaseFootprintBytes, which is the one figure for what this process
+// keeps for itself (Section 23.3: degrade concurrency before coverage, and
 // leave headroom rather than allocate to the last byte).
-const (
-	DefaultBaseFootprintBytes int64 = 1 * giB
-	DefaultSafetyMarginBytes  int64 = 1 * giB
-)
+const DefaultSafetyMarginBytes int64 = 1 * giB
+
+// UnobservedAllocationBytes is the allocation used on a host that does not
+// expose available memory. It is not a memory ceiling on the work: it is the
+// finite bound every queue and process admission must have, standing in for
+// the observation the platform withheld. Without it a host with no /proc
+// equivalent would admit every child at once, which is the one outcome worse
+// than a conservative allocation.
+const UnobservedAllocationBytes int64 = 8 * giB
 
 // hostShareDenominator is the second bound on the allocation: whatever the
 // machine had available when the run began, the allocation is at most that
@@ -120,9 +125,9 @@ const (
 
 // Reservation is what one unit must be admitted against. Parse and export
 // never run at the same time, so Bytes is the peak of the two rather than
-// their sum; the coordinator serializes heavy analyzers on it
-// (`max_concurrent_heavy_analyzers`, 1 by default) and co-schedules a second
-// only when the summed reservations fit the allocation.
+// their sum; the scheduler admits a unit when the summed reservations of
+// everything already running plus this one fit the machine-derived
+// allocation, and there is no count beside that sum.
 type Reservation struct {
 	Family Family
 	// HeapCapBytes is the cap placed on the frontend heap for the parse step,
@@ -178,32 +183,41 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 	return alloc
 }
 
+// SchedulingAllocation is the one allocation every heavy child of this process
+// is admitted against: the machine-derived allocation, or
+// UnobservedAllocationBytes where the platform does not expose available
+// memory. It is always positive, so admission is always bounded by a sum of
+// reservations and never by a count of children.
+func (m Machine) SchedulingAllocation() int64 {
+	if alloc := m.Allocation(config.BaseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
+		return alloc
+	}
+	return UnobservedAllocationBytes
+}
+
 // Governor sizes reservations. It holds no state and reads nothing: the
 // machine observation is a parameter, so the sizing is a pure function a test
 // can drive across hosts it does not have.
 type Governor struct {
 	FloorBytes    int64
-	CeilingBytes  int64
 	BaseFootprint int64
 	SafetyMargin  int64
 }
 
-// NewGovernor applies the defaults for any bound the caller left at zero.
-// A zero ceiling is not a default: it is the documented value that means
-// machine-derived.
-func NewGovernor(floorBytes, ceilingBytes int64) Governor {
+// NewGovernor applies the default floor when the caller left it at zero.
+func NewGovernor(floorBytes int64) Governor {
 	if floorBytes <= 0 {
 		floorBytes = DefaultUnitMemoryFloorBytes
 	}
-	return Governor{FloorBytes: floorBytes, CeilingBytes: ceilingBytes,
-		BaseFootprint: DefaultBaseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
+	return Governor{FloorBytes: floorBytes,
+		BaseFootprint: config.BaseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
 }
 
 // Reserve sizes the reservation of a unit of sourceBytes bytes on machine m.
 // The heap cap is the family's estimate from the unit's byte count, never
 // below the floor, and bounded above by the machine-derived allocation when
-// one could be observed. An explicit non-zero ceiling bounds it too, and is
-// the only value that can reject the unit outright (Reject).
+// one could be observed. Nothing here can reject the unit: a cap that is
+// narrower than the estimate costs the unit time, never its facts.
 func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
 		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
@@ -216,9 +230,6 @@ func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	if r.AllocationBytes > 0 && cap > r.AllocationBytes {
 		cap = r.AllocationBytes
 	}
-	if g.CeilingBytes > 0 && cap > g.CeilingBytes {
-		cap = g.CeilingBytes
-	}
 	if cap < g.FloorBytes {
 		cap = g.FloorBytes
 	}
@@ -230,22 +241,6 @@ func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 		r.ExportHeapCapBytes = cap
 	}
 	return r
-}
-
-// Reject reports the typed refusal for a unit whose reservation does not fit
-// an explicit user ceiling, or nil when the unit may run. A machine-derived
-// allocation never rejects: it bounds the cap and the unit runs, because the
-// alternative is refusing work the user never asked to have refused.
-func (g Governor) Reject(r Reservation, scopeKey string) error {
-	if g.CeilingBytes <= 0 || r.ParseBytes() <= g.CeilingBytes {
-		return nil
-	}
-	return resourceLimit("the dependence unit reserves more memory than providers.dependence.unit_memory_ceiling_bytes allows").
-		WithDetail("scope_key", truncate(scopeKey, model.MaxIdentifierBytes)).
-		WithDetail("reservation_bytes", itoa(r.ParseBytes())).
-		WithDetail("ceiling_bytes", itoa(g.CeilingBytes)).
-		WithDetail("limit", "unit_memory_ceiling_bytes").
-		WithRemediation("raise or clear providers.dependence.unit_memory_ceiling_bytes; 0 means the allocation is derived from the machine")
 }
 
 // RetryCap is the cap an out-of-memory unit is retried at, or zero when no
@@ -270,9 +265,6 @@ func (g Governor) RetryCap(r Reservation, peakBytes int64) int64 {
 		return 0
 	}
 	cap := r.AllocationBytes
-	if g.CeilingBytes > 0 && cap > g.CeilingBytes {
-		cap = g.CeilingBytes
-	}
 	if cap <= r.HeapCapBytes {
 		return 0
 	}
