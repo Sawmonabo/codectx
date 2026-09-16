@@ -183,10 +183,21 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		case levelServing:
 			// The sorted run this leg serves out of.
 			o.Retain.hold(levelFileName(sortedLevelPrefix, c.Level))
+			if err := o.Retain.alignFrontier(c.Level); err != nil {
+				return walkState{}, err
+			}
 		case levelCollecting:
-			// The run collected so far, and the frontier the scan reads.
+			// The run collected so far, and the frontier the scan reads -- and
+			// the sorted run of this level, which exists only if this cursor
+			// has been presented before and its transition committed. A page
+			// that committed it and then failed retryably sends the caller
+			// back to THIS cursor, and collect below serves that run rather
+			// than collecting the level again; a walk that had released it
+			// would answer CTX_STORAGE_CORRUPT. Where the transition has not
+			// run, the name holds nothing and releaseHeld removes nothing.
 			o.Retain.hold(levelFileName(rawLevelPrefix, c.Level))
 			o.Retain.hold(levelFileName(admittedLevelPrefix, c.Level-1))
+			o.Retain.hold(levelFileName(sortedLevelPrefix, c.Level))
 		}
 	}
 	return w.run(ctx, st)
@@ -281,6 +292,27 @@ func (w *levelWalk) seed(ctx context.Context, seeds []model.NodeID) error {
 // transition. It reports whether the walk stops here.
 func (w *levelWalk) collect(ctx context.Context, st *walkState) (bool, error) {
 	o := w.o
+	// A cursor re-presented after its transition COMMITTED must not collect
+	// the level again. The transition applied this level's admissions to the
+	// visited bits, so a second scan of the same frontier drops every entry
+	// the first one kept -- the direction rule reads those bits -- and
+	// finish() would rewrite sorted.<level> strictly smaller while
+	// writeAdmitted reused the admitted file, leaving the frontier and the
+	// counts untouched: relations would vanish from a page that reports itself
+	// complete. An existing admitted.<level> IS that commit, so this leg picks
+	// the level up where the transition left it, at the head of its sorted
+	// run.
+	committed, err := o.Retain.committed(st.Level)
+	if err != nil {
+		return false, err
+	}
+	if committed {
+		if err := o.Retain.alignFrontier(st.Level); err != nil {
+			return false, err
+		}
+		st.LevelState, st.LevelPos, st.RawBytes, st.LevelOffset = levelServing, EdgePos{}, 0, 0
+		return false, nil
+	}
 	// The frontier this level expands is the level before it. An empty one is
 	// an exhausted walk: nothing admitted anything to expand.
 	live, err := o.Retain.hasFrontier(st.Level - 1)
