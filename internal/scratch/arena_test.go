@@ -6,17 +6,19 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // newArena is an arena over root that is NOT the process-wide one, so a test
 // can hold two at once and watch them claim different instances.
 func newArena(root string) *Arena {
 	return &Arena{
-		root:  filepath.Join(root, dirName),
-		free:  map[Purpose][]string{},
-		held:  map[string]bool{},
-		next:  map[Purpose]int{},
-		swept: map[Purpose]bool{},
+		root:   filepath.Join(root, dirName),
+		served: root,
+		free:   map[Purpose][]string{},
+		held:   map[string]bool{},
+		next:   map[Purpose]int{},
+		swept:  map[Purpose]bool{},
 	}
 }
 
@@ -185,4 +187,102 @@ func TestTwoLiveProcessesNeverSharePooledFiles(t *testing.T) {
 		t.Fatalf("a new process took %s and left the exited process's %s behind: an abandoned pool accumulates", c.Path(), path)
 	}
 	c.Release()
+}
+
+// The requirement: space a run removed and did not live to give back is not
+// lost. A removal renames its file into the arena's to-free set, which is a
+// directory inside the instance this process claims, so a run that crashed or
+// exited between the rename and the free left it named there; claiming that
+// instance is what puts it back in front of the reclaimer, at the same pace as
+// anything else.
+//
+// Mutation: drop the AdoptSet call from claim and what the dead run left is
+// never looked at again -- the file survives every later run of the store.
+func TestWhatADeadRunLeftQueuedIsFreedWhenItsInstanceIsClaimed(t *testing.T) {
+	dir := t.TempDir()
+	// The instance a process died holding, with one removal still queued in
+	// its to-free set under the purpose it was removed for.
+	set := paced.ToFreeDir(filepath.Join(Dir(dir), "0"))
+	queued := filepath.Join(set, string(paced.Materialization))
+	if err := os.MkdirAll(queued, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	left := filepath.Join(queued, "7.99999")
+	if err := os.WriteFile(left, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freed := paced.FreedByPurpose()[paced.Materialization]
+
+	lease, err := For(dir).Take(SortRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	paced.Drain()
+
+	if _, err := os.Lstat(left); !os.IsNotExist(err) {
+		t.Fatalf("the dead run's queued removal survived this run's claim of its instance: %v", err)
+	}
+	if got := paced.FreedByPurpose()[paced.Materialization] - freed; got != 4096 {
+		t.Fatalf("freed %d bytes of what the dead run left; want 4096", got)
+	}
+}
+
+// TestASurfaceThatCannotBeOpenedLeavesThePoolInsteadOfBeingHandedOutForever
+// protects the pool against its own worst failure: a surface that has become
+// unopenable being handed to every taker of its purpose, for the life of the
+// data directory, with no recovery.
+//
+// The pool is a last-in-first-out stack and a taker that fails releases what
+// it was given, so the bad surface goes straight back on top for the next
+// taker. Nothing about that is transient: a blob staging surface left at a
+// read-only mode, an image a crash left mid-write, fail identically every
+// time, and the sweep re-finds the name after a restart. Every seal, every
+// path query, every import of that purpose then fails, and the only way back
+// is removing the directory by hand.
+//
+// The surface must therefore leave the pool AND the disk at the take that
+// cannot open it, so there is no name for the sweep to re-pool either.
+//
+// Mutation: hand the path out without opening it (drop the open from Take)
+// and the second take returns the unusable surface.
+func TestASurfaceThatCannotBeOpenedLeavesThePoolInsteadOfBeingHandedOutForever(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// A privileged process opens a 0400 file for writing, so the surface
+		// never becomes unopenable and the mutation would pass.
+		t.Skip("a process that may override file permissions cannot make a surface unopenable this way")
+	}
+	a := newArena(t.TempDir())
+
+	first, err := a.Take(ContentTemp)
+	if err != nil {
+		t.Fatalf("first take: %v", err)
+	}
+	bad := first.Path()
+	// The shape the content store reaches: a staged blob is set read-only
+	// before it is published, and a publication that fails releases it.
+	if err := os.Chmod(bad, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	for i := range 3 {
+		l, f, err := a.TakeFile(ContentTemp)
+		if err != nil {
+			t.Fatalf("take %d after the unusable surface was released: %v", i+1, err)
+		}
+		if l.Path() == bad {
+			t.Fatalf("take %d was handed %s again: the surface that could not be opened is back on the pool",
+				i+1, filepath.Base(bad))
+		}
+		if _, err := f.Write([]byte("x")); err != nil {
+			t.Fatalf("take %d handed out a surface it cannot write: %v", i+1, err)
+		}
+		l.Release()
+	}
+	paced.Drain()
+	if _, err := os.Lstat(bad); !os.IsNotExist(err) {
+		t.Fatalf("the unusable surface is still on the disk as %s: the next sweep pools it again (%v)",
+			filepath.Base(bad), err)
+	}
 }

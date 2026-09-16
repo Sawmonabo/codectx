@@ -229,12 +229,17 @@ published gives the surface straight back at its length, as do a blob staged
 twice in one group, an abandoned batch and every error path. Only a blob that
 really is published gives up its slot, and then the surface *is* the object —
 the pool keeps its blocks and only the temporary's directory entry goes,
-unpaced, because pacing a removal empties the file first.
+unpaced, because pacing a removal empties the file first. A publication that
+FAILS puts the surface back at the mode the pool hands out: a blob is set
+read-only before it is published, and a surface left at that mode could never
+be opened for writing again.
 
-The pool never truncates, so a surface may carry the tail of a larger blob
-staged into it earlier and a published object is proved by its length. The
-excess is trimmed a window at a time before the object exists, so the only disk
-a capture gives back is the difference between one blob and the largest that
+Nothing truncates a surface to reuse it, so a surface may carry the tail of a
+larger blob staged into it earlier and a published object is proved by its
+length. The excess is trimmed a window at a time before the object exists --
+the one truncation of a pooled surface anywhere in the store -- and it is
+charged to the same freeing budget as every other free, so the only disk a
+capture gives back is the difference between one blob and the largest that
 shared its slot. There is nothing for `Sweep` to remove: a crashed capture's
 unpublished bytes sit in a surface the next run writes over.
 

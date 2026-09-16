@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	arena "github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -933,23 +934,26 @@ func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 // per slot, emptied by dropping its tables so the engine writes over its own
 // free list, frees nothing at all and the file never shrinks.
 //
+// It is also what keeps the largest surface the product writes inside the
+// figure the resources block reports: the staging database is a surface of the
+// shared scratch arena, so a pool of its own would be disk the run holds and
+// never discloses.
+//
 // Mutation that fails it: give each import its own staging database again --
-// take a fresh slot per import and remove the file when the import ends.
+// take a fresh surface per import and remove the file when the import ends.
 func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
-	scratch := t.TempDir()
+	dir := t.TempDir()
+	pool := filepath.Join(arena.Dir(dir), "0", string(arena.ImportStaging))
 	staged := func() []os.DirEntry {
 		t.Helper()
-		entries, err := os.ReadDir(scratch)
+		entries, err := os.ReadDir(pool)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
 			t.Fatalf("scratch: %v", err)
 		}
-		var dbs []os.DirEntry
-		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".db") {
-				dbs = append(dbs, e)
-			}
-		}
-		return dbs
+		return entries
 	}
 	sizeOf := func(e os.DirEntry) int64 {
 		t.Helper()
@@ -960,7 +964,7 @@ func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
 		return info.Size()
 	}
 
-	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: scratch}); err != nil {
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("first import: %v", err)
 	}
 	first := staged()
@@ -972,7 +976,7 @@ func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
 		t.Fatalf("the first import left an empty staging database: nothing was staged in it")
 	}
 
-	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: scratch}); err != nil {
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("second import: %v", err)
 	}
 	second := staged()
@@ -985,5 +989,42 @@ func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
 	}
 	if got := sizeOf(second[0]); got < firstSize {
 		t.Errorf("the staging database shrank from %d to %d bytes: its pages were freed rather than recycled", firstSize, got)
+	}
+}
+
+// TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool protects the pool
+// against the failure that turns it into a trap.
+//
+// The staging database is opened with journalling off, so a crash mid-write
+// leaves an image whose tables cannot be dropped. The surface is taken
+// last-in-first-out, so an import that gave such a surface back would be
+// handed it again by the next import, and the next, for the life of the data
+// directory -- every dependence unit of the workspace failing identically,
+// with no recovery but removing the directory by hand.
+//
+// Mutation: release the surface instead of retiring it (lease.Release in place
+// of lease.Unusable on the failed reset) and the second import fails too.
+func TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool(t *testing.T) {
+	dir := t.TempDir()
+	pool := filepath.Join(arena.Dir(dir), "0", string(arena.ImportStaging))
+	if err := os.MkdirAll(pool, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What a crash mid-write leaves: a file in the pool that is not a readable
+	// database. The import that takes it cannot empty it.
+	poisoned := filepath.Join(pool, "0")
+	if err := os.WriteFile(poisoned, bytes.Repeat([]byte("not a database"), 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src, export := filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c")
+	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err == nil {
+		t.Fatal("the import staged into a file that is not a database and reported success")
+	}
+	if _, err := os.Stat(poisoned); !os.IsNotExist(err) {
+		t.Fatalf("the surface that could not be emptied is still in the pool: %v", err)
+	}
+	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+		t.Fatalf("the next import was handed the same unusable surface: %v", err)
 	}
 }

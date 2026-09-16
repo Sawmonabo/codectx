@@ -492,7 +492,7 @@ never be mis-diffed against a fresh one.
 ## The staging database
 
 The importer stages the whole export in a private SQLite database under
-`<data_dir>/dependence/scratch/`, one file per slot, and derives the unit's
+`<data_dir>/dependence/scratch/`, a pooled surface per import, and derives the unit's
 facts from it by
 ordered query, so a fact is a function of the export's content and never of
 the order its files were read. The staging is written the way a bulk load
@@ -520,27 +520,38 @@ in memory and a larger one spills once to a temporary file under the data
 directory's `tmp/`. [ADR-0009](adr/ADR-0009-import-staging.md) records the
 measurements and the alternatives.
 
-A staging file is created once and reused — the same rule the rest of the
-store follows for every working file it writes for its own later reading (see
-[the scratch pool](storage.md#the-scratch-pool)). An import takes a slot in the
-scratch directory, empties the slot's file by dropping its tables -- which
-returns their pages to the file's own free list, with automatic vacuuming off,
-so the file never shrinks -- and gives the slot back when it ends. Dropping is
-also what makes the schema creation idempotent: each phase of an import creates
-the structures it fills, and a reused file already holds them. A slot rather
-than one fixed path is what keeps this correct whether or not imports through
-one provider overlap: a staging database is opened with an exclusive lock, so
-two concurrent imports must have two files. Nothing removes a staging file
-during a run. Creating and deleting hundreds of megabytes per unit is what the
-run must not do: where the filesystem discards freed blocks and the machine's
-disk is a sparse image, a free of several gigabytes stalls every process on the
-machine about a minute later, unobservably.
+A staging file is created once and reused. It is a surface of the shared
+scratch pool (purpose `import-staging`, see
+[the scratch pool](storage.md#the-scratch-pool)) rather than a pool of this
+provider's own: it is the largest single file the product writes, so a pool
+nobody else knew about was disk the run held and never disclosed, missing from
+`scratch_bytes` and out of reach of `codectx gc`.
+
+An import takes a surface, empties it by dropping its tables -- which returns
+their pages to the file's own free list, with automatic vacuuming off, so the
+file never shrinks -- and gives it back when it ends. Dropping is also what
+makes the schema creation idempotent: each phase of an import creates the
+structures it fills, and a reused file already holds them. A pooled surface
+rather than one fixed path is what keeps this correct whether or not imports
+through one provider overlap: a staging database is opened with an exclusive
+lock, so two concurrent imports must have two files. An import whose staging
+cannot be emptied -- an image a crash left mid-write -- retires that surface
+instead of giving it back, because handing it to the next import would fail
+every import of the workspace identically.
+
+Nothing removes a staging file during a run, and the sweep below leaves the
+pool alone: its instances are claimed with a lock, so the surface a killed run
+held is taken over by the next run rather than swept. Creating and deleting
+hundreds of megabytes per unit is what the run must not do: where the
+filesystem discards freed blocks and the machine's disk is a sparse image, a
+free of several gigabytes stalls every process on the machine about a minute
+later, unobservably.
 
 ## Privacy and cleanup
 
 Materializations, graphs not selected for the cache and exports are removed on
 every termination path; the importer's staging files are emptied and reused
-instead, and only the sweep below removes them.
+instead, and nothing removes them but `codectx gc`.
 
 Those three are removed rather than pooled, and the reason is the content, not
 the disk. An export and a graph are written by the engine, which chooses their
@@ -550,9 +561,10 @@ materialization is this unit's own files: copying the whole snapshot and
 pruning "spent the time and the disk of every sibling project, and left another
 unit's source inside this unit's private tree", so one tree shared between units
 reinstates exactly that, and an analyzer writes into the tree it was given. What
-those removals cost is volume rather than a burst — every one of them is
-windowed, a sync per step — and each is accounted in the resources block's
-`freed_by_purpose` as `analyzer-output` or `materialization`. All of them
+those removals cost is volume rather than a burst: each is renamed aside and
+returns at once, and the process's one reclaimer gives the space back a window
+at a time off the run's path, accounted in the resources block's
+`freed_by_purpose` as `analyzer-output` or `materialization` as it goes. All of them
 live under the provider's own private roots — `<data_dir>/dependence/runs/` for
 the per-run directories and `<data_dir>/dependence/scratch/` for the staging
 databases — never under the system temp directory: the staging database holds

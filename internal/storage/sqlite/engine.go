@@ -85,6 +85,12 @@ func itoa(n int) string {
 // throwaway connection, before the store or any other database of the process
 // is opened, and never changed afterwards: the engine reads it without a lock
 // whenever it opens a temporary file.
+//
+// It is also where the pool of those temporaries lives. The file-system shim
+// serves the engine's unnamed delete-on-close opens from this directory's
+// scratch arena, so what the engine would create and unlink once per sort is
+// taken and given back instead; the directory the engine is told about is the
+// fallback for a process that reaches a temporary before a store is opened.
 func SetTempDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return internal("engine temporary directory: " + err.Error())
@@ -92,6 +98,10 @@ func SetTempDir(dir string) error {
 	if err := pacedvfs.Register(); err != nil {
 		return internal(err.Error())
 	}
+	// The engine's temporaries come from this directory's scratch pool rather
+	// than being created and unlinked one per sort. The pool is the process's,
+	// as the file system is, and the first store to open names it.
+	pacedvfs.Pool(dir)
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return internal("engine temporary directory: " + err.Error())

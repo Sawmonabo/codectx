@@ -29,18 +29,28 @@ import (
 // freeing that did happen was an analyzer's output or a copied source tree,
 // never a working file the run will need again.
 //
-// Mutation: sum one arena instead of scratch.All(), or drop the per-purpose
-// map, and this fails.
+// The two freeing figures must be the same counter read two ways. Counted in
+// whole windows, freed_bytes reported nothing at all for a removal of files
+// smaller than the window -- the shape a materialized tree of source files has
+// -- while freed_by_purpose reported their exact lengths beside it, so the
+// block contradicted itself about the one thing it exists to disclose.
+//
+// Mutation: sum one arena instead of scratch.All(), drop the per-purpose map,
+// or round freed_bytes down to whole windows, and this fails.
 func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	const each = 128 << 10
 	var held int64
-	for range 2 {
-		lease, f, err := scratch.For(t.TempDir()).TakeFile(scratch.SortRun)
+	// Two directories, and the import staging surface among them: it is the
+	// largest single file the product writes, and while it was pooled outside
+	// the arena the figure whose own comment says a partial sum "is the one
+	// thing this figure exists to rule out" did not count it at all.
+	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.ImportStaging} {
+		lease, f, err := scratch.For(t.TempDir()).TakeFile(p)
 		if err != nil {
-			t.Fatalf("take: %v", err)
+			t.Fatalf("take %s: %v", p, err)
 		}
 		if _, err := f.Write(make([]byte, each)); err != nil {
-			t.Fatalf("write: %v", err)
+			t.Fatalf("write %s: %v", p, err)
 		}
 		lease.Release()
 		held += each
@@ -71,5 +81,12 @@ func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	}
 	if n < 64<<10 {
 		t.Fatalf("freed_by_purpose accounts %d bytes of %s, want at least the %d removed", n, paced.AnalyzerOutput, 64<<10)
+	}
+	if res.FreedBytes == nil {
+		t.Fatal("the resources block reports no freed_bytes beside a breakdown of what was freed")
+	}
+	if got := uint64(*res.FreedBytes); got < n {
+		t.Fatalf("freed_bytes is %d while freed_by_purpose accounts %d for %s alone: the whole and its labelled part are not the same counter, so one of them is wrong",
+			got, n, paced.AnalyzerOutput)
 	}
 }

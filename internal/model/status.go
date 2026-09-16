@@ -165,8 +165,10 @@ type ResourceReport struct {
 	// because on a host that discards freed blocks into a sparse image a
 	// multi-gigabyte free stalls every process on the machine, minutes later,
 	// with nothing able to observe or wait for it. This is what makes that
-	// claim checkable from outside. It is counted in windows, so it is the
-	// window count times the window rather than a byte-exact figure.
+	// claim checkable from outside. It is byte-exact and counted as each
+	// truncation and each unlink releases the space: a file smaller than the
+	// window frees its length without a windowed step and is counted here
+	// like any other.
 	FreedBytes *uint64 `json:"freed_bytes,omitempty"`
 	// ScratchBytes is the disk the store's scratch pools hold: every working
 	// file this process writes for its own later reading -- sort runs,
@@ -178,18 +180,29 @@ type ResourceReport struct {
 	// hands them back to the pool and writes over them next time, so what
 	// would have been freed and re-created over and over is disclosed here
 	// instead as space the store is holding. It shrinks only when an operator
-	// asks for the pools to be emptied.
+	// asks for the pools to be emptied, which is what `codectx gc` does.
 	ScratchBytes *uint64 `json:"scratch_bytes,omitempty"`
 	// FreedByPurpose says what the freeing this process did was for, in bytes
-	// measured before each removal, keyed by internal/paced.Purpose. A
-	// well-behaved run frees the outputs of foreign writers it cannot write
-	// over, the source trees it copied for them, and the leftovers of runs
-	// whose caller never came back -- and nothing else. It does not add up to
-	// FreedBytes, which counts every window the pacer handed back including
-	// removals no call site names; see paced.FreedByPurpose.
+	// released, keyed by internal/paced.Purpose. A well-behaved run frees the
+	// outputs of foreign writers it cannot write over, the source trees it
+	// built for them, and the leftovers of runs whose caller never came back
+	// -- and nothing else. It is the labelled part of FreedBytes, counted by
+	// the same additions, so it never exceeds it; the difference is the
+	// removals no call site names, such as the engine shortening a file it
+	// owns.
 	FreedByPurpose map[string]uint64 `json:"freed_by_purpose,omitempty"`
-	UnitsReused    *int64            `json:"units_reused,omitempty"`
-	UnitsParsed    *int64            `json:"units_parsed,omitempty"`
+	// PendingFreeBytes is disk this process has finished with and not yet
+	// given back: every file and tree a removal renamed aside, waiting for the
+	// reclaimer to release it a window at a time.
+	//
+	// It is not part of ScratchBytes, which is space the pools are holding to
+	// write over again, and it is not yet part of FreedByPurpose, which counts
+	// space as it is actually released. A run's removals return to their
+	// callers at once and land here; a run that exits with this above zero
+	// leaves the rest for the next run to release at the same pace.
+	PendingFreeBytes *uint64 `json:"pending_free_bytes,omitempty"`
+	UnitsReused      *int64  `json:"units_reused,omitempty"`
+	UnitsParsed      *int64  `json:"units_parsed,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -213,6 +226,7 @@ func (r ResourceReport) Validate() error {
 		{"resources.cas_bytes", r.CASBytes},
 		{"resources.freed_bytes", r.FreedBytes},
 		{"resources.scratch_bytes", r.ScratchBytes},
+		{"resources.pending_free_bytes", r.PendingFreeBytes},
 	} {
 		if f.value == nil {
 			continue
@@ -396,4 +410,27 @@ func (r DoctorReport) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ScratchCollection is what one operator request to give the pooled scratch
+// space back did: what each pool held, by what its surfaces were taken for,
+// and what was actually released.
+//
+// Held and freed are reported separately and are not the same number. Held is
+// what the pools were carrying when the request arrived; freed is what the
+// filesystem was actually given back, which excludes an instance another live
+// process still owns.
+type ScratchCollection struct {
+	Pools      []ScratchPool `json:"pools"`
+	HeldBytes  uint64        `json:"held_bytes"`
+	FreedBytes uint64        `json:"freed_bytes"`
+}
+
+// ScratchPool is one pool of ScratchCollection: the directory it serves, what
+// it held by purpose, and what went.
+type ScratchPool struct {
+	Directory     string            `json:"directory"`
+	HeldBytes     uint64            `json:"held_bytes"`
+	HeldByPurpose map[string]uint64 `json:"held_by_purpose,omitempty"`
+	FreedBytes    uint64            `json:"freed_bytes"`
 }

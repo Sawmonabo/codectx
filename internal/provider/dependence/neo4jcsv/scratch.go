@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	"modernc.org/sqlite"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	arena "github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
@@ -122,8 +122,16 @@ type graphNode struct {
 // table, and the first design of this scratch did both, at thirty to forty
 // times the export's bytes (ADR-0009).
 type scratch struct {
-	db   *sql.DB
-	rows int64
+	db *sql.DB
+	// lease is the pooled surface the staging database is written into. It
+	// goes back to the pool at its length when the import ends.
+	lease *arena.Lease
+	// defaultKeys is where the import writes its key file when the caller
+	// names none. It sits BESIDE the pool, never inside it: a file in the
+	// pool's own directory would be counted as pooled space and read by the
+	// sweep that finds surfaces to reuse.
+	defaultKeys string
+	rows        int64
 	// maxRows is the user's `providers.dependence.max_staged_rows`, unlimited for
 	// unlimited. It never stops the staging: crossing it sets overRows once,
 	// which the import reports.
@@ -170,56 +178,23 @@ CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER N
 // spill file.
 const defaultCacheKiB = 256 << 10
 
-// stagingSlots hands each import a staging database file under its scratch
-// directory and takes it back when the import ends.
+// The staging database is a pooled scratch surface (internal/scratch), taken
+// for the length of one import and given back holding its bytes.
 //
 // A slot's file is created once and reused by every later import that takes
-// the slot: its tables are dropped at the start of an import and the engine
-// recycles their pages from the file's free list, so the file never shrinks
-// and an import frees nothing. Hundreds of megabytes created and deleted per
-// unit is what the run must not do: on a host that discards freed blocks into
-// a sparse image, a multi-gigabyte free stalls every process on the machine.
-// The files are removed only by the provider's sweep of a dead run at
-// construction, which is the one free the design allows.
+// it: its tables are dropped at the start of an import and the engine recycles
+// their pages from the file's free list, so the file never shrinks and an
+// import frees nothing. Hundreds of megabytes created and deleted per unit is
+// what the run must not do: on a host that discards freed blocks into a sparse
+// image, a multi-gigabyte free stalls every process on the machine.
 //
-// A slot is what keeps the reuse correct whether or not imports through one
+// The pool is what keeps the reuse correct whether or not imports through one
 // provider overlap: a staging database is opened with an exclusive lock, so
-// two concurrent imports must have two files, and a slot released by one is
-// taken by the next rather than created afresh.
-var stagingSlots = struct {
-	mu   sync.Mutex
-	free map[string][]string
-	made map[string]int
-}{free: map[string][]string{}, made: map[string]int{}}
-
-// takeStagingSlot returns the path of a staging database under dir, reusing a
-// released one when there is one.
-func takeStagingSlot(dir string) string {
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	stagingSlots.mu.Lock()
-	defer stagingSlots.mu.Unlock()
-	if free := stagingSlots.free[dir]; len(free) > 0 {
-		path := free[len(free)-1]
-		stagingSlots.free[dir] = free[:len(free)-1]
-		return path
-	}
-	n := stagingSlots.made[dir]
-	stagingSlots.made[dir] = n + 1
-	return filepath.Join(dir, "stage-"+strconv.Itoa(n)+".db")
-}
-
-// releaseStagingSlot gives the slot back for the next import. The file stays
-// where it is; the next import that takes the slot empties it.
-func releaseStagingSlot(dir, path string) {
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	stagingSlots.mu.Lock()
-	defer stagingSlots.mu.Unlock()
-	stagingSlots.free[dir] = append(stagingSlots.free[dir], path)
-}
+// two concurrent imports must have two files, and one given back is taken by
+// the next rather than created afresh. It is the arena's pool rather than one
+// of this package's own so that the largest surface the product writes is in
+// the figure the resources block reports as the disk a run is holding, and so
+// that a run which died holding one has it taken over rather than left.
 
 // resetSchema empties the staging database and creates the tables the load
 // phase appends to. Every object a previous import left is dropped, which
@@ -260,17 +235,26 @@ func resetSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// openScratch opens the import's staging database at path, which a previous
-// import through the same slot may already have written, and empties it.
-// Durability is deliberately off: the file is private, single-writer and
-// carries nothing across an import. Its pages reach the disk through the paced
-// file system every connection of the process uses, so a phase that fills
-// the page cache at memory speed hands the disk its pages at the disk's
-// own rate rather than in one burst at the commit.
-func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.Limit) (*scratch, error) {
+// openScratch takes the import's staging database from the pool of dir, which
+// a previous import may already have written, and empties it. Durability is
+// deliberately off: the file is private, single-writer and carries nothing
+// across an import. Its pages reach the disk through the paced file system
+// every connection of the process uses, so a phase that fills the page cache
+// at memory speed hands the disk its pages at the disk's own rate rather than
+// in one burst at the commit.
+func openScratch(ctx context.Context, dir string, cacheKiB int, maxRows config.Limit) (*scratch, error) {
 	if cacheKiB <= 0 {
 		cacheKiB = defaultCacheKiB
 	}
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	lease, err := arena.For(dir).Take(arena.ImportStaging)
+	if err != nil {
+		return nil, internalErr("import scratch surface: %v", err)
+	}
+	path := lease.Path()
+	defaultKeys := filepath.Join(dir, "keys-"+filepath.Base(path))
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)",
 		"cache_size(-" + strconv.Itoa(cacheKiB) + ")"} {
@@ -278,20 +262,27 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 	if err := pacedvfs.Register(); err != nil {
+		lease.Release()
 		return nil, internalErr("import scratch: %v", err)
 	}
 	connector, err := sqlite.NewConnector(dsn)
 	if err != nil {
+		lease.Release()
 		return nil, internalErr("import scratch connector: %v", err)
 	}
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := resetSchema(ctx, db); err != nil {
+		// Emptying the surface is what failed, so the surface itself is the
+		// problem -- an image a crash left mid-write, whose DROP TABLE cannot
+		// run. Given back it would fail every import after this one, for the
+		// life of the data directory; it leaves the pool instead.
 		db.Close()
+		lease.Unusable()
 		return nil, err
 	}
-	return &scratch{db: db, maxRows: maxRows,
+	return &scratch{db: db, lease: lease, defaultKeys: defaultKeys, maxRows: maxRows,
 		unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
 }
 
@@ -300,11 +291,18 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 // not the rows it can hold.
 const commitEvery = 200_000
 
+// close gives the staging surface back to the pool at its length, freeing
+// nothing: the next import writes over it.
 func (s *scratch) close() error {
 	for _, st := range s.stmt {
 		st.Close()
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.lease != nil {
+		s.lease.Release()
+		s.lease = nil
+	}
+	return err
 }
 
 // exec runs one reused statement inside the staging transaction, opening the

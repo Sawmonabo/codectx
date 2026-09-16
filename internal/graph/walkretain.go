@@ -1089,6 +1089,22 @@ func (w *retainedWalk) hold(name string) {
 	}
 }
 
+// releaseLevel removes the named files of a level this leg has finished with,
+// leaving alone any the walk is holding: a held name belongs to the cursor
+// this leg was handed, which a retryable failure can still send the caller
+// back to, and only the mint that supersedes that cursor may remove it.
+func (w *retainedWalk) releaseLevel(names ...string) error {
+	for _, name := range names {
+		if w.isHeld(name) {
+			continue
+		}
+		if err := openRetainFile(w.home, name).remove(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // isHeld reports whether the walk must leave a file where it is.
 func (w *retainedWalk) isHeld(name string) bool { return slices.Contains(w.held, name) }
 

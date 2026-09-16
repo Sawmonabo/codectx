@@ -1,11 +1,6 @@
 package paced
 
-import (
-	"io/fs"
-	"os"
-	"path/filepath"
-	"sync"
-)
+import "sync"
 
 // A Purpose names what a removal was for. The set is small and closed on
 // purpose: an operator reading the resources block should be able to tell at a
@@ -13,8 +8,9 @@ import (
 // need again.
 //
 // It is the set of removals this product labels, not the set it makes. A
-// removal with no purpose here is not a removal that did not happen -- see
-// FreedByPurpose on what Steps counts that this does not.
+// removal with no purpose here is not a removal that did not happen: its
+// bytes are in FreedBytes like any other, they simply have no name to appear
+// under in FreedByPurpose.
 type Purpose string
 
 const (
@@ -39,18 +35,47 @@ const (
 
 var (
 	freedMu sync.Mutex
-	freed   = map[Purpose]int64{}
+	// freed is the one counter of bytes this process has given back. Its
+	// total is FreedBytes and its labelled part is FreedByPurpose, so the two
+	// figures cannot disagree: they are the same additions, read two ways.
+	freed      = map[Purpose]int64{}
+	freedTotal int64
 )
 
-// FreedByPurpose is the bytes this process has removed for each purpose since
-// it started, as measured before each removal.
+// FreedBytes is the bytes this process has actually given back to the
+// filesystem since it started, counted as each truncation and each unlink
+// released them, not as whole windows: a file smaller than the window is
+// unlinked without a windowed step and still frees its length, and the last
+// step of a shrink frees the remainder rather than a window.
 //
-// It does not add up to what Steps reports. Steps counts every window the
-// pacer handed back, including removals no call site names -- a caller's own
-// temporary file, a test's fixture -- while this accounts only the removals
-// the product labels, and it accounts their length rather than their windows.
-// The two answer different questions on purpose: Steps says how much freeing
-// this process did, and this says what the freeing was for.
+// It is what the freeing cost, not what the removals asked for. Space a
+// removal has queued and the reclaimer has not reached is not here; it is
+// PendingFreeBytes.
+func FreedBytes() int64 {
+	freedMu.Lock()
+	defer freedMu.Unlock()
+	return freedTotal
+}
+
+// Freed records n bytes a caller has just released by its own truncation --
+// the shrink that trims a pooled surface, the engine's shim shortening a file
+// -- and makes that caller wait the pace those bytes owe before it goes on.
+//
+// The budget is the process's: bytes freed here and bytes freed by the
+// reclaimer spend the same windows, so a run cannot outrun the pace by
+// splitting its freeing across both.
+func Freed(n int64) {
+	attribute("", n)
+	reclaim.charge(n, nil)
+}
+
+// FreedByPurpose is the part of FreedBytes whose removal named a purpose,
+// split by that purpose: not how much freeing this process did, which is
+// FreedBytes, but what the freeing was for. It is counted as the bytes were
+// released rather than when the removal was asked for, so it never exceeds
+// FreedBytes and falls short of it by exactly the removals no call site
+// names -- a caller's own temporary file, the engine's own shortening of a
+// file it owns.
 func FreedByPurpose() map[Purpose]int64 {
 	freedMu.Lock()
 	defer freedMu.Unlock()
@@ -61,39 +86,44 @@ func FreedByPurpose() map[Purpose]int64 {
 	return out
 }
 
-// attribute records n bytes freed for p.
+// attribute records n bytes freed, for p when the removal named one. An
+// unnamed removal still counts towards the total: the figure an operator
+// reads as "what this run freed" must not depend on whether the call site
+// had a label for it.
 func attribute(p Purpose, n int64) {
 	if n <= 0 {
 		return
 	}
 	freedMu.Lock()
-	freed[p] += n
+	freedTotal += n
+	if p != "" {
+		freed[p] += n
+	}
 	freedMu.Unlock()
 }
 
-// RemoveFor removes one file as Remove does and attributes its length to p.
+// RemoveFor removes one file or empty directory as Remove does and attributes
+// the bytes it releases to p. RemoveAllFor does the same for a tree.
+//
+// The removal renames the path into the to-free set that serves it and
+// returns; the reclaimer frees it, and attributes it, as the space actually
+// goes back to the filesystem. So the purpose travels with the path -- it is
+// the name of the directory the path is renamed into -- and a process that
+// exits with removals still queued has not yet accounted them, because it has
+// not yet freed them. The next process to claim the same set frees them and
+// accounts them as its own.
 func RemoveFor(p Purpose, path string) error {
-	if st, err := os.Lstat(path); err == nil && st.Mode().IsRegular() {
-		attribute(p, st.Size())
+	if queue(p, path) {
+		return nil
 	}
-	return Remove(path)
+	return freeInPlace(p, path)
 }
 
-// RemoveAllFor removes a tree as RemoveAll does and attributes the length of
-// every regular file in it to p. The measurement is taken before the removal,
-// so a tree that vanishes underneath it is accounted as what was there when it
-// was read, which is the honest figure either way.
+// RemoveAllFor removes a tree as RemoveAll does and attributes the bytes it
+// releases to p. Symbolic links are removed, never followed.
 func RemoveAllFor(p Purpose, dir string) error {
-	var total int64
-	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
-			return nil //nolint:nilerr // a tree that cannot be read is removed anyway
-		}
-		if info, err := d.Info(); err == nil {
-			total += info.Size()
-		}
+	if queue(p, dir) {
 		return nil
-	})
-	attribute(p, total)
-	return RemoveAll(dir)
+	}
+	return freeInPlace(p, dir)
 }
