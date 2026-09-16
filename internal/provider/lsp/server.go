@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -119,8 +120,24 @@ var errServerGone = errors.New("the language server process has exited")
 // resolution and Profile.Tool carries that digest, so a second read of the same
 // file would prove nothing the fingerprint in the overlay binding does not
 // already commit to.
-func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (*server, error) {
+func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (srv *server, err error) {
 	snap := view.Header()
+	// A start is lazy, pooled and shared between generations, so it hangs off
+	// the process's overlay run and never off a generation's. It spans the
+	// whole start -- filling the shared tree, launching the payload and the
+	// handshake -- because that is what a caller waits for. No processor time
+	// is attributed to it: the child is still running when the start returns,
+	// so its resource usage does not exist yet, and the in-process half runs
+	// beside every other goroutine.
+	ctx, span := ledger.StartProvider(m.overlayContext(ctx, string(snap.RepositoryID)),
+		stageServerStart, p.Root, p.Name)
+	defer func() {
+		// End is idempotent, so the success path below ends the span itself
+		// and this closes only the paths that returned an error -- of which
+		// there are five, and a missed one would leave a span the stopping
+		// ledger writes as interrupted.
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
+	}()
 	// One tree per snapshot, shared read-only by every server of it: this
 	// server is rooted at its own project directory INSIDE that tree, and
 	// everything it writes goes to workDir below.
@@ -221,7 +238,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		s.fail(err)
 	}()
 
-	if err := s.initialize(ctx, snap); err != nil {
+	if err = s.initialize(ctx, snap); err != nil {
 		// A start that failed after the process exists must not leave it: the
 		// same path a running server takes on failure.
 		s.fail(err)
@@ -236,6 +253,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		}
 		return nil, err
 	}
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	return s, nil
 }
 
