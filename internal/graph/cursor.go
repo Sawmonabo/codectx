@@ -931,7 +931,7 @@ func (e *Engine) releaseSpool(sp *pagination.Spool, cause error) error {
 //
 // Minting and verifying both go through here, so the two can never disagree.
 func (e *Engine) walkBinding() (model.Binding, error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return model.Binding{}, err
 	}

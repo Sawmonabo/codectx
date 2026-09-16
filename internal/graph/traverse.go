@@ -1121,7 +1121,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// this page names the edges it serves from one batched read per level
 	// instead of one per edge.
 	names := &levelNames{}
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return model.GraphResult{}, err
 	}
