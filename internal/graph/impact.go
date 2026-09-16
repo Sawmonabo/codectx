@@ -135,7 +135,8 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// still holding is the whole remedy the reason offers -- and a fresh
 	// request gets a fresh deadline (beginImpactQuery), so a warm read really
 	// can advance where this one could not. Releasing the state on that path
-	// destroyed it and made the documented remedy cost the walk from its seed.
+	// would destroy it and make the documented remedy cost the walk from its
+	// seed.
 	// It is an explicit flag rather than "no cursor was minted", because the
 	// exhausted, fully served answer mints no cursor either and that state is
 	// genuinely finished; same shape as serveRankedImpact's complete.

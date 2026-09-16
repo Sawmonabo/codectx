@@ -326,9 +326,9 @@ type pairRollup struct {
 	// resolved, keyed by its surrogate. Its bound is the number of DISTINCT
 	// CONTAINERS the walk touched -- packages and modules -- and never the
 	// number of nodes or edges it visited: a container is hydrated once per
-	// walk however many of its members the walk admits, which is what turned
-	// the old rollup's per-batch re-hydration of the same few packages into 93
-	// per cent of a large walk. A repository has orders of magnitude fewer
+	// walk however many of its members the walk admits, so the same few
+	// packages are never re-hydrated batch after batch. A repository has
+	// orders of magnitude fewer
 	// packages than symbols, so the cache is a page-sized structure by
 	// construction.
 	labels map[NodeRef]containerLabel
@@ -371,12 +371,11 @@ func (p *pairRollup) Visit(_ frontierState, e Edge) error {
 //
 // The resolution is two ARRAY reads on the pinned reader -- the endpoints'
 // container surrogates and the batch's evidence counts -- and never a
-// containment traversal. ADR-0005 states why: the old rollup
-// re-read the incoming `contains` edges of every endpoint of every batch and
-// re-hydrated the same handful of container nodes over a thousand batches,
-// which is where 93 per cent of a large walk's wall clock went. The container
-// of a node is a per-generation side array now, so a batch costs one indexed
-// read per array whatever the fan-out of its endpoints.
+// containment traversal, which is the point of ADR-0005: reading the incoming
+// `contains` edges of every endpoint of every batch would re-hydrate the same
+// handful of container nodes over a thousand batches. The container of a node
+// is a per-generation side array, so a batch costs one indexed read per array
+// whatever the fan-out of its endpoints.
 func (p *pairRollup) flush() error {
 	if len(p.batch) == 0 {
 		return nil
