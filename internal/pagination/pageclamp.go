@@ -16,16 +16,16 @@ import (
 // ceiling and a page is always continuable by cursor, so nothing is lost). What
 // the scale posture forbids is the SILENCE: a caller that asks for 1000 and is
 // served 200 with no continuation notice cannot tell a clamped page from the
-// end of the answer. A zero is "no caller bound" on the edge batch limit, so
-// it resolves to 200 here rather than being refused.
+// end of the answer. A request of zero names no bound of its own and resolves
+// to the ceiling, which is a resolution and not a clamp, so it is not reported.
 //
 // It lives here, beside the cursors and spools the "continue with the cursor"
 // half of its message points at, rather than in the storage package that
 // records into it: the query engine and the context compiler drain a collector
 // into their answer's notices, and a package that must not depend on the store
 // to report a clamp would otherwise have to import it for this type alone.
-// storage/sqlite records into it and re-exports the two names its callers
-// already use.
+// storage/sqlite records into it and re-exports the collector type and its
+// constructor for the callers that install one.
 //
 // It travels on the context rather than through every reader signature. Two
 // dozen reader methods on the pinned reader return rows only, and threading an
@@ -66,21 +66,6 @@ func (c *PageClamps) add(note string) {
 	}
 	c.notes[note] = struct{}{}
 	c.order = append(c.order, note)
-}
-
-// RecordUnbounded notes a request that named no bound of its own and was served
-// at the wire ceiling. It is recorded only where the caller's zero is a USER
-// setting that means unlimited -- the edge batch limit -- and not at the many
-// internal sites that pass 0 simply because they never had a page bound to
-// pass, where it would be noise rather than news.
-func RecordUnbounded(ctx context.Context, effective int) {
-	c, ok := ctx.Value(pageClampKey{}).(*PageClamps)
-	if !ok {
-		return
-	}
-	note := fmt.Sprintf("a page bound was resolved: requested unlimited, effective %d "+
-		"(the wire ceiling; continue with the cursor to read the rest)", effective)
-	c.add(note)
 }
 
 // Notices is what was clamped, in the order it was first observed. It is empty
