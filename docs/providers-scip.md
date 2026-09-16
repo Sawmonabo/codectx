@@ -515,7 +515,7 @@ launcher prefix:
 | Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture | Host toolchain it needs |
 |---|---|---|---|---|---|
 | `scip-go` | `go.mod`, `go.work` | `index --output <output>` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | allowed | `go` |
-| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar` | `HOME` | denied | none (managed Node) |
+| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar --infer-tsconfig` | `HOME` | denied | none (managed Node) |
 | `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied | `python3`, `pip3` |
 | `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --scip-config <input>/scip-java.json --targetroot <work>/scip-java-targetroot --output <output>` | `PATH HOME` | denied | none (managed JDK) |
 | `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo` |
@@ -545,6 +545,12 @@ describes less than the unit claims. What the indexer is *run over* is the
 unit's project, which is what makes the unit a project rather than a
 repository. The call site says so explicitly rather than leaving it to an
 omitted selection.
+
+What the copy cannot supply is a dependency directory: those are excluded from
+the snapshot, so an indexer that resolves installed packages by reading them
+out of the tree it is given resolves them to nothing. That is a limit on what a
+unit publishes — the project's own definitions and the references among them —
+not a reason for the unit to fail.
 
 **Document paths are prefixed back to the workspace.** An indexer writes
 document paths relative to what it was run over: `scip-go` run in `sub/`
@@ -593,7 +599,22 @@ a process failure with no stderr and no remediation. The refusal is the same
 typed one the other profiles produce for an index that describes no admitted
 document, raised before a JVM is started rather than after.
 
-**Two pinned arguments exist because of a measured failure, not a preference.**
+**Three pinned arguments exist because of a measured failure, not a
+preference.** `scip-typescript` is given `--infer-tsconfig` because two of its
+three triggers — `jsconfig.json` and `package.json` — name a project that has
+no `tsconfig.json`. Without the flag the indexer prints `(missing
+tsconfig.json)`, indexes nothing and exits 1, so every such project fails its
+unit with `CTX_PROVIDER_UNAVAILABLE` and zero records: nine projects of one
+monorepo failed exactly that way, and every one of them indexes with the flag.
+With it the indexer infers the configuration it needs and writes it into the
+private materialization — never into the repository, which this provider never
+writes to — and indexes the project. A project that already carries a
+`tsconfig.json` is unaffected: the flag is consulted only when the file is
+absent, so a configured project is still indexed under its own configuration.
+The symbols such a unit can resolve are bounded by the paragraph above: a
+snapshot holds no dependency directories, so a name owned by an installed
+package has no definition in the index, and what the unit publishes is the
+project's own definitions and the references among them.
 `scip-python` is given `--project-version` because, left to itself, it asks git
 for the current revision; the private materialization is never a repository, so
 the lookup fails, the version stays undefined and the indexer dies inside its
