@@ -136,7 +136,7 @@ with at most two windows dirty is a bounded wait.
 With the shim in place an uncapped index of the 6 270-file repository kept dirty pages under 8 MB through a
 3.4 GB build, and an independent 4 KiB write and data-sync beside it never waited more than 245 ms (at the
 892 MB checkpoint) -- and the host still stalled for 64 s, once, 27 s after the run had freed 6 GB (the
-export's removal and the log's reset). The same 64 s stall followed every multi-gigabyte free in the earlier
+export's removal and the log's reset). (Amended; see below.) The same 64 s stall followed every multi-gigabyte free in the earlier
 runs. It was then reproduced without the product: a script wrote 5 GB one window at a time in 6 s (850 MB/s,
 so a completed write is host-cached, not on a disk), idled two minutes with no stall, freed the file one
 window at a time in 3.6 s, and 72 s later the independent write waited 64 s. The root filesystem discards
@@ -167,6 +167,22 @@ index of the 6 270-file repository died of exactly that at its activation, the f
 journal more than the threshold inside a savepoint, with 881 GB free). The shim therefore hands
 the wrapped write every call in 64 KiB pieces, whatever length the engine asks for. The threshold
 stays where decision 3 put it; the write path is what had the limit.
+
+### Decision 3, amended again 2026-09-16: the log is rewound, and the shim says when a group spills
+
+The zero journal size limit made the engine truncate the log at every reset: on a filesystem that
+discards freed blocks that is up to the log bound of discards per checkpoint, three times in one
+uncapped index, and (decision 5, second amendment) a free of that size is what stalls the host. The
+limit is gone; the engine rewinds the log in place, the file keeps its high-water length, bounded by
+the log bound, and every later group reuses it. The store can then no longer learn from the log's
+size or header whether a group has begun to spill -- frames appended inside the existing length
+change neither -- and the engine's own frame count arrives only at commit, after the decision it
+serves. The signal is therefore the shim's: it sees every write the engine makes to a file the engine
+opened as a log, and the store marks that count when a group begins. The count is the process's, not
+one database's, which can only make a group commit earlier than it had to, never later than it must.
+Measured on the ingestion test after the change: 1.3× engine, 1.2× disk against the 4× bound, peak
+log 2.3 MiB under a 2 MiB cache; the 600 × 40 rows above were re-measured on today's fixture at
+85.4 MiB stored with the same ratios, so the 73.1 MiB in them is fixture drift, not this change.
 
 ## What the numbers must show
 
