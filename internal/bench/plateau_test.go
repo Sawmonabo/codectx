@@ -54,6 +54,11 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
+	// One arm of the ledger cost measurement, for the same reason: it runs no
+	// row, and the root it measures against is its parent's.
+	if len(os.Args) > 1 && os.Args[1] == ledgerArmSubcommand {
+		os.Exit(ledgerArmMain(os.Args[2:]))
+	}
 	if err := os.RemoveAll(benchRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "clear the bench root %s: %v\n", benchRoot, err)
 		os.Exit(1)
