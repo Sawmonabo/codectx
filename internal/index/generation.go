@@ -65,6 +65,13 @@ type generation struct {
 	// only reuses units the previous generation selected and these sealed into
 	// a staging generation instead. It is nil on the indexing path.
 	sealed map[string]bool
+	// failedScopes holds, per plan key, the reason a deferred unit of this
+	// publication's batch did not seal. A scope that failed is neither
+	// covered nor still running, and telling the three apart is what keeps a
+	// provider whose other scopes published from being reported as though
+	// none of them had. It is nil on the indexing path, where a unit's
+	// failure is recorded as it happens.
+	failedScopes map[string]string
 
 	// mu guards everything the unit workers accumulate.
 	mu   sync.Mutex
@@ -640,16 +647,31 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 // (residual 113). "Available, zero units" is not fresh coverage, and without a
 // row for it status would report a capability nothing answers as healthy.
 func (g *generation) coverage() error {
-	covered, deferred, err := g.coveredProviders()
+	covered, deferred, failed, err := g.coveredProviders()
 	if err != nil {
 		return err
 	}
 	for _, p := range g.sel.Active {
 		d := p.Descriptor()
 		for _, capability := range d.Capabilities {
+			// A scope that failed is published as the failure it is, naming
+			// that scope and its reason, before the three coverage answers
+			// below: none of them may speak for a capability one of whose
+			// scopes is a known failure. It is recorded first so `reported`
+			// sees it.
+			if f, ok := failed[d.ID]; ok {
+				g.caps.addFailure(d.ID, capability, f.scopeKey, f.code)
+			}
+			// And a capability whose other scopes did publish is partial, not
+			// failed: the facts of those scopes are in this generation and
+			// answer queries.
+			if covered[d.ID] {
+				g.caps.coveredElsewhere(d.ID, capability)
+			}
 			switch {
-			// Deferred wins over covered: a provider with one scope still
-			// running is not fresh coverage, whatever its other scopes did.
+			// Deferred is a scope still running and nothing else: a provider
+			// with work in flight is not fresh coverage, whatever its other
+			// scopes did.
 			case deferred[d.ID]:
 				g.caps.addDeferred(d.ID, capability)
 			case covered[d.ID]:
@@ -662,6 +684,15 @@ func (g *generation) coverage() error {
 	return nil
 }
 
+// failedScope is one scope of a provider that did not seal, with the reason.
+// One exemplar per provider is kept -- the lexicographically first, so two
+// identical runs publish the same row -- because the capability row it
+// becomes carries one scope key and one diagnostic code.
+type failedScope struct {
+	scopeKey string
+	code     string
+}
+
 // coveredProviders is the set of providers this generation actually holds a
 // member for -- a unit it ran, a unit it reused, or a stale unit it carried --
 // and, separately, the providers whose only work was deferred. A deferred unit
@@ -670,18 +701,27 @@ func (g *generation) coverage() error {
 // been written for it, which is the false readiness Section 11.6 forbids. The
 // Reuse key is the provider id and the scope key joined by NUL, which is the
 // frozen shape of plan.Key.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool, err error) {
+func (g *generation) coveredProviders() (covered, deferred map[string]bool, failed map[string]failedScope, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
 	deferred = make(map[string]bool, len(g.sel.Active))
+	failed = make(map[string]failedScope, len(g.sel.Active))
 	// Streamed, not ranged: the plan's unit list is repository-sized, and the
-	// two answers here are one bounded entry per provider whatever it holds.
+	// three answers here are one bounded entry per provider whatever it holds.
 	if err := g.eachUnit(func(u plan.Unit) error {
 		if u.Deferred {
+			key := plan.Key(u.ProviderID, u.ScopeKey)
 			// A publication generation holds the deferred units that have
-			// already sealed; the rest are still background work.
-			if g.sealed[plan.Key(u.ProviderID, u.ScopeKey)] {
+			// already sealed; of the rest, the ones this batch tried and
+			// could not seal are failures, and only what is left is still
+			// background work.
+			switch {
+			case g.sealed[key]:
 				out[u.ProviderID] = true
-			} else {
+			case g.failedScopes[key] != "":
+				if prev, ok := failed[u.ProviderID]; !ok || u.ScopeKey < prev.scopeKey {
+					failed[u.ProviderID] = failedScope{scopeKey: u.ScopeKey, code: g.failedScopes[key]}
+				}
+			default:
 				deferred[u.ProviderID] = true
 			}
 			return nil
@@ -689,7 +729,7 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, err 
 		out[u.ProviderID] = true
 		return nil
 	}); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true
@@ -699,7 +739,7 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, err 
 			out[id] = true
 		}
 	}
-	return out, deferred, nil
+	return out, deferred, failed, nil
 }
 
 // capabilitiesOf is one provider's declared capability list, empty when the

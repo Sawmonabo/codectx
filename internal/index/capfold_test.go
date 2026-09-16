@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"maps"
@@ -8,8 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // TestCapabilityFoldSumsCollapsedCounts protects the aggregate's honesty above
@@ -183,5 +187,72 @@ func TestCapabilityFoldMergesInOrderIndependently(t *testing.T) {
 		if !strings.HasSuffix(value, "_of_a_widely_degraded_unit") {
 			t.Fatalf("the merged reason carries the fragment %q; the cut split a value", value)
 		}
+	}
+}
+
+// coverageProvider is the smallest provider the coverage pass reads: it asks
+// for the descriptor and nothing else.
+type coverageProvider struct{ desc model.ProviderDescriptor }
+
+func (p coverageProvider) Descriptor() model.ProviderDescriptor { return p.desc }
+func (p coverageProvider) Detect(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+	return provider.Detection{}, nil
+}
+func (p coverageProvider) IndexUnit(context.Context, provider.UnitRequest, provider.Sink) (model.ProviderResult, error) {
+	return model.ProviderResult{}, nil
+}
+
+// TestCoverageReportsAFailedDeferredScopeAsPartial protects what `codectx
+// status` says after a late publication.
+//
+// Failure mode: one deferred unit of a provider fails and the other nine
+// publish, and every capability of that provider is reported `unavailable:
+// units_deferred` -- a repository whose control dependence, data dependence,
+// reads, writes and calls are all in the generation and queryable reads as a
+// provider nobody has heard from. A scope that failed is not a scope still
+// running: it is a failure, published as `partial` with that scope named,
+// because the other scopes' facts are there.
+//
+// Mutation proof: in coveredProviders, drop the failedScopes case so a scope
+// that failed falls through to `deferred` again.
+func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
+	t.Parallel()
+	const id, capability = "dependence", "calls"
+	const sealedScope, failedScope = "pkg:javascript:app", "pkg:java:qa"
+
+	g := &generation{
+		caps: newCapabilityReport(),
+		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
+			ID: id, Version: "1", Capabilities: []string{capability}}}}},
+		sealed:       map[string]bool{plan.Key(id, sealedScope): true},
+		failedScopes: map[string]string{plan.Key(id, failedScope): model.CodeProviderOutputInvalid},
+	}
+	g.plan.Units = func(yield func(plan.Unit) error) error {
+		for _, scope := range []string{sealedScope, failedScope} {
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: true}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := g.coverage(); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if len(rows) != 1 {
+		t.Fatalf("coverage published %d rows, want one: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row.State != model.CapabilityPartial {
+		t.Errorf("capability state %q, want partial: nine scopes published and one failed", row.State)
+	}
+	if row.Details[scopeKeyDetail] != failedScope {
+		t.Errorf("the row names scope %q, want the scope that failed (%q)", row.Details[scopeKeyDetail], failedScope)
+	}
+	if row.DiagnosticCode != model.CodeProviderOutputInvalid {
+		t.Errorf("diagnostic code %q, want the failure's own", row.DiagnosticCode)
+	}
+	if row.Details["reason"] == "units_deferred" {
+		t.Error("a scope that failed was reported as still running")
 	}
 }
