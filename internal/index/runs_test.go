@@ -239,3 +239,72 @@ func TestUnitWhoseToolIsAbsentEndsUnavailableWithItsReason(t *testing.T) {
 			scope, row.DiagnosticCode, row.Failure)
 	}
 }
+
+// TestATickThatPublishedNothingIsSweptFromTheLedger protects the one bound on
+// the run ledger's growth. A background tick that finds nothing to publish
+// never opens a generation, and Ledger.DeleteRuns is keyed by generation, so
+// such a run has no other way out of the file; the ticks are periodic, so
+// without a caller for the sweep the file grows a run and its spans every tick
+// for as long as the workspace is open. The failure mode guarded is a sweep
+// that exists, is correct and is called by nothing.
+//
+// It drives Coordinator.collect -- the process's collection pass, which is
+// where the sweep is wired -- rather than the sweep itself, because the sweep
+// having a caller is the whole of what is at stake here.
+func TestATickThatPublishedNothingIsSweptFromTheLedger(t *testing.T) {
+	f := newFixture(t, map[string]string{"a.txt": "a\n"})
+	repo := string(f.c.repo)
+	barren, err := f.ledger.NewRun(ledger.KindDeferred, repo)
+	if err != nil {
+		t.Fatalf("NewRun: %v", err)
+	}
+	// The tick did some work -- it swept and collected -- and published no
+	// generation, which is exactly the run that has no other way out.
+	written := make(chan struct{}, 1)
+	f.ledger.Subscribe(func(ledger.SpanRow) {
+		select {
+		case written <- struct{}{}:
+		default:
+		}
+	})
+	_, span := ledger.Start(barren.Context(f.ctx), stageCollection, "")
+	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	barren.Finish(ledger.OutcomeOK)
+	select {
+	case <-written:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the ledger never wrote the tick's span")
+	}
+	reader, ok, err := ledger.OpenReader(f.ctx, f.dataDir)
+	if err != nil || !ok {
+		t.Fatalf("OpenReader: %v, present=%v", err, ok)
+	}
+	t.Cleanup(func() { reader.Close() })
+	// A run is swept only once it is no longer live, so the row must first be
+	// on disk saying how it ended: a run still writing is indistinguishable
+	// from one that has not reached its generation yet.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		view, present, err := reader.LatestRun(f.ctx, repo, 0)
+		if err != nil {
+			t.Fatalf("LatestRun: %v", err)
+		}
+		if present && view.Run.Outcome == ledger.OutcomeOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the tick's run never reached the ledger as finished (present=%v)", present)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.c.collect(f.ctx)
+	view, present, err := reader.LatestRun(f.ctx, repo, 0)
+	if err != nil {
+		t.Fatalf("LatestRun: %v", err)
+	}
+	if present {
+		t.Fatalf("the collection pass left the %s run %s, which no generation will ever collect: "+
+			"every tick that publishes nothing adds a row that is never removed",
+			view.Run.Kind, view.Run.RunID)
+	}
+}

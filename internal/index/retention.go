@@ -96,10 +96,16 @@ type Collector interface {
 // leave behind. Its failure is logged with its diagnostic code so it cannot be
 // silent.
 func (c *Coordinator) collect(ctx context.Context) {
+	// The sweep runs before the store's own pass and outside the collection
+	// span, on the uncancellable context: it is the ledger's half of the same
+	// collection, it is what keeps the two classes of run no generation will
+	// ever reach from accumulating, and a coordinator assembled without a
+	// store-side collector still has a ledger to sweep.
+	ctx = context.WithoutCancel(ctx)
+	c.sweepLedger(ctx)
 	if c.opts.Collector == nil {
 		return
 	}
-	ctx = context.WithoutCancel(ctx)
 	ctx, span := ledger.Start(ctx, stageCollection, "")
 	report, err := c.opts.Collector.Collect(ctx)
 	span.End(endOutcome(err), ledger.Measured{}, err)
@@ -115,6 +121,38 @@ func (c *Coordinator) collect(ctx context.Context) {
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
 		"orphan_objects_swept", report.OrphanObjectsSwept,
 		"orphan_sweep", report.OrphanSweepPhrase())
+}
+
+// sweepLedger deletes the ledger rows no generation will ever collect, one
+// bounded page per pass. Two classes of run have no other way out of the file:
+// the overlay run a process opens for its language-server starts, which belongs
+// to no generation and outlives nothing but its own process; and a run that
+// ended without publishing anything -- the periodic tick that finds nothing to
+// publish never attaches a generation, and the ticks do not stop. DeleteRuns is
+// keyed by generation, so without this pass both grow for as long as the
+// workspace is indexed.
+//
+// It is called from the collection pass because that is where the process
+// already reclaims what nothing references, and because both sweeps skip a run
+// whose writer is still live: the run this pass is part of, another process's
+// overlay, and a tick in flight are all live by the same judgement a reader
+// uses, so nothing here can delete a run a status surface has just called live.
+//
+// Like the passes around it, a failure never fails the run that published: the
+// rows stay and the next pass takes them, and the diagnostic is logged so a
+// file that is never being swept cannot be silent.
+func (c *Coordinator) sweepLedger(ctx context.Context) {
+	overlays, err := c.opts.Ledger.OverlayRuns(ctx)
+	if err == nil {
+		err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
+	}
+	if err == nil {
+		err = c.opts.Ledger.DeleteRunsWithoutGeneration(ctx)
+	}
+	if err != nil {
+		logTyped(c.log, "the ledger runs no generation will collect were not swept", err,
+			"component", component, "repository_id", string(c.repo))
+	}
 }
 
 // retentionState is what this coordinator knows about its own last retention
