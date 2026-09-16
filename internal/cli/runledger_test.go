@@ -127,6 +127,20 @@ func TestTableAndJSONReportTheSameRows(t *testing.T) {
 // Mutation: move followStatus's snapshot call after its select, so the first
 // snapshot waits an interval.
 func TestFollowEmitsOneWholeEnvelopePerInterval(t *testing.T) {
+	// A follow that is stopped before its first interval has still answered
+	// once: the report goes out before the wait, so a live view is never blank
+	// for its first interval where it cannot be told from one that failed to
+	// start.
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	first := 0
+	if err := followStatus(stopped, time.Hour, func() error { first++; return nil }); err != nil {
+		t.Fatalf("a follow stopped before its first interval reported %v, want a clean end", err)
+	}
+	if first != 1 {
+		t.Fatalf("a follow stopped before its first interval reported %d times, want 1", first)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out strings.Builder
