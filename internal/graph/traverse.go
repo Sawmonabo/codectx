@@ -307,7 +307,13 @@ func (w *levelWalk) collect(ctx context.Context, st *walkState) (bool, error) {
 		return false, err
 	}
 	if committed {
-		if err := o.Retain.alignFrontier(st.Level); err != nil {
+		// The frontier is whatever the last transition to RUN left, and this
+		// level's did not run in this leg: it is the level before it, so the
+		// scan that follows this serve would apply the direction rule against
+		// the wrong level and drop every edge whose far end this level
+		// admitted. It is set outright rather than through alignFrontier,
+		// whose skip is about a RESUMED level and not this one.
+		if err := o.Retain.setFrontier(st.Level); err != nil {
 			return false, err
 		}
 		st.LevelState, st.LevelPos, st.RawBytes, st.LevelOffset = levelServing, EdgePos{}, 0, 0
