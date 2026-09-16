@@ -91,7 +91,7 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 				pool.HeldBytes += uint64(n)
 			}
 		}
-		freed, err := a.Empty()
+		collected, err := a.Empty()
 		if err != nil {
 			if errors.Is(err, scratch.ErrInUse) {
 				return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
@@ -101,7 +101,11 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 			return &model.Error{Code: model.CodeInternal,
 				Message: "emptying the scratch pool " + a.Root() + ": " + err.Error()}
 		}
-		pool.FreedBytes = uint64(max(freed, 0))
+		pool.FreedBytes = uint64(max(collected.FreedBytes, 0))
+		for _, stuck := range collected.Stuck {
+			pool.StuckFrees = append(pool.StuckFrees,
+				model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
+		}
 		report.HeldBytes += pool.HeldBytes
 		report.FreedBytes += pool.FreedBytes
 		report.Pools = append(report.Pools, pool)
@@ -163,6 +167,12 @@ func writeGCReport(w io.Writer, r model.ScratchCollection) error {
 		fmt.Fprintf(tw, "%s\t%d bytes held\t%d bytes freed\n", p.Directory, p.HeldBytes, p.FreedBytes)
 		for _, purpose := range slices.Sorted(maps.Keys(p.HeldByPurpose)) {
 			fmt.Fprintf(tw, "  %s\t%d bytes\t\n", purpose, p.HeldByPurpose[purpose])
+		}
+		// A removal the filesystem refused is why freed can fall short of
+		// held; unnamed it would read as this command having quietly done
+		// less than it said.
+		for _, stuck := range p.StuckFrees {
+			fmt.Fprintf(tw, "  could not free %s\t%s\t\n", stuck.Entry, stuck.Reason)
 		}
 	}
 	fmt.Fprintf(tw, "total\t%d bytes held\t%d bytes freed\n", r.HeldBytes, r.FreedBytes)

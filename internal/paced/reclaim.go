@@ -72,9 +72,16 @@ type reclaimer struct {
 	// resolved is the to-free set of each registered directory, once its
 	// resolver has run.
 	resolved map[string]string
-	// idle is set when the worker has looked at every set and found nothing.
-	// Drain waits for it.
+	// idle is set when the worker has looked at every set and found nothing
+	// it can free. Drain waits for it.
 	idle bool
+	// stuck holds the queued entries the reclaimer has tried and failed to
+	// free, with the reason, keyed by the entry's path. An entry here is
+	// passed over so that everything queued behind it still goes, and it is
+	// dropped -- and so retried -- at the next wake. It is what keeps a
+	// removal nothing can make from stopping every other removal in the
+	// process, and from spending a core retrying itself.
+	stuck map[string]string
 	// started is set when the worker goroutine is running.
 	started bool
 	// spentMu guards spent, which the reclaimer's goroutine and any caller
@@ -95,6 +102,7 @@ func newReclaimer() *reclaimer {
 	r := &reclaimer{
 		sets:     map[string]func() (string, error){},
 		resolved: map[string]string{},
+		stuck:    map[string]string{},
 		sleep:    time.Sleep,
 	}
 	r.cond = sync.NewCond(&r.mu)
@@ -263,6 +271,12 @@ func (r *reclaimer) wake() {
 
 func (r *reclaimer) wakeLocked() {
 	r.idle = false
+	// A wake is new work, and the entry that could not be freed a moment ago
+	// may be freeable now -- the process holding it open has exited, the
+	// mount is writable again, the directory above it has been made
+	// writable. Retrying it here is what the reclaimer does instead of
+	// retrying it in a loop: once per wake, never in a spin.
+	clear(r.stuck)
 	r.cond.Broadcast()
 }
 
@@ -294,18 +308,29 @@ func (r *reclaimer) work() {
 		}
 		// A failure to free one entry must not stop the reclaimer: the
 		// remaining entries are other callers' space. It stays named in the
-		// set and is retried at the next wake, and the next start after that.
-		_ = r.freeEntry(entry, purpose)
+		// set, is recorded with its reason so an operator can read what is
+		// stuck and why, and is passed over until the next wake.
+		if err := r.freeEntry(entry, purpose); err != nil {
+			r.mu.Lock()
+			r.stuck[entry] = err.Error()
+			r.mu.Unlock()
+		}
 	}
 }
 
-// nextEntry names one queued removal, in the order the sets and their
-// purposes read. It reports false when every set is empty.
+// nextEntry names one queued removal the reclaimer has not already failed on,
+// in the order the sets and their purposes read. It reports false when every
+// set holds nothing but entries this pass could not free, which is when the
+// worker has nothing left to do and goes to sleep.
 func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 	r.mu.Lock()
 	sets := make([]string, 0, len(r.resolved))
 	for _, set := range r.resolved {
 		sets = append(sets, set)
+	}
+	stuck := make(map[string]bool, len(r.stuck))
+	for path := range r.stuck {
+		stuck[path] = true
 	}
 	r.mu.Unlock()
 	sort.Strings(sets)
@@ -323,7 +348,11 @@ func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 				continue
 			}
 			for _, e := range entries {
-				return filepath.Join(set, pe.Name(), e.Name()), purposeByName[pe.Name()], true
+				path := filepath.Join(set, pe.Name(), e.Name())
+				if stuck[path] {
+					continue
+				}
+				return path, purposeByName[pe.Name()], true
 			}
 		}
 	}
@@ -472,18 +501,58 @@ func (r *reclaimer) charge(n int64, set *os.File) {
 	}
 }
 
-// Drain frees everything queued and returns when the sets are empty. It is
-// what an operator's request to give the space back waits on; nothing on a
-// run's path calls it.
-func Drain() {
+// A Stuck is one queued removal the reclaimer tried to make and could not,
+// and the reason it could not. The space it holds is still counted by
+// PendingFreeBytes, so a figure that stops going down is never left without
+// an explanation beside it.
+type Stuck struct {
+	// Entry names the queued removal inside its to-free set: the purpose it
+	// was removed for and the name the rename gave it. The set's own path is
+	// left off, because what an operator needs is which removal is stuck, not
+	// where this process happens to keep its scratch.
+	Entry string
+	// Reason is what the filesystem said.
+	Reason string
+}
+
+// Drain frees everything queued and returns when nothing is left that can be
+// freed, reporting what could not be. It is what an operator's request to
+// give the space back waits on; nothing on a run's path calls it.
+//
+// It returns rather than waiting for the impossible: a queued removal the
+// filesystem refuses -- a directory the process may not write, a file a
+// device error will not release -- would otherwise hold the request open for
+// the life of the process while everything behind it went unfreed.
+func Drain() []Stuck {
 	reclaim.mu.Lock()
-	defer reclaim.mu.Unlock()
-	if !reclaim.started {
-		return
+	if reclaim.started {
+		for !reclaim.idle {
+			reclaim.cond.Wait()
+		}
 	}
-	for !reclaim.idle {
-		reclaim.cond.Wait()
+	reclaim.mu.Unlock()
+	return StuckFrees()
+}
+
+// StuckFrees is every queued removal the reclaimer has tried and failed to
+// make since its last wake, with the reason. It is disclosed beside
+// PendingFreeBytes: that figure alone says space is waiting, and this says
+// which of it is waiting on something that will not resolve itself.
+func StuckFrees() []Stuck {
+	reclaim.mu.Lock()
+	out := make([]Stuck, 0, len(reclaim.stuck))
+	for path, reason := range reclaim.stuck {
+		out = append(out, Stuck{Entry: entryName(path), Reason: reason})
 	}
+	reclaim.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Entry < out[j].Entry })
+	return out
+}
+
+// entryName is a queued entry's purpose directory and name, which is all of
+// its path that means anything outside this process.
+func entryName(path string) string {
+	return filepath.Join(filepath.Base(filepath.Dir(path)), filepath.Base(path))
 }
 
 // PendingFreeBytes is the disk held by everything renamed into a to-free set

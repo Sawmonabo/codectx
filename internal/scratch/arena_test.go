@@ -130,12 +130,15 @@ func TestTakeNeverHandsOneSurfaceToTwoTenants(t *testing.T) {
 	second.Release()
 	third.Release()
 
-	freed, err := a.Empty()
+	collected, err := a.Empty()
 	if err != nil {
 		t.Fatalf("empty: %v", err)
 	}
-	if freed < 0 {
-		t.Fatalf("Empty reported %d bytes freed", freed)
+	if collected.FreedBytes < 0 {
+		t.Fatalf("Empty reported %d bytes freed", collected.FreedBytes)
+	}
+	if len(collected.Stuck) != 0 {
+		t.Fatalf("Empty could not free %v", collected.Stuck)
 	}
 	if _, err := os.Stat(filepath.Join(a.instance, string(SortRun))); !os.IsNotExist(err) {
 		t.Fatalf("the emptied arena still holds %s: %v", SortRun, err)

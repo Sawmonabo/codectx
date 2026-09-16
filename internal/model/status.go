@@ -201,8 +201,14 @@ type ResourceReport struct {
 	// callers at once and land here; a run that exits with this above zero
 	// leaves the rest for the next run to release at the same pace.
 	PendingFreeBytes *uint64 `json:"pending_free_bytes,omitempty"`
-	UnitsReused      *int64  `json:"units_reused,omitempty"`
-	UnitsParsed      *int64  `json:"units_parsed,omitempty"`
+	// StuckFrees names the removals the reclaimer has tried and could not
+	// make, each with the reason. It is the neighbour PendingFreeBytes needs:
+	// that figure rising and never falling is either a run removing faster
+	// than the pace gives back, which resolves itself, or a removal nothing
+	// can make, which does not, and only this tells the two apart.
+	StuckFrees  []StuckFree `json:"stuck_frees,omitempty"`
+	UnitsReused *int64      `json:"units_reused,omitempty"`
+	UnitsParsed *int64      `json:"units_parsed,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -433,4 +439,15 @@ type ScratchPool struct {
 	HeldBytes     uint64            `json:"held_bytes"`
 	HeldByPurpose map[string]uint64 `json:"held_by_purpose,omitempty"`
 	FreedBytes    uint64            `json:"freed_bytes"`
+	// StuckFrees names the removals this collection could not make, each with
+	// the reason the filesystem gave. They are why freed can fall short of
+	// held without the request having failed, and an operator reading the two
+	// figures needs them to tell "the space is gone" from "the space is stuck".
+	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+}
+
+// A StuckFree is one removal the space reclaimer tried to make and could not.
+type StuckFree struct {
+	Entry  string `json:"entry"`
+	Reason string `json:"reason"`
 }

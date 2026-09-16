@@ -563,6 +563,12 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		n := r.FreedByPurpose[purpose]
 		fmt.Fprintf(tw, "    freed for %s\t%s\n", purpose, byteMetric(&n))
 	}
+	// A removal that could not be made holds its space in "awaiting freeing"
+	// and will go on holding it, so it is named under that figure rather than
+	// left to look like a backlog the pace is still working through.
+	for _, stuck := range r.StuckFrees {
+		fmt.Fprintf(tw, "    stuck %s\t%s\n", stuck.Entry, stuck.Reason)
+	}
 	flushTableInto(tw)
 }
 
