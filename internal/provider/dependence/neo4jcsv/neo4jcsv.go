@@ -160,6 +160,31 @@ type Options struct {
 	// beside the staging database, which is deleted with it; a caller that
 	// wants to keep the key set for the next refresh must name a path.
 	KeysPath string
+	// OnPhase, when set, is called as each phase of the import completes,
+	// with the phase's name: the provider logs them with their durations, and
+	// a measurement reads its counters between them.
+	OnPhase func(phase string)
+}
+
+// Import phases, in order, as OnPhase reports them.
+const (
+	PhaseFilesStaged      = "files staged"
+	PhaseExportStaged     = "export staged"
+	PhaseProjected        = "entities and edges projected"
+	PhaseReadsWrites      = "reads and writes derived"
+	PhaseLocated          = "located"
+	PhaseIdentified       = "identified"
+	PhaseRelationsStaged  = "relations staged"
+	PhaseKeysSaved        = "keys saved"
+	PhaseNodesEmitted     = "nodes emitted"
+	PhaseAliasesEmitted   = "aliases emitted"
+	PhaseRelationsEmitted = "relations emitted"
+)
+
+func (o Options) phase(name string) {
+	if o.OnPhase != nil {
+		o.OnPhase(name)
+	}
 }
 
 func (o Options) validate() error {
@@ -282,26 +307,33 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err := e.stageFiles(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseFilesStaged)
 	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes, opts.MaxExportFiles)
 	rep.BytesRead = uint64(n)
 	if err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseExportStaged)
 	if err := sc.project(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseProjected)
 	if err := e.deriveReadsWrites(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseReadsWrites)
 	if err := e.locate(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseLocated)
 	if err := e.identify(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseIdentified)
 	if err := e.stageRelations(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseRelationsStaged)
 	keysPath := opts.KeysPath
 	if keysPath == "" {
 		keysPath = filepath.Join(dir, "keys")
@@ -314,15 +346,19 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseKeysSaved)
 	if err := e.emitNodes(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseNodesEmitted)
 	if err := e.emitAliases(ctx); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseAliasesEmitted)
 	if err := e.emitRelations(ctx, deltaFilter(opts.PreviousKeys, delta)); err != nil {
 		return rep, err
 	}
+	opts.phase(PhaseRelationsEmitted)
 
 	rep.Nodes, rep.Relations, rep.Aliases = e.nodes, e.relations, e.aliases
 	rep.ExternalMethods, rep.DroppedMethods = e.external, e.dropped

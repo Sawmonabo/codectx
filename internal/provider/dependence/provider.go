@@ -721,10 +721,19 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	if err := os.MkdirAll(scratch, 0o700); err != nil {
 		return ImportReport{}, internalErr("the dependence import scratch directory could not be created: " + err.Error())
 	}
+	// Each phase is logged with the time it took, so a slow import names
+	// the phase that was slow.
+	phaseStart := time.Now()
+	onPhase := func(phase string) {
+		now := time.Now()
+		slog.Info("dependence import phase finished", "component", component, "run", string(req.Run),
+			"unit", string(req.Unit.ID), "phase", phase, "elapsed", now.Sub(phaseStart).Round(time.Millisecond))
+		phaseStart = now
+	}
 	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
-		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows,
+		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
 		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles,
 		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
 		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
