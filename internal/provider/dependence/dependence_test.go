@@ -53,8 +53,12 @@ type fakeBackend struct {
 	// while every subdivided part's export succeeds -- the measured shape of a
 	// 4,984-file project whose export died at every heap cap.
 	wholeExportCrash dependence.Outcome
-	parses           int
-	exports          int
+	// wholeParseCrash is the engine crash the WHOLE unit's parse dies on while
+	// every subdivided part parses cleanly, which is the shape of the
+	// reproducible linker fault a real monorepo unit crashed on twice.
+	wholeParseCrash dependence.Outcome
+	parses          int
+	exports         int
 }
 
 func (b *fakeBackend) Engine() dependence.Engine {
@@ -70,6 +74,11 @@ func (b *fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
 
 func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	b.parses++
+	// A subdivided part's graph is "graph-<n>"; anything else is the whole
+	// unit's, exactly as in Export below.
+	if b.wholeParseCrash.Class != dependence.FailureNone && !strings.HasPrefix(filepath.Base(req.OutputPath), "graph-") {
+		return b.wholeParseCrash, nil
+	}
 	if b.parse.Class == dependence.FailureNone && !b.noGraph {
 		if err := os.WriteFile(req.OutputPath, []byte("graph"), 0o600); err != nil {
 			return dependence.Outcome{}, err
@@ -205,7 +214,9 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		detail  map[string]string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
-		// permits for that class, plus one per subdivided part.
+		// permits for that class -- which a crash that named its failing pass
+		// and its exception does not get, because it reproduces on sight --
+		// plus one per subdivided part.
 		parses int
 	}{
 		{
@@ -217,7 +228,7 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 				Pass: "CfgCreationPass", Exception: "java.util.NoSuchElementException", ExitCode: 1}},
 			code:   model.CodeProviderOutputInvalid,
 			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass"},
-			parses: 3,
+			parses: 2,
 		},
 		{
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
@@ -714,8 +725,49 @@ func TestADeadExportIsRecoveredBySubdivision(t *testing.T) {
 		if row.Details["subdivided"] != rootScope {
 			t.Errorf("%s names subdivided=%q, want %q", c, row.Details["subdivided"], rootScope)
 		}
-		if got := row.Details["backend_failure"]; got != "Base/java.util.NoSuchElementException" {
-			t.Errorf("%s reports backend_failure=%q, want the failing pass and its exception", c, got)
+		// The export step has no first-sight rule: its crash was observed twice
+		// before the unit was split, and the row says which it was.
+		if got := row.Details["backend_failure"]; got != "Base/java.util.NoSuchElementException (failure class observed twice)" {
+			t.Errorf("%s reports backend_failure=%q, want the pass, its exception and how the crash was established", c, got)
+		}
+	}
+}
+
+// TestANamedCrashIsSubdividedWithoutASecondParse protects the most expensive
+// decision this provider makes. Failure mode: a crash whose standard error had
+// already named the failing pass and the exception class was parsed a second
+// time before the unit was split — on a real monorepo that second parse cost
+// three minutes and twenty-two seconds of machine time and only re-proved the
+// same deterministic fault, and the unit was subdivided anyway. The report must
+// also say which way the decision went, so nobody has to infer from a duration
+// why one crash was re-parsed and another was not.
+//
+// Mutation: make the first-sight branch in graphFor unreachable
+// (`if false && reproducibleOnSight(outcome)`) so every crash is confirmed ->
+// "the unit cost 3 parse steps, want 2".
+func TestANamedCrashIsSubdividedWithoutASecondParse(t *testing.T) {
+	b := &fakeBackend{wholeParseCrash: dependence.Outcome{Class: dependence.FailureEngine,
+		Pass: "ObjectPropertyCallLinker", Exception: "java.lang.RuntimeException", ExitCode: 1}}
+	h := providertest.New(t, splittable)
+	result, unit, err := h.Run(t, newProvider(t, b), rootScope, []string{"app.go", "go.mod", "inner/inner.go"})
+	if err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	if state, ok := h.UnitState(t, unit); !ok || state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed: the parts the engine could parse are facts", state)
+	}
+	if b.parses != 2 {
+		t.Errorf("the unit cost %d parse steps, want 2 (the crash, one part): a crash that named its pass and its exception reproduces on sight",
+			b.parses)
+	}
+	const want = "ObjectPropertyCallLinker/java.lang.RuntimeException (named pass and exception, taken on first sight)"
+	for _, c := range dependence.Capabilities {
+		row := byCapability(result.Capabilities)[c]
+		if row.State != model.CapabilityPartial {
+			t.Errorf("%s = %q, want partial: a subdivided unit is never fresh", c, row.State)
+		}
+		if got := row.Details["backend_failure"]; got != want {
+			t.Errorf("%s reports backend_failure=%q, want %q", c, got, want)
 		}
 	}
 }
