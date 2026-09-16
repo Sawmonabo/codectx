@@ -1,6 +1,6 @@
 //go:build linux
 
-package sqlite
+package writeback_test
 
 import (
 	"os"
@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Sawmonabo/codectx/internal/writeback"
 )
 
 func procIOField(t *testing.T, field string) int64 {
@@ -30,18 +32,19 @@ func procIOField(t *testing.T, field string) int64 {
 	return 0
 }
 
-// TestWritebackPacerStreamsTheLogToDisk writes a log's worth of pages while
-// the pacer runs and shows they reached the disk before the file was
-// truncated: the kernel counts a dirty page that is truncated away as a
-// cancelled write, and a page the pacer had already written back is not one.
+// TestPacerStreamsAFileToDisk writes a log's worth of pages while a pacer
+// runs and shows they reached the disk before the file was truncated: the
+// kernel counts a dirty page that is truncated away as a cancelled write, and
+// a page the pacer had already written back is not one.
 //
-// Requirement: while a group is open and through its commit, the store's
-// files reach the disk steadily rather than in one burst at a sync. Left to
-// itself the kernel holds a dirty page for thirty seconds, so a group's
-// commit would hand the disk everything at once.
+// Requirement: a file a pacer covers reaches the disk steadily rather than in
+// one burst at a sync. Left to itself the kernel holds a dirty page for
+// thirty seconds, so a writer's commit would hand the disk everything at
+// once.
 //
-// Mutation that fails it: make startPacer a no-op (every byte is cancelled).
-func TestWritebackPacerStreamsTheLogToDisk(t *testing.T) {
+// Mutation that fails it: make the pacer's pass a no-op (every byte is
+// cancelled).
+func TestPacerStreamsAFileToDisk(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/store.db"
 	if err := os.WriteFile(path, []byte("header"), 0o600); err != nil {
@@ -53,8 +56,7 @@ func TestWritebackPacerStreamsTheLogToDisk(t *testing.T) {
 	}
 	defer log.Close()
 
-	s := &Store{path: path}
-	s.startPacer()
+	p := writeback.Start(path, path+"-wal")
 	const chunk = 1 << 20
 	const total = 64 * chunk
 	buf := make([]byte, chunk)
@@ -70,7 +72,7 @@ func TestWritebackPacerStreamsTheLogToDisk(t *testing.T) {
 	// The pacer's last pass queues whatever the ticks had not; waiting for
 	// that writeback to land is the only wait here, and it is bounded by the
 	// disk's rate for 64 MiB.
-	s.stopPacer()
+	p.Stop()
 	if err := unix.SyncFileRange(int(log.Fd()), 0, 0, unix.SYNC_FILE_RANGE_WAIT_AFTER); err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/writeback"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -172,7 +173,7 @@ type Store struct {
 	groupLog logMark
 	// pacer runs while a group is open and through its commit, so the
 	// group's log and the checkpoint reach the disk steadily.
-	pacer *writebackPacer
+	pacer *writeback.Pacer
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -490,7 +491,7 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		}
 		s.group = tx
 		s.groupLog = s.logMark()
-		s.startPacer()
+		s.pacer = writeback.Start(s.path, s.path+"-wal")
 	}
 	tx := s.group
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -574,7 +575,8 @@ func (s *Store) commitGroupLocked() error {
 		// the log folds what it can and is not a failure of the commit.
 		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
 	}
-	s.stopPacer()
+	s.pacer.Stop()
+	s.pacer = nil
 	s.writerMu.Unlock()
 	if err != nil {
 		return wrap("commit", err)
@@ -591,7 +593,8 @@ func (s *Store) abandonGroupLocked() {
 	tx := s.group
 	s.group = nil
 	tx.Rollback()
-	s.stopPacer()
+	s.pacer.Stop()
+	s.pacer = nil
 	s.writerMu.Unlock()
 }
 
