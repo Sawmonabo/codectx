@@ -150,7 +150,6 @@ type Index struct {
 	// from available CPUs and memory reservations, which is still a finite
 	// bound and never "unlimited".
 	Workers           int      `toml:"workers"`
-	MaxParserWorkers  int      `toml:"max_parser_workers"`
 	BatchRecords      int      `toml:"batch_records"`
 	BatchBytes        int64    `toml:"batch_bytes"`
 	QueueBytes        int64    `toml:"queue_bytes"`
@@ -201,21 +200,17 @@ type Index struct {
 
 // Resources is the memory, concurrency, disk and response policy.
 type Resources struct {
-	BaseMemoryBudgetBytes     int64    `toml:"base_memory_budget_bytes"`
-	QueryMemoryBytes          int64    `toml:"query_memory_bytes"`
-	CacheBytes                int64    `toml:"cache_bytes"`
-	MaxConcurrentQueries      int      `toml:"max_concurrent_queries"`
-	MaxConcurrentGraphQueries int      `toml:"max_concurrent_graph_queries"`
-	MaxConcurrentHeavy        int      `toml:"max_concurrent_heavy_analyzers"`
-	MaxTempBytes              int64    `toml:"max_temp_bytes"`
-	MinFreeDiskBytes          int64    `toml:"min_free_disk_bytes"`
-	MaxMetadataResponseBytes  int64    `toml:"max_metadata_response_bytes"`
-	MaxSourceResponseBytes    int64    `toml:"max_source_response_bytes"`
-	QueryTimeout              Duration `toml:"query_timeout"`
-	MaxQueryTextBytes         int      `toml:"max_query_text_bytes"`
-	MaxQueryTerms             Limit    `toml:"max_query_terms"`
-	MaxPageItems              int      `toml:"max_page_items"`
-	MaxProviderRecordBytes    Limit    `toml:"max_provider_record_bytes"`
+	QueryMemoryBytes         int64    `toml:"query_memory_bytes"`
+	CacheBytes               int64    `toml:"cache_bytes"`
+	MaxTempBytes             int64    `toml:"max_temp_bytes"`
+	MinFreeDiskBytes         int64    `toml:"min_free_disk_bytes"`
+	MaxMetadataResponseBytes int64    `toml:"max_metadata_response_bytes"`
+	MaxSourceResponseBytes   int64    `toml:"max_source_response_bytes"`
+	QueryTimeout             Duration `toml:"query_timeout"`
+	MaxQueryTextBytes        int      `toml:"max_query_text_bytes"`
+	MaxQueryTerms            Limit    `toml:"max_query_terms"`
+	MaxPageItems             int      `toml:"max_page_items"`
+	MaxProviderRecordBytes   Limit    `toml:"max_provider_record_bytes"`
 }
 
 // The two accepted spellings of storage.synchronous. They are the whole set:
@@ -310,9 +305,8 @@ type Manifest struct {
 // subcommand of this same binary with bundled grammars, so `enabled` is a plain
 // boolean: there is no external executable to approve.
 type TreeSitter struct {
-	Enabled       bool     `toml:"enabled"`
-	Languages     []string `toml:"languages"`
-	WorkerIdleTTL Duration `toml:"worker_idle_ttl"`
+	Enabled   bool     `toml:"enabled"`
+	Languages []string `toml:"languages"`
 	// MaxCalleeReferences is how many distinct cross-file callee names the
 	// user wants one file to mint nodes for. Unlimited by default: a
 	// generated file names what it names, and the count is bounded by the
@@ -388,11 +382,16 @@ type SCIP struct {
 
 // LSP configures the snapshot-qualified working-tree overlay.
 type LSP struct {
-	Enabled                Enablement `toml:"enabled"`
-	RequestTimeout         Duration   `toml:"request_timeout"`
-	MaxServers             int        `toml:"max_servers"`
-	MaxOutstandingRequests int        `toml:"max_outstanding_requests"`
-	IdleTTL                Duration   `toml:"idle_ttl"`
+	Enabled Enablement `toml:"enabled"`
+	// StallTimeout is a hang detector and not a deadline on an answer. It is
+	// how long a request tolerates NO bytes moving on the connection in either
+	// direction before the server is declared hung. A server indexing a
+	// monorepo before it answers its first request is working, not wedged, and
+	// a wall-clock request deadline could not tell the two apart; bytes moving
+	// can.
+	StallTimeout           Duration `toml:"stall_timeout"`
+	MaxOutstandingRequests int      `toml:"max_outstanding_requests"`
+	IdleTTL                Duration `toml:"idle_ttl"`
 	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
 	// pinned bytes cached for coordinate conversion, and the bytes sent to and
 	// received from a server over its lifetime.
@@ -423,11 +422,6 @@ type Dependence struct {
 	// Sizing a unit near its live set costs time instead of memory, so the
 	// floor keeps a small unit from being starved into a much slower run.
 	UnitMemoryFloorBytes int64 `toml:"unit_memory_floor_bytes"`
-	// UnitMemoryCeilingBytes is 0 by default, which means the allocation is
-	// derived from the machine: free memory minus the base index footprint
-	// minus a safety margin. There is no default memory ceiling, and only a
-	// non-zero value here may reject a unit before it runs.
-	UnitMemoryCeilingBytes int64 `toml:"unit_memory_ceiling_bytes"`
 	// MaxUnitsPerFamily is how many projects of one language family the user
 	// wants a plan to hold. Unlimited by default: a monorepo's project count
 	// is a property of the repository, not something the product refuses on
@@ -622,7 +616,6 @@ func Defaults() Config {
 		},
 		Index: Index{
 			Workers:           0,
-			MaxParserWorkers:  2,
 			BatchRecords:      1000,
 			BatchBytes:        4194304,
 			QueueBytes:        16777216,
@@ -642,16 +635,12 @@ func Defaults() Config {
 			MaxEvidencePerFact: Unlimited,
 		},
 		Resources: Resources{
-			BaseMemoryBudgetBytes:     805306368,
-			QueryMemoryBytes:          33554432,
-			CacheBytes:                33554432,
-			MaxConcurrentQueries:      4,
-			MaxConcurrentGraphQueries: 2,
-			MaxConcurrentHeavy:        1,
-			MaxTempBytes:              0,
-			MinFreeDiskBytes:          1073741824,
-			MaxMetadataResponseBytes:  262144,
-			MaxSourceResponseBytes:    7340032,
+			QueryMemoryBytes:         33554432,
+			CacheBytes:               33554432,
+			MaxTempBytes:             0,
+			MinFreeDiskBytes:         1073741824,
+			MaxMetadataResponseBytes: 262144,
+			MaxSourceResponseBytes:   7340032,
 			// QueryTimeout is 0: a call that carries no deadline of its own runs
 			// to the complete answer. Only a user-set value ends a page early,
 			// and then with a cursor, never an error.
@@ -685,7 +674,6 @@ func Defaults() Config {
 			TreeSitter: TreeSitter{
 				Enabled:             true,
 				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
-				WorkerIdleTTL:       Duration(60 * time.Second),
 				MaxCalleeReferences: Unlimited,
 				MaxRecordsPerFile:   Unlimited,
 			},
@@ -695,24 +683,22 @@ func Defaults() Config {
 				MaxSourceFileBytes: Unlimited, MaxMaterializeBytes: Unlimited},
 			LSP: LSP{
 				Enabled:                Auto,
-				RequestTimeout:         Duration(15 * time.Second),
-				MaxServers:             1,
+				StallTimeout:           Duration(5 * time.Minute),
 				MaxOutstandingRequests: 8,
 				IdleTTL:                Duration(60 * time.Second),
 				MaxOverlayBytes:        Unlimited,
 			},
 			Dependence: Dependence{
-				Enabled:                Auto,
-				Timeout:                0,
-				StallTimeout:           Duration(5 * time.Minute),
-				CacheBytes:             4294967296,
-				UnitMemoryFloorBytes:   805306368,
-				UnitMemoryCeilingBytes: 0,
-				MaxUnitsPerFamily:      Unlimited,
-				MaxStagedRows:          Unlimited,
-				MaxDerivedRows:         Unlimited,
-				MaxExportFiles:         Unlimited,
-				StagingCacheKiB:        262144,
+				Enabled:              Auto,
+				Timeout:              0,
+				StallTimeout:         Duration(5 * time.Minute),
+				CacheBytes:           4294967296,
+				UnitMemoryFloorBytes: 805306368,
+				MaxUnitsPerFamily:    Unlimited,
+				MaxStagedRows:        Unlimited,
+				MaxDerivedRows:       Unlimited,
+				MaxExportFiles:       Unlimited,
+				StagingCacheKiB:      262144,
 			},
 			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited,
 				MaxTOMLLines: Unlimited, MaxXMLElements: Unlimited},

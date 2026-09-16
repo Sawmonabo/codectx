@@ -57,10 +57,12 @@ by the server at the project the workspace root itself declares.
 The materialization stays whole: the server is rooted inside it, and every URI
 the client sends and resolves is still a snapshot-relative path, so a location
 the server returns from outside its project is mapped and admitted exactly as
-before. Concurrency is unchanged — each server takes one
-`providers.lsp.max_servers` slot and one reservation on the shared server
-runner, so a repository with many projects queues on the same bound a
-repository with one project does.
+before. Concurrency is the machine's: each server is admitted against the one
+machine-derived allocation by the memory its pinned definition reserves, so a
+repository with many projects runs as many servers at once as the machine has
+room for. When there is no room, an idle server is stopped to make room and
+otherwise the open waits — another project's server already running is never a
+refusal.
 
 A `Profile` is runnable, and `Resolve(ctx, resolver, cfg, name)` is its only
 constructor:
@@ -227,9 +229,9 @@ Bounds, all finite:
 
 | Bound | Source | Effect when hit |
 |---|---|---|
-| concurrent servers | `providers.lsp.max_servers` (default 1) | an idle server is stopped to make room; otherwise `CTX_RESOURCE_LIMIT` |
+| concurrent servers | the machine-derived allocation, summed over the definitions' memory reservations | an idle server is stopped to make room; otherwise the open waits for room |
 | in-flight requests per server | `providers.lsp.max_outstanding_requests` | callers wait for a slot under their context |
-| one request | `providers.lsp.request_timeout` | `$/cancelRequest` sent, `CTX_PROVIDER_TIMEOUT` |
+| a request making no progress | `providers.lsp.stall_timeout` (default 5m, no bytes moving either way) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer. |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
 | server lifetime | the definition's own `Timeout` (1 h) | the runner terminates the tree |
 | materialized bytes, one admitted file, bytes sent per rolling minute | `Options.MaxOverlayBytes` (default unlimited) | files that do not fit are named in the log and left out; a file over the bound is not admitted and the query answers about the rest; a sustained flood over the send budget fails the server |
@@ -258,7 +260,7 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   `conn.write` itself is not context-aware, so a call can wait on the writer
   lock behind a frame the server has not yet consumed; that wait is bounded by
   the server's own progress and ultimately by the approval's `timeout`
-  terminating the tree, not by `providers.lsp.request_timeout`.
+  terminating the tree, not by `providers.lsp.stall_timeout`.
 - **Server-initiated requests** are handled by explicit policy:
   `workspace/configuration` is answered with `null` per item (at most 64
   items) — codectx supplies no settings; **everything else** is answered with
@@ -319,7 +321,7 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 ## Typed surface
 
 ```go
-mgr, _ := lsp.New(lsp.Options{Runner: runner, DataDir: dataDir, MaxServers: cfg.Providers.LSP.MaxServers, ...})
+mgr, _ := lsp.New(lsp.Options{Runner: runner, DataDir: dataDir, AllocationBytes: allocation, ...})
 profile, err := lsp.Resolve(ctx, resolver, cfg, "gopls")     // CTX_TOOL_* when the payload does not resolve
 ov, err := mgr.Open(ctx, view, profile)            // starts lazily, shares a running server
 defer ov.Close()                                   // last close starts the idle TTL

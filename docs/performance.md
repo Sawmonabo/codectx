@@ -96,10 +96,10 @@ parser workers), read by the Task 20 host sampler.
 
 ### What one parser worker costs
 
-`index.max_parser_workers` is a CONCURRENCY ceiling, not a resident cost: the
-pool starts no process until a unit demands one and reaps an idle worker after
-`tree_sitter.worker_idle_ttl`, so a process that parses nothing holds no worker
-(`TestPoolLazyAndReaped`), and the number alive at any moment is the concurrent
+The parser worker count is a CONCURRENCY figure, not a resident cost: the
+pool starts no process until a unit demands one and drains every worker when the
+last unit returns, so a process that has stopped parsing holds no worker at all
+(`TestPoolLazyAndDrainedWhenTheStageEnds`), and the number alive is the concurrent
 parse demand rather than the ceiling. What one live worker costs was measured on
 the measuring host from `/proc/<pid>/smaps_rollup`, on a worker that had sent its
 hello and parsed nothing: **18.2 MiB RSS, 9.4 MiB PSS**.
@@ -147,7 +147,7 @@ percentile over `n` samples.
 Row 11 measures a RESTING session, which is what "idle" claims. It used to open
 its sampling window at process start with `mcp.watch` at its default, so the
 window covered the initial refresh and its parser workers — a startup peak
-reported under an idle label, and a default `max_parser_workers` was once
+reported under an idle label, and a low default worker count was once
 reverted on the strength of it. The row now starts the session with
 `--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
 the server at rest: workspace open, no refresh running. The refresh peak is row

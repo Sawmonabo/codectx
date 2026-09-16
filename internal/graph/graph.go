@@ -54,7 +54,7 @@ type Promoter interface { // nil in report mode; a failed promotion never fails 
 	Promote(ctx context.Context, providerID, scopeKey string) (PendingUnits, error)
 }
 
-// Gate is the PROCESS-scoped max_concurrent_graph_queries semaphore. It is owned by the app stack
+// Gate is the PROCESS-scoped traversal semaphore, sized from the cores. It is owned by the app stack
 // and passed in, because Workspace.Query builds one Engine per request: a per-Engine semaphore
 // would gate nothing. Acquire honours the request deadline and returns CTX_RESOURCE_LIMIT.
 type Gate interface {
