@@ -62,14 +62,14 @@ func TestAnImportSpoolIsReusedAndNeverCarriesTheLastImportsFacts(t *testing.T) {
 		t.Fatal("the first import's spool is empty; it spooled nothing and proves nothing")
 	}
 
-	steps := paced.Steps()
+	freedBefore := paced.FreedBytes()
 	second, err := openScratch(ctx, work)
 	if err != nil {
 		t.Fatalf("second openScratch: %v", err)
 	}
 	defer second.close()
-	if freed := paced.Steps() - steps; freed != 0 {
-		t.Fatalf("taking the spool again freed %d windows of disk; it must free none", freed)
+	if freed := paced.FreedBytes() - freedBefore; freed != 0 {
+		t.Fatalf("taking the spool again freed %d bytes of disk; it must free none", freed)
 	}
 	if got := second.lease.Path(); got != path {
 		t.Fatalf("the second import spooled into %s, want the pooled surface %s: a spool is created per import again", got, path)

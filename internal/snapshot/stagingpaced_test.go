@@ -2,12 +2,37 @@ package snapshot
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
+
+// alone runs the caller in a child copy of the test binary with no other test
+// selected, and reports whether this call is that child.
+//
+// Registration is a process-wide, once-only act, so "this open path registers
+// the shim itself" is only observable in a process where nothing else has
+// registered. Run among its package's other tests the assertion below holds
+// whatever the open path does, which is no assertion at all: the child is
+// what gives it its meaning.
+func alone(t *testing.T, name string) bool {
+	t.Helper()
+	const marker = "CODECTX_PACED_REGISTRATION_CHILD"
+	if os.Getenv(marker) != "" {
+		return true
+	}
+	cmd := exec.Command(os.Args[0], "-test.run", "^"+name+"$", "-test.v")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the open path did not register the file-system shim: %v\n%s", err, out)
+	}
+	return false
+}
 
 // The requirement: a capture's staging database is paced whatever else the
 // process has opened. It holds one row per eligible path of the repository and
@@ -16,12 +41,14 @@ import (
 // application happens to register first -- and a capture reached on another
 // path would hand the kernel a repository-sized file at once.
 //
-// The test opens the staging on its own, as a package with no application
-// wiring does, and asserts the shim saw the writes.
-// Mutation: drop pacedvfs.Register() from openStaging and run this test alone
-// (-run TestTheCaptureStagingIsPacedWithoutTheApplicationsWiring, so no other
-// test in the package registers first); no window is counted.
+// The test opens the staging on its own in a process where nothing else has
+// opened a database -- see alone -- and asserts the shim saw the writes.
+// Mutation: drop pacedvfs.Register() from openStaging; no window is counted,
+// and the whole package fails, not only this test under -run.
 func TestTheCaptureStagingIsPacedWithoutTheApplicationsWiring(t *testing.T) {
+	if !alone(t, "TestTheCaptureStagingIsPacedWithoutTheApplicationsWiring") {
+		return
+	}
 	ctx := context.Background()
 	s, err := openStaging(ctx, t.TempDir())
 	if err != nil {

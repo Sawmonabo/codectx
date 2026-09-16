@@ -58,7 +58,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	const windows = 4
 	path := filepath.Join(served, "big")
 	writeFile(t, path, windows*Window)
-	steps, freed := Steps(), FreedByPurpose()[AnalyzerOutput]
+	beforeSteps, freed := steps.Load(), FreedByPurpose()[AnalyzerOutput]
 
 	if err := RemoveFor(AnalyzerOutput, path); err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 
 	release()
 	Drain()
-	if got := Steps() - steps; got != windows {
+	if got := steps.Load() - beforeSteps; got != windows {
 		t.Fatalf("the reclaimer freed %d windows; want %d", got, windows)
 	}
 	if got := FreedByPurpose()[AnalyzerOutput] - freed; got != int64(windows)*Window {

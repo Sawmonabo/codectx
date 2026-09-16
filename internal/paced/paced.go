@@ -32,12 +32,13 @@ import (
 	"sync/atomic"
 )
 
-// steps counts the windows freed so far, one per truncation step.
+// steps counts the truncation steps this package has taken. It is not a
+// figure anything discloses -- what an operator reads is bytes, FreedBytes,
+// because that is what the disk charges for -- but whether a given removal
+// truncated at all, and in how many steps, is the difference between freeing
+// a window at a time and freeing in a burst, and nothing else distinguishes
+// the two once the bytes are the same.
 var steps atomic.Int64
-
-// Steps reports how many windows the process has freed one at a time since
-// it started: a removal's cost in disk work, for diagnostics.
-func Steps() int64 { return steps.Load() }
 
 // Window is the number of bytes handed to the disk between two waits: the
 // bytes written to one file before the writer waits for the window before
@@ -112,6 +113,7 @@ func Shrink(path string, size int64) error {
 // shrinkFile is Shrink on an open file whose current size the caller knows.
 func shrinkFile(f *os.File, cur, size int64) error {
 	for cur > size {
+		prev := cur
 		cur = max(cur-Window, size)
 		if err := f.Truncate(cur); err != nil {
 			return err
@@ -120,6 +122,7 @@ func shrinkFile(f *os.File, cur, size int64) error {
 			return err
 		}
 		steps.Add(1)
+		Freed(prev - cur)
 	}
 	return nil
 }

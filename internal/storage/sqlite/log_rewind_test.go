@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/paced"
-	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -34,7 +33,7 @@ func TestTheLogIsRewoundAndNeverTruncated(t *testing.T) {
 	const cacheKiB = 16 << 10
 	dir := t.TempDir()
 	path := dir + "/rewind.db"
-	truncationsBefore := pacedvfs.Truncations()
+	freedBefore := paced.FreedBytes()
 	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
 
 	var high int64
@@ -58,14 +57,14 @@ func TestTheLogIsRewoundAndNeverTruncated(t *testing.T) {
 	if st.Size() < high {
 		t.Errorf("the log shrank from %d to %d bytes at the run's last commit and checkpoint: it is being truncated, not rewound", high, st.Size())
 	}
-	// Without a log larger than the window a truncation would take no windowed
-	// step, and the mutation above would pass with nothing proven.
+	// Without a log larger than the window a truncation would free less than
+	// one window, and the mutation above would pass with nothing proven.
 	if high <= paced.Window {
 		t.Fatalf("the log reached only %d bytes, which is not past the %d-byte window: the fixture proves nothing", high, paced.Window)
 	}
-	if steps := pacedvfs.Truncations() - truncationsBefore; steps != 0 {
-		t.Errorf("the store freed %d windows of log space during the run; a run that reuses its space frees none", steps)
+	if freed := paced.FreedBytes() - freedBefore; freed != 0 {
+		t.Errorf("the store freed %d bytes of disk during the run; a run that reuses its space frees none", freed)
 	}
-	t.Logf("log high-water %.1f MiB across the run's groups, never shrunk; windows freed %d",
-		float64(high)/(1<<20), pacedvfs.Truncations()-truncationsBefore)
+	t.Logf("log high-water %.1f MiB across the run's groups, never shrunk; bytes freed %d",
+		float64(high)/(1<<20), paced.FreedBytes()-freedBefore)
 }

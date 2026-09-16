@@ -240,20 +240,25 @@ const unixWritePiece = 1 << 16
 func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	m := innerMethods(pFile)
 	write := *(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxWrite}))
+	// A write that fails part way through has still put its earlier pieces in
+	// the file, so they are credited before the failure is returned: the log
+	// count is the store's spill signal and the window count decides where the
+	// next wait falls, and both would be wrong by the pieces that landed.
+	h := (*header)(ptr(pFile))
 	var rc int32
-	for done := int32(0); done < iAmt; {
+	done := int32(0)
+	for done < iAmt {
 		n := min(iAmt-done, unixWritePiece)
 		if rc = write(tls, wrapped(pFile), zBuf+uintptr(done), n, iOfst+int64(done)); rc != sqlite3.SQLITE_OK {
-			return rc
+			break
 		}
 		done += n
 	}
-	h := (*header)(ptr(pFile))
 	if h.isLog != 0 {
-		logBytes.Add(int64(iAmt))
+		logBytes.Add(int64(done))
 	}
-	h.since += int64(iAmt)
-	if h.since < Window {
+	h.since += int64(done)
+	if rc != sqlite3.SQLITE_OK || h.since < Window {
 		return rc
 	}
 	h.since = 0
@@ -275,7 +280,9 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 
 // xTruncate shrinks a file a window at a time, syncing between steps, so
 // that freeing a large log hands the filesystem one window of freed space
-// at a time.
+// at a time. Every step's bytes, the last one included, are counted and paced
+// with the rest of the process's freeing: a truncation gives space back just
+// as an unlink does, and the host charges for it the same way.
 func xTruncate(tls *libc.TLS, pFile uintptr, size int64) int32 {
 	m := innerMethods(pFile)
 	truncate := *(*func(*libc.TLS, uintptr, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxTruncate}))
@@ -293,10 +300,17 @@ func xTruncate(tls *libc.TLS, pFile uintptr, size int64) int32 {
 		if rc := sync(tls, wrapped(pFile), sqlite3.SQLITE_SYNC_NORMAL); rc != sqlite3.SQLITE_OK {
 			return rc
 		}
+		// The file is on the disk as far as this step goes, so the window
+		// counted since the last wait is spent.
+		(*header)(ptr(pFile)).since = 0
 		truncations.Add(1)
+		paced.Freed(Window)
 	}
-	(*header)(ptr(pFile)).since = 0
-	return truncate(tls, wrapped(pFile), size)
+	rc := truncate(tls, wrapped(pFile), size)
+	if rc == sqlite3.SQLITE_OK {
+		paced.Freed(cur - size)
+	}
+	return rc
 }
 
 func xSync(tls *libc.TLS, pFile uintptr, flags int32) int32 {
