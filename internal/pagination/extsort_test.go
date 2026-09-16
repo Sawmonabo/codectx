@@ -37,7 +37,7 @@ func compareResume(a, b resumeRecord) int {
 // foldResume concatenates the payloads of equal records in the order they
 // reach the fold, so the survivor records the ARRIVAL ORDER of every record it
 // absorbed. It is neither commutative nor associative-with-order, which is
-// exactly the fold shape WithFold documents and the one an out-of-order adopted
+// exactly the folding contract WithFold documents and the one an out-of-order adopted
 // run would corrupt.
 func foldResume(a, b resumeRecord) (resumeRecord, error) {
 	a.Payload += "+" + b.Payload

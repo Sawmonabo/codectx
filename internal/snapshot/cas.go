@@ -107,7 +107,7 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 // two-hex-digit prefix, instead of one per blob. The caller commits the
 // manifest or generation that names the blobs only after Barrier returns.
 //
-// Publishing after the fsync rather than before is what keeps a crash
+// Publishing after the fsync rather than ahead of it is what keeps a crash
 // recoverable: an interrupted batch leaves nothing in the buckets, only
 // temporaries that Sweep already removes. A bucket entry whose bytes had not
 // reached the disk would survive as a short file and fail every later capture

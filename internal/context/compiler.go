@@ -465,7 +465,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 			return c.stageIngest(ctx, reader, gen, req, sorts, st, func() bool { return stop(passIngest) })
 		}},
 		{passHydrate, func() error { return c.stageHydrate(ctx, reader, sorts, st) }},
-		{passAttributes, func() error { return c.stageAttributes(ctx, reader, sorts, st) }},
+		{passAttributes, func() error { return c.stageAttributes(ctx, reader, gen, sorts, st) }},
 		{passRoutes, func() error { return c.stageRouteScoring(ctx, sorts, st) }},
 		{passCentrality, func() error { return c.stageCentrality(ctx, sorts, st) }},
 		{passBoosts, func() error { return c.stageBoosts(ctx, sorts, st) }},
@@ -519,8 +519,9 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 }
 
 // stageIngest is P-A. The graph engine is opened here and released when the
-// pass ends: it is the only pass that reads it, so a resumed compile that
-// re-enters past P-A opens no engine at all.
+// pass ends, and P-C opens one of its own: each pass holds the engine only
+// while it reads structure, so a resumed compile re-entering past a pass opens
+// nothing for it.
 //
 // An unresolved seed is carried INTO the expansion rather than around it: the
 // expansion is what decides whether an unresolvable identity is the discovery
@@ -607,11 +608,13 @@ func (c *Compiler) stageHydrate(ctx context.Context, reader *sqlite.PinnedReader
 	return nil
 }
 
-// stageAttributes is P-C, over the PRE-hydration spool and before any scoring:
-// that is what relationsOnPaths reads today, and running it here keeps the
-// edge-scan reads ahead of the evidence reads exactly as today's call order
-// does. Both P-B and P-C may read the ingest stream because a sorted run is
+// stageAttributes is P-C, over the PRE-hydration spool and before any scoring.
+// Both P-B and P-C may read the ingest stream because a sorted run is
 // replayable until the sort area is released.
+//
+// The graph engine is opened here and released when the pass ends: P-C reads
+// the candidate nodes' adjacency through the packed port, and the engine is a
+// bounded resource that must not outlive the one pass that reads it.
 //
 // An incomplete edge scan narrows scopeComplete HERE rather than travelling as
 // a second flag: a route whose edges could not all be read is scored as
@@ -619,9 +622,18 @@ func (c *Compiler) stageHydrate(ctx context.Context, reader *sqlite.PinnedReader
 // false, so folding the verdict in at the pass that produces it is exact and
 // leaves one scalar for every boundary behind this one to carry.
 func (c *Compiler) stageAttributes(ctx context.Context, reader *sqlite.PinnedReader,
-	sorts *compileSorts, st *compileState,
+	gen model.GenerationID, sorts *compileSorts, st *compileState,
 ) error {
-	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, st.hops, st.cands)
+	engine, release, err := c.graph(ctx, gen)
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	defer release()
+	g, err := engine.Reader()
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, g, st.hops, st.cands)
 	if err != nil {
 		return contextErr(ctx, err)
 	}

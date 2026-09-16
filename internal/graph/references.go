@@ -652,7 +652,7 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 // Peak memory is the sort's run budget, never the node's degree.
 func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	walk referenceWalk) (*pagination.SortedRun[referenceRelation], error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return nil, err
 	}
