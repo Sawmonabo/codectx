@@ -236,7 +236,7 @@ func TestIncrementalReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	lock, err := snapshot.LockWorkspace(ctx, dataDir, 0)
+	lock, err := snapshot.LockWorkspace(ctx, dataDir, "index", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

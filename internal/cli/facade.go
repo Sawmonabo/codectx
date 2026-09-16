@@ -34,8 +34,10 @@ func openForQuery() opener {
 }
 
 // openForBuild opens the workspace as the single cross-process writer, with the
-// bounded lock wait, rebuild cache and supplied-index inputs the caller's flags
-// resolved to. Only the building commands use it.
+// operation name, bounded lock wait, rebuild cache and supplied-index inputs
+// the caller's flags resolved to. Only the building commands use it, and each
+// names itself: the name is what the lock file carries for whichever process is
+// refused while this one holds the workspace.
 func openForBuild(o app.OpenOptions) opener {
 	return func(ctx context.Context, repo string) (*app.Workspace, error) {
 		return app.OpenWorkspace(ctx, repo, o)

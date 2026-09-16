@@ -45,6 +45,12 @@ type Workspace struct {
 // pair -- and four positional parameters that must agree read worse than one
 // value that carries the agreement.
 type OpenOptions struct {
+	// Operation is what this process is doing, in the words a person would
+	// recognise on the refusal another process reads when it finds the
+	// workspace busy -- an index, a refresh, a watch, a connected session.
+	// The holder records it in the lock file, so an open that will take the
+	// lock and leaves it empty is refused rather than holding anonymously.
+	Operation string
 	// Wait is how long the acquisition of the workspace lock retries before
 	// reporting CTX_WORKSPACE_BUSY; Wait <= 0 tries once. The acquisition is
 	// the open itself for an indexing command and the first build for a
@@ -67,7 +73,7 @@ type OpenOptions struct {
 // (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
 // at unit time, not a missing capability and not a cost this call pays.
 func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeIndex, wait: o.Wait, rebuild: o.Rebuild,
+	return open(ctx, repo, openOptions{mode: modeIndex, operation: o.Operation, wait: o.Wait, rebuild: o.Rebuild,
 		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
@@ -102,7 +108,7 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 // they then answer while this process's own refresh writes, without committing
 // its ingestion group early and without waiting behind it.
 func OpenWorkspaceForServer(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeServe, wait: o.Wait, rebuild: o.Rebuild,
+	return open(ctx, repo, openOptions{mode: modeServe, operation: o.Operation, wait: o.Wait, rebuild: o.Rebuild,
 		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 

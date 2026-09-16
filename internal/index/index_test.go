@@ -122,7 +122,7 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	// One lock per workspace, taken once and handed to every coordinator the
 	// scenario builds: it is the cross-process owner, and a second acquisition
 	// in this process is refused exactly as another process would be.
-	if f.lock, err = snapshot.LockWorkspace(ctx, f.dataDir, 0); err != nil {
+	if f.lock, err = snapshot.LockWorkspace(ctx, f.dataDir, "index", 0); err != nil {
 		t.Fatalf("LockWorkspace: %v", err)
 	}
 	t.Cleanup(func() { f.lock.Close() })
