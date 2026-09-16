@@ -121,14 +121,22 @@ func (r *Registry) Lookup(id string) (Provider, bool) {
 // Selection is the outcome of detection over one workspace. Active holds the
 // providers that will run, in dependency order. States holds every capability
 // row detection publishes, at ScopeWorkspace and one per declared capability:
-// `unavailable` for a disabled or absent optional provider, `failed` for an
-// enabled provider that could not be detected, and `partial` for a provider
-// that *will* run but whose detection named something inside it that cannot
-// (Detection.Details). The categories are kept apart because a disabled
-// optional tool must not make a healthy base generation falsely fail, while an
-// enabled requested capability that fails makes the generation degraded
+// `unavailable` for an absent optional provider, `failed` for an enabled
+// provider that could not be detected, and `partial` for a provider that
+// *will* run but whose detection named something inside it that cannot
+// (Detection.Details). The categories are kept apart because an optional tool
+// that is absent must not make a healthy base generation falsely fail, while
+// an enabled requested capability that fails makes the generation degraded
 // (Sections 11.1, 13.3); a partial row is the middle case -- the provider runs,
 // and the coordinator publishes the reasons the rest of it will not.
+//
+// A provider the configuration disabled publishes NO row at all. `unavailable`
+// is the record of work that was wanted and not attempted, each row carrying
+// the reason it was not; nobody asked a disabled provider for anything, so it
+// has nothing to report per capability, and a report full of `unavailable`
+// rows for it reads as a degraded index rather than a configured one. That a
+// provider is off is said once, by the coordinator, on the result and in the
+// log -- not once per capability.
 type Selection struct {
 	Active []Provider
 	States []model.CapabilityState
@@ -206,6 +214,12 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 				WithDetail("provider_id", id).WithDetail("diagnostic_code", code)
 		}
 		inactive[id] = inactiveProvider{state: state, code: code}
+		if mode == config.Disabled {
+			// Recorded as inactive, so a dependent still inherits the reason
+			// it cannot run -- and published as nothing, because a provider
+			// the operator turned off was never asked to do anything.
+			continue
+		}
 		for _, c := range d.Capabilities {
 			sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code})
 		}
@@ -245,6 +259,8 @@ type inactiveProvider struct {
 func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode config.Enablement, root workspace.Root, policy workspace.Policy,
 	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string, map[string]string, Detection) {
 	if mode == config.Disabled {
+		// The state is what a dependent of this provider inherits; Select
+		// publishes no row of its own for it.
 		return model.CapabilityUnavailable, model.CodeProviderUnavailable, nil, Detection{}
 	}
 	for _, dep := range d.DependsOn {

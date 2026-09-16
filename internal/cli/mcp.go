@@ -146,7 +146,17 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 				Context: svc,
 				Config:  cfg,
 				Build:   build,
-				Logger:  log,
+				// The server reports progress and logs stages from the one run
+				// ledger this workspace composed. It never opens a ledger of
+				// its own: the file has a single writer, and a second one would
+				// contend with the very run these notifications describe.
+				// IndexRun names the run those stages belong to, so a call
+				// following an index counts its stages and not those of the
+				// per-process overlay run a language server's start opens
+				// beside it.
+				Spans:    ws.Spans,
+				IndexRun: ws.IndexRunID,
+				Logger:   log,
 			})
 			if err != nil {
 				return err

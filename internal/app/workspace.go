@@ -130,9 +130,13 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// only place in this process that holds both the cross-process
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
-		Pool:      s.pool,
-		Watcher:   s.watcher,
-		States:    s.states,
+		Ledger:    s.ledger,
+		// The read-only side of the same file, so a finished run states in its
+		// result what it did. It opens the ledger per call and never writes.
+		RunLedgerReader: runLedger{dir: s.dataDir},
+		Pool:            s.pool,
+		Watcher:         s.watcher,
+		States:          s.states,
 		// The supplied `--scip-index` path reaches the SCIP provider at
 		// composition time and is invisible to the coordinator that writes the
 		// generation row, so it is handed over here as well. The scope key is
@@ -178,6 +182,29 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 
 // Coordinator is the index coordinator over this workspace.
 func (w *Workspace) Coordinator() *index.Coordinator { return w.coord }
+
+// Spans registers fn to be called with every stage of this workspace's run as
+// it finishes. It is how a command prints progressive lines and how the MCP
+// server reports progress, and it is the ONLY way to reach the composed run
+// ledger's stream: a caller that opened its own ledger would be a second
+// writer on a file whose whole design rests on there being one, and would
+// contend with the run it is reporting on.
+//
+// fn runs on a goroutine of the workspace's own, fed by a bounded queue the
+// collector never waits on, so a slow subscriber costs rows and never paces
+// the run being measured. A workspace that composed no ledger -- a report
+// holds no lock and records nothing -- registers nothing and calls fn never.
+func (w *Workspace) Spans(fn func(model.StageRecord)) { w.s.spans.subscribe(fn) }
+
+// IndexRunID is the identifier of the indexing run this workspace is recording
+// at this moment, and false when none is open. It is how a surface that
+// follows one run -- the MCP progress notifications of a single call -- tells
+// this run's stages from the stages of the per-process overlay run a language
+// server's start opens, which can be recorded concurrently with it.
+//
+// A workspace that composed no ledger records nothing and answers false, so a
+// follower of it counts nothing rather than counting everything.
+func (w *Workspace) IndexRunID() (string, bool) { return w.s.ledger.IndexRunID() }
 
 // Resolver is the managed-toolchain resolver this workspace resolves analyzers
 // through, and ToolStore is the store it reads. A report renders them; nothing

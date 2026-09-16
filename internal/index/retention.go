@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -41,8 +43,21 @@ func (c *Coordinator) retain(ctx context.Context) {
 	policy := sqlite.RetentionPolicy{RetainRefs: c.opts.Config.Index.RetainRefs.Int(),
 		MaxRetainedBytes: c.opts.Config.Index.MaxRetainedBytes.Value()}
 	// The sweep must finish even when the caller's context is already ending:
-	// a half-swept store is the one state retention must not leave behind.
-	report, err := c.opts.Store.RetainByRef(context.WithoutCancel(ctx), c.repo, policy, c.now())
+	// a half-swept store is the one state retention must not leave behind. The
+	// span is opened on that same uncancellable context, or a run cancelled
+	// while retention is sweeping would record no retention at all.
+	ctx = context.WithoutCancel(ctx)
+	ctx, span := ledger.Start(ctx, stageRetention, "")
+	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
+	span.AddOut(int64(report.GenerationsSwept))
+	// A deleted generation's ledger rows go with it. The ledger keeps its own
+	// file, so nothing else would ever collect them and the file would grow
+	// for as long as the workspace is indexed.
+	if delErr := c.opts.Ledger.DeleteRuns(ctx, report.GenerationsDeleted); delErr != nil {
+		logTyped(c.log, "the swept generations' ledger rows could not be deleted", delErr,
+			"component", component, "repository_id", string(c.repo))
+	}
+	span.End(endOutcome(err), ledger.Measured{}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
 			"component", component, "repository_id", string(c.repo))
@@ -82,10 +97,19 @@ type Collector interface {
 // leave behind. Its failure is logged with its diagnostic code so it cannot be
 // silent.
 func (c *Coordinator) collect(ctx context.Context) {
+	// The sweep runs before the store's own pass and outside the collection
+	// span, on the uncancellable context: it is the ledger's half of the same
+	// collection, it is what keeps the two classes of run no generation will
+	// ever reach from accumulating, and a coordinator assembled without a
+	// store-side collector still has a ledger to sweep.
+	ctx = context.WithoutCancel(ctx)
+	c.sweepLedger(ctx)
 	if c.opts.Collector == nil {
 		return
 	}
-	report, err := c.opts.Collector.Collect(context.WithoutCancel(ctx))
+	ctx, span := ledger.Start(ctx, stageCollection, "")
+	report, err := c.opts.Collector.Collect(ctx)
+	span.End(endOutcome(err), ledger.Measured{}, err)
 	if err != nil {
 		logTyped(c.log, "the collection pass did not finish", err,
 			"component", component, "repository_id", string(c.repo))
@@ -98,6 +122,61 @@ func (c *Coordinator) collect(ctx context.Context) {
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
 		"orphan_objects_swept", report.OrphanObjectsSwept,
 		"orphan_sweep", report.OrphanSweepPhrase())
+}
+
+// recordReclaim records what the paced reclaimer gave back to the filesystem
+// while this run was open, read from the counter the reclaimer already keeps
+// rather than measured a second time: the freeing is the run's own cost --
+// every analyzer output, every materialization and every scratch surface the
+// run removed goes back through it, a window at a time -- and nothing else in
+// the ledger accounts for it.
+//
+// It is one span at the end of the run and not a bracket around it. The
+// reclaimer is a process-wide goroutine that frees at its own pace for the
+// whole life of the run, so a span holding the run's own wall would top every
+// wall-sorted surface while measuring nothing; the fact here is a quantity,
+// and items_out is where the ledger carries quantities.
+//
+// The figure is what THIS PROCESS freed while the run was open, not what this
+// run's own removals cost: one reclaimer serves the process, and a removal a
+// run queues may be freed after it ends, by the next run or by the next
+// process to claim the same set.
+func recordReclaim(ctx context.Context, freedBefore int64) {
+	freed := paced.FreedBytes() - freedBefore
+	_, span := ledger.Start(ctx, stageReclaim, "")
+	span.End(ledger.OutcomeOK, ledger.Measured{ItemsOut: &freed, CPUUnattributed: ledger.CPUOverlapped}, nil)
+}
+
+// sweepLedger deletes the ledger rows no generation will ever collect, one
+// bounded page per pass. Two classes of run have no other way out of the file:
+// the overlay run a process opens for its language-server starts, which belongs
+// to no generation and outlives nothing but its own process; and a run that
+// ended without publishing anything -- the periodic tick that finds nothing to
+// publish never attaches a generation, and the ticks do not stop. DeleteRuns is
+// keyed by generation, so without this pass both grow for as long as the
+// workspace is indexed.
+//
+// It is called from the collection pass because that is where the process
+// already reclaims what nothing references, and because both sweeps skip a run
+// whose writer is still live: the run this pass is part of, another process's
+// overlay, and a tick in flight are all live by the same judgement a reader
+// uses, so nothing here can delete a run a status surface has just called live.
+//
+// Like the passes around it, a failure never fails the run that published: the
+// rows stay and the next pass takes them, and the diagnostic is logged so a
+// file that is never being swept cannot be silent.
+func (c *Coordinator) sweepLedger(ctx context.Context) {
+	overlays, err := c.opts.Ledger.OverlayRuns(ctx)
+	if err == nil {
+		err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
+	}
+	if err == nil {
+		err = c.opts.Ledger.DeleteRunsWithoutGeneration(ctx)
+	}
+	if err != nil {
+		logTyped(c.log, "the ledger runs no generation will collect were not swept", err,
+			"component", component, "repository_id", string(c.repo))
+	}
 }
 
 // retentionState is what this coordinator knows about its own last retention

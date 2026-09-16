@@ -19,6 +19,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -218,10 +219,20 @@ func (o openOptions) locksAtOpen() bool { return o.mode == modeIndex }
 // the store, the toolchain, the runners, the providers and the registry -- is
 // one reviewable unit that depends on no coordinator.
 type stack struct {
-	root     workspace.Root
-	cfg      config.Config
-	dataDir  string
-	store    *sqlite.Store
+	root    workspace.Root
+	cfg     config.Config
+	dataDir string
+	store   *sqlite.Store
+	// ledger is this process's run accounting. Only a run that holds the
+	// cross-process workspace lock opens one: the ledger has a single writer,
+	// so a report -- which takes no lock and may run beside an index -- reads
+	// the file through internal/ledger's read-only reader and never opens a
+	// writer of its own. A nil ledger records nothing and is legal everywhere.
+	ledger *ledger.Ledger
+	// spans is the one hop off the collector's goroutine. Every surface that
+	// renders a finished stage subscribes here, so the process holds exactly
+	// one ledger subscription however many surfaces are listening.
+	spans    *spanFanout
 	cas      *snapshot.CAS
 	registry *provider.Registry
 	pool     *provider.Pool
@@ -472,6 +483,25 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, err
 		}
 	}
+	// The run ledger lives beside the store, under the same directory. It is
+	// opened by every composition that BUILDS, not only by the one that locks
+	// as it opens: the server publishes generations through its own refresh and
+	// takes the workspace only for the beat that needs it, so tying the ledger
+	// to the lock-at-open would leave its refresh recording nothing and its
+	// progress and log notifications with no source. Stack.Close stops it;
+	// nothing else may, because Stop is what flushes the last rows and closes
+	// every span the process left open.
+	if o.indexing() {
+		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
+			return nil, err
+		}
+		// One subscription for the process. The structured line is registered
+		// here, where the logger lives; the command line and the MCP server
+		// add theirs through Workspace.Spans.
+		s.spans = newSpanFanout()
+		s.ledger.Subscribe(s.spans.publish)
+		s.spans.subscribe(logSpan(s.logger))
+	}
 
 	// The cursor key and the query spools are workspace-private state under the
 	// cache this run actually opened, so a rebuild cache signs with its own key
@@ -637,6 +667,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
 		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
+		// The one ledger this process opened. The manager never opens its own:
+		// the ledger file has a single collector, and a second writer on it is
+		// what the whole separate-database design exists to avoid.
+		Ledger: s.ledger,
 	}); err != nil {
 		return nil, err
 	}
@@ -740,16 +774,16 @@ func makeRebuildDir(dataDir string, now time.Time) (string, error) {
 
 // openDependence builds the dependence provider, or reports its absence.
 //
-// The provider is not constructed when the configuration disables it, and it
-// cannot be constructed when the analysis payload does not resolve. Neither is
-// an error: an optional tool that is off or absent must not fail a healthy base
-// generation (Section 11.1). What it must not do is disappear -- so the reason
-// becomes a capability row the coordinator publishes, which is the difference
-// between "this capability is unavailable, here is why" and a capability the
-// report never mentions.
+// A provider the configuration disables is not constructed and records no
+// capability row: work nobody asked for is not an unavailable capability, and
+// the run names every disabled provider once, in providers_disabled. A
+// provider that is enabled but cannot be constructed, because its analysis
+// payload does not resolve, is different: that is an optional tool that is
+// absent, which must not fail a healthy base generation (Section 11.1) and
+// must not disappear either, so its reason becomes the capability row the
+// coordinator publishes.
 func (s *stack) openDependence(ctx context.Context, runner *process.Runner) provider.Provider {
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
-		s.dependenceAbsent(model.CapabilityUnavailable, "", nil)
 		return nil
 	}
 	// Nothing here installs anything any more: the locator reports the pinned
@@ -897,6 +931,7 @@ func (s *stack) openDiagnostics() error {
 		Root:      s.root.Path,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
+		Ledger:    runLedger{dir: dataDir},
 		Toolchain: toolchainReporter{r: s.resolver},
 		Workspace: workspaceProber{},
 		Now:       time.Now,
@@ -1391,6 +1426,14 @@ func (s *stack) Close() error {
 	if s.ts != nil {
 		s.ts.Close()
 	}
+	// The ledger is stopped once nothing can still end a span and before the
+	// store, so the last flush and the interrupted marks are written while the
+	// process is still whole.
+	errs = append(errs, s.ledger.Stop())
+	// After the ledger, never before: stopping it is what publishes the last
+	// finished spans, and a fanout closed first would drop exactly the rows a
+	// run's final stages produced.
+	s.spans.stop(s.logger)
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}

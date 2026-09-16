@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -368,8 +369,30 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 // deliver, never announced from here: this may be the background loop's
 // goroutine.
 func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
-	sel provider.Selection, ref string) error {
+	sel provider.Selection, ref string) (err error) {
 	c := l.c
+	// A deferred publication opens generations of its own, so it is a run in
+	// its own right and not spans of the index run that queued it -- which had
+	// ended long before this tick started. Its spans are keyed by the run id
+	// and outlive the work generation, which is aborted on every path: the
+	// reason a deferred unit failed is therefore still there after the tick,
+	// where a row written against the aborted generation would not be.
+	run := c.newRun(ledger.KindDeferred)
+	ctx = run.Context(ctx)
+	// The publication is remembered for a Drain to deliver only once this run
+	// has ended and has read itself back: the result a Drain hands out states
+	// what THIS deferred run did, never the index run's account, and a run
+	// still going is not what a publication that has activated looks like.
+	var res model.IndexResult
+	published := false
+	defer func() {
+		run.Finish(endOutcome(err))
+		if err != nil || !published {
+			return
+		}
+		c.attachRunLedger(ctx, &res, run, err)
+		l.record(res)
+	}()
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
 		return err
@@ -412,7 +435,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			return model.Canceled(ctx.Err())
 		}
 		work.plan.Previous[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = d.previous
-		unit, res, err := l.runOne(ctx, work, d)
+		unit, out, err := l.runOne(ctx, work, d)
 		l.finished()
 		if err != nil {
 			// One background unit's failure does not stop the others, and it
@@ -420,7 +443,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			// stale from its carried predecessor. The reason is kept on the
 			// run row and logged by the same path the foreground uses, so a
 			// deferred failure is as diagnosable as a foreground one.
-			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = work.recordFailure(ctx, d.unit, res, err)
+			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = work.recordFailure(ctx, d.unit, out, err)
 			continue
 		}
 		b.sealed = append(b.sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
@@ -430,7 +453,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		return nil
 	}
 	l.setPublishing(true)
-	res, published, err := l.publish(ctx, snap, sel, ref, b)
+	res, published, err = l.publish(ctx, snap, sel, ref, b)
 	l.setPublishing(false)
 	abort()
 	if err != nil {
@@ -441,9 +464,6 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		c.log.Warn("a deferred publication failed and its sealed units are abandoned",
 			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return err
-	}
-	if published {
-		l.record(res)
 	}
 	return nil
 }
@@ -460,34 +480,45 @@ func (l *lateSealer) setPublishing(on bool) {
 // analyzer admission gate.
 // The provider result is answered on both paths: a failure's result carries
 // the run the provider actually opened, which is where the reason is kept.
-func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, model.ProviderResult, error) {
+func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (id model.UnitID, res outcome, err error) {
 	started := l.c.now()
+	// The row exists before the unit is admitted, and the deferred close below
+	// gives it a terminal state on every path this call can take; run closes
+	// it first for a unit that reached its provider.
+	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
+	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
-		return "", model.ProviderResult{}, err
+		return "", outcome{}, err
 	}
 	state, exists, err := l.c.opts.Store.UnitState(ctx, spec.ID)
 	if err != nil {
-		return "", model.ProviderResult{}, err
+		return "", outcome{}, err
 	}
 	if exists && state == model.UnitSealed {
 		// An earlier tick sealed it and could not publish; the unit is
 		// immutable, so it is published now rather than rebuilt.
-		return spec.ID, model.ProviderResult{}, nil
+		return spec.ID, outcome{}, nil
 	}
 	if d.unit.Heavy {
-		release, err := l.c.sched.Admit(ctx, d.unit.Reservation)
-		if err != nil {
-			return "", model.ProviderResult{}, err
+		release, admitErr := l.c.sched.Admit(ctx, d.unit.Reservation)
+		if admitErr != nil {
+			// The gate refused or was cancelled, so the unit never reached its
+			// work: unavailable with that reason, not a failure of a provider
+			// that was never asked. Ending the span here wins over the deferred
+			// close, which takes the first terminal state a span is given.
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return "", outcome{}, admitErr
 		}
 		defer release()
 	}
-	out, err := work.run(ctx, d.unit, spec)
+	out, err := work.run(ctx, d.unit, spec, span)
 	if err != nil {
-		return "", out.result, err
+		return "", out, err
 	}
 	l.observe(l.c.now().Sub(started))
-	return spec.ID, out.result, nil
+	return spec.ID, out, nil
 }
 
 // observe folds one completed unit's duration into the running mean Pending
@@ -623,6 +654,11 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	if err != nil {
 		return model.IndexResult{}, false, err
 	}
+	// The run is linked to the generation it publishes INTO, never to the work
+	// generation, which is aborted on every path: a run linked to a generation
+	// that no longer exists would be swept with it, taking the record of what
+	// the tick did.
+	ledger.RunFromContext(ctx).AttachGeneration(int64(pubGen))
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
 		snap: captured, started: started, caps: c.newCapabilityReport(),
 		failedScopes: b.failed, failures: l.foregroundFailures()}
@@ -634,7 +670,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	var health model.GenerationHealth
 	err = l.attach(ctx, g, replacing)
 	if err == nil {
-		err = g.coverage()
+		err = g.coverage(ctx)
 	}
 	if err == nil {
 		states = g.caps.finish(c.log)
@@ -672,7 +708,8 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: runs, RunsOmitted: omitted, StartedAt: started, CompletedAt: c.now()}, true, nil
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(c.opts.Config),
+		StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
 // foregroundFailures is a copy of the failure aggregate the queued units were

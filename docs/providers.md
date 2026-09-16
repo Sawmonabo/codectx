@@ -58,16 +58,26 @@ and 13.3 require to stay apart:
 
 | Configured state | Detect outcome | Category |
 |---|---|---|
-| `false` | not run | `unavailable`, `CTX_PROVIDER_UNAVAILABLE` |
+| `false` | not run | no row at all |
 | `auto` | `Available: false` | `unavailable`, the detection's diagnostic code |
 | `auto` | error | `failed`, the error's code |
 | `true` | `Available: false` | `failed`, the detection's diagnostic code |
 | `true` | error | `failed`, the error's code |
-| any | a dependency is inactive | the dependency's category |
+| any | a dependency is inactive | the dependency's category — this provider is itself enabled, so it does publish rows |
 
-An active provider goes into `Selection.Active`; an inactive one contributes
-one `CapabilityState` per declared capability at scope `workspace` to
-`Selection.Inactive`. A `Required` provider that ends inactive is an error:
+A provider the configuration turns **off** is the one row above that publishes
+nothing. `unavailable` is the record of work that was wanted and not reached --
+the tool is absent, no profile matched, admission was never reached -- and each
+such row carries the reason. Nobody asked a disabled provider for anything, so
+it has nothing to report per capability, and a report carrying one row per
+capability for it reads as a list of failures rather than as the configuration
+the operator chose. It is still recorded as inactive internally, so a provider
+that depends on it inherits the reason it cannot run; that the provider is off
+is said once, on the result, as `providers_disabled`.
+
+An active provider goes into `Selection.Active`; an inactive one that is
+**enabled** contributes one `CapabilityState` per declared capability at scope
+`workspace` to `Selection.Inactive`. A `Required` provider that ends inactive is an error:
 no generation can be built without it. `auto` means "use an already approved
 profile when one is available" (Section 20.2); it never executes something
 found on `PATH`, and detection that would run a tool requires trust first.
