@@ -559,8 +559,14 @@ creates nor frees a file of the size it just spilled. The engine sees an empty
 file: the shim keeps that tenant's own length for the surface and answers
 reads, the file size and truncations from it, so a read past what this sort
 wrote is the short read a file system gives at the end of a file rather than
-the previous sort's records, and the engine shortening its temporary back to
-zero is a reset of that length rather than a free. With no pool named -- a
+the previous sort's records. A write PAST that length -- a temporary
+database's pager writes each page where the page belongs, not in order --
+zeroes what it skipped, so a read below the length and above what this tenant
+wrote is the hole a file system would give rather than the previous sort's
+records. Those zeroes are real writes and a gap is as wide as the offset the
+pager jumped to, so the fill waits a window at a time like every other write
+through the shim rather than handing the disk the whole gap at once. The engine shortening its temporary back to zero is a reset of that
+length rather than a free. With no pool named -- a
 process that opens no store -- the engine creates its own under
 `<data_dir>/tmp`, which the process names at start-up, so they live on the disk
 the user gave the data and never on a memory-backed system temp directory.
