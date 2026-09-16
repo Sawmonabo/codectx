@@ -125,6 +125,22 @@ type Result struct {
 	StdoutBytes int64
 	StderrBytes int64
 	Duration    time.Duration
+	// CPUUserMillis and CPUSysMillis are the processor time the child consumed,
+	// in milliseconds, read from its exit status when it was reaped.
+	//
+	// The scope of the figure is the reaped child plus every descendant it
+	// waited for: that is what the kernel accumulates into a parent's usage.
+	// A descendant that outlived the child, or re-parented away from it,
+	// contributes nothing, so this is narrower than the process group the tree
+	// sampler follows and it is not the tree's total.
+	CPUUserMillis int64
+	CPUSysMillis  int64
+	// CPUUnsampled reports that no processor time was obtained -- the child
+	// never started, or it was killed and never reaped, so there is no exit
+	// status to read it from -- and the two figures above are therefore
+	// unavailable rather than zero. A caller that publishes them must omit
+	// them rather than publish an observed zero (Section 22).
+	CPUUnsampled bool
 	// TimedOut and Canceled distinguish the two reasons a tree is terminated;
 	// Section 22 requires cancellation not to be reported as a crash.
 	TimedOut bool
@@ -416,7 +432,9 @@ func (r *Runner) release(w *admission) {
 
 func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	started := time.Now()
-	var result Result
+	// Every measured field starts unavailable, so a run that fails before the
+	// measurement exists reports it as absent rather than as an observed zero.
+	result := Result{CPUUnsampled: true}
 
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
@@ -537,6 +555,16 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	var waitErr error
 	if !unreaped {
 		waitErr = waiter.wait()
+		// The exit status carries the child's consumed processor time, and it
+		// exists only once the child has been reaped. The read is here, under
+		// the same condition, because the reaping goroutine is what writes it:
+		// a tree that never exited is still being waited on, and its status
+		// must not be read at all. Its figures stay absent.
+		if state := cmd.ProcessState; state != nil {
+			result.CPUUserMillis = state.UserTime().Milliseconds()
+			result.CPUSysMillis = state.SystemTime().Milliseconds()
+			result.CPUUnsampled = false
+		}
 	}
 
 	// Reaping the direct child says nothing about its descendants: they may
