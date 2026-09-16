@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -181,7 +182,7 @@ func previousState(ctx context.Context, store *sqlite.Store, dir, name string, u
 	if err != nil {
 		return "", internal("delta state: " + err.Error())
 	}
-	err = store.DeltaState(ctx, unit, kind, f)
+	err = store.DeltaState(ctx, unit, kind, paced.NewWriter(f))
 	if closeErr := f.Close(); err == nil && closeErr != nil {
 		err = internal("delta state: " + closeErr.Error())
 	}

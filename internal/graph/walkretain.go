@@ -346,7 +346,7 @@ func (r *retainFile) writer() (*bufio.Writer, error) {
 	if err != nil {
 		return nil, internalErr("graph: the retained walk input: " + err.Error())
 	}
-	r.f, r.w = f, bufio.NewWriter(f)
+	r.f, r.w = f, bufio.NewWriter(paced.NewWriter(f))
 	return r.w, nil
 }
 

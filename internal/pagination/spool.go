@@ -260,7 +260,7 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 	if err != nil {
 		return nil, internalErr("spool create: " + err.Error())
 	}
-	sp := &Spool{owner: s, header: h, path: path, file: f, w: bufio.NewWriter(f)}
+	sp := &Spool{owner: s, header: h, path: path, file: f, w: bufio.NewWriter(paced.NewWriter(f))}
 	if err := sp.writeFrame(head); err != nil {
 		sp.discard()
 		return nil, err
