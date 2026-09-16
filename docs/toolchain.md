@@ -394,7 +394,15 @@ outside the input directory, a private scratch root per run. A matrix that ran a
 different argv would prove that some invocation works on the platform rather
 than that the one the product issues does. The fixture and the assertion that
 each index names the documents it was given are the smoke's own. C++ and TSX are exercised
-explicitly because the research rounds covered only C and TypeScript. A language
+explicitly because the research rounds covered only C and TypeScript. One
+project — the JavaScript one — carries **no compiler configuration at all**,
+only a `package.json`, because a matrix whose every project is configured proves
+the argument array for the configured half of a repository and no more: that gap
+is how an argv that failed every configuration-less JavaScript project passed
+this matrix and shipped. The indexer writes the configuration it infers into the
+directory it is given, so the materialization removes it before each run;
+otherwise a kept or reused fixture would carry it into the next one and the leg
+would pass while proving the opposite. A language
 no run covers fails the job, so a payload that silently stopped working cannot
 leave a green matrix behind it.
 

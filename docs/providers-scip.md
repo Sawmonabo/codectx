@@ -289,6 +289,33 @@ converts to the same bytes, so there is nothing to catch. A document whose
 guess does not hold is skipped and the capabilities are `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID`.
 
+The probe is not the guarantee, only its precondition. **Every** occurrence's
+range is then proved against the bytes it claims to describe, because a wrong
+column does not need a wrong encoding: on a line indented with spaces followed
+by a tab an indexer can count columns to a different tab stop than the file
+does, so the range is shifted a few columns, stays inside its line, converts to
+a valid rune-aligned extent, and names source that is not the symbol. Measured
+on one Java project: 1,183 of 93,167 occurrences, in 79 of its 223 documents.
+
+The per-occurrence proof is two byte comparisons. A symbol whose last
+descriptor is a name the grammar spells literally must find that identifier at
+the **start** of its range, ending on a token boundary; every other range — a
+`local` symbol, an escaped name, a package or synthetic descriptor — must at
+least start on a token boundary. The range may be wider than the name because a
+real one is: an aliased import puts the whole `OrderedDict as OD` clause on the
+imported symbol (measured), so demanding equality would refuse every project
+that aliases an import. Measured cost on the fixtures of the per-platform
+matrix, over the indexes the pinned indexers produce: 9 ns per occurrence and
+no allocation.
+
+The two proofs deliberately have different outcomes. The encoding probe decides
+whether an encoding the index never stated may be used at all, so a document it
+cannot prove is skipped and counted — an unproven guess must not fail a unit the
+index never claimed. The per-occurrence proof is about a claim the index did
+make, so a range that fails it is refused: the unit fails closed under a
+verified binding, and the occurrence is skipped and counted under an unverified
+one.
+
 `Metadata.text_document_encoding` is deliberately never consulted. All six
 indexers set it to `UTF8`, including the three whose columns are UTF-16,
 because `scip.proto` defines it as the encoding of the source files on disk and
@@ -300,10 +327,10 @@ skipped and the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`:
 Section 9.3 forbids guessing one. `Report.AssumedPositionEncoding` counts the
 documents that were converted through the per-tool-build table **and** proved
 against their pinned bytes. A
-coordinate that does not land on the bytes is `CTX_PROVIDER_OUTPUT_INVALID`
-and fails the unit under a verified binding (the index claims to describe
-these bytes and does not); under an unverified binding it is skipped and
-counted.
+coordinate that does not land on the bytes, or a range that does not describe
+the identifier it names, is `CTX_PROVIDER_OUTPUT_INVALID` and fails the unit
+under a verified binding (the index claims to describe these bytes and does
+not); under an unverified binding it is skipped and counted.
 
 A document proves its bytes by embedded `text` whose SHA-256 equals the
 pinned content hash, or by a matching row of a **qualifying** input-hash
