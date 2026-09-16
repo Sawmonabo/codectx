@@ -687,7 +687,8 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: runs, RunsOmitted: omitted, StartedAt: started, CompletedAt: c.now()}, true, nil
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: c.disabledProviders(),
+		StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
 // foregroundFailures is a copy of the failure aggregate the queued units were
