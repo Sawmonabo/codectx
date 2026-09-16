@@ -623,6 +623,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
+	writeProvidersDisabled(&b, result.ProvidersDisabled)
 	writeCapabilities(&b, result.Completeness)
 	writeIndexRunLedger(&b, result.Run, result.Stages, result.StagesOmitted)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
@@ -718,6 +719,7 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	if s.LastReconciledAt != nil {
 		fmt.Fprintf(&b, "reconciled  %s\n", s.LastReconciledAt.Format(time.RFC3339))
 	}
+	writeProvidersDisabled(&b, s.ProvidersDisabled)
 	writeCapabilities(&b, s.Completeness)
 	for _, warning := range s.Warnings {
 		fmt.Fprintf(&b, "warning     %s\n", warning)
@@ -955,6 +957,19 @@ func countMetric(v *int64) string {
 // is not printed as fresh and is not invented: the absence of a row is itself
 // what "this provider published nothing" looks like, and Section 13.3 forbids
 // reading available-with-no-units as fresh coverage.
+// writeProvidersDisabled names the providers the configuration turns off, on
+// one line above the capability summary. It is what makes the rows that are
+// NOT there readable: a disabled provider publishes no capability row, so an
+// operator reading a report with no symbol coverage in it learns here that
+// nobody asked for any, rather than reading a healthy report as a silent loss.
+// Nothing is written when nothing is disabled, which is every ordinary run.
+func writeProvidersDisabled(b *strings.Builder, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "disabled    %s\n", strings.Join(names, ", "))
+}
+
 func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 	if len(states) == 0 {
 		b.WriteString("capabilities none reported\n")
