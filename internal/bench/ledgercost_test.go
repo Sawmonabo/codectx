@@ -241,8 +241,9 @@ func verdict(off, on []float64) string {
 
 func fmtf(format string, v float64) string { return fmt.Sprintf(format, v) }
 
-// median is the nearest-rank middle, so an odd sample count reports a real
-// observation rather than an average of two.
+// median is the nearest-rank middle: for an even sample count it is the upper
+// of the two middle values. Either way it is a real observation and never an
+// average of two, which would report a figure no repetition produced.
 func median(v []float64) float64 {
 	if len(v) == 0 {
 		return 0
