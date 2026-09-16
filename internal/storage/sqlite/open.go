@@ -68,6 +68,21 @@ type Options struct {
 	// mutates must be composed with the writer rather than discover at runtime
 	// that it cannot.
 	ReadOnly bool
+	// LazyWriter opens a writing store that performs no write at all until
+	// something actually writes. The writer pool is built, but database/sql
+	// establishes no connection until a statement runs on it, so the only
+	// write a writing open ever performed -- the schema check inside an
+	// immediate transaction -- is what this removes: the schema is verified by
+	// READING, and created only when the cache holds no tables at all, which
+	// is a cache no run has ever built here and therefore one no run can be
+	// holding a transaction against.
+	//
+	// It exists for the process that both answers and indexes: it must come up
+	// and serve beside an index another process is already running, and a
+	// schema check in a write transaction queues behind that run's ingestion
+	// group and is refused `database is busy: begin` when the busy timeout
+	// runs out. Ignored when ReadOnly is set: that store has no writer.
+	LazyWriter bool
 }
 
 // synchronousPragma pairs the value the DSN applies with the value reading
@@ -291,9 +306,12 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// same comparison, run on the reader pool, so it neither begins a write
 	// transaction nor waits for one another process holds -- which is what
 	// made every report fail while a run was ingesting.
-	if opts.ReadOnly {
+	switch {
+	case opts.ReadOnly:
 		err = s.verifySchema(ctx)
-	} else {
+	case opts.LazyWriter:
+		err = s.adoptSchema(ctx)
+	default:
 		err = s.initSchema(ctx)
 	}
 	if err != nil {
