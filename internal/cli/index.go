@@ -545,6 +545,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"wal", byteMetric(r.WALBytes)},
 		{"temp", byteMetric(r.TempBytes)},
 		{"content store", byteMetric(r.CASBytes)},
+		{"freed this run", byteMetric(r.FreedBytes)},
 		{"live subprocesses", countMetric(r.LiveSubprocesses)},
 		{"pending events", countMetric(r.PendingEvents)},
 		{"units reused", countMetric(r.UnitsReused)},

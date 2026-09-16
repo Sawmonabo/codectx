@@ -4,7 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 
 	"modernc.org/sqlite"
 
@@ -166,9 +170,100 @@ CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER N
 // spill file.
 const defaultCacheKiB = 256 << 10
 
-// openScratch creates the import's staging database. Durability is
-// deliberately off: the file is private, single-writer and deleted with the
-// import's scratch directory. Its pages reach the disk through the paced
+// stagingSlots hands each import a staging database file under its scratch
+// directory and takes it back when the import ends.
+//
+// A slot's file is created once and reused by every later import that takes
+// the slot: its tables are dropped at the start of an import and the engine
+// recycles their pages from the file's free list, so the file never shrinks
+// and an import frees nothing. Hundreds of megabytes created and deleted per
+// unit is what the run must not do: on a host that discards freed blocks into
+// a sparse image, a multi-gigabyte free stalls every process on the machine.
+// The files are removed only by the provider's sweep of a dead run at
+// construction, which is the one free the design allows.
+//
+// A slot is what keeps the reuse correct whether or not imports through one
+// provider overlap: a staging database is opened with an exclusive lock, so
+// two concurrent imports must have two files, and a slot released by one is
+// taken by the next rather than created afresh.
+var stagingSlots = struct {
+	mu   sync.Mutex
+	free map[string][]string
+	made map[string]int
+}{free: map[string][]string{}, made: map[string]int{}}
+
+// takeStagingSlot returns the path of a staging database under dir, reusing a
+// released one when there is one.
+func takeStagingSlot(dir string) string {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	stagingSlots.mu.Lock()
+	defer stagingSlots.mu.Unlock()
+	if free := stagingSlots.free[dir]; len(free) > 0 {
+		path := free[len(free)-1]
+		stagingSlots.free[dir] = free[:len(free)-1]
+		return path
+	}
+	n := stagingSlots.made[dir]
+	stagingSlots.made[dir] = n + 1
+	return filepath.Join(dir, "stage-"+strconv.Itoa(n)+".db")
+}
+
+// releaseStagingSlot gives the slot back for the next import. The file stays
+// where it is; the next import that takes the slot empties it.
+func releaseStagingSlot(dir, path string) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	stagingSlots.mu.Lock()
+	defer stagingSlots.mu.Unlock()
+	stagingSlots.free[dir] = append(stagingSlots.free[dir], path)
+}
+
+// resetSchema empties the staging database and creates the tables the load
+// phase appends to. Every object a previous import left is dropped, which
+// returns its pages to the file's free list for this import to write over;
+// automatic vacuuming is off, so the file itself never shrinks and nothing is
+// freed to the filesystem. Dropping is also what makes the schema creation
+// idempotent: every phase of an import creates the structures it fills, and a
+// reused file would otherwise already hold them.
+func resetSchema(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx,
+		`SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return internalErr("import scratch reset: %v", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return internalErr("import scratch reset: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return internalErr("import scratch reset: %v", err)
+	}
+	rows.Close()
+	for _, name := range tables {
+		// A table's indexes go with it, so nothing else has to be listed.
+		if _, err := db.ExecContext(ctx, `DROP TABLE "`+strings.ReplaceAll(name, `"`, `""`)+`"`); err != nil {
+			return internalErr("import scratch reset: %v", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, scratchSchema); err != nil {
+		return internalErr("import scratch schema: %v", err)
+	}
+	return nil
+}
+
+// openScratch opens the import's staging database at path, which a previous
+// import through the same slot may already have written, and empties it.
+// Durability is deliberately off: the file is private, single-writer and
+// carries nothing across an import. Its pages reach the disk through the paced
 // file system every connection of the process uses, so a phase that fills
 // the page cache at memory speed hands the disk its pages at the disk's
 // own rate rather than in one burst at the commit.
@@ -192,9 +287,9 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if _, err := db.ExecContext(ctx, scratchSchema); err != nil {
+	if err := resetSchema(ctx, db); err != nil {
 		db.Close()
-		return nil, internalErr("import scratch schema: %v", err)
+		return nil, err
 	}
 	return &scratch{db: db, maxRows: maxRows,
 		unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
