@@ -768,8 +768,9 @@ func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.Searc
 
 // maxQueryTokens is the ceiling on tokens one query can yield. Query text is
 // bounded to MaxQueryTextBytes and every token occupies at least one byte, so
-// this LIMIT can never truncate; Section 20.1's resources.max_query_terms (32)
-// is enforced by the search service on top.
+// this LIMIT can never truncate. The bound on how many terms a query may carry
+// is the operator's resources.max_query_terms, which the search service
+// enforces on top and which is unlimited by default.
 const maxQueryTokens = model.MaxQueryTextBytes
 
 // tokenizerDDL declares a throwaway FTS5 table with exactly search_fts's

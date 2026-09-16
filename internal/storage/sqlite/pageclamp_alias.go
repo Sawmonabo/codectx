@@ -11,9 +11,10 @@ import (
 // its answer -- the graph engine, the search service, the coverage session --
 // does not have to import the store for a type the store only writes into.
 //
-// These are the names this package's own readers and its callers already use;
-// re-exporting them keeps the move to one import line per caller and no change
-// to the two dozen reader bodies that resolve a page bound.
+// PageClamps and WithPageClamps are re-exported because this package's callers
+// install a collector on the context they hand to the store and drain it into
+// their answer's notices, so they name the collector type without importing the
+// pagination package for it alone.
 type PageClamps = pagination.PageClamps
 
 // WithPageClamps returns a context that collects page-bound clamps and the
@@ -25,9 +26,3 @@ func WithPageClamps(ctx context.Context) (context.Context, *PageClamps) {
 // pageLimit resolves a requested page size against the wire ceiling and reports
 // the resolution to the context's collector when the two differ.
 func pageLimit(ctx context.Context, limit int) int { return pagination.PageLimit(ctx, limit) }
-
-// recordUnbounded notes a request that named no bound of its own and was served
-// at the wire ceiling.
-func recordUnbounded(ctx context.Context, effective int) {
-	pagination.RecordUnbounded(ctx, effective)
-}
