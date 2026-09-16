@@ -87,7 +87,7 @@ func TestARefusedWriteIsSettledAgainstTheDisk(t *testing.T) {
 	if !errors.As(err, &typed) || typed.Code != model.CodeInternal {
 		t.Fatalf("with 4 GiB free the refusal is %v; want CTX_INTERNAL", err)
 	}
-	for _, want := range []string{"disk I/O error", "engine code 778", "not full"} {
+	for _, want := range []string{"disk I/O error", "engine code 778", "4294967296 bytes were free"} {
 		if !strings.Contains(typed.Message, want) {
 			t.Fatalf("message %q does not say %q", typed.Message, want)
 		}
@@ -104,6 +104,19 @@ func TestARefusedWriteIsSettledAgainstTheDisk(t *testing.T) {
 	}
 	if !strings.Contains(typed.Message, "disk I/O error") || !strings.Contains(typed.Message, "12288 bytes are free") {
 		t.Fatalf("message %q hides the engine's message or the measurement", typed.Message)
+	}
+
+	// Zero free is the definitive full disk, not an unmeasurable one: it is the
+	// state the measurement exists to report, and reporting it as unmeasured
+	// would send the operator to the device instead of to the space.
+	restore = f.s.SetFreeBytes(func(string) (uint64, bool) { return 0, true })
+	err = f.s.Attribute(refused)
+	restore()
+	if !errors.As(err, &typed) || typed.Code != model.CodeDiskFull {
+		t.Fatalf("with nothing free the refusal is %v; want CTX_DISK_FULL", err)
+	}
+	if !strings.Contains(typed.Message, "0 bytes are free") {
+		t.Fatalf("message %q does not report the full disk it measured", typed.Message)
 	}
 
 	restore = f.s.SetFreeBytes(func(string) (uint64, bool) { return 0, false })

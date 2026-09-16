@@ -38,18 +38,42 @@ func Steps() int64 { return steps.Load() }
 // device stays busy between submissions.
 const Window = 8 << 20
 
+// ShrinkForRemoval empties the named file a window at a time so that the
+// unlink which follows frees nothing, and reports only the failures that make
+// the removal itself unsafe. Anything that is not a regular file larger than
+// the window is left to the unlink whole, and so is a file already gone.
+//
+// A shrink refused for permissions is one of those: emptying a file needs
+// write on the FILE, unlinking it needs write on the DIRECTORY holding it, so
+// a process may be entitled to remove a file it may not truncate -- an
+// analyzer's read-only output among them. Pacing is how a removal is
+// performed, never whether it is allowed, so such a file is unlinked whole.
+// It is the one case where more than a window of extents is freed at once, and
+// it is bounded by what the process did not write itself.
+func ShrinkForRemoval(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !st.Mode().IsRegular() || st.Size() <= Window {
+		return nil
+	}
+	err = Shrink(path, 0)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+		return nil
+	}
+	return err
+}
+
 // Remove deletes one file or empty directory. A regular file larger than the
 // window is truncated down one window at a time first, each step synced so
 // the freed window is dealt with before the next is freed.
 func Remove(path string) error {
-	st, err := os.Lstat(path)
-	if err != nil {
+	if err := ShrinkForRemoval(path); err != nil {
 		return err
-	}
-	if st.Mode().IsRegular() && st.Size() > Window {
-		if err := Shrink(path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
 	}
 	return os.Remove(path)
 }
@@ -68,19 +92,7 @@ func RemoveAll(dir string) error {
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		info, err := d.Info()
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if info.Size() > Window {
-			if err := Shrink(path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-		}
-		return nil
+		return ShrinkForRemoval(path)
 	})
 	if err != nil {
 		return err

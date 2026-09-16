@@ -1347,6 +1347,14 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			return model.Binding{}, err
 		}
 	}
+	// Whatever compaction the generation's segment set is due runs FIRST, each
+	// merge its own ingestion call, so the group can commit between merges and
+	// the cascade is bounded by WALBoundBytes like any other ingestion. The
+	// activation below then names the set the merges left. See
+	// compactGeneration for why a merge committed before the swap is safe.
+	if err := s.compactBeforeActivation(ctx, gen); err != nil {
+		return model.Binding{}, err
+	}
 	var binding model.Binding
 	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 )
 
@@ -176,6 +177,13 @@ func (s *pathScratch) open(ctx context.Context, journal string) error {
 		q.Add("_pragma", p)
 	}
 	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(s.dir, "path.db"), RawQuery: q.Encode()}).String()
+	// The shim is registered here, in the path that opens the file, rather
+	// than relied on to have been registered by whatever ran first: a
+	// traversal's scratch is the surface that spills gigabytes, and "every
+	// write the engine makes is paced" must not rest on call order.
+	if err := pacedvfs.Register(); err != nil {
+		return internalErr("path scratch: " + err.Error())
+	}
 	connector, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		return internalErr("path scratch connector: " + err.Error())

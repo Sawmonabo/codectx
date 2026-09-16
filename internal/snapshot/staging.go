@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	_ "modernc.org/sqlite"
 )
 
@@ -65,6 +66,13 @@ func openStaging(ctx context.Context, dir string) (*staging, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "cache_size(-4096)", "locking_mode(EXCLUSIVE)"} {
 		q.Add("_pragma", p)
+	}
+	// Registered here, in the path that opens the file, rather than relied on
+	// to have been registered by whatever ran first: a capture's staging holds
+	// a row per eligible path and is written before any store need be open, so
+	// "every write the engine makes is paced" must not rest on call order.
+	if err := pacedvfs.Register(); err != nil {
+		return nil, internal("staging file system: %v", err)
 	}
 	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String())
 	if err != nil {

@@ -6,8 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"log/slog"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -115,48 +117,122 @@ func segmentStats(ctx context.Context, tx *sql.Tx, ids []int64) (map[int64]segme
 	return out, nil
 }
 
-// compactSegments merges the generation's segment set down to what the
-// geometric partitioning allows and returns the set that replaces it, in
-// segment-id order, with the number of merges it performed. live and stats are
-// updated in place so the caller's coverage check and its hidden counts are
-// about the set that is actually recorded.
+// compactBeforeActivation runs the staging generation's due merges before the
+// call that publishes it, and reports what they cost. The pass is logged on
+// its own, as the activation's own build is, because a cost hidden inside an
+// activation's total cannot be told from the publication itself.
+func (s *Store) compactBeforeActivation(ctx context.Context, gen model.GenerationID) error {
+	var row int64
+	if err := s.ingest(ctx, func(tx *sql.Tx) error {
+		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
+		if err != nil {
+			return err
+		}
+		row = g.id
+		return nil
+	}); err != nil {
+		return err
+	}
+	started := time.Now()
+	merges, err := s.compactGeneration(ctx, row)
+	if merges > 0 || err != nil {
+		slog.Default().Info("packed lexical compaction finished", "generation", gen,
+			"duration_ms", time.Since(started).Milliseconds(), "merges", merges)
+	}
+	return err
+}
+
+// compactGeneration merges the generation's segment set down to what the
+// geometric partitioning allows, each merge its own ingestion call, before the
+// call that activates the generation.
 //
-// The loop terminates: a tier merge reads more than one segment and writes one,
-// so it strictly reduces the set's size; a dead-fraction rewrite reads one
-// segment and writes one whose dead count is zero, so it strictly reduces the
-// set's total dead documents and never grows the set. Neither can undo the
-// other's progress, and both quantities are finite.
-func compactSegments(ctx context.Context, tx *sql.Tx, ids []int64, live map[int64]int64,
-	stats map[int64]segmentStat) ([]int64, int64, error) {
+// Each merge is its own call for one reason: the group's commit decision fires
+// only at the end of an ingestion call, so a cascade run inside the activation
+// would have no commit point and nothing in the group's accounting would bound
+// its log. A first index seals one segment per unit, so its cascade is
+// (N-4)/lexMergeRatio merges -- thousands of them for a large repository -- and
+// WALBoundBytes, which is stated as the largest log an ingestion group leaves
+// behind, would not be a bound on it.
+//
+// Committing a merge before the swap is safe because a merged segment is data
+// nothing published references yet. The merge writes a new immutable segment
+// and re-points the rows that named its inputs; the generations already
+// published still name the inputs in generation_segments, and the collector
+// drops a segment only when NO generation names it and NO row points at it, so
+// neither the inputs a live generation still reads nor the merged segment a row
+// now points at can be collected. If the activation never happens, the merged
+// segment is simply the shape the next one will publish.
+//
+// The activation itself stays atomic: it is one call, which resolves the
+// segment set from the rows the merges left and flips the pointer.
+func (s *Store) compactGeneration(ctx context.Context, gen int64) (int64, error) {
+	var (
+		ids   []int64
+		live  map[int64]int64
+		stats map[int64]segmentStat
+	)
+	if err := s.ingest(ctx, func(tx *sql.Tx) error {
+		var err error
+		if _, _, _, live, err = visibleDocuments(ctx, tx, gen); err != nil {
+			return err
+		}
+		ids = slices.Sorted(maps.Keys(live))
+		stats, err = segmentStats(ctx, tx, ids)
+		return err
+	}); err != nil {
+		return 0, err
+	}
 	var merges int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, 0, model.Canceled(err)
+			return merges, model.Canceled(err)
 		}
 		inputs := dueMerge(ids, stats)
 		if inputs == nil {
-			return ids, merges, nil
+			return merges, nil
 		}
-		merged, kept, size, err := mergeSegments(ctx, tx, inputs, stats)
-		if err != nil {
-			return nil, 0, err
+		if err := s.ingest(ctx, func(tx *sql.Tx) error {
+			var err error
+			ids, err = applyMerge(ctx, tx, inputs, ids, live, stats)
+			return err
+		}); err != nil {
+			return merges, err
 		}
-		var carried int64
-		for _, in := range inputs {
-			carried += live[in]
-			delete(live, in)
-			delete(stats, in)
-		}
-		live[merged] = carried
-		// The merged segment holds exactly the documents the merge kept, and
-		// every one of them has a row pointing at it: the re-point ran over the
-		// same rows the keep set was read from, in the same transaction.
-		stats[merged] = segmentStat{docs: kept, bytes: size, alive: kept}
-		ids = slices.DeleteFunc(ids, func(id int64) bool { return slices.Contains(inputs, id) })
-		ids = append(ids, merged)
-		slices.Sort(ids)
 		merges++
 	}
+}
+
+// applyMerge folds inputs into one segment and returns the set that replaces
+// them, in segment-id order. live and stats are updated in place so the
+// caller's next decision -- and the activation's coverage check and hidden
+// counts -- are about the set that is actually recorded.
+//
+// The cascade terminates: a tier merge reads more than one segment and writes
+// one, so it strictly reduces the set's size; a dead-fraction rewrite reads one
+// segment and writes one whose dead count is zero, so it strictly reduces the
+// set's total dead documents and never grows the set. Neither can undo the
+// other's progress, and both quantities are finite.
+func applyMerge(ctx context.Context, tx *sql.Tx, inputs, ids []int64, live map[int64]int64,
+	stats map[int64]segmentStat) ([]int64, error) {
+	merged, kept, size, err := mergeSegments(ctx, tx, inputs, stats)
+	if err != nil {
+		return nil, err
+	}
+	var carried int64
+	for _, in := range inputs {
+		carried += live[in]
+		delete(live, in)
+		delete(stats, in)
+	}
+	live[merged] = carried
+	// The merged segment holds exactly the documents the merge kept, and
+	// every one of them has a row pointing at it: the re-point ran over the
+	// same rows the keep set was read from, in the same transaction.
+	stats[merged] = segmentStat{docs: kept, bytes: size, alive: kept}
+	ids = slices.DeleteFunc(ids, func(id int64) bool { return slices.Contains(inputs, id) })
+	ids = append(ids, merged)
+	slices.Sort(ids)
+	return ids, nil
 }
 
 // dueMerge picks the segments of one merge, or nil when the set is already
