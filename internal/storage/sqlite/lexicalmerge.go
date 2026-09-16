@@ -132,7 +132,7 @@ func (s *Store) compactBeforeActivation(ctx context.Context, gen model.Generatio
 	}); err != nil {
 		return err
 	}
-	_, span := ledger.Start(ctx, stageLexicalCompaction, "")
+	ctx, span := ledger.Start(ctx, stageLexicalCompaction, "")
 	merges, err := s.compactGeneration(ctx, row)
 	span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &merges}, err)
 	return err

@@ -246,7 +246,7 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	slog.Default().Info("packed adjacency build started", "generation", gen)
-	_, span := ledger.Start(ctx, stageAdjacency, "")
+	ctx, span := ledger.Start(ctx, stageAdjacency, "")
 	defer func() {
 		span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		runtime.ReadMemStats(&after)
