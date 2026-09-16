@@ -53,9 +53,9 @@ type IndexResult struct {
 	CompletedAt time.Time `json:"completed_at"`
 	// Run is this indexing run as the run ledger recorded it, and Stages is
 	// one page of its span tree in the order the stages were opened. Both are
-	// absent where the run recorded nothing. They are the same rows status
-	// reports, so the ledger's counts and the counts above cannot disagree
-	// about what the run did.
+	// absent where the run recorded nothing. They carry the same rows status
+	// reports, so a surface renders the run's accounting and the result's own
+	// counts above from one set of numbers rather than two.
 	Run    *RunRecord    `json:"run,omitempty"`
 	Stages []StageRecord `json:"stages,omitempty"`
 }
@@ -599,9 +599,11 @@ type RunRecord struct {
 // not, because they are the stage's own tally.
 type StageRecord struct {
 	// Seq is the run's own ordinal for this stage, in the order the stages
-	// were opened; ParentSeq is the ordinal of the stage this one nests
-	// under, absent at the run's top level. The tree is carried as ordinals
-	// because that is what both the recording and the reading side know.
+	// were opened, counting from zero; ParentSeq is the ordinal of the stage
+	// this one nests under, absent at the run's top level. Absent and not
+	// zero, because zero is the first stage's own ordinal. The tree is
+	// carried as ordinals because that is what both the recording and the
+	// reading side know.
 	Seq       int64     `json:"seq"`
 	ParentSeq *int64    `json:"parent_seq,omitempty"`
 	Stage     string    `json:"stage"`
@@ -636,9 +638,9 @@ type StageRecord struct {
 	// Failure is the retained detail of a failed stage: the typed error's
 	// message and details as the ledger stored them.
 	Failure string `json:"failure,omitempty"`
-	// ShareOfWall is this stage's wall as a fraction of its run's. It is
-	// computed where the rows are read, so that every surface divides the
-	// same way rather than each recomputing it.
+	// ShareOfWall is this stage's wall as a fraction of its run's, as the
+	// ledger computes it when the row is read. It is zero on a row that
+	// reached a surface before its run's own wall was known.
 	ShareOfWall float64 `json:"share_of_wall,omitempty"`
 }
 
