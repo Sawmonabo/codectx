@@ -113,16 +113,12 @@ Four kinds of command, by what they may change:
 | | Workspace lock | Database writes | Commands |
 |---|---|---|---|
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
-| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep`, the graph walks |
-| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `repomap`, `doctor` |
+| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
+| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
 | **Both** | Held for the session | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
-
-The graph walks are in the recording row for one reason: their continuations
-retain a spool directory whose reclamation is governed by a cursor lease, and a
-lease is a write. They keep the writer until that is settled.
 
 A command in the answering row opens the store without a writer connection. It
 answers throughout another process's `index` or `watch` -- that is the promise
@@ -142,6 +138,14 @@ Two consequences an operator sees:
   generation it names is held by the read snapshot of whichever call presents
   it, and a generation collected in between is answered `CTX_CURSOR_INVALID`,
   re-run from the first page.
+* A **graph walk** -- `refs`, `callers`, `callees`, `path`, `impact` -- answers
+  one page and mints no continuation. Its continuation would retain a spool or a
+  search-state directory, and what reclaims such a directory is the expiry of the
+  cursor lease that names it: a lease is a write, and a directory adopted without
+  one would sit on disk with nothing to reclaim it. So nothing is adopted at all,
+  the page is served and the answer is marked truncated with a reason naming what
+  lies beyond it. Narrow the walk with `--depth`, `--visited` or `--edges` to
+  bring the answer inside one page.
 * `doctor --deep` is in the recording row, not the answering one: the search
   index's own integrity check is spelled as an insert into the index, so a deep
   report needs the writer. It still takes no workspace lock.
