@@ -22,7 +22,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/writeback"
+	"github.com/Sawmonabo/codectx/internal/storage/paced"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -171,9 +171,6 @@ type Store struct {
 	// page cache, so a log that differs from this is one the cache has
 	// started spilling into.
 	groupLog logMark
-	// pacer runs while a group is open and through its commit, so the
-	// group's log and the checkpoint reach the disk steadily.
-	pacer *writeback.Pacer
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -298,6 +295,9 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int) (*sql.
 	} else {
 		dsn = (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 	}
+	if err := paced.Register(); err != nil {
+		return nil, internal(err.Error())
+	}
 	base, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		return nil, internal("sqlite connector: " + err.Error())
@@ -413,7 +413,7 @@ func (s *Store) Close() error {
 // commit appends each one to the log exactly once; a group that spilled
 // would write hot pages to the log again and again, in place, and would
 // rewrite every frame's checksum at commit, so the log would no longer be an
-// append-only file the pacer can stream to disk. A commit writes the group's
+// append-only file the disk receives as one sequential stream. A commit writes the group's
 // distinct pages once to the log and the checkpoint copies them once more,
 // so the bytes an index run sends to disk are the distinct pages its groups
 // touch, not the rows it stores; content-addressed identities land on pages
@@ -491,7 +491,6 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		}
 		s.group = tx
 		s.groupLog = s.logMark()
-		s.pacer = writeback.Start(s.path, s.path+"-wal")
 	}
 	tx := s.group
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -575,8 +574,6 @@ func (s *Store) commitGroupLocked() error {
 		// the log folds what it can and is not a failure of the commit.
 		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
 	}
-	s.pacer.Stop()
-	s.pacer = nil
 	s.writerMu.Unlock()
 	if err != nil {
 		return wrap("commit", err)
@@ -593,8 +590,6 @@ func (s *Store) abandonGroupLocked() {
 	tx := s.group
 	s.group = nil
 	tx.Rollback()
-	s.pacer.Stop()
-	s.pacer = nil
 	s.writerMu.Unlock()
 }
 

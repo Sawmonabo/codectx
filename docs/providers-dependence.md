@@ -506,8 +506,8 @@ sort; only the edges whose endpoint several entities resolved to, and
 The result is that an import's disk traffic is a small constant times its
 export -- 6.6× on the synthetic export of the importer's scale test, with a
 staging cache small enough that every sort spills, against 34.5× before --
-and that every byte is written once, sequentially, and paced to the disk
-every hundred milliseconds rather than in a burst at each commit. The page
+and that every byte is written once, sequentially, with a bounded window in
+flight rather than in a burst at each commit. The page
 cache of the staging database is `providers.dependence.staging_cache_kib`
 (256 MiB by default): it bounds the memory one import holds for its staging
 and is the buffer the engine sorts in, so a table smaller than it is ordered
