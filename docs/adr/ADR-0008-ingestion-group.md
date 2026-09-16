@@ -131,30 +131,31 @@ a spilled statement journal, a sort's runs -- and only the file system sees ever
 them. On a platform without range writeback the wait is the wrapped file's own sync, which
 with at most two windows dirty is a bounded wait.
 
-### Decision 5, amended again 2026-09-16: freeing is windowed like writing, as a symmetric bound
+### Decision 5, amended again 2026-09-16: the run reuses space and frees almost nothing
 
-Two later uncapped indexes with the shim in place kept the dirty set under 5 MB and the pool never
-exhausted through the 1.8 GB commit, and near the moments the run frees space -- the log's reset after
-the checkpoint and the removal of the analyzer's export and staging, about 4.4 GB -- the independent
-latency probe recorded the host stalling. The root filesystem is mounted to discard freed blocks as
-they are freed (`discard`), so one unlink of a multi-gigabyte file can hand the device its whole
-discard queue at once; that was the first hypothesis for the stall. A controlled test then measured
-the cost of freeing directly and did not bear it out: truncating a 2 GB file one window at a time
-freed it in 0.33 s with an independent 4 KiB write and data-sync completing in about a millisecond
-throughout, and the device reported discarding 7.6 GB in 48 ms. Windowed freeing is cheap and does not
-by itself stall the host. The earlier runs' stalls are therefore not attributed to freeing; their
-mechanism is unresolved, recorded in the engineering ledger, and left for a clean coexistence proof on
-a quiet host that names, per process, whatever saturates the device.
+With the shim in place an uncapped index of the 6 270-file repository kept dirty pages under 8 MB through a
+3.4 GB build, and an independent 4 KiB write and data-sync beside it never waited more than 245 ms (at the
+892 MB checkpoint) -- and the host still stalled for 64 s, once, 27 s after the run had freed 6 GB (the
+export's removal and the log's reset). The same 64 s stall followed every multi-gigabyte free in the earlier
+runs. It was then reproduced without the product: a script wrote 5 GB one window at a time in 6 s (850 MB/s,
+so a completed write is host-cached, not on a disk), idled two minutes with no stall, freed the file one
+window at a time in 3.6 s, and 72 s later the independent write waited 64 s. The root filesystem discards
+freed blocks as they are freed, and the host keeps the machine's disk as a sparse image, so a free becomes
+host-side work the virtual machine can neither observe nor wait for: the device reports every discard complete
+in microseconds and the hang arrives a minute later, on whatever request is in flight then. A free of under a
+gigabyte caused nothing in two minutes; five and six gigabytes caused the stall.
 
-Freeing is windowed nonetheless, symmetrically with writing, as a bounded discipline and not as a fix
-for a proven stall: a file larger than the window is truncated down one window at a time with a data
-sync between steps, so the filesystem frees, and the device discards, one window at a time, and only
-then is the file unlinked. The shim does this for the engine's own truncations and deletions (a log
-reset, a rollback or statement journal's removal), and `internal/paced` does it for every file the
-process removes itself (a spool, a sort's runs, a staging tree, an export). This is the delete
-scheduler of a log-structured storage engine, whose `bytes_max_delete_chunk` "ftruncate[s] the file by
-this size each time, rather than dropping the whole file"; the window is the same layout constant as
-the write window and there is no rate and no setting.
+Windowed freeing (the delete scheduler discipline) therefore bounds what the guest submits but not what the
+host owes, and no discipline the guest can apply does: the signal it would need is on the other side of the
+virtual disk. The decision is to free almost nothing while a run works. The log is rewound in place rather than
+truncated at each reset (the file holds its high-water size, bounded by the log bound, and every later group
+reuses it); the import's staging database is created once and reused, rows deleted and pages recycled by the
+engine, the file never shrinking; every child's named outputs are handed to the disk one window at a time by a
+pacer in the process runner, so the dependence engine's export -- which dirtied 1.5 GB at 50 MB/s and was
+flushed as one 714 MB burst with 407 requests in flight -- reaches the disk as it is written; and the run's only
+frees are the sweep of a dead run at start and the export's removal after its import, which is the follow-up:
+an export that never touches the disk. Windowed freeing stays for the frees that remain. What a run freed is
+disclosed by the diagnostics. There is no rate and no setting: reuse has no knob.
 
 ### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
 
