@@ -132,9 +132,18 @@ and the figure kept is **the last sweep that still found the tree** -- an
 exiting process takes its counters with it, so there is no exit-time total to
 read. They count bytes the process asked the kernel for, so a pipe write and a
 page-cache write both count and the figure is not disk volume. The same sweep
-supplies a child span's peak resident memory. Both figures reach `--json` and
-the MCP row only: the table and the log line below carry the eight columns
-shown there and not these two.
+supplies a child span's peak resident memory. Both figures reach `--json`, the
+MCP row and the structured log line; the table below carries the eight columns
+shown there and not these two, because a table wide enough for them stops
+fitting a terminal.
+
+**The run row's peak is the process's peak, not the run's.** It is the kernel's
+own high-water mark for this process, read at the run's end, so it covers every
+run this process has already served: in a one-shot command the two are the same
+figure, and in a long-lived server on its fourth refresh the mark may have been
+set by the first. The stage rows carry no peak of their own for the reason
+above, and the run row's `cpu` stays `unavailable` because nothing measures
+processor time for the process as a whole.
 
 **An interrupted run shows no wall.** A run states on its own row a deadline
 its writer promises to renew while it lives. A reader that finds the deadline
@@ -183,11 +192,11 @@ ordered by wall time, with each stage's reason on its own line beneath it:
 
 ```
 run
-  stage             scope         wall        cpu          peak         in   out  outcome
-  run               generation 7  12s         unavailable  unavailable  120  2    ok
-  walk              -             8s          unavailable  unavailable  120  118  ok
-  structural_parse  -             running 3s  unavailable  unavailable  40   0    running
-  seal              -             1s          unavailable  unavailable  0    0    failed (CTX_UNIT_FAILED)
+  stage             scope         wall        cpu          peak             in   out  outcome
+  run               generation 7  12s         unavailable  431497216 bytes  120  2    ok
+  walk              -             8s          unavailable  unavailable      120  118  ok
+  structural_parse  -             running 3s  unavailable  unavailable      40   0    running
+  seal              -             1s          unavailable  unavailable      0    0    failed (CTX_UNIT_FAILED)
     seal failed     the unit did not seal
 ```
 
@@ -207,7 +216,7 @@ finished stage on stderr, with `component=ledger` and the row's fields as
 attributes:
 
 ```
-level=INFO msg="stage finished" component=ledger run_id=… stage=treesitter seq=7 wall_ms=31402 items_in=812 items_out=812 outcome=ok scope_key=go:root provider=treesitter cpu_user_ms=4100 peak_rss_bytes=268435456
+level=INFO msg="stage finished" component=ledger run_id=… stage=treesitter seq=7 wall_ms=31402 items_in=812 items_out=812 outcome=ok scope_key=go:root provider=treesitter cpu_user_ms=4100 peak_rss_bytes=268435456 read_bytes=1073741824 write_bytes=268435456
 ```
 
 An attribute nothing measured is absent rather than zero, `wall_ms` included:

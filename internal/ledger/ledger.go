@@ -163,6 +163,11 @@ type Run struct {
 // Totals are the run row's own counts, which the run reports as it learns
 // them. ProcessPeakRSSBytes is nil where the platform does not expose the
 // process's peak resident size.
+//
+// ProcessPeakRSSBytes is the kernel's high-water mark for THIS PROCESS, read
+// once the run has ended, and not a mark taken over the run alone: in a
+// one-shot command the two are the same figure, while in a long-lived process
+// serving a fourth refresh the mark may have been set by the first.
 type Totals struct {
 	FileCount           int64
 	SourceBytes         int64
