@@ -42,6 +42,22 @@ was the measurement for this family at this size.
 4. **Every unit discloses its reservation, its ceiling and its observed peak** in the resources
    block and in `codectx status`, so a host that is short of memory can be read from the product's
    own report rather than from the kernel's.
+5. **Every heavy child is admitted against the one allocation, and nothing counts them.** The
+   allocation of decision 2 is not the analysis engine's alone: engine runs, external indexers and
+   language servers are all admitted while the sum of what they reserve fits it, and a child larger
+   than the whole allocation runs alone rather than being refused. There is no count of concurrent
+   heavy children, no per-family count and no setting for either; where the platform does not
+   publish available memory the scheduler stands a conservative allocation in for the observation,
+   because an admission gate with no bound is not a gate. The counts that remain anywhere in the
+   product are for CPU-bound work and come from the machine's cores.
+
+   Admission figures, from the fixture that proves the rule: a machine reporting 32 GiB available
+   has an allocation of 16 GiB — `min(32 - 1 - 1, 32 / 2)` — and admits four 4 GiB reservations at
+   once; a fifth waits and is admitted the moment one of the four is released. The same reservation
+   on a machine reporting 8 GiB has a 4 GiB allocation and one runs at a time, the first by the
+   runs-alone rule rather than by the sum. Before this, `max_concurrent_heavy_analyzers = 1`
+   serialised all five on both machines, and a second project's language server was refused with
+   `CTX_RESOURCE_LIMIT` on a machine with room for six.
 
 ## Measurements
 

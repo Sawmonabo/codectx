@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"context"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -143,22 +144,21 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 
 // reservations fills the three figures that are not measured but promised: what
 // this process has set aside for concurrent queries, for the parsed-graph cache
-// and for the indexing queue. They are configuration, so they are always
-// available and a zero here is a real zero.
+// and for the indexing queue. Two are configuration and the third is how many
+// queries this machine's cores run at once, so all three are always available
+// and a zero here is a real zero.
 //
-// This is the first runtime reader of resources.cache_bytes: until now that key
-// was read only by configuration validation. Validation already proves the three
-// reservations fit resources.base_memory_budget_bytes
-// (internal/config/validate.go:204-211), so the report states the three rather
-// than re-deriving the check -- a second implementation of that arithmetic would
-// drift from the one that refuses a bad configuration.
+// Validation already proves the three fit config.BaseFootprintBytes, so the
+// report states them rather than re-deriving the check -- a second
+// implementation of that arithmetic would drift from the one that refuses a
+// bad configuration.
 func (s *Service) reservations(report *model.ResourceReport) {
 	res := s.opts.Config.Resources
-	// Validation refuses a configuration whose product overflows
-	// (mulNoOverflow, internal/config/validate.go:199), so the multiplication
-	// here cannot wrap on a loaded configuration; a negative from any other
-	// path is absent rather than published as a huge unsigned.
-	report.QueryReservationBytes = nonNegativeBytes(int64(res.MaxConcurrentQueries) * res.QueryMemoryBytes)
+	// Validation refuses a configuration whose product overflows (mulNoOverflow),
+	// so the multiplication here cannot wrap on a loaded configuration; a
+	// negative from any other path is absent rather than published as a huge
+	// unsigned.
+	report.QueryReservationBytes = nonNegativeBytes(int64(config.QuerySlots()) * res.QueryMemoryBytes)
 	report.CacheReservationBytes = nonNegativeBytes(res.CacheBytes)
 	report.QueueReservationBytes = nonNegativeBytes(s.opts.Config.Index.QueueBytes)
 }
