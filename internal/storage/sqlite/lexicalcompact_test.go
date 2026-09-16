@@ -92,66 +92,85 @@ func segmentOf(t *testing.T, db *sql.DB, doc int64) int64 {
 // derives its set from, so a row still naming an absorbed segment would name it
 // beside the segment holding the very same documents.
 func TestActivationMergesATierIntoOneSegment(t *testing.T) {
-	dbPath := t.TempDir() + "/codectx.db"
-	f := newFixture(t, dbPath)
-	ratio := store.LexicalMergeRatio()
-	files := make([]fileFixture, 0, ratio+1)
-	for i := 0; i <= ratio; i++ {
-		files = append(files, tierFile(f, i))
-	}
-	snap := f.snapshot("one", files...)
-	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	run := f.run(gen)
-	// One unit per file, each its own scope key, so the generation seals
-	// ratio+1 segments into the one tier a fixture's kilobytes fall in.
-	for i, ff := range files {
-		w := f.beginScopeKey(gen, run, configHash, fmt.Sprintf("scope-%d", i), ff)
-		f.fillFile(w, run, ff)
-		if err := f.s.SealUnit(f.ctx, w); err != nil {
-			t.Fatalf("SealUnit(%s): %v", ff.path, err)
+	// Run twice: once at the part size that ships, and once at one small
+	// enough to split a 32-byte directory entry and a posting list across two
+	// parts, which forces both stitch paths -- the reader's and the merge's.
+	// The shipped 1 MiB is a multiple of the entry width, so a directory entry
+	// never straddles a boundary there and the reader's stitch is reached only
+	// by a posting list on a repository-sized fixture. The comparison at the
+	// end is byte identity of what every term answers, so a stitch that joined
+	// its parts wrongly shows up as a missing or misplaced document.
+	for _, part := range []int{0, 100} {
+		name := "at the part size that ships"
+		if part != 0 {
+			name = "at a part size that forces every stitch"
 		}
-	}
-	f.activate(gen, 0)
-	flushed(t, f.s)
-	db := openRawDB(t, dbPath)
+		t.Run(name, func(t *testing.T) {
+			if part != 0 {
+				defer store.SetLexPartBytes(part)()
+			}
+			dbPath := t.TempDir() + "/codectx.db"
+			f := newFixture(t, dbPath)
+			ratio := store.LexicalMergeRatio()
+			files := make([]fileFixture, 0, ratio+1)
+			for i := 0; i <= ratio; i++ {
+				files = append(files, tierFile(f, i))
+			}
+			snap := f.snapshot("one", files...)
+			gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := f.run(gen)
+			// One unit per file, each its own scope key, so the generation seals
+			// ratio+1 segments into the one tier a fixture's kilobytes fall in.
+			for i, ff := range files {
+				w := f.beginScopeKey(gen, run, configHash, fmt.Sprintf("scope-%d", i), ff)
+				f.fillFile(w, run, ff)
+				if err := f.s.SealUnit(f.ctx, w); err != nil {
+					t.Fatalf("SealUnit(%s): %v", ff.path, err)
+				}
+			}
+			f.activate(gen, 0)
+			flushed(t, f.s)
+			db := openRawDB(t, dbPath)
 
-	set := segmentSet(t, db, int64(gen))
-	if len(set) != 1 {
-		t.Fatalf("a generation of %d sealed segments names %d of them; the tier was not merged", ratio+1, len(set))
+			set := segmentSet(t, db, int64(gen))
+			if len(set) != 1 {
+				t.Fatalf("a generation of %d sealed segments names %d of them; the tier was not merged", ratio+1, len(set))
+			}
+			merged := set[0]
+			var docs, hidden int64
+			if err := db.QueryRow(`SELECT doc_count FROM lexical_segments WHERE id = ?`, merged).Scan(&docs); err != nil {
+				t.Fatal(err)
+			}
+			if docs != int64(ratio+1) {
+				t.Fatalf("the merged segment packs %d documents, want the %d its inputs held", docs, ratio+1)
+			}
+			if err := db.QueryRow(`SELECT hidden FROM generation_segments WHERE generation_id = ? AND segment_id = ?`,
+				int64(gen), merged).Scan(&hidden); err != nil {
+				t.Fatal(err)
+			}
+			if hidden != 0 {
+				t.Fatalf("the merged segment reports %d hidden documents; every one of them is this generation's", hidden)
+			}
+			// Every input row re-pointed. A row left naming an absorbed segment is what
+			// lets a later generation name that segment beside the merged one.
+			var stale int64
+			if err := db.QueryRow(`SELECT count(*) FROM search_units WHERE segment_id IS NOT NULL AND segment_id <> ?`,
+				merged).Scan(&stale); err != nil {
+				t.Fatal(err)
+			}
+			if stale != 0 {
+				t.Fatalf("%d documents still name a segment the merge absorbed; the merged segment holds them too", stale)
+			}
+			r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+			if err != nil {
+				t.Fatalf("PinGeneration: %v", err)
+			}
+			comparePackedToLive(t, f, r, gen, db)
+		})
 	}
-	merged := set[0]
-	var docs, hidden int64
-	if err := db.QueryRow(`SELECT doc_count FROM lexical_segments WHERE id = ?`, merged).Scan(&docs); err != nil {
-		t.Fatal(err)
-	}
-	if docs != int64(ratio+1) {
-		t.Fatalf("the merged segment packs %d documents, want the %d its inputs held", docs, ratio+1)
-	}
-	if err := db.QueryRow(`SELECT hidden FROM generation_segments WHERE generation_id = ? AND segment_id = ?`,
-		int64(gen), merged).Scan(&hidden); err != nil {
-		t.Fatal(err)
-	}
-	if hidden != 0 {
-		t.Fatalf("the merged segment reports %d hidden documents; every one of them is this generation's", hidden)
-	}
-	// Every input row re-pointed. A row left naming an absorbed segment is what
-	// lets a later generation name that segment beside the merged one.
-	var stale int64
-	if err := db.QueryRow(`SELECT count(*) FROM search_units WHERE segment_id IS NOT NULL AND segment_id <> ?`,
-		merged).Scan(&stale); err != nil {
-		t.Fatal(err)
-	}
-	if stale != 0 {
-		t.Fatalf("%d documents still name a segment the merge absorbed; the merged segment holds them too", stale)
-	}
-	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
-	if err != nil {
-		t.Fatalf("PinGeneration: %v", err)
-	}
-	comparePackedToLive(t, f, r, gen, db)
 }
 
 // One merge reads a bounded number of segments, so a tier holding more than
