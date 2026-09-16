@@ -131,25 +131,30 @@ a spilled statement journal, a sort's runs -- and only the file system sees ever
 them. On a platform without range writeback the wait is the wrapped file's own sync, which
 with at most two windows dirty is a bounded wait.
 
-### Decision 5, amended again 2026-09-16: freeing is windowed like writing
+### Decision 5, amended again 2026-09-16: freeing is windowed like writing, as a symmetric bound
 
-The third uncapped index, with the shim in place, kept the dirty set under 5 MB and the pool
-never exhausted through the 1.8 GB commit -- and then stalled the host anyway, twice, at the
-two moments the run frees space: the log's reset after the checkpoint and the removal of the
-analyzer's export and staging (4.4 GB) at the end. The root filesystem is mounted to discard
-freed blocks as they are freed (`discard`), so one unlink of a multi-gigabyte file hands the
-device every discard at once, and every other process's sync waits behind them. Writing was
-bounded; freeing was not.
+Two later uncapped indexes with the shim in place kept the dirty set under 5 MB and the pool never
+exhausted through the 1.8 GB commit, and near the moments the run frees space -- the log's reset after
+the checkpoint and the removal of the analyzer's export and staging, about 4.4 GB -- the independent
+latency probe recorded the host stalling. The root filesystem is mounted to discard freed blocks as
+they are freed (`discard`), so one unlink of a multi-gigabyte file can hand the device its whole
+discard queue at once; that was the first hypothesis for the stall. A controlled test then measured
+the cost of freeing directly and did not bear it out: truncating a 2 GB file one window at a time
+freed it in 0.33 s with an independent 4 KiB write and data-sync completing in about a millisecond
+throughout, and the device reported discarding 7.6 GB in 48 ms. Windowed freeing is cheap and does not
+by itself stall the host. The earlier runs' stalls are therefore not attributed to freeing; their
+mechanism is unresolved, recorded in the engineering ledger, and left for a clean coexistence proof on
+a quiet host that names, per process, whatever saturates the device.
 
-Freeing is therefore windowed the same way: a file larger than the window is truncated down
-one window at a time with a data sync between steps, so the filesystem frees, and the device
-discards, one window at a time, and only then is the file unlinked. The shim does this for the engine's own truncations and
-deletions (a log reset, a rollback or statement journal's removal), and `internal/paced` does
-it for every file the process removes itself (a spool, a sort's runs, a staging tree, an
-export). This is the delete scheduler of a log-structured storage engine, whose
-`bytes_max_delete_chunk` "ftruncate[s] the file by this size each time, rather than dropping
-the whole file"; the window is the same layout constant as the write window and there is no
-rate and no setting.
+Freeing is windowed nonetheless, symmetrically with writing, as a bounded discipline and not as a fix
+for a proven stall: a file larger than the window is truncated down one window at a time with a data
+sync between steps, so the filesystem frees, and the device discards, one window at a time, and only
+then is the file unlinked. The shim does this for the engine's own truncations and deletions (a log
+reset, a rollback or statement journal's removal), and `internal/paced` does it for every file the
+process removes itself (a spool, a sort's runs, a staging tree, an export). This is the delete
+scheduler of a log-structured storage engine, whose `bytes_max_delete_chunk` "ftruncate[s] the file by
+this size each time, rather than dropping the whole file"; the window is the same layout constant as
+the write window and there is no rate and no setting.
 
 ### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
 
