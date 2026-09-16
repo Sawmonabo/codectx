@@ -196,7 +196,8 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			"while another process is indexing or watching.\n\n" +
 			"--resources adds the Section 23 accounting block: parent and worker memory, " +
 			"the query, cache and queue reservations, live subprocesses and pending events, " +
-			"database, WAL, temporary and content bytes, and unit reuse and parse counts. " +
+			"database, WAL, temporary and content bytes, unit reuse and parse counts, and " +
+			"what each heavy analysis unit was reserved, capped and observed to peak at. " +
 			"It is not reported by default because measuring it costs more than the rest of " +
 			"this report put together. A metric this host cannot measure is reported as " +
 			"unavailable, never as zero.",
@@ -568,6 +569,15 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	// left to look like a backlog the pace is still working through.
 	for _, stuck := range r.StuckFrees {
 		fmt.Fprintf(tw, "    stuck %s\t%s\n", stuck.Entry, stuck.Reason)
+	}
+	// One line per heavy analysis unit: what it was admitted against, the cap
+	// it ran under, and what its process tree actually reached. Reading the
+	// three together is the whole point -- a peak far under the cap says the
+	// unit was serialized behind memory it never used.
+	for _, u := range r.AnalyzerUnits {
+		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s\n",
+			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
+			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
 	flushTableInto(tw)
 }
