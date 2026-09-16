@@ -791,9 +791,12 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 	if int64(served) >= total {
 		return b.items, nil, false, b.clipped, nil
 	}
-	if e.signer == nil || e.leases == nil || e.spools == nil {
-		// Nothing to bind a token to. The caller marks the answer truncated
-		// rather than presenting a bounded page as the complete set.
+	if e.signer == nil || e.spools == nil || !e.leases.Retains() {
+		// Nothing to bind a token to, or a process that writes nothing: the
+		// spool below is reclaimed on its cursor lease's expiry, so adopting
+		// one without a lease would leak it. Nothing is created here -- this
+		// return precedes spools.Create -- and the caller marks the answer
+		// truncated rather than presenting a bounded page as the complete set.
 		return b.items, nil, true, b.clipped, nil
 	}
 
@@ -910,6 +913,12 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 			return nil, nil, false, false, err
 		}
 	}
+	if served >= c.Total && !e.leases.Retains() {
+		// The answer is complete, but this process cannot end the lease that
+		// governs the spool, so it ends neither: the lease's TTL and the sweep
+		// the next writer-bearing process runs reclaim both together.
+		return b.items, nil, false, b.clipped, nil
+	}
 	if served >= c.Total {
 		// The answer is complete. The spool and the lease it pinned are
 		// released here rather than left to their TTL, so a walk read to
@@ -921,6 +930,14 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 			return nil, nil, false, false, err
 		}
 		return b.items, nil, false, b.clipped, nil
+	}
+	if !e.leases.Retains() {
+		// The page is served out of the spool -- a read -- but the lease that
+		// keeps that spool readable cannot be renewed by a process that writes
+		// nothing, so the answer ends here and reports the occurrences it did
+		// not reach. Nothing is released: the lease minted by the process that
+		// wrote the spool still governs the directory.
+		return b.items, nil, true, b.clipped, nil
 	}
 	// The spool's liveness is its lease's (pagination.Spools.OpenAt) and the
 	// token's is its own expiry, so a cursor that carried page one's expiry

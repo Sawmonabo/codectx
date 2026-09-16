@@ -599,14 +599,16 @@ func (e *Engine) continueRankedCursor(ctx context.Context, b *budget, c traversa
 }
 
 // canContinue reports whether this engine can mint a ranked continuation at
-// all. Without a signer, a lease store or a spool store the answer stops with
+// all. Without a signer or a spool store, and in a process that retains
+// nothing -- one that opened the workspace read-only, so it can record neither
+// the cursor lease nor the renewal a later page needs -- the answer stops with
 // this page and SAYS so, exactly as a walk that cannot spill its frontier does.
 // It is only consulted with a ranked remainder still unserved -- every caller
 // checks that first -- so the stop always cuts the answer, and returning an
 // empty token alone left the caller reading a complete-looking page of a longer
 // ranking. Marking it is what makes the cut visible.
 func (e *Engine) canContinue(meta *model.QueryMeta) bool {
-	if e.signer == nil || e.leases == nil || e.spools == nil {
+	if e.signer == nil || e.spools == nil || !e.leases.Retains() {
 		markTruncated(meta, reasonNoContinuation)
 		return false
 	}
@@ -841,12 +843,14 @@ func impactPhaseError(ctx context.Context, err error, meta *model.QueryMeta) err
 const reasonDeadline = "query deadline reached"
 
 // reasonNoContinuation is the truncation reason for a ranked answer whose
-// remainder cannot be paged because this engine was built without the
-// continuation machinery -- no signer, no lease store or no spool store. The
-// records exist and the ranking is complete; what is missing is the token that
-// would hand the rest of them back, so the page that is served is a prefix and
-// must say it is one.
-const reasonNoContinuation = "continuation state is unavailable in this workspace"
+// remainder cannot be paged: either this engine was built without the
+// continuation machinery, or the process retains nothing at all because it
+// opened the workspace read-only. The records exist and the ranking is
+// complete; what is missing is the token that would hand the rest of them
+// back, so the page that is served is a prefix and must say it is one.
+const reasonNoContinuation = "this answer was served by a process that retains no continuation state, " +
+	"so the ranked records beyond this page are not reachable; narrow the walk's depth or its node bound " +
+	"to bring the answer within one page"
 
 // reasonDeadlineStalled is the truncation reason for a page that ran out of
 // time WITHOUT moving the walk on: it admitted nothing and left the frontier
