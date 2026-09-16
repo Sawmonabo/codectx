@@ -3,7 +3,9 @@ package index
 import (
 	"context"
 	"errors"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,13 +71,25 @@ type generation struct {
 	// only reuses units the previous generation selected and these sealed into
 	// a staging generation instead. It is nil on the indexing path.
 	sealed map[string]bool
-	// failedScopes holds, per plan key, the reason a deferred unit of this
-	// publication's batch did not seal. A scope that failed is neither
-	// covered nor still running, and telling the three apart is what keeps a
-	// provider whose other scopes published from being reported as though
-	// none of them had. It is nil on the indexing path, where a unit's
-	// failure is recorded as it happens.
-	failedScopes map[string]string
+	// failedScopes holds, per plan key, the typed reason a DEFERRED unit of
+	// this publication's batch did not seal. A deferred scope that failed is
+	// neither covered nor still running, and telling the three apart is what
+	// keeps a provider whose other scopes published from being reported as
+	// though none of them had. It is nil on the indexing path.
+	failedScopes map[string]unitFailure
+
+	// failures aggregates the units that failed, per provider. It is the
+	// indexing path's record of what did not seal, and a publication
+	// generation is seeded with the foreground generation's copy of it:
+	// those scopes are re-planned by the publication and still have nothing
+	// behind them, so losing them here republishes them as coverage -- which
+	// is how a provider whose every precise unit failed came back `fresh`.
+	//
+	// It is an aggregate and not a per-unit map because it outlives the run:
+	// a repository can fail thousands of scopes, and what the report needs is
+	// a count, a planned total and a bounded sample, all of which are one
+	// small entry per provider whatever failed.
+	failures map[string]*providerFailures
 
 	// mu guards everything the unit workers accumulate.
 	mu sync.Mutex
@@ -102,6 +116,51 @@ type generation struct {
 	planned    int64
 	failed     int64
 	subdivided int64
+}
+
+// unitFailure is the typed reason one unit did not seal: the diagnostic
+// family, the safe message and the bounded particulars the provider attached.
+// The code alone cannot tell an analyzer that could not be started from one
+// that exited nonzero, which is the distinction an operator acts on.
+type unitFailure struct {
+	code    string
+	message string
+	details map[string]string
+}
+
+// maxFailedScopesNamed bounds the failed scope keys one capability row names.
+// A repository can fail thousands of scopes and the row must fit the same
+// detail bound either way, so past this many the row publishes the count in
+// units_failed and flags the list as cut rather than growing with the failure.
+const maxFailedScopesNamed = 8
+
+// providerFailures aggregates one provider's failed scopes for the capability
+// fold: how many failed, how many were planned, and a bounded, sorted sample
+// of the scope keys with the reason each carried.
+type providerFailures struct {
+	units   int
+	planned int
+	named   []failedScope
+}
+
+// add folds one failed scope in, keeping the lexicographically first
+// maxFailedScopesNamed of them. The sample is ordered by scope key and never
+// by arrival: the units of one provider are built concurrently, and both
+// details_json and diagnostic_code fold into the AnalysisKey, so an
+// arrival-ordered sample would key two identical runs differently.
+func (f *providerFailures) add(scopeKey string, failure unitFailure) {
+	f.units++
+	at := len(f.named)
+	for at > 0 && f.named[at-1].scopeKey > scopeKey {
+		at--
+	}
+	if at == maxFailedScopesNamed {
+		return
+	}
+	f.named = slices.Insert(f.named, at, failedScope{scopeKey: scopeKey, failure: failure})
+	if len(f.named) > maxFailedScopesNamed {
+		f.named = f.named[:maxFailedScopesNamed]
+	}
 }
 
 // attempt captures, plans, builds and publishes exactly once.
@@ -816,7 +875,7 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 	if !ok || p.Descriptor().Required {
 		return cause
 	}
-	code := provider.CodeOf(cause)
+	f := g.recordFailure(ctx, u, res, cause)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.failed++
@@ -826,15 +885,65 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 			g.runs = append(g.runs, res)
 		}
 	}
-	for _, capability := range p.Descriptor().Capabilities {
-		g.caps.addFailure(u.ProviderID, capability, u.ScopeKey, code)
+	// The reason is aggregated per provider and folded into the capability
+	// rows by coverage, which publishes a count, a planned total and a
+	// bounded sample of the scopes instead of one row per failed unit.
+	if g.failures == nil {
+		g.failures = map[string]*providerFailures{}
 	}
-	// The scope key is the only identifier logged; a provider's own output,
-	// source bytes and native keys never reach an ordinary log line.
-	g.c.log.Warn("an optional provider unit failed; its capability is published failed",
-		"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
-		"generation_id", int64(g.gen), "diagnostic_code", code)
+	agg, ok := g.failures[u.ProviderID]
+	if !ok {
+		agg = &providerFailures{}
+		g.failures[u.ProviderID] = agg
+	}
+	agg.add(u.ScopeKey, f)
 	return nil
+}
+
+// recordFailure types one unit's failure, keeps it on the run row and tells
+// the operator. The durable row is what survives the log: a capability row
+// carries one exemplar per provider capability and never the tool output, so
+// without it the particulars of every other failed scope are lost the moment
+// the process exits.
+//
+// The log line carries the message and the bounded particulars, but never the
+// standard-error tail: that is raw analyzer output, which Section 6 keeps out
+// of ordinary logs. The tail is on the run row alone. The scope key is the
+// only identifier logged; a provider's own source bytes and native keys never
+// reach a log line at all.
+func (g *generation) recordFailure(ctx context.Context, u plan.Unit, res model.ProviderResult, cause error) unitFailure {
+	f := typedFailure(cause)
+	if res.RunID != "" {
+		stored := model.RunFailure{ScopeKey: u.ScopeKey, Code: f.code, Message: f.message, Details: f.details}
+		// Under a context that survives the cancellation the failure may have
+		// arrived with: a reason dropped because the run was cancelled is the
+		// case the operator most needs the row for.
+		if err := g.c.opts.Store.RecordRunFailure(context.WithoutCancel(ctx), res.RunID, stored); err != nil {
+			logTyped(g.c.log, "the reason a provider unit failed could not be recorded", err,
+				"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey)
+		}
+	}
+	args := []any{"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
+		"generation_id", int64(g.gen), "diagnostic_code", f.code, "message", f.message}
+	for _, k := range slices.Sorted(maps.Keys(f.details)) {
+		if k != model.DetailStderrTail {
+			args = append(args, k, f.details[k])
+		}
+	}
+	g.c.log.Warn("an optional provider unit failed; its capability is published failed", args...)
+	return f
+}
+
+// typedFailure projects an error onto the reason a capability row and a run
+// row publish. An untyped error has no safe message to publish -- it is a
+// defect's text, not a diagnostic -- so only its family is kept.
+func typedFailure(cause error) unitFailure {
+	f := unitFailure{code: provider.CodeOf(cause)}
+	var typed *model.Error
+	if errors.As(cause, &typed) {
+		f.message, f.details = typed.Message, typed.Details
+	}
+	return f
 }
 
 // coverage publishes the fresh rows and the one degradation that is otherwise
@@ -857,7 +966,7 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// scopes is a known failure. It is recorded first so `reported`
 			// sees it.
 			if f, ok := failed[d.ID]; ok {
-				g.caps.addFailure(d.ID, capability, f.scopeKey, f.code)
+				g.caps.addFailures(d.ID, capability, f)
 			}
 			// And a capability that did publish a scope is partial, not
 			// failed: the facts of that scope are in this generation and
@@ -884,12 +993,9 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 }
 
 // failedScope is one scope of a provider that did not seal, with the reason.
-// One exemplar per provider is kept -- the lexicographically first, so two
-// identical runs publish the same row -- because the capability row it
-// becomes carries one scope key and one diagnostic code.
 type failedScope struct {
 	scopeKey string
-	code     string
+	failure  unitFailure
 }
 
 // coveredProviders is the set of providers this generation actually holds a
@@ -905,10 +1011,10 @@ type failedScope struct {
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool, failed map[string]failedScope, published map[string]bool, err error) {
+func (g *generation) coveredProviders() (covered, deferred map[string]bool, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
 	deferred = make(map[string]bool, len(g.sel.Active))
-	failed = make(map[string]failedScope, len(g.sel.Active))
+	failed = make(map[string]*providerFailures, len(g.sel.Active))
 	published = make(map[string]bool, len(g.sel.Active))
 	g.mu.Lock()
 	for id := range g.published {
@@ -917,7 +1023,24 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 	g.mu.Unlock()
 	// Streamed, not ranged: the plan's unit list is repository-sized, and the
 	// three answers here are one bounded entry per provider whatever it holds.
+	g.mu.Lock()
+	for id, agg := range g.failures {
+		clone := *agg
+		clone.named = slices.Clone(agg.named)
+		failed[id] = &clone
+	}
+	g.mu.Unlock()
+	record := func(u plan.Unit, f unitFailure) {
+		agg, ok := failed[u.ProviderID]
+		if !ok {
+			agg = &providerFailures{}
+			failed[u.ProviderID] = agg
+		}
+		agg.add(u.ScopeKey, f)
+	}
+	planned := make(map[string]int, len(g.sel.Active))
 	if err := g.eachUnit(func(u plan.Unit) error {
+		planned[u.ProviderID]++
 		if u.Deferred {
 			key := plan.Key(u.ProviderID, u.ScopeKey)
 			// A publication generation holds the deferred units that have
@@ -928,10 +1051,8 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 			case g.sealed[key]:
 				out[u.ProviderID] = true
 				published[u.ProviderID] = true
-			case g.failedScopes[key] != "":
-				if prev, ok := failed[u.ProviderID]; !ok || u.ScopeKey < prev.scopeKey {
-					failed[u.ProviderID] = failedScope{scopeKey: u.ScopeKey, code: g.failedScopes[key]}
-				}
+			case g.failedScopes[key].code != "":
+				record(u, g.failedScopes[key])
 			default:
 				deferred[u.ProviderID] = true
 			}
@@ -941,6 +1062,9 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 		return nil
 	}); err != nil {
 		return nil, nil, nil, nil, err
+	}
+	for id, agg := range failed {
+		agg.planned = planned[id]
 	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true

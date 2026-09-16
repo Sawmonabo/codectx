@@ -58,6 +58,13 @@ type IndexResult struct {
 	// counts above from one set of numbers rather than two.
 	Run    *RunRecord    `json:"run,omitempty"`
 	Stages []StageRecord `json:"stages,omitempty"`
+	// StagesOmitted is how many of the run's stages this generation recorded
+	// beyond the per-result ceiling Stages carries, exactly as RunsOmitted
+	// reports it for runs. Stages is a wire-sized page, not the whole of the
+	// run's accounting, and a short list that did not say how much it dropped
+	// would read as the complete cost of the run -- the one thing a bounded
+	// response must never do.
+	StagesOmitted int64 `json:"stages_omitted"`
 }
 
 // Validate enforces the result shape.
@@ -96,7 +103,7 @@ func (r IndexResult) Validate() error {
 			return err
 		}
 	}
-	if err := validateRunLedger("index_result", r.Run, r.Stages); err != nil {
+	if err := validateRunLedger("index_result", r.Run, r.Stages, r.StagesOmitted); err != nil {
 		return err
 	}
 	return nil
@@ -238,6 +245,9 @@ type ResourceReport struct {
 	// a share of.
 	Run    *RunRecord    `json:"run,omitempty"`
 	Stages []StageRecord `json:"stages,omitempty"`
+	// StagesOmitted is how many of the run's stages this page does not carry,
+	// with the same meaning it has on IndexResult.
+	StagesOmitted int64 `json:"stages_omitted"`
 }
 
 // An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
@@ -328,7 +338,7 @@ func (r ResourceReport) Validate() error {
 			}
 		}
 	}
-	if err := validateRunLedger("resources", r.Run, r.Stages); err != nil {
+	if err := validateRunLedger("resources", r.Run, r.Stages, r.StagesOmitted); err != nil {
 		return err
 	}
 	return nil
@@ -648,7 +658,16 @@ type StageRecord struct {
 // rows. Both surfaces that carry them -- the completed run an index reports
 // and the latest run status reports -- have the same bound and the same
 // non-negativity rules, so they share one check rather than drifting apart.
-func validateRunLedger(field string, run *RunRecord, stages []StageRecord) *Error {
+func validateRunLedger(field string, run *RunRecord, stages []StageRecord, omitted int64) *Error {
+	if err := requireNonNegative(field+".stages_omitted", omitted); err != nil {
+		return err
+	}
+	// Rows can only have been dropped from a page that is actually full, of a
+	// run whose rows it is a page of: a count reported over a short list names
+	// stages nothing could have omitted.
+	if omitted > 0 && (run == nil || len(stages) < MaxRecordsPerResult) {
+		return invalid("%s.stages_omitted is %d on a page of %d stages that dropped none", field, omitted, len(stages))
+	}
 	if run != nil {
 		for _, c := range []struct {
 			name  string

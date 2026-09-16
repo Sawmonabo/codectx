@@ -78,12 +78,14 @@ type SpanRow struct {
 	ShareOfWall float64
 }
 
-// A RunView is one run and its spans. Truncated says the run holds more spans
-// than one page carries, so a caller reports a partial view as partial.
+// A RunView is one run and its spans. SpansOmitted is how many of the run's
+// spans this page does not carry, so a caller reports a partial view as
+// partial and says by how much: "some stages are missing" does not tell an
+// operator whether the page dropped three of them or three hundred.
 type RunView struct {
-	Run       RunRow
-	Spans     []SpanRow
-	Truncated bool
+	Run          RunRow
+	Spans        []SpanRow
+	SpansOmitted int64
 }
 
 // A Reader is a read-only view of a ledger file. It is a separate connection
@@ -224,7 +226,7 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	} else {
 		view.Run.WallMS = end.Sub(view.Run.StartedAt).Milliseconds()
 	}
-	if view.Spans, view.Truncated, err = r.spans(ctx, raw, view.Run.WallMS, now, lapsed); err != nil {
+	if view.Spans, view.SpansOmitted, err = r.spans(ctx, raw, view.Run.WallMS, now, lapsed); err != nil {
 		return RunView{}, false, err
 	}
 	return view, true, nil
@@ -237,8 +239,12 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 // one that has been going ever since. The
 // page is model.MaxRecordsPerResult wide, the same bound every other list in
 // the product carries; one extra row is read to tell a full page from a
-// truncated one.
-func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now time.Time, lapsed bool) ([]SpanRow, bool, error) {
+// truncated one, and only a page that is actually truncated pays for the one
+// COUNT that says by how much. The count is a second statement rather than a
+// longer scan because the run's spans are indexed by (run_id, seq): counting
+// them reads the index, while scanning past the page would read every row of a
+// run this page deliberately did not read.
+func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now time.Time, lapsed bool) ([]SpanRow, int64, error) {
 	const query = `SELECT s.seq, p.seq, s.stage, s.scope_key, s.provider, s.started_at, s.finished_at,
 		s.wall_ms, s.cpu_user_ms, s.cpu_sys_ms, s.cpu_unattributed, s.peak_rss_bytes, s.read_bytes, s.write_bytes,
 		s.items_in, s.items_out, s.outcome, s.diagnostic_code, s.failure_json
@@ -246,7 +252,7 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		WHERE s.run_id = ? ORDER BY s.seq LIMIT ?`
 	rows, err := r.db.QueryContext(ctx, query, runID, model.MaxRecordsPerResult+1)
 	if err != nil {
-		return nil, false, wrap("run spans", err)
+		return nil, 0, wrap("run spans", err)
 	}
 	defer rows.Close()
 	hexID := hex.EncodeToString(runID)
@@ -265,7 +271,7 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		if err := rows.Scan(&row.Seq, &parent, &row.Stage, &row.ScopeKey, &row.Provider, &started, &finished,
 			&wall, &cpuUser, &cpuSys, &row.CPUUnattributed, &peak, &read, &write,
 			&row.ItemsIn, &row.ItemsOut, &outcome, &row.DiagnosticCode, &row.Failure); err != nil {
-			return nil, false, wrap("run spans", err)
+			return nil, 0, wrap("run spans", err)
 		}
 		row.RunID = hexID
 		row.Outcome = Outcome(outcome)
@@ -285,12 +291,12 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		row.ReadBytes = optionalBytes(read)
 		row.WriteBytes = optionalBytes(write)
 		if row.StartedAt, err = parseTime(started); err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
 		if finished.Valid {
 			at, err := parseTime(finished.String)
 			if err != nil {
-				return nil, false, err
+				return nil, 0, err
 			}
 			row.FinishedAt = &at
 		}
@@ -308,7 +314,26 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		}
 		out = append(out, row)
 	}
-	return out, truncated, wrap("run spans", rows.Err())
+	if err := rows.Err(); err != nil {
+		return nil, 0, wrap("run spans", err)
+	}
+	if !truncated {
+		return out, 0, nil
+	}
+	// The page is closed before the count so the reader's two connections are
+	// not both held for one answer.
+	rows.Close()
+	var total int64
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM spans WHERE run_id = ?`, runID).Scan(&total); err != nil {
+		return nil, 0, wrap("count run spans", err)
+	}
+	omitted := total - int64(len(out))
+	if omitted < 0 {
+		// A span deleted between the page and the count: the page is still
+		// every span this read saw, and nothing was omitted from it.
+		omitted = 0
+	}
+	return out, omitted, nil
 }
 
 func optionalInt(v sql.NullInt64) *int64 {

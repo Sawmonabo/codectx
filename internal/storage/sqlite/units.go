@@ -10,8 +10,27 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
+
+// The stages of an activation that are recorded on their own. Each runs inside
+// the activation, not as a phase the coordinator can bracket, so its span is
+// opened here, under the activation span the caller already holds.
+const (
+	stageLexicalCompaction = "lexical_compaction"
+	stageAdjacency         = "adjacency"
+	stageLexicalBuild      = "lexical_build"
+)
+
+// spanOutcome is how an activation stage reports itself: a span that returned
+// an error failed, and every other return is a success.
+func spanOutcome(err error) ledger.Outcome {
+	if err != nil {
+		return ledger.OutcomeFailed
+	}
+	return ledger.OutcomeOK
+}
 
 // Hash domains for the aggregate digests folded into AnalysisKey (Section 9.1).
 const (
@@ -113,6 +132,71 @@ func (s *Store) CompleteProviderRun(ctx context.Context, result model.ProviderRe
 			`UPDATE provider_runs SET status = ?, counters_json = ?, diagnostic_code = ?, completed_at = ? WHERE id = ? AND status = 'running'`,
 			string(result.State), string(counters), diagnosticCode, formatTime(time.Now()), raw)
 	})
+}
+
+// RecordRunFailure keeps the typed reason a run produced no unit on the run
+// row. It is the only durable home for a failed unit's message and details: a
+// unit that never sealed has no row of its own, and the capability row the
+// fold publishes carries one exemplar scope per provider capability and
+// excludes the raw tool output entirely.
+//
+// It is written after CompleteProviderRun and therefore does not require the
+// run to still be running; a run recorded as succeeded has no failure to
+// write, which is why the empty reason is refused rather than stored.
+func (s *Store) RecordRunFailure(ctx context.Context, id model.ProviderRunID, failure model.RunFailure) error {
+	if err := failure.Validate(); err != nil {
+		return err
+	}
+	raw, err := idBlob("run_id", string(id))
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(failure)
+	if err != nil {
+		return internal("run failure: " + err.Error())
+	}
+	return s.ingest(ctx, func(tx *sql.Tx) error {
+		return exec1(ctx, tx, invalid("provider run %s does not exist", id),
+			`UPDATE provider_runs SET failure_json = ? WHERE id = ?`, string(encoded), raw)
+	})
+}
+
+// RunFailure reads back the reason recorded for a run, and false when the run
+// recorded none. A run whose generation has been collected is gone with it, so
+// a missing row is reported as "no reason kept" rather than as an error: the
+// caller is asking why a scope has no facts, and "the generation that failed
+// is no longer retained" is an answer, not a failure.
+func (s *Store) RunFailure(ctx context.Context, id model.ProviderRunID) (model.RunFailure, bool, error) {
+	raw, err := idBlob("run_id", string(id))
+	if err != nil {
+		return model.RunFailure{}, false, err
+	}
+	var failure model.RunFailure
+	var found bool
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+		var encoded string
+		err := tx.QueryRowContext(ctx, `SELECT failure_json FROM provider_runs WHERE id = ?`, raw).Scan(&encoded)
+		if isNoRows(err) {
+			found = false
+			return nil
+		}
+		if err != nil {
+			return wrap("provider_runs", err)
+		}
+		if encoded == "" {
+			found = false
+			return nil
+		}
+		if err := json.Unmarshal([]byte(encoded), &failure); err != nil {
+			return corrupt("the recorded provider run failure is not readable")
+		}
+		found = true
+		return nil
+	})
+	if err != nil {
+		return model.RunFailure{}, false, err
+	}
+	return failure, found, nil
 }
 
 // ProviderRun reads one run's provenance. GenerationID is zero once the
