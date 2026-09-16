@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -121,6 +122,29 @@ func (c *Coordinator) collect(ctx context.Context) {
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
 		"orphan_objects_swept", report.OrphanObjectsSwept,
 		"orphan_sweep", report.OrphanSweepPhrase())
+}
+
+// recordReclaim records what the paced reclaimer gave back to the filesystem
+// while this run was open, read from the counter the reclaimer already keeps
+// rather than measured a second time: the freeing is the run's own cost --
+// every analyzer output, every materialization and every scratch surface the
+// run removed goes back through it, a window at a time -- and nothing else in
+// the ledger accounts for it.
+//
+// It is one span at the end of the run and not a bracket around it. The
+// reclaimer is a process-wide goroutine that frees at its own pace for the
+// whole life of the run, so a span holding the run's own wall would top every
+// wall-sorted surface while measuring nothing; the fact here is a quantity,
+// and items_out is where the ledger carries quantities.
+//
+// The figure is what THIS PROCESS freed while the run was open, not what this
+// run's own removals cost: one reclaimer serves the process, and a removal a
+// run queues may be freed after it ends, by the next run or by the next
+// process to claim the same set.
+func recordReclaim(ctx context.Context, freedBefore int64) {
+	freed := paced.FreedBytes() - freedBefore
+	_, span := ledger.Start(ctx, stageReclaim, "")
+	span.End(ledger.OutcomeOK, ledger.Measured{ItemsOut: &freed, CPUUnattributed: ledger.CPUOverlapped}, nil)
 }
 
 // sweepLedger deletes the ledger rows no generation will ever collect, one
