@@ -519,9 +519,12 @@ func (p *pairRollup) evidenceCounts(rels []RelRef) (map[RelRef]int64, error) {
 
 // hydrate reads the canonical id and the reported label of every container the
 // cache is missing, in batched round trips, and records them. A container the
-// generation publishes no node for is recorded as absent rather than retried
-// on the next batch, so one unpublishable container cannot cost one read per
-// batch for the rest of the walk.
+// generation publishes no node for records NOTHING and is looked up again by
+// the next batch that names it: caching it as absent would need an entry the
+// cache cannot tell from a real label, and containerLabels reads a present
+// entry as a nameable container, so an unpublishable one would enter the
+// answer as a pair with no id and no path. A re-read of the few surrogates in
+// that state is a cost; a labelless pair is a wrong answer.
 func (p *pairRollup) hydrate(reader GraphReader, missing map[NodeRef]bool) error {
 	if len(missing) == 0 {
 		return nil
