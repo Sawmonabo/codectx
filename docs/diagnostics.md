@@ -136,6 +136,14 @@ supplies a child span's peak resident memory. Both figures reach `--json` and
 the MCP row only: the table and the log line below carry the eight columns
 shown there and not these two.
 
+**The run row's peak is the process's peak, not the run's.** It is the kernel's
+own high-water mark for this process, read at the run's end, so it covers every
+run this process has already served: in a one-shot command the two are the same
+figure, and in a long-lived server on its fourth refresh the mark may have been
+set by the first. The stage rows carry no peak of their own for the reason
+above, and the run row's `cpu` stays `unavailable` because nothing measures
+processor time for the process as a whole.
+
 **An interrupted run shows no wall.** A run states on its own row a deadline
 its writer promises to renew while it lives. A reader that finds the deadline
 elapsed knows the process writing that run stopped -- the only signal of
@@ -183,11 +191,11 @@ ordered by wall time, with each stage's reason on its own line beneath it:
 
 ```
 run
-  stage             scope         wall        cpu          peak         in   out  outcome
-  run               generation 7  12s         unavailable  unavailable  120  2    ok
-  walk              -             8s          unavailable  unavailable  120  118  ok
-  structural_parse  -             running 3s  unavailable  unavailable  40   0    running
-  seal              -             1s          unavailable  unavailable  0    0    failed (CTX_UNIT_FAILED)
+  stage             scope         wall        cpu          peak             in   out  outcome
+  run               generation 7  12s         unavailable  431497216 bytes  120  2    ok
+  walk              -             8s          unavailable  unavailable      120  118  ok
+  structural_parse  -             running 3s  unavailable  unavailable      40   0    running
+  seal              -             1s          unavailable  unavailable      0    0    failed (CTX_UNIT_FAILED)
     seal failed     the unit did not seal
 ```
 

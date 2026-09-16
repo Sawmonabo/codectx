@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -352,5 +353,39 @@ func TestUnitsTheRunNeverReachedAreStillAccountedFor(t *testing.T) {
 	if !reached {
 		t.Fatalf("the run ended with no row for any %s unit: the units it planned and never reached left no trace",
 			manifest.ID)
+	}
+}
+
+// TestTheRunRowCarriesTheProcessPeakResidentSize protects the one field of the
+// run row that a platform measures rather than the run counting it: the
+// process's high-water resident size. Every surface that reports a run reads it
+// -- the resources table, the diagnose block and the JSON -- and a field with
+// readers and no writer reports "unavailable" for ever on a host that can
+// answer, which is indistinguishable from a host that cannot and is the one
+// failure this guards.
+//
+// It asserts the value is present and above zero rather than a particular
+// figure: the peak is the kernel's and nothing here may pin what it should be.
+// The assertion is Linux-only because /proc/self/status is where the figure
+// comes from; elsewhere absent is the correct answer and asserting presence
+// would demand a measurement the platform does not take.
+//
+// Mutation proof: pass nil instead of the reading at the run's end in
+// Coordinator.attempt.
+func TestTheRunRowCarriesTheProcessPeakResidentSize(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the process's peak resident size is read from /proc/self/status")
+	}
+	f := newFixture(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
+	res, err := f.c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	view := f.latestRun(res.Binding.GenerationID)
+	if view.Run.ProcessPeakRSSBytes == nil {
+		t.Fatal("the run row reports no process peak resident size on a host that exposes one")
+	}
+	if *view.Run.ProcessPeakRSSBytes == 0 {
+		t.Fatal("the run row reports a process peak resident size of zero, which is a measurement nobody took")
 	}
 }
