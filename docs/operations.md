@@ -108,13 +108,14 @@ actually active on this host, in addition to refusing every fetch.
 
 ## Which commands write, and which never do
 
-Three kinds of command, by what they may change:
+Four kinds of command, by what they may change:
 
 | | Workspace lock | Database writes | Commands |
 |---|---|---|---|
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
 | **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep`, the graph walks |
 | **Answering** | None | **None at all** | `status`, `search`, `symbol`, `repomap`, `doctor` |
+| **Both** | Held for the session | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
