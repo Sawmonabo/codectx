@@ -151,6 +151,15 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 		w.terms, w.dir.total+w.text.total+w.list.total, segment); err != nil {
 		return 0, wrap("lexical_segments", err)
 	}
+	// The documents the fold just packed name their segment. They are exactly
+	// the unit's rows that no earlier fold claimed: a carried document arrived
+	// with its predecessor's segment already on it, and a batch whose ingestion
+	// failed left no row here at all.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE search_units SET segment_id = ?1 WHERE unit_id = ?2 AND segment_id IS NULL`,
+		segment, unitRow); err != nil {
+		return 0, wrap("search_units", err)
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO segment_units(segment_id, unit_id) VALUES(?, ?)`,
 		segment, unitRow); err != nil {
 		return 0, wrap("segment_units", err)
@@ -158,16 +167,34 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 	return segment, nil
 }
 
+// predecessorSegmentQuery reads a generation's own segment set in read order.
+// There is deliberately no ORDER BY: generation_segments is a WITHOUT ROWID
+// table keyed by (generation_id, ord), so a scan of its primary key already
+// delivers the segments in that order.
+const predecessorSegmentQuery = `SELECT segment_id FROM generation_segments WHERE generation_id = ?1`
+
 // buildLexical records the generation's segment set. It runs inside Activate's
 // transaction, after the packed adjacency and before the active pointer flips,
 // so a generation is published only with the structure every lexical query
 // reads.
 //
-// A generation with no predecessor takes its member units' segments alone.
-// Inheriting a predecessor's set, and compacting it, hang off this same set:
-// they extend what goes into generation_segments and change nothing about how
-// the set is read.
-func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
+// The set is the PREDECESSOR generation's set, in its own read order, plus the
+// segments of this generation's members that it does not already hold. An
+// activation therefore writes one row per segment and the visible-document
+// bitmap, never a packed structure: publishing a one-file delta costs the
+// delta's own segment, not a rewrite of everything the store already packed.
+// predecessor is zero for a first index, which starts from its members' own
+// segments alone.
+//
+// A document lies in exactly ONE segment -- search_units.segment_id names it,
+// and a carry-over copies that column forward -- so a member's segment that
+// the inherited set already holds must NOT be added again: two copies of one
+// segment in one set deliver every one of its documents twice, which the
+// posting merge refuses as a corrupt structure. An inherited segment none of
+// this generation's documents lies in is dropped instead of carried: it can
+// answer nothing, and carrying it would grow the set a query binary-searches
+// with every delta forever.
+func buildLexical(ctx context.Context, tx *sql.Tx, gen, predecessor int64) error {
 	// ADR-0007 holds this pass to 5 % of the index wall clock. That bound is
 	// only checkable if the operator can see the pass on its own, so its start
 	// and end are logged rather than hidden inside the activation's total, and
@@ -177,63 +204,119 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	started := time.Now()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	slog.Default().Info("packed lexical activation started", "generation", gen)
-	var segments int64
+	slog.Default().Info("packed lexical activation started", "generation", gen, "predecessor", predecessor)
+	var segments, inherited int64
 	defer func() {
 		runtime.ReadMemStats(&after)
 		slog.Default().Info("packed lexical activation finished",
 			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
-			"segments", segments,
+			"segments", segments, "inherited", inherited,
 			// Signed: a pass that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.
 			"heap_delta_bytes", int64(after.HeapInuse)-int64(before.HeapInuse))
 	}()
 
-	_, docCount, tokenTotal, err := visibleDocuments(ctx, tx, gen)
+	var ids []int64
+	seen := map[int64]bool{}
+	collect := func(what, query string, arg int64) error {
+		rows, err := tx.QueryContext(ctx, query, arg)
+		if err != nil {
+			return wrap(what, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return wrap(what, err)
+			}
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return wrap(what, err)
+		}
+		return wrap(what, rows.Close())
+	}
+	if predecessor != 0 {
+		if err := collect("generation_segments", predecessorSegmentQuery, predecessor); err != nil {
+			return err
+		}
+		inherited = int64(len(ids))
+	}
+	if err := collect("segment_units", generationSegmentQuery, gen); err != nil {
+		return err
+	}
+
+	visible, docCount, tokenTotal, live, err := visibleDocuments(ctx, tx, gen)
 	if err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, generationSegmentQuery, gen)
+	held, err := segmentDocCounts(ctx, tx, ids)
 	if err != nil {
-		return wrap("segment_units", err)
+		return err
 	}
-	defer rows.Close()
-	var ids []int64
-	seen := map[int64]bool{}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return wrap("segment_units", err)
-		}
-		if seen[id] {
+	ord, covered := 0, int64(0)
+	for _, id := range ids {
+		if live[id] == 0 {
 			continue
 		}
-		seen[id] = true
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return wrap("segment_units", err)
-	}
-	if err := rows.Close(); err != nil {
-		return wrap("segment_units", err)
-	}
-	for ord, id := range ids {
+		hidden := held[id] - live[id]
+		if hidden < 0 {
+			return corrupt("generation %d holds %d documents of segment %d, which packed %d",
+				gen, live[id], id, held[id])
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO generation_segments(generation_id, segment_id, ord) VALUES(?, ?, ?)`,
-			gen, id, ord); err != nil {
+			`INSERT INTO generation_segments(generation_id, segment_id, ord, hidden) VALUES(?, ?, ?, ?)`,
+			gen, id, ord, hidden); err != nil {
 			return wrap("generation_segments", err)
 		}
+		ord++
+		covered += live[id]
 	}
-	segments = int64(len(ids))
+	segments = int64(ord)
+	// Every visible document of a generation lies in exactly ONE of its
+	// segments. The set is assembled from the units' ownership, so a document
+	// whose segment no member owns would simply never be read -- a term would
+	// silently miss it on every query, with no failing check anywhere.
+	if covered != docCount {
+		return corrupt("generation %d carries %d documents but its %d segments hold %d of them",
+			gen, docCount, segments, covered)
+	}
 	// The commit row is written last: its presence is what tells a reader the
-	// whole segment set behind it is durable.
+	// whole segment set behind it is durable. The bitmap travels with it, so a
+	// reader takes the generation's visible documents as activation resolved
+	// them instead of scanning them again for every pinned generation.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO generation_lexical(generation_id, doc_count, token_total) VALUES(?, ?, ?)`,
-		gen, docCount, tokenTotal); err != nil {
+		`INSERT INTO generation_lexical(generation_id, doc_count, token_total, visible) VALUES(?, ?, ?, ?)`,
+		gen, docCount, tokenTotal, visible.bits); err != nil {
 		return wrap("generation_lexical", err)
 	}
 	return nil
+}
+
+// segmentDocCounts reads how many documents each of the candidate segments
+// packed. It is one point lookup per segment on the segments' primary key --
+// the set is a function of the generation's units, never of its documents --
+// and it is what turns a per-segment live count into the hidden count a
+// document frequency uses to skip the posting walk.
+func segmentDocCounts(ctx context.Context, tx *sql.Tx, ids []int64) (map[int64]int64, error) {
+	out := make(map[int64]int64, len(ids))
+	for _, id := range ids {
+		var n int64
+		err := tx.QueryRowContext(ctx, `SELECT doc_count FROM lexical_segments WHERE id = ?`, id).Scan(&n)
+		if isNoRows(err) {
+			return nil, corrupt("generation names lexical segment %d, which does not exist", id)
+		}
+		if err != nil {
+			return nil, wrap("lexical_segments", err)
+		}
+		out[id] = n
+	}
+	return out, nil
 }
 
 // docBitmap is the generation's visible document set, resolved once. A
@@ -257,36 +340,46 @@ func (b *docBitmap) set(doc int64) {
 	b.bits[doc>>3] |= 1 << uint(doc&7)
 }
 
-// visibleDocuments resolves the generation's visible documents into a bitmap
-// and returns the document statistics the scorer needs, in one pass each. A
-// reader computes it once when it opens the structure and every read of that
-// pinned generation shares it.
-func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, int64, int64, error) {
+// visibleDocuments resolves the generation's visible documents into a bitmap,
+// the document statistics the scorer needs, and how many documents of each
+// segment the generation still carries -- all from ONE pass over the
+// generation's documents, which is the only place the segment a document lies
+// in is known per document. The live counts are what the hidden count on
+// generation_segments is derived from, and activation stores the bitmap, so no
+// reader repeats this pass.
+func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, int64, int64, map[int64]int64, error) {
 	var docCount, tokenTotal, maxDoc int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(su.token_count), 0), coalesce(max(su.doc_id), 0)
 		FROM search_units su WHERE EXISTS (SELECT 1 FROM generation_units gu
 			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`, gen).
 		Scan(&docCount, &tokenTotal, &maxDoc); err != nil {
-		return nil, 0, 0, wrap("search_units", err)
+		return nil, 0, 0, nil, wrap("search_units", err)
 	}
 	b := &docBitmap{bits: make([]byte, maxDoc/8+1), max: maxDoc}
-	rows, err := tx.QueryContext(ctx, `SELECT su.doc_id FROM search_units su
+	live := map[int64]int64{}
+	rows, err := tx.QueryContext(ctx, `SELECT su.doc_id, su.segment_id FROM search_units su
 		WHERE EXISTS (SELECT 1 FROM generation_units gu
 			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`, gen)
 	if err != nil {
-		return nil, 0, 0, wrap("search_units", err)
+		return nil, 0, 0, nil, wrap("search_units", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var doc int64
-		if err := rows.Scan(&doc); err != nil {
-			return nil, 0, 0, wrap("search_units", err)
+		var segment sql.NullInt64
+		if err := rows.Scan(&doc, &segment); err != nil {
+			return nil, 0, 0, nil, wrap("search_units", err)
 		}
 		if doc >= 0 && doc <= maxDoc {
 			b.set(doc)
 		}
+		// A sealed unit's documents always name a segment; a NULL is a document
+		// of a unit that is still building, which no generation carries.
+		if segment.Valid {
+			live[segment.Int64]++
+		}
 	}
-	return b, docCount, tokenTotal, wrap("search_units", rows.Err())
+	return b, docCount, tokenTotal, live, wrap("search_units", rows.Err())
 }
 
 // lexicalWriter folds the instance scan into the three streams. It holds one

@@ -79,6 +79,13 @@ const stageDirName = "tmp"
 // stageDir is the directory a unit's staging database lives in.
 func (s *Store) stageDir() string { return filepath.Join(filepath.Dir(s.path), stageDirName) }
 
+// stagePath is the staging database of the unit with row id unitRow. It is
+// named from the row id alone, so the collection of a dead unit can remove that
+// unit's file without touching a staging another process is still writing.
+func (s *Store) stagePath(unitRow int64) string {
+	return filepath.Join(s.stageDir(), "lexical-"+strconv.FormatInt(unitRow, 10)+".db")
+}
+
 // openLexicalStage creates the staging database of the unit with row id
 // unitRow, replacing any file a previous, abandoned attempt left behind.
 func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalStage, error) {
@@ -86,7 +93,7 @@ func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalSt
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, internal("lexical staging directory: " + err.Error())
 	}
-	path := filepath.Join(dir, "lexical-"+strconv.FormatInt(unitRow, 10)+".db")
+	path := s.stagePath(unitRow)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return nil, internal("lexical staging: " + err.Error())
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +61,14 @@ func packedLexicalFixture(t *testing.T) (*fixture, *store.PinnedReader, model.Ge
 func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 	f, r, gen, dbPath := packedLexicalFixture(t)
 	flushed(t, f.s)
-	db := openRawDB(t, dbPath)
+	comparePackedToLive(t, f, r, gen, openRawDB(t, dbPath))
+}
+
+// comparePackedToLive is the comparison itself, so a generation assembled any
+// other way -- a delta that inherits its predecessor's segments, say -- is held
+// to the same equality without a second copy of it.
+func comparePackedToLive(t *testing.T, f *fixture, r *store.PinnedReader, gen model.GenerationID, db *sql.DB) {
+	t.Helper()
 	genID := int64(gen)
 
 	var liveDocs, liveTokens int64
@@ -117,6 +126,212 @@ func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 		if packedSeq != liveSeq {
 			t.Fatalf("term %q packed occurrences\n%s\nlive occurrences\n%s", term, packedSeq, liveSeq)
 		}
+	}
+}
+
+// deltaChain publishes a generation over two files, then a delta generation
+// whose one unit re-emits the changed file and carries the untouched one, and
+// returns both. It is the smallest shape that exercises inheritance: the delta
+// unit owns the segment its predecessor folded -- through the document it
+// carried out of it -- AND the segment its own seal folded, so an activation
+// that does not suppress a member's segment it has already inherited names one
+// segment twice and delivers every document in it twice.
+func deltaChain(t *testing.T) (*fixture, model.GenerationID, model.GenerationID, string) {
+	t.Helper()
+	dbPath := t.TempDir() + "/codectx.db"
+	f := newFixture(t, dbPath)
+	a1 := f.file("pkg/a.go", "package pkg\nfunc Alpha() { Alpha() }\n")
+	b := f.file("pkg/b.go", "package pkg\nfunc Beta() { Alpha() }\n")
+	snap1 := f.snapshot("one", a1, b)
+	gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run1 := f.run(gen1)
+	w1 := f.beginScope(gen1, run1, configHash, a1, b)
+	f.fillScope(w1, run1, a1, b)
+	if err := f.s.SealUnit(f.ctx, w1); err != nil {
+		t.Fatalf("SealUnit: %v", err)
+	}
+	f.activate(gen1, 0)
+
+	a2 := f.file("pkg/a.go", "package pkg\nfunc Alpha() { /* changed */ Alpha() }\n")
+	snap2 := f.snapshot("two", a2, b)
+	gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run2 := f.run(gen2)
+	w2 := f.beginScope(gen2, run2, "cfg-delta", a2, b)
+	f.fillFile(w2, run2, a2)
+	f.fillIndexLevel(w2, run2, a2)
+	stats, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{
+		Files:  slices.Values([]model.FileID{a2.id}),
+		Scopes: slices.Values([]string{"file:" + a2.path}),
+		Keys:   slices.Values(keyList("key:node:" + a2.path)),
+	})
+	if err != nil {
+		t.Fatalf("CarryOver: %v", err)
+	}
+	if stats.SearchUnits != 1 {
+		t.Fatalf("the delta carried %d documents, want b.go's one", stats.SearchUnits)
+	}
+	if err := f.s.SealUnit(f.ctx, w2); err != nil {
+		t.Fatalf("SealUnit(delta): %v", err)
+	}
+	f.activate(gen2, gen1)
+	return f, gen1, gen2, dbPath
+}
+
+// segmentSet is a generation's segments in read order.
+func segmentSet(t *testing.T, db *sql.DB, gen int64) []int64 {
+	t.Helper()
+	rows, err := db.Query(`SELECT segment_id FROM generation_segments WHERE generation_id = ? ORDER BY ord`, gen)
+	if err != nil {
+		t.Fatalf("generation_segments(%d): %v", gen, err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("generation_segments(%d): %v", gen, err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("generation_segments(%d): %v", gen, err)
+	}
+	return out
+}
+
+// A delta inherits its predecessor's segments, and its own members own some of
+// those same segments through the documents they carried. Naming such a segment
+// a second time is not a wasted row: every document in it is then offered by two
+// cursors of the same merge, which doubles its contribution to every score it
+// appears in. The packed answer must stay identical to the live path across the
+// whole inherited set.
+func TestADeltaInheritsEachOfItsPredecessorsSegmentsExactlyOnce(t *testing.T) {
+	f, gen1, gen2, dbPath := deltaChain(t)
+	flushed(t, f.s)
+	db := openRawDB(t, dbPath)
+	inherited, got := segmentSet(t, db, int64(gen1)), segmentSet(t, db, int64(gen2))
+	if len(inherited) != 1 {
+		t.Fatalf("the first generation named %d segments, want the one its single unit folded", len(inherited))
+	}
+	if len(got) != 2 {
+		t.Fatalf("the delta named %d segments %v, want the inherited one and its own", len(got), got)
+	}
+	if got[0] != inherited[0] {
+		t.Fatalf("the delta's set is %v; the inherited segment %d must keep its read position", got, inherited[0])
+	}
+	if got[0] == got[1] {
+		t.Fatalf("the delta named segment %d twice; every document in it would be delivered twice", got[0])
+	}
+	r, err := f.s.PinGeneration(f.ctx, f.repo, gen2, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	comparePackedToLive(t, f, r, gen2, db)
+}
+
+// An activation NAMES segments; it never folds one. The cost of publishing a
+// delta is therefore the delta's own segment -- written at its seal, over the
+// documents that unit itself published -- plus one row per named segment and
+// one visible-document bitmap, and not a rewrite of everything the store has
+// already packed. A segment that claimed documents it did not fold is the same
+// defect in reverse: the generation's live count of it would exceed what it
+// packed, and no posting exists for the difference.
+func TestADeltaActivationPacksOnlyTheDocumentsItsOwnUnitPublished(t *testing.T) {
+	f, gen1, gen2, dbPath := deltaChain(t)
+	flushed(t, f.s)
+	db := openRawDB(t, dbPath)
+
+	var segments int64
+	if err := db.QueryRow(`SELECT count(*) FROM lexical_segments`).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	if segments != 2 {
+		t.Fatalf("the store holds %d segments after two seals; an activation folded one of its own", segments)
+	}
+	set := segmentSet(t, db, int64(gen2))
+	counts := map[int64]int64{}
+	for _, id := range set {
+		var docs int64
+		if err := db.QueryRow(`SELECT doc_count FROM lexical_segments WHERE id = ?`, id).Scan(&docs); err != nil {
+			t.Fatal(err)
+		}
+		counts[id] = docs
+	}
+	inherited := segmentSet(t, db, int64(gen1))[0]
+	if counts[inherited] != 2 {
+		t.Fatalf("the inherited segment packs %d documents, want the two its seal folded", counts[inherited])
+	}
+	fresh := set[len(set)-1]
+	if counts[fresh] != 1 {
+		t.Fatalf("the delta's segment packs %d documents; a one-file delta publishes ONE, and anything more is the whole structure folded again", counts[fresh])
+	}
+	// The only per-document thing an activation writes: one BIT per document
+	// rowid, not a row per document.
+	var bitmap, docs int64
+	if err := db.QueryRow(`SELECT length(visible), doc_count FROM generation_lexical WHERE generation_id = ?`,
+		int64(gen2)).Scan(&bitmap, &docs); err != nil {
+		t.Fatal(err)
+	}
+	if docs != 2 {
+		t.Fatalf("the delta carries %d documents, want a.go's and b.go's", docs)
+	}
+	var maxDoc int64
+	if err := db.QueryRow(`SELECT coalesce(max(su.doc_id), 0) FROM search_units su
+		JOIN generation_units gu ON gu.unit_id = su.unit_id AND gu.generation_id = ?`,
+		int64(gen2)).Scan(&maxDoc); err != nil {
+		t.Fatal(err)
+	}
+	if want := maxDoc/8 + 1; bitmap != want {
+		t.Fatalf("the visible bitmap is %d bytes for document rowids up to %d, want %d", bitmap, maxDoc, want)
+	}
+}
+
+// A build that dies between its first documents and its seal leaves a staging
+// database nothing will ever read again. The directory it sits in is shared by
+// every unit of every process using this data directory, so it is never swept
+// blindly -- the file goes where the dead unit is already known to be dead. If
+// it did not, a workspace that crashes repeatedly grows a second copy of its
+// token instances, on the operator's data disk, forever.
+func TestRecoveringACrashedBuildRemovesItsLexicalStaging(t *testing.T) {
+	dbPath := t.TempDir() + "/codectx.db"
+	f := newFixture(t, dbPath)
+	a := f.file("pkg/a.go", "package pkg\nfunc Alpha() { Alpha() }\n")
+	snap := f.snapshot("one", a)
+	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := f.run(gen)
+	// Deliberately neither sealed, abandoned nor failed: this is the writer a
+	// killed process leaves behind.
+	w := f.begin(gen, run, a)
+	f.fill(w, run, a)
+	staging := filepath.Join(filepath.Dir(dbPath), "tmp", "lexical-*.db")
+	before, err := filepath.Glob(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("a building unit left %d staging databases, want the one it stages its token instances in", len(before))
+	}
+	// Recovery looks for staging generations on the reader pool, which cannot
+	// see an ingestion group the store still holds open.
+	flushed(t, f.s)
+	if err := f.s.Recover(f.ctx, time.Now()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	after, err := filepath.Glob(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("recovery left %v behind; the unit is gone and nothing will ever read or remove them", after)
 	}
 }
 
@@ -223,6 +438,7 @@ func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 	db, genID := openRawDB(t, dbPath), int64(gen)
 	for _, q := range []struct{ what, query string }{
 		{"the activation's walk of its members' segments", store.GenerationSegmentQuery()},
+		{"the activation's walk of its predecessor's set", store.PredecessorSegmentQuery()},
 		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery()},
 	} {
 		plan := explain(t, db, q.query, genID)
