@@ -21,4 +21,6 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0006](ADR-0006-language-servers.md) | Language servers and indexers: the Python server moves to a native checker | Accepted, 2026-09-15 |
 | [ADR-0007](ADR-0007-lexical-first-page.md) | Lexical first page: packed term statistics at activation, rank before hydrate, heap-served first page | Accepted, 2026-09-15 |
 | [ADR-0008](ADR-0008-ingestion-group.md) | Ingestion commits once per run: the ingestion group | Accepted, 2026-09-15 |
+| [ADR-0009](ADR-0009-import-staging.md) | The dependence import stages its export the way a bulk load writes | Accepted |
 | [ADR-0010](ADR-0010-engine-memory.md) | Engine memory: the heap is sized to the unit's need, and the host keeps half of what it had | Accepted, 2026-09-16 |
+| [ADR-0011](ADR-0011-run-ledger.md) | The run ledger: a run records what each stage cost, in its own database, read live | Accepted, 2026-09-16 |
