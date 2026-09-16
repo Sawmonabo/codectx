@@ -70,6 +70,8 @@ const maxScanTokenBytes = 1 << 20
 func classify(res process.Result, private []string) dependence.Outcome {
 	out := dependence.Outcome{ExitCode: res.ExitCode, Duration: res.Duration, StderrBytes: res.StderrBytes,
 		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled,
+		CPUUserMS: res.CPUUserMillis, CPUSysMS: res.CPUSysMillis, CPUUnsampled: res.CPUUnsampled,
+		ReadBytes: res.ReadBytes, WriteBytes: res.WriteBytes, IOUnsampled: res.IOUnsampled,
 		StderrTail: stderrTail(res.Stderr, private)}
 	if res.TimedOut {
 		out.Class = dependence.FailureTimeout
