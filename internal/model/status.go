@@ -165,7 +165,8 @@ type ResourceReport struct {
 	// because on a host that discards freed blocks into a sparse image a
 	// multi-gigabyte free stalls every process on the machine, minutes later,
 	// with nothing able to observe or wait for it. This is what makes that
-	// claim checkable from outside.
+	// claim checkable from outside. It is counted in windows, so it is the
+	// window count times the window rather than a byte-exact figure.
 	FreedBytes  *uint64 `json:"freed_bytes,omitempty"`
 	UnitsReused *int64  `json:"units_reused,omitempty"`
 	UnitsParsed *int64  `json:"units_parsed,omitempty"`
