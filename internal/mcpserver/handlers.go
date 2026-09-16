@@ -37,6 +37,12 @@ type handlers struct {
 	cfg   config.Config
 	build model.BuildInfo
 	log   *slog.Logger
+
+	// spans fans the finished stages of an indexing run out to the calls
+	// that are listening (progress.go). Nil is a server built without a span
+	// source, and watchSpans answers with a no-op rather than a guard at
+	// every call site.
+	spans *spanHub
 }
 
 // The frozen per-tool method set. Every name below is registered by
