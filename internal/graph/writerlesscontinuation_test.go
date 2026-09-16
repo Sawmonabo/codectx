@@ -40,6 +40,8 @@ func (writerlessLeases) AcquireLease(context.Context, model.Lease, string) error
 //
 // Mutation: restore the retention test in firstReferencePage's guard
 // (`|| !e.leases.Retains()`) and the reference leg stops after one page.
+// Second mutation: restore `|| e.leases == nil` in resumedReferencePage's
+// guard and the engine with no lease store refuses its own token.
 func TestAWriterlessGraphAnswerPagesAndIsReclaimable(t *testing.T) {
 	ctx := context.Background()
 	f := newGraphFixture(t)
@@ -106,6 +108,30 @@ func TestAWriterlessGraphAnswerPagesAndIsReclaimable(t *testing.T) {
 	}
 	if len(second.Items) == 0 {
 		t.Fatalf("page two of a writerless reference answer served no occurrence")
+	}
+
+	// An engine composed with NO lease store at all -- the read handle a
+	// serving process gives its exploration tools -- mints the same leaseless
+	// continuation, and must honour it. A page one that mints a token page two
+	// refuses is worse than a page one that mints nothing.
+	leaseless, err := New(Options{Adjacency: f, Reader: NewMemoryGraph(f.binding, nodes,
+		append([]model.Relation(nil), f.relations...)), Signer: signer, Spools: spools,
+		Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine without a lease store: %v", err)
+	}
+	noLease := model.ReferenceRequest{NodeID: fixtureNodeID("n-b"),
+		Operation: model.ReferenceReferences, SemanticSource: model.SemanticCanonical}
+	firstNoLease, err := leaseless.References(ctx, noLease)
+	if err != nil {
+		t.Fatalf("an engine with no lease store failed the query instead of answering: %v", err)
+	}
+	if firstNoLease.Meta.NextCursor == "" {
+		t.Fatalf("an engine with no lease store stopped after one page of a longer answer")
+	}
+	noLease.Page = model.PageRequest{Cursor: firstNoLease.Meta.NextCursor}
+	if _, err := leaseless.References(ctx, noLease); err != nil {
+		t.Fatalf("an engine with no lease store refused the continuation it had just minted: %v", err)
 	}
 
 	if n := store.liveCount(); n != 0 {
