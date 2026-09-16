@@ -23,6 +23,13 @@ func OutputWindows() int64 { return outputWindows.Load() }
 // before it is submitted, and the submission itself is clocked by the disk.
 const outputPoll = 50 * time.Millisecond
 
+// writeRange is the platform's range writeback: the call that hands one window
+// of a foreign writer's output to the disk and returns when it is written
+// back. It is a variable so the fallback below -- the only path on a platform
+// that has no range writeback at all, and the path Stop's contract rests on
+// there -- is exercised on a platform that does have one.
+var writeRange = WriteRange
+
 // Outputs paces the files a foreign writer -- a child process this process
 // cannot instrument -- writes, so that they reach the disk as they are
 // written instead of as one burst when the kernel's flusher wakes.
@@ -125,23 +132,31 @@ func (o *Outputs) sweep(final bool) {
 // well. A platform without range writeback has nothing finer than the file's
 // own sync, which the final sweep issues once per file.
 func (o *Outputs) hand(path string, final bool) {
+	// The kind is settled BEFORE the open, never after it. The entries of a
+	// writer's output directory are the writer's own vocabulary, and opening
+	// a named pipe blocks until a writer arrives: an open-first pacer would
+	// wedge its poll goroutine on the first one, and Stop -- which the runner
+	// defers after every child exits and which joins that goroutine -- would
+	// hang the run with nothing to time it out. Only a regular file has a
+	// range this can hand to the disk, so anything else is skipped here.
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return
-	}
 	end, sent := info.Size(), o.sent[path]
 	for end-sent >= Window {
-		if !WriteRange(int(f.Fd()), sent, Window) {
-			o.sent[path] = end
-			if final {
-				_ = f.Sync()
-			}
-			return
+		if !writeRange(int(f.Fd()), sent, Window) {
+			// This platform has no range writeback, so the file's own sync is
+			// the finest thing it offers and it belongs at the end of the
+			// writer's work rather than on every poll. The offset is NOT
+			// advanced: these bytes are still only in the page cache, and the
+			// final sweep below is what owes them to the disk.
+			break
 		}
 		sent += Window
 		o.sent[path] = sent
@@ -150,10 +165,15 @@ func (o *Outputs) hand(path string, final bool) {
 	if !final || end == sent {
 		return
 	}
-	if WriteRange(int(f.Fd()), sent, end-sent) {
+	// The final sweep owes the tail, and where the range write failed it owes
+	// everything past the last offset handed over. Stop's contract is that the
+	// caller's outputs are on the disk when it returns; the sync is what makes
+	// that true on a platform with no range writeback, and a sync that itself
+	// fails leaves the offset where it was rather than claiming the bytes.
+	if writeRange(int(f.Fd()), sent, end-sent) {
 		outputWindows.Add(1)
-	} else {
-		_ = f.Sync()
+	} else if err := f.Sync(); err != nil {
+		return
 	}
 	o.sent[path] = end
 }

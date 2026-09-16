@@ -40,20 +40,22 @@ type graphReader struct {
 
 var _ graph.GraphReader = (*graphReader)(nil)
 
-// partsPerStream bounds the parts one stream keeps resident for one request.
-// It is an INTERNAL working-set constant, not a user limit: a stream with more
-// parts is read in full, one window at a time, and nothing is ever refused or
-// truncated because of it. Sixteen parts is ~16 MiB for an edge stream and
-// ~8 MiB for an offset directory in the worst case, and a walk that visits
-// owners in ascending order touches parts sequentially, so the window is
-// typically one or two parts deep.
+// partsPerStream bounds the parts one of the GRAPH reader's streams keeps
+// resident for one request; the lexical reader bounds its parts over the whole
+// cache instead, at lexPartsLive. It is an INTERNAL working-set constant, not a
+// user limit: a stream with more parts is read in full, one window at a time,
+// and nothing is ever refused or truncated because of it. Sixteen parts is
+// ~16 MiB for an edge stream and ~8 MiB for an offset directory in the worst
+// case, and a walk that visits owners in ascending order touches parts
+// sequentially, so the window is typically one or two parts deep.
 const partsPerStream = 16
 
 // partWindow is a bounded most-recently-used window over one stream's parts.
-// The eviction order is a plain slice because the window is sixteen entries
-// deep: a map plus a list would cost more than the scan it saves.
+// The eviction order is a plain slice because the window is a handful of
+// entries deep: a map plus a list would cost more than the scan it saves.
 type partWindow struct {
 	size  int // bytes in a full part of this stream
+	limit int // parts this window keeps resident
 	order []int
 	parts map[int][]byte
 }
@@ -129,7 +131,7 @@ func (g *graphReader) Kinds() graph.KindTable { return g.kinds }
 func (g *graphReader) part(ctx context.Context, stream string, index int) ([]byte, error) {
 	w := g.cache[stream]
 	if w == nil {
-		w = &partWindow{size: partSizeFor(stream), parts: map[int][]byte{}}
+		w = &partWindow{size: partSizeFor(stream), limit: partsPerStream, parts: map[int][]byte{}}
 		g.cache[stream] = w
 	}
 	if b, ok := w.parts[index]; ok {
@@ -150,7 +152,7 @@ func (g *graphReader) part(ctx context.Context, stream string, index int) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	for len(w.order) >= partsPerStream {
+	for len(w.order) >= w.limit {
 		delete(w.parts, w.order[0])
 		w.order = w.order[1:]
 	}

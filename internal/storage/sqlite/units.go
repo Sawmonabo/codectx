@@ -1347,7 +1347,30 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			return model.Binding{}, err
 		}
 	}
-	// Whatever compaction the generation's segment set is due runs FIRST, each
+	// The two conditions an activation loses a race on are read FIRST, before
+	// any work: the pointer the caller believes is published, and the frozen
+	// membership being non-empty. Each is one row, and the cascade below is
+	// thousands of committed merges -- so a coordinator that has already been
+	// overtaken pays a read rather than a rebuild of the segment set. It is a
+	// fast fail and nothing more: both conditions are checked again inside the
+	// activation transaction below, which is where they decide anything, so a
+	// pointer that moves between this read and that transaction is caught
+	// there exactly as before.
+	// readOwn, not read: the generation this is about may still be in the
+	// store's open ingestion group, which the reader pool cannot see.
+	if err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
+		if err != nil {
+			return err
+		}
+		if err := checkExpectedActive(ctx, tx, g.repo, expectedActive); err != nil {
+			return err
+		}
+		return checkMembership(ctx, tx, g.id, gen)
+	}); err != nil {
+		return model.Binding{}, err
+	}
+	// Whatever compaction the generation's segment set is due runs next, each
 	// merge its own ingestion call, so the group can commit between merges and
 	// the cascade is bounded by WALBoundBytes like any other ingestion. The
 	// activation below then names the set the merges left. See
@@ -1361,17 +1384,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if err != nil {
 			return err
 		}
-		var current int64
-		if err := activeGeneration(ctx, tx, g.repo, &current); err != nil {
-			var typed *model.Error
-			if !errors.As(err, &typed) || typed.Code != model.CodeNoActiveGeneration {
-				return err
-			}
-		}
-		if current != int64(expectedActive) {
-			return &model.Error{Code: model.CodeVersionConflict,
-				Message:     fmt.Sprintf("active generation is %d, not the expected %d; another activation intervened", current, expectedActive),
-				Remediation: "re-read the active generation and decide again whether to publish"}
+		if err := checkExpectedActive(ctx, tx, g.repo, expectedActive); err != nil {
+			return err
 		}
 		checks := []struct {
 			what  string
@@ -1417,12 +1431,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 					Message: fmt.Sprintf("generation %d cannot activate: %d %s", gen, n, c.what)}
 			}
 		}
-		var members int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, g.id).Scan(&members); err != nil {
-			return wrap("generation_units", err)
-		}
-		if members == 0 {
-			return conflict("generation %d has no units; nothing to publish", gen)
+		if err := checkMembership(ctx, tx, g.id, gen); err != nil {
+			return err
 		}
 		var violations int64
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check('generation_units')`).Scan(&violations); err != nil {
@@ -1611,6 +1621,42 @@ func (s *Store) ActiveGeneration(ctx context.Context, repo model.RepositoryID) (
 		return activeGeneration(ctx, tx, raw, &gen)
 	})
 	return model.GenerationID(gen), err
+}
+
+// checkExpectedActive compares the repository's published pointer with the one
+// the caller believes it saw. A repository with no active generation compares
+// as zero, which is what a first publication passes. It is the single
+// definition of the version conflict: the activation transaction applies it at
+// the moment that decides, and Activate's preflight applies it before the
+// compaction cascade so a loser pays a row read instead of the cascade.
+func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected model.GenerationID) error {
+	var current int64
+	if err := activeGeneration(ctx, tx, repo, &current); err != nil {
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeNoActiveGeneration {
+			return err
+		}
+	}
+	if current != int64(expected) {
+		return &model.Error{Code: model.CodeVersionConflict,
+			Message:     fmt.Sprintf("active generation is %d, not the expected %d; another activation intervened", current, expected),
+			Remediation: "re-read the active generation and decide again whether to publish"}
+	}
+	return nil
+}
+
+// checkMembership refuses a generation with no frozen members. Like the
+// pointer comparison it is one row read, applied both in the activation
+// transaction and in the preflight before the cascade.
+func checkMembership(ctx context.Context, tx *sql.Tx, row int64, gen model.GenerationID) error {
+	var members int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, row).Scan(&members); err != nil {
+		return wrap("generation_units", err)
+	}
+	if members == 0 {
+		return conflict("generation %d has no units; nothing to publish", gen)
+	}
+	return nil
 }
 
 func activeGeneration(ctx context.Context, tx *sql.Tx, repo []byte, gen *int64) error {

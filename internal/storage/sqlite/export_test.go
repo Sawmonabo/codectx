@@ -166,3 +166,30 @@ func SetLexPartBytes(n int) func() {
 // can prove a long cascade of writes reached the group's commit decision
 // between its steps rather than running as one unbounded transaction.
 func (s *Store) Commits() int64 { return s.commits.Load() }
+
+// LexicalSegments counts the packed segments the store holds. A merge inserts
+// one and leaves its inputs for the collector, so the count rises by one per
+// merge: it is how a test sees whether a compaction cascade ran. It reads the
+// writer's own view, because a merge sits in the open ingestion group until
+// the group's commit decision fires.
+func (s *Store) LexicalSegments(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT count(*) FROM lexical_segments`).Scan(&n)
+	})
+	return n, err
+}
+
+// LexicalPartsLive is the bound on the parts a reader's lexical part cache
+// holds at once, exported so the test that proves the bound is over the whole
+// cache asserts against the constant rather than a copy of it.
+func LexicalPartsLive() int { return lexPartsLive }
+
+// LexicalPartsPeak reports the most parts this session's lexical part cache
+// has held at once. A session that never opened one has held none.
+func (p *PostingSession) LexicalPartsPeak() int {
+	if p.lex == nil {
+		return 0
+	}
+	return p.lex.peak
+}
