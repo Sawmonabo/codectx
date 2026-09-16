@@ -39,13 +39,21 @@ type Options struct {
 	// DataDir is the data directory; materializations live under
 	// snapshot.MaterializeDir(DataDir).
 	DataDir string
-	// MaxServers caps concurrent language servers (providers.lsp.max_servers).
-	MaxServers int
+	// AllocationBytes is the machine-derived allocation every running server
+	// is admitted against. Servers are admitted by the sum of the memory
+	// reservations their pinned definitions declare, never by a count: a
+	// monorepo answers as many projects at once as the machine has room for,
+	// and one whose reservation is larger than the whole allocation runs alone
+	// rather than being refused.
+	AllocationBytes int64
 	// MaxOutstandingRequests caps in-flight requests per server
 	// (providers.lsp.max_outstanding_requests).
 	MaxOutstandingRequests int
-	// RequestTimeout bounds one request (providers.lsp.request_timeout).
-	RequestTimeout time.Duration
+	// RequestStallTimeout is how long a request tolerates no bytes moving on
+	// the connection in either direction before the server is declared hung
+	// (providers.lsp.stall_timeout). It is a hang detector, never a deadline on
+	// an answer: a server that is still reading or writing is working.
+	RequestStallTimeout time.Duration
 	// IdleTTL is how long a server with no open overlay is kept
 	// (providers.lsp.idle_ttl).
 	IdleTTL time.Duration
@@ -83,7 +91,12 @@ const (
 type Manager struct {
 	opts Options
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// used is the summed reservation of every entry currently holding room in
+	// the allocation, and free is closed and replaced whenever room is given
+	// back, which is how a waiting Open learns to look again.
+	used    int64
+	free    chan struct{}
 	servers map[serverKey]*entry
 	// live holds every server whose process tree has not yet been reaped,
 	// including servers that failed and were forgotten. Close waits on it, so
@@ -94,11 +107,15 @@ type Manager struct {
 }
 
 // entry is one server slot: ready is closed once the start attempt finished,
-// with either srv or err set.
+// with either srv or err set. bytes is the room it holds in the allocation,
+// and released guards the give-back so an entry removed twice -- a failed
+// start that is both forgotten and dropped by Open -- returns its room once.
 type entry struct {
-	ready chan struct{}
-	srv   *server
-	err   error
+	ready    chan struct{}
+	srv      *server
+	err      error
+	bytes    int64
+	released bool
 }
 
 // New validates and defaults the options.
@@ -110,12 +127,14 @@ func New(opts Options) (*Manager, error) {
 		return nil, invalid("the lsp manager needs an absolute data directory")
 	}
 	def := config.Defaults().Providers.LSP
+	if opts.AllocationBytes <= 0 {
+		return nil, invalid("the lsp manager needs the machine allocation servers are admitted against")
+	}
 	for _, b := range []struct {
 		name  string
 		value *int
 		def   int
 	}{
-		{"max_servers", &opts.MaxServers, def.MaxServers},
 		{"max_outstanding_requests", &opts.MaxOutstandingRequests, def.MaxOutstandingRequests},
 	} {
 		if *b.value < 0 {
@@ -130,7 +149,7 @@ func New(opts Options) (*Manager, error) {
 		value *time.Duration
 		def   time.Duration
 	}{
-		{"request_timeout", &opts.RequestTimeout, def.RequestTimeout.Std()},
+		{"stall_timeout", &opts.RequestStallTimeout, def.StallTimeout.Std()},
 		{"idle_ttl", &opts.IdleTTL, def.IdleTTL.Std()},
 		{"start_timeout", &opts.StartTimeout, DefaultStartTimeout},
 		{"stop_timeout", &opts.StopTimeout, DefaultStopTimeout},
@@ -164,7 +183,8 @@ func New(opts Options) (*Manager, error) {
 	if opts.MaxOverlayBytes.Exceeded(opts.MaxFrameBytes) {
 		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
-	return &Manager{opts: opts, servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
+	return &Manager{opts: opts, free: make(chan struct{}),
+		servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
 }
 
 // Open returns an overlay over view answered by profile at profile.Root,
@@ -172,9 +192,11 @@ func New(opts Options) (*Manager, error) {
 // afterwards. Two projects of one repository are two servers: a server
 // resolves a project from the directory it was started in, so one server
 // rooted at a monorepo's workspace root knows none of the projects under it.
-// The profile must come from Resolve. When every server slot is taken by a server nobody is
-// using, the idle one is stopped to make room; when all are in use, the
-// answer is CTX_RESOURCE_LIMIT rather than a queue.
+// The profile must come from Resolve. When the machine has no room left for
+// this server, an idle one is stopped to make room; when every running server
+// is in use, the open waits for one of them rather than being refused --
+// another project's server already running is never an answer of
+// CTX_RESOURCE_LIMIT.
 func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Profile) (*Overlay, error) {
 	if view == nil {
 		return nil, invalid("an overlay needs a snapshot view")
@@ -186,7 +208,7 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	// Two attempts: the second covers a shared server that failed or began
 	// stopping between being found and being acquired.
 	for attempt := 0; attempt < 2; attempt++ {
-		e, starter, err := m.slot(key)
+		e, starter, err := m.slot(ctx, key, profile.MemoryBudgetBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -201,7 +223,7 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 			// handed to every later Open. The identity check matters: expire
 			// or forget may have replaced this entry already.
 			if e2, ok := m.servers[key]; ok && e2 == e && (err != nil || srv.running() != nil) {
-				delete(m.servers, key)
+				m.dropLocked(key, e2)
 			}
 			m.mu.Unlock()
 			close(e.ready)
@@ -227,9 +249,10 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	return nil, unavailable("the language server could not be acquired")
 }
 
-// slot finds or reserves the entry for key. starter is true when the caller
-// must start the server and complete the entry.
-func (m *Manager) slot(key serverKey) (*entry, bool, error) {
+// slot finds or reserves the entry for key, admitting bytes against the
+// allocation. starter is true when the caller must start the server and
+// complete the entry.
+func (m *Manager) slot(ctx context.Context, key serverKey, bytes int64) (*entry, bool, error) {
 	for {
 		m.mu.Lock()
 		if m.closed {
@@ -240,13 +263,19 @@ func (m *Manager) slot(key serverKey) (*entry, bool, error) {
 			m.mu.Unlock()
 			return e, false, nil
 		}
-		if len(m.servers) < m.opts.MaxServers {
-			e := &entry{ready: make(chan struct{})}
+		// The sum is checked only against something already admitted, exactly
+		// as the heavy-analyzer gate does: with nothing running, a server is
+		// admitted whatever it reserves, so a definition larger than the whole
+		// allocation runs alone instead of never.
+		if m.used == 0 || m.used+bytes <= m.opts.AllocationBytes {
+			e := &entry{ready: make(chan struct{}), bytes: bytes}
 			m.servers[key] = e
+			m.used += bytes
 			m.mu.Unlock()
 			return e, true, nil
 		}
-		// Every slot is taken. Stop one idle server, if any, and try again.
+		// No room. Stop one server nobody is using, if there is one, and look
+		// again; otherwise wait for room rather than refusing the open.
 		var idle *server
 		for k, e := range m.servers {
 			select {
@@ -256,17 +285,35 @@ func (m *Manager) slot(key serverKey) (*entry, bool, error) {
 			}
 			if e.srv != nil && e.srv.isIdle() {
 				idle = e.srv
-				delete(m.servers, k)
+				m.dropLocked(k, e)
 				break
 			}
 		}
+		free := m.free
 		m.mu.Unlock()
-		if idle == nil {
-			return nil, false, resourceLimit("all %d language server slots are in use", m.opts.MaxServers).
-				WithDetail("limit", "max_servers")
+		if idle != nil {
+			idle.stop()
+			continue
 		}
-		idle.stop()
+		select {
+		case <-free:
+		case <-ctx.Done():
+			return nil, false, model.Canceled(ctx.Err())
+		}
 	}
+}
+
+// dropLocked removes an entry and gives its room back exactly once, waking
+// every Open that is waiting for room. The mutex must be held.
+func (m *Manager) dropLocked(key serverKey, e *entry) {
+	delete(m.servers, key)
+	if e.released {
+		return
+	}
+	e.released = true
+	m.used -= e.bytes
+	close(m.free)
+	m.free = make(chan struct{})
 }
 
 // isIdle reports a running server with no overlay open on it.
@@ -284,7 +331,7 @@ func (m *Manager) expire(s *server) {
 		m.mu.Unlock()
 		return
 	}
-	delete(m.servers, s.key)
+	m.dropLocked(s.key, e)
 	m.mu.Unlock()
 	s.stop()
 }
@@ -295,7 +342,7 @@ func (m *Manager) forget(s *server) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if e, ok := m.servers[s.key]; ok && e.srv == s {
-		delete(m.servers, s.key)
+		m.dropLocked(s.key, e)
 	}
 }
 
@@ -323,7 +370,7 @@ func (m *Manager) Close() error {
 	entries := make([]*entry, 0, len(m.servers))
 	for k, e := range m.servers {
 		entries = append(entries, e)
-		delete(m.servers, k)
+		m.dropLocked(k, e)
 	}
 	live := make([]*server, 0, len(m.live))
 	for s := range m.live {

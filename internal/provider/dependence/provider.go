@@ -86,12 +86,9 @@ type Options struct {
 	StallTimeout time.Duration
 	// CacheBytes is the parsed-graph cache budget; 0 disables the cache.
 	CacheBytes int64
-	// UnitMemoryFloorBytes is the smallest heap cap a unit is given, and
-	// UnitMemoryCeilingBytes the explicit user limit that may reject a unit
-	// before it runs; 0 means the allocation is derived from the machine and
-	// nothing is rejected up front.
-	UnitMemoryFloorBytes   int64
-	UnitMemoryCeilingBytes int64
+	// UnitMemoryFloorBytes is the smallest heap cap a unit is given. Nothing
+	// rejects a unit for the memory it asks for; the cap only sizes it.
+	UnitMemoryFloorBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
 	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
@@ -181,7 +178,7 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	}
 	sweepPrivate(opts.DataDir)
 	return &Provider{backend: backend, importer: importer, opts: opts,
-		gov: NewGovernor(opts.UnitMemoryFloorBytes, opts.UnitMemoryCeilingBytes), cache: cache, engine: e}, nil
+		gov: NewGovernor(opts.UnitMemoryFloorBytes), cache: cache, engine: e}, nil
 }
 
 // Descriptor is the static contract. Version is the adapter version plus the
@@ -325,9 +322,6 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, err
 	}
 	res := p.gov.Reserve(unit.Family, unit.Bytes, ObserveMachine())
-	if err := p.gov.Reject(res, unit.ScopeKey); err != nil {
-		return Report{}, err
-	}
 
 	run, err := p.openRun(req)
 	if err != nil {

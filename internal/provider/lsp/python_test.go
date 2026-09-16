@@ -116,8 +116,8 @@ func TestBindingCarriesTheServerReportAndEncoding(t *testing.T) {
 		}
 		profile.EnvAllowlist = append(profile.EnvAllowlist,
 			"CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
-		mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
-			StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+		mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, AllocationBytes: 8 << 30, IdleTTL: 200 * time.Millisecond,
+			StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 		if err != nil {
 			t.Fatal(err)
 		}
