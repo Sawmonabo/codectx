@@ -363,6 +363,39 @@ func (l *Ledger) Subscribe(fn func(SpanRow)) {
 	l.subs = append(l.subs, fn)
 }
 
+// IndexRunID is the identifier of the indexing run this process is recording
+// at this moment, and false when it is recording none. It exists because a
+// process records more than one run at a time -- a language server's start
+// hangs under a per-process overlay run that can be open while an index run
+// is going -- so a surface that follows an indexing run has to be able to say
+// which of them a span it is handed came from.
+//
+// Runs are held in the order they opened and a process indexes under one
+// cross-process owner, so the last one still running is the one a caller is
+// asking about. A run that has finished is not it: its rows are complete, and
+// answering with it would hand a later caller a run that is over.
+func (l *Ledger) IndexRunID() (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for i := len(runs) - 1; i >= 0; i-- {
+		run := runs[i]
+		if run.kind != KindIndex {
+			continue
+		}
+		run.mu.Lock()
+		running := run.outcome == OutcomeRunning
+		run.mu.Unlock()
+		if running {
+			return run.idHex, true
+		}
+	}
+	return "", false
+}
+
 func (l *Ledger) notify(row SpanRow) {
 	l.subMu.Lock()
 	subs := l.subs

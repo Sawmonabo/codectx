@@ -141,6 +141,16 @@ func (w *Workspace) Coordinator() *index.Coordinator { return w.coord }
 // holds no lock and records nothing -- registers nothing and calls fn never.
 func (w *Workspace) Spans(fn func(model.StageRecord)) { w.s.spans.subscribe(fn) }
 
+// IndexRunID is the identifier of the indexing run this workspace is recording
+// at this moment, and false when none is open. It is how a surface that
+// follows one run -- the MCP progress notifications of a single call -- tells
+// this run's stages from the stages of the per-process overlay run a language
+// server's start opens, which can be recorded concurrently with it.
+//
+// A workspace that composed no ledger records nothing and answers false, so a
+// follower of it counts nothing rather than counting everything.
+func (w *Workspace) IndexRunID() (string, bool) { return w.s.ledger.IndexRunID() }
+
 // Resolver is the managed-toolchain resolver this workspace resolves analyzers
 // through, and ToolStore is the store it reads. A report renders them; nothing
 // else reaches for a tool outside a provider.
