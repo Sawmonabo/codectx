@@ -426,22 +426,30 @@ func vocabularyTerms(t *testing.T, db *sql.DB) []string {
 	return out
 }
 
-// No scan of the packed lexical structure may build a temporary b-tree. Both
-// of these run at activation, over a set that grows with the repository, and a
-// sorter over either is unbounded memory at the one moment that publishes facts
-// to every reader -- the defect ADR-0007 Decision 1 exists to avoid. The ONE
-// ordered read of the design is the seal's, over one unit's own staging in a
-// database of its own; nothing in the workspace database sorts.
+// No scan of the packed lexical structure may build a temporary b-tree. Every
+// one of these runs at activation or at a read, over a set that grows with the
+// repository, and a sorter over any of them is unbounded memory at the one
+// moment that publishes facts to every reader -- the defect ADR-0007 Decision 1
+// exists to avoid. The ONE ordered read of the design is the seal's, over one
+// unit's own staging in a database of its own; nothing in the workspace
+// database sorts, which is why the generation's segment set is folded in a map
+// and the merge's per-segment document walk relies on the index's own order.
 func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 	f, _, gen, dbPath := packedLexicalFixture(t)
 	flushed(t, f.s)
 	db, genID := openRawDB(t, dbPath), int64(gen)
-	for _, q := range []struct{ what, query string }{
-		{"the activation's walk of its members' segments", store.GenerationSegmentQuery()},
-		{"the activation's walk of its predecessor's set", store.PredecessorSegmentQuery()},
-		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery()},
+	segment := segmentSet(t, db, genID)[0]
+	for _, q := range []struct {
+		what  string
+		query string
+		args  []any
+	}{
+		{"the activation's pass over its documents", store.GenerationDocumentQuery(), []any{genID}},
+		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery(), []any{genID}},
+		{"the merge's walk of the documents a segment still holds", store.SegmentDocumentQuery(), []any{segment}},
+		{"the merge's re-point of an absorbed segment's rows", store.RepointSegmentStatement(), []any{segment, segment}},
 	} {
-		plan := explain(t, db, q.query, genID)
+		plan := explain(t, db, q.query, q.args...)
 		t.Logf("%s:\n%s", q.what, plan)
 		if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
 			t.Fatalf("%s builds a temporary b-tree:\n%s", q.what, plan)

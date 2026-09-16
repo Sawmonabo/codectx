@@ -131,9 +131,9 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   original Decision 1 (`term.dir`, `term.text`, `post.list`) plus the per-document attribute stream
   of Decision 2, chunked into parts exactly as before, with postings inside a segment ascending by
   document rowid. `lexical_segments` carries a segment's term and document counts and its packed
-  bytes; `lexical_segment_parts` holds the chunks; `segment_units` names the units whose documents
-  it holds; `generation_segments` is one generation's set, in read order. There is no
-  generation-level parts table any more.
+  bytes; `lexical_segment_parts` holds the chunks; `generation_segments` is one generation's set, in
+  read order. There is no generation-level parts table any more, and no ownership table either: the
+  relation "this document lies in this segment" is a column of the document's own row.
 - **The seal folds one segment per unit, from the tokenizer pass the seal already makes.** There is
   no second tokenisation and no second index. The pass that counts a batch's tokens reads its
   grouped instance vocabulary once and serves both answers from it: the per-document token counts,
@@ -146,15 +146,15 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   is the only `ORDER BY` any plan of this store issues; the engine's external merge sort performs it,
   bounded by the staging's page cache and spilling under the same temporary directory. The staging is
   deleted at seal, at Abandon and at Fail. A unit that publishes no document folds no segment.
-- **Activation adds segments; it never rebuilds.** A generation's set is its predecessor's set, in
-  the predecessor's own read order, plus the segments of its members that the inherited set does not
-  already hold, recorded in `generation_segments`. A generation with no predecessor takes its
-  members' segments alone. An inherited segment none of the generation's documents lies in is
-  dropped rather than carried: it can answer nothing, and carrying it would grow the set a query
-  binary-searches with every delta forever. The invariant, tested: every visible document of a
-  generation lies in exactly ONE of its segments — so a member's segment that is already inherited
-  must NOT be named a second time, or every document in it is offered by two cursors of the same
-  merge and counted twice in every score.
+- **Activation adds segments; it never rebuilds.** A generation's set is DERIVED, not copied: it is
+  the distinct segments the live documents of its member units point at, in segment-id order,
+  recorded in `generation_segments`. Inheritance is that rule rather than a copy of the
+  predecessor's set — a carried document brings its segment with it — so a segment none of the
+  generation's documents lies in is simply never named, and a first index needs no special case.
+  The invariant, tested: every visible document of a generation lies in exactly ONE of its segments,
+  which is what the derivation gives for free and what a copied set had to be checked for: a segment
+  named twice offers every document in it through two cursors of the same merge and counts it twice
+  in every score. It is also why a compaction must re-point every row it absorbs.
 - **A document names the segment it was folded into.** The fold records it on the document's row, and
   a delta's carried documents keep their document rowid and that column together, so nothing is
   rewritten to carry a document forward. It is what makes ownership EXACT: a unit owns precisely the
@@ -170,13 +170,30 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   difference from what the segment packed is stored per named segment, which is what lets a document
   frequency answer from the term directory for every segment that hides nothing and walk the posting
   only for the ones that do.
-- **Compaction by geometric partitioning, at activation, amortised.** While a size tier holds more
-  than `r` segments, that tier's segments are merged into one — a streaming merge on
-  (term, document rowid) that copies a term's posting bytes verbatim when only one input holds the
-  term and drops hidden documents — as is any segment more than half of whose documents are hidden.
-  The merged segment replaces its inputs in the activating generation's set ONLY; a retained
-  generation keeps its own rows and is never touched. A document therefore pays O(log_r N) merges
-  over its life, and a one-file delta pays for one small segment plus, occasionally, one tier merge.
+- **Compaction by geometric partitioning, at activation, amortised.** While a size tier — segments
+  grouped by packed bytes, each tier `r` times as wide as the one below — holds more than `r`
+  segments, its segments are merged into one, and any segment more than half of whose documents are
+  DEAD is rewritten alone. The merge is a streaming merge on (term, document rowid) over the inputs'
+  parts, read through the store's own part reads and written through the ingestion group's writes;
+  nothing of a segment is held whole, one merge reads a bounded number of inputs, and a term only
+  one input carries is copied verbatim when that input has no dead document. A document therefore
+  pays O(log_r N) merges over its life, and a one-file delta pays for one small segment plus,
+  occasionally, one tier merge. The tier width, the ratio and the number of inputs one merge reads
+  are INTERNAL layout constants: they decide how often already-packed bytes are rewritten and how
+  much of a merge is resident, never what may be stored or answered.
+- **A merge is a SOFT deletion: it keeps hidden documents and drops only dead ones.** A document
+  hidden in the activating generation belongs to a unit that merely left it; that unit can be
+  attached to a later generation at any time, and the index is contentless, so its postings are the
+  only copy of the text it was indexed with. Dropping them at the merge would delete text no row of
+  the store can rebuild. Only DEAD documents are dropped — rowids no `search_units` row names any
+  more, because the unit holding them was collected — which is the retention rule an inverted-index
+  engine applies to its own soft-deleted documents: a merge policy carries them across merges until
+  the retention query stops matching them. The merge re-points EVERY row of its inputs, the members'
+  and the retired units' alike, in the same activation, so afterwards no row names an input, a
+  reattached unit finds its documents where its rows point, and a segment can never be named beside
+  the one that absorbed it. The merged segment replaces its inputs in the activating generation's
+  set ONLY; a generation published earlier keeps its own rows and reads the inputs until it is
+  collected.
 - **Reads merge segments by document rowid.** A term is one binary search per segment over that
   segment's directory; the per-segment posting streams are merged so the candidate walk still
   receives one strictly ascending sequence of rowids, and a document two segments both claim is
@@ -185,7 +202,7 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   the bitmap. Approximate frequencies that count hidden documents are rejected: a ranking would then
   depend on the store's history, and a delta-built store would not answer identically to a fresh one
   over the same tree.
-- **Garbage.** A segment no retained generation names and no live unit owns is deleted in the same
+- **Garbage.** A segment that no retained generation names and that no document points at is deleted in the same
   transaction as the generation or the unit that released it. A build that died between its first
   documents and its seal is collected the same way, and its staging database goes with it: the
   temporary directory is never swept blindly, because several processes may share one data directory
@@ -266,6 +283,7 @@ plan test mutation-proved.
 - Patrick O'Neil, Edward Cheng, Dieter Gawlick, Elizabeth O'Neil, "The Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica 33, 1996 — https://www.cs.umb.edu/~poneil/lsmtree.pdf (immutable runs merged on a size schedule instead of updated in place).
 - "TieredMergePolicy", search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/index/TieredMergePolicy.html (a production tiered merge schedule).
 - "Lucene90LiveDocsFormat", search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/codecs/lucene90/Lucene90LiveDocsFormat.html (deletions as a live-document bitset, dropped at merge).
+- "SoftDeletesRetentionMergePolicy", search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/index/SoftDeletesRetentionMergePolicy.html (a merge that carries soft-deleted documents across merges instead of reclaiming them, which is the retention rule this decision adopts for a hidden document).
 - Index file formats, segments, search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/codecs/lucene99/package-summary.html (an index as a set of immutable segments).
 
 ## Measurement record
