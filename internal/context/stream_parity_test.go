@@ -80,29 +80,6 @@ func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader
 	return out, nil
 }
 
-// relationsOnPaths reads the relation kind of every edge the expansion admitted
-// onto a retained route, and reports whether it found all of them.
-//
-// A model.RelationPath stores relation ids only, graph.ImpactResult never
-// returns the relations it walked, and the pinned reader exposes no by-id
-// relation read -- adding one would be a second spelling of EdgesBatch. So the
-// edges are re-read here from the candidate node set, keyset-paged by relation
-// id and bounded by the same context.max_graph_edges the walk ran under, and
-// filtered to the ids the routes actually name.
-//
-// The completeness flag matters: ranking treats an edge it cannot type as
-// inadmissible, so stopping at the edge bound with ids still unfound changes
-// scores. The caller discloses that as an incomplete scope rather than letting
-// two compiles of one generation disagree in silence.
-// It is a thin wrapper: the body moved to rankjoin.go, beside the streamed
-// pass that must reproduce its read log, and reads through the narrow
-// relationReader so that log is observable. Lane L5 removes this wrapper when
-// Compile stops calling it.
-func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedReader,
-	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
-	return c.relationsOnPathsWholeSet(ctx, reader, cands)
-}
-
 // expandScope turns resolved seeds into the Section 15.2 required scope. The
 // engine and the generation are passed in already open and already pinned: the
 // reader lease and the engine release belong to Compile, which defers them in
@@ -522,7 +499,26 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 	return out, nil
 }
 
-func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relationReader,
+// relationsOnPathsWholeSet reads the relation kind of every edge the expansion
+// admitted onto a retained route, and reports whether it found all of them.
+//
+// A model.RelationPath stores relation ids only and graph.ImpactResult never
+// returns the relations it walked, so the edges are re-read here from the
+// candidate node set through the packed adjacency port, bounded by the same
+// context.max_graph_edges the walk ran under, and filtered to the ids the
+// routes actually name.
+//
+// The completeness flag matters: ranking treats an edge it cannot type as
+// inadmissible, so stopping at the edge bound with ids still unfound changes
+// scores. The caller discloses that as an incomplete scope rather than letting
+// two compiles of one generation disagree in silence.
+//
+// This is the whole-set shape the streamed pass is proved against: it holds
+// `wanted` and the typed set in maps and probes them, where P-C merge-joins two
+// sorted runs. The node batching, the surrogate resolution, the per-entry
+// budget accounting and the early exit are the same, because those decide WHICH
+// relations a cut scan types and the two plans must agree on that.
+func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, g graph.GraphReader,
 	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
 	wanted := map[model.RelationID]struct{}{}
 	nodes := make([]model.NodeID, 0, len(cands))
@@ -546,28 +542,67 @@ func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relation
 	if len(wanted) == 0 || len(nodes) == 0 {
 		return out, len(wanted) == 0, nil
 	}
+	codes, absent := scopeKindCodes(g)
+	if absent {
+		return out, false, nil
+	}
 
 	limit := c.pageLimit()
 	budget, bounded := c.edgeScanBudget()
 	scanned := 0
+	buf := make([]graph.Edge, 0, limit)
+	drain := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		rels := make([]graph.RelRef, len(buf))
+		for i, e := range buf {
+			rels[i] = e.Rel
+		}
+		ids, err := g.RelationIDs(ctx, rels)
+		if err != nil {
+			return err
+		}
+		for i, e := range buf {
+			kind, ok := g.Kinds().Kind(e.Kind)
+			if !ok || ids[i] == "" {
+				continue
+			}
+			if _, want := wanted[ids[i]]; want {
+				out[ids[i]] = model.Relation{ID: ids[i], Kind: kind}
+			}
+		}
+		buf = buf[:0]
+		return nil
+	}
 	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
-		batch := nodes[start:min(start+limit, len(nodes))]
-		var after model.RelationID
-		for len(out) < len(wanted) {
-			page, err := reader.EdgesBatch(ctx, batch, model.DirectionBoth, scopeRelations, after, limit)
-			if err != nil {
-				return nil, false, err
-			}
-			for _, rel := range page {
-				if _, want := wanted[rel.ID]; want {
-					out[rel.ID] = rel
+		refs, err := g.Resolve(ctx, nodes[start:min(start+limit, len(nodes))])
+		if err != nil {
+			return nil, false, err
+		}
+		if refs = ascendingDistinctRefs(refs); len(refs) == 0 {
+			continue
+		}
+		if _, err := g.Neighbours(ctx, refs, model.DirectionBoth, codes, graph.EdgePos{},
+			func(e graph.Edge) error {
+				buf = append(buf, e)
+				scanned++
+				spent := bounded && scanned >= budget
+				if len(buf) < limit && !spent {
+					return nil
 				}
-				after = rel.ID
-			}
-			scanned += len(page)
-			if len(page) < limit || (bounded && scanned >= budget) {
-				break
-			}
+				if err := drain(); err != nil {
+					return err
+				}
+				if spent || len(out) == len(wanted) {
+					return graph.ErrStopScan
+				}
+				return nil
+			}); err != nil {
+			return nil, false, err
+		}
+		if err := drain(); err != nil {
+			return nil, false, err
 		}
 		if bounded && scanned >= budget {
 			break
@@ -576,9 +611,9 @@ func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relation
 	return out, len(out) == len(wanted), nil
 }
 
-// resolvePrecisionWholeSet is today's resolvePrecision (rank.go), moved here
-// unchanged except for the reader type, for the same reason.
-func (c *Compiler) resolvePrecisionWholeSet(ctx context.Context, reader relationReader,
+// resolvePrecisionWholeSet is the whole-set precision read: the same evidence
+// batches P-C issues, reduced into one map instead of a sorted run.
+func (c *Compiler) resolvePrecisionWholeSet(ctx context.Context, reader evidenceReader,
 	cands []candidate) (map[model.RelationID]int64, error) {
 	seen := map[model.RelationID]struct{}{}
 	ids := make([]model.RelationID, 0, len(cands))
@@ -976,7 +1011,11 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
-	relations, complete, err := c.relationsOnPaths(ctx, reader, scoped.Candidates)
+	g, err := engine.Reader()
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	relations, complete, err := c.relationsOnPathsWholeSet(ctx, g, scoped.Candidates)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
