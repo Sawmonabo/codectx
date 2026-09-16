@@ -1034,6 +1034,23 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if hb.PendingEvents != nil {
 		t.Fatalf("a watch that never held the workspace claimed a pending count of %d, which reads as coverage", *hb.PendingEvents)
 	}
+	// The watcher marks itself reconciled on its own rescans and ticks, with no
+	// regard for the workspace lock. Once it has, the row must STILL claim
+	// nothing: this is the steady state a second process reads, and the entry
+	// publish asserted above is only its first ten seconds.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if _, _, marked := w.Coverage(); !marked.IsZero() || time.Now().After(deadline) {
+			break
+		}
+		f.write("pkg/b.go", goFile("pkg", "B", ""))
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, _, marked := w.Coverage(); marked.IsZero() {
+		t.Fatal("the watcher never marked itself reconciled, so the steady state went unexercised")
+	}
+	if lastPass, pending := c.watch.heartbeat(); lastPass != nil || pending != nil {
+		t.Fatalf("a watch that never held the workspace published %v / %v after the watcher reconciled itself", lastPass, pending)
+	}
 	stop()
 	if err := <-done; err != nil {
 		t.Fatalf("watch: %v", err)
