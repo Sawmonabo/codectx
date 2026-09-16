@@ -274,6 +274,7 @@ func TestCollectingEarlierGenerationsLeavesOnlyTheLastOnesSegments(t *testing.T)
 	// Two deltas, each re-emitting one file and carrying the other, so each
 	// generation folds a segment of its own and inherits one.
 	prev, prevGen := w1, gen1
+	published := []model.GenerationID{gen1}
 	for i, changed := range []fileFixture{
 		f.file("pkg/a.go", "package pkg\nfunc Alpha() { /* two */ Alpha() }\n"),
 		f.file("pkg/a.go", "package pkg\nfunc Alpha() { /* three */ Alpha() }\n"),
@@ -294,9 +295,12 @@ func TestCollectingEarlierGenerationsLeavesOnlyTheLastOnesSegments(t *testing.T)
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 		f.activate(gen, prevGen)
+		published = append(published, gen)
 		prev, prevGen = w, gen
 	}
-	for _, gen := range []model.GenerationID{gen1} {
+	// Every generation but the live one, so what remains is what the live one
+	// needs and nothing else.
+	for _, gen := range published[:len(published)-1] {
 		if err := f.s.DeleteGeneration(f.ctx, gen); err != nil {
 			t.Fatalf("DeleteGeneration(%d): %v", gen, err)
 		}
