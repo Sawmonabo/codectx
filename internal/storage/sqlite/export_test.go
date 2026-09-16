@@ -148,3 +148,16 @@ func SegmentPostingDocuments(db *sql.DB, segment int64) ([]int64, error) {
 	}
 	return slices.Sorted(maps.Keys(seen)), nil
 }
+
+// SetLexPartBytes shrinks the lexical stream part size for one test and returns
+// a function that restores it. It is not a user setting: the part size bounds
+// how much of a stream is resident at once, never what is stored or answered.
+// A small value is what forces the stitch paths -- the reader's, which joins a
+// directory entry split across two parts, and the merge's, which joins a
+// posting list split across two -- that the shipped size reaches only on a
+// repository-sized fixture.
+func SetLexPartBytes(n int) func() {
+	prev := lexPartBytes
+	lexPartBytes = n
+	return func() { lexPartBytes = prev }
+}
