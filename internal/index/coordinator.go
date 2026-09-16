@@ -262,6 +262,7 @@ const (
 	stageActivation    = "activation"
 	stageRetention     = "retention"
 	stageCollection    = "collection"
+	stageReclaim       = "reclaim"
 )
 
 // buildAppliers binds the delta appliers of the two providers that can
