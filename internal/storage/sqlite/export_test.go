@@ -18,9 +18,11 @@ func SetEdgePartBytes(n int) func() {
 func OutgoingEdgeQuery() string { return outgoingEdgeQuery() }
 func IncomingEdgeQuery() string { return incomingEdgeQuery() }
 
-// LexicalInstanceQuery is the bare instance scan the packed-lexical build
-// streams, exported so the query-plan test asserts the SQL that ships.
-func LexicalInstanceQuery() string { return lexicalInstanceQuery }
+// The two scans the packed lexical structure streams, exported so the
+// query-plan test asserts the SQL that ships: the activation's walk of its
+// members' segments, and the seal's ordered read of the unit's staging.
+func GenerationSegmentQuery() string { return generationSegmentQuery }
+func GenerationLexicalQuery() string { return generationLexicalQuery }
 
 // EvidenceCountQuery is the build's third ordered scan.
 func EvidenceCountQuery() string { return evidenceCountQuery() }

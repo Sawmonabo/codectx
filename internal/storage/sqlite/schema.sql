@@ -719,28 +719,66 @@ CREATE TABLE generation_graph_parts (
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
 
--- generation_lexical is written LAST, after every lexical part, so its presence
--- is the commit marker: a reader that finds the row is guaranteed every part
--- behind it. It also carries the generation's document statistics, which the
--- scorer would otherwise recompute by probing every visible document
--- (ADR-0007 Decision 1).
+-- generation_lexical is written LAST, after every generation_segments row, so
+-- its presence is the commit marker: a reader that finds the row is guaranteed
+-- the generation's whole segment set behind it. It also carries the
+-- generation's document statistics, which the scorer would otherwise recompute
+-- by probing every visible document (ADR-0007 Decision 1).
 CREATE TABLE generation_lexical (
     generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
     doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    token_total INTEGER NOT NULL CHECK(token_total >= 0),
-    term_count INTEGER NOT NULL CHECK(term_count >= 0)
+    token_total INTEGER NOT NULL CHECK(token_total >= 0)
 );
--- One chunk of one lexical stream. `term.dir` is the fixed-width term
+
+-- A lexical segment is an immutable packed structure over a set of documents:
+-- the term directory, the term text it points into and the posting lists, each
+-- chunked into lexical_segment_parts. A segment is written once, by the seal of
+-- the unit whose documents it holds, and is never rewritten; an activation
+-- names segments, it does not rebuild them (ADR-0007 Decision 1).
+CREATE TABLE lexical_segments (
+    id INTEGER PRIMARY KEY,
+    term_count INTEGER NOT NULL CHECK(term_count >= 0),
+    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
+    bytes INTEGER NOT NULL CHECK(bytes >= 0)
+);
+
+-- One chunk of one segment stream. `term.dir` is the fixed-width term
 -- directory in term order -- term slice, document frequency and the slice of
 -- `post.list` holding that term's per-document (column, count) sequence --
 -- `term.text` the concatenated term bytes it points into, and `post.list` the
--- posting lists themselves. `part` is 0-based and the parts of a stream
--- concatenate to it, so a reader holds a bounded window of parts rather than a
--- whole vocabulary.
-CREATE TABLE generation_lexical_parts (
-    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+-- posting lists themselves, whose documents ascend by rowid. `part` is 0-based
+-- and the parts of a stream concatenate to it, so a reader holds a bounded
+-- window of parts rather than a whole vocabulary.
+CREATE TABLE lexical_segment_parts (
+    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
     stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list')),
     part INTEGER NOT NULL CHECK(part >= 0),
     bytes BLOB NOT NULL,
-    PRIMARY KEY(generation_id, stream, part)
+    PRIMARY KEY(segment_id, stream, part)
 ) WITHOUT ROWID;
+
+-- The units whose documents a segment holds. A segment a sealing unit wrote
+-- names that one unit; a merged segment names every unit whose documents
+-- survived the merge. It is what lets an activation decide that a segment it
+-- already carries covers a member unit's documents.
+CREATE TABLE segment_units (
+    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    PRIMARY KEY(segment_id, unit_id)
+) WITHOUT ROWID;
+-- The reverse direction: the segments that hold a unit's documents, which is
+-- how an activation walks its members' segments in member order without a sort.
+CREATE INDEX idx_segment_units_unit ON segment_units(unit_id, segment_id);
+
+-- The segment set of one generation, in read order. A generation names
+-- segments; nothing is rewritten to publish it, and a retained generation keeps
+-- its own rows when a later generation merges the same segments away. The
+-- reference is RESTRICT rather than CASCADE: a segment a generation still names
+-- must not be collectable while that row exists.
+CREATE TABLE generation_segments (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,
+    ord INTEGER NOT NULL CHECK(ord >= 0),
+    PRIMARY KEY(generation_id, ord)
+) WITHOUT ROWID;
+CREATE INDEX idx_generation_segments_segment ON generation_segments(segment_id, generation_id);

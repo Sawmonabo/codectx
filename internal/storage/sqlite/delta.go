@@ -430,6 +430,22 @@ func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow in
 		return wrap("search_units", err)
 	}
 	stats.SearchUnits = n
+	if n == 0 {
+		return nil
+	}
+	// The carried documents keep their doc_id, so they are already packed --
+	// in the segments the predecessor unit's own seal folded. Recording this
+	// unit as an owner of those segments is what tells an activation that its
+	// member's documents are already held and no new segment is needed for
+	// them. The segments are shared, not copied: nothing is rewritten to carry
+	// a document forward. A document of the predecessor that was NOT carried
+	// stays in the segment and is hidden by the generation's visible-document
+	// bitmap instead.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO segment_units(segment_id, unit_id)
+		SELECT p.segment_id, ?2 FROM segment_units p WHERE p.unit_id = ?1
+		ON CONFLICT(segment_id, unit_id) DO NOTHING`, prevRow, w.rowID); err != nil {
+		return wrap("segment_units", err)
+	}
 	return nil
 }
 

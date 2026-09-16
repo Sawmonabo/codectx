@@ -33,10 +33,20 @@ func packedLexicalFixture(t *testing.T) (*fixture, *store.PinnedReader, model.Ge
 		t.Fatal(err)
 	}
 	run := f.run(gen)
-	w := f.beginScope(gen, run, configHash, a, b)
-	f.fillScope(w, run, a, b)
-	if err := f.s.SealUnit(f.ctx, w); err != nil {
-		t.Fatalf("SealUnit: %v", err)
+	// TWO units, so the generation publishes TWO segments: the structure is
+	// segmented per sealed unit, and a one-unit generation would exercise
+	// neither the merge that keeps rowids ascending across segments nor the
+	// part window that must be keyed by segment as well as by stream.
+	first := f.beginScopeKey(gen, run, configHash, "scope-a", a)
+	f.fillFile(first, run, a)
+	f.fillIndexLevel(first, run, a)
+	if err := f.s.SealUnit(f.ctx, first); err != nil {
+		t.Fatalf("SealUnit(first): %v", err)
+	}
+	second := f.beginScopeKey(gen, run, configHash, "scope-b", b)
+	f.fillFile(second, run, b)
+	if err := f.s.SealUnit(f.ctx, second); err != nil {
+		t.Fatalf("SealUnit(second): %v", err)
 	}
 	f.activate(gen, 0)
 	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
@@ -201,15 +211,24 @@ func vocabularyTerms(t *testing.T, db *sql.DB) []string {
 	return out
 }
 
-// The build's instance scan must not build a temporary b-tree: it steps every
-// posting instance of the repository, and a sorter over that set is unbounded
-// memory at activation -- the defect ADR-0007 Decision 1 exists to avoid.
-func TestLexicalBuildScanUsesNoTempBTree(t *testing.T) {
-	f, _, _, dbPath := packedLexicalFixture(t)
+// No scan of the packed lexical structure may build a temporary b-tree. Both
+// of these run at activation, over a set that grows with the repository, and a
+// sorter over either is unbounded memory at the one moment that publishes facts
+// to every reader -- the defect ADR-0007 Decision 1 exists to avoid. The ONE
+// ordered read of the design is the seal's, over one unit's own staging in a
+// database of its own; nothing in the workspace database sorts.
+func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
+	f, _, gen, dbPath := packedLexicalFixture(t)
 	flushed(t, f.s)
-	plan := explain(t, openRawDB(t, dbPath), store.LexicalInstanceQuery())
-	t.Logf("instance scan plan:\n%s", plan)
-	if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
-		t.Fatalf("the build's instance scan builds a temporary b-tree over every posting instance:\n%s", plan)
+	db, genID := openRawDB(t, dbPath), int64(gen)
+	for _, q := range []struct{ what, query string }{
+		{"the activation's walk of its members' segments", store.GenerationSegmentQuery()},
+		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery()},
+	} {
+		plan := explain(t, db, q.query, genID)
+		t.Logf("%s:\n%s", q.what, plan)
+		if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
+			t.Fatalf("%s builds a temporary b-tree:\n%s", q.what, plan)
+		}
 	}
 }
