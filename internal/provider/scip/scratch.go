@@ -39,6 +39,9 @@ type scratch struct {
 	db    *sql.DB
 	tx    *sql.Tx
 	bytes int64
+	// broken says the surface's own contents are what failed, so it leaves
+	// the pool instead of going back to be handed to the next import.
+	broken bool
 }
 
 // scratchEmpty is run before the schema. The surface is never truncated --
@@ -105,6 +108,10 @@ func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	s.db.SetMaxOpenConns(1)
 	s.db.SetMaxIdleConns(1)
 	if _, err := s.db.ExecContext(ctx, scratchEmpty+scratchSchema); err != nil {
+		// Emptying the spool is what failed, so the surface itself is the
+		// problem -- an image a crash left mid-write -- and it leaves the
+		// pool rather than failing every import after this one.
+		s.broken = true
 		s.close()
 		return nil, internal("scip scratch schema: " + err.Error())
 	}
@@ -130,7 +137,11 @@ func (s *scratch) close() error {
 		s.db = nil
 	}
 	if s.lease != nil {
-		s.lease.Release()
+		if s.broken {
+			s.lease.Unusable()
+		} else {
+			s.lease.Release()
+		}
 		s.lease = nil
 	}
 	return nil
