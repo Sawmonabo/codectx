@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
@@ -555,7 +557,13 @@ func TestIncrementalScenario(t *testing.T) {
 		// A supplied index that is not a SCIP index at all: the optional
 		// provider plans its unit and cannot produce it.
 		f.write("index.scip", "this is not a scip index\n")
+		// Enabled for this case only: a provider the configuration turns off
+		// plans nothing and publishes nothing, so a disabled one could never
+		// exercise a failure of the provider at all.
+		disabled := f.cfg.Providers.SCIP.Enabled
+		f.cfg.Providers.SCIP.Enabled = config.Auto
 		opt := f.coordinator(f.providers(true))
+		f.cfg.Providers.SCIP.Enabled = disabled
 		res, err := opt.Index(ctx, model.IndexRequest{})
 		if err != nil {
 			t.Fatalf("index with a broken optional provider: %v", err)
@@ -957,4 +965,69 @@ func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 // that assembles a plan by hand supplies the same shape over one unit.
 func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
 	return func(yield func(plan.Unit) error) error { return yield(u) }
+}
+
+// TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce guards the
+// failure mode a report full of `unavailable` rows is: a provider the
+// operator turned off was planned for nothing and then reported once per
+// declared capability -- three providers off is eight rows -- which reads to a
+// person as eight failures and tells an agent it is holding a degraded index
+// rather than a configured one. What is off must be said once, in one field,
+// and nowhere else.
+//
+// The distinction the rows must not blur is the other half: `unavailable`
+// stays the record of a provider that IS enabled and reached no output, with
+// the reason it did not. That is why an enabled provider's rows are asserted
+// here too -- a filter that swallowed them would pass every other assertion.
+func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
+	f := newFixture(t, map[string]string{"go.mod": "module example.com/off\n\ngo 1.27\n", "a.go": "package a\n"})
+	// The fixture's configuration disables scip, lsp and dependence; this
+	// registry holds the scip provider, so selection is asked about a
+	// provider that is registered AND off.
+	c := f.coordinator(f.providers(true))
+	// What the composition root records for a provider it could not build --
+	// and it never even tries to build one the configuration disabled, which
+	// is the second way these rows reached the report.
+	for _, capability := range dependence.Capabilities {
+		c.opts.States = append(c.opts.States, model.CapabilityState{ProviderID: dependence.ProviderID,
+			Capability: capability, Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
+			DiagnosticCode: model.CodeProviderUnavailable})
+	}
+	res, err := c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := res.Validate(); err != nil {
+		t.Fatalf("the result does not validate: %v", err)
+	}
+	st, err := c.Status(f.ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("the status does not validate: %v", err)
+	}
+	off := []string{"scip", "lsp", "dependence"}
+	for _, surface := range []struct {
+		name     string
+		disabled []string
+		states   []model.CapabilityState
+	}{
+		{"the index result", res.ProvidersDisabled, res.Completeness},
+		{"status", st.ProvidersDisabled, st.Completeness},
+	} {
+		if !slices.Equal(surface.disabled, off) {
+			t.Errorf("%s names %v as disabled, want %v: a reader with no capability rows has nothing to read the absence from",
+				surface.name, surface.disabled, off)
+		}
+		for _, s := range surface.states {
+			if slices.Contains(off, s.ProviderID) {
+				t.Errorf("%s reports %s %s as %q: work nobody asked for is not an unavailable capability",
+					surface.name, s.ProviderID, s.Capability, s.State)
+			}
+		}
+		if !slices.ContainsFunc(surface.states, func(s model.CapabilityState) bool { return s.ProviderID == filesystem.ID }) {
+			t.Errorf("%s reports no row for an enabled provider at all: the exclusion is not confined to what is off", surface.name)
+		}
+	}
 }
