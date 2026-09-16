@@ -256,3 +256,40 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 		t.Error("a scope that failed was reported as still running")
 	}
 }
+
+// TestCoverageKeepsAProviderWithNoMemberFailed is the other half of the same
+// ruling: softening a failure row is only honest when facts exist.
+//
+// Failure mode: a provider's every unit fails, the plan still names those
+// units, and the row is softened to `partial` on the strength of the plan --
+// a capability holding nothing reported as answering some queries, which is
+// exactly the over-claim the partial state exists to avoid.
+//
+// Mutation proof: in coverage, soften on `covered` (a planned unit) instead of
+// `published` (a member that exists).
+func TestCoverageKeepsAProviderWithNoMemberFailed(t *testing.T) {
+	t.Parallel()
+	const id, capability = "dependence", "calls"
+	const scope = "pkg:java:qa"
+
+	g := &generation{
+		caps: newCapabilityReport(),
+		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
+			ID: id, Version: "1", Capabilities: []string{capability}}}}},
+	}
+	g.plan.Units = func(yield func(plan.Unit) error) error {
+		return yield(plan.Unit{ProviderID: id, ScopeKey: scope})
+	}
+	// What the indexing path does when an optional provider's unit fails.
+	g.caps.addFailure(id, capability, scope, model.CodeProviderOutputInvalid)
+	if err := g.coverage(); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if len(rows) != 1 {
+		t.Fatalf("coverage published %d rows, want one: %+v", len(rows), rows)
+	}
+	if rows[0].State != model.CapabilityFailed {
+		t.Errorf("capability state %q, want failed: every unit of this provider failed", rows[0].State)
+	}
+}
