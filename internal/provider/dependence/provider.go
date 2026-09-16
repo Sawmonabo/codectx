@@ -525,14 +525,15 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		return publication{}, ImportReport{}, err
 	}
 
-	graph, outcome, err := p.graphFor(ctx, req, unit, res, run, source)
+	graph, outcome, decision, err := p.graphFor(ctx, req, unit, res, run, source)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
 	if outcome.Class == FailureEngine {
 		// A reproducible crash is the only thing subdivision is for. Every
-		// capability of the result then says so.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome)
+		// capability of the result then says so, and says how the crash was
+		// established to reproduce.
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision)
 	}
 
 	exp, crash, err := p.export(ctx, req, unit, res, run, graph)
@@ -547,7 +548,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// on a 4,984-file project whose export died at every heap cap while
 		// every subdivided part of it exported. Reporting it as a failed unit
 		// threw away facts the engine could still produce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed)
 	}
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
@@ -561,35 +562,35 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // partial result naming the subdivided scope and the failing pass and
 // exception, never a failed unit.
 func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome) (publication, ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (publication, ImportReport, error) {
 
-	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash)
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
-	return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(crash),
+	return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(crash, decision),
 		OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily.Value()}, report, nil
 }
 
 // graphFor reuses a cached graph whose semantic closure matches, or parses a
 // new one. The returned outcome is FailureEngine when the unit crashed
-// reproducibly and the caller must subdivide; every other failure class is
-// already an error by then.
+// reproducibly and the caller must subdivide, and the crashDecision says how
+// that was established; every other failure class is already an error by then.
 func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string) (string, Outcome, error) {
+	run *runDir, source string) (string, Outcome, crashDecision, error) {
 
 	key, err := CacheKey(ctx, req.Content, unit, p.backend.Argv(unit.Family), p.engine)
 	if err != nil {
-		return "", Outcome{}, err
+		return "", Outcome{}, "", err
 	}
 	if cached, ok := p.cache.Lookup(key); ok {
 		slog.Info("dependence graph reused", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey)
-		return cached, Outcome{}, nil
+		return cached, Outcome{}, "", nil
 	}
 	graph := run.path("graph")
 	outcome, err := p.parse(ctx, req, unit, res, source, graph, nil)
 	if err != nil {
-		return "", Outcome{}, err
+		return "", Outcome{}, "", err
 	}
 	switch outcome.Class {
 	case FailureMemory:
@@ -599,39 +600,52 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 			// the tree it ran in peaked at what the machine can allocate. A
 			// retry with no more memory behind it cannot succeed and costs a
 			// full parse.
-			return "", Outcome{}, failure(FailureMemory, unit.ScopeKey, outcome, res)
+			return "", Outcome{}, "", failure(FailureMemory, unit.ScopeKey, outcome, res)
 		}
 		retried := res
 		retried.HeapCapBytes = retry
 		if outcome, err = p.parse(ctx, req, unit, retried, source, graph, nil); err != nil {
-			return "", Outcome{}, err
+			return "", Outcome{}, "", err
 		}
 		if outcome.Class == FailureMemory {
-			return "", Outcome{}, failure(FailureMemory, unit.ScopeKey, outcome, retried)
+			return "", Outcome{}, "", failure(FailureMemory, unit.ScopeKey, outcome, retried)
 		}
 		res = retried
 	case FailureTimeout:
-		return "", Outcome{}, failure(FailureTimeout, unit.ScopeKey, outcome, res)
+		return "", Outcome{}, "", failure(FailureTimeout, unit.ScopeKey, outcome, res)
 	}
 	if outcome.Class == FailureEngine {
-		// Confirm the crash before anything is split. The neutral option
-		// allowlist is empty for every frontend today, so the confirmation
-		// runs the same argv over the same source; the engine is not
-		// run-to-run deterministic, so what it yields is a second observation
-		// of the same failure class, which raises the odds that the crash is
-		// deterministic without proving it. That is what subdivision is
-		// allowed to rest on: a class seen twice, against the cost of
-		// splitting a project, which loses more than half of its resolved
-		// calls. A crash seen once is never split on.
+		if reproducibleOnSight(outcome) {
+			// The child named the pass that died and the exception it died
+			// on. That is a deterministic fault in that pass, so the unit is
+			// split on the first sight of it: the confirmation below would
+			// run the same argv over the same source and re-prove what the
+			// stderr already says, at the price of a second full parse of a
+			// unit large enough to be worth splitting.
+			slog.Info("a dependence crash named its failing pass and is not re-parsed to confirm it",
+				"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
+				"pass", outcome.Pass, "exception", outcome.Exception)
+			return "", outcome, crashNamed, nil
+		}
+		// A crash that named no pass -- a signal death, a step that left no
+		// graph, an exit with nothing said about a pass -- may be the machine
+		// rather than the source, so it is confirmed before anything is split.
+		// The neutral option allowlist is empty for every frontend today, so
+		// the confirmation runs the same argv over the same source; the engine
+		// is not run-to-run deterministic, so what it yields is a second
+		// observation of the same failure class, which raises the odds that
+		// the crash is deterministic without proving it. That is what
+		// subdivision is allowed to rest on, against the cost of splitting a
+		// project, which loses more than half of its resolved calls.
 		confirm, err := p.parse(ctx, req, unit, res, source, graph, p.backend.NeutralOptions(unit.Family))
 		if err != nil {
-			return "", Outcome{}, err
+			return "", Outcome{}, "", err
 		}
 		if confirm.Class == FailureEngine {
-			return "", confirm, nil
+			return "", confirm, crashConfirmed, nil
 		}
 		if confirm.Class != FailureNone {
-			return "", Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm, res)
+			return "", Outcome{}, "", failure(confirm.Class, unit.ScopeKey, confirm, res)
 		}
 		outcome = confirm
 	}
@@ -643,9 +657,9 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 		// bodies. Not caching it costs a reparse for units that skip at all,
 		// which the pinned definition cap makes rare (docs/research/
 		// 10-round3-empirical.md Section 9a); caching it would cost the truth.
-		return p.cache.path(key), outcome, nil
+		return p.cache.path(key), outcome, "", nil
 	}
-	return graph, outcome, nil
+	return graph, outcome, "", nil
 }
 
 // parse runs one parse step and validates that it left a graph behind.
@@ -827,7 +841,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome) (ImportReport, int, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
@@ -846,7 +860,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	}
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
-		"children", len(children))
+		"decision", string(decision), "children", len(children))
 	// Every part imports into the one sink storage opened for the unit. Two
 	// parts legitimately describe the same entity — above all the external
 	// stub of a callee both parts reference — and storage now admits a
@@ -1006,16 +1020,26 @@ func unitSource(root string, unit Unit) (string, error) {
 
 // backendFailure renders the crash a subdivided unit publishes: the failing
 // pass and its exception class, which is what a maintainer needs to report the
-// crash upstream.
-func backendFailure(o Outcome) string {
+// crash upstream, followed by how the provider established that it reproduces.
+//
+// The decision travels inside this value rather than under a detail key of its
+// own because a subdivided capability row already fills most of the bounded
+// detail map a provider may contribute, and a key that is dropped exactly when
+// the row is busiest would tell an operator nothing at all.
+func backendFailure(o Outcome, d crashDecision) string {
+	var named string
 	switch {
 	case o.Pass != "" && o.Exception != "":
-		return o.Pass + "/" + o.Exception
+		named = o.Pass + "/" + o.Exception
 	case o.Pass != "":
-		return o.Pass
+		named = o.Pass
 	default:
-		return o.Exception
+		named = o.Exception
 	}
+	if named == "" {
+		return string(d)
+	}
+	return named + " (" + string(d) + ")"
 }
 
 // remaining is the time left on the unit's deadline, or a typed timeout when

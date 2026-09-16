@@ -315,11 +315,25 @@ Every one of these was reproduced against the real engine.
 | Class | Signal | Outcome |
 |---|---|---|
 | `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
-| `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. No retry: it reproduces. Siblings are unaffected. |
-| `engine` (zero-exit helper crash) | `Process exited with code <n>` on stderr, **or** a clean exit that left no graph | same code. The exit status is a lie in this mode; the empty result is the only honest signal. |
+| `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable, **or** the untimed `Pass <name> failed` at ERROR that a pass which dies before it is timed leaves | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. A parse crash that names **both** is taken as reproducible on first sight and is not re-parsed: it goes straight to subdivision. Siblings are unaffected. |
+| `engine` (crash that names no pass) | `Process exited with code <n>` on stderr, a clean exit that left no graph, a signal death, or any non-zero exit with nothing said about a pass | same code. For the zero-exit helper crash the exit status is a lie and the empty result is the only honest signal. Nothing here identifies the defect, so the one confirmation below is kept before anything is split. |
 | `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`. Not worded as a crash, because none happened: a frontend whose own defaults exclude the directories a project keeps its sources in skips every file it was given. The Java frontend excludes any path with a `test` directory component, which is measurably the whole of a project laid out as `src/test/java/...`. Compare `source_files` with what the family's frontend admits. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
+
+**What is run a second time, and what is not.** Heap exhaustion keeps the one
+retry described above, and only when more memory is actually available. A
+parse crash whose standard error names **both** the failing pass and the
+exception class is a deterministic fault in that pass: re-running the same argv
+over the same source only re-proves what the stderr already says, at the price
+of a second full parse of a unit large enough to be worth splitting — three
+minutes and twenty-two seconds of one measured run — so the unit is subdivided
+on first sight of it. Every other engine crash — a signal death, a step that
+left no graph, an exit that named no pass — may be the machine rather than the
+source and keeps the one confirmation of Subdivision step 2. An export crash is
+always confirmed, whatever it named: the first-sight rule is the parse's, and
+re-exporting a graph that is already on disk costs an export rather than a
+parse. A timeout is never re-run.
 
 Every failure carries `observed_peak_bytes`: the peak of the summed resident
 memory over the whole analyzer tree, sampled every 250 ms while it ran. It is
@@ -373,17 +387,22 @@ Subdivision is the last-resort recovery from a **reproducible** engine crash,
 in the parse or in the export, and is never used for memory.
 
 1. The full frontend-native unit always runs first.
-2. On a crash the same unit is rerun once with the frontend's fixed
+2. A parse crash that named both its failing pass and its exception class is
+   not rerun at all: the child's own diagnostics identify the defect, so the
+   unit goes straight to step 3 on first sight of it. On any other crash the
+   same unit is rerun once with the frontend's fixed
    semantics-neutral option allowlist. That list is **empty for all six
    frontends today**: every option this release offers changes results, so
    nothing can be added without changing what a success would mean. The rerun
    is therefore the same argv over the same source, and since the engine is not
    run-to-run deterministic it yields a *second observation of the same failure
    class*: that raises the odds the crash is deterministic rather than
-   transient without proving it. A crash seen once is never split on.
+   transient without proving it. A crash that said nothing about which pass
+   died is never split on after a single observation.
 
    An **export** that dies on the engine's own exception is confirmed the same
-   way, by exporting the graph already on disk a second time; this step has no
+   way — including one that named its failing pass, because the confirmation
+   costs an export of a graph already on disk rather than a second parse — by exporting the graph already on disk a second time; this step has no
    neutral option to offer, so the confirmation is the same argv again. A
    project whose parse succeeds at every heap cap and whose whole-unit export
    dies at every one of them, while each of its subdivided parts exports
@@ -406,7 +425,17 @@ in the parse or in the export, and is never used for memory.
    it can be seen instead of being absorbed into a silently truncated one.
 4. Every capability the subdivided unit publishes is `partial`, carrying the
    failed unit id under `subdivided` and the backend failure under
-   `backend_failure` (`<pass>/<exception>`) in its `details`. Control and
+   `backend_failure` in its `details`. That value is the failing pass and its
+   exception class — `<pass>/<exception>`, or whichever of the two the crash
+   named — followed in parentheses by how the provider established that the
+   crash reproduces: `named pass and exception, taken on first sight` for a
+   parse crash that identified itself, `failure class observed twice` for
+   everything else, including every export crash. A crash that named neither
+   publishes the decision alone. The decision travels inside this one value
+   rather than under a key of its own because a subdivided row already fills
+   most of the bounded detail map a provider may contribute, and a key dropped
+   at the budget would tell an operator nothing exactly when the row is
+   busiest. Control and
    data dependence survive splitting almost intact; engine `calls` keep under
    half of their resolved targets, so consumers that need calls should use the
    syntax-plus-SCIP path, which never depended on the engine.

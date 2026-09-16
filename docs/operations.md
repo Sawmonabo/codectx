@@ -106,6 +106,60 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_CURSOR_INVALID` | A continuation token or a source receipt was malformed, tampered with, or older than `storage.query_cursor_ttl`. | Re-run the query from the first page. |
 | `CTX_INTERNAL` | A composition or producer defect. | Report it with the command you ran. It is not an operator-fixable state. |
 
+## When a capability is not `fresh`
+
+`status` publishes one row per provider capability, and a row that is not
+`fresh` says in machine-readable `details` why. Read the state first:
+
+| State | What it means |
+|---|---|
+| `fresh` | This generation holds the capability's facts and nothing degraded it. |
+| `partial` | Some scope of this capability published facts into this generation and at least one other did not. The facts that are there are complete for the scopes that sealed. |
+| `failed` | The capability was attempted and no scope of it published facts into this generation. It is never reported `unavailable`: that would leave the generation healthy over a provider that answers nothing. |
+| `unavailable` | Nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload, the provider is disabled), or its units are still deferred to background work. |
+
+A `partial` or `failed` row carries the shape of the failure, not just its
+code:
+
+- `units_planned` — how many units the plan gave this provider behind this
+  row. It is what makes the next figure readable: "two failed" is a different
+  report depending on whether two or two hundred were tried.
+- `units_failed` — how many of them failed.
+- `failed_scopes` — the scope keys that failed, **at most eight**, the
+  lexicographically first ones rather than the first to arrive, so two
+  identical runs publish an identical row. When more than eight failed, this
+  list is a sample and `details_truncated` names `failed_scopes` to say so;
+  `units_failed` is still the full count.
+- `scope_key` — the one exemplar scope whose reason the row's
+  `diagnostic_code` and `failure_message` belong to, which is the first of
+  `failed_scopes`.
+- `failure_message` — that scope's safe message, so the row says what happened
+  and not only which family it belongs to. The provider's own bounded
+  particulars travel beside it — which profile, which tool, which project,
+  what the run was declared under.
+- `subdivided`, on a dependence capability, names a unit that crashed and was
+  recovered by splitting; `backend_failure` beside it says what the crash was
+  and how it was established to reproduce ([dependence](providers-dependence.md)).
+
+Raw analyzer output is never in a capability row and never in an ordinary log
+line. What an operator can read is, in order of how long it lasts:
+
+1. The warning logged when the unit failed: the provider, the scope key, the
+   generation, the diagnostic code, the message and the particulars — all of
+   it except the tool's standard error.
+2. The capability row above, for as long as the generation is active.
+3. The failed provider run row in the workspace database, which keeps the
+   whole typed reason including the bounded tail of what the tool wrote to its
+   standard error, for exactly as long as the generation that failed is
+   retained. **No command in this build prints that row**: the log line and the
+   capability row are what you read a failure from.
+
+A provider may contribute only a bounded number of details to one row. The
+figures above take several of those slots, so a busy row can now carry
+`details_omitted` — a count of the provider particulars that did not fit —
+where the same row previously carried them all. The count is published rather
+than the drop being silent.
+
 ## Retention, collection and the grace window
 
 Nothing is deleted implicitly by a query. Reclamation happens in one **collection
