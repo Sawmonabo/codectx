@@ -248,37 +248,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 					if !follow {
 						return snapshot()
 					}
-					// Section 18.2 allows one envelope per answer, and every
-					// pass here is a whole answer: a --json follow emits one
-					// complete envelope per interval, each independently
-					// parseable, which is what a script tails. A delta would
-					// hand that script a partial snapshot.
-					//
-					// The first report goes out before the first wait, because
-					// a live view that showed nothing for its first interval
-					// would be indistinguishable from one that had failed to
-					// start.
-					ticker := time.NewTicker(statusFollowInterval)
-					defer ticker.Stop()
-					for {
-						if err := snapshot(); err != nil {
-							// Unlike `watch`, which reports its cancellation
-							// as the typed end of a session that owed a final
-							// envelope, a follow has already delivered every
-							// snapshot whole and owes nothing further: the
-							// operator stopping it is how it ends, not a way
-							// it failed.
-							if isCanceled(err) {
-								return nil
-							}
-							return err
-						}
-						select {
-						case <-ctx.Done():
-							return nil
-						case <-ticker.C:
-						}
-					}
+					return followStatus(ctx, statusFollowInterval, snapshot)
 				})
 		},
 	}
@@ -288,6 +258,39 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().Bool(statusFollowFlag, false,
 		"re-report every second until interrupted; with --json one complete envelope per second, and with --resources the host is measured again each time")
 	return cmd
+}
+
+// followStatus re-reports every interval until the operator stops it.
+//
+// Section 18.2 allows one envelope per answer, and every pass here is a whole
+// answer: a --json follow emits one complete envelope per interval, each
+// independently parseable, which is what a script tails. A delta would hand
+// that script a partial snapshot to reassemble.
+//
+// The first report goes out before the first wait, because a live view that
+// showed nothing for its first interval would be indistinguishable from one
+// that had failed to start.
+//
+// Unlike `watch`, which reports its cancellation as the typed end of a session
+// that still owed a final envelope, a follow has already delivered every
+// snapshot whole and owes nothing further: the operator stopping it is how it
+// ends, not a way it failed.
+func followStatus(ctx context.Context, interval time.Duration, snapshot func() error) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := snapshot(); err != nil {
+			if isCanceled(err) {
+				return nil
+			}
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // writeStatus reads one status and renders it, which is one whole answer: the
