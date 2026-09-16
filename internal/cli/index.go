@@ -33,7 +33,20 @@ const (
 	// coordinator already knows, and every `status` paying for it would make
 	// the cheapest report in the tree one of the most expensive.
 	statusResourcesFlag = "resources"
+	// statusFollowFlag turns one status report into a live one. It reads and
+	// writes nothing but its own output, so it costs a run that is going
+	// nothing at all.
+	statusFollowFlag = "follow"
 )
+
+// statusFollowInterval is how often --follow re-renders. One second is the
+// rate a person reading a terminal can actually take in and the rate a script
+// tailing the output can keep up with, and a stage worth watching lasts
+// seconds. It is a constant and not a setting because a report that re-read
+// faster would measure the host more often than the host changes, and one that
+// re-read slower would stop being live -- neither is a choice an operator
+// gains anything by making.
+const statusFollowInterval = time.Second
 
 // indexLockWait is the bounded wait a building command makes for the
 // cross-process workspace lock. Section 13.2 offers a second caller exactly
@@ -204,12 +217,20 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			"reported as running with the time it has been going rather than as a finished wall. " +
 			"It is not reported by default because measuring it costs more than the rest of " +
 			"this report put together. A metric this host cannot measure is reported as " +
-			"unavailable, never as zero.",
+			"unavailable, never as zero.\n\n" +
+			"--follow reports again every second until it is interrupted, which is the live " +
+			"view from a second terminal while a run is going; with --json it emits one " +
+			"complete envelope per second, each a whole snapshot rather than a change since " +
+			"the last, and with --resources the host is measured again on every one.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resources, err := boolFlag(cmd, statusResourcesFlag)
+			if err != nil {
+				return err
+			}
+			follow, err := boolFlag(cmd, statusFollowFlag)
 			if err != nil {
 				return err
 			}
@@ -222,39 +243,82 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return runService(cmd, openForReport(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
-					// A provider that could not be constructed publishes no
-					// detection row of its own. Those rows are folded in by the
-					// coordinator, before the capability report's own bound is
-					// applied: appending them here pushed Completeness past
-					// model.MaxCapabilityStates, a list IndexStatus.Validate
-					// then rejects.
-					status, err := svc.IndexStatus(ctx, req)
-					if err != nil {
-						return err
+					snapshot := func() error { return writeStatus(ctx, cmd, build, args, ws, svc, req) }
+					if !follow {
+						return snapshot()
 					}
-					// The rows are read from the store, and the whole report
-					// path was composed with fetching refused, so nothing here
-					// can install the tool it is reporting on -- a report that
-					// installed what it reports could only ever say the tool is
-					// installed (ledger 159). The toolchain is not a service
-					// operation, so this row keeps ws.Resolver()/ws.ToolStore().
-					data := statusReport{Index: status,
-						Tools: report(ws.ToolStore(), ws.Resolver().Status(ctx), nil)}
-					out := cmd.OutOrStdout()
-					if jsonRequested(cmd, args) {
-						return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
+					// Section 18.2 allows one envelope per answer, and every
+					// pass here is a whole answer: a --json follow emits one
+					// complete envelope per interval, each independently
+					// parseable, which is what a script tails. A delta would
+					// hand that script a partial snapshot.
+					//
+					// The first report goes out before the first wait, because
+					// a live view that showed nothing for its first interval
+					// would be indistinguishable from one that had failed to
+					// start.
+					ticker := time.NewTicker(statusFollowInterval)
+					defer ticker.Stop()
+					for {
+						if err := snapshot(); err != nil {
+							// Unlike `watch`, which reports its cancellation
+							// as the typed end of a session that owed a final
+							// envelope, a follow has already delivered every
+							// snapshot whole and owes nothing further: the
+							// operator stopping it is how it ends, not a way
+							// it failed.
+							if isCanceled(err) {
+								return nil
+							}
+							return err
+						}
+						select {
+						case <-ctx.Done():
+							return nil
+						case <-ticker.C:
+						}
 					}
-					if err := writeIndexStatus(out, data.Index); err != nil {
-						return err
-					}
-					return writeToolTable(out, data.Tools, false)
 				})
 		},
 	}
 	addRepoFlag(cmd)
 	cmd.Flags().Bool(statusResourcesFlag, false,
 		"also report the Section 23 resource accounting block, which an ordinary status does not measure")
+	cmd.Flags().Bool(statusFollowFlag, false,
+		"re-report every second until interrupted; with --json one complete envelope per second, and with --resources the host is measured again each time")
 	return cmd
+}
+
+// writeStatus reads one status and renders it, which is one whole answer: the
+// report a plain `status` emits and one pass of a --follow. It is a function
+// rather than a closure over the command because both callers need exactly the
+// same bytes -- a live view whose rows differed from the one-shot report would
+// be a second surface of the same model.
+func writeStatus(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, args []string,
+	ws *app.Workspace, svc *app.Services, req model.StatusRequest) error {
+	// A provider that could not be constructed publishes no detection row of
+	// its own. Those rows are folded in by the coordinator, before the
+	// capability report's own bound is applied: appending them here pushed
+	// Completeness past model.MaxCapabilityStates, a list
+	// IndexStatus.Validate then rejects.
+	status, err := svc.IndexStatus(ctx, req)
+	if err != nil {
+		return err
+	}
+	// The rows are read from the store, and the whole report path was composed
+	// with fetching refused, so nothing here can install the tool it is
+	// reporting on -- a report that installed what it reports could only ever
+	// say the tool is installed (ledger 159). The toolchain is not a service
+	// operation, so this row keeps ws.Resolver()/ws.ToolStore().
+	data := statusReport{Index: status, Tools: report(ws.ToolStore(), ws.Resolver().Status(ctx), nil)}
+	out := cmd.OutOrStdout()
+	if jsonRequested(cmd, args) {
+		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
+	}
+	if err := writeIndexStatus(out, data.Index); err != nil {
+		return err
+	}
+	return writeToolTable(out, data.Tools, false)
 }
 
 // newWatchCommand builds `codectx watch`.
