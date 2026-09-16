@@ -568,9 +568,10 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 // recorded while an index runs -- and its stages printed into this command's
 // output would be read as this command's work.
 //
-// The run's id is looked up per row and never captured once: a subscription is
-// made before the run exists, so an id read at subscribe time is not there yet
-// and a filter holding it would drop every line of the run it is following.
+// The run's id is looked up per row and never captured once. A subscription is
+// made before the run exists, so an id read at subscribe time is not there yet;
+// and the run in progress can be replaced when an attempt re-captures. Either
+// way a filter holding an id drops every line of the run it is following.
 func progressiveStages(cmd *cobra.Command, args []string, ws stageSource) (stop func()) {
 	machine := jsonRequested(cmd, args)
 	// A --json consumer's stdout carries the one envelope and nothing else, so
@@ -585,18 +586,15 @@ func progressiveStages(cmd *cobra.Command, args []string, ws stageSource) (stop 
 	// result below on the same writer.
 	var mu sync.Mutex
 	var done bool
-	// Latched under the same mutex the rows are rendered under, and only once
-	// the run exists: an absent id is not remembered as an answer.
-	var runID string
+	// Asked per row rather than remembered. One index call can open more than
+	// one run: a version conflict makes the coordinator re-capture, and the
+	// second attempt opens a run of its own. An id held from the first attempt
+	// would suppress every stage of the attempt that actually published --
+	// the same silence this filter exists to prevent, arriving from the other
+	// side.
 	following := func(id string) bool {
-		if runID == "" {
-			current, ok := ws.IndexRunID()
-			if !ok || current == "" {
-				return false
-			}
-			runID = current
-		}
-		return id == runID
+		current, ok := ws.IndexRunID()
+		return ok && current != "" && id == current
 	}
 	ws.Spans(func(row model.StageRecord) {
 		mu.Lock()
