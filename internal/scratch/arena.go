@@ -287,10 +287,42 @@ func (l *Lease) Discard() {
 	delete(a.held, l.path)
 }
 
+// Unusable ends the lease of a surface the tenant found it cannot use: a
+// database whose rollback did not finish, a slot whose schema could not be
+// emptied. The surface leaves the pool AND the disk, because what makes it
+// unusable is its contents and handing it to the next taker would fail the
+// same way -- every time, for the life of the data directory, and again after
+// a restart once the sweep re-found it.
+//
+// It is not Release with a removal bolted on: releasing is what a tenant that
+// is merely finished does, and the difference between the two is the
+// difference between a pool and a trap.
+func (l *Lease) Unusable() {
+	path := l.path
+	a := l.close()
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	delete(a.held, path)
+	a.mu.Unlock()
+	_ = paced.Remove(path)
+}
+
 // Take hands out a surface of the given purpose: one the arena already holds
 // and nobody is using, or a new one when the pool is empty. The surface is an
 // existing file, never truncated, whose bytes past this tenant's writes are
 // the previous tenant's.
+//
+// The surface is OPENED here, and a surface that cannot be opened never
+// leaves the pool: it is removed from the disk and the next one is tried. A
+// pool is a last-in-first-out stack, so one surface that had become
+// unopenable -- left at a mode the process cannot write, on a filesystem that
+// went read-only -- would otherwise be handed to every taker of its purpose
+// for the life of the data directory, and re-found by the sweep after a
+// restart, with no way back but removing the directory by hand. Removing it
+// here is what makes that impossible: there is no name left for the sweep to
+// re-pool.
 func (a *Arena) Take(p Purpose) (*Lease, error) {
 	instance, err := a.claim()
 	if err != nil {
@@ -301,18 +333,23 @@ func (a *Arena) Take(p Purpose) (*Lease, error) {
 	if err := a.sweepLocked(instance, p); err != nil {
 		return nil, err
 	}
-	if n := len(a.free[p]); n > 0 {
+	for n := len(a.free[p]); n > 0; n = len(a.free[p]) {
 		path := a.free[p][n-1]
 		a.free[p] = a.free[p][:n-1]
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			_ = paced.Remove(path)
+			continue
+		}
 		a.held[path] = true
-		return &Lease{arena: a, path: path, purpose: p}, nil
+		return &Lease{arena: a, path: path, purpose: p, file: f}, nil
 	}
-	path, err := a.createLocked(instance, p)
+	path, f, err := a.createLocked(instance, p)
 	if err != nil {
 		return nil, err
 	}
 	a.held[path] = true
-	return &Lease{arena: a, path: path, purpose: p}, nil
+	return &Lease{arena: a, path: path, purpose: p, file: f}, nil
 }
 
 // TakeFile is Take followed by File: the common case of a byte file taken to
@@ -407,11 +444,12 @@ func (a *Arena) sweepLocked(instance string, p Purpose) error {
 	return nil
 }
 
-// createLocked makes one new surface of a purpose.
-func (a *Arena) createLocked(instance string, p Purpose) (string, error) {
+// createLocked makes one new surface of a purpose and hands back the open
+// file, so that a taker holds an open surface whether it was pooled or new.
+func (a *Arena) createLocked(instance string, p Purpose) (string, *os.File, error) {
 	dir := filepath.Join(instance, string(p))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	for {
 		n := a.next[p]
@@ -422,12 +460,9 @@ func (a *Arena) createLocked(instance string, p Purpose) (string, error) {
 			if errors.Is(err, fs.ErrExist) {
 				continue
 			}
-			return "", err
+			return "", nil, err
 		}
-		if err := f.Close(); err != nil {
-			return "", err
-		}
-		return path, nil
+		return path, f, nil
 	}
 }
 

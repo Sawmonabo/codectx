@@ -286,7 +286,10 @@ func (b *Batch) flush(ctx context.Context) error {
 		// group. A Close after a successful Close fails harmlessly.
 		//
 		// A surface that was NOT published still holds only this batch's own
-		// bytes, so it goes back to the pool and frees nothing. A surface that
+		// bytes, so it goes back to the pool and frees nothing -- at the mode
+		// the pool hands out, because a blob is set read-only BEFORE it is
+		// published and a surface left at that mode could never be opened for
+		// writing again. A surface that
 		// WAS published is a second name for the object now in the bucket: its
 		// blocks belong to the store from here on, so the pool gives up the
 		// slot and only the temporary's directory entry goes. That unlink must
@@ -295,6 +298,10 @@ func (b *Batch) flush(ctx context.Context) error {
 		for i := range group {
 			group[i].f.Close()
 			if !published[i] {
+				if err := os.Chmod(group[i].lease.Path(), 0o600); err != nil {
+					group[i].lease.Unusable()
+					continue
+				}
 				group[i].lease.Release()
 				continue
 			}
