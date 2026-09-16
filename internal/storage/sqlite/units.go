@@ -210,6 +210,12 @@ type UnitWriter struct {
 	ids   interner
 	nodes *refCache
 
+	// lex is the unit's lexical staging database, opened by the first
+	// PutSearchUnits batch and folded into the unit's segment at seal. It is
+	// deleted at seal, at Abandon and at Fail, so no staging outlives the
+	// building unit that owns it.
+	lex *lexicalStage
+
 	// stmts holds the prepared statements of the write transaction currently
 	// running, so the dozen SQL texts the per-row helpers issue are parsed
 	// once per transaction instead of once per row (stmtcache.go). It is
@@ -709,10 +715,24 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err := w.s.checkBatch(len(docs), bytes); err != nil {
 		return err
 	}
-	tokenCounts, err := w.s.countTokens(ctx, docs)
+	if w.lex == nil {
+		stage, err := w.s.openLexicalStage(ctx, w.rowID)
+		if err != nil {
+			return err
+		}
+		w.lex = stage
+	}
+	batch := w.lex.nextBatch()
+	// One tokenizer pass serves both the token counts and the unit's lexical
+	// staging. The staged rows carry the batch-local document number; the
+	// ingestion below resolves it to the document rowid it assigns.
+	tokenCounts, err := w.s.countTokens(ctx, docs, func(doc int64, term, col string, n int64) error {
+		return w.lex.putTerm(ctx, batch, doc, term, col, n)
+	})
 	if err != nil {
 		return err
 	}
+	docIDs := make([]int64, len(docs))
 	var inserted int64
 	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(tx, func() error {
@@ -756,6 +776,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i], docID); err != nil {
 					return err
 				}
+				docIDs[i] = docID
 				inserted++
 			}
 			return nil
@@ -763,6 +784,15 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	})
 	if err != nil {
 		return err
+	}
+	// The document rowids are staged only now, after the ingestion returned:
+	// a batch whose transaction failed leaves no mapping, and the seal's join
+	// drops its staged terms rather than folding a document that does not
+	// exist.
+	for i := range docs {
+		if err := w.lex.putDoc(ctx, batch, int64(i+1), docIDs[i]); err != nil {
+			return err
+		}
 	}
 	w.searchDocs += inserted
 	return nil
@@ -1094,6 +1124,9 @@ func (w *UnitWriter) Abandon(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
+	if err := w.closeStage(); err != nil {
+		return err
+	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
 			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
@@ -1108,6 +1141,9 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
+	if err := w.closeStage(); err != nil {
+		return err
+	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		var state model.UnitState
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE id = ?`, w.rowID).Scan(&state)
@@ -1122,6 +1158,18 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		}
 		return w.s.deleteUnit(ctx, tx, w.rowID)
 	})
+}
+
+// closeStage releases the unit's lexical staging and deletes its file. Every
+// path that ends a building unit -- seal, Abandon, Fail -- calls it, so a
+// staging database never outlives the unit it belongs to.
+func (w *UnitWriter) closeStage() error {
+	if w.lex == nil {
+		return nil
+	}
+	stage := w.lex
+	w.lex = nil
+	return stage.close()
 }
 
 // closureCTE selects the unit row and every transitive dependency.
@@ -1185,10 +1233,21 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
+		// The unit's lexical segment is folded in the seal's own transaction,
+		// so a unit becomes sealed and gains the segment its documents live in
+		// together or neither. A unit that published no document folds none.
+		if w.lex != nil {
+			if _, err := foldUnitSegment(ctx, tx, w.rowID, w.lex); err != nil {
+				return err
+			}
+		}
 		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey, false, Carry{})
 	})
 	if err == nil {
 		w.done = true
+		if closeErr := w.closeStage(); closeErr != nil {
+			return closeErr
+		}
 		if w.evidenceClipped != 0 {
 			// One bounded line per sealed unit, and only when the bound
 			// actually truncated something: the clip is legitimate but it

@@ -72,8 +72,12 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("retention_leases", err)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id)
-		return wrap("generations", err)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id); err != nil {
+			return wrap("generations", err)
+		}
+		// The generation's generation_segments rows have just cascaded away, so
+		// the segments only it named are collectable in this same transaction.
+		return collectUnreferencedSegments(ctx, tx)
 	})
 	if err != nil {
 		return err
@@ -100,6 +104,9 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 		return err
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := collectUnreferencedSegments(ctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
 			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
 			return wrap("provider_runs", err)
@@ -305,12 +312,31 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 				}
 			}
 			deleted = len(ids)
-			return nil
+			// The deleted units' segment_units rows cascaded away with them, so
+			// the segments nothing owns or names go in the same transaction.
+			return collectUnreferencedSegments(ctx, tx)
 		})
 		if err != nil || deleted == 0 {
 			return err
 		}
 	}
+}
+
+// collectUnreferencedSegments deletes every lexical segment no retained
+// generation names and no live unit owns. A segment survives its unit only
+// while a generation still reads it, and survives its generation only while a
+// unit could still be attached to a new one, so the two tests together are
+// what makes a segment collectable. Its parts and its segment_units rows
+// cascade with it.
+//
+// It runs in the caller's transaction: a generation or a unit that goes away
+// and the segments that go away with it are one atomic change, so no reader
+// can pin a generation whose segments have already been reclaimed.
+func collectUnreferencedSegments(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM lexical_segments
+		WHERE NOT EXISTS (SELECT 1 FROM generation_segments gs WHERE gs.segment_id = lexical_segments.id)
+		AND NOT EXISTS (SELECT 1 FROM segment_units su WHERE su.segment_id = lexical_segments.id)`)
+	return wrap("lexical_segments", err)
 }
 
 // deleteUnit is the one unit deletion procedure (Section 12.4). It deletes the
