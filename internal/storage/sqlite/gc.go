@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -285,9 +286,19 @@ func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
 // transaction per batch, until the query returns nothing.
+//
+// It is also where a crashed build's lexical staging file goes. A unit that
+// died between its first documents and its seal left a staging database under
+// the data directory that nothing else will ever read; the directory is NOT
+// swept blindly, because several processes may share one data directory and a
+// live build's staging looks exactly like a dead one's. Here the unit is
+// already known dead -- its rows are being deleted -- so its file is named
+// exactly, and it is removed after the transaction commits: a rolled-back batch
+// leaves the unit and its staging both intact.
 func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
 	for {
 		var deleted int
+		var gone []int64
 		err := s.write(ctx, func(tx *sql.Tx) error {
 			rows, err := tx.QueryContext(ctx, query, arg, gcBatchUnits)
 			if err != nil {
@@ -311,13 +322,21 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 					return err
 				}
 			}
-			deleted = len(ids)
+			deleted, gone = len(ids), ids
 			// The deleted units' segment_units rows cascaded away with them, so
 			// the segments nothing owns or names go in the same transaction.
 			return collectUnreferencedSegments(ctx, tx)
 		})
-		if err != nil || deleted == 0 {
+		if err != nil {
 			return err
+		}
+		for _, id := range gone {
+			if rmErr := os.Remove(s.stagePath(id)); rmErr != nil && !os.IsNotExist(rmErr) {
+				return internal("lexical staging: " + rmErr.Error())
+			}
+		}
+		if deleted == 0 {
+			return nil
 		}
 	}
 }

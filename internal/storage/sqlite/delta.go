@@ -415,9 +415,9 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 // carried document's lexical hits, BM25 length and snippets.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
 	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
-		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
+		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id, segment_id)
 		SELECT ?3, su.search_key, su.node_id, su.file_id, su.path, su.kind,
-			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id
+			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id, su.segment_id
 		FROM search_units su WHERE su.unit_id = ?1
 			AND su.file_id NOT IN (SELECT file_id FROM cx_carry_files)
 			AND (su.node_id IS NULL OR EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = su.node_id))
@@ -433,17 +433,18 @@ func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow in
 	if n == 0 {
 		return nil
 	}
-	// The carried documents keep their doc_id, so they are already packed --
-	// in the segments the predecessor unit's own seal folded. Recording this
-	// unit as an owner of those segments is what tells an activation that its
-	// member's documents are already held and no new segment is needed for
-	// them. The segments are shared, not copied: nothing is rewritten to carry
-	// a document forward. A document of the predecessor that was NOT carried
-	// stays in the segment and is hidden by the generation's visible-document
-	// bitmap instead.
+	// The carried documents keep their doc_id and the segment it was folded
+	// into, so they are already packed and nothing is rewritten to carry one
+	// forward. Ownership is read back off the rows that were just written, not
+	// off the predecessor's own ownership: a unit owns EXACTLY the segments
+	// that hold at least one of its documents, so a segment whose documents a
+	// carry chain has all dropped stops being owned and becomes collectable.
+	// The unit's own re-emitted documents are not named here -- their segment
+	// is NULL until the seal folds them.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO segment_units(segment_id, unit_id)
-		SELECT p.segment_id, ?2 FROM segment_units p WHERE p.unit_id = ?1
-		ON CONFLICT(segment_id, unit_id) DO NOTHING`, prevRow, w.rowID); err != nil {
+		SELECT DISTINCT su.segment_id, ?1 FROM search_units su
+		WHERE su.unit_id = ?1 AND su.segment_id IS NOT NULL
+		ON CONFLICT(segment_id, unit_id) DO NOTHING`, w.rowID); err != nil {
 		return wrap("segment_units", err)
 	}
 	return nil

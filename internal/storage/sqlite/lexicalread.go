@@ -26,7 +26,11 @@ import (
 type segmentRef struct {
 	id        int64
 	termCount int64
-	docCount  int64
+	// hidden is how many of the segment's documents this generation does not
+	// carry. Zero -- the common case, and the only case for a segment the
+	// generation's own units folded -- is what lets a document frequency
+	// answer from the term directory instead of walking the posting list.
+	hidden int64
 }
 
 // lexicalMeta is the pinned generation's lexical shape, resolved once per
@@ -37,17 +41,10 @@ type lexicalMeta struct {
 	docCount   int64
 	tokenTotal int64
 	segments   []segmentRef
-	// visible is the generation's visible documents. A document an inherited
-	// segment still holds but whose unit left the generation is hidden here;
-	// nothing is rewritten to hide it.
+	// visible is the generation's visible documents, as activation stored it.
+	// A document an inherited segment still holds but whose unit left the
+	// generation is hidden here; nothing is rewritten to hide it.
 	visible *docBitmap
-	// complete says the generation hides no document of any of its segments,
-	// which is the case whenever no unit has left since the segments were
-	// folded. Documents lie in exactly one segment, so the segments' document
-	// counts sum to the generation's own only when none is hidden -- and then
-	// a document frequency is the directory entry, with no posting list read
-	// at all.
-	complete bool
 }
 
 // lexicalIndex is one call's bounded view of that shape: the shared metadata
@@ -73,7 +70,7 @@ type partSlot struct {
 // deliberately no ORDER BY: generation_segments is a WITHOUT ROWID table keyed
 // by (generation_id, ord), so a scan of its primary key already delivers the
 // generation's segments in read order.
-const generationLexicalQuery = `SELECT gs.segment_id, s.term_count, s.doc_count
+const generationLexicalQuery = `SELECT gs.segment_id, s.term_count, gs.hidden
 	FROM generation_segments gs JOIN lexical_segments s ON s.id = gs.segment_id
 	WHERE gs.generation_id = ?1`
 
@@ -89,36 +86,29 @@ func (r *PinnedReader) lexical(ctx context.Context) (*lexicalMeta, error) {
 	}
 	m := &lexicalMeta{}
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT doc_count, token_total
-			FROM generation_lexical WHERE generation_id = ?`, r.gen).Scan(&m.docCount, &m.tokenTotal)
+		var bits []byte
+		err := tx.QueryRowContext(ctx, `SELECT doc_count, token_total, visible
+			FROM generation_lexical WHERE generation_id = ?`, r.gen).Scan(&m.docCount, &m.tokenTotal, &bits)
 		if isNoRows(err) {
 			return corrupt("generation %d has no packed term statistics; it was published without them", r.gen)
 		}
 		if err != nil {
 			return wrap("generation_lexical", err)
 		}
+		m.visible = &docBitmap{bits: bits, max: int64(len(bits))*8 - 1}
 		rows, err := tx.QueryContext(ctx, generationLexicalQuery, r.gen)
 		if err != nil {
 			return wrap("generation_segments", err)
 		}
 		defer rows.Close()
-		var held int64
 		for rows.Next() {
 			var s segmentRef
-			if err := rows.Scan(&s.id, &s.termCount, &s.docCount); err != nil {
+			if err := rows.Scan(&s.id, &s.termCount, &s.hidden); err != nil {
 				return wrap("generation_segments", err)
 			}
-			held += s.docCount
 			m.segments = append(m.segments, s)
 		}
-		if err := rows.Err(); err != nil {
-			return wrap("generation_segments", err)
-		}
-		if m.visible, _, _, err = visibleDocuments(ctx, tx, r.gen); err != nil {
-			return err
-		}
-		m.complete = held == m.docCount
-		return nil
+		return wrap("generation_segments", rows.Err())
 	})
 	if err != nil {
 		return nil, err
@@ -303,7 +293,7 @@ func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([
 			if !ok {
 				continue
 			}
-			if x.complete {
+			if seg.hidden == 0 {
 				out[i] += e.df
 				continue
 			}

@@ -1469,7 +1469,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		// The packed term statistics follow the adjacency, under the same rule
 		// and in the same transaction (ADR-0007 Decision 1): a generation is
 		// never published without the structure every lexical query reads.
-		if err := buildLexical(ctx, tx, g.id); err != nil {
+		if err := buildLexical(ctx, tx, g.id, current); err != nil {
 			return err
 		}
 

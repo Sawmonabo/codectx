@@ -333,6 +333,14 @@ CREATE TABLE search_units (
     -- there. The posting is released like node_ids: deleteUnit removes it only
     -- when no other unit's row still names it.
     doc_id INTEGER NOT NULL CHECK(doc_id > 0),
+    -- The lexical segment this document's postings were folded into, or NULL
+    -- while the unit is still building. It is the DOCUMENT's segment, not the
+    -- row's: a carry-over copies it forward with doc_id, which is what makes a
+    -- carried unit own exactly the segments that hold at least one of its
+    -- carried documents rather than every segment its predecessor ever owned.
+    -- The reference is NO ACTION: a segment a document still names must not be
+    -- collectable.
+    segment_id INTEGER REFERENCES lexical_segments(id),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
@@ -727,7 +735,13 @@ CREATE TABLE generation_graph_parts (
 CREATE TABLE generation_lexical (
     generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
     doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    token_total INTEGER NOT NULL CHECK(token_total >= 0)
+    token_total INTEGER NOT NULL CHECK(token_total >= 0),
+    -- The generation's visible documents, one bit per document rowid. A
+    -- document an inherited segment still holds but whose unit left the
+    -- generation is hidden here; nothing is rewritten to hide it, and a reader
+    -- takes the bitmap as it stands instead of scanning the generation's
+    -- documents to rebuild it.
+    visible BLOB NOT NULL
 );
 
 -- A lexical segment is an immutable packed structure over a set of documents:
@@ -779,6 +793,11 @@ CREATE TABLE generation_segments (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,
     ord INTEGER NOT NULL CHECK(ord >= 0),
+    -- How many of the segment's documents this generation hides. Zero is the
+    -- common case and is what lets a document frequency answer from the term
+    -- directory; a segment with hidden documents is counted by walking the
+    -- term's posting list against the visible bitmap instead.
+    hidden INTEGER NOT NULL CHECK(hidden >= 0),
     PRIMARY KEY(generation_id, ord)
 ) WITHOUT ROWID;
 CREATE INDEX idx_generation_segments_segment ON generation_segments(segment_id, generation_id);
