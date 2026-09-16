@@ -484,8 +484,11 @@ func (s *scratch) order(ctx context.Context) error {
 //     are never published;
 //   - a graph node anchors to the entity it stands for: an entity to itself, a
 //     non-operator call site to the method it invokes, and an identifier to
-//     the declaration its REF edge names. Nothing else anchors, so no fact is
-//     attributed to a node the export did not bind;
+//     the declaration its REF edge names. A method reference is the one node
+//     whose REF edge names a method rather than a declaration -- it is the
+//     method taken as a value -- so it anchors to that method, and every fact
+//     derived through it names the method the value carries. Nothing else
+//     anchors, so no fact is attributed to a node the export did not bind;
 //   - calls: a call site's containing method calls the site's target;
 //   - control dependence: on a CDG edge, the dependent node's entity
 //     control_depends_on the controlling node's entity, evidenced at the
@@ -552,8 +555,9 @@ func (s *scratch) project(ctx context.Context) error {
 				JOIN edges e ON e.label = '` + edgeCall + `' AND e.src = c.id JOIN ents t ON t.id = e.dst
 				WHERE c.label = '` + labelCall + `' AND c.method_full_name NOT LIKE '<operator>.%' GROUP BY c.id
 			UNION ALL SELECT i.id, MIN(e.dst) FROM nodes i
-				JOIN edges e ON e.label = '` + edgeRef + `' AND e.src = i.id JOIN ents d ON d.id = e.dst AND d.kind = '` + kindDecl + `'
-				WHERE i.label IN ('` + labelIdent + `', '` + labelFieldIdMe + `', '` + labelMethodRef + `') GROUP BY i.id
+				JOIN edges e ON e.label = '` + edgeRef + `' AND e.src = i.id JOIN ents d ON d.id = e.dst
+				WHERE (i.label IN ('` + labelIdent + `', '` + labelFieldIdMe + `') AND d.kind = '` + kindDecl + `')
+					OR (i.label = '` + labelMethodRef + `' AND d.kind IN ('` + kindDecl + `', '` + kindMethod + `')) GROUP BY i.id
 			ORDER BY 1`},
 		// The field-access map, built in one pass instead of one join per
 		// write site. A type with two members of the same name takes the

@@ -36,6 +36,35 @@ type counts struct {
 	// test can read what actually reached the sink rather than what the
 	// export held.
 	sig map[string]string
+	// id is the identity each published node resolved to, by node name, and
+	// meta the metadata it carried.
+	id   map[string]model.NodeID
+	meta map[string]string
+	// edges are the published edges themselves, so a test can ask which
+	// entities one names rather than only how many were published.
+	edges []model.Relation
+}
+
+func newCounts() counts {
+	return counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
+		sig: map[string]string{}, id: map[string]model.NodeID{}, meta: map[string]string{}}
+}
+
+// has reports whether the edge from -> to of kind k was published, naming its
+// endpoints by the node names they were published under.
+func (c counts) has(kind model.RelationKind, from, to string) bool {
+	src, okFrom := c.id[from]
+	dst, okTo := c.id[to]
+	if !okFrom || !okTo {
+		return false
+	}
+	for _, e := range c.edges {
+		if e.Kind == kind && e.From == src && e.To == dst {
+			return true
+		}
+	}
+	return false
 }
 
 // edgeID names one published edge independently of the run that published it.
@@ -59,6 +88,8 @@ func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys []
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
 		r.c.sig[n.Node.Name] = n.Node.Signature
+		r.c.id[n.Node.Name] = n.Node.ID
+		r.c.meta[n.Node.Name] = string(n.Node.Metadata)
 	}
 	if d, ok := r.Sink.(provider.DeltaSink); ok {
 		return d.PutKeyedNodes(ctx, f, keys)
@@ -75,6 +106,7 @@ func (r recorder) PutRelations(ctx context.Context, f []model.RelationFact) erro
 func (r recorder) PutKeyedRelations(ctx context.Context, f []model.RelationFact, keys [][]string) error {
 	for i, x := range f {
 		r.c.rel[x.Relation.Kind]++
+		r.c.edges = append(r.c.edges, x.Relation)
 		for _, ev := range x.Evidence {
 			r.c.detail[ev.Detail]++
 		}
@@ -101,9 +133,7 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 	t.Helper()
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
-	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
-		sig: map[string]string{}}
+	c := newCounts()
 	var rep neo4jcsv.Report
 	var importErr error
 	p := providertest.Func{
@@ -185,6 +215,15 @@ func TestImport(t *testing.T) {
 			}
 			if c.detail["reaching_def capture"] == 0 {
 				t.Errorf("no capture detail published; a flow through a global was labelled intraprocedural")
+			}
+			// Failure mode: a method taken as a value never anchors, so every
+			// fact that would name the method the value carries -- and with it
+			// any call made through that value -- is silently dropped. The
+			// export's METHOD_REF for `run` is the only node here whose REF
+			// edge names a method rather than a declaration.
+			if !c.has(model.RelDataFlowsTo, "<global>", "run") {
+				t.Errorf("the method the reference names is not an endpoint of the flow that reaches it; "+
+					"the method reference did not anchor (edges = %d)", len(c.edges))
 			}
 		},
 	}, {
@@ -467,9 +506,7 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	files, paths := readSource(t, filepath.Join("testdata", "src", "gofix"))
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
-	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
-		sig: map[string]string{}}
+	c := newCounts()
 	var part [2]struct{ nodes, aliases int }
 	nodesSoFar := func() int {
 		n := 0
