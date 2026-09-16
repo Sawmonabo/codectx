@@ -181,6 +181,31 @@ and the foreign outputs themselves (an indexer's index, the dependence export), 
 follow-up that never touches the disk. An operator command empties the arena on request; nothing
 else does.
 
+### Decision 5, amended a fourth time 2026-09-16: what still frees is freed at the pace the host tolerates
+
+The third amendment left four frees in a run, and the next uncapped index of the 6 270-file
+repository stalled the host 64 s again, 36 s after the removal of the largest analysis unit's export
+directory: twenty files, 1.7 GB, shrunk a window at a time and unlinked within one second, counted
+by the device as 11.4 GB of discards. The mechanism was then measured without the product. Two
+gigabytes as twenty files, unlinked in one burst: no stall. Five gigabytes freed within four seconds:
+a 64 s stall about a minute later, in every measured case. The same five gigabytes freed as 8 MiB
+windows, each followed by a data sync and a wait of 250 ms (32 MiB/s of file bytes; the device
+counted 21 GB of discards over 152 s and never more than 464 MB in one second): no stall, and nothing
+over 92 ms on an independent write during or after. The host tolerates any amount freed at a pace
+and hangs on a burst; neither the byte count nor the file count is the trigger, the rate is.
+
+Every removal the product still performs is therefore paced and taken off the run's path. A removal
+renames its file or directory into the arena's to-free set, which frees nothing, and returns; one
+reclaimer per process frees that set at the measured pace, charging every byte to the same budget
+whatever the method, so a burst of small whole-file unlinks spends their sizes too and a materialized
+tree of thousands of files drains at the rate of one large file. A crash or an exit with frees pending
+leaves the set on disk, and the startup collection pass resumes it at the same pace; nothing is freed
+faster for being old. The operator command that empties the arena goes through the same reclaimer.
+The resources block discloses `pending_free_bytes` beside `scratch_bytes`. The pace is a constant in
+the code with its measurement beside it, not a setting: a user tunes nothing, and a host that would
+tolerate more loses at most the minutes a large export takes to drain behind a run that has already
+moved on.
+
 ### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
 
 The statement journal's threshold is also the size of the chunks the engine's memory journal
