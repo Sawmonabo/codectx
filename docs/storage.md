@@ -466,7 +466,12 @@ store asks the kernel every hundred milliseconds to begin writing the log's
 and the database's dirty pages, so the disk receives them as they are
 produced rather than as one burst at the sync. At activation and abort the
 writer's page cache is released to the process, so a long-lived server does
-not keep a run's working set resident.
+not keep a run's working set resident. The engine's temporary files -- the
+spill files of a sort larger than its cache, a statement journal past its
+memory threshold, a temporary table too large for memory -- are created
+under `<data_dir>/tmp`, which the process names at start-up, so they live on
+the disk the user gave the data and never on a memory-backed system temp
+directory.
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.
 

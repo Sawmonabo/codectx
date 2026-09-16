@@ -42,6 +42,10 @@ import (
 // databaseName is the workspace database under the data directory.
 const databaseName = "codectx.db"
 
+// engineTempDirName is the directory under the data directory that holds the
+// database engine's temporary files.
+const engineTempDirName = "tmp"
+
 // Private working directories under the data directory. Each is created 0700
 // before the component that owns it is constructed, because a provider that
 // creates its own scratch directory on first use creates it with whatever
@@ -314,6 +318,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// The content store opens before the database: it holds no lock and no
 	// state of its own.
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
+		return nil, err
+	}
+	// The engine's temporary files -- sort spills, statement journals past
+	// their memory threshold, temporary tables -- live under the data
+	// directory, on the disk the user gave the data, and never in a system
+	// temp directory that may be a memory filesystem.
+	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
@@ -663,6 +674,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
 				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
+				StagingCacheKiB:        s.cfg.Providers.Dependence.StagingCacheKiB,
 				MaxEvidencePerFact:     evidenceClip(s.cfg),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,

@@ -1,6 +1,9 @@
 package sqlite
 
 import (
+	"database/sql"
+	"os"
+	"strings"
 	"unsafe"
 
 	"modernc.org/libc"
@@ -64,4 +67,34 @@ func itoa(n int) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// SetTempDir names the directory the engine creates its temporary files in
+// for the rest of the process: the spill files of a sort that outgrows its
+// cache, the statement journal of a savepoint past statementJournalSpillBytes,
+// and the temporary tables of a query too large for memory. The engine's own
+// default is the first writable one of the process temp directory and the
+// system's, which on a host whose temp directory is a memory filesystem turns
+// a sort of a large table into a memory allocation of its size. The product
+// calls this once at start-up with a directory under its data directory, so
+// every temporary file lives on the disk the user gave the data and is
+// bounded by that disk, not by memory.
+//
+// The directory is a process-wide engine setting. It is set through a
+// throwaway connection, before the store or any other database of the process
+// is opened, and never changed afterwards: the engine reads it without a lock
+// whenever it opens a temporary file.
+func SetTempDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return internal("engine temporary directory: " + err.Error())
+	}
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return internal("engine temporary directory: " + err.Error())
+	}
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA temp_store_directory = '` + strings.ReplaceAll(dir, `'`, `''`) + `'`); err != nil {
+		return internal("engine temporary directory: " + err.Error())
+	}
+	return nil
 }
