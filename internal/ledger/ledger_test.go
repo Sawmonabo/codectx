@@ -3,10 +3,12 @@ package ledger_test
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
+	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // repositoryID is a fixed 32-byte identity in the wire shape every repository
@@ -304,5 +306,73 @@ func TestStopLeavesOpenSpansInterrupted(t *testing.T) {
 	}
 	if _, err := os.Stat(ledger.Path(dir)); err != nil {
 		t.Fatalf("the ledger file is not beside the store: %v", err)
+	}
+}
+
+// TestUnadmittedUnitReachesASubscriberLikeAnyOtherEnding protects the live
+// surfaces against going silent on the endings that matter most. A unit the
+// plan named and nothing ever started is the one an operator is waiting to be
+// told about, and it is the only ending that never came from a stage's own
+// End: it is discovered when the run ends. If that discovery writes the row
+// directly instead of publishing it, the structured log line and the tool
+// notification are missing for exactly those units, and the only way to learn
+// of them is to go and read the rows afterwards.
+//
+// Mutation: close the planned rows with the raw UPDATE again instead of
+// sweepPlanned. The unadmitted scope below never reaches the subscriber.
+func TestUnadmittedUnitReachesASubscriberLikeAnyOtherEnding(t *testing.T) {
+	l, _ := openLedger(t)
+	var mu sync.Mutex
+	published := map[string]ledger.SpanRow{}
+	// The subscriber runs on the collector's goroutine, so the map it fills is
+	// read under the same lock and never while that goroutine is mid-flush.
+	l.Subscribe(func(row ledger.SpanRow) {
+		mu.Lock()
+		defer mu.Unlock()
+		published[row.ScopeKey] = row
+	})
+	seen := func(scope string) (ledger.SpanRow, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		row, ok := published[scope]
+		return row, ok
+	}
+
+	run, ctx := newRun(t, l)
+	_, ran := ledger.StartProvider(ctx, "engine_unit", "pkg/ran", "structural")
+	ran.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	ledger.Plan(ctx, "engine_unit", "pkg/unadmitted", "structural")
+	run.Finish(ledger.OutcomeOK)
+
+	// Published when the run ends, not when the process does: a client waiting
+	// on this run's notifications is gone by the time the ledger stops.
+	var row ledger.SpanRow
+	deadline := time.Now().Add(20 * flushIntervalForTest)
+	for {
+		var ok bool
+		if row, ok = seen("pkg/unadmitted"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the run ended and the unit nothing admitted reached no subscriber: the log line and the tool notification an operator is waiting for were never published")
+		}
+		time.Sleep(flushIntervalForTest / 5)
+	}
+	if _, ok := seen("pkg/ran"); !ok {
+		t.Fatal("the unit that ended during the run reached no subscriber")
+	}
+	if row.Outcome != ledger.OutcomeUnavailable || row.DiagnosticCode != model.CodeProviderUnavailable ||
+		row.Failure != ledger.ReasonNotAdmitted {
+		t.Fatalf("published %q/%q/%q, want unavailable with the not-admitted reason",
+			row.Outcome, row.DiagnosticCode, row.Failure)
+	}
+	// Nobody measured this unit, so the row states no measurement: a stamped
+	// finish and a zero wall would be a figure nobody observed.
+	if row.FinishedAt != nil || row.WallMS != 0 || row.Running {
+		t.Fatalf("published finish %v wall %d running %v, want no measurement at all",
+			row.FinishedAt, row.WallMS, row.Running)
+	}
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
