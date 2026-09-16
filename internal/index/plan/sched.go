@@ -1,13 +1,14 @@
 package plan
 
-// Heavy-analyzer admission (Sections 11.6, 13.1, 20.1
-// `max_concurrent_heavy_analyzers`).
+// Heavy-analyzer admission (Sections 11.6, 13.1).
 //
-// A reservation orders and serializes heavy work; it never refuses it. Only an
-// explicit user `unit_memory_ceiling_bytes` may reject a unit before it runs,
-// and that check lives in dependence.Governor.Reject, not here: a scheduler
-// that refused on the machine-derived allocation would be a default memory
-// ceiling by another name, which Section 11.6 forbids.
+// How much heavy work runs at once is decided by one observation of the
+// machine and nothing else: a reservation is admitted when the summed
+// reservations of everything already running plus this one fit the
+// machine-derived allocation. There is no count of analyzers, no setting and
+// no ceiling that can refuse a unit -- a waiter always runs eventually, and a
+// scheduler that refused on the allocation would be a default memory ceiling
+// by another name, which Section 11.6 forbids.
 //
 // Admission is strict first-in-first-out. A waiter that does not fit blocks
 // every waiter behind it rather than letting a small unit overtake it: the
@@ -29,13 +30,11 @@ import (
 // resource of its own: what it hands back is permission to run, and the
 // release function returns that permission exactly once.
 type Scheduler struct {
-	mu       sync.Mutex
-	maxHeavy int
+	mu sync.Mutex
 	// allocation is the machine-derived allocation every admitted reservation
-	// must sum within, or zero when the host does not expose available memory.
-	// Zero means unknown, not none: with no observation only maxHeavy bounds
-	// concurrency, because inventing a bound would be the forbidden default
-	// ceiling.
+	// must sum within. It is always positive: Machine.SchedulingAllocation
+	// stands in for an unobservable host, so admission is bounded by a sum of
+	// bytes on every platform and never by a count of children.
 	allocation int64
 	admitted   int
 	used       int64
@@ -51,21 +50,15 @@ type waiter struct {
 	release sync.Once
 }
 
-// NewScheduler builds the admission gate. maxHeavy is
-// `resources.max_concurrent_heavy_analyzers`; a value below one is one,
-// because zero heavy analyzers would mean no dependence unit ever runs.
-func NewScheduler(maxHeavy int, m dependence.Machine) *Scheduler {
-	if maxHeavy < 1 {
-		maxHeavy = 1
-	}
-	return &Scheduler{maxHeavy: maxHeavy,
-		allocation: m.Allocation(dependence.DefaultBaseFootprintBytes, dependence.DefaultSafetyMarginBytes)}
+// NewScheduler builds the admission gate over the machine's one allocation.
+func NewScheduler(m dependence.Machine) *Scheduler {
+	return &Scheduler{allocation: m.SchedulingAllocation()}
 }
 
-// Admit blocks until this reservation may run: at most maxHeavy heavy
-// analyzers at once, and the summed reservations of everything admitted plus
-// this one within the machine-derived allocation. It returns a release
-// function that is idempotent and must be called on every path.
+// Admit blocks until this reservation may run: the summed reservations of
+// everything admitted plus this one within the machine-derived allocation. It
+// returns a release function that is idempotent and must be called on every
+// path.
 //
 // A unit larger than the whole allocation is admitted when nothing else is
 // running. Refusing it would refuse work the user never asked to have
@@ -107,12 +100,10 @@ func (s *Scheduler) Admit(ctx context.Context, r dependence.Reservation) (func()
 func (s *Scheduler) pump() {
 	for len(s.queue) > 0 {
 		head := s.queue[0]
-		if s.admitted >= s.maxHeavy {
-			return
-		}
 		// The sum is checked only against something already admitted: an idle
-		// scheduler admits any single unit, whatever it reserves.
-		if s.admitted > 0 && s.allocation > 0 && s.used+head.bytes > s.allocation {
+		// scheduler admits any single unit, whatever it reserves, so a unit
+		// larger than the whole allocation runs alone rather than never.
+		if s.admitted > 0 && s.used+head.bytes > s.allocation {
 			return
 		}
 		// Cleared before the reslice: a popped waiter left in the backing array
