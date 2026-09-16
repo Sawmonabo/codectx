@@ -155,22 +155,25 @@ questions from the same process while that refresh is writing.
 
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by
-reading. The exploration tools -- search, the repository overview, symbol
-lookup, references and the graph walks -- are served through the read-only
-handle. They pin no generation on the writer, so a tool call no longer commits
-the session's own refresh mid-group nor queues behind it; the run commits the
-same ingestion groups it would have committed with nobody reading.
+reading. Every tool that only asks a question -- search, the repository
+overview, symbol lookup, references, the graph walks, and the index status
+report -- is served through the read-only handle. They pin no generation on the
+writer, so a tool call no longer commits the session's own refresh mid-group nor
+queues behind it; the run commits the same ingestion groups it would have
+committed with nobody reading.
 
 What an agent sees for it:
 
 * Those tools answer **one page** during a session, for the same reason the
   answering row does: a continuation needs a cursor lease and a spool, and both
   are writes.
-* `codectx_index_status` and the session tools (`codectx_context_*`,
-  `codectx_read_source`) still go through the writer -- the session tools
-  record rows, which is what they are for, and the status projection still pins
-  through the writer. Called during the session's own refresh, they wait for
-  the group the run has open.
+* The status report is not one of them: it is a single bounded answer, so
+  `codectx_index_status` answers during the session's own refresh -- including
+  what that session's watch covers and a retention sweep that did not finish,
+  which the serving process knows in memory and reads from no handle at all.
+* The session tools (`codectx_context_*`, `codectx_read_source`) still go
+  through the writer: they record rows, which is what they are for. Called
+  during the session's own refresh, they wait for the group the run has open.
 
 ## When a capability is not `fresh`
 
