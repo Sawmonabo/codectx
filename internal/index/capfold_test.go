@@ -46,7 +46,7 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 			State:          model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 	}
-	big.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
 
 	bounded := big.finish(log)
 	seen := map[string]int{}
@@ -225,7 +225,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
 			ID: id, Version: "1", Capabilities: []string{capability}}}}},
 		sealed:       map[string]bool{plan.Key(id, sealedScope): true},
-		failedScopes: map[string]string{plan.Key(id, failedScope): model.CodeProviderOutputInvalid},
+		failedScopes: map[string]unitFailure{plan.Key(id, failedScope): {code: model.CodeProviderOutputInvalid}},
 	}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
 		for _, scope := range []string{sealedScope, failedScope} {
@@ -281,7 +281,7 @@ func TestCoverageKeepsAProviderWithNoMemberFailed(t *testing.T) {
 		return yield(plan.Unit{ProviderID: id, ScopeKey: scope})
 	}
 	// What the indexing path does when an optional provider's unit fails.
-	g.caps.addFailure(id, capability, scope, model.CodeProviderOutputInvalid)
+	g.failures = map[string]*providerFailures{id: oneFailure(scope, model.CodeProviderOutputInvalid)}
 	if err := g.coverage(); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
@@ -344,5 +344,87 @@ func TestCapabilityFoldTieNamesTheFailedScope(t *testing.T) {
 		if got := forward.Details[key]; got != want {
 			t.Errorf("the published row reports %s=%q, want %q", key, got, want)
 		}
+	}
+}
+
+// oneFailure is the aggregate the coverage pass builds for a provider with one
+// failed scope.
+func oneFailure(scope, code string) *providerFailures {
+	f := &providerFailures{}
+	f.add(scope, unitFailure{code: code})
+	return f
+}
+
+// TestCoverageNeverReportsFreshOverAFailedPlannedUnit protects what `codectx
+// status` says about a provider whose units did not all run.
+//
+// Failure mode: a provider is planned N units, one of them fails and the rest
+// publish. The coverage pass counted every planned unit as coverage whatever
+// its outcome, so the capability took the `covered` branch and published
+// `fresh` -- a monorepo whose precise definitions are missing for nine of its
+// ten projects reporting precise definitions as healthy, which is the false
+// readiness a reader acts on by trusting an empty answer. The honest row is
+// `partial`, naming the scope that failed, how many were planned and how many
+// failed, with the reason the unit actually carried.
+//
+// It also protects the privacy rule on the way out: the standard-error tail a
+// provider retains is raw analyzer output and must reach the run row alone,
+// never a published capability row.
+//
+// Mutation proof: in coveredProviders, drop the loop that seeds `failed` from
+// g.failures, and the row comes back `fresh`.
+func TestCoverageNeverReportsFreshOverAFailedPlannedUnit(t *testing.T) {
+	t.Parallel()
+	const id, capability = "scip", "precise_definitions"
+	const okScope, failedScope = "profile:a:app", "profile:b:vendor"
+	const message = "the indexer exited with status 1"
+
+	failure := unitFailure{code: model.CodeProviderUnavailable, message: message,
+		details: map[string]string{"profile": "b", "tool": "an-indexer", "exit_status": "1",
+			model.DetailStderrTail: "a stack trace naming source paths"}}
+	agg := &providerFailures{}
+	agg.add(failedScope, failure)
+
+	g := &generation{
+		caps: newCapabilityReport(),
+		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
+			ID: id, Version: "1", Capabilities: []string{capability}}}}},
+		published: map[string]bool{id: true},
+		failures:  map[string]*providerFailures{id: agg},
+	}
+	g.plan.Units = func(yield func(plan.Unit) error) error {
+		for _, scope := range []string{okScope, failedScope} {
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := g.coverage(); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if len(rows) != 1 {
+		t.Fatalf("coverage published %d rows, want one: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row.State != model.CapabilityPartial {
+		t.Fatalf("capability state %q, want partial: one of two planned units failed", row.State)
+	}
+	for key, want := range map[string]string{
+		scopeKeyDetail:       failedScope,
+		failedScopesDetail:   failedScope,
+		unitsFailedDetail:    "1",
+		unitsPlannedDetail:   "2",
+		failureMessageDetail: message,
+		"profile":            "b",
+		"exit_status":        "1",
+	} {
+		if got := row.Details[key]; got != want {
+			t.Errorf("the row reports %s=%q, want %q: %+v", key, got, want, row.Details)
+		}
+	}
+	if _, ok := row.Details[model.DetailStderrTail]; ok {
+		t.Error("the published capability row carries the raw tool output the run row alone may keep")
 	}
 }
