@@ -33,6 +33,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -70,6 +71,7 @@ type fixture struct {
 	cas     *snapshot.CAS
 	lock    *snapshot.WorkspaceLock
 	cfg     config.Config
+	ledger  *ledger.Ledger
 	c       *Coordinator
 }
 
@@ -126,8 +128,36 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 		t.Fatalf("LockWorkspace: %v", err)
 	}
 	t.Cleanup(func() { f.lock.Close() })
+	// The run ledger the composition root opens beside the store, so every
+	// coordinator this fixture builds records its runs exactly as a real one
+	// does and a test can read them back through the same reader status uses.
+	if f.ledger, err = ledger.Open(ctx, f.dataDir); err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	t.Cleanup(func() { f.ledger.Stop() })
 	f.c = f.coordinator(f.providers(false))
 	return f
+}
+
+// latestRun reads back what the ledger recorded for the run that just ran.
+func (f *fixture) latestRun(generation model.GenerationID) ledger.RunView {
+	f.t.Helper()
+	if err := f.ledger.Stop(); err != nil {
+		f.t.Fatalf("ledger.Stop: %v", err)
+	}
+	reader, ok, err := ledger.OpenReader(f.ctx, f.dataDir)
+	if err != nil || !ok {
+		f.t.Fatalf("OpenReader: ok=%v err=%v", ok, err)
+	}
+	f.t.Cleanup(func() { reader.Close() })
+	view, ok, err := reader.LatestRun(f.ctx, string(f.c.repo), int64(generation))
+	if err != nil {
+		f.t.Fatalf("LatestRun: %v", err)
+	}
+	if !ok {
+		f.t.Fatal("the ledger holds no run for this repository: an index run recorded nothing")
+	}
+	return view
 }
 
 // providers builds the registry. withSCIP adds the optional provider over a
@@ -199,7 +229,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 		f.t.Fatal(err)
 	}
 	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
-		Lock: f.lock, Pool: pool})
+		Lock: f.lock, Pool: pool, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
@@ -844,7 +874,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// no member for it: the unit seals into a later publication.
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan: plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published := g.caps.finish(f.c.log)
@@ -864,7 +894,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	g = &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan:   plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published = g.caps.finish(f.c.log)

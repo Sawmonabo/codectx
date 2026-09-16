@@ -84,6 +84,7 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// only place in this process that holds both the cross-process
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
+		Ledger:    s.ledger,
 		Pool:      s.pool,
 		Watcher:   s.watcher,
 		States:    s.states,

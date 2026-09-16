@@ -17,6 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -163,10 +164,16 @@ type openOptions struct {
 // the store, the toolchain, the runners, the providers and the registry -- is
 // one reviewable unit that depends on no coordinator.
 type stack struct {
-	root     workspace.Root
-	cfg      config.Config
-	dataDir  string
-	store    *sqlite.Store
+	root    workspace.Root
+	cfg     config.Config
+	dataDir string
+	store   *sqlite.Store
+	// ledger is this process's run accounting. Only a run that holds the
+	// cross-process workspace lock opens one: the ledger has a single writer,
+	// so a report -- which takes no lock and may run beside an index -- reads
+	// the file through internal/ledger's read-only reader and never opens a
+	// writer of its own. A nil ledger records nothing and is legal everywhere.
+	ledger   *ledger.Ledger
 	cas      *snapshot.CAS
 	registry *provider.Registry
 	pool     *provider.Pool
@@ -353,6 +360,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// generation.
 	if o.mode == modeIndex {
 		if err = s.store.Recover(ctx, time.Now()); err != nil {
+			return nil, err
+		}
+		// The run ledger lives beside the store, under the same directory and
+		// the same lock. Stack.Close stops it; nothing else may, because Stop
+		// is what flushes the last rows and closes every span the process left
+		// open.
+		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
 			return nil, err
 		}
 	}
@@ -1146,6 +1160,10 @@ func (s *stack) Close() error {
 	if s.ts != nil {
 		s.ts.Close()
 	}
+	// The ledger is stopped once nothing can still end a span and before the
+	// store, so the last flush and the interrupted marks are written while the
+	// process is still whole.
+	errs = append(errs, s.ledger.Stop())
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}

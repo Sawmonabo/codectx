@@ -40,6 +40,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -99,6 +100,11 @@ type Options struct {
 	// Collector interface in retention.go.
 	Collector Collector
 	Pool      *provider.Pool
+	// Ledger is the run ledger every stage of a run records into. It may be
+	// nil -- a coordinator composed without one records nothing and indexes
+	// exactly as it would otherwise, because a nil ledger opens a nil run
+	// whose spans do nothing.
+	Ledger *ledger.Ledger
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
@@ -228,6 +234,35 @@ func New(o Options) (*Coordinator, error) {
 	c.late = newLateSealer(c)
 	return c, nil
 }
+
+// newRun opens this process's ledger run of the given kind. A ledger failure
+// never fails the run it was recording: the index is correct whatever the
+// accounting did, so the failure is logged with its diagnostic code and the
+// pass continues with a run that records nothing.
+func (c *Coordinator) newRun(kind ledger.Kind) *ledger.Run {
+	run, err := c.opts.Ledger.NewRun(kind, string(c.repo))
+	if err != nil {
+		logTyped(c.log, "this run is not being recorded in the run ledger", err,
+			"component", component, "repository_id", string(c.repo))
+		return nil
+	}
+	return run
+}
+
+// The stages a run records. They are the coordinator's own phases, named once
+// here so the ledger, the log line and every reader spell them identically.
+const (
+	stageCapture       = "capture"
+	stageWalk          = "walk"
+	stagePlan          = "plan"
+	stageAttachReused  = "attach_reused"
+	stageAttachCarried = "attach_carried"
+	stageBuild         = "build"
+	stageCoverage      = "coverage"
+	stageActivation    = "activation"
+	stageRetention     = "retention"
+	stageCollection    = "collection"
+)
 
 // buildAppliers binds the delta appliers of the two providers that can
 // describe what changed since their last run. A provider the registry does not
