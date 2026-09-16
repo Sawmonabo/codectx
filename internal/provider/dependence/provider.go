@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -671,13 +672,15 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	if err != nil {
 		return Outcome{}, err
 	}
+	_, span := ledger.Start(ctx, stageParse, unit.ScopeKey)
 	out, err := p.backend.Parse(ctx, ParseRequest{SourceDir: source, OutputPath: graph, Family: unit.Family,
 		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 		return Outcome{}, err
 	}
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"family", string(unit.Family), "exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"family", string(unit.Family), "exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
 		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
 		"tree_peak_bytes", peakForLog(out))
@@ -690,6 +693,10 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 			out.Class = FailureEngine
 		}
 	}
+	// Ended after the graph-presence check, so the span's outcome is the
+	// verdict on the step and not the child's exit code: a zero exit that left
+	// no graph is a failed parse, and its span must say so.
+	span.End(spanOutcome(out), measured(out), nil)
 	return out, nil
 }
 
@@ -762,13 +769,20 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 	if err != nil {
 		return ExportOutcome{}, err
 	}
+	_, span := ledger.Start(ctx, stageExport, unit.ScopeKey)
 	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: run.path("export"),
 		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 		return ExportOutcome{}, err
 	}
+	// The span is the child's, so it carries the child's verdict. An export
+	// that exited cleanly over a unit with source and carries no method is
+	// judged FailureEmptyExport by the caller afterwards; that verdict belongs
+	// to the unit, whose own span records it.
+	span.End(spanOutcome(out.Outcome), measured(out.Outcome), nil)
 	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
 		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes, "pass", out.Pass, "exception", out.Exception)
 	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
@@ -818,6 +832,10 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 			"unit", string(req.Unit.ID), "phase", phase, "elapsed", now.Sub(phaseStart).Round(time.Millisecond))
 		phaseStart = now
 	}
+	// In-process work beside every other unit of the run, so no processor time
+	// is attributed to it: Go has no per-goroutine CPU and a share of the
+	// process counters would be a guess.
+	ctx, span := ledger.Start(ctx, stageImport, unit.ScopeKey)
 	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
@@ -826,8 +844,10 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
 		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return ImportReport{}, err
 	}
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	if err := paced.RemoveAllFor(paced.AnalyzerOutput, dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
 	}
@@ -872,25 +892,37 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	var total ImportReport
 	var admitted int
 	for i, child := range children {
+		// One span per part, under the unit's: every step below nests inside
+		// it, so a subdivided unit's cost reads as the sum of its parts rather
+		// than as one unattributed total.
+		partCtx, part := ledger.Start(ctx, stagePart, child)
 		graph := run.path("graph-" + itoa(int64(i)))
-		out, err := p.parse(ctx, req, unit, res, filepath.Join(source, child), graph, nil)
+		out, err := p.parse(partCtx, req, unit, res, filepath.Join(source, child), graph, nil)
 		if err != nil {
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
+			part.End(ledger.OutcomeFailed, measured(out), nil)
 			continue
 		}
 		dir := run.path("export-" + itoa(int64(i)))
-		timeout, err := remaining(ctx)
+		timeout, err := remaining(partCtx)
 		if err != nil {
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 			return ImportReport{}, 0, err
 		}
-		exp, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
+		exportCtx, exportSpan := ledger.Start(partCtx, stageExport, child)
+		exp, err := p.backend.Export(exportCtx, ExportRequest{GraphPath: graph, OutputDir: dir,
 			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
+			exportSpan.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 			return ImportReport{}, 0, err
 		}
+		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), nil)
 		if exp.Class != FailureNone || !exp.Live {
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
 			continue
 		}
 		// No delta options: a part's key set is a subset of the unit's, so
@@ -898,13 +930,15 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		// every other part's keys removed and carry nothing. Every part
 		// imports in full and merge reports the absent set, which makes the
 		// next refresh of a subdivided unit a full import.
-		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
+		report, err := p.importExport(partCtx, req, unit, filepath.Join(source, child),
 			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
 			return ImportReport{}, 0, err
 		}
 		total = merge(total, report)
 		admitted++
+		part.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
