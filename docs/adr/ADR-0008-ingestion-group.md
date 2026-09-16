@@ -201,8 +201,9 @@ over 92 ms on an independent write during or after. The host tolerates any amoun
 and hangs on a burst; neither the byte count nor the file count is the trigger, the rate is.
 
 Every removal the product still performs is therefore paced and taken off the run's path. A removal
-renames its file or directory into the arena's to-free set, which frees nothing, and returns; one
-reclaimer per process frees that set at the measured pace, charging every byte to the same budget
+renames its file or directory into the arena's to-free set, which frees nothing, and returns; a
+reclaimer frees that set at the measured pace (one pace for the whole host: the fifth amendment
+below), charging every byte to the same budget
 whatever the method, so a burst of small whole-file unlinks spends their sizes too and a materialized
 tree of thousands of files drains at the rate of one large file. A crash or an exit with frees pending
 leaves the set on disk, and the startup collection pass resumes it at the same pace; nothing is freed
