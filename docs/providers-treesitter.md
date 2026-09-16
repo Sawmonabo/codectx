@@ -248,7 +248,7 @@ MemoryReservationBytes  Options.WorkerMemoryBytes (default 256 MiB)
 
 The runner holds one concurrency slot per live worker for the worker's whole
 lifetime, so `process.Limits.MaxConcurrent` must exceed
-`index.max_parser_workers` by the number of other children expected to run
+the worker count by the number of other children expected to run
 concurrently.
 
 Wiring for `cmd/codectx/main.go` (the controller applies it; this package does
@@ -266,7 +266,7 @@ and in application composition:
 exe, _ := os.Executable()          // then filepath.EvalSymlinks
 ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
-	MaxWorkers:        cfg.Index.MaxParserWorkers,
+	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
 	WorkerIdleTTL:     time.Duration(cfg.Providers.TreeSitter.WorkerIdleTTL),
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
@@ -362,7 +362,7 @@ truncation, never sent oversize.
   kills every worker that is not idle, and waits for the runner to reap each.
 - `Stats()` is the aggregate accounting of Section 22: `Processes` (every
   worker process the runner has not yet reaped, idle ones included, never more
-  than `index.max_parser_workers`), `IdleWorkers` (its reusable subset) and
+  than the worker count), `IdleWorkers` (its reusable subset) and
   `BusyWorkers` (the rest: parsing, or on their way out), started and exited
   counts, parses, retries, the sum of the resident set each live worker last
   reported, the parent's own resident set and the live worker PIDs. Both sides
@@ -436,7 +436,7 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
 | signature | `MaxSignatureBytes` (4 KiB), whitespace-collapsed | parent |
-| workers | `index.max_parser_workers` (default 2) | pool |
+| workers | one per CPU (`config.ParserWorkers()`) | pool |
 | parse time | `Options.ParseTimeout` (default 60 s) | pool; kills the worker |
 | worker lifetime | 1 h / 2048 parses / 1 GiB each way | pool; recycled at three quarters |
 | hello | 30 s | pool |

@@ -61,7 +61,7 @@ type Definition struct {
 
 // Standard bounds for a language server. A server is an interactive process
 // held open across many requests, so the timeout is a lifetime ceiling rather
-// than a per-request bound (Options.RequestTimeout is that one), and the
+// than a per-request bound (Options.RequestStallTimeout is that one), and the
 // reservations are what the runner accounts before the child starts.
 const (
 	serverLifetime     = time.Hour

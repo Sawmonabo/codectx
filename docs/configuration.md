@@ -54,10 +54,18 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
     `max_receipts_per_confirmation`, `tools.max_fetch_bytes`. These bound one
     page or one message, which is lossless: the next page carries the rest.
 
-  Two keys give `0` a meaning of its own that is not "unlimited":
-  `index.workers = 0` chooses the count from available CPUs and reservations,
-  and `providers.dependence.unit_memory_ceiling_bytes = 0` derives a unit's
-  allocation from the machine.
+  One key gives `0` a meaning of its own that is not "unlimited":
+  `index.workers = 0` chooses the count from available CPUs and reservations.
+
+  **How much runs at once is not configurable at all.** How many heavy children
+  — analysis engine runs, external indexers, language servers — run beside each
+  other is decided by one observation of the machine: each is admitted while the
+  sum of the memory they reserve fits the machine-derived allocation (available
+  memory less this process's own footprint and a safety margin, and never more
+  than half of what was available). A child larger than the whole allocation
+  runs alone. CPU-bound work — the structural parser workers, the query and
+  traversal gates — is sized from `runtime.NumCPU()`. Nothing there refuses
+  work: a child or a query that finds no room waits.
 
   **Every bound that defaults to unlimited**, grouped by the table it lives in.
   Each key is described in full in that table below.
@@ -170,7 +178,6 @@ the analysis config hash.
 | Key | Default | Meaning |
 |---|---|---|
 | `workers` | `0` | Indexing workers; `0` chooses from available CPUs and memory reservations. |
-| `max_parser_workers` | `2` | Ceiling on concurrent native parser worker processes. |
 | `batch_records` | `1000` | Records per provider batch. |
 | `batch_bytes` | `4194304` | Bytes per provider batch. Must fit `index.queue_bytes`. |
 | `queue_bytes` | `16777216` | Reserved bytes for the staging queue. |
@@ -191,12 +198,8 @@ All **user** trust.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `base_memory_budget_bytes` | `805306368` | Aggregate baseline memory reservation. |
 | `query_memory_bytes` | `33554432` | Reservation per concurrent query. |
 | `cache_bytes` | `33554432` | Total cache reservation. |
-| `max_concurrent_queries` | `4` | Concurrent queries. |
-| `max_concurrent_graph_queries` | `2` | Concurrent graph queries; must not exceed `max_concurrent_queries`. |
-| `max_concurrent_heavy_analyzers` | `1` | Concurrent heavy analyzer runs. |
 | `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
@@ -301,8 +304,7 @@ directories and network posture are product code, not configuration.
 | `scip.max_source_file_bytes` | `0` (unlimited) | user | How large a document's source you allow to be held whole while its positions are converted, as `workspace.max_parse_file_bytes` does for structural parsing. Unlimited by default. This one does bound memory, so a set value leaves the document out — and every skip marks the capability rows partial with `CTX_RESOURCE_LIMIT`, naming this key. Changing it changes which facts are emitted, so it is part of the index fingerprint. |
 | `scip.max_materialize_bytes` | `0` (unlimited) | user | How much content you allow an indexer's private copy of the pinned snapshot to hold. Unlimited by default: an indexer resolves symbols through the project's own dependency context, so a copy narrowed by a budget produces an index describing less than the unit claims. A set value leaves files out, named in the log with a complete count. Changing it changes which facts are emitted, so it is part of the index fingerprint. |
 | `lsp.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
-| `lsp.request_timeout` | `"15s"` | user | Deadline for one language-server request. |
-| `lsp.max_servers` | `1` | user | Concurrent language servers. |
+| `lsp.stall_timeout` | `"5m"` | user | Hang detector for one language-server request: how long the connection may move no bytes in either direction before the server is reported as not responding. It is not a deadline on an answer — a server indexing a monorepo before its first reply is working — and there is no such deadline. |
 | `lsp.max_outstanding_requests` | `8` | user | In-flight requests per server. |
 | `lsp.idle_ttl` | `"60s"` | user | Idle time before a server is stopped. |
 | `lsp.max_overlay_bytes` | `0` (unlimited) | user | Unlimited by default. When set, it bounds, separately, the materialized snapshot (files that do not fit are named in the log and left out, never refused), admission of one file to the pinned coordinate cache (a file over the bound is reported and the query answers about the rest), and the bytes sent to a server in one rolling minute. Unlimited still keeps a finite ceiling on the pinned cache, whose eviction costs a re-read and no answer. A value you set must be at least `resources.max_source_response_bytes`. |
@@ -311,7 +313,6 @@ directories and network posture are product code, not configuration.
 | `dependence.stall_timeout` | `"5m"` | user | The same progress-based hang detector as `scip.stall_timeout`, applied to one dependence unit. |
 | `dependence.cache_bytes` | `4294967296` | user | Budget for the per-unit parsed-graph cache, which is what makes an unchanged unit cost nothing on refresh. |
 | `dependence.unit_memory_floor_bytes` | `805306368` | user | Smallest allocation a unit may be sized to. Sizing a unit near its live set costs time rather than memory, so the floor keeps a small unit from being starved into a much slower run. |
-| `dependence.unit_memory_ceiling_bytes` | `0` | user | Largest allocation a unit may be sized to. `0` derives it from the machine: free memory minus the base index footprint minus a safety margin. There is no default memory ceiling, and only a non-zero value here may reject a unit before it runs. |
 | `dependence.max_units_per_family` | `0` (unlimited) | user | How many frontend-native projects of one language family you want a plan to hold. Unlimited by default: a monorepo's project count belongs to the repository, so every project is planned as its own unit and a crashed unit is still split along every one of its parts. A set value refuses nothing and drops nothing — crossing it marks the family's capability rows partial with `CTX_RESOURCE_LIMIT`, naming the family, the project count and this value. |
 | `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (a few times the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
 | `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
@@ -558,16 +559,14 @@ relationships that must hold:
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.
-- `resources.max_concurrent_graph_queries` ≤ `resources.max_concurrent_queries`.
-- `max_concurrent_queries × query_memory_bytes` + `cache_bytes` + `queue_bytes`
-  ≤ `resources.base_memory_budget_bytes`.
+- (query slots on this machine) × `query_memory_bytes` + `cache_bytes` +
+  `queue_bytes` ≤ the 1 GiB base footprint this process keeps for itself. How
+  many queries run at once comes from the cores, so this is checked against the
+  machine the configuration is loaded on.
 - `resources.max_temp_bytes` > `resources.min_free_disk_bytes`, when `max_temp_bytes` is set at all (`0` is unlimited and has nothing to exceed).
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when
   the bound on the right is set. There is nothing to exceed in an unlimited one.
-- `providers.dependence.unit_memory_ceiling_bytes`, when set, is at least
-  `providers.dependence.unit_memory_floor_bytes`. A ceiling under the floor is
-  not a narrow budget; it is a provider that rejects every unit before it runs.
 - All byte arithmetic stays inside 64-bit signed range.
 
 ## Fingerprints

@@ -383,3 +383,34 @@ func TestToolStoreIsSharedByEveryWorkspace(t *testing.T) {
 		t.Fatalf("Load created the tool store: stat = %v, want not-exist", err)
 	}
 }
+
+// TestCPUBoundWorkIsSizedFromTheMachine protects the rule that no typed-in
+// number decides how much CPU-bound work runs at once. Failure mode: a fixed
+// worker or slot count leaves a sixteen-core machine running two parsers while
+// a two-core laptop is oversubscribed, and neither figure is anything a user
+// or an agent can be asked to tune.
+//
+// Mutation: return a constant from parserWorkersFor -- `func
+// parserWorkersFor(cpus int) int { return 2 }` -> "16 CPUs give 2 parser
+// workers, want 16: the count is not coming from the machine".
+func TestCPUBoundWorkIsSizedFromTheMachine(t *testing.T) {
+	for _, cpus := range []int{16, 2, 1} {
+		if got := parserWorkersFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d parser workers, want %d: the count is not coming from the machine", cpus, got, cpus)
+		}
+		if got := querySlotsFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d query slots, want %d", cpus, got, cpus)
+		}
+		// A traversal holds a query slot as well, so half the cores answer them
+		// and the rest stay free for the cheap calls interleaved with them --
+		// but never fewer than one, or a single-core machine answers no
+		// traversal at all.
+		want := cpus / 2
+		if want < 1 {
+			want = 1
+		}
+		if got := graphSlotsFor(cpus); got != want {
+			t.Errorf("%d CPUs give %d traversal slots, want %d", cpus, got, want)
+		}
+	}
+}
