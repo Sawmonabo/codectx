@@ -252,7 +252,7 @@ func openWorkspace(tb testing.TB, ctx context.Context, repo, home, extra string)
 	dataDir := filepath.Join(home, "data")
 	writeConfig(tb, home, dataDir, extra)
 	restore := useConfigHome(tb, home)
-	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{})
+	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{Operation: "index"})
 	// The environment is restored as soon as the workspace has read it: a
 	// shared fixture outlives the function that built it, and leaving HOME
 	// pointing into the fixture would silently reconfigure every later row.

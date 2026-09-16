@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -178,6 +179,10 @@ const (
 // worse than one value that carries the agreement.
 type openOptions struct {
 	mode openMode
+	// operation names what this composition is doing for the lock file it
+	// will write, so a process refused for a busy workspace can say who holds
+	// it. Every mode that takes the lock must carry one.
+	operation string
 	// wait is how long modeIndex waits for the workspace lock. modeReport
 	// takes no lock and ignores it.
 	wait time.Duration
@@ -225,12 +230,14 @@ type stack struct {
 	// an indexing composition has it from its open, the server takes it at its
 	// first build, and in both cases this field is the ONE lock the process
 	// holds and Close is the one release. lockWait is how long the acquisition
-	// waits, and builds records whether this composition may take it at all --
-	// a report or a query composition never does.
-	lock     *snapshot.WorkspaceLock
-	lockMu   sync.Mutex
-	lockWait time.Duration
-	builds   bool
+	// waits, operation is what it records in the lock file for whoever is
+	// refused while it is held, and builds records whether this composition
+	// may take it at all -- a report or a query composition never does.
+	lock      *snapshot.WorkspaceLock
+	lockMu    sync.Mutex
+	lockWait  time.Duration
+	operation string
+	builds    bool
 	// holders is how many operations are holding the lock right now. The
 	// composition that locks at its open holds one for its whole life; the
 	// server's operations take one each and give it back when they end.
@@ -382,9 +389,17 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// nil, so the absence is enforced there rather than trusted here. The
 	// serving composition takes the lock at its first build instead (Hold),
 	// for the same reason in a process that also answers questions.
-	s.builds, s.lockWait = o.indexing(), o.wait
+	// A composition that may take the lock must be able to name itself in it.
+	// Screened here rather than at the acquisition alone, so the server -- whose
+	// acquisition is a later build -- cannot come up anonymous and discover it
+	// at the first refresh.
+	if o.indexing() && strings.TrimSpace(o.operation) == "" {
+		return nil, &model.Error{Code: model.CodeInternal,
+			Message: "this workspace takes the indexing lock and was composed without naming its operation"}
+	}
+	s.builds, s.lockWait, s.operation = o.indexing(), o.wait, o.operation
 	if o.locksAtOpen() {
-		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, o.wait); err != nil {
+		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, s.operation, o.wait); err != nil {
 			return nil, err
 		}
 		// The composition itself is the first holder: this run's whole life is
@@ -1012,7 +1027,7 @@ func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error
 		// passes: an agent asking for a refresh while the person's own index
 		// runs is answered now, with the retryable refusal, rather than held
 		// for the length of a lock wait.
-		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.lockWait)
+		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.operation, s.lockWait)
 		if err != nil {
 			return nil, nil, err
 		}

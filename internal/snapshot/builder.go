@@ -205,7 +205,9 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	lock := b.Lock
 	if lock == nil {
 		var err error
-		if lock, err = LockWorkspace(ctx, b.Policy.DataDir, b.LockWait); err != nil {
+		// A capture the caller did not already hold the workspace for is what
+		// this lock names itself as to whoever is refused while it runs.
+		if lock, err = LockWorkspace(ctx, b.Policy.DataDir, "capture", b.LockWait); err != nil {
 			return model.Snapshot{}, err
 		}
 		defer lock.Close()

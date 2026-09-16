@@ -20,9 +20,12 @@ import (
 //
 // LastPassAt and PendingEvents are pointers because absent and zero are
 // different answers. A watch driven only by periodic reconciliation has no
-// notification queue to count, and a watch that has not completed a pass yet
-// has no pass time; reporting either as zero would state that the watch is
-// caught up.
+// notification queue to count, and a watch that has not completed a pass yet has
+// no pass time and publishes no pending count either; reporting either as zero
+// would state that the watch is caught up. A row with no pass time is therefore
+// a watch that is running and covering nothing -- waiting for whichever process
+// holds the workspace -- which is a third answer beside a covering watch and no
+// row at all.
 type WatchHeartbeat struct {
 	WriterPID     int
 	LastPassAt    *time.Time

@@ -313,7 +313,7 @@ func openCorpus(t *testing.T, ctx context.Context, repo string, languages []stri
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
 
-	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{})
+	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{Operation: "index"})
 	if err != nil {
 		t.Fatalf("open workspace: %v", err)
 	}

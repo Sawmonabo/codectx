@@ -97,7 +97,11 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			// answered now, with the retryable refusal it can act on, rather
 			// than held silent for a wait that cannot outlast that run; the
 			// watch loop takes the lock on a later pass of its own.
-			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{})
+			// The operation the lock will carry is this session: whatever
+			// the build behind it turns out to be -- a refresh a client asked
+			// for, or a watch pass -- what the person needs to recognise on
+			// the refusal is the server they left running.
+			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{Operation: "mcp server"})
 			if err != nil {
 				return err
 			}
