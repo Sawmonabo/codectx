@@ -84,6 +84,10 @@ const (
 	// into while it hashes it, before it knows whether the store already
 	// holds that content.
 	ContentTemp Purpose = "content-temp"
+	// EngineTemp is a temporary the database engine asked its file system
+	// for: a sort's spilled runs, a statement's pre-image. The engine never
+	// names these files and would create and unlink one per use.
+	EngineTemp Purpose = "engine-temp"
 )
 
 // dirName is the arena's own directory under the directory it serves.
