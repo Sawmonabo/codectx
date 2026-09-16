@@ -299,14 +299,22 @@ func (w *watchState) project(st *model.IndexStatus) {
 // heartbeat is what this watch publishes for another process to read: when its
 // last pass completed and how many events are pending, both absent when nothing
 // measured them.
+//
+// A watch that has completed no pass publishes neither figure. Until it owns
+// the workspace it has reconciled nothing, and the events its notification
+// queue has already collected are a backlog it has not touched, not coverage of
+// them: published, `0 pending` would tell another process's `status` that this
+// workspace is caught up while an index it is waiting behind is still running.
+// The row itself is still published, which is what keeps a watch that is
+// waiting distinguishable from a workspace where no watch has ever run.
 func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	_, _, pending, at := w.observe()
-	if !at.IsZero() {
-		lastPass = &at
+	if at.IsZero() {
+		return nil, nil
 	}
-	return lastPass, pending
+	return &at, pending
 }
 
 // capabilityReport accumulates one generation's capability rows and publishes

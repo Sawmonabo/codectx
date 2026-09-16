@@ -33,6 +33,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -948,4 +949,93 @@ type heldLock struct{ l *snapshot.WorkspaceLock }
 
 func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	return h.l, func() error { return nil }, nil
+}
+
+// busyLock is a workspace another process holds for as long as this fixture
+// runs: every hold is refused the way snapshot.LockWorkspace refuses a caller
+// that cannot have the lock, so a watch composed with it waits forever.
+type busyLock struct{}
+
+func (busyLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+	return nil, nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: "another codectx process holds the workspace indexing lock"}
+}
+
+// TestAWaitingWatchPublishesNoCoverage protects the heartbeat's three-way
+// distinction, whose collapse in either direction is silent and costly.
+//
+// Failure mode one: a watch that is still waiting for a workspace another
+// process holds publishes its notification backlog as a pending count, so
+// another process's `codectx status` reports `0 pending` -- the workspace is
+// caught up -- for a watch that has reconciled nothing and an index that is
+// still running.
+//
+// Failure mode two, the opposite: suppressing the row entirely would make a
+// waiting watch indistinguishable from a workspace where no watch has ever run,
+// and an operator who started one would be told nothing is watching.
+func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	ctx := f.ctx
+	root, err := workspace.Discover(f.repoDir)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	t.Cleanup(func() { root.Close() })
+	policy := f.cfg.TraversalPolicy()
+	policy.DataDir = f.dataDir
+	w, err := watch.New(watch.Options{Root: root, Policy: policy})
+	if err != nil {
+		t.Fatalf("watch.New: %v", err)
+	}
+	registry, err := provider.NewRegistry(f.providers(false)...)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	pool, err := provider.NewPool(f.cfg.Index.QueueBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
+		Lock: busyLock{}, Watcher: w, Pool: pool})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	// The heartbeat row is keyed by the repository, so the repository must
+	// exist before a watch can publish anything about it.
+	if err := f.store.EnsureRepository(ctx, c.Repository(), f.repoDir); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	watchCtx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Watch(watchCtx, nil) }()
+	var hb sqlite.WatchHeartbeat
+	var found bool
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if hb, found, err = f.store.WatchHeartbeat(ctx, c.Repository()); err != nil {
+			t.Fatalf("WatchHeartbeat: %v", err)
+		}
+		if found || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("a watch that is waiting for the workspace published no row at all, so it cannot be told from a workspace no watch ever ran in")
+	}
+	if hb.WriterPID != os.Getpid() {
+		t.Fatalf("the row must name this watch's process, got %d", hb.WriterPID)
+	}
+	if hb.LastPassAt != nil {
+		t.Fatalf("a watch that never held the workspace reported a completed pass at %v", hb.LastPassAt)
+	}
+	if hb.PendingEvents != nil {
+		t.Fatalf("a watch that never held the workspace claimed a pending count of %d, which reads as coverage", *hb.PendingEvents)
+	}
+	stop()
+	if err := <-done; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
 }

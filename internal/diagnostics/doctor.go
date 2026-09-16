@@ -90,7 +90,9 @@ type SuppliedIndexReader interface {
 // death that needs no pid probe and works on every platform. LastPassAt and
 // PendingEvents are absent when nothing measured them: a watch driven only by
 // periodic reconciliation counts no notification queue, and a watch that has
-// completed no pass has no pass time.
+// completed no pass has neither a pass time nor any figure at all -- it is
+// running and covering nothing, which is a third answer beside coverage and no
+// watch at all.
 type WatchHeartbeat struct {
 	WriterPID     int
 	LastPassAt    *time.Time
@@ -750,27 +752,36 @@ func (s *Service) checkAnalyzerRestriction() model.DoctorCheck {
 // checkWatchHeartbeat reports whether a watch is running for this workspace,
 // from the row a watching process publishes and refreshes (Section 13.2).
 //
-// The three states are three different facts and never collapse. `pass` is a
-// live row: some process is watching, and it says which one, so an operator who
-// wants it stopped knows what to stop. `warn` is an expired row: a watch ran and
-// is no longer refreshing, so every change since is unseen while the workspace
-// still looks watched -- the one state an operator must act on. `unavailable` is
-// no row at all, which is the ordinary state of a workspace nobody is watching
-// and not a defect; it is also what a build with no heartbeat reader reports.
+// The states are different facts and never collapse. A live row is `pass`, and
+// its detail separates a watch that is covering this workspace from one that is
+// running but has completed no pass -- a watch waiting for whichever process
+// holds the workspace covers nothing yet, and reporting it as coverage is how an
+// operator comes to trust an index that is not being kept fresh. `warn` is an
+// expired row: a watch ran and is no longer refreshing, so every change since is
+// unseen while the workspace still looks watched -- the one state an operator
+// must act on. `unavailable` is no row at all, which is the ordinary state of a
+// workspace nobody is watching and not a defect; it is also what a build with no
+// heartbeat reader reports.
 func (s *Service) checkWatchHeartbeat(ctx context.Context) model.DoctorCheck {
 	hb, live, ok := s.liveWatch(ctx)
 	switch {
 	case !ok:
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,
 			Detail: "this build publishes no watch heartbeat, so whether a watch is running for this workspace cannot be told from another process"}
+	case live && hb.LastPassAt == nil:
+		// A watch process is here and refreshing its row, but it has completed
+		// no pass -- it is waiting for a workspace another process holds. It is
+		// neither coverage nor an absent watch, and saying either would send an
+		// operator looking for the wrong thing.
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckPass,
+			Detail: "a watch is running in process " + strconv.Itoa(hb.WriterPID) +
+				" but has completed no pass yet, so nothing in this workspace is covered by it; it is waiting for whichever process holds the workspace"}
 	case live:
 		detail := "a watch is running in process " + strconv.Itoa(hb.WriterPID)
 		if hb.PendingEvents != nil {
 			detail += ", with " + strconv.FormatInt(*hb.PendingEvents, 10) + " pending event/events"
 		}
-		if hb.LastPassAt != nil {
-			detail += "; its last pass completed " + hb.LastPassAt.UTC().Format(time.RFC3339)
-		}
+		detail += "; its last pass completed " + hb.LastPassAt.UTC().Format(time.RFC3339)
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckPass, Detail: detail}
 	case hb.ExpiresAt.IsZero():
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,
