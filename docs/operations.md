@@ -129,23 +129,19 @@ could queue behind one.
 
 Two consequences an operator sees:
 
-* A `search` answer from such a process is a **single page**. A continuation
-  needs a cursor lease and a spool, which are writes, so the answer is served
-  and marked truncated, with a reason naming the hits beyond it, rather than
-  carrying a token the process could not honour.
-* `symbol` pages in full from such a process. Its continuation carries its whole
-  position in the token and retains nothing on disk, so it needs no lease: the
-  generation it names is held by the read snapshot of whichever call presents
-  it, and a generation collected in between is answered `CTX_CURSOR_INVALID`,
-  re-run from the first page.
-* A **graph walk** -- `refs`, `callers`, `callees`, `path`, `impact` -- answers
-  one page and mints no continuation. Its continuation would retain a spool or a
-  search-state directory, and what reclaims such a directory is the expiry of the
-  cursor lease that names it: a lease is a write, and a directory adopted without
-  one would sit on disk with nothing to reclaim it. So nothing is adopted at all,
-  the page is served and the answer is marked truncated with a reason naming what
-  lies beyond it. Narrow the walk with `--depth`, `--visited` or `--edges` to
-  bring the answer inside one page.
+* Every answering command **pages in full**. A continuation needs a signed token
+  and, for an answer whose position does not fit one, some state beside the
+  workspace; neither is a database write. What such a process cannot record is
+  the retention lease, so the state it keeps is bound to the continuation's own
+  recorded expiry instead and is reclaimed on that deadline by the next `gc` or
+  `index` in any process. Pass the printed cursor back to take the next page.
+* A continuation that names state whose deadline has passed, or a generation
+  collected in the meantime, is answered `CTX_CURSOR_INVALID`: re-run from the
+  first page. A `search`, `refs` or `impact` answer paged this way is reachable
+  for one `storage.query_cursor_ttl` from its first page, because the spool it
+  reads carries the expiry the page that wrote it stamped and no lease renews
+  it. A walk and a `path` search re-stamp their state on every page, so their
+  deadline advances with the walk.
 * `doctor --deep` is in the recording row, not the answering one: the search
   index's own integrity check is spelled as an insert into the index, so a deep
   report needs the writer. It still takes no workspace lock.

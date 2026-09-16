@@ -37,15 +37,13 @@ func (c Cursor) Validate() error {
 	if !model.ValidHexID(string(c.AnalysisKey)) || !model.ValidHexID(c.QueryHash) {
 		return cursorInvalid("cursor analysis key and query hash must be well-formed identifiers")
 	}
-	// A cursor that names a SPOOL must name the lease that keeps that spool
-	// readable. A pure keyset cursor retains nothing on disk: it carries its
-	// whole position in the token, and the generation it pins is held by the
-	// read snapshot of whichever call presents it, so it may carry no lease at
-	// all. That is what lets a process with no writer -- one answering while
-	// another indexes -- hand back a continuation instead of stopping.
-	if c.SpoolID != "" && !model.ValidHexID(c.LeaseID) {
-		return cursorInvalid("a cursor naming a spool must name the lease that retains it")
-	}
+	// A cursor may carry no lease at all. A pure keyset cursor retains nothing
+	// on disk, and a cursor naming a SPOOL written by a process that records no
+	// lease binds that spool to this expiry instead: Spools.live reads the
+	// header's own ExpiresAt when the header names no lease, so leaseless state
+	// is reclaimed by time rather than by the existence of a row. That is what
+	// lets a process with no writer -- one answering while another indexes --
+	// hand back a continuation instead of stopping.
 	if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
 		return cursorInvalid("cursor lease id is malformed")
 	}
