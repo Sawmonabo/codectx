@@ -1267,11 +1267,10 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 //
 // One packed scan covers a whole level, where a keyset reader makes one round
 // trip per node chunk per page of at most model.MaxPageItems rows, plus the
-// empty page that ends the loop. A clock that ticked once per scan
-// would therefore be far coarser than the one these cases were calibrated
-// against, so a "round trip" here is one scan, one per adjacencyBatch entries
-// it delivers, and one for the scan's end -- the same granularity the old port
-// charged, which is what lets the trigger counts stand unchanged.
+// empty page that ends the loop. A clock that ticked once per scan would
+// therefore be far coarser than these cases are calibrated against, so a
+// "round trip" here is one scan, one per adjacencyBatch entries it delivers,
+// and one for the scan's end.
 type slowReader struct {
 	GraphReader
 	knobs slowAdjacency

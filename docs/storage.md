@@ -577,10 +577,14 @@ Four fixed-width arrays sit beside them, indexed the same way: each node's kind
 code, its container surrogate, and the source size of a file node, and each
 relation's evidence count. Zero is "absent" in all four, so a surrogate the
 generation does not carry costs one zeroed entry and never a lookup. The
-container is the node itself when the node is a container kind, otherwise the
-`contains` parent of a container kind with the **lowest canonical id** — the
-32-byte identity, never the surrogate, so the attribution is a fact of the ids
-and not of the order the repository happened to be indexed in.
+container is the node itself when the node is a container kind; otherwise it is
+the container-kind node that claims the node's **file**, overridden wherever a
+container-kind node claims the node **directly** by `contains`. Either claim
+settles ties on the **lowest canonical id** — the 32-byte identity, never the
+surrogate, so the attribution is a fact of the ids and not of the order the
+repository happened to be indexed in. A node whose file publishes no container
+and that nothing contains keeps a zero slot: neither a directory nor a file
+answers "which package does this symbol belong to".
 
 Parts are a fixed size except the last of each stream, which makes locating a
 byte pure arithmetic. A list may straddle a boundary and the reader stitches it.

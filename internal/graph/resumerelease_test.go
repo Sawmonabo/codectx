@@ -260,6 +260,143 @@ func TestBusyCollectingTraversalPageKeepsItsFrontier(t *testing.T) {
 	}
 }
 
+// TestARetriedCollectingPageDoesNotReCollectACommittedLevel is the other half
+// of the collecting retry, and the one the caller cannot detect. A page
+// resumed into a COLLECTING level may commit that level's transition and then
+// fail retryably on the level below; the remedy the error names is to present
+// the SAME cursor again, which still says "collecting".
+//
+// Collecting it again is not idempotent. The committed transition already
+// applied this level's admissions to the visited bits, and the direction dedup
+// rule reads exactly those bits, so the second scan of the same frontier drops
+// the incoming edges the first one kept. finish() then rewrites sorted.<level>
+// strictly smaller while writeAdmitted reuses the admitted file that is
+// already there, so the frontier, the admitted count and the visited count all
+// stand: the retried walk serves FEWER relations and reports itself complete
+// and untruncated. A caller has nothing to compare against, which is why this
+// is proved against the same walk run in one page.
+//
+// The visited count is asserted with the relations: the level being served is
+// what closeGroup charges the budget from, and a leg that re-presents a serving
+// or collecting cursor after the next level has committed finds the frontier
+// bitset rebuilt around that next level unless it is realigned first.
+//
+// Mutation proof (fails this test): drop the committed() check at the head of
+// collect, so the retry re-collects the level -- `the retried walk served 47
+// relations, want the 48 the unbounded walk serves`.
+func TestARetriedCollectingPageDoesNotReCollectACommittedLevel(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems, limits.QueryTimeout = 2000, time.Minute
+	// DirectionBoth: the direction dedup rule -- the thing a re-collect
+	// silently re-applies against bits that have moved on -- is skipped
+	// outright on a one-direction walk.
+	req := model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionBoth, Relations: []model.RelationKind{model.RelCalls}}
+
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Neighbors(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unbounded walk: %v", err)
+	}
+	if all.Meta.NextCursor != "" || len(all.Relations) == 0 {
+		t.Fatalf("the unbounded walk is paged (%d relations, cursor %t)",
+			len(all.Relations), all.Meta.NextCursor != "")
+	}
+
+	for trigger := 2; ; trigger++ {
+		if trigger > 12 {
+			t.Fatalf("no deadline placement minted a COLLECTING continuation")
+		}
+		clock := time.Now()
+		calls, fired := 0, false
+		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+			trigger: trigger, jump: 2 * time.Minute, fired: &fired}
+		// The failure lands on the SECOND adjacency read of the resumed page:
+		// by then the level the cursor names has been collected, its
+		// transition has committed and the level below has begun.
+		adj := &busyOnceReader{GraphReader: slow.reader(memGraphFor(f)), failAt: 2}
+		e, err := New(Options{Adjacency: slow, Reader: adj, Signer: signer, Spools: spools,
+			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+			Now: func() time.Time { return clock }})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		first, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("the deadline-stopped page failed: %v", err)
+		}
+		if first.Meta.NextCursor == "" || cursorLevelState(t, e, first.Meta.NextCursor) != levelCollecting {
+			continue
+		}
+		next := req
+		next.Page, next.GenerationID = model.PageRequest{Cursor: first.Meta.NextCursor}, 0
+
+		adj.fail, adj.calls = true, 0
+		if _, err := e.Neighbors(context.Background(), next); err == nil {
+			continue
+		} else if typed := (*model.Error)(nil); !errors.As(err, &typed) || !typed.Retryable {
+			t.Fatalf("the contended page reported %v, not a retryable failure", err)
+		}
+		if adj.injected != 1 {
+			t.Fatalf("the contended read was never served; this case proves nothing")
+		}
+
+		// The retry the error invites: the same cursor, a healthy store.
+		served := append([]model.Relation(nil), first.Relations...)
+		var last model.GraphResult
+		for page := 2; ; page++ {
+			if page > 200 {
+				t.Fatalf("the retried walk did not end in %d pages", page)
+			}
+			last, err = e.Neighbors(context.Background(), next)
+			if err != nil {
+				t.Fatalf("the retry of the contended page failed: %v", err)
+			}
+			served = append(served, last.Relations...)
+			if last.Meta.NextCursor == "" {
+				break
+			}
+			next.Page = model.PageRequest{Cursor: last.Meta.NextCursor}
+		}
+		seen := map[model.RelationID]bool{}
+		for _, rel := range served {
+			if seen[rel.ID] {
+				t.Fatalf("relation %s was served twice across the retried walk", rel.ID)
+			}
+			seen[rel.ID] = true
+		}
+		if len(seen) != len(all.Relations) {
+			t.Fatalf("the retried walk served %d relations, want the %d the unbounded walk serves: "+
+				"the retry re-collected a level whose transition had already committed",
+				len(seen), len(all.Relations))
+		}
+		if last.Meta.Truncated {
+			t.Fatalf("the retried walk ended truncated with %q", last.Meta.TruncationReason)
+		}
+		if last.VisitedCount != all.VisitedCount {
+			t.Fatalf("the retried walk reports visited_count %d, want the %d the unbounded walk "+
+				"reports: the served level's admissions were charged against another level's frontier",
+				last.VisitedCount, all.VisitedCount)
+		}
+		return
+	}
+}
+
 // cursorLevelState is the level state a continuation resumes in.
 func cursorLevelState(t *testing.T, e *Engine, token string) levelState {
 	t.Helper()

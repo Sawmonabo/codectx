@@ -192,21 +192,101 @@ func TestReferenceListThatFitsOnePageRetainsNothing(t *testing.T) {
 	}
 }
 
+// TestReferencePagesResumeAcrossADeferredBatch protects the one thing a paged
+// reference answer must never do: lose or duplicate an occurrence. A batch of
+// relations is hydrated as a unit, and when its FIRST relation does not fit the
+// page the batch that preceded it partly filled, the batch consumes nothing.
+// That is not a stuck cursor -- the offset still names the batch's start, so
+// the deferred relation is the next page's first -- and answering
+// CTX_INTERNAL there makes a whole class of ordinary reference lists
+// unreadable past their second page.
+//
+// The counts below are chosen so the case arises on a RESUMED page: relations
+// carrying no evidence row contribute no occurrence, so a batch of four can
+// leave the page half full, and the next batch opens on a relation whose three
+// occurrences overflow it. The per-page counts are asserted because a fixture
+// that stopped producing the deferred batch would leave this passing on a case
+// it no longer exercises.
+//
+// Mutation (the `break` on b.full restored to the internalErr it replaced):
+// page two answers CTX_INTERNAL and this fails.
+func TestReferencePagesResumeAcrossADeferredBatch(t *testing.T) {
+	f := newGraphFixture(t)
+	// n-sink is referenced by nothing, so the list below is the whole answer
+	// and its batch arithmetic is a fact of this test rather than of the
+	// fixture's other scenarios.
+	addReferences(t, f, "n-sink", []int{1, 1, 1, 1, 1, 0, 0, 1, 3, 1, 1, 1})
+	whole, _ := refsEngine(t, f, MemoryGraphOrder{}, 200)
+	want := refsPage(t, whole, "n-sink", "")
+
+	// Four occurrences a page, which is also the hydration batch: batch one of
+	// page two serves two occurrences and batch two opens on the relation
+	// carrying three.
+	paged, leases := refsEngine(t, f, MemoryGraphOrder{}, 4)
+	page := refsPage(t, paged, "n-sink", "")
+	got, sizes := append([]model.ReferenceOccurrence(nil), page.Items...), []int{len(page.Items)}
+	for cursor := page.Meta.NextCursor; cursor != ""; {
+		page = refsPage(t, paged, "n-sink", cursor)
+		got, sizes = append(got, page.Items...), append(sizes, len(page.Items))
+		cursor = page.Meta.NextCursor
+	}
+	if fmt.Sprint(sizes) != fmt.Sprint([]int{4, 2, 4, 2}) {
+		t.Fatalf("page sizes = %v, want [4 2 4 2]: the deferred batch is what page two's short page is", sizes)
+	}
+	if s, w := mustJSON(t, got), mustJSON(t, want.Items); s != w {
+		t.Fatalf("the pages do not concatenate to the single-shot answer\n want: %s\n got:  %s", w, s)
+	}
+	if leases.liveCount() != 0 {
+		t.Fatalf("liveCount = %d after the last page; an exhausted answer must retain nothing", leases.liveCount())
+	}
+}
+
+// addReferences appends one calling relation per entry of rows, from a caller
+// of its own to node, carrying that many evidence rows. A relation with zero
+// rows is a canonical reference with no location: it is consumed and reported
+// as no occurrence, which is what lets a hydration batch fill less of a page
+// than it holds relations.
+func addReferences(t *testing.T, f *graphFixture, node string, rows []int) {
+	t.Helper()
+	proto := protoEvidence(t, f)
+	target := fixtureNodeID(node)
+	for i, n := range rows {
+		name := fmt.Sprintf("n-defer-src-%d", i)
+		src := fixtureNodeID(name)
+		f.nodes[src] = model.Node{ID: src, Kind: model.NodeFunction, Name: name,
+			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
+		rel := model.RelationID(fmt.Sprintf("%064x", 0xe000+i))
+		f.relations = append(f.relations, model.Relation{
+			ID: rel, From: src, Kind: model.RelCalls, To: target})
+		for j := 0; j < n; j++ {
+			row := proto
+			row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-defer-%d-%d", i, j)))
+			row.RelationID = rel
+			f.evidence[rel] = append(f.evidence[rel], row)
+		}
+	}
+	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
+}
+
+// protoEvidence is the fixture's own evidence row, copied by the helpers that
+// mint new ones so a minted row carries a valid precision, file and range.
+func protoEvidence(t *testing.T, f *graphFixture) model.Evidence {
+	t.Helper()
+	for _, r := range f.relations {
+		if rows := f.evidence[r.ID]; len(rows) > 0 {
+			return rows[0]
+		}
+	}
+	t.Fatalf("the fixture carries no evidence row to model a new one on")
+	return model.Evidence{}
+}
+
 // widenReferences adds n further evidence-bearing callers of node to the
 // fixture. Their relation ids sort after every declared edge, so no existing
 // scenario's keyset order moves and no other answer gains an occurrence.
 func widenReferences(t *testing.T, f *graphFixture, node string, n int) {
 	t.Helper()
-	var proto model.Evidence
-	for _, r := range f.relations {
-		if rows := f.evidence[r.ID]; len(rows) > 0 {
-			proto = rows[0]
-			break
-		}
-	}
-	if proto.ID == "" {
-		t.Fatalf("the fixture carries no evidence row to model a new one on")
-	}
+	proto := protoEvidence(t, f)
 	target := fixtureNodeID(node)
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("n-page-src-%d", i)

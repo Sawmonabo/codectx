@@ -55,10 +55,11 @@ type ContainerReader interface {
 // overviewContainerKinds is the vocabulary of the repository map: the kinds
 // Section 19.2's "repository/package/module/language map" is built from.
 //
-// It is deliberately WIDER than isContainerKind: a rollup asks "which package
-// does this symbol belong to", where a directory would answer a different
-// question, while the map is the structure itself and a repository whose
-// directories were omitted would not be a map of it.
+// It is deliberately WIDER than the rollup's container vocabulary (packages
+// and modules): a rollup asks "which package does this symbol belong to",
+// where a directory would answer a different question, while the map is the
+// structure itself and a repository whose directories were omitted would not
+// be a map of it.
 func overviewContainerKinds() []model.NodeKind {
 	return []model.NodeKind{model.NodeRepository, model.NodeDirectory,
 		model.NodePackage, model.NodeModule, model.NodeNamespace}
@@ -85,8 +86,9 @@ func overviewRelationKinds() []model.RelationKind {
 //
 // Depth is inclusive and 0-based: a root container is depth 0, and a request
 // asking for depth 2 receives depths 0, 1 and 2. A zero Depth means the
-// engine's configured MaxDepth, never "unlimited", exactly as every other
-// bound on this engine.
+// engine's configured MaxDepth, exactly as every other bound on this engine:
+// zero on the request is never "unlimited", but the configured bound it falls
+// back to is unlimited by default (docs/queries.md).
 func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page model.Page[model.OverviewItem], err error) {
 	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
@@ -566,10 +568,12 @@ type containerCounts struct{ files, symbols, bytes int64 }
 // hydrated in batches, never one node at a time, and the whole page shares one
 // cumulative edge budget.
 //
-// A container tree that outruns that budget REFUSES with CTX_RESOURCE_LIMIT.
-// Nothing here can be reported instead: the counts already accumulated are
-// short by an unknown amount, and a page flag naming no container would leave
-// every number on it indistinguishable from a measured one.
+// A container whose children the budget could not be counted within is OMITTED
+// from the map this returns, and the page is marked truncated with a notice
+// naming the bound. Reporting its short totals is what is refused: the counts
+// accumulated for it are under by an unknown amount and would read as the
+// shape of a small container, while an omitted container is a missing
+// measurement the caller can see and page past.
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts,
 	map[model.NodeID]bool, error) {
@@ -640,9 +644,9 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 			continue
 		}
 		// The counts come from the generation's node-kind and source-byte side
-		// arrays, read once per batch of children. Nothing is hydrated: the
-		// old map read a whole model.Node per child to look at two fields of
-		// it, which is what made its second page refuse at the deadline
+		// arrays, read once per batch of children. Nothing is hydrated:
+		// reading a whole model.Node per child to look at two fields of it
+		// costs a page its deadline on the second page of a large map
 		// (ADR-0005).
 		complete, err := scanNeighbours(ctx, reader, chunk, model.DirectionOutgoing,
 			kinds, remaining, b, func(owners, children []NodeRef) error {
@@ -758,7 +762,7 @@ func stripQuoting(s string) string {
 }
 
 // isOverviewContainer reports whether a node kind is part of the repository
-// map. See overviewContainerKinds for why it is wider than isContainerKind.
+// map. See overviewContainerKinds for why it is wider than the rollup's.
 func isOverviewContainer(k model.NodeKind) bool {
 	switch k {
 	case model.NodeRepository, model.NodeDirectory, model.NodePackage,

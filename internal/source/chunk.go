@@ -120,9 +120,11 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 //
 // It never returns zero. When body holds no rune boundary after its first
 // byte, every cut but the full window would leave the chunk making no
-// progress, so the window is kept whole; its trailing bytes are not a
-// sequence under any reading and the caller carries them as base64 or
-// sanitises them.
+// progress, so the window is kept whole -- trailing bytes and all. If the byte
+// after that window is itself a continuation byte, the next PlanChunk refuses
+// it: a request whose offset is inside a UTF-8 sequence is CTX_INVALID_INPUT,
+// and a file that holds such a run is unreadable past it rather than served in
+// pieces that do not decode.
 func trimToRuneBoundary(body []byte) int {
 	last := -1
 	for i := len(body) - 1; i >= 0; i-- {
