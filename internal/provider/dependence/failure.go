@@ -60,6 +60,12 @@ const (
 	FailureEngine FailureClass = "engine"
 	// FailureTimeout is a step that exceeded the unit's deadline.
 	FailureTimeout FailureClass = "timeout"
+	// FailureEmptyExport is an export that carries no method for a unit that
+	// has source. Both steps exited cleanly; what the export holds is the
+	// only signal, and it is not a crash: a frontend that skips every file it
+	// was given -- because its own default excludes the directories the
+	// project keeps its sources in, say -- leaves exactly this.
+	FailureEmptyExport FailureClass = "empty_export"
 )
 
 // code maps a class to its Section 22 error code.
@@ -87,6 +93,8 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		msg += "the analysis ran out of memory"
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
+	case FailureEmptyExport:
+		msg += "the analysis exported no method for a unit that has source"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -100,6 +108,12 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	if o.Exception != "" {
 		err = err.WithDetail("exception", truncate(o.Exception, model.MaxIdentifierBytes))
+	}
+	// The child's own last words. A failure that reports only how many bytes
+	// its child wrote to standard error has discarded the one record of what
+	// went wrong, which is what a 7.5 KB crash on a real repository did.
+	if o.StderrTail != "" {
+		err = err.WithDetail("stderr_tail", truncate(o.StderrTail, model.MaxDetailBytes))
 	}
 	// The observed peak is the tree's, sampled while it ran: what the failed
 	// unit actually used, against what it was admitted for. It is reported for

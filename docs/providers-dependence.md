@@ -238,9 +238,32 @@ reservation = heap cap + per-family resident allowance + helper allowance
 heap cap    = clamp(unit_memory_floor_bytes,
                     unit source bytes x per-family estimate,
                     machine-derived allocation, unit_memory_ceiling_bytes)
-allocation  = MemAvailable - base footprint - safety margin
+allocation  = min(MemAvailable - base footprint - safety margin,
+                  MemAvailable / 2)
 ```
 
+* The cap is sized to what the unit needs, never to what the machine has. A
+  frontend grows toward whatever cap it is given and does not need it: a
+  157 MB JavaScript project of 4,984 files parsed in 3 m 38 s under a 4 GiB
+  cap and in 3 m 41 s with no cap at all, while the process tree's peak
+  resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
+  16 GiB — for exports whose method, call, control-dependence and
+  data-dependence counts were identical at every cap. A 2 GiB cap on the same
+  project failed closed. Sizing a cap from the machine therefore buys nothing
+  and serializes every other unit behind a reservation nothing uses. A soft
+  heap ceiling was measured as an alternative and is not one: under a 16 GiB
+  cap with a 1 GiB soft ceiling the same tree still peaked at 3.8 GB against
+  the 1.2 GB a real 1 GiB cap produced, and adding periodic collection and
+  aggressive free ratios moved it to 3.3 GB while costing time. The hard cap
+  is the only thing the runtime honours.
+* The allocation leaves the host at least **half** of what was available when
+  the run began. The product runs beside the editor, the agents and the
+  browser of the person indexing their repository; an allocation of
+  "everything but the safety margin" handed one analyzer a 42 GB heap cap on
+  a 47 GB machine. It is a design constant, not a setting, for the same
+  reason the ruling forbids a default ceiling: it decides how the product
+  shares a machine, not how much work it will do. A unit whose estimate
+  exceeds even the allocation still runs, whole, at the allocation.
 * The cap is placed on the engine's frontend heap. It is lossless everywhere
   it succeeds: on five large repositories a capped run produced the same facts
   as the default run within the engine's run-to-run variance — no systematic
@@ -248,7 +271,11 @@ allocation  = MemAvailable - base footprint - safety margin
 * A heap cap is not a memory cap. The per-family allowance is the resident
   memory the frontend keeps outside the heap, measured in §10: C/C++ 2.6 GB,
   Python 1.9 GB, Go 0.3–0.5 GB, Java 0.1–0.4 GB, TypeScript/JavaScript 0.3 GB,
-  Rust 0.25 GB plus a fixed ~0.8 GB helper outside the heap.
+  Rust 0.25 GB plus a fixed ~0.8 GB helper outside the heap. The
+  TypeScript/JavaScript figure is the one that scales with the project rather
+  than sitting flat: the syntax helper holds the whole project's trees outside
+  the heap, and on the 4,984-file project above the tree ran 1.7 GB above its
+  cap, so that is the allowance the family reserves.
 * Export gets its own, smaller heap cap and its own reservation: it scales with
   the graph, not the source, and the export is deleted after import. Its size
   is not capped: an export the disk cannot hold is a disk that is full, which
@@ -272,6 +299,11 @@ allocation  = MemAvailable - base footprint - safety margin
   make one fit. `max_concurrent_heavy_analyzers` (default 1) and the summed
   reservations are the coordinator's scheduling inputs; the provider exposes
   the reservation and runs what it is given.
+* What each unit was reserved, capped and observed to peak at is disclosed
+  per unit in the `status --resources` accounting block. It is process
+  accounting rather than a capability detail: an observed peak differs on
+  every run, and a capability row's details fold into the analysis key, where
+  two identical runs must key identically.
 
 ## Failure classes
 
@@ -281,7 +313,8 @@ Every one of these was reproduced against the real engine.
 |---|---|---|
 | `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
 | `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. No retry: it reproduces. Siblings are unaffected. |
-| `engine` (zero-exit helper crash) | `Process exited with code <n>` on stderr, **or** an export with no methods for a unit that has source, **or** a clean exit that left no graph | same code. The exit status is a lie in this mode; the empty result is the only honest signal. |
+| `engine` (zero-exit helper crash) | `Process exited with code <n>` on stderr, **or** a clean exit that left no graph | same code. The exit status is a lie in this mode; the empty result is the only honest signal. |
+| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`. Not worded as a crash, because none happened: a frontend whose own defaults exclude the directories a project keeps its sources in skips every file it was given. The Java frontend excludes any path with a `test` directory component, which is measurably the whole of a project laid out as `src/test/java/...`. Compare `source_files` with what the family's frontend admits. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
 
@@ -308,8 +341,24 @@ engine/none decision, which the graph-presence check then resolves. Reading it
 as heap exhaustion would spend the unit's single retry on a full reparse of a
 unit that had already succeeded.
 
+Every failure also carries `stderr_tail`: the last of what the child wrote to
+its standard error, bounded to what one error detail holds, cut at a line
+boundary, with the run's private directories and every other absolute path
+reduced to a name. Without it a failure reported only how many bytes the child
+wrote, and a crash on a real repository left nothing that could be read
+afterwards.
+
 Classification depends on the engine logging at WARN, so the child environment
-pins its log level rather than inheriting whatever the host set.
+pins its log level rather than inheriting whatever the host set. The child's
+environment is built by the product and inherits nothing, which also means it
+inherits no locale: every child is given a UTF-8 one, because a C locale makes
+the platform's path encoding ASCII and a runtime that encodes a file name
+through it cannot open a source file whose name holds a letter outside ASCII
+at all. One such file failed a 4,984-file project with
+`java.nio.file.InvalidPathException`; the same project parsed and exported with
+the locale set and nothing else changed. Setting the encoding as a runtime
+property instead does not work and was measured not to: the runtime derives its
+path encoding from the locale and ignores the property.
 
 Every result is validated for non-emptiness before admission, and a failed
 unit leaves no facts: `provider.RunUnit` deletes everything the run wrote and

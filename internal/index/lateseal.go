@@ -311,6 +311,16 @@ type sealedUnit struct {
 	unit                 model.UnitID
 }
 
+// batch is what one tick produced: the units that sealed, and the reason, per
+// plan key, for each one that did not. The failures travel with the seals
+// because the publication has to tell a scope that failed from a scope still
+// running -- a provider whose other scopes published is partial with the
+// failed scope named, not a provider nobody has heard from.
+type batch struct {
+	sealed []sealedUnit
+	failed map[string]string
+}
+
 // tick takes the tick slot and runs one batch, abandoning the attempt if ctx
 // is cancelled before the slot is free.
 func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
@@ -355,7 +365,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 	work := &generation{c: c, view: view, gen: workGen, prev: active, caps: c.newCapabilityReport(),
 		snap: model.Snapshot{ID: snap, RepositoryID: c.repo},
 		plan: plan.Plan{Previous: map[string]model.UnitID{}}}
-	var sealed []sealedUnit
+	b := batch{failed: map[string]string{}}
 	// One unit is popped at a time, so Promote can still see everything that
 	// has not sealed yet; every unit that seals before the queue empties
 	// publishes through the one generation below, which is the coalescing
@@ -379,16 +389,17 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			// stale from its carried predecessor.
 			logTyped(c.log, "a deferred unit failed", err, "component", component,
 				"provider_id", d.unit.ProviderID, "scope_key", d.unit.ScopeKey)
+			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = provider.CodeOf(err)
 			continue
 		}
-		sealed = append(sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
+		b.sealed = append(b.sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
 	}
-	if len(sealed) == 0 {
+	if len(b.sealed) == 0 {
 		abort()
 		return nil
 	}
 	l.setPublishing(true)
-	res, published, err := l.publish(ctx, snap, sel, ref, sealed)
+	res, published, err := l.publish(ctx, snap, sel, ref, b)
 	l.setPublishing(false)
 	abort()
 	if err != nil {
@@ -397,7 +408,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		// engine work is lost. Saying how much is lost is the difference
 		// between a diagnosable failure and minutes of analysis vanishing.
 		c.log.Warn("a deferred publication failed and its sealed units are abandoned",
-			"component", component, "repository_id", string(c.repo), "units", len(sealed))
+			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return err
 	}
 	if published {
@@ -483,9 +494,9 @@ func (l *lateSealer) observe(d time.Duration) {
 // the indexing path stops there: a caller that loses twice is contending with
 // a writer that is winning.
 func (l *lateSealer) publish(ctx context.Context, snap model.SnapshotID, sel provider.Selection,
-	ref string, sealed []sealedUnit) (model.IndexResult, bool, error) {
+	ref string, b batch) (model.IndexResult, bool, error) {
 	for attempt := 0; ; attempt++ {
-		res, published, err := l.publishOnce(ctx, snap, sel, ref, sealed)
+		res, published, err := l.publishOnce(ctx, snap, sel, ref, b)
 		if err == nil {
 			return res, published, nil
 		}
@@ -505,7 +516,7 @@ func (l *lateSealer) publish(ctx context.Context, snap model.SnapshotID, sel pro
 // generation the tick saw and has retention delete it, so pinning that id
 // would fail and discard the whole batch.
 func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel provider.Selection,
-	ref string, sealed []sealedUnit) (model.IndexResult, bool, error) {
+	ref string, b batch) (model.IndexResult, bool, error) {
 	c := l.c
 	started := c.now()
 	active, err := c.activeGeneration(ctx)
@@ -523,7 +534,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	pinned.Close()
 	if current != snap {
 		c.log.Warn("deferred units were sealed over a superseded snapshot; they are not published and the next index rebuilds them",
-			"component", component, "repository_id", string(c.repo), "units", len(sealed))
+			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return model.IndexResult{}, false, nil
 	}
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
@@ -544,8 +555,8 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	defer func() { _ = p.Close() }()
-	replacing := make(map[string]model.UnitID, len(sealed))
-	for _, s := range sealed {
+	replacing := make(map[string]model.UnitID, len(b.sealed))
+	for _, s := range b.sealed {
 		replacing[plan.Key(s.providerID, s.scopeKey)] = s.unit
 	}
 	// Every sealed unit must be the unit this plan derives for its scope. If
@@ -579,7 +590,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
-		snap: captured, started: started, caps: c.newCapabilityReport()}
+		snap: captured, started: started, caps: c.newCapabilityReport(), failedScopes: b.failed}
 	for _, s := range p.States {
 		g.caps.add(s)
 	}

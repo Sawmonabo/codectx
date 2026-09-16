@@ -28,6 +28,8 @@ package joern
 import (
 	"bufio"
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -58,9 +60,14 @@ const maxScanTokenBytes = 1 << 20
 // classify turns one child's outcome into the neutral vocabulary the provider
 // acts on. A timeout wins over everything, because a terminated tree's stderr
 // says whatever it happened to have flushed.
-func classify(res process.Result) dependence.Outcome {
+//
+// private are the directories this run made for the child. They are reduced to
+// their names in the tail the outcome carries: a diagnostic an operator reads
+// must not publish where a private materialization or a work directory lives.
+func classify(res process.Result, private []string) dependence.Outcome {
 	out := dependence.Outcome{ExitCode: res.ExitCode, Duration: res.Duration, StderrBytes: res.StderrBytes,
-		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled}
+		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled,
+		StderrTail: stderrTail(res.Stderr, private)}
 	if res.TimedOut {
 		out.Class = dependence.FailureTimeout
 		return out
@@ -112,6 +119,53 @@ func classify(res process.Result) dependence.Outcome {
 	}
 	return out
 }
+
+// stderrTail is the last of a child's standard error: at most one error
+// detail's worth, cut forward to a line boundary so a stack frame is never
+// served half-written, and with every absolute path in it reduced to a name.
+//
+// The reduction is deliberately blunt. What a reader needs from an engine
+// stack trace is the exception, the pass and the file it choked on, and every
+// one of those survives a base name; what nobody outside this process may be
+// told is where the run materialized the repository. A field that begins with
+// a path separator is a path whatever produced it, so the rule needs no
+// knowledge of which tool wrote the line -- and the private directories are
+// replaced first, by name, so a path under one of them cannot survive as an
+// unrelated-looking suffix.
+func stderrTail(b []byte, private []string) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) > model.MaxDetailBytes {
+		b = b[len(b)-model.MaxDetailBytes:]
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			b = b[i+1:]
+		}
+	}
+	s := string(b)
+	for _, dir := range private {
+		if dir != "" {
+			s = strings.ReplaceAll(s, dir, privatePathName)
+		}
+	}
+	fields := strings.Fields(s)
+	for i, f := range fields {
+		if strings.HasPrefix(f, string(os.PathSeparator)) {
+			fields[i] = filepath.Base(f)
+		}
+	}
+	tail := strings.Join(fields, " ")
+	if len(tail) > model.MaxDetailBytes {
+		tail = tail[len(tail)-model.MaxDetailBytes:]
+	}
+	return tail
+}
+
+// privatePathName is what a directory this run made is called in a
+// diagnostic. It does not begin with a path separator, so what is left of a
+// path under it -- the part inside the run's own directory, which is the part
+// that says which step wrote the file -- survives the reduction below.
+const privatePathName = "(private)"
 
 // failedPass extracts the analysis pass name from the engine's own
 // `Pass %s failed in %.0f ms` warning. The name is matched from the right,

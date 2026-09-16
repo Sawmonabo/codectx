@@ -206,9 +206,35 @@ type ResourceReport struct {
 	// that figure rising and never falling is either a run removing faster
 	// than the pace gives back, which resolves itself, or a removal nothing
 	// can make, which does not, and only this tells the two apart.
-	StuckFrees  []StuckFree `json:"stuck_frees,omitempty"`
-	UnitsReused *int64      `json:"units_reused,omitempty"`
-	UnitsParsed *int64      `json:"units_parsed,omitempty"`
+	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// AnalyzerUnits is what each heavy analysis unit this process ran was
+	// given and what it used: the reservation it was admitted against, the
+	// heap caps its two steps ran under, the machine-derived allocation those
+	// caps were bounded by, and the peak resident memory its process tree
+	// reached. It is the only place the three appear together, and the only
+	// way an operator can see that a unit was handed far more than it needed
+	// -- or serialized behind a reservation it never came close to using.
+	//
+	// It is process accounting and not a capability detail on purpose: an
+	// observed peak differs on every run, and a capability row's details fold
+	// into the analysis key, where two identical runs must key identically.
+	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
+	UnitsReused   *int64         `json:"units_reused,omitempty"`
+	UnitsParsed   *int64         `json:"units_parsed,omitempty"`
+}
+
+// An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
+// ObservedPeakBytes are absent rather than zero where the host does not expose
+// available memory and where the platform cannot sample a process tree: a zero
+// there would claim a measurement nobody made (Section 23).
+type AnalyzerUnit struct {
+	ScopeKey           string  `json:"scope_key"`
+	Family             string  `json:"family"`
+	ReservationBytes   uint64  `json:"reservation_bytes"`
+	HeapCapBytes       uint64  `json:"heap_cap_bytes"`
+	ExportHeapCapBytes uint64  `json:"export_heap_cap_bytes"`
+	AllocationBytes    *uint64 `json:"allocation_bytes,omitempty"`
+	ObservedPeakBytes  *uint64 `json:"observed_peak_bytes,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -255,6 +281,34 @@ func (r ResourceReport) Validate() error {
 		}
 		if err := requireNonNegative(f.field, *f.value); err != nil {
 			return err
+		}
+	}
+	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
+		return invalid("resources.analyzer_units holds %d rows, more than the %d a bounded response carries",
+			len(r.AnalyzerUnits), MaxRecordsPerResult)
+	}
+	for _, u := range r.AnalyzerUnits {
+		for _, f := range []struct {
+			field string
+			value uint64
+		}{
+			{"resources.analyzer_units.reservation_bytes", u.ReservationBytes},
+			{"resources.analyzer_units.heap_cap_bytes", u.HeapCapBytes},
+			{"resources.analyzer_units.export_heap_cap_bytes", u.ExportHeapCapBytes},
+		} {
+			if err := boundSigned64(f.field, f.value); err != nil {
+				return err
+			}
+		}
+		if u.AllocationBytes != nil {
+			if err := boundSigned64("resources.analyzer_units.allocation_bytes", *u.AllocationBytes); err != nil {
+				return err
+			}
+		}
+		if u.ObservedPeakBytes != nil {
+			if err := boundSigned64("resources.analyzer_units.observed_peak_bytes", *u.ObservedPeakBytes); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

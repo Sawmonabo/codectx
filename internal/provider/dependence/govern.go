@@ -47,18 +47,44 @@ const (
 	DefaultSafetyMarginBytes  int64 = 1 * giB
 )
 
+// hostShareDenominator is the second bound on the allocation: whatever the
+// machine had available when the run began, the allocation is at most that
+// divided by this, so the host keeps at least the rest of it.
+//
+// It is a design constant and not a setting. The product runs beside the
+// editor, the agents and the browser that the person indexing their
+// repository is using at the time, and "available memory minus two gigabytes"
+// is an allocation that treats the machine as the product's own: on a 47 GB
+// host it handed one analyzer a 42 GB heap cap, which then had to be
+// serialized against every other unit because no two such reservations fit.
+// Half is the share that leaves the machine usable by construction rather
+// than by the operator noticing; a unit whose estimate exceeds even that
+// still runs, whole, at the allocation, because refusing work for memory is
+// not a thing this product does (docs/research/00-synthesis.md Section 8).
+const hostShareDenominator = 2
+
 // heapPerSourceByte is how much frontend heap one byte of unit source is
-// estimated to need, per family. Each value is taken from the most demanding
-// measured point of docs/research/10-round3-empirical.md Sections 4, 4b, 5 and
-// 7 with headroom, because research Section 4 also measured that a cap close
-// to the live set costs time rather than memory (the Java repository ran 3.6x
-// slower at a cap it could just fit in). Over-reserving only serializes work;
-// under-reserving fails a unit.
+// estimated to need, per family. Each value is the smallest cap a measured
+// project of its family ran at FULL SPEED under, divided by that project's
+// source bytes, with headroom -- not the smallest cap it survived: research
+// Section 4 measured that a cap close to the live set costs time rather than
+// memory (the Java repository ran 3.6x slower at a cap it could just fit in).
+// Over-reserving only serializes work; under-reserving fails a unit.
+//
+// The estimate is deliberately the cap itself and not a fraction of the
+// machine. A frontend grows toward whatever cap it is given and does not need
+// it: on a 157 MB JavaScript project, one measured parse took 3 m 38 s under
+// a 4 GiB cap and 3 m 41 s with no cap at all, while the process tree's peak
+// resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
+// 16 GiB, for exports whose method, call, control-dependence and
+// data-dependence counts were identical. A cap sized to the machine therefore
+// buys nothing and takes the host's memory away from everything else running
+// on it.
 var heapPerSourceByte = map[Family]int64{
-	FamilyC:          128, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass, 8 GiB to run at full speed
+	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
 	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
 	FamilyJava:       256, // 1.5M-line Java repository wanted ~8 GiB to avoid collector thrashing
-	FamilyJavaScript: 512, // 81k-line TypeScript project passed at a 1 GiB cap
+	FamilyJavaScript: 48,  // 157 MB of JavaScript over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all
 	FamilyPython:     640, // 1.05M-line Python tree needed ~18 GiB uncapped and failed closed at 4 GiB
 	FamilyRust:       640, // 56k-line Cargo workspace peaked at 1.77 GB of tree RSS, most of it outside the heap
 }
@@ -70,7 +96,7 @@ var residentAboveHeap = map[Family]int64{
 	FamilyC:          2662 * miB, // native parser memory
 	FamilyGo:         512 * miB,
 	FamilyJava:       448 * miB,
-	FamilyJavaScript: 320 * miB,
+	FamilyJavaScript: 1712 * miB, // the syntax helper holds the whole project's trees outside the heap
 	FamilyPython:     1945 * miB,
 	FamilyRust:       256 * miB,
 }
@@ -134,15 +160,18 @@ type Machine struct {
 }
 
 // Allocation is the machine-derived allocation: available memory minus this
-// process's base footprint minus the safety margin. It is zero when the host
-// does not expose available memory, which means unknown: with no observation
-// the estimate is used as it stands, because inventing a bound would be a
-// default memory ceiling by another name and the ruling forbids one.
+// process's base footprint minus the safety margin, and never more than the
+// share of the machine this product takes (hostShareDenominator), so the host
+// keeps at least the rest of what was available when the run began. It is
+// zero when the host does not expose available memory, which means unknown:
+// with no observation the estimate is used as it stands, because inventing a
+// bound would be a default memory ceiling by another name and the ruling
+// forbids one.
 func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 	if !m.Observed {
 		return 0
 	}
-	alloc := m.AvailableBytes - baseFootprint - safetyMargin
+	alloc := min(m.AvailableBytes-baseFootprint-safetyMargin, m.AvailableBytes/hostShareDenominator)
 	if alloc < 0 {
 		return 0
 	}

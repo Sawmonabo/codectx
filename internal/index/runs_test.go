@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
@@ -31,7 +32,7 @@ func TestRunsOmittedCountsEveryRunPastTheCeiling(t *testing.T) {
 	const extra = 5
 	g := &generation{caps: newCapabilityReport(), c: &Coordinator{log: slog.Default()}}
 	for i := range model.MaxRecordsPerResult + extra {
-		g.record(outcome{result: model.ProviderResult{RunID: model.ProviderRunID("run-" + strconv.Itoa(i)),
+		g.record(plan.Unit{ProviderID: "dependence"}, outcome{result: model.ProviderResult{RunID: model.ProviderRunID("run-" + strconv.Itoa(i)),
 			State: model.RunSucceeded}})
 	}
 	if len(g.runs) != model.MaxRecordsPerResult {

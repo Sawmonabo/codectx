@@ -233,6 +233,11 @@ type capabilityReport struct {
 type failureRow struct {
 	providerID, capability, scope, code string
 	units                               int
+	// covered records that another scope of this provider capability DID
+	// publish into this generation. A capability with facts in it is partial,
+	// never failed: Section 13.3 lets a report under-claim, and reporting a
+	// capability that answers queries as failed is the opposite.
+	covered bool
 }
 
 func newCapabilityReport() *capabilityReport {
@@ -549,6 +554,16 @@ func (r *capabilityReport) addFailure(providerID, capability, scope, code string
 	row.units++
 }
 
+// coveredElsewhere records that this provider capability has a scope that did
+// publish into this generation, which is what turns its failure row from
+// failed into partial. It is a no-op for a capability with no failure row: a
+// capability nothing failed for has nothing to soften.
+func (r *capabilityReport) coveredElsewhere(providerID, capability string) {
+	if row, ok := r.failures[providerID+"\x00"+capability]; ok {
+		row.covered = true
+	}
+}
+
 // addCarried records the provenance distance of one carried stale scope
 // (Section 13.3, ruling Q4).
 func (r *capabilityReport) addCarried(providerID, capability, scope string, generations, files int) {
@@ -600,8 +615,12 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 		return compareString(a.capability, b.capability)
 	})
 	for _, f := range failures {
+		state := model.CapabilityFailed
+		if f.covered {
+			state = model.CapabilityPartial
+		}
 		out = append(out, model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
-			Scope: provider.ScopeWorkspace, State: model.CapabilityFailed, DiagnosticCode: f.code,
+			Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
 			Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units), scopeKeyDetail: model.TruncateDetail(f.scope)}})
 	}
 	carried := slices.Clone(r.carried)
