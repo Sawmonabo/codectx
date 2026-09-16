@@ -444,10 +444,22 @@ type ScratchPool struct {
 	// held without the request having failed, and an operator reading the two
 	// figures needs them to tell "the space is gone" from "the space is stuck".
 	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// LeftAlone names the instances of this pool the collection did not
+	// touch, and why. An instance is a whole pool of surfaces, so held minus
+	// freed is mostly these; without them the report reads as a collection
+	// that quietly did less than it counted.
+	LeftAlone []UntouchedInstance `json:"left_alone,omitempty"`
 }
 
 // A StuckFree is one removal the space reclaimer tried to make and could not.
 type StuckFree struct {
 	Entry  string `json:"entry"`
 	Reason string `json:"reason"`
+}
+
+// An UntouchedInstance is one pool instance a collection left as it was.
+type UntouchedInstance struct {
+	Instance  string `json:"instance"`
+	HeldBytes uint64 `json:"held_bytes"`
+	Reason    string `json:"reason"`
 }
