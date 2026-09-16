@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -231,5 +234,67 @@ func TestTruncatedStagesPageSaysHowManyItDropped(t *testing.T) {
 	writeRunLedger(&whole, run, stages, 0)
 	if strings.Contains(whole.String(), "omitted") {
 		t.Fatalf("a page that dropped nothing claims it omitted stages:\n%s", whole.String())
+	}
+}
+
+// fakeStageSource is a workspace's two progressive-line inputs and nothing
+// else: the stages of every run the process records, and the run this command
+// opened -- which, like the real one, is not known when the subscription is
+// made.
+type fakeStageSource struct {
+	emit  func(model.StageRecord)
+	runID string
+}
+
+func (f *fakeStageSource) Spans(fn func(model.StageRecord)) { f.emit = fn }
+
+func (f *fakeStageSource) IndexRunID() (string, bool) {
+	if f.runID == "" {
+		return "", false
+	}
+	return f.runID, true
+}
+
+// ledgerCommand is a human-output command writing into a buffer: the
+// progressive lines take the command's own writer, so the buffer is what was
+// printed.
+func ledgerCommand() (*cobra.Command, *bytes.Buffer) {
+	out := &bytes.Buffer{}
+	cmd := &cobra.Command{Use: "index"}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	return cmd, out
+}
+
+// TestProgressiveLinesFollowOnlyThisCommandsRun guards the progressive block
+// against two failures that look opposite and are both silent.
+//
+// The rows reach every subscriber from every run this process records, so a
+// deferred run recorded by a late seal tick would print its stages into an
+// index command's output, where an operator reads them as that command's work.
+//
+// The second failure is the fix's own: the run id does not exist when the
+// subscription is made, so a filter that captures it once captures nothing and
+// suppresses every line of the run it is meant to follow. That is why the run
+// id here appears only after the subscription, exactly as it does in a command.
+//
+// Mutation: capture the id at subscribe time -- bind runID from ws.IndexRunID()
+// before ws.Spans and compare against it -- and the followed run's line is gone.
+func TestProgressiveLinesFollowOnlyThisCommandsRun(t *testing.T) {
+	ws := &fakeStageSource{}
+	cmd, out := ledgerCommand()
+	stop := progressiveStages(cmd, nil, ws)
+	// The run opens after the subscription, which is the ordering that breaks a
+	// filter bound once.
+	ws.runID = "mine"
+	ws.emit(model.StageRecord{RunID: "mine", Stage: "walk", ItemsIn: 1, ItemsOut: 1})
+	ws.emit(model.StageRecord{RunID: "another", Stage: "collection", ItemsIn: 9, ItemsOut: 9})
+	stop()
+	printed := out.String()
+	if !strings.Contains(printed, "walk") {
+		t.Fatalf("the followed run's stage is missing from the progressive lines:\n%s", printed)
+	}
+	if strings.Contains(printed, "collection") {
+		t.Fatalf("another run's stage was printed as this command's work:\n%s", printed)
 	}
 }
