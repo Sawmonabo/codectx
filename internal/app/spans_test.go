@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -57,3 +59,57 @@ func TestASlowSubscriberNeverPacesTheRun(t *testing.T) {
 	once.Do(func() { close(release) })
 	fanout.stop(nil)
 }
+
+// TestStageLogLineCarriesTransferredBytesAndOnlyWhenTaken guards the structured
+// line against the two ways a measurement goes wrong in a log: silently missing,
+// and silently invented.
+//
+// A log shipper and a proof recorder read this line and nothing else, so a
+// recorded field the line omits is a fact that never leaves the process --
+// transferred bytes were carried by the row, promised by this function's own
+// doc comment and never emitted. And a stage that ran no child has no counters
+// at all, where a zero would read as a stage that moved nothing rather than as
+// a figure nobody took.
+//
+// Mutation: emit the two attributes unconditionally, dereferencing through a
+// zero default, and the absent case fails.
+func TestStageLogLineCarriesTransferredBytesAndOnlyWhenTaken(t *testing.T) {
+	read, write := uint64(4096), uint64(8192)
+	measured := attrsOfStageLog(t, model.StageRecord{Stage: "treesitter", ReadBytes: &read, WriteBytes: &write})
+	if measured["read_bytes"] != uint64(4096) || measured["write_bytes"] != uint64(8192) {
+		t.Fatalf("the line carries read_bytes=%v write_bytes=%v; the row recorded 4096 and 8192",
+			measured["read_bytes"], measured["write_bytes"])
+	}
+	absent := attrsOfStageLog(t, model.StageRecord{Stage: "walk"})
+	if _, ok := absent["read_bytes"]; ok {
+		t.Fatalf("a stage nobody measured logged read_bytes=%v", absent["read_bytes"])
+	}
+	if _, ok := absent["write_bytes"]; ok {
+		t.Fatalf("a stage nobody measured logged write_bytes=%v", absent["write_bytes"])
+	}
+}
+
+// attrsOfStageLog logs one row through the real logSpan and returns the
+// attributes the handler was given, so the assertions are over what a shipper
+// receives and not over a rendered string.
+func attrsOfStageLog(t *testing.T, row model.StageRecord) map[string]any {
+	t.Helper()
+	h := &captureHandler{attrs: map[string]any{}}
+	logSpan(slog.New(h))(row)
+	return h.attrs
+}
+
+type captureHandler struct{ attrs map[string]any }
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, rec slog.Record) error {
+	rec.Attrs(func(a slog.Attr) bool {
+		h.attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
