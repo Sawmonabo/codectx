@@ -60,6 +60,14 @@ type event struct {
 // A Ledger is one process's run accounting: the database, the bus and the one
 // collector goroutine that owns the writer. Everything else in the product
 // holds spans, not this.
+//
+// A nil *Ledger is a valid ledger that records nothing, exactly as a nil *Span
+// is a valid span that records nothing: it opens nil runs, and every method on
+// it does nothing and reports no failure. This is what lets a composition
+// without a ledger -- a test of a package that records, or a process where
+// opening the file failed -- be instrumented at all. The alternative is a
+// guard at every one of the dozens of stage sites, where the first one anybody
+// forgets panics the run it was meant to measure.
 type Ledger struct {
 	db *sql.DB
 
@@ -93,6 +101,10 @@ type Ledger struct {
 // A Run is one recorded run: an index attempt, a deferred publication, or the
 // per-process overlay. It allocates its spans' ordinals and carries the run
 // row's own totals, which the collector writes at every flush.
+//
+// A nil *Run is the run of a ledger that records nothing: its methods do
+// nothing, and the context it returns carries no run, so every span opened
+// under it is a nil span.
 type Run struct {
 	ledger *Ledger
 	id     []byte
@@ -157,8 +169,13 @@ func Open(ctx context.Context, dir string) (*Ledger, error) {
 
 // NewRun records a new run and returns its handle. The run id is 32 random
 // bytes, allocated before any generation exists, so a run that fails before
-// publication still has a complete ledger.
+// publication still has a complete ledger. A ledger that records nothing opens
+// a run that records nothing, and validates nothing, because there is nothing
+// to record.
 func (l *Ledger) NewRun(kind Kind, repositoryID string) (*Run, error) {
+	if l == nil {
+		return nil, nil
+	}
 	switch kind {
 	case KindIndex, KindDeferred, KindOverlay:
 	default:
@@ -185,18 +202,30 @@ func (l *Ledger) NewRun(kind Kind, repositoryID string) (*Run, error) {
 	return run, nil
 }
 
-// ID is the run's public identifier: the same 32 bytes as lowercase hex.
-func (r *Run) ID() string { return r.idHex }
+// ID is the run's public identifier: the same 32 bytes as lowercase hex, and
+// empty for a run that records nothing.
+func (r *Run) ID() string {
+	if r == nil {
+		return ""
+	}
+	return r.idHex
+}
 
 // Context returns a context whose spans belong to this run. Every package that
 // records is handed one of these and calls Start; none of them holds a *Run.
 func (r *Run) Context(ctx context.Context) context.Context {
+	if r == nil {
+		return ctx
+	}
 	return context.WithValue(ctx, runContextKey{}, r)
 }
 
 // AttachGeneration records the generation this run produced, once publication
 // has opened one. A run that never reaches it leaves the column null.
 func (r *Run) AttachGeneration(id int64) {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	r.generationID = &id
 	r.mu.Unlock()
@@ -206,6 +235,9 @@ func (r *Run) AttachGeneration(id int64) {
 // Report records the run row's totals as the run learns them. The last call
 // before the collector's next flush is what a reader sees.
 func (r *Run) Report(t Totals) {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	r.totals = t
 	r.mu.Unlock()
@@ -215,6 +247,9 @@ func (r *Run) Report(t Totals) {
 // Finish records how the run ended. Spans still open when the ledger stops are
 // written interrupted regardless of what the run says about itself.
 func (r *Run) Finish(outcome Outcome) {
+	if r == nil {
+		return
+	}
 	now := time.Now()
 	r.mu.Lock()
 	r.outcome = outcome
@@ -227,7 +262,12 @@ func (r *Run) Finish(outcome Outcome) {
 // and not on an event because a drop happens exactly when no event gets
 // through: an event carrying the count would be lost at the only moment it
 // matters.
-func (r *Run) Dropped() int64 { return r.dropped.Load() }
+func (r *Run) Dropped() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.dropped.Load()
+}
 
 // publish is the one non-blocking send. A bus with no room drops the event and
 // counts it on the run row; the run itself never waits on its own accounting.
@@ -289,6 +329,9 @@ func (l *Ledger) anyDirty() bool {
 // subscriber that waits delays every later flush, and with it every live
 // reader's view.
 func (l *Ledger) Subscribe(fn func(SpanRow)) {
+	if l == nil {
+		return
+	}
 	l.subMu.Lock()
 	defer l.subMu.Unlock()
 	l.subs = append(l.subs, fn)
@@ -308,6 +351,9 @@ func (l *Ledger) notify(row SpanRow) {
 // every span still open as interrupted and every run's finish, and closes the
 // database. It is safe to call more than once and returns the first failure.
 func (l *Ledger) Stop() error {
+	if l == nil {
+		return nil
+	}
 	l.stopOnce.Do(func() {
 		close(l.quit)
 		<-l.done
@@ -324,7 +370,7 @@ func (l *Ledger) Stop() error {
 // generation, so the two lifetimes stay the same one; this package does not
 // wire it, because it does not know when a generation goes.
 func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
-	if len(generationIDs) == 0 {
+	if l == nil || len(generationIDs) == 0 {
 		return nil
 	}
 	return l.writeTx(ctx, func(tx *sql.Tx) error {
@@ -347,7 +393,7 @@ func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
 // collect it. A process that exits cleanly calls it for its own; the next
 // collection pass calls it for the ones that did not.
 func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
-	if len(runIDs) == 0 {
+	if l == nil || len(runIDs) == 0 {
 		return nil
 	}
 	raw := make([][]byte, 0, len(runIDs))
@@ -376,6 +422,9 @@ func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 // OverlayRuns lists the overlay runs the file still holds, so the caller that
 // knows which processes are alive can hand the rest to DeleteOverlayRuns.
 func (l *Ledger) OverlayRuns(ctx context.Context) ([]string, error) {
+	if l == nil {
+		return nil, nil
+	}
 	var ids []string
 	rows, err := l.db.QueryContext(ctx, `SELECT run_id FROM runs WHERE kind = 'overlay' ORDER BY started_at LIMIT ?`, model.MaxRecordsPerResult)
 	if err != nil {
