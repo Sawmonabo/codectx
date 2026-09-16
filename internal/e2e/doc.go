@@ -1,6 +1,6 @@
-// Package e2e holds the one end-to-end product-boundary scenario of Section
-// 25.1. There is no production code in this package: it is this file plus one
-// _test.go, and nothing imports it.
+// Package e2e holds the end-to-end product-boundary scenarios of Section 25.1.
+// There is no production code in this package: it is this file plus the _test.go
+// files beside it, and nothing imports it.
 //
 // What it exists for is the process boundary, and only that. internal/mcpserver
 // already drives the tool set over mcp.NewInMemoryTransports, so a test here
