@@ -154,6 +154,12 @@ func (r *PinnedReader) Binding() model.Binding { return r.binding }
 // a token it could not honour.
 func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
 
+// RetainsLeases is Continuable for a caller that holds the lease store rather
+// than a pinned reader -- the graph engine, whose continuations are minted far
+// from the reader that pinned them. It satisfies pagination.LeaseRetainer, so
+// pagination.Leases answers it for the whole process.
+func (s *Store) RetainsLeases() bool { return !s.opts.ReadOnly }
+
 // LeaseID is the retention lease this reader holds; cursors carry it.
 func (r *PinnedReader) LeaseID() string { return r.lease }
 
