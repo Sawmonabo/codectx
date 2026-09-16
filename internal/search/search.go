@@ -621,6 +621,10 @@ func (s *Service) orderSpool(ctx context.Context, c *searchCursor) error {
 // one: leaking the lease would pin a generation against retention for the full
 // cursor TTL for a page nobody can ask for.
 func (s *Service) releaseLease(ctx context.Context, id string) {
+	if id == "" {
+		// A keyset continuation minted by a writerless process holds none.
+		return
+	}
 	if err := s.leases.Release(context.WithoutCancel(ctx), id); err != nil {
 		s.log.Warn("a continuation lease could not be released", "component", "search", "error", err.Error())
 	}
@@ -1006,7 +1010,7 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	meta.Completeness = append(meta.Completeness, result.Completeness...)
 	if result.LastKey != "" {
-		if meta.NextCursor, err = s.keysetNext(ctx, binding, hash, now, result.LastKey); err != nil {
+		if meta.NextCursor, err = s.keysetNext(ctx, reader, binding, hash, now, result.LastKey); err != nil {
 			return empty, err
 		}
 	}
@@ -1022,20 +1026,33 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	return page, nil
 }
 
-// keysetNext signs the Resolve continuation. It takes a cursor-owned lease for
-// the same reason the spooled one does: the pinned reader's query lease ends
-// with this request, and a continuation that named it would point at a
-// generation retention is free to collect.
-func (s *Service) keysetNext(ctx context.Context, b model.Binding, hash string, now time.Time, lastKey string) (string, error) {
-	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return "", err
+// keysetNext signs the Resolve continuation. It carries its whole position in
+// the token and writes nothing, so the only thing it needs of the workspace is
+// that the generation it names still be readable when it is presented.
+//
+// A writer-bearing process still takes a cursor-owned lease, which retains that
+// generation for the token's life. A process that opened the store read-only
+// takes none and mints the token anyway: it has nothing on disk to keep alive,
+// and if the generation is collected before the token comes back, the pin finds
+// no row and the caller is told to re-run from the first page. Refusing the
+// continuation instead would make `symbol` page only once for the whole length
+// of another process's index, which is the one thing a writerless answer exists
+// to avoid.
+func (s *Service) keysetNext(ctx context.Context, reader *sqlite.PinnedReader, b model.Binding,
+	hash string, now time.Time, lastKey string) (string, error) {
+	var leaseID string
+	if reader.Continuable() {
+		lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		leaseID = lease.ID
 	}
-	next := newCursor(endpointSymbol, b, lease.ID, hash, now.Add(s.ttl))
+	next := newCursor(endpointSymbol, b, leaseID, hash, now.Add(s.ttl))
 	next.LastKey = lastKey
 	token, err := s.signer.EncodeCursor(next)
 	if err != nil {
-		s.releaseLease(ctx, lease.ID)
+		s.releaseLease(ctx, leaseID)
 		return "", err
 	}
 	return token, nil
