@@ -187,13 +187,12 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 	// The reclaimer's own total when this run opened. What it gave back while
 	// the run was open is the difference, read at the finish.
 	freedBefore := paced.FreedBytes()
-	runCtx := ctx
 	defer func() {
 		// Reported again at the finish so a pass that failed still states what
 		// it got through, not zeros. The publish path reports at activation as
 		// well, which is what a live reader sees while retention still runs.
 		g.report()
-		recordReclaim(runCtx, freedBefore)
+		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 	}()
 	// The plan's whole-snapshot input run is a file under the work directory
