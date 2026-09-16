@@ -101,15 +101,11 @@ type materializationURI struct {
 	root string
 }
 
-// uri returns the file URI the server should use for rel.
+// uri returns the file URI the server should use for rel. The empty rel is
+// the materialization root itself, which is how the workspace-root project is
+// spelled.
 func (m materializationURI) uri(rel string) string {
 	u := url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(m.root, filepath.FromSlash(rel)))}
-	return u.String()
-}
-
-// rootURI is the workspace root the server is initialized with.
-func (m materializationURI) rootURI() string {
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(m.root)}
 	return u.String()
 }
 

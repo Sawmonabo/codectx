@@ -31,9 +31,36 @@ A `Definition` is what this build knows about a supported server: name — which
 is also the name of its entry in the embedded tool lock — manifest language
 tags, the stdio argument array, the environment allowlist, the budgets and the
 root markers. `Definitions()` lists the six of Section 11.5. A definition
-**authorizes nothing**. `Definition.Detect(root)` reports which root markers
-exist, reading metadata through the confined `workspace.Root` only; it is a
+**authorizes nothing**. `Definition.ProjectRoot(ctx, view, path)` reports the
+project directory a server would be rooted at for one snapshot file — the
+deepest directory at or above it holding one of the server's root markers, read
+from the pinned snapshot's manifest and never from the live checkout; it is a
 hint for choosing among the supported servers and never a reason to execute.
+
+## One server per project
+
+A language server resolves a project from the directory it is started in. A
+repository does not keep its projects at its root, so a server started at the
+workspace root of a monorepo is handed a directory whose manifest declares none
+of the projects beneath it: it resolves no dependency, builds no project model,
+and answers about a file with whatever that file alone tells it — a degraded
+answer labelled exactly like a good one.
+
+A server is therefore identified by the snapshot, the profile **and** the
+project directory, and so is everything derived from it: its private working
+directory (which for the Java server holds that project's own workspace index)
+and the `input_digest` on the overlay binding it publishes. The project is the
+queried file's own. A request that names no file — a workspace-symbol query,
+which is about the repository rather than about a position in it — is answered
+by the server at the project the workspace root itself declares.
+
+The materialization stays whole: the server is rooted inside it, and every URI
+the client sends and resolves is still a snapshot-relative path, so a location
+the server returns from outside its project is mapped and admitted exactly as
+before. Concurrency is unchanged — each server takes one
+`providers.lsp.max_servers` slot and one reservation on the shared server
+runner, so a repository with many projects queues on the same bound a
+repository with one project does.
 
 A `Profile` is runnable, and `Resolve(ctx, resolver, cfg, name)` is its only
 constructor:

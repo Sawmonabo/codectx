@@ -167,9 +167,12 @@ func New(opts Options) (*Manager, error) {
 	return &Manager{opts: opts, servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
 }
 
-// Open returns an overlay over view answered by profile, starting the server
-// lazily on first use and sharing a running one afterwards. The profile must
-// come from Resolve. When every server slot is taken by a server nobody is
+// Open returns an overlay over view answered by profile at profile.Root,
+// starting the server lazily on first use and sharing a running one
+// afterwards. Two projects of one repository are two servers: a server
+// resolves a project from the directory it was started in, so one server
+// rooted at a monorepo's workspace root knows none of the projects under it.
+// The profile must come from Resolve. When every server slot is taken by a server nobody is
 // using, the idle one is stopped to make room; when all are in use, the
 // answer is CTX_RESOURCE_LIMIT rather than a queue.
 func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Profile) (*Overlay, error) {
@@ -179,7 +182,7 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	if len(profile.Tool.ArgvPrefix) == 0 || profile.Name == "" {
 		return nil, trustRequired("the profile was not constructed by lsp.Resolve; a server the tool lock did not pin is never started")
 	}
-	key := serverKey{snapshot: view.Header().ID, profile: profile.Name}
+	key := serverKey{snapshot: view.Header().ID, profile: profile.Name, root: profile.Root}
 	// Two attempts: the second covers a shared server that failed or began
 	// stopping between being found and being acquired.
 	for attempt := 0; attempt < 2; attempt++ {
