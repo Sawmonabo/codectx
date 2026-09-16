@@ -116,7 +116,17 @@ actually active on this host, in addition to refusing every fetch.
 | `fresh` | This generation holds the capability's facts and nothing degraded it. |
 | `partial` | Some scope of this capability published facts into this generation and at least one other did not. The facts that are there are complete for the scopes that sealed. |
 | `failed` | The capability was attempted and no scope of it published facts into this generation. It is never reported `unavailable`: that would leave the generation healthy over a provider that answers nothing. |
-| `unavailable` | Nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload, the provider is disabled), or its units are still deferred to background work. |
+| `unavailable` | It was wanted and nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload), or its units are still deferred to background work. The row says which. |
+
+A provider you turned off in the configuration has **no row here at all**, in
+any state. It was planned for nothing, so there is nothing to report about it
+per capability, and eight `unavailable` rows for three disabled providers would
+read as eight failures of work nobody asked for. What is off is said once
+instead: `status` and the result of an indexing run both carry
+`providers_disabled`, the provider names in a stable order, absent when nothing
+is disabled, and the text output prints them on a `disabled` line above the
+capability summary. An indexing run also logs the same list once, at its start,
+under `component=index`.
 
 A `partial` or `failed` row carries the shape of the failure, not just its
 code:
@@ -302,6 +312,25 @@ and `CTX_SOURCE_INTEGRITY`:
 
 Open sessions, cursors and receipts do not survive a rebuild. That is correct:
 they cite a generation that no longer exists.
+
+## What a run cost, while it is still running
+
+`codectx status --resources` reports two things. One is the resource
+accounting block below. The other is the run ledger: the latest run for this
+repository and the cost of each of its stages, the run's own row first and the
+stages under it ordered by wall time, with the reason beneath any row that
+failed or reached no output. "Latest" is the run that is live if one is, and
+otherwise the run that produced the active generation.
+
+Add **`--follow`** and the whole report re-renders every second until you
+interrupt it. That is the live view from a second terminal while an index run
+is going in the first: it opens the ledger read-only, so it costs the run
+nothing. With `--json` it emits one complete envelope per second, each a whole
+snapshot rather than a delta, which is what a script tails.
+
+[The diagnostics page](diagnostics.md#the-run-ledger) says what a span is,
+which stages a run opens and how to read each column without being misled by
+an absent one.
 
 ## Unavailable metrics and unsupported platforms
 

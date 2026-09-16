@@ -10,8 +10,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -231,11 +231,11 @@ type packedEdge struct {
 // buildGraph writes the packed adjacency for gen. It runs inside Activate's
 // transaction, before the active pointer flips, so a generation is published
 // only with its graph and a failed build fails the activation.
-func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
+func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 	// The build is the one sequential pass activation adds, and ADR-0005 holds
 	// it to 5 % of the index wall clock. That bound is only checkable if the
-	// operator can see the pass on its own, so its start and end are logged
-	// rather than hidden inside the activation's total.
+	// operator can see the pass on its own, so it is a span of its own rather
+	// than time hidden inside the activation's total.
 	//
 	// The pass's own memory share is reported beside its wall clock for the
 	// same reason: ADR-0005 bounds what the build costs, and a cost stated only
@@ -243,14 +243,15 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 	// its memory ceiling. The two ReadMemStats calls that measure it each stop
 	// the world, once per activation rather than once per unit -- the price of
 	// an operator-visible figure, paid at the rate of a published generation.
-	started := time.Now()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	slog.Default().Info("packed adjacency build started", "generation", gen)
+	ctx, span := ledger.Start(ctx, stageAdjacency, "")
 	defer func() {
+		span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		runtime.ReadMemStats(&after)
 		slog.Default().Info("packed adjacency build finished",
-			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
+			"generation", gen,
 			// Signed: a build that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.

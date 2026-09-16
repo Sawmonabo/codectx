@@ -33,6 +33,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +42,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -99,6 +102,16 @@ type Options struct {
 	// Collector interface in retention.go.
 	Collector Collector
 	Pool      *provider.Pool
+	// Ledger is the run ledger every stage of a run records into. It may be
+	// nil -- a coordinator composed without one records nothing and indexes
+	// exactly as it would otherwise, because a nil ledger opens a nil run
+	// whose spans do nothing.
+	Ledger *ledger.Ledger
+	// RunLedgerReader reads back the rows this process's runs recorded, and is
+	// how a finished run states in its own result what it did. It may be nil,
+	// which is a coordinator whose results carry no run: a composition that
+	// records nothing has nothing to read back.
+	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
@@ -229,6 +242,36 @@ func New(o Options) (*Coordinator, error) {
 	return c, nil
 }
 
+// newRun opens this process's ledger run of the given kind. A ledger failure
+// never fails the run it was recording: the index is correct whatever the
+// accounting did, so the failure is logged with its diagnostic code and the
+// pass continues with a run that records nothing.
+func (c *Coordinator) newRun(kind ledger.Kind) *ledger.Run {
+	run, err := c.opts.Ledger.NewRun(kind, string(c.repo))
+	if err != nil {
+		logTyped(c.log, "this run is not being recorded in the run ledger", err,
+			"component", component, "repository_id", string(c.repo))
+		return nil
+	}
+	return run
+}
+
+// The stages a run records. They are the coordinator's own phases, named once
+// here so the ledger, the log line and every reader spell them identically.
+const (
+	stageCapture       = "capture"
+	stageWalk          = "walk"
+	stagePlan          = "plan"
+	stageAttachReused  = "attach_reused"
+	stageAttachCarried = "attach_carried"
+	stageBuild         = "build"
+	stageCoverage      = "coverage"
+	stageActivation    = "activation"
+	stageRetention     = "retention"
+	stageCollection    = "collection"
+	stageReclaim       = "reclaim"
+)
+
 // buildAppliers binds the delta appliers of the two providers that can
 // describe what changed since their last run. A provider the registry does not
 // hold simply has no applier: its units are then never planned either.
@@ -304,6 +347,13 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 	}
 	if err := req.Validate(); err != nil {
 		return model.IndexResult{}, err
+	}
+	// Said once, at the start of the run the operator asked for, and never on
+	// a watch-driven refresh, which would repeat it on every batch: what is
+	// off is a property of the configuration, not of the pass.
+	if disabled := c.disabledProviders(); len(disabled) > 0 {
+		c.log.Info("providers disabled by configuration: "+strings.Join(disabled, ", "),
+			"component", component, "repository_id", string(c.repo))
 	}
 	c.run.Lock()
 	defer c.run.Unlock()
@@ -556,6 +606,62 @@ func (c *Coordinator) enablement(providerID string) config.Enablement {
 		}
 	}
 	return config.Enabled
+}
+
+// lspOverlayID is how the configuration and the overlay's own provider ids
+// ("lsp:<profile>") name the snapshot-qualified working-tree overlay. It is
+// not a registry provider -- it answers live queries rather than sealing units
+// -- so it has no descriptor to take the name from, and it is named here
+// because an operator who turned it off must read that on the result like any
+// other provider they turned off.
+const lspOverlayID = "lsp"
+
+// disabledProviders names every provider this configuration turns off, in one
+// stable order. It is the one place the product states that fact: a disabled
+// provider is planned for nothing and reports no capability row, so without
+// this list an agent that finds no call facts cannot tell a configured index
+// from a degraded one. It is derived from the configuration rather than from a
+// selection, because the overlay above never appears in one.
+//
+// The order is the configuration's own declaration order, so two runs of one
+// configuration say the same thing in the same way.
+func (c *Coordinator) disabledProviders() []string {
+	p := c.opts.Config.Providers
+	var out []string
+	if !p.TreeSitter.Enabled {
+		out = append(out, tslang.ProviderID)
+	}
+	if p.SCIP.Enabled == config.Disabled {
+		out = append(out, scip.ID)
+	}
+	if p.LSP.Enabled == config.Disabled {
+		out = append(out, lspOverlayID)
+	}
+	if p.Dependence.Enabled == config.Disabled {
+		out = append(out, dependence.ProviderID)
+	}
+	return out
+}
+
+// composedStates are Options.States without the rows of a provider the
+// configuration disabled. The composition root records a capability row for a
+// provider it could not construct, and a provider that is off is one it does
+// not even try to construct; that row is the same misreading the selection no
+// longer produces, so it is dropped at the one place both capability reports
+// read those rows from.
+func (c *Coordinator) composedStates() []model.CapabilityState {
+	disabled := c.disabledProviders()
+	if len(disabled) == 0 {
+		return c.opts.States
+	}
+	out := make([]model.CapabilityState, 0, len(c.opts.States))
+	for _, st := range c.opts.States {
+		if slices.Contains(disabled, st.ProviderID) {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // activeGeneration reads the published generation, answering zero when nothing

@@ -17,6 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -163,10 +164,20 @@ type openOptions struct {
 // the store, the toolchain, the runners, the providers and the registry -- is
 // one reviewable unit that depends on no coordinator.
 type stack struct {
-	root     workspace.Root
-	cfg      config.Config
-	dataDir  string
-	store    *sqlite.Store
+	root    workspace.Root
+	cfg     config.Config
+	dataDir string
+	store   *sqlite.Store
+	// ledger is this process's run accounting. Only a run that holds the
+	// cross-process workspace lock opens one: the ledger has a single writer,
+	// so a report -- which takes no lock and may run beside an index -- reads
+	// the file through internal/ledger's read-only reader and never opens a
+	// writer of its own. A nil ledger records nothing and is legal everywhere.
+	ledger *ledger.Ledger
+	// spans is the one hop off the collector's goroutine. Every surface that
+	// renders a finished stage subscribes here, so the process holds exactly
+	// one ledger subscription however many surfaces are listening.
+	spans    *spanFanout
 	cas      *snapshot.CAS
 	registry *provider.Registry
 	pool     *provider.Pool
@@ -355,6 +366,19 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if err = s.store.Recover(ctx, time.Now()); err != nil {
 			return nil, err
 		}
+		// The run ledger lives beside the store, under the same directory and
+		// the same lock. Stack.Close stops it; nothing else may, because Stop
+		// is what flushes the last rows and closes every span the process left
+		// open.
+		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
+			return nil, err
+		}
+		// One subscription for the process. The structured line is registered
+		// here, where the logger lives; the command line and the MCP server
+		// add theirs through Workspace.Spans.
+		s.spans = newSpanFanout()
+		s.ledger.Subscribe(s.spans.publish)
+		s.spans.subscribe(logSpan(s.logger))
 	}
 
 	// The cursor key and the query spools are workspace-private state under the
@@ -521,6 +545,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
 		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
+		// The one ledger this process opened. The manager never opens its own:
+		// the ledger file has a single collector, and a second writer on it is
+		// what the whole separate-database design exists to avoid.
+		Ledger: s.ledger,
 	}); err != nil {
 		return nil, err
 	}
@@ -758,6 +786,7 @@ func (s *stack) openDiagnostics() error {
 		Root:      s.root.Path,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
+		Ledger:    runLedger{dir: dataDir},
 		Toolchain: toolchainReporter{r: s.resolver},
 		Workspace: workspaceProber{},
 		Now:       time.Now,
@@ -1146,6 +1175,14 @@ func (s *stack) Close() error {
 	if s.ts != nil {
 		s.ts.Close()
 	}
+	// The ledger is stopped once nothing can still end a span and before the
+	// store, so the last flush and the interrupted marks are written while the
+	// process is still whole.
+	errs = append(errs, s.ledger.Stop())
+	// After the ledger, never before: stopping it is what publishes the last
+	// finished spans, and a fanout closed first would drop exactly the rows a
+	// run's final stages produced.
+	s.spans.stop(s.logger)
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}

@@ -77,6 +77,12 @@ type RetentionReport struct {
 	UnitsDeleted     int
 	BytesReclaimed   int64
 	BytesReclaimable int64
+	// GenerationsDeleted names the generations this pass actually deleted, so
+	// a caller that keeps its own rows against a generation can delete them
+	// with it. It holds exactly the swept generations, which is what this pass
+	// already materialized as its candidates, and never a repository-sized
+	// list.
+	GenerationsDeleted []int64
 }
 
 // RetainByRef applies the policy to repo and reports what it did. It keeps the
@@ -151,6 +157,7 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 			return RetentionReport{}, err
 		}
 		report.GenerationsSwept++
+		report.GenerationsDeleted = append(report.GenerationsDeleted, gen)
 		report.BytesReclaimed += bytes
 	}
 	// The collection tail: leases that expired by now, the snapshots nothing

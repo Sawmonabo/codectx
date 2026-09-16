@@ -630,7 +630,10 @@ func (g *Git) runEnv(ctx context.Context, root string, extraEnv []string, sink i
 // locale.
 func (g *Git) runStderr(ctx context.Context, root string, extraEnv []string, sink io.Writer, maxStdout int64, args ...string) (process.Result, string, error) {
 	if !filepath.IsAbs(root) {
-		return process.Result{}, "", internal("git working directory must be absolute")
+		// No child was started, so nothing about one was measured: a bare
+		// Result would report a run that used no processor time, no memory and
+		// no bytes, which is a measurement nobody took.
+		return process.Unmeasured(), "", internal("git working directory must be absolute")
 	}
 	var stderr bytes.Buffer
 	argv := append(append([]string(nil), safeConfig...), args...)
