@@ -13,6 +13,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -476,15 +477,21 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if spec := prof.spec().timeout; timeout > 0 && spec > 0 && spec < timeout {
 		timeout = spec
 	}
-	_, err = p.runner.Run(ctx, process.Spec{
+	_, span := ledger.Start(ctx, stageRun, prof.Name())
+	res, err := p.runner.Run(ctx, process.Spec{
 		Path: path, Args: args, Dir: input, Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
 		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
 	})
+	// What the indexer cost is recorded on both paths: a run that failed on
+	// its deadline or its memory is the one an operator most needs the figures
+	// for, and the runner measured it either way.
 	if err != nil {
+		span.End(ledger.OutcomeFailed, measured(res), err)
 		return "", "", p.profileError(prof, "", err)
 	}
+	span.End(ledger.OutcomeOK, measured(res), nil)
 	// The output must be a regular file the tool wrote inside the run
 	// directory, within the index bound. A symlink is refused: the decoder
 	// would otherwise read whatever it points at as the tool's output.
