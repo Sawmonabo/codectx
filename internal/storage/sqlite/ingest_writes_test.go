@@ -11,29 +11,40 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// procWriteBytes reads the bytes this process has submitted to the block
-// layer so far (write_bytes in /proc/self/io). It counts what reaches the
-// disk, which is what saturates a host, and not what a file grew by.
-func procWriteBytes(t *testing.T) int64 {
+// procIO reads one counter of /proc/self/io.
+func procIO(t *testing.T, field string) int64 {
 	t.Helper()
 	raw, err := os.ReadFile("/proc/self/io")
 	if err != nil {
 		t.Skipf("/proc/self/io: %v", err)
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		if rest, ok := strings.CutPrefix(line, "write_bytes: "); ok {
+		if rest, ok := strings.CutPrefix(line, field+": "); ok {
 			n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
 			if err != nil {
-				t.Fatalf("write_bytes: %v", err)
+				t.Fatalf("%s: %v", field, err)
 			}
 			return n
 		}
 	}
-	t.Fatal("/proc/self/io has no write_bytes line")
+	t.Fatalf("/proc/self/io has no %s line", field)
 	return 0
 }
+
+// procWriteBytes is the bytes this process has caused to be sent to the
+// block layer so far (write_bytes): a page counts when it is dirtied, so a
+// page written many times while it stays dirty counts once, and a page the
+// pacer has cleaned counts again when it is dirtied again. It is what reaches
+// the disk, which is what saturates a host, and not what a file grew by.
+func procWriteBytes(t *testing.T) int64 { return procIO(t, "write_bytes") }
+
+// procWriteChars is the bytes this process has passed to write calls so far
+// (wchar), whether or not the kernel later merged them: what the engine
+// itself wrote.
+func procWriteChars(t *testing.T) int64 { return procIO(t, "wchar") }
 
 func envInt(t *testing.T, name string, fallback int) int {
 	t.Helper()
@@ -48,31 +59,19 @@ func envInt(t *testing.T, name string, fallback int) int {
 	return n
 }
 
-// TestIngestionWritesAreProportionalToStoredBytes seals a repository's worth
-// of file-scoped units the way an index run does -- every unit its own
-// batches of nodes, relations, evidence, aliases and search documents, one
-// unit after another -- and compares the bytes the process sent to disk with
-// the bytes the store holds afterwards.
-//
-// Requirement: ingestion writes each stored byte a small constant number of
-// times. A store file plus its log is written at most once each, so the bound
-// admits the log copy, the checkpoint copy and the index entries for every
-// row, and refuses a write path that rewrites pages it already wrote. Nothing
-// below the bound is a tuning question: a write volume that scales with the
-// number of units times the number of index pages, rather than with the bytes
-// stored, saturates the host's disk on a large repository.
-//
-// Mutation that fails it: commit every batch on its own with hash-keyed
-// indexes maintained per row.
-func TestIngestionWritesAreProportionalToStoredBytes(t *testing.T) {
-	// A byte ratio, not a wall-clock one: host load cannot change it, so the
-	// test runs on a loaded host too.
-	units := envInt(t, "CODECTX_INGEST_UNITS", 600)
-	perUnit := envInt(t, "CODECTX_INGEST_FACTS", 40)
-
-	dir := t.TempDir()
-	path := dir + "/ingest.db"
+// sealRepository seals units file-scoped units of perUnit facts each into a
+// fresh store at path, the way an index run does, and returns the fixture.
+func sealRepository(t *testing.T, path string, units, perUnit int) *fixture {
+	t.Helper()
 	f := newFixture(t, path)
+	sealRepositoryInto(t, f, units, perUnit, nil)
+	return f
+}
+
+// sealRepositoryInto seals units file-scoped units of perUnit facts each into
+// f's store, calling after (when given) once each unit is sealed.
+func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, after func()) {
+	t.Helper()
 	files := make([]fileFixture, units)
 	for i := range files {
 		files[i] = f.file(fmt.Sprintf("pkg%d/file%d.go", i%37, i), fmt.Sprintf("package p%d\n// unit %d\n%s", i%37, i, strings.Repeat("x", 32*perUnit+32)))
@@ -96,8 +95,6 @@ func TestIngestionWritesAreProportionalToStoredBytes(t *testing.T) {
 		return model.Node{ID: id, Kind: model.NodeFunction, Language: "go", Name: name,
 			QualifiedName: ff.path + "." + name, FileID: ff.id, ContentHash: ff.hash, Range: rangeOf(i)}, key
 	}
-
-	before := procWriteBytes(t)
 	for ui, ff := range files {
 		w := f.begin(gen, run, ff)
 		facts := make([]model.NodeFact, 0, perUnit)
@@ -146,27 +143,113 @@ func TestIngestionWritesAreProportionalToStoredBytes(t *testing.T) {
 		if err := f.s.SealUnit(f.ctx, w); err != nil {
 			t.Fatalf("SealUnit(%d): %v", ui, err)
 		}
+		if after != nil {
+			after()
+		}
 	}
+}
+
+// TestIngestionWritesAreProportionalToStoredBytes seals a repository's worth
+// of file-scoped units the way an index run does -- every unit its own
+// batches of nodes, relations, evidence, aliases and search documents, one
+// unit after another -- and compares the bytes the process sent to disk with
+// the bytes the store holds afterwards.
+//
+// Requirement: ingestion writes each stored byte a small constant number of
+// times. A store file plus its log is written at most once each, so the bound
+// admits the log copy, the checkpoint copy and the index entries for every
+// row, and refuses a write path that rewrites pages it already wrote. Nothing
+// below the bound is a tuning question: a write volume that scales with the
+// number of units times the number of index pages, rather than with the bytes
+// stored, saturates the host's disk on a large repository.
+//
+// The second figure is what the engine itself wrote (wchar), which the
+// kernel's page cache can hide from the first: a group whose dirty pages
+// outgrow the writer's page cache spills them to the log and rewrites the
+// hot ones there in place, tens of times each, and every such write becomes
+// disk traffic once the log is paced to disk. The engine's writes are bounded
+// the same way as the disk's.
+//
+// Mutations that fail it: commit every batch on its own with hash-keyed
+// indexes maintained per row (44.9x to disk); leave the engine's statement
+// journal at its default 64 KiB threshold so every batch's savepoint
+// journals to a file (15.5x written by the engine).
+func TestIngestionWritesAreProportionalToStoredBytes(t *testing.T) {
+	// A byte ratio, not a wall-clock one: host load cannot change it, so the
+	// test runs on a loaded host too.
+	units := envInt(t, "CODECTX_INGEST_UNITS", 600)
+	perUnit := envInt(t, "CODECTX_INGEST_FACTS", 40)
+
+	dir := t.TempDir()
+	path := dir + "/ingest.db"
+	before := procWriteBytes(t)
+	engineBefore := procWriteChars(t)
+	f := sealRepository(t, path, units, perUnit)
 	// The measurement is of the durable outcome: the run's group commits and
 	// the log is folded into the database, as it is at every activation.
 	if err := f.s.Flush(f.ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	written := procWriteBytes(t) - before
-	if written == 0 {
-		t.Skip("the temporary directory is not on a block device, so the bytes sent to disk cannot be read")
-	}
+	engine := procWriteChars(t) - engineBefore
 	var stored int64
 	for _, suffix := range []string{"", "-wal"} {
 		if st, err := os.Stat(path + suffix); err == nil {
 			stored += st.Size()
 		}
 	}
-	ratio := float64(written) / float64(stored)
-	t.Logf("units=%d facts/unit=%d stored=%.1f MiB written=%.1f MiB ratio=%.1fx",
-		units, perUnit, float64(stored)/(1<<20), float64(written)/(1<<20), ratio)
+	t.Logf("units=%d facts/unit=%d stored=%.1f MiB engine wrote=%.1f MiB (%.1fx) sent to disk=%.1f MiB (%.1fx)",
+		units, perUnit, float64(stored)/(1<<20), float64(engine)/(1<<20), float64(engine)/float64(stored),
+		float64(written)/(1<<20), float64(written)/float64(stored))
+	if engine > 4*stored {
+		t.Errorf("the engine wrote %.1f MiB for %.1f MiB stored (%.1fx): the group's pages are being spilled and rewritten in the log",
+			float64(engine)/(1<<20), float64(stored)/(1<<20), float64(engine)/float64(stored))
+	}
+	if written == 0 {
+		t.Skip("the temporary directory is not on a block device, so the bytes sent to disk cannot be read")
+	}
 	if written > 4*stored {
 		t.Errorf("ingestion sent %.1f MiB to disk for %.1f MiB stored (%.1fx): the write path rewrites pages it already wrote",
-			float64(written)/(1<<20), float64(stored)/(1<<20), ratio)
+			float64(written)/(1<<20), float64(stored)/(1<<20), float64(written)/float64(stored))
+	}
+}
+
+// TestIngestionGroupCommitsWhenTheCacheWouldSpill gives the writer a page
+// cache far smaller than the run and asserts that the run commits in groups
+// the size of the cache: the log never holds more than the cache plus one
+// batch.
+//
+// Requirement: an ingestion group is bounded by the writer's page cache, not
+// by the log, because a group that outgrows the cache spills its dirty pages
+// to the log and rewrites the hot ones there in place, and the pacer then
+// carries every rewrite to the disk. The cache is the only memory the group
+// takes, so this is also the run's memory bound.
+//
+// Mutation that fails it: bound the group by the log's size (1 GiB) and let
+// the cache spill (the log reaches 18 MiB under a 2 MiB cache).
+func TestIngestionGroupCommitsWhenTheCacheWouldSpill(t *testing.T) {
+	const cacheKiB = 2048
+	dir := t.TempDir()
+	path := dir + "/ingest.db"
+	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
+	var peakLog int64
+	sealRepositoryInto(t, f, 300, 40, func() {
+		if st, err := os.Stat(path + "-wal"); err == nil && st.Size() > peakLog {
+			peakLog = st.Size()
+		}
+	})
+	if err := f.s.Flush(f.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	stored := int64(0)
+	if st, err := os.Stat(path); err == nil {
+		stored = st.Size()
+	}
+	t.Logf("cache=%d KiB stored=%.1f MiB peak log=%.1f MiB", cacheKiB, float64(stored)/(1<<20), float64(peakLog)/(1<<20))
+	// One batch of a 40-fact unit dirties well under a mebibyte; the bound
+	// leaves room for the spill that triggers the commit and the frames the
+	// commit itself appends.
+	if bound := int64(2*cacheKiB) << 10; peakLog > bound {
+		t.Errorf("the log reached %.1f MiB under a %d KiB writer cache: the group is not bounded by the cache", float64(peakLog)/(1<<20), cacheKiB)
 	}
 }

@@ -957,7 +957,7 @@ PRAGMA busy_timeout = 5000;
 PRAGMA temp_store = FILE;
 PRAGMA mmap_size = 0;
 -- Writer connection, KiB budget:
-PRAGMA cache_size = -8192;
+PRAGMA cache_size = -1048576;
 -- Each read connection uses cache_size = -4096 instead.
 ```
 
@@ -2035,7 +2035,7 @@ max_provider_record_bytes = 0  # 0 = unlimited; when set, must fit index.batch_b
 data_dir = ""
 busy_timeout = "5s"
 read_connections = 2
-writer_cache_kib = 8192
+writer_cache_kib = 1048576
 reader_cache_kib = 4096
 closed_session_retention = "7d"
 query_cursor_ttl = "15m"

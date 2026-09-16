@@ -659,7 +659,7 @@ func Defaults() Config {
 			DataDir:                "",
 			BusyTimeout:            Duration(5 * time.Second),
 			ReadConnections:        2,
-			WriterCacheKiB:         8192,
+			WriterCacheKiB:         1048576,
 			ReaderCacheKiB:         4096,
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),
 			QueryCursorTTL:         Duration(15 * time.Minute),

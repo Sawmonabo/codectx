@@ -48,46 +48,75 @@ batch; the reference repository seals 20 000 units in six batches each.
 
 ## Decision
 
-Every write an index run makes joins one write transaction per run, the ingestion group, and the
-group commits at the points below; nothing commits per batch.
+Every write an index run makes joins one write transaction, the ingestion group, and the group is
+bounded by the writer's page cache; nothing commits per batch.
 
 1. **Joining.** The store's ingestion calls (repository, blob and snapshot rows; unit begin, inputs,
    facts, evidence, aliases, search documents, delta state, seal, membership and carry-over;
    supplied indexes; capability rows; activation; abort) run inside the open group, each in a
    savepoint so a refused batch rolls back alone. The group's transaction is begun under a context
    that outlives any one caller.
-2. **Commit points.** The group commits when its write-ahead log reaches 1 GiB; when an exclusive
-   writer is waiting; at activation and at abort, whether they succeed or not; and when the store
-   closes. 1 GiB of log is about 262 000 pages, the size of the hash-keyed index set of a reference
-   store of 100 000 files, so a group that large lands many rows on each such page before the page
-   is paid for; the bound is disk, never memory, because the writer's page cache spills to the log
-   as it fills.
-3. **Exclusive writers.** State that must be visible to every connection the moment the call
+2. **Commit points.** The group commits the moment the writer's page cache would spill a dirty
+   page to the log; when an exclusive writer is waiting; at activation and at abort, whether they
+   succeed or not; and when the store closes. The cache (`storage.writer_cache_kib`, 1 GiB) is
+   about 262 000 pages, the size of the hash-keyed index set of a reference store of 100 000
+   files, so a group that large lands many rows on each such page before the page is paid for. A
+   group that never spills writes nothing to the log until its commit, and the commit appends each
+   dirtied page exactly once. The bound is memory the engine allocates as the cache fills, so a
+   small run never takes it all, and the run releases it at activation and abort.
+3. **Why the cache and not the log.** A group that outgrows its cache spills dirty pages to the
+   log one at a time and, when a spilled page is dirtied again, rewrites its frame in place; at
+   commit it rewrites the checksum of every frame from the first such rewrite on. The kernel's
+   page cache hides those rewrites on a short run, and the disk pays for them on a long one or
+   under paced writeback: under an 8 MiB cache the store's ingestion test wrote 65 MiB of log
+   frames and dirtied 555 MiB of them. The store detects a group's first frame from the log's
+   size and header (the writer's journal size limit is zero, so the engine truncates the log at
+   each reset, and a reset rewrites the header's salt and sequence), and commits.
+4. **Statement journal in memory.** Each savepoint records the prior image of every page its batch
+   touches; content-addressed rows touch a fresh page each. The engine's default moves that
+   journal to a temporary file past 64 KiB, rewritten from offset zero at every batch: fifteen
+   times the bytes stored, measured, in write calls the kernel absorbs on a short run and flushes
+   on a long one. The store sets the engine's spill threshold to 64 MiB before the first
+   connection, one batch's pages, released with the savepoint.
+5. **Paced writeback.** While a group is open and until its commit and checkpoint have finished,
+   the store asks the kernel every hundred milliseconds to begin writing the dirty pages of the
+   log and the database, the way a database's bytes-per-sync and checkpoint-flush settings do. It
+   never waits and never changes what is durable when; it spreads a group's disk traffic over
+   the time the group takes wherever the writer is slower than the disk, and it starts the
+   commit's traffic during the commit's own append rather than at the sync that ends it.
+6. **Exclusive writers.** State that must be visible to every connection the moment the call
    returns (sessions, leases, heartbeats, retention, the planner's statistics, generation pins)
    keeps its own transaction. It announces itself, the next ingestion call commits the group, and
    it runs; it waits at most one batch.
-4. **Own-writes reads.** The ingestion side's reads (unit states, aliases of dependency units,
+7. **Own-writes reads.** The ingestion side's reads (unit states, aliases of dependency units,
    selected and carried units, delta state, unit inputs, the snapshot and blobs a capture recorded,
    generation status, provider runs) run on the group's connection while a group is open, so a run
    sees what it has stored. Query paths read the reader pool and see a run's units at its commits.
-5. **Requirement, as a test.** The store's ingestion test asserts that the bytes sent to disk are at
-   most four times the bytes stored, and fails at 44.9× under per-batch commits.
+8. **Requirements, as tests.** The store's ingestion test asserts that the bytes the engine writes
+   and the bytes sent to disk are each at most four times the bytes stored; a second test gives
+   the writer a 2 MiB cache and asserts the log never exceeds twice the cache; a third writes
+   64 MiB under the pacer and asserts none of it is still dirty when the file is truncated.
 
 ## What the numbers must show
 
 The ingestion test after the change, the group flushed and the log folded into the database before
-measuring:
+measuring. "Engine" is what the engine passed to write calls; "disk" is what the process caused to
+be sent to the block layer:
 
-| units × facts | stored | written | ratio | wall |
+| units × facts | stored | engine | disk | wall |
 |---|---|---|---|---|
-| 600 × 40 | 73.1 MiB | 74.1 MiB | 1.0× | 5.5 s |
-| 1 000 × 40 | 122.0 MiB | 123.5 MiB | 1.0× | 9.7 s |
-| 100 × 400 | 117.9 MiB | 128.8 MiB | 1.1× | 8.4 s |
+| 600 × 40, per-batch commits (before) | 41.3 MiB | — | 1 854 MiB, 44.9× | 48 s |
+| 600 × 40, 1 GiB log bound, 8 MiB cache, file statement journal | 73.1 MiB | 2 798 MiB, 23× | 74 MiB, 1.0× | 5.5 s |
+| the same, paced | 73.1 MiB | 2 798 MiB | 161 MiB, 2.2× | 3.8 s |
+| 600 × 40, cache-bound group, statement journal in memory, paced | 73.1 MiB | 73.1 MiB, 1.0× | 73.3 MiB, 1.0× | 3.5 s |
+| 300 × 40 under a 2 MiB cache | 18.3 MiB | — | peak log 2.6 MiB | 3.1 s |
 
-Stored counts the database and its log, which holds the group's frames until the next checkpoint
-folds them; against the database alone the durable cost is about 2×, the log copy plus the
-checkpoint copy. A reference repository's index must write no more than four times its database
-and must not stall its host's disk path.
+The probe that separated the two costs: 60 000 random 16-byte keys into a table and one index
+under a 1 GiB cache wrote 10.3 MB for a 5.1 MB database (the log and the checkpoint, exactly), and
+546 MB with a savepoint every forty rows. Stored counts the database and its log; the log is
+truncated at the next reset, so the durable cost is the database plus the checkpoint copy. A
+reference repository's index must write no more than four times its database and must not stall
+its host's disk path.
 
 ## Alternatives considered
 
@@ -96,14 +125,27 @@ and must not stall its host's disk path.
 2. *Commit on a clock: one group per second or per N units.* Rejected: a cadence is a tuning knob
    with no right value (a second is 20 units on one host and 2 000 on another), and an idle group
    would hold the writer connection until its timer fired. Committing on demand, when another
-   writer needs the database, has no knob and never holds a writer longer than one batch.
-3. *A staging database per run, attached and merged at activation.* Steel-man: the run's writes
+   writer needs the database or the cache is full, has no knob and never holds a writer longer
+   than one batch.
+3. *Bound the group by the log's size (1 GiB) and let the kernel's page cache absorb the
+   writer's spills.* Steel-man: the kernel's cache is larger than any setting and costs nothing to
+   allocate. Rejected by measurement (decision 3): the spills are in-place rewrites of the log,
+   which the kernel absorbs only while the pages are still dirty; on a run longer than the
+   kernel's expiry, or under paced writeback, each rewrite reaches the disk, and the cost grows
+   with the run.
+4. *A pacer that bounds the kernel's dirty set to a constant.* Steel-man: it would make a group's
+   commit invisible to the host. Rejected as a promise: a group's commit appends its pages at
+   memory speed, faster than any disk, so an interval pacer can only start the traffic early; a
+   bound would need the writer to wait on the disk, which is a rate limit and a knob. The pacer
+   is kept for what it does deliver (decision 5); the burst that remains is one group, sequential,
+   at the disk's own rate.
+5. *A staging database per run, attached and merged at activation.* Steel-man: the run's writes
    would be sequential appends into an empty file with no index maintenance, and the main
    database would stay untouched until the merge. Rejected: the merge inserts every row into the
    same hash-keyed indexes and pays the per-fact term once more; every read of a generation
    built over several runs would union several files; and sessions, leases and retention are
    keyed across generations in one file.
-4. *Sorted, per-generation packed fact structures built at activation* (the shape ADR-0005 and
+6. *Sorted, per-generation packed fact structures built at activation* (the shape ADR-0005 and
    ADR-0007 give the adjacency and the term statistics). This removes the per-fact term
    altogether, because a sorted build writes each page once with tens of rows on it, and it is
    the design for the residual cost recorded below. Not adopted here: the group removes the
@@ -114,28 +156,51 @@ and must not stall its host's disk path.
 
 A run's units become visible to query paths at its commits. A process that dies with a group
 open loses the group: its units are rebuilt by the next run, which the store is built to do
-cheaply, and nothing partly published is visible. The write-ahead log grows to the group's dirtied
-pages, up to 1 GiB, before the checkpoint folds it. The callerless WAL maintenance routine and its
-high-water option are deleted with this record; the planner's statistics refresh runs in an
-exclusive transaction of its own. The store gains `Flush`, which commits the open group for a test
-or a tool that opens a connection of its own.
+cheaply, and nothing partly published is visible. An index run holds up to the writer's page cache
+in memory for its writes, allocated as the groups fill it and released at activation and abort.
+The write-ahead log holds at most one group plus the batch that spilled before the checkpoint
+folds it and the next reset truncates it; a reader that keeps old frames open defers the reset
+and the log grows by a group per commit until the reader is done, which the doctor's log check
+reports past twice the cache. The callerless WAL maintenance routine and its high-water option are
+deleted with this record; the planner's statistics refresh runs in an exclusive transaction of its
+own. The store gains `Flush`, which commits the open group for a test or a tool that opens a
+connection of its own.
 
-The residual cost is the per-fact term inside one group: a group touches at most one leaf per new
-row per hash-keyed index, so a delta run of K new rows writes up to 8 KiB × K per such index, and a
-full run writes each hash-keyed index about once. The trigger for the packed fact store of
-alternative 4 is a measured delta run on a reference store above the 4× bound.
+The residual cost is the per-fact term across groups: a group touches at most one leaf per new
+row per hash-keyed index, so once an index's leaf set is larger than the cache, every group of a
+full run rewrites the leaves it touched, about the whole leaf set per group, and a delta run of K
+new rows writes up to 8 KiB × K per such index. A store whose hash-keyed leaf sets are several
+times the cache pays several times its size per full run. That is the trigger for the sorted-run
+fact store of alternative 6: a measured run above the 4× bound, which a repository several times
+the reference repository's size is expected to reach.
 
 ## Sources
 
 - Write-Ahead Logging — https://sqlite.org/wal.html (what a commit writes to the log, what a
-  checkpoint copies, why a reader never blocks the writer).
+  checkpoint copies, why a reader never blocks the writer, when the log restarts).
 - Atomic Commit In SQLite — https://sqlite.org/atomiccommit.html (a dirtied page is written in
   full at commit).
 - SAVEPOINT — https://sqlite.org/lang_savepoint.html (a nested rollback inside one transaction).
 - Isolation In SQLite — https://sqlite.org/isolation.html (a connection sees its own uncommitted
   writes; other connections see the last commit).
+- PRAGMA statements: cache_size, cache_spill, journal_size_limit, wal_checkpoint, shrink_memory —
+  https://sqlite.org/pragma.html (when the cache spills, when the log is truncated, what a
+  passive checkpoint does, releasing the cache).
+- Configuration options, SQLITE_CONFIG_STMTJRNL_SPILL — https://sqlite.org/c3ref/c_config_covering_index_scan.html
+  (the statement journal's in-memory threshold, settable only before the engine initialises).
+- Temporary disk files used by SQLite, statement journals — https://sqlite.org/tempfiles.html
+  (what a savepoint records and when the journal spills to a file).
+- SQLite source, wal.c — https://sqlite.org/src/file?name=src/wal.c (a page already in the log for
+  the current transaction is rewritten in place; the frame checksums after it are recomputed at
+  commit).
+- sync_file_range(2) — https://man7.org/linux/man-pages/man2/sync_file_range.2.html (initiating
+  writeback of a range without waiting for it).
+- RocksDB Tuning Guide, bytes_per_sync and wal_bytes_per_sync —
+  https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide (paced writeback of files being
+  written, for the same reason).
+- PostgreSQL, checkpoint_flush_after — https://www.postgresql.org/docs/current/runtime-config-wal.html
+  (the same pacing for checkpoint writes, and why a burst at the sync is what it prevents).
 - The /proc Filesystem, `/proc/[pid]/io` — https://www.kernel.org/doc/html/latest/filesystems/proc.html
-  (`write_bytes`: bytes the process caused to be sent to the storage layer, the figure the test
-  and the sampled runs read).
+  (`write_bytes`, `wchar` and `cancelled_write_bytes`: the figures the tests read).
 - PSI — Pressure Stall Information — https://docs.kernel.org/accounting/psi.html (the IO stall
   figures quoted in Context).
