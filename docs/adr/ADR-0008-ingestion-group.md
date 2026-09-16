@@ -19,9 +19,10 @@ shows the same shape:
 | r3, packed-lexical delta | 22:15 | 3.2 GB | 136.0 GB | 43× |
 | redglass, wave-i tip, sampled | 6:45 | 624 MB | 46.6 GB | 75× |
 
-The sampled redglass run locates the writes: 47.2 GB of the 46.6 GB total (the remainder is the
-snapshot's content store) were written between "snapshot captured" and "packed adjacency build
-started", the phase in which providers seal units, while the database grew from 6 MB to 624 MB.
+The sampled redglass run locates the writes: all but a fraction of a gigabyte of the 47 GB (the
+remainder is the snapshot's content store) were written between "snapshot captured" and "packed
+adjacency build started", the phase in which providers seal units and the dependence import stages
+its export, while the database grew from 6 MB to 624 MB.
 Activation itself, the packed adjacency and term-statistics builds, wrote 0.1 GB. The host's disk
 path saturated: 98 % full IO stall, load 22 on 16 cores, and the machine froze for the length of
 the run.
