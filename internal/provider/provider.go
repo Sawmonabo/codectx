@@ -62,6 +62,15 @@ type Detection struct {
 	// affected input -- `details["rust-analyzer"] = "CTX_TOOL_OFFLINE"` --
 	// keeps that typed rather than silent.
 	Details map[string]string `json:"details,omitempty"`
+	// Reason is the one bounded phrase that says, in the product's own words,
+	// why a detection is unavailable. A diagnostic code alone names the
+	// category and not the finding -- CTX_PROVIDER_UNAVAILABLE on a
+	// repository whose projects simply sit in subdirectories reads as "this
+	// provider is broken or absent" -- and Details deliberately do not
+	// survive an unavailable detection, so this is where the finding goes.
+	// It is empty for an available detection, which has its rows to speak
+	// with.
+	Reason string `json:"reason,omitempty"`
 }
 
 // WithDetail returns the detection with one bounded diagnostic pair added, so

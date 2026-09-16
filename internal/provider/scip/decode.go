@@ -217,6 +217,12 @@ func summarizeDrops(counts map[string]int64) string {
 // the binding pre-pass reads only paths and text hashes.
 type walker struct {
 	limits Limits
+	// pathPrefix is the root-relative directory the indexer was run over,
+	// prepended to every document path so the import speaks workspace-relative
+	// paths whatever project the unit is. It is empty for a unit rooted at the
+	// workspace itself and for a supplied index, which is written against the
+	// repository already.
+	pathPrefix string
 	// drops counts the records and fields this walk discarded for exceeding a
 	// field bound. It is owned by the caller so one account covers every pass.
 	drops *decodeDrops
@@ -426,6 +432,14 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 	}
 	if d.path == "" {
 		return malformed("document " + strconv.FormatInt(index, 10) + " has no relative_path")
+	}
+	// A document's path is relative to what the indexer was run over, which
+	// for a project unit is a directory inside the workspace. Every path the
+	// import resolves, stores and publishes is workspace-relative, so the
+	// project's own directory is put back here, once, before anything sees
+	// the document.
+	if w.pathPrefix != "" {
+		d.path = w.pathPrefix + "/" + d.path
 	}
 	if d.hasText {
 		d.textHash = hex.EncodeToString(hasher.Sum(nil))

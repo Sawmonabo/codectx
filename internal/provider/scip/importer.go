@@ -109,6 +109,17 @@ type importer struct {
 	seen limitSeen
 }
 
+// pathPrefix is the project directory this unit's index is written against,
+// or empty when it is the workspace itself. A supplied index is never
+// prefixed: it was produced outside this product and its paths are the
+// repository's already.
+func (im *importer) pathPrefix() string {
+	if im.profile == nil {
+		return ""
+	}
+	return im.profile.Root
+}
+
 // Bound names the seven providers.scip.* bounds are reported under. They are
 // the configuration keys themselves, so an operator reading a capability row
 // reads the name of the key to raise.
@@ -255,7 +266,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceBinding, metadata, error) {
 	var meta metadata
 	var verified, unverified int64
-	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
+	w := &walker{limits: im.p.limits, pathPrefix: im.pathPrefix(), onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onMetadata: func(m metadata) error { meta = m; return nil },
 		onDocument: func(d document) error {
 			admitted, err := im.seeDocument(ctx, d)
@@ -447,7 +458,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 // passDefinitions is pass 1: spool occurrences and symbols, bind each
 // document to its snapshot file when it ends, and publish its definitions.
 func (im *importer) passDefinitions(ctx context.Context, open opener) error {
-	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
+	w := &walker{limits: im.p.limits, pathPrefix: im.pathPrefix(), onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onOccurrence: func(doc, seq int64, o occurrence, n int64) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
