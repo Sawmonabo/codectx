@@ -1026,21 +1026,16 @@ func (w *retainedWalk) committed(level int) (bool, error) {
 	return false, internalErr("graph: the admitted level: " + err.Error())
 }
 
-// alignFrontier restores the invariant every served level depends on: while
-// level is being served, the frontier bitset is THAT level's admitted set --
-// which is what closeGroup charges the visited budget from and what the next
-// level's scan applies the direction rule against.
+// setFrontier makes the frontier bitset the named level's admitted set: the
+// invariant every served level depends on, since that set is what closeGroup
+// charges the visited budget from and what the NEXT level's scan applies the
+// direction rule against -- an edge to a node already admitted is served only
+// when its far end is on the frontier of the level being scanned.
 //
-// The bitset is rebuilt in place at every transition, so a leg that resumes
-// into a level whose SUCCESSOR has since committed finds the successor's
-// admissions there instead. Nothing else can disturb it: levels commit in
-// order, so the frontier is this level's unless admitted.<level+1> exists, and
-// the rebuild is skipped whenever it does not.
-func (w *retainedWalk) alignFrontier(level int) error {
-	stale, err := w.committed(level + 1)
-	if err != nil || !stale {
-		return err
-	}
+// It is what a transition leaves behind, so it is only ever called where a
+// transition is NOT going to run: a level whose transition committed in an
+// earlier leg, picked up by a leg whose frontier is still the level before it.
+func (w *retainedWalk) setFrontier(level int) error {
 	file := openRetainFile(w.home, levelFileName(admittedLevelPrefix, level))
 	if err := w.frontier.clear(); err != nil {
 		return err
@@ -1049,6 +1044,23 @@ func (w *retainedWalk) alignFrontier(level int) error {
 		return err
 	}
 	return w.frontier.sync()
+}
+
+// alignFrontier is setFrontier for the level a leg is RESUMED into, skipped
+// where the bitset on disk is already that level's.
+//
+// The bitset is rebuilt in place at every transition, so the frontier a leg
+// finds is the highest committed level's. Levels commit in order, so it is the
+// resumed level's unless admitted.<level+1> exists -- which it does when the
+// page that failed retryably had gone on past this level, and the cursor its
+// caller was told to present again names this one. Rebuilding on every resumed
+// page instead would cost a page the whole level it merely seeks into.
+func (w *retainedWalk) alignFrontier(level int) error {
+	stale, err := w.committed(level + 1)
+	if err != nil || !stale {
+		return err
+	}
+	return w.setFrontier(level)
 }
 
 // hasFrontier reports whether the level admitted anything. An empty level is
