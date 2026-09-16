@@ -527,6 +527,28 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 	if got := mgr.Servers(); got != 2 {
 		t.Fatalf("two projects share one server (%d running), want one server per project", got)
 	}
+	// One tree per snapshot, shared read-only by both servers. Failure mode:
+	// each server copies the whole snapshot for itself, so a monorepo with
+	// several projects holds several full copies of the repository on disk to
+	// serve trees nobody writes to.
+	//
+	// Mutation: materialize per server -- call snapshot.Materialize directly in
+	// startServer instead of m.materialize -> "2 materialization trees on disk
+	// for 2 servers of one snapshot, want 1 shared read-only tree".
+	trees, err := os.ReadDir(snapshot.MaterializeDir(h.Policy.DataDir))
+	if err != nil {
+		t.Fatalf("read the materialization directory: %v", err)
+	}
+	var dirs int
+	for _, e := range trees {
+		if e.IsDir() {
+			dirs++
+		}
+	}
+	if dirs != 1 {
+		t.Fatalf("%d materialization trees on disk for %d servers of one snapshot, want 1 shared read-only tree",
+			dirs, mgr.Servers())
+	}
 	if appOv.Binding().InputDigest == svcOv.Binding().InputDigest {
 		t.Fatalf("both projects' answers carry input digest %q, so nothing tells them apart",
 			appOv.Binding().InputDigest)

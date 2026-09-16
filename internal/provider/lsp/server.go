@@ -12,7 +12,6 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
-	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -39,10 +38,11 @@ type Capabilities struct {
 	CallHierarchy    bool `json:"call_hierarchy"`
 }
 
-// server is one running language server bound to one snapshot: its private
-// materialization, its process, its connection and the documents it has been
-// told about. It is shared by every Overlay opened for the same snapshot and
-// profile and stopped when the last one closes and the idle TTL passes.
+// server is one running language server bound to one snapshot: the tree it
+// shares with every other server of that snapshot, its process, its connection
+// and the documents it has been told about. It is shared by every Overlay
+// opened for the same snapshot and profile and stopped when the last one
+// closes and the idle TTL passes.
 type server struct {
 	key     serverKey
 	profile Profile
@@ -50,7 +50,6 @@ type server struct {
 	opts    Options
 	manager *Manager
 
-	mat  *snapshot.Materialization
 	uris materializationURI
 	conn *conn
 	enc  source.ColumnEncoding
@@ -110,7 +109,8 @@ func (p pipeStream) Write(b []byte) (int, error) { return p.w.Write(b) }
 // errServerGone is the write-side error after the process has exited.
 var errServerGone = errors.New("the language server process has exited")
 
-// startServer materializes the snapshot, starts the pinned payload through the
+// startServer takes a reference to the snapshot's shared tree, starts the
+// pinned payload through the
 // shared runner, performs the initialize/initialized handshake and negotiates
 // the position encoding. Any failure releases the process, the pipes and the
 // materialization before returning.
@@ -121,9 +121,10 @@ var errServerGone = errors.New("the language server process has exited")
 // already commit to.
 func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (*server, error) {
 	snap := view.Header()
-	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{
-		Dir: snapshot.MaterializeDir(m.opts.DataDir), MaxBytes: m.opts.MaxOverlayBytes.Value(),
-	})
+	// One tree per snapshot, shared read-only by every server of it: this
+	// server is rooted at its own project directory INSIDE that tree, and
+	// everything it writes goes to workDir below.
+	mat, err := m.materialize(ctx, view)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +136,6 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		docCacheBytes: m.opts.MaxOverlayBytes.ValueOr(DefaultDocCacheBytes),
 		key:           serverKey{snapshot: snap.ID, profile: p.Name, root: p.Root},
 		profile:       p, view: view, opts: m.opts, manager: m,
-		mat:    mat,
 		uris:   materializationURI{root: mat.Root()},
 		exited: make(chan struct{}),
 		docs:   make(map[model.FileID]*document),
@@ -148,7 +148,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 
 	workDir := p.workDir(m.opts.DataDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		mat.Close()
+		_ = m.releaseMat(snap.ID)
 		return nil, unavailable("language server %q work directory cannot be created: %v", p.Name, err)
 	}
 	if p.Name == serverJDTLS && p.Tool.Source == toolchain.SourceManaged {
@@ -157,7 +157,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		// store payload to seed from -- it replaces the binary and owns its own
 		// launch -- so the copy is the managed payload's alone.
 		if err := seedPlatformConfig(p.Tool.Root, workDir); err != nil {
-			mat.Close()
+			_ = m.releaseMat(snap.ID)
 			return nil, err
 		}
 	}
@@ -333,12 +333,14 @@ func (s *server) handleServerRequest(method string, params json.RawMessage) (any
 
 // onExit runs once the runner has reaped the process tree. It ends the
 // stream on both sides so the reader sees end of file and any writer fails
-// instead of blocking on a pipe nobody drains, removes the materialization,
-// and reports the exit as a failure unless this was a requested stop.
+// instead of blocking on a pipe nobody drains, gives back this server's
+// reference to the shared materialization -- which is removed once the last
+// server of the snapshot has exited -- and reports the exit as a failure
+// unless this was a requested stop.
 func (s *server) onExit(runErr error) {
 	s.stdoutW.Close()
 	s.stdinR.CloseWithError(errServerGone)
-	matErr := s.mat.Close()
+	matErr := s.manager.releaseMat(s.key.snapshot)
 	s.mu.Lock()
 	closing := s.state == serverClosing
 	s.mu.Unlock()
