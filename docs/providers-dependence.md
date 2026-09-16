@@ -366,8 +366,8 @@ the base generation is untouched.
 
 ## Subdivision
 
-Subdivision is the last-resort recovery from a **reproducible** engine crash
-and is never used for memory.
+Subdivision is the last-resort recovery from a **reproducible** engine crash,
+in the parse or in the export, and is never used for memory.
 
 1. The full frontend-native unit always runs first.
 2. On a crash the same unit is rerun once with the frontend's fixed
@@ -378,6 +378,18 @@ and is never used for memory.
    run-to-run deterministic it yields a *second observation of the same failure
    class*: that raises the odds the crash is deterministic rather than
    transient without proving it. A crash seen once is never split on.
+
+   An **export** that dies on the engine's own exception is confirmed the same
+   way, by exporting the graph already on disk a second time; this step has no
+   neutral option to offer, so the confirmation is the same argv again. A
+   project whose parse succeeds at every heap cap and whose whole-unit export
+   dies at every one of them, while each of its subdivided parts exports
+   cleanly, is a measured shape, not a hypothetical: reporting it as a failed
+   unit threw away every fact the engine could still produce for that project.
+   Memory, the unit deadline and an export that exits cleanly holding no method
+   keep their own paths and are never subdivided — the first two are properties
+   of what the unit was given, the third a statement about the frontend's own
+   exclusions.
 3. Only then is the unit split along the next frontend-native boundary, and
    each part that produces a live export is imported into the same unit.
    Two parts legitimately describe the same entity — above all the external
