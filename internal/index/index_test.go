@@ -86,6 +86,18 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	}
 	cfg := config.Defaults()
 	cfg.Storage.DataDir = f.dataDir
+	// The three optional providers are absent from the registry below, and
+	// the configuration says so: SCIP and LSP index through managed toolchain
+	// payloads and the dependence provider through a resolved analysis
+	// engine, none of which a test machine holds. providers(true) is the one
+	// exception — the SCIP provider over an index supplied in the tree, which
+	// needs no payload.
+	//
+	// Their delta appliers are therefore not driven through a coordinator
+	// here. internal/index/delta covers both against a real store, each
+	// refreshed unit held against a full import of the same tree: the
+	// dependence applier over a replaced, an added and a removed declared
+	// input, and the SCIP applier over a moved document.
 	cfg.Providers.SCIP.Enabled = config.Disabled
 	cfg.Providers.LSP.Enabled = config.Disabled
 	cfg.Providers.Dependence.Enabled = config.Disabled
