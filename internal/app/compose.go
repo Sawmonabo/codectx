@@ -134,6 +134,22 @@ const (
 	// (ledger 159 keeps the same path from installing anything, which the
 	// providers now honour by construction).
 	modeReport
+	// modeQuery composes for a command that only answers questions: it takes
+	// no lock and, beyond what modeReport already withholds, opens the store
+	// with NO writer connection at all. Every write a query process used to
+	// perform -- the schema check inside a write transaction at open, and the
+	// retention lease each pinned generation inserted -- waited on the write
+	// transaction a concurrent run holds, so a second process was refused
+	// `database is busy` for the whole of an index. A reader pool on a
+	// write-ahead log never waits on a writer, so this composition answers
+	// throughout a run and delays none of it.
+	//
+	// It is separate from modeReport because the commands that read a
+	// generation and the commands that record a reading session are both
+	// lock-free: `context ...` mutates session state and keeps the writer,
+	// while `status`, `search`, `symbol`, the graph walks, `repomap` and
+	// `doctor` change nothing at all.
+	modeQuery
 )
 
 // openOptions are the composition's variable inputs. They are one struct
@@ -340,6 +356,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// or merged from carried occurrences.
 		MaxEvidencePerFact: evidenceClip(cfg),
 		Synchronous:        cfg.Storage.Synchronous,
+		ReadOnly:           o.mode == modeQuery,
 	}); err != nil {
 		return nil, err
 	}

@@ -66,6 +66,16 @@ func OpenWorkspaceForReport(ctx context.Context, repo string) (*Workspace, error
 	return open(ctx, repo, openOptions{mode: modeReport})
 }
 
+// OpenWorkspaceForQuery composes the workspace for a command that only answers
+// questions. It writes nothing to the database at all -- no writer connection
+// is opened -- so it answers while another process is indexing or watching
+// instead of waiting out that run's write transaction, and it delays that run
+// by nothing. A command that records anything, a reading session included,
+// uses OpenWorkspaceForReport.
+func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeQuery})
+}
+
 func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 	s, err := openStack(ctx, repo, o)
 	if err != nil {

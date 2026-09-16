@@ -82,7 +82,7 @@ func newRepoMapCommand(build model.BuildInfo) *cobra.Command {
 // value back into a flag the operator never typed.
 func repoMapOpener(repo string) opener {
 	return func(ctx context.Context, _ string) (*app.Workspace, error) {
-		return app.OpenWorkspaceForReport(ctx, repo)
+		return app.OpenWorkspaceForQuery(ctx, repo)
 	}
 }
 

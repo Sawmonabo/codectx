@@ -24,6 +24,15 @@ func openForReport() opener {
 	return app.OpenWorkspaceForReport
 }
 
+// openForQuery opens a workspace that writes nothing to the database: no
+// writer connection at all, the schema fingerprint verified by reading and the
+// pinned generation held without a retention lease. Every command that only
+// answers questions uses it, so it answers throughout another process's index
+// instead of waiting out that run's write transaction.
+func openForQuery() opener {
+	return app.OpenWorkspaceForQuery
+}
+
 // openForBuild opens the workspace as the single cross-process writer, with the
 // bounded lock wait, rebuild cache and supplied-index inputs the caller's flags
 // resolved to. Only the building commands use it.
