@@ -301,10 +301,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if res == nil || sink == nil {
 		return rep, argumentInvalid("import needs both a resolver and a sink")
 	}
-	stage := takeStagingSlot(opts.ScratchDir)
-	defer releaseStagingSlot(opts.ScratchDir, stage)
-
-	sc, err := openScratch(ctx, stage, opts.StagingCacheKiB, opts.MaxStagedRows)
+	sc, err := openScratch(ctx, opts.ScratchDir, opts.StagingCacheKiB, opts.MaxStagedRows)
 	if err != nil {
 		return rep, err
 	}
@@ -352,7 +349,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	opts.phase(PhaseRelationsStaged)
 	keysPath := opts.KeysPath
 	if keysPath == "" {
-		keysPath = stage + ".keys"
+		keysPath = sc.defaultKeys
 	}
 	fresh, err := sc.saveKeys(ctx, keysPath)
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -477,6 +478,14 @@ func sweepPrivate(dataDir string) {
 		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())
+			if path == scratch.Dir(root) {
+				// The pool of staging surfaces, which is not a leftover. Its
+				// instances are claimed with a lock, so the one a killed run
+				// held is taken over by the next run rather than left: the
+				// sweep would free exactly the space the pool exists to keep,
+				// and it is what `codectx gc` empties on request.
+				continue
+			}
 			if err := paced.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				failed++
 				slog.Error("a stale dependence working directory was not removed", "component", component, "error", err)
