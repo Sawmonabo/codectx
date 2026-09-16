@@ -18,7 +18,7 @@ for the export, under a heap ceiling the provider chooses ([providers-dependence
 byte ranges. Those facts are what `codectx_callers`, `codectx_callees`, `codectx_dependency_path` and
 `codectx_impact` walk; `codectx_symbol_info` and `codectx_references` report their precision.
 
-The engine is reached through one backend package and consumed through a Neo4j-CSV export staged in a
+The engine is reached through one backend package and consumed through a graph CSV export staged in a
 private SQLite database ([ADR-0009](ADR-0009-import-staging.md)). It has no incremental mode: one
 edited file re-runs a whole unit.
 
@@ -210,10 +210,15 @@ and 10×** the reference repository.
 not an enforced ceiling**: the process runner sums reservations against a budget and there is no
 resource limit or control group behind it. A file whose parse tree overruns its reservation does not
 fail — it makes `W × M_worker` an under-estimate. `R_run ≈ 5.00 GiB` is therefore an **admission
-bound**, and what makes its drift visible is [ADR-0010](ADR-0010-engine-memory.md) decision 4's
-per-unit disclosure of reservation, ceiling and observed peak. Given that freezing the machine is a
-product defect, the plan should **add a real limit** rather than assert one it does not have; that is
-recorded here as required work, not as a solved problem.
+bound**. A hard per-worker limit is **not** the answer: a limit that fails a file for its size is the
+cap requirement 8 forbids, and [ADR-0010](ADR-0010-engine-memory.md) already rules that a unit whose
+need exceeds the allocation still runs, whole. The answer is to make the estimate **observed**: the
+250 ms tree sampler that already measures every child's peak measures each worker's, the observed
+peak per file-size class feeds the next admission in the same run and is persisted with the
+generation for the next, a worker whose observed need exceeds the standing allocation is admitted
+alone rather than refused, and every admission discloses reservation, observed peak and the drift
+between them through decision 4 of the same record. That closes the loop the estimate leaves open
+without a single refusal.
 
 **Coexistence, as a mechanism.** Each worker takes its reservation from the standing allocation — the
 smaller of available memory less the base footprint and margin, and half of available memory
@@ -283,16 +288,23 @@ dependence diverges for normalisation reasons, reaching definitions for def/use 
 per-cause**, because the formulation change of decision 2 produces divergence in both directions and an
 unsigned aggregate would let an over-connection cancel a miss.
 
-### 8. Precision is labelled honestly
+### 8. Precision names the analysis, not the toolchain
 
-The engine stamps `static_analysis`. The honest label for a parse-tree-derived control and data
-dependence with heuristically resolved endpoints is **`syntax`**, unless the endpoints come from a
-precise index, in which case the *call* endpoint is `compiler` and the dependence edge is still
-`syntax`. This is a product decision about what the product promises and it is the largest
-non-engineering cost in the plan. The mechanism for carrying two sources at two precisions already
-exists. Noted on the other side of the ledger: the engine's own `static_analysis` stamp already carries
-facts with no type evidence at all — a bare-name linker's untyped joins are published under it — so the
-downgrade is smaller in substance than in label.
+Precision describes the origin of a fact (`internal/model/facts.go`): `compiler`, `language_server`,
+`static_analysis`, `syntax`, `heuristic`. A control dependence computed from a control-flow graph and
+post-dominators, or a data dependence computed from def-use chains, **is static analysis** whichever
+parser produced the tree it was built from. The engine's own frontends for four of the six invoked
+languages are parsers with no type information behind them, and their facts are published today at
+`static_analysis`; the native pass performs the same analysis on the same class of input, so it is
+published at **`static_analysis`** too, and a consumer sees no change of label for the four dependence
+families. What differs between producers is endpoint *resolution*, and that is already carried
+separately: a `calls` edge whose callee comes from a precise index carries the `compiler` origin on
+that endpoint, a name-joined or hierarchy-resolved callee carries `static_analysis`, and an ambiguous
+site publishes its candidate count. The earlier plan proposed downgrading the native families to
+`syntax`; that would have labelled the toolchain rather than the analysis, created a consumer-visible
+regression for languages that have `static_analysis` today, and put two labels on one fact class for
+the length of every gate. It is rejected here. The label remains what it is; the retirement gate's
+parity condition is what proves the label is earned.
 
 ## Measurements
 
@@ -417,17 +429,16 @@ stderr failure classifier — and it gains the program dependence graph as a sur
 had. Indexing becomes incremental per file for these families, against a backend that has no
 incremental mode at any price. A run's resident memory stops naming the repository.
 
-Against that: a consumer-visible precision downgrade from `static_analysis` to `syntax` for languages
-that have the former today; two producers for one relation kind during each gate, which is a
+Against that: two producers for one relation kind during each gate, which is a
 verification state only because every gate terminates on a measured condition; a differential corpus
 plausibly larger than the implementation, which for Rust and Java cannot be a diff against the engine
 at all and must be authored from the language reference; and per-language lowering semantics, where
 every reference implementation surveyed is measurably wrong on something.
 
 Two obligations this record creates rather than discharges. The whole-run figure is an admission bound
-and not an enforced one, so a real per-worker limit is required work, and until it exists the
-disclosure of [ADR-0010](ADR-0010-engine-memory.md) decision 4 is what makes drift visible. And the
-plan still publishes no native throughput target, because none can be measured before something is
+and not an enforced one, so the observed-reservation loop of decision 5 is required work, and until
+it exists the disclosure of [ADR-0010](ADR-0010-engine-memory.md) decision 4 is what makes drift
+visible. And the plan still publishes no native throughput target, because none can be measured before something is
 built — what it publishes instead is the instrument and the comparison: phase 2 closes on a lower wall
 *and* a lower tree-summed peak than the engine, on the same unit and the same 250 ms sampler.
 

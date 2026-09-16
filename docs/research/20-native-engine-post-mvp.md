@@ -503,8 +503,12 @@ estimate, not an enforced ceiling**: the process runner sums reservations agains
 no resource limit or cgroup anywhere behind it. A file whose parse tree overruns its reservation does
 not fail — it makes `W × M_worker` an under-estimate. So `R_run ≈ 5.00 GiB` is an **admission bound**,
 and what makes its drift visible is the per-unit disclosure of reservation, ceiling and observed peak
-that the engine-memory record already requires. Any claim stronger than that would need a real limit,
-and the plan should add one rather than assert one.
+that the engine-memory record already requires. A hard per-worker limit is not the answer — a limit
+that fails a file for its size is a cap, and the engine-memory record already rules that work whose
+need exceeds the allocation still runs, whole. The answer is an **observed** estimate: the existing
+250 ms tree sampler measures each worker's peak, the observed peak per file-size class feeds the next
+admission and is persisted with the generation, a worker whose need exceeds the allocation is admitted
+alone rather than refused, and every admission discloses the drift between reservation and peak.
 
 **Coexistence, as a mechanism rather than an intention.** Each worker takes its reservation from the
 standing allocation — the smaller of available memory less the base footprint and margin, and half of
@@ -553,19 +557,20 @@ over-connection cancel a miss.
 ### 7.6 Precision
 
 `internal/model/facts.go:94-98` offers `compiler`, `language_server`, `static_analysis`, `syntax`,
-`heuristic`. The engine stamps `static_analysis`; the honest label for a CST-derived CFG/CDG/def-use
-with heuristically resolved endpoints is **`syntax`** (doc 05 §0). This is a product decision about
-what the product promises, not an engineering one, and it is the largest non-engineering cost in the
-plan. The mechanism for carrying two sources at two precisions already exists — evidence `Detail`
-strings are built exactly this way today.
-
-Worth noting on the other side of the ledger: the engine's own `static_analysis` stamp is already
-carrying facts with no type evidence at all — the bare-name linker's untyped joins are published under
-it — so the downgrade is smaller in substance than it is in label.
+`heuristic`, and the type's own comment says precision names the origin of a fact. A control
+dependence from a CFG and post-dominators, or a data dependence from def-use chains, is static analysis
+whichever parser produced the tree; the engine's own frontends for four of the six invoked languages
+are parsers with no type information behind them and publish at `static_analysis` today. The native
+families therefore publish at **`static_analysis`** — no consumer-visible change of label — and what
+differs between producers, endpoint resolution, is carried where it already lives: the endpoint's own
+origin (`compiler` from a precise index, `static_analysis` from a name or hierarchy join) and the
+candidate count on an ambiguous site. Doc 05 §0's proposal to label the native families `syntax` is
+withdrawn: it labelled the toolchain rather than the analysis and would have regressed languages that
+carry `static_analysis` today. The retirement gate's parity condition is what proves the label is earned.
 
 ### 7.7 Effort
 
-| Component | Go lines | Weeks (one lead, parallel implementers) | Dominant risk |
+| Component | Go lines | Weeks (parallel implementers) | Dominant risk |
 |---|---|---|---|
 | CFG + post-dominators + CDG core | 1,200–1,800 | 2–3 | exceptional-edge semantics, and the frontier port is 28 readable BSD-3 lines rather than an invention |
 | Sparse SSA def-use core | 1,150–1,880 | 2–3 | the engine's use filter matches normalised text a CST does not have; the band is asymmetric |
@@ -624,9 +629,7 @@ its call sites are syntax-only today.
    the only references left, and all are deleted in the same change — no dead consumer, no unreachable
    path, no configuration key nothing reads.
 
-**Trade-off accepted.** Two producers for one relation kind at two precisions during each gate, and a
-consumer-visible downgrade from `static_analysis` to `syntax` for languages that have the former today.
-Two producers behind a *measured, terminating* gate is a verification state, not a compatibility layer
+**Trade-off accepted.** Two producers for one relation kind during each gate. Two producers behind a *measured, terminating* gate is a verification state, not a compatibility layer
 — it is the absence of a terminating gate that would turn it into one, which is the defect this
 revision removes.
 
@@ -733,8 +736,7 @@ near-linear dominator algorithms: the two papers' PDFs 404 at every mirror cited
 abstract was verified in place of its tables. The achievable call-resolution ceiling for the dynamic
 languages — 18.7% of sites / 24.1% of edges is the best any technique **actually run** on this
 repository reached, and it is quoted as a measurement, never as a limit. The size at which a parse
-tree overruns its worker's reservation, which is what §7.4's admission bound would need to become an
-enforced one.
+tree overruns its worker's reservation, which is what §7.4's observed-reservation loop measures first.
 
 **Previously weak, now settled.** The inference that a generic dominator implementation can be run on
 reversed CFG edges to obtain post-dominators is **verified from source**: both entry points consult
