@@ -44,8 +44,12 @@ func newMCPCommand(build model.BuildInfo) *cobra.Command {
 // unlike every other command here, which opens a report workspace per
 // invocation. That is forced by what the tool set does: codectx_refresh_index
 // publishes generations, so the process must be the Section 13.2 cross-process
-// owner and hold the workspace lock for its lifetime, and a *Services is valid
-// only for the workspace it was made from. The facade is documented safe for
+// owner while it refreshes, and a *Services is valid only for the workspace it
+// was made from. The lock that ownership means is taken for the duration of a
+// refresh rather than for the session, so the exploration tools -- which need
+// neither it nor the writer -- answer from the moment the session opens,
+// including while another process indexes, and an idle session leaves the
+// workspace to the person's own commands. The facade is documented safe for
 // concurrent use over one workspace (services.go, Task 19 Q2), which is what
 // lets the bounded set of concurrent tool calls share this single instance.
 //
@@ -60,10 +64,16 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 		Use:   "serve",
 		Short: "Run the MCP server over stdio for one workspace",
 		Long: "Serves one workspace over stdio until the client disconnects or the " +
-			"process is interrupted. The workspace lock is held for the whole " +
-			"session -- one writer, never two -- so a workspace another `codectx " +
-			"index`, `refresh` or `watch` already holds is reported as busy at " +
-			"startup instead of being waited on forever.\n\n" +
+			"process is interrupted. Startup takes no workspace lock and writes " +
+			"nothing, so the server comes up and answers beside an index another " +
+			"process is already running. The lock is taken for the duration of a " +
+			"refresh and given back when it ends -- one writer, never two, and " +
+			"never a workspace this session keeps while it is idle -- so a " +
+			"refresh asked for while another `codectx index`, `refresh` or " +
+			"`watch` holds the workspace is the only thing reported as busy, and " +
+			"the questions keep being answered throughout. With --watch the " +
+			"session takes the lock at its first pass and keeps it while it " +
+			"watches, because that watch is what keeps the index fresh.\n\n" +
 			"Results and errors travel as MCP tool answers on the protocol " +
 			"stream; logs and startup failures go to stderr.",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -81,7 +91,13 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
+			// No lock wait: the open takes no lock, and the wait it would
+			// carry is what a refresh would spend before answering. A client
+			// asking for a refresh while the person's own index runs is
+			// answered now, with the retryable refusal it can act on, rather
+			// than held silent for a wait that cannot outlast that run; the
+			// watch loop takes the lock on a later pass of its own.
+			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{})
 			if err != nil {
 				return err
 			}

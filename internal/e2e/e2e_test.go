@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -220,8 +221,23 @@ func data[T any](t *testing.T, env envelope, code int) T {
 // session. Nothing else in a row may take that lock while this is open.
 func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSession {
 	t.Helper()
+	session, closeSession := s.mcpServer(t, ctx)
+	t.Cleanup(closeSession)
+	return session
+}
+
+// mcpServer is mcpSession with the extra `mcp serve` arguments a row needs and
+// the close in the caller's hands. A row that starts a second server must be
+// able to end the first one where it says so rather than at the end of the
+// test: a session that is still connected is still a process on this
+// workspace, and two of them is a different scenario from one.
+//
+// The close is idempotent, so a caller may end the session early and still let
+// the cleanup it registered run.
+func (s *sandbox) mcpServer(t *testing.T, ctx context.Context, extra ...string) (*mcp.ClientSession, func()) {
+	t.Helper()
 	var stderr bytes.Buffer
-	cmd := exec.Command(binary, "mcp", "serve", "--repo", s.Repo)
+	cmd := exec.Command(binary, append([]string{"mcp", "serve", "--repo", s.Repo}, extra...)...)
 	cmd.Env = s.Environ
 	cmd.Stderr = &stderr
 	client := mcp.NewClient(&mcp.Implementation{Name: "codectx-e2e", Version: "0.0.0-test"}, nil)
@@ -229,12 +245,14 @@ func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSessi
 	if err != nil {
 		t.Fatalf("connect to `codectx mcp serve` over stdio: %v\nserver stderr:\n%s", err, stderr.String())
 	}
-	t.Cleanup(func() {
-		if err := session.Close(); err != nil {
-			t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
-		}
-	})
-	return session
+	var once sync.Once
+	return session, func() {
+		once.Do(func() {
+			if err := session.Close(); err != nil {
+				t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
+			}
+		})
+	}
 }
 
 // callTool calls one tool and decodes the Section 19 answer envelope out of the
@@ -365,9 +383,11 @@ func TestE2ESearchParity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 
-	// The index is built first and the process exits, releasing the workspace
-	// lock. `mcp serve` below takes that same lock for its whole session, so
-	// the order is not stylistic: an overlapping index would be refused busy.
+	// The index is built first and the process exits: this row compares the
+	// CLI's answer with the server's over one published generation, so both
+	// must read the same one. `mcp serve` no longer needs the order -- it
+	// starts and answers beside a running index -- but an overlapping index
+	// would leave the two halves comparing different generations.
 	indexEnv, indexCode := s.run(t, "index")
 	if !indexEnv.OK || indexCode != 0 {
 		t.Fatalf("index failed (exit %d): %+v", indexCode, indexEnv.Error)
@@ -784,7 +804,7 @@ func scopeReviewOf(session model.SessionID, actor string, scope int, manifestHas
 // repoState is every file in the repository with its bytes, as one comparable
 // value. It is what "the MCP leg writes nothing to the repository" is asserted
 // against: Section 6 forbids codectx writing into the tree it indexes, and the
-// MCP server is the one boundary that holds the workspace for a whole session.
+// MCP server is the one boundary that serves a workspace for a whole session.
 func repoState(t *testing.T, dir string) string {
 	t.Helper()
 	var state bytes.Buffer
@@ -1220,7 +1240,7 @@ func TestE2EProductBoundary(t *testing.T) {
 		cli = runScenario(t, cliAdapter{s: s}, cliActor, start)
 
 		// The repository is captured before the server starts and compared
-		// after it stops. `codectx mcp serve` holds the workspace for its whole
+		// after it stops. `codectx mcp serve` serves the workspace for its whole
 		// session, and it is the one boundary a client drives without a process
 		// boundary between each step, so "codectx writes no file into the tree
 		// it indexes" is asserted where it is hardest to keep.

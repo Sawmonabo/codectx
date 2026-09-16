@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +165,197 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 	}
 
 	mcpReadsDuringOwnRefresh(t, ctx, s)
+}
+
+// TestE2EServerStartsDuringAnotherProcessIndex is the leg that could not run
+// while the server took the workspace lock at startup: an external `codectx
+// index` is the writer, the server is STARTED DURING it, and it serves the
+// whole time.
+//
+// Failure mode it protects: `mcp serve` takes the cross-process workspace lock
+// as part of opening, so a server an agent starts while the person is indexing
+// in a terminal is refused CTX_WORKSPACE_BUSY at startup and answers nothing at
+// all -- not even the exploration tools, which need neither the lock nor the
+// writer. Mutations that must fail it are quoted in this lane's report:
+// internal/app/compose.go's `o.locksAtOpen()` -> `o.indexing()` on the lock (the
+// connect is refused busy), and `LazyWriter: o.mode == modeServe` -> false (the
+// open's schema check queues behind the run and is refused `database is busy`).
+//
+// What it asserts, and why each one is the product's promise: the session
+// CONNECTS during the run; both exploration tools answer throughout it;
+// codectx_refresh_index answers the typed busy refusal naming the holder --
+// that one call, not the session; and the server is still answering after the
+// run has ended. The server is started exactly as an agent starts it, with the
+// watch loop at its shipped default: a watch that ended the session on a busy
+// workspace would fail here rather than in the field.
+// It is a sandbox of its own, not a further leg of the row above: the server
+// that row leaves connected holds the workspace lock for the rest of its
+// session, so an external index started beside it would be refused -- which is
+// the product working, and the opposite of what this row must set up.
+func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
+	s := newSandbox(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	// A published generation first: the exploration tools below must answer
+	// about something, and CTX_NO_ACTIVE_GENERATION would be this row asking
+	// before it indexed rather than the server failing to serve.
+	if env, code := s.run(t, "index"); !env.OK || code != 0 {
+		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
+	}
+	padFixture(t, s.Repo, 2)
+	child := exec.Command(binary, "index", "--repo", s.Repo, "--json")
+	child.Env = s.Environ
+	child.Stdout, child.Stderr = os.Stderr, os.Stderr
+	if err := child.Start(); err != nil {
+		t.Fatalf("start the indexing child: %v", err)
+	}
+	indexed := make(chan error, 1)
+	go func() { indexed <- child.Wait() }()
+	defer func() {
+		if err := <-indexed; err != nil {
+			t.Errorf("the external index failed while the server served beside it: %v", err)
+		}
+	}()
+
+	// The connect is the first assertion: it starts the server process and
+	// completes the protocol handshake, which the old composition could not
+	// reach at all while another process held the workspace.
+	session, closeSession := s.mcpServer(t, ctx)
+	t.Cleanup(closeSession)
+
+	tools := []struct {
+		name string
+		args any
+	}{
+		{"codectx_index_status", model.StatusRequest{}},
+		{"codectx_search", model.SearchRequest{Query: "TinyStore"}},
+	}
+	cycles, refusals := 0, 0
+	for running := true; running; {
+		for _, tool := range tools {
+			start := time.Now()
+			res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
+			wall := time.Since(start)
+			if err != nil {
+				t.Fatalf("%s failed while another process was indexing: %v", tool.name, err)
+			}
+			if res.IsError {
+				t.Fatalf("%s was refused while another process was indexing: %s",
+					tool.name, contentText(res))
+			}
+			if wall > readerCeiling {
+				t.Errorf("%s took %s while another process was indexing, over the %s ceiling",
+					tool.name, wall, readerCeiling)
+			}
+		}
+		// The one operation that DOES need the workspace: it must be refused,
+		// and refused as the typed, retryable busy answer rather than as a
+		// session that ends or an untyped internal failure.
+		refusals += refusedBusy(t, ctx, session)
+		time.Sleep(readerPause)
+		select {
+		case err := <-indexed:
+			indexed <- err
+			running = false
+		default:
+			cycles++
+		}
+	}
+	t.Logf("tool cycles completed strictly inside another process's index: %d, refresh refusals: %d", cycles, refusals)
+	if cycles == 0 {
+		t.Fatal("the external index finished before one full tool cycle completed: " +
+			"nothing was proved about serving beside another process's run")
+	}
+	if refusals == 0 {
+		t.Fatal("codectx_refresh_index was never refused while another process held the workspace: " +
+			"either the run was over or the refusal is not typed")
+	}
+	// The session outlived the run it served beside. A refresh that had ended
+	// the session, or a watch pass that had, would fail here.
+	for _, tool := range tools {
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
+		if err != nil || res.IsError {
+			t.Fatalf("%s no longer answers after the external index ended: the busy refusal took the session with it (err %v)", tool.name, err)
+		}
+	}
+	// That session is ended here, deliberately: the other half of coexistence
+	// is asked of a session of its own, with one server on the workspace.
+	closeSession()
+	serverReleasesTheWorkspaceAfterARefresh(t, ctx, s, tools)
+}
+
+// serverReleasesTheWorkspaceAfterARefresh is the other half of the same
+// promise: the person's own `codectx index` runs while an agent's server is
+// connected and answering.
+//
+// Failure mode it protects: the server takes the workspace lock at its first
+// refresh and KEEPS it for the rest of the session, so an idle agent server
+// makes `codectx index` in a terminal answer busy for as long as that server
+// lives -- the same coexistence defect from the other side. Mutation that must
+// fail it is quoted in this lane's report: hold the lock for the session in
+// internal/app/compose.go (drop the release, or never decrement) and the
+// external index below is refused.
+//
+// The session runs with --watch=false, which is the product's own distinction
+// and not an accommodation: a watching session is the one operation whose
+// duration IS the session, and it holds the workspace deliberately because it
+// is already keeping the index fresh.
+func serverReleasesTheWorkspaceAfterARefresh(t *testing.T, ctx context.Context, s *sandbox, tools []struct {
+	name string
+	args any
+}) {
+	t.Helper()
+	session, closeSession := s.mcpServer(t, ctx, "--watch=false")
+	t.Cleanup(closeSession)
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "codectx_refresh_index", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("codectx_refresh_index failed at the transport on an unheld workspace: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("codectx_refresh_index was refused on a workspace nothing else holds: %s", contentText(res))
+	}
+
+	// The assertion: the person's own index, as a further process, while that
+	// same session is still connected.
+	if env, code := s.run(t, "index"); !env.OK || code != 0 {
+		t.Fatalf("`codectx index` was refused (exit %d) while a connected server sat idle: %+v -- "+
+			"the server is holding the workspace lock past the refresh that took it", code, env.Error)
+	}
+	// And the session is still answering afterwards, so what it gave up was
+	// the lock and not the workspace.
+	for _, tool := range tools {
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
+		if err != nil || res.IsError {
+			t.Fatalf("%s no longer answers after another process indexed beside the session (err %v)", tool.name, err)
+		}
+	}
+}
+
+// refusedBusy calls codectx_refresh_index once and reports 1 when it was
+// refused as CTX_WORKSPACE_BUSY. A refresh that SUCCEEDS is not a failure: the
+// external run may have ended between the read above and this call, and this
+// leg's caller asserts that at least one call landed strictly inside it. Any
+// other refusal is a failure -- an untyped one, or a second spelling of busy,
+// is precisely what this leg exists to catch.
+func refusedBusy(t *testing.T, ctx context.Context, session *mcp.ClientSession) int {
+	t.Helper()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "codectx_refresh_index", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("codectx_refresh_index failed at the transport while another process was indexing: %v", err)
+	}
+	if !res.IsError {
+		return 0
+	}
+	text := contentText(res)
+	if !strings.HasPrefix(text, model.CodeWorkspaceBusy+":") {
+		t.Fatalf("codectx_refresh_index was refused while another process held the workspace, but not as %s: %s",
+			model.CodeWorkspaceBusy, text)
+	}
+	return 1
 }
 
 // mcpReadsDuringOwnRefresh is the MCP half, and it is the server's OWN refresh
