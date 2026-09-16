@@ -85,9 +85,12 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
 		Ledger:    s.ledger,
-		Pool:      s.pool,
-		Watcher:   s.watcher,
-		States:    s.states,
+		// The read-only side of the same file, so a finished run states in its
+		// result what it did. It opens the ledger per call and never writes.
+		RunLedgerReader: runLedger{dir: s.dataDir},
+		Pool:            s.pool,
+		Watcher:         s.watcher,
+		States:          s.states,
 		// The supplied `--scip-index` path reaches the SCIP provider at
 		// composition time and is invisible to the coordinator that writes the
 		// generation row, so it is handed over here as well. The scope key is
@@ -140,6 +143,16 @@ func (w *Workspace) Coordinator() *index.Coordinator { return w.coord }
 // the run being measured. A workspace that composed no ledger -- a report
 // holds no lock and records nothing -- registers nothing and calls fn never.
 func (w *Workspace) Spans(fn func(model.StageRecord)) { w.s.spans.subscribe(fn) }
+
+// IndexRunID is the identifier of the indexing run this workspace is recording
+// at this moment, and false when none is open. It is how a surface that
+// follows one run -- the MCP progress notifications of a single call -- tells
+// this run's stages from the stages of the per-process overlay run a language
+// server's start opens, which can be recorded concurrently with it.
+//
+// A workspace that composed no ledger records nothing and answers false, so a
+// follower of it counts nothing rather than counting everything.
+func (w *Workspace) IndexRunID() (string, bool) { return w.s.ledger.IndexRunID() }
 
 // Resolver is the managed-toolchain resolver this workspace resolves analyzers
 // through, and ToolStore is the store it reads. A report renders them; nothing

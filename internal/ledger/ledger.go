@@ -51,6 +51,11 @@ const (
 	// has been written, and the rows still 'planned' are exactly the work
 	// nothing ever started.
 	eventFinish
+	// eventFlush is a barrier a caller waits on. It crosses the bus for the
+	// same reason eventFinish does: the bus is first-in-first-out and one
+	// goroutine drains it, so everything published before this event has been
+	// written by the time the collector answers it.
+	eventFlush
 )
 
 // An event is what crosses the bus. It is small and owns nothing the producing
@@ -64,7 +69,11 @@ type event struct {
 	run *Run
 	// planned marks a start event whose row is written as 'planned' rather
 	// than 'running': the work exists but nothing has begun it.
-	planned  bool
+	planned bool
+	// ack answers an eventFlush, with the failure of the flush it waited on if
+	// there was one. It is buffered, so the collector never waits on a caller
+	// that has given up.
+	ack      chan error
 	outcome  Outcome
 	measured Measured
 	endWall  time.Time
@@ -363,12 +372,84 @@ func (l *Ledger) Subscribe(fn func(SpanRow)) {
 	l.subs = append(l.subs, fn)
 }
 
+// IndexRunID is the identifier of the indexing run this process is recording
+// at this moment, and false when it is recording none. It exists because a
+// process records more than one run at a time -- a language server's start
+// hangs under a per-process overlay run that can be open while an index run
+// is going -- so a surface that follows an indexing run has to be able to say
+// which of them a span it is handed came from.
+//
+// Runs are held in the order they opened and a process indexes under one
+// cross-process owner, so the last one still running is the one a caller is
+// asking about. A run that has finished is not it: its rows are complete, and
+// answering with it would hand a later caller a run that is over.
+func (l *Ledger) IndexRunID() (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	l.runsMu.Lock()
+	runs := append([]*Run(nil), l.runs...)
+	l.runsMu.Unlock()
+	for i := len(runs) - 1; i >= 0; i-- {
+		run := runs[i]
+		if run.kind != KindIndex {
+			continue
+		}
+		run.mu.Lock()
+		running := run.outcome == OutcomeRunning
+		run.mu.Unlock()
+		if running {
+			return run.idHex, true
+		}
+	}
+	return "", false
+}
+
 func (l *Ledger) notify(row SpanRow) {
 	l.subMu.Lock()
 	subs := l.subs
 	l.subMu.Unlock()
 	for _, fn := range subs {
 		fn(row)
+	}
+}
+
+// Flush returns once the collector has written everything published before
+// the call: the spans that ended, the run rows whose totals or outcome moved,
+// and the rows a finished run left planned, which the collector closes in
+// batches and this waits out in full.
+//
+// It exists because finishing a run moves in-memory state, and the row turns
+// terminal only at the next flush: a read straight after a run returns would
+// otherwise render a finished run as still running, with its last stages
+// missing. It is a barrier and not a wait: nothing is slept on and nothing is
+// polled, the collector answers the event when the write it was already going
+// to do has committed.
+//
+// Nothing a run records goes through here, so the bus keeps its non-blocking
+// discipline: the barrier's own send waits, because its caller is a reader
+// that asked to wait, while every producer's publish still drops rather than
+// block. A ledger that records nothing, and one whose collector has already
+// stopped and therefore written everything it had, return at once.
+func (l *Ledger) Flush(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	ack := make(chan error, 1)
+	select {
+	case l.bus <- event{kind: eventFlush, ack: ack}:
+	case <-l.done:
+		return nil
+	case <-ctx.Done():
+		return wrap("flush the ledger", ctx.Err())
+	}
+	select {
+	case err := <-ack:
+		return err
+	case <-l.done:
+		return nil
+	case <-ctx.Done():
+		return wrap("flush the ledger", ctx.Err())
 	}
 }
 

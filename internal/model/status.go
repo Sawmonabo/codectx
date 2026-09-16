@@ -608,6 +608,12 @@ type RunRecord struct {
 // absent and never zero (Section 23). The counters ItemsIn and ItemsOut are
 // not, because they are the stage's own tally.
 type StageRecord struct {
+	// RunID is the run this stage belongs to, hex-encoded as RunRecord.RunID
+	// is. It is carried on every row because one process records more than one
+	// run at a time -- an indexing run and the per-process overlay a language
+	// server's start hangs under -- and a subscriber that cannot tell them
+	// apart would count another run's stages as its own.
+	RunID string `json:"run_id"`
 	// Seq is the run's own ordinal for this stage, in the order the stages
 	// were opened, counting from zero; ParentSeq is the ordinal of the stage
 	// this one nests under, absent at the run's top level. Absent and not
