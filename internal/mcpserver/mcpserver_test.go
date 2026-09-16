@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -596,6 +598,71 @@ var scenarios = []scenario{
 
 	// L2 rows.
 	{
+		// Failure mode: the MCP surface grows a second shape for the run
+		// ledger. codectx_index_status has no special case for resources: it
+		// hands model.StatusRequest to the same IndexStatus the CLI calls and
+		// returns the answer whole, so the run and stage rows a client reads
+		// are the ones the service produced. A handler that built its own row
+		// list -- or projected, reordered or trimmed the service's -- would let
+		// the two surfaces disagree about what a run cost, and neither would be
+		// wrong on its face. The row also pins the JSON PATH: the MCP envelope
+		// puts model.IndexStatus directly in data, one level shallower than the
+		// CLI's, so the rows live at data.resources.stages and a consumer that
+		// assumed the CLI's path would read nothing.
+		name: "index_status carries the service's own ledger rows at data.resources.stages",
+		facade: func(f *fakeServices) {
+			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
+				if !r.Resources {
+					return model.IndexStatus{}, unset("IndexStatus: resources was not forwarded")
+				}
+				return model.IndexStatus{Resources: ledgerReport()}, nil
+			}
+		},
+		tool: "codectx_index_status",
+		args: model.StatusRequest{Resources: true},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("index_status reported a tool error: %s", firstText(res))
+			}
+			var got result[model.IndexStatus]
+			decode(t, res, &got)
+			want := ledgerReport()
+			if got.Data.Resources == nil {
+				t.Fatalf("data.resources is absent; the service reported %+v", want)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Run, want.Run) {
+				t.Errorf("data.resources.run = %+v, want the service's row %+v", got.Data.Resources.Run, want.Run)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Stages, want.Stages) {
+				t.Errorf("data.resources.stages = %+v, want the service's rows %+v", got.Data.Resources.Stages, want.Stages)
+			}
+			// The path itself, read from the wire rather than from the typed
+			// envelope, so a renamed or re-nested field is caught here and not
+			// only by a client in the field.
+			var wire struct {
+				Data struct {
+					Resources struct {
+						Stages []struct {
+							Stage   string `json:"stage"`
+							WallMS  int64  `json:"wall_ms"`
+							ItemsIn int64  `json:"items_in"`
+						} `json:"stages"`
+					} `json:"resources"`
+				} `json:"data"`
+			}
+			decode(t, res, &wire)
+			if len(wire.Data.Resources.Stages) != len(want.Stages) {
+				t.Fatalf("data.resources.stages carried %d rows, want %d", len(wire.Data.Resources.Stages), len(want.Stages))
+			}
+			for i, s := range wire.Data.Resources.Stages {
+				if s.Stage != want.Stages[i].Stage || s.WallMS != want.Stages[i].WallMS || s.ItemsIn != want.Stages[i].ItemsIn {
+					t.Errorf("data.resources.stages[%d] = %+v, want %+v", i, s, want.Stages[i])
+				}
+			}
+		},
+	},
+
+	{
 		// Failure mode: an LSP overlay answer reaches the model looking like a
 		// sealed canonical fact. Two ways that happens, both guarded here: the
 		// handler rewrites semantic_source/profile on the way in, so the facade
@@ -1107,6 +1174,34 @@ func decode(t *testing.T, res *mcp.CallToolResult, v any) {
 	}
 	if err := json.Unmarshal(raw, v); err != nil {
 		t.Fatalf("decode structured content: %v", err)
+	}
+}
+
+// ledgerReport is the run ledger one fake IndexStatus reports, built the same
+// way on both sides of the assertion so the row compares the wire against the
+// service's own rows rather than against a second hand-written shape.
+func ledgerReport() *model.ResourceReport {
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finished := started.Add(2 * time.Second)
+	generation := int64(9)
+	return &model.ResourceReport{
+		Run: &model.RunRecord{
+			RunID:          "5f2b",
+			Kind:           "index",
+			RepositoryID:   "a1b2",
+			GenerationID:   &generation,
+			StartedAt:      started,
+			FinishedAt:     &finished,
+			WallMS:         2000,
+			Outcome:        "ok",
+			FileCount:      12,
+			UnitsPlanned:   2,
+			UnitsSucceeded: 2,
+		},
+		Stages: []model.StageRecord{
+			{Seq: 0, Stage: "walk", StartedAt: started, WallMS: 500, Outcome: "ok", ItemsIn: 12, ItemsOut: 12, ShareOfWall: 0.25},
+			{Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", StartedAt: started, WallMS: 1500, Outcome: "ok", ItemsIn: 12, ItemsOut: 340, ShareOfWall: 0.75},
+		},
 	}
 }
 
