@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"context"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -374,5 +375,42 @@ func TestUnadmittedUnitReachesASubscriberLikeAnyOtherEnding(t *testing.T) {
 	}
 	if err := l.Stop(); err != nil {
 		t.Fatalf("stop: %v", err)
+	}
+}
+
+// TestSpansPastOnePageAreCountedAsOmitted protects a bounded answer from being
+// read as the whole of it. The page is what the surfaces render; the omitted
+// count is the only thing that says the run had more. Computed wrongly here it
+// would render faithfully at every surface and still be wrong, and an operator
+// would take a thousand stages for all of them.
+//
+// Mutation: return the count as zero from Reader.spans. The assertion below
+// reads 0 where the run left three spans out.
+func TestSpansPastOnePageAreCountedAsOmitted(t *testing.T) {
+	const beyond = 3
+	l, dir := openLedger(t)
+	run, ctx := newRun(t, l)
+	for i := 0; i < model.MaxRecordsPerResult+beyond; i++ {
+		_, span := ledger.Start(ctx, "engine_unit", "pkg/"+strconv.Itoa(i))
+		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	}
+	run.Finish(ledger.OutcomeOK)
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	// Stated as its own precondition: a dropped event would leave fewer spans
+	// recorded than were opened, and the count below would stop matching for a
+	// reason that has nothing to do with what this test protects.
+	if dropped := run.Dropped(); dropped != 0 {
+		t.Fatalf("the bus dropped %d events; the recording, not the count, is what differs", dropped)
+	}
+	view := latest(t, dir)
+	if len(view.Spans) != model.MaxRecordsPerResult {
+		t.Fatalf("the page carries %d spans, want the %d-wide bound every list in the product carries",
+			len(view.Spans), model.MaxRecordsPerResult)
+	}
+	if view.SpansOmitted != beyond {
+		t.Fatalf("the page omitted %d spans and says %d: a partial view that reports itself as whole",
+			beyond, view.SpansOmitted)
 	}
 }
