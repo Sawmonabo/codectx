@@ -37,9 +37,9 @@ type treeSampler struct {
 	stop chan struct{}
 	done chan struct{}
 	once sync.Once
-	// peak is written only by the sampling goroutine and read only after done
+	// sample is written only by the sampling goroutine and read only after done
 	// is closed, so the join in stopSampling is what publishes it.
-	peak int64
+	sample treeSample
 	// cpu is the tree's summed user+system time in clock ticks as of the last
 	// sweep. Unlike peak it is read while the run is still going, by the stall
 	// watchdog, so it is atomic: a tree that produces no output but is burning
@@ -61,11 +61,20 @@ func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
 		for {
 			// The sweep comes first so that a child which exits inside the
 			// first interval is still measured at least once.
-			rss, ticks := sumGroup(pgid)
-			if rss > s.peak {
-				s.peak = rss
+			sums := sumGroup(pgid)
+			if sums.rss > s.sample.peakBytes {
+				s.sample.peakBytes = sums.rss
 			}
-			s.cpu.Store(ticks)
+			if sums.ioSeen {
+				// The byte counters are kept from the last sweep that still
+				// found the tree. Sweeps after it exits observe nothing, and
+				// letting those overwrite the totals with zero would erase the
+				// measurement at exactly the moment it is wanted.
+				s.sample.readBytes = sums.read
+				s.sample.writeBytes = sums.write
+				s.sample.ioSampled = true
+			}
+			s.cpu.Store(sums.ticks)
 			select {
 			case <-s.stop:
 				return
@@ -76,16 +85,16 @@ func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
 	return s
 }
 
-// stopSampling ends the sweep, joins the goroutine and returns the peak. It is
-// idempotent, and it never returns before the goroutine has finished: no
-// goroutine this package starts outlives the run that started it.
-func (s *treeSampler) stopSampling() int64 {
+// stopSampling ends the sweep, joins the goroutine and returns what the sweeps
+// observed. It is idempotent, and it never returns before the goroutine has
+// finished: no goroutine this package starts outlives the run that started it.
+func (s *treeSampler) stopSampling() treeSample {
 	if s == nil {
-		return 0
+		return treeSample{}
 	}
 	s.once.Do(func() { close(s.stop) })
 	<-s.done
-	return s.peak
+	return s.sample
 }
 
 // cpuTicks reports the tree's summed user+system time as of the last sweep, or
@@ -98,14 +107,27 @@ func (s *treeSampler) cpuTicks() int64 {
 	return s.cpu.Load()
 }
 
-// sumGroup adds the resident set size and the consumed CPU ticks of every live
-// process in the group. Processes that exit mid-sweep are simply absent from
-// the sums; an unreadable /proc yields zero for that sweep rather than aborting
-// the run.
-func sumGroup(pgid int) (rss, ticks int64) {
+// groupSums is one sweep's totals over a process group.
+type groupSums struct {
+	rss   int64
+	ticks int64
+	read  int64
+	write int64
+	// ioSeen reports that at least one member had readable byte counters, so a
+	// sweep that found the tree is distinguishable from one that found nothing
+	// and from one whose members all denied their counters.
+	ioSeen bool
+}
+
+// sumGroup adds the resident set size, the consumed CPU ticks and the
+// transferred bytes of every live process in the group. Processes that exit
+// mid-sweep are simply absent from the sums; an unreadable /proc yields an
+// empty sweep rather than aborting the run.
+func sumGroup(pgid int) groupSums {
+	var sums groupSums
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0, 0
+		return sums
 	}
 	pageSize := int64(os.Getpagesize())
 	var scanned int
@@ -121,10 +143,56 @@ func sumGroup(pgid int) (rss, ticks int64) {
 		if !ok || group != pgid {
 			continue
 		}
-		rss += pages * pageSize
-		ticks += cpu
+		sums.rss += pages * pageSize
+		sums.ticks += cpu
+		// Only a member of the group is opened a second time, so the extra
+		// read costs the size of the tree and not the size of /proc.
+		if read, write, ok := ioBytes(pid); ok {
+			sums.read += read
+			sums.write += write
+			sums.ioSeen = true
+		}
 	}
-	return rss, ticks
+	return sums
+}
+
+// ioBytes reads one process's transferred byte counters from /proc/<pid>/io.
+//
+// The figures are the counts taken where the process called the kernel, not
+// the block-layer totals that stand beside them in the same file: a child
+// whose output is still in the page cache, or whose work directory is a memory
+// filesystem, has transferred every byte it wrote and moved none of them to a
+// disk, and the block-layer counters would report that work as having cost
+// nothing.
+//
+// An entry that cannot be read -- the process exited mid-sweep, or the kernel
+// denies the counters to this user -- contributes nothing and is not an error,
+// which is the posture the sweep already takes for an unreadable stat.
+func ioBytes(pid int) (read, write int64, ok bool) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/io")
+	if err != nil {
+		return 0, 0, false
+	}
+	var found int
+	for line := range strings.Lines(string(raw)) {
+		name, value, cut := strings.Cut(strings.TrimSpace(line), ": ")
+		if !cut {
+			continue
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 0 {
+			continue
+		}
+		switch name {
+		case "rchar":
+			read, found = n, found+1
+		case "wchar":
+			write, found = n, found+1
+		}
+	}
+	// Both counters or neither: a half-read file is an unreadable one, so a
+	// missing figure is never summed in as a zero.
+	return read, write, found == 2
 }
 
 // statGroup reads one process's group ID, resident pages and consumed CPU
