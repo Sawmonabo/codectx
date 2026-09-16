@@ -417,11 +417,18 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 // -- from the content store over [start_byte, end_byte) -- would index source
 // text no producer ever published as a document body, silently changing every
 // carried document's lexical hits, BM25 length and snippets.
+//
+// segment_id travels with doc_id, so a carried document arrives already packed
+// and already naming the segment it lies in. That column is what makes the
+// carried documents part of the new generation's segment set without anything
+// being rewritten, and it is why a compaction re-points every row it absorbs:
+// a carry that copied an absorbed segment forward would name it beside the one
+// that holds the same documents.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
 	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
-		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
+		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id, segment_id)
 		SELECT ?3, su.search_key, su.node_id, su.file_id, su.path, su.kind,
-			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id
+			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id, su.segment_id
 		FROM search_units su WHERE su.unit_id = ?1
 			AND su.file_id NOT IN (SELECT file_id FROM cx_carry_files)
 			AND (su.node_id IS NULL OR EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = su.node_id))

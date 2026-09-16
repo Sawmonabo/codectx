@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // gcBatchUnits bounds one collection transaction.
@@ -72,8 +74,12 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("retention_leases", err)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id)
-		return wrap("generations", err)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id); err != nil {
+			return wrap("generations", err)
+		}
+		// The generation's generation_segments rows have just cascaded away, so
+		// the segments only it named are collectable in this same transaction.
+		return collectUnreferencedSegments(ctx, tx)
 	})
 	if err != nil {
 		return err
@@ -100,6 +106,9 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 		return err
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := collectUnreferencedSegments(ctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
 			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
 			return wrap("provider_runs", err)
@@ -278,9 +287,19 @@ func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
 // transaction per batch, until the query returns nothing.
+//
+// It is also where a crashed build's lexical staging file goes. A unit that
+// died between its first documents and its seal left a staging database under
+// the data directory that nothing else will ever read; the directory is NOT
+// swept blindly, because several processes may share one data directory and a
+// live build's staging looks exactly like a dead one's. Here the unit is
+// already known dead -- its rows are being deleted -- so its file is named
+// exactly, and it is removed after the transaction commits: a rolled-back batch
+// leaves the unit and its staging both intact.
 func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
 	for {
 		var deleted int
+		var gone []int64
 		err := s.write(ctx, func(tx *sql.Tx) error {
 			rows, err := tx.QueryContext(ctx, query, arg, gcBatchUnits)
 			if err != nil {
@@ -304,13 +323,45 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 					return err
 				}
 			}
-			deleted = len(ids)
-			return nil
+			deleted, gone = len(ids), ids
+			// The deleted units' search_units rows cascaded away with them, so
+			// the segments no row points at and no generation names go in the
+			// same transaction.
+			return collectUnreferencedSegments(ctx, tx)
 		})
-		if err != nil || deleted == 0 {
+		if err != nil {
 			return err
 		}
+		for _, id := range gone {
+			if rmErr := paced.Remove(s.stagePath(id)); rmErr != nil && !os.IsNotExist(rmErr) {
+				return internal("lexical staging: " + rmErr.Error())
+			}
+		}
+		if deleted == 0 {
+			return nil
+		}
 	}
+}
+
+// collectUnreferencedSegments deletes every lexical segment that no retained
+// generation names and that no document still points at. A segment survives
+// its generation only while some document lies in it -- the unit holding that
+// document may be attached to a new generation at any time, and it must find
+// its postings where its rows point -- and it survives its last document only
+// while a retained generation still reads it. The two tests together are what
+// makes a segment collectable, and they are what collects a segment a
+// compaction emptied: the merge re-points every row of its inputs, so an
+// absorbed segment is left named only by the generations that were published
+// before it, and it goes when the last of them does. Its parts cascade with it.
+//
+// It runs in the caller's transaction: a generation or a unit that goes away
+// and the segments that go away with it are one atomic change, so no reader
+// can pin a generation whose segments have already been reclaimed.
+func collectUnreferencedSegments(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM lexical_segments
+		WHERE NOT EXISTS (SELECT 1 FROM generation_segments gs WHERE gs.segment_id = lexical_segments.id)
+		AND NOT EXISTS (SELECT 1 FROM search_units su WHERE su.segment_id = lexical_segments.id)`)
+	return wrap("lexical_segments", err)
 }
 
 // deleteUnit is the one unit deletion procedure (Section 12.4). It deletes the

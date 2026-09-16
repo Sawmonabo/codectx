@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -22,6 +23,16 @@ type PinnedReader struct {
 	repo    []byte
 	gen     int64
 	lease   string
+
+	// The generation's lexical shape -- its segment set, its document
+	// statistics and its visible-document bitmap -- resolved once for the
+	// whole reader. It costs a scan of the generation's documents, and a
+	// single request opens the structure for its statistics, its frequencies
+	// and its postings, so resolving it per call would pay that scan three
+	// times. The mutex is because a reader is pinned once and may be used from
+	// more than one goroutine of the request it serves.
+	lexMu   sync.Mutex
+	lexMeta *lexicalMeta
 }
 
 // PinGeneration resolves gen (zero selects the active generation) and acquires
@@ -834,9 +845,17 @@ func (s *Store) Tokenize(ctx context.Context, text string) ([]string, error) {
 }
 
 // countTokens returns, for each document, the number of token instances the
-// index tokenizer produces across every indexed column. It is the one source
-// of search_units.token_count.
-func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit) ([]int64, error) {
+// index tokenizer produces across every indexed column, and stages those
+// instances for the unit's lexical segment. It is the one source of
+// search_units.token_count and the ONE tokenizer pass a document ever gets:
+// the packed lexical structure is folded from these same rows at seal, never
+// from a second tokenization.
+//
+// stage is called once per (term, column, document) group of the batch, with
+// the document's batch-local number; the caller resolves that number to the
+// document rowid its ingestion transaction assigns.
+func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit,
+	stage func(doc int64, term, col string, n int64) error) ([]int64, error) {
 	counts := make([]int64, len(docs))
 	if len(docs) == 0 {
 		return counts, nil
@@ -852,20 +871,27 @@ func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit) ([]int
 				return wrap("tokenizer", err)
 			}
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT doc, count(*) FROM tok_vocab GROUP BY doc`)
+		// The grouped instance vocabulary answers both questions at once: a
+		// document's token count is the sum of its groups, and each group is
+		// one staged row. Reading it twice would tokenize the batch twice.
+		rows, err := tx.QueryContext(ctx, `SELECT term, doc, col, count(*) FROM tok_vocab GROUP BY term, doc, col`)
 		if err != nil {
 			return wrap("tokenizer", err)
 		}
 		defer rows.Close()
 		for rows.Next() {
+			var term, col string
 			var doc, n int64
-			if err := rows.Scan(&doc, &n); err != nil {
+			if err := rows.Scan(&term, &doc, &col, &n); err != nil {
 				return wrap("tokenizer", err)
 			}
 			if doc < 1 || doc > int64(len(docs)) {
 				return corrupt("tokenizer reported document %d outside the batch", doc)
 			}
-			counts[doc-1] = n
+			counts[doc-1] += n
+			if err := stage(doc, term, col, n); err != nil {
+				return err
+			}
 		}
 		return wrap("tokenizer", rows.Err())
 	})
