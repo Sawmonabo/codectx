@@ -64,6 +64,12 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 // than one directory -- the data directory, the continuation store's, a
 // provider's work directory -- and reporting one of them would understate it.
 //
+// Beside it goes the space this run has removed and not yet given back: a
+// removal renames its file aside and returns, so between the removal and the
+// release the space belongs to neither figure, and reporting only the pools
+// would leave it invisible. Summing the two would be worse -- the pool would
+// appear to grow every time the run removed something.
+//
 // A pool that cannot be read leaves the figure absent rather than short: a
 // partial sum here would read as "the run is holding less than it is", which
 // is the one thing this figure exists to rule out. The purposes the freeing
@@ -80,6 +86,9 @@ func scratchBytes(report *model.ResourceReport) {
 		total += n
 	}
 	report.ScratchBytes = nonNegativeBytes(total)
+	if pending, err := paced.PendingFreeBytes(); err == nil {
+		report.PendingFreeBytes = nonNegativeBytes(pending)
+	}
 	if byPurpose := paced.FreedByPurpose(); len(byPurpose) > 0 {
 		report.FreedByPurpose = make(map[string]uint64, len(byPurpose))
 		for p, n := range byPurpose {

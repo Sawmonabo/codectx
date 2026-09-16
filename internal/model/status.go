@@ -188,8 +188,18 @@ type ResourceReport struct {
 	// FreedBytes, which counts every window the pacer handed back including
 	// removals no call site names; see paced.FreedByPurpose.
 	FreedByPurpose map[string]uint64 `json:"freed_by_purpose,omitempty"`
-	UnitsReused    *int64            `json:"units_reused,omitempty"`
-	UnitsParsed    *int64            `json:"units_parsed,omitempty"`
+	// PendingFreeBytes is disk this process has finished with and not yet
+	// given back: every file and tree a removal renamed aside, waiting for the
+	// reclaimer to release it a window at a time.
+	//
+	// It is not part of ScratchBytes, which is space the pools are holding to
+	// write over again, and it is not yet part of FreedByPurpose, which counts
+	// space as it is actually released. A run's removals return to their
+	// callers at once and land here; a run that exits with this above zero
+	// leaves the rest for the next run to release at the same pace.
+	PendingFreeBytes *uint64 `json:"pending_free_bytes,omitempty"`
+	UnitsReused      *int64  `json:"units_reused,omitempty"`
+	UnitsParsed      *int64  `json:"units_parsed,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -213,6 +223,7 @@ func (r ResourceReport) Validate() error {
 		{"resources.cas_bytes", r.CASBytes},
 		{"resources.freed_bytes", r.FreedBytes},
 		{"resources.scratch_bytes", r.ScratchBytes},
+		{"resources.pending_free_bytes", r.PendingFreeBytes},
 	} {
 		if f.value == nil {
 			continue

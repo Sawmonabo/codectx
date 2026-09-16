@@ -110,14 +110,23 @@ const lockName = "owner.lock"
 // out of one pool.
 type Arena struct {
 	root string
+	// served is the directory this arena pools for: removals under it are
+	// renamed into the arena's to-free set instead of being freed in place.
+	served string
 
-	mu       sync.Mutex
-	instance string               // the claimed instance directory, once claimed
-	lock     *os.File             // the open, locked claim file; closed by Empty only
-	free     map[Purpose][]string // paths available to take, per purpose
-	held     map[string]bool      // paths currently leased
-	next     map[Purpose]int      // the next ordinal to create, per purpose
-	swept    map[Purpose]bool     // purposes whose directory has been read
+	// claimMu guards the instance claim, and only that. It is separate from
+	// mu because the arena's to-free set is resolved by the removal path,
+	// which can be reached from a caller already holding mu; a claim that
+	// waited on mu would deadlock there.
+	claimMu  sync.Mutex
+	instance string   // the claimed instance directory, once claimed
+	lock     *os.File // the open, locked claim file, held for the process's life
+
+	mu    sync.Mutex
+	free  map[Purpose][]string // paths available to take, per purpose
+	held  map[string]bool      // paths currently leased
+	next  map[Purpose]int      // the next ordinal to create, per purpose
+	swept map[Purpose]bool     // purposes whose directory has been read
 }
 
 // arenas is the process's arena per served directory.
@@ -154,14 +163,37 @@ func For(dir string) *Arena {
 		return a
 	}
 	a := &Arena{
-		root:  root,
-		free:  map[Purpose][]string{},
-		held:  map[string]bool{},
-		next:  map[Purpose]int{},
-		swept: map[Purpose]bool{},
+		root:   root,
+		served: filepath.Clean(dir),
+		free:   map[Purpose][]string{},
+		held:   map[string]bool{},
+		next:   map[Purpose]int{},
+		swept:  map[Purpose]bool{},
 	}
 	arenas[root] = a
+	// Every removal under the directory this arena serves is renamed into the
+	// arena's own to-free set and given back at the pace, off the run's path.
+	// The set lives inside the claimed instance, so it is exclusive to this
+	// process while it runs and inherited, with whatever it still holds, by
+	// the next process to claim that instance after a crash.
+	paced.RegisterToFree(dir, a.toFreeSet)
 	return a
+}
+
+// toFreeSet is the directory removals under this arena's served directory are
+// renamed into. Claiming the instance is what makes the set this process's
+// alone, so it happens here, on the first removal, rather than when the arena
+// is first reached for.
+func (a *Arena) toFreeSet() (string, error) {
+	instance, err := a.claim()
+	if err != nil {
+		return "", err
+	}
+	set := paced.ToFreeDir(instance)
+	if err := os.MkdirAll(set, 0o700); err != nil {
+		return "", err
+	}
+	return set, nil
 }
 
 // Root is the arena's directory: the parent of every instance.
@@ -260,12 +292,13 @@ func (l *Lease) Discard() {
 // existing file, never truncated, whose bytes past this tenant's writes are
 // the previous tenant's.
 func (a *Arena) Take(p Purpose) (*Lease, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.claimLocked(); err != nil {
+	instance, err := a.claim()
+	if err != nil {
 		return nil, err
 	}
-	if err := a.sweepLocked(p); err != nil {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.sweepLocked(instance, p); err != nil {
 		return nil, err
 	}
 	if n := len(a.free[p]); n > 0 {
@@ -274,7 +307,7 @@ func (a *Arena) Take(p Purpose) (*Lease, error) {
 		a.held[path] = true
 		return &Lease{arena: a, path: path, purpose: p}, nil
 	}
-	path, err := a.createLocked(p)
+	path, err := a.createLocked(instance, p)
 	if err != nil {
 		return nil, err
 	}
@@ -298,27 +331,30 @@ func (a *Arena) TakeFile(p Purpose) (*Lease, *os.File, error) {
 	return l, f, nil
 }
 
-// claimLocked claims this process's instance directory, the first time the
-// arena is used. It takes the lowest-numbered instance whose lock is free,
-// which is how a process started after a crash inherits the crashed
-// process's files instead of leaving them for an operator to notice.
-func (a *Arena) claimLocked() error {
+// claim claims this process's instance directory, the first time the arena is
+// used, and answers it. It takes the lowest-numbered instance whose lock is
+// free, which is how a process started after a crash inherits the crashed
+// process's files -- and whatever its to-free set still holds -- instead of
+// leaving them for an operator to notice.
+func (a *Arena) claim() (string, error) {
+	a.claimMu.Lock()
+	defer a.claimMu.Unlock()
 	if a.instance != "" {
-		return nil
+		return a.instance, nil
 	}
 	for n := 0; ; n++ {
 		dir := filepath.Join(a.root, strconv.Itoa(n))
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+			return "", err
 		}
 		f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
-			return err
+			return "", err
 		}
 		held, err := fslock.TryLock(f)
 		if err != nil {
 			f.Close()
-			return err
+			return "", err
 		}
 		if !held {
 			// A live process owns this instance and its files are its own.
@@ -326,7 +362,14 @@ func (a *Arena) claimLocked() error {
 			continue
 		}
 		a.instance, a.lock = dir, f
-		return nil
+		// The claim is exclusive, so the to-free set inside it is this
+		// process's alone -- including whatever a process that died holding
+		// this instance left queued in it. Announcing it here is the startup
+		// collection pass: the reclaimer resumes freeing it at the pace.
+		if set := paced.ToFreeDir(dir); os.MkdirAll(set, 0o700) == nil {
+			paced.AdoptSet(a.served, set)
+		}
+		return dir, nil
 	}
 }
 
@@ -334,12 +377,12 @@ func (a *Arena) claimLocked() error {
 // instance by the process that held it before — an earlier run of the store,
 // or one that crashed — are taken again instead of created beside them.
 // Without it the instance would grow a second pool every time it was claimed.
-func (a *Arena) sweepLocked(p Purpose) error {
+func (a *Arena) sweepLocked(instance string, p Purpose) error {
 	if a.swept[p] {
 		return nil
 	}
 	a.swept[p] = true
-	entries, err := os.ReadDir(filepath.Join(a.instance, string(p)))
+	entries, err := os.ReadDir(filepath.Join(instance, string(p)))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -359,14 +402,14 @@ func (a *Arena) sweepLocked(p Purpose) error {
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		a.free[p] = append(a.free[p], filepath.Join(a.instance, string(p), n))
+		a.free[p] = append(a.free[p], filepath.Join(instance, string(p), n))
 	}
 	return nil
 }
 
 // createLocked makes one new surface of a purpose.
-func (a *Arena) createLocked(p Purpose) (string, error) {
-	dir := filepath.Join(a.instance, string(p))
+func (a *Arena) createLocked(instance string, p Purpose) (string, error) {
+	dir := filepath.Join(instance, string(p))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -392,6 +435,11 @@ func (a *Arena) createLocked(p Purpose) (string, error) {
 // free, at its current length, including the instances of processes that are
 // no longer running. It is what the resources block discloses as the space a
 // run keeps instead of freeing.
+//
+// It excludes the to-free sets. Space that has been removed and is waiting
+// for the reclaimer is not space the pool is holding, and the resources block
+// reports it separately; counting it here would count it twice and would say
+// the pool grows every time the run removes something.
 func (a *Arena) Bytes() (int64, error) { return dirBytes(a.root) }
 
 // ErrInUse refuses to empty an arena while something holds a surface of it.
@@ -407,6 +455,12 @@ var ErrInUse = errors.New("scratch arena in use")
 // surface a tenant is writing would corrupt that tenant's work, and it leaves
 // alone the instance of any other process that is still running.
 func (a *Arena) Empty() (int64, error) {
+	// The claim, and with it the to-free set, is resolved before the arena is
+	// locked: the removals below reach it through the reclaimer.
+	instance, err := a.claim()
+	if err != nil {
+		return 0, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if n := len(a.held); n > 0 {
@@ -425,7 +479,7 @@ func (a *Arena) Empty() (int64, error) {
 			continue
 		}
 		dir := filepath.Join(a.root, e.Name())
-		if dir != a.instance {
+		if dir != instance {
 			free, err := a.emptyIdleLocked(dir)
 			if err != nil {
 				return freed, err
@@ -447,7 +501,7 @@ func (a *Arena) Empty() (int64, error) {
 			return freed, err
 		}
 		for _, pe := range purposes {
-			if !pe.IsDir() {
+			if !pe.IsDir() || paced.IsToFreeDir(pe.Name()) {
 				continue
 			}
 			if err := paced.RemoveAllFor(paced.ScratchCollection, filepath.Join(dir, pe.Name())); err != nil {
@@ -457,6 +511,11 @@ func (a *Arena) Empty() (int64, error) {
 		freed += n
 		a.free, a.next, a.swept = map[Purpose][]string{}, map[Purpose]int{}, map[Purpose]bool{}
 	}
+	// The removals above renamed the pools into the to-free set and returned;
+	// the space is given back by the one reclaimer, at the one pace, and this
+	// is the only caller in the product that waits for it, because it is the
+	// only one an operator asked for.
+	paced.Drain()
 	return freed, nil
 }
 
@@ -487,15 +546,19 @@ func (a *Arena) emptyIdleLocked(dir string) (int64, error) {
 	return n, nil
 }
 
-// dirBytes is the length of every regular file under dir except the claim.
+// dirBytes is the length of every regular file under dir except the claims
+// and the space awaiting freeing.
 func dirBytes(dir string) (int64, error) {
 	var total int64
-	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
 			}
 			return err
+		}
+		if d.IsDir() && path != dir && paced.IsToFreeDir(d.Name()) {
+			return filepath.SkipDir
 		}
 		if !d.Type().IsRegular() || d.Name() == lockName {
 			return nil
