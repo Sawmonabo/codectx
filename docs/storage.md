@@ -512,6 +512,16 @@ same counter, split by what the removal was for, so the two cannot disagree.
 rename and the release the space belongs to neither the pool nor the freed
 total, and reporting only the other two would leave it invisible.
 
+A queued removal the filesystem refuses -- a device error, a read-only mount, a
+directory a failed child left without write permission -- is passed over rather
+than retried, so the removals queued behind it are still given back, and it is
+retried the next time something is queued. It is named, with the reason, in
+`stuck_frees` beside `pending_free_bytes`: that figure climbing and never
+falling is either a run removing faster than the pace gives back, which
+resolves itself, or a removal nothing can make, which does not, and only the
+list beside it tells the two apart. The request that empties the pools reports
+the same list rather than waiting for a removal that will never succeed.
+
 At activation and abort the writer's page cache is released to the process, so
 a long-lived server does not keep a run's working set resident.
 

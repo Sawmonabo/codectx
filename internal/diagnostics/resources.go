@@ -96,6 +96,14 @@ func scratchBytes(report *model.ResourceReport) {
 	if pending, err := paced.PendingFreeBytes(); err == nil {
 		report.PendingFreeBytes = nonNegativeBytes(pending)
 	}
+	// What is waiting, and what is waiting on something that will not
+	// resolve itself. A removal the filesystem refuses keeps its space in the
+	// pending figure for the life of the process, so the figure alone would
+	// read as a backlog the pace is working through.
+	for _, stuck := range paced.StuckFrees() {
+		report.StuckFrees = append(report.StuckFrees,
+			model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
+	}
 	if byPurpose := paced.FreedByPurpose(); len(byPurpose) > 0 {
 		report.FreedByPurpose = make(map[string]uint64, len(byPurpose))
 		for p, n := range byPurpose {
