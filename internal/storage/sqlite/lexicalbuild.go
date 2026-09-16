@@ -9,8 +9,8 @@ import (
 	"maps"
 	"runtime"
 	"slices"
-	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -191,23 +191,23 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 // An activation therefore writes one row per segment and the visible-document
 // bitmap, never a rewrite of the whole packed structure: publishing a one-file
 // delta costs the delta's own segment plus, occasionally, one tier merge.
-func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
+func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 	// ADR-0007 holds this pass to 5 % of the index wall clock. That bound is
-	// only checkable if the operator can see the pass on its own, so its start
-	// and end are logged rather than hidden inside the activation's total, and
-	// its heap share is reported beside its wall clock because a cost stated
-	// only in milliseconds cannot answer whether the build is what pushed a run
-	// into its memory ceiling.
-	started := time.Now()
+	// only checkable if the operator can see the pass on its own, so it is a
+	// span of its own rather than time hidden inside the activation's total,
+	// and its heap share is still logged because a cost stated only in
+	// milliseconds cannot answer whether the build is what pushed a run into
+	// its memory ceiling.
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	slog.Default().Info("packed lexical activation started", "generation", gen)
 	var segments int64
+	ctx, span := ledger.Start(ctx, stageLexicalBuild, "")
 	defer func() {
+		span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &segments}, err)
 		runtime.ReadMemStats(&after)
 		slog.Default().Info("packed lexical activation finished",
-			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
-			"segments", segments,
+			"generation", gen, "segments", segments,
 			// Signed: a pass that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.
