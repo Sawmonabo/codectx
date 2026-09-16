@@ -514,8 +514,8 @@ visibility once, at publication, and scanning a packed array instead turns the
 per-page cost into a sequential read.
 
 **The two tables.** `generation_graph` carries one row per generation: the
-largest node and relation surrogate, the node and edge counts, the relation-kind
-and node-kind dictionaries, and the layout version. `generation_graph_parts`
+largest node and relation surrogate, the node and edge counts, and the
+relation-kind and node-kind dictionaries. `generation_graph_parts`
 carries the bytes, one row per chunk of one stream, keyed by generation, stream
 name and a 0-based part number whose parts concatenate to the stream. Both
 cascade from `generations`, so collecting a generation collects its graph.
