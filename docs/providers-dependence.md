@@ -56,6 +56,37 @@ it names, and the import anchors it there. Every fact derived through such a
 reference names the method the value carries, which is how a dependence on a
 function reached through a variable is published at all.
 
+`control_depends_on` is a single-hop join, not a walk: the engine's control
+dependence edge is published wherever both of its endpoints anchor to a
+published entity, and nothing is followed from there. `data_flows_to` is the
+other shape — a def-use walk, bounded at eight hops, from one anchored node
+through the lowering nodes between it and the next one — so a control
+dependence answer is exactly as deep as the graph the engine emitted, while a
+data flow answer is as deep as that bound allows. Because both endpoints must
+anchor, a control dependence whose controlling node is the `if`, `while`,
+`switch` or `try` node itself is not published at all: what survives is a
+dependence between two resolved call sites or declarations.
+
+Every language with a `try` statement — C++, Java, JavaScript, TypeScript, TSX,
+and Python's `try`/`except`/`else` — carries a second known gap, in that
+control dependence. The engine's control-flow graph models the exceptional exit
+of a whole `try` body as one edge from the body's **last** statement into each
+handler, and wires an explicit `throw` (Python `raise`) to the method's exit
+rather than to a handler. So a call in a handler is published as
+`control_depends_on` the last call of the `try` body, which is the wrong
+controlling statement whenever an earlier call is the one that could have
+thrown, and an explicit throw inside a `try` creates no control dependence on
+the handler that catches it. The product publishes the control-flow graph the
+engine emits and has no pass of its own that could thread a throw destination
+through it, so it cannot correct this.
+
+For a consumer of `codectx_impact` and `codectx_dependency_path` the
+consequence is a plausible-looking wrong controller rather than a missing
+fact: inside a `try`, the dependence on the handler is real and both endpoints
+are real calls, but the statement named as the controller is not the one that
+throws. C and Go have no exception construct and are unaffected; Rust's `?` is
+the separate caveat above.
+
 `reads` and `writes` come from this provider alone: no SCIP indexer sets a
 write role, and syntax cannot resolve the target of an assignment.
 
