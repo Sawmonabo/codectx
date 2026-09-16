@@ -221,6 +221,33 @@ func TestAPooledTemporaryNeverServesTheBytesTheLastOneLeft(t *testing.T) {
 		t.Fatalf("the surface is %d bytes after the engine reset its temporary: the reset gave the space back",
 			after.Size())
 	}
+
+	// A tenant that writes at its own offsets rather than in order -- a
+	// temporary database's pager writes each page where that page belongs --
+	// leaves everything below the offset it wrote unwritten. The surface
+	// still physically holds the last tenant's bytes there, and a read of it
+	// is BELOW the high-water mark, so it is served from the file rather than
+	// as the end of it. Unless the gap is zeroed, the engine reads another
+	// sort's records as its own: well formed, and wrong.
+	if rc := xWrite(tls, second, buf, n, 2*n); rc != sqlite3.SQLITE_OK {
+		t.Fatalf("a write past the tenant's own length was refused with result code %d", rc)
+	}
+	if rc := xFileSize(tls, second, uintptr(unsafe.Pointer(&size))); rc != sqlite3.SQLITE_OK || size != 3*n {
+		t.Fatalf("after a write of %d bytes at offset %d the temporary reports %d bytes (result code %d)", n, 2*n, size, rc)
+	}
+	gap := libc.Xmalloc(tls, n)
+	if gap == 0 {
+		t.Fatal("out of memory allocating the buffer")
+	}
+	defer libc.Xfree(tls, gap)
+	libc.Xmemset(tls, gap, 0xff, n)
+	if rc := xRead(tls, second, gap, n, 0); rc != sqlite3.SQLITE_OK {
+		t.Fatalf("reading below the tenant's high-water mark answered with result code %d", rc)
+	}
+	if got := unsafe.Slice((*byte)(ptr(gap)), n); !bytes.Equal(got, make([]byte, n)) {
+		t.Fatal("a read in the gap a write past the tenant's own length left returned the last tenant's bytes, " +
+			"not the zeroes a file system gives for a hole")
+	}
 }
 
 // openTempThrough opens one engine temporary through the registered file
@@ -289,4 +316,37 @@ func TestMain(m *testing.M) {
 		_ = os.RemoveAll(poolDirPath)
 	}
 	os.Exit(code)
+}
+
+// TestTheGapAPooledTemporaryZeroesIsPacedLikeAnyOtherWrite protects against
+// the zero-fill handing the disk the whole gap in one submission. A pager
+// that writes its first page at a high offset makes a gap as large as that
+// offset, so an unpaced fill is exactly the multi-window burst this file
+// system exists to prevent -- and it would be invisible, because the bytes
+// are still counted and the file still ends up correct.
+func TestTheGapAPooledTemporaryZeroesIsPacedLikeAnyOtherWrite(t *testing.T) {
+	if err := Register(); err != nil {
+		t.Fatal(err)
+	}
+	enginePoolDir(t)
+	pFile, _, closeFile := openTempThrough(t)
+	defer closeFile()
+
+	const gapWindows = 4
+	n := int32(4096)
+	buf := libc.Xmalloc(tls, uint64(n))
+	if buf == 0 {
+		t.Fatal("out of memory allocating the buffer")
+	}
+	defer libc.Xfree(tls, buf)
+	libc.Xmemset(tls, buf, 0x5a, uint64(n))
+
+	before := Windows()
+	if rc := xWrite(tls, pFile, buf, n, gapWindows*Window); rc != sqlite3.SQLITE_OK {
+		t.Fatalf("a write past the tenant's own length was refused with result code %d", rc)
+	}
+	if got := Windows() - before; got < gapWindows {
+		t.Fatalf("zeroing a %d-window gap closed %d windows: the fill reached the disk in one submission",
+			gapWindows, got)
+	}
 }

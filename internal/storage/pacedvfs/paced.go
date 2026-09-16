@@ -329,6 +329,22 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	// count is the store's spill signal and the window count decides where the
 	// next wait falls, and both would be wrong by the pieces that landed.
 	h := (*header)(ptr(pFile))
+	// A write past a pooled temporary's logical length leaves everything
+	// between the two unwritten, and the surface still holds the previous
+	// tenant's bytes there: a read in that gap is below the high-water mark,
+	// so it is served from the file rather than as the end of it, and the
+	// engine gets another sort's records as its own -- well formed, and
+	// wrong. A pager writing its pages at their own offsets does exactly
+	// this. The gap is therefore zeroed here, which is what an ordinary file
+	// system gives a reader of a hole, and those bytes are real writes so
+	// they are paced with the rest.
+	if h.pooled != 0 && iOfst > h.logical {
+		filled, rc := fillGap(tls, pFile, write, h.logical, iOfst)
+		h.logical += filled
+		if rc != sqlite3.SQLITE_OK {
+			return rc
+		}
+	}
 	var rc int32
 	done := int32(0)
 	for done < iAmt {
@@ -348,11 +364,19 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	if rc != sqlite3.SQLITE_OK || h.since < Window {
 		return rc
 	}
+	h.closeWindow(tls, pFile)
+	return rc
+}
+
+// closeWindow waits for the window just filled to reach the disk and submits
+// it. Every place that adds to a file's byte count reaches it, so a window
+// bounds what is in flight whoever wrote the bytes.
+func (h *header) closeWindow(tls *libc.TLS, pFile uintptr) {
 	h.since = 0
 	windows.Add(1)
 	if h.mode == byRange {
 		if waitRange(h.fd) {
-			return rc
+			return
 		}
 		// A file system without range writeback answers every call the
 		// same way; fall back to the wrapped sync for the file's life.
@@ -361,8 +385,8 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	// The wrapped sync waits for every dirty page of the file: with at most
 	// two windows dirty that is a bounded wait, and a platform without range
 	// writeback has nothing finer.
+	m := innerMethods(pFile)
 	(*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxSync})))(tls, wrapped(pFile), sqlite3.SQLITE_SYNC_NORMAL)
-	return rc
 }
 
 // xTruncate shrinks a file a window at a time, syncing between steps, so
@@ -407,6 +431,36 @@ func xTruncate(tls *libc.TLS, pFile uintptr, size int64) int32 {
 		paced.Freed(cur - size)
 	}
 	return rc
+}
+
+// fillGap writes zeroes over [from, to) and reports how many bytes landed.
+// It writes in the same pieces xWrite does, because the wrapped file system
+// keeps only seventeen bits of a write's length, and it closes a window as
+// soon as one fills: a gap is as large as the offset the engine jumped to,
+// so filling it in one submission would be exactly the burst this file
+// system exists to prevent.
+func fillGap(tls *libc.TLS, pFile uintptr,
+	write func(*libc.TLS, uintptr, uintptr, int32, int64) int32, from, to int64) (int64, int32) {
+	zeroes := libc.Xmalloc(tls, types.Size_t(unixWritePiece))
+	if zeroes == 0 {
+		return 0, sqlite3.SQLITE_NOMEM
+	}
+	defer libc.Xfree(tls, zeroes)
+	libc.Xmemset(tls, zeroes, 0, types.Size_t(unixWritePiece))
+	h := (*header)(ptr(pFile))
+	var filled int64
+	for from+filled < to {
+		n := min(int64(unixWritePiece), to-from-filled)
+		if rc := write(tls, wrapped(pFile), zeroes, int32(n), from+filled); rc != sqlite3.SQLITE_OK {
+			return filled, rc
+		}
+		filled += n
+		h.since += n
+		if h.since >= Window {
+			h.closeWindow(tls, pFile)
+		}
+	}
+	return filled, sqlite3.SQLITE_OK
 }
 
 func xSync(tls *libc.TLS, pFile uintptr, flags int32) int32 {
