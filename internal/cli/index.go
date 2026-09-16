@@ -102,7 +102,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait, Rebuild: req.Rebuild,
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "index", Wait: indexLockWait, Rebuild: req.Rebuild,
 				SCIPImport: scipIndex, SCIPManifest: scipInputs}),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					if req.Rebuild {
@@ -167,7 +167,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			// there is no request field to carry them into and a hint that
 			// changed the answer would be the thing the help text promises it
 			// is not.
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "refresh", Wait: indexLockWait}),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					result, err := svc.Refresh(ctx, model.IndexRequest{})
 					if err != nil {
@@ -283,7 +283,7 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			// that is meant to run until it is stopped, and the *Services it is
 			// handed goes unread because streaming is deliberately not a facade
 			// operation (digest 17 Section 4) -- Coordinator is.
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "watch", Wait: indexLockWait}),
 				func(ctx context.Context, ws *app.Workspace, _ *app.Services) error {
 					return runWatch(ctx, cmd, build, args, ws)
 				})
