@@ -85,9 +85,12 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
 		Ledger:    s.ledger,
-		Pool:      s.pool,
-		Watcher:   s.watcher,
-		States:    s.states,
+		// The read-only side of the same file, so a finished run states in its
+		// result what it did. It opens the ledger per call and never writes.
+		RunLedgerReader: runLedger{dir: s.dataDir},
+		Pool:            s.pool,
+		Watcher:         s.watcher,
+		States:          s.states,
 		// The supplied `--scip-index` path reaches the SCIP provider at
 		// composition time and is invisible to the coordinator that writes the
 		// generation row, so it is handed over here as well. The scope key is

@@ -105,6 +105,11 @@ type Options struct {
 	// exactly as it would otherwise, because a nil ledger opens a nil run
 	// whose spans do nothing.
 	Ledger *ledger.Ledger
+	// RunLedgerReader reads back the rows this process's runs recorded, and is
+	// how a finished run states in its own result what it did. It may be nil,
+	// which is a coordinator whose results carry no run: a composition that
+	// records nothing has nothing to read back.
+	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
