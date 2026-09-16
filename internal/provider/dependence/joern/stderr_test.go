@@ -71,8 +71,27 @@ func TestClassify(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			// The child's measured cost travels out of the backend whatever
+			// the step became: the outcome is the only channel between the
+			// runner and the span that ran the child, so a class decision
+			// that dropped it would leave every analyzer stage costless. The
+			// tree peak is marked unsampled here to assert the other half:
+			// a figure nobody took stays flagged absent rather than becoming
+			// an observed zero.
 			got := classify(process.Result{Stderr: []byte(c.stderr), ExitCode: c.exit, TimedOut: c.timedOut,
-				StderrBytes: int64(len(c.stderr))}, nil)
+				StderrBytes: int64(len(c.stderr)), CPUUserMillis: 7, CPUSysMillis: 3,
+				ReadBytes: 11, WriteBytes: 13, TreeUnsampled: true}, nil)
+			if got.CPUUserMS != 7 || got.CPUSysMS != 3 || got.CPUUnsampled {
+				t.Errorf("processor time = %d/%d ms (unsampled %t), want the child's 7/3 ms measured",
+					got.CPUUserMS, got.CPUSysMS, got.CPUUnsampled)
+			}
+			if got.ReadBytes != 11 || got.WriteBytes != 13 || got.IOUnsampled {
+				t.Errorf("transferred bytes = %d/%d (unsampled %t), want the child's 11/13 measured",
+					got.ReadBytes, got.WriteBytes, got.IOUnsampled)
+			}
+			if !got.PeakUnsampled {
+				t.Errorf("the tree peak reads measured (%d) for a result that sampled none", got.PeakBytes)
+			}
 			if got.Class != c.want {
 				t.Errorf("class = %q, want %q", got.Class, c.want)
 			}
