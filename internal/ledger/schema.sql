@@ -73,7 +73,11 @@ CREATE TABLE spans (
     -- Null while the span is running, and on a span whose run ended before it
     -- did: that span never finished, and stamping a time on it would invent a
     -- wall nobody measured.
-    finished_at TEXT CHECK(finished_at IS NOT NULL OR outcome IN ('running','interrupted')),
+    -- A span that has no finish time is one nobody measured the end of: it is
+    -- still running, it was cut off when its run ended, it has not begun, or
+    -- it never will because what it needed was absent. Stamping a time on any
+    -- of them would invent a wall nobody measured.
+    finished_at TEXT CHECK(finished_at IS NOT NULL OR outcome IN ('running','interrupted','planned','unavailable')),
     wall_ms INTEGER CHECK(wall_ms IS NULL OR wall_ms >= 0),
     -- Null where no CPU time can be attributed to this span; cpu_unattributed
     -- then names why. 'overlapped' is in-process work that ran beside other
@@ -90,7 +94,11 @@ CREATE TABLE spans (
     write_bytes INTEGER CHECK(write_bytes IS NULL OR write_bytes >= 0),
     items_in INTEGER NOT NULL CHECK(items_in >= 0),
     items_out INTEGER NOT NULL CHECK(items_out >= 0),
-    outcome TEXT NOT NULL CHECK(outcome IN ('running','ok','failed','subdivided','reused','skipped','interrupted')),
+    -- 'planned' is a unit the plan named and nothing has started; 'unavailable'
+    -- is one that reached no output because something it needed was absent,
+    -- with diagnostic_code and failure_json naming which. A row left 'planned'
+    -- when its run ends is swept to 'unavailable': it was never admitted.
+    outcome TEXT NOT NULL CHECK(outcome IN ('planned','running','ok','failed','subdivided','reused','skipped','interrupted','unavailable')),
     diagnostic_code TEXT NOT NULL,
     failure_json TEXT NOT NULL
 );

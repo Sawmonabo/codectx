@@ -6,13 +6,17 @@ import (
 	"time"
 )
 
-// An Outcome is what became of a run or a span. 'running' is the value a span
-// carries between its start and its end; 'interrupted' is what a span that was
-// still running when its run ended is left as, which is neither a success nor a
-// recorded failure but a measurement that was cut off.
+// An Outcome is what became of a run or a span. 'planned' is a unit that has a
+// row before anything ran it, so a unit that never reaches its work still
+// exists; 'running' is the value a span carries between its start and its end;
+// 'interrupted' is what a span that was still running when its run ended is
+// left as, which is neither a success nor a recorded failure but a measurement
+// that was cut off; 'unavailable' is work that reached no output because
+// something it needed was absent, and it carries the reason.
 type Outcome string
 
 const (
+	OutcomePlanned     Outcome = "planned"
 	OutcomeRunning     Outcome = "running"
 	OutcomeOK          Outcome = "ok"
 	OutcomeFailed      Outcome = "failed"
@@ -20,7 +24,14 @@ const (
 	OutcomeReused      Outcome = "reused"
 	OutcomeSkipped     Outcome = "skipped"
 	OutcomeInterrupted Outcome = "interrupted"
+	OutcomeUnavailable Outcome = "unavailable"
 )
+
+// ReasonNotAdmitted is the reason of a unit whose span was still 'planned' when
+// its run ended: nothing ever started it, so it was never admitted to the work
+// its plan named. It is the ledger's own reason rather than a provider's,
+// because no provider was ever reached to state one.
+const ReasonNotAdmitted = "the unit was planned but never reached admission"
 
 // A Kind is what opened a run: an index run, the deferred publication of a
 // generation whose run had already ended, or the per-process overlay a
@@ -164,6 +175,41 @@ func RunFromContext(ctx context.Context) *Run {
 // waits: a full bus drops the event and counts it on the run row.
 func Start(ctx context.Context, stage, scopeKey string) (context.Context, *Span) {
 	return StartProvider(ctx, stage, scopeKey, "")
+}
+
+// Plan opens a span for work that has been decided on but not started. The row
+// exists from the moment the plan names the unit, so a unit that is never run
+// -- because nothing admitted it, or because the run ended first -- still has a
+// row that says so, instead of leaving no trace at all.
+//
+// It returns no context: a planned span has no work under it yet. Begin makes
+// it the parent of what runs.
+func Plan(ctx context.Context, stage, scopeKey, provider string) *Span {
+	run := RunFromContext(ctx)
+	if run == nil {
+		return nil
+	}
+	parent := int64(-1)
+	if p := FromContext(ctx); p != nil {
+		parent = p.seq
+	}
+	span := &Span{run: run, seq: run.seq.Add(1) - 1, parent: parent, started: time.Now(),
+		stage: stage, scopeKey: scopeKey, provider: provider}
+	run.ledger.publish(event{kind: eventStart, span: span, planned: true})
+	return span
+}
+
+// Begin moves a planned span to running and returns a context a nested Start
+// finds it in. The span's wall is measured from here and not from the plan, so
+// a unit's cost stays the cost of running it and never the time it waited in a
+// queue; what the row says about the wait is that it was 'planned' until now.
+func (s *Span) Begin(ctx context.Context) context.Context {
+	if s == nil {
+		return ctx
+	}
+	s.started = time.Now()
+	s.run.ledger.publish(event{kind: eventBegin, span: s})
+	return context.WithValue(ctx, spanContextKey{}, s)
 }
 
 // StartProvider is Start for a span a provider owns, which records which

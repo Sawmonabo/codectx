@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // collect is the one goroutine that writes. It drains the bus into a batch and
@@ -80,10 +82,18 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 			}
 			switch e.kind {
 			case eventStart:
-				if err := insertSpan(ctx, tx, e.span); err != nil {
+				outcome := OutcomeRunning
+				if e.planned {
+					outcome = OutcomePlanned
+				}
+				if err := insertSpan(ctx, tx, e.span, outcome); err != nil {
 					return err
 				}
 				running[e.span] = struct{}{}
+			case eventBegin:
+				if err := beginSpan(ctx, tx, e.span); err != nil {
+					return err
+				}
 			case eventEnd:
 				row, err := endSpan(ctx, tx, e)
 				if err != nil {
@@ -141,6 +151,15 @@ func (l *Ledger) finalize(running map[*Span]struct{}) {
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE spans SET outcome = 'interrupted' WHERE run_id = ? AND outcome = 'running'`, run.id); err != nil {
 				return wrap("close open spans", err)
+			}
+			// A row still 'planned' when its run stops is work nothing ever
+			// started. It is not interrupted -- no measurement was cut off --
+			// it was never admitted, and that is the reason it carries.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE spans SET outcome = 'unavailable', diagnostic_code = ?, failure_json = ?
+				 WHERE run_id = ? AND outcome = 'planned'`,
+				model.CodeProviderUnavailable, ReasonNotAdmitted, run.id); err != nil {
+				return wrap("close unadmitted spans", err)
 			}
 		}
 		return l.updateRuns(ctx, tx)
@@ -247,16 +266,25 @@ func (l *Ledger) updateRuns(ctx context.Context, tx *sql.Tx) error {
 // it, so a parent's row is always already there, and neither side ever holds a
 // row id. A span with no parent carries the ordinal -1, which no span can
 // have, so the subselect finds nothing and the column is null.
-func insertSpan(ctx context.Context, tx *sql.Tx, s *Span) error {
+func insertSpan(ctx context.Context, tx *sql.Tx, s *Span, outcome Outcome) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO spans(
 		run_id, parent_id, seq, stage, scope_key, provider, started_at, finished_at,
 		wall_ms, cpu_user_ms, cpu_sys_ms, cpu_unattributed, peak_rss_bytes, read_bytes, write_bytes,
 		items_in, items_out, outcome, diagnostic_code, failure_json)
 		VALUES(?, (SELECT id FROM spans WHERE run_id = ? AND seq = ?), ?, ?, ?, ?, ?, NULL,
-		NULL, NULL, NULL, '', NULL, NULL, NULL, ?, ?, 'running', '', '')`,
+		NULL, NULL, NULL, '', NULL, NULL, NULL, ?, ?, ?, '', '')`,
 		s.run.id, s.run.id, s.parent, s.seq, s.stage, s.scopeKey, s.provider, formatTime(s.started),
-		s.In(), s.Out())
+		s.In(), s.Out(), string(outcome))
 	return wrap("record a span", err)
+}
+
+// beginSpan moves a planned row to running and restamps its start, so the wall
+// the row ends with is the work's and not the wait's.
+func beginSpan(ctx context.Context, tx *sql.Tx, s *Span) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE spans SET outcome = 'running', started_at = ? WHERE run_id = ? AND seq = ?`,
+		formatTime(s.started), s.run.id, s.seq)
+	return wrap("begin a span", err)
 }
 
 // endSpan writes a span's end onto the row its start inserted and returns the

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -337,8 +338,15 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 // deliver, never announced from here: this may be the background loop's
 // goroutine.
 func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
-	sel provider.Selection, ref string) error {
+	sel provider.Selection, ref string) (err error) {
 	c := l.c
+	// The tick's own ledger run. Its work generation is aborted on every path,
+	// so a row written against that generation does not outlive the tick;
+	// ledger rows are keyed by run and survive it, which is the only place a
+	// deferred unit's outcome can still be read afterwards.
+	run := c.newRun(ledger.KindDeferred)
+	ctx = run.Context(ctx)
+	defer func() { run.Finish(endOutcome(err)) }()
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
 		return err
@@ -427,8 +435,13 @@ func (l *lateSealer) setPublishing(on bool) {
 
 // runOne builds one deferred unit in the work generation, under the heavy
 // analyzer admission gate.
-func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, error) {
+func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (id model.UnitID, err error) {
 	started := l.c.now()
+	// The row exists before the unit is admitted, and the deferred close below
+	// gives it a terminal state on every path this call can take; run closes
+	// it first for a unit that reached its provider.
+	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
+	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
 		return "", err
@@ -443,13 +456,15 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 		return spec.ID, nil
 	}
 	if d.unit.Heavy {
-		release, err := l.c.sched.Admit(ctx, d.unit.Reservation)
-		if err != nil {
-			return "", err
+		release, admitErr := l.c.sched.Admit(ctx, d.unit.Reservation)
+		if admitErr != nil {
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return "", admitErr
 		}
 		defer release()
 	}
-	if _, err := work.run(ctx, d.unit, spec); err != nil {
+	if _, err := work.run(ctx, d.unit, spec, span); err != nil {
 		return "", err
 	}
 	l.observe(l.c.now().Sub(started))
