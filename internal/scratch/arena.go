@@ -28,11 +28,14 @@
 //
 // A pool is per process, because a lease is an object in one process's heap
 // and means nothing to another. Some purposes are written from paths several
-// processes can run at once — SortRun is taken on the query path, where any
-// number of readers may serve pages from one data directory at the same time,
-// and on the index path, where the workspace's single writer takes it. Two
-// processes sharing a pool would each take slot zero and each read the
-// other's bytes as its own.
+// processes can run at once. SortRun and PathSearch are both taken on the
+// query path, where any number of readers may serve pages from one data
+// directory at the same time, and SortRun is taken on the index path too,
+// where the workspace's single writer takes it. ContentTemp and LexicalStage
+// are the index path's alone, which one writer holds at a time. Two processes
+// sharing a pool would each take slot zero and each read the other's bytes as
+// its own, so the claim below applies to every purpose rather than to the two
+// that need it.
 //
 // So the pool lives under a numbered INSTANCE directory that the process
 // claims with an exclusive lock held for as long as it runs, and no two live
@@ -71,6 +74,9 @@ const (
 	SortRun Purpose = "sort-run"
 	// LexicalStage is a lexical seal's staging database, one per seal slot.
 	LexicalStage Purpose = "lexical-stage"
+	// PathSearch is one shortest-path search's external-memory state: the
+	// settled set, the parent edges and the cost buckets, in a database.
+	PathSearch Purpose = "path-search"
 	// ContentTemp is the file a content-addressed store streams one blob
 	// into while it hashes it, before it knows whether the store already
 	// holds that content.
@@ -79,6 +85,13 @@ const (
 
 // dirName is the arena's own directory under the directory it serves.
 const dirName = "scratch"
+
+// Dir is where the arena of the given directory keeps its surfaces. Anything
+// that enumerates a served directory -- a sweep, a budget, a test counting
+// what a run left behind -- uses it to tell the pool apart from the state it
+// is looking for: the pool is not a leftover, and emptying it is an
+// operator's decision.
+func Dir(served string) string { return filepath.Join(served, dirName) }
 
 // lockName is the file inside an instance directory whose exclusive lock is
 // the claim on that instance.
@@ -116,7 +129,7 @@ var (
 // through it with no new plumbing. Nothing touches the disk until the first
 // Take, so For cannot fail.
 func For(dir string) *Arena {
-	root := filepath.Join(dir, dirName)
+	root := Dir(dir)
 	arenasMu.Lock()
 	defer arenasMu.Unlock()
 	if a := arenas[root]; a != nil {
