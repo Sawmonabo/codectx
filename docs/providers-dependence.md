@@ -52,9 +52,16 @@ that, an invented callee reads as a real dependency of the source.
 
 A method taken as a value — assigned to a variable, passed as an argument,
 bound by a `def` or `function` statement — is bound by the export to the method
-it names, and the import anchors it there. Every fact derived through such a
-reference names the method the value carries, which is how a dependence on a
-function reached through a variable is published at all.
+it names, and the import anchors it there, so every fact derived through such a
+reference names the method the value carries. That flow is how a dependence on
+a function reached through a variable is published at all, and it is all that
+is published: the call through the value is **not** a `calls` edge to the
+referenced method. The engine binds such a call site to an invented callee
+named after the variable (JavaScript) or to no callee at all (Python), never to
+the method the value holds, so a `calls` edge naming it would be this product's
+inference from reachability rather than a fact the analysis produced. It is
+published as the data dependence it is, and a consumer of `codectx_callees`
+follows `data_flows_to` to find the function a variable was called through.
 
 `control_depends_on` is a single-hop join, not a walk: the engine's control
 dependence edge is published wherever both of its endpoints anchor to a
