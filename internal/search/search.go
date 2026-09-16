@@ -845,9 +845,9 @@ func exactRanked(e exactHit) (ranked, bool) {
 }
 
 // exactHitOf projects the stored node an exact tier carried into the hit it
-// will be served as. It never goes back through SearchDocuments: an exact
-// candidate has no search_fts rowid, and that contract omits missing rowids,
-// so the round trip would blank the hit or drop it.
+// will be served as. It never goes back through the packed hydration: an exact
+// candidate has no search_fts rowid, and that contract omits a rowid no segment
+// packs, so the round trip would blank the hit or drop it.
 func exactHitOf(e exactHit) hitFacts {
 	n := e.Node.Node
 	return hitFacts{
