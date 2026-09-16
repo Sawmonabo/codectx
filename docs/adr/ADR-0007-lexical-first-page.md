@@ -96,8 +96,8 @@ activation, including a one-file delta. So the shape changes and the format stay
   index table with the same tokenizer and column set, so the terms are identical to the store-wide
   index by construction; the temporary vocabulary, which holds only that unit's instances, is folded
   into the unit's packed term list (term directory, term text, per-document column-ascending
-  `(column, count)` sequences, and the per-document attributes of Decision 2) and stored with the
-  unit. A unit's list is built once, in the parallel seal phase, and is reused by every generation
+  `(column, count)` sequences, and the per-document attribute streams of Decision 2) and stored with
+  the unit. A unit's list is built once, in the parallel seal phase, and is reused by every generation
   that carries the unit, exactly as its facts are.
 - **At activation, per generation.** The visible units' term lists are merged term by term (a batched
   k-way merge whose memory is proportional to the batch, not to the unit count) into the generation
@@ -128,8 +128,8 @@ which is exactly the write amplification ADR-0008 and ADR-0009 removed from the 
 So the unit of the packed form becomes a **segment**, and an activation stops producing one.
 
 - **A segment is an immutable packed structure over a set of documents**: the three streams of the
-  original Decision 1 (`term.dir`, `term.text`, `post.list`) plus the per-document attribute stream
-  of Decision 2, chunked into parts exactly as before, with postings inside a segment ascending by
+  original Decision 1 (`term.dir`, `term.text`, `post.list`) plus the two per-document attribute
+  streams of Decision 2 (`doc.dir`, `doc.attr`; see its amendment), chunked into parts exactly as before, with postings inside a segment ascending by
   document rowid. `lexical_segments` carries a segment's term and document counts and its packed
   bytes; `lexical_segment_parts` holds the chunks; `generation_segments` is one generation's set, in
   read order. There is no generation-level parts table any more, and no ownership table either: the
@@ -241,6 +241,27 @@ order, with no SQL statement per candidate; the document-row read path is delete
 is unchanged because the values are the same values, and the comparator and the deduplication key
 are untouched. What Decision 2 removes is the per-candidate index descent, not the per-candidate
 data.
+
+### Decision 2, amended 2026-09-16: built; the attribute stream is a directory and a record stream
+
+Decision 2 was assigned to the segmented-structure work and left undone there; it is now built. The
+per-document attributes are two physical streams, for the same reason the term side is a pair: a
+binary-searchable directory must be fixed width, and holding one combined stream back to append the
+directory after the records would hold every entry of a segment at once (5.6 MB for a 279 000-document
+merged segment). `doc.dir` is a fixed-width directory in ascending document rowid; `doc.attr` holds the
+records it points into: rowid, search key, node id, file id, path, kind, name, qualified name, signature,
+byte range, token count. Both are packed at seal from the rows the fold claims in one ordered index walk,
+merged by rowid with every kept record copied verbatim (dead dropped, hidden kept), and read on the
+posting session by a binary search per segment and a cursor across pages, with no statement per
+candidate. The document-row hydration path and its seam are deleted; a page costs the parts its
+documents lie in; an invisible rowid is omitted. Identity is asserted field by field against the row in
+the shared harness, so every delta, reattach, merge, rewrite and collection test proves it, and the cost
+is proved by clobbering every document row after activation and hydrating the same page byte-identically:
+document rows read per search, 46 487 before, 0 now. Measured on 4 000 documents in one sealed segment:
+`doc.attr` 832 542 B (208 B per document), `doc.dir` 80 000 B (20 B per document), against 382 886 B for
+the three term streams -- a segment is about 3.4 times its former packed size, and the store carries a
+second copy of those document columns, about 64 MB at the reference store's 279 164 documents against a
+1.97 GB database.
 
 ## Decision 3 — the first page from a bounded heap; the full order sorted on the first continuation
 
