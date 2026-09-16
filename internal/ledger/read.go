@@ -15,7 +15,9 @@ import (
 // A RunRow is one recorded run as a reader sees it. WallMS is the run's
 // elapsed time: the time between its start and its finish, or between its
 // start and now while it is still going, so a live run reads as how far it has
-// got rather than as a zero.
+// got rather than as a zero. It is zero on a run whose writer stopped
+// refreshing its liveness, because that run's end was never measured; such a
+// run reads as interrupted and carries no FinishedAt.
 type RunRow struct {
 	RunID               string
 	Kind                Kind
@@ -127,11 +129,19 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 func (r *Reader) Close() error { return wrap("close", r.db.Close()) }
 
 // LatestRun is the run a status surface shows for a repository: the one that
-// is still running if one is, and otherwise the one that produced
-// generationID. A generationID of zero or less means the repository has no
-// active generation, in which case the most recently started finished run
-// answers -- which is what an operator asking about the run that just failed
-// is asking for.
+// is still live if one is, and otherwise the one that produced generationID. A
+// generationID of zero or less means the repository has no active generation,
+// in which case the most recently started run answers -- which is what an
+// operator asking about the run that just failed is asking for.
+//
+// Live means the run's writer has renewed the deadline it published on the run
+// row, not merely that the row says 'running'. A process that died without
+// stopping its ledger leaves 'running' behind for ever, and preferring it would
+// show that dead run instead of the run that produced the active generation --
+// exactly when an operator is investigating the crash. Such a run reads as
+// interrupted, with its still-open spans interrupted too, which is what the
+// collector itself writes for a ledger that stops; the reader states the same
+// fact without touching the file, because a status surface must never write.
 //
 // It returns false, and no error, when the repository has no recorded run.
 // Spans are bounded to one page; a run with more says so.
@@ -142,14 +152,20 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	}
 	// One statement, so the choice between "the live run" and "the run that
 	// produced the generation" cannot see two different snapshots of the file.
-	// A running run sorts ahead of everything; among the rest the generation's
+	// A live run sorts ahead of everything; among the rest the generation's
 	// own run sorts ahead of the others, and then the most recent start wins.
+	// Liveness is the writer's own unelapsed deadline, evaluated once and
+	// returned beside the row, so the ordering and what the caller is told
+	// about the run it chose cannot disagree. The stamps are fixed-width UTC,
+	// which is why the clock compares as text.
 	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
-		events_dropped, process_peak_rss_bytes
+		events_dropped, process_peak_rss_bytes, (outcome = 'running' AND expires_at > ?) AS live
 		FROM runs WHERE repository_id = ?
-		ORDER BY (outcome = 'running') DESC, (generation_id IS NOT NULL AND generation_id = ?) DESC, started_at DESC
+		ORDER BY live DESC, (generation_id IS NOT NULL AND generation_id = ?) DESC, started_at DESC
 		LIMIT 1`
+	now := time.Now()
+	var live bool
 	var view RunView
 	var raw, rawRepo []byte
 	var generation sql.NullInt64
@@ -157,9 +173,9 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	var finished sql.NullString
 	var kind, outcome string
 	var peak sql.NullInt64
-	err = r.db.QueryRowContext(ctx, query, repo, generationID).Scan(&raw, &kind, &rawRepo, &generation, &started, &finished, &outcome,
+	err = r.db.QueryRowContext(ctx, query, formatTime(now), repo, generationID).Scan(&raw, &kind, &rawRepo, &generation, &started, &finished, &outcome,
 		&view.Run.FileCount, &view.Run.SourceBytes, &view.Run.UnitsPlanned, &view.Run.UnitsSucceeded,
-		&view.Run.UnitsFailed, &view.Run.UnitsSubdivided, &view.Run.EventsDropped, &peak)
+		&view.Run.UnitsFailed, &view.Run.UnitsSubdivided, &view.Run.EventsDropped, &peak, &live)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RunView{}, false, nil
 	}
@@ -170,6 +186,13 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	view.Run.Kind = Kind(kind)
 	view.Run.RepositoryID = hex.EncodeToString(rawRepo)
 	view.Run.Outcome = Outcome(outcome)
+	// A run that says 'running' but whose writer stopped refreshing is a run
+	// that was cut off, which is the same fact the collector writes for itself
+	// when a ledger stops.
+	lapsed := Outcome(outcome) == OutcomeRunning && !live
+	if lapsed {
+		view.Run.Outcome = OutcomeInterrupted
+	}
 	if generation.Valid {
 		id := generation.Int64
 		view.Run.GenerationID = &id
@@ -181,7 +204,6 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	if view.Run.StartedAt, err = parseTime(started); err != nil {
 		return RunView{}, false, err
 	}
-	now := time.Now()
 	end := now
 	if finished.Valid {
 		at, err := parseTime(finished.String)
@@ -191,19 +213,32 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 		view.Run.FinishedAt = &at
 		end = at
 	}
-	view.Run.WallMS = end.Sub(view.Run.StartedAt).Milliseconds()
-	if view.Spans, view.Truncated, err = r.spans(ctx, raw, view.Run.WallMS, now); err != nil {
+	if lapsed {
+		// Nobody measured how long this run took: it has no finish time, and
+		// the deadline it last published is the writer's promise, not an end.
+		// It reads as no wall at all, exactly as a span that was open when its
+		// ledger stopped reads as no wall, and so every span in it reports no
+		// share of one either. A span inside it may still carry the seconds it
+		// was measured for; the run around it was never measured.
+		view.Run.WallMS = 0
+	} else {
+		view.Run.WallMS = end.Sub(view.Run.StartedAt).Milliseconds()
+	}
+	if view.Spans, view.Truncated, err = r.spans(ctx, raw, view.Run.WallMS, now, lapsed); err != nil {
 		return RunView{}, false, err
 	}
 	return view, true, nil
 }
 
 // spans reads one page of a run's spans in the order they were opened, filling
-// a running span's elapsed time and every span's share of the run's wall. The
+// a running span's elapsed time and every span's share of the run's wall.
+// lapsed says the run's writer stopped refreshing its liveness, in which case a
+// span the run left open never finished and reads as interrupted rather than as
+// one that has been going ever since. The
 // page is model.MaxRecordsPerResult wide, the same bound every other list in
 // the product carries; one extra row is read to tell a full page from a
 // truncated one.
-func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now time.Time) ([]SpanRow, bool, error) {
+func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now time.Time, lapsed bool) ([]SpanRow, bool, error) {
 	const query = `SELECT s.seq, p.seq, s.stage, s.scope_key, s.provider, s.started_at, s.finished_at,
 		s.wall_ms, s.cpu_user_ms, s.cpu_sys_ms, s.cpu_unattributed, s.peak_rss_bytes, s.read_bytes, s.write_bytes,
 		s.items_in, s.items_out, s.outcome, s.diagnostic_code, s.failure_json
@@ -234,6 +269,12 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		}
 		row.RunID = hexID
 		row.Outcome = Outcome(outcome)
+		// Judged before the wall below, so an open span of a run whose writer
+		// died reports no measurement rather than an elapsed time that grows
+		// for as long as the row survives.
+		if lapsed && row.Outcome == OutcomeRunning {
+			row.Outcome = OutcomeInterrupted
+		}
 		if parent.Valid {
 			seq := parent.Int64
 			row.ParentSeq = &seq
