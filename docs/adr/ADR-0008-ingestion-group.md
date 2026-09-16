@@ -175,8 +175,11 @@ resources block discloses the disk the pools hold (`scratch_bytes`) and what eac
 freed (`freed_by_purpose`) beside the pacer's window count (`freed_bytes`). Measured on the e2e
 corpus with every foreign writer off: freed this run 0 bytes. What still frees during a run, and
 stays to be taken from the arena: the engine's own temporary sort files, which it creates and
-deletes through the shim (the shim can pool them); walk retention, whose state machine reads a
-file's existence as walk state; the per-unit materialized trees and the indexer run directories;
+deletes through the shim (the shim pools them); walk retention, which is not pooled and stays
+freed: the existence of a level's admitted file is that level's one-object commit record, and a
+pooled file that always exists would need a second durable record ordered after it, a protocol
+whose failure is a silently wrong frontier -- the reclaimer below keeps these frees off the burst
+path, which is all pooling would have bought; the per-unit materialized trees and the indexer run directories;
 the foreign outputs themselves (an indexer's index, the dependence export); and six surfaces a
 later review found freed by the code and missing from this list: a published blob when its
 snapshot is collected, the trim of a blob's staging surface at publication, a sort run the walk
