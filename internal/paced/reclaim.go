@@ -336,7 +336,16 @@ func (r *reclaimer) work() {
 		// remaining entries are other callers' space. It stays named in the
 		// set, is recorded with its reason so an operator can read what is
 		// stuck and why, and is passed over until the next wake.
+		//
+		// An entry that is gone from the disk is not stuck whatever was
+		// returned: freeing a file shrinks it before unlinking it, and a
+		// shrink that failed is still reported although the unlink that
+		// followed succeeded. Naming it would disclose an entry that no
+		// longer exists and does not hold a byte.
 		if err := r.freeEntry(entry, purpose); err != nil {
+			if _, gone := os.Lstat(entry); gone != nil {
+				continue
+			}
 			r.mu.Lock()
 			r.stuck[entry] = err.Error()
 			r.mu.Unlock()
