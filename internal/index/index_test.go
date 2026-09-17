@@ -947,7 +947,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// runs, which is the whole window a query needs the answer in.
 	l := f.c.late
 	l.mu.Lock()
-	l.running = &deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "running"}}
+	l.inflight[plan.Key(d.ID, "running")] = true
 	l.queue = append(l.queue, deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "queued"}})
 	l.mu.Unlock()
 	p, err := f.c.Promote(ctx, d.ID, "running")
