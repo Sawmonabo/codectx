@@ -154,8 +154,18 @@ type IndexStatus struct {
 	Coherence          Coherence          `json:"coherence"`
 	CaptureConsistency CaptureConsistency `json:"capture_consistency"`
 	Completeness       []CapabilityState  `json:"completeness"`
-	FileCount          uint64             `json:"file_count"`
-	SourceBytes        uint64             `json:"source_bytes"`
+	// FailedUnits is one page of the reasons the runs of the active
+	// generation failed, read from the run rows and so answerable by any
+	// process, and FailedUnitsOmitted is how many did not fit that page. The
+	// capability rows above carry ONE exemplar scope per provider capability;
+	// this is every failed scope with its own reason, which is what an
+	// operator asking "why does this scope have no facts" is asking for.
+	FailedUnits []RunFailure `json:"failed_units,omitempty"`
+	// A short list served as the whole of it is the one thing a bounded
+	// failure report must never be, so what did not fit is counted here.
+	FailedUnitsOmitted int64  `json:"failed_units_omitted"`
+	FileCount          uint64 `json:"file_count"`
+	SourceBytes        uint64 `json:"source_bytes"`
 	// Watchers is every watching process whose heartbeat is live for this
 	// workspace, freshest deadline first, read from the store and so visible
 	// to a process that is not watching. WatchActive and the three fields
@@ -435,6 +445,17 @@ func (s IndexStatus) Validate() error {
 		return err
 	}
 	if err := requireNonNegative("index_status.pending_paths", s.PendingPaths); err != nil {
+		return err
+	}
+	if err := boundPage("index_status.failed_units", len(s.FailedUnits)); err != nil {
+		return err
+	}
+	for _, f := range s.FailedUnits {
+		if err := f.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := requireNonNegative("index_status.failed_units_omitted", s.FailedUnitsOmitted); err != nil {
 		return err
 	}
 	// A response bound, which Section 6 requires of every list: the store's own

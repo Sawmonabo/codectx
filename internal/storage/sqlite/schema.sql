@@ -165,6 +165,18 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    -- remediation is what an operator can do about this row, in prose. It is a
+    -- column rather than an entry in details_json because details_json is the
+    -- provider's own bounded budget: a remediation charged to it could be the
+    -- entry a busy row drops.
+    remediation TEXT NOT NULL DEFAULT '',
+    -- units_running is how many scopes of this capability were still being
+    -- built in the background when the generation was published. It is stored
+    -- because it is the only way a process other than the one doing the work
+    -- learns that the capability has work in flight. It is NOT folded into
+    -- the capability digest: it is what was in flight at publication, which is
+    -- scheduling and not content.
+    units_running INTEGER NOT NULL DEFAULT 0 CHECK(units_running >= 0),
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
