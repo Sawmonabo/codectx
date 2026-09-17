@@ -142,9 +142,10 @@ type Builder struct {
 	// without its membership and ignore rules.
 	Git *git.Git
 	// Lock is the workspace lock the caller already holds. When nil, Build
-	// acquires the lock for the capture and releases it before returning.
-	Lock     *WorkspaceLock
-	LockWait time.Duration
+	// acquires the lock for the capture and releases it before returning. It
+	// tries once: an unheld capture is a capture nobody is coordinating, and
+	// there is no holder whose progress it could be waiting on.
+	Lock *WorkspaceLock
 	// MaxRetries bounds how many validation passes may find changes before the
 	// capture is declared unstable. Zero -- the default -- means unlimited
 	// retries, bounded instead by RetryDeadline: a count that refuses a busy
@@ -207,7 +208,7 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 		var err error
 		// A capture the caller did not already hold the workspace for is what
 		// this lock names itself as to whoever is refused while it runs.
-		if lock, err = LockWorkspace(ctx, b.Policy.DataDir, "capture", b.LockWait); err != nil {
+		if lock, err = LockWorkspace(ctx, b.Policy.DataDir, "capture", TryOnce()); err != nil {
 			return model.Snapshot{}, err
 		}
 		defer lock.Close()

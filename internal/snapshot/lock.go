@@ -13,7 +13,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// lockPollInterval is how often a bounded wait for the workspace lock retries.
+// lockPollInterval is how often a waiting acquisition of the workspace lock
+// retries and re-reads the holder's progress.
 const lockPollInterval = 100 * time.Millisecond
 
 // WorkspaceLock is the cross-process indexing/GC coordination lock of
@@ -33,17 +34,87 @@ type WorkspaceLock struct {
 	err  error
 }
 
+// A HolderProbe answers, for the process that currently holds the workspace
+// lock, whether it is still making progress and which stage it is in. It is
+// INJECTED: the evidence of progress lives in the run ledger beside the index
+// cache, and this package neither reads it nor knows it exists.
+//
+// progressing is the probe's answer to "has the holder shown a fresh stamp",
+// judged by the holder's own published deadline and never recomputed from this
+// process's configuration. stage is the innermost work the holder has named,
+// empty when it has named none.
+type HolderProbe func(context.Context) (stage string, progressing bool)
+
+// A WaitingHolder is what a waiter knows about the process it is waiting for:
+// what that process recorded in the lock file, and the stage the probe last
+// saw it in. PID is zero for a holder that recorded nothing.
+//
+// Waiting is false on exactly one call: the one that says the wait is over,
+// acquired or refused. An observer rewriting one line in a terminal needs to be
+// told that, or it leaves the command's own first line of output appended to a
+// progress line. It is a field rather than the struct's zero value because a
+// holder that recorded nothing and has named no stage is otherwise
+// indistinguishable from the end of the wait.
+type WaitingHolder struct {
+	Waiting   bool
+	PID       int
+	Operation string
+	Stage     string
+}
+
+// LockWait is the policy an acquisition waits under. There are exactly two:
+// TryOnce, and WaitWhileProgressing. It is a policy and not a duration because
+// no duration is choosable -- any fixed wait is at once too long for a holder
+// that has died and too short for one that is working -- and the question that
+// IS answerable is whether the holder is still getting somewhere.
+//
+// The zero value is TryOnce, so a caller that leaves the field out is refused
+// promptly rather than held indefinitely.
+type LockWait struct {
+	probe   HolderProbe
+	observe func(WaitingHolder)
+	grace   time.Duration
+}
+
+// TryOnce attempts the lock once and reports CTX_WORKSPACE_BUSY when another
+// process holds it. It is what a caller answering somebody who is waiting for
+// an answer now takes: a server's refresh tool tells the agent the workspace is
+// busy rather than holding the call open behind the person's own index.
+func TryOnce() LockWait { return LockWait{} }
+
+// WaitWhileProgressing waits for as long as probe keeps saying the holder is
+// getting somewhere, and reports CTX_WORKSPACE_BUSY only once it has said
+// nothing for grace. There is no other bound: a holder that keeps working is
+// waited out however long it takes, and the operator's interrupt is what ends
+// a wait they no longer want.
+//
+// grace is what makes this a progress judgement rather than a fixed wait in
+// disguise. A holder legitimately shows no fresh stamp for a while -- between
+// taking the lock and its collector's first flush, between two renewals, and
+// after its run has been finalized while it still holds -- and a waiter that
+// refused the instant nothing was advancing would refuse exactly the healthy
+// holder this exists for. The caller passes the run ledger's own liveness
+// window (ledger.LiveWindow), which already is this product's answer to how
+// late a stamp may legitimately be; it is not a second number invented here,
+// and nothing in this package may choose one.
+//
+// observe, when non-nil, is called when the wait begins, again whenever what it
+// would say changes, and once with the zero WaitingHolder when the wait ends.
+func WaitWhileProgressing(grace time.Duration, probe HolderProbe, observe func(WaitingHolder)) LockWait {
+	return LockWait{probe: probe, observe: observe, grace: grace}
+}
+
 // LockWorkspace acquires the lock for dataDir, creating the directory (0700)
-// and lock file (0600) as needed. When the lock is held elsewhere it retries
-// until wait has elapsed or ctx ends, then fails with a retryable
-// CTX_WORKSPACE_BUSY naming whoever recorded themselves in the file. wait <= 0
-// tries exactly once.
+// and lock file (0600) as needed. When the lock is held elsewhere it behaves as
+// wait says: it tries once, or it retries while the holder progresses. Either
+// way the failure is a retryable CTX_WORKSPACE_BUSY naming whoever recorded
+// themselves in the file.
 //
 // operation is what the acquiring process is doing, in the words a person would
 // recognise on the refusal another process is about to read -- an index, a
 // refresh, a watch. It is required: a holder that stayed anonymous would leave
 // the waiter with the refusal that motivated recording a holder at all.
-func LockWorkspace(ctx context.Context, dataDir, operation string, wait time.Duration) (*WorkspaceLock, error) {
+func LockWorkspace(ctx context.Context, dataDir, operation string, wait LockWait) (*WorkspaceLock, error) {
 	if !filepath.IsAbs(dataDir) {
 		return nil, invalid("the data directory must be an absolute path")
 	}
@@ -60,7 +131,20 @@ func LockWorkspace(ctx context.Context, dataDir, operation string, wait time.Dur
 	if err != nil {
 		return nil, ioError("workspace lock file", err)
 	}
-	deadline := time.Now().Add(wait)
+	// Reported to the observer exactly once per change, so a terminal gets one
+	// line that is rewritten rather than one line per poll.
+	var shown WaitingHolder
+	var showing bool
+	report := func(next WaitingHolder) {
+		if wait.observe == nil || (showing && next == shown) {
+			return
+		}
+		shown, showing = next, true
+		wait.observe(next)
+	}
+	// The wait begins in progress: the holder has just been seen holding, and
+	// the grace below is what the very first poll is measured against.
+	lastProgress := time.Now()
 	for {
 		held, err := fslock.TryLock(f)
 		if err != nil {
@@ -68,17 +152,33 @@ func LockWorkspace(ctx context.Context, dataDir, operation string, wait time.Dur
 			return nil, internal("workspace lock: %v", err)
 		}
 		if held {
+			report(WaitingHolder{})
 			l := &WorkspaceLock{f: f}
 			l.record(operation)
 			return l, nil
 		}
-		if !time.Now().Add(lockPollInterval).Before(deadline) {
-			err := busy(readHolder(f))
+		h, recorded := readHolder(f)
+		refuse := func() (*WorkspaceLock, error) {
+			report(WaitingHolder{})
+			err := busy(h, recorded)
 			f.Close()
 			return nil, err
 		}
+		if wait.probe == nil {
+			return refuse()
+		}
+		stage, progressing := wait.probe(ctx)
+		now := time.Now()
+		if progressing {
+			lastProgress = now
+		}
+		report(WaitingHolder{Waiting: true, PID: h.pid, Operation: h.operation, Stage: stage})
+		if now.Sub(lastProgress) > wait.grace {
+			return refuse()
+		}
 		select {
 		case <-ctx.Done():
+			report(WaitingHolder{})
 			f.Close()
 			return nil, model.Canceled(ctx.Err())
 		case <-time.After(lockPollInterval):

@@ -327,7 +327,7 @@ func (c *collector) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
 	if run.inserted {
 		return nil
 	}
-	expires := time.Now().Add(liveWindow)
+	expires := time.Now().Add(LiveWindow)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(
 		run_id, kind, repository_id, generation_id, started_at, expires_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
@@ -354,7 +354,7 @@ func (c *collector) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Ti
 		if !run.refreshDue(now) {
 			continue
 		}
-		expires := now.Add(liveWindow)
+		expires := now.Add(LiveWindow)
 		if _, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
 			formatTime(expires), run.id); err != nil {
 			return wrap("refresh the run's liveness", err)

@@ -59,7 +59,7 @@ func TestLapsedRunLosesToTheActiveGeneration(t *testing.T) {
 	// writer's own, so backdating the row is exactly the state a killed
 	// process produces; the run's in-memory deadline stays ahead, so no later
 	// flush renews it.
-	lapsed := time.Now().Add(-liveWindow)
+	lapsed := time.Now().Add(-LiveWindow)
 	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
 			formatTime(lapsed), crashed.id)
@@ -174,7 +174,7 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	// never renewed, on a row that still says 'running'.
 	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
-			formatTime(time.Now().Add(-liveWindow)), abandoned.id)
+			formatTime(time.Now().Add(-LiveWindow)), abandoned.id)
 		return err
 	}); err != nil {
 		t.Fatalf("backdate the abandoned run's liveness: %v", err)
