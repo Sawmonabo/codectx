@@ -922,11 +922,11 @@ func TestOverLimitSignatureIsTruncatedNotDropped(t *testing.T) {
 // `precise_references` and `precise_implementations` unavailable for the whole
 // repository, with six indexers installed and a project for each of them.
 //
-// It also holds the two rules a per-directory plan needs. A project nested
-// inside another project of a kind that does not nest belongs to the outer
-// one: a TypeScript project split by subdirectory loses more than half of the
-// calls that resolve to its own methods. A Go module nested inside another
-// one is its own project, because the toolchain says so.
+// It also holds the rule a per-directory plan needs: a directory that carries
+// its own manifest is its own project, nested or not. The measured shape is a
+// monorepo whose inner package has a manifest of its own; folding it into the
+// outer project left it planned by nobody's unit but the outer one's, which is
+// what made a nested project's facts depend on where its manifest sat.
 //
 // Mutation proof: in walkTriggers, stop the walk after the workspace root and
 // the assertion fails with no scopes at all.
@@ -962,7 +962,7 @@ func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
 		t.Fatalf("Detect: %v", err)
 	}
 	if !det.Available {
-		t.Fatal("Detect reports unavailable for a workspace holding four indexable projects")
+		t.Fatal("Detect reports unavailable for a workspace holding five indexable projects")
 	}
 	got := p.Scopes(det)
 	slices.Sort(got)
@@ -970,6 +970,7 @@ func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
 		scip.ProfileScope("scip-go", ""),
 		scip.ProfileScope("scip-go", "tools/build"),
 		scip.ProfileScope("scip-typescript", "app"),
+		scip.ProfileScope("scip-typescript", "app/packages/ui"),
 		scip.ProfileScope("scip-typescript", "legacyPortal"),
 	}
 	slices.Sort(want)
