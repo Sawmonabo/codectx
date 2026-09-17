@@ -368,7 +368,7 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 		// then fail on a payload Detect already reported as absent, with its
 		// typed reason. A deferred kind does plan one -- its payload is pinned
 		// for this platform and the unit fetches it.
-		for _, root := range projectRoots(k, byKind[k]) {
+		for _, root := range projectRoots(byKind[k]) {
 			key := ProfileScope(string(k), root)
 			if len(key) > model.MaxScopeKeyBytes {
 				// A key that does not fit is refused as a project, never
