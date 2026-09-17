@@ -880,12 +880,18 @@ func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
 // belong to the one ledger every heavy child of the process shares.
 func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes))
+	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes), testDiskAllocationBytes)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
 	return l
 }
+
+// testDiskAllocationBytes is a disk allocation wide enough that no unit in
+// these tests ever waits on the ledger's second dimension: what they prove is
+// the memory sizing, and a disk figure that bound anything here would make
+// them prove something else.
+const testDiskAllocationBytes int64 = 64 << 30
 
 // testBaseFootprintBytes stands in for what the composition derives from the
 // machine and the configuration (config.BaseFootprint). It is the shipped

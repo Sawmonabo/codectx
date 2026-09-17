@@ -386,7 +386,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		RecordsEmitted: uint64(report.Nodes + report.Relations + report.Aliases),
 		BytesProcessed: report.BytesRead,
 		Capabilities:   pub.capabilities(unit.ScopeKey)}
-	slog.Info("dependence unit imported", "component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
+	fields := []any{"component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
 		"scope", unit.ScopeKey, "family", string(unit.Family), "source_files", unit.Files, "source_bytes", unit.Bytes,
 		"nodes", report.Nodes, "relations", report.Relations, "aliases", report.Aliases,
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
@@ -399,9 +399,18 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
 		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
 		"derived_rows", report.DerivedRows, "over_max_derived_rows", report.OverDerivedRows,
-		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
+		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(),
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
-		"keys_removed", report.Removed)
+		"keys_removed", report.Removed}
+	// The allocation is an observation of the machine, and a host that
+	// publishes no available-memory figure leaves it zero. Logging that zero
+	// would tell an operator this unit was admitted against no memory at all;
+	// an unavailable measurement is absent from the line instead, as it is
+	// from the resources block and from a memory failure's details.
+	if res.AllocationBytes > 0 {
+		fields = append(fields, "allocation_bytes", res.AllocationBytes)
+	}
+	slog.Info("dependence unit imported", fields...)
 	return Report{Result: result, Keys: report.Keys,
 		Delta: neo4jcsv.Delta{Changed: report.Changed, Unchanged: report.Unchanged, Removed: report.Removed}}, nil
 }

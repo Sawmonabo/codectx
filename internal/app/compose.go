@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
+	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -112,6 +114,58 @@ const collectorBatchLimit = 200
 // cap a heavy analyzer is given -- so the division over-counts rather than
 // under-counts.
 const smallestChildReservationBytes int64 = 768 << 20
+
+// unobservedFreeDiskBytes is the disk allocation used where the platform
+// reports no free-space figure for the data directory. It is not a
+// measurement and is never reported as one: it is the finite bound the gate
+// must have, standing in for the observation the platform withheld, exactly
+// as dependence.UnobservedAllocationBytes stands in for available memory.
+//
+// It is deliberately one child's worth of staging and not a machine's. Where
+// memory is unobservable the stand-in may be generous, because the host's own
+// pressure eventually pushes back; a device that fills does not push back, it
+// fails every writer on it including the operator's editor. So the unreadable
+// case admits roughly one staging child at a time and says so once, which is
+// the conservative direction on the dimension that has no second chance.
+const unobservedFreeDiskBytes int64 = 1 << 30
+
+// freeDiskAllocation is the temporary disk this process's children may hold
+// between them: the space actually free under the data directory, less the
+// floor the host keeps free whatever the product is doing
+// (resources.min_free_disk_bytes).
+//
+// Three readings, three answers, and none of them is "unlimited":
+//   - a figure: that figure less the floor, which is what the children may
+//     take without taking the host below its floor;
+//   - a figure at or below the floor: zero, which is a real reading and not an
+//     absence. Nothing is admitted beside a child that wants disk, so staging
+//     work serializes instead of racing the device to full;
+//   - no figure at all: the stand-in above, recorded as unavailable. An
+//     unreadable device is not an empty one and is not an infinite one.
+//
+// The observation is taken once, here, like the memory one, and for the same
+// reason: the ledger observes nothing. What it cannot see is the space another
+// process on the same device takes while this one runs, which is why the floor
+// exists and why the store still attributes a refused write against free space
+// at the moment it fails.
+func freeDiskAllocation(dataDir string, floorBytes int64) int64 {
+	free, ok := diskfree.Available(dataDir)
+	if !ok {
+		slog.Warn("this host reports no free-space figure for the data directory, so heavy children are admitted against a conservative stand-in rather than a measurement",
+			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
+		return unobservedFreeDiskBytes
+	}
+	if free > math.MaxInt64 {
+		free = math.MaxInt64
+	}
+	allocation := int64(free) - floorBytes
+	if allocation <= 0 {
+		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
+			"component", "app", "data_dir", dataDir, "free_bytes", free, "min_free_disk_bytes", floorBytes)
+		return 0
+	}
+	return allocation
+}
 
 // childSlots is that division: how many children of the smallest possible size
 // fit the budget, never below one.
@@ -606,7 +660,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// stated on both sides in govern.go and is an open question, not a claim
 	// that they always agree.
 	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
-	if s.admission, err = admission.NewLedger(childMemory); err != nil {
+	// Disk is the ledger's second dimension and is observed the same way: the
+	// free space under the data directory, less the floor the host keeps, is
+	// what the children may stage between them. It is observed here, once, for
+	// the reason the memory allocation is -- the ledger observes nothing and
+	// derives nothing -- and a child that does not fit it waits rather than
+	// filling the device.
+	childDisk := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
+	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its

@@ -1,4 +1,4 @@
-# ADR-0010: The engine's heap is sized to the unit's need, and the host keeps half of what it had
+# ADR-0010: The engine's heap is sized to the unit's need, and the host keeps half of what it had and its free disk
 
 ## Status
 
@@ -62,6 +62,38 @@ was the measurement for this family at this size.
    runs-alone rule rather than by the sum. Before this, `max_concurrent_heavy_analyzers = 1`
    serialised all five on both machines, and a second project's language server was refused with
    `CTX_RESOURCE_LIMIT` on a machine with room for six.
+
+6. **Disk is admitted on the same ledger, against the space that is actually free.** Memory is not
+   the only exhaustible resource a heavy child takes: it stages its inputs and writes its outputs
+   into temporary space, and a device that fills fails every writer on it, including the person's
+   editor. The rule is stated with the same method as the memory rule.
+
+   *What is observed*: the free space under the data directory, read once when the process composes
+   its children, exactly as available memory is. It is the space an unprivileged writer can use,
+   not the reserve the filesystem holds back.
+
+   *What is reserved*: a child's staged inputs plus its expected outputs, summed on the one ledger
+   that carries memory, admitted when BOTH dimensions fit. A child that does not fit waits for one
+   that is holding the space to release it; it is not refused, for the reason memory is not. The
+   two dimensions are taken in one grant, so no child can hold half of what another needs.
+
+   *What the host keeps*: `resources.min_free_disk_bytes`, the host-safety floor, subtracted from
+   the observation before anything is admitted against it. The floor is therefore checked against
+   real free space on every run, and not only by `doctor`: before this decision it was read by
+   `doctor` and by configuration validation alone, and the product's own classification of it as
+   "checked against real free space" described an intention rather than a code path. `doctor` still
+   reads it, so an operator learns about disk pressure before a capture meets it.
+
+   *Where the observation is missing*: a platform that reports no free-space figure is recorded as
+   unavailable and never as zero and never as unlimited. A conservative stand-in of one child's
+   staging is admitted against instead — the same shape as the memory stand-in, and deliberately
+   smaller in proportion, because a host under memory pressure pushes back and a full device does
+   not. A host whose measured free space is already at or below its floor is a different case and a
+   real reading: its allocation is zero, so staging children run one at a time.
+
+   *What is not changed*: `resources.max_temp_bytes` stays what it was, the ceiling an operator may
+   put on temporary bytes, enforced where it always was and unlimited by default. It is not the
+   host-safety mechanism and never was; the ledger is.
 
 ## Measurements
 
@@ -139,7 +171,10 @@ move it. The soft ceiling is not honoured by the collector in use.
 
 The reference repository's dependence phase can schedule units beside each other again, since a
 reservation is now gigabytes rather than the machine; the host keeps at least half of what it had
-for everything else; a unit larger than that still runs whole and says so. The constants are
+for everything else; a unit larger than that still runs whole and says so. The device is held the
+same way: no run can plan more temporary space than the host has free above its floor, and a host
+that publishes no free-space figure is admitted against a stand-in that says so rather than against
+a zero or an unlimited figure. The constants are
 measured on one engine version and one host and are re-measured when either changes; the
 disclosure in decision 4 is what makes a drift visible.
 

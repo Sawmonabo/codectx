@@ -50,9 +50,9 @@ type WorkerCommand struct {
 	Args []string
 }
 
-// Options configure the provider. Zero values take the defaults below: two
-// workers, a 60-second parse timeout and a 256 MiB reservation per worker. An
-// unset byte bound stays unlimited rather than being given a finite default.
+// Options configure the provider. Zero values take the defaults below, which
+// match config's: 5 MiB per file, a 60-second idle TTL. The worker count is
+// not among them -- it comes from the machine and is required.
 type Options struct {
 	// Languages restricts the supported set (config tree_sitter.languages);
 	// empty means every pinned language.
@@ -93,7 +93,6 @@ type Options struct {
 }
 
 const (
-	defaultMaxWorkers   = 2
 	defaultParseTimeout = 60 * time.Second
 	defaultWorkerMemory = 256 << 20
 )
@@ -147,8 +146,12 @@ func (p *Provider) leaveStage(ctx context.Context) {
 // New validates options and builds the provider. Nothing is started until the
 // first unit.
 func New(o Options) (*Provider, error) {
+	// A worker count is the caller's one-per-core figure (config.ParserWorkers)
+	// and is never defaulted here: the substitute this replaces restated a
+	// count nothing measured, and a provider composed with no workers would
+	// otherwise start and parse nothing.
 	if o.MaxWorkers <= 0 {
-		o.MaxWorkers = defaultMaxWorkers
+		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
 	}
 	// Unlimited is left unlimited: substituting a finite default here would
 	// discard a user's explicit "no bound" with no report. The worker's

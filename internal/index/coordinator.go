@@ -36,7 +36,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -76,12 +75,6 @@ const refNone = "(none)"
 // domainRepository separates the repository identity digest from every other
 // digest in the product, so one can never be presented as another.
 const domainRepository = "repository-identity-v1"
-
-// maxWorkers bounds the units one generation builds concurrently when the
-// configuration asks for the machine default. Each concurrent unit holds a
-// live sink and an open writer, so the bound is a resource decision and not a
-// throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
-const maxWorkers = 8
 
 // HoldIntent is how patient the operation taking the workspace is. It is the
 // OPERATION's property and not the composition's, because one process runs
@@ -295,7 +288,7 @@ func New(o Options) (*Coordinator, error) {
 	c := &Coordinator{opts: o, repo: model.RepositoryID(model.H(domainRepository, filepath.ToSlash(o.Root.Path))),
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
-		workers: workerCount(o.Config.Index.Workers),
+		workers: workerCount(o.Config.Index.Workers, config.CPUs()),
 		sched:   plan.NewScheduler(o.Admission),
 	}
 	if c.log == nil {
@@ -370,13 +363,21 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 	return out, nil
 }
 
-// workerCount resolves index.workers. Zero selects from the available CPUs
-// under a fixed ceiling; it is never unlimited (Section 20.1).
-func workerCount(configured int) int {
+// workerCount resolves how many units one generation builds at once: one per
+// core this machine allows the process, under the structural ceiling on live
+// sinks. There is no count beside those two. How much of the machine those
+// units may hold is decided by the reservation ledger every heavy unit is
+// admitted against, so a typed-in ceiling here would be a second gate on the
+// same work -- and one nobody measured, which is what an eight-worker ceiling
+// on a sixteen-core machine was.
+//
+// cpus is a parameter and not a call so the resolution can be exercised for
+// machines this one is not, exactly as config's own counts are.
+func workerCount(configured, cpus int) int {
 	if configured > 0 {
 		return min(configured, provider.MaxLiveSinks)
 	}
-	return max(1, min(runtime.NumCPU(), maxWorkers))
+	return min(cpus, provider.MaxLiveSinks)
 }
 
 // buildable refuses an entry point that captures, builds or publishes when the
