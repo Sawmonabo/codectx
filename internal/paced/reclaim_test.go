@@ -354,3 +354,93 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 		t.Fatalf("after draining, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
+
+// The requirement: an entry the reclaimer cannot even STAT is stuck, not gone.
+//
+// `work` frees an entry, and on a failure asks the filesystem whether the
+// entry is still there: one that has gone is not stuck, because freeing a
+// file shrinks it before unlinking it and a shrink that failed under an
+// unlink that succeeded holds no byte. But "gone" is exactly one answer --
+// the entry does not exist -- and every other answer is the filesystem
+// refusing to say. Reading a refusal as "gone" passes the entry straight back
+// to the queue, which returns it again at once: `Drain` never returns, the
+// operator is told nothing is stuck, one core spins for the life of the
+// process, and every removal queued behind it is never reached.
+//
+// The refusal here is a purpose directory that may be read but not searched,
+// which is what a tree the reclaimer can list and cannot descend looks like;
+// the same shape reaches it from a device error or a stale network handle,
+// neither of which a test can construct.
+//
+// Mutation: treat every stat error as gone (`if _, gone := os.Lstat(entry);
+// gone != nil`) and this test fails on the wait -- Drain does not return and
+// the entry behind is never freed.
+func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability searches a directory that grants nobody search, " +
+			"so the refusal this test is built on never happens and it would pass vacuously")
+	}
+	served := t.TempDir()
+	set := filepath.Join(served, "to-free")
+	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	// Registered before anything under the set is made unsearchable, so the
+	// temporary directory's own removal -- which runs after this -- is not the
+	// thing that fails.
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(served, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	Drain()
+
+	refusedFile := filepath.Join(served, "refused")
+	writeFile(t, refusedFile, 4096)
+	if err := RemoveFor(AnalyzerOutput, refusedFile); err != nil {
+		t.Fatal(err)
+	}
+	// Read but not searched: the reclaimer lists the entry and cannot stat it.
+	// Applied after the rename, which needs both.
+	refusedDir := filepath.Join(set, string(AnalyzerOutput))
+	if err := os.Chmod(refusedDir, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	// Queued behind it, under the purpose that reads second, and smaller than
+	// a window so the freeing takes no turn and the test waits on nothing.
+	const behindSize = 4096
+	behind := filepath.Join(served, "behind")
+	writeFile(t, behind, behindSize)
+	freedBefore := FreedByPurpose()[Materialization]
+	if err := RemoveFor(Materialization, behind); err != nil {
+		t.Fatal(err)
+	}
+
+	stuck := mustDrain(t, 10*time.Second)
+
+	if got := FreedByPurpose()[Materialization] - freedBefore; got != behindSize {
+		t.Fatalf("the file queued behind the unstattable entry gave back %d bytes; want %d", got, int64(behindSize))
+	}
+	if len(stuck) != 1 {
+		t.Fatalf("the reclaimer reported %v as stuck; want exactly the entry it could not stat", stuck)
+	}
+	if !strings.HasPrefix(stuck[0].Entry, string(AnalyzerOutput)+string(filepath.Separator)) {
+		t.Fatalf("the stuck entry is named %q; want it named under %s", stuck[0].Entry, AnalyzerOutput)
+	}
+	if !strings.Contains(stuck[0].Reason, "permission denied") {
+		t.Fatalf("the stuck entry's reason is %q; want the refusal the filesystem gave", stuck[0].Reason)
+	}
+
+	// The next wake retries it: what stopped it has gone, so the entry goes.
+	if err := os.Chmod(refusedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reclaim.wake()
+	if left := mustDrain(t, 10*time.Second); len(left) != 0 {
+		t.Fatalf("the entry was still refused after what stopped it was undone: %v", left)
+	}
+	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+		t.Fatalf("after the retry, %d bytes await freeing (%v); want none", pending, err)
+	}
+}

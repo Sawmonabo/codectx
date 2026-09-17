@@ -342,8 +342,16 @@ func (r *reclaimer) work() {
 		// shrink that failed is still reported although the unlink that
 		// followed succeeded. Naming it would disclose an entry that no
 		// longer exists and does not hold a byte.
+		//
+		// Gone is exactly one answer -- the entry does not exist -- and every
+		// other answer is the filesystem refusing to say. A refusal read as
+		// "gone" hands the entry straight back to the queue, which returns it
+		// again at once: nothing is recorded, the operator is told nothing is
+		// stuck, and the entry is retried in a spin that never reaches
+		// anything queued behind it. So only not-exist passes over; anything
+		// else is stuck with the reason the free itself gave.
 		if err := r.freeEntry(entry, purpose); err != nil {
-			if _, gone := os.Lstat(entry); gone != nil {
+			if _, statErr := os.Lstat(entry); errors.Is(statErr, fs.ErrNotExist) {
 				continue
 			}
 			r.mu.Lock()
