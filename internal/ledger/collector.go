@@ -223,8 +223,14 @@ func (c *collector) finalize(running map[*Span]struct{}) {
 			if err := c.ensureRun(ctx, tx, run); err != nil {
 				return err
 			}
+			// The reason travels with the outcome, as it does on every other
+			// non-ok row: a cut-off span with two empty columns reads as a
+			// failure whose cause nobody recorded, which is a worse answer
+			// than the true one.
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE spans SET outcome = 'interrupted' WHERE run_id = ? AND outcome = 'running'`, run.id); err != nil {
+				`UPDATE spans SET outcome = 'interrupted', diagnostic_code = ?, failure_json = ?
+				WHERE run_id = ? AND outcome = 'running'`,
+				model.CodeCanceled, ReasonInterrupted, run.id); err != nil {
 				return wrap("close open spans", err)
 			}
 			// A row still 'planned' when its run stops is work nothing ever

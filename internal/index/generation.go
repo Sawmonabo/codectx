@@ -268,7 +268,7 @@ func (g *generation) captureBuilder(lock *snapshot.WorkspaceLock) *snapshot.Buil
 func (g *generation) capture(ctx context.Context) (err error) {
 	c := g.c
 	ctx, span := ledger.Start(ctx, stageCapture, "")
-	defer func() { span.End(endOutcome(err), ledger.Measured{}, err) }()
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	// The caller took the lock before this generation began; asking for it
 	// again is how the builder names the one this process holds, and it
 	// acquires nothing a second time. It sits inside the span so a capture
@@ -283,7 +283,7 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	walkCtx, walk := ledger.Start(ctx, stageWalk, "")
 	snap, err := b.Build(walkCtx)
 	walk.AddOut(int64(snap.FileCount))
-	walk.End(endOutcome(err), ledger.Measured{}, err)
+	walk.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		return err
 	}
@@ -308,7 +308,7 @@ func (g *generation) capture(ctx context.Context) (err error) {
 func (g *generation) planUnits(ctx context.Context) (err error) {
 	c := g.c
 	ctx, span := ledger.Start(ctx, stagePlan, "")
-	defer func() { span.End(endOutcome(err), ledger.Measured{}, err) }()
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	// Detection walks the workspace itself, so it is given the same Git
 	// exclusion the capture applies. The configured policy alone has no ignore
 	// hook at all, which had detection proposing scopes over every ignored
@@ -375,7 +375,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	health := healthOf(states)
 	activateCtx, activation := ledger.Start(ctx, stageActivation, "")
 	binding, err := g.c.opts.Store.Activate(activateCtx, g.gen, g.prev, health, states, NormalizationVersion)
-	activation.End(endOutcome(err), ledger.Measured{}, err)
+	activation.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		return model.IndexResult{}, err
 	}
@@ -567,7 +567,8 @@ func (g *generation) runsPage() ([]model.ProviderResult, int64) {
 func (g *generation) attachReused(ctx context.Context) (err error) {
 	ctx, span := ledger.Start(ctx, stageAttachReused, "")
 	defer func() {
-		span.End(endOutcome(err), ledger.Measured{ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+			ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
 	}()
 	for _, unit := range g.plan.Reuse {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
@@ -585,7 +586,8 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 func (g *generation) attachCarried(ctx context.Context) (err error) {
 	ctx, span := ledger.Start(ctx, stageAttachCarried, "")
 	defer func() {
-		span.End(endOutcome(err), ledger.Measured{ItemsIn: int64Ptr(int64(len(g.plan.Carry))), ItemsOut: &g.carried}, err)
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+			ItemsIn: int64Ptr(int64(len(g.plan.Carry))), ItemsOut: &g.carried}, err)
 	}()
 	for _, carried := range g.plan.Carry {
 		err := g.c.opts.Store.AttachCarried(ctx, g.gen, carried.Unit,
@@ -617,7 +619,9 @@ func (g *generation) attachCarried(ctx context.Context) (err error) {
 // whose declared dependency is not yet sealed.
 func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	ctx, span := ledger.Start(ctx, stageBuild, "")
-	defer func() { span.End(endOutcome(err), ledger.Measured{ItemsOut: &g.built}, err) }()
+	defer func() {
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &g.built}, err)
+	}()
 	var deferred []plan.Unit
 	var group *unitGroup
 	current := ""
@@ -803,7 +807,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	// first for a unit that reached a provider and End is idempotent, so this
 	// states the outcome only for the paths that never do: the attach of a
 	// unit already sealed, and the failures before the run.
-	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
+	defer func() { span.End(unitEnding(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	spec, err := u.Spec(g.c.cfgHash)
 	if err != nil {
 		return err
@@ -883,7 +887,8 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 			return
 		}
 		span.End(unitOutcome(res, nil),
-			ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
+			ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+				ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
 	}()
 	p, ok := c.opts.Registry.Lookup(u.ProviderID)
 	if !ok {
@@ -1062,7 +1067,8 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, caus
 	// from the breakdown. recordFailure ends it first, with the reason it also
 	// writes to the run row, and an end is once-only -- so this is the backstop
 	// for the two exits below, neither of which records a row to agree with.
-	m := ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
+	m := ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
 	defer func() { out.span.End(endingFor(provider.CodeOf(cause)), m, cause) }()
 	if ctx.Err() != nil && errors.Is(cause, ctx.Err()) {
 		return cause
@@ -1117,8 +1123,9 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	// from the error's own text, which is what typedFailure deliberately drops
 	// for an untyped error, and the two records would then diverge on exactly
 	// the failures nobody has a safe message for.
-	out.span.End(endingFor(stored.Code), ledger.Measured{ItemsIn: int64Ptr(u.InputCount),
-		ItemsOut: int64Ptr(out.parsed), DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
+	out.span.End(endingFor(stored.Code), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed),
+		DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
 	if res.RunID != "" {
 		// Under a context that survives the cancellation the failure may have
 		// arrived with: a reason dropped because the run was cancelled is the
@@ -1157,7 +1164,7 @@ func typedFailure(cause error) unitFailure {
 // row for it status would report a capability nothing answers as healthy.
 func (g *generation) coverage(ctx context.Context) (err error) {
 	_, span := ledger.Start(ctx, stageCoverage, "")
-	defer func() { span.End(endOutcome(err), ledger.Measured{}, err) }()
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	covered, deferred, failed, published, err := g.coveredProviders()
 	if err != nil {
 		return err

@@ -244,7 +244,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 	}
 	row := rows[0]
 	if row.State != model.CapabilityPartial {
-		t.Errorf("capability state %q, want partial: nine scopes published and one failed", row.State)
+		t.Errorf("capability state %q, want partial: one scope published and one failed", row.State)
 	}
 	if row.Details[scopeKeyDetail] != failedScope {
 		t.Errorf("the row names scope %q, want the scope that failed (%q)", row.Details[scopeKeyDetail], failedScope)

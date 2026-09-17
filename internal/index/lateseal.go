@@ -388,9 +388,10 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	// A deferred publication opens generations of its own, so it is a run in
 	// its own right and not spans of the index run that queued it -- which had
 	// ended long before this tick started. Its spans are keyed by the run id
-	// and outlive the work generation, which is aborted on every path: the
-	// reason a deferred unit failed is therefore still there after the tick,
-	// where a row written against the aborted generation would not be.
+	// and belong to no generation, so they outlive the work generation this
+	// tick aborts on every path and the publication generation a later
+	// retention sweeps: the reason a deferred unit failed is still there after
+	// the tick, where a row written against the aborted generation is not.
 	run := c.newRun(ledger.KindDeferred)
 	ctx = run.Context(ctx)
 	// The publication is remembered for a Drain to deliver only once this run
@@ -399,8 +400,25 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	// still going is not what a publication that has activated looks like.
 	var res model.IndexResult
 	published := false
+	// What this tick popped and what became of it. They are declared here
+	// because the run row's totals are reported on every exit path, including
+	// the one where nothing sealed: a deferred run whose counts were only ever
+	// reported by the index path rendered `0 planned, 0 succeeded` for a batch
+	// it had plainly run, which is a measurement nobody made.
+	planned := 0
+	b := batch{failed: map[string]unitFailure{}}
 	defer func() {
-		run.Finish(endOutcome(err))
+		run.Report(ledger.Totals{UnitsPlanned: int64(planned),
+			UnitsSucceeded: int64(len(b.sealed)), UnitsFailed: int64(len(b.failed))})
+		// A batch whose every unit failed is not an ok run. It publishes
+		// nothing and returns no error -- one background unit's failure never
+		// stops the others, and the next index plans them again -- so the run
+		// row is the only place that says the batch got nowhere.
+		outcome := endOutcome(err)
+		if err == nil && len(b.sealed) == 0 && len(b.failed) > 0 {
+			outcome = ledger.OutcomeFailed
+		}
+		run.Finish(outcome)
 		if err != nil || !published {
 			return
 		}
@@ -433,7 +451,6 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	work := &generation{c: c, view: view, gen: workGen, prev: active, caps: c.newCapabilityReport(),
 		snap: model.Snapshot{ID: snap, RepositoryID: c.repo},
 		plan: plan.Plan{Previous: map[string]model.UnitID{}}}
-	b := batch{failed: map[string]unitFailure{}}
 	// The predecessor of every unit this tick may run is written into the work
 	// plan here, before the first worker starts: generation.run reads that map
 	// from each worker's own goroutine, and writing it beside those reads would
@@ -459,6 +476,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 			l.finished(d)
 			break
 		}
+		planned++
 		ready := make(chan struct{})
 		admitted := sync.OnceFunc(func() { close(ready) })
 		wg.Add(1)
@@ -506,6 +524,18 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	}
 	if len(b.sealed) == 0 {
 		abort()
+		if len(b.failed) > 0 {
+			// Nothing published, so no capability row states it and the work
+			// generation that held the provider-run failure rows is gone with
+			// the abort. What survives is this run: its unit spans carry each
+			// scope's typed reason, its row says the batch failed, and this
+			// line is what an operator watching the log sees at the moment it
+			// happens. Every scope keeps answering from its carried
+			// predecessor and the next index plans them again.
+			c.log.Warn("every deferred unit of this batch failed; nothing was published",
+				"component", component, "repository_id", string(c.repo),
+				"units", len(b.failed), "run_id", run.ID())
+		}
 		return nil
 	}
 	l.setPublishing(true)
@@ -565,7 +595,7 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 	// gives it a terminal state on every path this call can take; run closes
 	// it first for a unit that reached its provider.
 	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
-	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
+	defer func() { span.End(unitEnding(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
 		return "", outcome{}, err
@@ -737,9 +767,11 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	// The run is linked to the generation it publishes INTO, never to the work
-	// generation, which is aborted on every path: a run linked to a generation
-	// that no longer exists would be swept with it, taking the record of what
-	// the tick did.
+	// generation, which is aborted on every path: the column states which
+	// generation this run produced, and the work generation is one no reader
+	// will ever find. A tick that publishes nothing leaves it null, which is
+	// the truthful answer and costs the run nothing -- the ledger's own bound
+	// keeps a run's account whether or not it reached a generation.
 	ledger.RunFromContext(ctx).AttachGeneration(int64(pubGen))
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
 		snap: captured, started: started, caps: c.newCapabilityReport(),

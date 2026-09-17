@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"slices"
 	"testing"
 	"time"
 )
@@ -129,9 +130,11 @@ func waitForSpan(t *testing.T, l *Ledger, run *Run) {
 // sweeps share. The failure mode: a sweep with no predicate deletes the ledger
 // of a process that is still running -- the overlay run of another process's
 // language servers, or an index run that has not reached its generation yet --
-// so the record of live work disappears from under the surface reading it,
-// while the rows nothing else can reach (a finished run that published no
-// generation) must still go, or periodic ticks accumulate them without bound.
+// so the record of live work disappears from under the surface reading it.
+//
+// Mutation: drop `notLive` from either sweep's WHERE clause and the live
+// overlay run is deleted here, which is a status surface reading a run this
+// process is still writing.
 func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -160,8 +163,8 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 		_, span := Start(run.Context(ctx), "server_start", "")
 		span.End(OutcomeOK, Measured{}, nil)
 	}
-	// A tick that published nothing: it ended, so no generation will ever be
-	// attached and the generation-keyed deletion can never reach its row.
+	// A tick that published nothing: it ended, and no generation will ever be
+	// attached to it. It is inside the retained window, so it stays.
 	barren, err := l.NewRun(KindDeferred, liveRepository)
 	if err != nil {
 		t.Fatalf("new run: %v", err)
@@ -192,14 +195,18 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	if err := l.DeleteOverlayRuns(ctx, ids); err != nil {
 		t.Fatalf("delete overlay runs: %v", err)
 	}
-	if err := l.DeleteRunsWithoutGeneration(ctx); err != nil {
-		t.Fatalf("delete runs without a generation: %v", err)
+	if err := l.SweepRuns(ctx, liveRepository, 0); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
 	}
 	left := runIDs(t, l)
-	if len(left) != 1 || left[0] != serving.ID() {
-		t.Fatalf("after both sweeps the ledger holds %v, want only the live overlay run %s "+
-			"(the abandoned overlay run and the tick that published no generation are the rows "+
-			"nothing else would ever collect)", left, serving.ID())
+	slices.Sort(left)
+	want := []string{serving.ID(), barren.ID()}
+	slices.Sort(want)
+	if !slices.Equal(left, want) {
+		t.Fatalf("after both sweeps the ledger holds %v, want the live overlay run and the tick "+
+			"that published nothing (%v): only the abandoned overlay run's writer is gone, and a "+
+			"run inside the retained window keeps its account whether or not it reached a generation",
+			left, want)
 	}
 }
 
@@ -243,4 +250,85 @@ func runIDs(t *testing.T, l *Ledger) []string {
 		t.Fatalf("read the runs: %v", err)
 	}
 	return ids
+}
+
+// TestARunsAccountOutlivesItsGeneration protects the one thing the ledger file
+// exists for: that an operator who asks `status --resources` after a run is
+// told what that run cost. A run's rows are about the run, not about the
+// generation it published -- retention keeps only the newest generation of each
+// ref, so the generation an index run activated is deleted the moment a
+// deferred publication extends it on the same ref, seconds later and inside the
+// same command.
+//
+// Mutation: restore a generation-keyed delete -- `DELETE FROM runs WHERE
+// generation_id = ?` for each generation retention swept -- or key this sweep
+// on generation_id at all, and the middle run below loses its spans while the
+// store it built is still the active one.
+//
+// Mutation: drop the `generation_id <> ?` clause from SweepRuns and the active
+// generation's run is swept once RetainedRuns newer runs exist, which is the
+// same operator asking the same question and being told nothing.
+func TestARunsAccountOutlivesItsGeneration(t *testing.T) {
+	ctx := context.Background()
+	l := New(t.TempDir())
+	if err := l.Attach(ctx); err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	defer func() {
+		if err := l.Stop(); err != nil {
+			t.Errorf("stop the ledger: %v", err)
+		}
+	}()
+
+	// One more run than the window retains, so the bound is actually exercised
+	// rather than merely never reached.
+	const total = RetainedRuns + 2
+	ids := make([]string, 0, total)
+	for i := range total {
+		run, err := l.NewRun(KindIndex, liveRepository)
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		_, span := Start(run.Context(ctx), "capture", "")
+		span.End(OutcomeOK, Measured{}, nil)
+		// Every run publishes a generation of its own, and every generation
+		// but the first has been swept by retention by the time this sweep
+		// runs: that is the ordinary shape of a workspace indexed twice.
+		run.AttachGeneration(int64(i + 1))
+		run.Finish(OutcomeOK)
+		ids = append(ids, run.ID())
+	}
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// The oldest run built the store that is active now. It is outside the
+	// retained window and must survive anyway.
+	if err := l.SweepRuns(ctx, liveRepository, 1); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
+	}
+
+	left := runIDs(t, l)
+	want := append([]string{ids[0]}, ids[len(ids)-RetainedRuns:]...)
+	slices.Sort(left)
+	slices.Sort(want)
+	if !slices.Equal(left, want) {
+		t.Fatalf("after the sweep the ledger holds %v, want %v: the last %d runs and the run that "+
+			"built the active generation, whichever generations retention has deleted",
+			left, want, RetainedRuns)
+	}
+	// The run immediately inside the window is the reference case: its
+	// generation is long gone and its account is still readable in full.
+	reader, ok, err := OpenReader(ctx, l.dir)
+	if err != nil || !ok {
+		t.Fatalf("open the reader: %v (%v)", ok, err)
+	}
+	defer func() { _ = reader.Close() }()
+	view, found, err := reader.Run(ctx, ids[len(ids)-1])
+	if err != nil {
+		t.Fatalf("read the run: %v", err)
+	}
+	if !found || len(view.Spans) != 1 {
+		t.Fatalf("the newest run reads back as found=%v with %d spans, want it found with its one "+
+			"span: a run whose generation is gone must still say what it cost", found, len(view.Spans))
+	}
 }
