@@ -823,7 +823,8 @@ func (w inLedgerRun) IndexUnit(ctx context.Context, req provider.UnitRequest, si
 // (`span.End(spanOutcome(out), ledger.Measured{}, nil)` in provider.parse) and
 // the parse stage reports no processor time.
 func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
-	led, err := ledger.Open(context.Background(), t.TempDir())
+	led := ledger.New(t.TempDir())
+	err := led.Attach(context.Background())
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}
