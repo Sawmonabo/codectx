@@ -1042,21 +1042,23 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 			files["pkg/tabs.go"] = src
 			files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
 				documentWithText("pkg/tabs.go", "go", 0, src,
-					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted)))
+					// Clean, refused, clean: the last one is spooled AFTER the
+					// refusal, so a refusal that cost the rest of its document
+					// would take it with it.
+					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted,
+					occurrenceRecord(symBrowser, 0, 5, 10, 17))))
 
 			h := providertest.New(t, files)
 			p := newProvider(t, "tabs.scip")
-			res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
-			if err != nil {
-				t.Fatalf("shifted %s occurrence failed the unit: %v; one wrong coordinate must cost one occurrence", tc.name, err)
+			got, rep := importDelta(t, h, p, scip.ImportScope("tabs.scip"),
+				append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...), nil)
+			// The clean reference after the refusal still published its
+			// call-site alias, which is what separates "one occurrence
+			// refused" from "the document dropped".
+			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
+				t.Fatalf("%d call-site aliases, want 1: the clean occurrence after the refused one must still publish (%v)", n, aliasKeys(got))
 			}
-			// Exactly the shifted occurrence was left out: the document's
-			// clean first definition still reached the sink, which is what
-			// separates "one occurrence refused" from "the document dropped".
-			if res.RecordsEmitted == 0 {
-				t.Fatal("the unit published nothing: a refused occurrence must not cost the rest of its document")
-			}
-			for _, cs := range res.Capabilities {
+			for _, cs := range rep.Result.Capabilities {
 				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
 					t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
 				}

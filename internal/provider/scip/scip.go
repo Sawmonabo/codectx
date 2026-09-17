@@ -552,27 +552,13 @@ type Report struct {
 	// later document with the same path superseded, Skipped a document the
 	// snapshot does not hold or whose encoding or size the import cannot
 	// stand behind.
+	//
+	// Everything else this import left out -- refused occurrences, documents
+	// dropped for an encoding that did not hold, occurrences cut past a
+	// relation's evidence bound, records and fields the decoder discarded --
+	// is published on the capability row's details, which is the channel that
+	// reaches a reader of the generation. It is not repeated here.
 	OutsideRoot, DuplicatePaths, Skipped int64
-	// SkippedOccurrences are coordinates that did not land on the pinned
-	// bytes under an unverified binding; SkippedCallsiteAliases are call-site
-	// aliases whose key would exceed the alias bounds. Occurrences cut past a
-	// relation's evidence bound are reported on the capability detail
-	// model.DetailEvidenceClipped instead, which is where a reader of the
-	// generation can see them.
-	SkippedOccurrences, SkippedCallsiteAliases int64
-	// RefusedOccurrences are coordinates the pinned bytes contradict under a
-	// VERIFIED binding: the index claims to describe exactly these bytes and
-	// this one does not. Each costs its own occurrence and nothing else, and
-	// the unit publishes partial under CTX_PROVIDER_OUTPUT_INVALID.
-	// EncodingDroppedDocuments are documents dropped whole because the
-	// position encoding assumed for them did not hold -- a shift of every
-	// column of the document rather than of one occurrence. They are also
-	// counted in Skipped, which is the total of documents not admitted.
-	RefusedOccurrences, EncodingDroppedDocuments int64
-	// AssumedPositionEncoding counts documents that left `position_encoding`
-	// unspecified and were converted in the measured encoding of the tool that
-	// wrote the index (see toolPositionEncoding).
-	AssumedPositionEncoding int64
 }
 
 // IndexUnit builds one unit: the supplied index or one profile run. It is the

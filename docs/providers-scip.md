@@ -637,15 +637,22 @@ unit seals with all three capabilities fresh. A repository's own
 configuration surface. `--targetroot` keeps the indexer's own intermediate
 output inside the run directory rather than in the materialization.
 
-A materialization that holds **no** `.java` file is refused before the indexer
-starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a remediation naming the
-source-free case. This is the aggregator POM of a multi-module repository —
+A materialization that holds **no** source file the indexer can describe is
+refused before that indexer starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a
+remediation naming the source-free case. Two profiles apply it, through one
+helper. For Java it is the aggregator POM of a multi-module repository —
 `pom.xml` triggers the profile, the root carries no source of its own — and
 without the check `javac` refuses, the indexer exits 1, and the run fails as
-`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured):
-a process failure with no stderr and no remediation. The refusal is the same
-typed one the other profiles produce for an index that describes no admitted
-document, raised before a JVM is started rather than after.
+`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured).
+For TypeScript it is a package directory holding only a manifest, a lock file
+and documentation, with no `.ts`/`.js` beside them: measured on a real
+repository, the run failed as `CTX_PROVIDER_UNAVAILABLE: node exited with
+status 1`. Both are a process failure with no stderr and no remediation, for a
+condition this provider can name precisely. `node_modules` is excluded from the
+TypeScript walk: a dependency's own sources are not the project's, and counting
+them would restore that opaque failure with an extra step. The refusal is the
+same typed one the other profiles produce for an index that describes no
+admitted document, raised before a tool is started rather than after.
 
 **Three pinned arguments exist because of a measured failure, not a
 preference.** `scip-typescript` is given `--infer-tsconfig` because two of its

@@ -96,9 +96,8 @@ type importer struct {
 	records    uint64
 	indexBytes uint64
 
-	skippedDocs, skippedOccurrences, truncatedEdges int64
-	outsideRoot, duplicatePaths, skippedAliases     int64
-	assumedEncoding                                 int64
+	skippedDocs, truncatedEdges int64
+	outsideRoot, duplicatePaths int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
 	// contradict; refusedExemplar is the first one's document and reason, kept
 	// as the example an operator starts from. One exemplar, not a set: a set
@@ -653,7 +652,6 @@ func (im *importer) endDocument(d document) error {
 			im.degrade(model.CodeProviderOutputInvalid)
 			return im.dropSpool(ctx, d.index)
 		}
-		im.assumedEncoding++
 	}
 	hash, err := im.documentHash(ctx, row)
 	if err != nil {
@@ -976,22 +974,19 @@ func identifierByte(b byte) bool {
 }
 
 // refuse records one occurrence the pinned bytes contradict. The occurrence is
-// left out and the unit continues, in both bindings:
+// left out, counted, and the unit continues; nothing is adjusted and nothing is
+// published for it. The occurrence is the unit of the refusal, never the
+// document and never the unit.
 //
-//   - under an unverified binding the index describes bytes it never saw, so
-//     the coordinate says nothing about this file and is a plain skip;
-//   - under a verified binding the index claims to describe exactly these
-//     bytes and does not, so the unit is degraded to partial under
-//     CTX_PROVIDER_OUTPUT_INVALID and the count and the first document reach
-//     the operator on the capability row.
-//
-// Nothing is adjusted and nothing is published for it: the occurrence is the
-// unit of the refusal, never the document and never the unit.
+// The binding is carried by the diagnostic code rather than by a second
+// counter. Under a verified binding the index claims to describe exactly these
+// bytes and does not, which is CTX_PROVIDER_OUTPUT_INVALID; under an unverified
+// one the index describes bytes it never saw, and degrade keeps the
+// CTX_SOURCE_BINDING_UNVERIFIED the run already set, because an unverified
+// binding outranks every later reason. Either way the count and the exemplar
+// reach the operator on the capability row, which is the only channel that
+// reaches one.
 func (im *importer) refuse(ds *docSource, msg string) {
-	if im.unverify {
-		im.skippedOccurrences++
-		return
-	}
 	im.refusedOccurrences++
 	if im.refusedExemplar == "" {
 		im.refusedExemplar = ds.doc.path + ": " + msg
@@ -1242,7 +1237,6 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.SourceRange, to model.NodeID) error {
 	scopeKey, nativeKey, ok := callsiteAlias(p, rng)
 	if !ok {
-		im.skippedAliases++
 		return nil
 	}
 	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scopeKey, NativeKey: nativeKey, NodeID: to}}); err != nil {
@@ -1573,9 +1567,5 @@ func (im *importer) report() Report {
 	return Report{
 		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
 		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
-		SkippedOccurrences: im.skippedOccurrences, SkippedCallsiteAliases: im.skippedAliases,
-		AssumedPositionEncoding:  im.assumedEncoding,
-		RefusedOccurrences:       im.refusedOccurrences,
-		EncodingDroppedDocuments: im.encodingDropped,
 	}
 }
