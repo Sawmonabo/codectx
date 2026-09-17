@@ -26,11 +26,18 @@ import "runtime"
 // utf8Locale is the locale name the child is given. It must be a locale the
 // platform's runtime actually has: an unknown name leaves the C locale in
 // place, which was measured to reproduce the failure exactly. "C.UTF-8" is
-// the locale-independent UTF-8 locale of the platforms this product builds
-// for; macOS does not carry it and carries "en_US.UTF-8" instead. On Windows
-// the variables are inert — that runtime names files through the wide
-// character interface and never encodes a path — and are set for the
-// non-Windows tools a Windows host may still run.
+// the locale-independent UTF-8 locale, and it is the measured value: the
+// failing unit above was reproduced and then passed under it on linux.
+//
+// The darwin value is not a measurement and is not presented as one. That
+// platform does not carry "C.UTF-8", so naming it there would leave the C
+// locale in place; "en_US.UTF-8" is chosen because it is the UTF-8 locale
+// that platform does carry. No run on darwin has been observed here, so the
+// value stands unverified on it until a run on one measures it.
+//
+// On windows the variables are inert — that runtime names files through the
+// wide character interface and never encodes a path — and are set for the
+// non-windows tools such a host may still run.
 func utf8Locale() string {
 	if runtime.GOOS == "darwin" {
 		return "en_US.UTF-8"
