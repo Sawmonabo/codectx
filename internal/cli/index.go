@@ -50,12 +50,6 @@ const (
 // gains anything by making.
 const statusFollowInterval = time.Second
 
-// indexLockWait is the bounded wait a building command makes for the
-// cross-process workspace lock. Section 13.2 offers a second caller exactly
-// two answers -- `busy` or a bounded wait -- and this is the wait; nothing
-// here ever becomes a second writer.
-const indexLockWait = 10 * time.Second
-
 // statusReport is the data payload of `status`: the coordinator's own index
 // status, and the managed-toolchain rows the same report renders, which is
 // what Task 22 Step 3 owes `status` beside `doctor`. They travel in one
@@ -117,7 +111,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runService(cmd, openForBuild(app.OpenOptions{Operation: "index", Wait: indexLockWait, Rebuild: req.Rebuild,
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "index", OnWaiting: waitingForHolder(cmd, args), Rebuild: req.Rebuild,
 				SCIPImport: scipIndex, SCIPManifest: scipInputs}),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					if req.Rebuild {
@@ -188,7 +182,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			// there is no request field to carry them into and a hint that
 			// changed the answer would be the thing the help text promises it
 			// is not.
-			return runService(cmd, openForBuild(app.OpenOptions{Operation: "refresh", Wait: indexLockWait}),
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "refresh", OnWaiting: waitingForHolder(cmd, args)}),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					result, err := svc.Refresh(ctx, model.IndexRequest{})
 					if err != nil {
@@ -364,7 +358,7 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			// that is meant to run until it is stopped, and the *Services it is
 			// handed goes unread because streaming is deliberately not a facade
 			// operation (digest 17 Section 4) -- Coordinator is.
-			return runService(cmd, openForBuild(app.OpenOptions{Operation: "watch", Wait: indexLockWait}),
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "watch", OnWaiting: waitingForHolder(cmd, args)}),
 				func(ctx context.Context, ws *app.Workspace, _ *app.Services) error {
 					return runWatch(ctx, cmd, build, args, ws)
 				})
@@ -618,6 +612,78 @@ func progressiveStages(cmd *cobra.Command, args []string, ws stageSource) (stop 
 		done = true
 		mu.Unlock()
 	}
+}
+
+// waitingForHolder is the progressive line a building command prints while it
+// waits for another process to give up the workspace: who holds it, what that
+// process is doing, and the stage it is in right now.
+//
+// It is ONE line that is rewritten as the holder's stage changes, not a line
+// per poll: a command waiting out a twenty-minute index would otherwise scroll
+// thousands of identical lines past everything the operator wanted to read.
+// The line is closed with a newline when the wait ends, so the command's own
+// first line of output never lands appended to it.
+//
+// A --json consumer gets one plain line per change on stderr instead, in the
+// idiom the machine progressive lines already use: a carriage return rewriting
+// a line is a terminal affordance, and a program reading the stream wants each
+// change as a record it can read once.
+//
+// The observer runs inside the workspace open, before any other output of this
+// command exists, so nothing else is writing to this writer while it does.
+func waitingForHolder(cmd *cobra.Command, args []string) func(app.WaitingHolder) {
+	machine := jsonRequested(cmd, args)
+	// Same channel choice, for the same reason, as the stage lines below: a
+	// --json consumer's stdout carries the one envelope and nothing else.
+	w := cmd.OutOrStdout()
+	if machine {
+		w = cmd.ErrOrStderr()
+	}
+	// width is the widest line printed so far, and zero means nothing has been
+	// printed -- so the end of a wait that never had to print closes nothing.
+	// It is only ever set on the human path: a machine line ends itself, and a
+	// closing newline after one would write a blank line into the stream.
+	width := 0
+	return func(h app.WaitingHolder) {
+		if !h.Waiting {
+			if width > 0 {
+				writeText(w, "\n") //nolint:errcheck // a progress line lost to a closed pipe must not fail the command; the operation below reports its own failures.
+				width = 0
+			}
+			return
+		}
+		if machine {
+			writeText(w, "waiting holder_pid=%d holder_operation=%s stage=%s\n", h.PID, h.Operation, h.Stage) //nolint:errcheck // as above.
+			return
+		}
+		line := "waiting     " + waitingHolderPhrase(h)
+		// Padded to the widest line printed so far: a shorter stage name would
+		// otherwise leave the tail of the previous one on the terminal.
+		pad := ""
+		if width > len(line) {
+			pad = strings.Repeat(" ", width-len(line))
+		} else {
+			width = len(line)
+		}
+		writeText(w, "\r%s%s", line, pad) //nolint:errcheck // as above.
+	}
+}
+
+// waitingHolderPhrase names the holder the way the busy refusal does, so the
+// process an operator watched themselves wait for and the process a refusal
+// names are the same words. A holder that recorded nothing is said to have
+// recorded nothing rather than reported as process zero, and a holder that has
+// named no stage yet has no stage clause at all -- an empty one would read as a
+// stage called nothing.
+func waitingHolderPhrase(h app.WaitingHolder) string {
+	if h.PID <= 0 || h.Operation == "" {
+		return "for the process holding the workspace, which did not record which process it is"
+	}
+	phrase := fmt.Sprintf("for the %s in process %d", h.Operation, h.PID)
+	if h.Stage != "" {
+		phrase += ", stage " + h.Stage
+	}
+	return phrase
 }
 
 // stageSource is what a progressive line needs of the workspace: the finished

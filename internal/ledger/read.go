@@ -130,6 +130,17 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 // Close releases the reader's connections.
 func (r *Reader) Close() error { return wrap("close", r.db.Close()) }
 
+// liveRun is the one rule this product answers "is the process writing that
+// run still there" by: the run says it is running AND the deadline its own
+// collector published on the row has not elapsed against the reader's clock.
+// It takes the clock as its single parameter.
+//
+// It is one constant rather than the same expression written out beside each
+// query, so the run a status surface reports as interrupted, the run a live
+// view measures and the run a process waiting for the workspace lock judges
+// the holder by cannot come to different conclusions about one row.
+const liveRun = `outcome = 'running' AND expires_at > ?`
+
 // LatestRun is the run a status surface shows for a repository: the one that
 // is still live if one is, and otherwise the one that produced generationID. A
 // generationID of zero or less means the repository has no active generation,
@@ -162,7 +173,7 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	// which is why the clock compares as text.
 	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
-		events_dropped, process_peak_rss_bytes, (outcome = 'running' AND expires_at > ?) AS live
+		events_dropped, process_peak_rss_bytes, (` + liveRun + `) AS live
 		FROM runs WHERE repository_id = ?
 		ORDER BY live DESC, (generation_id IS NOT NULL AND generation_id = ?) DESC, started_at DESC
 		LIMIT 1`
@@ -186,7 +197,7 @@ func (r *Reader) Run(ctx context.Context, runID string) (RunView, bool, error) {
 	}
 	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
-		events_dropped, process_peak_rss_bytes, (outcome = 'running' AND expires_at > ?) AS live
+		events_dropped, process_peak_rss_bytes, (` + liveRun + `) AS live
 		FROM runs WHERE run_id = ?`
 	now := time.Now()
 	return r.read(ctx, now, r.db.QueryRowContext(ctx, query, formatTime(now), id))
@@ -380,4 +391,35 @@ func optionalBytes(v sql.NullInt64) *uint64 {
 	}
 	n := uint64(v.Int64)
 	return &n
+}
+
+// LiveStage is what a process waiting for the workspace lock needs of this
+// file and nothing more: whether SOME run in it is still live by the liveRun
+// rule above, and the stage that run is inside right now.
+//
+// It is not scoped to a repository, and deliberately so. The lock and this
+// ledger are both per workspace directory, the waiter is asking about the one
+// process holding that directory, and the repository identity is derived far
+// below the point where a waiter must decide whether to keep waiting.
+//
+// The stage is the innermost span the live run still has open, which is the
+// most specific thing that can be said about where the holder is. It is empty
+// for a run that has opened no span yet, which is a live holder that has not
+// reached a stage rather than a holder that is doing nothing.
+//
+// One statement, so the liveness and the stage cannot be read from two
+// different moments of a file another process is writing.
+func (r *Reader) LiveStage(ctx context.Context) (stage string, live bool, err error) {
+	const query = `SELECT COALESCE((SELECT s.stage FROM spans s
+			WHERE s.run_id = runs.run_id AND s.outcome = 'running'
+			ORDER BY s.seq DESC LIMIT 1), '')
+		FROM runs WHERE ` + liveRun + ` ORDER BY started_at DESC LIMIT 1`
+	err = r.db.QueryRowContext(ctx, query, formatTime(time.Now())).Scan(&stage)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, wrap("read the live run", err)
+	}
+	return stage, true, nil
 }

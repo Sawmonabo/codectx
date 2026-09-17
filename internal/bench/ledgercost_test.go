@@ -383,7 +383,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 		return ledgerArmResult{}, err
 	}
 	defer store.Close()
-	lock, err := snapshot.LockWorkspace(ctx, dataDir, "benchmark", 0)
+	lock, err := snapshot.LockWorkspace(ctx, dataDir, "benchmark", snapshot.TryOnce())
 	if err != nil {
 		return ledgerArmResult{}, err
 	}
