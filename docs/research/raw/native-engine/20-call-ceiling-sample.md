@@ -982,7 +982,10 @@ existing call-site join.** Supported, and the qualification is named rather than
   through an un-inferred binding.
 - The residue's own composition closes it: **4.27% of in-repo-targeted sites need class-hierarchy
   analysis through a declared repository type** and 1.02% flow inference, which takes the cumulative to
-  **100%**. So ≥ 95% is honest **for the join plus the index-time inference of this plan**, and is
+  **100%**. And the 94.26% union decomposes as **91.70 pp from the join**, 0.91 pp from the sound
+  `in-file` state and **1.31 pp from the `import` state** that §8.3 measures at 9 of 38 — so the
+  defensible floor for what is resolved today on this class is **92.61%**, which is below the target
+  by more than the inference is worth guessing about. So ≥ 95% is honest **for the join plus the index-time inference of this plan**, and is
   **not** honest for the join alone on a repository whose precise unit skips files or runs without the
   dependency environment. The target is stated on the pair.
 

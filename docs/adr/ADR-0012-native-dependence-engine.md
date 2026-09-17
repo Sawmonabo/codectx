@@ -271,7 +271,7 @@ of this class about a minute later — after the product has reported done.
 | **2 — ECMAScript family, and the shared write algebra** | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate, **and** the same unit that costs the engine 3:38 and a 5.44 GB process-tree peak completes natively with a lower wall *and* a lower tree-summed peak, on the same 250 ms sampler |
 | **3 — Python, Java, C/C++ dependence** | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language, **and** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation — which is what licenses deleting the import path |
 | **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java** | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora — **not** on the reference repository, which contains no C, Go or Rust unit at all; a second corpus supplies 1,101 Go, 362 Java and 54 C call sites and the nine-language fixture supplies all four languages configured, which is where the per-language argv is proved. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
-| **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository and **≥ 85%** on an unconfigured or dynamic-language one, measured by that section's sample method — while the ambiguous syntax-tier population does not rise above its measured 20,046 sites / 179,626 candidate edges |
+| **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise above its measured 20,046 sites / 179,626 candidate edges |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
 
 **The retirement gate — all five at once.**
@@ -285,7 +285,11 @@ of this class about a minute later — after the product has reported done.
    denominator is call sites whose callee is **defined in a tracked file**, measured by the sample
    method of the measurements section, not every call site. On a **configured typed repository** — a
    project configuration present and the precise indexer run — a fresh index resolves **≥ 95%** of
-   in-repo-targeted call sites, the precise join carrying compiler precision wherever it reaches. On a
+   in-repo-targeted call sites **through the call-site join together with the index-time inference of
+   decision 2**, not through the join alone: the join alone measures 91.70% and the three producers'
+   union 94.26%, and what closes the gap is hierarchy and flow inference over the sites the indexer
+   emitted no occurrence for. A gate that read "≥ 95% from the join" would be unmeetable as written,
+   which is the defect the withdrawn floor had. On a
    **typed repository without configuration, or a dynamic-language repository**, it resolves
    **≥ 85%** by the language-general inference of decision 2. The reference repository is the instance
    of the second class these numbers were measured on, never the definition of the target. The
@@ -414,6 +418,14 @@ callee identifier and whether that symbol has a definition occurrence inside a r
 | …resolved by the precise join | 0.00% (one profile ran, 17 files) | **91.70%** [90.16, 93.40] |
 | …**union of the three** | **28.60%** [21.98, 35.48] | **94.26%** [92.75, 95.75] |
 | what closes the rest | field-based resolution **+29.73 pp**, flow inference **+27.41 pp** → **90.07%**; hierarchy +8.66 pp; demand-driven residue 1.27% | hierarchy **+4.27 pp**, flow +1.02 pp → **100%** |
+
+The class-(a) union decomposes as **91.70 pp from the precise join**, 0.91 pp from the syntax tier's
+`in-file` state and **1.31 pp from its `import` state**, whose soundness the next paragraph measures at
+9 of 38 — so the defensible floor for what is resolved *today* on that class is **92.61%**, and the
+≥ 95% target is met by the join **plus** decision 2's inference, never by the join alone. The sites the
+join does not answer for are not exotic: all 90 sampled from indexed files are attribute calls whose
+receiver the indexer could not type, and 25 of the 38 that target repository definitions need
+class-hierarchy analysis through a declared repository type.
 
 On a nine-language fixture with every project configured and every pinned indexer run through the
 product's own argv, the join covers **41 of 45** call sites and **23 of the 23** whose callee the
