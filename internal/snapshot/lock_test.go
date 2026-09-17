@@ -118,11 +118,11 @@ func TestAWaiterWaitsOutAProgressingHolderAndRefusesAStalledOne(t *testing.T) {
 	const hold = 11 * time.Second
 	stages := []string{"capture", "parse", "publish"}
 	start := time.Now()
-	probe := func(context.Context) (string, bool) {
+	probe := func(context.Context, WaitingHolder) (string, bool, error) {
 		// One stage per third of the hold, so the observer below sees the
 		// holder move rather than one stage repeated.
 		at := int(3 * time.Since(start) / hold)
-		return stages[min(at, len(stages)-1)], true
+		return stages[min(at, len(stages)-1)], true, nil
 	}
 	var observed []WaitingHolder
 	go func() {
@@ -178,12 +178,58 @@ func TestAWaiterWaitsOutAProgressingHolderAndRefusesAStalledOne(t *testing.T) {
 	}
 	defer stuck.Close()
 	_, err = LockWorkspace(ctx, stalled, "refresh",
-		WaitWhileProgressing(200*time.Millisecond, func(context.Context) (string, bool) { return "", false }, nil))
+		WaitWhileProgressing(200*time.Millisecond, func(context.Context, WaitingHolder) (string, bool, error) { return "", false, nil }, nil))
 	var typed *model.Error
 	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy || !typed.Retryable {
 		t.Fatalf("a holder that stopped progressing must end the wait with a retryable CTX_WORKSPACE_BUSY, got %v", err)
 	}
 	if typed.Details[DetailHolderOperation] != "index" || typed.Details[DetailHolderPID] != strconv.Itoa(os.Getpid()) {
 		t.Fatalf("the refusal must name the holder's pid and operation, got %v", typed.Details)
+	}
+}
+
+// TestAProbeErrorEndsTheWaitAtOnceWithThatError protects the invariant that a
+// probe which cannot judge the holder at all ends the acquisition immediately
+// with its own diagnosis.
+//
+// The failure mode: the error is swallowed into "no progress", so the waiter
+// spends the whole grace and then reports the generic CTX_WORKSPACE_BUSY --
+// blaming a holder that is working perfectly well, after a wait that could
+// never have succeeded. The grace here is deliberately far longer than the
+// assertion on elapsed time, so a wait that spent it cannot pass.
+func TestAProbeErrorEndsTheWaitAtOnceWithThatError(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	held, err := LockWorkspace(ctx, dir, "index", TryOnce())
+	if err != nil {
+		t.Fatalf("the holder must acquire: %v", err)
+	}
+	defer held.Close()
+
+	diagnosis := &model.Error{Code: model.CodeSchemaMismatch, Message: "the holder is another build"}
+	var observed []WaitingHolder
+	var seen WaitingHolder
+	const grace = 30 * time.Second
+	start := time.Now()
+	_, err = LockWorkspace(ctx, dir, "refresh", WaitWhileProgressing(grace,
+		func(_ context.Context, h WaitingHolder) (string, bool, error) {
+			seen = h
+			return "", false, diagnosis
+		},
+		func(h WaitingHolder) { observed = append(observed, h) }))
+	if !errors.Is(err, diagnosis) {
+		t.Fatalf("the probe's own error must be what the caller gets, got %v", err)
+	}
+	if waited := time.Since(start); waited > grace/10 {
+		t.Fatalf("the wait ended after %s: a probe error must not spend the grace", waited)
+	}
+	// The probe is told who it is judging, so it can name the holder itself.
+	if seen.PID != os.Getpid() || seen.Operation != "index" || !seen.Waiting || seen.Stage != "" {
+		t.Fatalf("the probe must be handed the holder with no stage, got %v", seen)
+	}
+	// The waiting line is closed: the observer's last word is the end of the
+	// wait, or the command's own output lands appended to a progress line.
+	if len(observed) == 0 || observed[len(observed)-1].Waiting {
+		t.Fatalf("the end of the wait must be reported as such, got %v", observed)
 	}
 }
