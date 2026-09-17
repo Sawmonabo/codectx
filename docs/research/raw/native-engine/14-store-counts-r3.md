@@ -256,11 +256,12 @@ it must not be quoted as one.
 
 **C4 — the syntax tier publishes two resolved states and only one of them is a resolution.** Checked by
 hand against the source at the byte range: `in-file` is sound in **52 of 52** sampled rows across both
-corpora — the tier really did find the definition in the same file. `import` reaches no definition at
-all. It matches the callee's **base name** against an import statement, so `import re`, `import
+corpora — the tier really did find the definition in the same file. `import` does not reach a
+definition; it matches the callee's **base name** against an import statement, so `import re`, `import
 org.testng.Assert`, `from httpx import Response`, `import typer` and `React.memo` all publish
-`resolution: import` while **no definition of that name exists in any tracked file**. Sampled, it is
-right **9 times in 16** on this repository and **9 times in 38** on the second corpus. Corrected for
+`resolution: import` while **no definition of that name exists in any tracked file**. It is therefore
+right only when the import happens to name a module the repository itself holds — sampled, **9 times
+in 16** on this repository and **9 times in 38** on the second corpus. Corrected for
 that soundness rate the tier resolves about **12.4%** of this repository's call sites and about
 **21.8%** of the second corpus's.
 

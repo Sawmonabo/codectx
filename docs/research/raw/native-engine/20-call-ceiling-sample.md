@@ -93,7 +93,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 `unresolved`); `engine` is instrument 3; `precise` is instrument 1 (`joined-defined`,
 `joined-external`, `unjoined-in-indexed-file`, `unjoined-file-not-indexed`).
 
-### A. Reference repository — JavaScript, first half
+### Reference repository — JavaScript, rows 1–150 of 300
 
 | id | file:line | call expression | callee | syntax | engine | class | reason |
 |---|---|---|---|---|---|---|---|
@@ -248,7 +248,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-239 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:7920 | `ctx.setLineDash(this.strokeDashArray)` | `setLineDash` | unresolved | stub | c-platform | canvas 2D context setLineDash |
 | C1-240 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:19503 | `_this.setAngle(value)` | `setAngle` | unresolved | stub | a-repo | T-hier: vendored fabric.js object prototype method |
 
-### B. Reference repository — JavaScript, second half
+### Reference repository — JavaScript, rows 151–300 of 300
 
 | id | file:line | call expression | callee | syntax | engine | class | reason |
 |---|---|---|---|---|---|---|---|
@@ -403,7 +403,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-389 | `vendorPortal/public/okta-auth-js.min.js`:8 | `n(9231)` | `n` | ambiguous | absent | a-repo | T-flow: webpack module require in a vendored okta bundle |
 | C1-390 | `vendorPortal/server/lib/publish/surveys.js`:456 | `_.get(v, "invited.o.rescindedUser", [])` | `get` | unresolved | in-repo | b-lib | lodash get; no lodash source tracked in the app tree |
 
-### C. Reference repository — Java, Python, TypeScript
+### Reference repository — Java, Python and TypeScript
 
 | id | file:line | call expression | callee | syntax | engine | class | reason |
 |---|---|---|---|---|---|---|---|
@@ -568,7 +568,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-459 | `Meteor3preUpgradeScripts/meteor-async-migration/utils-component.ts`:557 | `debug( "[handleComponent] _child component at:", theComponent?.value.loc.start )` | `debug` | unresolved | stub | b-lib | npm debug package logger instance |
 | C1-460 | `Meteor3preUpgradeScripts/meteor-async-migration/utils.ts`:363 | `debug( `convert all functions use the async function which has the name is ${name} to a…` | `debug` | unresolved | stub | b-lib | npm debug package logger instance |
 
-### D. Second corpus — Python, TSX/TypeScript, Go/Java/JavaScript/C
+### Second corpus — Python, TSX/TypeScript, Go/Java/JavaScript/C
 
 | id | file:line | call expression | callee | syntax | precise | class | reason |
 |---|---|---|---|---|---|---|---|
@@ -931,8 +931,8 @@ Two properties, both measured, and neither a property of its calls:
    the tree, so no precise profile is planned for it and the precise column above is 0.00% by
    configuration rather than by capability.
 2. **Half-vendored.** Its dependencies are checked in. 128,205 of its call sites are in one bundled
-   front-end template alone, and in the sample **78 of block B's 83 `a-repo` rows and most of block A's
-   66 are bundle-internal calls**. That is why its honest denominator is as high as 49.92% while only
+   front-end template alone, and in the sample **78 of the 83 `a-repo` rows drawn from its second
+   JavaScript half, and most of the 66 from the first, are bundle-internal calls**. That is why its honest denominator is as high as 49.92% while only
    about a twentieth of its calls are its own team's code calling its own team's code.
 
 A reader must not carry 49.92% to a repository that installs its dependencies instead of committing
