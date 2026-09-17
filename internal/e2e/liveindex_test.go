@@ -1263,3 +1263,63 @@ func storeDigest(t *testing.T, db string) map[string]string {
 	}
 	return out
 }
+
+// A workspace an operator has made read-only must still answer. Read-only media
+// and a locked-down data directory are the same thing to this process: it may
+// read every byte and write none.
+//
+// Two separate things refused it before anything had been read. The composition
+// created the engine's temporary directory under the data directory
+// unconditionally, so the open failed with CTX_INTERNAL, exit 10, on a
+// directory a question never needed to write; and the engine refuses to open a
+// write-ahead-log database at all when it cannot create the shared-memory index
+// beside it, which on a directory nobody may write it cannot. Both reached the
+// operator as an internal defect with nothing to act on.
+//
+// Mutations that fail this test: give the engine temp directory back to the
+// data directory unconditionally (`sqlite.SetTempDir(filepath.Join(s.dataDir,
+// engineTempDirName))` in compose) -> CTX_INTERNAL "not a writable directory";
+// or make `immutableAnswer` always report false -> CTX_INTERNAL "attempt to
+// write a readonly database (1544)".
+func TestAnsweringAWorkspaceOnReadOnlyMedia(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability writes into a directory that grants nobody write, " +
+			"so the refusal this test is built on never happens and it would pass vacuously")
+	}
+	s := newSandbox(t)
+	if _, code := s.run(t, "index"); code != 0 {
+		t.Fatalf("the index exited %d", code)
+	}
+	data := filepath.Join(s.Home, "data")
+	// Every file unwritable and every directory unwritable, restored for the
+	// harness's own cleanup.
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(data, func(path string, d os.DirEntry, err error) error {
+			if err == nil {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	if err := filepath.WalkDir(data, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.Chmod(path, 0o500)
+		}
+		return os.Chmod(path, 0o400)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := storeDigest(t, filepath.Join(data, "codectx.db"))
+	env, code := s.run(t, "status")
+	if code != 0 || !env.OK {
+		t.Fatalf("status on a read-only workspace exited %d: %+v", code, env.Error)
+	}
+	if after := storeDigest(t, filepath.Join(data, "codectx.db")); after[""] != before[""] {
+		t.Fatalf("status changed the database of a read-only workspace: %s before, %s after",
+			before[""], after[""])
+	}
+}

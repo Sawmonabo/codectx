@@ -21,6 +21,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -253,7 +254,13 @@ type stack struct {
 	root    workspace.Root
 	cfg     config.Config
 	dataDir string
-	store   *sqlite.Store
+	// engineTemp is the process temp directory this composition fell back to
+	// for the engine's spills because the data directory would not take them,
+	// and which it therefore owns and gives back at Close. Empty whenever the
+	// spills went where they belong, under the data directory, which no
+	// composition owns alone and none removes.
+	engineTemp string
+	store      *sqlite.Store
 	// ledger is this process's run accounting: a stable handle composed by
 	// every building composition, whose COLLECTOR -- the writer on ledger.db
 	// -- attaches under the workspace lock and detaches when that hold ends.
@@ -427,12 +434,21 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		}
 	}()
 
+	// A composition that only answers questions creates nothing here. The two
+	// work directories belong to providers a question never runs, and the data
+	// directory itself is either there -- with the store this question reads --
+	// or absent, which the store reports as the workspace nothing has
+	// published. Creating them would also be the one thing that makes a
+	// workspace on read-only media, or one an operator has locked down,
+	// unanswerable: `MkdirAll` under such a tree fails, and it failed before
+	// anything had tried to read a byte.
 	tsWorkDir := filepath.Join(s.dataDir, workersDirName, "treesitter")
 	scipWorkDir := filepath.Join(s.dataDir, workDirName, "scip")
-	for _, dir := range []string{s.dataDir, tsWorkDir, scipWorkDir} {
-		if err = os.MkdirAll(dir, 0o700); err != nil {
-			return nil, &model.Error{Code: model.CodeInternal,
-				Message: "the private data directory cannot be created: " + err.Error()}
+	if o.mode != modeQuery {
+		for _, dir := range []string{s.dataDir, tsWorkDir, scipWorkDir} {
+			if err = os.MkdirAll(dir, 0o700); err != nil {
+				return nil, dataDirNotWritable(dir, err)
+			}
 		}
 	}
 
@@ -442,7 +458,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// temp directory that may be a memory filesystem. It is named before
 	// ANYTHING in this composition opens an engine handle, the run ledger's
 	// collector included, so no store in this process ever spills elsewhere.
-	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
+	if err := s.setEngineTempDir(o.mode == modeQuery); err != nil {
 		return nil, err
 	}
 
@@ -919,6 +935,49 @@ func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, 
 // exists rather than from openStack, because the alternative -- re-deriving the
 // identity here -- would be a second spelling of it that silently drifts the
 // day the first one changes.
+// setEngineTempDir names where every engine handle in this process spills.
+//
+// Under the data directory, on the disk the operator gave the data. A
+// composition that only ANSWERS may find that directory unwritable -- a
+// workspace on read-only media, one an operator has locked down, one mounted
+// read-only for an audit -- and it has nothing to publish there in any case, so
+// its spills go to the process temp directory instead and it gives that
+// directory back when it closes. Falling back is what keeps such a workspace
+// answerable at all: the engine refuses a temp directory it cannot write, and
+// it refused before this process had read a byte.
+//
+// A composition that BUILDS never falls back. A run whose spills went to a
+// memory filesystem is the failure this directory exists to prevent, and a data
+// directory that will not take them is an operator-fixable configuration, named
+// as one rather than reported as a defect in this build.
+func (s *stack) setEngineTempDir(answersOnly bool) error {
+	under := filepath.Join(s.dataDir, engineTempDirName)
+	err := sqlite.SetTempDir(under)
+	if err == nil || !answersOnly {
+		if err != nil {
+			return dataDirNotWritable(under, err)
+		}
+		return nil
+	}
+	fallback := filepath.Join(os.TempDir(), "codectx-engine-"+strconv.Itoa(os.Getpid()))
+	if ferr := sqlite.SetTempDir(fallback); ferr != nil {
+		return dataDirNotWritable(fallback, ferr)
+	}
+	s.engineTemp = fallback
+	return nil
+}
+
+// dataDirNotWritable is the answer to a directory this process must write and
+// cannot. It is the operator's to fix -- a permission, a mount, a data_dir
+// pointing somewhere it may not write -- so it is typed as the configuration
+// error it is and carries the remedy, rather than reaching the operator as an
+// internal defect with nothing to act on.
+func dataDirNotWritable(dir string, cause error) error {
+	return &model.Error{Code: model.CodeConfigInvalid,
+		Message:     "this process must write under " + dir + " and cannot: " + cause.Error(),
+		Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
+}
+
 func (s *stack) openQueries(repo model.RepositoryID) error {
 	s.repo = repo
 	svc, err := search.New(search.Options{
@@ -1632,6 +1691,15 @@ func (s *stack) Close() error {
 	}
 	s.lockMu.Unlock()
 	errs = append(errs, s.root.Close())
+	// The engine temp directory this composition fell back to is this
+	// process's own, so it goes with the process rather than being left for
+	// the next one to find. Through the reclaimer, like every other removal:
+	// a sort spill is as large as the answer that spilled it, and freeing it
+	// off the pace is what stalls the host.
+	if s.engineTemp != "" {
+		errs = append(errs, paced.RemoveAllFor(paced.ScratchCollection, s.engineTemp))
+		s.engineTemp = ""
+	}
 	return errors.Join(errs...)
 }
 

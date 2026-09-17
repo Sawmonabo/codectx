@@ -320,12 +320,21 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
 		{"query_only", "ON", "1"}})
 
-	if !opts.ReadOnly {
-		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1, false); err != nil {
+	// Whether this read-only open must declare the database unchanging is
+	// settled before any pool is built, so every connection of every pool
+	// carries the same view of the file.
+	immutable := false
+	if opts.ReadOnly {
+		if immutable, err = immutableAnswer(ctx, abs, readerPragmas); err != nil {
 			return nil, err
 		}
 	}
-	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly)
+	if !opts.ReadOnly {
+		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1, false, false); err != nil {
+			return nil, err
+		}
+	}
+	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
@@ -356,14 +365,14 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// starve the short reads (Match) the same query issues
 	// while the stream is open, which on the shared reader pool would be a
 	// deadlock as soon as two queries ran at once.
-	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly)
+	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
 	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
-	s.tokenizer, err = openPool("", nil, "deferred", 1, false)
+	s.tokenizer, err = openPool("", nil, "deferred", 1, false, false)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
@@ -389,15 +398,18 @@ type pragma struct {
 }
 
 // openPool builds one connection pool over path. readOnly opens every
-// connection of it in the engine's own read-only mode, which is what query_only
-// does not do: query_only refuses writes through SQL, and leaves the handle
+// connection of it in the engine's own read-only mode; immutable additionally
+// declares the file unchanging, which is what a store on media this process
+// cannot write needs and nothing else may claim (see immutableAnswer).
+//
+// readOnly is what query_only does not do: query_only refuses writes through SQL, and leaves the handle
 // read-WRITE at the file level, so the last connection to close still runs the
 // engine's write-ahead-log close -- checkpoint the log into the database,
 // unlink the log and the shared-memory index. That is a rewrite of the whole
 // published index by a command that promises to write nothing, and it is
 // performed holding the database exclusively. The open mode is the only thing
 // that stops it.
-func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOnly bool) (*sql.DB, error) {
+func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOnly, immutable bool) (*sql.DB, error) {
 	q := url.Values{}
 	for _, p := range pragmas {
 		q.Add("_pragma", p.name+"("+p.set+")")
@@ -405,6 +417,9 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOn
 	q.Set("_txlock", txlock)
 	if readOnly {
 		q.Set("mode", "ro")
+	}
+	if immutable {
+		q.Set("immutable", "1")
 	}
 	var dsn string
 	if path == "" {
@@ -425,6 +440,44 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOn
 	db.SetConnMaxLifetime(0)
 	return db, nil
 }
+
+// immutableAnswer reports whether a read-only open of this store has to declare
+// the database unchanging, which is the one way a store on media this process
+// cannot write can be read at all.
+//
+// A write-ahead-log database is normally read through the shared-memory index
+// beside it, and a reader CREATES that index where it is missing. On a data
+// directory this process may not write -- read-only media, a workspace an
+// operator has locked down, a mount taken read-only for an audit -- it cannot,
+// and the engine refuses the open outright ("attempt to write a readonly
+// database"). Declaring the file immutable is what lets the engine read the
+// database without an index, and it is a claim about the file, so it is made
+// only where the file cannot change: when the ordinary open is refused AND no
+// log lies beside the database. A log is what a writer appends to, and creating
+// one needs write on the very directory that just refused this process, so a
+// store with no log under a directory nobody may write has nothing that could
+// change under this answer. Where a log IS there, the refusal is returned as
+// it came: reading a database a writer may be appending to as though it were
+// frozen would answer from a torn view of it.
+func immutableAnswer(ctx context.Context, path string, pragmas []pragma) (bool, error) {
+	db, err := openPool(path, pragmas, "deferred", 1, true, false)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	pingErr := db.PingContext(ctx)
+	if pingErr == nil {
+		return false, nil
+	}
+	if _, statErr := os.Stat(path + walSuffix); errors.Is(statErr, fs.ErrNotExist) {
+		return true, nil
+	}
+	return false, pingErr
+}
+
+// walSuffix names the write-ahead log beside a database, which is the engine's
+// own naming and not a choice this package makes.
+const walSuffix = "-wal"
 
 // verifiedConnector wraps the driver connector so every physical connection
 // database/sql opens has its pragmas read back before it joins the pool.

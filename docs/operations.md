@@ -146,7 +146,20 @@ index.
 
 A workspace with no database at all is the answer `CTX_NO_ACTIVE_GENERATION`,
 "run `codectx index`": an answering command does not bring the workspace into
-being in order to report that it is empty.
+being in order to report that it is empty. Nor does it create the provider work
+directories, which belong to a run.
+
+That is what lets such a command answer a workspace on **read-only media**, or
+one an operator has locked down. Two things are then different, and neither is
+visible in the answer: the engine's temporary files -- sort spills, statement
+journals past their memory threshold -- go to the process temp directory
+instead of the data directory, and are given back when the command ends; and
+where no log lies beside the database, the store is read as an unchanging file,
+which is the only way a write-ahead-log database can be read without an index
+beside it. A directory a command that BUILDS cannot write is refused instead,
+as `CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
+operator's to fix, and a run whose spills went elsewhere is what this directory
+exists to prevent.
 
 It answers throughout another process's `index` or `watch` -- that is the
 promise `status --help` makes -- and it delays that run by nothing, because a
