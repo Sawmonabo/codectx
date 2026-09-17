@@ -184,9 +184,11 @@ type openOptions struct {
 	// will write, so a process refused for a busy workspace can say who holds
 	// it. Every mode that takes the lock must carry one.
 	operation string
-	// wait is how long modeIndex waits for the workspace lock. modeReport
-	// takes no lock and ignores it.
-	wait time.Duration
+	// onWaiting, when non-nil, is told about the process modeIndex is waiting
+	// for while it waits, so a command can say who it is behind. It changes
+	// nothing about the wait itself: which of the two policies applies is the
+	// mode's, not the caller's (see locksAtOpen below).
+	onWaiting func(snapshot.WaitingHolder)
 	// rebuild opens a sibling cache instead of the configured one, which is
 	// what `index --rebuild` means in Section 12.2: an explicitly requested new
 	// cache, with the existing database left exactly as it was.
@@ -212,6 +214,14 @@ func (o openOptions) indexing() bool { return o.mode == modeIndex || o.mode == m
 
 // locksAtOpen reports whether this composition takes the workspace lock as part
 // of opening, which is every building composition but the server's.
+//
+// It is also what decides the WAIT POLICY, and that is why the policy is not a
+// caller's option. An indexing command is a person's own foreground command:
+// it waits for as long as whoever holds the workspace keeps getting somewhere,
+// because refusing a command that would have succeeded in a minute is the
+// defect. The server's acquisition is an agent's tool call with somebody
+// waiting on the answer, so it tries once and says the workspace is busy -- a
+// retryable answer now beats a call held open behind the person's own index.
 func (o openOptions) locksAtOpen() bool { return o.mode == modeIndex }
 
 // stack is everything a workspace owns below the coordinator. It exists apart
@@ -247,13 +257,12 @@ type stack struct {
 	// lock is the cross-process workspace lock, and lockMu guards taking it:
 	// an indexing composition has it from its open, the server takes it at its
 	// first build, and in both cases this field is the ONE lock the process
-	// holds and Close is the one release. lockWait is how long the acquisition
-	// waits, operation is what it records in the lock file for whoever is
-	// refused while it is held, and builds records whether this composition
-	// may take it at all -- a report or a query composition never does.
+	// holds and Close is the one release. operation is what it records in the
+	// lock file for whoever is refused while it is held, and builds records
+	// whether this composition may take it at all -- a report or a query
+	// composition never does.
 	lock      *snapshot.WorkspaceLock
 	lockMu    sync.Mutex
-	lockWait  time.Duration
 	operation string
 	builds    bool
 	// holders is how many operations are holding the lock right now. The
@@ -425,7 +434,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, &model.Error{Code: model.CodeInternal,
 			Message: "this workspace takes the indexing lock and was composed without naming its operation"}
 	}
-	s.builds, s.lockWait, s.operation = o.indexing(), o.wait, o.operation
+	s.builds, s.operation = o.indexing(), o.operation
 	// The run ledger's HANDLE is composed here, before anything takes the
 	// lock, and opens nothing: it is the stable thing the language-server
 	// manager and the coordinator are handed, and its collector attaches under
@@ -444,7 +453,17 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		s.spans.subscribe(logSpan(s.logger))
 	}
 	if o.locksAtOpen() {
-		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, s.operation, o.wait); err != nil {
+		// The holder's progress is read from the run ledger beside this cache,
+		// through the lockless read-only reader, and the grace is the ledger's
+		// own LiveWindow -- this product's existing answer to how late a
+		// holder's stamp may legitimately be, reused here rather than a second
+		// number chosen for waiting. internal/snapshot is handed the probe and
+		// never learns where the evidence comes from.
+		probe, closeProbe := ledgerProgress(s.dataDir)
+		s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, s.operation,
+			snapshot.WaitWhileProgressing(ledger.LiveWindow, probe, o.onWaiting))
+		closeProbe()
+		if err != nil {
 			return nil, err
 		}
 		// This acquisition does not go through Hold, so it attaches the
@@ -1075,11 +1094,12 @@ func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error
 			Message: "this workspace was opened for reading and cannot take the workspace indexing lock"}
 	}
 	if s.lock == nil {
-		// wait <= 0 tries exactly once, which is what the serving composition
-		// passes: an agent asking for a refresh while the person's own index
-		// runs is answered now, with the retryable refusal, rather than held
-		// for the length of a lock wait.
-		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.operation, s.lockWait)
+		// Try once. This acquisition is only ever reached by the serving
+		// composition -- an indexing command already holds the lock from its
+		// open, so its holds only count -- and an agent asking for a refresh
+		// while the person's own index runs is answered now, with the
+		// retryable refusal, rather than held behind that index.
+		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.operation, snapshot.TryOnce())
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1134,6 +1154,44 @@ func (s *stack) release() error {
 	}
 	s.lock = nil
 	return err
+}
+
+// ledgerProgress is the HolderProbe a waiting acquisition judges the current
+// holder of the workspace by, and the close that gives up what it opened.
+//
+// The evidence is the run ledger beside the index cache: a holder attaches its
+// collector when it takes the lock and detaches when it releases, so a live run
+// in that file is exactly a holder that is getting somewhere, and the stage is
+// the innermost span it still has open. The reader is read-only and takes no
+// lock of its own, so asking costs the holder nothing.
+//
+// The reader is opened lazily and re-tried on every poll until it opens: a
+// waiter can arrive before the holder has created the file, and one failed
+// open at the start would then say "no progress" for the rest of the wait. A
+// file that never appears simply never reports progress, which is the honest
+// answer -- and the grace above is what keeps that from refusing a holder that
+// is merely between stamps.
+func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
+	var reader *ledger.Reader
+	probe := func(ctx context.Context) (string, bool) {
+		if reader == nil {
+			r, ok, err := ledger.OpenReader(ctx, dataDir)
+			if err != nil || !ok {
+				return "", false
+			}
+			reader = r
+		}
+		stage, live, err := reader.LiveStage(ctx)
+		if err != nil {
+			return "", false
+		}
+		return stage, live
+	}
+	return probe, func() {
+		if reader != nil {
+			reader.Close()
+		}
+	}
 }
 
 // locker is what the coordinator is composed with: this stack when it may

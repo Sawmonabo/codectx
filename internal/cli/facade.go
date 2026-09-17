@@ -12,7 +12,8 @@ import (
 // than chosen inside runService because the difference between the two openers
 // is real and not drift: a read command pins a generation and takes no
 // cross-process lock, while a building command must be the single owner of
-// Section 13.2 and waits a bounded time for the workspace lock. A runner that
+// Section 13.2 and waits for the workspace lock for as long as whoever holds
+// it keeps making progress. A runner that
 // decided this for itself would have to be told which kind of command it was
 // running anyway, and the flag that told it would be the second call path.
 type opener func(ctx context.Context, repo string) (*app.Workspace, error)
@@ -34,10 +35,11 @@ func openForQuery() opener {
 }
 
 // openForBuild opens the workspace as the single cross-process writer, with the
-// operation name, bounded lock wait, rebuild cache and supplied-index inputs
-// the caller's flags resolved to. Only the building commands use it, and each
-// names itself: the name is what the lock file carries for whichever process is
-// refused while this one holds the workspace.
+// operation name, waiting line, rebuild cache and supplied-index inputs the
+// caller's flags resolved to. Only the building commands use it, and each names
+// itself: the name is what the lock file carries for whichever process is
+// refused while this one holds the workspace, and what the process waiting
+// behind it prints while it waits.
 func openForBuild(o app.OpenOptions) opener {
 	return func(ctx context.Context, repo string) (*app.Workspace, error) {
 		return app.OpenWorkspace(ctx, repo, o)

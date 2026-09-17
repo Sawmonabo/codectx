@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -39,6 +40,12 @@ type Workspace struct {
 	status *index.StatusReader
 }
 
+// WaitingHolder is what an open waiting for the workspace lock reports about
+// the process holding it. It is the lock's own type: a second spelling of the
+// same three fields would be one more place for the pid a command prints and
+// the pid the refusal carries to drift apart.
+type WaitingHolder = snapshot.WaitingHolder
+
 // OpenOptions are the caller-supplied inputs of an indexing open. They are one
 // exported struct because the CLI now resolves four independent flags into
 // them -- the lock wait, `--rebuild`, and the `--scip-index`/`--scip-inputs`
@@ -51,11 +58,17 @@ type OpenOptions struct {
 	// The holder records it in the lock file, so an open that will take the
 	// lock and leaves it empty is refused rather than holding anonymously.
 	Operation string
-	// Wait is how long the acquisition of the workspace lock retries before
-	// reporting CTX_WORKSPACE_BUSY; Wait <= 0 tries once. The acquisition is
-	// the open itself for an indexing command and the first build for a
-	// server, so this is what either of those waits.
-	Wait time.Duration
+	// OnWaiting, when set, is told about the process holding the workspace
+	// while this open waits for it: once when the wait begins, again whenever
+	// the holder's stage changes, and once with Waiting false when the wait
+	// ends. It is how a command says what it is behind instead of going
+	// silent, and it changes nothing about how long the open waits.
+	//
+	// There is nothing here to choose how long that is. An indexing open waits
+	// for as long as the holder keeps making progress and a server's build
+	// tries once; both are properties of what the composition IS, so neither
+	// is a field a caller could set wrongly.
+	OnWaiting func(WaitingHolder)
 	// Rebuild opens an explicitly requested new cache beside the configured
 	// one and leaves the existing database untouched (Section 12.2).
 	Rebuild bool
@@ -73,7 +86,7 @@ type OpenOptions struct {
 // (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
 // at unit time, not a missing capability and not a cost this call pays.
 func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeIndex, operation: o.Operation, wait: o.Wait, rebuild: o.Rebuild,
+	return open(ctx, repo, openOptions{mode: modeIndex, operation: o.Operation, onWaiting: o.OnWaiting, rebuild: o.Rebuild,
 		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
@@ -108,7 +121,7 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 // they then answer while this process's own refresh writes, without committing
 // its ingestion group early and without waiting behind it.
 func OpenWorkspaceForServer(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeServe, operation: o.Operation, wait: o.Wait, rebuild: o.Rebuild,
+	return open(ctx, repo, openOptions{mode: modeServe, operation: o.Operation, rebuild: o.Rebuild,
 		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 

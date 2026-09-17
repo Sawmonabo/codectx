@@ -25,17 +25,24 @@ const (
 	// reader's view of a running span can be.
 	flushInterval = 250 * time.Millisecond
 	flushEvents   = 256
-	// liveWindow is how far ahead of itself a run's collector stamps the
-	// liveness deadline it publishes on the run row, and so how long after a
-	// process dies its run still reads as live. It is a multiple of the flush
-	// interval rather than a duration chosen on its own: the collector renews
-	// the stamp on the flush it already performs, and the window has only to
-	// cover the longest a flush can legitimately be late -- a write waiting up
-	// to busyTimeout for the single writer that retention also takes, and a
-	// subscriber running on the collector's own goroutine. A hundred and
-	// twenty intervals is thirty seconds, six times that wait.
-	liveWindow = 120 * flushInterval
 )
+
+// LiveWindow is how far ahead of itself a run's collector stamps the liveness
+// deadline it publishes on the run row, and so how long after a process dies
+// its run still reads as live. It is a multiple of the flush interval rather
+// than a duration chosen on its own: the collector renews the stamp on the
+// flush it already performs, and the window has only to cover the longest a
+// flush can legitimately be late -- a write waiting up to busyTimeout for the
+// single writer that retention also takes, and a subscriber running on the
+// collector's own goroutine. A hundred and twenty intervals is thirty seconds,
+// six times that wait.
+//
+// It is exported because it is also the answer to the question a process
+// waiting for the workspace lock asks: how long a holder may legitimately show
+// no fresh stamp before it is treated as no longer progressing. That waiter
+// reuses this window rather than choosing a second number, because the two
+// questions are the same question.
+const LiveWindow = 120 * flushInterval
 
 // eventKind distinguishes the things a run's goroutine tells the collector.
 type eventKind int
@@ -457,7 +464,7 @@ func (c *collector) publish(e event) {
 func (r *Run) refreshDue(now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.inserted && r.outcome == OutcomeRunning && !now.Before(r.expires.Add(-liveWindow/2))
+	return r.inserted && r.outcome == OutcomeRunning && !now.Before(r.expires.Add(-LiveWindow/2))
 }
 
 // anyRefreshDue reports whether any run's liveness deadline needs renewing, so
