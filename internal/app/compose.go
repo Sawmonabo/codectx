@@ -1222,27 +1222,67 @@ func (s *stack) release() error {
 // file that never appears simply never reports progress, which is the honest
 // answer -- and the grace above is what keeps that from refusing a holder that
 // is merely between stamps.
+//
+// One open failure is not that, and it is the one this probe answers with an
+// error instead: a ledger whose schema fingerprint is not this binary's. The
+// holder is then a DIFFERENT BUILD of this product, its stamps are unreadable
+// here however long anyone waits, and reporting "no progress" would spend the
+// whole grace and then call a perfectly healthy holder stalled. The diagnosis
+// is composed here because this is the layer that knows both the ledger and
+// the holder; internal/snapshot returns it unchanged.
 func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
 	var reader *ledger.Reader
-	probe := func(ctx context.Context) (string, bool) {
+	probe := func(ctx context.Context, holder snapshot.WaitingHolder) (string, bool, error) {
 		if reader == nil {
 			r, ok, err := ledger.OpenReader(ctx, dataDir)
 			if err != nil || !ok {
-				return "", false
+				return "", false, foreignHolder(err, holder)
 			}
 			reader = r
 		}
 		stage, live, err := reader.LiveStage(ctx)
 		if err != nil {
-			return "", false
+			return "", false, nil
 		}
-		return stage, live
+		return stage, live, nil
 	}
 	return probe, func() {
 		if reader != nil {
 			reader.Close()
 		}
 	}
+}
+
+// foreignHolder turns the one open failure that must end a wait into the
+// answer the waiter reports, and every other one into nil -- no progress, which
+// the grace above absorbs.
+//
+// The holder is named the way the busy refusal names it, under the same detail
+// keys, so the process an operator watched themselves wait for and the process
+// this error names are the same words. A holder that recorded nothing is said
+// to have recorded nothing rather than reported as process zero.
+//
+// It is not retryable: the ledger carrying the foreign fingerprint is still
+// there after the holder exits, so the repair is the operator's, not another
+// attempt.
+func foreignHolder(err error, holder snapshot.WaitingHolder) error {
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeSchemaMismatch {
+		return nil
+	}
+	who := "another codectx process, which did not record which process it is,"
+	if holder.PID > 0 {
+		who = "the " + holder.Operation + " running in process " + strconv.Itoa(holder.PID)
+	}
+	out := &model.Error{Code: model.CodeSchemaMismatch,
+		Message: who + " holds the workspace indexing lock and its run ledger was written by another schema: " + typed.Message,
+		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it. " +
+			"Then delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+	if holder.PID > 0 {
+		out.WithDetail(snapshot.DetailHolderPID, strconv.Itoa(holder.PID)).
+			WithDetail(snapshot.DetailHolderOperation, holder.Operation)
+	}
+	return out
 }
 
 // locker is what the coordinator is composed with: this stack when it may
