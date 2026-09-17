@@ -310,8 +310,23 @@ type ResourceReport struct {
 	// observed peak differs on every run, and a capability row's details fold
 	// into the analysis key, where two identical runs must key identically.
 	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
-	UnitsReused   *int64         `json:"units_reused,omitempty"`
-	UnitsParsed   *int64         `json:"units_parsed,omitempty"`
+	// AnalyzerOverrunUnits is how many of those units peaked ABOVE the
+	// reservation they were admitted against. It is the one direction of the
+	// memory accounting that can freeze the host the product is running on --
+	// every reservation in flight is sized so the machine holds them all, and
+	// a unit that exceeds its own takes memory nobody accounted for -- so it
+	// is a count in its own right and not something an operator has to derive
+	// by reading every unit row. The rows name which ones.
+	//
+	// It counts the units this process RECORDED, which the record's own bound
+	// limits, and it counts none of the units whose process tree this platform
+	// cannot sample: an unsampled peak is not a peak below the reservation, so
+	// it is neither an overrun nor evidence against one. It is absent where
+	// this process ran no heavy unit at all, and zero where it ran them and
+	// none overran.
+	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
+	UnitsReused          *int64 `json:"units_reused,omitempty"`
+	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
 	// Run is the latest recorded run for this repository -- the live one if a
 	// run is going, otherwise the one that produced the active generation --
 	// and Stages is one page of its stages. Run is carried beside Stages
@@ -336,6 +351,20 @@ type AnalyzerUnit struct {
 	ExportHeapCapBytes uint64  `json:"export_heap_cap_bytes"`
 	AllocationBytes    *uint64 `json:"allocation_bytes,omitempty"`
 	ObservedPeakBytes  *uint64 `json:"observed_peak_bytes,omitempty"`
+}
+
+// OverranReservation reports that this unit's process tree peaked above the
+// reservation it was admitted against, which is the one direction of the
+// memory accounting that can take memory the machine had promised to another
+// unit. It is the ONE place that comparison is spelled, so the count on the
+// report and the row an operator reads cannot disagree about which units it
+// covers.
+//
+// A unit whose tree this platform never sampled carries no peak and answers
+// false: nothing was measured, which is not a measurement below the
+// reservation and must never be counted as one either way.
+func (u AnalyzerUnit) OverranReservation() bool {
+	return u.ObservedPeakBytes != nil && *u.ObservedPeakBytes > u.ReservationBytes
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -376,6 +405,7 @@ func (r ResourceReport) Validate() error {
 	}{
 		{"resources.live_subprocesses", r.LiveSubprocesses},
 		{"resources.pending_events", r.PendingEvents},
+		{"resources.analyzer_overrun_units", r.AnalyzerOverrunUnits},
 		{"resources.units_reused", r.UnitsReused},
 		{"resources.units_parsed", r.UnitsParsed},
 	} {
