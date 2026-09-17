@@ -67,11 +67,14 @@ type generation struct {
 	// a pass that fails before a generation exists is still a recorded run.
 	ledgerRun *ledger.Run
 	caps      *capabilityReport
-	// failedScopes holds, per plan key, the typed reason a DEFERRED unit of
-	// this publication's batch did not seal. A deferred scope that failed is
-	// neither covered nor still running, and telling the three apart is what
-	// keeps a provider whose other scopes published from being reported as
-	// though none of them had. It is nil on the indexing path.
+	// failedScopes holds, per plan key, the typed reason a DEFERRED unit did
+	// not seal -- every one the background queue this publication drains has
+	// recorded, not only the batch it is publishing. A deferred scope that
+	// failed is neither covered nor still running, and telling the three apart
+	// is what keeps a provider whose other scopes published from being
+	// reported as though none of them had; a failure from an earlier tick that
+	// was not carried here would be re-planned deferred and published as still
+	// running for ever. It is nil on the indexing path.
 	failedScopes map[string]unitFailure
 
 	// failures aggregates the units that failed, per provider. It is the
