@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -24,13 +25,13 @@ func TestBusyRefusalNamesTheHolderAndSurvivesAnUnusableRecord(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	held, err := LockWorkspace(ctx, dir, "watch", 0)
+	held, err := LockWorkspace(ctx, dir, "watch", TryOnce())
 	if err != nil {
 		t.Fatalf("the first acquisition must succeed: %v", err)
 	}
 	defer held.Close()
 
-	_, err = LockWorkspace(ctx, dir, "index", 0)
+	_, err = LockWorkspace(ctx, dir, "index", TryOnce())
 	var typed *model.Error
 	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
 		t.Fatalf("a held workspace must be refused CTX_WORKSPACE_BUSY, got %v", err)
@@ -48,7 +49,7 @@ func TestBusyRefusalNamesTheHolderAndSurvivesAnUnusableRecord(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, lockFileName), []byte("not a record"), 0o600); err != nil {
 		t.Fatalf("overwrite the record: %v", err)
 	}
-	_, err = LockWorkspace(ctx, dir, "index", 0)
+	_, err = LockWorkspace(ctx, dir, "index", TryOnce())
 	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
 		t.Fatalf("an unreadable record must still be the busy refusal, got %v", err)
 	}
@@ -59,7 +60,7 @@ func TestBusyRefusalNamesTheHolderAndSurvivesAnUnusableRecord(t *testing.T) {
 	// An operation name carrying a newline records one line and not two: a
 	// second line would forge a record for the waiter to parse instead.
 	forged := t.TempDir()
-	l, err := LockWorkspace(ctx, forged, "index\n999 refresh", 0)
+	l, err := LockWorkspace(ctx, forged, "index\n999 refresh", TryOnce())
 	if err != nil {
 		t.Fatalf("acquire the forged-name workspace: %v", err)
 	}
@@ -88,4 +89,101 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestAWaiterWaitsOutAProgressingHolderAndRefusesAStalledOne protects the rule
+// that replaced the fixed lock wait, whose silent breakage is the defect that
+// motivated it: a command refused although the workspace was being used
+// correctly, because somebody's index took longer than a number nobody could
+// choose.
+//
+// The failure modes: a bound creeping back in, so a holder that keeps working
+// is abandoned after some duration and the arriving command is refused for no
+// reason; a waiter that never gives up, so a holder whose process died leaves
+// every later command hanging instead of reporting the retryable refusal that
+// names it; and a waiter that goes silent, so the operator cannot tell a wait
+// from a hang.
+func TestAWaiterWaitsOutAProgressingHolderAndRefusesAStalledOne(t *testing.T) {
+	ctx := context.Background()
+
+	// The holder is progressing. It is held for eleven seconds, longer than
+	// any fixed lock wait this product ever had (ten), and the grace below is
+	// a fifth of a second -- so nothing but the probe's answer can be what
+	// keeps the waiter waiting.
+	dir := t.TempDir()
+	held, err := LockWorkspace(ctx, dir, "index", TryOnce())
+	if err != nil {
+		t.Fatalf("the holder must acquire: %v", err)
+	}
+	const hold = 11 * time.Second
+	stages := []string{"capture", "parse", "publish"}
+	start := time.Now()
+	probe := func(context.Context) (string, bool) {
+		// One stage per third of the hold, so the observer below sees the
+		// holder move rather than one stage repeated.
+		at := int(3 * time.Since(start) / hold)
+		return stages[min(at, len(stages)-1)], true
+	}
+	var observed []WaitingHolder
+	go func() {
+		time.Sleep(hold)
+		held.Close()
+	}()
+	lock, err := LockWorkspace(ctx, dir, "refresh",
+		WaitWhileProgressing(200*time.Millisecond, probe, func(h WaitingHolder) { observed = append(observed, h) }))
+	if err != nil {
+		t.Fatalf("a waiter behind a progressing holder must not be refused: %v", err)
+	}
+	defer lock.Close()
+	if waited := time.Since(start); waited < hold {
+		t.Fatalf("the waiter acquired after %s, before the holder let go at %s", waited, hold)
+	}
+
+	// The observer was told who it was waiting for, and told again only when
+	// that changed. The poll ran about a hundred and ten times, so an upper
+	// bound of one report per stage plus the end is the whole claim; which of
+	// the stages a poll happened to sample is timing and is not asserted.
+	if len(observed) > len(stages)+1 {
+		t.Fatalf("the waiter must report the holder on change and not per poll, got %v", observed)
+	}
+	for i := 1; i < len(observed); i++ {
+		if observed[i] == observed[i-1] {
+			t.Fatalf("report %d repeats the one before it: %v", i, observed)
+		}
+	}
+	// Every report but the last names the holder, and its stages arrive in the
+	// order the holder moved through them.
+	next := 0
+	for i, h := range observed[:len(observed)-1] {
+		if !h.Waiting || h.PID != os.Getpid() || h.Operation != "index" {
+			t.Fatalf("report %d must name the holder's pid and operation, got %v", i, h)
+		}
+		for next < len(stages) && stages[next] != h.Stage {
+			next++
+		}
+		if next == len(stages) {
+			t.Fatalf("report %d names %q, which is not the next stage the holder entered: %v", i, h.Stage, observed)
+		}
+	}
+	if last := observed[len(observed)-1]; last.Waiting {
+		t.Fatalf("the end of the wait must be reported as such, got %v", last)
+	}
+
+	// The holder has stopped showing a stamp. Once the grace has passed with
+	// nothing advancing, the waiter reports the typed refusal and names it.
+	stalled := t.TempDir()
+	stuck, err := LockWorkspace(ctx, stalled, "index", TryOnce())
+	if err != nil {
+		t.Fatalf("the stalled holder must acquire: %v", err)
+	}
+	defer stuck.Close()
+	_, err = LockWorkspace(ctx, stalled, "refresh",
+		WaitWhileProgressing(200*time.Millisecond, func(context.Context) (string, bool) { return "", false }, nil))
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy || !typed.Retryable {
+		t.Fatalf("a holder that stopped progressing must end the wait with a retryable CTX_WORKSPACE_BUSY, got %v", err)
+	}
+	if typed.Details[DetailHolderOperation] != "index" || typed.Details[DetailHolderPID] != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("the refusal must name the holder's pid and operation, got %v", typed.Details)
+	}
 }
