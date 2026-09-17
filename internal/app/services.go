@@ -10,6 +10,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workflow"
 )
@@ -48,11 +49,39 @@ import (
 // request is reading.
 type Services struct {
 	w *Workspace
+	// read routes the question-answering half of this facade through the
+	// composition's reader handle. See Workspace.ReadServices.
+	read bool
 }
 
 // Services is the one accessor Tasks 18 and 19 call. It is cheap: the services
 // it routes to were composed when the workspace opened.
 func (w *Workspace) Services() *Services { return &Services{w: w} }
+
+// ReadServices is the same facade with its ExploreService half bound to the
+// composition's READER handle. It exists for the one process that indexes and
+// answers questions at the same time: the MCP server, whose codectx_refresh_index
+// holds an ingestion group open while an agent calls codectx_search beside it.
+// Through Services that search pinned a generation on the writing handle, and a
+// pin writes a retention lease -- so the tool call force-committed the refresh's
+// group and then queued behind the writer. Through ReadServices it reaches no
+// write transaction at all.
+//
+// In every composition but the server's the reader handle IS the writing one,
+// so this returns the same behaviour as Services: nothing else needs to know
+// which process it is in.
+//
+// Only the read half is affected. Index, Refresh and the whole ContextService
+// record rows and stay on the writer, which is what they are for.
+func (w *Workspace) ReadServices() *Services { return &Services{w: w, read: true} }
+
+// searchService is the search half of whichever handle this facade is bound to.
+func (s *Services) searchService() *search.Service {
+	if s.read {
+		return s.w.s.querySearch
+	}
+	return s.w.s.search
+}
 
 // The four interfaces are asserted against *Services here rather than at each
 // consumer, so a signature that drifts fails in this package instead of in the
@@ -168,11 +197,18 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 // caller asked for resources, so answering without them would report a
 // measurement as absent when it was refused. Absence inside the block still
 // means "not measurable on this host", which is the sampler's own contract.
+//
+// It answers through the composition's READER handle on both facades, not only
+// on the read one. The report is a read in every composition, and the MCP
+// status tool is registered against the writing facade beside refresh -- so a
+// split that followed the facade would leave the single most likely question
+// an agent asks during a refresh, "is the index still running?", the one call
+// that pins on the writer and commits that refresh's ingestion group early.
 func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.IndexStatus{}, err
 	}
-	st, err := s.w.coord.Status(ctx)
+	st, err := s.w.status.Status(ctx)
 	if err != nil {
 		return model.IndexStatus{}, s.fail("index status", err)
 	}
@@ -223,7 +259,7 @@ func (s *Services) Search(ctx context.Context, req model.SearchRequest) (model.P
 	if err := req.Validate(); err != nil {
 		return model.Page[model.SearchHit]{}, err
 	}
-	page, err := s.w.s.search.Search(ctx, req)
+	page, err := s.searchService().Search(ctx, req)
 	if err != nil {
 		return model.Page[model.SearchHit]{}, s.fail("search", err)
 	}
@@ -243,7 +279,7 @@ func (s *Services) Symbol(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	switch req.SemanticSource {
 	case model.SemanticCanonical:
-		page, err := s.w.s.search.Resolve(ctx, req)
+		page, err := s.searchService().Resolve(ctx, req)
 		if err != nil {
 			return model.Page[model.Node]{}, s.fail("symbol", err)
 		}
@@ -697,7 +733,7 @@ func (s *Services) workflow() (*workflow.Service, error) {
 // instead, the same way a continuation lease that cannot be released is.
 func (s *Services) withEngine(ctx context.Context, gen model.GenerationID,
 	query func(*graph.Engine) error) error {
-	engine, release, err := s.w.Query(ctx, gen)
+	engine, release, err := s.w.query(ctx, gen, s.read)
 	if err != nil {
 		return err
 	}

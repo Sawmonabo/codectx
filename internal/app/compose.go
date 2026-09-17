@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
+	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -135,6 +137,59 @@ const (
 	// (ledger 159 keeps the same path from installing anything, which the
 	// providers now honour by construction).
 	modeReport
+	// modeQuery composes for a command that only answers questions: it takes
+	// no lock and, beyond what modeReport already withholds, opens the store
+	// with NO writer connection at all. Every write a query process used to
+	// perform -- the schema check inside a write transaction at open, and the
+	// retention lease each pinned generation inserted -- waited on the write
+	// transaction a concurrent run holds, so a second process was refused
+	// `database is busy` for the whole of an index. A reader pool on a
+	// write-ahead log never waits on a writer, so this composition answers
+	// throughout a run and delays none of it.
+	//
+	// It is separate from modeReport because the commands that read a
+	// generation and the commands that record a reading session are both
+	// lock-free: `context ...` mutates session state and keeps the writer,
+	// while `status`, `search`, `symbol`, the graph walks, `repomap` and
+	// `doctor` change nothing at all.
+	modeQuery
+	// modeServe composes for the one process that is BOTH: the MCP server
+	// indexes on request and answers questions for the same client, in the
+	// same process, at the same time. It opens a SECOND, read-only handle on
+	// the same database for the read path. Without it every tool call pinned a
+	// generation through the writer, and pinning writes a retention lease:
+	// that write force-commits whatever ingestion group the session's own
+	// refresh has open and then waits behind the writer, so one agent query
+	// both cut the run's group short and blocked on it. The reader handle has
+	// no writer connection at all, so a tool call cannot reach either.
+	//
+	// What it does NOT do at startup is take the workspace lock or write. An
+	// agent's server must come up and answer beside an index the person
+	// started in a terminal, and a server that took the lock at its open was
+	// refused outright for the whole of that run -- every exploration tool
+	// with it, none of which needs the lock or the writer. So the read-only
+	// handle opens first, the store is opened LazyWriter, and the lock, the
+	// startup recovery and the collection pass are taken at the first
+	// operation that needs them: the refresh tool, or a watch pass.
+	modeServe
+	// modeWatch composes for a command whose whole life is a watch: `codectx
+	// watch`, and `codectx index --watch` once its base generation is built.
+	// It BUILDS, so it is one of the Section 13.2 owners, but like the server
+	// it does not take the workspace at its open.
+	//
+	// The reason is the same one and so is the mechanism. A watch is idle
+	// between its beats, and a session that owned the workspace while it was
+	// idle refused the person's own `codectx index` in the next terminal for
+	// as long as the watch happened to be running -- for nothing, because a
+	// watch between beats is building nothing. So the store opens LazyWriter,
+	// and the lock, the startup recovery and the collection pass are taken by
+	// the beat that builds (Coordinator.reconcile) and given back when that
+	// beat ends, by whichever path. A beat that cannot have the workspace is
+	// skipped and reported once for the episode; the session keeps running and
+	// the next beat starts from whatever the other process published.
+	//
+	// It opens no second read-only handle: a watch answers no questions.
+	modeWatch
 )
 
 // openOptions are the composition's variable inputs. They are one struct
@@ -143,9 +198,15 @@ const (
 // worse than one value that carries the agreement.
 type openOptions struct {
 	mode openMode
-	// wait is how long modeIndex waits for the workspace lock. modeReport
-	// takes no lock and ignores it.
-	wait time.Duration
+	// operation names what this composition is doing for the lock file it
+	// will write, so a process refused for a busy workspace can say who holds
+	// it. Every mode that takes the lock must carry one.
+	operation string
+	// onWaiting, when non-nil, is told about the process modeIndex is waiting
+	// for while it waits, so a command can say who it is behind. It changes
+	// nothing about the wait itself: which of the two policies applies is the
+	// mode's, not the caller's (see locksAtOpen below).
+	onWaiting func(snapshot.WaitingHolder)
 	// rebuild opens a sibling cache instead of the configured one, which is
 	// what `index --rebuild` means in Section 12.2: an explicitly requested new
 	// cache, with the existing database left exactly as it was.
@@ -159,6 +220,31 @@ type openOptions struct {
 	scipImport, scipManifest string
 }
 
+// indexing reports whether this composition may build generations: it holds
+// the cross-process workspace lock while it builds, runs startup recovery
+// under it, watches the worktree and schedules collection. The one-shot
+// indexing commands, a watch and the server are all that composition. What
+// distinguishes them is the reader handle the server opens beside the writer,
+// and WHEN each takes the lock (see locksAtOpen).
+func (o openOptions) indexing() bool {
+	return o.mode == modeIndex || o.mode == modeServe || o.mode == modeWatch
+}
+
+// locksAtOpen reports whether this composition takes the workspace lock as part
+// of opening, which is the ONE-SHOT indexing commands and nothing else: a
+// composition whose whole life is one run owns the workspace for that life,
+// while a session that is idle between the things it builds -- the server, a
+// watch -- takes it per operation through Hold.
+//
+// It decides WHEN the lock is taken and nothing else. How patient that
+// acquisition is belongs to the operation, not to the composition, because one
+// process runs both kinds: a watch session's base build is a person waiting at
+// a terminal and waits out a holder that is getting somewhere, while every beat
+// of that same session takes the workspace or is skipped. index.HoldIntent is
+// what says which, and acquire is what turns it into a policy. A one-shot
+// command's open is simply the patient case reached at the open.
+func (o openOptions) locksAtOpen() bool { return o.mode == modeIndex }
+
 // stack is everything a workspace owns below the coordinator. It exists apart
 // from Workspace so the composition -- configuration, directories, the lock,
 // the store, the toolchain, the runners, the providers and the registry -- is
@@ -168,11 +254,18 @@ type stack struct {
 	cfg     config.Config
 	dataDir string
 	store   *sqlite.Store
-	// ledger is this process's run accounting. Only a run that holds the
-	// cross-process workspace lock opens one: the ledger has a single writer,
-	// so a report -- which takes no lock and may run beside an index -- reads
-	// the file through internal/ledger's read-only reader and never opens a
-	// writer of its own. A nil ledger records nothing and is legal everywhere.
+	// ledger is this process's run accounting: a stable handle composed by
+	// every building composition, whose COLLECTOR -- the writer on ledger.db
+	// -- attaches under the workspace lock and detaches when that hold ends.
+	// The handle is what the language-server manager and the coordinator are
+	// composed with, so nothing has to be rebuilt per hold; a detached handle
+	// records nothing, exactly as a nil one does.
+	//
+	// The writer therefore exists only while this process holds the lock: a
+	// report takes no lock and reads the file through internal/ledger's
+	// read-only reader, and an idle server holds no writer for the person's
+	// own index to contend with. A nil ledger records nothing and is legal
+	// everywhere.
 	ledger *ledger.Ledger
 	// spans is the one hop off the collector's goroutine. Every surface that
 	// renders a finished stage subscribes here, so the process holds exactly
@@ -182,7 +275,28 @@ type stack struct {
 	registry *provider.Registry
 	pool     *provider.Pool
 	git      *git.Git
-	lock     *snapshot.WorkspaceLock
+	// lock is the cross-process workspace lock, and lockMu guards taking it:
+	// an indexing composition has it from its open, the server takes it at its
+	// first build, and in both cases this field is the ONE lock the process
+	// holds and Close is the one release. operation is what it records in the
+	// lock file for whoever is refused while it is held, and builds records
+	// whether this composition may take it at all -- a report or a query
+	// composition never does.
+	lock      *snapshot.WorkspaceLock
+	lockMu    sync.Mutex
+	operation string
+	builds    bool
+	// onWaiting is the caller's waiting line, told about the process holding
+	// the workspace while an acquisition waits for it. It is kept on the stack
+	// because a session's patient acquisition is a later Hold and not the open:
+	// `codectx index --watch` builds its base generation through the
+	// coordinator, so that is where its waiting line has to reach.
+	onWaiting func(snapshot.WaitingHolder)
+	// holders is how many operations are holding the lock right now. The
+	// composition that locks at its open holds one for its whole life; a
+	// session's operations -- a server's refresh, a watch's beat -- take one
+	// each and give it back when they end.
+	holders  int
 	resolver *toolchain.Resolver
 	toolDir  string
 	lsp      *lsp.Manager
@@ -208,6 +322,13 @@ type stack struct {
 	repo     model.RepositoryID
 	search   *search.Service
 	coverage *coverage.Service
+	// queryStore and querySearch are the read path's half of a modeServe
+	// composition: a second store handle on the same database, opened with no
+	// writer connection, and the search service over it. In every other mode
+	// they ALIAS store and search, so every read site names them
+	// unconditionally and only the server's open has two of anything.
+	queryStore  *sqlite.Store
+	querySearch *search.Service
 	// workflow is the Section 17 guard, review and capsule service the facade
 	// routes every session mutation through. INT wires it.
 	workflow *workflow.Service
@@ -315,27 +436,76 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		}
 	}
 
+	// The engine's temporary files -- sort spills, statement journals past
+	// their memory threshold, temporary tables -- live under the data
+	// directory, on the disk the user gave the data, and never in a system
+	// temp directory that may be a memory filesystem. It is named before
+	// ANYTHING in this composition opens an engine handle, the run ledger's
+	// collector included, so no store in this process ever spills elsewhere.
+	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
+		return nil, err
+	}
+
 	// Section 13.2's single cross-process owner governs indexing. A report
 	// publishes nothing, so it takes no lock: the writer lock on this path made
 	// `codectx status` permanently refused while a `watch` session ran, with a
 	// remediation ("wait for the running process to finish") that a watch never
 	// satisfies. internal/index refuses its building entry points when Lock is
-	// nil, so the absence is enforced there rather than trusted here.
-	if o.mode == modeIndex {
-		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, o.wait); err != nil {
+	// nil, so the absence is enforced there rather than trusted here. The
+	// serving composition takes the lock at its first build instead (Hold),
+	// for the same reason in a process that also answers questions.
+	// A composition that may take the lock must be able to name itself in it.
+	// Screened here rather than at the acquisition alone, so the server -- whose
+	// acquisition is a later build -- cannot come up anonymous and discover it
+	// at the first refresh.
+	if o.indexing() && strings.TrimSpace(o.operation) == "" {
+		return nil, &model.Error{Code: model.CodeInternal,
+			Message: "this workspace takes the indexing lock and was composed without naming its operation"}
+	}
+	s.builds, s.operation, s.onWaiting = o.indexing(), o.operation, o.onWaiting
+	// The run ledger's HANDLE is composed here, before anything takes the
+	// lock, and opens nothing: it is the stable thing the language-server
+	// manager and the coordinator are handed, and its collector attaches under
+	// each hold. Composed by every composition that BUILDS, because the
+	// server's refresh records through the same handle its composition
+	// captured.
+	//
+	// One subscription for the process, registered on the handle so the
+	// collector of every later hold feeds it. The structured line is
+	// registered here, where the logger lives; the command line and the MCP
+	// server add theirs through Workspace.Spans.
+	if o.indexing() {
+		s.ledger = ledger.New(s.dataDir)
+		s.spans = newSpanFanout()
+		s.ledger.Subscribe(s.spans.publish)
+		s.spans.subscribe(logSpan(s.logger))
+	}
+	if o.locksAtOpen() {
+		// The holder's progress is read from the run ledger beside this cache,
+		// through the lockless read-only reader, and the grace is the ledger's
+		// own LiveWindow -- this product's existing answer to how late a
+		// holder's stamp may legitimately be, reused here rather than a second
+		// number chosen for waiting. internal/snapshot is handed the probe and
+		// never learns where the evidence comes from.
+		s.lock, err = s.acquire(ctx, index.HoldPatiently)
+		if err != nil {
 			return nil, err
 		}
+		// This acquisition does not go through Hold, so it attaches the
+		// collector itself -- without it `codectx index`, whose whole life is
+		// one hold, would record nothing at all. A failure here returns like
+		// every other step's, and the deferred close above gives the lock back.
+		if err = s.ledger.Attach(ctx); err != nil {
+			return nil, err
+		}
+		// The composition itself is the first holder: this run's whole life is
+		// the run, so nothing an operation does inside it may give the lock
+		// away, and Close is what gives it up.
+		s.holders = 1
 	}
 	// The content store opens before the database: it holds no lock and no
 	// state of its own.
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
-		return nil, err
-	}
-	// The engine's temporary files -- sort spills, statement journals past
-	// their memory threshold, temporary tables -- live under the data
-	// directory, on the disk the user gave the data, and never in a system
-	// temp directory that may be a memory filesystem.
-	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
@@ -351,8 +521,35 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// or merged from carried occurrences.
 		MaxEvidencePerFact: evidenceClip(cfg),
 		Synchronous:        cfg.Storage.Synchronous,
+		ReadOnly:           o.mode == modeQuery,
+		// A BUILDING session that does not lock at its open writes nothing at
+		// its open either, so a server or a watch started while another
+		// process is indexing is not refused `database is busy: begin` at the
+		// schema check. Its first actual write is its first build's, under the
+		// lock that build takes. A report is not one of them: it takes no lock
+		// because it builds nothing, and it still records the reading session
+		// it was opened for.
+		LazyWriter: o.indexing() && !o.locksAtOpen(),
 	}); err != nil {
 		return nil, err
+	}
+	s.queryStore = s.store
+	if o.mode == modeServe {
+		// AFTER the writer, never before: the read-only handle verifies the
+		// schema by reading it, and on a cache that has never been written
+		// there is nothing to read until the writer's open has created it.
+		// A LazyWriter open still creates the schema of an empty cache for
+		// exactly that reason, and writes nothing on any other.
+		if s.queryStore, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
+			BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+			ReadConnections: cfg.Storage.ReadConnections,
+			ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+			MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
+			Synchronous:     cfg.Storage.Synchronous,
+			ReadOnly:        true,
+		}); err != nil {
+			return nil, err
+		}
 	}
 	// Recovery runs under the lock and before anything reads a generation, so
 	// a staging generation an earlier crash abandoned is failed and collected
@@ -362,25 +559,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// index. Skipping it costs a report nothing, because Store.Recover never
 	// touches the active pointer and Coordinator.Status reads only the active
 	// generation.
-	if o.mode == modeIndex {
+	if o.locksAtOpen() {
 		if err = s.store.Recover(ctx, time.Now()); err != nil {
 			return nil, err
 		}
-		// The run ledger lives beside the store, under the same directory and
-		// the same lock. Stack.Close stops it; nothing else may, because Stop
-		// is what flushes the last rows and closes every span the process left
-		// open.
-		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
-			return nil, err
-		}
-		// One subscription for the process. The structured line is registered
-		// here, where the logger lives; the command line and the MCP server
-		// add theirs through Workspace.Spans.
-		s.spans = newSpanFanout()
-		s.ledger.Subscribe(s.spans.publish)
-		s.spans.subscribe(logSpan(s.logger))
 	}
-
 	// The cursor key and the query spools are workspace-private state under the
 	// cache this run actually opened, so a rebuild cache signs with its own key
 	// and a cursor issued against the old cache is refused rather than decoded
@@ -568,7 +751,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// is honoured by the next generation's own traversal, which recomputes it,
 	// but not by the watch set, which keeps this snapshot of it until the
 	// workspace is reopened. Watcher.Coverage's doc names that window.
-	if o.mode == modeIndex {
+	if o.indexing() {
 		policy, perr := snapshot.TraversalPolicy(ctx, cfg.TraversalPolicy(), root, s.git)
 		if perr != nil {
 			return nil, perr
@@ -586,7 +769,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, err
 		}
 	}
-	if err = s.openCollector(ctx, o.mode == modeIndex); err != nil {
+	if err = s.openCollector(ctx, o.locksAtOpen()); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -754,6 +937,29 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		return err
 	}
 	s.search = svc
+	s.querySearch = svc
+	if s.queryStore != s.store {
+		// The same service over the reader handle. A generation pinned through
+		// it takes no retention lease, so a search served this way reaches no
+		// write transaction; it still pages in full, because a continuation
+		// carries its own recorded expiry rather than a lease row.
+		read, err := search.New(search.Options{
+			Store:     s.queryStore,
+			Repo:      repo,
+			Signer:    s.signer,
+			Spools:    s.spools,
+			Leases:    s.leases,
+			Content:   s.cas,
+			Resources: s.cfg.Resources,
+			CursorTTL: s.cfg.Storage.QueryCursorTTL.Std(),
+			Now:       time.Now,
+			Logger:    s.logger,
+		})
+		if err != nil {
+			return err
+		}
+		s.querySearch = read
+	}
 	if err := s.openCoverage(); err != nil {
 		return err
 	}
@@ -842,14 +1048,25 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 	if !recovering {
 		return nil
 	}
-	// The startup pass is the caller pagination.Spools.Sweep, ExpireSessions,
-	// PruneSessions, snapshot.Sweep and Resolver.GC were documented to expect
-	// and never had. Like retention after an activation it never fails the
-	// command that opened the workspace: the state it reclaims is by definition
-	// state nothing references, and the only consequence of a failed pass is
-	// disk the next pass reclaims. It is logged with its typed code so it
-	// cannot be silent.
-	report, err := collector.Collect(context.WithoutCancel(ctx))
+	s.collect(ctx)
+	return nil
+}
+
+// collect runs the one startup collection pass of a composition that has just
+// become the workspace's owner. It is the caller pagination.Spools.Sweep,
+// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC were
+// documented to expect and never had.
+//
+// Like retention after an activation it never fails what triggered it: the
+// state it reclaims is by definition state nothing references, and the only
+// consequence of a failed pass is disk the next pass reclaims. It is logged
+// with its typed code so it cannot be silent.
+//
+// It is its own function because a composition becomes the owner at one of two
+// moments -- at its open, or at the first build of a serving session -- and
+// the pass belongs to that moment rather than to either caller.
+func (s *stack) collect(ctx context.Context) {
+	report, err := s.collector.Collect(context.WithoutCancel(ctx))
 	if err != nil {
 		var typed *model.Error
 		if errors.As(err, &typed) {
@@ -859,7 +1076,7 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 			s.logger.Warn("the startup collection pass did not finish", "component", "app",
 				"diagnostic", err.Error())
 		}
-		return nil
+		return
 	}
 	s.logger.Info("startup collection pass finished", "component", "app",
 		"sessions_expired", report.SessionsExpired, "sessions_pruned", report.SessionsPruned,
@@ -868,7 +1085,215 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
 		"orphan_objects_swept", report.OrphanObjectsSwept,
 		"orphan_sweep", report.OrphanSweepPhrase())
-	return nil
+}
+
+// acquire takes the cross-process workspace lock under the wait policy the
+// operation's intent asks for. It is the ONE place this process turns an
+// intent into a policy, so the open-time acquisition of a one-shot indexing
+// command and the per-operation acquisition of a session cannot drift.
+//
+// A patient acquisition judges the holder by the run ledger beside this cache,
+// through the lockless read-only reader, and its grace is the ledger's own
+// LiveWindow -- this product's existing answer to how long a holder's stamp may
+// legitimately be stale, reused here rather than a second number chosen for
+// waiting. internal/snapshot is handed the probe and never learns where the
+// evidence comes from, and internal/index names only the intent.
+func (s *stack) acquire(ctx context.Context, intent index.HoldIntent) (*snapshot.WorkspaceLock, error) {
+	if intent != index.HoldPatiently {
+		return snapshot.LockWorkspace(ctx, s.dataDir, s.operation, snapshot.TryOnce())
+	}
+	probe, closeProbe := ledgerProgress(s.dataDir)
+	defer closeProbe()
+	return snapshot.LockWorkspace(ctx, s.dataDir, s.operation,
+		snapshot.WaitWhileProgressing(ledger.LiveWindow, probe, s.onWaiting))
+}
+
+// Hold is the stack's index.Locker: it lends the ONE cross-process workspace
+// lock of this process to one operation and hands back the release that gives
+// it up again.
+//
+// Holds are COUNTED, not taken one per caller. The first holder acquires and
+// the last one to give it back closes it, so a capture inside a refresh and a
+// refresh inside a watch share the lock the outermost of them took, and no
+// inner operation can release one an outer one still needs. A composition that
+// locks at its open (a one-shot indexing command, whose whole life is the run)
+// starts with that one reference and gives it up in Close.
+//
+// Everything the workspace owner must do before it builds happens on the way
+// in, under the lock and exactly once per acquisition: the run ledger's
+// collector, which is the one writer on ledger.db and exists for exactly as
+// long as this hold; startup recovery, which fails the staging generations an
+// earlier crash abandoned; and the startup collection pass.
+//
+// The lifetime is the point. The lock is published to the stack only once the
+// acquisition has fully succeeded, so a failure releases what it took and
+// leaves nothing to release twice; the release a caller is handed runs its
+// decrement exactly once however often the caller calls it; and the mutex is
+// held across the whole acquisition, so two tool calls racing to be the first
+// builder produce one lock and one recovery. A second acquisition in this
+// process would not quietly succeed beside the first -- the advisory lock is
+// per open file description, so it is refused CTX_WORKSPACE_BUSY like any
+// other process's -- which is why nesting has to be counted rather than left
+// to each operation to take for itself.
+func (s *stack) Hold(ctx context.Context, intent index.HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	if !s.builds {
+		return nil, nil, &model.Error{Code: model.CodeInternal,
+			Message: "this workspace was opened for reading and cannot take the workspace indexing lock"}
+	}
+	if s.lock == nil {
+		// This acquisition is only ever reached by a composition that does not
+		// lock at its open -- the server and a watch; a one-shot indexing
+		// command already holds the lock from its open, so its holds only
+		// count and never arrive here. The OPERATION says how patient it is:
+		// the base build of a watch session is a person waiting at a terminal
+		// and waits out a holder that is getting somewhere, while a beat and an
+		// agent's refresh take the workspace now or are told it is busy.
+		lock, err := s.acquire(ctx, intent)
+		if err != nil {
+			return nil, nil, err
+		}
+		// The ledger's collector attaches with the acquisition and detaches
+		// with the release, so this process holds a writer on ledger.db for
+		// exactly as long as it holds the workspace. Before the recovery pass
+		// and the collection pass rather than after, so everything this
+		// acquisition does is inside the accounting it opened.
+		if err := s.ledger.Attach(ctx); err != nil {
+			lock.Close()
+			return nil, nil, err
+		}
+		if err := s.store.Recover(ctx, time.Now()); err != nil {
+			// Acquired, then failed: release it here and leave s.lock nil, so
+			// the next build starts from a clean state and nothing of this
+			// attempt is left for Close. The collector goes first, for the
+			// same reason release closes it before the lock.
+			_ = s.ledger.Detach()
+			lock.Close()
+			return nil, nil, err
+		}
+		s.lock = lock
+		s.collect(ctx)
+	}
+	s.holders++
+	var once sync.Once
+	return s.lock, func() error {
+		var err error
+		once.Do(func() { err = s.release() })
+		return err
+	}, nil
+}
+
+// release gives up one hold and closes the lock when the last one is gone. An
+// idle session must own nothing: a server that has finished a refresh is not a
+// reason for the person's own `codectx index` to be refused.
+func (s *stack) release() error {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	s.holders--
+	if s.holders > 0 || s.lock == nil {
+		return nil
+	}
+	// The collector finishes and closes the ledger file BEFORE the lock goes.
+	// Release the lock first and the process waiting on it acquires on its
+	// next poll and attaches its own collector while this one is still
+	// flushing -- two writers on a file whose separate-database design exists
+	// so there is only ever one.
+	err := s.ledger.Detach()
+	if cerr := s.lock.Close(); err == nil {
+		err = cerr
+	}
+	s.lock = nil
+	return err
+}
+
+// ledgerProgress is the HolderProbe a waiting acquisition judges the current
+// holder of the workspace by, and the close that gives up what it opened.
+//
+// The evidence is the run ledger beside the index cache: a holder attaches its
+// collector when it takes the lock and detaches when it releases, so a live run
+// in that file is exactly a holder that is getting somewhere, and the stage is
+// the innermost span it still has open. The reader is read-only and takes no
+// lock of its own, so asking costs the holder nothing.
+//
+// The reader is opened lazily and re-tried on every poll until it opens: a
+// waiter can arrive before the holder has created the file, and one failed
+// open at the start would then say "no progress" for the rest of the wait. A
+// file that never appears simply never reports progress, which is the honest
+// answer -- and the grace above is what keeps that from refusing a holder that
+// is merely between stamps.
+//
+// One open failure is not that, and it is the one this probe answers with an
+// error instead: a ledger whose schema fingerprint is not this binary's. The
+// holder is then a DIFFERENT BUILD of this product, its stamps are unreadable
+// here however long anyone waits, and reporting "no progress" would spend the
+// whole grace and then call a perfectly healthy holder stalled. The diagnosis
+// is composed here because this is the layer that knows both the ledger and
+// the holder; internal/snapshot returns it unchanged.
+func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
+	var reader *ledger.Reader
+	probe := func(ctx context.Context, holder snapshot.WaitingHolder) (string, bool, error) {
+		if reader == nil {
+			r, ok, err := ledger.OpenReader(ctx, dataDir)
+			if err != nil || !ok {
+				return "", false, foreignHolder(err, holder)
+			}
+			reader = r
+		}
+		stage, live, err := reader.LiveStage(ctx)
+		if err != nil {
+			return "", false, nil
+		}
+		return stage, live, nil
+	}
+	return probe, func() {
+		if reader != nil {
+			reader.Close()
+		}
+	}
+}
+
+// foreignHolder turns the one open failure that must end a wait into the
+// answer the waiter reports, and every other one into nil -- no progress, which
+// the grace above absorbs.
+//
+// The holder is named the way the busy refusal names it, under the same detail
+// keys, so the process an operator watched themselves wait for and the process
+// this error names are the same words. A holder that recorded nothing is said
+// to have recorded nothing rather than reported as process zero.
+//
+// It is not retryable: the ledger carrying the foreign fingerprint is still
+// there after the holder exits, so the repair is the operator's, not another
+// attempt.
+func foreignHolder(err error, holder snapshot.WaitingHolder) error {
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeSchemaMismatch {
+		return nil
+	}
+	who := "another codectx process, which did not record which process it is,"
+	if holder.PID > 0 {
+		who = "the " + holder.Operation + " running in process " + strconv.Itoa(holder.PID)
+	}
+	out := &model.Error{Code: model.CodeSchemaMismatch,
+		Message: who + " holds the workspace indexing lock and its run ledger was written by another schema: " + typed.Message,
+		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it. " +
+			"Then delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+	if holder.PID > 0 {
+		out.WithDetail(snapshot.DetailHolderPID, strconv.Itoa(holder.PID)).
+			WithDetail(snapshot.DetailHolderOperation, holder.Operation)
+	}
+	return out
+}
+
+// locker is what the coordinator is composed with: this stack when it may
+// build, and an untyped nil when it may not. A *stack in a non-nil interface
+// would make every building entry point of a report composition try to take
+// the lock instead of refusing.
+func (s *stack) locker() index.Locker {
+	if !s.builds {
+		return nil
+	}
+	return s
 }
 
 // openCoverage builds the Section 16 coverage service. It is called from
@@ -1169,6 +1594,15 @@ func (s *stack) Close() error {
 	if s.search != nil {
 		errs = append(errs, s.search.Close())
 	}
+	// The reader half closes before the writer half it reads beside, and only
+	// when it is a handle of its own: in every other mode these alias the
+	// writing pair and are already closed above and below.
+	if s.querySearch != nil && s.querySearch != s.search {
+		errs = append(errs, s.querySearch.Close())
+	}
+	if s.queryStore != nil && s.queryStore != s.store {
+		errs = append(errs, s.queryStore.Close())
+	}
 	if s.lsp != nil {
 		errs = append(errs, s.lsp.Close())
 	}
@@ -1186,9 +1620,17 @@ func (s *stack) Close() error {
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}
+	// Under the same mutex the acquisition takes. This is the composition's own
+	// reference -- the whole of it for a run that locked at its open -- and the
+	// backstop for an operation that ended without giving its hold back: a lock
+	// left held outlives this process for every other one on the workspace.
+	s.lockMu.Lock()
+	s.holders = 0
 	if s.lock != nil {
 		errs = append(errs, s.lock.Close())
+		s.lock = nil
 	}
+	s.lockMu.Unlock()
 	errs = append(errs, s.root.Close())
 	return errors.Join(errs...)
 }

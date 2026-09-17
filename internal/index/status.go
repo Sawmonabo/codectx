@@ -11,16 +11,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// statusLeaseTTL is how long the status read pins the generation it projects.
-// It is short because nothing is served from the pin: it exists so the
-// generation cannot be collected between the pointer read and the capability
-// read (Section 12.3).
+// statusLeaseTTL is how long the status read asks to pin the generation it
+// projects. It is short because nothing is served from the pin: on a handle
+// that can write it exists so the generation cannot be collected between the
+// pointer read and the capability read (Section 12.3). A read-only handle
+// records no retention lease at all, so there the pin is the read snapshot
+// alone and a generation collected mid-report ends it typed rather than
+// projecting bytes from two instants.
 const statusLeaseTTL = 30 * time.Second
 
 // maxStatusChanges bounds the worktree comparison. Status answers one bit --
@@ -31,21 +37,99 @@ const maxStatusChanges = 1
 // errWorktreeChanged stops the bounded worktree comparison at its first hit.
 var errWorktreeChanged = errors.New("index: worktree changed")
 
+// StatusOptions are what a status report reads. Store is the handle the report
+// is answered from and Repo the identity it is scoped by; Git and Root are the
+// worktree comparison, and States the composition-time capability rows.
+//
+// Repo is supplied rather than derived so the derivation keeps exactly one
+// spelling in the process -- Coordinator.New's -- and a reader built beside a
+// coordinator answers about the same repository by construction.
+type StatusOptions struct {
+	Root   workspace.Root
+	Config config.Config
+	Store  *sqlite.Store
+	Git    *git.Git
+	Repo   model.RepositoryID
+	States []model.CapabilityState
+	Logger *slog.Logger
+}
+
+// StatusReader answers the Sections 13.2/13.3 status report from ONE store
+// handle. It is the one producer of that report: `codectx status` and the
+// server's codectx_index_status both reach this body, so the two can never
+// drift into different answers about one generation.
+//
+// It is separate from Coordinator because a status report is a read and needs
+// none of what a coordinator owns -- no capture, no provider runtime, no delta
+// appliers, no deferred sealer, no work directory. That is what lets the one
+// process that indexes and answers at the same time serve this report from its
+// read-only handle: that handle has no writer connection, so a status call
+// cannot commit the ingestion group the same process's own refresh has open,
+// and cannot queue behind it.
+type StatusReader struct {
+	opts StatusOptions
+	log  *slog.Logger
+	// watch and retention are the in-process state of the coordinator that
+	// built this reader: a running watch's coverage and the last retention
+	// sweep that did not finish. Both are nil for a reader built without one,
+	// and neither performs a store call, so which handle the report is read
+	// from does not change what they project.
+	watch     *watchState
+	retention *retentionState
+}
+
+// NewStatusReader validates the dependencies and builds the reader.
+func NewStatusReader(o StatusOptions) (*StatusReader, error) {
+	switch {
+	case o.Store == nil:
+		return nil, invalid("a status reader needs a store handle")
+	case o.Repo == "":
+		return nil, invalid("a status reader needs the repository identity")
+	case o.Root.HasGit && o.Git == nil:
+		return nil, invalid("the workspace is a Git repository but no git executable is available")
+	}
+	r := &StatusReader{opts: o, log: o.Logger}
+	if r.log == nil {
+		r.log = slog.Default()
+	}
+	return r, nil
+}
+
+// StatusReader is this coordinator's status path over the given store handle,
+// carrying everything the coordinator knows: the repository identity it
+// derived, the composition-time capability rows, and its own watch and
+// retention state.
+//
+// The handle is a parameter because the serving composition answers this
+// report from its read-only handle while the coordinator itself writes through
+// the other one. Passing the coordinator's own store returns the path
+// `codectx status` takes.
+func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
+	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
+		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
+	if err != nil {
+		return nil, err
+	}
+	r.watch, r.retention = &c.watch, &c.retention
+	return r, nil
+}
+
 // Status projects the active generation (Sections 13.2, 13.3). It runs no
 // provider, captures nothing and never publishes: a status call on a busy
-// workspace is a read, which is why it is the one entry point legal without
-// the workspace indexing lock.
+// workspace is a read, which is why it is legal without the workspace indexing
+// lock.
 //
-// The composition-time rows of Options.States are folded into the published
-// completeness and the whole list is brought back inside its bound here, so a
-// capability whose provider could not be constructed is reported even by a
-// generation published before it failed, and the answer still validates.
-func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
-	gen, err := c.opts.Store.ActiveGeneration(ctx, c.repo)
+// The composition-time rows of StatusOptions.States are folded into the
+// published completeness and the whole list is brought back inside its bound
+// here, so a capability whose provider could not be constructed is reported
+// even by a generation published before it failed, and the answer still
+// validates.
+func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
+	gen, err := r.opts.Store.ActiveGeneration(ctx, r.opts.Repo)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	pinned, err := c.opts.Store.PinGeneration(ctx, c.repo, gen, statusLeaseTTL)
+	pinned, err := r.opts.Store.PinGeneration(ctx, r.opts.Repo, gen, statusLeaseTTL)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
@@ -55,13 +139,13 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	snap, err := c.opts.Store.Snapshot(ctx, binding.SnapshotID)
+	snap, err := r.opts.Store.Snapshot(ctx, binding.SnapshotID)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	states = composedStates(states, c.composedStates())
-	states, aggregated := boundStates(states, c.log)
-	coherence, warnings, err := c.coherence(ctx, snap)
+	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
+	states, aggregated := boundStates(states, r.log)
+	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
@@ -76,10 +160,51 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	st := model.IndexStatus{Binding: binding, Health: healthOf(states), Coherence: coherence,
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
 		FileCount: snap.FileCount, SourceBytes: snap.SourceBytes, Warnings: warnings,
-		ProvidersDisabled: c.disabledProviders()}
-	c.watch.project(&st)
-	c.retention.project(&st)
+		ProvidersDisabled: disabledProviders(r.opts.Config)}
+	watchers, err := r.watchers(ctx)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	st.Watchers = watchers
+	if r.watch != nil {
+		r.watch.project(&st)
+	}
+	if r.retention != nil {
+		r.retention.project(&st)
+	}
 	return st, nil
+}
+
+// watchers lists the watching processes whose heartbeat is live, freshest
+// deadline first (Section 13.2).
+//
+// It is read from the store and not from watchState, so it answers in a process
+// that is watching nothing: a `codectx status` in another terminal is exactly
+// the reader this list exists for, and it has no in-process watch to project.
+// A watcher that has completed no pass is listed with no pass time rather than
+// omitted -- a watch waiting for whichever process holds the workspace is
+// running, and dropping it would report the workspace as one no watch has ever
+// run in.
+//
+// A row past its writer's own deadline is left out: its process stopped
+// refreshing, and listing it would report a watch that is no longer running.
+// That the watch stopped is what the doctor's `watch_heartbeat` check reports;
+// this list states who is watching now.
+func (r *StatusReader) watchers(ctx context.Context) ([]model.WatchProcess, error) {
+	rows, err := r.opts.Store.WatchHeartbeats(ctx, r.opts.Repo)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var out []model.WatchProcess
+	for _, hb := range rows {
+		if !hb.Live(now) {
+			continue
+		}
+		out = append(out, model.WatchProcess{SessionID: hb.SessionID, PID: hb.WriterPID,
+			LastBeatAt: hb.BeatAt, LastPassAt: hb.LastPassAt, PendingEvents: hb.PendingEvents})
+	}
+	return out, nil
 }
 
 // coherence answers what the active generation is coherent with (Section
@@ -90,18 +215,18 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 // than compared: the comparison would be a full walk of the repository, and
 // Section 13.3 forbids inferring freshness. The warning says the check was not
 // performed, which is the honest answer.
-func (c *Coordinator) coherence(ctx context.Context, snap model.Snapshot) (model.Coherence, []string, error) {
-	if !c.opts.Root.HasGit || c.opts.Git == nil {
+func (r *StatusReader) coherence(ctx context.Context, snap model.Snapshot) (model.Coherence, []string, error) {
+	if !r.opts.Root.HasGit || r.opts.Git == nil {
 		return model.CoherenceSnapshot, []string{"worktree coherence is not checked for a workspace that is not a Git repository"}, nil
 	}
-	head, err := c.opts.Git.Head(ctx, c.opts.Root.Path)
+	head, err := r.opts.Git.Head(ctx, r.opts.Root.Path)
 	if err != nil {
 		return "", nil, err
 	}
 	if head != snap.HeadObjectID {
 		return model.CoherenceWorktreeChange, nil, nil
 	}
-	err = c.opts.Git.Status(ctx, c.opts.Root.Path, c.opts.Config.Workspace.IncludeUntracked, maxStatusChanges,
+	err = r.opts.Git.Status(ctx, r.opts.Root.Path, r.opts.Config.Workspace.IncludeUntracked, maxStatusChanges,
 		func(git.Change) error { return errWorktreeChanged })
 	if errors.Is(err, errWorktreeChanged) {
 		return model.CoherenceWorktreeChange, nil, nil
@@ -123,19 +248,33 @@ func (c *Coordinator) coherence(ctx context.Context, snap model.Snapshot) (model
 // without one the only coverage is periodic reconciliation, which is never
 // complete notification coverage, and what is reported is exactly that.
 type watchState struct {
-	mu         sync.Mutex
-	active     int
-	source     *watch.Watcher
+	mu     sync.Mutex
+	active int
+	source *watch.Watcher
+	// skipping is true while this watch is inside a held-lock episode: a run
+	// of beats that could not take the workspace because another process has
+	// it. It makes the episode reportable once instead of once per beat, and a
+	// beat that takes the workspace clears it, so the next episode is reported
+	// again.
+	skipping   bool
 	reconciled time.Time
+	// watchSession is the identity of the watch this coordinator is running,
+	// minted by Watch and carried here because the beat is published from both
+	// the heartbeat ticker and the end of a reconciliation pass. It keys this
+	// watch's own heartbeat row, so a second watching process on this
+	// workspace keeps its own row rather than overwriting this one's.
+	watchSession string
 }
 
-// enter records one running watch and the notification source driving it, if
-// any. Concurrent watches over one coordinator are not a supported
-// composition, but the counter makes a second one visible rather than letting
-// the first one's exit report "watch off" while it still runs.
-func (w *watchState) enter(source *watch.Watcher) {
+// enter records one running watch, its session identity and the notification
+// source driving it, if any. Concurrent watches over one coordinator are not a
+// supported composition, but the counter makes a second one visible rather than
+// letting the first one's exit report "watch off" while it still runs.
+func (w *watchState) enter(source *watch.Watcher, session string) {
 	w.mu.Lock()
 	w.active++
+	w.skipping = false
+	w.watchSession = session
 	if source != nil {
 		w.source = source
 	}
@@ -147,7 +286,35 @@ func (w *watchState) leave() {
 	w.active--
 	if w.active == 0 {
 		w.source = nil
+		w.watchSession = ""
 	}
+	w.mu.Unlock()
+}
+
+// session is the identity of the watch running over this coordinator, which is
+// what its heartbeat row is keyed by.
+func (w *watchState) session() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.watchSession
+}
+
+// beginSkipping opens a held-lock episode and reports whether this beat is the
+// one that opened it; every later beat of the same episode reports false.
+func (w *watchState) beginSkipping() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.skipping {
+		return false
+	}
+	w.skipping = true
+	return true
+}
+
+// tookWorkspace ends whatever episode was open.
+func (w *watchState) tookWorkspace() {
+	w.mu.Lock()
+	w.skipping = false
 	w.mu.Unlock()
 }
 
@@ -205,17 +372,30 @@ func (w *watchState) project(st *model.IndexStatus) {
 	}
 }
 
-// heartbeat is what this watch publishes for another process to read: when its
-// last pass completed and how many events are pending, both absent when nothing
-// measured them.
-func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
+// heartbeat is what this watch publishes for another process to read: which
+// watch it is, when its last pass completed and how many events are pending,
+// the latter two absent when nothing measured them.
+//
+// A watch that has completed no pass publishes neither figure. Until it owns
+// the workspace it has reconciled nothing, and the events its notification
+// queue has already collected are a backlog it has not touched, not coverage of
+// them: published, `0 pending` would tell another process's `status` that this
+// workspace is caught up while an index it is waiting behind is still running.
+// The row itself is still published, which is what keeps a watch that is
+// waiting distinguishable from a workspace where no watch has ever run.
+func (w *watchState) heartbeat() (session string, lastPass *time.Time, pending *int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_, _, pending, at := w.observe()
-	if !at.IsZero() {
-		lastPass = &at
+	session = w.watchSession
+	// w.reconciled and not observe's merged time: the watcher marks itself
+	// reconciled on its own rescans and polling ticks, which happen whether or
+	// not this watch ever had the workspace. Only w.reconciled is a pass this
+	// coordinator completed while holding it.
+	if w.reconciled.IsZero() {
+		return session, nil, nil
 	}
-	return lastPass, pending
+	_, _, pending, at := w.observe()
+	return session, &at, pending
 }
 
 // capabilityReport accumulates one generation's capability rows and publishes
@@ -270,7 +450,7 @@ func newCapabilityReport() *capabilityReport {
 // of past it.
 func (c *Coordinator) newCapabilityReport() *capabilityReport {
 	r := newCapabilityReport()
-	for _, st := range c.composedStates() {
+	for _, st := range enabledComposedStates(c.opts.Config, c.opts.States) {
 		r.add(st)
 	}
 	return r

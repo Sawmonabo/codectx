@@ -217,7 +217,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	}
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
-		return empty, err
+		return empty, resumePinFailure(req.Page.Cursor != "", err)
 	}
 	defer reader.Close()
 	binding := reader.Binding()
@@ -288,7 +288,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored],
 	limit int, b model.Binding, hash string, now time.Time, truncated bool, reason string) ([]model.SearchHit, string, bool, string, error) {
 	h := &pageHeap{limit: limit}
-	w := &rawWriter{svc: s, binding: b, hash: hash, now: now}
+	w := &rawWriter{svc: s, binding: b, hash: hash, now: now, retains: reader.Continuable()}
 	total := int64(0)
 	err := run.Each(func(v scored) error {
 		if err := ctx.Err(); err != nil {
@@ -369,6 +369,11 @@ type rawWriter struct {
 	now     time.Time
 	lease   string
 	spool   *pagination.Spool
+	// retains says whether this process can record the cursor-owned lease. A
+	// process that opened the store read-only cannot, and spools anyway: the
+	// spool is a filesystem write, and the entry it creates is bound to the
+	// cursor's own expiry instead of to a lease row.
+	retains bool
 	// dropped records that the shared spool budget refused a record. The walk
 	// continues -- the count of candidates is what the truncation reason names
 	// -- but nothing further is written and the answer carries no continuation.
@@ -381,15 +386,17 @@ func (w *rawWriter) started() bool { return w.spool != nil || w.dropped }
 
 // start opens the spool and writes every candidate the heap holds.
 func (w *rawWriter) start(ctx context.Context, held []scored) error {
-	lease, err := w.svc.leases.Acquire(ctx, w.binding.GenerationID, w.binding.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return err
+	if w.retains {
+		lease, err := w.svc.leases.Acquire(ctx, w.binding.GenerationID, w.binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return err
+		}
+		w.lease = lease.ID
 	}
-	w.lease = lease.ID
-	c := w.svc.newSearchCursor(w.binding, w.hash, lease.ID, w.now)
+	c := w.svc.newSearchCursor(w.binding, w.hash, w.lease, w.now)
 	sp, err := w.svc.spools.Create(c.spoolBinding())
 	if err != nil {
-		w.svc.releaseLease(ctx, lease.ID)
+		w.svc.releaseLease(ctx, w.lease)
 		w.lease = ""
 		if pagination.IsBudgetExhausted(err) {
 			w.dropped = true
@@ -497,26 +504,35 @@ func (s *Service) resumedPage(ctx context.Context, reader *sqlite.PinnedReader, 
 	}
 	served := c.Served + int64(len(chunk))
 	if served >= c.Total {
-		// The answer is complete. The spool and the lease it pinned are
-		// released here rather than left to their TTL, so a walk read to
-		// exhaustion holds nothing.
-		if err := s.spools.Release(c.SpoolID); err != nil {
+		// The answer is complete. The spool is released here rather than left
+		// to its deadline, so a walk read to exhaustion holds nothing, and the
+		// lease it pinned goes with it. A process that records no lease ends
+		// only the spool: the row a writer-bearing page minted is not this
+		// process's to end, and its own TTL and the next sweep reclaim it.
+		relErr := s.spools.Release(c.SpoolID)
+		if reader.Continuable() {
 			s.releaseLease(ctx, c.LeaseID)
-			return nil, "", err
 		}
-		s.releaseLease(ctx, c.LeaseID)
+		if relErr != nil {
+			return nil, "", relErr
+		}
 		return hits, "", nil
-	}
-	// The spool's liveness is its lease's and the token's is its own expiry, so
-	// a cursor that carried page one's expiry forward would bound the WHOLE
-	// answer by one CursorTTL: a long answer would stop being reachable part
-	// way through, which is truncation by clock.
-	if _, err := s.leases.Renew(ctx, c.LeaseID); err != nil {
-		return nil, "", err
 	}
 	next := c
 	next.Offset, next.Served = end, served
-	next.ExpiresAt = now.Add(s.ttl).UTC().Truncate(time.Second)
+	// A leased spool's liveness is its lease's, and renewing it on every page
+	// is what keeps a long answer reachable past one cursor TTL. A LEASELESS
+	// spool -- and a leased one presented to a process that writes nothing --
+	// has no renewal: the token carries forward the expiry the spool's header
+	// was stamped with, so the whole answer is reachable for that one window
+	// and a page asked for after it is the typed CTX_CURSOR_INVALID every
+	// continuation already answers when its state is gone.
+	if c.LeaseID != "" && reader.Continuable() {
+		if _, err := s.leases.Renew(ctx, c.LeaseID); err != nil {
+			return nil, "", err
+		}
+		next.ExpiresAt = now.Add(s.ttl).UTC().Truncate(time.Second)
+	}
 	token, err := s.signSearchCursor(next)
 	if err != nil {
 		return nil, "", err
@@ -602,6 +618,10 @@ func (s *Service) orderSpool(ctx context.Context, c *searchCursor) error {
 // one: leaking the lease would pin a generation against retention for the full
 // cursor TTL for a page nobody can ask for.
 func (s *Service) releaseLease(ctx context.Context, id string) {
+	if id == "" {
+		// A keyset continuation minted by a writerless process holds none.
+		return
+	}
 	if err := s.leases.Release(context.WithoutCancel(ctx), id); err != nil {
 		s.log.Warn("a continuation lease could not be released", "component", "search", "error", err.Error())
 	}
@@ -949,7 +969,7 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
-		return empty, err
+		return empty, resumePinFailure(req.Page.Cursor != "", err)
 	}
 	defer reader.Close()
 	binding := reader.Binding()
@@ -976,7 +996,7 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	meta.Completeness = append(meta.Completeness, result.Completeness...)
 	if result.LastKey != "" {
-		if meta.NextCursor, err = s.keysetNext(ctx, binding, hash, now, result.LastKey); err != nil {
+		if meta.NextCursor, err = s.keysetNext(ctx, reader, binding, hash, now, result.LastKey); err != nil {
 			return empty, err
 		}
 	}
@@ -992,20 +1012,33 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	return page, nil
 }
 
-// keysetNext signs the Resolve continuation. It takes a cursor-owned lease for
-// the same reason the spooled one does: the pinned reader's query lease ends
-// with this request, and a continuation that named it would point at a
-// generation retention is free to collect.
-func (s *Service) keysetNext(ctx context.Context, b model.Binding, hash string, now time.Time, lastKey string) (string, error) {
-	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return "", err
+// keysetNext signs the Resolve continuation. It carries its whole position in
+// the token and writes nothing, so the only thing it needs of the workspace is
+// that the generation it names still be readable when it is presented.
+//
+// A writer-bearing process still takes a cursor-owned lease, which retains that
+// generation for the token's life. A process that opened the store read-only
+// takes none and mints the token anyway: it has nothing on disk to keep alive,
+// and if the generation is collected before the token comes back, the pin finds
+// no row and the caller is told to re-run from the first page. Refusing the
+// continuation instead would make `symbol` page only once for the whole length
+// of another process's index, which is the one thing a writerless answer exists
+// to avoid.
+func (s *Service) keysetNext(ctx context.Context, reader *sqlite.PinnedReader, b model.Binding,
+	hash string, now time.Time, lastKey string) (string, error) {
+	var leaseID string
+	if reader.Continuable() {
+		lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		leaseID = lease.ID
 	}
-	next := newCursor(endpointSymbol, b, lease.ID, hash, now.Add(s.ttl))
+	next := newCursor(endpointSymbol, b, leaseID, hash, now.Add(s.ttl))
 	next.LastKey = lastKey
 	token, err := s.signer.EncodeCursor(next)
 	if err != nil {
-		s.releaseLease(ctx, lease.ID)
+		s.releaseLease(ctx, leaseID)
 		return "", err
 	}
 	return token, nil

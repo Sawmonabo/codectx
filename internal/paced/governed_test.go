@@ -26,6 +26,12 @@ import (
 var inPlaceFrees = map[string]string{
 	"internal/snapshot/cas.go (*Batch).flush": "unlinks the staging name of a blob that has just been " +
 		"published, so the object is reached by its name in the bucket and this unlink frees no blocks at all.",
+	"internal/snapshot/lock.go (*WorkspaceLock).record": "clears the workspace lock file before writing " +
+		"the holder's one-line record into it. The file never holds more than maxHolderRecord bytes, so " +
+		"this returns less than a single block and cannot burst whatever the workspace's history.",
+	"internal/snapshot/lock.go (*WorkspaceLock).Close": "clears that same one-line record as the lock is " +
+		"given up, so a waiter arriving before the next holder is told nobody recorded themselves rather " +
+		"than handed the name of a process that has let go. Same bounded line, same nothing freed.",
 }
 
 // The requirement: every free in the product is governed by the pace. A burst

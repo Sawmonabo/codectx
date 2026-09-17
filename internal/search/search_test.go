@@ -70,12 +70,14 @@ type fixture struct {
 	t       *testing.T
 	ctx     context.Context
 	store   *sqlite.Store
+	dbPath  string
 	repo    model.RepositoryID
 	gen     model.GenerationID
 	binding model.Binding
 	opts    Options
 	nodes   map[string]model.NodeID
 	files   map[string]model.FileID
+	hashes  map[string]string
 }
 
 // newFixture builds and activates the corpus. It runs at every lane's entry so
@@ -84,13 +86,14 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{})
+	dbPath := filepath.Join(dir, "codectx.db")
+	st, err := sqlite.Open(ctx, dbPath, sqlite.Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
 
-	f := &fixture{t: t, ctx: ctx, store: st, repo: model.RepositoryID(model.H("search-fixture", "1")),
+	f := &fixture{t: t, ctx: ctx, store: st, dbPath: dbPath, repo: model.RepositoryID(model.H("search-fixture", "1")),
 		nodes: map[string]model.NodeID{}, files: map[string]model.FileID{}}
 	if err := st.EnsureRepository(ctx, f.repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
@@ -104,6 +107,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("OpenCAS: %v", err)
 	}
 	hashes := make(map[string]string, len(fixtureDocs))
+	f.hashes = hashes
 	files := make([]model.FileVersion, 0, len(fixtureDocs))
 	for _, d := range fixtureDocs {
 		rec, err := cas.Put(ctx, strings.NewReader(d.body))
@@ -156,7 +160,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
 	for _, d := range fixtureDocs {
-		f.publish(run, d, hashes[d.path])
+		f.publish(f.gen, run, d, hashes[d.path])
 	}
 	f.binding, err = st.Activate(ctx, f.gen, 0, model.HealthFresh,
 		[]model.CapabilityState{{ProviderID: fixtureProviderID, Capability: "structure", Scope: "workspace", State: model.CapabilityFresh}},
@@ -181,8 +185,8 @@ func newFixture(t *testing.T) *fixture {
 }
 
 // publish seals one file-scoped unit carrying d's node fact and its lexical
-// documents into the staging generation.
-func (f *fixture) publish(run model.ProviderRunID, d doc, hash string) {
+// documents into the staging generation gen.
+func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc, hash string) {
 	f.t.Helper()
 	fileID := f.files[d.path]
 	nodeID := f.nodes[d.path]
@@ -196,7 +200,7 @@ func (f *fixture) publish(run model.ProviderRunID, d doc, hash string) {
 	spec.ID = model.NewUnitID(spec, fixtureConfigHash)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: fixtureConfigHash, OriginRunID: run,
 		SourceBinding: model.SourceBindingVerified}
-	w, err := f.store.BeginUnit(f.ctx, f.gen, build,
+	w, err := f.store.BeginUnit(f.ctx, gen, build,
 		func(yield func(model.UnitInput) error) error { return yield(input) })
 	if err != nil {
 		f.t.Fatalf("BeginUnit(%s): %v", d.path, err)
@@ -287,6 +291,8 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
+		{"fix/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
+		{"fix/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
 		// FX-H-G rows
@@ -1436,6 +1442,75 @@ func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
 	}
 }
 
+// legWriterlessSearchPagesInFull proves that a search answered by a process
+// that opened the store read-only -- which is how `codectx search` answers
+// while another process is indexing -- pages through its WHOLE answer, across
+// separate calls, and reaches the same hits the unpaged answer holds.
+//
+// Failure mode: such a process serves page one and mints no continuation, so a
+// person searching during an index silently sees a prefix of the ranking with
+// no way to reach the rest. The spool a continuation needs is a filesystem
+// write, which this process can make; only the retention lease is a database
+// write, and the entry is bound to the cursor's own expiry instead.
+//
+// Mutation: drop the spool write -- make rawWriter.start return before
+// spools.Create, leaving w.spool nil -- and the continuation the first page
+// hands back names nothing, so page two fails instead of serving the tail.
+func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("read-only Open: %v", err)
+	}
+	t.Cleanup(func() { ro.Close() })
+	opts := f.opts
+	opts.Store = ro
+	opts.Leases = pagination.NewLeases(ro, pagination.DefaultCursorTTL)
+	s := newService(t, opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	first, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless process failed the query instead of answering it: %v", err)
+	}
+	if len(first.Items) != 1 {
+		t.Fatalf("page 1 served %d hits, want the 1 it asked for", len(first.Items))
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a writerless search stopped after one page of a longer answer")
+	}
+	seen := len(first.Items)
+	// The SECOND call is the point: the token was minted with no lease row, and
+	// the process that presents it back reads the spool by the expiry its
+	// header carries.
+	req.Page.Cursor = first.Meta.NextCursor
+	second, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless continuation failed instead of serving page two: %v", err)
+	}
+	if len(second.Items) != 1 {
+		t.Fatalf("page 2 served %d hits, want 1", len(second.Items))
+	}
+	if second.Items[0].NodeID == first.Items[0].NodeID {
+		t.Fatal("page 2 served page 1's hit again")
+	}
+	seen += len(second.Items)
+	for cursor := second.Meta.NextCursor; cursor != ""; {
+		req.Page.Cursor = cursor
+		page, err := s.Search(f.ctx, req)
+		if err != nil {
+			t.Fatalf("a writerless continuation failed: %v", err)
+		}
+		seen += len(page.Items)
+		cursor = page.Meta.NextCursor
+	}
+	whole, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
+	if err != nil {
+		t.Fatalf("Search(unpaged): %v", err)
+	}
+	if seen != len(whole.Items) {
+		t.Fatalf("paging a writerless search reached %d hits, want the %d the one-shot answer has", seen, len(whole.Items))
+	}
+}
+
 // legContinuationTruncation proves that Service.Search's continuation branch
 // reports the answer-level truncation the FIRST page computed. A continuation
 // reads its hits from the spool and has nothing of its own to recompute
@@ -2128,5 +2203,154 @@ func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
 	if hit.Range.Start.Byte != winner {
 		t.Fatalf("the hit is served at byte %d, want the precedence winner's %d; the winner is the LATER "+
 			"declaration, so serving %d is the first-declaration reading", hit.Range.Start.Byte, winner, loser)
+	}
+}
+
+// TestSearchContinuationOverACollectedGeneration proves the across-call end of a pin
+// that holds its generation by snapshot rather than by lease. Both endpoints
+// here pin the generation the TOKEN names, so a continuation presented after
+// the retention pass behind another process's activation has collected that
+// generation finds no row at all.
+//
+// The answer owed there is the cursor's own family: the caller typed nothing,
+// it presented a token this service minted, and what it must be told is to
+// re-run from the first page. Reported as CTX_ARGUMENT_INVALID -- which is what
+// the store raises, correctly, for an operator who named the generation by hand
+// -- it reads as a command line typed wrong, and a caller paging through an
+// answer while an index publishes has no way to tell that it should simply
+// start again.
+//
+// Mutation: make resumePinFailure return err unchanged. The leg then fails with
+// CTX_ARGUMENT_INVALID.
+// It collects a generation, so it runs on a fixture of its own rather than as a
+// leg of the shared-corpus scenario.
+func TestSearchContinuationOverACollectedGeneration(t *testing.T) {
+	f := newFixture(t)
+	s := newService(t, f.opts)
+	first, err := s.Search(f.ctx, model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}})
+	if err != nil {
+		t.Fatalf("Search(page 1): %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a bounded page over three matching documents minted no continuation")
+	}
+	// The chain is walked to its end, which releases every cursor lease along
+	// it: a continuation is single-use, so the token page 1 handed back is now
+	// one a caller may still present and nothing retains its generation for.
+	// That is the only state in which the generation a live token names can be
+	// collected, and it is an ordinary one -- a caller that retries a page it
+	// has already followed.
+	cursor := first.Meta.NextCursor
+	for cursor != "" {
+		page, err := s.Search(f.ctx, model.SearchRequest{Query: "handle",
+			Page: model.PageRequest{Limit: 1, Cursor: cursor}})
+		if err != nil {
+			t.Fatalf("Search(continuation): %v", err)
+		}
+		cursor = page.Meta.NextCursor
+	}
+	// Another process publishes the next generation, which supersedes the one
+	// the cursor names, and collects it.
+	st := f.opts.Store
+	gen2, err := st.BeginGeneration(f.ctx, f.repo, f.binding.SnapshotID, model.H("semantic-next"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration(2): %v", err)
+	}
+	// The sealed unit of the first generation is reused rather than rebuilt,
+	// which is what an incremental run does: the second generation differs from
+	// the first only in the membership it publishes.
+	if err := st.AttachUnit(f.ctx, gen2, f.unitOf(fixtureDocs[0])); err != nil {
+		t.Fatalf("AttachUnit: %v", err)
+	}
+	if _, err := st.Activate(f.ctx, gen2, f.gen, model.HealthFresh, nil, "norm-v1"); err != nil {
+		t.Fatalf("Activate(2): %v", err)
+	}
+	if err := st.DeleteGeneration(f.ctx, f.gen); err != nil {
+		t.Fatalf("DeleteGeneration: %v", err)
+	}
+	_, err = s.Search(f.ctx, model.SearchRequest{Query: "handle",
+		Page: model.PageRequest{Limit: 1, Cursor: first.Meta.NextCursor}})
+	if err == nil {
+		t.Fatal("a continuation over a collected generation was served")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
+		t.Fatalf("a continuation whose generation was collected failed as %v, want CTX_CURSOR_INVALID", err)
+	}
+	if !strings.Contains(typed.Message, "first page") {
+		t.Errorf("the refusal does not tell the caller what to do: %q", typed.Message)
+	}
+}
+
+// unitOf is the id of the file-scoped unit publish seals for d, recomputed from
+// the same spec rather than remembered, so it cannot drift from what was built.
+func (f *fixture) unitOf(d doc) model.UnitID {
+	f.t.Helper()
+	h := model.NewUnitInputHasher()
+	if err := h.Add(model.UnitInput{FileID: f.files[d.path], ContentHash: f.hashes[d.path]}); err != nil {
+		f.t.Fatalf("UnitInputHasher.Add(%s): %v", d.path, err)
+	}
+	spec := model.UnitSpec{ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
+		ScopeKey: d.path, InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
+	return model.NewUnitID(spec, fixtureConfigHash)
+}
+
+// legWriterlessSymbolPagesInFull proves that `symbol` keeps PAGING from a
+// process that opened the store read-only -- the composition that answers while
+// another process is indexing.
+//
+// Unlike search's, this continuation writes nothing: it carries its whole
+// position in the token and retains no spool, so the only thing it ever needed
+// a lease for was to retain the generation it names. The read snapshot of the
+// call that presents it does that, and a generation collected in between is
+// answered in the cursor's family. Requiring the lease anyway made an answer
+// larger than one page unreachable for the whole length of an index -- a
+// symbol query that silently stops after its first page is the failure this
+// guards.
+//
+// Mutation: drop the reader.Continuable() branch in keysetNext so the lease is
+// always acquired. The leg then fails with the read-only store's refusal.
+func legWriterlessSymbolPagesInFull(t *testing.T, f *fixture) {
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("read-only Open: %v", err)
+	}
+	t.Cleanup(func() { ro.Close() })
+	opts := f.opts
+	opts.Store = ro
+	opts.Leases = pagination.NewLeases(ro, pagination.DefaultCursorTTL)
+	s := newService(t, opts)
+
+	req := model.SymbolRequest{Query: "Handle", Operation: model.SymbolResolve,
+		SemanticSource: model.SemanticCanonical, Page: model.PageRequest{Limit: 1}}
+	first, err := s.Resolve(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless symbol query failed instead of answering: %v", err)
+	}
+	if len(first.Items) != 1 {
+		t.Fatalf("page 1 served %d nodes, want 1", len(first.Items))
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a writerless symbol query stopped after one page of a longer answer")
+	}
+	seen := len(first.Items)
+	cursor := first.Meta.NextCursor
+	for cursor != "" {
+		req.Page.Cursor = cursor
+		page, err := s.Resolve(f.ctx, req)
+		if err != nil {
+			t.Fatalf("a writerless symbol continuation failed: %v", err)
+		}
+		seen += len(page.Items)
+		cursor = page.Meta.NextCursor
+	}
+	whole := model.SymbolRequest{Query: "Handle", Operation: model.SymbolResolve,
+		SemanticSource: model.SemanticCanonical}
+	all, err := s.Resolve(f.ctx, whole)
+	if err != nil {
+		t.Fatalf("Resolve(unpaged): %v", err)
+	}
+	if seen != len(all.Items) {
+		t.Fatalf("paging a writerless symbol query reached %d nodes, want the %d the one-shot answer has", seen, len(all.Items))
 	}
 }

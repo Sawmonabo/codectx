@@ -75,7 +75,7 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			// close, the --timeout deadline and the typing of a bare context
 			// failure, so nothing here repeats them.
 			var result model.Page[model.SearchHit]
-			if err := runService(cmd, openForReport(),
+			if err := runService(cmd, openForQuery(),
 				func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 					var err error
 					result, err = svc.Search(ctx, req)

@@ -13,20 +13,39 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // Workspace is one opened workspace: the composed stack plus the index
 // coordinator over it. Opened for indexing it is the single cross-process owner
-// of Section 13.2 -- the workspace lock is held for its whole lifetime -- so
-// exactly one of `index`, `refresh`, `watch` and the MCP server builds at a
-// time and a second caller is told the workspace is busy rather than becoming a
-// second writer. Opened for a report it holds no lock and can build nothing.
+// of Section 13.2 -- the workspace lock is held from the open in a one-shot
+// command whose whole life is one run (`index`, `refresh`), and for the
+// duration of each operation in a session that is idle between the things it
+// builds (`watch`, `index --watch`, the MCP server) -- so exactly one of them
+// builds at a time and a second caller is told the workspace is busy rather
+// than becoming a second writer. Opened for a report it holds no lock and can
+// build nothing.
 type Workspace struct {
 	s     *stack
 	coord *index.Coordinator
+	// status is the one status path of this process, bound to the
+	// composition's READER handle. In every mode but the server's that handle
+	// IS the writer, so this is the path `codectx status` has always taken; in
+	// the server it is the second, read-only handle, which is what keeps
+	// codectx_index_status -- the one question an agent asks while a refresh
+	// runs -- off the writer. Pinning a generation through the writer records
+	// a retention lease, and that write commits the refresh's ingestion group
+	// early and then queues the tool call behind it.
+	status *index.StatusReader
 }
+
+// WaitingHolder is what an open waiting for the workspace lock reports about
+// the process holding it. It is the lock's own type: a second spelling of the
+// same three fields would be one more place for the pid a command prints and
+// the pid the refusal carries to drift apart.
+type WaitingHolder = snapshot.WaitingHolder
 
 // OpenOptions are the caller-supplied inputs of an indexing open. They are one
 // exported struct because the CLI now resolves four independent flags into
@@ -34,9 +53,25 @@ type Workspace struct {
 // pair -- and four positional parameters that must agree read worse than one
 // value that carries the agreement.
 type OpenOptions struct {
-	// Wait is how long the open waits for the workspace lock before reporting
-	// CTX_WORKSPACE_BUSY; Wait <= 0 tries once.
-	Wait time.Duration
+	// Operation is what this process is doing, in the words a person would
+	// recognise on the refusal another process reads when it finds the
+	// workspace busy -- an index, a refresh, a watch, a connected session.
+	// The holder records it in the lock file, so an open that will take the
+	// lock and leaves it empty is refused rather than holding anonymously.
+	Operation string
+	// OnWaiting, when set, is told about the process holding the workspace
+	// while this open waits for it: once when the wait begins, again whenever
+	// the holder's stage changes, and once with Waiting false when the wait
+	// ends. It is how a command says what it is behind instead of going
+	// silent, and it changes nothing about how long the open waits.
+	//
+	// There is nothing here to choose how long that is. A build the person
+	// asked for waits for as long as the holder keeps making progress; a beat
+	// and an agent's refresh take the workspace or are told it is busy. That
+	// is the OPERATION's property (index.HoldIntent), not a field a caller
+	// could set wrongly -- this one only says where to report the wait, and
+	// goes unread by an open whose operations never wait.
+	OnWaiting func(WaitingHolder)
 	// Rebuild opens an explicitly requested new cache beside the configured
 	// one and leaves the existing database untouched (Section 12.2).
 	Rebuild bool
@@ -54,7 +89,7 @@ type OpenOptions struct {
 // (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
 // at unit time, not a missing capability and not a cost this call pays.
 func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeIndex, wait: o.Wait, rebuild: o.Rebuild,
+	return open(ctx, repo, openOptions{mode: modeIndex, operation: o.Operation, onWaiting: o.OnWaiting, rebuild: o.Rebuild,
 		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
@@ -64,6 +99,53 @@ func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace,
 // another process indexes or watches.
 func OpenWorkspaceForReport(ctx context.Context, repo string) (*Workspace, error) {
 	return open(ctx, repo, openOptions{mode: modeReport})
+}
+
+// OpenWorkspaceForQuery composes the workspace for a command that only answers
+// questions. It writes nothing to the database at all -- no writer connection
+// is opened -- so it answers while another process is indexing or watching
+// instead of waiting out that run's write transaction, and it delays that run
+// by nothing. A command that records anything, a reading session included,
+// uses OpenWorkspaceForReport.
+func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeQuery})
+}
+
+// OpenWorkspaceForWatch composes the workspace for a command whose whole life
+// is a watch -- `codectx watch`, and `codectx index --watch` once its base
+// generation is built.
+//
+// It builds, so it is one of the Section 13.2 owners, but it takes NEITHER the
+// workspace lock nor a single write to open: the beat that builds takes the
+// lock through the coordinator and gives it back when that beat ends, so a
+// watch that is between beats owns nothing and the person's own `codectx
+// index` beside it runs. A beat that finds the workspace busy is skipped and
+// the session keeps running.
+//
+// Nothing waits at this open, but OpenOptions.OnWaiting is still carried: the
+// base generation of `codectx index --watch` is built through the coordinator,
+// and that build is a person waiting at a terminal, so it waits out a holder
+// that is getting somewhere and reports what it is behind while it does.
+func OpenWorkspaceForWatch(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeWatch, operation: o.Operation, onWaiting: o.OnWaiting,
+		rebuild: o.Rebuild, scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
+}
+
+// OpenWorkspaceForServer composes the workspace for the one process that both
+// indexes and answers questions: it opens a second, read-only handle on the
+// same database beside the writer, and it takes NEITHER the workspace lock nor
+// a single write to open. An agent's server must come up and answer beside an
+// index the person started in a terminal, so the lock, the startup recovery
+// and the collection pass are taken by the operation that needs them -- the
+// refresh tool, or a watch pass -- and given back when it ends, and a
+// workspace that is busy then refuses that one operation rather than the
+// session. Workspace.ReadServices is the facade bound to
+// that handle, and it is what the server's read tools must be served through:
+// they then answer while this process's own refresh writes, without committing
+// its ingestion group early and without waiting behind it.
+func OpenWorkspaceForServer(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeServe, operation: o.Operation, rebuild: o.Rebuild,
+		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
 func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
@@ -78,7 +160,7 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		Registry: s.registry,
 		CAS:      s.cas,
 		Git:      s.git,
-		Lock:     s.lock,
+		Lock:     s.locker(),
 		// The collector is composed at the end of openStack precisely so it can
 		// be handed over here: the coordinator's post-activation path is the
 		// only place in this process that holds both the cross-process
@@ -108,7 +190,13 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		s.Close()
 		return nil, err
 	}
-	w := &Workspace{s: s, coord: coord}
+	status, err := coord.StatusReader(s.queryStore)
+	if err != nil {
+		coord.Close()
+		s.Close()
+		return nil, err
+	}
+	w := &Workspace{s: s, coord: coord, status: status}
 	// The compiler is composed last because its graph factory is w.Query, so
 	// it cannot exist before the workspace it queries through.
 	if err := s.openCompiler(w.Query); err != nil {
@@ -190,12 +278,35 @@ func (w *Workspace) Config() config.Config { return w.s.cfg }
 // requires it, so a report promotes nothing and reports the deferred capability
 // rows instead (Section 11.6).
 func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
-	reader, err := w.s.store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
+	return w.query(ctx, gen, false)
+}
+
+// query is Query with the choice of handle made explicit. readOnly selects the
+// composition's reader handle, which in a modeServe process is a second handle
+// on the same database with no writer connection: the pin takes no retention
+// lease and reaches no write transaction, so a tool call cannot commit or wait
+// on the ingestion group this process's own refresh has open.
+//
+// A read-only engine is given NO lease store, which is the engine's own
+// documented "continuations are not offered" ending: every mint site returns an
+// empty token and the answer is reported truncated. Handing it the writer's
+// lease store instead would put the cursor lease -- a write -- back on the very
+// transaction this handle exists to stay off, and handing it a lease store over
+// the reader would fail the page rather than end it.
+func (w *Workspace) query(ctx context.Context, gen model.GenerationID, readOnly bool) (*graph.Engine, func() error, error) {
+	store, leases, mayPromote := w.s.store, w.s.leases, w.s.lock != nil
+	if readOnly && w.s.queryStore != w.s.store {
+		// The reader handle, no lease store, and no promoter: promotion builds
+		// a deferred capability, which is a write. A read tool in a serving
+		// process reports the deferred rows exactly as a report does.
+		store, leases, mayPromote = w.s.queryStore, nil, false
+	}
+	reader, err := store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {
 		return nil, nil, err
 	}
 	var promote graph.Promoter
-	if w.s.lock != nil {
+	if mayPromote {
 		promote = promoter{coord: w.coord}
 	}
 	// The packed per-generation adjacency is the structure every traversal
@@ -212,7 +323,7 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 		Promoter:  promote,
 		Signer:    w.s.signer,
 		Spools:    w.s.spools,
-		Leases:    w.s.leases,
+		Leases:    leases,
 		Gate:      w.s.gate,
 		Limits:    graphLimits(w.s.cfg),
 		Now:       time.Now,

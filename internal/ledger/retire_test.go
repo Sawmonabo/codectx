@@ -14,7 +14,8 @@ import (
 // The failure it protects against is a server that grows for as long as it
 // serves, which no test of one run can see.
 func TestFinishedRunsAreNotRetained(t *testing.T) {
-	l, err := Open(context.Background(), t.TempDir())
+	l := New(t.TempDir())
+	err := l.Attach(context.Background())
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}
@@ -34,9 +35,10 @@ func TestFinishedRunsAreNotRetained(t *testing.T) {
 		}
 	}
 
-	l.runsMu.Lock()
-	held := len(l.runs)
-	l.runsMu.Unlock()
+	c := l.current()
+	c.runsMu.Lock()
+	held := len(c.runs)
+	c.runsMu.Unlock()
 	if held != 0 {
 		t.Errorf("the ledger still holds %d of %d finished runs: a process that keeps serving keeps growing", held, runs)
 	}

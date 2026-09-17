@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -57,6 +58,31 @@ type Options struct {
 	// An empty value selects the default; an unrecognized value fails Open.
 	// See docs/adr/ADR-0004-wal-synchronous-mode.md.
 	Synchronous string
+	// ReadOnly opens the store for a process that answers questions and
+	// changes nothing. No writer connection is opened at all, so this process
+	// can neither wait on the write transaction another process holds nor
+	// delay it: the reader pool is `query_only` and reads a write-ahead log
+	// snapshot, which never blocks on a writer. The schema fingerprint is
+	// verified by reading instead of inside a write transaction, and every
+	// mutating entry point refuses with CTX_INTERNAL, because a command that
+	// mutates must be composed with the writer rather than discover at runtime
+	// that it cannot.
+	ReadOnly bool
+	// LazyWriter opens a writing store that performs no write at all until
+	// something actually writes. The writer pool is built, but database/sql
+	// establishes no connection until a statement runs on it, so the only
+	// write a writing open ever performed -- the schema check inside an
+	// immediate transaction -- is what this removes: the schema is verified by
+	// READING, and created only when the cache holds no tables at all, which
+	// is a cache no run has ever built here and therefore one no run can be
+	// holding a transaction against.
+	//
+	// It exists for the process that both answers and indexes: it must come up
+	// and serve beside an index another process is already running, and a
+	// schema check in a write transaction queues behind that run's ingestion
+	// group and is refused `database is busy: begin` when the busy timeout
+	// runs out. Ignored when ReadOnly is set: that store has no writer.
+	LazyWriter bool
 }
 
 // synchronousPragma pairs the value the DSN applies with the value reading
@@ -95,6 +121,13 @@ func synchronousPragma(mode string) (pragma, error) {
 // than guessed at or failed: this is a diagnostic read, and an unexpected
 // number is itself the answer.
 func (s *Store) SynchronousMode(ctx context.Context) (string, error) {
+	if s.opts.ReadOnly {
+		// There is no connection whose mode is a choice: this process commits
+		// nothing. Reporting the readers' pinned FULL would claim a durability
+		// the operator may not have configured, so the mode is unread here and
+		// the caller says so rather than guessing.
+		return "", internal("this process opened the store read-only and holds no writer connection")
+	}
 	var raw string
 	if err := s.writerQueryRow(ctx, `PRAGMA synchronous`, &raw); err != nil {
 		return "", wrap("read the synchronous mode", err)
@@ -214,6 +247,17 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return nil, internal("database directory: " + err.Error())
 	}
+	// The engine unlinks the write-ahead log from inside its close, and it
+	// holds the database exclusively for the whole of that call: a log freed
+	// in place there is minutes of held lock on a large one, which every other
+	// process on this workspace waits out at open. Freeing it must therefore be
+	// a rename into the to-free set, and that set exists only where the
+	// directory has been registered. Registering it HERE, from the store that
+	// owns the file, is what makes that true of every process that opens a
+	// database -- rather than only of one that happened to stage a lexical unit
+	// first and claim the arena on the way. The claim itself stays lazy:
+	// nothing is created until something is actually freed.
+	scratch.For(filepath.Dir(abs))
 	s := &Store{path: abs, opts: opts, freeBytes: diskfree.Available}
 	busy := strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10)
 	common := []pragma{
@@ -243,21 +287,35 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
 		{"query_only", "ON", "1"}})
 
-	s.writer, err = openPool(abs, writerPragmas, "immediate", 1)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.checkEngine(ctx); err != nil {
-		s.writer.Close()
-		return nil, err
-	}
-	if err := s.initSchema(ctx); err != nil {
-		s.writer.Close()
-		return nil, err
+	if !opts.ReadOnly {
+		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1); err != nil {
+			return nil, err
+		}
 	}
 	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)
 	if err != nil {
-		s.writer.Close()
+		s.closeOpened()
+		return nil, err
+	}
+	if err := s.checkEngine(ctx); err != nil {
+		s.closeOpened()
+		return nil, err
+	}
+	// A writer-bearing process creates the schema when the cache is empty; a
+	// read-only one verifies the fingerprint it finds. The verification is the
+	// same comparison, run on the reader pool, so it neither begins a write
+	// transaction nor waits for one another process holds -- which is what
+	// made every report fail while a run was ingesting.
+	switch {
+	case opts.ReadOnly:
+		err = s.verifySchema(ctx)
+	case opts.LazyWriter:
+		err = s.adoptSchema(ctx)
+	default:
+		err = s.initSchema(ctx)
+	}
+	if err != nil {
+		s.closeOpened()
 		return nil, err
 	}
 	// Posting streams hold one read transaction open for the whole candidate
@@ -267,20 +325,28 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// deadlock as soon as two queries ran at once.
 	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)
 	if err != nil {
-		s.readers.Close()
-		s.writer.Close()
+		s.closeOpened()
 		return nil, err
 	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
 	s.tokenizer, err = openPool("", nil, "deferred", 1)
 	if err != nil {
-		s.postings.Close()
-		s.readers.Close()
-		s.writer.Close()
+		s.closeOpened()
 		return nil, err
 	}
 	return s, nil
+}
+
+// closeOpened closes whichever pools Open has opened so far. Open builds them
+// in order and a read-only store never has a writer, so every failure path
+// releases exactly what exists rather than naming a fixed set.
+func (s *Store) closeOpened() {
+	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
+		if db != nil {
+			db.Close()
+		}
+	}
 }
 
 // pragma is one required per-connection setting: the value the DSN applies and
@@ -368,7 +434,7 @@ func queryScalar(ctx context.Context, q driver.QueryerContext, query string) (st
 // embedded engine older than 3.51.3 or the withdrawn 3.52.0 (Section 12.1).
 // A module name does not prove the WAL-reset fix is present; the version does.
 func (s *Store) checkEngine(ctx context.Context) error {
-	if err := s.writer.QueryRowContext(ctx, `SELECT sqlite_version(), sqlite_source_id()`).Scan(&s.Version, &s.SourceID); err != nil {
+	if err := s.readers.QueryRowContext(ctx, `SELECT sqlite_version(), sqlite_source_id()`).Scan(&s.Version, &s.SourceID); err != nil {
 		return wrap("sqlite_version", err)
 	}
 	var v [3]int
@@ -436,6 +502,9 @@ const defaultWriterCacheKiB = 1 << 20
 // and it ends any open ingestion group first, since the group holds the
 // connection. Any error rolls back; the caller sees the first typed failure.
 func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	if s.opts.ReadOnly {
+		return readOnlyRefusal()
+	}
 	s.writerWanted.Add(1)
 	defer s.writerWanted.Add(-1)
 	s.groupMu.Lock()
@@ -486,6 +555,9 @@ func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) 
 }
 
 func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) error {
+	if s.opts.ReadOnly {
+		return readOnlyRefusal()
+	}
 	s.groupMu.Lock()
 	defer s.groupMu.Unlock()
 	if s.group == nil {
@@ -655,6 +727,14 @@ func exec1(ctx context.Context, tx *sql.Tx, conflict *model.Error, query string,
 }
 
 // Error helpers. Every failure leaving this package is a *model.Error.
+
+// readOnlyRefusal is what every mutating entry point returns on a store opened
+// read-only. It is CTX_INTERNAL rather than an operator-facing family because
+// it can only be reached by composing a mutating command with the read-only
+// composition: the operator has no input that produces it.
+func readOnlyRefusal() *model.Error {
+	return internal("this process opened the store read-only; a command that changes the workspace must be composed with the writer")
+}
 
 func internal(msg string) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: msg}

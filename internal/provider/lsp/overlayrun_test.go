@@ -53,9 +53,9 @@ func TestAServerStartIsRecordedAgainstTheProcessOverlayRun(t *testing.T) {
 
 	// The one ledger the composition root opens beside the store. The manager
 	// is handed it and never opens one of its own.
-	led, err := ledger.Open(ctx, h.Policy.DataDir)
-	if err != nil {
-		t.Fatalf("ledger.Open: %v", err)
+	led := ledger.New(h.Policy.DataDir)
+	if err := led.Attach(ctx); err != nil {
+		t.Fatalf("attach the ledger: %v", err)
 	}
 	recorded := make(chan ledger.SpanRow, 8)
 	led.Subscribe(func(row ledger.SpanRow) {

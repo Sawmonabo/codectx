@@ -50,12 +50,6 @@ const (
 // gains anything by making.
 const statusFollowInterval = time.Second
 
-// indexLockWait is the bounded wait a building command makes for the
-// cross-process workspace lock. Section 13.2 offers a second caller exactly
-// two answers -- `busy` or a bounded wait -- and this is the wait; nothing
-// here ever becomes a second writer.
-const indexLockWait = 10 * time.Second
-
 // statusReport is the data payload of `status`: the coordinator's own index
 // status, and the managed-toolchain rows the same report renders, which is
 // what Task 22 Step 3 owes `status` beside `doctor`. They travel in one
@@ -117,8 +111,22 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait, Rebuild: req.Rebuild,
-				SCIPImport: scipIndex, SCIPManifest: scipInputs}),
+			// --watch changes what this command IS, so it changes how it is
+			// composed: a one-shot index owns the workspace for its whole run
+			// and takes it at its open, while a watching session owns it for
+			// the beat that builds -- its base generation below included, which
+			// takes the very same counted hold through svc.Index. Both wait
+			// there for a holder that is getting somewhere, because both are a
+			// person waiting on the index they just asked for, so both carry
+			// the same waiting line.
+			opts := app.OpenOptions{Operation: "index", OnWaiting: waitingForHolder(cmd, args),
+				Rebuild: req.Rebuild, SCIPImport: scipIndex, SCIPManifest: scipInputs}
+			open := openForBuild(opts)
+			if req.Watch {
+				opts.Operation = "index --watch"
+				open = openForWatch(opts)
+			}
+			return runService(cmd, open,
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					if req.Rebuild {
 						// Section 12.2: the new cache is explicit and the old
@@ -188,7 +196,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			// there is no request field to carry them into and a hint that
 			// changed the answer would be the thing the help text promises it
 			// is not.
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+			return runService(cmd, openForBuild(app.OpenOptions{Operation: "refresh", OnWaiting: waitingForHolder(cmd, args)}),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					result, err := svc.Refresh(ctx, model.IndexRequest{})
 					if err != nil {
@@ -249,7 +257,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			return runService(cmd, openForReport(),
+			return runService(cmd, openForQuery(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					snapshot := func() error { return writeStatus(ctx, cmd, build, args, ws, svc, req) }
 					if !follow {
@@ -345,24 +353,34 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			"than a partial list of paths, and a host that cannot notify falls back " +
 			"to the periodic pass alone. Which of the two is covering the workspace " +
 			"is reported by a status call made inside this process; a separate " +
-			"`codectx status` process cannot see this session's coverage and always " +
-			"reports the watch as off, though `status --resources` and `doctor` do " +
-			"report this watch from its persisted heartbeat. Work an optional " +
+			"`codectx status` process cannot see this session's coverage and " +
+			"reports its own watch as off, but it does list this watch among the " +
+			"watching processes, from the heartbeat this one publishes and " +
+			"refreshes, as `status --resources` and `doctor` also report it. " +
+			"Work an optional " +
 			"provider deferred keeps " +
-			"publishing for the whole session, and the workspace lock is held " +
-			"throughout: one writer, never two.",
+			"publishing for the whole session. The workspace is held for the " +
+			"beat that builds and given back when that beat ends, so a `codectx " +
+			"index` or `refresh` beside an idle watch runs; a beat that finds " +
+			"another process building is skipped and the next one starts from " +
+			"whatever that process published.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// `watch` is a building command, so it opens through the same
-			// runner and the same building opener `index` and `refresh` use:
-			// one open dance, one Close, and a cancellation typed once. It
-			// declares no --timeout, so no deadline is installed over a session
-			// that is meant to run until it is stopped, and the *Services it is
-			// handed goes unread because streaming is deliberately not a facade
-			// operation (digest 17 Section 4) -- Coordinator is.
-			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+			// runner `index` and `refresh` use: one open dance, one Close, and
+			// a cancellation typed once. It opens through the WATCHING opener,
+			// which takes the workspace for the beat that builds instead of for
+			// the session. It passes no waiting line because it runs no build a
+			// person is waiting on -- every one of its holds is a beat, which
+			// is skipped rather than queued. It declares no --timeout, so no
+			// deadline is installed over
+			// a session that is meant to run until it is stopped, and the
+			// *Services it is handed goes unread because streaming is
+			// deliberately not a facade operation (digest 17 Section 4) --
+			// Coordinator is.
+			return runService(cmd, openForWatch(app.OpenOptions{Operation: "watch"}),
 				func(ctx context.Context, ws *app.Workspace, _ *app.Services) error {
 					return runWatch(ctx, cmd, build, args, ws)
 				})
@@ -618,6 +636,78 @@ func progressiveStages(cmd *cobra.Command, args []string, ws stageSource) (stop 
 	}
 }
 
+// waitingForHolder is the progressive line a building command prints while it
+// waits for another process to give up the workspace: who holds it, what that
+// process is doing, and the stage it is in right now.
+//
+// It is ONE line that is rewritten as the holder's stage changes, not a line
+// per poll: a command waiting out a twenty-minute index would otherwise scroll
+// thousands of identical lines past everything the operator wanted to read.
+// The line is closed with a newline when the wait ends, so the command's own
+// first line of output never lands appended to it.
+//
+// A --json consumer gets one plain line per change on stderr instead, in the
+// idiom the machine progressive lines already use: a carriage return rewriting
+// a line is a terminal affordance, and a program reading the stream wants each
+// change as a record it can read once.
+//
+// The observer runs inside the workspace open, before any other output of this
+// command exists, so nothing else is writing to this writer while it does.
+func waitingForHolder(cmd *cobra.Command, args []string) func(app.WaitingHolder) {
+	machine := jsonRequested(cmd, args)
+	// Same channel choice, for the same reason, as the stage lines below: a
+	// --json consumer's stdout carries the one envelope and nothing else.
+	w := cmd.OutOrStdout()
+	if machine {
+		w = cmd.ErrOrStderr()
+	}
+	// width is the widest line printed so far, and zero means nothing has been
+	// printed -- so the end of a wait that never had to print closes nothing.
+	// It is only ever set on the human path: a machine line ends itself, and a
+	// closing newline after one would write a blank line into the stream.
+	width := 0
+	return func(h app.WaitingHolder) {
+		if !h.Waiting {
+			if width > 0 {
+				writeText(w, "\n") //nolint:errcheck // a progress line lost to a closed pipe must not fail the command; the operation below reports its own failures.
+				width = 0
+			}
+			return
+		}
+		if machine {
+			writeText(w, "waiting holder_pid=%d holder_operation=%s stage=%s\n", h.PID, h.Operation, h.Stage) //nolint:errcheck // as above.
+			return
+		}
+		line := "waiting     " + waitingHolderPhrase(h)
+		// Padded to the widest line printed so far: a shorter stage name would
+		// otherwise leave the tail of the previous one on the terminal.
+		pad := ""
+		if width > len(line) {
+			pad = strings.Repeat(" ", width-len(line))
+		} else {
+			width = len(line)
+		}
+		writeText(w, "\r%s%s", line, pad) //nolint:errcheck // as above.
+	}
+}
+
+// waitingHolderPhrase names the holder the way the busy refusal does, so the
+// process an operator watched themselves wait for and the process a refusal
+// names are the same words. A holder that recorded nothing is said to have
+// recorded nothing rather than reported as process zero, and a holder that has
+// named no stage yet has no stage clause at all -- an empty one would read as a
+// stage called nothing.
+func waitingHolderPhrase(h app.WaitingHolder) string {
+	if h.PID <= 0 || h.Operation == "" {
+		return "for the process holding the workspace, which did not record which process it is"
+	}
+	phrase := fmt.Sprintf("for the %s in process %d", h.Operation, h.PID)
+	if h.Stage != "" {
+		phrase += ", stage " + h.Stage
+	}
+	return phrase
+}
+
 // stageSource is what a progressive line needs of the workspace: the finished
 // stages of every run this process records, and which of those runs is the one
 // this command opened. It is an interface so the filter above can be exercised
@@ -748,6 +838,7 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	if s.LastReconciledAt != nil {
 		fmt.Fprintf(&b, "reconciled  %s\n", s.LastReconciledAt.Format(time.RFC3339))
 	}
+	writeWatchers(&b, s.Watchers)
 	writeProvidersDisabled(&b, s.ProvidersDisabled)
 	writeCapabilities(&b, s.Completeness)
 	for _, warning := range s.Warnings {
@@ -760,6 +851,39 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	}
 	b.WriteString("\n")
 	return writeText(w, "%s", b.String())
+}
+
+// writeWatchers lists the watching processes whose heartbeats are live, which
+// is what the line above cannot say: `watch` is this process's own watch, and a
+// `codectx status` run in another terminal is watching nothing however many
+// watches the workspace has.
+//
+// The list is printed even when it is empty, for the reason the resource block
+// prints every row: a section that vanished with its contents would leave an
+// operator unable to tell "nothing is watching this workspace" from "this
+// output does not report watches". Each watcher is named by its own session and
+// process, and a watcher that has completed no pass is shown as covering
+// nothing rather than with a figure it never published -- it is running and
+// waiting for whichever process holds the workspace, which is neither coverage
+// nor an absent watch.
+func writeWatchers(b *strings.Builder, watchers []model.WatchProcess) {
+	if len(watchers) == 0 {
+		b.WriteString("watchers    none\n")
+		return
+	}
+	fmt.Fprintf(b, "watchers    %d live\n", len(watchers))
+	for _, w := range watchers {
+		fmt.Fprintf(b, "  pid %d  session %s  beat %s  ", w.PID, w.SessionID, w.LastBeatAt.Format(time.RFC3339))
+		if w.LastPassAt == nil {
+			b.WriteString("no pass completed, covering nothing yet\n")
+			continue
+		}
+		fmt.Fprintf(b, "last pass %s", w.LastPassAt.Format(time.RFC3339))
+		if w.PendingEvents != nil {
+			fmt.Fprintf(b, ", %d pending %s", *w.PendingEvents, plural(int(*w.PendingEvents), "event", "events"))
+		}
+		b.WriteString("\n")
+	}
 }
 
 // metricUnavailable is how an unmeasured metric renders. Section 22 requires an

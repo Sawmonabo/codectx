@@ -91,7 +91,7 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				// Names are resolved against the same generation the answer
 				// will pin, so a name and an id name the same node in one
 				// invocation. An argument that is already an id passes through.
@@ -176,9 +176,15 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 		Long: detail + "\n\nThe walk is bounded: --depth caps the hop count from the nearest seed, " +
 			"--visited and --edges cap the distinct nodes and relations it may admit, and those two " +
 			"are per-page work budgets that refill on each page rather than ceilings on the whole " +
-			"traversal. A page that spends one ends there and returns a continuation cursor; " +
-			"--timeout ends a page the same way. Following the cursor reaches the rest of the " +
-			"walk, so a page-end reason is not a claim that the answer is all there is.\n\n" +
+			"traversal. A page that spends one ends there, and --timeout ends a page the same way, " +
+			"so a page-end reason is never a claim that the answer is all there is.\n\n" +
+			"Every page that has more to give comes with a continuation: a walk whose whole " +
+			"position fits the token carries it there, and one that has to keep a frontier keeps " +
+			"it on disk beside the workspace, which this command writes even while another " +
+			"process is indexing. Pass the printed cursor back with --cursor to take the next " +
+			"page. Continuation state is reclaimed on its own deadline, so a cursor left unused " +
+			"for longer than the configured cursor lifetime is refused and the walk is re-run " +
+			"from the first page.\n\n" +
 			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
 			"that asking for the overlay is refused explicitly rather than answered from canonical " +
 			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
@@ -201,7 +207,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				return err
 			}
 			var result model.GraphResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -247,9 +253,11 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"An exhausted --depth, --visited or --timeout is reported as truncation together with " +
 			"whatever routes were found; it is never reported as \"no path exists\". A target that " +
 			"is genuinely unreachable returns no routes and is not marked truncated.\n\n" +
-			"A page ends on --timeout or on the --visited budget with a continuation cursor; the " +
-			"search state is kept, and following the cursor carries the same search on until it " +
-			"reaches the target. The answer is exact once the final page arrives.\n\n" +
+			"A page ends on --timeout or on the --visited budget and carries a continuation: the " +
+			"half-explored frontier is kept beside the workspace and the printed cursor resumes " +
+			"the same search where it stopped. The routes found so far are returned, marked " +
+			"truncated with the reason; pass the cursor back with --cursor, or raise --visited " +
+			"or --timeout to let one page reach the target.\n\n" +
 			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
 			"cap, not paged.\n\n" +
 			"--direction chooses which way edges are followed. The default, outgoing, answers " +
@@ -285,7 +293,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.PathResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -352,7 +360,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -704,18 +712,20 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 
 // addTraversalFlags declares the walk budgets. The two switches are separate
 // because the commands differ on both axes: `path` carries no edge budget at
-// all and issues no continuation, while `impact` carries one and pages its
-// ranked list. A flag with no field behind it would describe a request the
-// command cannot build, and "cumulative across pages" on a command that issues
-// no continuation would describe a workflow it cannot perform.
+// all and refills nothing, while `impact` carries one and bounds its whole
+// answer. A flag with no field behind it would describe a request the command
+// cannot build, and "per page" on a command that answers in one page would
+// describe a workflow it cannot perform.
 func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
-	// The two paging endpoints refill these budgets per page and mint a cursor
-	// where a page spends one; impact expands its walk in one request, so there
-	// the same flag is a ceiling on the whole answer.
+	// The two paging endpoints refill these budgets per page; impact expands its
+	// walk in one request, so there the same flag is a ceiling on the whole
+	// answer. Spending a per-page budget is exactly what mints a continuation,
+	// so the flag says only that the budget is per page and the command's own
+	// help states the continuation rule once.
 	cumulative := " for the whole walk"
 	if acrossPages {
-		cumulative = " per page; a page that spends it returns a cursor"
+		cumulative = " per page"
 	}
 	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+cumulative+zeroBoundHelp)
 	if edges {

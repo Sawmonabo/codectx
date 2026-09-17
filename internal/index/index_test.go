@@ -22,8 +22,10 @@ package index
 //     members, reporting a unit stale for many generations as stale for one.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,6 +36,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -75,6 +78,14 @@ type fixture struct {
 	cfg     config.Config
 	ledger  *ledger.Ledger
 	c       *Coordinator
+	// locker is what the coordinators this fixture builds take the workspace
+	// from. It is the fixture's own held lock unless a scenario is about the
+	// taking and giving back itself, which needs a source it can count.
+	locker Locker
+	// logger is where the coordinators this fixture builds write. It is nil
+	// unless a scenario is about what a watch reports, which needs a
+	// destination it can read back at debug.
+	logger *slog.Logger
 }
 
 func newFixture(t *testing.T, files map[string]string) *fixture {
@@ -126,14 +137,15 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	// One lock per workspace, taken once and handed to every coordinator the
 	// scenario builds: it is the cross-process owner, and a second acquisition
 	// in this process is refused exactly as another process would be.
-	if f.lock, err = snapshot.LockWorkspace(ctx, f.dataDir, 0); err != nil {
+	if f.lock, err = snapshot.LockWorkspace(ctx, f.dataDir, "index", snapshot.TryOnce()); err != nil {
 		t.Fatalf("LockWorkspace: %v", err)
 	}
 	t.Cleanup(func() { f.lock.Close() })
 	// The run ledger the composition root opens beside the store, so every
 	// coordinator this fixture builds records its runs exactly as a real one
 	// does and a test can read them back through the same reader status uses.
-	if f.ledger, err = ledger.Open(ctx, f.dataDir); err != nil {
+	f.ledger = ledger.New(f.dataDir)
+	if err = f.ledger.Attach(ctx); err != nil {
 		t.Fatalf("ledger.Open: %v", err)
 	}
 	t.Cleanup(func() { f.ledger.Stop() })
@@ -230,13 +242,28 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	locker := f.locker
+	if locker == nil {
+		locker = heldLock{f.lock}
+	}
 	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
-		Lock: f.lock, Pool: pool, Ledger: f.ledger})
+		Lock: locker, Pool: pool, Logger: f.logger, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
 	f.t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// status answers through the given coordinator's own store handle, which is
+// the path `codectx status` takes: one StatusReader over the writing handle.
+func (f *fixture) status(c *Coordinator) (model.IndexStatus, error) {
+	f.t.Helper()
+	r, err := c.StatusReader(f.store)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	return r.Status(f.ctx)
 }
 
 func (f *fixture) write(path, content string) {
@@ -491,7 +518,7 @@ func TestIncrementalScenario(t *testing.T) {
 		var st model.IndexStatus
 		for deadline := time.Now().Add(10 * time.Second); ; {
 			var err error
-			if st, err = f.c.Status(ctx); err != nil {
+			if st, err = f.status(f.c); err != nil {
 				t.Fatalf("status: %v", err)
 			}
 			if st.WatchActive || time.Now().After(deadline) {
@@ -967,6 +994,443 @@ func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
 	return func(yield func(plan.Unit) error) error { return yield(u) }
 }
 
+// heldLock presents a lock the fixture already holds as the coordinator's
+// Locker. The composition root's own implementation takes the lock when a
+// build needs it; a fixture that took it in its setup has nothing left to
+// take and nothing to give back, so Hold is the lock itself.
+type heldLock struct{ l *snapshot.WorkspaceLock }
+
+func (h heldLock) Hold(context.Context, HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	return h.l, func() error { return nil }, nil
+}
+
+// countingLock is the composition root's counted Hold as a fixture can count
+// it: it hands out the lock the fixture already holds and records how many
+// holds are outstanding, so an operation that leaked one is visible as a
+// balance that never comes back to zero. refuse makes every hold answer the
+// way snapshot.LockWorkspace answers a caller that cannot have the workspace.
+type countingLock struct {
+	l  *snapshot.WorkspaceLock
+	mu sync.Mutex
+	// outstanding is holds taken minus holds given back; taken is every hold
+	// this lock granted, so a beat that never asked is not read as a beat that
+	// asked and gave back.
+	outstanding int
+	taken       int
+	refuse      error
+	// patient records every hold that asked to WAIT for the workspace. A beat
+	// must never be one: batches are delivered synchronously, so a beat that
+	// queued behind another process would stall every notification behind it
+	// for the length of the grace, and the next beat repeats the work anyway.
+	patient int
+}
+
+func (c *countingLock) Hold(_ context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if intent == HoldPatiently {
+		c.patient++
+	}
+	if c.refuse != nil {
+		return nil, nil, c.refuse
+	}
+	c.outstanding++
+	c.taken++
+	var once sync.Once
+	return c.l, func() error {
+		once.Do(func() {
+			c.mu.Lock()
+			c.outstanding--
+			c.mu.Unlock()
+		})
+		return nil
+	}, nil
+}
+
+func (c *countingLock) counts() (outstanding, taken int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.outstanding, c.taken
+}
+
+// TestAWatchGivesTheWorkspaceBackWhenTheBeatEnds protects the lifetime of the
+// workspace lock a watching session takes.
+//
+// Failure mode: a beat takes the cross-process workspace lock and returns
+// without giving it back on one of its exits -- the ordinary one, the refused
+// one, or the one where the beat failed or was cancelled partway. A watching
+// server that leaks it on any of them holds the workspace for the rest of its
+// session, so the person's own `codectx index` in a terminal is refused for as
+// long as that server lives, and nothing reports it: every later beat of that
+// session succeeds, because the lock it is leaking is its own.
+func TestAWatchGivesTheWorkspaceBackWhenTheBeatEnds(t *testing.T) {
+	lock := &countingLock{}
+	f := newCountedFixture(t, lock, nil)
+
+	// The ordinary exit: a beat that built and published.
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); !ok {
+		t.Fatal("the first beat did not complete, so the ordinary exit went unexercised")
+	}
+	if outstanding, taken := lock.counts(); outstanding != 0 || taken == 0 {
+		t.Fatalf("after a beat that built, %d holds are outstanding of %d taken", outstanding, taken)
+	}
+
+	// The refused exit: the workspace belongs to another process for this
+	// beat. Nothing was taken, so nothing may be given back either.
+	before := func() int { _, taken := lock.counts(); return taken }()
+	lock.refuse = heldByAnother("4242", "index")
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); ok {
+		t.Fatal("a beat completed on a workspace another process holds")
+	}
+	if outstanding, taken := lock.counts(); outstanding != 0 || taken != before {
+		t.Fatalf("after a refused beat, %d holds are outstanding and %d were taken (was %d)", outstanding, taken, before)
+	}
+
+	// The exit where the beat failed partway: the workspace is free again and
+	// the beat is cancelled inside its own refresh.
+	lock.refuse = nil
+	beat, stop := context.WithCancel(f.ctx)
+	stop()
+	if _, ok := f.c.reconcile(beat, nil, nil); ok {
+		t.Fatal("a cancelled beat completed, so the failure exit went unexercised")
+	}
+	if outstanding, _ := lock.counts(); outstanding != 0 {
+		t.Fatalf("after a beat that was cancelled partway, %d holds are outstanding", outstanding)
+	}
+}
+
+// TestOnlyTheBuildAPersonAsksForWaitsForTheWorkspace protects which operations
+// may queue behind another process and which must not.
+//
+// Failure mode one: `codectx index --watch` builds its base generation through
+// Index, and if that build takes the workspace the way a beat does it is
+// refused CTX_WORKSPACE_BUSY the instant somebody else is indexing -- the
+// person is told no for a command that would have succeeded in a minute.
+//
+// Failure mode two, the opposite and worse: make a BEAT patient and it queues
+// inside the watcher's synchronous batch delivery for the whole grace, so every
+// notification behind it is held up and the pending queue grows, to redo work
+// the next beat would have done anyway.
+//
+// The intent is what separates them, and it is asserted on the real call paths
+// rather than at the fake, because the pairing is the thing that breaks: the
+// wait it selects is proved in internal/snapshot, which measures that a patient
+// acquisition waits out a progressing holder and still refuses a stalled one.
+func TestOnlyTheBuildAPersonAsksForWaitsForTheWorkspace(t *testing.T) {
+	lock := &countingLock{}
+	f := newCountedFixture(t, lock, nil)
+
+	if _, err := f.c.Index(f.ctx, model.IndexRequest{}); err != nil {
+		t.Fatalf("the index a person asked for failed: %v", err)
+	}
+	if lock.patient == 0 {
+		t.Fatal("the index a person asked for took the workspace without waiting: " +
+			"a build behind another process is refused at once instead of waiting it out")
+	}
+	patientAfterIndex := lock.patient
+
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); !ok {
+		t.Fatal("the beat on a free workspace did not complete")
+	}
+	if lock.patient != patientAfterIndex {
+		t.Fatalf("a beat asked to wait for the workspace (%d patient holds, was %d): "+
+			"batches are delivered synchronously, so a beat that queues stalls every notification behind it",
+			lock.patient, patientAfterIndex)
+	}
+	if outstanding, _ := lock.counts(); outstanding != 0 {
+		t.Fatalf("%d holds are outstanding after both operations ended", outstanding)
+	}
+}
+
+// newCountedFixture is newFixture with the counting workspace source, and
+// optionally a logger, in place before the first coordinator is built.
+func newCountedFixture(t *testing.T, lock *countingLock, log *slog.Logger) *fixture {
+	t.Helper()
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	lock.l = f.lock
+	f.locker = lock
+	f.logger = log
+	f.c = f.coordinator(f.providers(false))
+	return f
+}
+
+// heldByAnother is the refusal snapshot.LockWorkspace writes for a waiter that
+// could not have the workspace, carrying the holder it recorded.
+func heldByAnother(pid, operation string) error {
+	return (&model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: "the " + operation + " running in process " + pid + " holds the workspace indexing lock"}).
+		WithDetail(snapshot.DetailHolderPID, pid).
+		WithDetail(snapshot.DetailHolderOperation, operation)
+}
+
+// TestASkippedBeatIsReportedOncePerEpisode protects what a watching session
+// writes while another process holds the workspace.
+//
+// Failure mode: a watch that skips every beat for the length of someone else's
+// index writes one line per beat. The person who started that index gets a
+// stream of reports about a workspace that is working exactly as designed, and
+// the line that matters -- who holds it -- is buried in the repetition. The
+// opposite failure is just as bad: report the first episode only, and a second
+// process taking the workspace an hour later is never mentioned at all.
+func TestASkippedBeatIsReportedOncePerEpisode(t *testing.T) {
+	var written bytes.Buffer
+	lock := &countingLock{}
+	f := newCountedFixture(t, lock,
+		slog.New(slog.NewTextHandler(&written, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	lock.refuse = heldByAnother("4242", "index")
+	for range 3 {
+		if _, ok := f.c.reconcile(f.ctx, nil, nil); ok {
+			t.Fatal("a beat completed on a workspace another process holds")
+		}
+	}
+	const holder = "holder_pid=4242"
+	if n := strings.Count(written.String(), holder); n != 1 {
+		t.Fatalf("three skipped beats of one episode reported the holder %d times:\n%s", n, written.String())
+	}
+	if !strings.Contains(written.String(), "holder_operation=index") {
+		t.Fatalf("the skipped beat did not name what the holder is doing:\n%s", written.String())
+	}
+
+	// The workspace comes free and the next beat takes it, which ends the
+	// episode; the one after it is refused again and is a new episode.
+	lock.refuse = nil
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); !ok {
+		t.Fatal("the beat on a free workspace did not complete")
+	}
+	lock.refuse = heldByAnother("4242", "index")
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); ok {
+		t.Fatal("a beat completed on a workspace another process holds")
+	}
+	if n := strings.Count(written.String(), holder); n != 2 {
+		t.Fatalf("a second held-lock episode was reported %d times in total:\n%s", n, written.String())
+	}
+	// And no beat asked to wait for it. A beat that did would hold up the
+	// synchronous delivery of every batch behind it for the whole grace,
+	// instead of being skipped and asking again at the next beat.
+	if lock.patient != 0 {
+		t.Fatalf("%d of these beats asked to wait for the workspace; a beat takes it now or is skipped", lock.patient)
+	}
+}
+
+// busyLock is a workspace another process holds for as long as this fixture
+// runs: every hold is refused the way snapshot.LockWorkspace refuses a caller
+// that cannot have the lock, so a watch composed with it waits forever.
+type busyLock struct{}
+
+func (busyLock) Hold(context.Context, HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	return nil, nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: "another codectx process holds the workspace indexing lock"}
+}
+
+// TestEveryWatchingProcessIsListedByItsOwnHeartbeat protects the fact that a
+// heartbeat is per watching process.
+//
+// Failure mode one: two watches of one workspace -- a terminal's `codectx
+// watch` and an editor's server, the ordinary arrangement -- share one row, so
+// each beat overwrites the other's claim and every reporting process sees one
+// watch where two are running. Whichever watch beat last is the only one an
+// operator can see, and stopping it reads as the workspace having no watch at
+// all while the other still runs.
+//
+// Failure mode two: a watch that stops withdraws more than its own claim, so a
+// person pressing Ctrl-C in one terminal makes the watch still running in the
+// other invisible -- an index that IS being kept fresh reported as one that is
+// not, which is the readiness answer Section 13.2 exists to give.
+//
+// The two watches here run in one process, so the rows are told apart by their
+// session identity and not by a pid: a pid is reused, and one process can hold
+// two watches.
+func TestEveryWatchingProcessIsListedByItsOwnHeartbeat(t *testing.T) {
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	ctx := f.ctx
+	if _, err := f.c.Index(ctx, model.IndexRequest{}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Both watches are refused the workspace for the whole test, so neither
+	// builds and neither completes a pass: what is asserted below is the
+	// listing itself, and a waiting watch is a watch that must be listed.
+	f.locker = busyLock{}
+	watch := func() (*Coordinator, context.CancelFunc, chan error) {
+		c := f.coordinator(f.providers(false))
+		watchCtx, stop := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- c.Watch(watchCtx, nil) }()
+		return c, stop, done
+	}
+	read := func() []sqlite.WatchHeartbeat {
+		t.Helper()
+		got, err := f.store.WatchHeartbeats(ctx, f.c.Repository())
+		if err != nil {
+			t.Fatalf("WatchHeartbeats: %v", err)
+		}
+		return got
+	}
+	// Waiting for rows to ARRIVE is a wait; every assertion about a row that
+	// must still be there is a single read. A watch republishes its row on its
+	// own interval, so a poll would let a withdrawal that deleted every row be
+	// repaired by the surviving watch's next beat and report as correct.
+	rows := func(want int) []sqlite.WatchHeartbeat {
+		t.Helper()
+		var got []sqlite.WatchHeartbeat
+		for deadline := time.Now().Add(10 * time.Second); ; {
+			if got = read(); len(got) == want || time.Now().After(deadline) {
+				return got
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	first, stopFirst, firstDone := watch()
+	second, stopSecond, secondDone := watch()
+	t.Cleanup(func() { stopSecond() })
+	published := rows(2)
+	if len(published) != 2 {
+		t.Fatalf("two watching processes published %d rows; each watch must publish its own", len(published))
+	}
+	if published[0].SessionID == published[1].SessionID {
+		t.Fatalf("both watches published the session %s, so one overwrote the other", published[0].SessionID)
+	}
+	for _, hb := range published {
+		if hb.WriterPID != os.Getpid() || hb.BeatAt.IsZero() {
+			t.Fatalf("a watcher row must name the process that wrote it and when, got pid %d at %v", hb.WriterPID, hb.BeatAt)
+		}
+	}
+	st, err := f.status(first)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(st.Watchers) != 2 {
+		t.Fatalf("status listed %d watching processes of the two that are running: %+v", len(st.Watchers), st.Watchers)
+	}
+	for _, w := range st.Watchers {
+		if w.LastPassAt != nil || w.PendingEvents != nil {
+			t.Fatalf("a watch that never held the workspace was listed as covering it: %+v", w)
+		}
+	}
+
+	// One watch stops. Its own claim goes and the other's stays: the workspace
+	// is still being watched, and a reader must still be told so.
+	stopFirst()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	surviving := read()
+	if len(surviving) != 1 {
+		t.Fatalf("one watch of two stopped and %d rows remain; it must withdraw its own claim and no other", len(surviving))
+	}
+	if surviving[0].SessionID != second.watch.session() {
+		t.Fatalf("the row that survived is %s, not the watch still running", surviving[0].SessionID)
+	}
+	st, err = f.status(second)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(st.Watchers) != 1 || st.Watchers[0].SessionID != second.watch.session() {
+		t.Fatalf("status must list the one watch still running, got %+v", st.Watchers)
+	}
+	stopSecond()
+	if err := <-secondDone; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+}
+
+// TestAWaitingWatchPublishesNoCoverage protects the heartbeat's three-way
+// distinction, whose collapse in either direction is silent and costly.
+//
+// Failure mode one: a watch that is still waiting for a workspace another
+// process holds publishes its notification backlog as a pending count, so
+// another process's `codectx status` reports `0 pending` -- the workspace is
+// caught up -- for a watch that has reconciled nothing and an index that is
+// still running.
+//
+// Failure mode two, the opposite: suppressing the row entirely would make a
+// waiting watch indistinguishable from a workspace where no watch has ever run,
+// and an operator who started one would be told nothing is watching.
+func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	ctx := f.ctx
+	root, err := workspace.Discover(f.repoDir)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	t.Cleanup(func() { root.Close() })
+	policy := f.cfg.TraversalPolicy()
+	policy.DataDir = f.dataDir
+	w, err := watch.New(watch.Options{Root: root, Policy: policy})
+	if err != nil {
+		t.Fatalf("watch.New: %v", err)
+	}
+	registry, err := provider.NewRegistry(f.providers(false)...)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	pool, err := provider.NewPool(f.cfg.Index.QueueBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
+		Lock: busyLock{}, Watcher: w, Pool: pool})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	// Nothing has ever indexed this workspace, so no repository row exists yet.
+	// The watch must still be able to say it is here: the heartbeat is keyed by
+	// the repository, and a watch that could not record the identity would have
+	// every beat refused by the foreign key and an operator asking whether this
+	// workspace is watched would be told nothing is.
+
+	watchCtx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Watch(watchCtx, nil) }()
+	var rows []sqlite.WatchHeartbeat
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if rows, err = f.store.WatchHeartbeats(ctx, c.Repository()); err != nil {
+			t.Fatalf("WatchHeartbeats: %v", err)
+		}
+		if len(rows) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if len(rows) == 0 {
+		t.Fatal("a watch that is waiting for the workspace published no row at all, so it cannot be told from a workspace no watch ever ran in")
+	}
+	hb := rows[0]
+	if hb.WriterPID != os.Getpid() {
+		t.Fatalf("the row must name this watch's process, got %d", hb.WriterPID)
+	}
+	if hb.LastPassAt != nil {
+		t.Fatalf("a watch that never held the workspace reported a completed pass at %v", hb.LastPassAt)
+	}
+	if hb.PendingEvents != nil {
+		t.Fatalf("a watch that never held the workspace claimed a pending count of %d, which reads as coverage", *hb.PendingEvents)
+	}
+	// The watcher marks itself reconciled on its own rescans and ticks, with no
+	// regard for the workspace lock. Once it has, the row must STILL claim
+	// nothing: this is the steady state a second process reads, and the entry
+	// publish asserted above is only its first ten seconds.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if _, _, marked := w.Coverage(); !marked.IsZero() || time.Now().After(deadline) {
+			break
+		}
+		f.write("pkg/b.go", goFile("pkg", "B", ""))
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, _, marked := w.Coverage(); marked.IsZero() {
+		t.Fatal("the watcher never marked itself reconciled, so the steady state went unexercised")
+	}
+	if _, lastPass, pending := c.watch.heartbeat(); lastPass != nil || pending != nil {
+		t.Fatalf("a watch that never held the workspace published %v / %v after the watcher reconciled itself", lastPass, pending)
+	}
+	stop()
+	if err := <-done; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+}
+
 // TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce guards the
 // failure mode a report full of `unavailable` rows is: a provider the
 // operator turned off was planned for nothing and then reported once per
@@ -1000,7 +1464,7 @@ func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 	if err := res.Validate(); err != nil {
 		t.Fatalf("the result does not validate: %v", err)
 	}
-	st, err := c.Status(f.ctx)
+	st, err := f.status(c)
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}

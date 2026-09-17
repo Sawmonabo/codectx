@@ -383,7 +383,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 		return ledgerArmResult{}, err
 	}
 	defer store.Close()
-	lock, err := snapshot.LockWorkspace(ctx, dataDir, 0)
+	lock, err := snapshot.LockWorkspace(ctx, dataDir, "benchmark", snapshot.TryOnce())
 	if err != nil {
 		return ledgerArmResult{}, err
 	}
@@ -439,12 +439,13 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	// to the other.
 	var led *ledger.Ledger
 	if record {
-		if led, err = ledger.Open(ctx, dataDir); err != nil {
+		led = ledger.New(dataDir)
+		if err = led.Attach(ctx); err != nil {
 			return ledgerArmResult{}, err
 		}
 	}
 	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
-		CAS: cas, Lock: lock, Pool: pool, Ledger: led})
+		CAS: cas, Lock: heldLock{lock}, Pool: pool, Ledger: led})
 	if err != nil {
 		return ledgerArmResult{}, err
 	}

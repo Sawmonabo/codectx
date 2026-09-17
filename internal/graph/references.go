@@ -370,8 +370,13 @@ func (c referenceCursor) validate() error {
 	if c.GenerationID <= 0 {
 		return cursorInvalid("cursor does not pin a generation")
 	}
-	if !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID) {
-		return cursorInvalid("cursor query hash and lease id must be well-formed identifiers")
+	if !model.ValidHexID(c.QueryHash) {
+		return cursorInvalid("cursor query hash must be a well-formed identifier")
+	}
+	// A continuation minted by a process that records no lease names none: the
+	// spool it names is bound to this cursor's expiry instead.
+	if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
+		return cursorInvalid("cursor lease id is malformed")
 	}
 	if c.AnalysisKey == "" || len(c.AnalysisKey) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor does not name an analysis key")
@@ -791,9 +796,11 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 	if int64(served) >= total {
 		return b.items, nil, false, b.clipped, nil
 	}
-	if e.signer == nil || e.leases == nil || e.spools == nil {
-		// Nothing to bind a token to. The caller marks the answer truncated
-		// rather than presenting a bounded page as the complete set.
+	if e.signer == nil || e.spools == nil {
+		// Nothing to bind a token to and nowhere to spill the remainder, so
+		// nothing is created here -- this return precedes spools.Create -- and
+		// the caller marks the answer truncated rather than presenting a
+		// bounded page as the complete set.
 		return b.items, nil, true, b.clipped, nil
 	}
 
@@ -801,21 +808,30 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 	// The lease is minted HERE and owned by the cursor: the pinned reader's
 	// query lease is released when this request returns, so a token naming it
 	// would be refused by the next invocation.
-	lease, err := e.leases.Acquire(ctx, bind.GenerationID, bind.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return nil, nil, false, false, err
+	//
+	// A process that writes nothing to the database records none and spools
+	// anyway: the spool is a filesystem write, and the entry is reclaimed by
+	// the expiry stamped into its header instead of by a lease row.
+	var leaseID string
+	if e.leases.Retains() {
+		lease, err := e.leases.Acquire(ctx, bind.GenerationID, bind.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return nil, nil, false, false, err
+		}
+		leaseID = lease.ID
 	}
 	next := referenceCursor{
 		Version: referenceCursorVersion, Endpoint: referenceEndpoint,
 		GenerationID: bind.GenerationID, AnalysisKey: bind.AnalysisKey, QueryHash: queryHash,
-		LeaseID: lease.ID, Served: int64(served), Total: total,
-		// The cursor expires with the retention lease it names: a token that
-		// outlived the lease would resume over facts nothing is holding.
+		LeaseID: leaseID, Served: int64(served), Total: total,
+		// The cursor expires with the state it names: a token that outlived the
+		// lease, or the leaseless spool's own stamped expiry, would resume over
+		// facts nothing is holding.
 		ExpiresAt: e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	sp, err := e.spools.Create(next.spoolCursor())
 	if err != nil {
-		return nil, nil, false, false, e.releaseLease(ctx, lease.ID, err)
+		return nil, nil, false, false, e.releaseLease(ctx, leaseID, err)
 	}
 	// Written counts the header frame Create wrote, so this is where the first
 	// record lands and where the next page begins reading.
@@ -835,10 +851,10 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 		return sp.Append(record)
 	}
 	if err := run.Each(spill); err != nil {
-		return nil, nil, false, false, e.releaseLease(ctx, lease.ID, e.releaseSpool(sp, err))
+		return nil, nil, false, false, e.releaseLease(ctx, leaseID, e.releaseSpool(sp, err))
 	}
 	if err := sp.Close(); err != nil {
-		return nil, nil, false, false, e.releaseLease(ctx, lease.ID, e.releaseSpool(sp, err))
+		return nil, nil, false, false, e.releaseLease(ctx, leaseID, e.releaseSpool(sp, err))
 	}
 	next.SpoolID = sp.ID()
 	return b.items, &next, true, b.clipped, nil
@@ -850,7 +866,11 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 // remainder behind it.
 func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 	pageLimit int) ([]model.ReferenceOccurrence, *referenceCursor, bool, bool, error) {
-	if e.spools == nil || e.leases == nil {
+	// A spool store is what a resumed page reads; a LEASE store is not. An
+	// engine composed without one mints leaseless continuations, so refusing
+	// them here would hand back a token that fails on every use. Every lease
+	// call below is nil-safe or sits behind a lease id the token carries.
+	if e.spools == nil {
 		return nil, nil, false, false, cursorInvalid("continuation state has expired or was released")
 	}
 	sc := c.spoolCursor()
@@ -911,29 +931,35 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 		}
 	}
 	if served >= c.Total {
-		// The answer is complete. The spool and the lease it pinned are
-		// released here rather than left to their TTL, so a walk read to
-		// exhaustion holds nothing.
-		if err := e.spools.Release(c.SpoolID); err != nil {
-			return nil, nil, false, false, e.releaseLease(ctx, c.LeaseID, err)
+		// The answer is complete. The spool is released here rather than left
+		// to its deadline, so a walk read to exhaustion holds nothing, and the
+		// lease it pinned goes with it -- unless this process records none, in
+		// which case the row a writer-bearing page minted is not its to end and
+		// that lease's own TTL and the next sweep reclaim it.
+		relErr := e.spools.Release(c.SpoolID)
+		if c.LeaseID != "" && e.leases.Retains() {
+			relErr = e.releaseLease(ctx, c.LeaseID, relErr)
 		}
-		if err := e.releaseLease(ctx, c.LeaseID, nil); err != nil {
-			return nil, nil, false, false, err
+		if relErr != nil {
+			return nil, nil, false, false, relErr
 		}
 		return b.items, nil, false, b.clipped, nil
 	}
-	// The spool's liveness is its lease's (pagination.Spools.OpenAt) and the
-	// token's is its own expiry, so a cursor that carried page one's expiry
-	// forward would bound the WHOLE answer by one CursorTTL: a long reference
-	// list would stop being reachable part way through, which is truncation by
-	// clock. Every page renews the lease and mints a fresh expiry, exactly as
-	// the ranked continuations do.
-	if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
-		return nil, nil, false, false, err
-	}
 	next := c
 	next.Offset, next.Served = offset, served
-	next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	// A LEASED spool's liveness is its lease's (pagination.Spools.live), and
+	// renewing it on every page is what keeps a long reference list reachable
+	// past one cursor TTL. A leaseless spool -- and a leased one presented to a
+	// process that writes nothing -- has no renewal: the token carries forward
+	// the expiry its header was stamped with, so the whole list is reachable
+	// for that one window and a page asked for after it is the typed
+	// CTX_CURSOR_INVALID.
+	if c.LeaseID != "" && e.leases.Retains() {
+		if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
+			return nil, nil, false, false, err
+		}
+		next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	}
 	return b.items, &next, true, b.clipped, nil
 }
 
