@@ -297,6 +297,19 @@ carries the whole row.
   because the details are the provider's own bounded budget and a remediation
   charged to it could be the entry a busy row has to drop. Text output prints
   it on its own line beneath the row.
+- `units_running` — how many scopes of this capability were still being built
+  in the background when the generation was published. Like `remediation` it
+  is a field of the row and not one of the details below, for the same reason.
+  It is counted, once, from the generation's own unit rows: a deferred scope
+  counts as still running until the generation holds the unit the plan derives
+  for it, so the figure is about the whole generation and every provider in
+  it, and never about whichever background batch happened to publish. It is
+  then stored on the row, and that — separately from where it is counted — is
+  what lets a second process, `codectx status` in another terminal, read the
+  same number as the process doing the work. It is stored but
+  deliberately kept out of the capability digest: it records what was in
+  flight at publication, which is scheduling and not content, so two rebuilds
+  of one workspace may legitimately differ on it.
 - `subdivided`, on a dependence capability, names a unit that crashed and was
   recovered by splitting; `backend_failure` beside it says what the crash was
   and how it was established to reproduce ([dependence](providers-dependence.md)).

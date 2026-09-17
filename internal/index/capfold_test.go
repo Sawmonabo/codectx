@@ -205,8 +205,8 @@ func (p coverageProvider) IndexUnit(context.Context, provider.UnitRequest, provi
 // TestCoverageReportsAFailedDeferredScopeAsPartial protects what `codectx
 // status` says after a late publication.
 //
-// Failure mode: one deferred unit of a provider fails and the other nine
-// publish, and every capability of that provider is reported `unavailable:
+// Failure mode: one deferred unit of a provider fails while another scope of
+// it publishes, and every capability of that provider is reported `unavailable:
 // units_deferred` -- a repository whose control dependence, data dependence,
 // reads, writes and calls are all in the generation and queryable reads as a
 // provider nobody has heard from. A scope that failed is not a scope still
@@ -224,12 +224,15 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 		caps: newCapabilityReport(),
 		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
 			ID: id, Version: "1", Capabilities: []string{capability}}}}},
-		sealed:       map[string]bool{plan.Key(id, sealedScope): true},
+		published:    map[string]bool{id: true},
 		failedScopes: map[string]unitFailure{plan.Key(id, failedScope): {code: model.CodeProviderOutputInvalid}},
 	}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
 		for _, scope := range []string{sealedScope, failedScope} {
-			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: true}); err != nil {
+			// Only the failed scope is deferred: the other one is a member of
+			// this generation, which is what `published` records and what
+			// makes the surviving row partial rather than failed.
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: scope == failedScope}); err != nil {
 				return err
 			}
 		}
@@ -244,7 +247,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 	}
 	row := rows[0]
 	if row.State != model.CapabilityPartial {
-		t.Errorf("capability state %q, want partial: nine scopes published and one failed", row.State)
+		t.Errorf("capability state %q, want partial: one scope published and one failed", row.State)
 	}
 	if row.Details[scopeKeyDetail] != failedScope {
 		t.Errorf("the row names scope %q, want the scope that failed (%q)", row.Details[scopeKeyDetail], failedScope)

@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -77,6 +78,23 @@ type lateSealer struct {
 	// planned over. It is replaced with the queue, because failures of a
 	// superseded generation say nothing about the one a later batch extends.
 	foreground map[string]*providerFailures
+	// background is the typed reason, per plan key, that a DEFERRED unit of
+	// THIS queue did not seal, accumulated across every tick the queue is
+	// drained by rather than held for the tick that produced it.
+	//
+	// It has to outlive its tick. A unit that fails is popped off the queue
+	// and never retried, and UnitWriter.Fail deletes its unit row, so nothing
+	// durable is left for a later publication to find: the scope is re-planned
+	// deferred by every later generation and, with only that tick's failures
+	// in hand, published as still running for ever -- an over-claim of work
+	// nothing will finish, which Section 13.3 forbids outright. A tick whose
+	// every unit failed publishes nothing at all, so its reasons would
+	// otherwise be discarded entirely.
+	//
+	// It is bounded by the queue it describes: one entry per queued scope at
+	// worst, and it is replaced with the queue for the same reason foreground
+	// is.
+	background map[string]unitFailure
 	// estimate is the mean duration of the deferred units this process has
 	// completed, and samples how many it is over. Zero samples means the
 	// estimate is unknown and Pending reports no estimate at all.
@@ -184,6 +202,9 @@ func (l *lateSealer) enqueue(g *generation, units []plan.Unit) {
 	// the ones that failed, so a report built without them calls the provider
 	// fresh over a hole the foreground already found.
 	l.foreground = g.failures
+	// The scopes this queue's own background work failed belong to the queue
+	// it was drained from, so they go with it.
+	l.background = map[string]unitFailure{}
 	pending := len(l.queue)
 	if pending > 0 && !l.started {
 		l.started = true
@@ -332,14 +353,13 @@ type sealedUnit struct {
 	unit                 model.UnitID
 }
 
-// batch is what one tick produced: the units that sealed, and the reason, per
-// plan key, for each one that did not. The failures travel with the seals
-// because the publication has to tell a scope that failed from a scope still
-// running -- a provider whose other scopes published is partial with the
-// failed scope named, not a provider nobody has heard from.
+// batch is what one tick produced: the units that sealed. What did NOT seal is
+// not here -- it is kept on the sealer, in `background`, because the
+// publication has to tell a scope that failed from a scope still running, and
+// a scope that failed in an EARLIER tick is just as far from running as one
+// that failed in this one.
 type batch struct {
 	sealed []sealedUnit
-	failed map[string]unitFailure
 }
 
 // tick takes the tick slot and runs one batch, abandoning the attempt if ctx
@@ -419,7 +439,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 	work := &generation{c: c, view: view, gen: workGen, prev: active, caps: c.newCapabilityReport(),
 		snap: model.Snapshot{ID: snap, RepositoryID: c.repo},
 		plan: plan.Plan{Previous: map[string]model.UnitID{}}}
-	b := batch{failed: map[string]unitFailure{}}
+	var b batch
 	// One unit is popped at a time, so Promote can still see everything that
 	// has not sealed yet; every unit that seals before the queue empties
 	// publishes through the one generation below, which is the coalescing
@@ -443,7 +463,8 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			// stale from its carried predecessor. The reason is kept on the
 			// run row and logged by the same path the foreground uses, so a
 			// deferred failure is as diagnosable as a foreground one.
-			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = work.recordFailure(ctx, d.unit, out, err)
+			l.recordBackgroundFailure(plan.Key(d.unit.ProviderID, d.unit.ScopeKey),
+				work.recordFailure(ctx, d.unit, out, err))
 			continue
 		}
 		b.sealed = append(b.sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
@@ -661,7 +682,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	ledger.RunFromContext(ctx).AttachGeneration(int64(pubGen))
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
 		snap: captured, started: started, caps: c.newCapabilityReport(),
-		failedScopes: b.failed, failures: l.foregroundFailures()}
+		failedScopes: l.backgroundFailures(), failures: l.foregroundFailures()}
 	for _, s := range p.States {
 		g.caps.add(s)
 	}
@@ -712,6 +733,29 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
+// recordBackgroundFailure keeps one deferred unit's typed reason for as long
+// as the queue it came from does. The unit is popped and never retried and its
+// unit row is deleted with it, so this is the only record left that the scope
+// is a failure and not work still in flight.
+func (l *lateSealer) recordBackgroundFailure(key string, f unitFailure) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.background == nil {
+		l.background = map[string]unitFailure{}
+	}
+	l.background[key] = f
+}
+
+// backgroundFailures is a copy of every reason this queue's ticks have
+// recorded, so the publication generation can fold them in without sharing
+// state with the sealer. It is nil before the first failure, which is the same
+// empty answer the indexing path gives.
+func (l *lateSealer) backgroundFailures() map[string]unitFailure {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return maps.Clone(l.background)
+}
+
 // foregroundFailures is a copy of the failure aggregate the queued units were
 // planned over, so the publication generation can fold it in without sharing
 // state with the sealer.
@@ -734,12 +778,14 @@ func (l *lateSealer) attach(ctx context.Context, g *generation, replacing map[st
 	if err := g.attachReused(ctx); err != nil {
 		return err
 	}
-	g.sealed = make(map[string]bool, len(replacing))
-	for key, unit := range replacing {
+	// The attached rows are themselves what the coverage pass reads back to
+	// decide which deferred scopes this generation still has outstanding, so
+	// nothing mirrors them in memory: they must be attached before coverage
+	// runs, which is the order publishOnce calls the two in.
+	for _, unit := range replacing {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
 			return err
 		}
-		g.sealed[key] = true
 		g.built++
 	}
 	for _, carried := range g.plan.Carry {

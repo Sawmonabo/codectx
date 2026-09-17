@@ -67,17 +67,14 @@ type generation struct {
 	// a pass that fails before a generation exists is still a recorded run.
 	ledgerRun *ledger.Run
 	caps      *capabilityReport
-	// sealed holds the plan keys of the deferred units a publication
-	// generation attaches (Section 11.6). They are members of this generation
-	// even though the plan still marks their scopes deferred, because the plan
-	// only reuses units the previous generation selected and these sealed into
-	// a staging generation instead. It is nil on the indexing path.
-	sealed map[string]bool
-	// failedScopes holds, per plan key, the typed reason a DEFERRED unit of
-	// this publication's batch did not seal. A deferred scope that failed is
-	// neither covered nor still running, and telling the three apart is what
-	// keeps a provider whose other scopes published from being reported as
-	// though none of them had. It is nil on the indexing path.
+	// failedScopes holds, per plan key, the typed reason a DEFERRED unit did
+	// not seal -- every one the background queue this publication drains has
+	// recorded, not only the batch it is publishing. A deferred scope that
+	// failed is neither covered nor still running, and telling the three apart
+	// is what keeps a provider whose other scopes published from being
+	// reported as though none of them had; a failure from an earlier tick that
+	// was not carried here would be re-planned deferred and published as still
+	// running for ever. It is nil on the indexing path.
 	failedScopes map[string]unitFailure
 
 	// failures aggregates the units that failed, per provider. It is the
@@ -1166,7 +1163,7 @@ func typedFailure(cause error) unitFailure {
 func (g *generation) coverage(ctx context.Context) (err error) {
 	_, span := ledger.Start(ctx, stageCoverage, "")
 	defer func() { span.End(endOutcome(err), ledger.Measured{}, err) }()
-	covered, deferred, failed, published, err := g.coveredProviders()
+	covered, deferred, failed, published, err := g.coveredProviders(ctx)
 	if err != nil {
 		return err
 	}
@@ -1224,12 +1221,16 @@ type failedScope struct {
 // capability row, where it is the only way a process other than the one doing
 // the work learns that a scope of this capability is still being built. "One
 // scope outstanding" and "forty" are different reports of the same generation.
+// Which deferred scopes it excludes is decided by holdsFreshUnit, against the
+// generation's own unit rows: the count is an assertion about the whole
+// generation for every provider, so no in-process record of what one batch
+// sealed may be its authority.
 //
 // published is the narrower question the partial ruling needs: the providers a
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
-func (g *generation) coveredProviders() (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
+func (g *generation) coveredProviders(ctx context.Context) (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
 	deferred = make(map[string]int, len(g.sel.Active))
 	failed = make(map[string]*providerFailures, len(g.sel.Active))
@@ -1261,12 +1262,16 @@ func (g *generation) coveredProviders() (covered map[string]bool, deferred map[s
 		planned[u.ProviderID]++
 		if u.Deferred {
 			key := plan.Key(u.ProviderID, u.ScopeKey)
-			// A publication generation holds the deferred units that have
-			// already sealed; of the rest, the ones this batch tried and
+			// The generation's own unit rows say which deferred scopes it
+			// already holds; of the rest, the ones this batch tried and
 			// could not seal are failures, and only what is left is still
 			// background work.
+			held, heldErr := g.holdsFreshUnit(ctx, u)
+			if heldErr != nil {
+				return heldErr
+			}
 			switch {
-			case g.sealed[key]:
+			case held:
 				out[u.ProviderID] = true
 				published[u.ProviderID] = true
 			case g.failedScopes[key].code != "":
@@ -1305,6 +1310,47 @@ func (g *generation) coveredProviders() (covered map[string]bool, deferred map[s
 		agg.planned = planned[id]
 	}
 	return out, deferred, failed, published, nil
+}
+
+// holdsFreshUnit answers whether this generation already selects the unit the
+// plan derives for a deferred scope. It reads the generation's own
+// generation_units rows, so "this scope is no longer running" is settled by
+// the durable membership every process can see rather than by a record of
+// what one background batch happened to seal -- which is what makes
+// units_running an assertion about the whole generation, for every provider,
+// wherever it is published from.
+//
+// The test is against the scope's freshly planned unit and not against
+// membership alone: a scope whose rebuild is still running is a member too,
+// through the stale predecessor AttachCarried keeps for it, and reading that
+// row as coverage would publish a stale answer as a fresh one. Only deferred
+// scopes reach here, and they are the heavy units the planner gates, so the
+// lookups are bounded by that set and not by the repository.
+func (g *generation) holdsFreshUnit(ctx context.Context, u plan.Unit) (bool, error) {
+	if g.gen == 0 {
+		// A generation that has no row of its own selects no unit: the
+		// coverage projection is run over a plan before the generation is
+		// begun on no path, and asking storage about generation zero would
+		// be a malformed lookup rather than the empty answer it means.
+		return false, nil
+	}
+	spec, err := u.Spec(g.c.cfgHash)
+	if err != nil {
+		return false, err
+	}
+	selected, err := g.c.opts.Store.SelectedUnit(ctx, g.gen, u.ProviderID, u.ScopeKey)
+	if err != nil {
+		// "This generation selects no unit for the scope" is the ordinary
+		// answer for work still queued, not a fault; storage marks it with
+		// this detail, which is what tells it from a malformed argument under
+		// the same code.
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Details["reason"] == sqlite.ReasonNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return selected == spec.ID, nil
 }
 
 // capabilitiesOf is one provider's declared capability list, empty when the
