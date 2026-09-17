@@ -1497,7 +1497,7 @@ Independent ready units run only when global byte/worker/disk admission permits.
 <a id="132-watch-mode-and-cross-process-coordination"></a>
 ### 13.2 Watch Mode and Cross-Process Coordination
 
-Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce paths; cap pending path count and bytes; overflow collapses to one full-reconciliation flag. During a run, new changes accumulate for the next pass. A cross-process workspace lock prevents concurrent `index`, `refresh`, and watch/MCP builds; a second explicit caller receives `busy` or joins a bounded wait, not another writer coordinator.
+Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce paths; cap pending path count and bytes; overflow collapses to one full-reconciliation flag. During a run, new changes accumulate for the next pass. A cross-process workspace lock prevents concurrent `index`, `refresh`, and watch/MCP builds; a second explicit caller waits while the holder's own liveness stamp keeps advancing and is refused `busy` when it stops, never becoming another writer coordinator.
 
 `fsnotify` does not recursively watch an entire tree automatically. Add permitted directories, handle new/deleted directories, prefer directory watches for atomic editor replacement, and fall back to bounded polling/reconciliation when OS watch limits or filesystem support prevent coverage. Git status alone is not the source of truth for non-Git/untracked or timestamp-preserving changes. Report watch coverage, last successful reconciliation, and pending state. [14](#ref-14)
 
