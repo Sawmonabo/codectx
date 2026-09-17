@@ -144,7 +144,8 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	// The run ledger the composition root opens beside the store, so every
 	// coordinator this fixture builds records its runs exactly as a real one
 	// does and a test can read them back through the same reader status uses.
-	if f.ledger, err = ledger.Open(ctx, f.dataDir); err != nil {
+	f.ledger = ledger.New(f.dataDir)
+	if err = f.ledger.Attach(ctx); err != nil {
 		t.Fatalf("ledger.Open: %v", err)
 	}
 	t.Cleanup(func() { f.ledger.Stop() })

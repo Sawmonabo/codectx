@@ -19,7 +19,8 @@ const repositoryID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 func openLedger(t *testing.T) (*ledger.Ledger, string) {
 	t.Helper()
 	dir := t.TempDir()
-	l, err := ledger.Open(context.Background(), dir)
+	l := ledger.New(dir)
+	err := l.Attach(context.Background())
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}
@@ -483,4 +484,117 @@ func TestARunReadsItsOwnRowsAndNotAnotherLiveRuns(t *testing.T) {
 	}
 	publishing.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	deferredRun.Finish(ledger.OutcomeOK)
+}
+
+// TestDetachAndAttachAgainRecordsBothHolds protects the invariant the handle
+// exists for: the writer on ledger.db lives exactly as long as the workspace
+// hold, and a handle that outlives one hold still records the next.
+//
+// The failure modes, all silent. A detach that does not finalize leaves the
+// first hold's spans reading 'running' for ever, so a reader is shown work
+// that is still going in a process that has moved on. A handle that cannot
+// attach again records nothing after its first hold, which for a server is
+// every refresh but the first. And a run cached across the detach -- the
+// per-process overlay a language server's start hangs under -- must record
+// NOTHING further rather than write into an attachment nobody drains.
+func TestDetachAndAttachAgainRecordsBothHolds(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	l := ledger.New(dir)
+
+	// A handle no hold has attached records nothing at all: this is what the
+	// language-server manager's overlay run gets in a process that is only
+	// answering questions.
+	detachedRun, err := l.NewRun(ledger.KindOverlay, repositoryID)
+	if err != nil || detachedRun != nil {
+		t.Fatalf("a detached handle opened run %v (err %v): it would be a writer with no workspace lock", detachedRun, err)
+	}
+	if _, err := os.Stat(ledger.Path(dir)); !os.IsNotExist(err) {
+		t.Fatalf("composing the handle created %s: the file is opened by a hold, not by a composition", ledger.Path(dir))
+	}
+
+	if err := l.Attach(ctx); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	first, firstCtx := newRun(t, l)
+	_, stage := ledger.Start(firstCtx, "capture", "")
+	stage.AddIn(3)
+	// Deliberately never ended: it is what a hold that detached mid-stage
+	// leaves, and finalizing is what must close it.
+	overlay, err := l.NewRun(ledger.KindOverlay, repositoryID)
+	if err != nil || overlay == nil {
+		t.Fatalf("overlay run: %v", err)
+	}
+	if err := l.Detach(); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+
+	firstID, overlayID := first.ID(), overlay.ID()
+	view := runByID(t, dir, firstID)
+	if view.Run.Outcome != ledger.OutcomeInterrupted || len(view.Spans) != 1 {
+		t.Fatalf("after the detach the first hold's run reads %q with %d spans, want interrupted with its one stage",
+			view.Run.Outcome, len(view.Spans))
+	}
+	if view.Spans[0].Outcome == ledger.OutcomeRunning {
+		t.Fatalf("the stage %q is still 'running' after the detach: a reader is shown work no process is doing",
+			view.Spans[0].Stage)
+	}
+
+	// The second hold. The run cached across the detach is the hazard: it must
+	// write nothing into either attachment.
+	if err := l.Attach(ctx); err != nil {
+		t.Fatalf("attach again: %v", err)
+	}
+	_, cached := ledger.Start(overlay.Context(ctx), "server_start", "")
+	cached.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	overlay.Finish(ledger.OutcomeOK)
+	if err := l.DiscardRun(ctx, overlay); err != nil {
+		t.Fatalf("discarding a run of the previous hold: %v", err)
+	}
+	second, secondCtx := newRun(t, l)
+	_, activation := ledger.Start(secondCtx, "activation", "")
+	activation.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	second.Finish(ledger.OutcomeOK)
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	if view := runByID(t, dir, second.ID()); view.Run.Outcome != ledger.OutcomeOK || len(view.Spans) != 1 {
+		t.Fatalf("the second hold's run reads %q with %d spans, want ok with its one stage: "+
+			"the handle stopped recording after its first hold", view.Run.Outcome, len(view.Spans))
+	}
+	// Still exactly what the first detach wrote: the second attachment did not
+	// reopen the first hold's rows.
+	if view := runByID(t, dir, firstID); len(view.Spans) != 1 || view.Run.Outcome != ledger.OutcomeInterrupted {
+		t.Fatalf("the first hold's run now reads %q with %d spans: a later attachment rewrote a closed hold's account",
+			view.Run.Outcome, len(view.Spans))
+	}
+	// The run cached across the detach keeps the account its own attachment
+	// closed: interrupted, with no span from the second hold and no finish of
+	// its own. The row itself stays -- an overlay run whose writer is gone is
+	// what the collection pass sweeps -- but nothing of the second hold is in
+	// it.
+	cachedView := runByID(t, dir, overlayID)
+	if cachedView.Run.Outcome != ledger.OutcomeInterrupted || len(cachedView.Spans) != 0 {
+		t.Fatalf("the run cached across the detach reads %q with %d spans, want interrupted with none: "+
+			"it kept recording into an attachment that had already finalized it",
+			cachedView.Run.Outcome, len(cachedView.Spans))
+	}
+}
+
+func runByID(t *testing.T, dir, id string) ledger.RunView {
+	t.Helper()
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err != nil || !open {
+		t.Fatalf("open the reader: %v, present=%v", err, open)
+	}
+	defer reader.Close()
+	view, found, err := reader.Run(context.Background(), id)
+	if err != nil || !found {
+		t.Fatalf("read run %s: %v, found=%v", id, err, found)
+	}
+	return view
 }

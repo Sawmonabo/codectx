@@ -664,3 +664,105 @@ func mustInt(t *testing.T, text string) int64 {
 	}
 	return n
 }
+
+// TestE2EAnIdleServerHoldsNoLedgerWriter is the one-writer-per-ledger proof.
+//
+// Failure mode it protects: a process opens the run ledger's WRITER for its
+// whole session while it holds the workspace lock only for the beat that
+// builds. A connected `mcp serve` sitting idle then has a collector on
+// ledger.db, and the person's own `codectx index` beside it is a second writer
+// on the same file -- the exact thing the ledger's separate database and its
+// single collector exist to prevent. The artifact is probed rather than the
+// run rows, because an idle server with a collector open writes no run row
+// either: only the file ledger.Open creates distinguishes the two.
+//
+// Mutation that must fail it: in internal/app/compose.go, attach the ledger's
+// collector at composition (`if o.indexing()`) instead of under the hold.
+func TestE2EAnIdleServerHoldsNoLedgerWriter(t *testing.T) {
+	s := newSandbox(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	root := filepath.Join(s.Home, "data")
+	if files := ledgerFiles(t, root); len(files) != 0 {
+		t.Fatalf("a workspace where nothing has built already carries %v", files)
+	}
+
+	session, serverLog, closeSession := s.mcpServer(t, ctx)
+	defer closeSession()
+	// Connected AND serving: a server that failed to come up would carry no
+	// ledger either, and would prove nothing. The tool listing and not a query
+	// tool, because nothing has been published yet and every query tool
+	// correctly refuses CTX_NO_ACTIVE_GENERATION on this workspace.
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil || len(tools.Tools) == 0 {
+		t.Fatalf("the session lists no tools (err %v), so it is not serving\nserver stderr:\n%s",
+			err, serverLog.String())
+	}
+	if files := ledgerFiles(t, root); len(files) != 0 {
+		t.Fatalf("a connected, idle `mcp serve` opened the run ledger's writer: %v\n"+
+			"it holds the workspace lock only for the beat that builds, so this is a second "+
+			"writer on a file whose design rests on there being one\nserver stderr:\n%s",
+			files, serverLog.String())
+	}
+
+	// The person's own index, as a second process, beside that idle server.
+	env, code := s.run(t, "index")
+	if !env.OK || code != 0 {
+		t.Fatalf("`codectx index` was refused (exit %d) beside a connected idle server: %+v", code, env.Error)
+	}
+	result := data[model.IndexResult](t, env, code)
+	if result.Run == nil {
+		t.Fatal("the index beside an idle server recorded no run: it is the only writer and must record in full")
+	}
+	if result.Run.GenerationID == nil || len(result.Stages) == 0 {
+		t.Fatalf("the index's run is incomplete: generation %v, %d stages",
+			result.Run.GenerationID, len(result.Stages))
+	}
+	if files := ledgerFiles(t, root); len(files) == 0 {
+		t.Fatal("the index recorded no ledger file at all, so the absence above proves nothing")
+	}
+	closeSession()
+
+	// The other half: a session that BUILDS does open the writer. The ledger
+	// is removed the way TestE2EResourcesReportsAStoreWithNoLedger removes it,
+	// so what reappears can only be this session's own refresh.
+	for _, path := range ledgerFiles(t, root) {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("removing the run ledger: %v", err)
+		}
+	}
+	_, watchLog, closeWatching := s.mcpServer(t, ctx, "--watch=true")
+	defer closeWatching()
+	touchFixture(t, s.Repo)
+	beat := awaitRefreshPast(t, ctx, watchLog, int64(result.Binding.GenerationID))
+	t.Logf("the watching session's beat published generation %d", beat.generation)
+	if files := ledgerFiles(t, root); len(files) == 0 {
+		t.Fatalf("a session that refreshed opened no run ledger, so its beat recorded nothing\nserver stderr:\n%s",
+			watchLog.String())
+	}
+}
+
+// ledgerFiles lists the run-ledger artifacts under a data root: the database
+// and its write-ahead sidecars, which are what opening the ledger for writing
+// creates.
+func ledgerFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() && strings.HasPrefix(d.Name(), "ledger.db") {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	return found
+}
