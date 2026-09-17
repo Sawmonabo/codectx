@@ -980,8 +980,9 @@ func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
 
 // documentWithText is documentRecord plus the Document.text field. A document
 // that carries the pinned file's own bytes is what makes an import's binding
-// verified, which is the binding under which a coordinate that misses those
-// bytes fails the unit instead of being skipped.
+// verified. Under either binding a coordinate that misses those bytes costs
+// that occurrence and degrades the unit to partial; what the binding changes
+// is the code the degradation carries, never whether the unit survives.
 func documentWithText(path, language string, encoding uint64, text string, occurrences ...[]byte) []byte {
 	return appendBytes(documentRecord(path, language, encoding, occurrences...), 5, []byte(text))
 }
