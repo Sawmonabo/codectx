@@ -514,9 +514,25 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// the nested projects afterwards spent the time and the disk of every
 	// sibling project, and left another unit's source inside this unit's
 	// private tree for as long as the pruning took.
+	//
+	// The same pass counts the source files the frontend will leave out of its
+	// analysis by a default of its own. It is one counter, not a list, and it
+	// is what lets a unit that exports nothing name the reason: a unit every
+	// one of whose files the frontend refuses has a cause an operator can act
+	// on, and one whose files it accepts does not.
+	var refused int64
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
-			Include: func(fv model.FileVersion) bool { return unit.Contains(fv.Path) }})
+			Include: func(fv model.FileVersion) bool {
+				if !unit.Contains(fv.Path) {
+					return false
+				}
+				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family &&
+					p.backend.RefusesInput(unit.Family, unitRelative(unit, fv.Path)) {
+					refused++
+				}
+				return true
+			}})
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -537,7 +553,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision)
 	}
 
-	exp, crash, err := p.export(ctx, req, unit, res, run, graph)
+	exp, crash, err := p.export(ctx, req, unit, res, run, graph, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -715,7 +731,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // confirmation is the same argv a second time and what it yields is a second
 // observation of the same class, which is what subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, graph string) (ExportOutcome, Outcome, error) {
+	run *runDir, graph string, refused int64) (ExportOutcome, Outcome, error) {
 
 	out, err := p.runExport(ctx, req, unit, res, run, graph)
 	if err != nil {
@@ -745,17 +761,11 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 	}
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
-		// not a crash and must not be worded as one: a frontend whose own
-		// defaults exclude the directories a project keeps its sources in
-		// skips every file it was given and leaves exactly this. What the
-		// reader needs is which family it was and how many files the unit
-		// declared, so the two can be compared against what the frontend
-		// admits.
+		// not a crash and must not be worded as one, and it must not be
+		// worded as itself either: the count of the unit's files the frontend
+		// leaves out of its analysis is what turns the symptom into a reason.
 		out.Outcome.Class = FailureEmptyExport
-		return ExportOutcome{}, Outcome{}, failure(FailureEmptyExport, unit.ScopeKey, out.Outcome, res).
-			WithDetail("family", string(unit.Family)).
-			WithDetail("source_files", itoa(unit.Files)).
-			WithRemediation("check whether the frontend of this language family excludes the directories this project's sources are in")
+		return ExportOutcome{}, Outcome{}, emptyExport(unit, out.Outcome, res, refused)
 	}
 	return out, Outcome{}, nil
 }
@@ -1050,6 +1060,18 @@ func unitSource(root string, unit Unit) (string, error) {
 		return "", invalid("the dependence unit's project directory is not in the snapshot: " + truncate(unit.Root, 128))
 	}
 	return dir, nil
+}
+
+// unitRelative is a snapshot path as the frontend sees it: relative to the
+// directory the unit is parsed from, which is the unit's own root. The
+// frontend's own defaults are expressed over that path and not over the
+// repository path, so asking about the repository path would answer for a
+// directory the frontend never saw.
+func unitRelative(u Unit, p string) string {
+	if u.Root == "" {
+		return p
+	}
+	return strings.TrimPrefix(p, u.Root+"/")
 }
 
 // backendFailure renders the crash a subdivided unit publishes: the failing

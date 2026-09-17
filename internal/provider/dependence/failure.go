@@ -94,7 +94,10 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
-		msg += "the analysis exported no method for a unit that has source"
+		// emptyExport below replaces this with the reason it measured. This
+		// wording is the one that holds without that measurement, and it is
+		// still a statement about the source rather than about the export.
+		msg += "the analysis read this unit's source and found no method definition in it"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -137,6 +140,28 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		}
 	}
 	return err
+}
+
+// emptyExport is the typed failure for a unit whose source the analysis read
+// without exporting a single method. "the export carries no method" is the
+// symptom, never the reason, so the error names which of the two reasons the
+// provider measured: the frontend left every one of the unit's source files
+// out of its analysis, or it took them and defined nothing.
+//
+// refused is how many of the unit's own source files the backend reports the
+// frontend leaves out. It is compared against the unit's file count rather
+// than tested for zero, because a unit some of whose files are analysed and
+// which still exports nothing is not explained by the refusal.
+func emptyExport(unit Unit, o Outcome, r Reservation, refused int64) *model.Error {
+	err := failure(FailureEmptyExport, unit.ScopeKey, o, r).
+		WithDetail("family", string(unit.Family)).
+		WithDetail("source_files", strconv.FormatInt(unit.Files, 10)).
+		WithDetail("refused_source_files", strconv.FormatInt(refused, 10))
+	if refused >= unit.Files {
+		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so nothing was analysed"
+		return err.WithRemediation("the frontend refuses these paths by a default no option of it turns off and no input directory avoids; exclude this project from the index, or move its sources to a path the frontend accepts")
+	}
+	return err.WithRemediation("check that this unit's source files hold method definitions this language family's frontend can parse")
 }
 
 // crashDecision is how the provider established that an engine crash

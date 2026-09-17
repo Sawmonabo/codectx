@@ -51,6 +51,10 @@ type fakeBackend struct {
 	deadExport bool
 	// noGraph makes a nominally clean parse leave no graph.
 	noGraph bool
+	// refusesEveryFile makes the frontend report that it leaves every source
+	// file of the unit out of its analysis, which is the measured shape of the
+	// Java project whose every path carried a component the frontend refuses.
+	refusesEveryFile bool
 	// wholeExportCrash is the engine crash the WHOLE unit's export dies on
 	// while every subdivided part's export succeeds -- the measured shape of a
 	// 4,984-file project whose export died at every heap cap.
@@ -73,6 +77,8 @@ func (b *fakeBackend) Engine() dependence.Engine {
 func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
 
 func (b *fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
+
+func (b *fakeBackend) RefusesInput(dependence.Family, string) bool { return b.refusesEveryFile }
 
 func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	b.parses++
@@ -214,6 +220,11 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		backend *fakeBackend
 		code    string
 		detail  map[string]string
+		// reason and remediation are substrings the failure's own text must
+		// carry. A classified failure whose message restates its class tells
+		// an operator nothing they did not already have from the class.
+		reason      string
+		remediation string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
 		// permits for that class -- which a crash that named its failing pass
@@ -241,15 +252,33 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			parses: 2,
 		},
 		{
-			// Both steps exited cleanly and the export holds no method. It is
-			// classified as what it is rather than as a crash, and it names
-			// the family and the file count so a reader can compare what the
-			// unit declared against what the frontend admitted.
-			name:    "an export with no methods for a unit that has source is not worded as a crash",
+			// Both steps exited cleanly and the export holds no method, and
+			// the frontend took every file it was given. It is classified as
+			// what it is rather than as a crash, and it says the analysis read
+			// the source rather than restating that nothing came out.
+			name:    "an export with no methods for a unit whose source was read names that as the reason",
 			backend: &fakeBackend{deadExport: true},
 			code:    model.CodeProviderOutputInvalid,
-			detail:  map[string]string{"failure_class": "empty_export", "family": "go", "source_files": "1"},
-			parses:  1,
+			detail: map[string]string{"failure_class": "empty_export", "family": "go",
+				"source_files": "1", "refused_source_files": "0"},
+			reason:      "read this unit's source and found no method definition",
+			remediation: "hold method definitions",
+			parses:      1,
+		},
+		{
+			// The same empty export, with the frontend leaving every file of
+			// the unit out of its analysis. The reason is then the refusal and
+			// not the empty export, and the remediation is one an operator can
+			// act on; this is the measured shape of a project every one of
+			// whose source paths carries a component the frontend refuses.
+			name:    "an export with no methods for a unit the frontend refused whole names the refusal",
+			backend: &fakeBackend{deadExport: true, refusesEveryFile: true},
+			code:    model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "empty_export", "family": "go",
+				"source_files": "1", "refused_source_files": "1"},
+			reason:      "leaves every source file of this unit out of its analysis",
+			remediation: "exclude this project from the index",
+			parses:      1,
 		},
 		{
 			name:    "a clean exit that left no graph is an engine failure, not a success",
@@ -277,6 +306,12 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 				if typed.Details[k] != want {
 					t.Errorf("detail %q = %q, want %q", k, typed.Details[k], want)
 				}
+			}
+			if c.reason != "" && !strings.Contains(typed.Message, c.reason) {
+				t.Errorf("the failure message is %q, which does not name the reason %q", typed.Message, c.reason)
+			}
+			if c.remediation != "" && !strings.Contains(typed.Remediation, c.remediation) {
+				t.Errorf("the failure remediation is %q, which does not carry %q", typed.Remediation, c.remediation)
 			}
 			if result.State == model.RunSucceeded {
 				t.Errorf("run state = %s, want a failed state", result.State)

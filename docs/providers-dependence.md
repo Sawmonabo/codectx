@@ -382,9 +382,31 @@ Every one of these was reproduced against the real engine.
 | `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
 | `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable, **or** the untimed `Pass <name> failed` at ERROR that a pass which dies before it is timed leaves | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. A parse crash that names **both** is taken as reproducible on first sight and is not re-parsed: it goes straight to subdivision. Siblings are unaffected. |
 | `engine` (crash that names no pass) | `Process exited with code <n>` on stderr, a clean exit that left no graph, a signal death, or any non-zero exit with nothing said about a pass | same code. For the zero-exit helper crash the exit status is a lie and the empty result is the only honest signal. Nothing here identifies the defect, so the one confirmation below is kept before anything is split. |
-| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`. Not worded as a crash, because none happened: a frontend whose own defaults exclude the directories a project keeps its sources in skips every file it was given. The Java frontend excludes any path with a `test` directory component, which is measurably the whole of a project laid out as `src/test/java/...`. Compare `source_files` with what the family's frontend admits. |
+| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family`, `source_files` and `refused_source_files`. Not worded as a crash, because none happened, and not worded as itself either: the failure names which of the two reasons the provider measured. `refused_source_files` equal to `source_files` means the frontend left every file of the unit out of its analysis, and the remediation says so; anything less means the frontend read the source and defined no method in it. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
+
+### What the Java frontend refuses, and why no argument avoids it
+
+The Java frontend leaves out of its analysis every file whose path, relative to
+the directory it is pointed at, carries a component named `test`. Measured on
+the pinned payload with the pinned parse and export argv over three one-class
+fixtures whose code is identical and whose only difference is that path:
+`com/x/Main.java` exported five method rows; `com/test/Main.java` exported
+none; and `com/selenium/test/utils/Main.java`, with the frontend pointed at the
+`src/main/java` source root above it, also exported none. All three runs exited
+0 from both steps and wrote nothing to standard error, so the refusal announces
+itself nowhere but in the missing rows — and the refused runs carried no file
+row for the source at all, not merely no method.
+
+Two consequences, both of them the frontend's and neither of them the
+product's. The component is matched anywhere in the path, so a package
+directory triggers it exactly as a source root does: pointing the frontend at
+one source root, or at each in turn, does not rescue a project whose packages
+are named that way, which is why the provider does not do it. And the
+frontend's only exclusion options are additive, so no argument turns the
+default off. A unit in that position cannot publish facts at all, which is why
+it fails with the refusal named rather than with an empty result explained away.
 
 **What is run a second time, and what is not.** Heap exhaustion keeps the one
 retry described above, and only when more memory is actually available. A
