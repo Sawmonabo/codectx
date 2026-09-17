@@ -186,41 +186,58 @@ func Definitions() []Definition {
 // The answer comes from the pinned snapshot's own manifest, never from the
 // live checkout: the server is materialized from that snapshot, so a marker
 // the working tree has and the snapshot does not names a directory the server
-// would find empty. Nothing repository-sized is retained -- the scan keeps one
-// string.
+// would find empty.
+//
+// The rows that can answer are known without looking: a directory that owns
+// rel is a prefix of rel, so the only candidates are one of the definition's
+// marker names in one of those directories. Asking for them by path is a
+// handful of point lookups per directory level, where scanning for them
+// visited every row of the manifest -- a monorepo's whole file list, once per
+// overlay request, to find at most a few names. Nothing repository-sized is
+// retained either way: the search keeps one directory's candidate names.
 func (d Definition) ProjectRoot(ctx context.Context, view model.SnapshotView, rel string) (string, error) {
-	markers := make(map[string]bool, len(d.RootMarkers))
-	for _, m := range d.RootMarkers {
-		markers[m] = true
+	if len(d.RootMarkers) == 0 {
+		// A definition that declares no marker is rooted at the workspace root
+		// by construction, and there is nothing to look for.
+		return "", nil
 	}
-	best := ""
-	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		if !markers[path.Base(fv.Path)] {
+	dir := parentDir(rel)
+	for {
+		candidates := make([]string, 0, len(d.RootMarkers))
+		for _, m := range d.RootMarkers {
+			candidates = append(candidates, path.Join(dir, m))
+		}
+		found := false
+		err := view.EachFile(ctx, model.FileSelection{Paths: candidates}, func(model.FileVersion) error {
+			found = true
 			return nil
+		})
+		if err != nil {
+			return "", err
 		}
-		dir := ""
-		if i := strings.LastIndexByte(fv.Path, '/'); i >= 0 {
-			dir = fv.Path[:i]
+		// Deepest first, so the first directory holding a marker is the project
+		// that owns the file and the search stops there.
+		if found {
+			return dir, nil
 		}
-		if len(dir) > len(best) && underDir(rel, dir) {
-			best = dir
+		if dir == "" {
+			// The workspace root declared nothing, which is the honest answer
+			// for a repository that declares nothing.
+			return "", nil
 		}
-		return nil
-	})
-	if err != nil {
-		return "", err
+		dir = parentDir(dir)
 	}
-	return best, nil
 }
 
-// underDir reports whether the root-relative path rel lies at or under the
-// root-relative directory dir; the empty dir is the workspace root and
-// contains everything.
-func underDir(rel, dir string) bool {
-	if dir == "" {
-		return true
+// parentDir is the root-relative directory holding the root-relative path p,
+// with the empty string for the workspace root itself. It never escapes the
+// root: a path with no separator left is already at it.
+func parentDir(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return ""
 	}
-	return strings.HasPrefix(rel, dir+"/")
+	return p[:i]
 }
 
 // Profile is a runnable server: a Definition joined with the payload the
