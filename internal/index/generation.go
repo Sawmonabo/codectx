@@ -248,11 +248,17 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 // its own function so the operator settings it carries -- index.capture_max_retries
 // and index.capture_retry_deadline, the only escape hatch from a worktree that
 // never settles -- are reachable by a test without running a capture.
-func (g *generation) captureBuilder() *snapshot.Builder {
+//
+// The workspace lock is passed in rather than read from the options: this
+// composition may have taken it at its first build rather than at its open,
+// and the builder must be handed the lock this run actually holds. A nil one
+// would make the builder take a second lock of its own and release it under
+// the run.
+func (g *generation) captureBuilder(lock *snapshot.WorkspaceLock) *snapshot.Builder {
 	c := g.c
 	return &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
 		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
-		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log,
+		Git: c.opts.Git, Lock: lock, Logger: c.log,
 		MaxRetries:    c.opts.Config.Index.CaptureMaxRetries.Value(),
 		RetryDeadline: c.opts.Config.Index.CaptureRetryDeadline.Std()}
 }
@@ -263,7 +269,17 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	c := g.c
 	ctx, span := ledger.Start(ctx, stageCapture, "")
 	defer func() { span.End(endOutcome(err), ledger.Measured{}, err) }()
-	b := g.captureBuilder()
+	// The caller took the lock before this generation began; asking for it
+	// again is how the builder names the one this process holds, and it
+	// acquires nothing a second time. It sits inside the span so a capture
+	// that was refused the workspace is recorded as the failed capture it is,
+	// and the release runs before the span closes.
+	lock, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
+		return err
+	}
+	defer release()
+	b := g.captureBuilder(lock)
 	walkCtx, walk := ledger.Start(ctx, stageWalk, "")
 	snap, err := b.Build(walkCtx)
 	walk.AddOut(int64(snap.FileCount))
@@ -370,7 +386,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: g.c.disabledProviders(),
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(g.c.opts.Config),
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
 }
 

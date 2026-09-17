@@ -422,7 +422,8 @@ const ledgerRepository = "0123456789abcdef0123456789abcdef0123456789abcdef012345
 // transferred bytes lost at the one moment they exist.
 func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 	ctx := context.Background()
-	l, err := ledger.Open(ctx, t.TempDir())
+	l := ledger.New(t.TempDir())
+	err := l.Attach(ctx)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}

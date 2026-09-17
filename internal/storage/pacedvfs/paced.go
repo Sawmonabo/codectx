@@ -30,6 +30,9 @@
 package pacedvfs
 
 import (
+	"os"
+	"path/filepath"
+
 	"sync"
 	"unsafe"
 
@@ -247,20 +250,61 @@ func openPooled(tls *libc.TLS, pFile uintptr, flags int32, pOutFlags uintptr) bo
 }
 
 // xDelete removes a file the way paced.Remove does, through the same helper:
-// a file larger than a window is shrunk a window at a time before the wrapped
-// delete unlinks it, so the log's reset and a journal's removal never free
-// gigabytes at once, while a small journal -- the common case, deleted at
-// every commit in rollback mode -- is unlinked whole rather than paying an
-// open, a truncate and a sync for four kilobytes. The engine also deletes
-// speculatively, naming files that are not there; that is not a failure.
+// the file is renamed into the to-free set that serves it and the space is
+// given back afterwards, at the pace, so the log's reset and a journal's
+// removal never free gigabytes at once and never hold the caller either.
+//
+// Holding the caller is the whole reason the rename comes first. The engine
+// deletes the write-ahead log from inside its WAL close, which holds the
+// database file exclusively for the length of the call: a log emptied here a
+// window at a time keeps that lock for a quarter second per window, and every
+// other process's first read waits it out on the busy ladder. What the engine
+// waits for is the name being gone, which a rename gives it at the cost of a
+// directory entry.
+//
+// A path no set serves has nowhere to be renamed to, so it is emptied here, a
+// window at a time, before the wrapped delete unlinks it; a file no larger
+// than a window is unlinked whole rather than paying an open, a truncate and
+// a sync for four kilobytes. The engine also deletes speculatively, naming
+// files that are not there; that is not a failure.
 func xDelete(tls *libc.TLS, pVfs, zName uintptr, syncDir int32) int32 {
 	if zName != 0 {
-		if err := paced.ShrinkForRemoval(libc.GoString(zName)); err != nil {
+		name := libc.GoString(zName)
+		// A file one window or smaller is left to the wrapped delete, which
+		// unlinks it whole: renaming a four-kilobyte journal would cost a
+		// directory entry and a reclaimer's turn to give back nothing. The
+		// existence check is the one ShrinkForRemoval makes anyway, made here
+		// so that a speculative delete of a file that is not there reaches the
+		// wrapped delete and is reported exactly as it always was.
+		st, sterr := os.Lstat(name)
+		if sterr == nil && st.Mode().IsRegular() && st.Size() > paced.Window && paced.QueueForRemoval(name) {
+			// The rename is the removal, so the durability the engine asked
+			// for is about the name it deleted: this syncs the directory
+			// that name was in, which is what the wrapped delete would have
+			// synced. The set the file now sits in is the reclaimer's.
+			if syncDir != 0 {
+				if err := syncDirectoryOf(name); err != nil {
+					return sqlite3.SQLITE_IOERR_DIR_FSYNC
+				}
+			}
+			return sqlite3.SQLITE_OK
+		}
+		if err := paced.ShrinkForRemoval(name); err != nil {
 			return sqlite3.SQLITE_IOERR_DELETE
 		}
 	}
 	del := (*sqlite3.Tsqlite3_vfs)(ptr(inner)).FxDelete
 	return (*(*func(*libc.TLS, uintptr, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{del})))(tls, inner, zName, syncDir)
+}
+
+// syncDirectoryOf makes a change to the directory holding path durable.
+func syncDirectoryOf(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // xClose closes the file and, for a pooled temporary, gives the surface back

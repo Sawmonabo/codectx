@@ -421,6 +421,51 @@ ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
 
+## A second process reading while a run writes
+
+A process that only answers questions opens the store with **no writer
+connection at all**. Nothing it does can wait on the ingestion group another
+process holds, and nothing it does can delay that group: the reader pool is
+`query_only`, it reads a write-ahead log snapshot, and a log reader never waits
+on a writer.
+
+That is not the default it looks like. A read-only command performed two
+writes before it read anything, and both were `_txlock=immediate` on the single
+writer connection, so both queued behind a run's group and were refused
+`database is busy` after `storage.busy_timeout`:
+
+* **the schema check at open**, which ran the fingerprint comparison inside a
+  write transaction because the same call creates the schema in an empty cache;
+* **the retention lease** every pinned generation inserted.
+
+Opened without a writer, the fingerprint is compared on the reader pool -- the
+same comparison, and a cache with no tables is reported as the workspace that
+was never built rather than as a fingerprint that failed to match -- and the
+pin takes no lease.
+
+**A pin without a lease is a snapshot, and a snapshot is what a query needs.**
+Every read such a reader serves runs in one deferred read transaction of its
+own, so within a call the log snapshot is fixed: a collection running in another
+process at that moment cannot take rows out from under the read, and the answer
+in hand is the whole answer for the generation it was bound to. The pin
+therefore accepts any published generation, superseded as readily as active; the
+lease was retaining rows against a hazard the snapshot already excludes.
+
+What the snapshot does not span is the gap BETWEEN calls, and that gap has an
+answer rather than a hole. A continuation names the generation its token was
+minted against, and both continuable endpoints pin that generation rather than
+the current one. If the retention pass behind another process's activation has
+collected it, the pin finds no row, and the caller is told so in the family a
+continuation is refused in -- `CTX_CURSOR_INVALID`, re-run from the first page
+-- and not as though the argument it never typed were malformed. A generation
+named by hand with `--generation` still meets the argument refusal, which is the
+answer that case asks for.
+
+Every mutating entry point on such a store refuses with `CTX_INTERNAL`: it is
+reachable only by composing a command that changes the workspace with the
+composition that cannot, which is a defect in this binary and not an operator
+state.
+
 ## How an index run commits
 
 Every write an index run makes -- the snapshot's blobs and file rows, each
@@ -726,7 +771,11 @@ and invalidate every cache. A diagnostic table is not worth that.
 
 The ledger has exactly one writer -- the collector goroutine of the process
 that holds the workspace lock -- and any number of read-only readers at any
-moment. It runs in WAL mode at `synchronous = normal`; a reader opens it with
+moment. The collector lives exactly as long as that hold: it is opened when a
+process takes the workspace lock to build and stopped, with its last rows
+flushed, before the lock is given back. A session that holds nothing writes
+nothing here, so a server left connected between refreshes is never a second
+collector beside the person's own run. It runs in WAL mode at `synchronous = normal`; a reader opens it with
 `query_only` set, so `status --resources` reads a run while that run writes,
 disturbs nothing, and cannot create the file in a workspace where no run has
 ever been recorded. A composition that only reports opens no ledger at all.

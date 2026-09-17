@@ -88,11 +88,11 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_WORKSPACE_NOT_FOUND` | No workspace was discovered from this directory upward. | Run `codectx init` at the repository root, or run from inside the repository. |
 | `CTX_CONFIG_INVALID` | A configuration key is unknown, malformed or violates a cross-key rule. | The detail names the key. Fix it in the layer that set it; there is no extension namespace, so an unknown key is always a typo or a setting from another version. |
 | `CTX_TRUST_REQUIRED` | A project file set a key only the user configuration may set, or raised a limit it may only lower. | Move the setting to your user configuration, or lower it. |
-| `CTX_SCHEMA_MISMATCH` | The database on disk was written by a different schema. **This fails closed on purpose**; there is no migration layer. | Remove the workspace's data directory and re-index. Nothing in it is a source of truth: the repository is. |
+| `CTX_SCHEMA_MISMATCH` | The database on disk was written by a different schema. **This fails closed on purpose**; there is no migration layer. It is also what a command waiting for the workspace reports when the process holding it wrote a run ledger this build cannot read. | Remove the workspace's data directory and re-index. Nothing in it is a source of truth: the repository is. When the message names a holding process instead, remove nothing: the two processes are different builds, so let the holder finish or stop it, and run the command again from one of them. |
 | `CTX_STORAGE_CORRUPT` | An integrity check failed. | Run `codectx doctor --deep` for the detail, then remove the data directory and re-index. |
 | `CTX_SOURCE_INTEGRITY` | A stored source block did not match its recorded hash. | Same as above: re-index. Do not keep serving from the store — retained bytes are what every answer cites. |
 | `CTX_NO_ACTIVE_GENERATION` | The workspace is initialized but nothing has been published yet, or the last run failed before publication. | Run `codectx index`. A failed or unsealed unit is invisible by design, so a partial run leaves no half-visible state to clean up. |
-| `CTX_WORKSPACE_BUSY` | Another process holds the workspace lock, or a live lease or retained session still references what was asked for. | **Retryable.** Wait and retry. The workspace lock is an advisory OS file lock, so it is released by the kernel if its holder dies — there is no stale lock file to remove by hand. |
+| `CTX_WORKSPACE_BUSY` | Another process holds the workspace lock, or a live lease or retained session still references what was asked for. | **Retryable.** Wait and retry. When the holder recorded itself in the lock file, the message and the `holder_pid`/`holder_operation` details name the process and what it is running, so you know what to wait for or stop; a holder that recorded nothing is reported as such rather than guessed at. The workspace lock is an advisory OS file lock, so it is released by the kernel if its holder dies — there is no stale lock file to remove by hand. |
 | `CTX_DISK_FULL` | Free space is below `resources.min_free_disk_bytes`, a temporary budget was exhausted, or the filesystem refused a database write with less than one ingestion group free under the data directory. The message carries the engine's own result and the free space measured at the failure. | See "Disk pressure" below. |
 | `CTX_RESOURCE_LIMIT` / `CTX_MINIMUM_BUDGET` | A bounded operation hit its ceiling, or the configured budgets cannot satisfy the minimum this build needs. | Narrow the request, or raise the relevant `[resources]` key. `CTX_MINIMUM_BUDGET` means the configuration itself does not hold together. |
 | `CTX_PROVIDER_UNAVAILABLE` | A provider is not usable — not installed, unsupported platform, or refused as too old. | The detail names the provider and the reason. Either install or enable it, or disable it; the index is still published without it, with that capability reported degraded. |
@@ -105,6 +105,141 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_SESSION_EXPIRED` / `CTX_SESSION_SUPERSEDED` / `CTX_ACTOR_MISMATCH` | A context session is past its deadline, was replaced, or is being used by a different actor. | Open a new session. Receipts are never shared between sessions. |
 | `CTX_CURSOR_INVALID` | A continuation token or a source receipt was malformed, tampered with, or older than `storage.query_cursor_ttl`. | Re-run the query from the first page. |
 | `CTX_INTERNAL` | A composition or producer defect. | Report it with the command you ran. It is not an operator-fixable state. |
+
+## Which commands write, and which never do
+
+Four kinds of command, by what they may change:
+
+| | Workspace lock | Database writes | Commands |
+|---|---|---|---|
+| **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
+| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
+| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
+| **Both** | Held for each refresh and each watch beat, never between them | The refresh's own; its exploration tools write nothing | `mcp serve` |
+
+`tools status` is in neither row: it opens the managed-tool store and no
+database at all.
+
+A command in the answering row opens the store without a writer connection. It
+answers throughout another process's `index` or `watch` -- that is the promise
+`status --help` makes -- and it delays that run by nothing, because a
+write-ahead log reader never waits on a writer. It is also why such a command
+never reports `CTX_WORKSPACE_BUSY`: it takes no lock and begins no write that
+could queue behind one.
+
+Two consequences an operator sees:
+
+* Every answering command **pages in full**. A continuation needs a signed token
+  and, for an answer whose position does not fit one, some state beside the
+  workspace; neither is a database write. What such a process cannot record is
+  the retention lease, so the state it keeps is bound to the continuation's own
+  recorded expiry instead and is reclaimed on that deadline by the next `gc` or
+  `index` in any process. Pass the printed cursor back to take the next page.
+* A continuation that names state whose deadline has passed, or a generation
+  collected in the meantime, is answered `CTX_CURSOR_INVALID`: re-run from the
+  first page. A `search`, `refs` or `impact` answer paged this way is reachable
+  for one `storage.query_cursor_ttl` from its first page, because the spool it
+  reads carries the expiry the page that wrote it stamped and no lease renews
+  it. A walk and a `path` search re-stamp their state on every page, so their
+  deadline advances with the walk.
+* `doctor --deep` is in the recording row, not the answering one: the search
+  index's own integrity check is spelled as an insert into the index, so a deep
+  report needs the writer. It still takes no workspace lock.
+
+### The one process that is both
+
+The MCP server is the only process in both rows at once. `codectx mcp serve`
+keeps the writer, because `codectx_refresh_index` publishes generations; and it
+answers an agent's questions from the same process while that refresh is
+writing.
+
+Its startup takes no lock and performs no write, so a server starts and answers
+beside an index that is already running in another terminal. The workspace lock
+is taken for the duration of a refresh and given back when it ends, so a
+session that is idle between refreshes holds nothing and the person's own
+`codectx index` runs while the server stays connected. A refresh asked for
+while another process holds the workspace is refused `CTX_WORKSPACE_BUSY` --
+that one tool call, not the session: every question-answering tool keeps
+answering throughout.
+
+A server started with `--watch` follows the same rule as a refresh: each beat
+that builds takes the lock and gives it back when that beat ends, so between
+beats the session owns nothing and your own `codectx index` runs. A beat that
+finds the workspace held by another process is skipped -- the debug record
+names the holder's pid and operation once for that episode, not once per beat
+-- and the next beat starts from whatever that process published, reusing its
+units rather than building them again. It never ends the session.
+
+Every watch follows that rule, wherever it runs: `codectx watch`, `codectx
+index --watch` and a server started with `--watch` are one mechanism, not
+three. A watching session that is between beats owns nothing at all, so your
+own `codectx index` runs beside any of them.
+
+The indexing row above is a different case, not an inconsistency: `codectx
+index` without `--watch`, and `codectx refresh`, ARE the workspace's owner for
+their whole run -- they take the lock at startup and hold it to the end,
+because the run IS the operation. The distinction is the session that is meant
+to be left running, whether it answers questions or waits for a file to change:
+it owns the workspace only while it is actually building in it.
+
+### What a building command does when the workspace is held
+
+It waits for as long as the holder is getting on with it, and no longer. There
+is no wait constant: a number chosen here would be too long for a holder that
+has died and too short for one that is doing exactly what it should. The
+waiter judges the holder by the stamp that holder renews while it builds -- the
+run row's liveness deadline, rewritten on the flush the collector already
+performs -- read through a read-only connection that takes no lock and costs
+the holder nothing. While it waits it prints one line naming the holder's
+process, what that process is running and the stage it is in, and rewrites that
+line as the stage changes, so a person watching a terminal can see whose work
+they are behind.
+
+When the holder finishes, the waiter takes the workspace and builds, reusing
+everything the holder published rather than repeating it. It gives up only when
+the stamp stops advancing, and then with the retryable `CTX_WORKSPACE_BUSY`
+that names the holder. A holder that has taken the lock but not yet published
+its first stamp is given the same grace the ledger already allows a late
+flush, so a run is never refused for the moment between its lock and its first
+write.
+
+There is one way the wait ends early. If the holder's run ledger was written by
+a different build of this product, this one cannot read its stamp at all, so
+waiting would tell nobody anything: the waiter stops at once with
+`CTX_SCHEMA_MISMATCH`, naming the process and the operation holding the
+workspace. The two processes are different builds; let the holder finish, or
+stop it, and run the command again from one of them.
+
+The wait belongs to the operation, not to the command: the build a person
+asked for waits, and a watch beat, a background seal and an agent's
+`codectx_refresh_index` take the workspace only if it is free this moment. A
+beat that queues would stall every notification behind it, and a tool call held
+open for the length of somebody else's index is not an answer; both are
+answered now with the retryable refusal instead. So `codectx index --watch`
+waits for its first, base build exactly as `codectx index` does, and every beat
+after it skips rather than queues.
+
+It therefore opens **two handles on one database**: the writer, and a read-only
+handle beside it, opened after the writer so there is a schema to verify by
+reading. Every tool that only asks a question -- search, the repository
+overview, symbol lookup, references, the graph walks, and the index status
+report -- is served through the read-only handle. They pin no generation on the
+writer, so a tool call no longer commits the session's own refresh mid-group nor
+queues behind it; the run commits the same ingestion groups it would have
+committed with nobody reading.
+
+What an agent sees for it:
+
+* The **paged** ones among them answer **one page** during a session, for the
+  same reason the answering row does: a continuation needs a cursor lease and a
+  spool, and both are writes.
+* The status report is not paged: it is a single bounded answer, so
+  `codectx_index_status` answers during the session's own refresh -- including
+  what that session's watch covers and a retention sweep that did not finish,
+  which the serving process knows in memory and reads from no handle at all.
+* The session tools (`codectx_context_*`, `codectx_read_source`) still go
+  through the writer: they record rows, which is what they are for. Called
+  during the session's own refresh, they wait for the group the run has open.
 
 ## When a capability is not `fresh`
 
@@ -369,7 +504,7 @@ reports `unavailable`. It never reports `0`.
 | Database, WAL, temporary and content-store bytes | measured | measured | measured | Filesystem sizes. |
 | Free disk bytes | measured, else `unavailable` | measured, else `unavailable` | measured, else `unavailable` | Reported by the OS for the data directory's filesystem. A filesystem that refuses to answer yields `unavailable`, not `0`. |
 | Unit reuse and parse counts | `unavailable` | `unavailable` | `unavailable` | Counted per indexing run and reported on that run's result, where `codectx index` prints them. They are **not** process-wide totals, and the resource block reports no figure rather than reporting `0` for a process that has indexed nothing this run. No platform differs. |
-| Pending watch events | measured while a watch is live, else `unavailable` | measured while a watch is live, else `unavailable` | measured while a watch is live, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row carrying its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. A second process reports the figure while that row is live. Once it expires — the watch was killed, or the machine went down — the figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. A watch running without filesystem notifications has no queue to count and publishes no figure. |
+| Pending watch events | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row of its own, carrying its process, when it last published itself, its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. There is one row per watching process, not one per repository, keyed by the watch's own session identity and not by its process id, which the operating system reuses: two watches on one workspace — a terminal's and an editor's server — each keep their own row instead of overwriting each other's. `codectx status` lists every watcher whose row is live, with its process and its last beat, in any process, including one that is watching nothing itself; `status --resources` reports the figure of a watch that is covering the workspace while its row is live. A watch that is still waiting for whichever process holds the workspace has reconciled nothing, so it publishes its presence and no figure at all: the count is `unavailable` and `doctor`'s `watch_heartbeat` check says the watch is running but covering nothing, which is a different answer from a covering watch and from a workspace no watch has ever run in. Once a row expires — the watch was killed, or the machine went down — that watcher drops out of the list and its figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. An elapsed deadline is the only death signal, the same rule the run ledger judges a run's writer by, and no process id is ever probed; the next beat published for the workspace deletes the rows that have elapsed. A watch running without filesystem notifications has no queue to count and publishes no figure. |
 | Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. `stuck_frees` names the queued removals the filesystem refused, with the reason, so `pending_free_bytes` that never falls is never left unexplained. |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
 | Per-unit analyzer memory (`analyzer_units`) | measured | reservation and caps only | reservation and caps only | One row per heavy analysis unit this process ran: the reservation it was admitted against, the heap caps its two steps ran under, the machine-derived allocation those caps were bounded by, and the peak its process tree reached. The first three are the governor's own arithmetic and are always present. `allocation_bytes` is absent where the host does not publish available memory, and `observed_peak_bytes` is absent wherever the tree sampler is — the same reader as the process-tree peak above. Reading the row's figures together is the point: a peak far under the cap says the unit was serialized behind memory it never used. It is process accounting and not per generation, so it covers what **this** process has run. |

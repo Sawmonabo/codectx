@@ -397,19 +397,21 @@ var scenarios = []scenario{
 		// The writer's own expiry is the only death signal, so a row past it
 		// must report no figure at all and must warn, while a live one
 		// reports the figure and a never-watched workspace says so without
-		// warning.
+		// warning. The second failure mode, with a watch per process: a
+		// waiting watcher's row is preferred over a covering one's and the
+		// workspace is reported as covered by nothing while a watch covers it.
 		name: "an expired watch heartbeat is never reported as live coverage",
 		run: func(t *testing.T) {
 			now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 			pending := int64(7)
 			pass := now.Add(-time.Second)
-			at := func(d time.Duration) *WatchHeartbeat {
-				return &WatchHeartbeat{WriterPID: 4321, LastPassAt: &pass,
-					PendingEvents: &pending, ExpiresAt: now.Add(d)}
+			at := func(d time.Duration) []WatchHeartbeat {
+				return []WatchHeartbeat{{WriterPID: 4321, LastPassAt: &pass,
+					PendingEvents: &pending, ExpiresAt: now.Add(d)}}
 			}
-			run := func(t *testing.T, hb *WatchHeartbeat) (model.ResourceReport, model.DoctorCheck) {
+			run := func(t *testing.T, hb []WatchHeartbeat) (model.ResourceReport, model.DoctorCheck) {
 				t.Helper()
-				svc := newTestService(t, Options{Store: &fakeStore{heartbeat: hb}})
+				svc := newTestService(t, Options{Store: &fakeStore{heartbeats: hb}})
 				res, err := svc.Resources(context.Background())
 				if err != nil {
 					t.Fatalf("Resources: %v", err)
@@ -444,6 +446,24 @@ var scenarios = []scenario{
 			if noneCheck.State != model.CheckUnavailable {
 				t.Fatalf("a workspace nobody watches is unavailable, not a defect: %+v", noneCheck)
 			}
+			// Two processes watch this workspace: one waiting for whichever
+			// process holds it, one covering it. The waiting row carries the
+			// later deadline, so a reader that judged the freshest row alone
+			// would report that nothing here is covered while something is,
+			// and would drop the covering watcher's pending count with it.
+			both := []WatchHeartbeat{
+				{WriterPID: 99, ExpiresAt: now.Add(2 * time.Minute)},
+				{WriterPID: 4321, LastPassAt: &pass, PendingEvents: &pending, ExpiresAt: now.Add(time.Minute)},
+			}
+			bothRes, bothCheck := run(t, both)
+			if bothRes.PendingEvents == nil || *bothRes.PendingEvents != pending {
+				t.Fatalf("a covering watch beside a waiting one must report its pending count, got %v", bothRes.PendingEvents)
+			}
+			if bothCheck.State != model.CheckPass || !strings.Contains(bothCheck.Detail, "4321") ||
+				strings.Contains(bothCheck.Detail, "covered by it") {
+				t.Fatalf("a covering watch beside a waiting one must be reported as coverage: %+v", bothCheck)
+			}
+
 			// A composition root that forgets to forward the probe must say
 			// so rather than report a workspace as unwatched.
 			svc := newTestService(t, Options{Store: bareStore{}})
@@ -550,8 +570,9 @@ type fakeStore struct {
 	// hashes is what SampleBlobs reports. Nil is the ordinary fixture (an
 	// empty store); a row that needs a populated one sets it.
 	hashes []string
-	// heartbeat is the watch heartbeat the store holds, absent when nil.
-	heartbeat *WatchHeartbeat
+	// heartbeats are the watch heartbeat rows the store holds, freshest
+	// deadline first as the store reads them.
+	heartbeats []WatchHeartbeat
 }
 
 // SampleBlobs is the optional hash source for the content-addressed-storage
@@ -570,14 +591,10 @@ func (f *fakeStore) SuppliedIndexes(context.Context, model.GenerationID) ([]Supp
 	return f.supplied, f.err
 }
 
-// WatchHeartbeat is the optional watch-liveness probe. A nil heartbeat is a
-// workspace no watch ever ran in, which is a different answer from an expired
-// one.
-func (f *fakeStore) WatchHeartbeat(context.Context, model.RepositoryID) (WatchHeartbeat, bool, error) {
-	if f.heartbeat == nil {
-		return WatchHeartbeat{}, false, f.err
-	}
-	return *f.heartbeat, true, f.err
+// WatchHeartbeats is the optional watch-liveness probe. No rows is a workspace
+// no watch ever ran in, which is a different answer from an expired row.
+func (f *fakeStore) WatchHeartbeats(context.Context, model.RepositoryID) ([]WatchHeartbeat, error) {
+	return f.heartbeats, f.err
 }
 
 func (f *fakeStore) SynchronousMode(context.Context) (string, error) {

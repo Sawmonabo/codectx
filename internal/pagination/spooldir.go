@@ -18,9 +18,15 @@ import (
 // files of its own rather than as a record stream -- the shortest-path search's
 // external-memory scratch is the one such producer. It is named, bound,
 // validated, released and swept exactly like a spool file: same `spool-`
-// naming, same header, same lease, same shared byte budget. Only the shape of
+// naming, same header, same lifetime predicate, same shared byte budget. Only
+// the shape of
 // the bytes inside differs, which is why the lifecycle below adds two entry
 // points and changes nothing about how a spool lives.
+//
+// A directory adopted leaselessly is re-stamped by every page -- ReadoptDir
+// writes the new cursor's expiry into the header it moves -- so a paged walk's
+// state advances its own reclamation deadline with the walk, where a spool
+// file, written once, keeps the expiry of the page that created it.
 //
 // The alternative -- serializing the scratch into a record spool on every page
 // stop and writing it back on the next one -- was rejected: it costs a full
@@ -252,8 +258,8 @@ func replaceDirHeader(dir string, frame []byte) error {
 }
 
 // OpenDir validates that the retained directory named by cursor c exists, was
-// adopted for exactly this lease, generation and query, and that its lease is
-// still live at now, then returns its path. It is Open's check, without the
+// adopted for exactly this lease, generation and query, and that it is still
+// live at now, then returns its path. It is Open's check, without the
 // record stream: the producer reads the directory's own files itself.
 func (s *Spools) OpenDir(ctx context.Context, c Cursor, now time.Time) (string, error) {
 	if err := c.Validate(); err != nil {
@@ -275,11 +281,11 @@ func (s *Spools) OpenDir(ctx context.Context, c Cursor, now time.Time) (string, 
 		h.AnalysisKey != c.AnalysisKey || h.QueryHash != c.QueryHash {
 		return "", cursorInvalid("spool does not belong to this cursor")
 	}
-	expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
+	live, err := s.live(ctx, h, now)
 	if err != nil {
 		return "", err
 	}
-	if !now.Before(expiry) {
+	if !live {
 		return "", cursorInvalid("continuation state has expired")
 	}
 	return path, nil

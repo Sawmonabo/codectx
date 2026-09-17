@@ -253,6 +253,16 @@ func (l *lateSealer) loop() {
 				if l.ctx.Err() != nil {
 					return
 				}
+				var typed *model.Error
+				if errors.As(err, &typed) && typed.Code == model.CodeWorkspaceBusy {
+					// Another process owns the workspace. The queue keeps its
+					// units and stops asking until something wakes it again;
+					// retrying here would be a hot loop against a lock that is
+					// held for as long as that process runs.
+					l.c.log.Info("deferred unit publication is waiting for the workspace another process holds",
+						"component", component, "repository_id", string(l.c.repo), "units", n)
+					break
+				}
 				// Background work that failed leaves the active generation
 				// untouched and the scope answering stale; the next index
 				// plans it again. Nothing here carries source or native keys.
@@ -336,6 +346,17 @@ type batch struct {
 // is cancelled before the slot is free.
 func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 	sel provider.Selection, ref string) error {
+	// The cross-process workspace lock first, then the tick slot: this batch
+	// publishes a generation, and the background loop is the one publisher
+	// that does not run inside a caller's hold. The lock order is
+	// retention/retention.go's -- workspace lock, then this process's indexing
+	// state -- and it is given back the moment the batch is done, so a
+	// deferred unit never keeps the workspace from the person's own index.
+	_, release, err := l.c.hold(ctx, HoldNow)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := l.acquire(ctx); err != nil {
 		return err
 	}
@@ -687,7 +708,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: c.disabledProviders(),
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(c.opts.Config),
 		StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
@@ -800,9 +821,11 @@ func (c *Coordinator) Pending() Pending {
 // unit and its publication, and a caller that closed the coordinator there
 // would cancel a completed batch away.
 func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult)) error {
-	if err := c.writable(); err != nil {
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
 		return err
 	}
+	defer release()
 	l := c.late
 	l.mu.Lock()
 	if l.draining {
@@ -848,9 +871,11 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 // not queued answers zero units: it is not pending, and the active generation
 // already holds whatever it has.
 func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) (Pending, error) {
-	if err := c.writable(); err != nil {
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
 		return Pending{}, err
 	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return Pending{}, model.Canceled(err)
 	}

@@ -49,21 +49,84 @@ func (s *Store) initSchema(ctx context.Context) error {
 			_, err := tx.ExecContext(ctx, `INSERT INTO schema_meta(singleton, version, fingerprint) VALUES(1, ?, ?)`, schemaVersion, Fingerprint)
 			return wrap("schema_meta", err)
 		}
-		var version int
-		var fingerprint string
-		err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint)
-		if err != nil || version != schemaVersion || fingerprint != Fingerprint {
-			found := fingerprint
-			if err != nil {
-				found = "unreadable"
-			}
-			return &model.Error{Code: model.CodeSchemaMismatch,
-				Message:     "database schema fingerprint " + found + " does not match this binary's schema " + Fingerprint,
-				Details:     map[string]string{"path": s.path},
-				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
-		}
-		return nil
+		return s.checkFingerprint(ctx, tx)
 	})
+}
+
+// verifySchema is initSchema's check for a process that opened the store
+// read-only: the same comparison, run on the reader pool, so a report never
+// begins a write transaction to learn whether it may read. It creates nothing.
+// A cache that holds no tables is one no run has ever built here -- a read-only
+// open of a missing database leaves a zero-byte file behind. That is the
+// workspace that exists but has published nothing, which is what the writing
+// open produced too: it created the schema, and the first pin then found no
+// active generation. Reporting it as a fingerprint that failed to match, or as
+// a workspace that was never discovered, would send the operator to the wrong
+// remedy.
+func (s *Store) verifySchema(ctx context.Context) error {
+	return s.read(ctx, func(tx *sql.Tx) error {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+			return wrap("sqlite_master", err)
+		}
+		if tables == 0 {
+			return &model.Error{Code: model.CodeNoActiveGeneration,
+				Message:     "nothing has been published in this workspace yet",
+				Remediation: "run `codectx index`"}
+		}
+		return s.checkFingerprint(ctx, tx)
+	})
+}
+
+// adoptSchema is the writer-deferred open's schema check (Options.LazyWriter):
+// the same comparison verifySchema runs, on the reader pool, with one
+// difference -- a cache that holds no tables is CREATED here rather than
+// reported as a workspace that has published nothing.
+//
+// That difference is safe and is the whole reason the check can be a read. A
+// cache with no tables is one no writing open has ever completed against, so
+// no run can be holding a transaction on it; every cache a run IS writing has
+// its schema already, and there this open writes nothing and waits for
+// nothing. The empty case is the one write an empty cache needs, and the
+// alternative -- deferring it too -- would leave the read-only handle opened
+// beside this one with no schema to verify.
+func (s *Store) adoptSchema(ctx context.Context) error {
+	empty := false
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+			return wrap("sqlite_master", err)
+		}
+		if tables == 0 {
+			empty = true
+			return nil
+		}
+		return s.checkFingerprint(ctx, tx)
+	})
+	if err != nil || !empty {
+		return err
+	}
+	return s.initSchema(ctx)
+}
+
+// checkFingerprint compares the stored schema identity with this binary's. It
+// is the one place the comparison lives, so the writing and the read-only opens
+// cannot come to different conclusions about the same database.
+func (s *Store) checkFingerprint(ctx context.Context, tx *sql.Tx) error {
+	var version int
+	var fingerprint string
+	err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint)
+	if err != nil || version != schemaVersion || fingerprint != Fingerprint {
+		found := fingerprint
+		if err != nil {
+			found = "unreadable"
+		}
+		return &model.Error{Code: model.CodeSchemaMismatch,
+			Message:     "database schema fingerprint " + found + " does not match this binary's schema " + Fingerprint,
+			Details:     map[string]string{"path": s.path},
+			Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+	}
+	return nil
 }
 
 // Recover is startup recovery for the indexing owner (Section 12.3). The

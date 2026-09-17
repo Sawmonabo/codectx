@@ -304,7 +304,7 @@ leaves live ones alone.
 
 ## Locking and recovery
 
-`snapshot.LockWorkspace(ctx, dataDir, wait)` is the cross-process indexing/GC
+`snapshot.LockWorkspace(ctx, dataDir, operation, wait)` is the cross-process indexing/GC
 coordination lock: `<data>/workspace.lock` held with `flock` (Unix) or
 `LockFileEx` (Windows). A capture, the indexing that follows it, publication,
 retention collection and startup recovery all take this one lock, so a
@@ -313,6 +313,16 @@ competing generations. A second caller gets a retryable `CTX_WORKSPACE_BUSY`
 after `wait` (or at once when `wait <= 0`). The lock is per open file: the
 outermost owner acquires it once and passes it to `Builder.Lock`; a builder
 given no lock acquires one for the duration of the capture.
+
+The holder records itself in the lock file once it has the lock -- its process
+id and the operation it named itself with -- and a waiter reads that file, which
+needs no lock, to name the holder in the refusal and in the refusal's
+`holder_pid` and `holder_operation` details. The record is a courtesy and the
+advisory lock is the contract: a record that cannot be written or cannot be
+parsed costs the waiter the holder's name and nothing else, and a refusal with
+no readable record says that nobody recorded themselves rather than naming a
+holder it guessed at. A recorded process id is what was written, not a claim
+that the process is alive; the lock itself is that claim.
 
 `snapshot.Sweep(dataDir)`, run by the lock holder at startup, removes staging
 databases and unpublished CAS temporaries left by a crashed capture, and

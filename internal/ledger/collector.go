@@ -18,8 +18,8 @@ import (
 // a ledger that cannot write must not take the run down with it. A failed
 // flush drops that batch and the next one carries on; the rows a reader is
 // missing are the honest consequence.
-func (l *Ledger) collect() {
-	defer close(l.done)
+func (c *collector) collect() {
+	defer close(c.done)
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
@@ -38,41 +38,41 @@ func (l *Ledger) collect() {
 
 	for {
 		select {
-		case e := <-l.bus:
+		case e := <-c.bus:
 			if e.kind == eventFlush {
-				e.ack <- l.barrier(batch, running, sweep)
+				e.ack <- c.barrier(batch, running, sweep)
 				batch = batch[:0]
 				continue
 			}
 			batch = append(batch, e)
 			if len(batch) >= flushEvents {
-				_ = l.flush(batch, running, sweep)
+				_ = c.flush(batch, running, sweep)
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			_ = l.flush(batch, running, sweep)
+			_ = c.flush(batch, running, sweep)
 			batch = batch[:0]
-		case <-l.quit:
+		case <-c.quit:
 			// Take what is already buffered -- it was recorded before the
 			// stop -- and then finish. Anything published after this point
 			// finds a bus nobody drains and is dropped and counted, which is
 			// the same answer a full bus gives.
 			for {
 				select {
-				case e := <-l.bus:
+				case e := <-c.bus:
 					if e.kind == eventFlush {
-						e.ack <- l.barrier(batch, running, sweep)
+						e.ack <- c.barrier(batch, running, sweep)
 						batch = batch[:0]
 						continue
 					}
 					batch = append(batch, e)
 					if len(batch) >= flushEvents {
-						_ = l.flush(batch, running, sweep)
+						_ = c.flush(batch, running, sweep)
 						batch = batch[:0]
 					}
 				default:
-					_ = l.flush(batch, running, sweep)
-					l.finalize(running)
+					_ = c.flush(batch, running, sweep)
+					c.finalize(running)
 					return
 				}
 			}
@@ -85,10 +85,10 @@ func (l *Ledger) collect() {
 // closes at most a batch of them, so a run that planned more units than a
 // batch would otherwise answer a reader with rows still marked planned -- work
 // the run is finished with, shown as work waiting to begin.
-func (l *Ledger) barrier(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
-	err := l.flush(batch, running, sweep)
+func (c *collector) barrier(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
+	err := c.flush(batch, running, sweep)
 	for err == nil && len(sweep) > 0 {
-		err = l.flush(nil, running, sweep)
+		err = c.flush(nil, running, sweep)
 	}
 	return err
 }
@@ -97,15 +97,15 @@ func (l *Ledger) barrier(batch []event, running map[*Span]struct{}, sweep map[*R
 // transaction, then publishes the spans that finished in it. Subscribers are
 // called after the commit, so a subscriber never reports a row a reader could
 // not yet see.
-func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
+func (c *collector) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
 	now := time.Now()
-	if len(batch) == 0 && len(running) == 0 && len(sweep) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
+	if len(batch) == 0 && len(running) == 0 && len(sweep) == 0 && !c.anyDirty() && !c.anyRefreshDue(now) {
 		return nil
 	}
 	ctx := context.Background()
 	var finished []SpanRow
 	var swept []*Run
-	err := l.writeTx(ctx, func(tx *sql.Tx) error {
+	err := c.writeTx(ctx, func(tx *sql.Tx) error {
 		for _, e := range batch {
 			if e.kind == eventFinish {
 				if !e.run.discarded.Load() {
@@ -122,7 +122,7 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 				delete(running, e.span)
 				continue
 			}
-			if err := l.ensureRun(ctx, tx, run); err != nil {
+			if err := c.ensureRun(ctx, tx, run); err != nil {
 				return err
 			}
 			switch e.kind {
@@ -171,10 +171,10 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 				swept = append(swept, run)
 			}
 		}
-		if err := l.refreshLiveness(ctx, tx, now); err != nil {
+		if err := c.refreshLiveness(ctx, tx, now); err != nil {
 			return err
 		}
-		return l.updateRuns(ctx, tx)
+		return c.updateRuns(ctx, tx)
 	})
 	if err != nil {
 		// The sweep is left pending and the rows unpublished: the transaction
@@ -186,26 +186,29 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	}
 	for _, run := range swept {
 		delete(sweep, run)
-		l.retire(run)
+		c.retire(run)
 	}
 	for _, row := range finished {
-		l.notify(row)
+		c.l.notify(row)
 	}
 	return nil
 }
 
-// finalize is the last write of a stopping ledger: every span still open is
-// closed as interrupted -- it never finished, so it gets no finish time and no
-// wall, which would be a measurement nobody made -- and every run that did not
-// say how it ended is interrupted too.
-func (l *Ledger) finalize(running map[*Span]struct{}) {
+// finalize is the last write of a detaching collector: every span still open
+// is closed as interrupted -- it never finished, so it gets no finish time and
+// no wall, which would be a measurement nobody made -- and every run that did
+// not say how it ended is interrupted too.
+//
+// Every run it closes is marked stopped, so a caller that cached one across
+// the hold records nothing further into an attachment nobody drains any more.
+func (c *collector) finalize(running map[*Span]struct{}) {
 	ctx := context.Background()
 	now := time.Now()
 	var swept []SpanRow
-	l.finalErr = l.writeTx(ctx, func(tx *sql.Tx) error {
-		l.runsMu.Lock()
-		runs := append([]*Run(nil), l.runs...)
-		l.runsMu.Unlock()
+	c.finalErr = c.writeTx(ctx, func(tx *sql.Tx) error {
+		c.runsMu.Lock()
+		runs := append([]*Run(nil), c.runs...)
+		c.runsMu.Unlock()
 		for _, run := range runs {
 			run.mu.Lock()
 			if run.outcome == OutcomeRunning {
@@ -217,7 +220,7 @@ func (l *Ledger) finalize(running map[*Span]struct{}) {
 			}
 			run.mu.Unlock()
 			run.dirty.Store(true)
-			if err := l.ensureRun(ctx, tx, run); err != nil {
+			if err := c.ensureRun(ctx, tx, run); err != nil {
 				return err
 			}
 			if _, err := tx.ExecContext(ctx,
@@ -240,13 +243,22 @@ func (l *Ledger) finalize(running map[*Span]struct{}) {
 				}
 			}
 		}
-		return l.updateRuns(ctx, tx)
+		return c.updateRuns(ctx, tx)
 	})
-	if l.finalErr == nil {
+	if c.finalErr == nil {
 		for _, row := range swept {
-			l.notify(row)
+			c.l.notify(row)
 		}
 	}
+	// After the write, so a run's own last rows are not skipped by the very
+	// pass that closes them, and before the collector's goroutine ends, so no
+	// event can be published into this bus once nothing drains it.
+	c.runsMu.Lock()
+	for _, run := range c.runs {
+		run.stopped.Store(true)
+	}
+	c.runs = nil
+	c.runsMu.Unlock()
 	clear(running)
 }
 
@@ -309,13 +321,13 @@ func sweepPlanned(ctx context.Context, tx *sql.Tx, run *Run) ([]SpanRow, bool, e
 // ensureRun writes the run row the first time one of its spans is written, so
 // a span never arrives before the row it references and nothing on the run's
 // own goroutine ever waits for the database.
-func (l *Ledger) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
+func (c *collector) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
 	run.mu.Lock()
 	defer run.mu.Unlock()
 	if run.inserted {
 		return nil
 	}
-	expires := time.Now().Add(liveWindow)
+	expires := time.Now().Add(LiveWindow)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(
 		run_id, kind, repository_id, generation_id, started_at, expires_at, finished_at, outcome,
 		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
@@ -334,15 +346,15 @@ func (l *Ledger) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
 // and it is a statement of its own rather than a column on the totals update:
 // the totals are written only when they move, and a run that is doing nothing
 // at this instant is no less alive for it.
-func (l *Ledger) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Time) error {
-	l.runsMu.Lock()
-	runs := append([]*Run(nil), l.runs...)
-	l.runsMu.Unlock()
+func (c *collector) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	c.runsMu.Lock()
+	runs := append([]*Run(nil), c.runs...)
+	c.runsMu.Unlock()
 	for _, run := range runs {
 		if !run.refreshDue(now) {
 			continue
 		}
-		expires := now.Add(liveWindow)
+		expires := now.Add(LiveWindow)
 		if _, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
 			formatTime(expires), run.id); err != nil {
 			return wrap("refresh the run's liveness", err)
@@ -357,10 +369,10 @@ func (l *Ledger) refreshLiveness(ctx context.Context, tx *sql.Tx, now time.Time)
 // updateRuns writes every known run's current totals. It runs on each flush
 // because a live reader reads the run row as well as the spans: the counts a
 // run has reached are as much of the live view as the spans are.
-func (l *Ledger) updateRuns(ctx context.Context, tx *sql.Tx) error {
-	l.runsMu.Lock()
-	runs := append([]*Run(nil), l.runs...)
-	l.runsMu.Unlock()
+func (c *collector) updateRuns(ctx context.Context, tx *sql.Tx) error {
+	c.runsMu.Lock()
+	runs := append([]*Run(nil), c.runs...)
+	c.runsMu.Unlock()
 	for _, run := range runs {
 		run.mu.Lock()
 		inserted := run.inserted

@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -315,5 +316,45 @@ func TestProgressiveLinesFollowOnlyThisCommandsRun(t *testing.T) {
 	}
 	if strings.Contains(printed, "retention") {
 		t.Fatalf("the abandoned attempt's stage was printed as this command's work:\n%s", printed)
+	}
+}
+
+// TestTheWaitingLineFollowsTheHolderOnOneLine guards what a building command
+// shows while it waits for another process to give up the workspace. The wait
+// is now unbounded as long as the holder keeps working, so silence here is a
+// command that looks hung for as long as an index takes, and a line per poll is
+// thousands of lines scrolling everything else away.
+//
+// Mutation: drop the carriage return, or print the holder unconditionally
+// rather than on change, and the single rewritten line becomes a transcript.
+func TestTheWaitingLineFollowsTheHolderOnOneLine(t *testing.T) {
+	cmd, out := ledgerCommand()
+	report := waitingForHolder(cmd, nil)
+	// The longer stage first, so the shorter one that follows it is the case
+	// that leaves a tail behind on a terminal when the rewrite does not pad.
+	report(app.WaitingHolder{Waiting: true, PID: 4321, Operation: "index", Stage: "publication"})
+	report(app.WaitingHolder{Waiting: true, PID: 4321, Operation: "index", Stage: "capture"})
+	report(app.WaitingHolder{})
+
+	printed := out.String()
+	for _, want := range []string{"4321", "index", "capture", "publication"} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("the waiting line must name the holder's pid, operation and each stage; %q is missing from %q", want, printed)
+		}
+	}
+	// One line, rewritten: every stage but the first arrives behind a carriage
+	// return, and the only newline is the one that closes the line when the
+	// wait ends.
+	if strings.Count(printed, "\n") != 1 || !strings.HasSuffix(printed, "\n") {
+		t.Fatalf("the wait must print one line, closed once at the end, got %q", printed)
+	}
+	if strings.Count(printed, "\r") != 2 {
+		t.Fatalf("each change must rewrite the line rather than add one, got %q", printed)
+	}
+	// The shorter stage must overwrite the whole of the longer one: the line
+	// it leaves on the terminal is at least as wide as the line it replaced.
+	rewrites := strings.Split(strings.TrimRight(printed, "\n"), "\r")
+	if last := rewrites[len(rewrites)-1]; len(last) < len(rewrites[len(rewrites)-2]) {
+		t.Fatalf("the rewritten line must not keep the previous stage's tail, got %q", printed)
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // The two Section 14.4 endpoint names. A cursor minted by one is rejected by
@@ -188,8 +189,13 @@ func (c searchCursor) validate() error {
 		return cursorInvalid("cursor was issued by a different endpoint")
 	case c.GenerationID <= 0:
 		return cursorInvalid("cursor does not pin a generation")
-	case !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID):
-		return cursorInvalid("cursor query hash and lease id must be well-formed identifiers")
+	case !model.ValidHexID(c.QueryHash):
+		return cursorInvalid("cursor query hash must be a well-formed identifier")
+	case c.LeaseID != "" && !model.ValidHexID(c.LeaseID):
+		// A continuation minted by a process that records no lease names none:
+		// the spool it names is bound to this cursor's expiry instead, which is
+		// the predicate pagination.Spools.live applies to a leaseless entry.
+		return cursorInvalid("cursor lease id is malformed")
 	case !model.ValidHexID(string(c.AnalysisKey)):
 		return cursorInvalid("cursor does not name an analysis key")
 	case !model.ValidHexID(c.SpoolID):
@@ -321,4 +327,23 @@ func (s *Service) consumed(ctx context.Context, c pagination.Cursor) {
 func releaseSpool(spools *pagination.Spools, sp *pagination.Spool) {
 	sp.Close()
 	spools.Release(sp.ID())
+}
+
+// resumePinFailure types the failure a CONTINUATION meets when the generation
+// its token pins has been collected between the page that minted it and the
+// page presenting it. Both endpoints here pin the generation the TOKEN names,
+// not the active one, so this is the across-call end of the snapshot a
+// writerless pin holds: within a call nothing can be collected under the read,
+// across calls the generation can go, and the caller must be told which it is.
+//
+// The store refuses a generation with no row as an invalid ARGUMENT, which is
+// the right answer for an operator who typed --generation and the wrong one for
+// a caller that presented a token: nothing about its argument is malformed, the
+// position it names is simply gone, and what it needs to be told is to start
+// again from the first page.
+func resumePinFailure(resumed bool, err error) error {
+	if !resumed || !sqlite.IsGenerationCollected(err) {
+		return err
+	}
+	return cursorInvalid("the generation this cursor pins has been collected; re-run from the first page")
 }

@@ -195,7 +195,7 @@ func Plan(ctx context.Context, stage, scopeKey, provider string) *Span {
 	}
 	span := &Span{run: run, seq: run.seq.Add(1) - 1, parent: parent, started: time.Now(),
 		stage: stage, scopeKey: scopeKey, provider: provider}
-	run.ledger.publish(event{kind: eventStart, span: span, planned: true})
+	run.c.publish(event{kind: eventStart, span: span, planned: true})
 	return span
 }
 
@@ -208,7 +208,7 @@ func (s *Span) Begin(ctx context.Context) context.Context {
 		return ctx
 	}
 	s.started = time.Now()
-	s.run.ledger.publish(event{kind: eventBegin, span: s})
+	s.run.c.publish(event{kind: eventBegin, span: s})
 	return context.WithValue(ctx, spanContextKey{}, s)
 }
 
@@ -233,7 +233,7 @@ func StartProvider(ctx context.Context, stage, scopeKey, provider string) (conte
 		scopeKey: scopeKey,
 		provider: provider,
 	}
-	run.ledger.publish(event{kind: eventStart, span: span})
+	run.c.publish(event{kind: eventStart, span: span})
 	return context.WithValue(ctx, spanContextKey{}, span), span
 }
 
@@ -262,7 +262,7 @@ func (s *Span) End(outcome Outcome, m Measured, err error) {
 		s.itemsOut.Store(*m.ItemsOut)
 	}
 	end := time.Now()
-	s.run.ledger.publish(event{
+	s.run.c.publish(event{
 		kind:     eventEnd,
 		span:     s,
 		outcome:  outcome,

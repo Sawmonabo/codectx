@@ -74,11 +74,14 @@ type Options struct {
 	MaxOverlayBytes config.Limit
 	// MaxFrameBytes bounds one protocol message.
 	MaxFrameBytes int64
-	// Ledger is the process's run ledger -- the one the composition root
-	// opened, never a second one: the ledger file has a single collector, and
-	// a manager that opened its own would be a second writer on it. It may be
-	// nil, and then the manager records nothing, which is what a composition
-	// with no ledger (a report, which never holds the workspace lock) gets.
+	// Ledger is the process's run ledger handle -- the one the composition
+	// root composed, never a second one: the ledger file has a single
+	// collector, and a manager that opened its own would be a second writer on
+	// it. It may be nil, and then the manager records nothing, which is what a
+	// composition with no ledger (a report, which never holds the workspace
+	// lock) gets. A handle whose collector is detached -- a server start from a
+	// query, with no hold -- records nothing in exactly the same way, rather
+	// than writing without the workspace lock.
 	//
 	// The manager records into a run of its own rather than a generation's: a
 	// server start is lazy, pooled and shared between generations, so it
@@ -470,7 +473,14 @@ func (m *Manager) untrack(s *server) {
 //
 // A ledger failure never fails a server start: the answer the server gives is
 // correct whatever the accounting did, so the failure is logged with its
-// diagnostic code and the start proceeds with a run that records nothing.
+// diagnostic code and the start proceeds with a run that records nothing. A
+// start with no hold gets the same nil run, because the handle it is given has
+// no collector attached then.
+//
+// The run is opened once per process and may outlive the hold that recorded
+// it. internal/ledger finalizes such a run when its collector detaches and
+// refuses everything it publishes afterwards, so this cache can never reach
+// into a later hold's accounting.
 func (m *Manager) overlayContext(ctx context.Context, repositoryID string) context.Context {
 	m.mu.Lock()
 	defer m.mu.Unlock()

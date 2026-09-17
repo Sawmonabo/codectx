@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,11 +13,13 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// PinnedReader reads exactly one generation. It was pinned together with its
-// retention lease in one short write transaction, so the generation cannot be
-// collected while the reader is open. Every read joins visible membership
-// through generation_units; staging, failed and non-member units are never
-// returned. Close releases the lease.
+// PinnedReader reads exactly one generation. A writer-bearing process pins it
+// together with its retention lease in one short write transaction, so the
+// generation cannot be collected while the reader is open; a process that
+// opened the store read-only holds it by snapshot instead, one deferred read
+// transaction per call. Every read joins visible membership through
+// generation_units; staging, failed and non-member units are never returned.
+// Close releases the lease, if there is one.
 type PinnedReader struct {
 	s       *Store
 	binding model.Binding
@@ -54,7 +57,18 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		return nil, err
 	}
 	r := &PinnedReader{s: s, repo: repoRaw, lease: leaseID}
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	// A read-only process cannot take the lease, so it resolves the generation
+	// on the reader pool instead: no write transaction, nothing for the writer
+	// of another process to be waited on for.
+	//
+	// Such a pin is a SNAPSHOT, not a lease, and that is enough. Every read it
+	// serves runs in one deferred read transaction of its own (Store.read), so
+	// within a call the log snapshot is fixed and a collection running
+	// concurrently in another process cannot take rows out from under it.
+	// Across calls the generation can indeed be collected, and the caller that
+	// named it -- a continuation naming the generation its token pins -- is
+	// told so by the typed refusal below rather than served a short answer.
+	resolve := func(tx *sql.Tx) error {
 		id := int64(gen)
 		if id == 0 {
 			if err := activeGeneration(ctx, tx, repoRaw, &id); err != nil {
@@ -66,7 +80,7 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		err := tx.QueryRowContext(ctx, `SELECT snapshot_id, analysis_key, status FROM generations WHERE id = ? AND repository_id = ?`, id, repoRaw).
 			Scan(&snapshot, &key, &status)
 		if isNoRows(err) {
-			return invalid("generation %d does not exist for this repository", id)
+			return generationMissing(id)
 		}
 		if err != nil {
 			return wrap("generations", err)
@@ -74,6 +88,13 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		if status != model.GenerationActive && status != model.GenerationSuperseded {
 			return &model.Error{Code: model.CodeNoActiveGeneration,
 				Message: "generation " + string(status) + " has never been published and cannot be pinned"}
+		}
+		if s.opts.ReadOnly {
+			r.lease = ""
+			r.gen = id
+			r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
+				GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
+			return nil
 		}
 		// Through insertLease, never a statement of its own: a query lease is
 		// a retention_leases row like any other, and a second write path here
@@ -91,23 +112,53 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
 			GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
 		return nil
-	})
+	}
+	if s.opts.ReadOnly {
+		err = s.read(ctx, resolve)
+	} else {
+		err = s.write(ctx, resolve)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
+// generationStateDetail marks the refusal a pin gets when the generation it
+// names has no row at all: it was collected. The refusal itself stays
+// CTX_ARGUMENT_INVALID, which is what an operator who named the generation by
+// hand asked for; a caller resuming from a token it was handed did not name it
+// by hand, and IsGenerationCollected is how that caller recognises the case and
+// answers in the cursor's own family instead.
+const generationStateDetail = "generation_state"
+
+func generationMissing(id int64) *model.Error {
+	return invalid("generation %d does not exist for this repository", id).
+		WithDetail(generationStateDetail, "collected")
+}
+
+// IsGenerationCollected reports whether err is a pin refused because the
+// generation it named has been collected.
+func IsGenerationCollected(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Details[generationStateDetail] == "collected"
+}
+
 // Binding is the generation every result from this reader is qualified by.
 func (r *PinnedReader) Binding() model.Binding { return r.binding }
 
-// LeaseID is the retention lease this reader holds; cursors carry it.
-func (r *PinnedReader) LeaseID() string { return r.lease }
+// Continuable reports whether a query served through this reader may record a
+// retention LEASE. A process that opened the store read-only cannot: it still
+// hands back a continuation -- the spool is a filesystem write and the token is
+// signed, not stored -- but that continuation names no lease and the state it
+// names is reclaimed by the expiry its header carries instead.
+func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
 
-// Renew extends the reader's lease for a further ttl.
-func (r *PinnedReader) Renew(ctx context.Context, ttl time.Duration) error {
-	return r.s.RenewLease(ctx, r.lease, time.Now().Add(ttl))
-}
+// RetainsLeases is Continuable for a caller that holds the lease store rather
+// than a pinned reader -- the graph engine, whose continuations are minted far
+// from the reader that pinned them. It satisfies pagination.LeaseRetainer, so
+// pagination.Leases answers it for the whole process.
+func (s *Store) RetainsLeases() bool { return !s.opts.ReadOnly }
 
 // Close releases the lease. It is safe to call more than once.
 func (r *PinnedReader) Close() error {
