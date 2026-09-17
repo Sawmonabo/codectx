@@ -11,7 +11,7 @@ once for the export, under a heap ceiling the provider chooses ([providers-depen
 Until this decision the ceiling was the unit's estimate -- 512 bytes of heap per byte of JavaScript
 source, from the round-3 research -- clamped to the machine's available memory minus two gigabytes.
 The first uncapped index of the 13,222-file reference repository showed what that means on a host
-with 47 GiB: the 157 MB JavaScript unit was given a 42 GB ceiling, and the JVM grew to 17.6 GB,
+with 47 GiB: the 157.2 MiB JavaScript unit was given a 39.1 GiB ceiling, and the JVM grew to 17.6 GB,
 twice, then 12.5, 11.1, 10.8 and 7.3 GB on the unit's parts, one JVM at a time for twenty minutes
 because every reservation was the size of the machine and nothing could be scheduled beside it.
 The product is meant to run beside the user's editor, browser and the agents driving it over MCP;
@@ -64,22 +64,38 @@ was the measurement for this family at this size.
 
 ## Measurements
 
-The 157.2 MB, 4,984-file JavaScript unit of the reference repository, parse only, the whole
-process tree's resident memory sampled every second (cap sweep of 2026-09-16):
+The 157.2 MiB (164,865,219-byte), 4,984-file JavaScript unit of the reference repository, parse
+only, the whole process tree's resident memory sampled every second (cap sweep of 2026-09-16):
 
 | heap ceiling | wall | peak tree RSS | outcome |
 |---|---|---|---|
-| 2 GiB | 1:08 | 4.57 GB | fails closed (heap exhausted) |
-| 4 GiB | 3:38 | 5.44 GB | completes |
-| 8 GiB | 3:47 | 9.67 GB | completes |
-| 16 GiB | 4:53 | 14.32 GB | completes, slower |
-| none (default) | 3:41 | 10.70 GB | completes |
+| 2 GiB | 1:08 | 4.57 GB | fails closed, heap exhausted; no graph |
+| 4 GiB | 3:38 | 5.44 GB | exits 1 on a deterministic pass crash, having written an 86,247,860-byte graph; the product classes that as an engine failure and recovers by subdividing the unit |
+| 8 GiB | 3:47 | 9.67 GB | as 4 GiB: exit 1 on the same pass, same graph size |
+| 16 GiB | 4:53 | 14.32 GB | as 4 GiB, slower |
+| none (default) | 3:41 | 10.70 GB | as 4 GiB |
 
-The 4 GiB ceiling runs at the speed of no ceiling with half the memory; 16 GiB is slower than 4
-because the collector has more to walk. The constant 48 = 4 GiB × 2 ÷ 157 MB, twice the smallest
-ceiling that ran at full speed, the research's headroom rule (§4, observation 3).
+No ceiling from 4 GiB up completes this unit: every one of them reaches the same deterministic
+pass crash, at the same point, having written the same graph, and its export then dies on the
+partial graph at every ceiling. The unit is recovered by subdivision, not by memory — the
+reference run's own ledger records exactly that outcome (`parse … scope=pkg:javascript:app …
+exit_code=1 failure_class=engine`, then `span 23 dependence pkg:javascript:app … subdivided`).
+What the sweep measures is therefore cost, not completion, and the rows stay comparable to each
+other because every run above 2 GiB stopped at the same place: the 4 GiB ceiling reaches it at the
+speed of no ceiling with half the memory, and 16 GiB is slower than 4 because the collector has
+more to walk. The 2 GiB row is the one that differs in kind — it stops earlier, on heap
+exhaustion, which is why its wall time is shorter and why it is the one row where the heap is
+known to have been filled.
 
-Fact identity, on the unit's 348-file, 2.79 MB sub-project, parse then export at each ceiling:
+The constant 52 = ⌊2 × 4 GiB ÷ 164,865,219 B⌋ = ⌊52.10⌋, twice the smallest ceiling that ran at
+full speed, the research's headroom rule (§4, observation 3). 52 × 164,865,219 = 8,572,991,388 B =
+7.98 GiB, which is 1.996× the 4 GiB ceiling — the multiple the rule claims is the multiple the
+code produces. The 48 this replaces was reachable only by dividing binary GiB by decimal MB
+(4 GiB × 2 ÷ 157 MB = 48.5); it yielded 7,913,530,512 B = 7.37 GiB, 1.84× the ceiling, not twice.
+
+Fact identity had to be measured elsewhere, for the reason the table above gives: the whole unit
+exports nothing at any ceiling, so there is no pair of exports to compare. It was measured on the
+unit's 348-file, 2.79 MiB sub-project, which does complete, parse then export at each ceiling:
 every ceiling from 768 MiB to none produced a 195 MB export with identical counts -- 24,507
 methods, 176,698 call edges, 81,040 control-dependence edges, 1,226,336 reaching-definition edges.
 The ceiling changes cost, never facts. Peak parse RSS 1.11 GB at 768 MiB, 1.17 at 1 GiB, 1.74 at
