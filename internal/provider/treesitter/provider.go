@@ -50,8 +50,9 @@ type WorkerCommand struct {
 	Args []string
 }
 
-// Options configure the provider. Zero values take the defaults below, which
-// match config's: two workers, 5 MiB per file, a 60-second idle TTL.
+// Options configure the provider. Zero values take the defaults below: two
+// workers, a 60-second parse timeout and a 256 MiB reservation per worker. An
+// unset byte bound stays unlimited rather than being given a finite default.
 type Options struct {
 	// Languages restricts the supported set (config tree_sitter.languages);
 	// empty means every pinned language.

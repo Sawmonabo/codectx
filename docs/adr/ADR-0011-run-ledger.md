@@ -22,7 +22,7 @@ itself when asked why a run is taking a long time *while it is still taking it*.
 What the product had instead, when this was decided, was scattered. Six stages each logged a
 duration, every one in its own shape and none of them aggregated:
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
-`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:258` and
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/snapshot/builder.go:289` and
 `internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
 needs were already being taken and thrown away: the child process tree's peak resident memory was
 sampled every 250 ms by `internal/process/treesample_linux.go:55` and reached only the dependence
