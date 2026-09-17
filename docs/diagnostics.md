@@ -130,13 +130,17 @@ ones it never got to.
 per-goroutine processor accounting. A stage that ran beside other work in this
 process therefore reports no processor time and says
 `unavailable (overlapped)` rather than a share of process-wide counters it
-does not own -- `seal`, `activation`, `adjacency`, `lexical_build`,
-`lexical_compaction`, the in-process `import` steps and `reclaim` all read this
-way. A plausible wrong attribution is worse than an honest absence, because
-only the first one gets believed. `unavailable (unsampled)` is a different
-answer: the platform does not expose the counters at all. A span that ran a
-child process has real processor time, taken from the child when it was
-reaped.
+does not own -- `capture`, `walk`, `plan`, `attach_reused`, `attach_carried`,
+`build`, `coverage`, `seal`, `activation`, `adjacency`, `lexical_build`,
+`lexical_compaction`, `retention`, `collection`, `reclaim`, the in-process
+`import` steps and every UNIT span all read this way. A unit span reads this way
+even where the unit ran a child: it brackets the whole unit, of which the child
+is one step and this process's own work beside other units is the rest. A
+plausible wrong attribution is worse than an honest absence, because only the
+first one gets believed. `unavailable (unsampled)` is a different answer: the
+platform does not expose the counters at all. The steps that ran a child --
+`parse`, `export` and a `part`'s own -- carry real processor time, taken from
+the child when it was reaped.
 
 **A child's transferred bytes are a sample, not a total.** They come from the
 per-process counters of every process in the child's group, swept every 250 ms,

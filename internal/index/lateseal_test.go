@@ -250,12 +250,15 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	if published := c.late.take(); len(published) != 0 {
 		t.Fatalf("a batch whose every unit failed delivered %d publication(s)", len(published))
 	}
-	// The collection pass is what would sweep a run that reached no generation,
-	// so it runs before the read rather than after it.
-	c.collect(ctx)
+	// The row must be on disk and terminal BEFORE the collection pass: a run
+	// that is still live is one no sweep would touch, so a sweep run ahead of
+	// the flush would prove nothing about what a sweep does.
 	if err := f.ledger.Flush(ctx); err != nil {
 		t.Fatalf("flush the ledger: %v", err)
 	}
+	// The collection pass is what would sweep a run that reached no generation,
+	// so it runs before the read rather than after it.
+	c.collect(ctx)
 	reader, ok, err := ledger.OpenReader(ctx, f.dataDir)
 	if err != nil || !ok {
 		t.Fatalf("OpenReader: %v, present=%v", err, ok)
