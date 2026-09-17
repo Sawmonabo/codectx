@@ -15,7 +15,8 @@ import (
 // noise here is a defect to report rather than a setting to add.
 func BenchmarkSpanStartEnd(b *testing.B) {
 	dir := b.TempDir()
-	l, err := ledger.Open(context.Background(), dir)
+	l := ledger.New(dir)
+	err := l.Attach(context.Background())
 	if err != nil {
 		b.Fatalf("open the ledger: %v", err)
 	}
@@ -47,7 +48,8 @@ func BenchmarkCollectorRun(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		dir := b.TempDir()
 		start := time.Now()
-		l, err := ledger.Open(context.Background(), dir)
+		l := ledger.New(dir)
+		err := l.Attach(context.Background())
 		if err != nil {
 			b.Fatalf("open the ledger: %v", err)
 		}

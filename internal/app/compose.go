@@ -223,11 +223,18 @@ type stack struct {
 	cfg     config.Config
 	dataDir string
 	store   *sqlite.Store
-	// ledger is this process's run accounting. Only a run that holds the
-	// cross-process workspace lock opens one: the ledger has a single writer,
-	// so a report -- which takes no lock and may run beside an index -- reads
-	// the file through internal/ledger's read-only reader and never opens a
-	// writer of its own. A nil ledger records nothing and is legal everywhere.
+	// ledger is this process's run accounting: a stable handle composed by
+	// every building composition, whose COLLECTOR -- the writer on ledger.db
+	// -- attaches under the workspace lock and detaches when that hold ends.
+	// The handle is what the language-server manager and the coordinator are
+	// composed with, so nothing has to be rebuilt per hold; a detached handle
+	// records nothing, exactly as a nil one does.
+	//
+	// The writer therefore exists only while this process holds the lock: a
+	// report takes no lock and reads the file through internal/ledger's
+	// read-only reader, and an idle server holds no writer for the person's
+	// own index to contend with. A nil ledger records nothing and is legal
+	// everywhere.
 	ledger *ledger.Ledger
 	// spans is the one hop off the collector's goroutine. Every surface that
 	// renders a finished stage subscribes here, so the process holds exactly
@@ -392,6 +399,16 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		}
 	}
 
+	// The engine's temporary files -- sort spills, statement journals past
+	// their memory threshold, temporary tables -- live under the data
+	// directory, on the disk the user gave the data, and never in a system
+	// temp directory that may be a memory filesystem. It is named before
+	// ANYTHING in this composition opens an engine handle, the run ledger's
+	// collector included, so no store in this process ever spills elsewhere.
+	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
+		return nil, err
+	}
+
 	// Section 13.2's single cross-process owner governs indexing. A report
 	// publishes nothing, so it takes no lock: the writer lock on this path made
 	// `codectx status` permanently refused while a `watch` session ran, with a
@@ -409,8 +426,32 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			Message: "this workspace takes the indexing lock and was composed without naming its operation"}
 	}
 	s.builds, s.lockWait, s.operation = o.indexing(), o.wait, o.operation
+	// The run ledger's HANDLE is composed here, before anything takes the
+	// lock, and opens nothing: it is the stable thing the language-server
+	// manager and the coordinator are handed, and its collector attaches under
+	// each hold. Composed by every composition that BUILDS, because the
+	// server's refresh records through the same handle its composition
+	// captured.
+	//
+	// One subscription for the process, registered on the handle so the
+	// collector of every later hold feeds it. The structured line is
+	// registered here, where the logger lives; the command line and the MCP
+	// server add theirs through Workspace.Spans.
+	if o.indexing() {
+		s.ledger = ledger.New(s.dataDir)
+		s.spans = newSpanFanout()
+		s.ledger.Subscribe(s.spans.publish)
+		s.spans.subscribe(logSpan(s.logger))
+	}
 	if o.locksAtOpen() {
 		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, s.operation, o.wait); err != nil {
+			return nil, err
+		}
+		// This acquisition does not go through Hold, so it attaches the
+		// collector itself -- without it `codectx index`, whose whole life is
+		// one hold, would record nothing at all. A failure here returns like
+		// every other step's, and the deferred close above gives the lock back.
+		if err = s.ledger.Attach(ctx); err != nil {
 			return nil, err
 		}
 		// The composition itself is the first holder: this run's whole life is
@@ -421,13 +462,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// The content store opens before the database: it holds no lock and no
 	// state of its own.
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
-		return nil, err
-	}
-	// The engine's temporary files -- sort spills, statement journals past
-	// their memory threshold, temporary tables -- live under the data
-	// directory, on the disk the user gave the data, and never in a system
-	// temp directory that may be a memory filesystem.
-	if err := sqlite.SetTempDir(filepath.Join(s.dataDir, engineTempDirName)); err != nil {
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
@@ -483,26 +517,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, err
 		}
 	}
-	// The run ledger lives beside the store, under the same directory. It is
-	// opened by every composition that BUILDS, not only by the one that locks
-	// as it opens: the server publishes generations through its own refresh and
-	// takes the workspace only for the beat that needs it, so tying the ledger
-	// to the lock-at-open would leave its refresh recording nothing and its
-	// progress and log notifications with no source. Stack.Close stops it;
-	// nothing else may, because Stop is what flushes the last rows and closes
-	// every span the process left open.
-	if o.indexing() {
-		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
-			return nil, err
-		}
-		// One subscription for the process. The structured line is registered
-		// here, where the logger lives; the command line and the MCP server
-		// add theirs through Workspace.Spans.
-		s.spans = newSpanFanout()
-		s.ledger.Subscribe(s.spans.publish)
-		s.spans.subscribe(logSpan(s.logger))
-	}
-
 	// The cursor key and the query spools are workspace-private state under the
 	// cache this run actually opened, so a rebuild cache signs with its own key
 	// and a cursor issued against the old cache is refused rather than decoded
@@ -1038,9 +1052,10 @@ func (s *stack) collect(ctx context.Context) {
 // with that one reference and gives it up in Close.
 //
 // Everything the workspace owner must do before it builds happens on the way
-// in, under the lock and exactly once per acquisition: startup recovery, which
-// fails the staging generations an earlier crash abandoned, and the startup
-// collection pass.
+// in, under the lock and exactly once per acquisition: the run ledger's
+// collector, which is the one writer on ledger.db and exists for exactly as
+// long as this hold; startup recovery, which fails the staging generations an
+// earlier crash abandoned; and the startup collection pass.
 //
 // The lifetime is the point. The lock is published to the stack only once the
 // acquisition has fully succeeded, so a failure releases what it took and
@@ -1068,10 +1083,21 @@ func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error
 		if err != nil {
 			return nil, nil, err
 		}
+		// The ledger's collector attaches with the acquisition and detaches
+		// with the release, so this process holds a writer on ledger.db for
+		// exactly as long as it holds the workspace. Before the recovery pass
+		// and the collection pass rather than after, so everything this
+		// acquisition does is inside the accounting it opened.
+		if err := s.ledger.Attach(ctx); err != nil {
+			lock.Close()
+			return nil, nil, err
+		}
 		if err := s.store.Recover(ctx, time.Now()); err != nil {
 			// Acquired, then failed: release it here and leave s.lock nil, so
 			// the next build starts from a clean state and nothing of this
-			// attempt is left for Close.
+			// attempt is left for Close. The collector goes first, for the
+			// same reason release closes it before the lock.
+			_ = s.ledger.Detach()
 			lock.Close()
 			return nil, nil, err
 		}
@@ -1097,7 +1123,15 @@ func (s *stack) release() error {
 	if s.holders > 0 || s.lock == nil {
 		return nil
 	}
-	err := s.lock.Close()
+	// The collector finishes and closes the ledger file BEFORE the lock goes.
+	// Release the lock first and the process waiting on it acquires on its
+	// next poll and attaches its own collector while this one is still
+	// flushing -- two writers on a file whose separate-database design exists
+	// so there is only ever one.
+	err := s.ledger.Detach()
+	if cerr := s.lock.Close(); err == nil {
+		err = cerr
+	}
 	s.lock = nil
 	return err
 }

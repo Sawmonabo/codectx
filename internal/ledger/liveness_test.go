@@ -21,7 +21,8 @@ const liveRepository = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba98
 func TestLapsedRunLosesToTheActiveGeneration(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	l, err := Open(ctx, dir)
+	l := New(dir)
+	err := l.Attach(ctx)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}
@@ -59,7 +60,7 @@ func TestLapsedRunLosesToTheActiveGeneration(t *testing.T) {
 	// process produces; the run's in-memory deadline stays ahead, so no later
 	// flush renews it.
 	lapsed := time.Now().Add(-liveWindow)
-	if err := l.writeTx(ctx, func(tx *sql.Tx) error {
+	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
 			formatTime(lapsed), crashed.id)
 		return err
@@ -110,7 +111,7 @@ func waitForSpan(t *testing.T, l *Ledger, run *Run) {
 	deadline := time.Now().Add(30 * flushInterval)
 	for {
 		var spans int
-		if err := l.db.QueryRowContext(context.Background(),
+		if err := l.current().db.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM spans WHERE run_id = ?`, run.id).Scan(&spans); err != nil {
 			t.Fatalf("count the run's spans: %v", err)
 		}
@@ -134,7 +135,8 @@ func waitForSpan(t *testing.T, l *Ledger, run *Run) {
 func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	l, err := Open(ctx, dir)
+	l := New(dir)
+	err := l.Attach(ctx)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}
@@ -170,7 +172,7 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	waitForRuns(t, l, 3)
 	// What a process killed while serving leaves behind: a deadline its writer
 	// never renewed, on a row that still says 'running'.
-	if err := l.writeTx(ctx, func(tx *sql.Tx) error {
+	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
 			formatTime(time.Now().Add(-liveWindow)), abandoned.id)
 		return err
@@ -208,7 +210,7 @@ func waitForRuns(t *testing.T, l *Ledger, n int) {
 	deadline := time.Now().Add(30 * flushInterval)
 	for {
 		var runs int
-		if err := l.db.QueryRowContext(context.Background(), `SELECT count(*) FROM runs`).Scan(&runs); err != nil {
+		if err := l.current().db.QueryRowContext(context.Background(), `SELECT count(*) FROM runs`).Scan(&runs); err != nil {
 			t.Fatalf("count the runs: %v", err)
 		}
 		if runs >= n {
@@ -224,7 +226,7 @@ func waitForRuns(t *testing.T, l *Ledger, n int) {
 // runIDs reads back the run ids the file still holds.
 func runIDs(t *testing.T, l *Ledger) []string {
 	t.Helper()
-	rows, err := l.db.QueryContext(context.Background(), `SELECT run_id FROM runs ORDER BY started_at`)
+	rows, err := l.current().db.QueryContext(context.Background(), `SELECT run_id FROM runs ORDER BY started_at`)
 	if err != nil {
 		t.Fatalf("read the runs: %v", err)
 	}
