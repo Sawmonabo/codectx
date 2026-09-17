@@ -213,13 +213,20 @@ mappings that already decide it — the SCIP indexers' trigger manifests, the
 language servers' root markers, the dependence families' project markers, and
 the path-to-language table for the source check below — plus each selected
 entry's `runtime` from the lock, so no second copy of any of them exists
-anywhere in the CLI. The whole repository is read, by filename only, through one
-traversal under the configuration's own traversal policy: nothing is opened and
-nothing is started, a manifest inside an excluded tree (`node_modules`,
-`vendor`, a build directory) is not a project and selects nothing, and the walk
-ends as soon as every marker has been seen and a source found, because at that
-moment the answer is complete. A repository that selects nothing is an argument
-error rather than a silent no-op.
+anywhere in the CLI. The whole repository is read, by filename only and in two
+passes: a traversal under the configuration's own traversal policy, then the
+paths Git's index names. Nothing is opened and nothing is started. An
+**untracked** manifest inside an excluded tree (`node_modules`, `vendor`, a
+build directory) is not a project and selects nothing; a **tracked** one selects
+its tools, because Section 10.2 forces a tracked path past every exclusion: it
+is in the snapshot manifest a capture builds, it roots a project and it plans a
+unit. That is the same force-include a capture applies, from the same index
+listing, and the two passes read the repository without holding any part of it:
+each ends as soon as every marker has been seen and a source found, because at
+that moment the answer is complete. A workspace carrying a `.git` entry whose
+Git cannot be run is a typed failure rather than the quieter answer that would
+under-select. A repository that selects nothing is an argument error rather than
+a silent no-op.
 
 `prefetch` also removes every payload directory the lock does not name — the
 `unlisted` rows of `verify`. Its post-condition is a store holding what this
