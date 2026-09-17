@@ -36,8 +36,9 @@ package scip
 //     rules cover. So a `package.json` under `node_modules` never reaches this
 //     rule, and nothing indexes a dependency's own manifest as a project of
 //     the repository. An operator who sets `index_vendor = true` is asking for
-//     those trees, and the triggers inside them become projects like any
-//     other.
+//     those trees, and a trigger inside one then becomes a project like any
+//     other -- unless the repository's own ignore rules still cover it, which
+//     is the usual case for `node_modules` and a build tree.
 
 import (
 	"slices"
