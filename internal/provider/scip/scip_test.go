@@ -1131,6 +1131,98 @@ func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
 	}
 }
 
+// TestAProbeLandingOnAnotherWholeTokenDropsTheDocument protects the name half
+// of the per-document encoding probe: the half that catches an assumed
+// encoding whose columns still convert cleanly.
+//
+// Failure mode, silent: an encoding taken from the per-tool table shifts every
+// column of a document onto other whole tokens of the same lines, so each range
+// converts, is in bounds, cuts no token and covers whole tokens -- and the
+// document publishes a full set of compiler-precision facts over source that is
+// not the symbol, with nothing downstream able to tell. Only the comparison of
+// the selected text against the name the symbol carries separates that reading
+// from the truth.
+//
+// The probe-deciding occurrence here is a declaration of `Start` ranged over
+// `browser`, one whole identifier token further along the same line: it
+// converts, it is not cut, it covers whole tokens, and it is not `Start`. The
+// conversion-error path that TestFailedEncodingProbeDropsTheDocument fires
+// through is therefore never reached, so this is the half that test misses.
+// Because the probe is a claim about the whole document, the assertions are
+// that nothing of it survives -- no call-site alias from the clean reference
+// spooled after it, no row in the fresh manifest -- and that the drop is
+// counted with its exemplar.
+//
+// Mutation that must fail this test, NOT applied and NOT run: let the
+// document-level probe ignore a name mismatch while the per-occurrence path
+// keeps it, i.e. in `encodingHolds` replace
+//
+//	holds = ds.onPinnedBytes(sym, &rng) == ""
+//
+// with
+//
+//	msg := ds.onPinnedBytes(sym, &rng)
+//	holds = msg == "" || msg == "the occurrence does not select the identifier its symbol names"
+//
+// The document is then admitted, the declaration is refused as one occurrence,
+// the reference after it publishes its call-site alias and the manifest gains a
+// row. Deleting the comparison from `onPinnedBytes` outright is a wider
+// mutation that TestOccurrenceMustDescribeThePinnedBytes/definition already
+// catches, so it does not describe this gap.
+//
+// This test was written but has not been compiled and has not been run.
+func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
+	// The same line as the two tests above. On line 4 "Start" sits at columns
+	// [5,10) and "browser" at [11,18); on line 2 "Server" sits at [5,11) and
+	// on line 5 "browser" at [10,17).
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	files := fixture(t)
+	files["pkg/tabs.go"] = src
+	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+		documentWithText("pkg/tabs.go", "go", 0, src,
+			// The document states no encoding, so the per-tool table supplies
+			// one and the probe runs. The first definition whose symbol names
+			// an identifier decides the document, and this is it: the columns
+			// of the parameter under the name of the function.
+			occurrenceRecord(symStart, 1, 4, 11, 18),
+			// Both clean, both spooled after the probe-deciding occurrence, so
+			// a document that was merely thinned rather than dropped would
+			// still resolve this definition and publish this reference's
+			// call-site alias.
+			occurrenceRecord(symServer, 1, 2, 5, 11),
+			occurrenceRecord(symBrowser, 0, 5, 10, 17))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "tabs.scip")
+	got, rep := importDelta(t, h, p, scip.ImportScope("tabs.scip"),
+		append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...), nil)
+	if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 0 {
+		t.Fatalf("%d call-site aliases, want 0: a failed encoding probe drops the whole document, not one occurrence (%v)", n, aliasKeys(got))
+	}
+	if n := rep.Manifest.Len(); n != 0 {
+		t.Fatalf("fresh manifest holds %d documents, want 0: a dropped document must stay out of it, so a later refresh treats it as new", n)
+	}
+	for _, cs := range rep.Result.Capabilities {
+		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+		}
+		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
+			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
+		}
+		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "pkg/tabs.go" {
+			t.Fatalf("documents_dropped_encoding_exemplar = %q, want pkg/tabs.go", got)
+		}
+		if got := cs.Details["refused_occurrences"]; got != "" {
+			t.Fatalf("refused_occurrences = %q: a failed encoding probe is one dropped document, not a refused occurrence", got)
+		}
+	}
+}
+
 // TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse holds the boundary of
 // the wrong-bytes guarantee, which docs/providers-scip.md states beside it: a
 // shift that lands on a whole token spelling the same identifier somewhere
