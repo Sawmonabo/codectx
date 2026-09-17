@@ -352,7 +352,7 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 	// retention/retention.go's -- workspace lock, then this process's indexing
 	// state -- and it is given back the moment the batch is done, so a
 	// deferred unit never keeps the workspace from the person's own index.
-	_, release, err := l.c.hold(ctx)
+	_, release, err := l.c.hold(ctx, HoldNow)
 	if err != nil {
 		return err
 	}
@@ -821,7 +821,7 @@ func (c *Coordinator) Pending() Pending {
 // unit and its publication, and a caller that closed the coordinator there
 // would cancel a completed batch away.
 func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult)) error {
-	_, release, err := c.hold(ctx)
+	_, release, err := c.hold(ctx, HoldNow)
 	if err != nil {
 		return err
 	}
@@ -871,7 +871,7 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 // not queued answers zero units: it is not pending, and the active generation
 // already holds whatever it has.
 func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) (Pending, error) {
-	_, release, err := c.hold(ctx)
+	_, release, err := c.hold(ctx, HoldNow)
 	if err != nil {
 		return Pending{}, err
 	}
