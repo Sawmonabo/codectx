@@ -20,14 +20,21 @@ import (
 // surfaces of one generation saw two different reports, and the human one gave
 // no way to tell a mostly healthy capability from a dead one.
 //
-// Mutation proof: in writeCapabilities, drop the per-row loop under the tally.
+// It also protects the row's REMEDIATION reaching that text. Failure mode: the
+// provider's one sentence about what to do is carried all the way to the row
+// and then not printed, so the human surfaces report a failure with no way to
+// act on it while the JSON one carries the answer.
+//
+// Mutation proof: in writeCapabilities, drop the per-row loop under the tally;
+// for the remediation, drop the `st.Remediation` line beneath it.
 func TestEveryTextSurfaceRendersOneCapabilityRowsOwnFigures(t *testing.T) {
 	t.Parallel()
 	row := model.CapabilityState{ProviderID: "scip", Capability: "precise_definitions",
 		Scope: "workspace", State: model.CapabilityPartial,
 		DiagnosticCode: model.CodeProviderUnavailable,
+		Remediation:    "install the analyzer for this language family, or disable the provider",
 		Details: map[string]string{model.DetailUnitsPlanned: "11", model.DetailUnitsFailed: "2",
-			"scope_key": "pkg:go:refused"}}
+			model.DetailScopeKey: "pkg:go:refused"}}
 	fresh := model.CapabilityState{ProviderID: "structural", Capability: "outline",
 		Scope: "workspace", State: model.CapabilityFresh}
 
@@ -39,7 +46,8 @@ func TestEveryTextSurfaceRendersOneCapabilityRowsOwnFigures(t *testing.T) {
 	writeCapabilities(&completion, []model.CapabilityState{fresh, row})
 
 	for name, out := range map[string]string{"status": status.String(), "the completion block": completion.String()} {
-		for _, want := range []string{"scip/precise_definitions", "2 of 11 units failed", "pkg:go:refused"} {
+		for _, want := range []string{"scip/precise_definitions", "2 of 11 units failed", "pkg:go:refused",
+			"remediation: install the analyzer"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s does not report %q, so the row's own figures reached no operator:\n%s", name, want, out)
 			}

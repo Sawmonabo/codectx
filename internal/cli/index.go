@@ -1156,12 +1156,19 @@ func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 			continue
 		}
 		fmt.Fprintf(b, "  %s/%s %s%s\n", st.ProviderID, st.Capability, st.State, capabilityFigures(st))
+		// The remediation is prose and takes its own line: it is the one part
+		// of the row an operator acts on rather than reads, and folding it
+		// into the comma-separated figures above would bury it behind them.
+		if st.Remediation != "" {
+			fmt.Fprintf(b, "    remediation: %s\n", st.Remediation)
+		}
 	}
 }
 
 // capabilityFigures is what one degraded capability row says about itself
 // beyond its state: how many of the scopes the plan assigned it failed, why,
-// and which scope the reason belongs to. An absent figure is left out rather
+// and which scope the reason belongs to. The row's remediation is not here --
+// it is prose and writeCapabilities gives it its own line. An absent figure is left out rather
 // than printed as zero -- a row with no units_planned did not plan nothing,
 // it is a degradation that counts no units at all.
 func capabilityFigures(st model.CapabilityState) string {
@@ -1176,11 +1183,7 @@ func capabilityFigures(st model.CapabilityState) string {
 	if reason := st.Details["reason"]; reason != "" {
 		parts = append(parts, reason)
 	}
-	// "scope_key" is the fold's exemplar-scope detail. It is spelled here
-	// because the model names the reserved keys the fold owns and this is not
-	// one of them; the two spellings are checked against each other by the
-	// test that renders a published row.
-	if scope := st.Details["scope_key"]; scope != "" {
+	if scope := st.Details[model.DetailScopeKey]; scope != "" {
 		parts = append(parts, "at "+scope)
 	}
 	if st.DiagnosticCode != "" {

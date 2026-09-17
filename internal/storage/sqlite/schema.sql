@@ -165,6 +165,11 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    -- remediation is what an operator can do about this row, in prose. It is a
+    -- column rather than an entry in details_json because details_json is the
+    -- provider's own bounded budget: a remediation charged to it could be the
+    -- entry a busy row drops.
+    remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;

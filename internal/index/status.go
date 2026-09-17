@@ -422,7 +422,11 @@ type failureRow struct {
 	// operator acts on. The standard-error tail is excluded: it is raw
 	// analyzer output and lives on the run row alone.
 	message string
-	details map[string]string
+	// remediation is that same exemplar scope's remediation, published as a
+	// field of the row rather than as a detail: it belongs to the exemplar's
+	// code and message, and the detail map is the provider's own budget.
+	remediation string
+	details     map[string]string
 	// scopes is the bounded, sorted sample of the failed scope keys, and
 	// planned is how many units the plan gave this provider. "Two failed" is
 	// a different report depending on whether two or two hundred were tried.
@@ -504,7 +508,7 @@ var scopeNamingDetails = map[string]bool{scopeKeyDetail: true, "unit_id": true, 
 
 const (
 	// scopeKeyDetail carries the exemplar scope of a fold.
-	scopeKeyDetail = "scope_key"
+	scopeKeyDetail = model.DetailScopeKey
 	// scopesDetail counts the scopes a folded row stands for.
 	//
 	// It, unitsFailedDetail and truncatedDetail are the model's RESERVED
@@ -765,7 +769,8 @@ func (r *capabilityReport) addFailures(providerID, capability string, f *provide
 	}
 	r.failures[providerID+"\x00"+capability] = &failureRow{providerID: providerID, capability: capability,
 		scope: exemplar.scopeKey, code: exemplar.failure.code, message: exemplar.failure.message,
-		details: exemplar.failure.details, scopes: scopes, planned: f.planned, units: f.units}
+		remediation: exemplar.failure.remediation, details: exemplar.failure.details,
+		scopes: scopes, planned: f.planned, units: f.units}
 }
 
 // coveredElsewhere records that this provider capability has a scope that did
@@ -832,6 +837,7 @@ func (f *failureRow) publish() model.CapabilityState {
 	}
 	row := model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
 		Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
+		Remediation: f.remediation,
 		Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units),
 			scopeKeyDetail: model.TruncateDetail(f.scope)}}
 	if f.planned > 0 {

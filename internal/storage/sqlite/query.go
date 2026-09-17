@@ -709,7 +709,7 @@ func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	var out []model.CapabilityState
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, details_json FROM generation_capabilities
+		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json FROM generation_capabilities
 			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, r.gen)
 		if err != nil {
 			return wrap("generation_capabilities", err)
@@ -718,7 +718,8 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 		for rows.Next() {
 			var c model.CapabilityState
 			var details string
-			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode, &details); err != nil {
+			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode,
+				&c.Remediation, &details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 			if details != "" && details != "{}" {

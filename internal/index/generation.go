@@ -135,7 +135,12 @@ type generation struct {
 type unitFailure struct {
 	code    string
 	message string
-	details map[string]string
+	// remediation is what the provider said an operator can do about this
+	// failure. It travels with the message rather than inside details: the
+	// detail map is the provider's own bounded budget, and a remediation
+	// charged to it could be the entry a busy row drops.
+	remediation string
+	details     map[string]string
 }
 
 // maxFailedScopesNamed bounds the failed scope keys one capability row names.
@@ -1109,7 +1114,8 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, caus
 func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome, cause error) unitFailure {
 	res := out.result
 	f := typedFailure(cause)
-	stored := model.RunFailure{ScopeKey: u.ScopeKey, Code: f.code, Message: f.message, Details: f.details}
+	stored := model.RunFailure{ProviderID: u.ProviderID, ScopeKey: u.ScopeKey, Code: f.code,
+		Message: f.message, Remediation: f.remediation, Details: f.details}
 	// One value, two records: the unit's span publishes the reason the run row
 	// publishes, so the ledger and the store can never disagree about why a
 	// unit failed. The error is not handed to End -- it would fill the span
@@ -1129,6 +1135,9 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	}
 	args := []any{"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
 		"generation_id", int64(g.gen), "diagnostic_code", f.code, "message", f.message}
+	if f.remediation != "" {
+		args = append(args, "remediation", f.remediation)
+	}
 	for _, k := range slices.Sorted(maps.Keys(f.details)) {
 		if k != model.DetailStderrTail {
 			args = append(args, k, f.details[k])
@@ -1145,7 +1154,7 @@ func typedFailure(cause error) unitFailure {
 	f := unitFailure{code: provider.CodeOf(cause)}
 	var typed *model.Error
 	if errors.As(cause, &typed) {
-		f.message, f.details = typed.Message, typed.Details
+		f.message, f.details, f.remediation = typed.Message, typed.Details, typed.Remediation
 	}
 	return f
 }

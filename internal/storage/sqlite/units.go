@@ -1551,8 +1551,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, details_json)
-			VALUES(?, ?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -1562,7 +1562,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			if err != nil {
 				return err
 			}
-			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State), c.DiagnosticCode, details); err != nil {
+			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State),
+				c.DiagnosticCode, c.Remediation, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
@@ -1579,7 +1580,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		}
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
-			|| char(0) || details_json
+			|| char(0) || remediation || char(0) || details_json
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}

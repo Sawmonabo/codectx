@@ -299,6 +299,14 @@ const (
 	DetailFailureMessage = "failure_message"
 )
 
+// DetailScopeKey carries the one exemplar scope a folded row names, the scope
+// whose DiagnosticCode, Remediation and DetailFailureMessage the row
+// publishes. It is NOT a reserved fold key -- it is charged to the provider
+// budget like any other particular -- and it is spelled here because the fold
+// that writes it and the surfaces that render it are in different packages,
+// where two spellings of one key would silently stop matching.
+const DetailScopeKey = "scope_key"
+
 // DetailStderrTail is the detail key under which a provider discloses the tail
 // of a failed tool's standard error. It is NOT a reserved fold key and it is
 // never published on a capability row or a log line: it is raw analyzer
@@ -352,7 +360,15 @@ type CapabilityState struct {
 	Scope          string               `json:"scope"`
 	State          CapabilityStateValue `json:"state"`
 	DiagnosticCode string               `json:"diagnostic_code,omitempty"`
-	Details        map[string]string    `json:"details,omitempty"`
+	// Remediation is what an operator can DO about this row, in prose, and
+	// it is a field rather than a detail key on purpose: the detail map has a
+	// fixed budget a provider fills with its own particulars, so a reserved
+	// key for it would be taken out of that budget and could be the entry a
+	// busy row drops. It belongs to the same scope as DiagnosticCode and the
+	// exemplar `scope_key` -- a fold that keeps one row's code keeps that
+	// row's remediation with it and never joins two.
+	Remediation string            `json:"remediation,omitempty"`
+	Details     map[string]string `json:"details,omitempty"`
 }
 
 // WithDetail returns the state with one bounded diagnostic pair added, so a
@@ -423,6 +439,9 @@ func (c CapabilityState) Validate() error {
 	if err := boundField("capability_state.diagnostic_code", c.DiagnosticCode, MaxIdentifierBytes); err != nil {
 		return err
 	}
+	if err := boundField("capability_state.remediation", c.Remediation, MaxDetailBytes); err != nil {
+		return err
+	}
 	if err := boundCount("capability_state.details", len(c.Details), MaxCapabilityDetails); err != nil {
 		return err
 	}
@@ -489,10 +508,19 @@ func (r ProviderResult) Validate() error {
 // the scope key the run was about (a run row is keyed by provider, not by
 // scope) and the raw tool output, which the fold and the log both exclude.
 type RunFailure struct {
-	ScopeKey string            `json:"scope_key"`
-	Code     string            `json:"code"`
-	Message  string            `json:"message"`
-	Details  map[string]string `json:"details,omitempty"`
+	// ProviderID names the provider whose run this was. It is on the wire
+	// because the failed runs of one generation are reported as a list: a row
+	// that says a scope failed without saying which provider was analysing it
+	// names no work an operator can act on.
+	ProviderID string `json:"provider_id"`
+	ScopeKey   string `json:"scope_key"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	// Remediation is what an operator can do about this failure, as the
+	// provider stated it. Without it a provider's own advice is lost between
+	// the error it raised and every surface that reports the failure.
+	Remediation string            `json:"remediation,omitempty"`
+	Details     map[string]string `json:"details,omitempty"`
 }
 
 // Validate bounds every field a run failure persists, so a provider's own text
@@ -504,7 +532,13 @@ func (f RunFailure) Validate() error {
 	if err := boundField("run_failure.scope_key", f.ScopeKey, MaxScopeKeyBytes); err != nil {
 		return err
 	}
+	if err := boundField("run_failure.provider_id", f.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
 	if err := boundField("run_failure.message", f.Message, MaxDetailBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.remediation", f.Remediation, MaxDetailBytes); err != nil {
 		return err
 	}
 	if len(f.Details) > MaxErrorDetails {
