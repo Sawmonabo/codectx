@@ -1106,10 +1106,6 @@ func countMetric(v *int64) string {
 	return fmt.Sprintf("%d", *v)
 }
 
-// writeCapabilities renders per-capability freshness. A capability with no row
-// is not printed as fresh and is not invented: the absence of a row is itself
-// what "this provider published nothing" looks like, and Section 13.3 forbids
-// reading available-with-no-units as fresh coverage.
 // writeProvidersDisabled names the providers the configuration turns off, on
 // one line above the capability summary. It is what makes the rows that are
 // NOT there readable: a disabled provider publishes no capability row, so an
@@ -1123,6 +1119,21 @@ func writeProvidersDisabled(b *strings.Builder, names []string) {
 	fmt.Fprintf(b, "disabled    %s\n", strings.Join(names, ", "))
 }
 
+// writeCapabilities renders per-capability freshness. A capability with no row
+// is not printed as fresh and is not invented: the absence of a row is itself
+// what "this provider published nothing" looks like, and Section 13.3 forbids
+// reading available-with-no-units as fresh coverage.
+//
+// The tally is followed by one line per row that is not fresh, naming the
+// capability, what it is and the figures the row carries. The tally alone
+// answers "how many capabilities are degraded" and nothing else, so an
+// operator reading it could not tell a provider that failed two of two scopes
+// from one that failed two of eleven -- the distinction the row's own
+// units_planned and units_failed exist to draw, and which the JSON output has
+// always carried while this one dropped it. Both figures come from the
+// published row and neither is recomputed here: the counting rule lives in
+// the indexing package that writes the row, so `status` and this run's
+// completion block cannot disagree about a generation.
 func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 	if len(states) == 0 {
 		b.WriteString("capabilities none reported\n")
@@ -1140,4 +1151,43 @@ func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 		}
 	}
 	fmt.Fprintf(b, "capabilities %s\n", strings.Join(parts, ", "))
+	for _, st := range states {
+		if st.State == model.CapabilityFresh {
+			continue
+		}
+		fmt.Fprintf(b, "  %s/%s %s%s\n", st.ProviderID, st.Capability, st.State, capabilityFigures(st))
+	}
+}
+
+// capabilityFigures is what one degraded capability row says about itself
+// beyond its state: how many of the scopes the plan assigned it failed, why,
+// and which scope the reason belongs to. An absent figure is left out rather
+// than printed as zero -- a row with no units_planned did not plan nothing,
+// it is a degradation that counts no units at all.
+func capabilityFigures(st model.CapabilityState) string {
+	var parts []string
+	if failed := st.Details[model.DetailUnitsFailed]; failed != "" {
+		if planned := st.Details[model.DetailUnitsPlanned]; planned != "" {
+			parts = append(parts, fmt.Sprintf("%s of %s units failed", failed, planned))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %s failed", failed, plural(atoiOrZero(failed), "unit", "units")))
+		}
+	}
+	if reason := st.Details["reason"]; reason != "" {
+		parts = append(parts, reason)
+	}
+	// "scope_key" is the fold's exemplar-scope detail. It is spelled here
+	// because the model names the reserved keys the fold owns and this is not
+	// one of them; the two spellings are checked against each other by the
+	// test that renders a published row.
+	if scope := st.Details["scope_key"]; scope != "" {
+		parts = append(parts, "at "+scope)
+	}
+	if st.DiagnosticCode != "" {
+		parts = append(parts, st.DiagnosticCode)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, ", ")
 }

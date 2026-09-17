@@ -264,9 +264,19 @@ capability summary. An indexing run also logs the same list once, at its start,
 under `component=index`.
 
 A `partial` or `failed` row carries the shape of the failure, not just its
-code:
+code. **The figures follow one counting rule, applied once where the row is
+built:** a capability's planned total is every scope the plan assigned its
+provider for that generation — the units the run builds, the stale
+predecessors it carries and the sealed units it reuses — and its failed total
+is those of them that did not seal. The row is the only place those two
+numbers are computed. `codectx status`, the completion block of an indexing
+run and the `codectx_index_status` tool all render that one row and none of
+them recounts, so one generation cannot read differently on two of them. In
+text output the capability tally is followed by one line per capability that is
+not fresh, naming it, its state and the figures its row carries; JSON output
+carries the whole row.
 
-- `units_planned` — how many units the plan gave this provider behind this
+- `units_planned` — how many scopes the plan gave this provider behind this
   row. It is what makes the next figure readable: "two failed" is a different
   report depending on whether two or two hundred were tried.
 - `units_failed` — how many of them failed.
