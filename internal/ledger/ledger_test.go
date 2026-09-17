@@ -96,8 +96,8 @@ func TestUnopenedLedgerRecordsNothing(t *testing.T) {
 	if len(overlay) != 0 || err != nil {
 		t.Fatalf("overlay runs %v (%v), want none and no failure", overlay, err)
 	}
-	if err := l.DeleteRuns(ctx, []int64{7}); err != nil {
-		t.Fatalf("delete runs: %v", err)
+	if err := l.SweepRuns(ctx, repositoryID, 7); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
 	}
 	if err := l.DeleteOverlayRuns(ctx, []string{repositoryID}); err != nil {
 		t.Fatalf("delete overlay runs: %v", err)
