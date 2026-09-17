@@ -9,51 +9,53 @@ package scip
 // whole repository although six indexers were installed and every one of them
 // had a project to run over.
 //
-// The rule is the one the dependence provider's unit planner uses, for the
-// same reason: a project is what the language's own toolchain calls a
-// project, and an indexer run at the wrong boundary resolves a different set
-// of symbols.
+// A project is what the language's own toolchain calls a project, because an
+// indexer run at the wrong boundary resolves a different set of symbols. The
+// dependence provider's unit planner answers the same question and does not
+// answer it the same way: it still folds a non-nesting family's inner
+// directories into the outermost one (internal/provider/dependence/units.go,
+// nestedFamilies), so that planner's javascript, python and rust units are
+// coarser than the projects below. The two are deliberately read as separate
+// rulings here and not shared, so neither drifts by inheriting the other.
 //
-//   - Every triggering directory is a project, including the workspace root
-//     when the root itself triggers. The root is not privileged and it is not
-//     excluded: a repository with a root `package.json` and an `app/`
-//     `package.json` has two projects, and each is indexed by its own unit.
-//   - Nesting: Go modules and Maven or Gradle modules nest -- a `go.mod`
-//     inside another module's tree is its own project, and the nearest
-//     trigger above a file is the project that owns it. Every other kind
-//     takes the outermost trigger and never splits below it, because the
-//     whole program is what makes its symbols resolvable: a `tsconfig`
-//     project split by subdirectory loses more than half of the calls that
-//     resolve to its own methods (docs/research/10-round3-empirical.md
-//     Section 8), and a Python package, a Cargo workspace and a compilation
-//     database are whole for the same reason.
-//   - A trigger inside a dependency directory is not a project, under the
-//     default `workspace.index_vendor = false`. Those directories --
-//     `node_modules`, `vendor`, a virtual environment, a build tree -- are
-//     then not part of the snapshot at all: workspace.Policy.ExcludeDir drops
-//     the vendor names while `index_vendor` is false, and
-//     snapshot.TraversalPolicy drops whatever the repository's own Git ignore
-//     rules cover. So a `package.json` under `node_modules` never reaches this
-//     rule, and nothing indexes a dependency's own manifest as a project of
-//     the repository. An operator who sets `index_vendor = true` is asking for
-//     those trees, and a trigger inside one then becomes a project like any
-//     other -- unless the repository's own ignore rules still cover it, which
-//     is the usual case for `node_modules` and a build tree.
+//   - Every triggering directory is a project, whatever the kind and whatever
+//     encloses it. The workspace root is not privileged and it is not
+//     excluded, and neither is a directory inside another project's tree: a
+//     repository with a root `package.json` and an `app/package.json` has two
+//     projects, a `go.mod` inside another module's tree is its own project,
+//     and each is indexed by its own unit. A manifest is the toolchain's own
+//     declaration of a boundary, so a nested one is a second program and not
+//     a subdirectory of the first; indexing its files at the boundary above
+//     runs the indexer over a program its toolchain never assembles and
+//     resolves a different set of symbols for them.
+//   - A directory that declares nothing is never a boundary, which is the
+//     split the empirical round measured: cutting one `tsconfig` project at
+//     subdirectories holding no `tsconfig` of their own loses more than half
+//     of the calls that resolve to the project's own methods
+//     (docs/research/10-round3-empirical.md Section 8). A Python package, a
+//     Cargo workspace and a compilation database are whole for the same
+//     reason -- whole up to the next directory that declares itself, and no
+//     further.
+//   - A trigger inside a dependency directory is a project only when the
+//     workspace holds that directory at all. With `workspace.index_vendor`
+//     false, which is the default, `node_modules`, `vendor`, `third_party`,
+//     `bower_components` and `Godeps` are outside the snapshot
+//     (internal/workspace/walk.go), so a `package.json` under `node_modules`
+//     never reaches this rule and nothing indexes a dependency's own manifest
+//     as a project of the repository. With `workspace.index_vendor` true the
+//     operator has asked for those directories to be indexed, their manifests
+//     are in the detection, and they are projects like any other -- bounded,
+//     as the whole detection is, by provider.MaxDetectionInputs.
 
 import (
 	"slices"
 	"strings"
 )
 
-// nestedKinds are the kinds whose projects nest inside one another. It mirrors
-// the dependence planner's nestedFamilies, which is the same ruling about the
-// same toolchains.
-var nestedKinds = map[Kind]bool{KindGo: true, KindJava: true}
-
 // projectRoots turns the trigger paths detection recognized for one kind into
 // its project directories, sorted, with the workspace root spelled as the
 // empty string. A directory holding two triggers of one kind is one project.
-func projectRoots(k Kind, triggers []string) []string {
+func projectRoots(triggers []string) []string {
 	dirs := make([]string, 0, len(triggers))
 	for _, t := range triggers {
 		dir := ""
@@ -65,16 +67,6 @@ func projectRoots(k Kind, triggers []string) []string {
 		}
 	}
 	slices.Sort(dirs)
-	if !nestedKinds[k] {
-		dirs = slices.DeleteFunc(dirs, func(d string) bool {
-			for _, outer := range dirs {
-				if outer != d && within(d, outer) {
-					return true
-				}
-			}
-			return false
-		})
-	}
 	return dirs
 }
 
@@ -90,26 +82,3 @@ var triggerKind = func() map[string]Kind {
 	}
 	return out
 }()
-
-// within reports whether p lies at or under the root-relative directory dir;
-// the empty dir is the workspace root and contains everything.
-func within(p, dir string) bool {
-	if dir == "" {
-		return true
-	}
-	return p == dir || strings.HasPrefix(p, dir+"/")
-}
-
-// ownerOf is the project of kind k that owns a root-relative path: the nearest
-// root at or above it, or no root at all when none encloses it. It is what
-// makes a nested Go or Maven module's files members of the nested unit rather
-// than of the one above it.
-func ownerOf(roots []string, p string) (string, bool) {
-	best, found := "", false
-	for _, r := range roots {
-		if within(p, r) && (!found || len(r) > len(best)) {
-			best, found = r, true
-		}
-	}
-	return best, found
-}

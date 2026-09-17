@@ -75,6 +75,35 @@ func overran(m *ledger.Measured, scopeKey string, reservedBytes int64) {
 		"scope", scopeKey, "reservation_bytes", reservedBytes, "tree_peak_bytes", int64(*m.PeakRSSBytes))
 }
 
+// unmeasured is what a span records when nothing of the step it brackets was
+// ever measured: the child never started, or the step ended before it ran. It
+// names why the CPU columns are null rather than leaving them unexplained --
+// and it is not measured(Outcome{}), which would publish three zeros as
+// figures somebody took.
+func unmeasured() ledger.Measured {
+	return ledger.Measured{CPUUnattributed: ledger.CPUUnsampled}
+}
+
+// bracketed is what a span that only brackets other spans records. Its children
+// carry the child processes' own figures, so attributing them here as well
+// would count the same processor time twice; the honest answer for the bracket
+// itself is a null with its reason.
+func bracketed() ledger.Measured {
+	return ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}
+}
+
+// spanFailure is the typed error a classified step hands its span so the row
+// carries the failure class the caller already holds, instead of a failed span
+// with nothing said about it. It is handed to End and nowhere else: the
+// provider's own recovery decides separately whether that class fails the
+// unit, retries it or subdivides it.
+func spanFailure(o Outcome, scopeKey string, r Reservation) error {
+	if o.Class == FailureNone {
+		return nil
+	}
+	return failure(o.Class, scopeKey, o, r)
+}
+
 // spanOutcome is what a step's class says about the span that ran it. Only the
 // class decides: a step whose child exited non-zero and was classified is a
 // failed span even though the provider may still recover the unit from it.

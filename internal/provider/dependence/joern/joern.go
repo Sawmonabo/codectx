@@ -8,7 +8,7 @@
 // distribution. There is no product-owned analysis script, no interpreter
 // server and no second export:
 //
-//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph>
+//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph> --frontend-args --no-default-exclude
 //	joern-export <graph> --repr=all --format=neo4jcsv --out <export>
 //
 // Both were run against Joern 4.0.627 on all six frontends before they were
@@ -171,18 +171,43 @@ func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
 	return b.resolved, nil
 }
 
+// clearDefaultExclusions empties the frontend's own default set of excluded
+// path patterns for this parse. The Java frontend of the pinned payload is the
+// only one that carries a non-empty default, and `test` is one of its nine
+// folder names, so without this the frontend silently reads no file whose path
+// holds a `test` component -- a whole package tree, not only a source root.
+//
+// The delimiter hands everything after it to the frontend rather than to the
+// parse tool, so it is appended last, after the paths the parse tool reads
+// itself; anything placed after the delimiter would never reach the parse
+// tool. The frontend's own file-selection default is the product's to decide,
+// not the frontend's: the frontend is pointed at a private materialization
+// that already holds exactly the files this unit owns.
+var clearDefaultExclusions = []string{"--frontend-args", "--no-default-exclude"}
+
+// pinnedArgs is the pinned parse argument array for a family, without the
+// paths and without the frontend arguments that must trail them. Argv and
+// Parse both build on it so the cache key and the command line cannot drift.
+func pinnedArgs(f dependence.Family) []string {
+	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
+}
+
 // Argv is the pinned parse argument array for a family, without the paths. It
 // is what the cache key folds in, so changing a pinned argument invalidates
 // every cached graph instead of silently reusing one built differently.
 func (b *Backend) Argv(f dependence.Family) []string {
-	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
+	return append(pinnedArgs(f), clearDefaultExclusions...)
 }
 
 // NeutralOptions is the frontend's fixed allowlist of semantics-neutral parse
 // options. It is empty for every frontend: every option this release offers
 // changes results (the Rust helper's --no-sysroot drops type resolution, the
 // overlay switches drop whole fact families), so there is nothing that could
-// be added to confirm a crash without changing what a success would mean.
+// be added to confirm a crash without changing what a success would mean. The
+// option that empties the default exclusions is no exception -- it changes
+// which files are read, which is the whole point of it -- and it is not a
+// retry lever in any case: every parse passes it, so a confirmation rerun
+// carries it already.
 func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 
 // Parse builds the graph for one unit. The heap cap reaches the frontend
@@ -191,8 +216,7 @@ func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 // release by inducing an out-of-memory failure with a cap the unit could not
 // fit in.
 func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
-	fe, ok := frontend[req.Family]
-	if !ok {
+	if _, ok := frontend[req.Family]; !ok {
 		return dependence.Outcome{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the analysis engine has no frontend for this language family"}
 	}
@@ -200,10 +224,7 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 	if err != nil {
 		return dependence.Outcome{}, err
 	}
-	args := append([]string{}, e.ParseArgv[1:]...)
-	args = append(args, "--language", fe, "--max-num-def", maxNumDef)
-	args = append(args, req.ExtraArgs...)
-	args = append(args, req.SourceDir, "--output", req.OutputPath)
+	args := parseArgs(e.ParseArgv[1:], req)
 	// The graph file is this step's only observable progress: the payload runs
 	// quiet, its stdout is discarded, and on a platform with no tree sampling
 	// there is no CPU signal either, so without naming the output a parse of a
@@ -239,6 +260,19 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 	out := dependence.ExportOutcome{Outcome: outcome}
 	out.Live, out.Bytes = probe(req.OutputDir)
 	return out, nil
+}
+
+// parseArgs assembles one parse command line. The order is the contract: the
+// delimiter that hands the rest of the line to the frontend stands last, so
+// the source directory and the output path still reach the parse tool itself.
+// Anything appended after it would be read by the frontend instead, and the
+// parse tool would run with no input path at all.
+func parseArgs(base []string, req dependence.ParseRequest) []string {
+	args := append([]string{}, base...)
+	args = append(args, pinnedArgs(req.Family)...)
+	args = append(args, req.ExtraArgs...)
+	args = append(args, req.SourceDir, "--output", req.OutputPath)
+	return append(args, clearDefaultExclusions...)
 }
 
 // stepOutcome turns the runner's result and error into the neutral outcome, or

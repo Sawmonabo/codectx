@@ -316,6 +316,29 @@ func TestImport(t *testing.T) {
 			if !c.has(model.RelCalls, "function:run", "function:f") || c.names(model.RelCalls, "function:helper") {
 				t.Errorf("the call through the value resolved to something other than the export's invented callee")
 			}
+			// Failure mode: this invented callee is the one the engine parks
+			// under the enclosing program rather than under its speculated
+			// namespace, so a marker read off that namespace publishes it as a
+			// real import -- a dependency on `f` the source never states. It
+			// is the only external method this export publishes, so no node
+			// here may carry an import resolution.
+			//
+			// NOT RUN in this round. Mutation that fails it: in project
+			// (scratch.go), drop the second arm of the invented table's
+			// INSERT, leaving only the speculated-namespace test; `f` is then
+			// published with a resolution of import.
+			var speculated int
+			for name, meta := range c.meta {
+				if strings.Contains(meta, `"resolution":"import"`) {
+					t.Errorf("node %q published as a real import; the export invented it for the call through the value", name)
+				}
+				if strings.Contains(meta, `"resolution":"speculated"`) {
+					speculated++
+				}
+			}
+			if speculated == 0 {
+				t.Errorf("no node carries a speculated resolution; the invented callee is indistinguishable from a real dependency")
+			}
 		},
 	}, {
 		// Same shape in Python, where the export binds the call site to

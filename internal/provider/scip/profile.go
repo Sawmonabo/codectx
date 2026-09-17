@@ -456,9 +456,18 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		if err := normalizeCompileCommands(input, p.limits.MaxManifestBytes, seen); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
+	case KindTypeScript:
+		// Refused before node starts, not diagnosed from its exit status. A
+		// package directory holding only a manifest and a lock file -- the
+		// measured second failure of this profile -- has nothing for this indexer to
+		// describe. node_modules is skipped: a dependency's own sources are
+		// not this project's.
+		if err := requireSources(input, "TypeScript", []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}, []string{"node_modules"}); err != nil {
+			return "", "", p.profileError(prof, "", err)
+		}
 	case KindJava:
 		// Refused before the JVM starts, not diagnosed from its exit status.
-		if err := requireJavaSources(input); err != nil {
+		if err := requireSources(input, "Java", []string{".java"}, nil); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 		if err := writeScipJavaConfig(input); err != nil {

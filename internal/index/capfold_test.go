@@ -46,7 +46,7 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 			State:          model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 	}
-	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
+	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout), 0)
 
 	bounded := big.finish(log)
 	seen := map[string]int{}
@@ -205,8 +205,8 @@ func (p coverageProvider) IndexUnit(context.Context, provider.UnitRequest, provi
 // TestCoverageReportsAFailedDeferredScopeAsPartial protects what `codectx
 // status` says after a late publication.
 //
-// Failure mode: one deferred unit of a provider fails and the other nine
-// publish, and every capability of that provider is reported `unavailable:
+// Failure mode: one deferred unit of a provider fails while another scope of
+// it publishes, and every capability of that provider is reported `unavailable:
 // units_deferred` -- a repository whose control dependence, data dependence,
 // reads, writes and calls are all in the generation and queryable reads as a
 // provider nobody has heard from. A scope that failed is not a scope still
@@ -224,12 +224,15 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 		caps: newCapabilityReport(),
 		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
 			ID: id, Version: "1", Capabilities: []string{capability}}}}},
-		sealed:       map[string]bool{plan.Key(id, sealedScope): true},
+		published:    map[string]bool{id: true},
 		failedScopes: map[string]unitFailure{plan.Key(id, failedScope): {code: model.CodeProviderOutputInvalid}},
 	}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
 		for _, scope := range []string{sealedScope, failedScope} {
-			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: true}); err != nil {
+			// Only the failed scope is deferred: the other one is a member of
+			// this generation, which is what `published` records and what
+			// makes the surviving row partial rather than failed.
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: scope == failedScope}); err != nil {
 				return err
 			}
 		}
@@ -426,5 +429,81 @@ func TestCoverageNeverReportsFreshOverAFailedPlannedUnit(t *testing.T) {
 	}
 	if _, ok := row.Details[model.DetailStderrTail]; ok {
 		t.Error("the published capability row carries the raw tool output the run row alone may keep")
+	}
+}
+
+// TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes protects the one
+// counting rule: a capability's units_planned is every scope the plan assigned
+// its provider, and units_failed is those of them that did not seal.
+//
+// Failure mode: a provider seals nine scopes it reused from the previous
+// generation and fails the two the plan gave it to run. `planned` was counted
+// from the walked units alone, so the row published "2 planned, 2 failed" --
+// every unit failed, for a capability that answers nine scopes' worth of
+// queries. An operator reading that row escalates a healthy provider, and the
+// same wrong pair is what `status`, the completion block and the index-status
+// tool all render, because all four read this row.
+//
+// It also protects the exemplar scope's REMEDIATION reaching that same row.
+// Failure mode: a provider attaches a remediation to the error it fails with
+// -- the one sentence that says what an operator can do -- and the fold drops
+// it, so every surface reports a failure nobody is told how to act on.
+//
+// Mutation proof: in coveredProviders, drop the `planned[id]++` from the
+// Plan.Reuse loop; for the remediation, drop `Remediation: f.remediation`
+// from failureRow.publish.
+func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
+	t.Parallel()
+	const id, capability = "scip", "precise_definitions"
+	const reused, walked = 9, 2
+	const remediation = "install the analyzer for this language family, or disable the provider"
+
+	g := &generation{
+		caps: newCapabilityReport(),
+		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
+			ID: id, Version: "1", Capabilities: []string{capability}}}}},
+		published: map[string]bool{id: true},
+	}
+	failures := &providerFailures{}
+	g.plan.Reuse = map[string]model.UnitID{}
+	for i := range reused {
+		g.plan.Reuse[plan.Key(id, "pkg:go:sealed"+strconv.Itoa(i))] = model.UnitID(strings.Repeat("a", 64))
+	}
+	var walkedScopes []string
+	for i := range walked {
+		scope := "pkg:go:refused" + strconv.Itoa(i)
+		walkedScopes = append(walkedScopes, scope)
+		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable, remediation: remediation})
+	}
+	g.failures = map[string]*providerFailures{id: failures}
+	g.plan.Units = func(yield func(plan.Unit) error) error {
+		for _, scope := range walkedScopes {
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := g.coverage(t.Context()); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if len(rows) != 1 {
+		t.Fatalf("coverage published %d rows, want one: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if got, want := row.Details[unitsPlannedDetail], strconv.Itoa(reused+walked); got != want {
+		t.Errorf("the row reports %s=%q, want %q: the reused scopes the plan assigned this provider are planned scopes",
+			unitsPlannedDetail, got, want)
+	}
+	if got, want := row.Details[unitsFailedDetail], strconv.Itoa(walked); got != want {
+		t.Errorf("the row reports %s=%q, want %q", unitsFailedDetail, got, want)
+	}
+	if row.State != model.CapabilityPartial {
+		t.Errorf("capability state %q, want partial: nine scopes are in this generation", row.State)
+	}
+	if row.Remediation != remediation {
+		t.Errorf("the row carries remediation %q, want %q: the provider's own advice reached no operator",
+			row.Remediation, remediation)
 	}
 }

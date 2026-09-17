@@ -535,8 +535,13 @@ func queryWarnings(meta model.QueryMeta) []string {
 		if reason := state.Details["reason"]; reason != "" {
 			note += " (" + reason + ")"
 		}
-		if units := state.Details["units"]; units != "" {
-			note += fmt.Sprintf(", %s %s still building", units, plural(atoiOrZero(units), "unit", "units"))
+		// The row's own field, not a detail key: the count is published as a
+		// field of the capability row precisely so it survives the detail
+		// budget, and a warning read from a key nothing writes was silent on
+		// every generation that had work in flight.
+		if state.UnitsRunning > 0 {
+			note += fmt.Sprintf(", %d %s still building", state.UnitsRunning,
+				plural(state.UnitsRunning, "unit is", "units are"))
 		}
 		warnings = append(warnings, note)
 	}

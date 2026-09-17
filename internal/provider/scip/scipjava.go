@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -39,42 +40,53 @@ type scipJavaProject struct {
 	JavacOptions      []string `json:"javacOptions"`
 }
 
-// requireJavaSources refuses a Java run whose materialization holds no `.java`
-// file at all, before the indexer is started.
+// requireSources refuses a profile run whose materialization holds no source
+// file the indexer can describe, before the tool is started.
 //
-// A root pom.xml with no compilable source is not exotic: it is every
-// aggregator POM of a multi-module repository, and a root manifest is exactly
-// what triggers this profile. javac refuses, scip-java exits 1, and the run
-// fails as `CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1`
-// (measured) -- a process failure with no stderr and no remediation, for a
-// condition this provider can name precisely and the other five profiles
-// already do name: the Go path reports the same empty index as
-// CTX_PROVIDER_OUTPUT_INVALID. The refusal is the same typed one, raised
-// before a JVM is started rather than after.
+// It is not exotic. A root pom.xml with no compilable source is every
+// aggregator POM of a multi-module repository, and a package.json with no
+// TypeScript or JavaScript beside it is every lock-only or metadata-only
+// package directory; a root manifest is exactly what triggers these profiles.
+// Left to the tool, javac refuses and scip-java exits 1, and scip-typescript
+// exits 1 with "no files got indexed" (both measured), so the run fails as
+// CTX_PROVIDER_UNAVAILABLE with a process exit status, no stderr and no
+// remediation -- for a condition this provider can name precisely and the Go
+// path already names as CTX_PROVIDER_OUTPUT_INVALID. The refusal is that same
+// typed one, raised before a tool starts rather than after.
 //
 // The walk stops at the first match and is bounded by the materialization,
-// which MaxMaterializeBytes already bounds.
-func requireJavaSources(matRoot string) error {
+// which MaxMaterializeBytes already bounds. Directories the indexers never
+// read are skipped so a vendored dependency tree cannot answer for the
+// project's own source.
+func requireSources(matRoot, what string, exts []string, skipDirs []string) error {
 	found := false
 	err := filepath.WalkDir(matRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() && strings.HasSuffix(path, ".java") {
-			found = true
-			return fs.SkipAll
+		if d.IsDir() {
+			if path != matRoot && slices.Contains(skipDirs, d.Name()) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		for _, ext := range exts {
+			if strings.HasSuffix(path, ext) {
+				found = true
+				return fs.SkipAll
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return internal("scip java source scan: " + err.Error())
+		return internal("scip source scan: " + err.Error())
 	}
 	if found {
 		return nil
 	}
 	return &model.Error{Code: model.CodeProviderOutputInvalid,
-		Message:     "the snapshot declares a Java project but holds no .java source for the indexer to describe",
-		Remediation: "an aggregator pom.xml whose modules hold the sources needs no index of its own; if sources were expected here, restore them and re-run"}
+		Message:     "the snapshot declares a " + what + " project but holds no " + what + " source for the indexer to describe",
+		Remediation: "a manifest whose sources live elsewhere needs no index of its own; if sources were expected here, restore them and re-run"}
 }
 
 // writeScipJavaConfig writes the Java profile's build description into the

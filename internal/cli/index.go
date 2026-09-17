@@ -843,6 +843,7 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	writeWatchers(&b, s.Watchers)
 	writeProvidersDisabled(&b, s.ProvidersDisabled)
 	writeCapabilities(&b, s.Completeness)
+	writeFailedUnits(&b, s.FailedUnits, s.FailedUnitsOmitted)
 	for _, warning := range s.Warnings {
 		fmt.Fprintf(&b, "warning     %s\n", warning)
 	}
@@ -853,6 +854,39 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	}
 	b.WriteString("\n")
 	return writeText(w, "%s", b.String())
+}
+
+// writeFailedUnits prints every failed unit of the active generation with the
+// reason its run recorded: the scope, the diagnostic code, the message and the
+// provider's remediation.
+//
+// The capability rows above name ONE exemplar scope per provider capability,
+// which is what makes them fit a fixed bound on any repository; this is the
+// list of the rest. It is printed only when there is one -- a workspace with
+// nothing failed has no failures section to read -- and what did not fit the
+// page is stated rather than dropped, because a short failure list read as the
+// whole of it is the one thing this section must never be.
+//
+// The tool's standard-error tail is deliberately not printed: it is raw
+// analyzer output and stays on the run row alone.
+func writeFailedUnits(b *strings.Builder, failed []model.RunFailure, omitted int64) {
+	if len(failed) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "failed      %d %s\n", len(failed), plural(len(failed), "unit", "units"))
+	for _, f := range failed {
+		fmt.Fprintf(b, "  %s %s %s", f.ProviderID, f.ScopeKey, f.Code)
+		if f.Message != "" {
+			fmt.Fprintf(b, ": %s", f.Message)
+		}
+		b.WriteString("\n")
+		if f.Remediation != "" {
+			fmt.Fprintf(b, "    remediation: %s\n", f.Remediation)
+		}
+	}
+	if omitted > 0 {
+		fmt.Fprintf(b, "  %d further %s not shown\n", omitted, plural(int(omitted), "reason is", "reasons are"))
+	}
 }
 
 // writeWatchers lists the watching processes whose heartbeats are live, which
@@ -1125,10 +1159,6 @@ func countMetric(v *int64) string {
 	return fmt.Sprintf("%d", *v)
 }
 
-// writeCapabilities renders per-capability freshness. A capability with no row
-// is not printed as fresh and is not invented: the absence of a row is itself
-// what "this provider published nothing" looks like, and Section 13.3 forbids
-// reading available-with-no-units as fresh coverage.
 // writeProvidersDisabled names the providers the configuration turns off, on
 // one line above the capability summary. It is what makes the rows that are
 // NOT there readable: a disabled provider publishes no capability row, so an
@@ -1142,6 +1172,21 @@ func writeProvidersDisabled(b *strings.Builder, names []string) {
 	fmt.Fprintf(b, "disabled    %s\n", strings.Join(names, ", "))
 }
 
+// writeCapabilities renders per-capability freshness. A capability with no row
+// is not printed as fresh and is not invented: the absence of a row is itself
+// what "this provider published nothing" looks like, and Section 13.3 forbids
+// reading available-with-no-units as fresh coverage.
+//
+// The tally is followed by one line per row that is not fresh, naming the
+// capability, what it is and the figures the row carries. The tally alone
+// answers "how many capabilities are degraded" and nothing else, so an
+// operator reading it could not tell a provider that failed two of two scopes
+// from one that failed two of eleven -- the distinction the row's own
+// units_planned and units_failed exist to draw, and which the JSON output has
+// always carried while this one dropped it. Both figures come from the
+// published row and neither is recomputed here: the counting rule lives in
+// the indexing package that writes the row, so `status` and this run's
+// completion block cannot disagree about a generation.
 func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 	if len(states) == 0 {
 		b.WriteString("capabilities none reported\n")
@@ -1159,4 +1204,50 @@ func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 		}
 	}
 	fmt.Fprintf(b, "capabilities %s\n", strings.Join(parts, ", "))
+	for _, st := range states {
+		if st.State == model.CapabilityFresh {
+			continue
+		}
+		fmt.Fprintf(b, "  %s/%s %s%s\n", st.ProviderID, st.Capability, st.State, capabilityFigures(st))
+		// The remediation is prose and takes its own line: it is the one part
+		// of the row an operator acts on rather than reads, and folding it
+		// into the comma-separated figures above would bury it behind them.
+		if st.Remediation != "" {
+			fmt.Fprintf(b, "    remediation: %s\n", st.Remediation)
+		}
+	}
+}
+
+// capabilityFigures is what one degraded capability row says about itself
+// beyond its state: how many of the scopes the plan assigned it failed, why,
+// and which scope the reason belongs to. The row's remediation is not here --
+// it is prose and writeCapabilities gives it its own line. An absent figure is left out rather
+// than printed as zero -- a row with no units_planned did not plan nothing,
+// it is a degradation that counts no units at all.
+func capabilityFigures(st model.CapabilityState) string {
+	var parts []string
+	if failed := st.Details[model.DetailUnitsFailed]; failed != "" {
+		if planned := st.Details[model.DetailUnitsPlanned]; planned != "" {
+			parts = append(parts, fmt.Sprintf("%s of %s units failed", failed, planned))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %s failed", failed, plural(atoiOrZero(failed), "unit", "units")))
+		}
+	}
+	if reason := st.Details["reason"]; reason != "" {
+		parts = append(parts, reason)
+	}
+	if scope := st.Details[model.DetailScopeKey]; scope != "" {
+		parts = append(parts, "at "+scope)
+	}
+	if st.UnitsRunning > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s still building", st.UnitsRunning,
+			plural(st.UnitsRunning, "unit is", "units are")))
+	}
+	if st.DiagnosticCode != "" {
+		parts = append(parts, st.DiagnosticCode)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, ", ")
 }

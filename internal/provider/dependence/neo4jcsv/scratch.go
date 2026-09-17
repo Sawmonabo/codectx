@@ -32,10 +32,13 @@ const (
 	labelParamIn   = "METHOD_PARAMETER_IN"
 	labelTypeDecl  = "TYPE_DECL"
 
-	// speculatedParent is the namespace the export parks an invented callee
-	// under: a method it emitted with no definition anywhere in the graph,
-	// so that a call site whose target it could not find still has one. A
-	// callee under it is a guess, not a dependency the source states.
+	// speculatedParent is the namespace the export parks an ORPHAN invented
+	// callee under: a method it emitted with no definition anywhere in the
+	// graph, so that a call site whose target it could not find still has one.
+	// A callee under it is a guess, not a dependency the source states. It is
+	// one of the two shapes an invented callee takes and never the test on its
+	// own -- the engine parks the other shape under the scope that encloses
+	// the call site (project, the invented table).
 	speculatedParent = "<speculatedMethods>"
 
 	edgeCall        = "CALL"
@@ -105,9 +108,9 @@ type graphNode struct {
 	id                                              int64
 	label, name, fullName, canonicalName, signature string
 	filename, code, methodFullName, typeFullName    string
-	closureBinding                                  string
+	closureBinding, astParent                       string
 	line, lineEnd, col, argIndex                    nullable
-	isExternal, speculated                          bool
+	isExternal                                      bool
 }
 
 // scratch is the on-disk staging database of one import. Everything the
@@ -174,7 +177,7 @@ CREATE TABLE node_in(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, label TEXT NO
 	full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
 	line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
 	method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL,
-	speculated INTEGER NOT NULL);
+	ast_parent TEXT NOT NULL);
 CREATE TABLE code(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, code TEXT NOT NULL);
 CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER NOT NULL, dst INTEGER NOT NULL);
 `
@@ -401,11 +404,11 @@ func (s *scratch) putNode(ctx context.Context, n graphNode) error {
 		return nil
 	}
 	err := s.exec(ctx, `INSERT INTO node_in(id, label, name, full_name, canonical_name, signature, filename,
-		line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, speculated)
+		line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, ast_parent)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.id, n.label, n.name, n.fullName, n.canonicalName, n.signature, n.filename,
 		n.line.value(), n.lineEnd.value(), n.col.value(), n.argIndex.value(),
-		boolInt(n.isExternal), n.methodFullName, n.typeFullName, n.closureBinding, boolInt(n.speculated))
+		boolInt(n.isExternal), n.methodFullName, n.typeFullName, n.closureBinding, n.astParent)
 	if err != nil {
 		return err
 	}
@@ -459,9 +462,9 @@ func (s *scratch) order(ctx context.Context) error {
 			full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
 			line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
 			method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL,
-			speculated INTEGER NOT NULL)`},
+			ast_parent TEXT NOT NULL)`},
 		{"nodes", `INSERT OR IGNORE INTO nodes SELECT id, label, name, full_name, canonical_name, signature, filename,
-			line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, speculated
+			line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, ast_parent
 			FROM node_in ORDER BY id, seq`},
 		{"nodes", `CREATE INDEX nodes_by_label ON nodes(label, id)`},
 		{"code", `CREATE INDEX code_by_id ON code(id)`},
@@ -578,6 +581,31 @@ func (s *scratch) project(ctx context.Context) error {
 			JOIN nodes m ON m.id = a.dst AND m.label = '` + labelMember + `'
 			WHERE t.label = '` + labelTypeDecl + `' AND t.full_name <> '' AND m.name <> ''
 			GROUP BY t.full_name, m.name`},
+		// The methods the export invented: a call site named a callee the
+		// engine could not find, so it emitted a method with no definition
+		// anywhere in the graph to give the site a target. Two shapes of that,
+		// and both are the engine's own signal rather than one namespace
+		// string: a method the engine parked in its speculated namespace, and
+		// an external method with no coordinates whose declaring scope IS
+		// defined in this graph, with coordinates -- if that method existed,
+		// the graph that holds its scope would hold its definition too.
+		//
+		// The second shape is what a parent test alone misses: the engine
+		// parks an invented callee named after a local value under the
+		// enclosing program or type, not under its speculated namespace, and
+		// such a callee published as a real import is a dependency the source
+		// never states. A declaration from ANOTHER unit is not caught by it,
+		// because its own scope is a stub with no coordinates either -- which
+		// is exactly what makes it a name from outside this graph.
+		{"invented", `CREATE TABLE scopes(full_name TEXT PRIMARY KEY) WITHOUT ROWID`},
+		{"invented", `INSERT OR IGNORE INTO scopes SELECT full_name FROM nodes
+			WHERE full_name <> '' AND line IS NOT NULL ORDER BY full_name`},
+		{"invented", `CREATE TABLE invented(id INTEGER PRIMARY KEY) WITHOUT ROWID`},
+		{"invented", `INSERT INTO invented SELECT n.id FROM nodes n
+			WHERE n.label = '` + labelMethod + `' AND (n.ast_parent = '` + speculatedParent + `'
+				OR (n.is_external = 1 AND n.line IS NULL AND n.ast_parent <> ''
+					AND EXISTS (SELECT 1 FROM scopes s WHERE s.full_name = n.ast_parent)))
+			ORDER BY n.id`},
 		// Occurrences are appended as each derivation produces them; the
 		// sorted, de-duplicated copy every later phase reads is built once
 		// they are all in (occurrences()).
@@ -585,9 +613,9 @@ func (s *scratch) project(ctx context.Context) error {
 			to_e INTEGER NOT NULL, site INTEGER NOT NULL, op TEXT NOT NULL, detail TEXT NOT NULL, target_name TEXT NOT NULL)`},
 		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
 			SELECT 'calls', a.owner, an.target, c.id, '',
-				CASE WHEN t.speculated = 1 THEN '` + detailCallSpeculated + `' ELSE '` + detailCall + `' END, '' FROM nodes c
+				CASE WHEN iv.id IS NOT NULL THEN '` + detailCallSpeculated + `' ELSE '` + detailCall + `' END, '' FROM nodes c
 			JOIN attr a ON a.id = c.id JOIN anchors an ON an.node = c.id JOIN ents o ON o.id = a.owner
-			JOIN nodes t ON t.id = an.target
+			LEFT JOIN invented iv ON iv.id = an.target
 			WHERE c.label = '` + labelCall + `' AND c.method_full_name NOT LIKE '<operator>.%' AND an.target <> a.owner`},
 		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
 			SELECT 'control_depends_on', ad.target, ac.target, e.dst, '', '` + detailCDG + `', '' FROM edges e

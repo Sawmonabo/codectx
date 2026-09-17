@@ -67,17 +67,14 @@ type generation struct {
 	// a pass that fails before a generation exists is still a recorded run.
 	ledgerRun *ledger.Run
 	caps      *capabilityReport
-	// sealed holds the plan keys of the deferred units a publication
-	// generation attaches (Section 11.6). They are members of this generation
-	// even though the plan still marks their scopes deferred, because the plan
-	// only reuses units the previous generation selected and these sealed into
-	// a staging generation instead. It is nil on the indexing path.
-	sealed map[string]bool
-	// failedScopes holds, per plan key, the typed reason a DEFERRED unit of
-	// this publication's batch did not seal. A deferred scope that failed is
-	// neither covered nor still running, and telling the three apart is what
-	// keeps a provider whose other scopes published from being reported as
-	// though none of them had. It is nil on the indexing path.
+	// failedScopes holds, per plan key, the typed reason a DEFERRED unit did
+	// not seal -- every one the background queue this publication drains has
+	// recorded, not only the batch it is publishing. A deferred scope that
+	// failed is neither covered nor still running, and telling the three apart
+	// is what keeps a provider whose other scopes published from being
+	// reported as though none of them had; a failure from an earlier tick that
+	// was not carried here would be re-planned deferred and published as still
+	// running for ever. It is nil on the indexing path.
 	failedScopes map[string]unitFailure
 
 	// failures aggregates the units that failed, per provider. It is the
@@ -135,7 +132,12 @@ type generation struct {
 type unitFailure struct {
 	code    string
 	message string
-	details map[string]string
+	// remediation is what the provider said an operator can do about this
+	// failure. It travels with the message rather than inside details: the
+	// detail map is the provider's own bounded budget, and a remediation
+	// charged to it could be the entry a busy row drops.
+	remediation string
+	details     map[string]string
 }
 
 // maxFailedScopesNamed bounds the failed scope keys one capability row names.
@@ -147,6 +149,21 @@ const maxFailedScopesNamed = 8
 // providerFailures aggregates one provider's failed scopes for the capability
 // fold: how many failed, how many were planned, and a bounded, sorted sample
 // of the scope keys with the reason each carried.
+//
+// THE COUNTING RULE, stated once for every surface that reports these figures:
+// a capability's planned total is every scope the plan assigned to its
+// provider for this generation -- the units it runs, the stale predecessors it
+// carries and the sealed units it reuses -- and its failed total is those of
+// them that did not seal. Both are counted in exactly one place,
+// coveredProviders, and published in exactly one place, failureRow.publish, as
+// the units_planned and units_failed details of the capability row. The
+// completion block of `codectx index`, `codectx status` and the index-status
+// tool all render that row and none of them recounts, so one generation cannot
+// read differently on two of them.
+//
+// Counting only the units the build walks is what published "2 planned, 2
+// failed" for a provider that sealed nine scopes and failed two: a row saying
+// every unit failed over a capability that answers most queries.
 type providerFailures struct {
 	units   int
 	planned int
@@ -1116,7 +1133,8 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, caus
 func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome, cause error) unitFailure {
 	res := out.result
 	f := typedFailure(cause)
-	stored := model.RunFailure{ScopeKey: u.ScopeKey, Code: f.code, Message: f.message, Details: f.details}
+	stored := model.RunFailure{ProviderID: u.ProviderID, ScopeKey: u.ScopeKey, Code: f.code,
+		Message: f.message, Remediation: f.remediation, Details: f.details}
 	// One value, two records: the unit's span publishes the reason the run row
 	// publishes, so the ledger and the store can never disagree about why a
 	// unit failed. The error is not handed to End -- it would fill the span
@@ -1137,6 +1155,9 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	}
 	args := []any{"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
 		"generation_id", int64(g.gen), "diagnostic_code", f.code, "message", f.message}
+	if f.remediation != "" {
+		args = append(args, "remediation", f.remediation)
+	}
 	for _, k := range slices.Sorted(maps.Keys(f.details)) {
 		if k != model.DetailStderrTail {
 			args = append(args, k, f.details[k])
@@ -1153,7 +1174,7 @@ func typedFailure(cause error) unitFailure {
 	f := unitFailure{code: provider.CodeOf(cause)}
 	var typed *model.Error
 	if errors.As(cause, &typed) {
-		f.message, f.details = typed.Message, typed.Details
+		f.message, f.details, f.remediation = typed.Message, typed.Details, typed.Remediation
 	}
 	return f
 }
@@ -1165,7 +1186,7 @@ func typedFailure(cause error) unitFailure {
 func (g *generation) coverage(ctx context.Context) (err error) {
 	_, span := ledger.Start(ctx, stageCoverage, "")
 	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
-	covered, deferred, failed, published, err := g.coveredProviders()
+	covered, deferred, failed, published, err := g.coveredProviders(ctx)
 	if err != nil {
 		return err
 	}
@@ -1178,7 +1199,7 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// scopes is a known failure. It is recorded first so `reported`
 			// sees it.
 			if f, ok := failed[d.ID]; ok {
-				g.caps.addFailures(d.ID, capability, f)
+				g.caps.addFailures(d.ID, capability, f, deferred[d.ID])
 			}
 			// And a capability that did publish a scope is partial, not
 			// failed: the facts of that scope are in this generation and
@@ -1192,8 +1213,8 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// Deferred is a scope still running and nothing else: a provider
 			// with work in flight is not fresh coverage, whatever its other
 			// scopes did.
-			case deferred[d.ID]:
-				g.caps.addDeferred(d.ID, capability)
+			case deferred[d.ID] > 0:
+				g.caps.addDeferred(d.ID, capability, deferred[d.ID])
 			case covered[d.ID]:
 				g.caps.addFresh(d.ID, capability)
 			default:
@@ -1219,13 +1240,22 @@ type failedScope struct {
 // Reuse key is the provider id and the scope key joined by NUL, which is the
 // frozen shape of plan.Key.
 //
+// deferred is a COUNT per provider and not a flag: it is published on the
+// capability row, where it is the only way a process other than the one doing
+// the work learns that a scope of this capability is still being built. "One
+// scope outstanding" and "forty" are different reports of the same generation.
+// Which deferred scopes it excludes is decided by holdsFreshUnit, against the
+// generation's own unit rows: the count is an assertion about the whole
+// generation for every provider, so no in-process record of what one batch
+// sealed may be its authority.
+//
 // published is the narrower question the partial ruling needs: the providers a
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool, failed map[string]*providerFailures, published map[string]bool, err error) {
+func (g *generation) coveredProviders(ctx context.Context) (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
-	deferred = make(map[string]bool, len(g.sel.Active))
+	deferred = make(map[string]int, len(g.sel.Active))
 	failed = make(map[string]*providerFailures, len(g.sel.Active))
 	published = make(map[string]bool, len(g.sel.Active))
 	g.mu.Lock()
@@ -1255,18 +1285,22 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 		planned[u.ProviderID]++
 		if u.Deferred {
 			key := plan.Key(u.ProviderID, u.ScopeKey)
-			// A publication generation holds the deferred units that have
-			// already sealed; of the rest, the ones this batch tried and
+			// The generation's own unit rows say which deferred scopes it
+			// already holds; of the rest, the ones this batch tried and
 			// could not seal are failures, and only what is left is still
 			// background work.
+			held, heldErr := g.holdsFreshUnit(ctx, u)
+			if heldErr != nil {
+				return heldErr
+			}
 			switch {
-			case g.sealed[key]:
+			case held:
 				out[u.ProviderID] = true
 				published[u.ProviderID] = true
 			case g.failedScopes[key].code != "":
 				record(u, g.failedScopes[key])
 			default:
-				deferred[u.ProviderID] = true
+				deferred[u.ProviderID]++
 			}
 			return nil
 		}
@@ -1274,9 +1308,6 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 		return nil
 	}); err != nil {
 		return nil, nil, nil, nil, err
-	}
-	for id, agg := range failed {
-		agg.planned = planned[id]
 	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true
@@ -1286,9 +1317,63 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 		if id, _, ok := strings.Cut(key, "\x00"); ok {
 			out[id] = true
 			published[id] = true
+			// A reused scope is a scope the plan assigned this provider: it
+			// is sealed already, so the walk above never yields it, and
+			// leaving it out of the total is what let a provider that sealed
+			// nine scopes and failed two publish "2 planned, 2 failed". A
+			// carried scope needs no such addition -- the planner emits its
+			// unit as well as its carry row, so the walk has already counted
+			// it.
+			planned[id]++
 		}
 	}
+	// The planned total is settled only here, once every source of a planned
+	// scope has been folded in.
+	for id, agg := range failed {
+		agg.planned = planned[id]
+	}
 	return out, deferred, failed, published, nil
+}
+
+// holdsFreshUnit answers whether this generation already selects the unit the
+// plan derives for a deferred scope. It reads the generation's own
+// generation_units rows, so "this scope is no longer running" is settled by
+// the durable membership every process can see rather than by a record of
+// what one background batch happened to seal -- which is what makes
+// units_running an assertion about the whole generation, for every provider,
+// wherever it is published from.
+//
+// The test is against the scope's freshly planned unit and not against
+// membership alone: a scope whose rebuild is still running is a member too,
+// through the stale predecessor AttachCarried keeps for it, and reading that
+// row as coverage would publish a stale answer as a fresh one. Only deferred
+// scopes reach here, and they are the heavy units the planner gates, so the
+// lookups are bounded by that set and not by the repository.
+func (g *generation) holdsFreshUnit(ctx context.Context, u plan.Unit) (bool, error) {
+	if g.gen == 0 {
+		// A generation that has no row of its own selects no unit: the
+		// coverage projection is run over a plan before the generation is
+		// begun on no path, and asking storage about generation zero would
+		// be a malformed lookup rather than the empty answer it means.
+		return false, nil
+	}
+	spec, err := u.Spec(g.c.cfgHash)
+	if err != nil {
+		return false, err
+	}
+	selected, err := g.c.opts.Store.SelectedUnit(ctx, g.gen, u.ProviderID, u.ScopeKey)
+	if err != nil {
+		// "This generation selects no unit for the scope" is the ordinary
+		// answer for work still queued, not a fault; storage marks it with
+		// this detail, which is what tells it from a malformed argument under
+		// the same code.
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Details["reason"] == sqlite.ReasonNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return selected == spec.ID, nil
 }
 
 // capabilitiesOf is one provider's declared capability list, empty when the

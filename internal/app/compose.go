@@ -987,6 +987,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 			var p *dependence.Provider
 			p, err = dependence.New(backend, dependence.Options{
 				DataDir:              s.dataDir,
+				AnalysisConfigHash:   s.cfg.AnalysisConfigHash(),
 				Timeout:              s.cfg.Providers.Dependence.Timeout.Std(),
 				StallTimeout:         s.cfg.Providers.Dependence.StallTimeout.Std(),
 				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,

@@ -21,11 +21,14 @@ import (
 // empty analysis as a fresh one.
 //
 // The inputs are the real engine's own bytes, captured from runs of the
-// pinned engine payload; only absolute paths were rewritten so the fixtures
-// carry no developer's home directory. The timed pass-crash line is built from
-// the `Pass %s failed in %.0f ms` format string the payload's pass base class
-// emits, with the throwable the release logs alongside it.
-// linker-pass-crash.stderr is the head of a
+// pinned payload; only absolute paths were rewritten so the fixtures carry no
+// developer's home directory. The timed pass-crash line is built from the
+// `Pass %s failed in %.0f ms` format string read out of the pass base class in
+// that payload, with the throwable the release logs alongside it.
+//
+// Mutation that fails it: in classify (stderr.go), return FailureEngine for an
+// out-of-memory stderr instead of FailureMemory -- the memory cases then fail
+// with the class they were misread as. linker-pass-crash.stderr is the head of a
 // real crash's standard error, recorded from a parse of the two source files
 // that reproduce it; its pass line is the untimed `Pass <name> failed` form,
 // which an earlier parser did not match — so a crash the product could have
@@ -166,5 +169,58 @@ func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 	}
 	if len(got.StderrTail) > model.MaxDetailBytes {
 		t.Errorf("the tail is %d bytes, more than one error detail carries", len(got.StderrTail))
+	}
+}
+
+// TestClassifyReducesPunctuatedPaths protects the privacy of a durable failure
+// row. Failure mode: the child prints absolute paths inside punctuation -- a
+// backticked command line, an argument list, a quoted value -- and a reduction
+// that only fired on a field beginning with a separator let the whole
+// directory chain, including the operator's home directory and the repository
+// path, travel through the failure detail into provider_runs.failure_json,
+// which outlives every log. The other half is asserted with it: a tail whose
+// base names are gone diagnoses nothing, and a path under a directory this run
+// made keeps the part inside that directory, which says which step wrote the
+// file.
+//
+// The paths are synthetic. A fixture built from this machine's own home
+// directory would put a host-local path in a tracked file.
+func TestClassifyReducesPunctuatedPaths(t *testing.T) {
+	const home = "/home/example-user"
+	const repo = home + "/src/demo-repo"
+	stderr := "2026-09-14 08:00:00.000 ERROR Runner cmd: `" + home + "/.local/bin/analyzer-parse --language go`\n" +
+		"java.lang.RuntimeException: refused List(" + repo + "/units/unit-4, --output)\n" +
+		"\tat Importer.read(Importer.scala:88) file=\"" + repo + "/pkg/handler.go\"\n" +
+		"java.nio.file.NoSuchFileException: (private)/out/export.json\n"
+
+	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))}, nil)
+	for _, outside := range []string{"example-user", "demo-repo", "/home", ".local", "/src", "/pkg", "/units"} {
+		if strings.Contains(got.StderrTail, outside) {
+			t.Errorf("the tail publishes %q, a directory outside the workspace: %q", outside, got.StderrTail)
+		}
+	}
+	for _, kept := range []string{"`analyzer-parse", "List(unit-4,", "file=\"handler.go\"", "(private)/out/export.json"} {
+		if !strings.Contains(got.StderrTail, kept) {
+			t.Errorf("the redaction destroyed the diagnostic: %q is not in %q", kept, got.StderrTail)
+		}
+	}
+}
+
+// TestParseArgsEndsWithTheFrontendDelimiter protects the one ordering the
+// parse command line cannot survive losing. Everything after the delimiter is
+// read by the frontend, not by the parse tool, so a source directory or an
+// output path placed after it would leave the parse tool with no input at all
+// -- a whole language family that analyses nothing, with no compile error and
+// no diagnostic from the engine to say so.
+func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
+	args := parseArgs([]string{"--base"}, dependence.ParseRequest{
+		Family: dependence.FamilyJava, SourceDir: "/src", OutputPath: "/out/graph"})
+	tail := args[len(args)-len(clearDefaultExclusions):]
+	if strings.Join(tail, " ") != strings.Join(clearDefaultExclusions, " ") {
+		t.Fatalf("the parse argv ends with %q, not with the frontend delimiter %q", tail, clearDefaultExclusions)
+	}
+	head := args[:len(args)-len(clearDefaultExclusions)]
+	if got := strings.Join(head, " "); !strings.HasSuffix(got, "/src --output /out/graph") {
+		t.Errorf("the paths do not precede the frontend delimiter: %q", got)
 	}
 }

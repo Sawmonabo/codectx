@@ -207,6 +207,17 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	if !nestedFamilies[f] {
 		// Never split a project: a marker inside another project's directory
 		// belongs to the outer project.
+		//
+		// The precise provider answers the same question the other way round:
+		// there a nested manifest is its own project, whatever encloses it
+		// (internal/provider/scip/projects.go). The divergence is deliberate,
+		// and it is the difference between what the two lose. The precise
+		// collapse cost located facts for a project nobody had planned a unit
+		// for; this collapse keeps a unit's call closure intact, and splitting
+		// it would cut cross-package call resolution -- a unit split at a
+		// directory that declares nothing of its own loses more than half of
+		// the calls that resolve to its own methods (docs/research/
+		// 10-round3-empirical.md Section 8). Neither rule inherits the other.
 		dirs = slices.DeleteFunc(dirs, func(d string) bool {
 			for _, outer := range dirs {
 				if outer != d && within(d, outer) {

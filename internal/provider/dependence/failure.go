@@ -94,7 +94,10 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
-		msg += "the analysis exported no method for a unit that has source"
+		// emptyExport below names the two causes that remain. This wording is
+		// what the product knows without them: which steps ran, and that
+		// nothing came of them.
+		msg += "both analysis steps exited cleanly and produced no method for a unit that has source"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -137,6 +140,76 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		}
 	}
 	return err
+}
+
+// unreadRemediation is what an operator can do about source the frontend read
+// and drew nothing from. Two causes remain there and the product cannot tell
+// them apart -- source with no definition the frontend parses, and a frontend
+// that failed without saying so -- so it names both rather than asserting the
+// first, which a helper that died behind a zero exit would make false.
+const unreadRemediation = "check that this unit's source files hold method definitions this language family's " +
+	"frontend can parse; if they do, the frontend failed without reporting it"
+
+// emptyExport is the typed failure for a unit whose analysis exported no
+// method at all. "the export carries no method" is the symptom, never the
+// reason, so the error names the two causes that remain once the frontend has
+// been given every file of the unit -- source it finds no definition in, and a
+// frontend that failed without reporting it -- and publishes how much source
+// it was handed.
+//
+// files is counted over the one pass that decided what the frontend was
+// given, so a zero there is "nothing reached the frontend" and not a guess.
+func emptyExport(unit Unit, o Outcome, r Reservation, files int64) *model.Error {
+	return failure(FailureEmptyExport, unit.ScopeKey, o, r).
+		WithDetail("family", string(unit.Family)).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithRemediation(unreadRemediation)
+}
+
+// emptyPart is the typed reason one part of a subdivided unit produced no
+// method: both its steps exited cleanly and its export carries none. It is the
+// part's own outcome and not the unit's -- the unit fails only when no part
+// produced anything (subdivisionEmpty) -- so the part's span row says so in
+// those words rather than in the unit's.
+func emptyPart(scopeKey string, o Outcome, r Reservation) *model.Error {
+	err := failure(FailureEmptyExport, scopeKey, o, r).WithRemediation(unreadRemediation)
+	err.Message = "this part of a subdivided dependence unit produced no method: " +
+		"both its analysis steps exited cleanly and its export carries none"
+	return err
+}
+
+// partTally is what a subdivided unit's parts did, counted as the loop ran
+// them. It is three integers, never the parts themselves: a unit is split into
+// as many parts as it has child projects, and a list of them would grow with
+// the repository.
+type partTally struct {
+	// Parts is how many parts the unit was split into, Failed how many failed
+	// in the analysis itself, and Empty how many were analysed cleanly and
+	// carried no method.
+	Parts  int
+	Failed int
+	Empty  int
+}
+
+// subdivisionEmpty is the typed failure for a subdivided unit no part of which
+// produced a method. A unit with no part at all never reaches it: childProjects
+// refuses the split before the parts run. "no part produced an honest result" is the same
+// restatement emptyExport removes, so this names the tally instead.
+func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {
+	err := failure(FailureEngine, unit.ScopeKey, crash, r).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithDetail("parts", strconv.Itoa(t.Parts)).
+		WithDetail("parts_failed", strconv.Itoa(t.Failed)).
+		WithDetail("parts_without_method", strconv.Itoa(t.Empty))
+	err.Message = "the dependence unit failed: no part of the subdivided unit produced a method -- " +
+		strconv.Itoa(t.Failed) + " of " + strconv.Itoa(t.Parts) + " failed in the analysis and " +
+		strconv.Itoa(t.Empty) + " were analysed cleanly and produced none"
+	if t.Empty > 0 {
+		return err.WithRemediation(unreadRemediation)
+	}
+	// Nothing was analysed cleanly: the failing pass and exception this error
+	// already carries are what a maintainer has to act on.
+	return err.WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream; no part of this unit was analysed cleanly")
 }
 
 // crashDecision is how the provider established that an engine crash
@@ -436,4 +509,15 @@ func peakForLog(o Outcome) any {
 		return "unsampled"
 	}
 	return o.PeakBytes
+}
+
+// allocationForLog renders the machine-derived allocation a reservation was
+// bounded by. Zero there means the machine's available memory could not be
+// observed at all (Reservation.AllocationBytes), so a log that printed 0 would
+// claim the host offered the unit nothing.
+func allocationForLog(r Reservation) any {
+	if r.AllocationBytes <= 0 {
+		return "unobserved"
+	}
+	return r.AllocationBytes
 }

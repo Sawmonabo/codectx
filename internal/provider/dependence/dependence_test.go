@@ -215,6 +215,11 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		backend *fakeBackend
 		code    string
 		detail  map[string]string
+		// reason and remediation are substrings the failure's own text must
+		// carry. A classified failure whose message restates its class tells
+		// an operator nothing they did not already have from the class.
+		reason      string
+		remediation string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
 		// permits for that class -- which a crash that named its failing pass
@@ -229,9 +234,14 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			name: "a reproducible pass crash fails the unit and names the pass",
 			backend: &fakeBackend{parse: dependence.Outcome{Class: dependence.FailureEngine,
 				Pass: "CfgCreationPass", Exception: "java.util.NoSuchElementException", ExitCode: 1}},
-			code:   model.CodeProviderOutputInvalid,
-			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass"},
-			parses: 2,
+			code: model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass",
+				"parts": "1", "parts_failed": "1", "parts_without_method": "0"},
+			// The tally is the reason -- not "no part produced an honest
+			// result", which restates the failure the class already names.
+			reason:      "1 of 1 failed in the analysis and 0 were analysed cleanly",
+			remediation: "identifies the defect upstream",
+			parses:      2,
 		},
 		{
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
@@ -244,13 +254,17 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		{
 			// Both steps exited cleanly and the export holds no method. It is
 			// classified as what it is rather than as a crash, and it names
-			// the family and the file count so a reader can compare what the
-			// unit declared against what the frontend admitted.
-			name:    "an export with no methods for a unit that has source is not worded as a crash",
+			// the two causes that remain together with how much source the
+			// frontend was handed, rather than restating that nothing came
+			// out.
+			name:    "an export with no methods names the causes and the source it was handed",
 			backend: &fakeBackend{deadExport: true},
 			code:    model.CodeProviderOutputInvalid,
-			detail:  map[string]string{"failure_class": "empty_export", "family": "go", "source_files": "1"},
-			parses:  1,
+			detail: map[string]string{"failure_class": "empty_export", "family": "go",
+				"source_files": "1"},
+			reason:      "produced no method for a unit that has source",
+			remediation: "hold method definitions",
+			parses:      1,
 		},
 		{
 			name:    "a clean exit that left no graph is an engine failure, not a success",
@@ -278,6 +292,12 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 				if typed.Details[k] != want {
 					t.Errorf("detail %q = %q, want %q", k, typed.Details[k], want)
 				}
+			}
+			if c.reason != "" && !strings.Contains(typed.Message, c.reason) {
+				t.Errorf("the failure message is %q, which does not name the reason %q", typed.Message, c.reason)
+			}
+			if c.remediation != "" && !strings.Contains(typed.Remediation, c.remediation) {
+				t.Errorf("the failure remediation is %q, which does not carry %q", typed.Remediation, c.remediation)
 			}
 			if result.State == model.RunSucceeded {
 				t.Errorf("run state = %s, want a failed state", result.State)

@@ -49,16 +49,23 @@ coordinator exists.
 - `Scopes(detection)` lists the unit scope keys to plan: `import:<path>` for a
   supplied index, and `profile:<indexer>:<project directory>` for one project
   of one indexer, the empty directory being the workspace root. **One unit per
-  triggering directory.** Go modules and Maven or Gradle modules nest — a
-  `go.mod` inside another module's tree is its own project and the nearest
-  trigger above a file is the project that owns it — and every other kind takes
-  the outermost trigger and never splits below it, because the whole program is
-  what makes its symbols resolvable: a `tsconfig` project split by subdirectory
-  loses more than half of the calls that resolve to its own methods
-  (`docs/research/10-round3-empirical.md` §8). A workspace root that triggers
-  is a project like any other, planned beside the projects below it. A trigger
-  inside a dependency directory is not a project and never reaches the rule:
-  those directories are excluded from the snapshot. A project whose scope key
+  triggering directory**, whatever the language and whatever encloses the
+  directory. A manifest is the toolchain's own declaration of a boundary, so a
+  nested one is a second program and not a subdirectory of the first: a `go.mod`
+  inside another module's tree, an `app/package.json` under a root
+  `package.json`, and a `tsconfig` inside another project's tree are each their
+  own project with their own unit. A workspace root that triggers is a project
+  like any other, planned beside the projects below it. What is never done is
+  splitting a project at a directory that declares nothing — that split loses
+  more than half of the calls that resolve to the project's own methods
+  (`docs/research/10-round3-empirical.md` §8), so a Python package, a Cargo
+  workspace and a compilation database are whole up to the next directory that
+  declares itself and no further. A trigger inside a dependency directory
+  (`node_modules`, `vendor`, `third_party`, `bower_components`, `Godeps`) is not
+  a project and never reaches the rule while `workspace.index_vendor` is false,
+  which is the default, because those directories are then excluded from the
+  snapshot; with it enabled the operator has asked for them to be indexed and
+  their manifests are projects like any other. A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
   project's facts would be attributed to the other. A profile this
@@ -129,8 +136,8 @@ real bindings, so the decoder is verified against library-encoded bytes.
 The import is three streaming passes over the index:
 
 1. **Binding pre-pass**: document paths and text hashes decide the binding
-   before any fact exists (the binding decides whether a bad coordinate
-   fails the unit or is skipped).
+   before any fact exists (the binding decides which diagnostic code a
+   refused coordinate carries).
 2. **Definitions**: occurrences and symbols are spooled to a private scratch
    SQLite file under the work directory (bounded by `MaxSpoolBytes`, 4 MiB
    page cache) as they stream; when a document ends its position encoding is
@@ -290,36 +297,97 @@ guess does not hold is skipped and the capabilities are `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID`.
 
 The probe is not the guarantee, only its precondition. **Every** occurrence's
-range is then proved against the bytes it claims to describe, because a wrong
-column does not need a wrong encoding: on a line indented with spaces followed
-by a tab an indexer can count columns to a different tab stop than the file
+range is then proved against the bytes it claims to describe — every one to the
+same two checks, whatever it is, and with what those checks cannot catch stated
+below rather than left implied. A wrong column does not need a wrong encoding: on a line carrying a tab after other
+characters an indexer can count columns to a different tab stop than the file
 does, so the range is shifted a few columns, stays inside its line, converts to
 a valid rune-aligned extent, and names source that is not the symbol. Measured
-on one Java project: 1,183 of 93,167 occurrences, in 79 of its 223 documents.
+on one Java project: 4,714 of 93,167 occurrences, in 91 of its 223 documents —
+3,531 refused for starting inside an identifier token and 1,183 for a column
+past the end of its line, 4,408 of them on lines indented with spaces followed
+by a tab and the remaining 306 on other lines, sampled and found to be the same
+shift. None of them is a false positive of the predicate: an identifier holding
+a `$` and one holding a non-ASCII letter are both admitted, by construction.
 
-The per-occurrence proof is one byte comparison, in two strengths. A
-**definition** occurrence whose symbol's last descriptor is a name the grammar
-spells literally must select exactly that identifier: a declaration is written
-where its name is written, which is the same rule the encoding probe above
-applies — one predicate, so an encoding cannot be proved by one rule while its
-occurrences are held to another. Every other range must start on a token
-boundary, which is what a shifted column usually fails. A reference is
-deliberately **not** required to spell its symbol's name, because measured, it
-does not: an aliased import puts the occurrence on the alias (`HashSet as Set`
-is a reference to `HashSet` over the bytes `Set`) or on the whole alias clause
-(`OrderedDict as OD`), and an operator is a reference to the method it desugars
-to (`+` to `add`). Measured over the indexes the six pinned indexers produce
-from the fixtures of the per-platform matrix — 308 occurrences, all nine
-languages — the proof refuses none of them, at ~8 ns per occurrence and no
-allocation.
+The per-occurrence proof holds **every** occurrence, declaration and reference
+alike, to two checks over the pinned bytes.
 
-The two proofs deliberately have different outcomes. The encoding probe decides
-whether an encoding the index never stated may be used at all, so a document it
-cannot prove is skipped and counted — an unproven guess must not fail a unit the
-index never claimed. The per-occurrence proof is about a claim the index did
-make, so a range that fails it is refused: the unit fails closed under a
-verified binding, and the occurrence is skipped and counted under an unverified
-one.
+**Whole-token coverage.** No range may cut an identifier token: an identifier
+byte inside the range with another immediately outside it is half a token, and
+no grammar produces one. A range that names an identifier on a single line must
+in addition begin and end on the tokens it covers rather than on the whitespace
+between them — `browser` shifted seven columns left is `return `, an identifier
+plus the gap before the next token, which is not how the source spells
+anything. Two shapes of range do not name an identifier on a line and keep the
+cut check alone: a range spanning lines is a block span, measured, a crate's
+whole file; and a range holding no identifier byte at all is punctuation the
+grammar spells without one, measured, the reference from `+` to the `add`
+method it desugars to, which one indexer ranges over the space beside the
+operator. A zero-width range selects no bytes, so there are none to contradict;
+measured, every one is a document-level symbol anchored at the start of a file.
+
+**The name check.** A range that is exactly one identifier token, whose symbol's
+last descriptor is a name the grammar spells literally, must select that name or
+an identifier the document itself spells for that symbol. A document that
+aliases an import spells the symbol under a name of its own — `use HashSet as
+Set` makes every later `Set` of that file a correct reference to `HashSet` — and
+the occurrence carries nothing saying so: the indexer that produces this shape
+sets no occurrence role at all, so the import role cannot mark it. A spelling is
+therefore bound by corroboration: the document must hold at least two
+occurrences of that symbol spelling it identically. That is not a threshold
+chosen to fit a measurement, it is the structural minimum of the construct — an
+alias that is *used* produces the occurrence in the alias clause and the
+occurrence at the use site. An alias declared and never used produces one
+occurrence, and no second one for the rule to refuse either, so nothing is lost.
+A range that is not one identifier token is not name-checked at all: an aliased
+import can put the occurrence on the whole alias clause (`OrderedDict as OD`),
+and an operator reference is punctuation.
+
+Measured over the indexes the six pinned indexers produce from the fixtures of
+the per-platform matrix — 308 occurrences, all nine languages — the proof
+refuses **none** of them. The corroboration rule is what admits 2 of those 308
+(`Set` for `HashSet`); no other spelling in the corpus is corroborated.
+
+**What the proof does not catch.** It compares bytes, and it never adjusts or
+guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
+the truth publishes. Measured by shifting every one of the 308 occurrences by
+the two column distances observed in the field: of 214 occurrences a +5 shift
+converts at all, 32 still pass, and of 126 a +12 shift converts, 19 still pass —
+against 63 and 45 under the start-boundary rule this replaces. Those survivors,
+by kind: **24** whose symbol carries no name the grammar spells literally (a
+`local` symbol, a namespace, a meta descriptor, a backtick-escaped name), so
+there is nothing to compare the token against; **17** whose range is punctuation
+rather than one identifier token; and **10** zero-width ranges, which name a
+position and no bytes. A shift landing on another token spelling the **same**
+identifier is the remaining kind — two byte-identical ranges are the same claim,
+and nothing in the bytes separates them; it occurs **0** times in this corpus
+under those two shifts, and `internal/provider/scip` holds a fixture case for it
+so the boundary stays stated rather than assumed.
+
+The two proofs deliberately have different outcomes, because the two failures
+have different reach. A failed **encoding probe** is a claim about the whole
+document — every column of it is read in an encoding its bytes contradict — so
+the document is dropped whole, counted under `documents_dropped_encoding` and
+named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
+proof** reaches exactly one coordinate, so exactly one occurrence is left out:
+it is counted under `refused_occurrences`, the first is named with its reason by
+`refused_occurrence_exemplar` as `<document>:<line>:<column>: <reason>` — the
+coordinate the occurrence claimed, spelled as the index spelled it, zero-based
+and with the column counted in the position encoding the document declared,
+which is the encoding the refusal is a disagreement about, so that an operator
+opens the disagreeing line instead of re-running the indexer to find it — and
+the unit publishes `partial` with
+`CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
+the index describes bytes it never saw, so the same coordinate is a plain skip
+and is counted with the other unverified skips.
+
+A unit is never failed over one occurrence. Failing closed on the first refusal
+threw away all 93,167 occurrences of the project above over 4,714 wrong columns:
+every fact the indexer got right was lost with the ones it got wrong, and an
+operator was told the unit was unavailable rather than thinner. The counts are
+what makes the thinner unit honest — a partial capability that does not say how
+much it left out is indistinguishable from a whole one.
 
 `Metadata.text_document_encoding` is deliberately never consulted. All six
 indexers set it to `UTF8`, including the three whose columns are UTF-16,
@@ -329,13 +397,7 @@ every UTF-16 column as a byte offset.
 
 A document of any other tool build that does not declare an encoding is
 skipped and the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`:
-Section 9.3 forbids guessing one. `Report.AssumedPositionEncoding` counts the
-documents that were converted through the per-tool-build table **and** proved
-against their pinned bytes. A
-coordinate that does not land on the bytes, or a range that does not describe
-the identifier it names, is `CTX_PROVIDER_OUTPUT_INVALID` and fails the unit
-under a verified binding (the index claims to describe these bytes and does
-not); under an unverified binding it is skipped and counted.
+Section 9.3 forbids guessing one.
 
 A document proves its bytes by embedded `text` whose SHA-256 equals the
 pinned content hash, or by a matching row of a **qualifying** input-hash
@@ -621,15 +683,22 @@ unit seals with all three capabilities fresh. A repository's own
 configuration surface. `--targetroot` keeps the indexer's own intermediate
 output inside the run directory rather than in the materialization.
 
-A materialization that holds **no** `.java` file is refused before the indexer
-starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a remediation naming the
-source-free case. This is the aggregator POM of a multi-module repository —
+A materialization that holds **no** source file the indexer can describe is
+refused before that indexer starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a
+remediation naming the source-free case. Two profiles apply it, through one
+helper. For Java it is the aggregator POM of a multi-module repository —
 `pom.xml` triggers the profile, the root carries no source of its own — and
 without the check `javac` refuses, the indexer exits 1, and the run fails as
-`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured):
-a process failure with no stderr and no remediation. The refusal is the same
-typed one the other profiles produce for an index that describes no admitted
-document, raised before a JVM is started rather than after.
+`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured).
+For TypeScript it is a package directory holding only a manifest, a lock file
+and documentation, with no `.ts`/`.js` beside them: measured on a real
+repository, the run failed as `CTX_PROVIDER_UNAVAILABLE: node exited with
+status 1`. Both are a process failure with no stderr and no remediation, for a
+condition this provider can name precisely. `node_modules` is excluded from the
+TypeScript walk: a dependency's own sources are not the project's, and counting
+them would restore that opaque failure with an extra step. The refusal is the
+same typed one the other profiles produce for an index that describes no
+admitted document, raised before a tool is started rather than after.
 
 **Three pinned arguments exist because of a measured failure, not a
 preference.** `scip-typescript` is given `--infer-tsconfig` because two of its

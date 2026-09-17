@@ -305,9 +305,19 @@ capability summary. An indexing run also logs the same list once, at its start,
 under `component=index`.
 
 A `partial` or `failed` row carries the shape of the failure, not just its
-code:
+code. **The figures follow one counting rule, applied once where the row is
+built:** a capability's planned total is every scope the plan assigned its
+provider for that generation — the units the run builds, the stale
+predecessors it carries and the sealed units it reuses — and its failed total
+is those of them that did not seal. The row is the only place those two
+numbers are computed. `codectx status`, the completion block of an indexing
+run and the `codectx_index_status` tool all render that one row and none of
+them recounts, so one generation cannot read differently on two of them. In
+text output the capability tally is followed by one line per capability that is
+not fresh, naming it, its state and the figures its row carries; JSON output
+carries the whole row.
 
-- `units_planned` — how many units the plan gave this provider behind this
+- `units_planned` — how many scopes the plan gave this provider behind this
   row. It is what makes the next figure readable: "two failed" is a different
   report depending on whether two or two hundred were tried.
 - `units_failed` — how many of them failed.
@@ -323,6 +333,24 @@ code:
   and not only which family it belongs to. The provider's own bounded
   particulars travel beside it — which profile, which tool, which project,
   what the run was declared under.
+- `remediation` — what an operator can do about that scope, as the provider
+  stated it. It is a field of the row rather than one of the details below,
+  because the details are the provider's own bounded budget and a remediation
+  charged to it could be the entry a busy row has to drop. Text output prints
+  it on its own line beneath the row.
+- `units_running` — how many scopes of this capability were still being built
+  in the background when the generation was published. Like `remediation` it
+  is a field of the row and not one of the details below, for the same reason.
+  It is counted, once, from the generation's own unit rows: a deferred scope
+  counts as still running until the generation holds the unit the plan derives
+  for it, so the figure is about the whole generation and every provider in
+  it, and never about whichever background batch happened to publish. It is
+  then stored on the row, and that — separately from where it is counted — is
+  what lets a second process, `codectx status` in another terminal, read the
+  same number as the process doing the work. It is stored but
+  deliberately kept out of the capability digest: it records what was in
+  flight at publication, which is scheduling and not content, so two rebuilds
+  of one workspace may legitimately differ on it.
 - `subdivided`, on a dependence capability, names a unit that crashed and was
   recovered by splitting; `backend_failure` beside it says what the crash was
   and how it was established to reproduce ([dependence](providers-dependence.md)).
@@ -334,11 +362,16 @@ line. What an operator can read is, in order of how long it lasts:
    generation, the diagnostic code, the message and the particulars — all of
    it except the tool's standard error.
 2. The capability row above, for as long as the generation is active.
-3. The failed provider run row in the workspace database, which keeps the
+3. The failed provider run rows in the workspace database, which keep the
    whole typed reason including the bounded tail of what the tool wrote to its
    standard error, for exactly as long as the generation that failed is
-   retained. **No command in this build prints that row**: the log line and the
-   capability row are what you read a failure from.
+   retained. `codectx status` and the `codectx_index_status` tool report them:
+   the text output prints a `failed` section naming every failed scope with its
+   provider, its diagnostic code, its message and its remediation, and JSON
+   output carries the same under `failed_units`. The list is one page, and
+   `failed_units_omitted` says how many reasons did not fit it. The tail of the
+   tool's standard error is never printed on any of those surfaces; it stays on
+   the run row.
 
 A provider may contribute only a bounded number of details to one row. The
 figures above take several of those slots, so a busy row can now carry
