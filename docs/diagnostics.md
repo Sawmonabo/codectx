@@ -63,6 +63,16 @@ finishes work an earlier run left staged; each tick is its own run. An
 the spans of things a process does outside a run -- today, starting a language
 server.
 
+**A run's account is kept for the last sixteen runs of the workspace, and for
+the run that built the active generation however old it is.** It is not kept
+for as long as the generation it published: retention keeps only the newest
+generation of each ref, so a generation can be swept minutes after it activated
+-- a deferred publication extends the base generation on the same ref inside
+the same command -- while "what did the run that built this store cost" is
+still exactly the question being asked. Overlay runs are collected as soon as
+the process that opened them is gone, so a server's starts never crowd out the
+runs that built something.
+
 ### The stages a run records
 
 An index run opens these at its top level: `capture` (with `walk` beneath it),
@@ -99,7 +109,9 @@ reported. Three are not:
 - `running` is a span that had not finished when the row was read.
 - `interrupted` is a span that was still open when its run ended -- a
   cancelled run, or a process that died. It has no finish time and no wall,
-  because nobody measured one.
+  because nobody measured one, and it carries `CTX_CANCELED` with that as
+  its reason: a non-ok row with no reason at all reads as a failure whose
+  cause nobody recorded.
 - `unavailable` is a unit the plan named that reached no output. Its
   `diagnostic_code` and reason say which of three things happened: no profile
   matched it and there was nothing to run; the tool it needs is absent
