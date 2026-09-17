@@ -254,14 +254,14 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		{
 			// Both steps exited cleanly and the export holds no method, and
 			// the frontend took every file it was given. It is classified as
-			// what it is rather than as a crash, and it says the analysis read
-			// the source rather than restating that nothing came out.
-			name:    "an export with no methods for a unit whose source was read names that as the reason",
+			// what it is rather than as a crash, and it says which steps ran
+			// rather than restating that nothing came out.
+			name:    "an export with no methods for a unit the frontend did not refuse says so",
 			backend: &fakeBackend{deadExport: true},
 			code:    model.CodeProviderOutputInvalid,
 			detail: map[string]string{"failure_class": "empty_export", "family": "go",
 				"source_files": "1", "refused_source_files": "0"},
-			reason:      "read this unit's source and found no method definition",
+			reason:      "refused none of this unit's source files by path",
 			remediation: "hold method definitions",
 			parses:      1,
 		},

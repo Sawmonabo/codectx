@@ -95,9 +95,9 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
 		// emptyExport below replaces this with the reason it measured. This
-		// wording is the one that holds without that measurement, and it is
-		// still a statement about the source rather than about the export.
-		msg += "the analysis read this unit's source and found no method definition in it"
+		// wording is what the product knows without that measurement: which
+		// steps ran, and that nothing came of them.
+		msg += "the analysis frontend refused none of this unit's source files by path, and both steps exited cleanly without producing a method"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -142,11 +142,11 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	return err
 }
 
-// emptyExport is the typed failure for a unit whose source the analysis read
-// without exporting a single method. "the export carries no method" is the
-// symptom, never the reason, so the error names which of the two reasons the
-// provider measured: the frontend left every one of the unit's source files
-// out of its analysis, or it took them and defined nothing.
+// emptyExport is the typed failure for a unit whose analysis exported no
+// method at all. "the export carries no method" is the
+// symptom, never the reason, so the error names what the provider measured:
+// the frontend left every one of the unit's source files out of its analysis,
+// or it refused none of them by path and produced nothing anyway.
 //
 // refused is how many of the unit's own source files the backend reports the
 // frontend leaves out. It is compared against the unit's file count rather
@@ -159,9 +159,13 @@ func emptyExport(unit Unit, o Outcome, r Reservation, refused int64) *model.Erro
 		WithDetail("refused_source_files", strconv.FormatInt(refused, 10))
 	if refused >= unit.Files {
 		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so nothing was analysed"
-		return err.WithRemediation("the frontend refuses these paths by a default no option of it turns off and no input directory avoids; exclude this project from the index, or move its sources to a path the frontend accepts")
+		return err.WithRemediation("the frontend refuses these paths by a default no option of it turns off; exclude this project from the index, or move its sources out of the path components it refuses")
 	}
-	return err.WithRemediation("check that this unit's source files hold method definitions this language family's frontend can parse")
+	// Two causes remain and the product cannot tell them apart: source that
+	// defines no method the frontend parses, and a frontend that failed
+	// without saying so. The remediation names both rather than asserting the
+	// first, which a helper that died behind a zero exit would make false.
+	return err.WithRemediation("check that this unit's source files hold method definitions this language family's frontend can parse; if they do, the frontend failed without reporting it")
 }
 
 // crashDecision is how the provider established that an engine crash

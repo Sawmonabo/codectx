@@ -382,7 +382,7 @@ Every one of these was reproduced against the real engine.
 | `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
 | `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable, **or** the untimed `Pass <name> failed` at ERROR that a pass which dies before it is timed leaves | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. A parse crash that names **both** is taken as reproducible on first sight and is not re-parsed: it goes straight to subdivision. Siblings are unaffected. |
 | `engine` (crash that names no pass) | `Process exited with code <n>` on stderr, a clean exit that left no graph, a signal death, or any non-zero exit with nothing said about a pass | same code. For the zero-exit helper crash the exit status is a lie and the empty result is the only honest signal. Nothing here identifies the defect, so the one confirmation below is kept before anything is split. |
-| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family`, `source_files` and `refused_source_files`. Not worded as a crash, because none happened, and not worded as itself either: the failure names which of the two reasons the provider measured. `refused_source_files` equal to `source_files` means the frontend left every file of the unit out of its analysis, and the remediation says so; anything less means the frontend read the source and defined no method in it. |
+| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family`, `source_files` and `refused_source_files`. Not worded as a crash, because none happened, and not worded as itself either: the failure names which of the two reasons the provider measured. `refused_source_files` equal to `source_files` means the frontend left every file of the unit out of its analysis, and the remediation says so; anything less means it refused none of them by path and still produced no method, which is either source without definitions the frontend parses or a frontend that failed without reporting it. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
 
@@ -401,9 +401,10 @@ row for the source at all, not merely no method.
 
 Two consequences, both of them the frontend's and neither of them the
 product's. The component is matched anywhere in the path, so a package
-directory triggers it exactly as a source root does: pointing the frontend at
-one source root, or at each in turn, does not rescue a project whose packages
-are named that way, which is why the provider does not do it. And the
+directory triggers it exactly as a source root does, so pointing the frontend
+at one source root, or at each in turn, does not rescue a project whose
+packages are named that way — measured above, and the reason the provider does
+not pay N parses and an export merge for a lever with no measured benefit. And the
 frontend's only exclusion options are additive, so no argument turns the
 default off. A unit in that position cannot publish facts at all, which is why
 it fails with the refusal named rather than with an empty result explained away.
