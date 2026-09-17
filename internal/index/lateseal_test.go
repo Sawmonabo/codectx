@@ -9,6 +9,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -51,11 +52,11 @@ func TestDeferredUnitsOverlapWithinTheAllocation(t *testing.T) {
 	// admitted against here is the figure the product would use.
 	allocation := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}.
 		SchedulingAllocation(config.BaseFootprint(c.opts.Config))
-	ledger, err := admission.NewLedger(allocation)
+	admissionLedger, err := admission.NewLedger(allocation)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
-	c.sched = plan.NewScheduler(ledger)
+	c.sched = plan.NewScheduler(admissionLedger)
 
 	t.Run("two units that fit the allocation run at once", func(t *testing.T) {
 		p.reset(2)
@@ -206,4 +207,83 @@ func (p *countingHeavyProvider) IndexUnit(ctx context.Context, req provider.Unit
 			&model.Error{Code: model.CodeProviderOutputInvalid, Message: "the fixture made this deferred unit fail"}
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded}, nil
+}
+
+// TestAnAllFailedDeferredBatchKeepsItsReason protects the record of the one
+// deferred outcome that has nowhere else to go. When every unit of a batch
+// fails, nothing is published: no capability row is written, because there is
+// no publication generation, and the provider-run rows that hold each unit's
+// reason are written against the work generation the tick aborts. The run
+// ledger is what is left, and a tick that reported itself as an ok run with no
+// units, or whose rows were swept because it reached no generation, would leave
+// an operator with a log line and nothing durable at all.
+//
+// Mutation: report the totals only on the publishing path (as the index path
+// did) and the run reads `0 planned, 0 succeeded` for a batch it ran.
+//
+// Mutation: finish the run with endOutcome(err) alone and a batch whose every
+// unit failed reads as an ok run.
+//
+// Mutation: key the ledger sweep on generation_id again -- the run reaches no
+// generation, so the collection pass deletes it and its spans.
+func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
+	f := newFixture(t, map[string]string{"main.go": "package main\n"})
+	ctx := f.ctx
+	p := &countingHeavyProvider{}
+	c := f.coordinator(append(f.providers(false), p))
+	res, err := c.Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, c.policy, c.enablement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.reset(1)
+	units := deferredScopes("all-fail", 1, 0)
+	p.fail = plan.Key(heavyProviderID, units[0].unit.ScopeKey)
+	if err := f.tick(c, units, res.Binding.SnapshotID, sel); err != nil {
+		t.Fatalf("tickHeld: %v", err)
+	}
+	// Nothing published, so nothing is delivered: the reason is in the ledger
+	// or it is nowhere.
+	if published := c.late.take(); len(published) != 0 {
+		t.Fatalf("a batch whose every unit failed delivered %d publication(s)", len(published))
+	}
+	// The collection pass is what would sweep a run that reached no generation,
+	// so it runs before the read rather than after it.
+	c.collect(ctx)
+	if err := f.ledger.Flush(ctx); err != nil {
+		t.Fatalf("flush the ledger: %v", err)
+	}
+	reader, ok, err := ledger.OpenReader(ctx, f.dataDir)
+	if err != nil || !ok {
+		t.Fatalf("OpenReader: %v, present=%v", err, ok)
+	}
+	t.Cleanup(func() { reader.Close() })
+	view, present, err := reader.LatestRun(ctx, string(c.repo), 0)
+	if err != nil || !present {
+		t.Fatalf("LatestRun: %v, present=%v", err, present)
+	}
+	if view.Run.Kind != ledger.KindDeferred {
+		t.Fatalf("the latest run is a %s run, want the deferred tick's own", view.Run.Kind)
+	}
+	if view.Run.Outcome != ledger.OutcomeFailed || view.Run.UnitsPlanned != 1 ||
+		view.Run.UnitsSucceeded != 0 || view.Run.UnitsFailed != 1 {
+		t.Fatalf("the run reads %s with %d planned, %d succeeded, %d failed; want failed with "+
+			"1 planned and 1 failed: the batch got nowhere and the row must say so",
+			view.Run.Outcome, view.Run.UnitsPlanned, view.Run.UnitsSucceeded, view.Run.UnitsFailed)
+	}
+	reason := false
+	for _, span := range view.Spans {
+		if span.ScopeKey == units[0].unit.ScopeKey &&
+			span.DiagnosticCode == model.CodeProviderOutputInvalid && span.Failure != "" {
+			reason = true
+		}
+	}
+	if !reason {
+		t.Fatalf("no span of the failed batch names the scope %q with its typed reason; the %d "+
+			"recorded spans are the only durable account of why the batch published nothing",
+			units[0].unit.ScopeKey, len(view.Spans))
+	}
 }
