@@ -1606,9 +1606,19 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ? ORDER BY u.unit_key`, g.id); err != nil {
 			return err
 		}
+		// The capability digest folds what the rows SAY and nothing about when
+		// they were written. remediation is in it because it is a function of
+		// the typed failure, exactly as diagnostic_code and the message inside
+		// details_json are: two identical runs produce the same string.
+		// units_running is deliberately NOT, and must not be added: it records
+		// how many scopes happened to still be in flight at the moment the
+		// generation was published, which is scheduling and not content, so
+		// two rebuilds of one workspace under one configuration can
+		// legitimately differ on it and folding it in would make the digest
+		// nondeterministic (Section 20.2).
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
-			|| char(0) || remediation || char(0) || units_running || char(0) || details_json
+			|| char(0) || remediation || char(0) || details_json
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}

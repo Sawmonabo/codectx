@@ -173,7 +173,9 @@ CREATE TABLE generation_capabilities (
     -- units_running is how many scopes of this capability were still being
     -- built in the background when the generation was published. It is stored
     -- because it is the only way a process other than the one doing the work
-    -- learns that the capability has work in flight.
+    -- learns that the capability has work in flight. It is NOT folded into
+    -- the capability digest: it is what was in flight at publication, which is
+    -- scheduling and not content.
     units_running INTEGER NOT NULL DEFAULT 0 CHECK(units_running >= 0),
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
