@@ -334,6 +334,6 @@ func TestIncrementalReuse(t *testing.T) {
 // take and nothing to give back, so Hold is the lock itself.
 type heldLock struct{ l *snapshot.WorkspaceLock }
 
-func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+func (h heldLock) Hold(context.Context, index.HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	return h.l, func() error { return nil }, nil
 }

@@ -1000,7 +1000,7 @@ func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
 // take and nothing to give back, so Hold is the lock itself.
 type heldLock struct{ l *snapshot.WorkspaceLock }
 
-func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+func (h heldLock) Hold(context.Context, HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	return h.l, func() error { return nil }, nil
 }
 
@@ -1018,11 +1018,19 @@ type countingLock struct {
 	outstanding int
 	taken       int
 	refuse      error
+	// patient records every hold that asked to WAIT for the workspace. A beat
+	// must never be one: batches are delivered synchronously, so a beat that
+	// queued behind another process would stall every notification behind it
+	// for the length of the grace, and the next beat repeats the work anyway.
+	patient int
 }
 
-func (c *countingLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+func (c *countingLock) Hold(_ context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if intent == HoldPatiently {
+		c.patient++
+	}
 	if c.refuse != nil {
 		return nil, nil, c.refuse
 	}
@@ -1091,6 +1099,49 @@ func TestAWatchGivesTheWorkspaceBackWhenTheBeatEnds(t *testing.T) {
 	}
 }
 
+// TestOnlyTheBuildAPersonAsksForWaitsForTheWorkspace protects which operations
+// may queue behind another process and which must not.
+//
+// Failure mode one: `codectx index --watch` builds its base generation through
+// Index, and if that build takes the workspace the way a beat does it is
+// refused CTX_WORKSPACE_BUSY the instant somebody else is indexing -- the
+// person is told no for a command that would have succeeded in a minute.
+//
+// Failure mode two, the opposite and worse: make a BEAT patient and it queues
+// inside the watcher's synchronous batch delivery for the whole grace, so every
+// notification behind it is held up and the pending queue grows, to redo work
+// the next beat would have done anyway.
+//
+// The intent is what separates them, and it is asserted on the real call paths
+// rather than at the fake, because the pairing is the thing that breaks: the
+// wait it selects is proved in internal/snapshot, which measures that a patient
+// acquisition waits out a progressing holder and still refuses a stalled one.
+func TestOnlyTheBuildAPersonAsksForWaitsForTheWorkspace(t *testing.T) {
+	lock := &countingLock{}
+	f := newCountedFixture(t, lock, nil)
+
+	if _, err := f.c.Index(f.ctx, model.IndexRequest{}); err != nil {
+		t.Fatalf("the index a person asked for failed: %v", err)
+	}
+	if lock.patient == 0 {
+		t.Fatal("the index a person asked for took the workspace without waiting: " +
+			"a build behind another process is refused at once instead of waiting it out")
+	}
+	patientAfterIndex := lock.patient
+
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); !ok {
+		t.Fatal("the beat on a free workspace did not complete")
+	}
+	if lock.patient != patientAfterIndex {
+		t.Fatalf("a beat asked to wait for the workspace (%d patient holds, was %d): "+
+			"batches are delivered synchronously, so a beat that queues stalls every notification behind it",
+			lock.patient, patientAfterIndex)
+	}
+	if outstanding, _ := lock.counts(); outstanding != 0 {
+		t.Fatalf("%d holds are outstanding after both operations ended", outstanding)
+	}
+}
+
 // newCountedFixture is newFixture with the counting workspace source, and
 // optionally a logger, in place before the first coordinator is built.
 func newCountedFixture(t *testing.T, lock *countingLock, log *slog.Logger) *fixture {
@@ -1154,6 +1205,12 @@ func TestASkippedBeatIsReportedOncePerEpisode(t *testing.T) {
 	if n := strings.Count(written.String(), holder); n != 2 {
 		t.Fatalf("a second held-lock episode was reported %d times in total:\n%s", n, written.String())
 	}
+	// And no beat asked to wait for it. A beat that did would hold up the
+	// synchronous delivery of every batch behind it for the whole grace,
+	// instead of being skipped and asking again at the next beat.
+	if lock.patient != 0 {
+		t.Fatalf("%d of these beats asked to wait for the workspace; a beat takes it now or is skipped", lock.patient)
+	}
 }
 
 // busyLock is a workspace another process holds for as long as this fixture
@@ -1161,7 +1218,7 @@ func TestASkippedBeatIsReportedOncePerEpisode(t *testing.T) {
 // that cannot have the lock, so a watch composed with it waits forever.
 type busyLock struct{}
 
-func (busyLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+func (busyLock) Hold(context.Context, HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	return nil, nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
 		Message: "another codectx process holds the workspace indexing lock"}
 }
