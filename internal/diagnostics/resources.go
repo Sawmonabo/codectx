@@ -191,10 +191,12 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 // queries this machine's cores run at once, so all three are always available
 // and a zero here is a real zero.
 //
-// Validation already proves the three fit config.BaseFootprintBytes, so the
-// report states them rather than re-deriving the check -- a second
-// implementation of that arithmetic would drift from the one that refuses a
-// bad configuration.
+// The three are exactly what config.BaseFootprint adds to this build's idle
+// overhead to derive what the process holds for itself, so the report states
+// them and derives nothing -- a second implementation of that arithmetic would
+// drift from the one the allocation is computed against. None of the three is
+// checked against a ceiling: the footprint follows the reservations, so there
+// is no figure here for an operator to exceed.
 func (s *Service) reservations(report *model.ResourceReport) {
 	res := s.opts.Config.Resources
 	// Validation refuses a configuration whose product overflows (mulNoOverflow),

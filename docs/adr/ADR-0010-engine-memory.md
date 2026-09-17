@@ -31,8 +31,11 @@ was the measurement for this family at this size.
    The machine-derived allocation bounds the ceiling only when the estimate exceeds it, as before.
 2. **The allocation leaves the host half of what was available when the run began.** The allocation
    the scheduler sums reservations against is the smaller of available memory minus the base
-   footprint and safety margin, and half of available memory. It is a constant with its reason in
-   the code, not a setting. A unit whose reservation exceeds even that runs whole at the allocation,
+   footprint and safety margin, and half of available memory. The base footprint is itself derived
+   from the machine and the configuration — this build's measured idle overhead plus the query,
+   cache and queue reservations, the query slots coming from the cores — so a larger host reserves
+   more for this process and offers its children less, and no core count can make the shipped
+   defaults unresolvable. The share is a constant with its reason in the code, not a setting. A unit whose reservation exceeds even that runs whole at the allocation,
    as [ADR-0001](ADR-0001-scale-posture.md) and the round-3 ruling require; it is never split for
    memory ([10-round3-empirical §8](../research/10-round3-empirical.md): splitting the JavaScript
    project loses more than half of the resolved calls).
@@ -52,8 +55,8 @@ was the measurement for this family at this size.
    product are for CPU-bound work and come from the machine's cores.
 
    Admission figures, from the fixture that proves the rule: a machine reporting 32 GiB available
-   has an allocation of 16 GiB — `min(32 - 1 - 1, 32 / 2)` — and admits four 4 GiB reservations at
-   once; a fifth waits and is admitted the moment one of the four is released. The same reservation
+   has an allocation of 16 GiB — `min(32 − base footprint − 1 GiB margin, 32 / 2)`, the half share
+   being what binds — and admits four 4 GiB reservations at once; a fifth waits and is admitted the moment one of the four is released. The same reservation
    on a machine reporting 8 GiB has a 4 GiB allocation and one runs at a time, the first by the
    runs-alone rule rather than by the sum. Before this, `max_concurrent_heavy_analyzers = 1`
    serialised all five on both machines, and a second project's language server was refused with
@@ -81,6 +84,13 @@ every ceiling from 768 MiB to none produced a 195 MB export with identical count
 methods, 176,698 call edges, 81,040 control-dependence edges, 1,226,336 reaching-definition edges.
 The ceiling changes cost, never facts. Peak parse RSS 1.11 GB at 768 MiB, 1.17 at 1 GiB, 1.74 at
 2 GiB, 2.68 at 4 GiB, 3.65 at 8 GiB, 4.44 GB with none: the JVM takes what it is allowed.
+
+This process's own idle overhead, the part of the base footprint that is not a stated reservation:
+`codectx status` over a freshly indexed five-file, 432-byte fixture, peak resident set of the
+command process ("Maximum resident set size", `/usr/bin/time -v`), three samples: **26,584 /
+27,052 / 26,732 KiB**, i.e. 26.4 MiB at the worst of the three. The shipped constant is 32 MiB, the
+worst sample rounded up to the next binary step. The 1 GiB that preceded it was never measured; it
+is 38× the measurement, and every byte of that over-statement was taken from the children.
 
 Soft ceiling: an 8 GiB hard ceiling with a 1 GiB soft ceiling peaked at 3.82 GB (3.65 without
 the soft ceiling; 1.17 with a real 1 GiB hard ceiling); a periodic collection interval did not
