@@ -51,8 +51,8 @@ type WorkerCommand struct {
 }
 
 // Options configure the provider. Zero values take the defaults below, which
-// match config's: 5 MiB per file, a 60-second idle TTL. The worker count is
-// not among them -- it comes from the machine and is required.
+// match config's: 5 MiB per file, a 60-second parse timeout. The worker count
+// is not among them -- it comes from the machine and is required.
 type Options struct {
 	// Languages restricts the supported set (config tree_sitter.languages);
 	// empty means every pinned language.

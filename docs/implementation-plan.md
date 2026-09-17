@@ -2050,7 +2050,8 @@ offline = false
 cache_dir = ""
 mirror = ""
 max_fetch_bytes = 2147483648
-fetch_timeout = "10m"
+# fetch_timeout was removed: a download is watched for bytes received, not
+# for elapsed time (ADR-0010 round, review finding I-16). No key replaces it.
 
 [providers.tree_sitter]
 enabled = true
@@ -3122,7 +3123,8 @@ type Options struct {
     Offline       bool
     Mirror        string        // optional URL prefix; the lock URL's host is replaced and its full path kept, so one mirror serves upstream and hosted assets
     MaxFetchBytes int64
-    FetchTimeout  time.Duration
+    // FetchTimeout removed with tools.fetch_timeout; the stall bound is a
+    // package constant beside the watcher that uses it.
     Overrides     map[string]config.ToolOverride
     Log           *slog.Logger
 }
@@ -3146,7 +3148,7 @@ type Tools struct {
     CacheDir      string             `toml:"cache_dir"`
     Mirror        string             `toml:"mirror"`
     MaxFetchBytes int64              `toml:"max_fetch_bytes"`
-    FetchTimeout  Duration           `toml:"fetch_timeout"`
+    // fetch_timeout removed; see the resolver note above.
     Override      map[string]ToolOverride `toml:"override"` // user configuration only
 }
 type ToolOverride struct {

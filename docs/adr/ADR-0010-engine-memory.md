@@ -91,6 +91,18 @@ was the measurement for this family at this size.
    not. A host whose measured free space is already at or below its floor is a different case and a
    real reading: its allocation is zero, so staging children run one at a time.
 
+   *Where the figure itself is missing*: a child reserves disk only where its expected bytes are a
+   figure the product already states. The language servers state one (`DiskBudgetBytes` per
+   profile) and reserve it. The analysis engine does not: `providers.dependence.max_staged_rows`
+   bounds rows, is unlimited by default, and nothing anywhere records bytes per staged row. An
+   engine unit is therefore admitted on memory alone, and that is said at the call site rather than
+   papered over with a constant derived from source bytes — putting an underived number into the
+   gate that decides whether a run may proceed is the defect the measurement table below was
+   corrected for, and it is not worth repeating to make a dimension look complete. The measurement
+   that closes it: the high-water bytes of a unit's scratch directory, recorded on its span beside
+   its peak RSS, over the reference repositories; the call then carries that history exactly as the
+   memory reservation already carries `ObservedPeakBytes`.
+
    *What is not changed*: `resources.max_temp_bytes` stays what it was, the ceiling an operator may
    put on temporary bytes, enforced where it always was and unlimited by default. It is not the
    host-safety mechanism and never was; the ledger is.
