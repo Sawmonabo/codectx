@@ -20,17 +20,23 @@ import (
 // whole method bodies, and a zero-exit dead graph misread as success admits an
 // empty analysis as a fresh one.
 //
-// The inputs are the real engine's own bytes, captured from Joern 4.0.627 runs
-// recorded in the lane report; only absolute paths were rewritten so the
-// fixtures carry no developer's home directory. The timed pass-crash line is
-// built from the `Pass %s failed in %.0f ms` format string read out of
-// io.shiftleft.passes.CpgPassBase in the pinned payload, with the throwable
-// the release logs alongside it. linker-pass-crash.stderr is the head of a
+// The inputs are the real engine's own bytes, captured from runs of the
+// pinned engine payload; only absolute paths were rewritten so the fixtures
+// carry no developer's home directory. The timed pass-crash line is built from
+// the `Pass %s failed in %.0f ms` format string the payload's pass base class
+// emits, with the throwable the release logs alongside it.
+// linker-pass-crash.stderr is the head of a
 // real crash's standard error, recorded from a parse of the two source files
 // that reproduce it; its pass line is the untimed `Pass <name> failed` form,
 // which an earlier parser did not match — so a crash the product could have
 // recognised as reproducible on sight recorded an empty pass name and was
 // parsed a second time for nothing.
+//
+// Mutation: in classify's outcome switch, put the `out.Pass != "",
+// helperCrash, res.ExitCode != 0` case ahead of the `oom && res.ExitCode != 0`
+// case -> a heap-exhausted run whose stderr also carries a failed pass is
+// classed as an engine crash, and the unit loses the one retry a larger cap
+// could have won.
 func TestClassify(t *testing.T) {
 	const passCrash = "2026-09-13 23:10:01.001 WARN  CfgCreationPass           Pass CfgCreationPass failed in 3410 ms\n" +
 		"java.util.NoSuchElementException: next on empty iterator\n" +
@@ -128,6 +134,11 @@ func fixture(t *testing.T, name string) string {
 // carries, and it must not carry the private directories this run made for the
 // child: a diagnostic an operator reads is not the place to publish where the
 // repository was materialized.
+//
+// Mutation: in stderrTail, take the FIRST model.MaxDetailBytes of the buffer
+// instead of the last -> the tail carries the child's startup banner and the
+// exception that ended the run is gone; or drop the private-path redaction
+// and the detail publishes the run's materialization directory.
 func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 	const private = "/var/data/codectx/abc123/work/run-7"
 	stderr := "the first line, far enough back to be cut\n" +

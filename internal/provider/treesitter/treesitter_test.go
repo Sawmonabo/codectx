@@ -88,6 +88,11 @@ func newProvider(t *testing.T) *treesitter.Provider {
 // boundary would publish a range that does not match the bytes; the second
 // conformance run with a flush after every Put would catch a relation or
 // alias handed over before the node it references.
+//
+// Mutation: make the parent trust the worker's reported byte range instead of
+// validating it against the pinned bytes it streamed -> a declaration's
+// published range no longer selects that declaration's source and the product
+// serves wrong bytes for a correct-looking fact.
 func TestLanguageFixtures(t *testing.T) {
 	p := newProvider(t)
 	for _, fx := range fixtures {
@@ -420,6 +425,11 @@ const ledgerRepository = "0123456789abcdef0123456789abcdef0123456789abcdef012345
 // ending a worker's span without the measurements the runner reaped, which
 // leaves the stage attributed to nothing and its processor time, tree peak and
 // transferred bytes lost at the one moment they exist.
+//
+// Mutation: start and end a ledger span around each parse instead of around
+// the worker process -> the row count grows with the file count, and the
+// runner's reaped measurements, which only exist once the process is gone,
+// are attributed to nothing.
 func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 	ctx := context.Background()
 	l := ledger.New(t.TempDir())
@@ -446,10 +456,11 @@ func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	// One worker, five files: the parses must be the counters of the one span
-	// that measures the process which ran them. ParseProbe is the production
-	// parse path -- the same pool, the same span, the same count -- reached
-	// without a unit, which is the only way one test can put several files
-	// through one worker: a treesitter unit is one file.
+	// that measures the process which ran them. ParseProbe is the diagnostic
+	// parse surface, not a path any product caller takes, but it runs through
+	// the same pool, framing and span as IndexUnit -- and it needs no unit,
+	// which is the only way one test can put several files through one worker:
+	// a treesitter unit is one file. The unit loop below is the product path.
 	probes := newSingleWorkerProvider(t)
 	for i := range 5 {
 		if _, err := probes.ParseProbe(ctx, "sample.go", src); err != nil {
