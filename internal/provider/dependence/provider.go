@@ -550,7 +550,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// A reproducible crash is the only thing subdivision is for. Every
 		// capability of the result then says so, and says how the crash was
 		// established to reproduce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision, refused)
 	}
 
 	exp, crash, err := p.export(ctx, req, unit, res, run, graph, refused)
@@ -565,7 +565,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// on a 4,984-file project whose export died at every heap cap while
 		// every subdivided part of it exported. Reporting it as a failed unit
 		// threw away facts the engine could still produce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed, refused)
 	}
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
@@ -579,9 +579,9 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // partial result naming the subdivided scope and the failing pass and
 // exception, never a failed unit.
 func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (publication, ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, refused int64) (publication, ImportReport, error) {
 
-	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision)
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -871,7 +871,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (ImportReport, int, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, refused int64) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
@@ -901,6 +901,10 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
+	// What the parts did, so a unit no part of which produced a method can say
+	// which of the two things happened to them rather than restating that
+	// nothing came out.
+	tally := partTally{Parts: len(children)}
 	for i, child := range children {
 		// One span per part, under the unit's: every step below nests inside
 		// it, so a subdivided unit's cost reads as the sum of its parts rather
@@ -913,6 +917,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
+			tally.Failed++
 			part.End(ledger.OutcomeFailed, measured(out), nil)
 			continue
 		}
@@ -931,7 +936,16 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			return ImportReport{}, 0, err
 		}
 		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), nil)
-		if exp.Class != FailureNone || !exp.Live {
+		if exp.Class != FailureNone {
+			tally.Failed++
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
+			continue
+		}
+		if !exp.Live {
+			// The part was analysed from end to end and carries no method.
+			// That is the empty export of a part, and it is counted apart from
+			// a failure so the unit's reason can tell the two apart.
+			tally.Empty++
 			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
 			continue
 		}
@@ -952,8 +966,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
-		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, res).
-			WithDetail("reason", "no subdivided part of the unit produced an honest result")
+		return ImportReport{}, 0, subdivisionEmpty(unit, crash, res, tally, refused)
 	}
 	return total, overParts, nil
 }

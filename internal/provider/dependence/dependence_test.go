@@ -36,6 +36,16 @@ var repo = map[string]string{
 	"docs/overview.md": "# overview\n",
 }
 
+// twoSourceRepo is the same module with a second source file, for the one case
+// that needs a unit whose files the frontend answers differently for.
+var twoSourceRepo = func() map[string]string {
+	m := map[string]string{"helper.go": "package app\n\nfunc Helper() int { return 2 }\n"}
+	for k, v := range repo {
+		m[k] = v
+	}
+	return m
+}()
+
 const rootScope = "pkg:go:"
 
 // fakeBackend stands in for the engine. It produces the artifacts the provider
@@ -55,6 +65,9 @@ type fakeBackend struct {
 	// file of the unit out of its analysis, which is the measured shape of the
 	// Java project whose every path carried a component the frontend refuses.
 	refusesEveryFile bool
+	// refusesPath makes it refuse only the paths holding this substring, which
+	// is the partial shape: some of the unit's files analysed, some not.
+	refusesPath string
 	// wholeExportCrash is the engine crash the WHOLE unit's export dies on
 	// while every subdivided part's export succeeds -- the measured shape of a
 	// 4,984-file project whose export died at every heap cap.
@@ -78,7 +91,12 @@ func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinn
 
 func (b *fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
 
-func (b *fakeBackend) RefusesInput(dependence.Family, string) bool { return b.refusesEveryFile }
+func (b *fakeBackend) RefusesInput(_ dependence.Family, rel string) bool {
+	if b.refusesPath != "" {
+		return strings.Contains(rel, b.refusesPath)
+	}
+	return b.refusesEveryFile
+}
 
 func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	b.parses++
@@ -225,6 +243,11 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		// an operator nothing they did not already have from the class.
 		reason      string
 		remediation string
+		// repo and inputs override the default one-source-file fixture for a
+		// case that needs a unit whose files the frontend answers differently
+		// for; nil takes the shared fixture.
+		repo   map[string]string
+		inputs []string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
 		// permits for that class -- which a crash that named its failing pass
@@ -239,9 +262,14 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			name: "a reproducible pass crash fails the unit and names the pass",
 			backend: &fakeBackend{parse: dependence.Outcome{Class: dependence.FailureEngine,
 				Pass: "CfgCreationPass", Exception: "java.util.NoSuchElementException", ExitCode: 1}},
-			code:   model.CodeProviderOutputInvalid,
-			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass"},
-			parses: 2,
+			code: model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass",
+				"parts": "1", "parts_failed": "1", "parts_without_method": "0"},
+			// The tally is the reason -- not "no part produced an honest
+			// result", which restates the failure the class already names.
+			reason:      "1 of 1 failed in the analysis and 0 were analysed cleanly",
+			remediation: "identifies the defect upstream",
+			parses:      2,
 		},
 		{
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
@@ -281,6 +309,22 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			parses:      1,
 		},
 		{
+			// Some of the unit's files refused and some analysed, and still no
+			// method. Neither of the two reasons above is true of it, and
+			// publishing either would tell the operator something measurably
+			// false about their own repository.
+			name:    "an export with no methods for a partly refused unit says how many were left out",
+			backend: &fakeBackend{deadExport: true, refusesPath: "helper.go"},
+			code:    model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "empty_export", "family": "go",
+				"source_files": "2", "refused_source_files": "1"},
+			reason:      "left 1 of this unit's 2 source files out of its analysis",
+			remediation: "For the files it did read",
+			repo:        twoSourceRepo,
+			inputs:      []string{"app.go", "helper.go", "go.mod"},
+			parses:      1,
+		},
+		{
 			name:    "a clean exit that left no graph is an engine failure, not a success",
 			backend: &fakeBackend{noGraph: true},
 			code:    model.CodeProviderOutputInvalid,
@@ -290,8 +334,12 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			h := providertest.New(t, repo)
-			result, unit, err := h.Run(t, newProvider(t, c.backend), rootScope, []string{"app.go", "go.mod"})
+			files, inputs := c.repo, c.inputs
+			if files == nil {
+				files, inputs = repo, []string{"app.go", "go.mod"}
+			}
+			h := providertest.New(t, files)
+			result, unit, err := h.Run(t, newProvider(t, c.backend), rootScope, inputs)
 			if err == nil {
 				t.Fatal("the unit succeeded; a classified analysis failure must never seal")
 			}
