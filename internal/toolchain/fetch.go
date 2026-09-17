@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -35,9 +37,29 @@ const (
 	// exponential because the whole budget is already bounded by the deadline.
 	retryBackoff = 2 * time.Second
 	// dialTimeout and tlsTimeout bound connection setup so a black-holed host
-	// cannot consume the whole fetch deadline before a byte moves.
+	// cannot hold an attempt open before a byte moves.
 	dialTimeout = 30 * time.Second
 	tlsTimeout  = 30 * time.Second
+	// transferStall is how long a started transfer may deliver no bytes at all
+	// before it is treated as wedged.
+	//
+	// It is a hang detector and not a budget for the download. A payload is as
+	// large as a language runtime and the link it arrives over is whatever the
+	// operator has, so no wall clock can tell a slow transfer from a dead one:
+	// a deadline over the whole fetch is a rate requirement in disguise, and it
+	// terminates the download that is working on the slower link. What
+	// separates the two is whether bytes arrive at all.
+	//
+	// It sits above the response-header timeout so a host that is answering
+	// slowly is ended by that bound, which is about the answer, rather than by
+	// this one, which is about the body.
+	transferStall = 60 * time.Second
+	// installWait is how long a resolution waits for another process's install
+	// of the same tool before reporting it busy. It is a queueing bound and not
+	// a deadline on the peer: the peer's own transfer watch decides whether it
+	// is progressing, and this only decides how long this process is willing to
+	// stand behind it rather than fail with a busy store.
+	installWait = 10 * time.Minute
 )
 
 // assetDelegates names the hosts an asset host may hand a download body to. It
@@ -58,11 +80,12 @@ type fetcher struct {
 	client   *http.Client
 	mirror   *url.URL
 	maxBytes int64
-	timeout  time.Duration
-	log      *slog.Logger
+	// stall is the transfer hang detector's window; see transferStall.
+	stall time.Duration
+	log   *slog.Logger
 }
 
-func newFetcher(transport http.RoundTripper, mirror *url.URL, maxBytes int64, timeout time.Duration, log *slog.Logger) *fetcher {
+func newFetcher(transport http.RoundTripper, mirror *url.URL, maxBytes int64, log *slog.Logger) *fetcher {
 	if transport == nil {
 		transport = &http.Transport{
 			// Section 11.7 requires the standard proxy environment to be
@@ -82,7 +105,7 @@ func newFetcher(transport http.RoundTripper, mirror *url.URL, maxBytes int64, ti
 		},
 		mirror:   mirror,
 		maxBytes: maxBytes,
-		timeout:  timeout,
+		stall:    transferStall,
 		log:      log,
 	}
 }
@@ -153,8 +176,7 @@ func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload,
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(withLockHost(ctx, lockHost), f.timeout)
-	defer cancel()
+	ctx = withLockHost(ctx, lockHost)
 
 	started := time.Now()
 	var last error
@@ -188,9 +210,16 @@ func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload,
 	return last
 }
 
-// attempt performs one request and one verified stream.
+// attempt performs one request and one verified stream, under a hang detector
+// on the bytes received rather than a deadline on the whole of it.
 func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p Payload, dst *os.File) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	// The request runs under a context this function can end on its own, which
+	// is what aborts a transfer that has stopped delivering. The caller's
+	// context still ends it too, and the two are told apart below: the watch
+	// reports whether it was the one that fired.
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return fetchFailed(name, "the payload request cannot be built", false)
 	}
@@ -208,10 +237,16 @@ func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p P
 	}
 
 	sum := sha256.New()
+	body := &progressReader{r: resp.Body}
+	watch := watchTransfer(body, f.stall, cancel)
+	defer watch.stop()
 	// One byte past the declared size is read so a longer body is detected as a
 	// disagreement with the lock instead of being silently truncated to it.
-	n, err := io.Copy(io.MultiWriter(dst, sum), io.LimitReader(resp.Body, p.Size+1))
+	n, err := io.Copy(io.MultiWriter(dst, sum), io.LimitReader(body, p.Size+1))
 	if err != nil {
+		if watch.fired() {
+			return fetchFailed(name, "the payload stream delivered no bytes for "+f.stall.String(), true)
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return model.Canceled(ctxErr)
 		}
@@ -227,6 +262,79 @@ func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p P
 		return ioError("tool payload sync", err)
 	}
 	return nil
+}
+
+// progressReader counts every byte it hands on, which is the only honest
+// progress signal a download has. The package already counts bytes this way
+// where a payload is expanded (see the payload byte budget in extract.go); this
+// is the same counting one layer earlier, on the wire.
+type progressReader struct {
+	r     io.Reader
+	moved atomic.Int64
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.moved.Add(int64(n))
+	}
+	return n, err
+}
+
+// transferWatch ends a transfer that has stopped moving. It is the fetch
+// path's hang detector: a transfer that delivered even one byte inside the
+// window is progressing however slow it is, and only one that delivered none
+// has stopped.
+type transferWatch struct {
+	stalled atomic.Bool
+	halt    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+// watchTransfer starts the detector over r and calls cancel once the transfer
+// has delivered nothing for window. The caller must call stop on every path,
+// which joins the goroutine: nothing this package starts outlives the attempt
+// that started it.
+func watchTransfer(r *progressReader, window time.Duration, cancel context.CancelFunc) *transferWatch {
+	w := &transferWatch{halt: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		// Sampling at the window itself would let a transfer that died just
+		// after a sample survive for nearly twice it; a quarter of the window
+		// bounds that overshoot, as the subprocess stall watchdog does.
+		ticker := time.NewTicker(window / 4)
+		defer ticker.Stop()
+		last, quietSince := r.moved.Load(), time.Now()
+		for {
+			select {
+			case <-w.halt:
+				return
+			case now := <-ticker.C:
+				if seen := r.moved.Load(); seen != last {
+					last, quietSince = seen, now
+					continue
+				}
+				if now.Sub(quietSince) >= window {
+					w.stalled.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return w
+}
+
+// fired reports that this watch, and not the caller, ended the transfer. It is
+// what keeps the failure honest: both end the copy by cancellation, and
+// without it a wedged host would be reported as the caller cancelling.
+func (w *transferWatch) fired() bool { return w.stalled.Load() }
+
+// stop ends the watch and joins its goroutine. It is idempotent.
+func (w *transferWatch) stop() {
+	w.once.Do(func() { close(w.halt) })
+	<-w.done
 }
 
 // rewind resets the staging file before a retry so a partial body from a failed

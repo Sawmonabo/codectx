@@ -182,7 +182,7 @@ func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
 		// Not one byte moves on the wire for several windows; only the child's
 		// processor time advances, which is exactly a server indexing.
 		deadline := time.After(3 * window)
-		tick := time.NewTicker(window / 8)
+		tick := time.NewTicker(window / 16)
 		defer tick.Stop()
 		for {
 			select {
@@ -204,7 +204,7 @@ func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
 		// The connection is busy -- another request's frames keep arriving --
 		// while the child does no work at all. The watched request is hung.
 		go func() {
-			tick := time.NewTicker(window / 8)
+			tick := time.NewTicker(window / 16)
 			defer tick.Stop()
 			for {
 				select {
@@ -233,7 +233,7 @@ func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
 		ctx, _, stop := c.watchProgress(context.Background(), window)
 		defer stop()
 		deadline := time.After(3 * window)
-		tick := time.NewTicker(window / 8)
+		tick := time.NewTicker(window / 16)
 		defer tick.Stop()
 		for {
 			select {
