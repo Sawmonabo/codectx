@@ -248,156 +248,156 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 
 | id | file:line | call expression | callee | syntax | engine | class | reason |
 |---|---|---|---|---|---|---|---|
-| C1-241 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.min.js`:7 | `this.getCurrentCharStyle(s,u)` | `getCurrentCharStyle` | unresolved | absent | ? | ? |
-| C1-242 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:16132 | `baseAssignValue(result, iteratee(value, key, object), value)` | `baseAssignValue` | in-file | absent | ? | ? |
-| C1-243 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:42362 | `Array.isArray(_iterator4)` | `isArray` | unresolved | absent | ? | ? |
-| C1-244 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:43843 | `feature('stylisticAlternatives', 'stylisticAltEleven')` | `feature` | in-file | absent | ? | ? |
-| C1-245 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:66619 | `__webpack_require__(142)` | `__webpack_require__` | in-file | absent | ? | ? |
-| C1-246 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:2 | `Math.pow(2,8*n-1)` | `pow` | unresolved | absent | ? | ? |
-| C1-247 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:5 | `t.replace("\t"," ")` | `replace` | unresolved | absent | ? | ? |
-| C1-248 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `new Error("TODO: cmap format 14")` | `Error` | unresolved | absent | ? | ? |
-| C1-249 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:26 | `t.slice(c,f+1)` | `slice` | unresolved | absent | ? | ? |
-| C1-250 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.js`:10474 | `f.replace(/COM\.MICROSOFT\./g, "")` | `replace` | unresolved | stub | ? | ? |
-| C1-251 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:2 | `data.charCodeAt(0)` | `charCodeAt` | unresolved | absent | ? | ? |
-| C1-252 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:2 | `fmt.substr(i,5)` | `substr` | unresolved | absent | ? | ? |
-| C1-253 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:10 | `px2pt(row.hpx)` | `px2pt` | in-file | absent | ? | ? |
-| C1-254 | `app/packages/sylido-meteor-selectize-bootstrap/selectize/dist/js/selectize.min.js`:1 | `e(g[d],c)` | `e` | in-file | absent | ? | ? |
-| C1-255 | `app/server/actionButtons/actionButtons.js`:584 | `_.union(_.get(relatedAggsByType, k, []), val)` | `union` | unresolved | stub | ? | ? |
-| C1-256 | `app/server/campaigns/campaigns.js`:247 | `_.get(auth, "sub._id")` | `get` | unresolved | stub | ? | ? |
-| C1-257 | `app/server/centralServicesAPI/requestProductUtils.test.js`:176 | `new Error("not-allowed")` | `Error` | unresolved | absent | ? | ? |
-| C1-258 | `app/server/fortressAPI/fortressAPI.js`:58 | `_.mapValues(_.get(requestOptions, "headers", {}), (v) => String(v))` | `mapValues` | unresolved | in-repo | ? | ? |
-| C1-259 | `app/server/jsreports/print.js`:174 | `_.get(user, "information.email", "")` | `get` | unresolved | stub | ? | ? |
-| C1-260 | `app/server/lib/publish/detectedVulnerabilitiesGrid.js`:222 | `__cb(err)` | `__cb` | ambiguous | in-repo | ? | ? |
-| C1-261 | `app/server/lib/publish/myWatchedItems.js`:122 | `_.get(Meteor, "settings.flags.debug", false)` | `get` | unresolved | stub | ? | ? |
-| C1-262 | `app/server/lib/publish/surveys.js`:813 | `_.escapeRegExp(query)` | `escapeRegExp` | unresolved | stub | ? | ? |
-| C1-263 | `app/server/lib/publish/widgetAggs/vulnByBUoverTimeAgg.js`:37 | `dateMomentUtils.modifiedDate("", "subtract", 6, "months")` | `modifiedDate` | import | stub | ? | ? |
-| C1-264 | `app/server/manageScoring/manageScoring.js`:416 | `_.get(oldDoc, "md.id")` | `get` | unresolved | stub | ? | ? |
-| C1-265 | `app/server/manageUsers/manUsers.js`:430 | `Meteor.users.find({ _id : { $in : tenantUserIds }, "information.vendorPortal" : true, i…` | `find` | unresolved | stub | ? | ? |
-| C1-266 | `app/server/methods/getBoDescriptions.test.js`:143 | `handler.call({}, ["a", "b"])` | `call` | unresolved | absent | ? | ? |
-| C1-267 | `app/server/navigation/navigation.test.js`:333 | `expect(boFindOne.mock.calls[0][0])` | `expect` | unresolved | absent | ? | ? |
-| C1-268 | `app/server/rolesNotifications/rolesNotifications.js`:88 | `EmailTemplates.find($match, $project)` | `find` | unresolved | in-repo | ? | ? |
-| C1-269 | `app/server/serverRouteApi/serverRouteApi.js`:157 | `logger.error("(/fp-api/runAggsMulti) Missing header parameters.", { nonce, hashAuth })` | `error` | unresolved | in-repo | ? | ? |
-| C1-270 | `app/server/surveys/importExport.js`:286 | `_.get(auth, "user._id")` | `get` | unresolved | stub | ? | ? |
-| C1-271 | `app/server/taxonomy/taxonomy.js`:97 | `taxonomySchema.validate(modifier, { modifier : true })` | `validate` | import | stub | ? | ? |
-| C1-272 | `app/server/unitTests/boAutomationRules/boAutomationRules.app-test.js`:96 | `sinon.createSandbox()` | `createSandbox` | import | absent | ? | ? |
-| C1-273 | `app/server/unitTests/cmDashboard/cmDashboardFindingsGrid.app-test.js`:419 | `chai.expect(runChart({ vendorID : "" }))` | `expect` | import | absent | ? | ? |
-| C1-274 | `app/server/utils/emailUtils.js`:572 | `_.get(val, "email", "")` | `get` | unresolved | stub | ? | ? |
-| C1-275 | `app/server/wfStatsBasic/wfStatsBasic.js`:54 | `getCustomLabel("info.date.due", "Date Due", "assessmentFindings")` | `getCustomLabel` | unresolved | stub | ? | ? |
-| C1-276 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/bootstrap.js`:190 | `$(element)` | `$` | unresolved | stub | ? | ? |
-| C1-277 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/inspinia.js`:255 | `$('body')` | `$` | unresolved | stub | ? | ? |
-| C1-278 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-2.1.1.js`:3 | `n.now()` | `now` | unresolved | absent | ? | ? |
-| C1-279 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:6 | `e("<a>")` | `e` | ambiguous | absent | ? | ? |
-| C1-280 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `t.effects.animateClass.call(this,n?{add:s}:{remove:s},a,o,r)` | `call` | unresolved | absent | ? | ? |
-| C1-281 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `s.outerHeight()` | `outerHeight` | unresolved | absent | ? | ? |
-| C1-282 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `this.helper.offset()` | `offset` | unresolved | absent | ? | ? |
-| C1-283 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/chartist/chartist.min.js`:7 | `c.serialize(o.meta)` | `serialize` | unresolved | absent | ? | ? |
-| C1-284 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/codemirror.js`:7629 | `getOrder(line)` | `getOrder` | in-file | in-repo | ? | ? |
-| C1-285 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/rst/rst.js`:170 | `stream.match(rx_role_pre, false)` | `match` | unresolved | in-repo | ? | ? |
-| C1-286 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/sparql/sparql.js`:121 | `pushContext(state, "}", stream.column())` | `pushContext` | in-file | in-repo | ? | ? |
-| C1-287 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/xml/xml.js`:133 | `stream.match(/^[^\s\u00a0=<>\"\']*[^\s\u00a0=<>\"\'\/]/)` | `match` | unresolved | in-repo | ? | ? |
-| C1-288 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/cropper/cropper.min.js`:9 | `this.renderImage("zoom")` | `renderImage` | unresolved | absent | ? | ? |
-| C1-289 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:500 | `_fnCompatMap( init, 'orderDataType', 'sortDataType' )` | `_fnCompatMap` | in-file | in-repo | ? | ? |
-| C1-290 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:4217 | `tmpTable.css( 'width', 'auto' )` | `css` | unresolved | in-repo | ? | ? |
-| C1-291 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:14632 | `a.toString()` | `toString` | unresolved | stub | ? | ? |
-| C1-292 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/footable/footable.all.min.js`:14 | `t(a.table).unbind(".sorting").bind({"footable_initialized.sorting":function(){var i,o,n…` | `data` | unresolved | absent | ? | ? |
-| C1-293 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/fullcalendar/fullcalendar.min.js`:6 | `ye(r,t[s],r.forwardSegs)` | `ye` | in-file | absent | ? | ? |
-| C1-294 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/fullcalendar/moment.min.js`:6 | `r(C(a)%60,2)` | `r` | in-file | absent | ? | ? |
-| C1-295 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:117 | `b(y,a).closest("table.ui-jqgrid-btable").attr("id")` | `attr` | unresolved | absent | ? | ? |
-| C1-296 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:221 | `a(c)` | `a` | ambiguous | absent | ? | ? |
-| C1-297 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:332 | `a("#"+v.themodal)` | `a` | ambiguous | absent | ? | ? |
-| C1-298 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:411 | `a.isFunction(b.p.beforeSelectRow)` | `isFunction` | unresolved | absent | ? | ? |
-| C1-299 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:437 | `s("unbind")` | `s` | ambiguous | absent | ? | ? |
-| C1-300 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:462 | `f.hasClass(a)` | `hasClass` | unresolved | absent | ? | ? |
-| C1-301 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:517 | `this.toObj(g)` | `toObj` | unresolved | absent | ? | ? |
-| C1-302 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:5372 | `rplusequals.exec( value )` | `exec` | unresolved | stub | ? | ? |
-| C1-303 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:6413 | `$( this )` | `$` | unresolved | stub | ? | ? |
-| C1-304 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:6605 | `toShow .hide()` | `hide` | unresolved | absent | ? | ? |
-| C1-305 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:8129 | `this._updateAlternate(inst)` | `_updateAlternate` | unresolved | in-repo | ? | ? |
-| C1-306 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:5 | `t(n.containment)` | `t` | in-file | absent | ? | ? |
-| C1-307 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:8 | `s.removeClass("ui-accordion-header-active ui-state-active")` | `removeClass` | unresolved | absent | ? | ? |
-| C1-308 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:8 | `this._updateDatepicker(e)` | `_updateDatepicker` | unresolved | absent | ? | ? |
-| C1-309 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jsTree/jstree.min.js`:4 | `c.element.find("ul:visible").addBack()` | `addBack` | unresolved | absent | ? | ? |
-| C1-310 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/morris/raphael-2.1.0.min.js`:10 | `bJ(b)` | `bJ` | in-file | absent | ? | ? |
-| C1-311 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/morris/raphael-2.1.0.min.js`:10 | `b.defs.removeChild(this.gradient)` | `removeChild` | unresolved | absent | ? | ? |
-| C1-312 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/rickshaw/rickshaw.min.js`:2 | `d3.svg.line().x(function(d){return graph.x(d.x)}).y(function(d){return graph.y(d.y)}).i…` | `tension` | unresolved | absent | ? | ? |
-| C1-313 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/rickshaw/vendor/d3.v3.js`:1 | `u()` | `u` | ambiguous | absent | ? | ? |
-| C1-314 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/select2/select2.full.min.js`:3 | `d.join(c._valueSeparator)` | `join` | unresolved | absent | ? | ? |
-| C1-315 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/sparkline/jquery.sparkline.min.js`:4 | `e.get("colorMap")` | `get` | unresolved | absent | ? | ? |
-| C1-316 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/staps/jquery.steps.min.js`:6 | `h.eq(e)` | `eq` | unresolved | absent | ? | ? |
-| C1-317 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/sweetalert/sweetalert.min.js`:1 | `l.addClass(o,"visible")` | `addClass` | unresolved | absent | ? | ? |
-| C1-318 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/validate/jquery.validate.min.js`:4 | `a(b).rules()` | `rules` | unresolved | absent | ? | ? |
-| C1-319 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/bootstrap.js`:1812 | `$tip.find('.popover-content')` | `find` | unresolved | stub | ? | ? |
-| C1-320 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/bootstrap.min.js`:6 | `c.isInStateTrue()` | `isInStateTrue` | unresolved | absent | ? | ? |
-| C1-321 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/jquery-ui-1.10.4.min.js`:6 | `this.headers.removeClass("ui-accordion-header ui-accordion-header-active ui-helper-rese…` | `removeAttr` | unresolved | absent | ? | ? |
-| C1-322 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/jquery-ui-1.10.4.min.js`:7 | `Math.max(0,a.maxHeight-e)` | `max` | unresolved | absent | ? | ? |
-| C1-323 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/plugins/pace/pace.min.js`:2 | `t(p)` | `t` | unresolved | absent | ? | ? |
-| C1-324 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/plugins/slimscroll/jquery.slimscroll.min.js`:11 | `b.scrollTop()` | `scrollTop` | unresolved | absent | ? | ? |
-| C1-325 | `mockup/www/js/bootstrap.min.js`:6 | `a(this)` | `a` | unresolved | absent | ? | ? |
-| C1-326 | `mockup/www/js/bootstrap.min.js`:7 | `a(document).on("click.bs.tab.data-api",'[data-toggle="tab"]',e).on("click.bs.tab.data-a…` | `on` | unresolved | absent | ? | ? |
-| C1-327 | `mockup/www/js/jquery-ui-1.10.4.min.js`:6 | `this.focusable.add(e)` | `add` | unresolved | absent | ? | ? |
-| C1-328 | `mockup/www/js/jquery-ui-1.10.4.min.js`:6 | `this._hideDatepicker()` | `_hideDatepicker` | unresolved | absent | ? | ? |
-| C1-329 | `mockup/www/js/jquery-ui-1.10.4.min.js`:7 | `this._trigger("beforeActivate",e,c)` | `_trigger` | unresolved | absent | ? | ? |
-| C1-330 | `mockup/www/js/plugins/amcharts/amcharts.js`:359 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | absent | ? | ? |
-| C1-331 | `mockup/www/js/plugins/amcharts/funnel.js`:24 | `q.getBBox()` | `getBBox` | unresolved | absent | ? | ? |
-| C1-332 | `mockup/www/js/plugins/amcharts/plugins/animate/animate.js`:288 | `getKeysSliced( chart, keys, seen )` | `getKeysSliced` | in-file | absent | ? | ? |
-| C1-333 | `mockup/www/js/plugins/amcharts/plugins/export/export.min.js`:1 | `c.isTainted(a)` | `isTainted` | unresolved | absent | ? | ? |
-| C1-334 | `mockup/www/js/plugins/amcharts/plugins/export/libs/fabric.js/fabric.js`:13929 | `Math.sin(this.endAngle)` | `sin` | unresolved | absent | ? | ? |
-| C1-335 | `mockup/www/js/plugins/amcharts/plugins/export/libs/fabric.js/fabric.js`:21986 | `this.fire('editing:exited')` | `fire` | unresolved | absent | ? | ? |
-| C1-336 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:779 | `hexWrite(this, string, offset, length)` | `hexWrite` | in-file | absent | ? | ? |
-| C1-337 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:12141 | `string.slice(0, trimmedRightIndex(string) + 1)` | `slice` | unresolved | absent | ? | ? |
-| C1-338 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:15481 | `pack(ALPHANUMERIC_MAP[data.charAt(i-1)], 6)` | `pack` | ambiguous | absent | ? | ? |
-| C1-339 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `_(e,ai.placeholder)` | `_` | ambiguous | absent | ? | ? |
-| C1-340 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readInt()` | `readInt` | unresolved | absent | ? | ? |
-| C1-341 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `this.glyphIDs.push(l.readShort())` | `push` | unresolved | absent | ? | ? |
-| C1-342 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `n.match(/^End(\w+)/)` | `match` | unresolved | absent | ? | ? |
-| C1-343 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:16 | `(function(t){/*! @source http://purl.eligrey.com/github/FileSaver.js/blob/master/FileSa…` | `call` | unresolved | absent | ? | ? |
-| C1-344 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.js`:1189 | `sector_list[minifat_store].data.slice(o.start*MSSZ,o.start*MSSZ+o.size)` | `slice` | unresolved | absent | ? | ? |
-| C1-345 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:2 | `write_num("n",r[1],ff[1])` | `write_num` | unresolved | absent | ? | ? |
-| C1-346 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:6 | `stack.pop()` | `pop` | unresolved | absent | ? | ? |
-| C1-347 | `mockup/www/js/plugins/fullcalendar/moment.min.js`:6 | `vb(this)` | `vb` | unresolved | absent | ? | ? |
-| C1-348 | `mockup/www/js/plugins/ionRangeSlider/ion.rangeSlider.js`:989 | `this.checkDiapason(this.coords.p_single_real, this.options.from_min, this.options.from_…` | `checkDiapason` | unresolved | absent | ? | ? |
-| C1-349 | `mockup/www/js/plugins/ionRangeSlider/ion.rangeSlider.min.js`:50 | `this.callOnChange()` | `callOnChange` | unresolved | absent | ? | ? |
-| C1-350 | `mockup/www/js/plugins/morris/morris.js`:1649 | `$.extend({}, this.defaults, options)` | `extend` | unresolved | absent | ? | ? |
-| C1-351 | `mockup/www/js/plugins/query-builder/query-builder.standalone.min.js`:2747 | `cbRule.call(context, this.rules[i])` | `call` | unresolved | absent | ? | ? |
-| C1-352 | `mockup/www/js/plugins/slimscroll/jquery.slimscroll.min.js`:12 | `e("<div></div>").addClass(a.wrapperClass).css({position:"relative",overflow:"hidden",wi…` | `css` | unresolved | absent | ? | ? |
-| C1-353 | `mockup/www/js/plugins/switchery/switchery.js`:1 | `adv.call(layer,type,callback.hijacked\|\|(callback.hijacked=function(event){if(!event.p…` | `call` | unresolved | absent | ? | ? |
-| C1-354 | `mockup/www/js/plugins/switchery/switchery.js`:1 | `this.needsClick(this.targetElement)` | `needsClick` | unresolved | absent | ? | ? |
-| C1-355 | `mockup/www/js/plugins/typeahead/bloodhound.js`:61 | `$.each(obj, function(key, val) { if (result = test.call(null, val, key, obj)) { return …` | `each` | unresolved | absent | ? | ? |
-| C1-356 | `mockup/www/js/plugins/typeahead/bloodhound.js`:701 | `this.index.reset()` | `reset` | unresolved | absent | ? | ? |
-| C1-357 | `mongo scripts/aiMonitoringScripts/aim-1056-activity-stamp-backfill.js`:165 | `JSON.stringify(batcher.result)` | `stringify` | unresolved | stub | ? | ? |
-| C1-358 | `mongo scripts/aiMonitoringScripts/aim-165-set-custom-fields-on-selectize-options.js`:147 | `db.getCollection(targetCollection).updateOne( { _id: doc._id }, { $set: doc }, { upsert…` | `updateOne` | unresolved | stub | ? | ? |
-| C1-359 | `mongo scripts/aiMonitoringScripts/aim-728-osd12-scrm-category-remap.js`:29 | `print("Migration ID: " + migrationID)` | `print` | unresolved | stub | ? | ? |
-| C1-360 | `mongo scripts/disa/fix_object_ids.js`:44 | `bulk.find({_id : obj_id})` | `find` | unresolved | stub | ? | ? |
-| C1-361 | `mongo scripts/internalTab-migration-initial.js`:749 | `_.each(_.get(selOption, "options", []), (option) => { newStatuses[_.toLower(_.get(optio…` | `each` | unresolved | absent | ? | ? |
-| C1-362 | `mongo scripts/vrm_servicenow_sys_id_fix.js`:278 | `combineResult(bulk[targetCollection].execute(), targetCollection)` | `combineResult` | in-file | in-repo | ? | ? |
-| C1-363 | `playwright-validation/capture-settings-baseline.js`:218 | `Object.values(snap.vocabularies)` | `values` | unresolved | stub | ? | ? |
-| C1-364 | `playwright-validation/deep-grid.js`:29 | `buf.toString("utf8").split("\n") .filter((l) => /(^\|\s)error:\|Exception while\|TypeEr…` | `filter` | unresolved | absent | ? | ? |
-| C1-365 | `playwright-validation/sweep-session.js`:121 | `page.locator(".slick-row").first()` | `first` | unresolved | in-repo | ? | ? |
-| C1-366 | `vendorPortal/client/accounts/accountsTemplates.app-test.js`:76 | `chai.assert.isFalse(routerGo.calledWith("login"), "must not fall back to login on succe…` | `isFalse` | unresolved | absent | ? | ? |
-| C1-367 | `vendorPortal/client/components/boCards/boAttachFileDialog.js`:132 | `_.get(tpl, "data.bo")` | `get` | unresolved | in-repo | ? | ? |
-| C1-368 | `vendorPortal/client/lib/bootstrap-editable/js/bootstrap-editable.js`:1257 | `this.hide()` | `hide` | unresolved | in-repo | ? | ? |
-| C1-369 | `vendorPortal/client/lib/bootstrap-editable/js/bootstrap-editable.js`:5203 | `d.getTimezoneOffset()` | `getTimezoneOffset` | unresolved | stub | ? | ? |
-| C1-370 | `vendorPortal/client/lib/form_utils.js`:170 | `errorCallback(errMsg)` | `errorCallback` | unresolved | stub | ? | ? |
-| C1-371 | `vendorPortal/client/lib/jquery-stickytableheaders/jquery.stickytableheaders.min.js`:1 | `f.css("padding-right")` | `css` | unresolved | absent | ? | ? |
-| C1-372 | `vendorPortal/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:2543 | `c.css( "paddingLeft" )` | `css` | unresolved | stub | ? | ? |
-| C1-373 | `vendorPortal/client/pages/findings/findings.js`:185 | `Meteor.call("boUpdateSeen", _id)` | `call` | unresolved | stub | ? | ? |
-| C1-374 | `vendorPortal/client/plugins/blueimp/jquery.blueimp-gallery.min.js`:1 | `define(["./blueimp-helper","./blueimp-gallery"],a)` | `define` | unresolved | absent | ? | ? |
-| C1-375 | `vendorPortal/client/plugins/d3/d3.min.js`:1 | `Math.cos(w)` | `cos` | unresolved | absent | ? | ? |
-| C1-376 | `vendorPortal/client/plugins/d3/d3.min.js`:1 | `n.point(p[0],p[1])` | `point` | unresolved | absent | ? | ? |
-| C1-377 | `vendorPortal/client/plugins/d3/d3.min.js`:2 | `Su(r=l,u)` | `Su` | in-file | absent | ? | ? |
-| C1-378 | `vendorPortal/client/plugins/d3/d3.min.js`:2 | `o.push(r[1])` | `push` | unresolved | absent | ? | ? |
-| C1-379 | `vendorPortal/client/plugins/d3/d3.min.js`:3 | `t.push(n[e])` | `push` | unresolved | absent | ? | ? |
-| C1-380 | `vendorPortal/client/plugins/d3/d3.min.js`:5 | `q.on("mousemove.brush",null).on("mouseup.brush",null)` | `on` | unresolved | absent | ? | ? |
-| C1-381 | `vendorPortal/client/plugins/slimscroll/jquery.slimscroll.min.js`:719 | `target.addEventListener('wheel', _onWheel, false )` | `addEventListener` | unresolved | absent | ? | ? |
-| C1-382 | `vendorPortal/lib/logger.js`:79 | `transports.push(new winston.transports.File({ level : logLevel, levels : customLevels.l…` | `push` | unresolved | absent | ? | ? |
-| C1-383 | `vendorPortal/packages/keithcoach-bootstrap3-datepicker/lib/js/bootstrap-datepicker.js`:500 | `this._detachEvents()` | `_detachEvents` | unresolved | in-repo | ? | ? |
-| C1-384 | `vendorPortal/packages/matomo-custom/client/matomo.js`:7 | `FlowRouter.current()` | `current` | unresolved | stub | ? | ? |
-| C1-385 | `vendorPortal/packages/meteor-template-extension/lib/template-inherits-hooks-from.js`:16 | `self.onCreated(hook)` | `onCreated` | unresolved | stub | ? | ? |
-| C1-386 | `vendorPortal/public/okta-auth-js.min.js`:8 | `Object.defineProperties(e,Object.getOwnPropertyDescriptors(n))` | `defineProperties` | unresolved | absent | ? | ? |
-| C1-387 | `vendorPortal/public/okta-auth-js.min.js`:8 | `n.n(i)` | `n` | unresolved | absent | ? | ? |
-| C1-388 | `vendorPortal/public/okta-auth-js.min.js`:8 | `Object.getOwnPropertyDescriptor(e,t)` | `getOwnPropertyDescriptor` | unresolved | absent | ? | ? |
-| C1-389 | `vendorPortal/public/okta-auth-js.min.js`:8 | `n(9231)` | `n` | ambiguous | absent | ? | ? |
-| C1-390 | `vendorPortal/server/lib/publish/surveys.js`:456 | `_.get(v, "invited.o.rescindedUser", [])` | `get` | unresolved | in-repo | ? | ? |
+| C1-241 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.min.js`:7 | `this.getCurrentCharStyle(s,u)` | `getCurrentCharStyle` | unresolved | absent | a-repo | T-field: fabric.js prototype method in a vendored bundle |
+| C1-242 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:16132 | `baseAssignValue(result, iteratee(value, key, object), value)` | `baseAssignValue` | in-file | absent | a-repo | T-none: bundled lodash helper in a vendored pdfmake bundle |
+| C1-243 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:42362 | `Array.isArray(_iterator4)` | `isArray` | unresolved | absent | c-platform | Array.isArray built-in |
+| C1-244 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:43843 | `feature('stylisticAlternatives', 'stylisticAltEleven')` | `feature` | in-file | absent | a-repo | T-none: in-file helper of a vendored pdfmake bundle |
+| C1-245 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.js`:66619 | `__webpack_require__(142)` | `__webpack_require__` | in-file | absent | a-repo | T-none: webpack runtime require in a vendored bundle |
+| C1-246 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:2 | `Math.pow(2,8*n-1)` | `pow` | unresolved | absent | c-platform | Math.pow built-in |
+| C1-247 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:5 | `t.replace("\t"," ")` | `replace` | unresolved | absent | c-platform | String.prototype.replace on a string |
+| C1-248 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `new Error("TODO: cmap format 14")` | `Error` | unresolved | absent | c-platform | Error constructor built-in |
+| C1-249 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:26 | `t.slice(c,f+1)` | `slice` | unresolved | absent | c-platform | slice on a built-in array/string value |
+| C1-250 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.js`:10474 | `f.replace(/COM\.MICROSOFT\./g, "")` | `replace` | unresolved | stub | c-platform | String.prototype.replace; receiver used with charCodeAt |
+| C1-251 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:2 | `data.charCodeAt(0)` | `charCodeAt` | unresolved | absent | c-platform | String.prototype.charCodeAt on a string |
+| C1-252 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:2 | `fmt.substr(i,5)` | `substr` | unresolved | absent | c-platform | String.prototype.substr on a format string |
+| C1-253 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/xlsx/xlsx.min.js`:10 | `px2pt(row.hpx)` | `px2pt` | in-file | absent | a-repo | T-none: in-file helper of a vendored xlsx bundle |
+| C1-254 | `app/packages/sylido-meteor-selectize-bootstrap/selectize/dist/js/selectize.min.js`:1 | `e(g[d],c)` | `e` | in-file | absent | a-repo | T-none: minified local of a vendored selectize bundle |
+| C1-255 | `app/server/actionButtons/actionButtons.js`:584 | `_.union(_.get(relatedAggsByType, k, []), val)` | `union` | unresolved | stub | b-lib | lodash union; no lodash source tracked in the app tree |
+| C1-256 | `app/server/campaigns/campaigns.js`:247 | `_.get(auth, "sub._id")` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-257 | `app/server/centralServicesAPI/requestProductUtils.test.js`:176 | `new Error("not-allowed")` | `Error` | unresolved | absent | c-platform | Error constructor built-in |
+| C1-258 | `app/server/fortressAPI/fortressAPI.js`:58 | `_.mapValues(_.get(requestOptions, "headers", {}), (v) => String(v))` | `mapValues` | unresolved | in-repo | b-lib | lodash mapValues; no lodash source tracked in the app tree |
+| C1-259 | `app/server/jsreports/print.js`:174 | `_.get(user, "information.email", "")` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-260 | `app/server/lib/publish/detectedVulnerabilitiesGrid.js`:222 | `__cb(err)` | `__cb` | ambiguous | in-repo | a-repo | T-none: local const callback function in the same block |
+| C1-261 | `app/server/lib/publish/myWatchedItems.js`:122 | `_.get(Meteor, "settings.flags.debug", false)` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-262 | `app/server/lib/publish/surveys.js`:813 | `_.escapeRegExp(query)` | `escapeRegExp` | unresolved | stub | b-lib | lodash escapeRegExp; no lodash source tracked in-tree |
+| C1-263 | `app/server/lib/publish/widgetAggs/vulnByBUoverTimeAgg.js`:37 | `dateMomentUtils.modifiedDate("", "subtract", 6, "months")` | `modifiedDate` | import | stub | a-repo | T-none: default import of a repo date utils module |
+| C1-264 | `app/server/manageScoring/manageScoring.js`:416 | `_.get(oldDoc, "md.id")` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-265 | `app/server/manageUsers/manUsers.js`:430 | `Meteor.users.find({ _id : { $in : tenantUserIds }, "information.vendorPortal" : true, i…` | `find` | unresolved | stub | b-lib | Mongo collection find; Meteor packages are not tracked |
+| C1-266 | `app/server/methods/getBoDescriptions.test.js`:143 | `handler.call({}, ["a", "b"])` | `call` | unresolved | absent | c-platform | Function.prototype.call on a method handler |
+| C1-267 | `app/server/navigation/navigation.test.js`:333 | `expect(boFindOne.mock.calls[0][0])` | `expect` | unresolved | absent | b-lib | jest global expect; jest is not tracked in-tree |
+| C1-268 | `app/server/rolesNotifications/rolesNotifications.js`:88 | `EmailTemplates.find($match, $project)` | `find` | unresolved | in-repo | b-lib | Mongo.Collection find; Meteor packages are not tracked |
+| C1-269 | `app/server/serverRouteApi/serverRouteApi.js`:157 | `logger.error("(/fp-api/runAggsMulti) Missing header parameters.", { nonce, hashAuth })` | `error` | unresolved | in-repo | b-lib | winston logger method; winston is not tracked in-tree |
+| C1-270 | `app/server/surveys/importExport.js`:286 | `_.get(auth, "user._id")` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-271 | `app/server/taxonomy/taxonomy.js`:97 | `taxonomySchema.validate(modifier, { modifier : true })` | `validate` | import | stub | b-lib | SimpleSchema validate; aldeed package not tracked in-tree |
+| C1-272 | `app/server/unitTests/boAutomationRules/boAutomationRules.app-test.js`:96 | `sinon.createSandbox()` | `createSandbox` | import | absent | b-lib | sinon createSandbox; no sinon source or definition in-tree |
+| C1-273 | `app/server/unitTests/cmDashboard/cmDashboardFindingsGrid.app-test.js`:419 | `chai.expect(runChart({ vendorID : "" }))` | `expect` | import | absent | b-lib | chai expect; chai is not tracked in-tree |
+| C1-274 | `app/server/utils/emailUtils.js`:572 | `_.get(val, "email", "")` | `get` | unresolved | stub | b-lib | lodash get; no lodash source tracked in the app tree |
+| C1-275 | `app/server/wfStatsBasic/wfStatsBasic.js`:54 | `getCustomLabel("info.date.due", "Date Due", "assessmentFindings")` | `getCustomLabel` | unresolved | stub | a-repo | T-import: named import from a repo schema module |
+| C1-276 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/bootstrap.js`:190 | `$(element)` | `$` | unresolved | stub | a-repo | T-flow: global $ assigned in the tracked jquery-2.1.1.js |
+| C1-277 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/inspinia.js`:255 | `$('body')` | `$` | unresolved | stub | a-repo | T-flow: global $ assigned in the tracked jquery-2.1.1.js |
+| C1-278 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-2.1.1.js`:3 | `n.now()` | `now` | unresolved | absent | c-platform | jQuery now is bound to the built-in Date.now |
+| C1-279 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:6 | `e("<a>")` | `e` | ambiguous | absent | a-repo | T-flow: minified jQuery param bound to the tracked jQuery |
+| C1-280 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `t.effects.animateClass.call(this,n?{add:s}:{remove:s},a,o,r)` | `call` | unresolved | absent | c-platform | Function.prototype.call on a plugin method |
+| C1-281 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `s.outerHeight()` | `outerHeight` | unresolved | absent | a-repo | T-demand: jQuery outerHeight generated in the tracked jQuery |
+| C1-282 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/jquery-ui-1.10.4.min.js`:7 | `this.helper.offset()` | `offset` | unresolved | absent | a-repo | T-field: jQuery offset in the tracked jquery-2.1.1.js |
+| C1-283 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/chartist/chartist.min.js`:7 | `c.serialize(o.meta)` | `serialize` | unresolved | absent | a-repo | T-field: Chartist core serialize in a vendored bundle |
+| C1-284 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/codemirror.js`:7629 | `getOrder(line)` | `getOrder` | in-file | in-repo | a-repo | T-none: in-file helper of the vendored CodeMirror core |
+| C1-285 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/rst/rst.js`:170 | `stream.match(rx_role_pre, false)` | `match` | unresolved | in-repo | a-repo | T-none: CodeMirror StringStream match in the tracked core |
+| C1-286 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/sparql/sparql.js`:121 | `pushContext(state, "}", stream.column())` | `pushContext` | in-file | in-repo | a-repo | T-none: in-file helper of a vendored CodeMirror mode |
+| C1-287 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/codemirror/mode/xml/xml.js`:133 | `stream.match(/^[^\s\u00a0=<>\"\']*[^\s\u00a0=<>\"\'\/]/)` | `match` | unresolved | in-repo | a-repo | T-none: CodeMirror StringStream match in the tracked core |
+| C1-288 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/cropper/cropper.min.js`:9 | `this.renderImage("zoom")` | `renderImage` | unresolved | absent | a-repo | T-field: cropper plugin method in a vendored bundle |
+| C1-289 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:500 | `_fnCompatMap( init, 'orderDataType', 'sortDataType' )` | `_fnCompatMap` | in-file | in-repo | a-repo | T-none: in-file helper of vendored DataTables |
+| C1-290 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:4217 | `tmpTable.css( 'width', 'auto' )` | `css` | unresolved | in-repo | a-repo | T-none: jQuery css in the tracked jquery-2.1.1.js |
+| C1-291 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/dataTables/jquery.dataTables.js`:14632 | `a.toString()` | `toString` | unresolved | stub | c-platform | Object.prototype.toString on an arbitrary value |
+| C1-292 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/footable/footable.all.min.js`:14 | `t(a.table).unbind(".sorting").bind({"footable_initialized.sorting":function(){var i,o,n…` | `data` | unresolved | absent | a-repo | T-field: jQuery data in the tracked jquery-2.1.1.js |
+| C1-293 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/fullcalendar/fullcalendar.min.js`:6 | `ye(r,t[s],r.forwardSegs)` | `ye` | in-file | absent | a-repo | T-none: minified in-file helper of vendored FullCalendar |
+| C1-294 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/fullcalendar/moment.min.js`:6 | `r(C(a)%60,2)` | `r` | in-file | absent | a-repo | T-none: minified in-file helper of vendored moment |
+| C1-295 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:117 | `b(y,a).closest("table.ui-jqgrid-btable").attr("id")` | `attr` | unresolved | absent | a-repo | T-field: jQuery attr in the tracked jquery-2.1.1.js |
+| C1-296 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:221 | `a(c)` | `a` | ambiguous | absent | a-repo | T-flow: minified jQuery param bound to the tracked jQuery |
+| C1-297 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:332 | `a("#"+v.themodal)` | `a` | ambiguous | absent | a-repo | T-flow: minified jQuery param bound to the tracked jQuery |
+| C1-298 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:411 | `a.isFunction(b.p.beforeSelectRow)` | `isFunction` | unresolved | absent | a-repo | T-field: jQuery isFunction in the tracked jquery-2.1.1.js |
+| C1-299 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:437 | `s("unbind")` | `s` | ambiguous | absent | a-repo | T-flow: minified local of the vendored jqModal plugin |
+| C1-300 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:462 | `f.hasClass(a)` | `hasClass` | unresolved | absent | a-repo | T-field: jQuery hasClass in the tracked jquery-2.1.1.js |
+| C1-301 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jqGrid/jquery.jqGrid.min.js`:517 | `this.toObj(g)` | `toObj` | unresolved | absent | a-repo | T-field: xmlJsonClass method in the vendored jqGrid bundle |
+| C1-302 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:5372 | `rplusequals.exec( value )` | `exec` | unresolved | stub | c-platform | RegExp.prototype.exec on a regex literal |
+| C1-303 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:6413 | `$( this )` | `$` | unresolved | stub | a-repo | T-flow: global $ assigned in the tracked jquery-2.1.1.js |
+| C1-304 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:6605 | `toShow .hide()` | `hide` | unresolved | absent | a-repo | T-field: jQuery hide in the tracked jquery-2.1.1.js |
+| C1-305 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.js`:8129 | `this._updateAlternate(inst)` | `_updateAlternate` | unresolved | in-repo | a-repo | T-none: jQuery UI datepicker method in the same tracked file |
+| C1-306 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:5 | `t(n.containment)` | `t` | in-file | absent | a-repo | T-none: minified jQuery alias in vendored jQuery UI |
+| C1-307 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:8 | `s.removeClass("ui-accordion-header-active ui-state-active")` | `removeClass` | unresolved | absent | a-repo | T-field: jQuery removeClass in the tracked jquery-2.1.1.js |
+| C1-308 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jquery-ui/jquery-ui.min.js`:8 | `this._updateDatepicker(e)` | `_updateDatepicker` | unresolved | absent | a-repo | T-field: jQuery UI datepicker method in the same tracked file |
+| C1-309 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/jsTree/jstree.min.js`:4 | `c.element.find("ul:visible").addBack()` | `addBack` | unresolved | absent | a-repo | T-field: jQuery addBack in the tracked jquery-2.1.1.js |
+| C1-310 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/morris/raphael-2.1.0.min.js`:10 | `bJ(b)` | `bJ` | in-file | absent | a-repo | T-none: minified in-file helper of vendored Raphael |
+| C1-311 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/morris/raphael-2.1.0.min.js`:10 | `b.defs.removeChild(this.gradient)` | `removeChild` | unresolved | absent | c-platform | DOM Node.removeChild on an SVG defs node |
+| C1-312 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/rickshaw/rickshaw.min.js`:2 | `d3.svg.line().x(function(d){return graph.x(d.x)}).y(function(d){return graph.y(d.y)}).i…` | `tension` | unresolved | absent | a-repo | T-flow: d3 line generator tension; d3.v3.js is tracked |
+| C1-313 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/rickshaw/vendor/d3.v3.js`:1 | `u()` | `u` | ambiguous | absent | a-repo | T-flow: minified in-file helper of vendored d3 v3 |
+| C1-314 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/select2/select2.full.min.js`:3 | `d.join(c._valueSeparator)` | `join` | unresolved | absent | c-platform | Array.prototype.join on a values array |
+| C1-315 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/sparkline/jquery.sparkline.min.js`:4 | `e.get("colorMap")` | `get` | unresolved | absent | a-repo | T-field: sparkline internal options get in a vendored bundle |
+| C1-316 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/staps/jquery.steps.min.js`:6 | `h.eq(e)` | `eq` | unresolved | absent | a-repo | T-field: jQuery eq in the tracked jquery-2.1.1.js |
+| C1-317 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/sweetalert/sweetalert.min.js`:1 | `l.addClass(o,"visible")` | `addClass` | unresolved | absent | a-repo | T-field: sweetalert dom utils addClass in a vendored bundle |
+| C1-318 | `mockup/INSPINIA-bootstrap-template/Static_Full_Version/js/plugins/validate/jquery.validate.min.js`:4 | `a(b).rules()` | `rules` | unresolved | absent | a-repo | T-field: jQuery Validate rules method in a vendored bundle |
+| C1-319 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/bootstrap.js`:1812 | `$tip.find('.popover-content')` | `find` | unresolved | stub | a-repo | T-field: jQuery find in the tracked jquery-2.1.1.js |
+| C1-320 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/bootstrap.min.js`:6 | `c.isInStateTrue()` | `isInStateTrue` | unresolved | absent | a-repo | T-field: bootstrap button plugin method in a vendored bundle |
+| C1-321 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/jquery-ui-1.10.4.min.js`:6 | `this.headers.removeClass("ui-accordion-header ui-accordion-header-active ui-helper-rese…` | `removeAttr` | unresolved | absent | a-repo | T-field: jQuery removeAttr in the tracked jquery-2.1.1.js |
+| C1-322 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/jquery-ui-1.10.4.min.js`:7 | `Math.max(0,a.maxHeight-e)` | `max` | unresolved | absent | c-platform | Math.max built-in |
+| C1-323 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/plugins/pace/pace.min.js`:2 | `t(p)` | `t` | unresolved | absent | a-repo | T-flow: minified in-file helper of vendored pace |
+| C1-324 | `mockup/INSPINIA-bootstrap-template/Static_Seed_Project/js/plugins/slimscroll/jquery.slimscroll.min.js`:11 | `b.scrollTop()` | `scrollTop` | unresolved | absent | a-repo | T-demand: jQuery scrollTop generated in the tracked jQuery |
+| C1-325 | `mockup/www/js/bootstrap.min.js`:6 | `a(this)` | `a` | unresolved | absent | a-repo | T-flow: minified jQuery param bound to the tracked jQuery |
+| C1-326 | `mockup/www/js/bootstrap.min.js`:7 | `a(document).on("click.bs.tab.data-api",'[data-toggle="tab"]',e).on("click.bs.tab.data-a…` | `on` | unresolved | absent | a-repo | T-field: jQuery on in the tracked jquery-2.1.1.js |
+| C1-327 | `mockup/www/js/jquery-ui-1.10.4.min.js`:6 | `this.focusable.add(e)` | `add` | unresolved | absent | a-repo | T-field: jQuery add in the tracked jquery-2.1.1.js |
+| C1-328 | `mockup/www/js/jquery-ui-1.10.4.min.js`:6 | `this._hideDatepicker()` | `_hideDatepicker` | unresolved | absent | a-repo | T-field: jQuery UI datepicker method in the same tracked file |
+| C1-329 | `mockup/www/js/jquery-ui-1.10.4.min.js`:7 | `this._trigger("beforeActivate",e,c)` | `_trigger` | unresolved | absent | a-repo | T-field: jQuery UI widget _trigger in the same tracked file |
+| C1-330 | `mockup/www/js/plugins/amcharts/amcharts.js`:359 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | absent | a-repo | T-field: AmCharts applyTheme in the same tracked file |
+| C1-331 | `mockup/www/js/plugins/amcharts/funnel.js`:24 | `q.getBBox()` | `getBBox` | unresolved | absent | a-repo | T-field: AmCharts SVG wrapper getBBox in a tracked file |
+| C1-332 | `mockup/www/js/plugins/amcharts/plugins/animate/animate.js`:288 | `getKeysSliced( chart, keys, seen )` | `getKeysSliced` | in-file | absent | a-repo | T-none: in-file helper of the vendored amcharts animate plugin |
+| C1-333 | `mockup/www/js/plugins/amcharts/plugins/export/export.min.js`:1 | `c.isTainted(a)` | `isTainted` | unresolved | absent | a-repo | T-field: amcharts export plugin method in a vendored bundle |
+| C1-334 | `mockup/www/js/plugins/amcharts/plugins/export/libs/fabric.js/fabric.js`:13929 | `Math.sin(this.endAngle)` | `sin` | unresolved | absent | c-platform | Math.sin built-in |
+| C1-335 | `mockup/www/js/plugins/amcharts/plugins/export/libs/fabric.js/fabric.js`:21986 | `this.fire('editing:exited')` | `fire` | unresolved | absent | a-repo | T-field: fabric Observable fire in a vendored bundle |
+| C1-336 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:779 | `hexWrite(this, string, offset, length)` | `hexWrite` | in-file | absent | a-repo | T-none: in-file buffer shim helper in vendored pdfmake |
+| C1-337 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:12141 | `string.slice(0, trimmedRightIndex(string) + 1)` | `slice` | unresolved | absent | c-platform | String.prototype.slice on a string |
+| C1-338 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.js`:15481 | `pack(ALPHANUMERIC_MAP[data.charAt(i-1)], 6)` | `pack` | ambiguous | absent | a-repo | T-flow: in-file qrcode helper of a vendored pdfmake bundle |
+| C1-339 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `_(e,ai.placeholder)` | `_` | ambiguous | absent | a-repo | T-flow: bundled lodash in a vendored pdfmake bundle |
+| C1-340 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readInt()` | `readInt` | unresolved | absent | a-repo | T-field: internal stream reader of vendored pdfmake |
+| C1-341 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `this.glyphIDs.push(l.readShort())` | `push` | unresolved | absent | c-platform | Array.prototype.push on a glyph id array |
+| C1-342 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `n.match(/^End(\w+)/)` | `match` | unresolved | absent | c-platform | String.prototype.match on a string |
+| C1-343 | `mockup/www/js/plugins/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:16 | `(function(t){/*! @source http://purl.eligrey.com/github/FileSaver.js/blob/master/FileSa…` | `call` | unresolved | absent | c-platform | Function.prototype.call on an IIFE |
+| C1-344 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.js`:1189 | `sector_list[minifat_store].data.slice(o.start*MSSZ,o.start*MSSZ+o.size)` | `slice` | unresolved | absent | c-platform | slice on a sector data buffer/array value |
+| C1-345 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:2 | `write_num("n",r[1],ff[1])` | `write_num` | unresolved | absent | a-repo | T-flow: internal writer of the vendored xlsx bundle |
+| C1-346 | `mockup/www/js/plugins/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:6 | `stack.pop()` | `pop` | unresolved | absent | c-platform | Array.prototype.pop on a stack array |
+| C1-347 | `mockup/www/js/plugins/fullcalendar/moment.min.js`:6 | `vb(this)` | `vb` | unresolved | absent | a-repo | T-flow: minified in-file helper of vendored moment |
+| C1-348 | `mockup/www/js/plugins/ionRangeSlider/ion.rangeSlider.js`:989 | `this.checkDiapason(this.coords.p_single_real, this.options.from_min, this.options.from_…` | `checkDiapason` | unresolved | absent | a-repo | T-field: ion.rangeSlider method in a vendored bundle |
+| C1-349 | `mockup/www/js/plugins/ionRangeSlider/ion.rangeSlider.min.js`:50 | `this.callOnChange()` | `callOnChange` | unresolved | absent | a-repo | T-field: ion.rangeSlider method in a vendored bundle |
+| C1-350 | `mockup/www/js/plugins/morris/morris.js`:1649 | `$.extend({}, this.defaults, options)` | `extend` | unresolved | absent | a-repo | T-field: jQuery extend in the tracked jquery-2.1.1.js |
+| C1-351 | `mockup/www/js/plugins/query-builder/query-builder.standalone.min.js`:2747 | `cbRule.call(context, this.rules[i])` | `call` | unresolved | absent | c-platform | Function.prototype.call on a callback |
+| C1-352 | `mockup/www/js/plugins/slimscroll/jquery.slimscroll.min.js`:12 | `e("<div></div>").addClass(a.wrapperClass).css({position:"relative",overflow:"hidden",wi…` | `css` | unresolved | absent | a-repo | T-field: jQuery css in the tracked jquery-2.1.1.js |
+| C1-353 | `mockup/www/js/plugins/switchery/switchery.js`:1 | `adv.call(layer,type,callback.hijacked\|\|(callback.hijacked=function(event){if(!event.p…` | `call` | unresolved | absent | c-platform | Function.prototype.call on addEventListener |
+| C1-354 | `mockup/www/js/plugins/switchery/switchery.js`:1 | `this.needsClick(this.targetElement)` | `needsClick` | unresolved | absent | a-repo | T-field: bundled fastclick method in vendored switchery |
+| C1-355 | `mockup/www/js/plugins/typeahead/bloodhound.js`:61 | `$.each(obj, function(key, val) { if (result = test.call(null, val, key, obj)) { return …` | `each` | unresolved | absent | a-repo | T-field: jQuery each in the tracked jquery-2.1.1.js |
+| C1-356 | `mockup/www/js/plugins/typeahead/bloodhound.js`:701 | `this.index.reset()` | `reset` | unresolved | absent | a-repo | T-field: bloodhound SearchIndex reset in a vendored bundle |
+| C1-357 | `mongo scripts/aiMonitoringScripts/aim-1056-activity-stamp-backfill.js`:165 | `JSON.stringify(batcher.result)` | `stringify` | unresolved | stub | c-platform | JSON.stringify built-in |
+| C1-358 | `mongo scripts/aiMonitoringScripts/aim-165-set-custom-fields-on-selectize-options.js`:147 | `db.getCollection(targetCollection).updateOne( { _id: doc._id }, { $set: doc }, { upsert…` | `updateOne` | unresolved | stub | c-platform | mongo shell collection updateOne host API |
+| C1-359 | `mongo scripts/aiMonitoringScripts/aim-728-osd12-scrm-category-remap.js`:29 | `print("Migration ID: " + migrationID)` | `print` | unresolved | stub | c-platform | mongo shell print host global |
+| C1-360 | `mongo scripts/disa/fix_object_ids.js`:44 | `bulk.find({_id : obj_id})` | `find` | unresolved | stub | c-platform | mongo shell bulk op find host API |
+| C1-361 | `mongo scripts/internalTab-migration-initial.js`:749 | `_.each(_.get(selOption, "options", []), (option) => { newStatuses[_.toLower(_.get(optio…` | `each` | unresolved | absent | a-repo | T-field: lodash each; the loaded lodash.min.js is tracked |
+| C1-362 | `mongo scripts/vrm_servicenow_sys_id_fix.js`:278 | `combineResult(bulk[targetCollection].execute(), targetCollection)` | `combineResult` | in-file | in-repo | a-repo | T-none: top-level function in the same script file |
+| C1-363 | `playwright-validation/capture-settings-baseline.js`:218 | `Object.values(snap.vocabularies)` | `values` | unresolved | stub | c-platform | Object.values built-in |
+| C1-364 | `playwright-validation/deep-grid.js`:29 | `buf.toString("utf8").split("\n") .filter((l) => /(^\|\s)error:\|Exception while\|TypeEr…` | `filter` | unresolved | absent | c-platform | Array.prototype.filter on a split result |
+| C1-365 | `playwright-validation/sweep-session.js`:121 | `page.locator(".slick-row").first()` | `first` | unresolved | in-repo | b-lib | Playwright Locator first; playwright is not tracked in-tree |
+| C1-366 | `vendorPortal/client/accounts/accountsTemplates.app-test.js`:76 | `chai.assert.isFalse(routerGo.calledWith("login"), "must not fall back to login on succe…` | `isFalse` | unresolved | absent | b-lib | chai assert isFalse; chai is not tracked in-tree |
+| C1-367 | `vendorPortal/client/components/boCards/boAttachFileDialog.js`:132 | `_.get(tpl, "data.bo")` | `get` | unresolved | in-repo | b-lib | lodash get; no lodash source tracked in the client tree |
+| C1-368 | `vendorPortal/client/lib/bootstrap-editable/js/bootstrap-editable.js`:1257 | `this.hide()` | `hide` | unresolved | in-repo | a-repo | T-none: bootstrap-editable method in the same tracked file |
+| C1-369 | `vendorPortal/client/lib/bootstrap-editable/js/bootstrap-editable.js`:5203 | `d.getTimezoneOffset()` | `getTimezoneOffset` | unresolved | stub | c-platform | Date.prototype.getTimezoneOffset on a Date |
+| C1-370 | `vendorPortal/client/lib/form_utils.js`:170 | `errorCallback(errMsg)` | `errorCallback` | unresolved | stub | d-unknown | callback parameter of validateForm invoked |
+| C1-371 | `vendorPortal/client/lib/jquery-stickytableheaders/jquery.stickytableheaders.min.js`:1 | `f.css("padding-right")` | `css` | unresolved | absent | b-lib | jQuery css; no jQuery core tracked under this tree |
+| C1-372 | `vendorPortal/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:2543 | `c.css( "paddingLeft" )` | `css` | unresolved | stub | b-lib | jQuery css; no jQuery core tracked under this tree |
+| C1-373 | `vendorPortal/client/pages/findings/findings.js`:185 | `Meteor.call("boUpdateSeen", _id)` | `call` | unresolved | stub | b-lib | Meteor.call; Meteor packages are not tracked in-tree |
+| C1-374 | `vendorPortal/client/plugins/blueimp/jquery.blueimp-gallery.min.js`:1 | `define(["./blueimp-helper","./blueimp-gallery"],a)` | `define` | unresolved | absent | b-lib | AMD define; no requirejs or almond tracked in-tree |
+| C1-375 | `vendorPortal/client/plugins/d3/d3.min.js`:1 | `Math.cos(w)` | `cos` | unresolved | absent | c-platform | Math.cos built-in |
+| C1-376 | `vendorPortal/client/plugins/d3/d3.min.js`:1 | `n.point(p[0],p[1])` | `point` | unresolved | absent | a-repo | T-field: d3 stream listener point in a vendored bundle |
+| C1-377 | `vendorPortal/client/plugins/d3/d3.min.js`:2 | `Su(r=l,u)` | `Su` | in-file | absent | a-repo | T-none: minified in-file helper of vendored d3 |
+| C1-378 | `vendorPortal/client/plugins/d3/d3.min.js`:2 | `o.push(r[1])` | `push` | unresolved | absent | c-platform | Array.prototype.push on a local array |
+| C1-379 | `vendorPortal/client/plugins/d3/d3.min.js`:3 | `t.push(n[e])` | `push` | unresolved | absent | c-platform | Array.prototype.push on a local array |
+| C1-380 | `vendorPortal/client/plugins/d3/d3.min.js`:5 | `q.on("mousemove.brush",null).on("mouseup.brush",null)` | `on` | unresolved | absent | a-repo | T-field: d3 selection on in a vendored bundle |
+| C1-381 | `vendorPortal/client/plugins/slimscroll/jquery.slimscroll.min.js`:719 | `target.addEventListener('wheel', _onWheel, false )` | `addEventListener` | unresolved | absent | c-platform | DOM addEventListener on a target element |
+| C1-382 | `vendorPortal/lib/logger.js`:79 | `transports.push(new winston.transports.File({ level : logLevel, levels : customLevels.l…` | `push` | unresolved | absent | c-platform | Array.prototype.push on a transports array |
+| C1-383 | `vendorPortal/packages/keithcoach-bootstrap3-datepicker/lib/js/bootstrap-datepicker.js`:500 | `this._detachEvents()` | `_detachEvents` | unresolved | in-repo | a-repo | T-none: bootstrap-datepicker method in the same tracked file |
+| C1-384 | `vendorPortal/packages/matomo-custom/client/matomo.js`:7 | `FlowRouter.current()` | `current` | unresolved | stub | b-lib | FlowRouter; the ostrio package is not tracked in-tree |
+| C1-385 | `vendorPortal/packages/meteor-template-extension/lib/template-inherits-hooks-from.js`:16 | `self.onCreated(hook)` | `onCreated` | unresolved | stub | b-lib | Blaze Template onCreated; Meteor packages not tracked |
+| C1-386 | `vendorPortal/public/okta-auth-js.min.js`:8 | `Object.defineProperties(e,Object.getOwnPropertyDescriptors(n))` | `defineProperties` | unresolved | absent | c-platform | Object.defineProperties built-in |
+| C1-387 | `vendorPortal/public/okta-auth-js.min.js`:8 | `n.n(i)` | `n` | unresolved | absent | a-repo | T-flow: webpack runtime helper in a vendored okta bundle |
+| C1-388 | `vendorPortal/public/okta-auth-js.min.js`:8 | `Object.getOwnPropertyDescriptor(e,t)` | `getOwnPropertyDescriptor` | unresolved | absent | c-platform | Object.getOwnPropertyDescriptor built-in |
+| C1-389 | `vendorPortal/public/okta-auth-js.min.js`:8 | `n(9231)` | `n` | ambiguous | absent | a-repo | T-flow: webpack module require in a vendored okta bundle |
+| C1-390 | `vendorPortal/server/lib/publish/surveys.js`:456 | `_.get(v, "invited.o.rescindedUser", [])` | `get` | unresolved | in-repo | b-lib | lodash get; no lodash source tracked in the app tree |
 
 ### C. Reference repository — Java, Python, TypeScript
 
