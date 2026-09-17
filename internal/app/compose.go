@@ -236,15 +236,13 @@ func (o openOptions) indexing() bool {
 // while a session that is idle between the things it builds -- the server, a
 // watch -- takes it per operation through Hold.
 //
-// It is also what decides the WAIT POLICY, and that is why the policy is not a
-// caller's option. A one-shot indexing command is a person's own foreground
-// command: it waits for as long as whoever holds the workspace keeps getting
-// somewhere, because refusing a command that would have succeeded in a minute
-// is the defect. A session's acquisition is one operation of many -- an
-// agent's tool call with somebody waiting on the answer, or a watch beat that
-// the next beat repeats -- so it tries once and is told the workspace is busy:
-// a retryable answer now beats a tool call held open behind the person's own
-// index, and a skipped beat costs a watch nothing at all.
+// It decides WHEN the lock is taken and nothing else. How patient that
+// acquisition is belongs to the operation, not to the composition, because one
+// process runs both kinds: a watch session's base build is a person waiting at
+// a terminal and waits out a holder that is getting somewhere, while every beat
+// of that same session takes the workspace or is skipped. index.HoldIntent is
+// what says which, and acquire is what turns it into a policy. A one-shot
+// command's open is simply the patient case reached at the open.
 func (o openOptions) locksAtOpen() bool { return o.mode == modeIndex }
 
 // stack is everything a workspace owns below the coordinator. It exists apart
@@ -288,6 +286,12 @@ type stack struct {
 	lockMu    sync.Mutex
 	operation string
 	builds    bool
+	// onWaiting is the caller's waiting line, told about the process holding
+	// the workspace while an acquisition waits for it. It is kept on the stack
+	// because a session's patient acquisition is a later Hold and not the open:
+	// `codectx index --watch` builds its base generation through the
+	// coordinator, so that is where its waiting line has to reach.
+	onWaiting func(snapshot.WaitingHolder)
 	// holders is how many operations are holding the lock right now. The
 	// composition that locks at its open holds one for its whole life; a
 	// session's operations -- a server's refresh, a watch's beat -- take one
@@ -458,7 +462,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, &model.Error{Code: model.CodeInternal,
 			Message: "this workspace takes the indexing lock and was composed without naming its operation"}
 	}
-	s.builds, s.operation = o.indexing(), o.operation
+	s.builds, s.operation, s.onWaiting = o.indexing(), o.operation, o.onWaiting
 	// The run ledger's HANDLE is composed here, before anything takes the
 	// lock, and opens nothing: it is the stable thing the language-server
 	// manager and the coordinator are handed, and its collector attaches under
@@ -483,10 +487,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// holder's stamp may legitimately be, reused here rather than a second
 		// number chosen for waiting. internal/snapshot is handed the probe and
 		// never learns where the evidence comes from.
-		probe, closeProbe := ledgerProgress(s.dataDir)
-		s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, s.operation,
-			snapshot.WaitWhileProgressing(ledger.LiveWindow, probe, o.onWaiting))
-		closeProbe()
+		s.lock, err = s.acquire(ctx, index.HoldPatiently)
 		if err != nil {
 			return nil, err
 		}
@@ -1086,6 +1087,27 @@ func (s *stack) collect(ctx context.Context) {
 		"orphan_sweep", report.OrphanSweepPhrase())
 }
 
+// acquire takes the cross-process workspace lock under the wait policy the
+// operation's intent asks for. It is the ONE place this process turns an
+// intent into a policy, so the open-time acquisition of a one-shot indexing
+// command and the per-operation acquisition of a session cannot drift.
+//
+// A patient acquisition judges the holder by the run ledger beside this cache,
+// through the lockless read-only reader, and its grace is the ledger's own
+// LiveWindow -- this product's existing answer to how long a holder's stamp may
+// legitimately be stale, reused here rather than a second number chosen for
+// waiting. internal/snapshot is handed the probe and never learns where the
+// evidence comes from, and internal/index names only the intent.
+func (s *stack) acquire(ctx context.Context, intent index.HoldIntent) (*snapshot.WorkspaceLock, error) {
+	if intent != index.HoldPatiently {
+		return snapshot.LockWorkspace(ctx, s.dataDir, s.operation, snapshot.TryOnce())
+	}
+	probe, closeProbe := ledgerProgress(s.dataDir)
+	defer closeProbe()
+	return snapshot.LockWorkspace(ctx, s.dataDir, s.operation,
+		snapshot.WaitWhileProgressing(ledger.LiveWindow, probe, s.onWaiting))
+}
+
 // Hold is the stack's index.Locker: it lends the ONE cross-process workspace
 // lock of this process to one operation and hands back the release that gives
 // it up again.
@@ -1113,7 +1135,7 @@ func (s *stack) collect(ctx context.Context) {
 // per open file description, so it is refused CTX_WORKSPACE_BUSY like any
 // other process's -- which is why nesting has to be counted rather than left
 // to each operation to take for itself.
-func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+func (s *stack) Hold(ctx context.Context, intent index.HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
 	if !s.builds {
@@ -1121,14 +1143,14 @@ func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error
 			Message: "this workspace was opened for reading and cannot take the workspace indexing lock"}
 	}
 	if s.lock == nil {
-		// Try once. This acquisition is only ever reached by a composition
-		// that does not lock at its open -- the server and a watch; a one-shot
-		// indexing command already holds the lock from its open, so its holds
-		// only count. An agent asking for a refresh while the person's own
-		// index runs is answered now, with the retryable refusal, rather than
-		// held behind that index, and a watch beat refused here is skipped and
-		// asks again at the next beat.
-		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.operation, snapshot.TryOnce())
+		// This acquisition is only ever reached by a composition that does not
+		// lock at its open -- the server and a watch; a one-shot indexing
+		// command already holds the lock from its open, so its holds only
+		// count and never arrive here. The OPERATION says how patient it is:
+		// the base build of a watch session is a person waiting at a terminal
+		// and waits out a holder that is getting somewhere, while a beat and an
+		// agent's refresh take the workspace now or are told it is busy.
+		lock, err := s.acquire(ctx, intent)
 		if err != nil {
 			return nil, nil, err
 		}

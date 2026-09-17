@@ -274,7 +274,7 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	// acquires nothing a second time. It sits inside the span so a capture
 	// that was refused the workspace is recorded as the failed capture it is,
 	// and the release runs before the span closes.
-	lock, release, err := c.hold(ctx)
+	lock, release, err := c.hold(ctx, HoldNow)
 	if err != nil {
 		return err
 	}

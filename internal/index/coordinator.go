@@ -82,6 +82,34 @@ const domainRepository = "repository-identity-v1"
 // throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
 const maxWorkers = 8
 
+// HoldIntent is how patient the operation taking the workspace is. It is the
+// OPERATION's property and not the composition's, because one process runs
+// both kinds: a watch session's base build is a person waiting at a terminal
+// for the index they just asked for, while every beat of that same session is
+// work the next beat will repeat.
+//
+// It is an intent and not a constructed wait policy because the evidence a
+// waiter judges a holder by -- the run ledger beside the cache -- is the
+// composition root's to open. This package says how patient the operation is;
+// internal/app decides what that means in seconds and where it reads progress.
+type HoldIntent uint8
+
+const (
+	// HoldNow is an operation that must not queue behind another process: it
+	// takes the workspace if it is free and is told CTX_WORKSPACE_BUSY if it
+	// is not. Every watch beat is one, because a beat that blocked would stall
+	// the synchronous delivery of the batches behind it and the next beat
+	// repeats the work anyway; so is an agent's refresh, which is a tool call
+	// with somebody waiting on the answer, and so is every background hold the
+	// deferred sealer takes.
+	HoldNow HoldIntent = iota
+	// HoldPatiently is a build a person asked for and is waiting on. It waits
+	// for as long as whoever holds the workspace keeps getting somewhere,
+	// because refusing a command that would have succeeded in a minute is the
+	// defect; a holder that has stopped making progress is still refused.
+	HoldPatiently
+)
+
 // Locker is where a coordinator gets the cross-process workspace lock of
 // Sections 12.3 and 13.2.
 //
@@ -90,12 +118,15 @@ const maxWorkers = 8
 // including the one where the operation failed partway. Holds NEST: the
 // composition root hands out one lock for the process and releases it when the
 // last holder has, so a capture inside a refresh, or a refresh inside a watch,
-// takes no second lock and cannot release one another still needs.
+// takes no second lock and cannot release one another still needs. The intent
+// is read only by the acquisition that actually takes the lock; a nested hold
+// is a counted increment on one this process already has, so it cannot wait
+// and its intent is immaterial.
 //
 // A workspace another process is indexing is reported as the typed, retryable
 // CTX_WORKSPACE_BUSY snapshot.LockWorkspace produces, and nothing is held.
 type Locker interface {
-	Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error)
+	Hold(ctx context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error)
 }
 
 // Options are the coordinator's dependencies. Every field except Lock,
@@ -360,11 +391,15 @@ func (c *Coordinator) buildable() error {
 // about to build and gives it back when that beat ends, by whichever path --
 // so a watching session that is between beats owns nothing at all and a beat
 // that cannot have the workspace is skipped rather than ending the session.
-func (c *Coordinator) hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+//
+// The intent is each caller's: Index is the one build a person is waiting on,
+// and everything else here is work that is repeated, backgrounded or answered
+// to an agent.
+func (c *Coordinator) hold(ctx context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	if err := c.buildable(); err != nil {
 		return nil, nil, err
 	}
-	return c.opts.Lock.Hold(ctx)
+	return c.opts.Lock.Hold(ctx, intent)
 }
 
 // Repository is the identity this coordinator derived for the workspace root.
@@ -389,7 +424,11 @@ func (c *Coordinator) Close() error {
 // deleted the store it was handed would be destroying state its caller still
 // owns.
 func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
-	_, release, err := c.hold(ctx)
+	// The one build in this package a person is waiting on: `codectx index`,
+	// with or without --watch, and nothing else reaches here. A watch session's
+	// base build therefore waits out a holder that is getting somewhere, while
+	// every beat of that same session below takes the workspace or is skipped.
+	_, release, err := c.hold(ctx, HoldPatiently)
 	if err != nil {
 		return model.IndexResult{}, err
 	}
@@ -414,7 +453,11 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 // notification that named the wrong file, or named none at all, changes what
 // this run costs and never what it concludes (Section 13.2).
 func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexResult, error) {
-	_, release, err := c.hold(ctx)
+	// An agent's refresh tool call, or the nested hold of a beat that already
+	// took the workspace above. Neither waits: the first is answered now with
+	// the retryable refusal, and the second cannot wait because the process
+	// already holds what it is asking for.
+	_, release, err := c.hold(ctx, HoldNow)
 	if err != nil {
 		return model.IndexResult{}, err
 	}
@@ -606,7 +649,7 @@ func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(m
 	// nothing, so the person's own `codectx index` runs beside it. A workspace
 	// another process is building in is not this beat's failure -- the beat is
 	// skipped, the next one asks again, and the session keeps running.
-	_, release, err := c.hold(ctx)
+	_, release, err := c.hold(ctx, HoldNow)
 	if err != nil {
 		c.skipped(ctx, err)
 		return model.IndexResult{}, false

@@ -65,13 +65,12 @@ type OpenOptions struct {
 	// ends. It is how a command says what it is behind instead of going
 	// silent, and it changes nothing about how long the open waits.
 	//
-	// There is nothing here to choose how long that is, and only the opens
-	// that take the lock at their open -- OpenWorkspace -- read it at all. A
-	// one-shot indexing open waits for as long as the holder keeps making
-	// progress; a session's build (a server's refresh, a watch's beat) takes
-	// the lock later and tries once, so it never waits and has nothing to
-	// report. Both are properties of what the composition IS, so neither is a
-	// field a caller could set wrongly.
+	// There is nothing here to choose how long that is. A build the person
+	// asked for waits for as long as the holder keeps making progress; a beat
+	// and an agent's refresh take the workspace or are told it is busy. That
+	// is the OPERATION's property (index.HoldIntent), not a field a caller
+	// could set wrongly -- this one only says where to report the wait, and
+	// goes unread by an open whose operations never wait.
 	OnWaiting func(WaitingHolder)
 	// Rebuild opens an explicitly requested new cache beside the configured
 	// one and leaves the existing database untouched (Section 12.2).
@@ -121,11 +120,15 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 // lock through the coordinator and gives it back when that beat ends, so a
 // watch that is between beats owns nothing and the person's own `codectx
 // index` beside it runs. A beat that finds the workspace busy is skipped and
-// the session keeps running. OpenOptions.OnWaiting is not read here: nothing
-// in this composition waits at its open.
+// the session keeps running.
+//
+// Nothing waits at this open, but OpenOptions.OnWaiting is still carried: the
+// base generation of `codectx index --watch` is built through the coordinator,
+// and that build is a person waiting at a terminal, so it waits out a holder
+// that is getting somewhere and reports what it is behind while it does.
 func OpenWorkspaceForWatch(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeWatch, operation: o.Operation, rebuild: o.Rebuild,
-		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
+	return open(ctx, repo, openOptions{mode: modeWatch, operation: o.Operation, onWaiting: o.OnWaiting,
+		rebuild: o.Rebuild, scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
 // OpenWorkspaceForServer composes the workspace for the one process that both
