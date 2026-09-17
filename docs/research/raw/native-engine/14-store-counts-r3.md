@@ -56,9 +56,12 @@ GROUP BY 1,2,3,4 ORDER BY 1,2,5 DESC;
 | ambiguous (`candidates` 2…67+) | 20,046 | 10,419 |
 | **total `calls`, precision=`syntax`** | **555,588** | **363,750** |
 
-Resolved = 75,751 sites (**13.6%**). Unresolved + ambiguous = 479,837 (**86.4%**). Ambiguous candidate
-sets are a separate kind: `may_refer_to` / detail `ambiguous call target` = **179,626 sites /
-92,598 edges** (≈8.96 candidates per ambiguous site).
+Resolved = 75,751 sites (**13.6%**) *as the store labels them* — but that is **two states, not one**:
+60,734 `in-file` (**10.9%**), which the sample finds sound, plus 15,017 `import` (2.7%), which matches
+the callee's base name against an import statement and mostly does **not** reach a definition.
+Corrected, the tier resolves about **12.4%** — C4 and C6 below. Unresolved + ambiguous = 479,837
+(**86.4%**). Ambiguous candidate sets are a separate kind: `may_refer_to` / detail
+`ambiguous call target` = **179,626 sites / 92,598 edges** (≈8.96 candidates per ambiguous site).
 
 By language (`snapshot_files.language`): javascript 3,748 files / **526,393 sites** (434,432 unres /
 60,346 local / 11,569 import / 20,046 ambig); java 210 / 26,416 (22,984 / 129 / 3,303 / 0); python
@@ -115,7 +118,8 @@ precise unit. `provider_runs` has one `provider_id='dependence'` row with `statu
 `partial`) carries
 `details_json={"scope_key":"pkg:java:QA/SeleniumWebdriver/TestngExtentFramework","units_failed":"1"}`.
 **There is no Java precise unit anywhere in either store.**
-**Correction 3 (a method gap AND a product observability defect):** the nine unavailable precise units
+**Correction 3 (a method gap AND a product observability defect; it reproduces on a second store —
+C5):** the nine unavailable precise units
 leave **no trace at all** — no `units` row, no `provider_runs` row, and `generation_capabilities` is
 keyed at `scope_key='workspace'` only, with `details_json={}` for scip. The "9 of 10 failed
 `CTX_PROVIDER_UNAVAILABLE` with 0 records" claim is **not checkable against the store**; it can only
@@ -158,7 +162,8 @@ happens to be almost as dense as JavaScript (140 sites/file).
 
 **Range:** restricting to profiles whose build file actually exists → (645 + 26,416)/555,588 =
 **4.87%**; admitting every language-plausible profile → **5.25%**. **A perfect SCIP run over this
-repository reaches roughly one call site in twenty.**
+repository reaches roughly one call site in twenty** — which is a property of *this repository's*
+configuration, not of the precise tier (C3).
 
 ## Q5 — where coverage is lost under SCIP + LSP
 
@@ -175,6 +180,10 @@ repository reaches roughly one call site in twenty.**
 | scip-java | 0.13.1 | **absent (0)** | absent | absent | yes |
 | scip-clang | 0.4.0 | **0** | 0 | 0 | no |
 
+**The `scip-java` row is a property of that fixture, not of the indexer (C1).** Re-run on a
+Maven-layout fixture through the product's own argv, scip-java 0.13.1 joins **6 of 6** Java call sites
+at compiler precision.
+
 **No indexer emits WriteAccess (0x4)** — `counter = …` is ReadAccess or 0 in all six, so SCIP role bits
 cannot back `reads`/`writes`. **Call edges are not derivable from occurrences**: roles are identical
 for `helper(counter)` and `f = helper`, so no indexer distinguishes a call site from a non-call
@@ -187,18 +196,22 @@ Structural gaps, with store support:
    all**. The only candidate indexer is scip-typescript, which measured **0 roles on the call site**,
    and the repo has **no `tsconfig.json` at all**. Meteor global-namespace and template-helper dispatch
    is not type-checkable without tsconfig + node_modules.
-2. **Java.** 223 files / **26,416 call sites**. `pom.xml` exists and scip-java would run, but scip-java
-   produced **no occurrence at all** at the call site — even a clean run yields nothing to join a call
-   edge to. In both stores Java also has zero engine edges (the dependence java unit failed), so all
-   26,416 sites are syntax-only today.
+2. **Java.** 223 files / **26,416 call sites**. `pom.xml` exists and scip-java would run; **no Java
+   precise unit ran in either store** (Q3). The earlier reading of this row — that scip-java produces
+   no occurrence at a call site and a clean run would yield nothing to join to — is **wrong** (C1): on
+   a Maven-layout fixture, through the product's own argv, scip-java 0.13.1 joins **6 of 6** Java call
+   sites at compiler precision. In both stores Java also has zero engine edges (the dependence java
+   unit failed), so all 26,416 sites are syntax-only today — for want of a unit, not of an indexer.
 3. **Dynamic/templating languages with no indexer and no grammar.** From the extension histogram over
    the 5,066 files with `snapshot_files.language=''`: **247 `.robot` + 156 `.resource`** (Robot
    Framework test logic) and **546 `.jade`** Blaze templates that call helpers. 0 call sites recorded
    today; SCIP adds none.
 4. **Call-through-a-value — the largest gap, and the store sizes it.** **459,791 of 555,588 call sites
    (82.8%)** carry `{"candidates":0,"resolution":"unresolved"}` — the callee is a member access or a
-   value (`.map`, `.then`, `.filter`, `.click`). Doc 08's conclusion 1 means SCIP cannot help: there is
-   no name-bearing occurrence to resolve. A further 20,046 sites (3.6%) are `ambiguous` with 179,626
+   value (`.map`, `.then`, `.filter`, `.click`). Doc 08's conclusion 1 is about the call *edge*, which
+   occurrence roles cannot carry; read as "SCIP cannot help" it is **wrong at scale** (C2). On a second
+   corpus **79,154 of 95,780 syntax-unresolved call sites (82.6%)** do carry a compiler-precision
+   occurrence at the callee identifier. A further 20,046 sites (3.6%) are `ambiguous` with 179,626
    candidate edges.
 5. **C/C++ macro call sites and Go build-tag-excluded files** are real structural gaps but carry **zero
    numeric weight in this repo** — `snapshot_files` has no c/cpp/go/rust rows. Doc 08 supports them
@@ -207,6 +220,67 @@ Structural gaps, with store support:
 6. **Kinds SCIP has no representation for at all**, lost outright: `control_depends_on` 101,814 sites /
    59,850 edges and `data_flows_to` 1,983,374 / 1,060,579 (r3-3 gen 3), plus `reads` 218,827/108,540
    and `writes` 153,194/129,751 that the WriteAccess finding rules out.
+
+## Corrections this record takes from `20-call-ceiling-sample.md`
+
+That file measures the denominator this one never had — the share of call sites whose callee is
+**defined in a file the repository tracks** — over a seeded, language-stratified hand sample of this
+store and a second one (460 rows and 204 rows, classified from the source at each byte range in a
+read-only clone at the snapshot's own commit), plus one product run on a nine-language fixture with
+every pinned indexer installed and invoked through the product's own argv. Nothing below was measured
+by running anything against *this* repository; both stores here are still read-only. Numbered C1–C6 so
+as not to collide with Q3's Corrections 1–3.
+
+**C1 — Q5.2's "scip-java produced no occurrence at all at the call site" is wrong.** That was doc 08's
+one-file fixture. Run through the product's own argv on a Maven-layout fixture, **scip-java 0.13.1
+joins 6 of 6 Java call sites at compiler precision**, 1 of them to a definition the fixture holds. The
+Q5 table records what doc 08's fixture produced and is not corrected as a measurement; what is wrong is
+the inference drawn from it. Java's 26,416 sites here are syntax-only because **no Java precise unit
+ran** (Q3), not because a run would have yielded nothing to join to.
+
+**C2 — Q5.4's "SCIP cannot help" with call-through-a-value is wrong at scale.** What survives is the
+narrow claim, and it survives intact: a call *edge* is not derivable from occurrence roles, so the call
+**site** must come from tree-sitter's `@call.name` range. The *join* onto that range works precisely on
+these sites — on a second corpus, **79,154 of 95,780 syntax-unresolved call sites (82.6%) carry a
+compiler-precision occurrence at the callee identifier**. The 459,791 unresolved sites counted in Q1
+are unresolved because no precise unit covers their files, not because there is nothing there to
+resolve them with.
+
+**C3 — Q4's "a perfect SCIP run over this repository reaches roughly one call site in twenty" is a
+property of this repository's configuration, not of the precise tier.** The same call-site join covers
+**112,554 of 135,714 call sites (82.9%)** on a corpus whose majority language carries a project file —
+**91.5%** of that language's own sites — and **41 of 45** on the nine-language fixture, including **23
+of the 23** whose callee the fixture defines. 4.87–5.25% is what a missing `tsconfig.json` costs across
+94.75% of *this* repository's call sites (Q5.1). It is not a ceiling any other repository inherits, and
+it must not be quoted as one.
+
+**C4 — the syntax tier publishes two resolved states and only one of them is a resolution.** Checked by
+hand against the source at the byte range: `in-file` is sound in **52 of 52** sampled rows across both
+corpora — the tier really did find the definition in the same file. `import` does not reach a
+definition; it matches the callee's **base name** against an import statement, so `import re`, `import
+org.testng.Assert`, `from httpx import Response`, `import typer` and `React.memo` all publish
+`resolution: import` while **no definition of that name exists in any tracked file**. It is therefore
+right only when the import happens to name a module the repository itself holds — sampled, **9 times
+in 16** on this repository and **9 times in 38** on the second corpus. Corrected for
+that soundness rate the tier resolves about **12.4%** of this repository's call sites and about
+**21.8%** of the second corpus's.
+
+**C5 — Q3's Correction 3 is not a property of this store.** The per-scope observability gap reproduces
+on the second store: its `scip` capabilities are `fresh` with empty `details_json` while only one of
+several eligible profiles produced a unit, and every profile that did not run leaves **no `units` row,
+no `provider_runs` row and no per-scope `generation_capabilities` row**. Two stores, two corpora, the
+same hole — it is a product defect rather than a corpus accident, and the remedy Correction 3 names (a
+per-scope capability row, or a `provider_runs` row for unavailable providers) stands unchanged.
+
+**C6 — Q1's "Resolved = 75,751 sites (13.6%)" is therefore two figures reported as one.** 60,734 of
+them (**10.9%**) are `in-file` and sound; 15,017 (2.7%) are `import` and mostly not resolutions at all.
+The edge column splits the same way: 40,773 `in-file` to 10,239 `import`. Every document that cites
+this record took 13.6% as a single resolved bucket, and that is the figure that propagated. Read the
+row as **10.9% sound, about 12.4% corrected, 13.6% as the store labels it**; Q1 above is annotated
+accordingly. The per-language breakdown in Q1 carries the same split and the same caveat — javascript
+60,346 local against 11,569 import, java 129 against 3,303, python 208 against 129, typescript 51
+against 16 — and Java's row is where it bites hardest, since 3,303 of its 3,432 syntax-resolved sites
+are `import`.
 
 ## Figures that could not be obtained
 

@@ -11,10 +11,12 @@ to `v4.0.100`, which docs 04 and 05 cited and which is 527 patch releases behind
 load-bearing: one of doc 05's two structural findings does not survive the re-check. The engine was
 cloned shallow outside the product tree; that clone is the one download this research made. Nothing was
 built and the engine was never run. Store figures come from `sqlite3 -readonly` on two real run
-artifacts on this host, and the reference implementations behind §7.2 were read as source in the local
-Go module cache, never resolved, built or benchmarked. Raw evidence, including each
-sub-investigation's complete findings, is in the files `00`–`19` under `raw/native-engine/`, cited by
-name throughout.
+artifacts on this host; §6's denominator and ceiling come additionally from a seeded hand sample of
+those two stores and from one product run on a polyglot fixture — never on a repository; and the
+reference implementations behind §7.2 were read as source in the local Go module cache, never
+resolved, built or benchmarked. Raw evidence, including
+each sub-investigation's complete findings, is in the files `00`–`20` under `raw/native-engine/`,
+cited by name throughout.
 
 **Standing under the direction ruling.** `00-synthesis.md` §8 (2026-09-13, user-adopted) makes
 engine-backed `dependence` the MVP backend and names the pinned benchmark corpora as the differential
@@ -42,14 +44,30 @@ Five findings decide the shape, and none of them is a line count.
    Java (`05-file-locality.md`). Subdividing a project keeps CDG 99.7% and REACHING_DEF 99.9% while
    resolved calls collapse to 46% (`03-parity-and-oracle.md`). The intraprocedural families are
    per-function; `calls` needs a project scope.
-3. **`calls` is not replaceable by precise indexers plus language servers on the repository that
-   motivated the question.** Had every planned precise unit run on r3, precise resolution would cover
-   **4.87–5.25%** of its call sites (`14-store-counts-r3.md`). So `calls` cannot be left to the
-   precise tier — which is exactly why it must be **ported**, not left on the engine indefinitely.
-4. **The target is much smaller than the engine's call graph looks.** Of the engine's 217,881 call
-   sites on r3, only **40,743 (18.7%), and 27,897 of 115,940 edges (24.1%), resolve to an in-repo
-   definition**; the other 177,138 point at external stubs and reproduce no capability. Every `calls`
-   gate in this plan is stated on the in-repo-resolved subset (`15-requirements-audit.md`).
+3. **`calls` is not replaceable by precise indexers plus language servers on an *unconfigured*
+   repository — and that qualifier is the finding.** Had every planned precise unit run on the
+   reference repository, precise resolution would cover **4.87–5.25%** of its 555,588 call sites,
+   **every one of them counted, library and platform calls included** (`14-store-counts-r3.md`). That
+   is a property of **that repository's configuration**, not of the precise tier: its majority
+   language, 94.8% of its call sites, carries no project configuration anywhere in the tree, so no
+   profile is planned for it. On a second corpus whose majority language does carry one, the same
+   call-site join covers **112,554 of 135,714 call sites (82.9%)** and **91.5%** of that language's
+   own; on a nine-language fixture with every project configured it covers **41 of 45**, and **23 of
+   the 23** whose callee the fixture defines (§6). So `calls` must be **ported** for the unconfigured
+   class — which is what keeps it off the engine indefinitely — while on a configured one the
+   call-site join, with the index-time inference of §7.2 behind it, already carries it.
+4. **The target is much smaller than the engine's call graph looks — and that percentage divides by
+   the wrong thing.** Of the engine's 217,881 call sites on the reference repository, only **40,743
+   (18.7%), and 27,897 of 115,940 edges (24.1%), resolve to an in-repo definition**; the other 177,138
+   point at external stubs and reproduce no capability (`15-requirements-audit.md`). But 18.7% counts
+   **every** call site, including the ones whose callee is a library, the platform or the language
+   runtime, for which "no in-repo definition" is the correct answer and not a miss. The honest
+   denominator — call sites whose callee is defined in a file the repository tracks — is **49.92%
+   [44.42, 55.33]** of that repository's sites and **42.81% [42.04, 43.57]** of a second corpus's
+   configured language, so 18.7% divides by roughly twice the honest number; against it the three
+   producers together resolve **28.60%** and **94.26%** respectively (§6,
+   `20-call-ceiling-sample.md`). Every `calls` gate in this plan is stated on the in-repo-resolved
+   subset, per repository class, against that denominator.
 5. **Four of the six frontends get no type recovery at all**, verified in the generator drivers at the
    tag: C/C++, Go and Rust never override post-processing, and Java's override is gated on a flag the
    product never passes (`16-passes-callgraph-and-types.md` §B2). For those four the engine's `calls`
@@ -336,12 +354,14 @@ four measured gaps already are.
 
 ---
 
-## 6. `calls` without the engine: measured, on the repository that raised the question
+## 6. `calls` without the engine: measured per repository class, against the honest denominator
 
 `14-store-counts-r3.md` answers this from two real stores, every figure scoped through the active
-generation (3 in both) and its unit set.
+generation (3 in both) and its unit set. `20-call-ceiling-sample.md` re-states it against the
+denominator nobody had measured, from a seeded hand sample of both stores and one product run on a
+nine-language fixture.
 
-| r3-3, generation 3 | sites | edges |
+| the reference repository, at its active generation | sites | edges |
 |---|---|---|
 | tree-sitter `calls`, `syntax` precision | **555,588** | 363,750 |
 | …resolved, in-file or via import | 75,751 (13.6%) | 51,012 |
@@ -351,44 +371,194 @@ generation (3 in both) and its unit set.
 | …**resolved to an in-repo definition** | 40,743 (18.7%) | 27,897 (24.1%) |
 | …to an external/library stub | 177,138 | 88,043 |
 
+Two things are wrong with reading that table as a capability statement. **Every percentage in it
+divides by every call site**, including the ones whose callee is a library, the platform or the
+language runtime, for which "no in-repo definition" is the correct answer and not a miss. And the
+13.6% row over-claims its numerator: the syntax tier's `in-file` state is sound in **52 of 52**
+sampled rows, but its `import` state matches the callee's base name against an import statement
+rather than reaching a definition, and is right **9 times in 16** on this repository and **9 times in
+38** on a second corpus — `import re`, `from httpx import Response` and `React.memo` all publish
+`resolution: import` while no definition of that name exists in any tracked file. Corrected for that,
+the tier resolves about **12.4%** of this repository's call sites rather than 13.6%, and about
+**21.8%** of the second corpus's rather than 29.1%.
+
 The one precise unit that ran was **`profile:scip-python:QA/RobotTests`** — 17 Python files, 24.3 s,
 1,099 `references` and **zero `calls` of any kind**, covering 645 of the repository's 555,588 call
 sites (0.116%). Three claims in the program ledger are corrected by the store: that unit was scip-python, not
 one of ten TypeScript units; the `CTX_PROVIDER_OUTPUT_INVALID` belongs to the **dependence** provider,
 not a precise one; and **no Java precise unit exists in either store**.
 
-**Projection.** Had every planned precise unit run, precise resolution would cover **4.87–5.25%** of
-r3's call sites. The assumption — call sites uniformly distributed across the files of a language — is
-stated and then *replaced by measurement*: uniform-by-files gives 4.85%, actual per-project call-site
-density gives 5.25%, and they agree only because Java at 126 sites/file happens to be nearly as dense
-as JavaScript at 140.
+**The honest denominator.** A call site whose callee is **defined in a file the repository tracks** is
+the only kind a linker can be asked to resolve, and a vendored or bundled dependency's own source
+counts, because the producers resolve into those files. Measured by hand from the source at each byte
+range in a read-only clone at the snapshot's own commit — 460 seeded rows on the reference repository,
+204 on a second corpus, stratified estimator, 4,000-draw bootstrap intervals — and counted from the
+compiler index rather than judged wherever one covers the site:
 
-**Where coverage is lost, with weights:**
+| corpus / class | in-repo-targeted share of call sites | 95% interval | in sites |
+|---|---|---|---|
+| the reference repository — **class (b)**, no project configuration for its majority language | **49.92%** | 44.42 – 55.33 | ≈ 277,300 of 555,588 |
+| a second corpus, all languages | 40.88% | 39.62 – 42.22 | ≈ 55,500 of 135,714 |
+| …its configured language — **class (a)** | **42.81%** | 42.04 – 43.57 | ≈ 52,700 of 123,029 |
+| …its unconfigured languages — class (b) | 22.15% | 11.38 – 34.39 | ≈ 2,800 of 12,685 |
+
+Per language on the reference repository: javascript 49.67% [44.05, 55.29], java 58.89% [48.56,
+68.49], python 13.33% [6.26, 26.18], typescript 12.00% [4.17, 29.96]. **So 18.7% divides by a
+denominator roughly twice the honest one**, and every `calls` gate in §7.8 is stated against the
+honest one, per repository class.
+
+**What the producers resolve against it.**
+
+| resolved by | class (b) — the reference repository | class (a) — the second corpus's configured language |
+|---|---|---|
+| syntax tier | **22.85%** [16.70, 29.56] | 25.48% |
+| engine | **10.89%** [6.31, 15.88] | 23.83% |
+| precise join | **0.00%** (one profile ran, over 17 files) | **91.70%** [90.16, 93.40] |
+| **union of the three** | **28.60%** [21.98, 35.48] | **94.26%** [92.75, 95.75] |
+
+The class-(a) union decomposes as **91.70 pp from the precise join**, 0.91 pp from the syntax tier's
+sound `in-file` state and **1.31 pp from its `import` state**, which the same sample measures at 9 of
+38 — so the defensible floor for what is resolved *today* on that class is **92.61%**: below the
+target §7.8 sets, and below it by more than the inference is worth guessing about.
+
+Counted over the whole population rather than estimated, the same producers resolve, on the reference
+repository, 75,751 sites by the syntax tier (13.63%), **38,779 by the engine (6.98%)**, 458 by the
+precise tier (0.08%) and **98,081 in union (17.65%)**, 16,449 of them by both syntax and engine. That
+38,779 is a *different instrument* from the 40,743 in the table above and not a retraction of it: it
+counts engine `calls` sites matched onto a tree-sitter site at the same byte range, or an overlapping
+range with the same callee name, and a site the engine lowered to a different range is missed — so it
+is a lower bound on the engine. On the second corpus the same counts are syntax 39,526 (29.12%),
+engine 24,385 (17.97%), precise 48,302 (35.59%), **union 64,599 (47.60%)**. The population union of
+17.65% against the 49.92% denominator is 35.4%, above the sample's 28.60%, because the sample
+**withdraws the numerator's own false positives** — the `import` state corrected above.
+
+Of the second corpus's **48,302 compiler-confirmed in-repo-targeted** Python call sites — the honest
+denominator *counted* rather than sampled, which is why it sits a little below the ≈52,700 the
+estimator gives for the same language — the syntax tier resolves 52.23%, the engine 43.85%, their
+union 57.02% and the precise join **100%**. Read the two corpora together and the shape is already
+visible: **without a precise index the two non-precise producers reach about three in five of the
+calls that have an in-repo target at all; with one they reach all of them.** The unconfigured corpus
+is worse than that because its majority language has no profile, not because its calls are harder.
+
+**The precise tier, measured where it is configured.** On the second corpus the call-site join covers
+**112,554 of 135,714 call sites (82.9%)** and **91.5%** of that corpus's own Python sites; of the
+joined, 48,302 have a callee defined in the repository and 64,252 do not, and the 23,160 unjoined are
+15,069 in files no indexer covered and 8,091 in files it did index. The second number is the one that
+matters for a gate: **all 90 sampled rows from indexed files are attribute calls whose receiver the
+indexer could not type**, and 25 of the 38 that do target a repository definition need class-hierarchy
+analysis through a declared repository type. And on the nine-language fixture, run through the
+product's own argv with every pinned analyzer installed (`tools status`: 14 entries, 14 installed) and
+the dependence provider disabled:
+
+| fixture project | call sites | joined at compiler precision | joined **and** callee defined in the fixture |
+|---|---|---|---|
+| `c` (a compilation database) | 9 | 8 | 4 |
+| `go` (a module) | 6 | 5 | 3 |
+| `java` (a Maven layout) | 6 | 6 | 1 |
+| `js` (**package.json only, no compiler configuration**) | 2 | 2 | 2 |
+| `py` (a project file) | 4 | 4 | 3 |
+| `rust` (a crate) | 6 | 6 | 2 |
+| `ts` (a tsconfig) | 12 | 10 | 8 |
+| **all nine advertised languages** | **45** | **41 (91.1%)** | **23 of 23 — 100%** |
+
+The four unjoined sites are few enough to name: `static_cast` in the C++ file (a keyword operator the
+grammar records as a call), Go's `len`, and `require` and `path.join` in a JavaScript file. **None of
+them targets a definition in the fixture.** That fixture is the case where the environment is
+complete — the upper end of class (a), not its typical member.
+
+**Projection, and what it is a property of.** Had every planned precise unit run on the reference
+repository, precise resolution would cover **4.87–5.25%** of its call sites. The assumption — call
+sites uniformly distributed across the files of a language — is stated and then *replaced by
+measurement*: uniform-by-files gives 4.85%, actual per-project call-site density gives 5.25%, and they
+agree only because Java at 126 sites/file happens to be nearly as dense as JavaScript at 140. What
+that figure is **not** is a property of the precise tier. It is a property of **this repository's
+configuration**: its majority language, 94.8% of its call sites, has no `tsconfig.json` anywhere in
+the tree, so no profile is planned for it and the precise column above is 0.00% by configuration
+rather than by capability. The same tier reaches 82.9% of call sites on a corpus whose majority
+language carries a project file, and 41 of 45 on the fixture.
+
+**And this repository is not a hard case — it is an unconfigured, half-vendored one.** Both properties
+are measured and neither is a property of its calls. Unconfigured, as above. Half-vendored: its
+dependencies are committed to the tree, **128,205 of its call sites are in one bundled front-end
+template alone**, and most of the sample's in-repo-targeted rows are bundle-internal calls. That is
+why its honest denominator is as high as 49.92% while only about a twentieth of its calls are its own
+team's code calling its own team's code. **A reader must not carry 49.92% to a repository that
+installs its dependencies instead of committing them.** The denominator is a property of a repository;
+the **shares against it** are the transferable quantity, and §7.8's targets are set on the shares.
+
+**Where coverage is lost on this repository, with weights:**
 
 1. **JavaScript is 94.75% of all call sites** (526,393 across 3,748 files) and the repository has **no
-   `tsconfig.json` anywhere**. scip-typescript measured **0 roles on a call site** (doc 08).
-2. **Java**: 26,416 sites, a `pom.xml` exists, and scip-java still emits **no occurrence at all** at a
-   call site. Its engine unit also failed, so all 26,416 are syntax-only today.
-3. **Call through a value: 82.8% of all sites.** The callee is a member access or a value (`.map`,
-   `.then`, `.click`). There is no name-bearing occurrence for SCIP to resolve.
+   `tsconfig.json` anywhere**, so no precise profile is planned for it at all. This is a configuration
+   boundary, not a capability one: on the fixture the `ts` project joins 10 of 12, and the `js`
+   project — a `package.json` and no compiler configuration whatever — joins 2 of 2.
+2. **Java**: 26,416 sites, a `pom.xml` exists, no Java precise unit ran in either store, and the
+   engine's Java unit also failed, so all 26,416 are syntax-only today. Doc 14's reading of this — that
+   scip-java emits no occurrence at a call site — **does not survive the fixture**: on a Maven layout,
+   through the product's own argv, scip-java 0.13.1 joins **6 of 6** Java call sites at compiler
+   precision. What is missing here is the unit, not the indexer.
+3. **Call through a value: 82.8% of all sites**, the callee a member access or a value (`.map`,
+   `.then`, `.click`). What is true is that a call *edge* is not derivable from occurrence roles, so
+   the call **site** must come from the grammar. What is **not** true is that a precise index cannot
+   supply the callee at that site: on the second corpus **79,154 of 95,780 syntax-unresolved call
+   sites (82.6%)** do carry a compiler-precision occurrence at the callee identifier.
 4. **403 `.robot`/`.resource` and 546 `.jade` files** have neither an indexer nor a grammar.
 5. **No indexer emits WriteAccess**, in any of the six — so `reads`/`writes` can never come from SCIP.
 6. C/C++ macro call sites and Go build-tag-excluded files are real structural gaps but carry **zero
    numeric weight in this repository**.
 
-And the language-server route, measured on this exact project: on `r3/app` **both** the pinned
-TypeScript server and the faster candidate return **2 references**, cold and after a 30 s settle,
-because with no `tsconfig.json` tsserver builds an inferred project and scopes references to the open
-file's import closure — *"a real limitation on JS monorepos, but not one a swap fixes"*
+And the language-server route, measured on the reference repository's largest project: **both** the
+pinned TypeScript server and the faster candidate return **2 references**, cold and after a 30 s
+settle, because with no `tsconfig.json` tsserver builds an inferred project and scopes references to
+the open file's import closure — *"a real limitation on JS monorepos, but not one a swap fixes"*
 (`19-language-server-and-indexer-matrix.md` §2).
 
-**Conclusion: the engine's call graph is not replaceable by a precise index plus a language server on
-this repository.** In the earlier version of this note that was read as a reason to leave `calls` on
-the engine. It is the opposite: because nothing else can supply it, `calls` is precisely the family a
-native engine **must** take, or the engine is never retired. §7.8 ports it in two phases — a name join
-for the four frontends the engine gives no type recovery, then type recovery for the two that have it
-— and every gate is stated on the in-repo-resolved subset, because reproducing an external stub
-reproduces no capability.
+**What would resolve the rest, technique by technique.** Every in-repo-targeted row in the sample
+carries the technique that would resolve it, so the residue is classified rather than guessed. Shares
+are of the in-repo-targeted population and the cumulative column is the reachable ceiling once that
+technique is added:
+
+| technique | class (b) | cumulative | class (a) | cumulative |
+|---|---|---|---|---|
+| `T-none` — resolved today | 28.60% | 28.60% | 93.91% | 93.91% |
+| `T-import` — follow the module edge to a definition (not the base-name match corrected above) | 4.32% | 32.93% | 0.79% | 94.71% |
+| `T-field` — field-based resolution: property name → the repository definitions bound to it | **29.73%** | 62.66% | 0.00% | 94.71% |
+| `T-flow` — flow-based type inference through assignments, parameters and returns | **27.41%** | **90.07%** | 1.02% | 95.73% |
+| `T-hier` — class-hierarchy analysis through a declared or inferred repository type | 8.66% | 98.73% | **4.27%** | **100%** |
+| `T-demand` — demand-driven resolution at read time | 1.27% | 100% | 0.00% | 100% |
+
+**Each of them is a rule per language family, not a rule per repository** — which is what makes
+§7.8's targets statable for all nine advertised languages rather than for the two the sample happens
+to weigh most:
+
+| technique | the families it is stated for | the nine advertised languages it applies to |
+|---|---|---|
+| `T-import` | every family with a module or package system | all nine — ES modules and CommonJS (javascript, typescript, tsx), `import`/`from … import` (python), package imports (go, java), `use` (rust), `#include` (c, cpp) |
+| `T-field` | families where a callable is stored in a named property of an object, prototype or class body | javascript, typescript, tsx, python primarily; degenerate but sound for java, go, rust, c, cpp, where a member name is already a declared member |
+| `T-flow` | every family — it is the intraprocedural forward propagation over the SSA def-use chains §7.2 already builds, assigning each value a candidate set | all nine. It is the **only** technique that supplies a receiver type in the dynamic families, and it is what makes `T-field` and `T-hier` applicable at all |
+| `T-hier` | families with a subtype relation | java, typescript, tsx (classes and interfaces), python (classes and `Protocol`), c++ (virtual dispatch), rust (traits), go (interfaces); inapplicable to c |
+| `T-demand` | every family — it refines only the site a query names, so it carries no index-time budget | all nine |
+
+**A name join is not among them.** On the reference repository **70.59%** of all call sites carry a
+callee name that some tracked definition also carries, and among the 82.8% the syntax tier leaves
+unresolved the figure is **65.68%**. A resolver keyed on the name alone would claim two sites in three
+and be wrong on most — which is exactly why the engine's full-name equality join lands at 18.7% of all
+sites and not at 70%. Every technique above **constrains** that join with a receiver type, a field
+table or a hierarchy; none of them relaxes it.
+
+**Conclusion, per repository class.** On a **configured** repository the call-site join already
+carries `calls`: 82.9% of all call sites on the second corpus, **91.70%** of its in-repo-targeted
+ones, 23 of 23 on the fixture. It does not carry them alone — the three producers' union is 94.26%
+and the defensible floor today is 92.61% — so the class-(a) gate of §7.8 is stated on the join
+together with the index-time inference of §7.2, never on the join by itself. On an **unconfigured or
+dynamic-language** repository nothing else supplies `calls` at all: 4.87–5.25% from the precise tier,
+2 references from either language server, 28.60% of in-repo-targeted sites from all three producers
+together. In the earlier version of this note that was read as a reason to leave `calls` on the
+engine. It is the opposite: because nothing else can supply it **for the unconfigured class**, `calls`
+is precisely the family a native engine **must** take, or the engine is never retired. §7.8 ports it
+in two phases — a name join for the four frontends the engine gives no type recovery, then type
+recovery for the two that have it — and every gate is stated on the in-repo-resolved subset against
+the honest denominator, because reproducing an external stub reproduces no capability.
 
 ---
 
@@ -444,8 +614,8 @@ in `18-algorithms-dominance-and-dataflow.md` (per function) and
 | Allocation | one **reset slab arena per worker**, holding pointer-free typed backing arrays, with a 1 MiB release threshold | near-zero steady-state allocation rate per function; the release threshold is what stops the high-water mark falsifying §7.1's memory claim |
 | `GOGC` / `GOMEMLIMIT` | **set neither** | the CST layer is cgo, so the dominant per-worker allocation is invisible to the Go runtime's limit; a runtime knob that cannot see the memory it is meant to bound is worse than none |
 | Call graph — statically typed with hierarchies (Java) | **class-hierarchy analysis** | decided on **streamability**, not precision: its inputs are two tables an ordered merge join consumes, while rapid type analysis needs a reachability fixed point and variable-type analysis a global propagation graph — both whole-program resident state the memory posture forbids. Megamorphic fan-out lands in the existing ambiguous-candidate family, which the product already publishes with a candidate count |
-| Call graph — Go, Rust, C/C++ | direct binding, plus the **signature-keyed address-taken × indirect-site cross-product** of rapid type analysis **without** its reachability fixed point, plus class-hierarchy analysis for interfaces and traits | most calls are direct; the interesting ones go through interfaces or function values. The gain is **unavailable** on the reference corpus, which contains no C, C++, Go or Rust file at all |
-| Call graph — ECMAScript family, Python | **no whole-program points-to in any formulation.** Field-based resolution at index time; demand-driven resolution at read time | inclusion-based points-to has the right semantics and a forbidden budget; unification-based has the right budget and precision that collapses on these flow shapes. The achievable ceiling is **unavailable**; the honest anchor is that **18.7% of sites / 24.1% of edges** is the best any technique actually run on this repository reached |
+| Call graph — Go, Rust, C/C++ | direct binding, plus the **signature-keyed address-taken × indirect-site cross-product** of rapid type analysis **without** its reachability fixed point, plus class-hierarchy analysis for interfaces and traits | most calls are direct; the interesting ones go through interfaces or function values. **The gain is no longer unavailable:** the reference corpus contains no C, C++, Go or Rust file, but a second corpus carries 1,101 Go, 54 C and 1 Rust call sites, and on the nine-language fixture with all three configured the call-site join resolves 5 of 6 Go, 8 of 9 C/C++ and 6 of 6 Rust sites — and **every** site whose callee the fixture defines (§6). Still unmeasured: a C, C++, Go or Rust corpus large enough to price the cross-product |
+| Call graph — ECMAScript family, Python | **no whole-program points-to in any formulation.** Flow-based type inference through assignments, parameters and returns over the def-use chains this table already builds; field-based resolution at index time; class-hierarchy analysis where a subtype relation exists; demand-driven resolution at read time | inclusion-based points-to has the right semantics and a forbidden budget; unification-based has the right budget and precision that collapses on these flow shapes. **The achievable ceiling is now measured, not unavailable.** Against the honest denominator of §6, 28.60% of in-repo-targeted sites are resolved today; field-based resolution accounts for a further **29.73 pp** and flow-based inference for **27.41 pp**, reaching **90.07%**, with class-hierarchy analysis a further 8.66 pp and a **1.27%** residue whose callee identity depends on a call-site-specific value. Neither of the two load-bearing techniques is optional, and neither is a name join: **70.59%** of that repository's call sites carry a callee name some tracked definition also carries, so a resolver keyed on the name alone claims two sites in three and is wrong on most |
 
 **What the engine's own linkers are, named for the first time.** The static linker is none of the
 academic algorithms — it is an exact full-name equality join. The dynamic linker **is**
@@ -579,7 +749,7 @@ carry `static_analysis` today. The retirement gate's parity condition is what pr
 | **Call-graph linking, shared** | **600–1,110** | **1–2** | a full name is a frontend product, not a language property: a mismatch produces a *wrong* edge, not a missing one |
 | **Type recovery, shared** | **2,700–4,690** | **3–5** | a heuristic fixed point; "within the band" can mean faithfully reproducing wrong edges |
 | **Type recovery / linking, per language** (ECMAScript 1,900–2,900 · Python 1,000–1,700 · Java 200–400 · C/C++, Go, Rust 150–350 each) | **3,550–6,050** | 1–3 each | the builtin table is 1,094 lines of transcription, not algorithm |
-| Scope/binding resolver where no precise index covers a unit | 0, or 400–900 per language | 1–2 each | **the swing factor**; §6 gives r3 ≤5.25% precise coverage |
+| Scope/binding resolver where no precise index covers a unit | 0, or 400–900 per language | 1–2 each | **the swing factor, and it swings per repository class**: §6 measures ≤5.25% precise coverage on an unconfigured repository against 82.9% of call sites on a configured one, so this row is the whole answer for class (b) and close to dead code for class (a) |
 | Differential harness + corpora | 2,500–4,500 + 400–900 per language | 3–4 | larger than the implementation; the engine's own control-flow and dataflow tests are 9,901 lines over five frontends and **zero for Rust** |
 | **Credit: importer and staging deleted** | **−4,535** | — | 4,874 lines of package source less the 339-line comparator that relocates to the oracle; 99 lines of Go fixture source go with it |
 
@@ -603,7 +773,7 @@ back-out risk, is `15-requirements-audit.md` Part 2; the summary:
 | **2 — ECMAScript family, and the shared write algebra** | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate, **and** the same unit that costs the engine 3:38 and a 5.44 GB process-tree peak completes natively with a lower wall *and* a lower tree-summed peak, both on the same 250 ms sampler |
 | **3 — Python, Java, C/C++ dependence** | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language, **and** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation — which is what licenses deleting the import path |
 | **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java** | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora — **not** on the reference repository, which contains no C, Go or Rust unit at all |
-| **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** on a fresh index of the reference repository, in-repo-resolved `calls` **≥ 40,743 sites / 27,897 edges** while the ambiguous syntax-tier population does not rise above its measured 20,046 sites / 179,626 candidate edges |
+| **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of §6, both measured by its sample method — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** §7.2's index-time inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one — while the ambiguous syntax-tier population does not rise above its measured 20,046 sites / 179,626 candidate edges. The absolute site/edge floor this row used to carry is **withdrawn**, for the reason the gate's condition 3 gives |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
 
 **Java moved.** It sits in phase 4, not phase 5, because its type-recovery override is gated on a flag
@@ -620,8 +790,20 @@ its call sites are syntax-only today.
    pinned corpus. For `calls`, the comparison is the in-repo-resolved subset.
 2. **No capability depends on it.** A fresh index of the reference repository with the dependence
    provider absent publishes every capability at the same state as one with it present.
-3. **No resolution regression.** In-repo-resolved `calls` is **≥ 40,743 sites and ≥ 27,897 edges**, and
-   the tree-sitter ambiguity population has not grown.
+3. **No resolution regression, stated per repository class against the honest denominator.** The
+   denominator is call sites whose callee is **defined in a tracked file**, measured by the sample
+   method of §6, not every call site. On a **configured typed repository** — a project configuration
+   present and the precise indexer run — a fresh index resolves **≥ 95%** of in-repo-targeted call
+   sites **through the call-site join together with the index-time inference of §7.2**, not through
+   the join alone: the join alone measures 91.70% and the three producers' union 94.26%, and what
+   closes the gap is hierarchy and flow inference over the sites the indexer emitted no occurrence
+   for. A gate that read "≥ 95% from the join" would be unmeetable as written, which is the defect the
+   withdrawn floor had. On a **typed repository without configuration, or a dynamic-language
+   repository**, it resolves **≥ 85%** by the language-general inference of §7.2. The reference
+   repository is the instance of the second class these numbers were measured on, never the definition
+   of the target. The absolute floor this condition used to carry — 40,743 sites and 27,897 edges — is
+   **withdrawn**: it was a count on one repository at one generation, and a count cannot be met on a
+   second repository at all. Additionally, the tree-sitter ambiguity population has not grown.
 4. **Coexistence.** The whole index completes with a tree-summed peak below the standing admission
    allocation, **no single reservation larger than one worker's**, and the dependence phase's share of
    the index wall below its measured **74%**.
@@ -677,7 +859,9 @@ store, which this plan assumes rather than selects.
 API; maintainer "No, it doesn't right now"; `--overlaysonly` corrupts graphs); splicing per-file engine
 graphs (TypeScript produces 19% *wrong* `METHOD_FULL_NAME` call edges, which aliasing cannot repair);
 cheaper engine exports (`--repr=pdg` unimplemented for CSV, `joern-slice` cannot emit CDG); SCIP alone
-for `calls` (identical roles for calls and references, all six indexers); SCIP role bits for
+for `calls` (roles are identical for a call and a plain reference, so the call *site* must come from
+the grammar — the callee identity the join then supplies is a different question, and §6 measures it);
+SCIP role bits for
 `reads`/`writes` (no indexer sets WriteAccess); `stack-graphs`/`tree-sitter-graph` for CFG (neither has
 one); Fraunhofer `cpg` as backend (same JVM profile); CodeQL (heavier, needs a build, extractors not
 open); lowering `--max-num-def` (measured to cost completeness for nothing); and splitting a
@@ -694,6 +878,20 @@ conditional-aggregation pass per store, no index built); the product-side Go lin
 contents; the function-size distributions in §7.2 (this repository 3,272 functions, p50 13 / p99 122 /
 max 387 body lines; a large Go library 4,153 functions, p50 9 / p99 187 / max 669; a generated driver
 3,609 functions, p99.9 2,499 / max 7,518).
+
+**Measured by sampling two stores, and by one product run on a fixture.** §6's honest denominator,
+its per-class shares and its technique-by-technique ceiling come from a seeded, language-stratified
+hand sample — **460 rows** from the reference repository (seed 20260916) and **204** from a second
+corpus (seed 20260917), rows sorted by `(path, start, end)` inside each stratum so the draw
+reproduces, each callee classified from the source at its byte range in a read-only clone at the
+snapshot's own commit, a stratified estimator with 4,000-draw bootstrap intervals, and all 664 rows
+passing an offset check. Both stores were read with `sqlite3 -readonly` and neither repository was
+indexed for this measurement. Where a compiler index covers a site the index answers instead of a
+human. The one thing in this note that *is* a product run is the nine-language figure: the polyglot
+tools-matrix fixture indexed through the product's own argv with every pinned analyzer installed
+(`tools status` 14 entries, 14 installed; `tools verify` rehashed against the lock) and the dependence
+provider disabled — a fixture, not a repository. Method, instruments, the 664 rows and the method
+limitations: `20-call-ceiling-sample.md`.
 
 **Read directly at `v4.0.627`.** `ControlFlow.scala`, `CfgCreator.scala`, `Cfg.scala`,
 `CfgCreationPass.scala`, the `cfgdominator/` and `codepencegraph/` packages, the whole
@@ -733,10 +931,8 @@ diffed on the CALL edge set, and it needs an engine run, which this research is 
 CFG nodes per body line, which is what would turn §7.4's bound in N into a bound in source lines; the
 measurement is a count of CFG nodes per method over a store. The published crossover tables for the
 near-linear dominator algorithms: the two papers' PDFs 404 at every mirror cited on this host, and one
-abstract was verified in place of its tables. The achievable call-resolution ceiling for the dynamic
-languages — 18.7% of sites / 24.1% of edges is the best any technique **actually run** on this
-repository reached, and it is quoted as a measurement, never as a limit. The size at which a parse
-tree overruns its worker's reservation, which is what §7.4's observed-reservation loop measures first.
+abstract was verified in place of its tables. The size at which a parse tree overruns its worker's
+reservation, which is what §7.4's observed-reservation loop measures first.
 
 **Previously weak, now settled.** The inference that a generic dominator implementation can be run on
 reversed CFG edges to obtain post-dominators is **verified from source**: both entry points consult
@@ -747,5 +943,5 @@ synthetic exit and an augmentation edge from every strongly-connected component 
 from the measured Scala anchors beside them, with the anchor spread recorded in §1. §7.4's whole-run
 figure is an **admission bound**, not an enforced ceiling, for the reason stated there.
 
-*Sources are inline. Engine citations pinned to `v4.0.627`. Raw evidence in the sibling files `00`–`19`
+*Sources are inline. Engine citations pinned to `v4.0.627`. Raw evidence in the sibling files `00`–`20`
 of this directory. Research date 2026-09-16.*
