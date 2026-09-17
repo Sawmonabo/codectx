@@ -164,18 +164,25 @@ const unreadRemediation = "check that this unit's source files hold method defin
 // be worded as another -- a unit some of whose files were refused and some
 // analysed is not explained by the refusal, and must not claim none was
 // refused either.
-func emptyExport(unit Unit, o Outcome, r Reservation, refused int64) *model.Error {
+//
+// files and refused are both counted over the one predicate that decided what
+// the frontend was given, so the comparison between them is a comparison over
+// a single set.
+func emptyExport(unit Unit, o Outcome, r Reservation, files, refused int64) *model.Error {
 	err := failure(FailureEmptyExport, unit.ScopeKey, o, r).
 		WithDetail("family", string(unit.Family)).
-		WithDetail("source_files", strconv.FormatInt(unit.Files, 10)).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
 		WithDetail("refused_source_files", strconv.FormatInt(refused, 10))
 	switch {
-	case refused >= unit.Files:
+	// files > 0 is not redundant: a unit the planner counted source for whose
+	// materialization handed the frontend none of it would otherwise satisfy
+	// 0 >= 0 and publish the refusal as the reason, which nothing measured.
+	case files > 0 && refused >= files:
 		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so nothing was analysed"
 		return err.WithRemediation(refusedRemediation)
 	case refused > 0:
 		err.Message = "the dependence unit failed: the analysis frontend left " + strconv.FormatInt(refused, 10) +
-			" of this unit's " + strconv.FormatInt(unit.Files, 10) +
+			" of this unit's " + strconv.FormatInt(files, 10) +
 			" source files out of its analysis, and the rest produced no method"
 		return err.WithRemediation(refusedRemediation + ". For the files it did read: " + unreadRemediation)
 	}
@@ -201,14 +208,14 @@ type partTally struct {
 // restatement emptyExport removes, so this names the tally instead, and names
 // the refusal when the frontend refuses the whole unit's source -- which is
 // exactly how a crashed unit of that shape ends up here.
-func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, refused int64) *model.Error {
+func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files, refused int64) *model.Error {
 	err := failure(FailureEngine, unit.ScopeKey, crash, r).
-		WithDetail("source_files", strconv.FormatInt(unit.Files, 10)).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
 		WithDetail("refused_source_files", strconv.FormatInt(refused, 10)).
 		WithDetail("parts", strconv.Itoa(t.Parts)).
 		WithDetail("parts_failed", strconv.Itoa(t.Failed)).
 		WithDetail("parts_without_method", strconv.Itoa(t.Empty))
-	if unit.Files > 0 && refused >= unit.Files {
+	if files > 0 && refused >= files {
 		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so no part of the subdivided unit had anything to analyse"
 		return err.WithRemediation(refusedRemediation)
 	}

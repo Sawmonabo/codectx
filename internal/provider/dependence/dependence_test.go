@@ -309,6 +309,22 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			parses:      1,
 		},
 		{
+			// Every file of a two-file unit refused. The all-refused reason
+			// must hold whatever the planner's own per-unit file count says:
+			// the count it is compared against is taken over the same pass
+			// that decided what the frontend was handed, not over the plan.
+			name:    "the all-refused reason is decided by the count the materialization took",
+			backend: &fakeBackend{deadExport: true, refusesEveryFile: true},
+			code:    model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "empty_export",
+				"source_files": "2", "refused_source_files": "2"},
+			reason:      "leaves every source file of this unit out of its analysis",
+			remediation: "exclude this project from the index",
+			repo:        twoSourceRepo,
+			inputs:      []string{"app.go", "helper.go", "go.mod"},
+			parses:      1,
+		},
+		{
 			// Some of the unit's files refused and some analysed, and still no
 			// method. Neither of the two reasons above is true of it, and
 			// publishing either would tell the operator something measurably

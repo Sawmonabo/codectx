@@ -515,21 +515,30 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// sibling project, and left another unit's source inside this unit's
 	// private tree for as long as the pruning took.
 	//
-	// The same pass counts the source files the frontend will leave out of its
-	// analysis by a default of its own. It is one counter, not a list, and it
-	// is what lets a unit that exports nothing name the reason: a unit every
-	// one of whose files the frontend refuses has a cause an operator can act
-	// on, and one whose files it accepts does not.
-	var refused int64
+	// The same pass counts this unit's own source files, and how many of them
+	// the frontend will leave out of its analysis by a default of its own.
+	// They are two counters, not lists, and they are what lets a unit that
+	// exports nothing name the reason: a unit every one of whose files the
+	// frontend refuses has a cause an operator can act on, one none of whose
+	// files it refuses does not, and one in between is neither.
+	//
+	// Both are taken here, over this one predicate, rather than against the
+	// planner's Unit.Files. That count is arbitrated across the whole plan --
+	// foldSizes gives each file to the first unit that claims it -- so the two
+	// are denominators over different sets, and a comparison between them
+	// would rest on their happening to agree.
+	var files, refused int64
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
 			Include: func(fv model.FileVersion) bool {
 				if !unit.Contains(fv.Path) {
 					return false
 				}
-				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family &&
-					p.backend.RefusesInput(unit.Family, unitRelative(unit, fv.Path)) {
-					refused++
+				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family {
+					files++
+					if p.backend.RefusesInput(unit.Family, unitRelative(unit, fv.Path)) {
+						refused++
+					}
 				}
 				return true
 			}})
@@ -550,10 +559,10 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// A reproducible crash is the only thing subdivision is for. Every
 		// capability of the result then says so, and says how the crash was
 		// established to reproduce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision, refused)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision, files, refused)
 	}
 
-	exp, crash, err := p.export(ctx, req, unit, res, run, graph, refused)
+	exp, crash, err := p.export(ctx, req, unit, res, run, graph, files, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -565,7 +574,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// on a 4,984-file project whose export died at every heap cap while
 		// every subdivided part of it exported. Reporting it as a failed unit
 		// threw away facts the engine could still produce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed, refused)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed, files, refused)
 	}
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
@@ -579,9 +588,9 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // partial result naming the subdivided scope and the failing pass and
 // exception, never a failed unit.
 func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, refused int64) (publication, ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files, refused int64) (publication, ImportReport, error) {
 
-	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision, refused)
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision, files, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -731,7 +740,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // confirmation is the same argv a second time and what it yields is a second
 // observation of the same class, which is what subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, graph string, refused int64) (ExportOutcome, Outcome, error) {
+	run *runDir, graph string, files, refused int64) (ExportOutcome, Outcome, error) {
 
 	out, err := p.runExport(ctx, req, unit, res, run, graph)
 	if err != nil {
@@ -765,7 +774,7 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		// worded as itself either: the count of the unit's files the frontend
 		// leaves out of its analysis is what turns the symptom into a reason.
 		out.Outcome.Class = FailureEmptyExport
-		return ExportOutcome{}, Outcome{}, emptyExport(unit, out.Outcome, res, refused)
+		return ExportOutcome{}, Outcome{}, emptyExport(unit, out.Outcome, res, files, refused)
 	}
 	return out, Outcome{}, nil
 }
@@ -871,7 +880,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, refused int64) (ImportReport, int, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files, refused int64) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
@@ -966,7 +975,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
-		return ImportReport{}, 0, subdivisionEmpty(unit, crash, res, tally, refused)
+		return ImportReport{}, 0, subdivisionEmpty(unit, crash, res, tally, files, refused)
 	}
 	return total, overParts, nil
 }
