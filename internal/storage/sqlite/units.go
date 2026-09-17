@@ -162,42 +162,70 @@ func (s *Store) RecordRunFailure(ctx context.Context, id model.ProviderRunID, fa
 	})
 }
 
-// RunFailure reads back the reason recorded for a run, and false when the run
-// recorded none. A run whose generation has been collected is gone with it, so
-// a missing row is reported as "no reason kept" rather than as an error: the
-// caller is asking why a scope has no facts, and "the generation that failed
-// is no longer retained" is an answer, not a failure.
-func (s *Store) RunFailure(ctx context.Context, id model.ProviderRunID) (model.RunFailure, bool, error) {
-	raw, err := idBlob("run_id", string(id))
-	if err != nil {
-		return model.RunFailure{}, false, err
-	}
-	var failure model.RunFailure
-	var found bool
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
-		var encoded string
-		err := tx.QueryRowContext(ctx, `SELECT failure_json FROM provider_runs WHERE id = ?`, raw).Scan(&encoded)
-		if isNoRows(err) {
-			found = false
-			return nil
-		}
+// FailedRuns is one page of the typed reasons the runs of one generation
+// failed, oldest first, with the number of reasons that did not fit the page.
+//
+// It is keyed by GENERATION and not by run id, which is what makes it
+// answerable at all: the reasons are on the run rows, a status report holds no
+// run ids, and a reader keyed by one could only be called by something that
+// already knew which run to ask about. Every surface that reports a failure
+// asks the same question -- why does this generation have no facts for these
+// scopes -- and this is the one answer to it.
+//
+// A generation that has been collected takes its runs with it, so an empty
+// page is "no reason is kept for this generation" and not an error: the
+// question was why a scope has no facts, and "the generation that failed is no
+// longer retained" is an answer.
+//
+// The page is bounded like every other result list, and what did not fit is
+// counted rather than dropped in silence: the one surface whose job is to
+// report failures must never lose one without saying so.
+func (s *Store) FailedRuns(ctx context.Context, gen model.GenerationID) ([]model.RunFailure, int64, error) {
+	var out []model.RunFailure
+	var total int64
+	// readOwn and not read: in the process that is indexing, `codectx status`
+	// is answered while an ingestion group is open, and a reason written into
+	// that group but read from the reader pool is a failure the run that just
+	// recorded it cannot see.
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		out, total = nil, 0
+		rows, err := tx.QueryContext(ctx, `SELECT provider_id, failure_json FROM provider_runs
+			WHERE generation_id = ? AND failure_json != '' ORDER BY provider_id, started_at, id`, int64(gen))
 		if err != nil {
 			return wrap("provider_runs", err)
 		}
-		if encoded == "" {
-			found = false
-			return nil
+		defer rows.Close()
+		for rows.Next() {
+			total++
+			var providerID, encoded string
+			if err := rows.Scan(&providerID, &encoded); err != nil {
+				return wrap("provider_runs", err)
+			}
+			if len(out) >= model.MaxRecordsPerResult {
+				continue
+			}
+			var failure model.RunFailure
+			if err := json.Unmarshal([]byte(encoded), &failure); err != nil {
+				return corrupt("the recorded provider run failure is not readable")
+			}
+			// The row's own column is the authority on which provider ran:
+			// the blob is the reason, and a reason that disagreed with the run
+			// it sits on would name the wrong provider on every surface.
+			failure.ProviderID = providerID
+			// The write path bounds every reason, but the read path must not
+			// trust the row: a blob written by a foreign binary would
+			// otherwise hand a caller an unbounded message.
+			if err := failure.Validate(); err != nil {
+				return corrupt("a recorded provider run failure is not a valid reason: %v", err)
+			}
+			out = append(out, failure)
 		}
-		if err := json.Unmarshal([]byte(encoded), &failure); err != nil {
-			return corrupt("the recorded provider run failure is not readable")
-		}
-		found = true
-		return nil
+		return wrap("provider_runs", rows.Err())
 	})
 	if err != nil {
-		return model.RunFailure{}, false, err
+		return nil, 0, err
 	}
-	return failure, found, nil
+	return out, total - int64(len(out)), nil
 }
 
 // ProviderRun reads one run's provenance. GenerationID is zero once the
@@ -1551,8 +1579,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, units_running, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -1563,7 +1591,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 				return err
 			}
 			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State),
-				c.DiagnosticCode, c.Remediation, details); err != nil {
+				c.DiagnosticCode, c.Remediation, c.UnitsRunning, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
@@ -1580,7 +1608,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		}
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
-			|| char(0) || remediation || char(0) || details_json
+			|| char(0) || remediation || char(0) || units_running || char(0) || details_json
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}

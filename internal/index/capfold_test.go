@@ -46,7 +46,7 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 			State:          model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 	}
-	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
+	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout), 0)
 
 	bounded := big.finish(log)
 	seen := map[string]int{}

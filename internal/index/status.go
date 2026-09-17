@@ -166,6 +166,16 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	st.Watchers = watchers
+	// The reasons come from the run rows of the generation just pinned, so a
+	// `codectx status` in another terminal and the index-status tool read the
+	// same failures the run that published them recorded. Nothing in this
+	// process is consulted: an in-process set would answer only for the
+	// process that did the indexing.
+	failed, omitted, err := r.opts.Store.FailedRuns(ctx, binding.GenerationID)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	st.FailedUnits, st.FailedUnitsOmitted = failed, omitted
 	if r.watch != nil {
 		r.watch.project(&st)
 	}
@@ -433,6 +443,12 @@ type failureRow struct {
 	scopes  []string
 	planned int
 	units   int
+	// running is how many scopes of this provider capability were still being
+	// built when the row was published. A failure row outranks the deferred
+	// row in the fold, so without this the one generation that most needs the
+	// disclosure -- one scope failed, one published, one still running --
+	// published a `partial` row and said nothing about the work in flight.
+	running int
 	// covered records that another scope of this provider capability DID
 	// publish into this generation. A capability with facts in it is partial,
 	// never failed: Section 13.3 lets a report under-claim, and reporting a
@@ -731,7 +747,7 @@ func (r *capabilityReport) addUnavailable(providerID, capability string) {
 // of whose scopes has nothing behind it at all -- the over-claim Section 13.3
 // forbids. Any other row (stale, partial, failed) already under-claims and
 // stays.
-func (r *capabilityReport) addDeferred(providerID, capability string) {
+func (r *capabilityReport) addDeferred(providerID, capability string, running int) {
 	key := stateKey(providerID, capability, provider.ScopeWorkspace, model.CapabilityFresh)
 	if _, ok := r.rows[key]; ok {
 		delete(r.rows, key)
@@ -742,8 +758,8 @@ func (r *capabilityReport) addDeferred(providerID, capability string) {
 	}
 	r.add(model.CapabilityState{ProviderID: providerID, Capability: capability,
 		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
-		DiagnosticCode: model.CodeProviderUnavailable,
-		Details:        map[string]string{"reason": "units_deferred"}})
+		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: running,
+		Details: map[string]string{"reason": "units_deferred"}})
 }
 
 // addFailures records one provider capability's failed units. The aggregate
@@ -758,7 +774,7 @@ func (r *capabilityReport) addDeferred(providerID, capability string) {
 // message and details travel with the scope they belong to -- a published row
 // naming one scope's key and another scope's reason is arrival-ordered again,
 // in a shape that also misreports.
-func (r *capabilityReport) addFailures(providerID, capability string, f *providerFailures) {
+func (r *capabilityReport) addFailures(providerID, capability string, f *providerFailures, running int) {
 	if f == nil || len(f.named) == 0 {
 		return
 	}
@@ -770,7 +786,7 @@ func (r *capabilityReport) addFailures(providerID, capability string, f *provide
 	r.failures[providerID+"\x00"+capability] = &failureRow{providerID: providerID, capability: capability,
 		scope: exemplar.scopeKey, code: exemplar.failure.code, message: exemplar.failure.message,
 		remediation: exemplar.failure.remediation, details: exemplar.failure.details,
-		scopes: scopes, planned: f.planned, units: f.units}
+		scopes: scopes, planned: f.planned, units: f.units, running: running}
 }
 
 // coveredElsewhere records that this provider capability has a scope that did
@@ -837,7 +853,7 @@ func (f *failureRow) publish() model.CapabilityState {
 	}
 	row := model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
 		Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
-		Remediation: f.remediation,
+		Remediation: f.remediation, UnitsRunning: f.running,
 		Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units),
 			scopeKeyDetail: model.TruncateDetail(f.scope)}}
 	if f.planned > 0 {
@@ -950,6 +966,10 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 				survivor, other = c, out[i]
 			}
 			merged := mergeDetails(survivor, other)
+			// The greater and never the sum: every row of one provider
+			// capability carries the same figure, so adding them would count
+			// one running unit once per row it appears on.
+			merged.UnitsRunning = max(out[i].UnitsRunning, c.UnitsRunning)
 			// The counts do not add here: the two rows are two assertions
 			// about the SAME scope, so the greater of them is the number of
 			// scopes the merged row stands for and summing would count one
@@ -1001,7 +1021,13 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 		// severe row holds. Only `scopes` is written here, because its sum
 		// must count a row that carries no count at all as the one scope it
 		// stands for.
-		out[i] = mergeDetails(survivor, other).WithDetail(scopesDetail, strconv.Itoa(scopes))
+		merged := mergeDetails(survivor, other).WithDetail(scopesDetail, strconv.Itoa(scopes))
+		// `scopes` sums here because the two rows stand for disjoint scope
+		// sets; units_running does not, for the reason foldToPrimaryKey gives:
+		// it is one figure per provider capability, repeated on every row of
+		// it, not a per-row count.
+		merged.UnitsRunning = max(out[i].UnitsRunning, c.UnitsRunning)
+		out[i] = merged
 	}
 	return out
 }
@@ -1140,6 +1166,7 @@ func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 	var order []string
 	folds := map[string]model.CapabilityState{}
 	counts := map[string]int{}
+	running := map[string]int{}
 	scoped := map[string]bool{}
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + string(c.State)
@@ -1152,12 +1179,17 @@ func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 			scoped[key] = c.Scope != provider.ScopeWorkspace
 		}
 		counts[key] += countDetail(c)
+		// The exemplar row is published whole, so its own units_running would
+		// be the only one kept; the figure is the same on every row of one
+		// provider capability, so the greatest of them is that figure.
+		running[key] = max(running[key], c.UnitsRunning)
 	}
 	out := make([]model.CapabilityState, 0, len(order))
 	for _, key := range order {
 		row := folds[key]
 		exemplar := row.Scope
 		row.Scope = provider.ScopeWorkspace
+		row.UnitsRunning = running[key]
 		if scoped[key] {
 			row = row.WithDetail(scopeKeyDetail, model.TruncateDetail(exemplar))
 		}

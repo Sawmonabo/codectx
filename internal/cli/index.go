@@ -841,6 +841,7 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	writeWatchers(&b, s.Watchers)
 	writeProvidersDisabled(&b, s.ProvidersDisabled)
 	writeCapabilities(&b, s.Completeness)
+	writeFailedUnits(&b, s.FailedUnits, s.FailedUnitsOmitted)
 	for _, warning := range s.Warnings {
 		fmt.Fprintf(&b, "warning     %s\n", warning)
 	}
@@ -851,6 +852,39 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	}
 	b.WriteString("\n")
 	return writeText(w, "%s", b.String())
+}
+
+// writeFailedUnits prints every failed unit of the active generation with the
+// reason its run recorded: the scope, the diagnostic code, the message and the
+// provider's remediation.
+//
+// The capability rows above name ONE exemplar scope per provider capability,
+// which is what makes them fit a fixed bound on any repository; this is the
+// list of the rest. It is printed only when there is one -- a workspace with
+// nothing failed has no failures section to read -- and what did not fit the
+// page is stated rather than dropped, because a short failure list read as the
+// whole of it is the one thing this section must never be.
+//
+// The tool's standard-error tail is deliberately not printed: it is raw
+// analyzer output and stays on the run row alone.
+func writeFailedUnits(b *strings.Builder, failed []model.RunFailure, omitted int64) {
+	if len(failed) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "failed      %d %s\n", len(failed), plural(len(failed), "unit", "units"))
+	for _, f := range failed {
+		fmt.Fprintf(b, "  %s %s %s", f.ProviderID, f.ScopeKey, f.Code)
+		if f.Message != "" {
+			fmt.Fprintf(b, ": %s", f.Message)
+		}
+		b.WriteString("\n")
+		if f.Remediation != "" {
+			fmt.Fprintf(b, "    remediation: %s\n", f.Remediation)
+		}
+	}
+	if omitted > 0 {
+		fmt.Fprintf(b, "  %d further %s not shown\n", omitted, plural(int(omitted), "reason is", "reasons are"))
+	}
 }
 
 // writeWatchers lists the watching processes whose heartbeats are live, which
@@ -1185,6 +1219,10 @@ func capabilityFigures(st model.CapabilityState) string {
 	}
 	if scope := st.Details[model.DetailScopeKey]; scope != "" {
 		parts = append(parts, "at "+scope)
+	}
+	if st.UnitsRunning > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s still building", st.UnitsRunning,
+			plural(st.UnitsRunning, "unit is", "units are")))
 	}
 	if st.DiagnosticCode != "" {
 		parts = append(parts, st.DiagnosticCode)

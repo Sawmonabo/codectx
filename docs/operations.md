@@ -292,6 +292,11 @@ carries the whole row.
   and not only which family it belongs to. The provider's own bounded
   particulars travel beside it — which profile, which tool, which project,
   what the run was declared under.
+- `remediation` — what an operator can do about that scope, as the provider
+  stated it. It is a field of the row rather than one of the details below,
+  because the details are the provider's own bounded budget and a remediation
+  charged to it could be the entry a busy row has to drop. Text output prints
+  it on its own line beneath the row.
 - `subdivided`, on a dependence capability, names a unit that crashed and was
   recovered by splitting; `backend_failure` beside it says what the crash was
   and how it was established to reproduce ([dependence](providers-dependence.md)).
@@ -303,11 +308,16 @@ line. What an operator can read is, in order of how long it lasts:
    generation, the diagnostic code, the message and the particulars — all of
    it except the tool's standard error.
 2. The capability row above, for as long as the generation is active.
-3. The failed provider run row in the workspace database, which keeps the
+3. The failed provider run rows in the workspace database, which keep the
    whole typed reason including the bounded tail of what the tool wrote to its
    standard error, for exactly as long as the generation that failed is
-   retained. **No command in this build prints that row**: the log line and the
-   capability row are what you read a failure from.
+   retained. `codectx status` and the `codectx_index_status` tool report them:
+   the text output prints a `failed` section naming every failed scope with its
+   provider, its diagnostic code, its message and its remediation, and JSON
+   output carries the same under `failed_units`. The list is one page, and
+   `failed_units_omitted` says how many reasons did not fit it. The tail of the
+   tool's standard error is never printed on any of those surfaces; it stays on
+   the run row.
 
 A provider may contribute only a bounded number of details to one row. The
 figures above take several of those slots, so a busy row can now carry

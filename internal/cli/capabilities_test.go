@@ -25,14 +25,20 @@ import (
 // and then not printed, so the human surfaces report a failure with no way to
 // act on it while the JSON one carries the answer.
 //
+// The third figure is the row's units_running: a scope of this capability is
+// still being built in the background, and a text surface that says only
+// "partial" leaves an operator escalating work that is about to finish.
+//
 // Mutation proof: in writeCapabilities, drop the per-row loop under the tally;
-// for the remediation, drop the `st.Remediation` line beneath it.
+// for the remediation, drop the `st.Remediation` line beneath it; for the
+// running count, drop the `st.UnitsRunning` branch in capabilityFigures.
 func TestEveryTextSurfaceRendersOneCapabilityRowsOwnFigures(t *testing.T) {
 	t.Parallel()
 	row := model.CapabilityState{ProviderID: "scip", Capability: "precise_definitions",
 		Scope: "workspace", State: model.CapabilityPartial,
 		DiagnosticCode: model.CodeProviderUnavailable,
 		Remediation:    "install the analyzer for this language family, or disable the provider",
+		UnitsRunning:   1,
 		Details: map[string]string{model.DetailUnitsPlanned: "11", model.DetailUnitsFailed: "2",
 			model.DetailScopeKey: "pkg:go:refused"}}
 	fresh := model.CapabilityState{ProviderID: "structural", Capability: "outline",
@@ -47,7 +53,7 @@ func TestEveryTextSurfaceRendersOneCapabilityRowsOwnFigures(t *testing.T) {
 
 	for name, out := range map[string]string{"status": status.String(), "the completion block": completion.String()} {
 		for _, want := range []string{"scip/precise_definitions", "2 of 11 units failed", "pkg:go:refused",
-			"remediation: install the analyzer"} {
+			"remediation: install the analyzer", "1 unit is still building"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s does not report %q, so the row's own figures reached no operator:\n%s", name, want, out)
 			}

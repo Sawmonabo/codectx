@@ -1179,7 +1179,7 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// scopes is a known failure. It is recorded first so `reported`
 			// sees it.
 			if f, ok := failed[d.ID]; ok {
-				g.caps.addFailures(d.ID, capability, f)
+				g.caps.addFailures(d.ID, capability, f, deferred[d.ID])
 			}
 			// And a capability that did publish a scope is partial, not
 			// failed: the facts of that scope are in this generation and
@@ -1193,8 +1193,8 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// Deferred is a scope still running and nothing else: a provider
 			// with work in flight is not fresh coverage, whatever its other
 			// scopes did.
-			case deferred[d.ID]:
-				g.caps.addDeferred(d.ID, capability)
+			case deferred[d.ID] > 0:
+				g.caps.addDeferred(d.ID, capability, deferred[d.ID])
 			case covered[d.ID]:
 				g.caps.addFresh(d.ID, capability)
 			default:
@@ -1220,13 +1220,18 @@ type failedScope struct {
 // Reuse key is the provider id and the scope key joined by NUL, which is the
 // frozen shape of plan.Key.
 //
+// deferred is a COUNT per provider and not a flag: it is published on the
+// capability row, where it is the only way a process other than the one doing
+// the work learns that a scope of this capability is still being built. "One
+// scope outstanding" and "forty" are different reports of the same generation.
+//
 // published is the narrower question the partial ruling needs: the providers a
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool, failed map[string]*providerFailures, published map[string]bool, err error) {
+func (g *generation) coveredProviders() (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
-	deferred = make(map[string]bool, len(g.sel.Active))
+	deferred = make(map[string]int, len(g.sel.Active))
 	failed = make(map[string]*providerFailures, len(g.sel.Active))
 	published = make(map[string]bool, len(g.sel.Active))
 	g.mu.Lock()
@@ -1267,7 +1272,7 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 			case g.failedScopes[key].code != "":
 				record(u, g.failedScopes[key])
 			default:
-				deferred[u.ProviderID] = true
+				deferred[u.ProviderID]++
 			}
 			return nil
 		}
