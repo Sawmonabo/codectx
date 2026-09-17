@@ -22,12 +22,15 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// MaxObservedUnits bounds the record. Section 6 requires a finite bound on
-// every retained collection, and the block that reports it is a bounded
-// response; a repository with more heavy units than this reports the first
-// ones it ran, which are the ones whose sizing decided how the rest were
-// scheduled.
-const MaxObservedUnits = 64
+// MaxObservedUnits bounds the record, at the one figure a bounded response
+// already carries. ADR-0010 decision 4 promises that EVERY unit discloses its
+// reservation, its ceiling and its observed peak, and the count of units that
+// overran their reservation is summed from these rows, so a unit dropped here
+// is a unit whose overrun nobody is told about. The sixty-four this replaces
+// was a figure nothing measured, well under the units a large repository runs;
+// the response bound is the real one, and a record wider than the response
+// could not be delivered whole anyway.
+const MaxObservedUnits = model.MaxRecordsPerResult
 
 // UnitMemory is one unit's memory accounting.
 type UnitMemory struct {
@@ -76,6 +79,10 @@ func Observe(scopeKey string, f Family, r Reservation, peakBytes int64, unsample
 		return
 	}
 	if len(observed.units) >= MaxObservedUnits {
+		// The record is as wide as a bounded response can carry. Section 6
+		// requires a finite bound on every retained collection, so the record
+		// stops here rather than growing; it is the response bound that is
+		// being reached, not a sizing choice of this file's.
 		return
 	}
 	observed.at[scopeKey] = len(observed.units)
