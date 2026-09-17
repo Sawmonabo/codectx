@@ -3,9 +3,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1136,4 +1138,128 @@ func TestE2EASecondBuildWaitsOutTheHolderAndReusesItsWork(t *testing.T) {
 		t.Errorf("the index that waited took %s against the holder's %s, over the %s ceiling: "+
 			"it waited out the holder and then did the holder's work again", waiter.wall, holder.wall, ceiling)
 	}
+}
+
+// A command that answers questions must leave the workspace byte for byte as it
+// found it -- proved here on the built binary, against the store an interrupted
+// run leaves behind, which is where the damage was found.
+//
+// `Options.ReadOnly` opened no writer connection and set `query_only`, which
+// refuses writes through SQL and leaves the handle read-WRITE at the file
+// level. The last connection to let go of one closes the write-ahead log: the
+// log is copied into the database and the log and its shared-memory index are
+// unlinked, with the database held exclusively for the whole of it. On a
+// workspace whose killed run left an 82 MB log, one `codectx status --json`
+// grew `codectx.db` from 12,865,536 to 94,973,952 bytes and removed both files.
+// `status --help` and docs/operations.md both promise that command writes
+// nothing.
+//
+// The log here is made the way an operator's is: a second run is killed in the
+// middle of its ingestion, leaving a live log beside a database that already
+// holds a published generation. A test that only ever saw a cleanly closed
+// store would not exercise the log close at all, so the log's presence is
+// asserted before the command runs.
+//
+// Mutation that fails this test: drop `mode=ro` from the read-only pools'
+// connection string in internal/storage/sqlite/open.go. The log and the
+// shared-memory index are then absent after `status`.
+func TestAnAnsweringCommandLeavesAnInterruptedRunsLogUntouched(t *testing.T) {
+	s := newSandbox(t)
+	const files = 400
+	write := func(body string) {
+		t.Helper()
+		dir := filepath.Join(s.Repo, "wide")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for i := range files {
+			src := fmt.Sprintf("package wide\n\nfunc F%d() int { return %d }\n%s\n", i, i, body)
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.go", i)), []byte(src), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write("")
+	if _, code := s.run(t, "index"); code != 0 {
+		t.Fatalf("the first index exited %d", code)
+	}
+
+	// A second run, killed while it is writing: what a machine losing power or
+	// an operator's interrupt leaves.
+	write("func pad() int { return 1 }")
+	db := filepath.Join(s.Home, "data", "codectx.db")
+	cmd := exec.Command(binary, "index", "--repo", s.Repo, "--json")
+	cmd.Env = s.Environ
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var killed bool
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, err := os.Stat(db + "-wal"); err == nil && st.Size() > 256*1024 {
+			_ = cmd.Process.Kill()
+			killed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = cmd.Wait()
+	if !killed {
+		t.Fatal("the second index never had a log of its own to leave behind, so this test would not " +
+			"exercise the close that writes")
+	}
+
+	before := storeDigest(t, db)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if before[suffix] == absentFile {
+			t.Fatalf("the killed run left no %s, so this test would not exercise the log close", suffix)
+		}
+	}
+
+	env, code := s.run(t, "status")
+	if code != 0 || !env.OK {
+		t.Fatalf("status on a workspace with an interrupted run's log exited %d: %+v", code, env.Error)
+	}
+
+	after := storeDigest(t, db)
+	for _, suffix := range []string{"", "-wal"} {
+		if before[suffix] != after[suffix] {
+			t.Fatalf("codectx status changed %q: %s before, %s after",
+				"codectx.db"+suffix, before[suffix], after[suffix])
+		}
+	}
+	// The shared-memory index is the one file a reader touches, and it holds no
+	// database content: it is the index OF the log, rebuilt from the log, and
+	// the bytes a reader writes are the read mark by which it takes its
+	// snapshot without blocking a writer -- a handful of them, in the index
+	// header and the read-mark block. What must not happen is what the log
+	// close does: the file unlinked, or resized.
+	if strings.Fields(after["-shm"])[0] != strings.Fields(before["-shm"])[0] {
+		t.Fatalf("codectx status removed or resized the shared-memory index: %s before, %s after",
+			before["-shm"], after["-shm"])
+	}
+}
+
+// absentFile is what storeDigest reports for a file that is not there, which is
+// itself an answer: the engine's log close unlinks the log and its index.
+const absentFile = "absent"
+
+// storeDigest is the length and content digest of a store's three files, keyed
+// by the suffix each carries beside the database.
+func storeDigest(t *testing.T, db string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		b, err := os.ReadFile(db + suffix)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("reading %s: %v", filepath.Base(db+suffix), err)
+			}
+			out[suffix] = absentFile
+			continue
+		}
+		sum := sha256.Sum256(b)
+		out[suffix] = fmt.Sprintf("%d bytes %x", len(b), sum[:8])
+	}
+	return out
 }

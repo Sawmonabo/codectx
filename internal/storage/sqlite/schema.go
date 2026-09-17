@@ -56,13 +56,11 @@ func (s *Store) initSchema(ctx context.Context) error {
 // verifySchema is initSchema's check for a process that opened the store
 // read-only: the same comparison, run on the reader pool, so a report never
 // begins a write transaction to learn whether it may read. It creates nothing.
-// A cache that holds no tables is one no run has ever built here -- a read-only
-// open of a missing database leaves a zero-byte file behind. That is the
-// workspace that exists but has published nothing, which is what the writing
-// open produced too: it created the schema, and the first pin then found no
-// active generation. Reporting it as a fingerprint that failed to match, or as
-// a workspace that was never discovered, would send the operator to the wrong
-// remedy.
+// A cache that holds no tables is one a writing open created and no run has
+// yet published into, and it is reported as the same state Open reports when
+// there is no database to open at all: the workspace that has published
+// nothing. A read-only open creates no database, so it never makes that state
+// itself.
 func (s *Store) verifySchema(ctx context.Context) error {
 	return s.read(ctx, func(tx *sql.Tx) error {
 		var tables int
@@ -70,12 +68,21 @@ func (s *Store) verifySchema(ctx context.Context) error {
 			return wrap("sqlite_master", err)
 		}
 		if tables == 0 {
-			return &model.Error{Code: model.CodeNoActiveGeneration,
-				Message:     "nothing has been published in this workspace yet",
-				Remediation: "run `codectx index`"}
+			return notPublishedYet()
 		}
 		return s.checkFingerprint(ctx, tx)
 	})
+}
+
+// notPublishedYet is the answer to a read-only open of a workspace nothing has
+// built: the database is not there at all, or it is there and holds no tables.
+// One answer for both, because they are one state to an operator and one
+// remedy. Reporting it as a fingerprint that failed to match, or as a workspace
+// that was never discovered, would send them to the wrong one.
+func notPublishedYet() error {
+	return &model.Error{Code: model.CodeNoActiveGeneration,
+		Message:     "nothing has been published in this workspace yet",
+		Remediation: "run `codectx index`"}
 }
 
 // adoptSchema is the writer-deferred open's schema check (Options.LazyWriter):

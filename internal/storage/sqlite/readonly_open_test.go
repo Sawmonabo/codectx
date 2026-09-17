@@ -2,6 +2,11 @@ package sqlite_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -199,5 +204,152 @@ func wantNoLeaseRow(t *testing.T, ctx context.Context, f *fixture) {
 	}
 	if st.Leases != 0 {
 		t.Fatalf("a writerless pin left %d retention leases", st.Leases)
+	}
+}
+
+// digestTriple is the length and content digest of a store's three files: the
+// database, its write-ahead log and the shared-memory index beside it. A file
+// that is not there is reported as absent, which is itself an answer: the
+// engine's close unlinks the log and the index, and an absence where there was
+// a file is the write this test exists to catch.
+func digestTriple(t *testing.T, dbPath string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("reading %s: %v", filepath.Base(path), err)
+			}
+			out[suffix] = "absent"
+			continue
+		}
+		sum := sha256.Sum256(b)
+		out[suffix] = fmt.Sprintf("%d bytes %x", len(b), sum[:8])
+	}
+	return out
+}
+
+// A command that answers questions must leave the workspace byte for byte as it
+// found it. `Options.ReadOnly` opened no writer connection and set query_only,
+// which refuses writes through SQL -- and left the connection read-WRITE at the
+// file level, so the last one to close ran the engine's log close: the log
+// checkpointed into the database, and the log and the shared-memory index were
+// unlinked. A `status` on a workspace whose finished run had left an 82 MB log
+// grew the database from 12,865,536 to 94,973,952 bytes and removed both.
+//
+// That is a write of the whole published index by a command whose help, and
+// docs/operations.md, both promise it writes nothing. It is also destructive
+// under a concurrent run: the checkpoint and the unlink are performed holding
+// the database exclusively, which is minutes of held lock on a large log.
+//
+// The store is copied aside with its log and index while the writer that made
+// them is open and between transactions, which is how a test gets the state a
+// crashed or killed run leaves: a database with a live log and no writer.
+//
+// Mutation that fails this test: drop `mode=ro` from the read-only pools'
+// connection string. The digests then differ and the log and index are absent.
+func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) {
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "codectx.db")
+	f := newFixture(t, src)
+	a := f.file("pkg/a.go", "package pkg\nfunc A() {}\n")
+	snap := f.snapshot("one", a)
+	gen, err := f.s.BeginGeneration(ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration: %v", err)
+	}
+	run := f.run(gen)
+	f.unit(gen, run, a)
+	if err := f.s.CompleteProviderRun(ctx, model.ProviderResult{RunID: run, State: model.RunSucceeded, RecordsEmitted: 1, BytesProcessed: 24}, ""); err != nil {
+		t.Fatalf("CompleteProviderRun: %v", err)
+	}
+	f.activate(gen, 0)
+
+	// The copy, taken with the writer open and no transaction in flight.
+	dst := filepath.Join(t.TempDir(), "codectx.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		b, err := os.ReadFile(src + suffix)
+		if err != nil {
+			t.Fatalf("a live store has no %s beside it: %v", suffix, err)
+		}
+		if err := os.WriteFile(dst+suffix, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := digestTriple(t, dst)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if before[suffix] == "absent" {
+			t.Fatalf("the copied store has no %s, so this test would not exercise the log close at all", suffix)
+		}
+	}
+
+	reader, err := store.Open(ctx, dst, store.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("a read-only open of a store with a live log was refused: %v", err)
+	}
+	pinned, err := reader.PinGeneration(ctx, f.repo, 0, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration through a read-only open of a store with a live log: %v", err)
+	}
+	nodes, err := pinned.NodesInFile(ctx, a.id, 0, "", 10)
+	if err != nil {
+		t.Fatalf("NodesInFile: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("the read-only open answered with %d nodes, want the 1 the log holds: it is reading the "+
+			"database without the log", len(nodes))
+	}
+	pinned.Close()
+	// After the close, which is where the engine's log close runs: the last
+	// connection to let go of a read-write handle is the one that checkpoints
+	// and unlinks.
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	after := digestTriple(t, dst)
+	for _, suffix := range []string{"", "-wal"} {
+		if before[suffix] != after[suffix] {
+			t.Fatalf("a read-only open changed %q: %s before, %s after",
+				"codectx.db"+suffix, before[suffix], after[suffix])
+		}
+	}
+	// The shared-memory index is the one file a reader does touch, and it is
+	// not workspace content: it holds no database bytes at all, it is the
+	// index OF the log and is rebuilt from the log, and the region a reader
+	// writes is the read mark by which it takes its snapshot without blocking
+	// the writer. Measured here: fewer than a dozen bytes differ, every one of
+	// them inside the first 136 -- the two index header copies and the
+	// read-mark block -- and the count varies with how the snapshot lands.
+	// What must not happen is what the log close does: the file unlinked, or
+	// resized. Asserting its bytes identical would be asserting that a reader
+	// takes no snapshot.
+	if strings.Fields(after["-shm"])[0] != strings.Fields(before["-shm"])[0] {
+		t.Fatalf("a read-only open removed or resized the shared-memory index: %s before, %s after",
+			before["-shm"], after["-shm"])
+	}
+}
+
+// A read-only open of a workspace nothing has ever published must say so, and
+// must not bring the workspace into being on the way. The open used to create
+// the database file -- the engine's own create flag -- and learn from the empty
+// schema that nothing was published; the file it left behind was a write by a
+// command that promises none, and the next writing open then adopted it.
+//
+// Mutation that fails this test: return the raw open failure instead of the
+// typed answer, or restore the creating open, and the assertion on the absent
+// file or on the code fails.
+func TestAReadOnlyOpenOfAWorkspaceNeverIndexedCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codectx.db")
+	_, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true})
+	if err == nil {
+		t.Fatal("a read-only open of a workspace that has published nothing succeeded")
+	}
+	wantCode(t, err, model.CodeNoActiveGeneration)
+	if _, statErr := os.Stat(dbPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("the read-only open left a database behind: %v", statErr)
 	}
 }
