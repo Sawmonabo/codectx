@@ -6,19 +6,20 @@ Accepted, 2026-09-16.
 
 ## Context
 
-The dependence provider runs an external analysis engine, a JVM, once per unit for the parse and
+The dependence provider runs an external analysis engine once per unit for the parse and
 once for the export, under a heap ceiling the provider chooses ([providers-dependence](../providers-dependence.md)).
 Until this decision the ceiling was the unit's estimate -- 512 bytes of heap per byte of JavaScript
 source, from the round-3 research -- clamped to the machine's available memory minus two gigabytes.
 The first uncapped index of the 13,222-file reference repository showed what that means on a host
-with 47 GiB: the 157.2 MiB JavaScript unit was given a 39.1 GiB ceiling, and the JVM grew to 17.6 GB,
-twice, then 12.5, 11.1, 10.8 and 7.3 GB on the unit's parts, one JVM at a time for twenty minutes
+with 47 GiB: the 157.2 MiB JavaScript unit was given a 39.1 GiB ceiling, and the engine grew to
+17.6 GB, twice, then 12.5, 11.1, 10.8 and 7.3 GB on the unit's parts, one run at a time for twenty
+minutes
 because every reservation was the size of the machine and nothing could be scheduled beside it.
 The product is meant to run beside the user's editor, browser and the agents driving it over MCP;
 a run that plans to hold nearly all of the host's memory is not a run that coexists with anything.
 
 The research already held the decisive observation: a heap ceiling is lossless everywhere the run
-succeeds, and a JVM given a high ceiling grows toward it rather than to what it needs
+succeeds, and an engine given a high ceiling grows toward it rather than to what it needs
 ([10-round3-empirical §4](../research/10-round3-empirical.md), observations 1 and 3: caps are
 lossless where they succeed; a cap close to the live set costs time, not memory). What was missing
 was the measurement for this family at this size.
@@ -40,7 +41,7 @@ was the measurement for this family at this size.
    memory ([10-round3-empirical §8](../research/10-round3-empirical.md): splitting the JavaScript
    project loses more than half of the resolved calls).
 3. **Only the hard ceiling sizes a unit.** A soft ceiling under a high hard ceiling does not hold
-   the JVM near its live set on the pinned engine's runtime (measured below), so the product sets
+   the engine near its live set on its pinned runtime (measured below), so the product sets
    no soft ceiling and does not rely on the collector giving memory back.
 4. **Every unit discloses its reservation, its ceiling and its observed peak** in the resources
    block and in `codectx status`, so a host that is short of memory can be read from the product's
@@ -111,7 +112,7 @@ unit's 348-file, 2.79 MiB sub-project, which does complete, parse then export at
 every ceiling from 768 MiB to none produced a 195 MB export with identical counts -- 24,507
 methods, 176,698 call edges, 81,040 control-dependence edges, 1,226,336 reaching-definition edges.
 The ceiling changes cost, never facts. Peak parse RSS 1.11 GB at 768 MiB, 1.17 at 1 GiB, 1.74 at
-2 GiB, 2.68 at 4 GiB, 3.65 at 8 GiB, 4.44 GB with none: the JVM takes what it is allowed.
+2 GiB, 2.68 at 4 GiB, 3.65 at 8 GiB, 4.44 GB with none: the engine takes what it is allowed.
 
 This process's own idle overhead, the part of the base footprint that is not a stated reservation:
 `codectx status` over a freshly indexed five-file, 432-byte fixture, peak resident set of the
