@@ -203,7 +203,11 @@ func (b *Backend) Argv(f dependence.Family) []string {
 // options. It is empty for every frontend: every option this release offers
 // changes results (the Rust helper's --no-sysroot drops type resolution, the
 // overlay switches drop whole fact families), so there is nothing that could
-// be added to confirm a crash without changing what a success would mean.
+// be added to confirm a crash without changing what a success would mean. The
+// option that empties the default exclusions is no exception -- it changes
+// which files are read, which is the whole point of it -- and it is not a
+// retry lever in any case: every parse passes it, so a confirmation rerun
+// carries it already.
 func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 
 // Parse builds the graph for one unit. The heap cap reaches the frontend
