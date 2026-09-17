@@ -234,6 +234,11 @@ func (s *Service) reservations(report *model.ResourceReport) {
 		allocation, reserved := s.opts.Admission.Snapshot()
 		report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
 		report.AdmissionReservedBytes = nonNegativeBytes(reserved)
+		// The ledger gates on two dimensions and a child can wait on either,
+		// so both are disclosed or the report explains only half of a wait.
+		diskAllocation, diskReserved := s.opts.Admission.DiskSnapshot()
+		report.AdmissionDiskAllocationBytes = nonNegativeBytes(diskAllocation)
+		report.AdmissionDiskReservedBytes = nonNegativeBytes(diskReserved)
 	}
 }
 

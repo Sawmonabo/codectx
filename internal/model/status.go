@@ -244,12 +244,23 @@ type ResourceReport struct {
 	// absent where this process composed no admission ledger.
 	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
 	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
-	LiveSubprocesses         *int64  `json:"live_subprocesses,omitempty"`
-	PendingEvents            *int64  `json:"pending_events,omitempty"`
-	DatabaseBytes            *uint64 `json:"database_bytes,omitempty"`
-	WALBytes                 *uint64 `json:"wal_bytes,omitempty"`
-	TempBytes                *uint64 `json:"temp_bytes,omitempty"`
-	CASBytes                 *uint64 `json:"cas_bytes,omitempty"`
+	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same
+	// pair for the ledger's second dimension: the free space under the data
+	// directory less the host-safety floor, and the sum the children running
+	// now have reserved of it. A child can wait on either dimension, so an
+	// operator who cannot read this one cannot tell a run waiting for disk from
+	// a run waiting for memory. Absent where this process composed no ledger,
+	// and absent -- never zero -- where the platform published no free-space
+	// figure, in which case the ledger admits against a stand-in it warned
+	// about at composition.
+	AdmissionDiskAllocationBytes *uint64 `json:"admission_disk_allocation_bytes,omitempty"`
+	AdmissionDiskReservedBytes   *uint64 `json:"admission_disk_reserved_bytes,omitempty"`
+	LiveSubprocesses             *int64  `json:"live_subprocesses,omitempty"`
+	PendingEvents                *int64  `json:"pending_events,omitempty"`
+	DatabaseBytes                *uint64 `json:"database_bytes,omitempty"`
+	WALBytes                     *uint64 `json:"wal_bytes,omitempty"`
+	TempBytes                    *uint64 `json:"temp_bytes,omitempty"`
+	CASBytes                     *uint64 `json:"cas_bytes,omitempty"`
 	// FreedBytes is the disk space this process has given back to the
 	// filesystem since it started, one window at a time. A run reuses the
 	// space it holds and frees only the leftovers of a dead run at its start,
@@ -384,6 +395,8 @@ func (r ResourceReport) Validate() error {
 		{"resources.queue_reservation_bytes", r.QueueReservationBytes},
 		{"resources.admission_allocation_bytes", r.AdmissionAllocationBytes},
 		{"resources.admission_reserved_bytes", r.AdmissionReservedBytes},
+		{"resources.admission_disk_allocation_bytes", r.AdmissionDiskAllocationBytes},
+		{"resources.admission_disk_reserved_bytes", r.AdmissionDiskReservedBytes},
 		{"resources.database_bytes", r.DatabaseBytes},
 		{"resources.wal_bytes", r.WALBytes},
 		{"resources.temp_bytes", r.TempBytes},

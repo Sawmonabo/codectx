@@ -186,6 +186,17 @@ func (l *Ledger) Snapshot() (allocation, reserved int64) {
 	return l.allocation, l.used
 }
 
+// DiskSnapshot is Snapshot for the second dimension: the temporary space the
+// ledger admits against -- free space under the data directory less the
+// host-safety floor, or the stand-in composition warned about where the
+// platform published no figure -- and the sum the children holding room have
+// reserved of it. A waiter blocked on disk is invisible in Snapshot alone.
+func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.diskAllocation, l.diskUsed
+}
+
 // pump grants the head of the queue for as long as the head fits. The mutex
 // must be held. It stops at the first waiter that does not fit rather than
 // looking past it, which is what makes admission first-in-first-out across

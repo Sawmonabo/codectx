@@ -914,6 +914,8 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"queue reservation", byteMetric(r.QueueReservationBytes)},
 		{"child admission allocation", byteMetric(r.AdmissionAllocationBytes)},
 		{"child admission reserved", byteMetric(r.AdmissionReservedBytes)},
+		{"child admission disk allocation", byteMetric(r.AdmissionDiskAllocationBytes)},
+		{"child admission disk reserved", byteMetric(r.AdmissionDiskReservedBytes)},
 		{"database", byteMetric(r.DatabaseBytes)},
 		{"wal", byteMetric(r.WALBytes)},
 		{"temp", byteMetric(r.TempBytes)},
