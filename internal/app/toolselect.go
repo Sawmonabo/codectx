@@ -9,10 +9,12 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
+	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -35,16 +37,33 @@ const cpgKind = "cpg"
 // measured monorepo sits in a subdirectory, so a root-only marker check
 // resolved no indexer payload at all while each of that repository's projects
 // had an indexer and a language server to run. The traversal is the
-// workspace's own, under the configuration's traversal policy, so a manifest
-// inside a dependency directory or any other excluded tree is never seen --
-// the same tree the precise and dependence planners walk, which is what makes
-// what this command installs and what an index needs one question.
+// workspace's own, under the configuration's traversal policy, so an untracked
+// manifest inside a dependency directory or any other excluded tree is never
+// seen -- the same tree the precise and dependence planners walk, which is what
+// makes what this command installs and what an index needs one question.
 //
-// The Git ignore predicate snapshot.TraversalPolicy adds is not installed
-// here: building it needs a Git process runner this command has none of, and
-// without it the walk sees a few paths a capture would exclude. That direction
-// only ever selects a payload the repository may not need; the direction this
-// command must never take is missing one.
+// A tracked path wins over every exclusion, here as in a capture. Section 10.2
+// forces Git's own membership past ignore rules and past the vendor and
+// generated exclusions, which is why a capture installs ForceInclude and
+// ForceIncludeDir over its staging database: a tracked `third_party/mycrate/
+// Cargo.toml` IS in the manifest, roots a project and plans a unit, so a
+// selection that pruned it installed nothing for a project the index then
+// needs -- the offline runner's mid-index failure again, from the other side.
+//
+// The second pass below is that force-include, reached without hooks and
+// without a staging database. A walk carrying the capture's two hooks emits
+// the paths the policy admits plus the tracked paths under excluded
+// directories; this walk plus every tracked path emits the paths the policy
+// admits plus ALL tracked paths. The two sets differ only by tracked paths the
+// policy already admits, which the walk emitted either way, so the answer is
+// the same one -- and it is reached by streaming Git's index rather than by
+// holding a tracked-path set the hooks could be asked about, which is the
+// repository-sized retention this command is not allowed.
+//
+// The Git ignore predicate snapshot.TraversalPolicy adds is still not
+// installed, so the walk sees a few untracked ignored paths a capture would
+// exclude. That direction only ever selects a payload the repository may not
+// need; the direction this command must never take is missing one.
 func SelectedTools(dir string) ([]string, error) {
 	root, err := workspace.Discover(dir)
 	if err != nil {
@@ -59,7 +78,7 @@ func SelectedTools(dir string) ([]string, error) {
 	lock := toolchain.Embedded()
 
 	// The marker names every mapping below asks about, collected before the
-	// walk so that one traversal answers all of them.
+	// passes so that one reading of the repository answers all of them.
 	markers := map[string]bool{}
 	for _, kind := range scip.Kinds {
 		for _, t := range scip.Triggers(kind) {
@@ -85,10 +104,15 @@ func SelectedTools(dir string) ([]string, error) {
 		}
 	}
 
-	present, hasDependenceSource, err := repositorySignals(root, cfg.TraversalPolicy(), markers)
-	if err != nil {
+	sig := newSignals(markers)
+	policy := cfg.TraversalPolicy()
+	if err := sig.walk(root, policy); err != nil {
 		return nil, err
 	}
+	if err := sig.tracked(root, policy.MaxFiles); err != nil {
+		return nil, err
+	}
+	present, hasDependenceSource := sig.present, sig.source
 
 	selected := make(map[string]bool, len(lock.Tools))
 	// A tool is selected by the first of its markers the repository holds;
@@ -158,40 +182,115 @@ func SelectedTools(dir string) ([]string, error) {
 	return names, nil
 }
 
-// repositorySignals walks the workspace once and answers the two questions the
-// selection asks of it: which of the marker file names the repository holds
-// anywhere the traversal admits, and whether it holds a source file of a
-// language family the dependence provider analyses.
+// signals is the answer the two passes below build together: which of the
+// marker file names the repository holds anywhere its source reaches, and
+// whether it holds a source file of a language family the dependence provider
+// analyses. Both passes ask the same two questions of a path, through observe,
+// so neither can record a signal the other would have read differently.
 //
 // Nothing repository-sized is retained: the set of marker names is fixed by
-// the packages that own them before the walk begins, and the source question
-// is one bit. The walk ends as soon as every marker has been seen and a source
-// has been found, because at that moment the answer is complete -- that is the
-// question being over, not a bound on how much of the repository is read.
-func repositorySignals(root workspace.Root, policy workspace.Policy, markers map[string]bool) (map[string]bool, bool, error) {
-	present := make(map[string]bool, len(markers))
-	source := false
+// the packages that own them before the first pass begins, present is bounded
+// by that set, and the source question is one bit. Each pass ends as soon as
+// complete reports the answer decided -- that is the question being over, not
+// a bound on how much of the repository is read.
+type signals struct {
+	markers map[string]bool
+	present map[string]bool
+	source  bool
+}
+
+func newSignals(markers map[string]bool) *signals {
+	return &signals{markers: markers, present: make(map[string]bool, len(markers))}
+}
+
+// observe records what one root-relative path contributes. Only its last
+// element is read: a marker is a file name, and a path's language is its
+// extension's.
+func (s *signals) observe(rel string) {
+	base := path.Base(rel)
+	if s.markers[base] {
+		s.present[base] = true
+	}
+	if !s.source && dependence.FamilyOf(lang.Of(base)) != "" {
+		s.source = true
+	}
+}
+
+// complete reports that every signal is decided, so nothing a pass could still
+// see would change the answer.
+func (s *signals) complete() bool { return s.source && len(s.present) == len(s.markers) }
+
+// walk is the first pass: every file the traversal policy admits.
+func (s *signals) walk(root workspace.Root, policy workspace.Policy) error {
 	err := workspace.Walk(context.Background(), root, policy, func(f workspace.File) error {
-		base := path.Base(f.Path)
-		if markers[base] {
-			present[base] = true
-		}
-		if !source && dependence.FamilyOf(lang.Of(base)) != "" {
-			source = true
-		}
-		if source && len(present) == len(markers) {
+		s.observe(f.Path)
+		if s.complete() {
 			return errSignalsComplete
 		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, errSignalsComplete) {
-		return nil, false, err
+		return err
 	}
-	return present, source, nil
+	return nil
 }
 
-// errSignalsComplete ends the selection walk once nothing later in the
-// repository could change its answer.
+// tracked is the second pass: every path Git tracks, whatever the policy says
+// about the directory holding it. It is the capture's force-include, from the
+// capture's own source -- the index listing, bounded by the same
+// workspace.max_files the walk is bounded by, with skip-worktree entries
+// passed over for the reason the capture passes over them: a sparse checkout
+// never materialized that path, so it is not on disk to root anything.
+//
+// The capture's forced predicate is `tracked = 1 OR change IN ('added',
+// 'modified', 'deleted')`, and the index alone answers it for every path that
+// exists: a staged add is an index entry, a modification is of a tracked path,
+// and a deleted path is not in the worktree to carry a marker or a source. So
+// no second Git call is needed here, and there is no second definition of what
+// this repository tracks for this one to drift from.
+//
+// A workspace with a .git entry and no usable Git is an error rather than a
+// quieter answer, exactly as it is for a capture: the quieter answer is an
+// under-selection, and an under-selection is what the offline runner discovers
+// mid-index.
+func (s *signals) tracked(root workspace.Root, maxFiles int64) error {
+	if !root.HasGit || s.complete() {
+		return nil
+	}
+	exe, err := git.Locate()
+	if err != nil {
+		return err
+	}
+	// One listing runs at a time and reserves nothing, so the runner is sized
+	// at the package's smallest child reservation: this command starts no
+	// other child and has no allocation to divide between them.
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: smallestChildReservationBytes})
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	g, err := git.New(ctx, runner, exe, 0)
+	if err != nil {
+		return err
+	}
+	err = g.ListIndex(ctx, root.Path, maxFiles, func(e git.IndexEntry) error {
+		if e.SkipWorktree {
+			return nil
+		}
+		s.observe(e.Path)
+		if s.complete() {
+			return errSignalsComplete
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errSignalsComplete) {
+		return err
+	}
+	return nil
+}
+
+// errSignalsComplete ends a selection pass once nothing it could still see
+// could change its answer.
 var errSignalsComplete = errors.New("every tool-selection signal is decided")
 
 // cpgEntries are the lock entries of the kind the dependence provider runs.
