@@ -166,6 +166,18 @@ func emptyExport(unit Unit, o Outcome, r Reservation, files int64) *model.Error 
 		WithRemediation(unreadRemediation)
 }
 
+// emptyPart is the typed reason one part of a subdivided unit produced no
+// method: both its steps exited cleanly and its export carries none. It is the
+// part's own outcome and not the unit's -- the unit fails only when no part
+// produced anything (subdivisionEmpty) -- so the part's span row says so in
+// those words rather than in the unit's.
+func emptyPart(scopeKey string, o Outcome, r Reservation) *model.Error {
+	err := failure(FailureEmptyExport, scopeKey, o, r).WithRemediation(unreadRemediation)
+	err.Message = "this part of a subdivided dependence unit produced no method: " +
+		"both its analysis steps exited cleanly and its export carries none"
+	return err
+}
+
 // partTally is what a subdivided unit's parts did, counted as the loop ran
 // them. It is three integers, never the parts themselves: a unit is split into
 // as many parts as it has child projects, and a list of them would grow with
@@ -497,4 +509,15 @@ func peakForLog(o Outcome) any {
 		return "unsampled"
 	}
 	return o.PeakBytes
+}
+
+// allocationForLog renders the machine-derived allocation a reservation was
+// bounded by. Zero there means the machine's available memory could not be
+// observed at all (Reservation.AllocationBytes), so a log that printed 0 would
+// claim the host offered the unit nothing.
+func allocationForLog(r Reservation) any {
+	if r.AllocationBytes <= 0 {
+		return "unobserved"
+	}
+	return r.AllocationBytes
 }
