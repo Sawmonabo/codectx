@@ -104,6 +104,12 @@ type Spec struct {
 	// them handed to the disk one window at a time while the child writes
 	// them, instead of left dirty until the kernel submits the lot at once.
 	ProgressFiles []string
+	// CPUProgress optionally receives this run's live processor-time signal --
+	// the same figure StallTimeout's detector watches -- for a caller whose own
+	// hang detector watches a protocol this package cannot see inside. The
+	// caller allocates it and reads it while the run is in flight; nil, which
+	// is the ordinary case, publishes nothing.
+	CPUProgress *CPUProgress
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
 	// native child can temporarily exceed a reservation, and only an OS control
@@ -555,6 +561,11 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	sampler := startTreeSampler(cmd.Process.Pid, sampleEvery)
 	defer sampler.stopSampling()
+	// The same figure, published to a caller watching this child's progress
+	// through a protocol of its own. It is bound after the sampler exists and
+	// never unbound: the last sweep's count stays readable, and a caller that
+	// sees it stop moving is reading a child that has stopped.
+	spec.CPUProgress.bind(sampler)
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.
 	outPipe.closeWriter()

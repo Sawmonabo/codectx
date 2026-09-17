@@ -1,0 +1,48 @@
+package process
+
+import "sync/atomic"
+
+// CPUProgress carries a running child's consumed processor time out to the
+// caller that started it.
+//
+// It exists so a caller that runs its own hang detector over a protocol this
+// package cannot see inside -- a framed request/response stream, where a
+// wedged request and a long one look identical on the wire -- watches the same
+// processor-time signal the stall watchdog here already watches, instead of
+// growing a second sampler beside it. A child computing an answer and saying
+// nothing is working, and only this signal can say so.
+//
+// The caller allocates one, hands it to the runner in Spec.CPUProgress and
+// reads it while the run is in flight. The runner binds it to the tree sampler
+// once the child exists; before that, and on a platform that cannot sample a
+// running tree at all, it reports nothing observed rather than zero ticks, so
+// no caller reads a missing measurement as "used no processor time"
+// (Section 22).
+type CPUProgress struct {
+	sampler atomic.Pointer[treeSampler]
+}
+
+// Ticks reports the child tree's summed user and system processor time, in
+// whatever unit the platform counts it in, as of the last sweep. ok is false
+// where there is no measurement: no sampler is bound yet, or this platform has
+// none. The value is a change signal, never a duration -- a caller compares it
+// with the previous reading and asks only whether it moved.
+func (p *CPUProgress) Ticks() (int64, bool) {
+	if p == nil || !treeSampled {
+		return 0, false
+	}
+	s := p.sampler.Load()
+	if s == nil {
+		return 0, false
+	}
+	return s.cpuTicks(), true
+}
+
+// bind publishes the run's tree sampler. A nil handle is the ordinary case --
+// most callers want no live signal -- and binds nothing.
+func (p *CPUProgress) bind(s *treeSampler) {
+	if p == nil {
+		return
+	}
+	p.sampler.Store(s)
+}

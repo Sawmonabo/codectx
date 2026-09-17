@@ -480,9 +480,12 @@ type Tools struct {
 	// lock's, so a mirror can relocate bytes but never change which bytes are
 	// accepted.
 	Mirror string `toml:"mirror"`
-	// MaxFetchBytes and FetchTimeout bound one payload download.
-	MaxFetchBytes int64    `toml:"max_fetch_bytes"`
-	FetchTimeout  Duration `toml:"fetch_timeout"`
+	// MaxFetchBytes bounds one payload download. There is no deadline beside
+	// it: a payload is as large as a language runtime and the link it arrives
+	// over is the operator's, so a clock over the whole download is a rate
+	// requirement in disguise. The fetch path watches the bytes instead and
+	// ends only a transfer that has stopped delivering.
+	MaxFetchBytes int64 `toml:"max_fetch_bytes"`
 	// Override is the `[tools.override.<name>]` table, keyed by lock entry
 	// name. Iterate it in sorted order so diagnostics are deterministic.
 	Override map[string]ToolOverride `toml:"override"`
@@ -668,7 +671,6 @@ func Defaults() Config {
 			CacheDir:      "",
 			Mirror:        "",
 			MaxFetchBytes: 2147483648,
-			FetchTimeout:  Duration(10 * time.Minute),
 		},
 		Providers: Providers{
 			TreeSitter: TreeSitter{

@@ -500,15 +500,15 @@ func (o *Overlay) position(ctx context.Context, at At) (*document, position, err
 	return doc, pos, nil
 }
 
-// call issues one request under the connection's hang detector. There is no
-// deadline on the answer: a server that is still moving bytes is working,
-// however long the project it is answering about takes to index.
+// call issues one request under its own hang detector. There is no deadline on
+// the answer: a server that is still working -- computing, or answering -- is
+// working, however long the project it is answering about takes to index.
 func (o *Overlay) call(ctx context.Context, method string, params, result any) error {
 	ctx, stalled, stop := o.s.conn.watchProgress(ctx, o.s.opts.RequestStallTimeout)
 	defer stop()
 	err := o.s.conn.call(ctx, method, params, result)
 	if err != nil && stalled() {
-		return unavailable("the language server moved no bytes for %s while answering %s; it is not responding",
+		return unavailable("the language server made no progress for %s while answering %s; it is not responding",
 			o.s.opts.RequestStallTimeout, method).
 			WithDetail("method", method).WithDetail("reason", "stalled")
 	}

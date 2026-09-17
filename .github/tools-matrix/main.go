@@ -224,7 +224,6 @@ func run(store, work string, keep bool) error {
 		// `codectx tools prefetch --all` immediately before this program.
 		Offline:       true,
 		MaxFetchBytes: 1 << 31,
-		FetchTimeout:  runTimeout,
 	})
 	if err != nil {
 		return err

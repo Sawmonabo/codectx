@@ -141,7 +141,6 @@ func (c Config) validate() error {
 		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
 		{"providers.dependence.stall_timeout", c.Providers.Dependence.StallTimeout},
-		{"tools.fetch_timeout", c.Tools.FetchTimeout},
 		{"coverage.session_ttl", c.Coverage.SessionTTL},
 	} {
 		if d.v <= 0 {

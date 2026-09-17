@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -119,10 +118,6 @@ type Options struct {
 	Mirror string
 	// MaxFetchBytes caps one payload.
 	MaxFetchBytes int64
-	// FetchTimeout bounds one payload fetch, including every retry, and is also
-	// how long a resolution waits for another process's install of the same
-	// tool.
-	FetchTimeout time.Duration
 	// Overrides are the user's [tools.override.<name>] entries.
 	Overrides map[string]Override
 	// Log receives one record per completed fetch and nothing else.
@@ -171,7 +166,6 @@ type Resolver struct {
 	fetch     *fetcher
 	platform  Platform
 	offline   bool
-	wait      time.Duration
 	overrides map[string]Override
 }
 
@@ -206,9 +200,6 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	if opts.MaxFetchBytes <= 0 {
 		return nil, invalid("tools.max_fetch_bytes must be positive")
 	}
-	if opts.FetchTimeout <= 0 {
-		return nil, invalid("tools.fetch_timeout must be positive")
-	}
 	var mirror *url.URL
 	if opts.Mirror != "" {
 		u, err := url.Parse(opts.Mirror)
@@ -234,10 +225,9 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	return &Resolver{
 		lock:      lock,
 		store:     &store{dir: storeDir},
-		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, opts.FetchTimeout, log),
+		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, log),
 		platform:  Current(),
 		offline:   opts.Offline,
-		wait:      opts.FetchTimeout,
 		overrides: overrides,
 	}, nil
 }
@@ -395,7 +385,7 @@ func (r *Resolver) ensure(ctx context.Context, name string, e Entry, p Payload) 
 	if r.offline {
 		return "", "", offline(name)
 	}
-	held, err := r.store.acquire(ctx, name, r.wait)
+	held, err := r.store.acquire(ctx, name, installWait)
 	if err != nil {
 		return "", "", err
 	}
