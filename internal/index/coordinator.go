@@ -172,10 +172,13 @@ type Options struct {
 	// totals, one machine, and a process free to reserve twice what the host
 	// has.
 	Admission *admission.Ledger
-	// RunLedgerReader reads back the rows this process's runs recorded, and is
-	// how a finished run states in its own result what it did. It may be nil,
-	// which is a coordinator whose results carry no run: a composition that
-	// records nothing has nothing to read back.
+	// RunLedgerReader reads back the rows this process's runs recorded: how a
+	// finished run states in its own result what it did, and what this
+	// workspace has already measured its heavy units to cost, which the plan
+	// raises a unit's reservation to. It may be nil, which is a coordinator
+	// whose results carry no run and whose heavy units are sized from the
+	// family estimates alone: a composition that records nothing has nothing
+	// to read back, which is no observation and never a measurement of zero.
 	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status

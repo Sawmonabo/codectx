@@ -332,6 +332,14 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 	if prev != 0 {
 		in.CarriedPage = c.carriedPage(prev)
 	}
+	if c.opts.RunLedgerReader != nil {
+		// What this workspace has already measured its heavy units to cost.
+		// It is wired whatever the previous generation is -- unlike the carry
+		// pages, which are about one generation's rows -- because the ledger
+		// outlives generations: a rebuild starts from no previous generation
+		// and must still not under-reserve what the last run measured.
+		in.RecordedPeaks = c.opts.RunLedgerReader.RecordedPeaks
+	}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return err
@@ -395,8 +403,16 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 // an interface here and satisfied in the composition, so the one conversion
 // from a recorded span to a stage row stays where every other surface's
 // conversion is and this package never grows a second.
+//
+// RecordedPeaks is the second thing this process asks of its own recorded
+// history, and the reason the interface is not named after one run: the
+// largest process-tree peak this workspace has measured for each scope key,
+// which is what stops the second index of a repository reserving less for a
+// unit than the first one watched it use. It is advisory and never a refusal,
+// so an implementation that cannot read its ledger answers no rows.
 type RunLedgerReader interface {
 	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
+	RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error)
 }
 
 // attachRunLedger states on a result what the run that produced it just did:

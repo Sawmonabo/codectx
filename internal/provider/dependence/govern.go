@@ -169,6 +169,27 @@ type Reservation struct {
 	// was applied. A unit whose estimate exceeds its cap is the one that
 	// earns an out-of-memory retry.
 	EstimatedBytes int64
+	// ObservedPeakBytes is the largest process-tree peak this workspace has
+	// already recorded for this unit's own scope, or for its language where
+	// its scope has none. It is the repository's own measurement of what this
+	// work costs, and it is set by whoever holds that history -- the planner,
+	// from the run ledger -- rather than derived here, because this package
+	// reads nothing.
+	//
+	// Zero means no such measurement, which is not a measurement of zero: a
+	// workspace with no ledger, a store with no history and a platform that
+	// never samples a process tree all leave it zero, and Bytes then answers
+	// exactly what the family constants derived. It can only ever RAISE the
+	// figure a unit is admitted against, never lower it, which is why Bytes
+	// takes the maximum rather than replacing anything.
+	//
+	// It is deliberately NOT the heap cap. The cap is handed to the frontend,
+	// which grows into whatever it is given (see heapPerSourceByte), so
+	// raising it on the evidence of a past peak would raise the next peak
+	// too. What a recorded peak is evidence about is how much of the machine
+	// this unit takes while it runs, which is what admission is about and
+	// what Bytes answers.
+	ObservedPeakBytes int64
 }
 
 // ParseBytes is the reservation of the parse step and ExportBytes that of the
@@ -176,8 +197,14 @@ type Reservation struct {
 func (r Reservation) ParseBytes() int64  { return r.HeapCapBytes + r.ResidentBytes + r.HelperBytes }
 func (r Reservation) ExportBytes() int64 { return r.ExportHeapCapBytes + exportResident }
 
-// Bytes is the reservation the coordinator schedules against.
-func (r Reservation) Bytes() int64 { return max(r.ParseBytes(), r.ExportBytes()) }
+// Bytes is the reservation the coordinator schedules against: the peak of the
+// two steps, and never less than what this repository has already been
+// measured to need for this work (ObservedPeakBytes). A second run of a
+// repository therefore cannot admit a unit against less than the first run
+// watched it use.
+func (r Reservation) Bytes() int64 {
+	return max(r.ParseBytes(), r.ExportBytes(), r.ObservedPeakBytes)
+}
 
 // Machine is the observed memory of the host the allocation is derived from.
 // Available is zero and Observed false when the platform does not expose it.

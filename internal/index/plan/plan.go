@@ -22,6 +22,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -129,6 +130,17 @@ type Carried struct {
 	DistanceGenerations, DistanceFiles int
 }
 
+// RecordedPeak is one scope key's largest recorded process-tree peak, as
+// Inputs.RecordedPeaks answers it. PeakBytes is always a measurement that was
+// actually taken and always above zero: a scope nothing ever sampled has no
+// row at all, because a row carrying zero would be read as "this work costs
+// nothing" and would be the one observation that could lower a reservation
+// instead of raising it.
+type RecordedPeak struct {
+	ScopeKey  string
+	PeakBytes int64
+}
+
 // Plan is one snapshot's complete unit plan.
 type Plan struct {
 	// Units yields the units to run, in provider dependency order. It is a
@@ -227,7 +239,25 @@ type Inputs struct {
 	// which is the cap the store applies anyway; a nil fetcher is refused
 	// whenever PrevGen is set.
 	CarriedPage func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]Carried, error)
-	Config      config.Config
+	// RecordedPeaks is what this workspace has already measured its own heavy
+	// units to cost: the largest process-tree peak recorded for each scope
+	// key, largest first, at most limit rows. It is a function field, in
+	// CarriedPage's style, so this package keeps no dependency on the run
+	// ledger; internal/app supplies it from the reader it already opens.
+	//
+	// It is read ONCE per plan, not once per unit: a plan answers every heavy
+	// unit from the one bounded page, so consulting the history costs the same
+	// whether the repository has one heavy unit or sixty.
+	//
+	// It is advisory in every direction. A nil fetcher, an empty answer and a
+	// scope this workspace has never run all mean the same thing -- no
+	// observation -- and the reservation the family constants derive then
+	// stands exactly as it is. A supplier that cannot read its ledger answers
+	// no rows rather than an error, because an unreadable accounting file must
+	// not refuse a plan; an error that does arrive is a broken supplier and is
+	// returned.
+	RecordedPeaks func(ctx context.Context, limit int) ([]RecordedPeak, error)
+	Config        config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot
 	// units. Empty takes the process temporary directory. The spill lives only
 	// as long as the returned Plan and is removed by Plan.Close.
@@ -354,6 +384,12 @@ type builder struct {
 	// that generation -- unit-scoped like Plan.Reuse and Plan.Previous, never
 	// file-scoped.
 	prior map[string]Carried
+	// peaks is the one bounded reading of Inputs.RecordedPeaks this plan
+	// takes, in the order it was answered. It is a slice and not a map
+	// because both questions asked of it -- this scope's own peak, and the
+	// largest peak of this scope's language -- are answered by one pass over
+	// a list the fetcher's limit already bounds.
+	peaks []RecordedPeak
 
 	byProvider map[string][]Unit
 	// overBound records one exemplar path per provider whose scope key does
@@ -635,6 +671,16 @@ func (b *builder) emit(ctx context.Context) error {
 		return err
 	}
 	b.plan.shared = shared
+	if b.in.RecordedPeaks != nil {
+		// model.MaxRecordsPerResult is the bound every other list in the
+		// product carries, and the planner never chooses its own: the page is
+		// as wide as a bounded response, and the reader answers the largest
+		// peaks first, so a repository with more recorded scopes than that
+		// keeps the measurements a reservation could be built on.
+		if b.peaks, err = b.in.RecordedPeaks(ctx, model.MaxRecordsPerResult); err != nil {
+			return err
+		}
+	}
 	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes,
 		config.BaseFootprint(b.in.Config))
 	machine := dependence.ObserveMachine()
@@ -676,7 +722,7 @@ func (b *builder) emit(ctx context.Context) error {
 				// bytes, which is the figure research measured the per-family
 				// ratio against; the unit's declared inputs are a larger set
 				// (its manifests and lock files) and would inflate it.
-				u.Reservation = gov.Reserve(s.family, s.bytes, machine)
+				u.Reservation = b.reserve(gov, s, machine)
 				u.Deferred = deferDependence
 			}
 			spec, err := u.Spec(b.cfgHash)
@@ -764,6 +810,66 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 		}
 		return flush(len(slots))
 	}
+}
+
+// reserve sizes one heavy unit's reservation: what the family constants derive
+// from the unit's own source bytes, raised to whatever this repository has
+// already been measured to need for this scope.
+//
+// The raise is a separate field and not a larger heap cap because the cap is
+// handed to the frontend, which grows into whatever it is given: raising it on
+// the evidence of a past peak would raise the next peak too. What the recorded
+// peak is evidence about is how much of the machine this unit takes while it
+// runs, which is what the unit is admitted against.
+//
+// Where no measurement exists the reservation is exactly what the constants
+// derived. ObservedPeakBytes is left at zero, which Reservation.Bytes reads as
+// "nothing to raise to" rather than as a reservation of zero; assigning an
+// unobserved peak unconditionally is the one mistake here that would collapse
+// every reservation in the product, which is why the raise is inside the
+// observation test.
+func (b *builder) reserve(gov dependence.Governor, s *semantic, m dependence.Machine) dependence.Reservation {
+	r := gov.Reserve(s.family, s.bytes, m)
+	if peak, observed := b.recordedPeak(s); observed {
+		r.ObservedPeakBytes = peak
+	}
+	return r
+}
+
+// recordedPeak is the largest process-tree peak this workspace's run ledger
+// holds for one heavy scope: the peak recorded for that scope key itself if it
+// has ever run here, and otherwise the largest peak recorded for any scope of
+// the same language, so a project indexed for the first time is still sized by
+// what its language has been measured to cost on this repository.
+//
+// The scope's own measurement wins over its language's even when it is the
+// smaller of the two: it is the one taken of this very work.
+//
+// The second result is whether a measurement exists, and it is the whole point
+// of the signature. No ledger, a store with no recorded run, a scope and a
+// language neither of which has ever been sampled, and a platform that samples
+// no process tree at all are every one of them "no observation", and every one
+// of them answers false -- never a peak of zero. A zero returned as observed
+// would be read as a reservation of zero for the work the plan is about.
+func (b *builder) recordedPeak(s *semantic) (int64, bool) {
+	for _, p := range b.peaks {
+		if p.ScopeKey == s.scopeKey {
+			return p.PeakBytes, true
+		}
+	}
+	if s.family == "" {
+		// Not a language-scoped heavy unit, so there is no language whose
+		// history could stand in for this scope's own.
+		return 0, false
+	}
+	prefix := dependence.ScopeKeyPrefix(s.family)
+	largest, observed := int64(0), false
+	for _, p := range b.peaks {
+		if strings.HasPrefix(p.ScopeKey, prefix) && p.PeakBytes > largest {
+			largest, observed = p.PeakBytes, true
+		}
+	}
+	return largest, observed
 }
 
 // carry records the stale predecessor of a refreshing semantic scope with its
