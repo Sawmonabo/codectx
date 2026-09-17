@@ -80,9 +80,25 @@ type event struct {
 	wallMS   int64
 }
 
-// A Ledger is one process's run accounting: the database, the bus and the one
-// collector goroutine that owns the writer. Everything else in the product
-// holds spans, not this.
+// A Ledger is a process's stable handle on the run ledger. It is composed once
+// and lives as long as the workspace; what comes and goes underneath it is its
+// COLLECTOR -- the database, the bus and the one goroutine that writes --
+// which ATTACHES when this process takes the cross-process workspace lock for
+// a building operation and DETACHES when that hold ends.
+//
+// The split is the one-writer-per-ledger invariant made structural. A process
+// that answers questions and occasionally builds -- a server -- would
+// otherwise hold a writer on this file for its whole session while holding the
+// workspace for the beat that builds, and the person's own index beside it
+// would be a second writer on a file whose separate-database design exists so
+// there is only ever one.
+//
+// A DETACHED handle records nothing, exactly as a nil *Ledger does: NewRun
+// returns a nil run, published events are dropped, and every query answers
+// empty. That is what lets the surfaces that are handed this handle at
+// composition -- the language-server manager's overlay run among them -- be
+// instrumented unconditionally and degrade to recording nothing rather than
+// writing without the lock.
 //
 // A nil *Ledger is a valid ledger that records nothing, exactly as a nil *Span
 // is a valid span that records nothing: it opens nil runs, and every method on
@@ -92,16 +108,39 @@ type event struct {
 // guard at every one of the dozens of stage sites, where the first one anybody
 // forgets panics the run it was meant to measure.
 type Ledger struct {
+	dir string
+
+	// mu guards cur and stopped. It is held across an attach and a detach, so
+	// the finalizing collector is gone before the next one exists and no two
+	// collectors of this handle ever hold the writer at once.
+	mu      sync.Mutex
+	cur     *collector
+	stopped bool
+
+	// Subscriptions belong to the handle and not to an attachment: the log
+	// line, the command line and the MCP server register once at composition
+	// and must still be fed by the collector of every later hold.
+	subMu sync.Mutex
+	subs  []func(SpanRow)
+}
+
+// A collector is one attachment: the writer connection, the bus, and the
+// goroutine that drains it. Its quit/done/stopOnce machinery is per
+// attachment, because detaching finalizes exactly as stopping used to --
+// drain, flush, write every still-open span as interrupted and every run's
+// finish, then close the pool.
+type collector struct {
+	l  *Ledger
 	db *sql.DB
 
 	bus chan event
-	// quit is what stops the collector. The bus is never closed: publish's
+	// quit is what stops this collector. The bus is never closed: publish's
 	// send is non-blocking, and a non-blocking send on a CLOSED channel fires
 	// its case and panics, so closing the bus would crash any goroutine still
-	// ending a span after Stop -- exactly what a deferred End in a goroutine
-	// outliving its coordinator does. After quit closes, a late event fills
-	// the buffer and is then dropped and counted, which is what a dropped
-	// event already means.
+	// ending a span after a detach -- exactly what a deferred End in a
+	// goroutine outliving its coordinator does. After quit closes, a late
+	// event fills the buffer and is then dropped and counted, which is what a
+	// dropped event already means.
 	quit chan struct{}
 	// writeMu guards the writer connection. The collector holds it for a
 	// flush; the retention calls hold it for a delete. Nothing else writes.
@@ -111,11 +150,8 @@ type Ledger struct {
 	stopOnce sync.Once
 	stopErr  error
 	// finalErr is the collector's last write, captured so a failure to close
-	// the open spans reaches the caller of Stop instead of vanishing.
+	// the open spans reaches the caller of Detach instead of vanishing.
 	finalErr error
-
-	subMu sync.Mutex
-	subs  []func(SpanRow)
 
 	runsMu sync.Mutex
 	runs   []*Run
@@ -129,11 +165,11 @@ type Ledger struct {
 // nothing, and the context it returns carries no run, so every span opened
 // under it is a nil span.
 type Run struct {
-	ledger *Ledger
-	id     []byte
-	idHex  string
-	kind   Kind
-	repo   []byte
+	c     *collector
+	id    []byte
+	idHex string
+	kind  Kind
+	repo  []byte
 
 	seq     atomic.Int64
 	dropped atomic.Int64
@@ -145,6 +181,12 @@ type Run struct {
 	// process must therefore stop writing: the collector skips its events
 	// rather than re-creating the row behind the delete.
 	discarded atomic.Bool
+	// stopped marks a run its collector has already finalized, which is every
+	// run of a detached attachment. Such a run records nothing further: its
+	// rows are closed, its bus has no drainer, and a surface that cached the
+	// handle -- the language-server manager's per-process overlay run -- would
+	// otherwise publish into a dead attachment for the life of the process.
+	stopped atomic.Bool
 
 	mu      sync.Mutex
 	started time.Time
@@ -178,34 +220,112 @@ type Totals struct {
 	ProcessPeakRSSBytes *uint64
 }
 
-// Open opens or creates the run ledger in dir -- the directory the index store
-// lives in, under the same lock -- and starts its collector. The caller stops
-// it with Stop, which flushes and joins.
-func Open(ctx context.Context, dir string) (*Ledger, error) {
-	path := Path(dir)
+// New composes the handle on the run ledger in dir -- the directory the index
+// store lives in, under the same lock. It opens NOTHING: the file is opened,
+// and the collector that writes it started, only by Attach.
+func New(dir string) *Ledger { return &Ledger{dir: dir} }
+
+// Attach opens the ledger file for writing and starts its collector. The
+// caller must already hold the cross-process workspace lock for this
+// workspace, and must Detach before it gives that lock up.
+//
+// A handle that already has a collector, or one that has been stopped, is a
+// composition defect rather than a condition to recover from: the first is two
+// writers in one process and the second is a hold taken after Close.
+func (l *Ledger) Attach(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stopped {
+		return internal("the run ledger has been stopped and cannot record another hold")
+	}
+	if l.cur != nil {
+		return internal("the run ledger already has a collector; one hold attaches it and the same hold detaches it")
+	}
+	path := Path(l.dir)
 	if err := ensureDir(path); err != nil {
-		return nil, err
+		return err
 	}
 	db, err := openPool(path, writerPragmas(), "immediate", 1, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := initSchema(ctx, db, path); err != nil {
 		db.Close()
-		return nil, err
+		return err
 	}
-	l := &Ledger{db: db, bus: make(chan event, busDepth), quit: make(chan struct{}), done: make(chan struct{})}
-	go l.collect()
-	return l, nil
+	c := &collector{l: l, db: db, bus: make(chan event, busDepth),
+		quit: make(chan struct{}), done: make(chan struct{})}
+	l.cur = c
+	go c.collect()
+	return nil
+}
+
+// Detach finishes this handle's collector and closes the ledger file: it
+// drains what is buffered, flushes it, writes every span still open as
+// interrupted and every run's finish, and closes the pool. The handle survives
+// and records nothing until the next Attach.
+//
+// It is the LAST thing a hold does before it releases the workspace lock.
+// Release the lock first and the waiter acquiring on its next poll opens its
+// collector while this one is still flushing -- two writers on the file again,
+// which is the whole defect this split exists to remove.
+func (l *Ledger) Detach() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	c := l.cur
+	l.cur = nil
+	l.mu.Unlock()
+	return c.stop()
+}
+
+// current is the attachment a call must go through, and nil when this handle
+// records nothing -- because it is nil, because no hold has attached one, or
+// because it has been stopped.
+func (l *Ledger) current() *collector {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.cur
+}
+
+// stop finalizes one attachment and closes its database. It is idempotent and
+// returns the first failure; a nil collector is a handle that was never
+// attached and has nothing to finish.
+func (c *collector) stop() error {
+	if c == nil {
+		return nil
+	}
+	c.stopOnce.Do(func() {
+		close(c.quit)
+		<-c.done
+		c.stopErr = c.finalErr
+		if err := c.db.Close(); err != nil && c.stopErr == nil {
+			c.stopErr = wrap("close", err)
+		}
+	})
+	return c.stopErr
 }
 
 // NewRun records a new run and returns its handle. The run id is 32 random
 // bytes, allocated before any generation exists, so a run that fails before
-// publication still has a complete ledger. A ledger that records nothing opens
-// a run that records nothing, and validates nothing, because there is nothing
-// to record.
+// publication still has a complete ledger. A ledger that records nothing --
+// nil, or a handle no hold has attached a collector to -- opens a run that
+// records nothing, and validates nothing, because there is nothing to record.
+//
+// The run belongs to the attachment that was current when it opened. When that
+// attachment detaches the run is finalized with it and records nothing
+// further, so a caller that cached one across a hold degrades to the same
+// no-op a composition with no ledger already gets.
 func (l *Ledger) NewRun(kind Kind, repositoryID string) (*Run, error) {
-	if l == nil {
+	c := l.current()
+	if c == nil {
 		return nil, nil
 	}
 	switch kind {
@@ -225,12 +345,12 @@ func (l *Ledger) NewRun(kind Kind, repositoryID string) (*Run, error) {
 	if err != nil {
 		return nil, internal("run identifier: " + err.Error())
 	}
-	run := &Run{ledger: l, id: id, idHex: idHex, kind: kind, repo: repo,
+	run := &Run{c: c, id: id, idHex: idHex, kind: kind, repo: repo,
 		started: time.Now(), outcome: OutcomeRunning}
 	run.dirty.Store(true)
-	l.runsMu.Lock()
-	l.runs = append(l.runs, run)
-	l.runsMu.Unlock()
+	c.runsMu.Lock()
+	c.runs = append(c.runs, run)
+	c.runsMu.Unlock()
 	return run, nil
 }
 
@@ -291,7 +411,7 @@ func (r *Run) Finish(outcome Outcome) {
 	r.finished = &now
 	r.mu.Unlock()
 	r.dirty.Store(true)
-	r.ledger.publish(event{kind: eventFinish, run: r})
+	r.c.publish(event{kind: eventFinish, run: r})
 }
 
 // Dropped is how many of this run's events the bus refused. It is on the run
@@ -307,14 +427,22 @@ func (r *Run) Dropped() int64 {
 
 // publish is the one non-blocking send. A bus with no room drops the event and
 // counts it on the run row; the run itself never waits on its own accounting.
-func (l *Ledger) publish(e event) {
+//
+// A run its collector has already finalized publishes nothing at all: nobody
+// drains a detached attachment's bus, so an event sent there would be retained
+// until the process exits and would be counted as a drop on a row that is
+// already closed.
+func (c *collector) publish(e event) {
+	run := e.run
+	if run == nil {
+		run = e.span.run
+	}
+	if run.stopped.Load() {
+		return
+	}
 	select {
-	case l.bus <- e:
+	case c.bus <- e:
 	default:
-		run := e.run
-		if run == nil {
-			run = e.span.run
-		}
 		run.dropped.Add(1)
 		run.dirty.Store(true)
 	}
@@ -334,10 +462,10 @@ func (r *Run) refreshDue(now time.Time) bool {
 
 // anyRefreshDue reports whether any run's liveness deadline needs renewing, so
 // a flush with nothing else to do still keeps a live run's claim current.
-func (l *Ledger) anyRefreshDue(now time.Time) bool {
-	l.runsMu.Lock()
-	runs := append([]*Run(nil), l.runs...)
-	l.runsMu.Unlock()
+func (c *collector) anyRefreshDue(now time.Time) bool {
+	c.runsMu.Lock()
+	runs := append([]*Run(nil), c.runs...)
+	c.runsMu.Unlock()
 	for _, run := range runs {
 		if run.refreshDue(now) {
 			return true
@@ -357,12 +485,12 @@ func (l *Ledger) anyRefreshDue(now time.Time) bool {
 //
 // It is called only from the collector, after the flush that completed the
 // run's sweep, so nothing is still writing the run when it goes.
-func (l *Ledger) retire(run *Run) {
-	l.runsMu.Lock()
-	defer l.runsMu.Unlock()
-	for i, held := range l.runs {
+func (c *collector) retire(run *Run) {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	for i, held := range c.runs {
 		if held == run {
-			l.runs = append(l.runs[:i], l.runs[i+1:]...)
+			c.runs = append(c.runs[:i], c.runs[i+1:]...)
 			return
 		}
 	}
@@ -370,10 +498,10 @@ func (l *Ledger) retire(run *Run) {
 
 // anyDirty reports whether any run row has moved since the last flush wrote
 // it. It is what lets an idle collector open no transaction at all.
-func (l *Ledger) anyDirty() bool {
-	l.runsMu.Lock()
-	defer l.runsMu.Unlock()
-	for _, run := range l.runs {
+func (c *collector) anyDirty() bool {
+	c.runsMu.Lock()
+	defer c.runsMu.Unlock()
+	for _, run := range c.runs {
 		if run.dirty.Load() {
 			return true
 		}
@@ -411,12 +539,13 @@ func (l *Ledger) Subscribe(fn func(SpanRow)) {
 // asking about. A run that has finished is not it: its rows are complete, and
 // answering with it would hand a later caller a run that is over.
 func (l *Ledger) IndexRunID() (string, bool) {
-	if l == nil {
+	c := l.current()
+	if c == nil {
 		return "", false
 	}
-	l.runsMu.Lock()
-	runs := append([]*Run(nil), l.runs...)
-	l.runsMu.Unlock()
+	c.runsMu.Lock()
+	runs := append([]*Run(nil), c.runs...)
+	c.runsMu.Unlock()
 	for i := len(runs) - 1; i >= 0; i-- {
 		run := runs[i]
 		if run.kind != KindIndex {
@@ -459,13 +588,14 @@ func (l *Ledger) notify(row SpanRow) {
 // block. A ledger that records nothing, and one whose collector has already
 // stopped and therefore written everything it had, return at once.
 func (l *Ledger) Flush(ctx context.Context) error {
-	if l == nil {
+	c := l.current()
+	if c == nil {
 		return nil
 	}
 	ack := make(chan error, 1)
 	select {
-	case l.bus <- event{kind: eventFlush, ack: ack}:
-	case <-l.done:
+	case c.bus <- event{kind: eventFlush, ack: ack}:
+	case <-c.done:
 		return nil
 	case <-ctx.Done():
 		return wrap("flush the ledger", ctx.Err())
@@ -473,30 +603,32 @@ func (l *Ledger) Flush(ctx context.Context) error {
 	select {
 	case err := <-ack:
 		return err
-	case <-l.done:
+	case <-c.done:
 		return nil
 	case <-ctx.Done():
 		return wrap("flush the ledger", ctx.Err())
 	}
 }
 
-// Stop tells the collector to finish, waits for it to drain and flush what is
-// left, writes
-// every span still open as interrupted and every run's finish, and closes the
-// database. It is safe to call more than once and returns the first failure.
+// Stop retires the handle for good: it detaches whatever collector is still
+// attached -- draining, flushing, writing every span still open as interrupted
+// and every run's finish, and closing the database -- and refuses any further
+// attach.
+//
+// It is what the composition's Close calls, and it is the backstop for a hold
+// that ended without detaching: a collector a leaked hold left open still
+// holds a writer on this file, and the process must not exit leaving it there.
+// It is safe to call more than once and returns the first failure.
 func (l *Ledger) Stop() error {
 	if l == nil {
 		return nil
 	}
-	l.stopOnce.Do(func() {
-		close(l.quit)
-		<-l.done
-		l.stopErr = l.finalErr
-		if err := l.db.Close(); err != nil && l.stopErr == nil {
-			l.stopErr = wrap("close", err)
-		}
-	})
-	return l.stopErr
+	l.mu.Lock()
+	c := l.cur
+	l.cur = nil
+	l.stopped = true
+	l.mu.Unlock()
+	return c.stop()
 }
 
 // DeleteRuns removes the runs that produced the given generations, with their
@@ -504,10 +636,11 @@ func (l *Ledger) Stop() error {
 // generation, so the two lifetimes stay the same one; this package does not
 // wire it, because it does not know when a generation goes.
 func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
-	if l == nil || len(generationIDs) == 0 {
+	c := l.current()
+	if c == nil || len(generationIDs) == 0 {
 		return nil
 	}
-	return l.writeTx(ctx, func(tx *sql.Tx) error {
+	return c.writeTx(ctx, func(tx *sql.Tx) error {
 		stmt, err := tx.PrepareContext(ctx, `DELETE FROM runs WHERE generation_id = ?`)
 		if err != nil {
 			return wrap("delete runs", err)
@@ -528,7 +661,8 @@ func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
 // which is ordered against its own writer; this is the collection pass's call
 // for the ones that did not.
 func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
-	if l == nil || len(runIDs) == 0 {
+	c := l.current()
+	if c == nil || len(runIDs) == 0 {
 		return nil
 	}
 	raw := make([][]byte, 0, len(runIDs))
@@ -539,7 +673,7 @@ func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 		}
 		raw = append(raw, decoded)
 	}
-	return l.writeTx(ctx, func(tx *sql.Tx) error {
+	return c.writeTx(ctx, func(tx *sql.Tx) error {
 		stmt, err := tx.PrepareContext(ctx, `DELETE FROM runs WHERE run_id = ? AND kind = 'overlay'`)
 		if err != nil {
 			return wrap("delete overlay runs", err)
@@ -567,19 +701,29 @@ func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 // the delete. The delete itself takes the writer, so a flush already in
 // progress finishes first and this sees the row it wrote.
 func (l *Ledger) DiscardRun(ctx context.Context, run *Run) error {
-	if l == nil || run == nil {
+	// The run must belong to the attachment that is current: a run of an
+	// earlier hold has already been finalized and its rows closed, and
+	// deleting it through THIS collector would be one attachment reaching into
+	// another's accounting. A caller that cached such a run gets the same
+	// no-op a ledger that records nothing gives it; the sweep of overlay runs
+	// whose writer is gone is what collects the row it left.
+	if run == nil {
+		return nil
+	}
+	c := l.current()
+	if c == nil || run.c != c {
 		return nil
 	}
 	run.discarded.Store(true)
-	l.runsMu.Lock()
-	for i, r := range l.runs {
+	c.runsMu.Lock()
+	for i, r := range c.runs {
 		if r == run {
-			l.runs = append(l.runs[:i], l.runs[i+1:]...)
+			c.runs = append(c.runs[:i], c.runs[i+1:]...)
 			break
 		}
 	}
-	l.runsMu.Unlock()
-	return l.writeTx(ctx, func(tx *sql.Tx) error {
+	c.runsMu.Unlock()
+	return c.writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE run_id = ?`, run.id)
 		return wrap("discard the run", err)
 	})
@@ -605,10 +749,11 @@ const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
 // deletes at most a page, because it is called periodically and the next pass
 // takes the rest.
 func (l *Ledger) DeleteRunsWithoutGeneration(ctx context.Context) error {
-	if l == nil {
+	c := l.current()
+	if c == nil {
 		return nil
 	}
-	return l.writeTx(ctx, func(tx *sql.Tx) error {
+	return c.writeTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE run_id IN (
 			SELECT run_id FROM runs WHERE generation_id IS NULL AND `+notLive+
 			` ORDER BY started_at LIMIT ?)`, formatTime(time.Now()), model.MaxRecordsPerResult)
@@ -622,11 +767,12 @@ func (l *Ledger) DeleteRunsWithoutGeneration(ctx context.Context) error {
 // serving a language server right now -- is never listed, so the caller can
 // hand everything it gets straight to DeleteOverlayRuns.
 func (l *Ledger) OverlayRuns(ctx context.Context) ([]string, error) {
-	if l == nil {
+	c := l.current()
+	if c == nil {
 		return nil, nil
 	}
 	var ids []string
-	rows, err := l.db.QueryContext(ctx, `SELECT run_id FROM runs WHERE kind = 'overlay' AND `+notLive+
+	rows, err := c.db.QueryContext(ctx, `SELECT run_id FROM runs WHERE kind = 'overlay' AND `+notLive+
 		` ORDER BY started_at LIMIT ?`, formatTime(time.Now()), model.MaxRecordsPerResult)
 	if err != nil {
 		return nil, wrap("overlay runs", err)
@@ -644,10 +790,10 @@ func (l *Ledger) OverlayRuns(ctx context.Context) ([]string, error) {
 
 // writeTx runs fn in one immediate write transaction on the single writer,
 // serialized against the collector's flushes.
-func (l *Ledger) writeTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	l.writeMu.Lock()
-	defer l.writeMu.Unlock()
-	tx, err := l.db.BeginTx(ctx, nil)
+func (c *collector) writeTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return wrap("begin", err)
 	}

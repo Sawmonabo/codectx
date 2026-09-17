@@ -439,7 +439,8 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	// to the other.
 	var led *ledger.Ledger
 	if record {
-		if led, err = ledger.Open(ctx, dataDir); err != nil {
+		led = ledger.New(dataDir)
+		if err = led.Attach(ctx); err != nil {
 			return ledgerArmResult{}, err
 		}
 	}
