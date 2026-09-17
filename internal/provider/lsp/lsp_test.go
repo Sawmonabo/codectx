@@ -589,7 +589,7 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 // reserver; a test that only drives the manager composes its own.
 func testAdmission(t *testing.T, allocation int64) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(allocation)
+	l, err := admission.NewLedger(allocation, 64<<30)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}

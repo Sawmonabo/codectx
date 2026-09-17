@@ -37,7 +37,7 @@ import (
 // that turns recording off, so the "off" arm is composed rather than
 // configured -- index.Options.Ledger left nil. That is honest precisely
 // because it is the same code path: *ledger.Ledger is nil-safe at every entry
-// point a run reaches (NewRun, DeleteRuns, Stop) and ledger.Start on a context
+// point a run reaches (NewRun, SweepRuns, Stop) and ledger.Start on a context
 // with no run returns a nil *Span whose methods do nothing, so neither arm
 // takes a branch the other does not.
 //

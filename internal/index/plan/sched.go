@@ -57,5 +57,17 @@ func NewScheduler(l *admission.Ledger) *Scheduler { return &Scheduler{ledger: l}
 func (s *Scheduler) Admit(ctx context.Context, r dependence.Reservation) (func(), error) {
 	// No makeRoom step: a heavy unit holds nothing it could give back to let
 	// itself in. It waits its turn, which the ledger keeps for it.
+	//
+	// Memory only, deliberately. The ledger's second dimension is disk, and an
+	// engine unit does stage on disk, but no measurement of how much exists:
+	// providers.dependence.max_staged_rows bounds rows and is unlimited by
+	// default, and nothing anywhere records bytes per staged row. Reserving a
+	// figure derived from source bytes would put an unmeasured constant in the
+	// gate that decides whether a run may proceed, which is the defect this
+	// round is correcting elsewhere, not one to add here. The measurement that
+	// would close it: the high-water bytes of the unit's scratch directory,
+	// recorded on its span beside the peak RSS, over the reference repositories
+	// — then this call carries DiskBytes from that history exactly as
+	// ObservedPeakBytes already carries the memory one.
 	return s.ledger.Reserve(ctx, r.Bytes(), nil)
 }

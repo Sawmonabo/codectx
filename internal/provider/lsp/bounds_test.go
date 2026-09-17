@@ -69,7 +69,7 @@ func TestSymbolFieldsAreBoundedAndTheCutIsRecorded(t *testing.T) {
 // the engine unit holds 6 GiB of the 8 GiB allocation.
 func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	const giB int64 = 1 << 30
-	led, err := admission.NewLedger(8 * giB)
+	led, err := admission.NewLedger(8*giB, 64<<30)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
@@ -100,13 +100,13 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	key := serverKey{snapshot: model.SnapshotID("s"), profile: "p", root: "proj"}
 	waiting, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, _, err := mgr.slot(waiting, key, 4*giB); err == nil {
+	if _, _, err := mgr.slot(waiting, key, admission.Reservation{MemoryBytes: 4 * giB}); err == nil {
 		t.Fatal("a 4 GiB server was admitted while a 6 GiB unit held the 8 GiB allocation; the process is reserving more memory than the machine has")
 	}
 
 	// The unit gives its room back and the same server is admitted at once.
 	releaseUnit()
-	e, starter, err := mgr.slot(context.Background(), key, 4*giB)
+	e, starter, err := mgr.slot(context.Background(), key, admission.Reservation{MemoryBytes: 4 * giB})
 	if err != nil {
 		t.Fatalf("the waiting server was not admitted once the unit released: %v", err)
 	}

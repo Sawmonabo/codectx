@@ -345,7 +345,7 @@ func (h heldLock) Hold(context.Context, index.HoldIntent) (*snapshot.WorkspaceLo
 // enough that admission never orders them -- what the ledger admits and when
 // is proved where the ledger lives.
 func benchAdmission() *admission.Ledger {
-	l, err := admission.NewLedger(64 << 30)
+	l, err := admission.NewLedger(64<<30, 64<<30)
 	if err != nil {
 		// A positive allocation is the constructor's only requirement and this
 		// one is a constant, so a failure here is this helper being wrong.

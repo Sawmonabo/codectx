@@ -255,7 +255,10 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	// Two attempts: the second covers a shared server that failed or began
 	// stopping between being found and being acquired.
 	for attempt := 0; attempt < 2; attempt++ {
-		e, starter, err := m.slot(ctx, key, profile.MemoryBudgetBytes)
+		e, starter, err := m.slot(ctx, key, admission.Reservation{
+			MemoryBytes: profile.MemoryBudgetBytes,
+			DiskBytes:   profile.DiskBudgetBytes,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -297,15 +300,17 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 }
 
 // slot finds or reserves the entry for key, admitting bytes against the
-// process's admission ledger. starter is true when the caller must start the
-// server and complete the entry.
+// process's admission ledger. The reservation carries both dimensions: a
+// server holds memory while it runs and disk while it indexes, and the two are
+// granted in one act so no server holds half of what another needs. starter is
+// true when the caller must start the server and complete the entry.
 //
 // The ledger is never asked for room while this manager's mutex is held: the
 // wait can be long, and the ledger calls stopIdle back, which takes that
 // mutex. The entry is therefore published after the room is granted, and the
 // map is re-checked then -- another Open may have started this very server
 // while this one queued, and the room it took is handed straight back.
-func (m *Manager) slot(ctx context.Context, key serverKey, bytes int64) (*entry, bool, error) {
+func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reservation) (*entry, bool, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -322,7 +327,7 @@ func (m *Manager) slot(ctx context.Context, key serverKey, bytes int64) (*entry,
 	// may still do, when it reaches the head and does not fit, is stop a server
 	// nobody is using: another project's server already running is never an
 	// answer of CTX_RESOURCE_LIMIT.
-	release, err := m.opts.Admission.Reserve(ctx, bytes, m.stopIdle)
+	release, err := m.opts.Admission.ReserveWith(ctx, res, m.stopIdle)
 	if err != nil {
 		return nil, false, err
 	}
