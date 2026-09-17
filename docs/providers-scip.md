@@ -129,8 +129,8 @@ real bindings, so the decoder is verified against library-encoded bytes.
 The import is three streaming passes over the index:
 
 1. **Binding pre-pass**: document paths and text hashes decide the binding
-   before any fact exists (the binding decides whether a bad coordinate
-   fails the unit or is skipped).
+   before any fact exists (the binding decides which diagnostic code a
+   refused coordinate carries).
 2. **Definitions**: occurrences and symbols are spooled to a private scratch
    SQLite file under the work directory (bounded by `MaxSpoolBytes`, 4 MiB
    page cache) as they stream; when a document ends its position encoding is
@@ -290,8 +290,9 @@ guess does not hold is skipped and the capabilities are `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID`.
 
 The probe is not the guarantee, only its precondition. **Every** occurrence's
-range is then proved against the bytes it claims to describe, because a wrong
-column does not need a wrong encoding: on a line carrying a tab after other
+range is then proved against the bytes it claims to describe — every one to the
+same two checks, whatever it is, and with what those checks cannot catch stated
+below rather than left implied. A wrong column does not need a wrong encoding: on a line carrying a tab after other
 characters an indexer can count columns to a different tab stop than the file
 does, so the range is shifted a few columns, stays inside its line, converts to
 a valid rune-aligned extent, and names source that is not the symbol. Measured
@@ -302,21 +303,60 @@ by a tab and the remaining 306 on other lines, sampled and found to be the same
 shift. None of them is a false positive of the predicate: an identifier holding
 a `$` and one holding a non-ASCII letter are both admitted, by construction.
 
-The per-occurrence proof is one byte comparison, in two strengths. A
-**definition** occurrence whose symbol's last descriptor is a name the grammar
-spells literally must select exactly that identifier: a declaration is written
-where its name is written, which is the same rule the encoding probe above
-applies — one predicate, so an encoding cannot be proved by one rule while its
-occurrences are held to another. Every other range must start on a token
-boundary, which is what a shifted column usually fails. A reference is
-deliberately **not** required to spell its symbol's name, because measured, it
-does not: an aliased import puts the occurrence on the alias (`HashSet as Set`
-is a reference to `HashSet` over the bytes `Set`) or on the whole alias clause
-(`OrderedDict as OD`), and an operator is a reference to the method it desugars
-to (`+` to `add`). Measured over the indexes the six pinned indexers produce
-from the fixtures of the per-platform matrix — 308 occurrences, all nine
-languages — the proof refuses none of them, at ~8 ns per occurrence and no
-allocation.
+The per-occurrence proof holds **every** occurrence, declaration and reference
+alike, to two checks over the pinned bytes.
+
+**Whole-token coverage.** No range may cut an identifier token: an identifier
+byte inside the range with another immediately outside it is half a token, and
+no grammar produces one. A range that names an identifier on a single line must
+in addition begin and end on the tokens it covers rather than on the whitespace
+between them — `browser` shifted seven columns left is `return `, an identifier
+plus the gap before the next token, which is not how the source spells
+anything. Two shapes of range do not name an identifier on a line and keep the
+cut check alone: a range spanning lines is a block span, measured, a crate's
+whole file; and a range holding no identifier byte at all is punctuation the
+grammar spells without one, measured, the reference from `+` to the `add`
+method it desugars to, which one indexer ranges over the space beside the
+operator. A zero-width range selects no bytes, so there are none to contradict;
+measured, every one is a document-level symbol anchored at the start of a file.
+
+**The name check.** A range that is exactly one identifier token, whose symbol's
+last descriptor is a name the grammar spells literally, must select that name or
+an identifier the document itself spells for that symbol. A document that
+aliases an import spells the symbol under a name of its own — `use HashSet as
+Set` makes every later `Set` of that file a correct reference to `HashSet` — and
+the occurrence carries nothing saying so: the indexer that produces this shape
+sets no occurrence role at all, so the import role cannot mark it. A spelling is
+therefore bound by corroboration: the document must hold at least two
+occurrences of that symbol spelling it identically. That is not a threshold
+chosen to fit a measurement, it is the structural minimum of the construct — an
+alias that is *used* produces the occurrence in the alias clause and the
+occurrence at the use site. An alias declared and never used produces one
+occurrence, and no second one for the rule to refuse either, so nothing is lost.
+A range that is not one identifier token is not name-checked at all: an aliased
+import can put the occurrence on the whole alias clause (`OrderedDict as OD`),
+and an operator reference is punctuation.
+
+Measured over the indexes the six pinned indexers produce from the fixtures of
+the per-platform matrix — 308 occurrences, all nine languages — the proof
+refuses **none** of them. The corroboration rule is what admits 2 of those 308
+(`Set` for `HashSet`); no other spelling in the corpus is corroborated.
+
+**What the proof does not catch.** It compares bytes, and it never adjusts or
+guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
+the truth publishes. Measured by shifting every one of the 308 occurrences by
+the two column distances observed in the field: of 214 occurrences a +5 shift
+converts at all, 32 still pass, and of 126 a +12 shift converts, 19 still pass —
+against 63 and 45 under the start-boundary rule this replaces. Those survivors,
+by kind: **24** whose symbol carries no name the grammar spells literally (a
+`local` symbol, a namespace, a meta descriptor, a backtick-escaped name), so
+there is nothing to compare the token against; **17** whose range is punctuation
+rather than one identifier token; and **10** zero-width ranges, which name a
+position and no bytes. A shift landing on another token spelling the **same**
+identifier is the remaining kind — two byte-identical ranges are the same claim,
+and nothing in the bytes separates them; it occurs **0** times in this corpus
+under those two shifts, and `internal/provider/scip` holds a fixture case for it
+so the boundary stays stated rather than assumed.
 
 The two proofs deliberately have different outcomes, because the two failures
 have different reach. A failed **encoding probe** is a claim about the whole
@@ -345,13 +385,7 @@ every UTF-16 column as a byte offset.
 
 A document of any other tool build that does not declare an encoding is
 skipped and the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`:
-Section 9.3 forbids guessing one. `Report.AssumedPositionEncoding` counts the
-documents that were converted through the per-tool-build table **and** proved
-against their pinned bytes. A
-coordinate that does not land on the bytes, or a range that does not describe
-the identifier it names, is `CTX_PROVIDER_OUTPUT_INVALID` and fails the unit
-under a verified binding (the index claims to describe these bytes and does
-not); under an unverified binding it is skipped and counted.
+Section 9.3 forbids guessing one.
 
 A document proves its bytes by embedded `text` whose SHA-256 equals the
 pinned content hash, or by a matching row of a **qualifying** input-hash

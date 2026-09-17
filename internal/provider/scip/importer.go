@@ -222,6 +222,12 @@ type docSource struct {
 	data []byte
 	cur  *source.Cursor
 	enc  source.ColumnEncoding
+	// spellings are the identifiers this document spells for a symbol that
+	// are not the name the symbol carries, per bindSpellings. It is what lets
+	// the name check hold every occurrence to its symbol's name without
+	// refusing the correct references an aliased import creates. It is bounded
+	// by this document's occurrences and discarded with it.
+	spellings map[string]map[string]struct{}
 }
 
 // docRow is the scratch record of one document bound to a snapshot file.
@@ -665,6 +671,11 @@ func (im *importer) endDocument(d document) error {
 		row.idx, row.path, row.language, row.encoding, string(fv.ID), fv.ContentHash, fv.Size); err != nil {
 		return err
 	}
+	// After the encoding is settled, because a spelling is read out of the
+	// bytes the columns resolve to.
+	if err := im.bindSpellings(ctx, ds); err != nil {
+		return err
+	}
 	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
 		[]any{row.idx, roleDefinition}, func(scan func(...any) error) error {
 			var seq int64
@@ -857,7 +868,7 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 			// The same predicate every occurrence of the document will be held
 			// to, so an encoding cannot be proved by one rule and its
 			// occurrences refused by another.
-			holds = onPinnedBytes(ds.data, sym, &rng, true) == ""
+			holds = ds.onPinnedBytes(sym, &rng) == ""
 			return nil
 		})
 	return holds, err
@@ -907,22 +918,20 @@ func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, stri
 // of 93,167 occurrences of one Java project, in 91 of its 223 documents, every
 // one of them that shift).
 //
-// So every occurrence is checked, not one per document. definition says the
-// occurrence declares its symbol, which is what makes the strict form of the
-// check available; see onPinnedBytes.
+// So every occurrence is checked, not one per document; see onPinnedBytes.
 //
 // A refused occurrence yields nil and is counted (refuse): one coordinate the
 // index got wrong costs that coordinate and nothing else. Failing the unit on
 // it would throw away every other fact of a project over shifted columns --
 // measured, 4,714 wrong of 93,167 cost all 93,167 -- and the count plus the
 // named document say exactly what was left out.
-func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32, definition bool) *model.SourceRange {
+func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) *model.SourceRange {
 	rng, why := im.rangeOf(ds, r)
 	if rng == nil {
 		im.refuse(ds, why)
 		return nil
 	}
-	if msg := onPinnedBytes(ds.data, sym, rng, definition); msg != "" {
+	if msg := ds.onPinnedBytes(sym, rng); msg != "" {
 		im.refuse(ds, msg)
 		return nil
 	}
@@ -930,33 +939,129 @@ func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32, defin
 }
 
 // onPinnedBytes reports why an occurrence's range does not describe the bytes
-// it claims, or "" when it does. Two checks, one byte comparison each:
+// it claims, or "" when it does. Every occurrence, declaration or reference, is
+// held to both checks:
 //
-//   - a definition occurrence whose symbol's last descriptor is a name the
-//     grammar spells literally (symbol.probeName) must select exactly that
-//     identifier: a declaration is written where its name is written;
-//   - every other range must at least start on a token boundary. A reference
-//     is not required to spell its symbol's name, and measured, does not: an
-//     aliased import puts the occurrence on the alias (`HashSet as Set` is a
-//     reference to HashSet over the bytes `Set`) or on the whole alias clause
-//     (`OrderedDict as OD`), and an operator is a reference to the method it
-//     desugars to (`+` to `add`). A range that starts inside an identifier
-//     token, which is what a shifted column usually produces, is refused.
+//   - whole-token coverage: the range begins at the first byte of a token and
+//     ends at the last byte of one. A range that starts or ends in the middle
+//     of an identifier, or on whitespace, describes a cut of the source no
+//     grammar produced. A shifted column is exactly that, at one end or both:
+//     `browser` moved five columns right is `er + br`, moved seven left is
+//     `return ` with the space the token does not have;
+//   - the name check: a range that is exactly one identifier token, and whose
+//     symbol's last descriptor is a name the grammar spells literally
+//     (symbol.probeName), selects that name or an identifier this document
+//     spells for that symbol (bindSpellings).
 //
-// Nothing is adjusted and nothing is guessed: the range either describes what
-// it claims or it is refused.
-func onPinnedBytes(data []byte, sym symbol, rng *model.SourceRange, definition bool) string {
-	if rng.Start.Byte > rng.End.Byte || rng.End.Byte > uint64(len(data)) {
+// A range that is not one identifier token is not held to the name check,
+// because measured, such ranges are correct without spelling the name: an
+// aliased import can put the occurrence on the whole alias clause
+// (`OrderedDict as OD`), and an operator is a reference to the method it
+// desugars to (`+` to `add`), which is not an identifier token at all.
+//
+// What survives both checks is a shift that lands on a whole token spelling
+// the same identifier somewhere else on the line. Comparing bytes cannot
+// separate those two ranges, and this provider never adjusts or guesses a
+// coordinate, so that residual is stated in docs/providers-scip.md rather than
+// covered by a rule that would refuse correct references to close it.
+func (ds *docSource) onPinnedBytes(sym symbol, rng *model.SourceRange) string {
+	if rng.Start.Byte > rng.End.Byte || rng.End.Byte > uint64(len(ds.data)) {
 		return "the range ends past the pinned bytes"
 	}
-	text := data[rng.Start.Byte:rng.End.Byte]
-	if len(text) > 0 && identifierByte(text[0]) && rng.Start.Byte > 0 && identifierByte(data[rng.Start.Byte-1]) {
+	text := ds.data[rng.Start.Byte:rng.End.Byte]
+	if len(text) == 0 {
+		// A zero-width range selects no bytes, so there are none for the
+		// pinned bytes to contradict. Measured, every one of them is a
+		// document-level symbol an indexer anchors at the start of the file
+		// (a module's `__init__`, a file namespace).
+		return ""
+	}
+	if why := cutsAToken(ds.data, rng, text); why != "" {
+		return why
+	}
+	if why := coversWholeTokens(text); why != "" {
+		return why
+	}
+	name, named := sym.probeName()
+	if !named || !wholeIdentifier(text) {
+		return ""
+	}
+	if string(text) == name {
+		return ""
+	}
+	if _, spelled := ds.spellings[sym.raw][string(text)]; spelled {
+		return ""
+	}
+	return "the occurrence does not select the identifier its symbol names"
+}
+
+// cutsAToken reports whether either end of the range splits an identifier
+// token: an identifier byte inside the range with another immediately outside
+// it. It holds for every range, whatever the range is meant to describe, since
+// no grammar produces half an identifier.
+func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
+	if identifierByte(text[0]) && rng.Start.Byte > 0 && identifierByte(data[rng.Start.Byte-1]) {
 		return "the range starts inside an identifier token"
 	}
-	if name, ok := sym.probeName(); definition && ok && string(text) != name {
-		return "the definition does not select the identifier its symbol names"
+	last := text[len(text)-1]
+	if identifierByte(last) && rng.End.Byte < uint64(len(data)) && identifierByte(data[rng.End.Byte]) {
+		return "the range ends inside an identifier token"
 	}
 	return ""
+}
+
+// coversWholeTokens reports whether a range that names an identifier on one
+// line begins and ends on the tokens it covers rather than on the whitespace
+// between them. A shifted column produces exactly that: `browser` moved seven
+// columns left is `return ` -- an identifier plus the gap before the next
+// token, which is not how the source spells anything.
+//
+// Two shapes of range do not name an identifier on a line and keep cutsAToken
+// alone. A range spanning lines is a block span -- measured, a crate's whole
+// file -- and its edges are the file's, not a token's. A range holding no
+// identifier byte at all is punctuation the grammar spells without one:
+// measured, rust-analyzer ranges the reference from `+` to the `add` method it
+// desugars to over the space beside the operator.
+func coversWholeTokens(text []byte) string {
+	named := false
+	for _, b := range text {
+		if b == '\n' {
+			return ""
+		}
+		named = named || identifierByte(b)
+	}
+	if !named {
+		return ""
+	}
+	if spaceByte(text[0]) {
+		return "the range begins on whitespace rather than on a token"
+	}
+	if spaceByte(text[len(text)-1]) {
+		return "the range ends on whitespace rather than on a token"
+	}
+	return ""
+}
+
+// wholeIdentifier reports whether text is one identifier token and nothing
+// else, which is the shape the name check compares. Held with cutsAToken and
+// coversWholeTokens it means the range is that token exactly.
+func wholeIdentifier(text []byte) bool {
+	for _, b := range text {
+		if !identifierByte(b) {
+			return false
+		}
+	}
+	return len(text) > 0
+}
+
+// spaceByte reports whether b is source whitespace. Every byte of a multi-byte
+// rune is >= 0x80, so no rune is ever mistaken for one.
+func spaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	}
+	return false
 }
 
 // identifierByte reports whether b can sit inside an identifier token of the
@@ -994,6 +1099,87 @@ func (im *importer) refuse(ds *docSource, msg string) {
 	im.degrade(model.CodeProviderOutputInvalid)
 }
 
+// bindSpellings records the identifiers this document spells for a symbol
+// that are not the name the symbol carries, so the name check can hold every
+// occurrence to its symbol's name without refusing them. A document that
+// aliases an import spells the symbol under a name of its own -- `use HashSet
+// as Set` makes every later `Set` of that file a correct reference to HashSet
+// -- and the occurrence carries nothing that says so: measured over the six
+// pinned indexers, the one that produces this shape sets no occurrence role at
+// all, so the import role cannot seed it.
+//
+// A spelling is bound only when the document holds at least two occurrences
+// that spell it identically, which is the structural minimum of the construct
+// the exemption exists for: an alias that is used produces the occurrence in
+// the alias clause and the occurrence at the use site. An alias declared and
+// never used produces one occurrence -- and no second one for the rule to
+// refuse either, so nothing is lost. A shifted column that lands on a whole
+// token spelling something else produces that spelling once, so it stays
+// refused; a shift landing twice on the same text within one document is the
+// residual stated in docs/providers-scip.md.
+//
+// The tally holds one document's spellings and is discarded with its
+// docSource; it is bounded by that document's occurrences, which
+// MaxOccurrencesPerDocument bounds. A coordinate that does not convert, and a
+// symbol that does not parse, are passed over here and refused by the pass
+// that publishes them, which is where a refusal is counted.
+func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
+	spelled := make(map[string]map[string]int)
+	if err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ?`, []any{ds.doc.idx},
+		func(scan func(...any) error) error {
+			var symbolText string
+			var r [4]int32
+			if err := scan(&symbolText, &r[0], &r[1], &r[2], &r[3]); err != nil {
+				return internal("scip scratch read: " + err.Error())
+			}
+			if symbolText == "" {
+				return nil
+			}
+			sym, err := parseSymbol(symbolText)
+			if err != nil {
+				return nil
+			}
+			name, ok := sym.probeName()
+			if !ok {
+				return nil
+			}
+			rng, _ := im.rangeOf(ds, r)
+			if rng == nil {
+				return nil
+			}
+			text := ds.data[rng.Start.Byte:rng.End.Byte]
+			if !wholeIdentifier(text) || string(text) == name {
+				return nil
+			}
+			counts := spelled[sym.raw]
+			if counts == nil {
+				counts = make(map[string]int)
+				spelled[sym.raw] = counts
+			}
+			counts[string(text)]++
+			return nil
+		}); err != nil {
+		return err
+	}
+	for raw, counts := range spelled {
+		for text, n := range counts {
+			if n < 2 {
+				continue
+			}
+			if ds.spellings == nil {
+				ds.spellings = make(map[string]map[string]struct{})
+			}
+			bound := ds.spellings[raw]
+			if bound == nil {
+				bound = make(map[string]struct{})
+				ds.spellings[raw] = bound
+			}
+			bound[text] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // defineSymbol resolves one definition occurrence and records its identity,
 // its containment extent for pass 2 and its entry in the symbol map. When the
 // document is changed it also publishes the node, its scoped alias and any
@@ -1005,7 +1191,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
-	rng := im.occurrenceRange(ds, sym, r, true)
+	rng := im.occurrenceRange(ds, sym, r)
 	if rng == nil {
 		// Refused and counted: this declaration is left out, the rest of the
 		// document is not.
@@ -1179,6 +1365,9 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 	if err != nil {
 		return err
 	}
+	if err := im.bindSpellings(ctx, ds); err != nil {
+		return err
+	}
 	return im.sc.each(ctx, `SELECT symbol, roles, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) = 0 ORDER BY seq`,
 		[]any{d.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
@@ -1194,7 +1383,7 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
-			rng := im.occurrenceRange(ds, sym, r, false)
+			rng := im.occurrenceRange(ds, sym, r)
 			if rng == nil {
 				// Refused and counted: this reference is left out, the rest of
 				// the document is not.
