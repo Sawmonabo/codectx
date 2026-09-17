@@ -49,16 +49,23 @@ coordinator exists.
 - `Scopes(detection)` lists the unit scope keys to plan: `import:<path>` for a
   supplied index, and `profile:<indexer>:<project directory>` for one project
   of one indexer, the empty directory being the workspace root. **One unit per
-  triggering directory.** Go modules and Maven or Gradle modules nest — a
-  `go.mod` inside another module's tree is its own project and the nearest
-  trigger above a file is the project that owns it — and every other kind takes
-  the outermost trigger and never splits below it, because the whole program is
-  what makes its symbols resolvable: a `tsconfig` project split by subdirectory
-  loses more than half of the calls that resolve to its own methods
-  (`docs/research/10-round3-empirical.md` §8). A workspace root that triggers
-  is a project like any other, planned beside the projects below it. A trigger
-  inside a dependency directory is not a project and never reaches the rule:
-  those directories are excluded from the snapshot. A project whose scope key
+  triggering directory**, whatever the language and whatever encloses the
+  directory. A manifest is the toolchain's own declaration of a boundary, so a
+  nested one is a second program and not a subdirectory of the first: a `go.mod`
+  inside another module's tree, an `app/package.json` under a root
+  `package.json`, and a `tsconfig` inside another project's tree are each their
+  own project with their own unit. A workspace root that triggers is a project
+  like any other, planned beside the projects below it. What is never done is
+  splitting a project at a directory that declares nothing — that split loses
+  more than half of the calls that resolve to the project's own methods
+  (`docs/research/10-round3-empirical.md` §8), so a Python package, a Cargo
+  workspace and a compilation database are whole up to the next directory that
+  declares itself and no further. A trigger inside a dependency directory
+  (`node_modules`, `vendor`, `third_party`, `bower_components`, `Godeps`) is not
+  a project and never reaches the rule while `workspace.index_vendor` is false,
+  which is the default, because those directories are then excluded from the
+  snapshot; with it enabled the operator has asked for them to be indexed and
+  their manifests are projects like any other. A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
   project's facts would be attributed to the other. A profile this
@@ -365,7 +372,12 @@ the document is dropped whole, counted under `documents_dropped_encoding` and
 named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
 proof** reaches exactly one coordinate, so exactly one occurrence is left out:
 it is counted under `refused_occurrences`, the first is named with its reason by
-`refused_occurrence_exemplar`, and the unit publishes `partial` with
+`refused_occurrence_exemplar` as `<document>:<line>:<column>: <reason>` — the
+coordinate the occurrence claimed, spelled as the index spelled it, zero-based
+and with the column counted in the position encoding the document declared,
+which is the encoding the refusal is a disagreement about, so that an operator
+opens the disagreeing line instead of re-running the indexer to find it — and
+the unit publishes `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
 the index describes bytes it never saw, so the same coordinate is a plain skip
 and is counted with the other unverified skips.

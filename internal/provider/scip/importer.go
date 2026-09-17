@@ -99,10 +99,12 @@ type importer struct {
 	skippedDocs, truncatedEdges int64
 	outsideRoot, duplicatePaths int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
-	// contradict; refusedExemplar is the first one's document and reason, kept
-	// as the example an operator starts from. One exemplar, not a set: a set
-	// grows with the repository and the report is a bounded diagnostic
-	// surface.
+	// contradict; refusedExemplar is the first one's document, the coordinate
+	// that occurrence claimed and the reason, kept as the example an operator
+	// starts from. The coordinate is what makes the example usable: without it
+	// the operator has a file and must re-run the indexer to find the line
+	// inside it that disagrees. One exemplar, not a set: a set grows with the
+	// repository and the report is a bounded diagnostic surface.
 	refusedOccurrences int64
 	refusedExemplar    string
 	// encodingDropped counts documents whose assumed position encoding the
@@ -157,7 +159,13 @@ const (
 	// detailRefusedOccurrences counts occurrences left out because their range
 	// does not describe the bytes it claims.
 	detailRefusedOccurrences = "refused_occurrences"
-	// detailRefusedExemplar is the first of them, as `<document>: <reason>`.
+	// detailRefusedExemplar is the first of them, as
+	// `<document>:<line>:<column>: <reason>`. The coordinate is the one the
+	// occurrence claimed, spelled exactly as the index spelled it: zero-based,
+	// and the column counted in the position encoding the document declared --
+	// the encoding this refusal is a disagreement about. It is not converted,
+	// because a converted coordinate is one the product computed and the
+	// operator cannot look it up in the index that produced the disagreement.
 	detailRefusedExemplar = "refused_occurrence_exemplar"
 	// detailEncodingDropped counts documents dropped whole because the
 	// position encoding assumed for them did not hold against their bytes,
@@ -924,15 +932,16 @@ func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, stri
 // index got wrong costs that coordinate and nothing else. Failing the unit on
 // it would throw away every other fact of a project over shifted columns --
 // measured, 4,714 wrong of 93,167 cost all 93,167 -- and the count plus the
-// named document say exactly what was left out.
+// first refused coordinate, named with its document, say exactly what was left
+// out and where to look at it.
 func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) *model.SourceRange {
 	rng, why := im.rangeOf(ds, r)
 	if rng == nil {
-		im.refuse(ds, why)
+		im.refuse(ds, r, why)
 		return nil
 	}
 	if msg := ds.onPinnedBytes(sym, rng); msg != "" {
-		im.refuse(ds, msg)
+		im.refuse(ds, r, msg)
 		return nil
 	}
 	return rng
@@ -1091,10 +1100,16 @@ func identifierByte(b byte) bool {
 // binding outranks every later reason. Either way the count and the exemplar
 // reach the operator on the capability row, which is the only channel that
 // reaches one.
-func (im *importer) refuse(ds *docSource, msg string) {
+func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
 	im.refusedOccurrences++
 	if im.refusedExemplar == "" {
-		im.refusedExemplar = ds.doc.path + ": " + msg
+		// The path is bounded before the coordinate is appended, so the
+		// coordinate survives the detail's own ceiling: a path may be four
+		// times MaxDetailBytes, and an exemplar cut back to a path alone is
+		// the very thing the coordinate is here to answer.
+		doc, _ := model.TruncateField(ds.doc.path, model.MaxIdentifierBytes)
+		im.refusedExemplar = doc + ":" + strconv.FormatInt(int64(r[0]), 10) +
+			":" + strconv.FormatInt(int64(r[1]), 10) + ": " + msg
 	}
 	im.degrade(model.CodeProviderOutputInvalid)
 }
