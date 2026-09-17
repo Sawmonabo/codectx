@@ -927,21 +927,6 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		}
 	}
 
-	// The same unit, once the publication generation attaches it, is coverage.
-	g = &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
-		plan:   plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})},
-		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
-	if err := g.coverage(ctx); err != nil {
-		t.Fatalf("coverage: %v", err)
-	}
-	published = g.caps.finish(f.c.log)
-	for _, s := range published {
-		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
-			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
-				s.ProviderID, s.Capability, s.State)
-		}
-	}
-
 	// A unit the sealer has already started is still pending. Reporting only
 	// what has not started answers "nothing pending" for as long as the unit
 	// runs, which is the whole window a query needs the answer in.
@@ -962,6 +947,60 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	}
 	if p.Units != 2 || p.Position != 2 {
 		t.Fatalf("a promoted unit behind the one in flight is %d units at position %d, want 2 at 2", p.Units, p.Position)
+	}
+
+	// The same unit, once the publication generation holds it, is coverage --
+	// and it is the generation's own unit rows that say so, not any record of
+	// what the background batch sealed. NOT RUN under the no-test order.
+	//
+	// Mutation: restore the in-process mirror by making holdsFreshUnit answer
+	// from a batch-local set instead of Store.SelectedUnit; the sealed unit
+	// below is attached to the generation and to nothing else, so the
+	// capability comes back `unavailable: units_deferred` and this fails.
+	cold, err := f.c.Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	snap := cold.Binding.SnapshotID
+	fv, err := f.store.SnapshotFile(ctx, snap, model.NewFileID(f.c.repo, "pkg/a.go"))
+	if err != nil {
+		t.Fatalf("SnapshotFile: %v", err)
+	}
+	held := plan.Unit{ProviderID: d.ID, ProviderVersion: "v1", ScopeKey: "scope", Deferred: true,
+		InputCount: 1, Inputs: func(yield func(model.UnitInput) error) error {
+			return yield(model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
+		}}
+	spec, err := held.Spec(f.c.cfgHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubGen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/deferred")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := f.store.BeginProviderRun(ctx, pubGen, held.ProviderID, held.ProviderVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := f.store.BeginUnit(ctx, pubGen, model.UnitBuild{Spec: spec, AnalysisConfigHash: f.c.cfgHash,
+		OriginRunID: run, SourceBinding: model.SourceBindingVerified}, held.Inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.SealUnit(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	g = &generation{c: f.c, gen: pubGen, caps: newCapabilityReport(), sel: sel,
+		plan: plan.Plan{Units: oneUnit(held)}}
+	if err := g.coverage(ctx); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	published = g.caps.finish(f.c.log)
+	for _, s := range published {
+		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
+			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
+				s.ProviderID, s.Capability, s.State)
+		}
 	}
 }
 

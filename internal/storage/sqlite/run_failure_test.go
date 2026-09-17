@@ -104,8 +104,26 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 		Scope: "workspace", State: model.CapabilityPartial, DiagnosticCode: reason.Code,
 		Remediation: reason.Remediation, UnitsRunning: 1,
 		Details: map[string]string{model.DetailUnitsFailed: "1", model.DetailUnitsPlanned: "3"}}
+	// A second provider with work of its own still in flight. units_running is
+	// an assertion about the whole generation, so a publication that counted
+	// only the scopes of whichever provider it was publishing for would answer
+	// zero here, and the second process would be told this capability is
+	// simply unavailable while its units are being built.
+	//
+	// NOT RUN under the no-test order. This builds the row rather than driving
+	// a late seal, which no test in this package can reach, so it holds the
+	// store and the second handle to the figure and not the counting; what
+	// counts it is internal/index's holdsFreshUnit, over generation_units.
+	//
+	// Mutation: restore the batch-local mirror in coveredProviders -- `case
+	// g.sealed[key]:` in place of the holdsFreshUnit read -- and drop
+	// otherProvider from the Activate list below; the second handle then reads
+	// one row and no running scope for the provider that was not publishing.
+	otherProvider := model.CapabilityState{ProviderID: "dependence", Capability: "calls",
+		Scope: "workspace", State: model.CapabilityUnavailable, DiagnosticCode: model.CodeProviderUnavailable,
+		UnitsRunning: 2, Details: map[string]string{"reason": "units_deferred"}}
 	if _, err = f.s.Activate(f.ctx, gen, 0, model.HealthDegraded,
-		[]model.CapabilityState{interleaved}, "norm-v1"); err != nil {
+		[]model.CapabilityState{interleaved, otherProvider}, "norm-v1"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	if err := f.s.Flush(f.ctx); err != nil {
@@ -139,13 +157,24 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 		got.Message != reason.Message || got.Remediation != reason.Remediation {
 		t.Errorf("the reason the second process read is %+v, want %+v", got, reason)
 	}
-	if len(st.Completeness) != 1 {
-		t.Fatalf("the second process read %d capability rows, want one: %+v", len(st.Completeness), st.Completeness)
+	running := map[string]int{}
+	var row model.CapabilityState
+	for _, c := range st.Completeness {
+		running[c.ProviderID] = c.UnitsRunning
+		if c.ProviderID == providerID {
+			row = c
+		}
 	}
-	row := st.Completeness[0]
-	if row.UnitsRunning != 1 {
+	if len(st.Completeness) != 2 {
+		t.Fatalf("the second process read %d capability rows, want two: %+v", len(st.Completeness), st.Completeness)
+	}
+	if running[providerID] != 1 {
 		t.Errorf("the row reports units_running=%d, want 1: the scope still being built was disclosed to nobody",
-			row.UnitsRunning)
+			running[providerID])
+	}
+	if running[otherProvider.ProviderID] != 2 {
+		t.Errorf("the other provider reports units_running=%d, want 2: the scopes queued for a provider other "+
+			"than the one being published for were counted by nobody", running[otherProvider.ProviderID])
 	}
 	if row.Remediation != reason.Remediation {
 		t.Errorf("the row carries remediation %q, want %q", row.Remediation, reason.Remediation)

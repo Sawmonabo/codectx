@@ -734,12 +734,14 @@ func (l *lateSealer) attach(ctx context.Context, g *generation, replacing map[st
 	if err := g.attachReused(ctx); err != nil {
 		return err
 	}
-	g.sealed = make(map[string]bool, len(replacing))
-	for key, unit := range replacing {
+	// The attached rows are themselves what the coverage pass reads back to
+	// decide which deferred scopes this generation still has outstanding, so
+	// nothing mirrors them in memory: they must be attached before coverage
+	// runs, which is the order publishOnce calls the two in.
+	for _, unit := range replacing {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
 			return err
 		}
-		g.sealed[key] = true
 		g.built++
 	}
 	for _, carried := range g.plan.Carry {
