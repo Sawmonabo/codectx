@@ -170,10 +170,16 @@ names the holder's pid and operation once for that episode, not once per beat
 -- and the next beat starts from whatever that process published, reusing its
 units rather than building them again. It never ends the session.
 
+Every watch follows that rule, wherever it runs: `codectx watch`, `codectx
+index --watch` and a server started with `--watch` are one mechanism, not
+three. A watching session that is between beats owns nothing at all, so your
+own `codectx index` runs beside any of them.
+
 The indexing row above is a different case, not an inconsistency: `codectx
-index` and `codectx watch` ARE the workspace's owner for their whole run, and
-they take the lock at startup and hold it to the end. The distinction is the
-session that also answers questions: `mcp serve` exists to be left running, so
+index` without `--watch`, and `codectx refresh`, ARE the workspace's owner for
+their whole run -- they take the lock at startup and hold it to the end,
+because the run IS the operation. The distinction is the session that is meant
+to be left running, whether it answers questions or waits for a file to change:
 it owns the workspace only while it is actually building in it.
 
 ### What a building command does when the workspace is held
@@ -197,9 +203,14 @@ its first stamp is given the same grace the ledger already allows a late
 flush, so a run is never refused for the moment between its lock and its first
 write.
 
-An MCP `codectx_refresh_index` is the exception, deliberately: it tries once
-and answers the agent now with the retryable refusal, rather than holding a
-tool call open for the length of somebody else's index.
+The wait belongs to the operation, not to the command: the build a person
+asked for waits, and a watch beat, a background seal and an agent's
+`codectx_refresh_index` take the workspace only if it is free this moment. A
+beat that queues would stall every notification behind it, and a tool call held
+open for the length of somebody else's index is not an answer; both are
+answered now with the retryable refusal instead. So `codectx index --watch`
+waits for its first, base build exactly as `codectx index` does, and every beat
+after it skips rather than queues.
 
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by
