@@ -457,10 +457,11 @@ func (e *emitter) identify(ctx context.Context) error {
 	after := int64(math.MinInt64)
 	for {
 		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.id, t.kind, n.label, n.name, n.canonical_name, n.full_name, n.signature,
-			n.line, n.line_end, n.col, t.external, n.speculated, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
+			n.line, n.line_end, n.col, t.external, iv.id IS NOT NULL, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
 			l.range_text, COALESCE(f.path, ''), COALESCE(o.full_name, ''),
 			COALESCE((SELECT c.code FROM code c WHERE c.id = t.id ORDER BY c.seq LIMIT 1), '')
 			FROM ents t JOIN nodes n ON n.id = t.id JOIN loc l ON l.node = t.id
+			LEFT JOIN invented iv ON iv.id = t.id
 			LEFT JOIN files f ON f.id = l.file LEFT JOIN attr a ON a.id = t.id LEFT JOIN nodes o ON o.id = a.owner
 			WHERE l.ok = 1 AND t.id > ? ORDER BY t.id LIMIT ?`, after, pageSize)
 		if err != nil {
@@ -726,7 +727,11 @@ func resolutionMetadata(res model.Resolution, external, unresolved, speculated b
 		return json.RawMessage(`{"resolution":"ambiguous","candidates":` + strconv.Itoa(len(res.Ambiguous)+1) + `}`)
 	case speculated:
 		// The export invented this callee, so it is not an import: nothing in
-		// the graph defines it and nothing says the source depends on it.
+		// the graph defines it and nothing says the source depends on it. The
+		// flag is the export's own stub signal, derived over the whole graph
+		// (scratch.go, the invented table), never one parent namespace: an
+		// invented callee the engine parked elsewhere would otherwise publish
+		// here as a real dependency of the source.
 		return json.RawMessage(`{"resolution":"speculated","candidates":1}`)
 	case external:
 		return json.RawMessage(`{"resolution":"import","candidates":1}`)
