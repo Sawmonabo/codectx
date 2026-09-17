@@ -115,8 +115,8 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-110 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/setup/clone-test-users.js`:35 | `SEC.passwordBcrypt()` | `passwordBcrypt` | unresolved | absent | a-repo | T-import: SEC required from a repo test lib module |
 | C1-111 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/system-surface.spec.js`:98 | `c.close()` | `close` | unresolved | absent | b-lib | Playwright BrowserContext.close |
 | C1-112 | `Meteor3preUpgradeScripts/meteor-async-migration/vp-codemods/6-password-method-hooks.js`:156 | `out.replace(`${a}\n`, "")` | `replace` | unresolved | stub | c-platform | String.prototype.replace on a source string |
-| C1-113 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-3.5.1.min.js`:2 | `t()` | `t` | in-file | absent | b-lib | internal helper inside the vendored jQuery bundle |
-| C1-114 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-ui.min.js`:6 | `this._delay(function(){var i=!t.contains(this.element[0],t.ui.safeActiveElement(this.do…` | `_delay` | unresolved | absent | b-lib | jQuery UI widget method inside the vendored bundle |
+| C1-113 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-3.5.1.min.js`:2 | `t()` | `t` | in-file | absent | a-repo | T-none: vendored jQuery bundle-internal helper |
+| C1-114 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-ui.min.js`:6 | `this._delay(function(){var i=!t.contains(this.element[0],t.ui.safeActiveElement(this.do…` | `_delay` | unresolved | absent | a-repo | T-hier: vendored jQuery UI widget prototype method |
 | C1-115 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script.js`:87 | `selected.previousSibling.click()` | `click` | unresolved | stub | c-platform | DOM HTMLElement.click via previousSibling |
 | C1-116 | `app/both/definitions/sbomTypes.test.js`:12 | `expect(sbomTypeOptions).toHaveLength(2)` | `toHaveLength` | unresolved | absent | b-lib | vitest expect() matcher |
 | C1-117 | `app/both/schemas/gridViews.js`:138 | `autoVal(this)` | `autoVal` | unresolved | stub | a-repo | T-field: Meteor global assigned as this.autoVal elsewhere |
@@ -130,45 +130,45 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-125 | `app/client/components/customAutoFormInputs/text-expandable.js`:42 | `autosize($(".expandableTextarea textarea"))` | `autosize` | unresolved | absent | b-lib | autosize third-party package |
 | C1-126 | `app/client/components/slickGrid/boColumnDefinitions.js`:131 | `_.find(value, { label : item })` | `find` | unresolved | absent | b-lib | lodash find() |
 | C1-127 | `app/client/components/slickGrid/slickGrid.js`:792 | `filters.entries()` | `entries` | unresolved | absent | c-platform | Array.prototype.entries, guarded by Array.isArray |
-| C1-128 | `app/client/components/slickGrid/slickGrid.js`:2068 | `grid.getCanvasNode()` | `getCanvasNode` | unresolved | absent | b-lib | SlickGrid grid API method |
+| C1-128 | `app/client/components/slickGrid/slickGrid.js`:2068 | `grid.getCanvasNode()` | `getCanvasNode` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
 | C1-129 | `app/client/components/slickGrid/slickGrid.js`:4376 | `$(grid.getCanvasNode())` | `$` | unresolved | absent | b-lib | jQuery factory call |
 | C1-130 | `app/client/components/workflow/simpleWorkflow.js`:38 | `$(document).on("click", function(evt) { popoverOffClick(evt); })` | `on` | unresolved | absent | b-lib | jQuery on() on a wrapped document |
 | C1-131 | `app/client/components/workflow/workflow.js`:134 | `Template.instance()` | `instance` | unresolved | absent | b-lib | Blaze Template.instance |
-| C1-132 | `app/client/imports/amcharts/amcharts.js`:188 | `n.click(function(a){h.handleGraphEvent(a,"clickGraph")})` | `click` | unresolved | absent | b-lib | internal call inside the vendored amcharts bundle |
-| C1-133 | `app/client/imports/amcharts/amcharts.js`:190 | `d.setCN(f,n,this.bcn+"stroke")` | `setCN` | unresolved | absent | b-lib | AmCharts namespace helper inside the vendored bundle |
-| C1-134 | `app/client/imports/amcharts/ammap.js`:21 | `d.formatNumber(a,g)` | `formatNumber` | unresolved | absent | b-lib | AmCharts namespace helper inside the vendored ammap bundle |
+| C1-132 | `app/client/imports/amcharts/amcharts.js`:188 | `n.click(function(a){h.handleGraphEvent(a,"clickGraph")})` | `click` | unresolved | absent | a-repo | T-flow: vendored AmCharts set object method |
+| C1-133 | `app/client/imports/amcharts/amcharts.js`:190 | `d.setCN(f,n,this.bcn+"stroke")` | `setCN` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-134 | `app/client/imports/amcharts/ammap.js`:21 | `d.formatNumber(a,g)` | `formatNumber` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
 | C1-135 | `app/client/imports/amcharts/ammap.js`:70 | `Math.round(d.toCoordinate(this.height,e))` | `round` | unresolved | absent | c-platform | Math.round built-in |
 | C1-136 | `app/client/imports/amcharts/gauge.js`:6 | `isNaN(K)` | `isNaN` | unresolved | absent | c-platform | global isNaN built-in |
 | C1-137 | `app/client/imports/amcharts/plugins/export/libs/fabric.js/fabric.min.js`:1 | `this._objects.filter(function(o){return o.type===type})` | `filter` | unresolved | absent | c-platform | Array.prototype.filter on an object array |
-| C1-138 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `a._data.getCompressedContent()` | `getCompressedContent` | unresolved | absent | b-lib | JSZip internal data-object method |
-| C1-139 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `s(this.crc32(p),4)` | `s` | ambiguous | absent | b-lib | internal helper inside the vendored JSZip bundle |
+| C1-138 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `a._data.getCompressedContent()` | `getCompressedContent` | unresolved | absent | a-repo | T-flow: vendored JSZip compressed-data object method |
+| C1-139 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `s(this.crc32(p),4)` | `s` | ambiguous | absent | a-repo | T-flow: vendored JSZip bundle-internal local helper |
 | C1-140 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:7 | `Math.pow(2,-a)` | `pow` | unresolved | absent | c-platform | Math.pow built-in |
-| C1-141 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `pn(e,n,3)` | `pn` | in-file | absent | b-lib | internal helper inside the vendored pdfmake bundle |
-| C1-142 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `r(t,e)` | `r` | ambiguous | absent | b-lib | internal helper inside the vendored pdfmake bundle |
-| C1-143 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:9 | `new h(e,n,r,this.imageMeasure,this.tableLayouts,u)` | `h` | ambiguous | absent | b-lib | internal constructor inside the vendored pdfmake bundle |
-| C1-144 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `n(71)` | `n` | ambiguous | absent | b-lib | webpack module require inside the vendored bundle |
-| C1-145 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readString(4)` | `readString` | unresolved | absent | b-lib | pdfkit stream reader method in the vendored bundle |
-| C1-146 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `T.writeUInt16(i)` | `writeUInt16` | unresolved | absent | b-lib | pdfkit buffer writer method in the vendored bundle |
+| C1-141 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `pn(e,n,3)` | `pn` | in-file | absent | a-repo | T-none: vendored pdfmake bundle-internal helper |
+| C1-142 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `r(t,e)` | `r` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal local helper |
+| C1-143 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:9 | `new h(e,n,r,this.imageMeasure,this.tableLayouts,u)` | `h` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal constructor |
+| C1-144 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `n(71)` | `n` | ambiguous | absent | a-repo | T-flow: vendored bundle module require, a bound parameter |
+| C1-145 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readString(4)` | `readString` | unresolved | absent | a-repo | T-flow: vendored pdfmake stream reader method |
+| C1-146 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `T.writeUInt16(i)` | `writeUInt16` | unresolved | absent | a-repo | T-flow: vendored pdfmake buffer writer method |
 | C1-147 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `t.charCodeAt(r)` | `charCodeAt` | unresolved | absent | c-platform | String.prototype.charCodeAt |
-| C1-148 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:17 | `n()` | `n` | ambiguous | absent | b-lib | internal helper inside the vendored pdfmake bundle |
+| C1-148 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:17 | `n()` | `n` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal local helper |
 | C1-149 | `app/client/imports/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:2 | `path.toUpperCase().replace(chr0,"").replace(chr1,"!")` | `replace` | unresolved | absent | c-platform | String.prototype.replace chained on toUpperCase |
-| C1-150 | `app/client/imports/amcharts/serial.js`:80 | `e.resetDateToMin(new Date(this.data[f].time),g,w,p)` | `resetDateToMin` | unresolved | absent | b-lib | AmCharts namespace helper inside the vendored bundle |
-| C1-151 | `app/client/imports/amcharts/xy.js`:5 | `this.getAxisBounds(a,f,m,k,b)` | `getAxisBounds` | unresolved | absent | b-lib | AmCharts chart method inside the vendored bundle |
+| C1-150 | `app/client/imports/amcharts/serial.js`:80 | `e.resetDateToMin(new Date(this.data[f].time),g,w,p)` | `resetDateToMin` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-151 | `app/client/imports/amcharts/xy.js`:5 | `this.getAxisBounds(a,f,m,k,b)` | `getAxisBounds` | unresolved | absent | a-repo | T-hier: vendored AmCharts chart prototype method |
 | C1-152 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:240 | `$("<div class='slick-header-columns' style='left:-1000px' />").appendTo($headerScroller)` | `appendTo` | unresolved | absent | b-lib | jQuery appendTo on a wrapped element |
-| C1-153 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:660 | `getEditorLock()` | `getEditorLock` | in-file | absent | b-lib | internal function inside the vendored SlickGrid source |
+| C1-153 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:660 | `getEditorLock()` | `getEditorLock` | in-file | absent | a-repo | T-none: vendored SlickGrid internal function |
 | C1-154 | `app/client/lib/bootstrap-daterangepicker-custom/daterangepicker.js`:458 | `moment(startDate, this.locale.format)` | `moment` | unresolved | absent | b-lib | moment factory call |
-| C1-155 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:254 | `this.showForm(false)` | `showForm` | unresolved | absent | b-lib | internal method inside vendored bootstrap-editable |
+| C1-155 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:254 | `this.showForm(false)` | `showForm` | unresolved | absent | a-repo | T-hier: vendored bootstrap-editable prototype method |
 | C1-156 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:2653 | `$.proxy(function () { this.sourceData = cache.sourceData; this.doPrepend(); success.cal…` | `proxy` | unresolved | absent | b-lib | jQuery.proxy |
-| C1-157 | `app/client/lib/gojs/go.js`:57 | `this.Fa.reset()` | `reset` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
+| C1-157 | `app/client/lib/gojs/go.js`:57 | `this.Fa.reset()` | `reset` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated field |
 | C1-158 | `app/client/lib/gojs/go.js`:103 | `Object.isFrozen(this)` | `isFrozen` | unresolved | absent | c-platform | Object.isFrozen built-in |
-| C1-159 | `app/client/lib/gojs/go.js`:337 | `d.Df()` | `Df` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
-| C1-160 | `app/client/lib/gojs/go.js`:882 | `d.gt(f.gj)` | `gt` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
-| C1-161 | `app/client/lib/gojs/go.js`:1162 | `c.lb(a)` | `lb` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
-| C1-162 | `app/client/lib/gojs/go.js`:1225 | `a.rect(l,r,Math.max(m,.1),Math.max(k,.1))` | `rect` | unresolved | absent | c-platform | canvas 2D context rect, beside beginPath and moveTo |
-| C1-163 | `app/client/lib/gojs/go.js`:1366 | `Ho(b,!1)` | `Ho` | in-file | absent | b-lib | internal function inside the vendored GoJS bundle |
-| C1-164 | `app/client/lib/gojs/go.js`:1718 | `l.na()` | `na` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
-| C1-165 | `app/client/lib/gojs/go.js`:1739 | `Wq(a.width)` | `Wq` | in-file | absent | b-lib | internal function inside the vendored GoJS bundle |
-| C1-166 | `app/client/lib/gojs/go.js`:2048 | `Ma.S.h(K,Ga)` | `h` | unresolved | absent | b-lib | internal method inside the vendored GoJS bundle |
+| C1-159 | `app/client/lib/gojs/go.js`:337 | `d.Df()` | `Df` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-160 | `app/client/lib/gojs/go.js`:882 | `d.gt(f.gj)` | `gt` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-161 | `app/client/lib/gojs/go.js`:1162 | `c.lb(a)` | `lb` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-162 | `app/client/lib/gojs/go.js`:1225 | `a.rect(l,r,Math.max(m,.1),Math.max(k,.1))` | `rect` | unresolved | absent | a-repo | T-hier: vendored GoJS context wrapper rect, not canvas |
+| C1-163 | `app/client/lib/gojs/go.js`:1366 | `Ho(b,!1)` | `Ho` | in-file | absent | a-repo | T-none: vendored GoJS bundle-internal function |
+| C1-164 | `app/client/lib/gojs/go.js`:1718 | `l.na()` | `na` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-165 | `app/client/lib/gojs/go.js`:1739 | `Wq(a.width)` | `Wq` | in-file | absent | a-repo | T-none: vendored GoJS bundle-internal function |
+| C1-166 | `app/client/lib/gojs/go.js`:2048 | `Ma.S.h(K,Ga)` | `h` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
 | C1-167 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:3668 | `parentInstance._over.call( parentInstance, event )` | `call` | unresolved | absent | c-platform | Function.prototype.call |
 | C1-168 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:4005 | `[ "padding", /ne\|nw\|n/.test( i ) ? "Top" : /se\|sw\|s/.test( i ) ? "Bottom" : /^e$/.t…` | `join` | unresolved | absent | c-platform | Array.prototype.join on an array literal |
 | C1-169 | `app/client/plugins/d3/d3.min.js`:2 | `o.unshift(l)` | `unshift` | unresolved | absent | c-platform | Array.prototype.unshift |
@@ -178,7 +178,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-173 | `app/client/views/campaigns/campaignStats/campaignStats.js`:60 | `_.isEmpty(existing)` | `isEmpty` | unresolved | absent | b-lib | lodash isEmpty() |
 | C1-174 | `app/client/views/common/iboxTools/ibox-tools.js`:74 | `$(e.target)` | `$` | unresolved | absent | b-lib | jQuery factory call |
 | C1-175 | `app/client/views/internalSecOps/boQuickEntry/quickEntryField.js`:566 | `relatedSet.add(key)` | `add` | ambiguous | absent | c-platform | Set.prototype.add; sibling binding is a Map |
-| C1-176 | `app/client/views/internalSecOps/incidents/incidentsList.js`:49 | `incidentsGrid.grid.render()` | `render` | unresolved | absent | b-lib | SlickGrid grid render() |
+| C1-176 | `app/client/views/internalSecOps/incidents/incidentsList.js`:49 | `incidentsGrid.grid.render()` | `render` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
 | C1-177 | `app/client/views/internalSecOps/ofra/ofraTracking.js`:240 | `mapUsers([Meteor.user()])` | `mapUsers` | unresolved | absent | a-repo | T-import: named import from a repo module in this file |
 | C1-178 | `app/client/views/internalSecOps/risks/risksCreateEdit.js`:117 | `_.result(fortress, "customOfraLinks.get.risks")` | `result` | unresolved | absent | b-lib | lodash result() |
 | C1-179 | `app/client/views/internalSecOps/rootIssues/edit/editRootIssues.js`:49 | `Template.editRootIssues.onRendered(function() { $('#panelCompanies').removeClass('hidde…` | `onRendered` | unresolved | absent | b-lib | Blaze Template.onRendered |
@@ -195,7 +195,7 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-190 | `app/client/views/rolesNotifications/notificationRules/recipientFields.js`:313 | `_.castArray(notificationRecipientUtils.getRecipientFieldValue(_.get(doc, "recipients"),…` | `castArray` | unresolved | absent | b-lib | lodash castArray() |
 | C1-191 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:611 | `validateSectionRanges(scale, path, vc, section)` | `validateSectionRanges` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
 | C1-192 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:914 | `Session.get("readOnly")` | `get` | unresolved | absent | b-lib | Meteor Session.get |
-| C1-193 | `app/client/views/system/manageKeywordMatchRules/manageKeywordMatchRules.js`:46 | `SlickGrid.keywordMatchRulesGrid.grid.getSelectionModel()` | `getSelectionModel` | unresolved | absent | b-lib | SlickGrid grid getSelectionModel() |
+| C1-193 | `app/client/views/system/manageKeywordMatchRules/manageKeywordMatchRules.js`:46 | `SlickGrid.keywordMatchRulesGrid.grid.getSelectionModel()` | `getSelectionModel` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
 | C1-194 | `app/client/views/system/manage_boConfigs/quickEntryFormBuilder/quickEntryFormBuilder.js`:825 | `_.get(o, "label")` | `get` | unresolved | absent | b-lib | lodash get() |
 | C1-195 | `app/client/views/system/navigation/systemNavigation.js`:759 | `_.get(existing, "parent")` | `get` | unresolved | absent | b-lib | lodash get() |
 | C1-196 | `app/client/views/threatAlerts/icsAlerts/IcsAlertsPage.test.jsx`:128 | `expect( extractCves({ cves : [ { code : "CVE-2024-1234", boID : "bo1" }, { code : "CVE-…` | `expect` | unresolved | absent | b-lib | vitest expect() matcher |
@@ -215,34 +215,34 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 | C1-210 | `app/lib/routeControllers/campaignStatsController.js`:17 | `createController({ template : "campaignStats", waitOn(params) { return [ Meteor.subscri…` | `createController` | unresolved | stub | a-repo | T-import: named import from a repo module in this file |
 | C1-211 | `app/lib/routeDefinitions/samlRoutes.js`:333 | `Subscriptions.findOneAsync({ "saml.identifier" : _.get(fGroup, "sub", "") })` | `findOneAsync` | unresolved | stub | b-lib | Mongo collection findOneAsync |
 | C1-212 | `app/packages/jade-compiler/package.js`:42 | `api.addFiles(["tests/tests.js"], "server")` | `addFiles` | unresolved | absent | b-lib | Meteor package build API api.addFiles |
-| C1-213 | `app/packages/meteor-amcharts/lib/amcharts.js`:39 | `a.getLabel()` | `getLabel` | unresolved | stub | b-lib | AmCharts axis method inside the vendored bundle |
-| C1-214 | `app/packages/meteor-amcharts/lib/amcharts.js`:301 | `b.set()` | `set` | unresolved | stub | b-lib | AmCharts container set inside the vendored bundle |
-| C1-215 | `app/packages/meteor-amcharts/lib/plugins/animate/animate.js`:351 | `getKeysGraphs( chart.graphs, keys, seen, getKeysGraph )` | `getKeysGraphs` | in-file | in-repo | b-lib | internal function inside the vendored amcharts plugin |
-| C1-216 | `app/packages/meteor-amcharts/lib/plugins/export/export.js`:1351 | `_this.gatherClassName( group.parent, _this.setup.chart.classNamePrefix + "-legend-div",…` | `gatherClassName` | unresolved | stub | b-lib | internal method inside the vendored amcharts plugin |
-| C1-217 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.js`:329 | `this.getObjects()` | `getObjects` | unresolved | in-repo | b-lib | internal method inside the vendored fabric.js source |
-| C1-218 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:6 | `toFixed(this.scaleX,NUM_FRACTION_DIGITS)` | `toFixed` | unresolved | absent | b-lib | fabric.util.toFixed, not Number.prototype.toFixed |
+| C1-213 | `app/packages/meteor-amcharts/lib/amcharts.js`:39 | `a.getLabel()` | `getLabel` | unresolved | stub | a-repo | T-flow: vendored AmCharts axis object method |
+| C1-214 | `app/packages/meteor-amcharts/lib/amcharts.js`:301 | `b.set()` | `set` | unresolved | stub | a-repo | T-flow: vendored AmCharts container set method |
+| C1-215 | `app/packages/meteor-amcharts/lib/plugins/animate/animate.js`:351 | `getKeysGraphs( chart.graphs, keys, seen, getKeysGraph )` | `getKeysGraphs` | in-file | in-repo | a-repo | T-none: vendored amcharts plugin internal function |
+| C1-216 | `app/packages/meteor-amcharts/lib/plugins/export/export.js`:1351 | `_this.gatherClassName( group.parent, _this.setup.chart.classNamePrefix + "-legend-div",…` | `gatherClassName` | unresolved | stub | a-repo | T-hier: vendored amcharts export plugin method |
+| C1-217 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.js`:329 | `this.getObjects()` | `getObjects` | unresolved | in-repo | a-repo | T-none: vendored fabric.js method, engine says in-repo |
+| C1-218 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:6 | `toFixed(this.scaleX,NUM_FRACTION_DIGITS)` | `toFixed` | unresolved | absent | a-repo | T-field: vendored fabric.util.toFixed, not the built-in |
 | C1-219 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:11 | `floor(j*ratioH)` | `floor` | unresolved | absent | c-platform | Math.floor via a local alias in the vendored bundle |
-| C1-220 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:2003 | `__webpack_require__(7)` | `__webpack_require__` | in-file | absent | b-lib | webpack module runtime require in the vendored bundle |
+| C1-220 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:2003 | `__webpack_require__(7)` | `__webpack_require__` | in-file | absent | a-repo | T-none: vendored bundle webpack module loader |
 | C1-221 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:17016 | `result.push({ x: self.rowSpanData[self.rowSpanData.length - 1].left, index: self.rowSpa…` | `push` | unresolved | absent | c-platform | Array.prototype.push on a result array |
-| C1-222 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:1 | `r.fs.bindFS(this.vfs)` | `bindFS` | unresolved | absent | b-lib | pdfkit virtual filesystem bindFS in the vendored bundle |
+| C1-222 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:1 | `r.fs.bindFS(this.vfs)` | `bindFS` | unresolved | absent | a-repo | T-flow: vendored pdfkit virtual filesystem method |
 | C1-223 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `s.split("\n").map(function(t){return" "+t})` | `map` | unresolved | absent | c-platform | Array.prototype.map on a split() result |
 | C1-224 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:420 | `fmt.match(dec1)` | `match` | unresolved | stub | c-platform | String.prototype.match on a format string |
-| C1-225 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:8532 | `unescapexml(Rn[3])` | `unescapexml` | unresolved | in-repo | b-lib | internal function inside the vendored xlsx source |
-| C1-226 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.min.js`:3 | `__utf16le(this,this.l,this.l+size)` | `__utf16le` | unresolved | absent | b-lib | internal helper inside the vendored xlsx bundle |
+| C1-225 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:8532 | `unescapexml(Rn[3])` | `unescapexml` | unresolved | in-repo | a-repo | T-none: vendored xlsx function, engine says in-repo |
+| C1-226 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.min.js`:3 | `__utf16le(this,this.l,this.l+size)` | `__utf16le` | unresolved | absent | a-repo | T-flow: vendored xlsx bundle-internal helper |
 | C1-227 | `app/packages/meteor-apm-agent/tests/hijack/subscriptions.js`:17 | `h2.stop()` | `stop` | unresolved | absent | b-lib | DDP subscription handle stop, from client.subscribe |
 | C1-228 | `app/packages/meteor-apm-agent/tests/models/base_error.js`:49 | `new BaseErrorModel()` | `BaseErrorModel` | unresolved | absent | a-repo | T-import: Meteor package-scope global from a repo file |
 | C1-229 | `app/packages/meteor-stylus/plugin/compile-stylus.js`:213 | `absoluteImportPath(parsed)` | `absoluteImportPath` | in-file | in-repo | a-repo | T-none: syntax in-file and engine in-repo agree |
 | C1-230 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:116 | `setTimeout(function(){b.destroy.call(b)},1E3*a)` | `setTimeout` | unresolved | absent | c-platform | setTimeout host API |
-| C1-231 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:143 | `d.setCN(c,r,"graph-bullet")` | `setCN` | unresolved | absent | b-lib | AmCharts namespace helper inside the vendored bundle |
-| C1-232 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:259 | `n.translate(t,p)` | `translate` | unresolved | absent | b-lib | AmCharts object method inside the vendored bundle |
-| C1-233 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:369 | `c.fire({type:"selectedObjectChanged",chart:c})` | `fire` | unresolved | absent | b-lib | AmCharts event fire inside the vendored bundle |
-| C1-234 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:482 | `this.chart.coordinatesToXY(this.longitudes[b],this.latitudes[b])` | `coordinatesToXY` | unresolved | absent | b-lib | AmCharts chart method inside the vendored bundle |
+| C1-231 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:143 | `d.setCN(c,r,"graph-bullet")` | `setCN` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-232 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:259 | `n.translate(t,p)` | `translate` | unresolved | absent | a-repo | T-flow: vendored AmCharts object translate method |
+| C1-233 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:369 | `c.fire({type:"selectedObjectChanged",chart:c})` | `fire` | unresolved | absent | a-repo | T-flow: vendored AmCharts event fire method |
+| C1-234 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:482 | `this.chart.coordinatesToXY(this.longitudes[b],this.latitudes[b])` | `coordinatesToXY` | unresolved | absent | a-repo | T-flow: vendored AmCharts chart method via this.chart |
 | C1-235 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:15 | `h.slice(g)` | `slice` | unresolved | stub | c-platform | String.prototype.slice inside a wordwrap loop |
-| C1-236 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:77 | `a[b].remove()` | `remove` | unresolved | stub | b-lib | AmCharts label object remove in the vendored bundle |
-| C1-237 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:95 | `d.Class({construct:function(){}})` | `Class` | unresolved | stub | b-lib | AmCharts.Class factory inside the vendored bundle |
-| C1-238 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:126 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | stub | b-lib | AmCharts applyTheme inside the vendored bundle |
+| C1-236 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:77 | `a[b].remove()` | `remove` | unresolved | stub | a-repo | T-flow: vendored AmCharts label object remove |
+| C1-237 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:95 | `d.Class({construct:function(){}})` | `Class` | unresolved | stub | a-repo | T-field: vendored AmCharts.Class factory |
+| C1-238 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:126 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | stub | a-repo | T-field: vendored AmCharts namespace helper |
 | C1-239 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:7920 | `ctx.setLineDash(this.strokeDashArray)` | `setLineDash` | unresolved | stub | c-platform | canvas 2D context setLineDash |
-| C1-240 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:19503 | `_this.setAngle(value)` | `setAngle` | unresolved | stub | b-lib | fabric object setAngle inside the vendored source |
+| C1-240 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:19503 | `_this.setAngle(value)` | `setAngle` | unresolved | stub | a-repo | T-hier: vendored fabric.js object prototype method |
 
 ### B. Reference repository — JavaScript, second half
 
