@@ -22,14 +22,18 @@ against that denominator, **per repository class**, never per repository.
 | majority language by call sites | JavaScript 526,393 (94.8%) | Python 123,029 (90.7%) |
 | other languages by call sites | java 26,416 · python 2,291 · typescript 488 | tsx 7,300 · typescript 3,634 · go 1,101 · java 362 · javascript 233 · c 54 · rust 1 |
 | tree-sitter `calls` sites / edges | 555,588 / 363,750 | 135,714 / 108,153 |
-| syntax tier resolved | 75,751 (13.6%) | 39,526 (29.1%) |
+| syntax tier resolved, **as published** (§8.3 corrects both) | 75,751 (13.6%) | 39,526 (29.1%) |
 | engine (`dependence`) `calls` sites | 217,881, of which 40,743 (18.7%) in-repo | 168,376, of which 33,990 (20.2%) in-repo |
 | precise units in the active generation | 1 (17 files of one language) | 1, **whole-repository**, 2,990 documents |
 
 The second corpus is what a *configured* repository looks like in the store, and it is the only
 place the Section 11.3 call-site join can be measured at scale. The reference repository is what an
 *unconfigured* repository looks like. Neither is the definition of a target; each is an instance of
-a class.
+a class — and the second corpus instantiates **both**: it carries a project file for its majority
+language and a precise unit that covered 2,990 of its 3,196 files, while its TSX and TypeScript
+projects carry a `tsconfig.json` each and still produced no precise unit in that generation and left
+no trace of not having done so (§12.5). Its Python leg is therefore read as class (a) and its other
+languages as class (b), which is why every figure below is given per leg and never only per corpus.
 
 ## 2. The instruments
 
