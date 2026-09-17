@@ -449,10 +449,22 @@ unit that had already succeeded.
 
 Every failure also carries `stderr_tail`: the last of what the child wrote to
 its standard error, bounded to what one error detail holds, cut at a line
-boundary, with the run's private directories and every other absolute path
-reduced to a name. Without it a failure reported only how many bytes the child
-wrote, and a crash on a real repository left nothing that could be read
-afterwards.
+boundary. Without it a failure reported only how many bytes the child wrote,
+and a crash on a real repository left nothing that could be read afterwards.
+A failure row is durable storage, so what it may contain is narrower than what
+a log may:
+
+- The run's private directories are replaced by `(private)`, by name.
+- Every remaining rooted path is reduced to its base name, wherever it sits in
+  a whitespace-delimited field: the child prints paths inside punctuation — a
+  backticked command line, an argument list, a quoted value — and reducing
+  only a field that begins with a separator published the operator's home
+  directory and the repository path. The punctuation around the path stays, so
+  ``cmd: `<abs>/analyzer-parse` `` reads as ``cmd: `analyzer-parse` ``.
+- A path *under* a private directory keeps what follows `(private)`, which is
+  the part that says which step of the run wrote the file. That remainder is
+  not a rooted path: it names something inside a directory the reader is not
+  being told.
 
 Classification depends on the engine logging at WARN, so the child environment
 pins its log level rather than inheriting whatever the host set. The child's
