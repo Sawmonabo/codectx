@@ -1701,7 +1701,6 @@ func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, str
 		Offline:       cfg.Tools.Offline,
 		Mirror:        cfg.Tools.Mirror,
 		MaxFetchBytes: cfg.Tools.MaxFetchBytes,
-		FetchTimeout:  cfg.Tools.FetchTimeout.Std(),
 		Overrides:     overrides,
 		// Section 11.7 requires one record per completed fetch in ordinary
 		// operation; Section 18.2 puts logs on stderr, never on the result
