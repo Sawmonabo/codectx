@@ -998,13 +998,12 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // detect it — the range is in bounds, the file is the right file, and the fact
 // simply names the wrong bytes.
 //
-// Both publication paths are covered because each has its own strength of
-// proof: a declaration must select exactly the identifier it names, while a
-// reference — which legitimately sits on an alias or an operator — must at
-// least start on a token boundary. The document leaves its position encoding
-// unspecified, so the per-document encoding probe runs and passes on the first
-// definition, which is correct in both cases; the shifted occurrence is the
-// second one.
+// Both publication paths are covered, and every occurrence of both is held to
+// the same proof: the range covers whole tokens, and a range that is one
+// identifier token spells the name its symbol carries. The document leaves its
+// position encoding unspecified, so the per-document encoding probe runs and
+// passes on the first definition, which is correct in every case; the shifted
+// occurrence is the second one.
 //
 // The second failure mode, measured on the same project and equally silent:
 // failing the unit on the first refusal threw away all 93,167 occurrences over
@@ -1014,8 +1013,10 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // thinned unit indistinguishable from a whole one.
 //
 // Mutations that must fail this test: probe once per document (drop the range
-// check from occurrenceRange), which republishes the wrong bytes; or drop the
-// refusal count from the capability details, which republishes the silence.
+// check from occurrenceRange), which republishes the wrong bytes; drop the
+// end-of-token half of the coverage check, which republishes the keyword case;
+// or drop the refusal count from the capability details, which republishes the
+// silence.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 is the FX-I-T-c shape: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
@@ -1035,6 +1036,16 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 		// Five columns to the right of "browser" and still inside the line:
 		// "er + br", which starts in the middle of an identifier.
 		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22)},
+		// Seven columns to the left: "return ", a keyword plus the space
+		// before the identifier. Both ends are wrong -- it covers no whole
+		// token and it does not spell the symbol's name -- and it is the
+		// shift the start-boundary check alone admitted.
+		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10)},
+		// Four columns to the right and four wider: "browser + b", which
+		// begins on a token boundary and stops in the middle of the next
+		// identifier. Only the end of it is wrong, which is the half of the
+		// coverage rule the three rows above do not exercise.
+		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1117,6 +1128,47 @@ func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
 	}
 	if got := refusedDetail(res); got != "" {
 		t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not a refused occurrence", got)
+	}
+}
+
+// TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse holds the boundary of
+// the wrong-bytes guarantee, which docs/providers-scip.md states beside it: a
+// shift that lands on a whole token spelling the same identifier somewhere
+// else publishes, because the two ranges are byte-for-byte the same claim and
+// this provider never adjusts or guesses a coordinate.
+//
+// Failure mode it guards: the guarantee being read, or later written, as
+// total. A page that claimed every occurrence is proved would tell an operator
+// that a located fact of a `partial` unit cannot name the wrong token, and the
+// counts would carry no warning at all for this class. If a later predicate
+// does refuse this occurrence, the residual on that page is stale and the
+// guarantee can be widened -- which is why this asserts publication rather
+// than leaving the class untested.
+func TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse(t *testing.T) {
+	// The same line as the test above. "browser" sits at columns [10,17) and
+	// again at [20,27); the occurrence below is the first one shifted ten
+	// columns right, onto the second.
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	files := fixture(t)
+	files["pkg/tabs.go"] = src
+	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+		documentWithText("pkg/tabs.go", "go", 0, src,
+			occurrenceRecord(symStart, 1, 4, 5, 10),
+			occurrenceRecord(symBrowser, 0, 5, 20, 27))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "tabs.scip")
+	res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := refusedDetail(res); got != "" {
+		t.Fatalf("refused_occurrences = %q: a shift onto a token spelling the same identifier is the measured residual, "+
+			"not something the pinned bytes can refuse -- if it now is, widen the guarantee on docs/providers-scip.md", got)
 	}
 }
 
