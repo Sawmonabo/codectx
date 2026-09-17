@@ -176,6 +176,31 @@ they take the lock at startup and hold it to the end. The distinction is the
 session that also answers questions: `mcp serve` exists to be left running, so
 it owns the workspace only while it is actually building in it.
 
+### What a building command does when the workspace is held
+
+It waits for as long as the holder is getting on with it, and no longer. There
+is no wait constant: a number chosen here would be too long for a holder that
+has died and too short for one that is doing exactly what it should. The
+waiter judges the holder by the stamp that holder renews while it builds -- the
+run row's liveness deadline, rewritten on the flush the collector already
+performs -- read through a read-only connection that takes no lock and costs
+the holder nothing. While it waits it prints one line naming the holder's
+process, what that process is running and the stage it is in, and rewrites that
+line as the stage changes, so a person watching a terminal can see whose work
+they are behind.
+
+When the holder finishes, the waiter takes the workspace and builds, reusing
+everything the holder published rather than repeating it. It gives up only when
+the stamp stops advancing, and then with the retryable `CTX_WORKSPACE_BUSY`
+that names the holder. A holder that has taken the lock but not yet published
+its first stamp is given the same grace the ledger already allows a late
+flush, so a run is never refused for the moment between its lock and its first
+write.
+
+An MCP `codectx_refresh_index` is the exception, deliberately: it tries once
+and answers the agent now with the retryable refusal, rather than holding a
+tool call open for the length of somebody else's index.
+
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by
 reading. Every tool that only asks a question -- search, the repository

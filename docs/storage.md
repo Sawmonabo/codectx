@@ -771,7 +771,11 @@ and invalidate every cache. A diagnostic table is not worth that.
 
 The ledger has exactly one writer -- the collector goroutine of the process
 that holds the workspace lock -- and any number of read-only readers at any
-moment. It runs in WAL mode at `synchronous = normal`; a reader opens it with
+moment. The collector lives exactly as long as that hold: it is opened when a
+process takes the workspace lock to build and stopped, with its last rows
+flushed, before the lock is given back. A session that holds nothing writes
+nothing here, so a server left connected between refreshes is never a second
+collector beside the person's own run. It runs in WAL mode at `synchronous = normal`; a reader opens it with
 `query_only` set, so `status --resources` reads a run while that run writes,
 disturbs nothing, and cannot create the file in a workspace where no run has
 ever been recorded. A composition that only reports opens no ledger at all.
