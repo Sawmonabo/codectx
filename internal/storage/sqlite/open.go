@@ -469,10 +469,19 @@ func immutableAnswer(ctx context.Context, path string, pragmas []pragma) (bool, 
 	if pingErr == nil {
 		return false, nil
 	}
+	// Only the engine REFUSING TO WRITE is the case this answers. A corrupt
+	// database, a busy one, a foreign schema, a device error: each has its own
+	// family and its own remedy, and opening any of them a second time as an
+	// unchanging file would replace the answer the operator needs with a
+	// second, stranger failure.
+	var se *sqlite.Error
+	if !errors.As(pingErr, &se) || se.Code()&0xff != sqlite3.SQLITE_READONLY {
+		return false, wrap("open read-only", pingErr)
+	}
 	if _, statErr := os.Stat(path + walSuffix); errors.Is(statErr, fs.ErrNotExist) {
 		return true, nil
 	}
-	return false, pingErr
+	return false, wrap("open read-only", pingErr)
 }
 
 // walSuffix names the write-ahead log beside a database, which is the engine's

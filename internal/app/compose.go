@@ -959,7 +959,14 @@ func (s *stack) setEngineTempDir(answersOnly bool) error {
 		}
 		return nil
 	}
-	fallback := filepath.Join(os.TempDir(), "codectx-engine-"+strconv.Itoa(os.Getpid()))
+	// A directory of its own, not one named after this process: a name derived
+	// from the pid is one a killed process leaves behind and the next process
+	// to be given that pid adopts, spills and all, and one a second
+	// composition in this process would remove from under the first.
+	fallback, ferr := os.MkdirTemp("", "codectx-engine-")
+	if ferr != nil {
+		return dataDirNotWritable(os.TempDir(), ferr)
+	}
 	if ferr := sqlite.SetTempDir(fallback); ferr != nil {
 		return dataDirNotWritable(fallback, ferr)
 	}

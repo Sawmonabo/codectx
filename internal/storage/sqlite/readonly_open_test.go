@@ -430,3 +430,66 @@ func TestAReadOnlyOpenOfAWorkspaceNeverIndexedCreatesNothing(t *testing.T) {
 		t.Fatalf("the read-only open left a database behind: %v", statErr)
 	}
 }
+
+// A refusal that is NOT the engine declining to write must never be answered by
+// opening the store as an unchanging file. The immutable open exists for one
+// case -- a store on media this process cannot write, where the shared-memory
+// index cannot be created -- and it is a claim about the file, so every other
+// refusal keeps its own family and its own remedy: a corrupt database, a
+// foreign schema, a busy one. Reading a corrupt store a second time as though
+// it were frozen would replace the answer an operator can act on with a
+// stranger one.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation that fails this test: drop the SQLITE_READONLY class check from
+// immutableAnswer, so any failed ping retries as immutable.
+func TestAReadOnlyOpenOfACorruptStoreKeepsItsOwnFamily(t *testing.T) {
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "codectx.db")
+	f := newFixture(t, src)
+	a := f.file("pkg/a.go", "package pkg\nfunc A() {}\n")
+	snap := f.snapshot("one", a)
+	gen, err := f.s.BeginGeneration(ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration: %v", err)
+	}
+	run := f.run(gen)
+	f.unit(gen, run, a)
+	if err := f.s.CompleteProviderRun(ctx, model.ProviderResult{RunID: run, State: model.RunSucceeded,
+		RecordsEmitted: 1, BytesProcessed: 24}, ""); err != nil {
+		t.Fatalf("CompleteProviderRun: %v", err)
+	}
+	f.activate(gen, 0)
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A file that is not a database at all: the header is what the engine reads
+	// first, and no log lies beside it, which is the shape the immutable open
+	// would otherwise be reached for.
+	dst := filepath.Join(t.TempDir(), "codectx.db")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(b[:16], []byte("not a database\x00\x00"))
+	if err := os.WriteFile(dst, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dst + "-wal"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the fixture left a log beside the copy, so this test would not reach the immutable path: %v", err)
+	}
+
+	_, err = store.Open(ctx, dst, store.Options{ReadOnly: true})
+	if err == nil {
+		t.Fatal("a read-only open of a file that is not a database succeeded")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("the refusal is untyped: %v", err)
+	}
+	if typed.Code == model.CodeNoActiveGeneration {
+		t.Fatalf("a file that is not a database was reported as a workspace that has published nothing: %v", err)
+	}
+}

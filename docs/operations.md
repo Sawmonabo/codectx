@@ -145,9 +145,10 @@ removed or resized by a reader, and neither carries a byte of the published
 index.
 
 A workspace with no database at all is the answer `CTX_NO_ACTIVE_GENERATION`,
-"run `codectx index`": an answering command does not bring the workspace into
-being in order to report that it is empty. Nor does it create the provider work
-directories, which belong to a run.
+"run `codectx index`": no answering command creates a database, and none
+creates the provider work directories -- both belong to a run. (The content
+store's own directory is still made where it is missing, which is the one
+directory such a command has always made.)
 
 That is what lets such a command answer a workspace on **read-only media**, or
 one an operator has locked down. Two things are then different, and neither is
