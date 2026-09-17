@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -290,7 +291,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
 		CAS: cas, Lock: heldLock{lock}, Pool: pool})
 	if err != nil {
 		t.Fatal(err)
@@ -336,4 +337,19 @@ type heldLock struct{ l *snapshot.WorkspaceLock }
 
 func (h heldLock) Hold(context.Context, index.HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
 	return h.l, func() error { return nil }, nil
+}
+
+// benchAdmission is the process memory admission ledger heavy units are
+// admitted against. Production composes exactly one and hands it to every
+// reserver; these tests run fake units, so the allocation is simply wide
+// enough that admission never orders them -- what the ledger admits and when
+// is proved where the ledger lives.
+func benchAdmission() *admission.Ledger {
+	l, err := admission.NewLedger(64 << 30)
+	if err != nil {
+		// A positive allocation is the constructor's only requirement and this
+		// one is a constant, so a failure here is this helper being wrong.
+		panic(err)
+	}
+	return l
 }

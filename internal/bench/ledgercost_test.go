@@ -444,7 +444,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 			return ledgerArmResult{}, err
 		}
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
 		CAS: cas, Lock: heldLock{lock}, Pool: pool, Ledger: led})
 	if err != nil {
 		return ledgerArmResult{}, err

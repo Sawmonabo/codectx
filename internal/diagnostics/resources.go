@@ -185,11 +185,19 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 	}
 }
 
-// reservations fills the three figures that are not measured but promised: what
-// this process has set aside for concurrent queries, for the parsed-graph cache
-// and for the indexing queue. Two are configuration and the third is how many
-// queries this machine's cores run at once, so all three are always available
-// and a zero here is a real zero.
+// reservations fills the figures that are not measured but promised: what this
+// process has set aside for concurrent queries, for the parsed-graph cache and
+// for the indexing queue, and beside them the one allocation every heavy child
+// of this process -- engine runs, external indexers, language servers -- is
+// admitted against, with the sum currently reserved against it. Two of the
+// first three are configuration and the third is how many queries this
+// machine's cores run at once, so all three are always available and a zero
+// there is a real zero.
+//
+// The admission pair is read together from the ledger so the two figures are
+// one moment rather than two, and is absent altogether when this composition
+// has no ledger: an unavailable figure is never published as zero, and a zero
+// allocation would read as a process that may run nothing.
 //
 // Validation already proves the three fit config.BaseFootprintBytes, so the
 // report states them rather than re-deriving the check -- a second
@@ -204,6 +212,11 @@ func (s *Service) reservations(report *model.ResourceReport) {
 	report.QueryReservationBytes = nonNegativeBytes(int64(config.QuerySlots()) * res.QueryMemoryBytes)
 	report.CacheReservationBytes = nonNegativeBytes(res.CacheBytes)
 	report.QueueReservationBytes = nonNegativeBytes(s.opts.Config.Index.QueueBytes)
+	if s.opts.Admission != nil {
+		allocation, reserved := s.opts.Admission.Snapshot()
+		report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
+		report.AdmissionReservedBytes = nonNegativeBytes(reserved)
+	}
 }
 
 // nonNegativeBytes converts a signed byte count to the report's unsigned

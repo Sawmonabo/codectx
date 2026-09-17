@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -337,6 +338,14 @@ type stack struct {
 	// resource sampler can count their live children. Nothing else reads them:
 	// each component keeps its own runner.
 	runners []diagnostics.ProcessCounter
+	// admission is the ONE memory admission ledger of this process, built here
+	// from the one observation of the machine and handed to every reserver:
+	// the heavy-unit scheduler inside the coordinator, the language-server
+	// manager, and the resource block that discloses it. There is no second
+	// one -- a reserver with a running total of its own is bounded by the same
+	// allocation as this one and nothing sums the two, which is a process free
+	// to reserve a multiple of the machine's memory.
+	admission *admission.Ledger
 	// diagnose produces the Section 22 check list and the Section 23 resource
 	// block; collector is the process-level reclaim pass and the Section 10.4
 	// blob grace protocol. Both are set by openDiagnostics, which needs the
@@ -586,6 +595,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// available memory less this process's own footprint and the safety
 	// margin, never more than the share of the machine the product takes.
 	childMemory := dependence.ObserveMachine().SchedulingAllocation()
+	if s.admission, err = admission.NewLedger(childMemory); err != nil {
+		return nil, err
+	}
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its
 	// unlimited default of 0: the runner reads a non-positive disk budget as
 	// unlimited and admits every reservation, so the default never refuses a
@@ -723,7 +735,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.lsp, err = lsp.New(lsp.Options{
 		Runner:                 servers,
 		DataDir:                s.dataDir,
-		AllocationBytes:        childMemory,
+		Admission:              s.admission,
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
 		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
@@ -990,6 +1002,7 @@ func (s *stack) openDiagnostics() error {
 		Build:     model.CurrentBuildInfo(),
 		Repo:      s.repo,
 		Root:      s.root.Path,
+		Admission: s.admission,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
 		Ledger:    runLedger{dir: dataDir},
