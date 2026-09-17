@@ -9,13 +9,14 @@ import (
 )
 
 // opener opens the workspace one command runs against. It is injected rather
-// than chosen inside runService because the difference between the two openers
-// is real and not drift: a read command pins a generation and takes no
-// cross-process lock, while a building command must be the single owner of
-// Section 13.2 and waits for the workspace lock for as long as whoever holds
-// it keeps making progress. A runner that
-// decided this for itself would have to be told which kind of command it was
-// running anyway, and the flag that told it would be the second call path.
+// than chosen inside runService because the differences between the openers are
+// real and not drift: a read command pins a generation and takes no
+// cross-process lock; a one-shot building command must be the single owner of
+// Section 13.2 for its whole run and waits for the workspace lock for as long
+// as whoever holds it keeps making progress; a watching command builds too but
+// owns the workspace only for the beat that builds. A runner that decided this
+// for itself would have to be told which kind of command it was running
+// anyway, and the flag that told it would be the second call path.
 type opener func(ctx context.Context, repo string) (*app.Workspace, error)
 
 // openForReport opens a read-only report workspace: no workspace lock, no
@@ -36,13 +37,29 @@ func openForQuery() opener {
 
 // openForBuild opens the workspace as the single cross-process writer, with the
 // operation name, waiting line, rebuild cache and supplied-index inputs the
-// caller's flags resolved to. Only the building commands use it, and each names
-// itself: the name is what the lock file carries for whichever process is
+// caller's flags resolved to. The ONE-SHOT building commands use it, and each
+// names itself: the name is what the lock file carries for whichever process is
 // refused while this one holds the workspace, and what the process waiting
 // behind it prints while it waits.
 func openForBuild(o app.OpenOptions) opener {
 	return func(ctx context.Context, repo string) (*app.Workspace, error) {
 		return app.OpenWorkspace(ctx, repo, o)
+	}
+}
+
+// openForWatch opens the workspace for a session that watches: it builds, so it
+// is one of the cross-process owners, but it takes the workspace for the beat
+// that builds and gives it back when that beat ends rather than owning it for
+// the session. A watch that is idle between beats is idle in every sense, and
+// the person's own `codectx index` beside it runs.
+//
+// It is separate from openForBuild rather than a flag on it because the two
+// differ in what the composition IS, which is also what decides that a
+// one-shot command waits for a progressing holder and a beat does not: there is
+// no waiting line to pass here, because nothing in this open waits.
+func openForWatch(o app.OpenOptions) opener {
+	return func(ctx context.Context, repo string) (*app.Workspace, error) {
+		return app.OpenWorkspaceForWatch(ctx, repo, o)
 	}
 }
 

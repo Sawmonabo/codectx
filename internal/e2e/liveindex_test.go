@@ -1,7 +1,10 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -547,7 +551,7 @@ func TestE2EAWatchingServerLeavesTheWorkspaceToThePerson(t *testing.T) {
 	t.Cleanup(closeSession)
 
 	touchFixture(t, s.Repo)
-	armed := awaitRefreshPast(t, ctx, serverLog, 0)
+	armed := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, 0)
 	t.Logf("the watching session completed a beat: generation %d, %d reused, %d built",
 		armed.generation, armed.reused, armed.built)
 
@@ -570,7 +574,7 @@ func TestE2EAWatchingServerLeavesTheWorkspaceToThePerson(t *testing.T) {
 	// the generation that index published; one that rebuilt them started from
 	// its own.
 	touchFixture(t, s.Repo)
-	next := awaitRefreshPast(t, ctx, serverLog, int64(person.Binding.GenerationID))
+	next := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, int64(person.Binding.GenerationID))
 	t.Logf("the beat after the person's index: generation %d, %d reused, %d built, %d invalidated",
 		next.generation, next.reused, next.built, next.invalidated)
 	if next.reused == 0 || next.built != 0 {
@@ -633,11 +637,16 @@ var refreshedRecord = regexp.MustCompile(
 // running when the caller's index started publishes whatever it staged before
 // it, and only a generation greater than the one that index published can have
 // been staged after it.
-func awaitRefreshPast(t *testing.T, ctx context.Context, log *serverLog, minGeneration int64) refreshed {
+//
+// The record pattern is the caller's because the two watching surfaces report a
+// beat in two different renderings -- the server logs one, `codectx watch`
+// writes its own machine line -- and one loop over both is what keeps the two
+// legs comparing the same thing.
+func awaitRefreshPast(t *testing.T, ctx context.Context, log *serverLog, record *regexp.Regexp, minGeneration int64) refreshed {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		for _, m := range refreshedRecord.FindAllStringSubmatch(log.String(), -1) {
+		for _, m := range record.FindAllStringSubmatch(log.String(), -1) {
 			r := refreshed{generation: mustInt(t, m[1]), reused: mustInt(t, m[2]),
 				built: mustInt(t, m[3]), invalidated: mustInt(t, m[4])}
 			if r.generation > minGeneration {
@@ -735,7 +744,7 @@ func TestE2EAnIdleServerHoldsNoLedgerWriter(t *testing.T) {
 	_, watchLog, closeWatching := s.mcpServer(t, ctx, "--watch=true")
 	defer closeWatching()
 	touchFixture(t, s.Repo)
-	beat := awaitRefreshPast(t, ctx, watchLog, int64(result.Binding.GenerationID))
+	beat := awaitRefreshPast(t, ctx, watchLog, refreshedRecord, int64(result.Binding.GenerationID))
 	t.Logf("the watching session's beat published generation %d", beat.generation)
 	if files := ledgerFiles(t, root); len(files) == 0 {
 		t.Fatalf("a session that refreshed opened no run ledger, so its beat recorded nothing\nserver stderr:\n%s",
@@ -765,4 +774,140 @@ func ledgerFiles(t *testing.T, root string) []string {
 		t.Fatalf("walking %s: %v", root, err)
 	}
 	return found
+}
+
+// cliRefreshedRecord matches the machine line `codectx watch --json` writes to
+// its stderr for each beat (internal/cli/index.go machineRefreshLine). It is
+// anchored to a whole line because the session's structured log shares that
+// stream, and it carries `carried` where the server's slog record does not,
+// which is exactly why the two legs cannot share one pattern.
+var cliRefreshedRecord = regexp.MustCompile(
+	`(?m)^refreshed generation=(\d+) health=\S+ reused=(\d+) built=(\d+) carried=\d+ invalidated=(\d+)$`)
+
+// watchCommand starts `codectx watch --json` as a child process and hands back
+// its stderr -- where every beat is reported while the session runs -- and the
+// stop that ends it.
+//
+// The stop INTERRUPTS rather than kills: cmd/codectx turns SIGINT into the
+// context cancellation a watch session ends on, so the envelope it returns is
+// the one a real interrupted session writes, and a session that had died on
+// its own is caught by the exit code rather than passing for a live one. It is
+// idempotent and registered as a cleanup, so a row may end the watch where it
+// says so and still be sure no child outlives the test.
+func (s *sandbox) watchCommand(t *testing.T) (*serverLog, func() (envelope, int)) {
+	t.Helper()
+	stderr := &serverLog{}
+	var stdout bytes.Buffer
+	cmd := exec.Command(binary, "watch", "--repo", s.Repo, "--json")
+	cmd.Env = s.Environ
+	cmd.Stdout, cmd.Stderr = &stdout, stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start `codectx watch`: %v", err)
+	}
+	var (
+		once sync.Once
+		env  envelope
+		code int
+	)
+	stop := func() (envelope, int) {
+		once.Do(func() {
+			if err := cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("interrupt `codectx watch`: %v\nstderr:\n%s", err, stderr.String())
+			}
+			if err := cmd.Wait(); err != nil {
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) {
+					t.Fatalf("`codectx watch`: %v\nstderr:\n%s", err, stderr.String())
+				}
+				code = exit.ExitCode()
+			}
+			if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &env); err != nil {
+				t.Fatalf("`codectx watch`: stdout is not one envelope: %v\nstdout:\n%s\nstderr:\n%s",
+					err, stdout.String(), stderr.String())
+			}
+		})
+		return env, code
+	}
+	t.Cleanup(func() { stop() })
+	return stderr, stop
+}
+
+// TestE2EAWatchingCommandLeavesTheWorkspaceToThePerson is the CLI half of
+// TestE2EAWatchingServerLeavesTheWorkspaceToThePerson: the same obligation,
+// asserted at the product boundary against `codectx watch` rather than against
+// a watching `mcp serve`.
+//
+// Failure mode it protects: a CLI watch composed itself as the workspace's
+// owner for its whole session -- the lock taken at its open and given up only
+// when the process exited -- so an idle `codectx watch` in one terminal owned a
+// workspace it was not building in, and the person's own `codectx index` in
+// another was made to wait out the grace and then refused by name. One watcher
+// mechanism, not two: a watch holds the workspace for the beat that builds and
+// nothing else, exactly as the server's watch already does.
+//
+// The beat BEFORE that index is load-bearing and not setup: a session that has
+// never beaten holds nothing under either behaviour, so a row that indexed
+// straight away would pass against the very defect it exists to catch.
+//
+// Mutation that must fail this row is quoted in this lane's report: make
+// locksAtOpen true for the watch composition again and the index below is
+// refused.
+func TestE2EAWatchingCommandLeavesTheWorkspaceToThePerson(t *testing.T) {
+	s := newSandbox(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	if env, code := s.run(t, "index"); !env.OK || code != 0 {
+		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
+	}
+	watchLog, stopWatch := s.watchCommand(t)
+
+	touchFixture(t, s.Repo)
+	armed := awaitRefreshPast(t, ctx, watchLog, cliRefreshedRecord, 0)
+	t.Logf("`codectx watch` completed a beat: generation %d, %d reused, %d built",
+		armed.generation, armed.reused, armed.built)
+
+	// The assertion: the person's own index, as a further process, while that
+	// watch session is running and has already beaten.
+	env, code := s.run(t, "index")
+	if !env.OK || code != 0 {
+		t.Fatalf("`codectx index` was refused (exit %d) beside a running `codectx watch`: %+v -- "+
+			"the watch is holding the workspace between its beats", code, env.Error)
+	}
+	person := data[model.IndexResult](t, env, code)
+	if int64(person.Binding.GenerationID) <= armed.generation {
+		t.Fatalf("the person's index published generation %d, which is not past the watch's beat at %d",
+			person.Binding.GenerationID, armed.generation)
+	}
+
+	// Letting go must cost nothing: the fixture is rewritten with the content
+	// it already has, so the notification fires and every unit hashes to what
+	// the person's index just sealed. A beat that reuses them is a beat that
+	// started from the generation that index published; one that rebuilt them
+	// started from its own.
+	touchFixture(t, s.Repo)
+	next := awaitRefreshPast(t, ctx, watchLog, cliRefreshedRecord, int64(person.Binding.GenerationID))
+	t.Logf("the beat after the person's index: generation %d, %d reused, %d built, %d invalidated",
+		next.generation, next.reused, next.built, next.invalidated)
+	if next.reused == 0 || next.built != 0 {
+		t.Fatalf("the beat after the person's index reused %d units and built %d: "+
+			"it rebuilt the workspace rather than reusing the generation that index published",
+			next.reused, next.built)
+	}
+
+	// And what it gave up was the workspace and not the session: the watch is
+	// still running here, and interrupting it now ends it the ordinary way,
+	// counting the beats it ran.
+	final, exit := stopWatch()
+	if !final.OK || exit != 0 {
+		t.Fatalf("the watch session did not end cleanly (exit %d): %+v", exit, final.Error)
+	}
+	var counts map[string]int64
+	if err := json.Unmarshal(final.Data, &counts); err != nil {
+		t.Fatalf("the watch envelope carries no refresh count: %v", err)
+	}
+	if counts["refreshes"] < 2 {
+		t.Fatalf("the watch reported %d refreshes: it did not survive the person's index beside it",
+			counts["refreshes"])
+	}
 }
