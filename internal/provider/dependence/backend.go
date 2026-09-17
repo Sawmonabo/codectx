@@ -76,13 +76,6 @@ type Backend interface {
 	// part of the cache key, so a change to the pinned arguments invalidates
 	// every cached graph rather than silently reusing one.
 	Argv(f Family) []string
-	// RefusesInput reports whether the frontend of f leaves a source file out
-	// of its analysis by a default of its own, given the file's path relative
-	// to the directory the frontend is pointed at. It is how a unit that
-	// exports nothing can name the reason instead of restating the symptom:
-	// when every file of a unit is refused, "no method was exported" has a
-	// cause the operator can act on, and when none is, it does not.
-	RefusesInput(f Family, unitRelPath string) bool
 }
 
 // ParseRequest is one parse step. SourceDir is a private materialization the

@@ -191,3 +191,22 @@ func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestParseArgsEndsWithTheFrontendDelimiter protects the one ordering the
+// parse command line cannot survive losing. Everything after the delimiter is
+// read by the frontend, not by the parse tool, so a source directory or an
+// output path placed after it would leave the parse tool with no input at all
+// -- a whole language family that analyses nothing, with no compile error and
+// no diagnostic from the engine to say so.
+func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
+	args := parseArgs([]string{"--base"}, dependence.ParseRequest{
+		Family: dependence.FamilyJava, SourceDir: "/src", OutputPath: "/out/graph"})
+	tail := args[len(args)-len(clearDefaultExclusions):]
+	if strings.Join(tail, " ") != strings.Join(clearDefaultExclusions, " ") {
+		t.Fatalf("the parse argv ends with %q, not with the frontend delimiter %q", tail, clearDefaultExclusions)
+	}
+	head := args[:len(args)-len(clearDefaultExclusions)]
+	if got := strings.Join(head, " "); !strings.HasSuffix(got, "/src --output /out/graph") {
+		t.Errorf("the paths do not precede the frontend delimiter: %q", got)
+	}
+}
