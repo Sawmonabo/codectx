@@ -2,7 +2,12 @@ package config
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 // IdleFootprintBytes is what this process holds before it reserves anything:
@@ -65,19 +70,177 @@ func baseFootprintFor(c Config, querySlots int) (int64, error) {
 // derived from the hardware would otherwise turn a busy moment on a small
 // machine into a refusal the caller cannot act on.
 
-// CPUs is how many cores this process may run on, never below one.
-// runtime.NumCPU already honours the CPU affinity the process was started
-// with, so a container given two cores of a large host reads two.
+// CPUs is how many cores this process may run on, never below one: the
+// smaller of the affinity the process was started with and the CPU quota its
+// control group is held to.
+//
+// Both are read because they are different limits. runtime.NumCPU honours
+// affinity, which is what a CPU set restricts; a container CPU limit is
+// normally not a set but a bandwidth quota, and a process held to two cores of
+// a sixteen-core host by a quota still reads sixteen from affinity alone. It
+// would then run sixteen parser workers and reserve sixteen workers' memory on
+// a machine that can run two.
+//
+// A quota is an observation that can be absent, and an absent one is not a
+// quota of zero: no control-group filesystem, a group that states no bandwidth
+// limit, and a file this process may not read all mean the group states no
+// quota, and the affinity count then stands alone.
 func CPUs() int {
-	if n := cpuCount(); n > 0 {
-		return n
+	n := cpuCount()
+	if quota, ok := cpuQuota(); ok && quota < n {
+		n = quota
 	}
-	return 1
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 // cpuCount is the machine observation CPUs reads, indirected so a test can
 // resolve a configuration for a core count this host does not have.
 var cpuCount = runtime.NumCPU
+
+// cpuQuota is the whole cores this process's control group hierarchy allows,
+// and false where no group in it states a bandwidth limit. It is indirected
+// for the same reason cpuCount is: a test cannot put this host under a quota.
+var cpuQuota = observedCPUQuota
+
+// cgroupRoot is where the control-group filesystem is mounted, and
+// procCgroupPath is where a process reads the groups it is in. A build on a
+// platform that has neither simply finds nothing there, which is the same
+// answer as a host that states no quota, so the reading needs no platform
+// split of its own. They are variables so a test can state a hierarchy this
+// host is not in.
+var (
+	cgroupRoot     = "/sys/fs/cgroup"
+	procCgroupPath = "/proc/self/cgroup"
+)
+
+// observedCPUQuota reads the CPU bandwidth limit of every group this process
+// is in, unified hierarchy first and then the legacy cpu controller, and
+// returns the smallest. Every group in the hierarchy enforces its own limit,
+// so a quota stated on an ancestor binds this process just as one stated on
+// its own group does -- and the common container and service case states it on
+// the ancestor, where a reading of the process's own group alone finds
+// nothing.
+//
+// Fractions round DOWN, never below one core: the count decides how many
+// workers run and how much memory they reserve, and rounding a half core up
+// would reserve a worker the quota cannot run.
+func observedCPUQuota() (int, bool) {
+	if cores, ok := unifiedCPUQuota(); ok {
+		return cores, true
+	}
+	return legacyCPUQuota()
+}
+
+// unifiedCPUQuota reads cpu.max ("<quota|max> <period>", in microseconds) from
+// this process's unified group and each of its ancestors.
+func unifiedCPUQuota() (int, bool) {
+	path, ok := cgroupPathFor("")
+	if !ok {
+		return 0, false
+	}
+	best, found := 0, false
+	for _, dir := range cgroupAncestors(filepath.Join(cgroupRoot, path)) {
+		fields := strings.Fields(readCgroupFile(filepath.Join(dir, "cpu.max")))
+		if len(fields) != 2 || fields[0] == "max" {
+			continue
+		}
+		quota, qerr := strconv.ParseInt(fields[0], 10, 64)
+		period, perr := strconv.ParseInt(fields[1], 10, 64)
+		if qerr != nil || perr != nil || quota <= 0 || period <= 0 {
+			continue
+		}
+		best, found = smallestQuota(best, found, quota, period)
+	}
+	return best, found
+}
+
+// legacyCPUQuota reads cpu.cfs_quota_us and cpu.cfs_period_us from the legacy
+// cpu controller's group and each of its ancestors. A quota of -1 is the
+// controller's spelling of "no limit".
+func legacyCPUQuota() (int, bool) {
+	path, ok := cgroupPathFor("cpu")
+	if !ok {
+		return 0, false
+	}
+	best, found := 0, false
+	for _, mount := range []string{"cpu,cpuacct", "cpu"} {
+		for _, dir := range cgroupAncestors(filepath.Join(cgroupRoot, mount, path)) {
+			quota, qerr := strconv.ParseInt(readCgroupFile(filepath.Join(dir, "cpu.cfs_quota_us")), 10, 64)
+			period, perr := strconv.ParseInt(readCgroupFile(filepath.Join(dir, "cpu.cfs_period_us")), 10, 64)
+			if qerr != nil || perr != nil || quota <= 0 || period <= 0 {
+				continue
+			}
+			best, found = smallestQuota(best, found, quota, period)
+		}
+	}
+	return best, found
+}
+
+// smallestQuota folds one group's quota and period into the smallest whole
+// core count seen so far.
+func smallestQuota(best int, found bool, quota, period int64) (int, bool) {
+	cores := int(quota / period)
+	if cores < 1 {
+		cores = 1
+	}
+	if !found || cores < best {
+		return cores, true
+	}
+	return best, found
+}
+
+// cgroupPathFor is the group path /proc/self/cgroup states for a controller:
+// the unified line ("0::/path") when controller is empty, otherwise the legacy
+// line whose comma-separated controller list holds it.
+func cgroupPathFor(controller string) (string, bool) {
+	for _, line := range strings.Split(readCgroupFile(procCgroupPath), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 || parts[2] == "" {
+			continue
+		}
+		if controller == "" {
+			if parts[1] == "" {
+				return parts[2], true
+			}
+			continue
+		}
+		if slices.Contains(strings.Split(parts[1], ","), controller) {
+			return parts[2], true
+		}
+	}
+	return "", false
+}
+
+// cgroupAncestors is dir and every directory above it up to the mount root,
+// so a limit stated anywhere in the hierarchy is read. The walk is bounded by
+// the path's own depth, which the kernel bounds.
+func cgroupAncestors(dir string) []string {
+	clean := filepath.Clean(dir)
+	out := []string{clean}
+	for {
+		parent := filepath.Dir(clean)
+		if parent == clean || !strings.HasPrefix(parent, cgroupRoot) {
+			return out
+		}
+		clean = parent
+		out = append(out, clean)
+	}
+}
+
+// readCgroupFile is one small, optional observation file. Absent, unreadable
+// and empty are all "this states nothing", which is why the error is not
+// carried: there is nothing an operator could do about a control-group file
+// that is not there, and a failure here is not a failure of the run.
+func readCgroupFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
 
 // ParserWorkers is how many structural-parse workers run at once: one per
 // core. A worker is a subprocess that parses one file at a time and spends
