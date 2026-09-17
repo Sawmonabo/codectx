@@ -236,12 +236,31 @@ type ResourceReport struct {
 	QueryReservationBytes *uint64 `json:"query_reservation_bytes,omitempty"`
 	CacheReservationBytes *uint64 `json:"cache_reservation_bytes,omitempty"`
 	QueueReservationBytes *uint64 `json:"queue_reservation_bytes,omitempty"`
-	LiveSubprocesses      *int64  `json:"live_subprocesses,omitempty"`
-	PendingEvents         *int64  `json:"pending_events,omitempty"`
-	DatabaseBytes         *uint64 `json:"database_bytes,omitempty"`
-	WALBytes              *uint64 `json:"wal_bytes,omitempty"`
-	TempBytes             *uint64 `json:"temp_bytes,omitempty"`
-	CASBytes              *uint64 `json:"cas_bytes,omitempty"`
+	// AdmissionAllocationBytes is the one machine-derived allocation every
+	// heavy child of this process is admitted against, and
+	// AdmissionReservedBytes the sum currently reserved against it by the
+	// children running now. They are the whole of this process's heavy-memory
+	// accounting: one allocation, one total, whatever the child is. Both are
+	// absent where this process composed no admission ledger.
+	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
+	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
+	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same
+	// pair for the ledger's second dimension: the free space under the data
+	// directory less the host-safety floor, and the sum the children running
+	// now have reserved of it. A child can wait on either dimension, so an
+	// operator who cannot read this one cannot tell a run waiting for disk from
+	// a run waiting for memory. Absent where this process composed no ledger,
+	// and absent -- never zero -- where the platform published no free-space
+	// figure, in which case the ledger admits against a stand-in it warned
+	// about at composition.
+	AdmissionDiskAllocationBytes *uint64 `json:"admission_disk_allocation_bytes,omitempty"`
+	AdmissionDiskReservedBytes   *uint64 `json:"admission_disk_reserved_bytes,omitempty"`
+	LiveSubprocesses             *int64  `json:"live_subprocesses,omitempty"`
+	PendingEvents                *int64  `json:"pending_events,omitempty"`
+	DatabaseBytes                *uint64 `json:"database_bytes,omitempty"`
+	WALBytes                     *uint64 `json:"wal_bytes,omitempty"`
+	TempBytes                    *uint64 `json:"temp_bytes,omitempty"`
+	CASBytes                     *uint64 `json:"cas_bytes,omitempty"`
 	// FreedBytes is the disk space this process has given back to the
 	// filesystem since it started, one window at a time. A run reuses the
 	// space it holds and frees only the leftovers of a dead run at its start,
@@ -302,8 +321,23 @@ type ResourceReport struct {
 	// observed peak differs on every run, and a capability row's details fold
 	// into the analysis key, where two identical runs must key identically.
 	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
-	UnitsReused   *int64         `json:"units_reused,omitempty"`
-	UnitsParsed   *int64         `json:"units_parsed,omitempty"`
+	// AnalyzerOverrunUnits is how many of those units peaked ABOVE the
+	// reservation they were admitted against. It is the one direction of the
+	// memory accounting that can freeze the host the product is running on --
+	// every reservation in flight is sized so the machine holds them all, and
+	// a unit that exceeds its own takes memory nobody accounted for -- so it
+	// is a count in its own right and not something an operator has to derive
+	// by reading every unit row. The rows name which ones.
+	//
+	// It counts the units this process RECORDED, which the record's own bound
+	// limits, and it counts none of the units whose process tree this platform
+	// cannot sample: an unsampled peak is not a peak below the reservation, so
+	// it is neither an overrun nor evidence against one. It is absent where
+	// this process ran no heavy unit at all, and zero where it ran them and
+	// none overran.
+	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
+	UnitsReused          *int64 `json:"units_reused,omitempty"`
+	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
 	// Run is the latest recorded run for this repository -- the live one if a
 	// run is going, otherwise the one that produced the active generation --
 	// and Stages is one page of its stages. Run is carried beside Stages
@@ -338,6 +372,20 @@ type AnalyzerUnit struct {
 	ObservedPeakBytes  *uint64 `json:"observed_peak_bytes,omitempty"`
 }
 
+// OverranReservation reports that this unit's process tree peaked above the
+// reservation it was admitted against, which is the one direction of the
+// memory accounting that can take memory the machine had promised to another
+// unit. It is the ONE place that comparison is spelled, so the count on the
+// report and the row an operator reads cannot disagree about which units it
+// covers.
+//
+// A unit whose tree this platform never sampled carries no peak and answers
+// false: nothing was measured, which is not a measurement below the
+// reservation and must never be counted as one either way.
+func (u AnalyzerUnit) OverranReservation() bool {
+	return u.ObservedPeakBytes != nil && *u.ObservedPeakBytes > u.ReservationBytes
+}
+
 // Validate enforces the signed-64 storage bound on every measured byte count
 // and rejects a negative count.
 func (r ResourceReport) Validate() error {
@@ -353,6 +401,10 @@ func (r ResourceReport) Validate() error {
 		{"resources.query_reservation_bytes", r.QueryReservationBytes},
 		{"resources.cache_reservation_bytes", r.CacheReservationBytes},
 		{"resources.queue_reservation_bytes", r.QueueReservationBytes},
+		{"resources.admission_allocation_bytes", r.AdmissionAllocationBytes},
+		{"resources.admission_reserved_bytes", r.AdmissionReservedBytes},
+		{"resources.admission_disk_allocation_bytes", r.AdmissionDiskAllocationBytes},
+		{"resources.admission_disk_reserved_bytes", r.AdmissionDiskReservedBytes},
 		{"resources.database_bytes", r.DatabaseBytes},
 		{"resources.wal_bytes", r.WALBytes},
 		{"resources.temp_bytes", r.TempBytes},
@@ -374,6 +426,7 @@ func (r ResourceReport) Validate() error {
 	}{
 		{"resources.live_subprocesses", r.LiveSubprocesses},
 		{"resources.pending_events", r.PendingEvents},
+		{"resources.analyzer_overrun_units", r.AnalyzerOverrunUnits},
 		{"resources.units_reused", r.UnitsReused},
 		{"resources.units_parsed", r.UnitsParsed},
 	} {

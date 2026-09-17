@@ -269,7 +269,12 @@ for ordinary use.
 | `cache_dir` | `""` | Absolute path of the tool store. Empty resolves to `$XDG_DATA_HOME/codectx/tools` (`~/.local/share/codectx/tools` when `XDG_DATA_HOME` is unset or not absolute) -- one store shared by every workspace on the machine, created user-private on the first install. |
 | `mirror` | `""` | Absolute `https` URL prefix serving every lock asset. It replaces the scheme and host and keeps the original host as the first path segment — `https://nodejs.org/dist/v22.23.2/node.tar.gz` becomes `<mirror>/nodejs.org/dist/v22.23.2/node.tar.gz` — so one mirror serves every publisher the lock names without their paths colliding. The digests stay the lock's, so a mirror relocates bytes and never changes which bytes are accepted. Plaintext `http` is rejected. A mirror answers `200` directly or redirects only within the upstream host's own set; a redirect to a host of the mirror's own is refused. |
 | `max_fetch_bytes` | `2147483648` | Ceiling on one payload download. |
-| `fetch_timeout` | `"10m"` | Deadline for one payload download. |
+
+A download has no deadline. A payload is as large as a language runtime and the
+link it arrives over is the operator's, so a clock over the whole of it is a
+sustained-rate requirement that terminates the download working on the slower
+link. The fetch path watches the bytes received instead and ends only a
+transfer that has delivered nothing at all for a full stall window.
 
 ### `[tools.override.<name>]`
 
@@ -558,10 +563,14 @@ relationships that must hold:
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.
-- (query slots on this machine) × `query_memory_bytes` + `cache_bytes` +
-  `queue_bytes` ≤ the 1 GiB base footprint this process keeps for itself. How
-  many queries run at once comes from the cores, so this is checked against the
-  machine the configuration is loaded on.
+- The base footprint this process keeps for itself is **derived**, not bounded:
+  this build's measured idle overhead + (query slots on this machine) ×
+  `query_memory_bytes` + `cache_bytes` + `queue_bytes`. How many queries run at
+  once comes from the cores, so a host with more cores has a larger base
+  footprint and leaves the analyzers and language servers it starts a smaller
+  allocation. There is no figure here for you to exceed and no core count that
+  makes the shipped defaults unresolvable; the only way this arithmetic fails
+  is by leaving 64-bit range, which names the keys that caused it.
 - `resources.max_temp_bytes` > `resources.min_free_disk_bytes`, when `max_temp_bytes` is set at all (`0` is unlimited and has nothing to exceed).
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when

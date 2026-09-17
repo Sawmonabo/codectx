@@ -769,7 +769,7 @@ func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []mode
 	for _, stage := range topLevelStagesByWall(stages) {
 		fmt.Fprintf(b, "stage       %s %s, %s of the run, %s, in %d, out %d\n",
 			stage.Stage, wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
-			shareMetric(stage.ShareOfWall), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
+			shareMetric(stage.ShareOfWall, run.WallMS), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
 	}
 	// The run recorded more stages than one result carries. Saying how many is
 	// what keeps the lines above a page of the run's accounting rather than a
@@ -801,12 +801,14 @@ func topLevelStagesByWall(stages []model.StageRecord) []model.StageRecord {
 	return top
 }
 
-// shareMetric renders a stage's share of its run. A share of zero is not a
-// measured zero: it is what a run whose own wall was never measured leaves
-// behind, and printing "0%" beside a stage with a real wall would claim the
-// stage took none of a run it plainly took time out of.
-func shareMetric(share float64) string {
-	if share <= 0 {
+// shareMetric renders a stage's share of its run. The discriminator is the
+// RUN's wall and never the share itself: a share is computed only where the
+// run was measured, so an unmeasured run is the one case that has no share to
+// print -- while a stage that finished inside a millisecond of a run that WAS
+// measured has a real share that rounds to zero, and printing "unavailable of
+// the run" for it would report a missing measurement in place of a fast stage.
+func shareMetric(share float64, runWallMS int64) string {
+	if runWallMS <= 0 {
 		return metricUnavailable
 	}
 	return fmt.Sprintf("%.0f%%", share*100)
@@ -910,6 +912,10 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"query reservation", byteMetric(r.QueryReservationBytes)},
 		{"cache reservation", byteMetric(r.CacheReservationBytes)},
 		{"queue reservation", byteMetric(r.QueueReservationBytes)},
+		{"child admission allocation", byteMetric(r.AdmissionAllocationBytes)},
+		{"child admission reserved", byteMetric(r.AdmissionReservedBytes)},
+		{"child admission disk allocation", byteMetric(r.AdmissionDiskAllocationBytes)},
+		{"child admission disk reserved", byteMetric(r.AdmissionDiskReservedBytes)},
 		{"database", byteMetric(r.DatabaseBytes)},
 		{"wal", byteMetric(r.WALBytes)},
 		{"temp", byteMetric(r.TempBytes)},
@@ -919,6 +925,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"awaiting freeing", byteMetric(r.PendingFreeBytes)},
 		{"live subprocesses", countMetric(r.LiveSubprocesses)},
 		{"pending events", countMetric(r.PendingEvents)},
+		{"analyzer units over reservation", countMetric(r.AnalyzerOverrunUnits)},
 		{"units reused", countMetric(r.UnitsReused)},
 		{"units parsed", countMetric(r.UnitsParsed)},
 	} {
@@ -941,9 +948,15 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	// three together is the whole point -- a peak far under the cap says the
 	// unit was serialized behind memory it never used.
 	for _, u := range r.AnalyzerUnits {
-		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s\n",
+		// The count above says how many overran; this names which, on the row
+		// that already carries both figures it is a comparison of.
+		overran := ""
+		if u.OverranReservation() {
+			overran = ", OVER RESERVATION"
+		}
+		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s%s\n",
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
-			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
+			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
 	}
 	// What this block could not read, and why. A figure that is simply absent
 	// looks the same as one nothing ever recorded, so the reason is printed

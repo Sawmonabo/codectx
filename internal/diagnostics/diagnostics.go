@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -149,7 +150,12 @@ type Options struct {
 	// Ledger reads the run ledger beside the index store. It is optional
 	// because a workspace that has recorded no run must still report its
 	// resources; a nil one leaves the run and stage rows out of the block.
-	Ledger    RunLedger
+	Ledger RunLedger
+	// Admission is the process's one memory admission ledger, whose allocation
+	// and current total the resource block discloses. It is optional: a
+	// composition without one -- a diagnostics service that starts no heavy
+	// child -- leaves both figures absent rather than reporting them as zero.
+	Admission *admission.Ledger
 	Toolchain ToolchainReporter
 	Workspace WorkspaceProber
 	// Now is the clock every check and the report's CheckedAt read (L1). A

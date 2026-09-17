@@ -268,7 +268,6 @@ ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-	WorkerIdleTTL:     time.Duration(cfg.Providers.TreeSitter.WorkerIdleTTL),
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 	Runner:            sharedRunner,
 	WorkDir:           filepath.Join(dataDir, "workers", "treesitter"),
@@ -344,8 +343,10 @@ truncation, never sent oversize.
   instead would let a caller start a fresh worker while an expiring one still
   held its runner slot and memory reservation, and the runner would then refuse
   an admission the pool itself caused.
-- A healthy worker returns to the idle list under `WorkerIdleTTL`; expiry
-  closes its stdin, the worker exits on EOF and the runner reaps it.
+- A healthy worker that has not exhausted a lifetime bound returns to the idle
+  list, where the next parse of the stage reuses it; the drain that follows the
+  last caller closes its stdin, the worker exits on EOF and the runner reaps
+  it. An unhealthy or exhausted worker is stopped at release instead.
 - A worker is recycled (stopped after its current parse) when it has done
   2048 parses, consumed three quarters of its stdin or stdout lifetime budget,
   or lived three quarters of its hour, so a healthy worker is never killed by

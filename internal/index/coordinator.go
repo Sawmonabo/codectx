@@ -32,10 +32,10 @@ package index
 import (
 	"context"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -75,12 +75,6 @@ const refNone = "(none)"
 // domainRepository separates the repository identity digest from every other
 // digest in the product, so one can never be presented as another.
 const domainRepository = "repository-identity-v1"
-
-// maxWorkers bounds the units one generation builds concurrently when the
-// configuration asks for the machine default. Each concurrent unit holds a
-// live sink and an open writer, so the bound is a resource decision and not a
-// throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
-const maxWorkers = 8
 
 // HoldIntent is how patient the operation taking the workspace is. It is the
 // OPERATION's property and not the composition's, because one process runs
@@ -164,10 +158,20 @@ type Options struct {
 	// exactly as it would otherwise, because a nil ledger opens a nil run
 	// whose spans do nothing.
 	Ledger *ledger.Ledger
-	// RunLedgerReader reads back the rows this process's runs recorded, and is
-	// how a finished run states in its own result what it did. It may be nil,
-	// which is a coordinator whose results carry no run: a composition that
-	// records nothing has nothing to read back.
+	// Admission is the process's one memory admission ledger, and it is
+	// required: every heavy unit this coordinator runs is admitted against it,
+	// and a coordinator that observed the machine and built its own would be a
+	// second running total bounded by the same allocation -- two gates, two
+	// totals, one machine, and a process free to reserve twice what the host
+	// has.
+	Admission *admission.Ledger
+	// RunLedgerReader reads back the rows this process's runs recorded: how a
+	// finished run states in its own result what it did, and what this
+	// workspace has already measured its heavy units to cost, which the plan
+	// raises a unit's reservation to. It may be nil, which is a coordinator
+	// whose results carry no run and whose heavy units are sized from the
+	// family estimates alone: a composition that records nothing has nothing
+	// to read back, which is no observation and never a measurement of zero.
 	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
@@ -274,6 +278,9 @@ func New(o Options) (*Coordinator, error) {
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}
+	if o.Admission == nil {
+		return nil, invalid("the coordinator needs the process memory admission ledger heavy units are admitted against")
+	}
 	workDir := filepath.Join(o.Config.Storage.DataDir, "work", "index")
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, internalErr("index work directory: " + err.Error())
@@ -281,8 +288,8 @@ func New(o Options) (*Coordinator, error) {
 	c := &Coordinator{opts: o, repo: model.RepositoryID(model.H(domainRepository, filepath.ToSlash(o.Root.Path))),
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
-		workers: workerCount(o.Config.Index.Workers),
-		sched:   plan.NewScheduler(dependence.ObserveMachine()),
+		workers: workerCount(o.Config.Index.Workers, config.CPUs()),
+		sched:   plan.NewScheduler(o.Admission),
 	}
 	if c.log == nil {
 		c.log = slog.Default()
@@ -356,13 +363,21 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 	return out, nil
 }
 
-// workerCount resolves index.workers. Zero selects from the available CPUs
-// under a fixed ceiling; it is never unlimited (Section 20.1).
-func workerCount(configured int) int {
+// workerCount resolves how many units one generation builds at once: one per
+// core this machine allows the process, under the structural ceiling on live
+// sinks. There is no count beside those two. How much of the machine those
+// units may hold is decided by the reservation ledger every heavy unit is
+// admitted against, so a typed-in ceiling here would be a second gate on the
+// same work -- and one nobody measured, which is what an eight-worker ceiling
+// on a sixteen-core machine was.
+//
+// cpus is a parameter and not a call so the resolution can be exercised for
+// machines this one is not, exactly as config's own counts are.
+func workerCount(configured, cpus int) int {
 	if configured > 0 {
 		return min(configured, provider.MaxLiveSinks)
 	}
-	return max(1, min(runtime.NumCPU(), maxWorkers))
+	return min(cpus, provider.MaxLiveSinks)
 }
 
 // buildable refuses an entry point that captures, builds or publishes when the

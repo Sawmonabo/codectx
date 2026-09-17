@@ -96,8 +96,8 @@ func TestUnopenedLedgerRecordsNothing(t *testing.T) {
 	if len(overlay) != 0 || err != nil {
 		t.Fatalf("overlay runs %v (%v), want none and no failure", overlay, err)
 	}
-	if err := l.DeleteRuns(ctx, []int64{7}); err != nil {
-		t.Fatalf("delete runs: %v", err)
+	if err := l.SweepRuns(ctx, repositoryID, 7); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
 	}
 	if err := l.DeleteOverlayRuns(ctx, []string{repositoryID}); err != nil {
 		t.Fatalf("delete overlay runs: %v", err)
@@ -597,4 +597,69 @@ func runByID(t *testing.T, dir, id string) ledger.RunView {
 		t.Fatalf("read run %s: %v, found=%v", id, err, found)
 	}
 	return view
+}
+
+// TestRecordedPeaksAnswerOnlyMeasurementsThatWereTaken protects the one
+// invariant whose silent breakage would collapse every reservation in the
+// product: the planner raises a heavy unit's reservation to the largest peak
+// this workspace has recorded for its scope, so a scope whose spans carry NO
+// peak -- a platform that samples no process tree, an in-process stage that
+// owns none, a run that was cut off before its child exited -- must answer
+// with no row at all. A NULL peak read back as the zero database/sql would
+// hand over is an observation of "this work costs nothing", and a reservation
+// derived from it would be a reservation of nothing.
+//
+// It also holds the ordering the bound rests on: the page is answered largest
+// first, so a repository with more recorded scopes than one page keeps the
+// measurements an under-reservation would be built on.
+func TestRecordedPeaksAnswerOnlyMeasurementsThatWereTaken(t *testing.T) {
+	l, dir := openLedger(t)
+	run, ctx := newRun(t, l)
+
+	peaked := func(stage, scope string, bytes uint64) {
+		_, span := ledger.Start(ctx, stage, scope)
+		span.End(ledger.OutcomeOK, ledger.Measured{PeakRSSBytes: &bytes}, nil)
+	}
+	// Two measurements of one scope: the largest is what that scope cost.
+	peaked("parse", "pkg:javascript:app", 4<<30)
+	peaked("export", "pkg:javascript:app", 9<<30)
+	peaked("parse", "pkg:go:service", 1<<30)
+	// Never sampled: no peak was measured for this scope at all.
+	_, unsampled := ledger.Start(ctx, "parse", "pkg:python:tool")
+	unsampled.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	// Measured, and measured at nothing. It cannot raise anything a caller
+	// derived, and it must not spend a row of the bound claiming it could.
+	peaked("parse", "pkg:rust:crate", 0)
+	run.Finish(ledger.OutcomeOK)
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop the ledger: %v", err)
+	}
+
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err != nil || !open {
+		t.Fatalf("open the reader: %v (open %v)", err, open)
+	}
+	defer reader.Close()
+	peaks, err := reader.RecordedPeaks(context.Background(), model.MaxRecordsPerResult)
+	if err != nil {
+		t.Fatalf("recorded peaks: %v", err)
+	}
+	want := []ledger.RecordedPeak{
+		{ScopeKey: "pkg:javascript:app", PeakBytes: 9 << 30},
+		{ScopeKey: "pkg:go:service", PeakBytes: 1 << 30},
+	}
+	if len(peaks) != len(want) {
+		t.Fatalf("read back %d recorded peaks, want %d: %v", len(peaks), len(want), peaks)
+	}
+	for i, w := range want {
+		if peaks[i] != w {
+			t.Fatalf("recorded peak %d is %v, want %v", i, peaks[i], w)
+		}
+	}
+	for _, p := range peaks {
+		if p.PeakBytes <= 0 {
+			t.Fatalf("scope %q answers a peak of %d: a figure nobody measured was read as zero",
+				p.ScopeKey, p.PeakBytes)
+		}
+	}
 }

@@ -20,11 +20,7 @@ package dependence
 // is not a memory cap, so the reservation adds the resident memory the
 // frontend keeps outside the heap, measured per family in research Section 10.
 
-import (
-	"strconv"
-
-	"github.com/Sawmonabo/codectx/internal/config"
-)
+import "strconv"
 
 const (
 	kiB = 1 << 10
@@ -38,10 +34,10 @@ const (
 const DefaultUnitMemoryFloorBytes int64 = 768 * miB
 
 // DefaultSafetyMarginBytes is the headroom the machine-derived allocation
-// leaves for transient allocation and resident-set variation on top of
-// config.BaseFootprintBytes, which is the one figure for what this process
-// keeps for itself (Section 23.3: degrade concurrency before coverage, and
-// leave headroom rather than allocate to the last byte).
+// leaves for transient allocation and resident-set variation on top of the
+// base footprint its caller derives for this process (Section 23.3: degrade
+// concurrency before coverage, and leave headroom rather than allocate to the
+// last byte).
 const DefaultSafetyMarginBytes int64 = 1 * giB
 
 // UnobservedAllocationBytes is the allocation used on a host that does not
@@ -78,30 +74,56 @@ const hostShareDenominator = 2
 //
 // The estimate is deliberately the cap itself and not a fraction of the
 // machine. A frontend grows toward whatever cap it is given and does not need
-// it: on a 157 MB JavaScript project, one measured parse took 3 m 38 s under
-// a 4 GiB cap and 3 m 41 s with no cap at all, while the process tree's peak
-// resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
+// it: on a 157.2 MiB JavaScript project, one measured parse took 3 m 38 s
+// under a 4 GiB cap and 3 m 41 s with no cap at all, while the process tree's
+// peak resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
 // 16 GiB, for exports whose method, call, control-dependence and
 // data-dependence counts were identical. A cap sized to the machine therefore
 // buys nothing and takes the host's memory away from everything else running
 // on it.
+//
+// One unit system: the derivations below divide bytes by bytes. Mixing binary
+// GiB with decimal MB is what put the JavaScript row at 48, a figure whose
+// stated derivation did not reproduce and whose product was 1.84x the ceiling
+// it claimed to double.
 var heapPerSourceByte = map[Family]int64{
 	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
 	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
 	FamilyJava:       256, // 1.5M-line Java repository wanted ~8 GiB to avoid collector thrashing
-	FamilyJavaScript: 48,  // 157 MB of JavaScript over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all
+	FamilyJavaScript: 52,  // 164,865,219 B over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all, so 2 x 4 GiB / 164,865,219 = 52.10
 	FamilyPython:     640, // 1.05M-line Python tree needed ~18 GiB uncapped and failed closed at 4 GiB
 	FamilyRust:       640, // 56k-line Cargo workspace peaked at 1.77 GB of tree RSS, most of it outside the heap
 }
 
 // residentAboveHeap is the resident memory the frontend keeps outside the
-// heap, measured per family in research Section 10. It is why a heap cap
-// cannot be used as the reservation.
+// heap. It is why a heap cap cannot be used as the reservation.
+//
+// Method, for a row derived from a measured run: peak resident set of the
+// whole process tree MINUS the heap cap the run was given. That difference is
+// the non-heap residency only where the heap was actually filled to its cap;
+// where it was not, the difference is smaller than the truth by whatever the
+// heap left unused, so such a row UNDER-states and must not be the row a
+// reservation is taken from. Under-reserving is the direction that fails a
+// unit, so where rows disagree the derivation takes the one whose inputs are
+// exact and whose cap the product actually chose.
+//
+// Every row but JavaScript comes from research Section 10 rather than from a
+// run measured here, and is left as it stands. Across the reference runs' 42
+// engine parse steps no C, Go or Rust unit ran at all, and the Java and Python
+// units never filled their caps (peak minus cap of -190 and 87 MiB), so for
+// those five families this method yields no observation. That is recorded as
+// unavailable, which is not zero and is not a licence to lower a row.
 var residentAboveHeap = map[Family]int64{
-	FamilyC:          2662 * miB, // native parser memory
-	FamilyGo:         512 * miB,
-	FamilyJava:       448 * miB,
-	FamilyJavaScript: 1712 * miB, // the syntax helper holds the whole project's trees outside the heap
+	FamilyC:    2662 * miB, // native parser memory
+	FamilyGo:   512 * miB,
+	FamilyJava: 448 * miB,
+	// The syntax helper holds the whole project's trees outside the heap. From
+	// the reference run's ledger for this unit, the one datapoint recorded in
+	// bytes rather than in a rounded unit and taken at the cap the product
+	// itself chose: 10,099,015,680 B of peak tree residency against a
+	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB. The 1712 this
+	// replaces read a decimal-GB figure as binary GiB.
+	FamilyJavaScript: 2084 * miB,
 	FamilyPython:     1945 * miB,
 	FamilyRust:       256 * miB,
 }
@@ -147,6 +169,27 @@ type Reservation struct {
 	// was applied. A unit whose estimate exceeds its cap is the one that
 	// earns an out-of-memory retry.
 	EstimatedBytes int64
+	// ObservedPeakBytes is the largest process-tree peak this workspace has
+	// already recorded for this unit's own scope, or for its language where
+	// its scope has none. It is the repository's own measurement of what this
+	// work costs, and it is set by whoever holds that history -- the planner,
+	// from the run ledger -- rather than derived here, because this package
+	// reads nothing.
+	//
+	// Zero means no such measurement, which is not a measurement of zero: a
+	// workspace with no ledger, a store with no history and a platform that
+	// never samples a process tree all leave it zero, and Bytes then answers
+	// exactly what the family constants derived. It can only ever RAISE the
+	// figure a unit is admitted against, never lower it, which is why Bytes
+	// takes the maximum rather than replacing anything.
+	//
+	// It is deliberately NOT the heap cap. The cap is handed to the frontend,
+	// which grows into whatever it is given (see heapPerSourceByte), so
+	// raising it on the evidence of a past peak would raise the next peak
+	// too. What a recorded peak is evidence about is how much of the machine
+	// this unit takes while it runs, which is what admission is about and
+	// what Bytes answers.
+	ObservedPeakBytes int64
 }
 
 // ParseBytes is the reservation of the parse step and ExportBytes that of the
@@ -154,8 +197,14 @@ type Reservation struct {
 func (r Reservation) ParseBytes() int64  { return r.HeapCapBytes + r.ResidentBytes + r.HelperBytes }
 func (r Reservation) ExportBytes() int64 { return r.ExportHeapCapBytes + exportResident }
 
-// Bytes is the reservation the coordinator schedules against.
-func (r Reservation) Bytes() int64 { return max(r.ParseBytes(), r.ExportBytes()) }
+// Bytes is the reservation the coordinator schedules against: the peak of the
+// two steps, and never less than what this repository has already been
+// measured to need for this work (ObservedPeakBytes). A second run of a
+// repository therefore cannot admit a unit against less than the first run
+// watched it use.
+func (r Reservation) Bytes() int64 {
+	return max(r.ParseBytes(), r.ExportBytes(), r.ObservedPeakBytes)
+}
 
 // Machine is the observed memory of the host the allocation is derived from.
 // Available is zero and Observed false when the platform does not expose it.
@@ -188,8 +237,16 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 // UnobservedAllocationBytes where the platform does not expose available
 // memory. It is always positive, so admission is always bounded by a sum of
 // reservations and never by a count of children.
-func (m Machine) SchedulingAllocation() int64 {
-	if alloc := m.Allocation(config.BaseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
+//
+// baseFootprintBytes is what this process holds for itself, which its caller
+// derives from this machine and the configuration (config.BaseFootprint). It
+// is a parameter and not a constant read from here because a figure typed into
+// this package could not follow the core count: the reservations the process
+// makes up front grow with the machine, and an allocation computed against a
+// fixed figure hands the children memory the parent has already promised
+// itself.
+func (m Machine) SchedulingAllocation(baseFootprintBytes int64) int64 {
+	if alloc := m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
 		return alloc
 	}
 	return UnobservedAllocationBytes
@@ -205,19 +262,30 @@ type Governor struct {
 }
 
 // NewGovernor applies the default floor when the caller left it at zero.
-func NewGovernor(floorBytes int64) Governor {
+// baseFootprintBytes is this process's own footprint on this machine, derived
+// by the caller exactly as SchedulingAllocation's is, so the allocation a unit
+// is sized against and the one it is admitted against are the same figure.
+func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 	if floorBytes <= 0 {
 		floorBytes = DefaultUnitMemoryFloorBytes
 	}
 	return Governor{FloorBytes: floorBytes,
-		BaseFootprint: config.BaseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
+		BaseFootprint: baseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
 }
 
 // Reserve sizes the reservation of a unit of sourceBytes bytes on machine m.
 // The heap cap is the family's estimate from the unit's byte count, never
-// below the floor, and bounded above by the machine-derived allocation when
-// one could be observed. Nothing here can reject the unit: a cap that is
-// narrower than the estimate costs the unit time, never its facts.
+// below the floor, and bounded above by the allocation the unit will be
+// admitted against. Nothing here can reject the unit: a cap that is narrower
+// than the estimate costs the unit time, never its facts.
+//
+// Where the machine could not be observed the cap is NOT bounded: a bound
+// invented for an unreadable machine is a default memory ceiling by another
+// name, which docs/research/00-synthesis.md Section 8 forbids. Admission does
+// stand a figure in there (SchedulingAllocation), because a gate with no bound
+// is not a gate, so on those platforms alone a unit is sized without a bound
+// and admitted against the stand-in. That asymmetry is deliberate on both
+// sides and is recorded as an open question rather than resolved here.
 func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
 		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
@@ -269,6 +337,31 @@ func (g Governor) RetryCap(r Reservation, peakBytes int64) int64 {
 		return 0
 	}
 	return cap
+}
+
+// MaxChildReservationBytes is the largest reservation Reserve can produce for
+// any family on a machine whose scheduling allocation is allocationBytes. It
+// is the figure a process runner beneath the admission gate must be able to
+// admit: the gate runs a child larger than the whole allocation alone rather
+// than refusing it, so a runner budgeted at the allocation would refuse
+// exactly the unit the gate just admitted, and "refusing work for memory" is
+// not a thing this product does.
+//
+// It is derived from the shipped constants rather than stated: the cap is
+// bounded by the allocation, and the most any family adds on top of it is the
+// largest non-heap residency plus the largest helper allowance. The export
+// step's allowance is included in the same maximum because a unit reserves the
+// peak of its two steps, not their sum.
+func MaxChildReservationBytes(allocationBytes int64) int64 {
+	var above int64 = exportResident
+	for _, v := range residentAboveHeap {
+		above = max(above, v)
+	}
+	var helper int64
+	for _, v := range helperAllowance {
+		helper = max(helper, v)
+	}
+	return allocationBytes + above + helper
 }
 
 // itoa renders a byte figure for a bounded error detail.

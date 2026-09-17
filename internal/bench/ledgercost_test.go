@@ -37,7 +37,7 @@ import (
 // that turns recording off, so the "off" arm is composed rather than
 // configured -- index.Options.Ledger left nil. That is honest precisely
 // because it is the same code path: *ledger.Ledger is nil-safe at every entry
-// point a run reaches (NewRun, DeleteRuns, Stop) and ledger.Start on a context
+// point a run reaches (NewRun, SweepRuns, Stop) and ledger.Start on a context
 // with no run returns a nil *Span whose methods do nothing, so neither arm
 // takes a branch the other does not.
 //
@@ -444,7 +444,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 			return ledgerArmResult{}, err
 		}
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
 		CAS: cas, Lock: heldLock{lock}, Pool: pool, Ledger: led})
 	if err != nil {
 		return ledgerArmResult{}, err

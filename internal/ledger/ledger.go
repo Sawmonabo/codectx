@@ -638,30 +638,6 @@ func (l *Ledger) Stop() error {
 	return c.stop()
 }
 
-// DeleteRuns removes the runs that produced the given generations, with their
-// spans. It is what the index store's retention calls when it deletes a
-// generation, so the two lifetimes stay the same one; this package does not
-// wire it, because it does not know when a generation goes.
-func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
-	c := l.current()
-	if c == nil || len(generationIDs) == 0 {
-		return nil
-	}
-	return c.writeTx(ctx, func(tx *sql.Tx) error {
-		stmt, err := tx.PrepareContext(ctx, `DELETE FROM runs WHERE generation_id = ?`)
-		if err != nil {
-			return wrap("delete runs", err)
-		}
-		defer stmt.Close()
-		for _, id := range generationIDs {
-			if _, err := stmt.ExecContext(ctx, id); err != nil {
-				return wrap("delete runs", err)
-			}
-		}
-		return nil
-	})
-}
-
 // DeleteOverlayRuns removes the overlay runs of processes that are no longer
 // running: an overlay run has no generation, so nothing else would ever
 // collect it. A process that exits cleanly removes its own through DiscardRun,
@@ -744,27 +720,62 @@ func (l *Ledger) DiscardRun(ctx context.Context, run *Run) error {
 // the record of a process another surface has just called live.
 const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
 
-// DeleteRunsWithoutGeneration removes the runs no generation will ever reach:
-// a run that ended without publishing anything -- a tick that found nothing to
-// publish never attaches a generation -- and one whose process died before it
-// could. DeleteRuns is keyed by generation, so those rows have no other way
-// out, and the ticks that produce them are periodic: without this pass they
-// accumulate without bound.
+// RetainedRuns is how many of a repository's runs the ledger keeps. It is
+// structural and not a setting, for the reason busDepth is: the file exists so
+// an operator can read what the last few runs of this workspace cost, and the
+// answer to "how many is a few" is not a number anybody tunes.
 //
-// It deletes only runs that are not live: a run that has not reached its
-// generation yet is exactly what a run in progress looks like. One pass
-// deletes at most a page, because it is called periodically and the next pass
-// takes the rest.
-func (l *Ledger) DeleteRunsWithoutGeneration(ctx context.Context) error {
+// It is what bounds the file. A run's rows are not a generation's rows and
+// never go with one: the generation of a run that published is deleted by
+// retention as soon as a later generation of the same ref exists -- which a
+// deferred publication makes true within the same command -- and a ledger kept
+// to a generation's lifetime therefore loses the account of the run that built
+// the store minutes after it built it. The ledger outlives generations, which
+// is also what lets a rebuild reserve from the peaks the last run measured.
+const RetainedRuns = 16
+
+// SweepRuns keeps this repository's last RetainedRuns runs and deletes the
+// rest, which is the whole of the ledger's own collection: a run that
+// published, a tick that published nothing, and a run whose process died
+// before it reached a generation all leave the file the same way.
+//
+// Three classes of row are never deleted:
+//
+//   - a live run -- one that says 'running' and whose writer has renewed the
+//     deadline it published. That is the run this pass is part of, and it is
+//     also another process's run in flight.
+//   - the run that produced activeGeneration, however old it is: the store an
+//     operator is asking `status --resources` about was built by that run, and
+//     losing its account is the defect this bound exists to avoid. Pass zero
+//     where the repository has no active generation.
+//   - an overlay run, which DeleteOverlayRuns collects by its own writer's
+//     liveness. Overlay runs are per-process and open with no work behind
+//     them, so counting them here would let a server's starts crowd out the
+//     runs that built something.
+//
+// One pass deletes at most a page. It is called from the periodic collection,
+// so the next pass takes the rest.
+func (l *Ledger) SweepRuns(ctx context.Context, repositoryID string, activeGeneration int64) error {
 	c := l.current()
 	if c == nil {
 		return nil
 	}
+	repo, err := model.DecodeID(repositoryID)
+	if err != nil {
+		return err
+	}
+	const query = `DELETE FROM runs WHERE run_id IN (
+		SELECT run_id FROM runs
+		WHERE repository_id = ? AND kind <> 'overlay' AND ` + notLive + `
+		  AND (generation_id IS NULL OR generation_id <> ?)
+		  AND run_id NOT IN (
+			SELECT run_id FROM runs WHERE repository_id = ? AND kind <> 'overlay'
+			ORDER BY started_at DESC LIMIT ?)
+		ORDER BY started_at LIMIT ?)`
 	return c.writeTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE run_id IN (
-			SELECT run_id FROM runs WHERE generation_id IS NULL AND `+notLive+
-			` ORDER BY started_at LIMIT ?)`, formatTime(time.Now()), model.MaxRecordsPerResult)
-		return wrap("delete runs without a generation", err)
+		_, err := tx.ExecContext(ctx, query, repo, formatTime(time.Now()), activeGeneration,
+			repo, RetainedRuns, model.MaxRecordsPerResult)
+		return wrap("sweep the runs", err)
 	})
 }
 

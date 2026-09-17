@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ func offlineResolver(t *testing.T, overrides map[string]toolchain.Override) *too
 	t.Helper()
 	r, err := toolchain.New(toolchain.Options{
 		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
-		FetchTimeout: time.Second, Overrides: overrides,
+		Overrides: overrides,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +139,7 @@ func runSilentServerScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, AllocationBytes: 8 << 30, IdleTTL: 200 * time.Millisecond,
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
 		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +193,7 @@ func runScenario(t *testing.T, enc string) {
 	}
 	// In-package: the fake needs two variables no real gopls does.
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, AllocationBytes: 8 << 30, IdleTTL: 200 * time.Millisecond,
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
 		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +494,7 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, AllocationBytes: 8 << 30, IdleTTL: time.Minute,
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: time.Minute,
 		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -581,4 +582,16 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 	if len(svcDef.Items) != 1 || svcDef.Items[0].Path != "svc/main.go" {
 		t.Fatalf("svc definition = %+v, want exactly svc/main.go", svcDef.Items)
 	}
+}
+
+// testAdmission is the process memory admission ledger a test manager admits
+// its servers against. Production composes exactly one and hands it to every
+// reserver; a test that only drives the manager composes its own.
+func testAdmission(t *testing.T, allocation int64) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(allocation, 64<<30)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
 }

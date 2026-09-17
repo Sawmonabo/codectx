@@ -129,7 +129,6 @@ func runtimeInstallCheck(ctx context.Context, lock Lock, only map[string]bool, f
 	r, err := toolchain.NewFromLock(lock, toolchain.Options{
 		DataDir:       store,
 		MaxFetchBytes: maxDownloadBytes,
-		FetchTimeout:  30 * time.Minute,
 	})
 	if err != nil {
 		return err

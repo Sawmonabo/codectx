@@ -27,12 +27,18 @@ package scip
 //     resolve to its own methods (docs/research/10-round3-empirical.md
 //     Section 8), and a Python package, a Cargo workspace and a compilation
 //     database are whole for the same reason.
-//   - A trigger inside a dependency directory is not a project. Those
-//     directories -- `node_modules`, `vendor`, a virtual environment, a build
-//     tree -- are not part of the snapshot at all (internal/workspace/walk.go
-//     and internal/snapshot/policy.go exclude them), so a `package.json`
-//     under `node_modules` never reaches this rule: nothing indexes a
-//     dependency's own manifest as a project of the repository.
+//   - A trigger inside a dependency directory is not a project, under the
+//     default `workspace.index_vendor = false`. Those directories --
+//     `node_modules`, `vendor`, a virtual environment, a build tree -- are
+//     then not part of the snapshot at all: workspace.Policy.ExcludeDir drops
+//     the vendor names while `index_vendor` is false, and
+//     snapshot.TraversalPolicy drops whatever the repository's own Git ignore
+//     rules cover. So a `package.json` under `node_modules` never reaches this
+//     rule, and nothing indexes a dependency's own manifest as a project of
+//     the repository. An operator who sets `index_vendor = true` is asking for
+//     those trees, and a trigger inside one then becomes a project like any
+//     other -- unless the repository's own ignore rules still cover it, which
+//     is the usual case for `node_modules` and a build tree.
 
 import (
 	"slices"

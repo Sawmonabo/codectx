@@ -167,6 +167,10 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
 		Ledger:    s.ledger,
+		// The one memory admission ledger this process composed. Every heavy
+		// unit the coordinator runs is admitted against it, beside the
+		// language servers the manager admits against the same handle.
+		Admission: s.admission,
 		// The read-only side of the same file, so a finished run states in its
 		// result what it did. It opens the ledger per call and never writes.
 		RunLedgerReader: runLedger{dir: s.dataDir},

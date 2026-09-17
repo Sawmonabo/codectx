@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"maps"
 	"os"
 	"path/filepath"
@@ -565,7 +566,7 @@ func edited(files map[string]string, path, content string) map[string]string {
 // succeed; a bound invented when the machine is unreadable is a default memory
 // ceiling by another name.
 func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
-	g := dependence.NewGovernor(0)
+	g := dependence.NewGovernor(0, testBaseFootprintBytes)
 	plenty := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}
 
 	small := g.Reserve(dependence.FamilyGo, 1<<20, plenty)
@@ -632,10 +633,11 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 // on a small machine a count admits work whose summed reservations the host
 // cannot hold.
 //
-// Mutation: give Scheduler a maxHeavy of 1 again -- add `maxHeavy int` set to
-// 1 by NewScheduler and `if s.admitted >= s.maxHeavy { return }` at the head of
-// pump -> "a 32 GiB machine admitted 1 of four 4 GiB reservations at once; how
-// much runs at once is being decided by a count, not by the allocation".
+// Mutation: give the admission ledger a maxHeavy of 1 again -- add
+// `maxHeavy int` set to 1 by NewLedger and `if l.admitted >= l.maxHeavy
+// { return }` at the head of pump -> "a 32 GiB machine admitted 1 of four
+// 4 GiB reservations at once; how much runs at once is being decided by a
+// count, not by the allocation".
 func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// The reservation is built directly so the figures in this test are the
 	// ones being asserted about, not a family estimate that would move with a
@@ -648,7 +650,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 
 	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
 	// four of these reservations.
-	big := plan.NewScheduler(dependence.Machine{AvailableBytes: 32 << 30, Observed: true})
+	big := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 32 << 30, Observed: true}))
 	var releases []func()
 	for i := 0; i < 4; i++ {
 		admitted, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -678,7 +680,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// The same reservation on an 8 GiB machine: the allocation is 4 GiB, so
 	// exactly one runs, and it runs because an idle scheduler admits any single
 	// unit whatever it reserves -- work is never refused for memory.
-	small := plan.NewScheduler(dependence.Machine{AvailableBytes: 8 << 30, Observed: true})
+	small := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 8 << 30, Observed: true}))
 	release, err := small.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an 8 GiB machine admitted nothing: %v", err)
@@ -870,4 +872,129 @@ func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
 		t.Errorf("the parse stage reports %v/%v transferred bytes for a child nothing counted them for: "+
 			"an unsampled figure must be absent, never an observed zero", got.ReadBytes, got.WriteBytes)
 	}
+}
+
+// schedulerLedger is the process admission ledger a scheduler front is bound
+// to, over the allocation this machine observation derives. The scheduler no
+// longer observes a machine itself: the allocation and the running total
+// belong to the one ledger every heavy child of the process shares.
+func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes), testDiskAllocationBytes)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
+}
+
+// testDiskAllocationBytes is a disk allocation wide enough that no unit in
+// these tests ever waits on the ledger's second dimension: what they prove is
+// the memory sizing, and a disk figure that bound anything here would make
+// them prove something else.
+const testDiskAllocationBytes int64 = 64 << 30
+
+// testBaseFootprintBytes stands in for what the composition derives from the
+// machine and the configuration (config.BaseFootprint). It is the shipped
+// defaults on a 16-core host -- 32 MiB idle + 16 query slots x 32 MiB + 32 MiB
+// cache + 16 MiB queue -- stated here rather than imported so this package's
+// tests do not resolve a configuration to size a reservation.
+const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
+
+// TestAllocationSubtractsTheDerivedBaseFootprint protects the rule that the
+// scheduling allocation is derived from THIS machine and THIS process's own
+// footprint: half of what was available, less what this process already holds.
+//
+// Failure mode it guards: a base footprint that does not reach the allocation
+// -- a constant, or a figure that does not follow the core count -- hands the
+// children memory the parent has already promised itself, so every heavy child
+// is admitted against bytes that are not there and the host is over-committed.
+//
+// Both branches of the min() are exercised deliberately. On a large host the
+// host-share branch binds and the footprint is invisible, which is why a
+// test that only looked at a roomy machine would pass with the base footprint
+// ignored entirely; the small-memory, many-core row is the one that binds on
+// the subtraction, and it is also the shape that used to be refused outright.
+func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
+	const margin = dependence.DefaultSafetyMarginBytes
+	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
+	const base128 = 32<<20 + 128*(32<<20) + 32<<20 + 16<<20
+
+	for _, c := range []struct {
+		name      string
+		available int64
+		base      int64
+		want      int64
+		binds     string
+	}{
+		{"64 GiB, 16 cores: the host keeps half", 64 << 30, testBaseFootprintBytes, 32 << 30, "host share"},
+		{"8 GiB, 128 cores: the footprint binds", 8 << 30, base128, 8<<30 - base128 - margin, "subtraction"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := dependence.Machine{AvailableBytes: c.available, Observed: true}
+			got := m.SchedulingAllocation(c.base)
+			if got != c.want {
+				t.Errorf("allocation is %d, want %d (the %s branch binds): the allocation is not "+
+					"available memory less this process's own footprint, bounded by the host's share",
+					got, c.want, c.binds)
+			}
+		})
+	}
+	// The same machine, a larger base footprint, must leave the children less.
+	// This is the whole point of deriving it: a host with more cores reserves
+	// more for itself.
+	m := dependence.Machine{AvailableBytes: 8 << 30, Observed: true}
+	if bigger, smaller := m.SchedulingAllocation(testBaseFootprintBytes), m.SchedulingAllocation(base128); bigger <= smaller {
+		t.Errorf("a %d-byte base footprint left the children %d and a %d-byte one left them %d; "+
+			"a larger footprint must leave a smaller allocation",
+			testBaseFootprintBytes, bigger, base128, smaller)
+	}
+}
+
+// TestLargestChildFitsTheRunnerBeneathTheGate protects the rule that nothing
+// below the admission gate refuses what the gate admitted.
+//
+// Failure mode it guards: the gate runs a unit larger than the whole
+// allocation ALONE rather than refusing it, but a unit's reservation is its
+// heap cap -- already bounded by the allocation -- PLUS the memory its family
+// keeps outside the heap, so the largest reservation always exceeds the
+// allocation. A process runner budgeted at the allocation therefore refuses
+// exactly the unit the gate just admitted, and the unit fails with a resource
+// limit instead of running. That is "refusing work for memory", which this
+// package's own ruling says the product never does. It is invisible on a host
+// roomy enough that no unit's estimate reaches the allocation, which is why it
+// is asserted here rather than left to a run to discover.
+func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
+	for _, available := range []int64{8 << 30, 16 << 30, 64 << 30} {
+		m := dependence.Machine{AvailableBytes: available, Observed: true}
+		allocation := m.SchedulingAllocation(testBaseFootprintBytes)
+		budget := dependence.MaxChildReservationBytes(allocation)
+		g := dependence.NewGovernor(0, testBaseFootprintBytes)
+
+		// A unit far too large for any host: its estimate clamps to the
+		// allocation, which is the case that produces the largest reservation.
+		for _, f := range []dependence.Family{
+			dependence.FamilyC, dependence.FamilyGo, dependence.FamilyJava,
+			dependence.FamilyJavaScript, dependence.FamilyPython, dependence.FamilyRust,
+		} {
+			r := g.Reserve(f, 1<<40, m)
+			if r.Bytes() > budget {
+				t.Errorf("on a %d-byte machine a %s unit reserves %d, over the %d-byte runner budget: "+
+					"the runner beneath the gate would refuse a unit the gate admitted",
+					available, f, r.Bytes(), budget)
+			}
+			// The cap itself never exceeds the allocation the unit is admitted
+			// against, or it is sized against one figure and admitted against
+			// another.
+			if r.HeapCapBytes > allocation {
+				t.Errorf("on a %d-byte machine a %s unit is capped at %d, over the %d-byte allocation "+
+					"it is admitted against", available, f, r.HeapCapBytes, allocation)
+			}
+		}
+	}
+	// The unobservable host is deliberately NOT covered here: sizing invents no
+	// bound there (a ceiling for an unreadable machine is what synthesis
+	// Section 8 forbids) while admission stands one in, so a unit is sized
+	// without a bound and admitted against the stand-in. Resolving that
+	// asymmetry is a ruling, not an assertion; it is recorded as an open
+	// question rather than pinned by a test that would fix one answer.
 }

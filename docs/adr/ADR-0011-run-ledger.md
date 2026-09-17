@@ -22,7 +22,7 @@ itself when asked why a run is taking a long time *while it is still taking it*.
 What the product had instead, when this was decided, was scattered. Six stages each logged a
 duration, every one in its own shape and none of them aggregated:
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
-`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:258` and
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/snapshot/builder.go:289` and
 `internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
 needs were already being taken and thrown away: the child process tree's peak resident memory was
 sampled every 250 ms by `internal/process/treesample_linux.go:55` and reached only the dependence
@@ -170,6 +170,21 @@ for about 7 ms of which stopping is 3-5.
 It is recorded as a cost at the noise floor rather than cleared, and is to be re-measured on a quiet
 machine before it is either dismissed or treated as the defect a cost above noise would be. The
 figure is reproduced by `go test -run TestLedgerCost ./internal/bench`.
+
+### The run ledger is where a batch that published nothing keeps its reason
+
+A deferred tick whose every unit fails publishes no generation. Its reason therefore has exactly one
+durable home: this ledger — the run row, which says the batch failed and how many units it planned
+and lost, and the unit spans, each naming its scope and its typed diagnostic code. Both survive the
+tick's abort, and the sweep keeps them because a run's rows are no longer swept with the generation
+that wrote them.
+
+The store is deliberately not a second home for it. `provider_runs.failure_json` belongs to the work
+generation the abort removes, and a `generation_capabilities` row would have to be written against
+the generation that is still active — one that did not produce the failure, whose scopes are in fact
+still answering from their carried predecessors, and whose capability rows are replaced wholesale by
+the next activation. Writing either would make the store state something that did not happen, which
+is the class of record defect this ADR exists to remove, so the reason stays where it is true.
 
 ## Alternatives considered
 

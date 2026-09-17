@@ -12,27 +12,19 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// graphTools is the traversal set that takes the SECOND concurrency gate.
-//
-// It is the traversal tools only — codectx_symbol_info is Section 19.2 row 6
-// and is two explore calls (Symbol then References) composed on one generation,
-// not a graph walk, so it is bounded by the general gate alone. Keeping the set
-// literal rather than deriving it from a name prefix is what lets a reviewer
-// check the classification instead of guessing it.
-var graphTools = map[string]bool{
-	"codectx_callers":         true,
-	"codectx_callees":         true,
-	"codectx_dependency_path": true,
-	"codectx_impact":          true,
-}
-
 // limits is the Section 19.3 bound set, resolved from configuration once at
 // construction so no per-call path re-reads or re-derives it.
 //
-// The two semaphores are buffered channels rather than a counter: a channel
-// send is the only acquire primitive that can be selected against ctx.Done(),
-// and an acquire that cannot be abandoned is the unbounded wait Section 6
-// forbids.
+// The semaphore is a buffered channel rather than a counter: a channel send is
+// the only acquire primitive that can be selected against ctx.Done(), and an
+// acquire that cannot be abandoned is the unbounded wait Section 6 forbids.
+//
+// There is ONE traversal gate in this process and it is not here. How many
+// graph traversals run at once (config.GraphSlots) is held by the engine's own
+// gate in internal/app, which every caller passes through -- a command as well
+// as a tool call -- and a second gate over the same slot count, sized from the
+// same figure and reachable only from this server, could only drift from it or
+// refuse a call the one gate would have admitted.
 type limits struct {
 	// maxParamsBytes caps the RAW tools/call arguments frame, before any
 	// decoding. resources.max_metadata_response_bytes serves as the MCP REQUEST
@@ -58,9 +50,6 @@ type limits struct {
 	// cores (config.QuerySlots, config.ParserWorkers) and neither refuses a
 	// call -- a call that finds no slot waits.
 	calls chan struct{}
-	// graph additionally bounds the traversal tools, which are the expensive
-	// ones. A traversal holds a slot in both.
-	graph chan struct{}
 	// timeout is the per-call deadline a tool handler runs under when neither
 	// the client's request nor the configuration asks for something else. Zero
 	// is "no deadline", which is what resources.query_timeout defaults to: the
@@ -98,32 +87,22 @@ func newLimits(cfg config.Config) (limits, error) {
 	return limits{
 		maxParamsBytes: r.MaxMetadataResponseBytes,
 		calls:          make(chan struct{}, config.QuerySlots()),
-		graph:          make(chan struct{}, config.GraphSlots()),
 		timeout:        r.QueryTimeout.Std(),
 	}, nil
 }
 
-// acquire takes the general gate and, for a traversal tool, the graph gate too.
-// The order is fixed (general first) and every slot taken is released by the
-// returned function, so the two gates cannot deadlock against each other.
+// acquire takes the tool-call gate. The slot it takes is released by the
+// returned function; a traversal takes the process's one graph slot further
+// down, inside the engine, where every caller takes it.
 //
 // Waiting is bounded by ctx: a caller that goes away, or a call that has spent
 // its deadline queuing, is refused rather than parked forever.
-func (l limits) acquire(ctx context.Context, tool string) (func(), *model.Error) {
+func (l limits) acquire(ctx context.Context) (func(), *model.Error) {
 	select {
 	case l.calls <- struct{}{}:
+		return func() { <-l.calls }, nil
 	case <-ctx.Done():
 		return nil, waitFailed(ctx, "waiting for a tool-call slot")
-	}
-	if !graphTools[tool] {
-		return func() { <-l.calls }, nil
-	}
-	select {
-	case l.graph <- struct{}{}:
-		return func() { <-l.graph; <-l.calls }, nil
-	case <-ctx.Done():
-		<-l.calls
-		return nil, waitFailed(ctx, "waiting for a graph-query slot")
 	}
 }
 
@@ -189,7 +168,7 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			ctx, cancel = model.QueryDeadline(ctx, s.limits.timeout)
 			defer cancel()
 
-			release, failed := s.limits.acquire(ctx, call.Params.Name)
+			release, failed := s.limits.acquire(ctx)
 			if failed != nil {
 				return refusal(failed), nil
 			}

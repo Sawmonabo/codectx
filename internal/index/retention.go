@@ -50,14 +50,15 @@ func (c *Coordinator) retain(ctx context.Context) {
 	ctx, span := ledger.Start(ctx, stageRetention, "")
 	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
 	span.AddOut(int64(report.GenerationsSwept))
-	// A deleted generation's ledger rows go with it. The ledger keeps its own
-	// file, so nothing else would ever collect them and the file would grow
-	// for as long as the workspace is indexed.
-	if delErr := c.opts.Ledger.DeleteRuns(ctx, report.GenerationsDeleted); delErr != nil {
-		logTyped(c.log, "the swept generations' ledger rows could not be deleted", delErr,
-			"component", component, "repository_id", string(c.repo))
-	}
-	span.End(endOutcome(err), ledger.Measured{}, err)
+	// The ledger is NOT swept with the generations this pass deleted. A run's
+	// account is about the run, not about the generation it happened to
+	// publish: retention keeps the newest generation of each ref, so a
+	// deferred publication -- which extends the base generation on the same
+	// ref, in the same command -- makes the index run's generation a sweep
+	// candidate seconds after it activated, and a ledger keyed to it would
+	// leave `status --resources` with nothing to say about the run that built
+	// the store. The ledger's own bound is sweepLedger's.
+	span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
 			"component", component, "repository_id", string(c.repo))
@@ -99,9 +100,8 @@ type Collector interface {
 func (c *Coordinator) collect(ctx context.Context) {
 	// The sweep runs before the store's own pass and outside the collection
 	// span, on the uncancellable context: it is the ledger's half of the same
-	// collection, it is what keeps the two classes of run no generation will
-	// ever reach from accumulating, and a coordinator assembled without a
-	// store-side collector still has a ledger to sweep.
+	// collection, it is the only thing that bounds that file, and a coordinator
+	// assembled without a store-side collector still has a ledger to sweep.
 	ctx = context.WithoutCancel(ctx)
 	c.sweepLedger(ctx)
 	if c.opts.Collector == nil {
@@ -109,7 +109,7 @@ func (c *Coordinator) collect(ctx context.Context) {
 	}
 	ctx, span := ledger.Start(ctx, stageCollection, "")
 	report, err := c.opts.Collector.Collect(ctx)
-	span.End(endOutcome(err), ledger.Measured{}, err)
+	span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		logTyped(c.log, "the collection pass did not finish", err,
 			"component", component, "repository_id", string(c.repo))
@@ -147,14 +147,13 @@ func recordReclaim(ctx context.Context, freedBefore int64) {
 	span.End(ledger.OutcomeOK, ledger.Measured{ItemsOut: &freed, CPUUnattributed: ledger.CPUOverlapped}, nil)
 }
 
-// sweepLedger deletes the ledger rows no generation will ever collect, one
-// bounded page per pass. Two classes of run have no other way out of the file:
-// the overlay run a process opens for its language-server starts, which belongs
-// to no generation and outlives nothing but its own process; and a run that
-// ended without publishing anything -- the periodic tick that finds nothing to
-// publish never attaches a generation, and the ticks do not stop. DeleteRuns is
-// keyed by generation, so without this pass both grow for as long as the
-// workspace is indexed.
+// sweepLedger is the whole of the ledger file's bound, one page per pass: the
+// overlay runs of processes that are gone, which belong to no generation and
+// outlive nothing but their own process, and then everything past this
+// repository's last ledger.RetainedRuns runs. Nothing else deletes a ledger
+// row, so a run's account survives for as many runs as the bound names --
+// including the run that built the store, whose generation retention deletes
+// as soon as a later one of the same ref exists.
 //
 // It is called from the collection pass because that is where the process
 // already reclaims what nothing references, and because both sweeps skip a run
@@ -162,16 +161,23 @@ func recordReclaim(ctx context.Context, freedBefore int64) {
 // overlay, and a tick in flight are all live by the same judgement a reader
 // uses, so nothing here can delete a run a status surface has just called live.
 //
+// The active generation is read first and handed to the sweep, which keeps its
+// run however old it is: an operator asking what the active store cost is
+// asking about that run, and the bound must not be what answers them.
+//
 // Like the passes around it, a failure never fails the run that published: the
 // rows stay and the next pass takes them, and the diagnostic is logged so a
 // file that is never being swept cannot be silent.
 func (c *Coordinator) sweepLedger(ctx context.Context) {
-	overlays, err := c.opts.Ledger.OverlayRuns(ctx)
+	active, err := c.activeGeneration(ctx)
 	if err == nil {
-		err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
+		var overlays []string
+		if overlays, err = c.opts.Ledger.OverlayRuns(ctx); err == nil {
+			err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
+		}
 	}
 	if err == nil {
-		err = c.opts.Ledger.DeleteRunsWithoutGeneration(ctx)
+		err = c.opts.Ledger.SweepRuns(ctx, string(c.repo), int64(active))
 	}
 	if err != nil {
 		logTyped(c.log, "the ledger runs no generation will collect were not swept", err,

@@ -339,6 +339,18 @@ func (u Unit) OwnsInput(p string) bool {
 	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base)
 }
 
+// ScopeKeyPrefix is what every scope key of a family begins with, and the one
+// place the family's position in that key is spelled. A caller holding a scope
+// key and a family -- the planner matching this repository's recorded history
+// to the language it was recorded for -- tests it against this rather than
+// rebuilding the key format for itself, so the format cannot drift between the
+// package that writes it and the package that reads it.
+//
+// It ends in the separator, so a prefix test can never match a family whose
+// name merely starts with another's. The whole-family unit's own key is
+// exactly this prefix, with an empty root.
+func ScopeKeyPrefix(f Family) string { return "pkg:" + string(f) + ":" }
+
 // scopeKey is the unit's capability and alias scope. It names the family in
 // the product's own vocabulary, never the engine's frontend name.
 //
@@ -349,7 +361,7 @@ func (u Unit) OwnsInput(p string) bool {
 // The planner drops such a project instead, which loses one project's facts
 // openly rather than mixing two projects' facts silently.
 func scopeKey(f Family, root string) (string, bool) {
-	key := "pkg:" + string(f) + ":" + root
+	key := ScopeKeyPrefix(f) + root
 	if len(key) > model.MaxScopeKeyBytes {
 		return "", false
 	}

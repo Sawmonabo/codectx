@@ -141,7 +141,6 @@ func (c Config) validate() error {
 		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
 		{"providers.dependence.stall_timeout", c.Providers.Dependence.StallTimeout},
-		{"tools.fetch_timeout", c.Tools.FetchTimeout},
 		{"coverage.session_ttl", c.Coverage.SessionTTL},
 	} {
 		if d.v <= 0 {
@@ -263,24 +262,16 @@ func (c Config) validateBudgets() error {
 		return configInvalid("resources.max_provider_record_bytes %s exceeds index.batch_bytes %d; one record must fit one batch",
 			c.Resources.MaxProviderRecordBytes, c.Index.BatchBytes)
 	}
-	// The process's own reservations must fit the footprint the machine-derived
-	// allocation subtracts for it before handing the rest to its children.
-	// Overrunning it is not a narrow budget: it is an allocation computed
-	// against a figure this process does not live within, so every child is
-	// admitted against memory that is already spoken for. How many queries run
-	// at once comes from the cores, so the check is against this machine.
-	concurrent, err := mulNoOverflow("query slots * resources.query_memory_bytes",
-		int64(QuerySlots()), c.Resources.QueryMemoryBytes)
-	if err != nil {
+	// This process's base footprint is DERIVED from the machine and these
+	// reservations (BaseFootprint), never checked against a figure: how many
+	// queries run at once comes from the cores, so a larger host simply has a
+	// larger base footprint and leaves its children a smaller allocation. A
+	// comparison here would refuse the shipped defaults for the core count of
+	// the machine they were loaded on, naming no key the operator could lower.
+	// The one thing that can still be wrong is arithmetic that leaves 64-bit
+	// range, and that names the keys that caused it.
+	if _, err := baseFootprintFor(c, QuerySlots()); err != nil {
 		return err
-	}
-	baseline, err := addNoOverflow("baseline memory reservation", concurrent, c.Resources.CacheBytes, c.Index.QueueBytes)
-	if err != nil {
-		return err
-	}
-	if baseline > BaseFootprintBytes {
-		return configInvalid("query, cache and queue reservations need %d bytes, over the %d-byte base footprint of this process",
-			baseline, BaseFootprintBytes)
 	}
 	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
 	// and is the default, a negative value is rejected, and the pairing against

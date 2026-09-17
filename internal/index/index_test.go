@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -246,7 +247,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if locker == nil {
 		locker = heldLock{f.lock}
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
 		Lock: locker, Pool: pool, Logger: f.logger, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
@@ -947,7 +948,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// runs, which is the whole window a query needs the answer in.
 	l := f.c.late
 	l.mu.Lock()
-	l.running = &deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "running"}}
+	l.inflight[plan.Key(d.ID, "running")] = true
 	l.queue = append(l.queue, deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "queued"}})
 	l.mu.Unlock()
 	p, err := f.c.Promote(ctx, d.ID, "running")
@@ -1369,7 +1370,7 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
 		Lock: busyLock{}, Watcher: w, Pool: pool})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1494,4 +1495,18 @@ func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 			t.Errorf("%s reports no row for an enabled provider at all: the exclusion is not confined to what is off", surface.name)
 		}
 	}
+}
+
+// testAdmission is the process memory admission ledger heavy units are
+// admitted against. Production composes exactly one and hands it to every
+// reserver; these tests run fake units, so the allocation is simply wide
+// enough that admission never orders them -- what the ledger admits and when
+// is proved where the ledger lives.
+func testAdmission(t testing.TB) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(64<<30, 64<<30)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
 }

@@ -205,7 +205,7 @@ func (f *fixture) resolver(t *testing.T, offline bool, transport http.RoundTripp
 	}
 	r, err := newResolver(f.lock, Options{
 		DataDir: f.dataDir, Offline: offline,
-		MaxFetchBytes: 64 << 20, FetchTimeout: 10 * time.Second,
+		MaxFetchBytes: 64 << 20,
 	}, transport)
 	if err != nil {
 		t.Fatalf("newResolver: %v", err)
@@ -282,7 +282,7 @@ func TestPayloadDisagreeingWithTheLockIsNeverInstalled(t *testing.T) {
 					t.Fatalf("mirror %q: %v", tc.mirror, err)
 				}
 			}
-			got, host, err := newFetcher(nil, mirror, 1<<30, time.Second, nil).target(tc.raw)
+			got, host, err := newFetcher(nil, mirror, 1<<30, nil).target(tc.raw)
 			if err != nil {
 				t.Fatalf("target(%q): %v", tc.raw, err)
 			}
@@ -632,4 +632,129 @@ func TestUnlistedStorePayloadIsReportedAndRemoved(t *testing.T) {
 	if len(after) != 1 || after[0].State != StateInstalled {
 		t.Fatalf("verify after prefetch = %+v, want only the installed lock entry", after)
 	}
+}
+
+// pacedBody delivers one byte every beat until the payload is exhausted, then
+// blocks until the request context ends. A total of stalls beats deliver
+// nothing at all, which is what a wedged host looks like.
+type pacedBody struct {
+	ctx     context.Context
+	payload []byte
+	sent    int
+	beat    time.Duration
+	dead    bool
+}
+
+func (b *pacedBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	case <-time.After(b.beat):
+	}
+	if b.dead || b.sent >= len(b.payload) {
+		// Nothing more will ever arrive; only the caller's context ends this.
+		<-b.ctx.Done()
+		return 0, b.ctx.Err()
+	}
+	p[0] = b.payload[b.sent]
+	b.sent++
+	return 1, nil
+}
+
+func (b *pacedBody) Close() error { return nil }
+
+// pacedTransport answers one GET with a pacedBody.
+type pacedTransport struct {
+	payload []byte
+	beat    time.Duration
+	dead    bool
+}
+
+func (t pacedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Body:       &pacedBody{ctx: req.Context(), payload: t.payload, beat: t.beat, dead: t.dead},
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// TestAFetchIsEndedByStoppedBytesAndNotByElapsedTime protects the one thing
+// that separates a hang detector from a deadline on the fetch path.
+//
+// Failure mode: a payload is as large as a language runtime and the link it
+// arrives over is the operator's, so any clock over the whole download is a
+// sustained-rate requirement. The 2 GiB ceiling under a ten-minute deadline
+// demanded 3.4 MB/s, and a download progressing below that was terminated --
+// repeatedly, since each retry restarts it -- while a host that accepted the
+// connection and then delivered nothing held the attempt open for the whole
+// ten minutes. Both outcomes are backwards.
+//
+// The slow transfer below moves one byte per stall quarter and takes several
+// stall windows in total, so any deadline shorter than the whole of it fails
+// this test; the dead one delivers nothing and must be ended at the window.
+//
+// Mutation: restore the deadline -- wrap the fetch context in
+// context.WithTimeout(ctx, f.stall) in download and drop the watch in attempt
+// -> the slow payload below is cancelled part way through and reported as a
+// stream that ended early.
+func TestAFetchIsEndedByStoppedBytesAndNotByElapsedTime(t *testing.T) {
+	const stall = 200 * time.Millisecond
+	payload := []byte("a tool payload delivered one byte at a time")
+	sum := sha256.Sum256(payload)
+	p := Payload{URL: "https://example.invalid/tool.bin", Size: int64(len(payload)), SHA256: hex.EncodeToString(sum[:])}
+	target, err := url.Parse(p.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	t.Run("a slow but moving transfer is never ended", func(t *testing.T) {
+		// A byte every stall/16, well inside the detector's stall/4 poll: the
+		// transfer must never look quiet for a whole window, and the whole of
+		// it still spans several windows.
+		f := newFetcher(pacedTransport{payload: payload, beat: stall / 16}, nil, 1<<30, nil)
+		f.stall = stall
+		dst := stagingFile(t)
+		// The whole transfer takes about len(payload)/4 stall windows, which is
+		// far longer than the window itself: only a detector that watches bytes
+		// lets it finish.
+		if err := f.attempt(context.Background(), "tool", target, p, dst); err != nil {
+			t.Fatalf("a transfer delivering a byte every %s was ended: %v", stall/16, err)
+		}
+	})
+
+	t.Run("a transfer that stops delivering is ended at the window", func(t *testing.T) {
+		f := newFetcher(pacedTransport{payload: payload, beat: stall / 16, dead: true}, nil, 1<<30, nil)
+		f.stall = stall
+		dst := stagingFile(t)
+		started := time.Now()
+		err := f.attempt(context.Background(), "tool", target, p, dst)
+		if err == nil {
+			t.Fatal("a host that accepted the request and delivered no bytes was never detected")
+		}
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeToolFetchFailed || !typed.Retryable {
+			t.Fatalf("a stalled transfer reported %v; want a retryable CTX_TOOL_FETCH_FAILED", err)
+		}
+		if !strings.Contains(typed.Message, "delivered no bytes") {
+			t.Fatalf("the failure reads %q; a stalled transfer must not be reported as a stream that ended early", typed.Message)
+		}
+		// Ended by the window, not by a deadline over the whole download: well
+		// under the ten minutes the deleted key allowed.
+		if elapsed := time.Since(started); elapsed > 10*stall {
+			t.Fatalf("a dead transfer was held open for %s, over the %s window", elapsed, stall)
+		}
+	})
+}
+
+// stagingFile is the staging file a download streams into.
+func stagingFile(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "staging"))
+	if err != nil {
+		t.Fatalf("staging file: %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
 }

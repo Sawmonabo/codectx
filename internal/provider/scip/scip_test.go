@@ -679,7 +679,7 @@ func managedResolver(t *testing.T, overrides map[string]toolchain.Override) *too
 	t.Helper()
 	r, err := toolchain.New(toolchain.Options{
 		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
-		FetchTimeout: time.Second, Overrides: overrides,
+		Overrides: overrides,
 	})
 	if err != nil {
 		t.Fatal(err)

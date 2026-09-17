@@ -8,6 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
 // inputAt is a distinct, deterministic snapshot input. File identities are
@@ -316,5 +317,74 @@ func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.
 	if !slices.Equal(got, want) {
 		t.Fatalf("the plan streamed %v, want %v: each provider's units must be one contiguous "+
 			"stretch, in Selection.Active order", got, want)
+	}
+}
+
+// A repository's second index must never reserve a heavy unit against less
+// than its first index watched that unit use: the reference runs recorded one
+// JavaScript unit peaking at 1.04x the figure it was admitted against, and
+// overrunning a reservation is the direction that freezes a host. The other
+// half of the same invariant is the one that would be catastrophic to get
+// wrong: a scope nobody ever measured, a workspace with no ledger at all and a
+// platform that samples no process tree are every one of them NO OBSERVATION,
+// and the reservation the family constants derived must then stand exactly as
+// it is. A missing measurement read as a peak of zero would collapse every
+// reservation in the product to the floor.
+//
+// Failure modes protected: (1) the second run of a repository under-reserves
+// what the first run measured and freezes the host; (2) an absent observation
+// is read as zero and every reservation collapses.
+func TestARecordedPeakOnlyEverRaisesAReservationAndAnAbsentOneChangesNothing(t *testing.T) {
+	const (
+		scope    = "pkg:javascript:app"
+		sibling  = "pkg:javascript:lib"
+		otherLan = "pkg:go:service"
+		// Far above what 1 MiB of JavaScript source derives, so a raise is
+		// unmistakable and the floor cannot account for it.
+		huge = int64(9) << 30
+	)
+	unit := func(key string) *semantic {
+		return &semantic{providerID: dependence.ProviderID, scopeKey: key, heavy: true,
+			family: dependence.FamilyJavaScript, bytes: 1 << 20}
+	}
+	gov := dependence.NewGovernor(0, 0)
+	// An unobserved machine, so no allocation bound can mask the raise.
+	machine := dependence.Machine{}
+	derived := gov.Reserve(dependence.FamilyJavaScript, 1<<20, machine).Bytes()
+	if derived <= 0 {
+		t.Fatalf("the family constants derive %d bytes for a heavy unit; the test cannot tell a raise from a collapse", derived)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		peaks []RecordedPeak
+		unit  *semantic
+		want  int64
+	}{
+		{name: "the scope's own recorded peak raises the reservation to it",
+			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: huge}}, unit: unit(scope), want: huge},
+		{name: "a scope with no history of its own is sized by its language's",
+			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: huge}}, unit: unit(sibling), want: huge},
+		{name: "no ledger at all leaves the derived reservation standing",
+			peaks: nil, unit: unit(scope), want: derived},
+		{name: "a ledger with no peak for this scope or its language leaves it standing",
+			peaks: []RecordedPeak{{ScopeKey: otherLan, PeakBytes: huge}}, unit: unit(scope), want: derived},
+		{name: "a recorded peak below the derived figure never lowers it",
+			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: 1}}, unit: unit(scope), want: derived},
+		{name: "the scope's own measurement wins over its language's larger one",
+			peaks: []RecordedPeak{{ScopeKey: sibling, PeakBytes: huge}, {ScopeKey: scope, PeakBytes: huge / 2}},
+			unit:  unit(scope), want: max(derived, huge/2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &builder{peaks: tc.peaks}
+			got := b.reserve(gov, tc.unit, machine).Bytes()
+			if got != tc.want {
+				t.Fatalf("the unit is admitted against %d bytes, want %d (the family constants derive %d)",
+					got, tc.want, derived)
+			}
+			if got <= 0 {
+				t.Fatalf("the unit is admitted against %d bytes: an absent observation was read as zero", got)
+			}
+		})
 	}
 }

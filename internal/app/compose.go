@@ -3,9 +3,11 @@ package app
 import (
 	"context"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
+	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -112,6 +115,58 @@ const collectorBatchLimit = 200
 // cap a heavy analyzer is given -- so the division over-counts rather than
 // under-counts.
 const smallestChildReservationBytes int64 = 768 << 20
+
+// unobservedFreeDiskBytes is the disk allocation used where the platform
+// reports no free-space figure for the data directory. It is not a
+// measurement and is never reported as one: it is the finite bound the gate
+// must have, standing in for the observation the platform withheld, exactly
+// as dependence.UnobservedAllocationBytes stands in for available memory.
+//
+// It is deliberately one child's worth of staging and not a machine's. Where
+// memory is unobservable the stand-in may be generous, because the host's own
+// pressure eventually pushes back; a device that fills does not push back, it
+// fails every writer on it including the operator's editor. So the unreadable
+// case admits roughly one staging child at a time and says so once, which is
+// the conservative direction on the dimension that has no second chance.
+const unobservedFreeDiskBytes int64 = 1 << 30
+
+// freeDiskAllocation is the temporary disk this process's children may hold
+// between them: the space actually free under the data directory, less the
+// floor the host keeps free whatever the product is doing
+// (resources.min_free_disk_bytes).
+//
+// Three readings, three answers, and none of them is "unlimited":
+//   - a figure: that figure less the floor, which is what the children may
+//     take without taking the host below its floor;
+//   - a figure at or below the floor: zero, which is a real reading and not an
+//     absence. Nothing is admitted beside a child that wants disk, so staging
+//     work serializes instead of racing the device to full;
+//   - no figure at all: the stand-in above, recorded as unavailable. An
+//     unreadable device is not an empty one and is not an infinite one.
+//
+// The observation is taken once, here, like the memory one, and for the same
+// reason: the ledger observes nothing. What it cannot see is the space another
+// process on the same device takes while this one runs, which is why the floor
+// exists and why the store still attributes a refused write against free space
+// at the moment it fails.
+func freeDiskAllocation(dataDir string, floorBytes int64) int64 {
+	free, ok := diskfree.Available(dataDir)
+	if !ok {
+		slog.Warn("this host reports no free-space figure for the data directory, so heavy children are admitted against a conservative stand-in rather than a measurement",
+			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
+		return unobservedFreeDiskBytes
+	}
+	if free > math.MaxInt64 {
+		free = math.MaxInt64
+	}
+	allocation := int64(free) - floorBytes
+	if allocation <= 0 {
+		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
+			"component", "app", "data_dir", dataDir, "free_bytes", free, "min_free_disk_bytes", floorBytes)
+		return 0
+	}
+	return allocation
+}
 
 // childSlots is that division: how many children of the smallest possible size
 // fit the budget, never below one.
@@ -344,6 +399,14 @@ type stack struct {
 	// resource sampler can count their live children. Nothing else reads them:
 	// each component keeps its own runner.
 	runners []diagnostics.ProcessCounter
+	// admission is the ONE memory admission ledger of this process, built here
+	// from the one observation of the machine and handed to every reserver:
+	// the heavy-unit scheduler inside the coordinator, the language-server
+	// manager, and the resource block that discloses it. There is no second
+	// one -- a reserver with a running total of its own is bounded by the same
+	// allocation as this one and nothing sums the two, which is a process free
+	// to reserve a multiple of the machine's memory.
+	admission *admission.Ledger
 	// diagnose produces the Section 22 check list and the Section 23 resource
 	// block; collector is the process-level reclaim pass and the Section 10.4
 	// blob grace protocol. Both are set by openDiagnostics, which needs the
@@ -617,15 +680,47 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// count of children and nothing is configurable: the allocation is
 	// available memory less this process's own footprint and the safety
 	// margin, never more than the share of the machine the product takes.
-	childMemory := dependence.ObserveMachine().SchedulingAllocation()
+	//
+	// The footprint it subtracts is DERIVED from this machine and this
+	// configuration rather than read from a constant: the reservations this
+	// process makes up front grow with the core count, so a host with more
+	// cores keeps more for itself and offers its children less. The same
+	// figure sizes the units (the governor below), so on a host whose memory
+	// can be observed a unit is sized against the allocation it is admitted
+	// against. Where the host publishes no figure the two deliberately differ:
+	// sizing invents no bound there and admission stands one in. That is
+	// stated on both sides in govern.go and is an open question, not a claim
+	// that they always agree.
+	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
+	// Disk is the ledger's second dimension and is observed the same way: the
+	// free space under the data directory, less the floor the host keeps, is
+	// what the children may stage between them. It is observed here, once, for
+	// the reason the memory allocation is -- the ledger observes nothing and
+	// derives nothing -- and a child that does not fit it waits rather than
+	// filling the device.
+	childDisk := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
+	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
+		return nil, err
+	}
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its
 	// unlimited default of 0: the runner reads a non-positive disk budget as
 	// unlimited and admits every reservation, so the default never refuses a
 	// child at admission. Only a value the operator set refuses one, and it
 	// says so with resources.max_temp_bytes named in the error.
+	// The runner beneath the admission gate must never refuse what the gate
+	// admitted. The gate runs a child larger than the whole allocation ALONE
+	// rather than refusing it, and a unit's reservation is its heap cap --
+	// itself bounded by the allocation -- plus the memory its family keeps
+	// outside the heap, so the largest child a unit can present is always
+	// larger than the allocation. A runner budgeted at the allocation would
+	// refuse precisely that unit, with the resource-limit error the whole
+	// memory ruling exists to avoid. This is the same rule the language-server
+	// runner below states: the budget is wide enough for the largest child the
+	// gate above it can admit.
+	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
 	shared, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     childSlots(childMemory),
-		MemoryBudgetBytes: childMemory,
+		MaxConcurrent:     childSlots(sharedBudget),
+		MemoryBudgetBytes: sharedBudget,
 		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
 	})
 	if err != nil {
@@ -755,7 +850,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.lsp, err = lsp.New(lsp.Options{
 		Runner:                 servers,
 		DataDir:                s.dataDir,
-		AllocationBytes:        childMemory,
+		Admission:              s.admission,
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
 		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
@@ -896,6 +991,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				StallTimeout:         s.cfg.Providers.Dependence.StallTimeout.Std(),
 				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
+				BaseFootprintBytes:   config.BaseFootprint(s.cfg),
 				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
 				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,
@@ -1072,6 +1168,7 @@ func (s *stack) openDiagnostics() error {
 		Build:     model.CurrentBuildInfo(),
 		Repo:      s.repo,
 		Root:      s.root.Path,
+		Admission: s.admission,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
 		Ledger:    runLedger{dir: dataDir},
@@ -1756,7 +1853,6 @@ func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, str
 		Offline:       cfg.Tools.Offline,
 		Mirror:        cfg.Tools.Mirror,
 		MaxFetchBytes: cfg.Tools.MaxFetchBytes,
-		FetchTimeout:  cfg.Tools.FetchTimeout.Std(),
 		Overrides:     overrides,
 		// Section 11.7 requires one record per completed fetch in ordinary
 		// operation; Section 18.2 puts logs on stderr, never on the result

@@ -307,6 +307,11 @@ allocation  = min(MemAvailable - base footprint - safety margin,
                   MemAvailable / 2)
 ```
 
+The base footprint is derived from the machine and the configuration -- this
+build's measured idle overhead plus the query, cache and queue reservations
+([configuration](configuration.md)) -- so a host with more cores keeps more for
+itself and offers its children less.
+
 * The cap is sized to what the unit needs, never to what the machine has. A
   frontend grows toward whatever cap it is given and does not need it: a
   157 MB JavaScript project of 4,984 files parsed in 3 m 38 s under a 4 GiB
@@ -534,7 +539,9 @@ carried into the new generation until the fresh one replaces it (Section 13.3).
 ## Refresh and delta
 
 The engine has no incremental mode, no merge and no per-file export
-(joern#5757), so a refreshed unit is a whole parse and export — unless the
+([upstream issue #5757](https://github.com/joernio/joern/issues/5757), answered by the
+engine's maintainer on 2026-08-28: incremental parsing is not supported), so a refreshed
+unit is a whole parse and export — unless the
 cache key still matches, in which case nothing runs at all.
 
 What is wired today, exactly. Every import derives an engine-id-independent

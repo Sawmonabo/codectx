@@ -60,6 +60,22 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	// it is process accounting: a unit's reservation and the peak its tree
 	// reached belong to the run that started it, not to a stored generation.
 	report.AnalyzerUnits = dependence.ObservedUnits()
+	if len(report.AnalyzerUnits) > 0 {
+		// A unit that peaked above what it was admitted against took memory
+		// the machine had accounted for elsewhere, which is the direction that
+		// freezes a host. The rows above already carry both figures; this is
+		// the count, so an overrun reaches an operator reading the block
+		// rather than only one comparing every row by hand. It is absent where
+		// this process ran no heavy unit -- nothing was measured -- and zero
+		// where it ran them and none overran.
+		overran := int64(0)
+		for _, u := range report.AnalyzerUnits {
+			if u.OverranReservation() {
+				overran++
+			}
+		}
+		report.AnalyzerOverrunUnits = &overran
+	}
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
@@ -209,16 +225,26 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 	}
 }
 
-// reservations fills the three figures that are not measured but promised: what
-// this process has set aside for concurrent queries, for the parsed-graph cache
-// and for the indexing queue. Two are configuration and the third is how many
-// queries this machine's cores run at once, so all three are always available
-// and a zero here is a real zero.
+// reservations fills the figures that are not measured but promised: what this
+// process has set aside for concurrent queries, for the parsed-graph cache and
+// for the indexing queue, and beside them the one allocation every heavy child
+// of this process -- engine runs, external indexers, language servers -- is
+// admitted against, with the sum currently reserved against it. Two of the
+// first three are configuration and the third is how many queries this
+// machine's cores run at once, so all three are always available and a zero
+// there is a real zero.
 //
-// Validation already proves the three fit config.BaseFootprintBytes, so the
-// report states them rather than re-deriving the check -- a second
-// implementation of that arithmetic would drift from the one that refuses a
-// bad configuration.
+// The admission pair is read together from the ledger so the two figures are
+// one moment rather than two, and is absent altogether when this composition
+// has no ledger: an unavailable figure is never published as zero, and a zero
+// allocation would read as a process that may run nothing.
+//
+// The three are exactly what config.BaseFootprint adds to this build's idle
+// overhead to derive what the process holds for itself, so the report states
+// them and derives nothing -- a second implementation of that arithmetic would
+// drift from the one the allocation is computed against. None of the three is
+// checked against a ceiling: the footprint follows the reservations, so there
+// is no figure here for an operator to exceed.
 func (s *Service) reservations(report *model.ResourceReport) {
 	res := s.opts.Config.Resources
 	// Validation refuses a configuration whose product overflows (mulNoOverflow),
@@ -228,6 +254,16 @@ func (s *Service) reservations(report *model.ResourceReport) {
 	report.QueryReservationBytes = nonNegativeBytes(int64(config.QuerySlots()) * res.QueryMemoryBytes)
 	report.CacheReservationBytes = nonNegativeBytes(res.CacheBytes)
 	report.QueueReservationBytes = nonNegativeBytes(s.opts.Config.Index.QueueBytes)
+	if s.opts.Admission != nil {
+		allocation, reserved := s.opts.Admission.Snapshot()
+		report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
+		report.AdmissionReservedBytes = nonNegativeBytes(reserved)
+		// The ledger gates on two dimensions and a child can wait on either,
+		// so both are disclosed or the report explains only half of a wait.
+		diskAllocation, diskReserved := s.opts.Admission.DiskSnapshot()
+		report.AdmissionDiskAllocationBytes = nonNegativeBytes(diskAllocation)
+		report.AdmissionDiskReservedBytes = nonNegativeBytes(diskReserved)
+	}
 }
 
 // nonNegativeBytes converts a signed byte count to the report's unsigned
