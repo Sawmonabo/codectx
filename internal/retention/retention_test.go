@@ -180,7 +180,7 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// FX-H-X1 rows
+	// rows added with the capability-state fix
 	{
 		// Failure mode: the CAS orphan sweep walks all 256 buckets and every
 		// object in them, and a collection pass runs after EVERY activation --

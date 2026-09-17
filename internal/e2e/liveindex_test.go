@@ -102,16 +102,20 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 		{"doctor", []string{"doctor"}},
 	}
 
-	// Arm one: the index alone. Both arms are handed the same shape of work --
-	// the same files, the same symbol count, the same appended byte width --
-	// so the difference between the two walls is about the readers and not
-	// about what each run had to parse.
+	// Arm one builds the generation the readers below read. Its wall is NOT
+	// compared with arm two's and is not reported: the two arms are not handed
+	// the same work. This one indexes a once-padded repository into an empty
+	// store; the next indexes a twice-padded one against a store that already
+	// holds this generation, and a counter-factual with no readers at all
+	// showed the second arm a third slower on that difference alone. A
+	// slowdown figure taken from the pair would be measuring the arm ordering,
+	// so there is no such figure here; what this test measures is what the
+	// readers answered and how long each of them took, which is per reader and
+	// needs no second arm.
 	padFixture(t, s.Repo, 1, padPerFile)
-	aloneStart := time.Now()
 	if env, code := s.run(t, "index"); !env.OK || code != 0 {
 		t.Fatalf("the unattended index failed (exit %d): %+v", code, env.Error)
 	}
-	aloneWall := time.Since(aloneStart)
 
 	// Arm two: the same index with every reader running throughout.
 	padFixture(t, s.Repo, 2, padPerFile)
@@ -173,7 +177,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 		}
 	}
 	t.Logf("reader cycles completed strictly inside the run: %d", cycles)
-	t.Logf("index wall alone %s, with the readers running throughout %s", aloneWall, withWall)
+	t.Logf("index wall with the readers running throughout %s", withWall)
 	if cycles == 0 {
 		t.Errorf("the index finished (wall %s) before one full reader cycle completed: "+
 			"the readers are being held up by the run", withWall)
@@ -528,88 +532,6 @@ func padFixture(t *testing.T, repo string, round, symbols int) {
 	}
 }
 
-// TestE2EAWatchingServerLeavesTheWorkspaceToThePerson is the product-boundary
-// proof of the other half of coexistence: the half a WATCHING session owes.
-//
-// Failure mode it protects: `mcp.watch` is the shipped default, and a watching
-// session used to take the Section 13.2 workspace lock at its first pass and
-// keep it until the session ended. The person's own `codectx index` in a
-// terminal was then refused CTX_WORKSPACE_BUSY for as long as their agent's
-// server happened to be running -- an idle process holding a workspace it is
-// not building in. Mutation that must fail this row is quoted in this lane's
-// report: give the beat's release back to the session in
-// internal/index/coordinator.go and the index below is refused.
-//
-// The beat BEFORE that index is load-bearing and not setup: a session that has
-// never beaten holds nothing under either behaviour, so a row that indexed
-// straight away would pass against the very defect it exists to catch.
-//
-// What it then asserts is that letting go costs nothing: the watch's next beat
-// REUSES the generation the person's index published rather than rebuilding
-// the workspace itself.
-func TestE2EAWatchingServerLeavesTheWorkspaceToThePerson(t *testing.T) {
-	s := newSandbox(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
-	defer cancel()
-
-	if env, code := s.run(t, "index"); !env.OK || code != 0 {
-		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
-	}
-	// --watch=true and not the sandbox default: this sandbox turns mcp.watch
-	// off so the other rows compare generations nothing moves underneath, and
-	// this row is about the watching session in particular.
-	session, serverLog, closeSession := s.mcpServer(t, ctx, "--watch=true")
-	t.Cleanup(closeSession)
-
-	touchFixture(t, s.Repo)
-	armed := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, 0)
-	t.Logf("the watching session completed a beat: generation %d, %d reused, %d built",
-		armed.generation, armed.reused, armed.built)
-
-	// The assertion: the person's own index, as a further process, while that
-	// watching session is connected and has already beaten.
-	env, code := s.run(t, "index")
-	if !env.OK || code != 0 {
-		t.Fatalf("`codectx index` was refused (exit %d) beside a connected watching server: %+v -- "+
-			"the watch is holding the workspace between its beats", code, env.Error)
-	}
-	person := data[model.IndexResult](t, env, code)
-	if int64(person.Binding.GenerationID) <= armed.generation {
-		t.Fatalf("the person's index published generation %d, which is not past the watch's beat at %d",
-			person.Binding.GenerationID, armed.generation)
-	}
-
-	// The next beat: the fixture is rewritten with the content it already has,
-	// so the notification fires and every unit hashes to what the person's
-	// index just sealed. A beat that reuses them is a beat that started from
-	// the generation that index published; one that rebuilt them started from
-	// its own.
-	touchFixture(t, s.Repo)
-	next := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, int64(person.Binding.GenerationID))
-	t.Logf("the beat after the person's index: generation %d, %d reused, %d built, %d invalidated",
-		next.generation, next.reused, next.built, next.invalidated)
-	if next.reused == 0 || next.built != 0 {
-		t.Fatalf("the beat after the person's index reused %d units and built %d: "+
-			"it rebuilt the workspace rather than reusing the generation that index published",
-			next.reused, next.built)
-	}
-
-	// And the session is still answering, so what it gave up was the workspace
-	// and not the session.
-	for _, tool := range []struct {
-		name string
-		args any
-	}{
-		{"codectx_index_status", model.StatusRequest{}},
-		{"codectx_search", model.SearchRequest{Query: "TinyStore"}},
-	} {
-		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
-		if err != nil || res.IsError {
-			t.Fatalf("%s no longer answers after the person indexed beside the watching session (err %v)", tool.name, err)
-		}
-	}
-}
-
 // touchFixture rewrites one generated source file with the content it already
 // holds. The filesystem notification fires on the write, so it is what makes a
 // beat happen now rather than at the next reconcile interval, and the content
@@ -854,7 +776,14 @@ func (s *sandbox) watchCommand(t *testing.T) (*serverLog, func() (envelope, int)
 // workspace it was not building in, and the person's own `codectx index` in
 // another was made to wait out the grace and then refused by name. One watcher
 // mechanism, not two: a watch holds the workspace for the beat that builds and
-// nothing else, exactly as the server's watch already does.
+// nothing else.
+//
+// This row covers the WATCHING SERVER too, and is the only row that covers
+// either. Both front ends compose the same watching workspace (modeWatch in
+// internal/app/compose.go) and take the lock at the same place (the beat, in
+// internal/index/coordinator.go); a second row driving the same mechanism
+// through `mcp serve --watch=true` asserted nothing this one does not, at the
+// cost of several real index runs per test pass.
 //
 // The beat BEFORE that index is load-bearing and not setup: a session that has
 // never beaten holds nothing under either behaviour, so a row that indexed

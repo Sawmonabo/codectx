@@ -80,13 +80,20 @@ type reclaimer struct {
 	// idle is set when the worker has looked at every set and found nothing
 	// it can free. Drain waits for it.
 	idle bool
-	// stuck holds the queued entries the reclaimer has tried and failed to
-	// free, with the reason, keyed by the entry's path. An entry here is
-	// passed over so that everything queued behind it still goes, and it is
-	// dropped -- and so retried -- at the next wake. It is what keeps a
-	// removal nothing can make from stopping every other removal in the
-	// process, and from spending a core retrying itself.
+	// stuck holds what the reclaimer has tried and could not give back, with
+	// the reason, keyed by path: a queued entry whose removal failed, or a
+	// directory it could not even list. An entry stays here until it is
+	// actually freed, because this is the DISCLOSURE an operator reads beside
+	// pending_free_bytes -- clearing it at every wake made it read empty for
+	// the whole of a run, which queues thousands of removals and therefore
+	// wakes thousands of times, in exactly the state it exists to explain.
 	stuck map[string]string
+	// tried is the skip set of this wake: what the worker has already
+	// attempted since the last wake, so everything queued behind a failure
+	// still goes and nothing is retried in a spin. THIS is what a wake
+	// clears -- the entry that could not be freed a moment ago may be
+	// freeable now -- which is the retry the disclosure above must outlive.
+	tried map[string]bool
 	// started is set when the worker goroutine is running.
 	started bool
 	// paceMu is the one place in the process a window's turn is taken. Every
@@ -100,9 +107,12 @@ type reclaimer struct {
 	// spent is the bytes freed since the last wait, at most a window. It is
 	// guarded by paceMu, because spending it is what takes a turn.
 	spent int64
-	// paceRoot is the cache directory whose turn file the processes sharing
-	// this cache take their windows through, and turnFile is that file, open.
-	// Both are read under paceMu; paceRoot is written under mu.
+	// paceRoot is the outermost cache directory this process has registered,
+	// and is the FALLBACK turn location: the turn is taken through one file
+	// above every cache of this user (see hostTurnPath), and this is where it
+	// goes only when there is no user cache directory to hold that file.
+	// turnFile is whichever of the two is open. turnFile/turnAt are read under
+	// paceMu; paceRoot is written under mu.
 	paceRoot string
 	turnFile *os.File
 	turnAt   string
@@ -120,6 +130,7 @@ func newReclaimer() *reclaimer {
 		sets:     map[string]func() (string, error){},
 		resolved: map[string]string{},
 		stuck:    map[string]string{},
+		tried:    map[string]bool{},
 		sleep:    time.Sleep,
 	}
 	r.cond = sync.NewCond(&r.mu)
@@ -301,8 +312,10 @@ func (r *reclaimer) wakeLocked() {
 	// may be freeable now -- the process holding it open has exited, the
 	// mount is writable again, the directory above it has been made
 	// writable. Retrying it here is what the reclaimer does instead of
-	// retrying it in a loop: once per wake, never in a spin.
-	clear(r.stuck)
+	// retrying it in a loop: once per wake, never in a spin. What is cleared
+	// is the skip set, never the disclosure: a retry that fails records the
+	// same reason again, and one that succeeds is what removes it.
+	clear(r.tried)
 	r.cond.Broadcast()
 }
 
@@ -350,49 +363,73 @@ func (r *reclaimer) work() {
 		// stuck, and the entry is retried in a spin that never reaches
 		// anything queued behind it. So only not-exist passes over; anything
 		// else is stuck with the reason the free itself gave.
-		if err := r.freeEntry(entry, purpose); err != nil {
-			if _, statErr := os.Lstat(entry); errors.Is(statErr, fs.ErrNotExist) {
-				continue
-			}
-			r.mu.Lock()
-			r.stuck[entry] = err.Error()
-			r.mu.Unlock()
+		err := r.freeEntry(entry, purpose)
+		r.mu.Lock()
+		r.tried[entry] = true
+		r.mu.Unlock()
+		if err == nil {
+			r.freed(entry)
+			continue
 		}
+		if _, statErr := os.Lstat(entry); errors.Is(statErr, fs.ErrNotExist) {
+			r.freed(entry)
+			continue
+		}
+		r.recordStuck(entry, err)
 	}
+}
+
+// freed drops what an entry that is gone left behind: its disclosure, because
+// an entry no operator can find is not an explanation of anything, and its
+// skip, because the path may be minted again.
+func (r *reclaimer) freed(path string) {
+	r.mu.Lock()
+	delete(r.stuck, path)
+	delete(r.tried, path)
+	r.mu.Unlock()
 }
 
 // nextEntry names one queued removal the reclaimer has not already failed on,
 // in the order the sets and their purposes read. It reports false when every
 // set holds nothing but entries this pass could not free, which is when the
 // worker has nothing left to do and goes to sleep.
+//
+// A directory it cannot LIST is recorded stuck with its reason, exactly as an
+// entry it cannot free is. Everything queued inside such a directory is space
+// this process is holding and cannot give back, and passing over it silently
+// left `pending_free_bytes` climbing with no explanation beside it and an
+// operator's `gc` reporting nothing wrong.
 func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 	r.mu.Lock()
 	sets := make([]string, 0, len(r.resolved))
 	for _, set := range r.resolved {
 		sets = append(sets, set)
 	}
-	stuck := make(map[string]bool, len(r.stuck))
-	for path := range r.stuck {
-		stuck[path] = true
+	tried := make(map[string]bool, len(r.tried))
+	for path := range r.tried {
+		tried[path] = true
 	}
 	r.mu.Unlock()
 	sort.Strings(sets)
 	for _, set := range sets {
 		purposes, err := os.ReadDir(set)
 		if err != nil {
+			r.recordStuck(set, err)
 			continue
 		}
 		for _, pe := range purposes {
 			if !pe.IsDir() {
 				continue
 			}
-			entries, err := os.ReadDir(filepath.Join(set, pe.Name()))
+			purposeDir := filepath.Join(set, pe.Name())
+			entries, err := os.ReadDir(purposeDir)
 			if err != nil {
+				r.recordStuck(purposeDir, err)
 				continue
 			}
 			for _, e := range entries {
 				path := filepath.Join(set, pe.Name(), e.Name())
-				if stuck[path] {
+				if tried[path] {
 					continue
 				}
 				return path, purposeByName[pe.Name()], true
@@ -400,6 +437,41 @@ func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 		}
 	}
 	return "", "", false
+}
+
+// recordStuck names one thing the reclaimer could not give back and why, so
+// that space it is still holding is never left without an explanation beside
+// it. A gone entry is never recorded (see work); everything else is, whether
+// it is a queued removal that failed or a directory that could not even be
+// listed. The next wake retries it; the record stands until it is freed.
+//
+// The reason is the filesystem's own, with this process's scratch path taken
+// out of it: what the removal is called inside its set is what identifies it
+// to an operator, and where this process happens to keep its pool is not
+// theirs to read (it is a path under a cache directory, in a report and a log
+// line that go to other people).
+func (r *reclaimer) recordStuck(path string, err error) {
+	r.mu.Lock()
+	r.stuck[path] = scrubPath(err.Error(), path)
+	r.tried[path] = true
+	r.mu.Unlock()
+}
+
+// scrubPath takes the absolute part of a to-free path out of a message,
+// leaving the purpose and name the entry is known by. The directories above
+// the set are what it removes, whichever of the three shapes the path has --
+// a set, a purpose directory inside it, or an entry inside that.
+func scrubPath(msg, path string) string {
+	for _, dir := range []string{
+		filepath.Dir(filepath.Dir(path)), filepath.Dir(path), path,
+	} {
+		if dir == "." || dir == string(filepath.Separator) {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, dir+string(filepath.Separator), "")
+		msg = strings.ReplaceAll(msg, dir, entryName(path))
+	}
+	return msg
 }
 
 // freeEntry gives one queued file or tree back to the filesystem at the pace,
@@ -506,10 +578,32 @@ func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, dir *os.Fil
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
+		// The unlink did not happen, so those bytes never reached the host and
+		// the budget they were charged against is given back. Without this a
+		// file whose directory refuses the unlink re-pays its whole length at
+		// every wake -- a large blob is minutes of pace per wake, spent
+		// waiting for space that was never freed and that the next wake will
+		// pay for again. The waits already made are time, and time is not
+		// returnable; the budget is.
+		r.refund(size)
 		return err
 	}
 	attribute(p, size)
 	return shrinkErr
+}
+
+// refund gives back budget charged for bytes that were not released after
+// all. It is the counterpart of charge and takes the same lock, so the two
+// can never race over spent; it never goes below zero, because a refund of
+// more than has been spent since the last wait is a refund of windows already
+// handed to the disk.
+func (r *reclaimer) refund(n int64) {
+	if n <= 0 {
+		return
+	}
+	r.paceMu.Lock()
+	defer r.paceMu.Unlock()
+	r.spent = max(r.spent-n, 0)
 }
 
 // empty truncates one regular file towards zero a window at a time, syncing
@@ -564,10 +658,10 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, dir *os.File) (int
 // parent, not the set at the top of the tree -- is synced here, which is the
 // journal commit that carries the freed extents with it.
 //
-// The budget is the host's, not one removal's and not one process's: every
-// charger waits under paceMu, and the processes over one cache take their
-// windows in turn through the file at its root, so no two of them ever hand
-// the disk two windows in one interval.
+// The budget is the host's, not one removal's, not one process's and not one
+// cache's: every charger waits under paceMu, and every process of this user
+// takes its windows in turn through one file above all its caches, so no two
+// of them ever hand the disk two windows in one interval.
 func (r *reclaimer) charge(n int64, dir *os.File) {
 	r.paceMu.Lock()
 	defer r.paceMu.Unlock()
@@ -581,15 +675,48 @@ func (r *reclaimer) charge(n int64, dir *os.File) {
 	}
 }
 
-// paceFileName is the file at a cache root whose lock and recorded time are
-// how the processes over that cache take one window's turn at a time.
+// paceFileName is the file whose lock and recorded time are how the processes
+// of this user take one window's turn at a time.
 const paceFileName = "free-pace.lock"
+
+// paceDirName is this product's own directory in the user cache, which is
+// where that file lives when there is a user cache to put it in.
+const paceDirName = "codectx"
+
+// hostTurnPath is the one turn file of this user on this host. The rate a
+// discard costs is a property of the DEVICE underneath, not of a cache
+// directory, so the turn cannot be taken per cache root: `codectx index
+// --rebuild` writes into a sibling cache while a server serves the original,
+// and two roots taking turns separately hand the host twice the measured rate
+// on an ordinary pair of commands. One file, above every cache root this user
+// opens, is what makes the sum of what this product frees on a host the rate
+// that was measured.
+//
+// It is the user's cache directory because that is the one location every
+// process of this user agrees on without being told. A user who gives two
+// processes different cache directories has given them different hosts as far
+// as this can tell, and each then keeps a pace of its own -- which is not a
+// safe degradation but the very case this exists to close: two paces hand the
+// host twice the measured rate. It is as narrow as it can be made from inside
+// the process, and it is written down here rather than described as harmless.
+func hostTurnPath() (string, bool) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Join(cache, paceDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", false
+	}
+	return filepath.Join(dir, paceFileName), true
+}
 
 // takeTurn waits until the host may be handed another window and records that
 // it has been. The record is on the disk at the cache root, under an
 // exclusive lock, so the turn is taken across processes and not only across
-// this one's chargers: two runs over one cache free at the pace between them,
-// not at twice it. The rate the measurement established is what the disk
+// this one's chargers: two runs free at the pace between them and not at twice
+// it, whether they share a cache or one of them is a --rebuild writing a
+// sibling cache beside the other. The rate the measurement established is what the disk
 // underneath tolerates, and a disk does not care how many processes are
 // asking.
 //
@@ -622,23 +749,31 @@ func (r *reclaimer) takeTurn() {
 	_, _ = f.WriteAt(record[:], 0)
 }
 
-// turn is the cache root's turn file, opened once. It reports nil when there
-// is no cache root, or when the file cannot be opened -- a read-only cache, a
-// directory already removed -- and the caller then keeps the pace for itself
-// alone, which is slower than it need be and never faster.
+// turn is this user's turn file, opened once. It is the host-wide one above
+// every cache root; only where there is no user cache directory to put it in
+// does it fall back to the cache root this process registered, which is the
+// narrower pace the rest of this package's comments describe. It reports nil
+// when there is neither, or when the file cannot be opened -- a read-only
+// cache, a directory already removed -- and the caller then keeps the pace for
+// itself alone. For ONE process that is the same rate; for two it is twice it,
+// which is why this is a last resort and not an equivalent.
 //
 // The caller holds paceMu.
 func (r *reclaimer) turn() *os.File {
-	r.mu.Lock()
-	root := r.paceRoot
-	r.mu.Unlock()
-	if root == "" {
-		return nil
+	root, ok := hostTurnPath()
+	if !ok {
+		r.mu.Lock()
+		dir := r.paceRoot
+		r.mu.Unlock()
+		if dir == "" {
+			return nil
+		}
+		root = filepath.Join(dir, paceFileName)
 	}
 	if r.turnFile != nil && r.turnAt == root {
 		return r.turnFile
 	}
-	f, err := os.OpenFile(filepath.Join(root, paceFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(root, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil
 	}

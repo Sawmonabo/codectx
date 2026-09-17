@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
@@ -88,5 +90,51 @@ func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	if got := uint64(*res.FreedBytes); got < n {
 		t.Fatalf("freed_bytes is %d while freed_by_purpose accounts %d for %s alone: the whole and its labelled part are not the same counter, so one of them is wrong",
 			got, n, paced.AnalyzerOutput)
+	}
+}
+
+// refusingLedger answers every read with the typed refusal a schema-mismatched
+// or corrupt run ledger produces, remediation and all.
+type refusingLedger struct{}
+
+func (refusingLedger) LatestRun(context.Context, model.RepositoryID, model.GenerationID) (
+	*model.RunRecord, []model.StageRecord, int64, error) {
+	return nil, nil, 0, &model.Error{Code: model.CodeSchemaMismatch,
+		Message:     "the run ledger was written by a different schema",
+		Remediation: "remove the ledger beside the store; the next run writes a new one"}
+}
+
+// The requirement: a resource block that could not read something says so.
+//
+// A schema-mismatched or corrupt run ledger produces a typed error with its own
+// remediation, and the block dropped it: no run rows, no warning, no log line,
+// exit 0. That is byte for byte the block a workspace that has never indexed
+// produces, so an operator diagnosing a problem could not tell "nothing ever
+// recorded a run here" from "your accounting file is unreadable, and here is
+// what to do about it".
+//
+// The figures themselves still stand -- the host readings the sampler produced
+// are true whatever the ledger says -- so this is a warning beside them and not
+// a failure of the call.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation: restore `if err != nil || run == nil { return }` in runLedger and
+// the block comes back with no warnings at all.
+func TestAnUnreadableRunLedgerIsDisclosedRatherThanDropped(t *testing.T) {
+	res, err := newTestService(t, Options{Ledger: refusingLedger{}}).Resources(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable run ledger failed the whole resource block: %v", err)
+	}
+	if res.Run != nil {
+		t.Fatalf("an unreadable ledger produced a run row: %+v", res.Run)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("the block carries %d warnings; want exactly the unreadable ledger", len(res.Warnings))
+	}
+	for _, want := range []string{model.CodeSchemaMismatch, "remove the ledger"} {
+		if !strings.Contains(res.Warnings[0], want) {
+			t.Fatalf("the warning %q does not carry %q: an operator cannot act on it", res.Warnings[0], want)
+		}
 	}
 }

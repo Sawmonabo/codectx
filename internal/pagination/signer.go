@@ -58,9 +58,32 @@ func OpenSigner(dir string) (*Signer, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, internalErr("token key directory: " + err.Error())
 	}
+	return openSigner(dir, false)
+}
+
+// OpenSignerForReading loads the key a process that answers questions signs
+// its continuations with, and creates nothing: not the directory, not the key.
+// A key is made by the run that built the workspace, so a workspace that has
+// one is one an answer can continue; a workspace that has none is incomplete,
+// and saying so with the remedy is the answer -- minting one here would be a
+// write by a command that promises none, and on a workspace an operator has
+// made read-only it would fail with nothing an operator could act on.
+func OpenSignerForReading(dir string) (*Signer, error) {
+	return openSigner(dir, true)
+}
+
+// openSigner is the two opens' shared body: the same key file, read the same
+// way, differing only in whether a missing one is minted or reported.
+func openSigner(dir string, readOnly bool) (*Signer, error) {
 	path := filepath.Join(dir, keyFileName)
 	key, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		if readOnly {
+			return nil, &model.Error{Code: model.CodeWorkspaceNotFound,
+				Message: "this workspace holds no continuation key, so an answer cannot be continued from it",
+				Remediation: "run `codectx index` in this workspace to build it; a command that only answers " +
+					"questions never creates one"}
+		}
 		key = make([]byte, keyBytes)
 		if _, err := rand.Read(key); err != nil {
 			return nil, internalErr("token key generation: " + err.Error())
@@ -69,7 +92,7 @@ func OpenSigner(dir string) (*Signer, error) {
 		// loser re-reads the winner's file instead of overwriting it.
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if errors.Is(err, os.ErrExist) {
-			return OpenSigner(dir)
+			return openSigner(dir, readOnly)
 		}
 		if err != nil {
 			return nil, internalErr("token key file: " + err.Error())

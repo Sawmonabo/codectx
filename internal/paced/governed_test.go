@@ -32,6 +32,31 @@ var inPlaceFrees = map[string]string{
 	"internal/snapshot/lock.go (*WorkspaceLock).Close": "clears that same one-line record as the lock is " +
 		"given up, so a waiter arriving before the next holder is told nobody recorded themselves rather " +
 		"than handed the name of a process that has let go. Same bounded line, same nothing freed.",
+	"internal/provider/dependence/neo4jcsv/keys.go (*scratch).saveKeys": "creates the key set over the " +
+		"previous import's, which is the one of these that is unbounded -- 153 MB in one recorded run. " +
+		"The old set is emptied through paced.Shrink immediately above the create, so by the time the " +
+		"truncating open runs there is nothing left for it to free.",
+	"internal/index/delta/delta.go previousState": "creates the file a predecessor's delta state is " +
+		"streamed into, which a previous call may have left as large as that predecessor's unit. It is " +
+		"emptied through paced.Shrink immediately above the open.",
+	"internal/provider/scip/compdb.go writeFileInPlace": "truncates a compilation database to write the " +
+		"rewritten one over it; the database is as large as the project it describes, so the old contents " +
+		"go back through paced.Shrink immediately above the open.",
+	"internal/tools/toollock/archive.go writeStream": "writes one entry of a verified archive into a " +
+		"freshly made extraction directory, so the target does not exist and nothing is freed. An archive " +
+		"naming one entry twice truncates the first, which is bounded by that entry's own size and so by " +
+		"the payload size the lock pins.",
+	"internal/tools/toollock/fetch.go downloadOnce": "creates the download destination, a path this " +
+		"function mints for one attempt; a retry gets its own. Nothing is there to free.",
+	"internal/tools/toollock/normalize.go packDeterministic": "creates the normalized archive beside the " +
+		"tree it packs, at a path the caller mints per normalization.",
+	"cmd/codectx/pprof.go startProfiling": "creates the CPU profile of one run, at a path named for the " +
+		"process and the moment it started, so nothing is overwritten.",
+	"cmd/codectx/pprof.go writeProfile": "creates one heap or block profile at the same kind of path, " +
+		"and for the same reason frees nothing.",
+	"internal/cli/init.go writeProjectConfig": "truncates the workspace's own config.toml to write the " +
+		"rendered one over it. A configuration file is a page of text; the whole of what this can free " +
+		"is smaller than one window.",
 }
 
 // The requirement: every free in the product is governed by the pace. A burst
@@ -47,8 +72,9 @@ var inPlaceFrees = map[string]string{
 // internal/paced fails here until it is either routed through this package or
 // written down above with its reason.
 //
-// Mutation: free one raw -- put os.Remove back at any governed call site --
-// and this names the file and the function.
+// Mutation: free one raw -- put os.Remove back at any governed call site, or
+// an os.Create over an existing file -- and this names the file and the
+// function. NOT RUN in this round (owner order 2026-09-17).
 func TestEveryFreeIsGovernedByThePace(t *testing.T) {
 	root := moduleRoot(t)
 	found := map[string]string{}
@@ -86,7 +112,14 @@ func TestEveryFreeIsGovernedByThePace(t *testing.T) {
 }
 
 // rawFree reports whether a call gives disk space back without this package:
-// os.Remove, os.RemoveAll, os.Truncate, or Truncate on a file.
+// os.Remove, os.RemoveAll, os.Truncate, Truncate on a file, or a TRUNCATING
+// OPEN -- os.Create, and os.OpenFile with O_TRUNC.
+//
+// The truncating opens are here because they free exactly what a truncation
+// frees: an existing file's blocks, all of them, in one act, before the first
+// byte of the new contents is written. Reading the enumeration as unlink and
+// truncate alone left nine of them unexamined, and a review proved the gap by
+// putting one at a governed site and watching this test stay green.
 //
 // A moment in time is truncated too, and says so: it is the result of an
 // expression rather than a named file, and it is cut to a unit of time. Both
@@ -103,8 +136,10 @@ func rawFree(call *ast.CallExpr) bool {
 	}
 	if recv != nil && recv.Name == "os" {
 		switch sel.Sel.Name {
-		case "Remove", "RemoveAll", "Truncate":
+		case "Remove", "RemoveAll", "Truncate", "Create":
 			return true
+		case "OpenFile":
+			return truncatingFlags(call)
 		}
 		return false
 	}
@@ -115,6 +150,29 @@ func rawFree(call *ast.CallExpr) bool {
 		return false
 	}
 	return len(call.Args) != 1 || !qualifiedBy(call.Args[0], "time")
+}
+
+// truncatingFlags reports whether an os.OpenFile call names os.O_TRUNC among
+// its flags. The flags are an or-ed expression, so the whole of it is walked
+// rather than matched: a call that reaches O_TRUNC through a variable is not
+// recognised here, which is why the enumeration is a floor and the list of
+// written-down sites is read by a person.
+func truncatingFlags(call *ast.CallExpr) bool {
+	if len(call.Args) < 2 {
+		return false
+	}
+	truncating := false
+	ast.Inspect(call.Args[1], func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if recv, _ := sel.X.(*ast.Ident); recv != nil && recv.Name == "os" && sel.Sel.Name == "O_TRUNC" {
+			truncating = true
+		}
+		return true
+	})
+	return truncating
 }
 
 // qualifiedBy reports whether e is pkg.Something.

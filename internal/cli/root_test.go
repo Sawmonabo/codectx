@@ -511,7 +511,7 @@ func TestInitRefusesToOverwriteProjectConfig(t *testing.T) {
 // receipt) and the signal half. The write end here is not fd 1, so the runtime
 // returns EPIPE without ever raising SIGPIPE and main.go's signal.Ignore is not
 // exercised. That 141 -> 7 path is proven against the real binary instead --
-// wave-f-verify-T18.md (b) drove `status --json | head -c 0` and observed exit
+// a verification run drove `status --json | head -c 0` and observed exit
 // 7, not 141.
 func TestBrokenStdoutPipeIsNotADefect(t *testing.T) {
 	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}

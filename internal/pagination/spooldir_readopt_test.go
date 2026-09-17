@@ -171,3 +171,95 @@ func isCode(err error, code string) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == code
 }
+
+// The requirement: a process that answers questions writes nothing at its
+// composition. Both halves of the continuation store used to: OpenSigner made
+// the data directory and MINTED a key file, and NewSpools made the spool
+// directory -- before a single question had been read, and on a workspace an
+// operator had made read-only both of them failed outright, taking the whole
+// command with them.
+//
+// So the key is read and never minted for such a process, a workspace without
+// one is a typed refusal that names the remedy, and the spool directory is made
+// by the first answer that does not fit one page.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation: make OpenSignerForReading call OpenSigner, or put the MkdirAll back
+// in NewSpools, and the read-only directory below is written into.
+func TestAnAnsweringProcessWritesNothingWhenItOpensTheContinuationStore(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability writes into a directory that grants nobody write, " +
+			"so this would pass vacuously")
+	}
+	dir := t.TempDir()
+	data := filepath.Join(dir, "data")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// A workspace with no key: the refusal is typed and carries the remedy,
+	// and nothing is created.
+	_, err := OpenSignerForReading(data)
+	if err == nil {
+		t.Fatal("a read-only open of a workspace with no continuation key succeeded")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("the refusal is untyped: %v", err)
+	}
+	if typed.Remediation == "" {
+		t.Fatalf("the refusal carries no remediation: %+v", typed)
+	}
+	if entries, readErr := os.ReadDir(data); readErr != nil || len(entries) != 0 {
+		t.Fatalf("the read-only signer open left %d entries behind (%v); want none", len(entries), readErr)
+	}
+
+	// The spool store over a directory that is not there: composing it creates
+	// nothing, and its budget reads zero rather than failing.
+	spools, err := NewSpools(filepath.Join(data, "spools"), 1<<20, noLeases{})
+	if err != nil {
+		t.Fatalf("composing the spool store over a directory that is not there: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(data, "spools")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("composing the spool store created its directory: %v", statErr)
+	}
+	// And a sweep over it reports nothing live rather than failing.
+	if live, sweepErr := spools.Sweep(context.Background(), time.Now()); sweepErr != nil || live != 0 {
+		t.Fatalf("sweeping a spool directory that is not there: %d live, %v", live, sweepErr)
+	}
+
+	// The signer of a workspace that HAS a key reads it and writes nothing,
+	// even with the directory read-only.
+	writing, err := OpenSigner(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(data, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(data, 0o700) })
+	reading, err := OpenSignerForReading(data)
+	if err != nil {
+		t.Fatalf("a read-only signer open of a workspace that has a key, on a read-only directory: %v", err)
+	}
+	token, err := writing.Sign(PurposeCursor, []byte("payload"), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, verifyErr := reading.Verify(token, PurposeCursor, time.Now()); verifyErr != nil {
+		t.Fatalf("the read-only signer read a different key: %v", verifyErr)
+	}
+	after, err := os.ReadDir(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("the read-only signer open changed the directory: %d entries before, %d after",
+			len(before), len(after))
+	}
+}

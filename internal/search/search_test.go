@@ -295,15 +295,15 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
-		// FX-H-G rows
+		// rows added with the ranking fix
 		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
 		{"fix/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
 
-		// FX-H-U rows
+		// rows added with the tokenizer fix
 		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
 
-		// FX-H-X1 rows
+		// rows added with the capability-state fix
 		{"fix/a_two_offset_node_is_served_at_the_precedence_winner",
 			legTwoOffsetNodeServesThePrecedenceWinner},
 	}
@@ -1950,7 +1950,7 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 }
 
 // ---------------------------------------------------------------------------
-// FX-H-U legs.
+// The tokenizer fix legs.
 // ---------------------------------------------------------------------------
 
 // stubFileReader answers File for any id by SYNTHESIZING the version, so a walk
@@ -2043,7 +2043,7 @@ func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
 }
 
 // ---------------------------------------------------------------------------
-// FX-H-X1 legs.
+// The capability-state fix legs.
 // ---------------------------------------------------------------------------
 
 // twoOffsetFixture is a second activated generation holding ONE file with ONE

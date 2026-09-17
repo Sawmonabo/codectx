@@ -1008,7 +1008,7 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // second one. Mutation that must fail this test: probe once per document (drop
 // the range check from occurrenceRange), which republishes the defect.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
-	// Line 5 is the FX-I-T-c shape: two spaces then a tab. "browser" sits at
+	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
 	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
 	const (

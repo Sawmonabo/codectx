@@ -945,6 +945,12 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
+	// What this block could not read, and why. A figure that is simply absent
+	// looks the same as one nothing ever recorded, so the reason is printed
+	// under the figures rather than left to the JSON.
+	for _, warning := range r.Warnings {
+		fmt.Fprintf(tw, "    warning\t%s\n", warning)
+	}
 	flushTableInto(tw)
 	writeRunLedger(b, r.Run, r.Stages, r.StagesOmitted)
 }

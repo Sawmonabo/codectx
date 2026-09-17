@@ -1,6 +1,7 @@
 package paced
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -442,5 +443,145 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 	}
 	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
 		t.Fatalf("after the retry, %d bytes await freeing (%v); want none", pending, err)
+	}
+}
+
+// The requirement: what the reclaimer could not free stays DISCLOSED until it
+// is actually freed.
+//
+// A wake retries a stuck entry, and `queue()` wakes on every removal, so a run
+// -- which queues thousands of removals -- wakes thousands of times. Clearing
+// the whole stuck map at each wake made `stuck_frees` read empty for the whole
+// of a run, in exactly the state it exists to explain: an operator watching
+// `pending_free_bytes` climb was told nothing was wrong, in both surfaces that
+// read it. What a wake clears is the SKIP set -- so the entry is retried --
+// never the record.
+//
+// A directory the reclaimer cannot even list is recorded the same way: every
+// removal queued inside it is space this process is holding and cannot give
+// back, and passing over it silently disclosed none of it.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation: put `clear(r.stuck)` back in wakeLocked (in place of
+// `clear(r.tried)`) and the disclosure is empty after the second removal.
+func TestAStuckEntryStaysDisclosedAcrossTheWakesOfARun(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability unlinks from a directory it may not write, " +
+			"so the refusal this test is built on never happens and it would pass vacuously")
+	}
+	served := t.TempDir()
+	set := filepath.Join(served, "to-free")
+	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(served, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	Drain()
+
+	// One entry that cannot be freed: a tree whose inner directory refuses the
+	// unlink of the child inside it.
+	tree := filepath.Join(served, "refused")
+	inner := filepath.Join(tree, "inner")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(inner, "child"), 4096)
+	if err := os.Chmod(inner, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveAllFor(AnalyzerOutput, tree); err != nil {
+		t.Fatal(err)
+	}
+	if stuck := mustDrain(t, 10*time.Second); len(stuck) != 1 {
+		t.Fatalf("the refused tree is reported as %v; want exactly one stuck entry", stuck)
+	}
+
+	// The wakes of a run: every removal queued after it wakes the reclaimer,
+	// and the entry above is still stuck the whole time.
+	for i := range 20 {
+		name := filepath.Join(served, fmt.Sprintf("queued-%d", i))
+		writeFile(t, name, 4096)
+		if err := RemoveFor(Materialization, name); err != nil {
+			t.Fatal(err)
+		}
+		if got := StuckFrees(); len(got) != 1 {
+			t.Fatalf("after %d further removals the reclaimer discloses %v; want the entry it still "+
+				"cannot free, which is holding the space the operator is watching", i+1, got)
+		}
+	}
+	stuck := mustDrain(t, 10*time.Second)
+	if len(stuck) != 1 {
+		t.Fatalf("after the queued removals the reclaimer reports %v; want the one it cannot free", stuck)
+	}
+	// The reason is the filesystem's, without this process's scratch path in
+	// it: the entry is named by its purpose and its name inside the set, and
+	// where the pool happens to live is not part of the answer.
+	if strings.Contains(stuck[0].Reason, served) {
+		t.Fatalf("the disclosed reason carries the absolute scratch path: %q", stuck[0].Reason)
+	}
+	if !strings.Contains(stuck[0].Reason, "permission denied") {
+		t.Fatalf("the disclosed reason is %q; want what the filesystem said", stuck[0].Reason)
+	}
+
+	// Freed at last: the record goes with it, because an entry no operator can
+	// find explains nothing.
+	if err := os.Chmod(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reclaim.wake()
+	if left := mustDrain(t, 10*time.Second); len(left) != 0 {
+		t.Fatalf("the entry is still disclosed after it was freed: %v", left)
+	}
+}
+
+// The requirement: a directory the reclaimer cannot LIST is disclosed, not
+// passed over. Everything queued inside it is space this process is holding.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation: drop the recordStuck call from nextEntry's ReadDir failure and
+// StuckFrees is empty while the bytes stay pending.
+func TestAPurposeDirectoryThatCannotBeListedIsDisclosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability lists a directory that grants nobody read, " +
+			"so the refusal this test is built on never happens and it would pass vacuously")
+	}
+	served := t.TempDir()
+	set := filepath.Join(served, "to-free")
+	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(served, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	Drain()
+
+	queued := filepath.Join(served, "queued")
+	writeFile(t, queued, 4096)
+	if err := RemoveFor(AnalyzerOutput, queued); err != nil {
+		t.Fatal(err)
+	}
+	// Neither readable nor searchable: the reclaimer can reach the purpose
+	// directory's name and nothing inside it.
+	purposeDir := filepath.Join(set, string(AnalyzerOutput))
+	if err := os.Chmod(purposeDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	reclaim.wake()
+
+	stuck := mustDrain(t, 10*time.Second)
+	if len(stuck) != 1 {
+		t.Fatalf("a purpose directory that cannot be listed is disclosed as %v; want exactly one entry", stuck)
+	}
+	if !strings.Contains(stuck[0].Reason, "permission denied") {
+		t.Fatalf("the disclosed reason is %q; want what the filesystem said", stuck[0].Reason)
 	}
 }

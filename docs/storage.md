@@ -552,12 +552,16 @@ surface never hand the disk three windows at once. Across processes the turn
 is taken through a small lock file at the cache root: a window's turn is
 locking that file, waiting out whatever remains of the interval since the last
 recorded turn, recording this one and unlocking, so an index run and a query
-server over one cache free at the pace between them rather than at twice it.
+server free at the pace between them rather than at twice it, whichever caches
+they are writing into: the turn is taken through one file per user on the host,
+above every cache root, because the rate belongs to the device and not to a
+directory.
 The remainder is clamped into one interval, because the recorded time is a
 wall clock written by another process and a clock adjustment must cost at most
-one interval rather than hang a run. A process with no cache root -- a
-standalone tool -- keeps the pace for itself alone, which is slower than it
-need be and never faster.
+one interval rather than hang a run. A process that can reach neither that file
+nor a cache root of its own -- a standalone tool on a read-only home -- keeps
+the pace for itself alone: the same rate while it is the only one, and twice it
+if a second joins, which is why that path is a last resort.
 
 A file the process may unlink but may not truncate -- every published blob is
 one, the store making its objects read-only at publication, and nothing bounds
@@ -678,8 +682,8 @@ between windows, charged to one budget and counted in `freed_bytes`. The two
 halves differ in who waits. A **removal** is renamed aside and freed by the
 reclaimer, off the run's path. An **in-place** free is a truncation of a file
 the caller keeps, or an unlink the caller must have completed when it returns,
-so it happens where it is asked for and the caller waits the windows it spends
--- at the same rate, never faster.
+so it happens where it is asked for and the caller waits the windows it spends,
+at the same rate as the reclaimer's own and through the same turn.
 
 | What | How | Why it is not pooled | Purpose |
 | --- | --- | --- | --- |
@@ -696,13 +700,18 @@ so it happens where it is asked for and the caller waits the windows it spends
 | A capture's staging database | Removal | It belongs to exactly one capture | — |
 | A dependence import's key set, emptied before the next is written over it | In place | The file keeps its name across imports | — |
 | A tool payload reset before a download is retried | In place | The staging file is written again from the start | — |
-| The engine's journals, and the log when a checkpoint truncates it | In place | The engine's own delete is waiting on it, so it must be empty when the call returns | — |
+| The engine's journals and its log, larger than one window | Removal | The engine deletes the log from inside its close, holding the database exclusively for the whole call; emptying it there is a quarter second of held lock per window, which every other process waits out at its next open | — |
+| The engine's journals and its log, one window or smaller | In place | A rename would cost a directory entry and a turn of the pace to give back less than one window | — |
 | The pools themselves, on `codectx gc` | Removal | An operator asked | `scratch-collection` |
 
 The list is enforced, not narrated: a test walks the source tree and fails on
-any `os.Remove`, `os.RemoveAll`, `os.Truncate` or file `Truncate` outside the
-pacing package that is neither routed through it nor written down beside it
-with its reason.
+any call outside the pacing package that gives a file's blocks back and is
+neither routed through it nor written down beside it with its reason. That is
+every `os.Remove`, `os.RemoveAll`, `os.Truncate` and file `Truncate`, and also
+every TRUNCATING OPEN -- `os.Create`, and `os.OpenFile` with `O_TRUNC` -- which
+frees an existing file's blocks just as a truncation does and passed the
+enumeration unseen until a review added one at a governed site and watched the
+test stay green.
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.

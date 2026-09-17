@@ -38,6 +38,12 @@ type CAS struct {
 	// free every one of them. Taking the temporary from the pool instead
 	// makes that pass free nothing at all.
 	arena *scratch.Arena
+	// readOnly is a store opened by a process that answers questions and
+	// changes nothing. It creates no directory and every entry point that
+	// would write refuses typed, because a command that stores content must
+	// be composed with a writing store rather than discover at runtime that
+	// it cannot -- the same contract the database store keeps.
+	readOnly bool
 }
 
 // OpenCAS opens or creates the store at dir (0700).
@@ -51,6 +57,37 @@ func OpenCAS(dir string) (*CAS, error) {
 	// The pool belongs to the data directory, not to the CAS inside it, so
 	// one arena serves the whole store and reports one figure.
 	return &CAS{dir: dir, arena: scratch.For(filepath.Dir(dir))}, nil
+}
+
+// OpenCASForReading opens the store at dir for a process that answers
+// questions. It creates nothing: no directory, no bucket, not the store
+// itself. A store that is not there is the workspace nothing has published --
+// the first thing an index makes is this directory -- and it is reported as
+// that, with the remedy, rather than brought into being so that the command
+// can report it empty. On a workspace an operator has made read-only, creating
+// it is also the one thing that would make the workspace unanswerable.
+func OpenCASForReading(dir string) (*CAS, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, invalid("the CAS directory must be an absolute path")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, &model.Error{Code: model.CodeNoActiveGeneration,
+				Message:     "nothing has been published in this workspace yet",
+				Remediation: "run `codectx index`"}
+		}
+		return nil, ioError("CAS directory", err)
+	}
+	return &CAS{dir: dir, arena: scratch.For(filepath.Dir(dir)), readOnly: true}, nil
+}
+
+// refuseWrite is what every storing entry point of a read-only store answers
+// with. It names the composition rather than the filesystem: the caller was
+// given a store that cannot write, which is a composition defect and not a
+// state an operator can act on.
+func (c *CAS) refuseWrite(op string) error {
+	return &model.Error{Code: model.CodeInternal,
+		Message: "this process opened the content store read-only and cannot " + op}
 }
 
 // path derives the blob location from a validated digest and nothing else.
@@ -85,6 +122,9 @@ func (c *CAS) Has(hash string) (bool, error) {
 // manifest that is already committed and so has no later barrier to order
 // against.
 func (c *CAS) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
+	if c.readOnly {
+		return model.BlobRecord{}, c.refuseWrite("store content")
+	}
 	return c.put(ctx, r, "")
 }
 
@@ -366,6 +406,12 @@ func (b *Batch) flush(ctx context.Context) error {
 // nothing was freed. The returned record is what the caller persists with
 // storage.PutBlob before any manifest names it.
 func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *scratch.Lease, *os.File, string, error) {
+	// Every blob that reaches this store passes here, whether it came through
+	// Put or through a batch, so this is the one place a read-only store has
+	// to refuse for none of them to be written.
+	if c.readOnly {
+		return model.BlobRecord{}, nil, nil, "", c.refuseWrite("store content")
+	}
 	if err := ctx.Err(); err != nil {
 		return model.BlobRecord{}, nil, nil, "", model.Canceled(err)
 	}
@@ -479,6 +525,9 @@ func indexOf(rec model.BlobRecord) source.Index {
 // derivation of an object's location; rebuilding <data>/cas/<hh>/<hash> in the
 // collector would be a second copy of the layout that can drift from this one.
 func (c *CAS) Remove(hash string) error {
+	if c.readOnly {
+		return c.refuseWrite("remove content")
+	}
 	p, err := c.path(hash)
 	if err != nil {
 		return err
@@ -529,6 +578,9 @@ func (c *CAS) Remove(hash string) error {
 // leftover file, not lost source.
 func (c *CAS) SweepOrphans(ctx context.Context, known func(context.Context, []string) (map[string]struct{}, error),
 	now time.Time, grace time.Duration, batch int) (int64, error) {
+	if c.readOnly {
+		return 0, c.refuseWrite("sweep orphans")
+	}
 	if batch <= 0 {
 		batch = defaultOrphanBatch
 	}

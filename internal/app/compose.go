@@ -520,8 +520,16 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		s.holders = 1
 	}
 	// The content store opens before the database: it holds no lock and no
-	// state of its own.
-	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
+	// state of its own. A composition that only answers opens it for reading,
+	// which creates nothing and refuses every storing entry point: this is the
+	// open that used to bring a workspace into being -- and fail outright on
+	// one an operator had made read-only -- before anything had read a byte.
+	if o.mode == modeQuery {
+		s.cas, err = snapshot.OpenCASForReading(snapshot.CASDir(s.dataDir))
+	} else {
+		s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir))
+	}
+	if err != nil {
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
@@ -585,7 +593,15 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// and a cursor issued against the old cache is refused rather than decoded
 	// against a generation that is not there. The store is the lease store: a
 	// spool lives exactly as long as the retention lease its cursor carries.
-	if s.signer, err = pagination.OpenSigner(s.dataDir); err != nil {
+	// The key is read, never minted, by a composition that only answers: a
+	// workspace that has been built has one, and a workspace that has not is
+	// told so with the remedy rather than having one written into it.
+	if o.mode == modeQuery {
+		s.signer, err = pagination.OpenSignerForReading(s.dataDir)
+	} else {
+		s.signer, err = pagination.OpenSigner(s.dataDir)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if s.spools, err = pagination.NewSpools(filepath.Join(s.dataDir, workDirName, spoolsDirName),
