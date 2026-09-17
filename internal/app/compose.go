@@ -610,9 +610,20 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// unlimited and admits every reservation, so the default never refuses a
 	// child at admission. Only a value the operator set refuses one, and it
 	// says so with resources.max_temp_bytes named in the error.
+	// The runner beneath the admission gate must never refuse what the gate
+	// admitted. The gate runs a child larger than the whole allocation ALONE
+	// rather than refusing it, and a unit's reservation is its heap cap --
+	// itself bounded by the allocation -- plus the memory its family keeps
+	// outside the heap, so the largest child a unit can present is always
+	// larger than the allocation. A runner budgeted at the allocation would
+	// refuse precisely that unit, with the resource-limit error the whole
+	// memory ruling exists to avoid. This is the same rule the language-server
+	// runner below states: the budget is wide enough for the largest child the
+	// gate above it can admit.
+	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
 	shared, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     childSlots(childMemory),
-		MemoryBudgetBytes: childMemory,
+		MaxConcurrent:     childSlots(sharedBudget),
+		MemoryBudgetBytes: sharedBudget,
 		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
 	})
 	if err != nil {

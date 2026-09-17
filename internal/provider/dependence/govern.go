@@ -248,9 +248,17 @@ func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 
 // Reserve sizes the reservation of a unit of sourceBytes bytes on machine m.
 // The heap cap is the family's estimate from the unit's byte count, never
-// below the floor, and bounded above by the machine-derived allocation when
-// one could be observed. Nothing here can reject the unit: a cap that is
-// narrower than the estimate costs the unit time, never its facts.
+// below the floor, and bounded above by the allocation the unit will be
+// admitted against. Nothing here can reject the unit: a cap that is narrower
+// than the estimate costs the unit time, never its facts.
+//
+// Where the machine could not be observed the cap is NOT bounded: a bound
+// invented for an unreadable machine is a default memory ceiling by another
+// name, which docs/research/00-synthesis.md Section 8 forbids. Admission does
+// stand a figure in there (SchedulingAllocation), because a gate with no bound
+// is not a gate, so on those platforms alone a unit is sized without a bound
+// and admitted against the stand-in. That asymmetry is deliberate on both
+// sides and is recorded as an open question rather than resolved here.
 func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
 		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
@@ -302,6 +310,31 @@ func (g Governor) RetryCap(r Reservation, peakBytes int64) int64 {
 		return 0
 	}
 	return cap
+}
+
+// MaxChildReservationBytes is the largest reservation Reserve can produce for
+// any family on a machine whose scheduling allocation is allocationBytes. It
+// is the figure a process runner beneath the admission gate must be able to
+// admit: the gate runs a child larger than the whole allocation alone rather
+// than refusing it, so a runner budgeted at the allocation would refuse
+// exactly the unit the gate just admitted, and "refusing work for memory" is
+// not a thing this product does.
+//
+// It is derived from the shipped constants rather than stated: the cap is
+// bounded by the allocation, and the most any family adds on top of it is the
+// largest non-heap residency plus the largest helper allowance. The export
+// step's allowance is included in the same maximum because a unit reserves the
+// peak of its two steps, not their sum.
+func MaxChildReservationBytes(allocationBytes int64) int64 {
+	var above int64 = exportResident
+	for _, v := range residentAboveHeap {
+		above = max(above, v)
+	}
+	var helper int64
+	for _, v := range helperAllowance {
+		helper = max(helper, v)
+	}
+	return allocationBytes + above + helper
 }
 
 // itoa renders a byte figure for a bounded error detail.
