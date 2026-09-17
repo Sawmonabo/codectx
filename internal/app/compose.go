@@ -599,8 +599,12 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// configuration rather than read from a constant: the reservations this
 	// process makes up front grow with the core count, so a host with more
 	// cores keeps more for itself and offers its children less. The same
-	// figure sizes the units (the governor below), so a unit is never sized
-	// against one allocation and admitted against another.
+	// figure sizes the units (the governor below), so on a host whose memory
+	// can be observed a unit is sized against the allocation it is admitted
+	// against. Where the host publishes no figure the two deliberately differ:
+	// sizing invents no bound there and admission stands one in. That is
+	// stated on both sides in govern.go and is an open question, not a claim
+	// that they always agree.
 	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
 	if s.admission, err = admission.NewLedger(childMemory); err != nil {
 		return nil, err
