@@ -566,7 +566,7 @@ func edited(files map[string]string, path, content string) map[string]string {
 // succeed; a bound invented when the machine is unreadable is a default memory
 // ceiling by another name.
 func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
-	g := dependence.NewGovernor(0)
+	g := dependence.NewGovernor(0, testBaseFootprintBytes)
 	plenty := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}
 
 	small := g.Reserve(dependence.FamilyGo, 1<<20, plenty)
@@ -880,9 +880,66 @@ func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
 // belong to the one ledger every heavy child of the process shares.
 func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(m.SchedulingAllocation())
+	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes))
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
 	return l
+}
+
+// testBaseFootprintBytes stands in for what the composition derives from the
+// machine and the configuration (config.BaseFootprint). It is the shipped
+// defaults on a 16-core host -- 32 MiB idle + 16 query slots x 32 MiB + 32 MiB
+// cache + 16 MiB queue -- stated here rather than imported so this package's
+// tests do not resolve a configuration to size a reservation.
+const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
+
+// TestAllocationSubtractsTheDerivedBaseFootprint protects the rule that the
+// scheduling allocation is derived from THIS machine and THIS process's own
+// footprint: half of what was available, less what this process already holds.
+//
+// Failure mode it guards: a base footprint that does not reach the allocation
+// -- a constant, or a figure that does not follow the core count -- hands the
+// children memory the parent has already promised itself, so every heavy child
+// is admitted against bytes that are not there and the host is over-committed.
+//
+// Both branches of the min() are exercised deliberately. On a large host the
+// host-share branch binds and the footprint is invisible, which is why a
+// test that only looked at a roomy machine would pass with the base footprint
+// ignored entirely; the small-memory, many-core row is the one that binds on
+// the subtraction, and it is also the shape that used to be refused outright.
+func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
+	const margin = dependence.DefaultSafetyMarginBytes
+	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
+	const base128 = 32<<20 + 128*(32<<20) + 32<<20 + 16<<20
+
+	for _, c := range []struct {
+		name      string
+		available int64
+		base      int64
+		want      int64
+		binds     string
+	}{
+		{"64 GiB, 16 cores: the host keeps half", 64 << 30, testBaseFootprintBytes, 32 << 30, "host share"},
+		{"8 GiB, 128 cores: the footprint binds", 8 << 30, base128, 8<<30 - base128 - margin, "subtraction"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := dependence.Machine{AvailableBytes: c.available, Observed: true}
+			got := m.SchedulingAllocation(c.base)
+			if got != c.want {
+				t.Errorf("allocation is %d, want %d (the %s branch binds): the allocation is not "+
+					"available memory less this process's own footprint, bounded by the host's share",
+					got, c.want, c.binds)
+			}
+		})
+	}
+	// The same machine, a larger base footprint, must leave the children less.
+	// This is the whole point of deriving it: a host with more cores reserves
+	// more for itself.
+	m := dependence.Machine{AvailableBytes: 8 << 30, Observed: true}
+	if bigger, smaller := m.SchedulingAllocation(testBaseFootprintBytes), m.SchedulingAllocation(base128); bigger <= smaller {
+		t.Errorf("a %d-byte base footprint left the children %d and a %d-byte one left them %d; "+
+			"a larger footprint must leave a smaller allocation",
+			testBaseFootprintBytes, bigger, base128, smaller)
+	}
 }

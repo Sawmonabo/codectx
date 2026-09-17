@@ -20,11 +20,7 @@ package dependence
 // is not a memory cap, so the reservation adds the resident memory the
 // frontend keeps outside the heap, measured per family in research Section 10.
 
-import (
-	"strconv"
-
-	"github.com/Sawmonabo/codectx/internal/config"
-)
+import "strconv"
 
 const (
 	kiB = 1 << 10
@@ -38,10 +34,10 @@ const (
 const DefaultUnitMemoryFloorBytes int64 = 768 * miB
 
 // DefaultSafetyMarginBytes is the headroom the machine-derived allocation
-// leaves for transient allocation and resident-set variation on top of
-// config.BaseFootprintBytes, which is the one figure for what this process
-// keeps for itself (Section 23.3: degrade concurrency before coverage, and
-// leave headroom rather than allocate to the last byte).
+// leaves for transient allocation and resident-set variation on top of the
+// base footprint its caller derives for this process (Section 23.3: degrade
+// concurrency before coverage, and leave headroom rather than allocate to the
+// last byte).
 const DefaultSafetyMarginBytes int64 = 1 * giB
 
 // UnobservedAllocationBytes is the allocation used on a host that does not
@@ -214,8 +210,16 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 // UnobservedAllocationBytes where the platform does not expose available
 // memory. It is always positive, so admission is always bounded by a sum of
 // reservations and never by a count of children.
-func (m Machine) SchedulingAllocation() int64 {
-	if alloc := m.Allocation(config.BaseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
+//
+// baseFootprintBytes is what this process holds for itself, which its caller
+// derives from this machine and the configuration (config.BaseFootprint). It
+// is a parameter and not a constant read from here because a figure typed into
+// this package could not follow the core count: the reservations the process
+// makes up front grow with the machine, and an allocation computed against a
+// fixed figure hands the children memory the parent has already promised
+// itself.
+func (m Machine) SchedulingAllocation(baseFootprintBytes int64) int64 {
+	if alloc := m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
 		return alloc
 	}
 	return UnobservedAllocationBytes
@@ -231,12 +235,15 @@ type Governor struct {
 }
 
 // NewGovernor applies the default floor when the caller left it at zero.
-func NewGovernor(floorBytes int64) Governor {
+// baseFootprintBytes is this process's own footprint on this machine, derived
+// by the caller exactly as SchedulingAllocation's is, so the allocation a unit
+// is sized against and the one it is admitted against are the same figure.
+func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 	if floorBytes <= 0 {
 		floorBytes = DefaultUnitMemoryFloorBytes
 	}
 	return Governor{FloorBytes: floorBytes,
-		BaseFootprint: config.BaseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
+		BaseFootprint: baseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
 }
 
 // Reserve sizes the reservation of a unit of sourceBytes bytes on machine m.

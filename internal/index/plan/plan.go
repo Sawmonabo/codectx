@@ -635,7 +635,8 @@ func (b *builder) emit(ctx context.Context) error {
 		return err
 	}
 	b.plan.shared = shared
-	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes)
+	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes,
+		config.BaseFootprint(b.in.Config))
 	machine := dependence.ObserveMachine()
 	deferDependence := b.in.Config.Providers.Dependence.Enabled == config.Auto
 

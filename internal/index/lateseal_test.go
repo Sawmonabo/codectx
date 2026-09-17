@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -44,8 +46,16 @@ func TestDeferredUnitsOverlapWithinTheAllocation(t *testing.T) {
 	snap := res.Binding.SnapshotID
 	// A machine whose allocation is known, so the reservations below are two
 	// fifths and three fifths of it rather than byte counts that assume a host.
-	c.sched = plan.NewScheduler(dependence.Machine{AvailableBytes: 32 << 30, Observed: true})
-	allocation := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}.SchedulingAllocation()
+	// The base footprint is the one this process derives from the machine and
+	// the configuration, exactly as the composition does: what the units are
+	// admitted against here is the figure the product would use.
+	allocation := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}.
+		SchedulingAllocation(config.BaseFootprint(c.opts.Config))
+	ledger, err := admission.NewLedger(allocation)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	c.sched = plan.NewScheduler(ledger)
 
 	t.Run("two units that fit the allocation run at once", func(t *testing.T) {
 		p.reset(2)

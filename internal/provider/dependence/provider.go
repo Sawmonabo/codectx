@@ -90,6 +90,13 @@ type Options struct {
 	// UnitMemoryFloorBytes is the smallest heap cap a unit is given. Nothing
 	// rejects a unit for the memory it asks for; the cap only sizes it.
 	UnitMemoryFloorBytes int64
+	// BaseFootprintBytes is what this process holds for itself on this
+	// machine, derived by the composition from the machine and the
+	// configuration (config.BaseFootprint). The governor subtracts it from
+	// available memory, so it must be the same figure the admission allocation
+	// was derived from or a unit is sized against one allocation and admitted
+	// against another.
+	BaseFootprintBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
 	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
@@ -179,7 +186,7 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	}
 	sweepPrivate(opts.DataDir)
 	return &Provider{backend: backend, importer: importer, opts: opts,
-		gov: NewGovernor(opts.UnitMemoryFloorBytes), cache: cache, engine: e}, nil
+		gov: NewGovernor(opts.UnitMemoryFloorBytes, opts.BaseFootprintBytes), cache: cache, engine: e}, nil
 }
 
 // Descriptor is the static contract. Version is the adapter version plus the

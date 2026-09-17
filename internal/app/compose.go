@@ -594,7 +594,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// count of children and nothing is configurable: the allocation is
 	// available memory less this process's own footprint and the safety
 	// margin, never more than the share of the machine the product takes.
-	childMemory := dependence.ObserveMachine().SchedulingAllocation()
+	//
+	// The footprint it subtracts is DERIVED from this machine and this
+	// configuration rather than read from a constant: the reservations this
+	// process makes up front grow with the core count, so a host with more
+	// cores keeps more for itself and offers its children less. The same
+	// figure sizes the units (the governor below), so a unit is never sized
+	// against one allocation and admitted against another.
+	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
 	if s.admission, err = admission.NewLedger(childMemory); err != nil {
 		return nil, err
 	}
@@ -876,6 +883,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				StallTimeout:         s.cfg.Providers.Dependence.StallTimeout.Std(),
 				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
+				BaseFootprintBytes:   config.BaseFootprint(s.cfg),
 				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
 				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,

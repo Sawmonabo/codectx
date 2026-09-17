@@ -5,16 +5,6 @@ import (
 	"runtime"
 )
 
-// BaseFootprintBytes is the figure the machine-derived allocation subtracts
-// from available memory before handing the rest to the analyzers and language
-// servers this process starts.
-//
-// It is a constant and not a setting, because it describes what this build
-// does rather than what the operator wants. Over-stating it only leaves the
-// children less, so where the measurement is uncertain the larger figure is
-// the safe one.
-const BaseFootprintBytes int64 = 1 << 30
-
 // IdleFootprintBytes is what this process holds before it reserves anything:
 // the Go runtime, the resolved configuration, the open store and the bounded
 // buffers a command needs to answer at all. Everything else in the footprint
