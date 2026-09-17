@@ -78,30 +78,56 @@ const hostShareDenominator = 2
 //
 // The estimate is deliberately the cap itself and not a fraction of the
 // machine. A frontend grows toward whatever cap it is given and does not need
-// it: on a 157 MB JavaScript project, one measured parse took 3 m 38 s under
-// a 4 GiB cap and 3 m 41 s with no cap at all, while the process tree's peak
-// resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
+// it: on a 157.2 MiB JavaScript project, one measured parse took 3 m 38 s
+// under a 4 GiB cap and 3 m 41 s with no cap at all, while the process tree's
+// peak resident memory rose from 5.4 GB to 9.7 GB at 8 GiB and to 14.3 GB at
 // 16 GiB, for exports whose method, call, control-dependence and
 // data-dependence counts were identical. A cap sized to the machine therefore
 // buys nothing and takes the host's memory away from everything else running
 // on it.
+//
+// One unit system: the derivations below divide bytes by bytes. Mixing binary
+// GiB with decimal MB is what put the JavaScript row at 48, a figure whose
+// stated derivation did not reproduce and whose product was 1.84x the ceiling
+// it claimed to double.
 var heapPerSourceByte = map[Family]int64{
 	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
 	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
 	FamilyJava:       256, // 1.5M-line Java repository wanted ~8 GiB to avoid collector thrashing
-	FamilyJavaScript: 48,  // 157 MB of JavaScript over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all
+	FamilyJavaScript: 52,  // 164,865,219 B over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all, so 2 x 4 GiB / 164,865,219 = 52.10
 	FamilyPython:     640, // 1.05M-line Python tree needed ~18 GiB uncapped and failed closed at 4 GiB
 	FamilyRust:       640, // 56k-line Cargo workspace peaked at 1.77 GB of tree RSS, most of it outside the heap
 }
 
 // residentAboveHeap is the resident memory the frontend keeps outside the
-// heap, measured per family in research Section 10. It is why a heap cap
-// cannot be used as the reservation.
+// heap. It is why a heap cap cannot be used as the reservation.
+//
+// Method, for a row derived from a measured run: peak resident set of the
+// whole process tree MINUS the heap cap the run was given. That difference is
+// the non-heap residency only where the heap was actually filled to its cap;
+// where it was not, the difference is smaller than the truth by whatever the
+// heap left unused, so such a row UNDER-states and must not be the row a
+// reservation is taken from. Under-reserving is the direction that fails a
+// unit, so where rows disagree the derivation takes the one whose inputs are
+// exact and whose cap the product actually chose.
+//
+// Every row but JavaScript comes from research Section 10 rather than from a
+// run measured here, and is left as it stands. Across the reference runs' 42
+// engine parse steps no C, Go or Rust unit ran at all, and the Java and Python
+// units never filled their caps (peak minus cap of -190 and 87 MiB), so for
+// those five families this method yields no observation. That is recorded as
+// unavailable, which is not zero and is not a licence to lower a row.
 var residentAboveHeap = map[Family]int64{
-	FamilyC:          2662 * miB, // native parser memory
-	FamilyGo:         512 * miB,
-	FamilyJava:       448 * miB,
-	FamilyJavaScript: 1712 * miB, // the syntax helper holds the whole project's trees outside the heap
+	FamilyC:    2662 * miB, // native parser memory
+	FamilyGo:   512 * miB,
+	FamilyJava: 448 * miB,
+	// The syntax helper holds the whole project's trees outside the heap. From
+	// the reference run's ledger for this unit, the one datapoint recorded in
+	// bytes rather than in a rounded unit and taken at the cap the product
+	// itself chose: 10,099,015,680 B of peak tree residency against a
+	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB. The 1712 this
+	// replaces read a decimal-GB figure as binary GiB.
+	FamilyJavaScript: 2084 * miB,
 	FamilyPython:     1945 * miB,
 	FamilyRust:       256 * miB,
 }

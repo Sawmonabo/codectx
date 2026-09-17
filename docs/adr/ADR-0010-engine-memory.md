@@ -26,8 +26,8 @@ was the measurement for this family at this size.
 ## Decision
 
 1. **The heap ceiling comes from the unit's bytes with headroom, never from the machine.** The
-   JavaScript/TypeScript constant is 48 bytes of heap per byte of source (the former 512 gave the
-   157 MB unit 84 GB), derived below; the other families keep their research-derived constants.
+   JavaScript/TypeScript constant is 52 bytes of heap per byte of source (the former 512 gave the
+   157.2 MiB unit a 78.6 GiB ceiling), derived below; the other families keep their research-derived constants.
    The machine-derived allocation bounds the ceiling only when the estimate exceeds it, as before.
 2. **The allocation leaves the host half of what was available when the run began.** The allocation
    the scheduler sums reservations against is the smaller of available memory minus the base
@@ -92,6 +92,18 @@ full speed, the research's headroom rule (§4, observation 3). 52 × 164,865,219
 7.98 GiB, which is 1.996× the 4 GiB ceiling — the multiple the rule claims is the multiple the
 code produces. The 48 this replaces was reachable only by dividing binary GiB by decimal MB
 (4 GiB × 2 ÷ 157 MB = 48.5); it yielded 7,913,530,512 B = 7.37 GiB, 1.84× the ceiling, not twice.
+
+The same unit's resident memory outside the heap, the second constant this ADR's tables carry, is
+peak tree residency minus the heap cap the run was given. That difference is the non-heap
+residency only where the heap was filled to its cap; where it was not, it is smaller than the
+truth by whatever the heap left unused. Of the rows available, only the reference run records both
+figures in bytes rather than in a rounded unit, and it is the cap the product itself chose for
+this unit: 10,099,015,680 − 7,913,530,512 = 2,185,485,168 B = **2084 MiB**, against the 1712 MiB
+shipped before, which read the sweep's decimal-GB column as binary GiB ((9.67 − 8) × 1024 = 1710).
+Read in one unit system the 8 GiB row gives 1030 MiB, but that run's heap was not filled — its
+tree peaked below the ceiling — so 1030 under-states and is not the figure to reserve against.
+Both constants therefore RISE: the JavaScript reservation for this unit goes from 7.37 GiB + 1712
+MiB to 7.98 GiB + 2084 MiB. Raising a reservation costs concurrency; lowering one fails a unit.
 
 Fact identity had to be measured elsewhere, for the reason the table above gives: the whole unit
 exports nothing at any ceiling, so there is no pair of exports to compare. It was measured on the
