@@ -703,7 +703,9 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	// Ended after the graph-presence check, so the span's outcome is the
 	// verdict on the step and not the child's exit code: a zero exit that left
 	// no graph is a failed parse, and its span must say so.
-	span.End(spanOutcome(out), measured(out), nil)
+	m := measured(out)
+	overran(&m, unit.ScopeKey, res.Bytes())
+	span.End(spanOutcome(out), m, nil)
 	return out, nil
 }
 
@@ -787,7 +789,9 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 	// that exited cleanly over a unit with source and carries no method is
 	// judged FailureEmptyExport by the caller afterwards; that verdict belongs
 	// to the unit, whose own span records it.
-	span.End(spanOutcome(out.Outcome), measured(out.Outcome), nil)
+	m := measured(out.Outcome)
+	overran(&m, unit.ScopeKey, res.Bytes())
+	span.End(spanOutcome(out.Outcome), m, nil)
 	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
 		"exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,

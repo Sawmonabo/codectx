@@ -358,3 +358,75 @@ func TestTheWaitingLineFollowsTheHolderOnOneLine(t *testing.T) {
 		t.Fatalf("the rewritten line must not keep the previous stage's tail, got %q", printed)
 	}
 }
+
+// A unit whose process tree peaks above the reservation it was admitted
+// against took memory the machine had already promised to another unit, which
+// is the direction that freezes the host the product is running on. The
+// reference runs held exactly one such unit, reproducibly, and nothing in the
+// product said so. This holds the whole disclosure: the named count, the scope
+// of the unit that overran, and -- just as load-bearing -- that a unit whose
+// tree this platform never sampled is NOT counted as an overrun, because
+// nothing was measured and an absent measurement is never a figure.
+//
+// Failure mode protected: a heavy unit silently overruns its reservation and
+// no operator can see that it did, or which one.
+func TestAnOverrunUnitIsCountedAndNamedOnTheResourcesBlock(t *testing.T) {
+	peak := func(n uint64) *uint64 { return &n }
+	overran := int64(1)
+	report := model.ResourceReport{
+		AnalyzerUnits: []model.AnalyzerUnit{
+			{ScopeKey: "pkg:javascript:app", Family: "javascript",
+				ReservationBytes: 9_704_251_392, HeapCapBytes: 7_913_530_512,
+				ObservedPeakBytes: peak(10_099_015_680)},
+			{ScopeKey: "pkg:go:service", Family: "go",
+				ReservationBytes: 9_704_251_392, ObservedPeakBytes: peak(1 << 30)},
+			// Never sampled: no peak, so no verdict either way.
+			{ScopeKey: "pkg:python:tool", Family: "python", ReservationBytes: 1 << 20},
+		},
+		AnalyzerOverrunUnits: &overran,
+	}
+	var b strings.Builder
+	writeResources(&b, report)
+	out := b.String()
+
+	if !strings.Contains(out, "analyzer units over reservation") {
+		t.Fatalf("the resources block names no overrun count:\n%s", out)
+	}
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "analyzer units over reservation") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, "1") {
+		t.Fatalf("the overrun count line is %q, want the one unit that overran", line)
+	}
+	for _, want := range []struct {
+		scope   string
+		overran bool
+	}{
+		{"pkg:javascript:app", true},
+		{"pkg:go:service", false},
+		{"pkg:python:tool", false},
+	} {
+		for _, l := range strings.Split(out, "\n") {
+			if !strings.Contains(l, want.scope) {
+				continue
+			}
+			if got := strings.Contains(l, "OVER RESERVATION"); got != want.overran {
+				t.Fatalf("the row for %s marks an overrun %v, want %v: %q", want.scope, got, want.overran, l)
+			}
+		}
+	}
+	// The same comparison the count is derived from, held against the rows it
+	// covers, so the two surfaces can never come to different answers.
+	counted := int64(0)
+	for _, u := range report.AnalyzerUnits {
+		if u.OverranReservation() {
+			counted++
+		}
+	}
+	if counted != overran {
+		t.Fatalf("the rows say %d units overran, the count says %d", counted, overran)
+	}
+}

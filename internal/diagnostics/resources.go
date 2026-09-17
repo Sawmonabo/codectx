@@ -59,6 +59,22 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	// it is process accounting: a unit's reservation and the peak its tree
 	// reached belong to the run that started it, not to a stored generation.
 	report.AnalyzerUnits = dependence.ObservedUnits()
+	if len(report.AnalyzerUnits) > 0 {
+		// A unit that peaked above what it was admitted against took memory
+		// the machine had accounted for elsewhere, which is the direction that
+		// freezes a host. The rows above already carry both figures; this is
+		// the count, so an overrun reaches an operator reading the block
+		// rather than only one comparing every row by hand. It is absent where
+		// this process ran no heavy unit -- nothing was measured -- and zero
+		// where it ran them and none overran.
+		overran := int64(0)
+		for _, u := range report.AnalyzerUnits {
+			if u.OverranReservation() {
+				overran++
+			}
+		}
+		report.AnalyzerOverrunUnits = &overran
+	}
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)

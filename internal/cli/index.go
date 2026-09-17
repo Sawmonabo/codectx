@@ -921,6 +921,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"awaiting freeing", byteMetric(r.PendingFreeBytes)},
 		{"live subprocesses", countMetric(r.LiveSubprocesses)},
 		{"pending events", countMetric(r.PendingEvents)},
+		{"analyzer units over reservation", countMetric(r.AnalyzerOverrunUnits)},
 		{"units reused", countMetric(r.UnitsReused)},
 		{"units parsed", countMetric(r.UnitsParsed)},
 	} {
@@ -943,9 +944,15 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	// three together is the whole point -- a peak far under the cap says the
 	// unit was serialized behind memory it never used.
 	for _, u := range r.AnalyzerUnits {
-		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s\n",
+		// The count above says how many overran; this names which, on the row
+		// that already carries both figures it is a comparison of.
+		overran := ""
+		if u.OverranReservation() {
+			overran = ", OVER RESERVATION"
+		}
+		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s%s\n",
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
-			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
+			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
 	}
 	flushTableInto(tw)
 	writeRunLedger(b, r.Run, r.Stages, r.StagesOmitted)

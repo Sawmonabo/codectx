@@ -423,3 +423,67 @@ func (r *Reader) LiveStage(ctx context.Context) (stage string, live bool, err er
 	}
 	return stage, true, nil
 }
+
+// A RecordedPeak is the largest process-tree peak this ledger ever recorded
+// for one scope key, across every run it still holds. PeakBytes is a
+// measurement that was actually taken: a scope whose spans carry no peak has
+// no RecordedPeak at all, because "nothing sampled this tree" and "this tree
+// used no memory" are different facts and a zero would state the second.
+type RecordedPeak struct {
+	ScopeKey  string
+	PeakBytes int64
+}
+
+// RecordedPeaks is what this workspace has already measured its own heavy work
+// to cost: for each scope key, the largest peak resident size any span
+// recorded for it, largest first, at most limit rows.
+//
+// It is one indexed-free aggregate over the spans table per reading and never
+// one per scope: a caller takes this page once and answers every scope from
+// it, so the cost of consulting the history does not grow with the number of
+// units consulting it. limit is the explicit finite bound Section 6 requires;
+// a limit outside (0, model.MaxRecordsPerResult] takes that ceiling. Ordering
+// by the peak descending is what makes the truncation safe to reason about --
+// a page that could not hold every scope holds the largest measurements, which
+// are the ones an under-reservation would be built on.
+//
+// Only peaks above zero are answered. A recorded zero is a real measurement,
+// but it can never raise anything a caller derived, so carrying it would spend
+// a row of the bound on a figure with no effect; a NULL peak is not a
+// measurement at all and is excluded by the same clause.
+func (r *Reader) RecordedPeaks(ctx context.Context, limit int) ([]RecordedPeak, error) {
+	if limit <= 0 || limit > model.MaxRecordsPerResult {
+		limit = model.MaxRecordsPerResult
+	}
+	const query = `SELECT scope_key, MAX(peak_rss_bytes) AS peak FROM spans
+		WHERE peak_rss_bytes > 0 AND scope_key <> ''
+		GROUP BY scope_key ORDER BY peak DESC, scope_key LIMIT ?`
+	rows, err := r.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, wrap("read the recorded peaks", err)
+	}
+	defer rows.Close()
+	out := make([]RecordedPeak, 0, limit)
+	for rows.Next() {
+		var row RecordedPeak
+		var peak sql.NullInt64
+		if err := rows.Scan(&row.ScopeKey, &peak); err != nil {
+			return nil, wrap("read the recorded peaks", err)
+		}
+		// MAX over a group is NULL where the group holds no measurement. The
+		// WHERE clause already excludes such groups; the guard stands because
+		// reading a NULL back as the zero database/sql would give is exactly
+		// how an absent observation becomes a peak of zero, and a peak of zero
+		// answered as observed would collapse the figure a caller derives from
+		// it.
+		if !peak.Valid || peak.Int64 <= 0 {
+			continue
+		}
+		row.PeakBytes = peak.Int64
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrap("read the recorded peaks", err)
+	}
+	return out, nil
+}
