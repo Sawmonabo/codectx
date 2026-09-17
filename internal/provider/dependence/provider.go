@@ -392,7 +392,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
 		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
 		"derived_rows", report.DerivedRows, "over_max_derived_rows", report.OverDerivedRows,
-		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
+		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", allocationForLog(res),
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
 		"keys_removed", report.Removed)
 	return Report{Result: result, Keys: report.Keys,
@@ -691,7 +691,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	out, err := p.backend.Parse(ctx, ParseRequest{SourceDir: source, OutputPath: graph, Family: unit.Family,
 		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
-		span.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+		span.End(ledger.OutcomeFailed, unmeasured(), err)
 		return Outcome{}, err
 	}
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
@@ -711,7 +711,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	// Ended after the graph-presence check, so the span's outcome is the
 	// verdict on the step and not the child's exit code: a zero exit that left
 	// no graph is a failed parse, and its span must say so.
-	span.End(spanOutcome(out), measured(out), nil)
+	span.End(spanOutcome(out), measured(out), spanFailure(out, unit.ScopeKey, res))
 	return out, nil
 }
 
@@ -782,14 +782,14 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: run.path("export"),
 		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
-		span.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+		span.End(ledger.OutcomeFailed, unmeasured(), err)
 		return ExportOutcome{}, err
 	}
 	// The span is the child's, so it carries the child's verdict. An export
 	// that exited cleanly over a unit with source and carries no method is
 	// judged FailureEmptyExport by the caller afterwards; that verdict belongs
 	// to the unit, whose own span records it.
-	span.End(spanOutcome(out.Outcome), measured(out.Outcome), nil)
+	span.End(spanOutcome(out.Outcome), measured(out.Outcome), spanFailure(out.Outcome, unit.ScopeKey, res))
 	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
 		"exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
@@ -912,32 +912,32 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		graph := run.path("graph-" + itoa(int64(i)))
 		out, err := p.parse(partCtx, req, unit, res, filepath.Join(source, child), graph, nil)
 		if err != nil {
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+			part.End(ledger.OutcomeFailed, unmeasured(), err)
 			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
 			tally.Failed++
-			part.End(ledger.OutcomeFailed, measured(out), nil)
+			part.End(ledger.OutcomeFailed, bracketed(), spanFailure(out, child, res))
 			continue
 		}
 		dir := run.path("export-" + itoa(int64(i)))
 		timeout, err := remaining(partCtx)
 		if err != nil {
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+			part.End(ledger.OutcomeFailed, unmeasured(), err)
 			return ImportReport{}, 0, err
 		}
 		exportCtx, exportSpan := ledger.Start(partCtx, stageExport, child)
 		exp, err := p.backend.Export(exportCtx, ExportRequest{GraphPath: graph, OutputDir: dir,
 			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
-			exportSpan.End(ledger.OutcomeFailed, ledger.Measured{}, err)
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+			exportSpan.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, unmeasured(), err)
 			return ImportReport{}, 0, err
 		}
-		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), nil)
+		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), spanFailure(exp.Outcome, child, res))
 		if exp.Class != FailureNone {
 			tally.Failed++
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
+			part.End(ledger.OutcomeFailed, bracketed(), spanFailure(exp.Outcome, child, res))
 			continue
 		}
 		if !exp.Live {
@@ -945,7 +945,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			// That is the empty export of a part, and it is counted apart from
 			// a failure so the unit's reason can tell the two apart.
 			tally.Empty++
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
+			part.End(ledger.OutcomeFailed, bracketed(), emptyPart(child, exp.Outcome, res))
 			continue
 		}
 		// No delta options: a part's key set is a subset of the unit's, so
@@ -956,12 +956,12 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		report, err := p.importExport(partCtx, req, unit, filepath.Join(source, child),
 			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
-			part.End(ledger.OutcomeFailed, ledger.Measured{}, err)
+			part.End(ledger.OutcomeFailed, unmeasured(), err)
 			return ImportReport{}, 0, err
 		}
 		total = merge(total, report)
 		admitted++
-		part.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+		part.End(ledger.OutcomeOK, bracketed(), nil)
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {

@@ -20,12 +20,15 @@ import (
 // whole method bodies, and a zero-exit dead graph misread as success admits an
 // empty analysis as a fresh one.
 //
-// The inputs are the real engine's own bytes, captured from Joern 4.0.627 runs
-// recorded in the lane report; only absolute paths were rewritten so the
-// fixtures carry no developer's home directory. The timed pass-crash line is
-// built from the `Pass %s failed in %.0f ms` format string read out of
-// io.shiftleft.passes.CpgPassBase in the pinned payload, with the throwable
-// the release logs alongside it. linker-pass-crash.stderr is the head of a
+// The inputs are the real engine's own bytes, captured from runs of the
+// pinned payload; only absolute paths were rewritten so the fixtures carry no
+// developer's home directory. The timed pass-crash line is built from the
+// `Pass %s failed in %.0f ms` format string read out of the pass base class in
+// that payload, with the throwable the release logs alongside it.
+//
+// Mutation that fails it: in classify (stderr.go), return FailureEngine for an
+// out-of-memory stderr instead of FailureMemory -- the memory cases then fail
+// with the class they were misread as. linker-pass-crash.stderr is the head of a
 // real crash's standard error, recorded from a parse of the two source files
 // that reproduce it; its pass line is the untimed `Pass <name> failed` form,
 // which an earlier parser did not match — so a crash the product could have
