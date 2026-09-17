@@ -147,6 +147,21 @@ const maxFailedScopesNamed = 8
 // providerFailures aggregates one provider's failed scopes for the capability
 // fold: how many failed, how many were planned, and a bounded, sorted sample
 // of the scope keys with the reason each carried.
+//
+// THE COUNTING RULE, stated once for every surface that reports these figures:
+// a capability's planned total is every scope the plan assigned to its
+// provider for this generation -- the units it runs, the stale predecessors it
+// carries and the sealed units it reuses -- and its failed total is those of
+// them that did not seal. Both are counted in exactly one place,
+// coveredProviders, and published in exactly one place, failureRow.publish, as
+// the units_planned and units_failed details of the capability row. The
+// completion block of `codectx index`, `codectx status` and the index-status
+// tool all render that row and none of them recounts, so one generation cannot
+// read differently on two of them.
+//
+// Counting only the units the build walks is what published "2 planned, 2
+// failed" for a provider that sealed nine scopes and failed two: a row saying
+// every unit failed over a capability that answers most queries.
 type providerFailures struct {
 	units   int
 	planned int
@@ -1252,9 +1267,6 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 	}); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	for id, agg := range failed {
-		agg.planned = planned[id]
-	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true
 		published[c.ProviderID] = true
@@ -1263,7 +1275,20 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool, fail
 		if id, _, ok := strings.Cut(key, "\x00"); ok {
 			out[id] = true
 			published[id] = true
+			// A reused scope is a scope the plan assigned this provider: it
+			// is sealed already, so the walk above never yields it, and
+			// leaving it out of the total is what let a provider that sealed
+			// nine scopes and failed two publish "2 planned, 2 failed". A
+			// carried scope needs no such addition -- the planner emits its
+			// unit as well as its carry row, so the walk has already counted
+			// it.
+			planned[id]++
 		}
+	}
+	// The planned total is settled only here, once every source of a planned
+	// scope has been folded in.
+	for id, agg := range failed {
+		agg.planned = planned[id]
 	}
 	return out, deferred, failed, published, nil
 }

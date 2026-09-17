@@ -428,3 +428,68 @@ func TestCoverageNeverReportsFreshOverAFailedPlannedUnit(t *testing.T) {
 		t.Error("the published capability row carries the raw tool output the run row alone may keep")
 	}
 }
+
+// TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes protects the one
+// counting rule: a capability's units_planned is every scope the plan assigned
+// its provider, and units_failed is those of them that did not seal.
+//
+// Failure mode: a provider seals nine scopes it reused from the previous
+// generation and fails the two the plan gave it to run. `planned` was counted
+// from the walked units alone, so the row published "2 planned, 2 failed" --
+// every unit failed, for a capability that answers nine scopes' worth of
+// queries. An operator reading that row escalates a healthy provider, and the
+// same wrong pair is what `status`, the completion block and the index-status
+// tool all render, because all four read this row.
+//
+// Mutation proof: in coveredProviders, drop the `planned[id]++` from the
+// Plan.Reuse loop.
+func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
+	t.Parallel()
+	const id, capability = "scip", "precise_definitions"
+	const reused, walked = 9, 2
+
+	g := &generation{
+		caps: newCapabilityReport(),
+		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
+			ID: id, Version: "1", Capabilities: []string{capability}}}}},
+		published: map[string]bool{id: true},
+	}
+	failures := &providerFailures{}
+	g.plan.Reuse = map[string]model.UnitID{}
+	for i := range reused {
+		g.plan.Reuse[plan.Key(id, "pkg:go:sealed"+strconv.Itoa(i))] = model.UnitID(strings.Repeat("a", 64))
+	}
+	var walkedScopes []string
+	for i := range walked {
+		scope := "pkg:go:refused" + strconv.Itoa(i)
+		walkedScopes = append(walkedScopes, scope)
+		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable})
+	}
+	g.failures = map[string]*providerFailures{id: failures}
+	g.plan.Units = func(yield func(plan.Unit) error) error {
+		for _, scope := range walkedScopes {
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := g.coverage(t.Context()); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if len(rows) != 1 {
+		t.Fatalf("coverage published %d rows, want one: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if got, want := row.Details[unitsPlannedDetail], strconv.Itoa(reused+walked); got != want {
+		t.Errorf("the row reports %s=%q, want %q: the reused scopes the plan assigned this provider are planned scopes",
+			unitsPlannedDetail, got, want)
+	}
+	if got, want := row.Details[unitsFailedDetail], strconv.Itoa(walked); got != want {
+		t.Errorf("the row reports %s=%q, want %q", unitsFailedDetail, got, want)
+	}
+	if row.State != model.CapabilityPartial {
+		t.Errorf("capability state %q, want partial: nine scopes are in this generation", row.State)
+	}
+}
