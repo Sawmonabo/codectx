@@ -32,6 +32,7 @@ package index
 import (
 	"context"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -164,6 +165,13 @@ type Options struct {
 	// exactly as it would otherwise, because a nil ledger opens a nil run
 	// whose spans do nothing.
 	Ledger *ledger.Ledger
+	// Admission is the process's one memory admission ledger, and it is
+	// required: every heavy unit this coordinator runs is admitted against it,
+	// and a coordinator that observed the machine and built its own would be a
+	// second running total bounded by the same allocation -- two gates, two
+	// totals, one machine, and a process free to reserve twice what the host
+	// has.
+	Admission *admission.Ledger
 	// RunLedgerReader reads back the rows this process's runs recorded, and is
 	// how a finished run states in its own result what it did. It may be nil,
 	// which is a coordinator whose results carry no run: a composition that
@@ -274,6 +282,9 @@ func New(o Options) (*Coordinator, error) {
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}
+	if o.Admission == nil {
+		return nil, invalid("the coordinator needs the process memory admission ledger heavy units are admitted against")
+	}
 	workDir := filepath.Join(o.Config.Storage.DataDir, "work", "index")
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, internalErr("index work directory: " + err.Error())
@@ -282,7 +293,7 @@ func New(o Options) (*Coordinator, error) {
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
 		workers: workerCount(o.Config.Index.Workers),
-		sched:   plan.NewScheduler(dependence.ObserveMachine()),
+		sched:   plan.NewScheduler(o.Admission),
 	}
 	if c.log == nil {
 		c.log = slog.Default()

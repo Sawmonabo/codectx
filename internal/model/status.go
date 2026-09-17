@@ -236,12 +236,20 @@ type ResourceReport struct {
 	QueryReservationBytes *uint64 `json:"query_reservation_bytes,omitempty"`
 	CacheReservationBytes *uint64 `json:"cache_reservation_bytes,omitempty"`
 	QueueReservationBytes *uint64 `json:"queue_reservation_bytes,omitempty"`
-	LiveSubprocesses      *int64  `json:"live_subprocesses,omitempty"`
-	PendingEvents         *int64  `json:"pending_events,omitempty"`
-	DatabaseBytes         *uint64 `json:"database_bytes,omitempty"`
-	WALBytes              *uint64 `json:"wal_bytes,omitempty"`
-	TempBytes             *uint64 `json:"temp_bytes,omitempty"`
-	CASBytes              *uint64 `json:"cas_bytes,omitempty"`
+	// AdmissionAllocationBytes is the one machine-derived allocation every
+	// heavy child of this process is admitted against, and
+	// AdmissionReservedBytes the sum currently reserved against it by the
+	// children running now. They are the whole of this process's heavy-memory
+	// accounting: one allocation, one total, whatever the child is. Both are
+	// absent where this process composed no admission ledger.
+	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
+	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
+	LiveSubprocesses         *int64  `json:"live_subprocesses,omitempty"`
+	PendingEvents            *int64  `json:"pending_events,omitempty"`
+	DatabaseBytes            *uint64 `json:"database_bytes,omitempty"`
+	WALBytes                 *uint64 `json:"wal_bytes,omitempty"`
+	TempBytes                *uint64 `json:"temp_bytes,omitempty"`
+	CASBytes                 *uint64 `json:"cas_bytes,omitempty"`
 	// FreedBytes is the disk space this process has given back to the
 	// filesystem since it started, one window at a time. A run reuses the
 	// space it holds and frees only the leftovers of a dead run at its start,
@@ -345,6 +353,8 @@ func (r ResourceReport) Validate() error {
 		{"resources.query_reservation_bytes", r.QueryReservationBytes},
 		{"resources.cache_reservation_bytes", r.CacheReservationBytes},
 		{"resources.queue_reservation_bytes", r.QueueReservationBytes},
+		{"resources.admission_allocation_bytes", r.AdmissionAllocationBytes},
+		{"resources.admission_reserved_bytes", r.AdmissionReservedBytes},
 		{"resources.database_bytes", r.DatabaseBytes},
 		{"resources.wal_bytes", r.WALBytes},
 		{"resources.temp_bytes", r.TempBytes},

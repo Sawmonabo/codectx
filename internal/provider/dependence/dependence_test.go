@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"maps"
 	"os"
 	"path/filepath"
@@ -632,10 +633,11 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 // on a small machine a count admits work whose summed reservations the host
 // cannot hold.
 //
-// Mutation: give Scheduler a maxHeavy of 1 again -- add `maxHeavy int` set to
-// 1 by NewScheduler and `if s.admitted >= s.maxHeavy { return }` at the head of
-// pump -> "a 32 GiB machine admitted 1 of four 4 GiB reservations at once; how
-// much runs at once is being decided by a count, not by the allocation".
+// Mutation: give the admission ledger a maxHeavy of 1 again -- add
+// `maxHeavy int` set to 1 by NewLedger and `if l.admitted >= l.maxHeavy
+// { return }` at the head of pump -> "a 32 GiB machine admitted 1 of four
+// 4 GiB reservations at once; how much runs at once is being decided by a
+// count, not by the allocation".
 func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// The reservation is built directly so the figures in this test are the
 	// ones being asserted about, not a family estimate that would move with a
@@ -648,7 +650,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 
 	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
 	// four of these reservations.
-	big := plan.NewScheduler(dependence.Machine{AvailableBytes: 32 << 30, Observed: true})
+	big := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 32 << 30, Observed: true}))
 	var releases []func()
 	for i := 0; i < 4; i++ {
 		admitted, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -678,7 +680,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// The same reservation on an 8 GiB machine: the allocation is 4 GiB, so
 	// exactly one runs, and it runs because an idle scheduler admits any single
 	// unit whatever it reserves -- work is never refused for memory.
-	small := plan.NewScheduler(dependence.Machine{AvailableBytes: 8 << 30, Observed: true})
+	small := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 8 << 30, Observed: true}))
 	release, err := small.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an 8 GiB machine admitted nothing: %v", err)
@@ -870,4 +872,17 @@ func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
 		t.Errorf("the parse stage reports %v/%v transferred bytes for a child nothing counted them for: "+
 			"an unsampled figure must be absent, never an observed zero", got.ReadBytes, got.WriteBytes)
 	}
+}
+
+// schedulerLedger is the process admission ledger a scheduler front is bound
+// to, over the allocation this machine observation derives. The scheduler no
+// longer observes a machine itself: the allocation and the running total
+// belong to the one ledger every heavy child of the process shares.
+func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(m.SchedulingAllocation())
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
 }

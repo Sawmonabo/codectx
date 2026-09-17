@@ -66,7 +66,7 @@ func TestAServerStartIsRecordedAgainstTheProcessOverlayRun(t *testing.T) {
 			}
 		}
 	})
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, AllocationBytes: 8 << 30,
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30),
 		IdleTTL: 200 * time.Millisecond, StopTimeout: 500 * time.Millisecond,
 		RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second, Ledger: led})
 	if err != nil {

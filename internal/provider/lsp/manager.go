@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -43,13 +44,18 @@ type Options struct {
 	// DataDir is the data directory; materializations live under
 	// snapshot.MaterializeDir(DataDir).
 	DataDir string
-	// AllocationBytes is the machine-derived allocation every running server
-	// is admitted against. Servers are admitted by the sum of the memory
+	// Admission is the process's one memory admission ledger -- the handle the
+	// composition root built, never a second one: a manager with a running
+	// total of its own would admit servers against an allocation the analysis
+	// engine is already holding, and the process would reserve a multiple of
+	// the machine's memory. Servers are admitted by the sum of the memory
 	// reservations their pinned definitions declare, never by a count: a
 	// monorepo answers as many projects at once as the machine has room for,
 	// and one whose reservation is larger than the whole allocation runs alone
 	// rather than being refused.
-	AllocationBytes int64
+	//
+	// It is not the run ledger below; the two share a word and nothing else.
+	Admission *admission.Ledger
 	// MaxOutstandingRequests caps in-flight requests per server
 	// (providers.lsp.max_outstanding_requests).
 	MaxOutstandingRequests int
@@ -111,12 +117,7 @@ const (
 type Manager struct {
 	opts Options
 
-	mu sync.Mutex
-	// used is the summed reservation of every entry currently holding room in
-	// the allocation, and free is closed and replaced whenever room is given
-	// back, which is how a waiting Open learns to look again.
-	used    int64
-	free    chan struct{}
+	mu      sync.Mutex
 	servers map[serverKey]*entry
 	// mats holds one materialization per snapshot, shared read-only by every
 	// server of that snapshot. A server only ever READS the tree -- everything
@@ -150,15 +151,15 @@ type materialization struct {
 }
 
 // entry is one server slot: ready is closed once the start attempt finished,
-// with either srv or err set. bytes is the room it holds in the allocation,
-// and released guards the give-back so an entry removed twice -- a failed
-// start that is both forgotten and dropped by Open -- returns its room once.
+// with either srv or err set. release gives the room it holds in the ledger
+// back; the ledger's own release is idempotent, so an entry removed twice -- a
+// failed start that is both forgotten and dropped by Open -- returns its room
+// once.
 type entry struct {
-	ready    chan struct{}
-	srv      *server
-	err      error
-	bytes    int64
-	released bool
+	ready   chan struct{}
+	srv     *server
+	err     error
+	release func()
 }
 
 // New validates and defaults the options.
@@ -170,8 +171,8 @@ func New(opts Options) (*Manager, error) {
 		return nil, invalid("the lsp manager needs an absolute data directory")
 	}
 	def := config.Defaults().Providers.LSP
-	if opts.AllocationBytes <= 0 {
-		return nil, invalid("the lsp manager needs the machine allocation servers are admitted against")
+	if opts.Admission == nil {
+		return nil, invalid("the lsp manager needs the process memory admission ledger servers are admitted against")
 	}
 	for _, b := range []struct {
 		name  string
@@ -226,7 +227,7 @@ func New(opts Options) (*Manager, error) {
 	if opts.MaxOverlayBytes.Exceeded(opts.MaxFrameBytes) {
 		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
-	return &Manager{opts: opts, free: make(chan struct{}),
+	return &Manager{opts: opts,
 		servers: make(map[serverKey]*entry), live: make(map[*server]struct{}),
 		mats: make(map[model.SnapshotID]*materialization)}, nil
 }
@@ -236,11 +237,12 @@ func New(opts Options) (*Manager, error) {
 // afterwards. Two projects of one repository are two servers: a server
 // resolves a project from the directory it was started in, so one server
 // rooted at a monorepo's workspace root knows none of the projects under it.
-// The profile must come from Resolve. When the machine has no room left for
-// this server, an idle one is stopped to make room; when every running server
-// is in use, the open waits for one of them rather than being refused --
-// another project's server already running is never an answer of
-// CTX_RESOURCE_LIMIT.
+// The profile must come from Resolve. Room for the server is taken from the
+// process's one admission ledger, in turn behind every other heavy child that
+// asked first. When the machine has no room left for this server, an idle one
+// is stopped to make room; when every running server is in use, the open waits
+// for room rather than being refused -- another project's server already
+// running is never an answer of CTX_RESOURCE_LIMIT.
 func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Profile) (*Overlay, error) {
 	if view == nil {
 		return nil, invalid("an overlay needs a snapshot view")
@@ -294,56 +296,73 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 }
 
 // slot finds or reserves the entry for key, admitting bytes against the
-// allocation. starter is true when the caller must start the server and
-// complete the entry.
+// process's admission ledger. starter is true when the caller must start the
+// server and complete the entry.
+//
+// The ledger is never asked for room while this manager's mutex is held: the
+// wait can be long, and the ledger calls stopIdle back, which takes that
+// mutex. The entry is therefore published after the room is granted, and the
+// map is re-checked then -- another Open may have started this very server
+// while this one queued, and the room it took is handed straight back.
 func (m *Manager) slot(ctx context.Context, key serverKey, bytes int64) (*entry, bool, error) {
-	for {
-		m.mu.Lock()
-		if m.closed {
-			m.mu.Unlock()
-			return nil, false, unavailable("the lsp manager is closed")
-		}
-		if e, ok := m.servers[key]; ok {
-			m.mu.Unlock()
-			return e, false, nil
-		}
-		// The sum is checked only against something already admitted, exactly
-		// as the heavy-analyzer gate does: with nothing running, a server is
-		// admitted whatever it reserves, so a definition larger than the whole
-		// allocation runs alone instead of never.
-		if m.used == 0 || m.used+bytes <= m.opts.AllocationBytes {
-			e := &entry{ready: make(chan struct{}), bytes: bytes}
-			m.servers[key] = e
-			m.used += bytes
-			m.mu.Unlock()
-			return e, true, nil
-		}
-		// No room. Stop one server nobody is using, if there is one, and look
-		// again; otherwise wait for room rather than refusing the open.
-		var idle *server
-		for k, e := range m.servers {
-			select {
-			case <-e.ready:
-			default:
-				continue
-			}
-			if e.srv != nil && e.srv.isIdle() {
-				idle = e.srv
-				m.dropLocked(k, e)
-				break
-			}
-		}
-		free := m.free
+	m.mu.Lock()
+	if m.closed {
 		m.mu.Unlock()
-		if idle != nil {
-			idle.stop()
+		return nil, false, unavailable("the lsp manager is closed")
+	}
+	if e, ok := m.servers[key]; ok {
+		m.mu.Unlock()
+		return e, false, nil
+	}
+	m.mu.Unlock()
+
+	// Queued first-in-first-out behind every other heavy child of this process,
+	// so a server can never overtake an engine unit that asked first. What it
+	// may still do, when it reaches the head and does not fit, is stop a server
+	// nobody is using: another project's server already running is never an
+	// answer of CTX_RESOURCE_LIMIT.
+	release, err := m.opts.Admission.Reserve(ctx, bytes, m.stopIdle)
+	if err != nil {
+		return nil, false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		release()
+		return nil, false, unavailable("the lsp manager is closed")
+	}
+	if e, ok := m.servers[key]; ok {
+		release()
+		return e, false, nil
+	}
+	e := &entry{ready: make(chan struct{}), release: release}
+	m.servers[key] = e
+	return e, true, nil
+}
+
+// stopIdle stops one server nobody is using, which gives its room back to the
+// ledger. It is the make-room step the ledger runs for a server open that has
+// reached the head of the queue and does not fit; a manager holding nothing
+// idle frees nothing and the open simply waits its turn.
+func (m *Manager) stopIdle() {
+	m.mu.Lock()
+	var idle *server
+	for k, e := range m.servers {
+		select {
+		case <-e.ready:
+		default:
 			continue
 		}
-		select {
-		case <-free:
-		case <-ctx.Done():
-			return nil, false, model.Canceled(ctx.Err())
+		if e.srv != nil && e.srv.isIdle() {
+			idle = e.srv
+			m.dropLocked(k, e)
+			break
 		}
+	}
+	m.mu.Unlock()
+	if idle != nil {
+		idle.stop()
 	}
 }
 
@@ -409,17 +428,15 @@ func (m *Manager) releaseMat(id model.SnapshotID) error {
 	return shared.mat.Close()
 }
 
-// dropLocked removes an entry and gives its room back exactly once, waking
-// every Open that is waiting for room. The mutex must be held.
+// dropLocked removes an entry and gives its room back to the ledger, which
+// admits whatever now fits -- an open of this manager's or an engine unit's,
+// the ledger does not distinguish them. The mutex must be held; the ledger's
+// release is idempotent, so an entry dropped twice returns its room once.
 func (m *Manager) dropLocked(key serverKey, e *entry) {
 	delete(m.servers, key)
-	if e.released {
-		return
+	if e.release != nil {
+		e.release()
 	}
-	e.released = true
-	m.used -= e.bytes
-	close(m.free)
-	m.free = make(chan struct{})
 }
 
 // isIdle reports a running server with no overlay open on it.
