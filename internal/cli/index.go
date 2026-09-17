@@ -113,16 +113,18 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			}
 			// --watch changes what this command IS, so it changes how it is
 			// composed: a one-shot index owns the workspace for its whole run
-			// and waits at its open for a holder that is getting somewhere,
-			// while a watching session owns it for the beat that builds -- its
-			// base generation below included, which takes the very same
-			// counted hold through svc.Index. There is no waiting line on that
-			// path because nothing on it waits.
-			open := openForBuild(app.OpenOptions{Operation: "index", OnWaiting: waitingForHolder(cmd, args),
-				Rebuild: req.Rebuild, SCIPImport: scipIndex, SCIPManifest: scipInputs})
+			// and takes it at its open, while a watching session owns it for
+			// the beat that builds -- its base generation below included, which
+			// takes the very same counted hold through svc.Index. Both wait
+			// there for a holder that is getting somewhere, because both are a
+			// person waiting on the index they just asked for, so both carry
+			// the same waiting line.
+			opts := app.OpenOptions{Operation: "index", OnWaiting: waitingForHolder(cmd, args),
+				Rebuild: req.Rebuild, SCIPImport: scipIndex, SCIPManifest: scipInputs}
+			open := openForBuild(opts)
 			if req.Watch {
-				open = openForWatch(app.OpenOptions{Operation: "index --watch",
-					Rebuild: req.Rebuild, SCIPImport: scipIndex, SCIPManifest: scipInputs})
+				opts.Operation = "index --watch"
+				open = openForWatch(opts)
 			}
 			return runService(cmd, open,
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
@@ -370,8 +372,10 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			// runner `index` and `refresh` use: one open dance, one Close, and
 			// a cancellation typed once. It opens through the WATCHING opener,
 			// which takes the workspace for the beat that builds instead of for
-			// the session, so it passes no waiting line: nothing in this open
-			// waits. It declares no --timeout, so no deadline is installed over
+			// the session. It passes no waiting line because it runs no build a
+			// person is waiting on -- every one of its holds is a beat, which
+			// is skipped rather than queued. It declares no --timeout, so no
+			// deadline is installed over
 			// a session that is meant to run until it is stopped, and the
 			// *Services it is handed goes unread because streaming is
 			// deliberately not a facade operation (digest 17 Section 4) --

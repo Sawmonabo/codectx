@@ -54,9 +54,11 @@ func openForBuild(o app.OpenOptions) opener {
 // the person's own `codectx index` beside it runs.
 //
 // It is separate from openForBuild rather than a flag on it because the two
-// differ in what the composition IS, which is also what decides that a
-// one-shot command waits for a progressing holder and a beat does not: there is
-// no waiting line to pass here, because nothing in this open waits.
+// differ in what the composition IS: when the lock is taken. How patient each
+// acquisition is belongs to the operation, so the waiting line is passed here
+// too -- `codectx index --watch` builds its base generation through the
+// coordinator, and that build waits for a holder that is getting somewhere and
+// says what it is behind while it waits.
 func openForWatch(o app.OpenOptions) opener {
 	return func(ctx context.Context, repo string) (*app.Workspace, error) {
 		return app.OpenWorkspaceForWatch(ctx, repo, o)
