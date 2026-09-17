@@ -995,7 +995,8 @@ func childProjects(source string, unit Unit) ([]string, error) {
 	slices.Sort(out)
 	if len(out) == 0 {
 		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
-			WithDetail("reason", "the unit has no boundary below it to split along")
+			WithDetail("reason", "the unit has no boundary below it to split along").
+			WithRemediation("the failing pass and exception on the crash that forced this split are what identifies the defect upstream")
 	}
 	return out, nil
 }

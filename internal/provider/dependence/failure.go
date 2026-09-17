@@ -196,7 +196,8 @@ type partTally struct {
 }
 
 // subdivisionEmpty is the typed failure for a subdivided unit no part of which
-// produced a method. "no part produced an honest result" is the same
+// produced a method. A unit with no part at all never reaches it: childProjects
+// refuses the split before the parts run. "no part produced an honest result" is the same
 // restatement emptyExport removes, so this names the tally instead, and names
 // the refusal when the frontend refuses the whole unit's source -- which is
 // exactly how a crashed unit of that shape ends up here.
@@ -210,12 +211,6 @@ func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, refu
 	if unit.Files > 0 && refused >= unit.Files {
 		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so no part of the subdivided unit had anything to analyse"
 		return err.WithRemediation(refusedRemediation)
-	}
-	if t.Parts == 0 {
-		// Nothing to tally: the unit crashed and holds no child project to
-		// analyse separately, so subdivision had no split to make.
-		err.Message = "the dependence unit failed: the analysis crashed and the unit holds no child project it could be split into, so no part of it was analysed"
-		return err.WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream; this unit cannot be split further")
 	}
 	err.Message = "the dependence unit failed: no part of the subdivided unit produced a method -- " +
 		strconv.Itoa(t.Failed) + " of " + strconv.Itoa(t.Parts) + " failed in the analysis and " +
