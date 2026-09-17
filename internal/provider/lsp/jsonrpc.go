@@ -58,13 +58,15 @@ type conn struct {
 	handler  serverRequestHandler
 
 	// moved counts every byte this connection has read from or written to the
-	// server. It is the progress signal a request is watched against: a server
-	// that is still sending frames -- a partial result, a progress
-	// notification, a log line -- or still being written to is working, however
-	// long its answer takes, and only a connection on which nothing at all
-	// moves is hung. Section 20.2's wall-clock request deadline could not tell
-	// a monorepo's first request from a wedged server; this can.
+	// server. It is the connection-wide fallback progress signal, used only
+	// where no processor-time signal exists; see progress.
 	moved atomic.Int64
+
+	// cpu is the child's live processor time, published by the runner that
+	// started it. It is the signal that keeps a server computing an answer in
+	// silence alive: bytes on the wire alone cannot tell that server from a
+	// wedged one.
+	cpu cpuProgress
 
 	writeMu sync.Mutex
 	// written counts the bytes sent inside the current window, and windowStart
@@ -96,6 +98,14 @@ type conn struct {
 	failure error
 }
 
+// cpuProgress reports a running child's consumed processor time and whether
+// this platform observes it at all. It is process.CPUProgress in the product
+// -- the handle the runner binds to the sampler that already measures every
+// child -- and one method is the whole of what the hang detector needs.
+type cpuProgress interface {
+	Ticks() (int64, bool)
+}
+
 // maxQueuedReplies bounds the answers to server-initiated requests waiting to
 // be written. Four is more than any server has outstanding against a client
 // that answers everything with a constant; beyond it the server is not
@@ -109,12 +119,15 @@ type reply struct {
 	err error
 }
 
-func newConn(rw io.ReadWriter, maxFrame, maxWrite int64, maxOutstanding int, handler serverRequestHandler) *conn {
+func newConn(rw io.ReadWriter, maxFrame, maxWrite int64, maxOutstanding int,
+	cpu cpuProgress, handler serverRequestHandler) *conn {
+
 	return &conn{
 		reader:   bufio.NewReaderSize(rw, 64<<10),
 		writer:   rw,
 		maxFrame: maxFrame,
 		maxWrite: maxWrite,
+		cpu:      cpu,
 		handler:  handler,
 		slots:    make(chan struct{}, maxOutstanding),
 		replies:  make(chan message, maxQueuedReplies),
@@ -362,11 +375,50 @@ func (c *conn) write(msg message) error {
 	return writeFrame(c.writer, payload)
 }
 
-// watchProgress returns a context that ends when the connection has moved no
-// bytes in either direction for window, a predicate that reports whether it
-// was the detector that ended it, and a stop function that must be called on
-// every path. A zero or negative window is no detector at all and hands the
-// caller's own context straight back.
+// progress is the one number a request's hang detector watches: the processor
+// time the language server child has consumed. A server computing an answer in
+// silence is working, however long the project it is answering about takes,
+// and only a child that is neither computing nor answering is wedged. This is
+// the same signal the subprocess stall watchdog sums into its own -- the
+// figure is sampled once, by that watchdog's sampler, and published here
+// through process.CPUProgress, so there is one sampler and not two.
+//
+// It is deliberately NOT the connection's byte count. That count is
+// per-connection while a hang is per-request, so a chatty sibling -- another
+// request's answer, a diagnostics stream, a log line -- speaks for a request
+// the server has wedged on and hides it for as long as the session lives.
+// There is no per-request byte signal to put in its place: this client sends
+// no partial-result or work-done token, so the protocol attributes nothing to
+// a request before its answer, and the answer itself ends the wait.
+//
+// Two limits, stated because the parity with the subprocess watchdog has to be
+// honest rather than claimed. Processor time is the whole child's, so a
+// sibling request burning CPU still speaks for a wedged one; the protocol
+// carries no per-request resource account and the signal cannot be narrower
+// than the process. And a server that emits frames while consuming less than
+// one clock tick of processor time for a whole window reads as wedged; that
+// costs a live but effectively idle session, where counting its bytes would
+// cost every wedged request on a busy connection.
+//
+// Where the platform cannot sample a running tree there is no processor-time
+// signal at all, and the connection's byte count stands in. The fallback
+// restores exactly the masking above, which is the right trade for it: it
+// cannot terminate a server that is progressing, and on such a platform there
+// is nothing else to watch.
+func (c *conn) progress() int64 {
+	if c.cpu != nil {
+		if ticks, ok := c.cpu.Ticks(); ok {
+			return ticks
+		}
+	}
+	return c.moved.Load()
+}
+
+// watchProgress returns a context that ends when the request being watched has
+// made no progress for window, a predicate that reports whether it was the
+// detector that ended it, and a stop function that must be called on every
+// path. A zero or negative window is no detector at all and hands the caller's
+// own context straight back.
 //
 // The predicate is what keeps the outcome honest: the context ends by
 // cancellation either way, and without it a hung server would be reported as
@@ -385,7 +437,7 @@ func (c *conn) watchProgress(ctx context.Context, window time.Duration) (context
 		poll := max(window/4, 10*time.Millisecond)
 		ticker := time.NewTicker(poll)
 		defer ticker.Stop()
-		last, quietSince := c.moved.Load(), time.Now()
+		last, quietSince := c.progress(), time.Now()
 		for {
 			select {
 			case <-stop:
@@ -393,7 +445,7 @@ func (c *conn) watchProgress(ctx context.Context, window time.Duration) (context
 			case <-watched.Done():
 				return
 			case now := <-ticker.C:
-				if seen := c.moved.Load(); seen != last {
+				if seen := c.progress(); seen != last {
 					last, quietSince = seen, now
 					continue
 				}

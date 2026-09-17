@@ -59,10 +59,11 @@ type Options struct {
 	// MaxOutstandingRequests caps in-flight requests per server
 	// (providers.lsp.max_outstanding_requests).
 	MaxOutstandingRequests int
-	// RequestStallTimeout is how long a request tolerates no bytes moving on
-	// the connection in either direction before the server is declared hung
+	// RequestStallTimeout is how long a request tolerates the server making no
+	// observable progress before it is declared hung
 	// (providers.lsp.stall_timeout). It is a hang detector, never a deadline on
-	// an answer: a server that is still reading or writing is working.
+	// an answer: a server that is still consuming processor time is working,
+	// and only one that is neither computing nor answering is wedged.
 	RequestStallTimeout time.Duration
 	// IdleTTL is how long a server with no open overlay is kept
 	// (providers.lsp.idle_ttl).

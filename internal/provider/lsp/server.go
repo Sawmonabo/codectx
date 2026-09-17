@@ -160,8 +160,12 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	}
 	s.stdinR, s.stdinW = io.Pipe()
 	s.stdoutR, s.stdoutW = io.Pipe()
+	// The child's live processor time, sampled by the runner and read by the
+	// connection's per-request hang detector: a server computing an answer in
+	// silence is working, and nothing on the wire says so.
+	cpu := &process.CPUProgress{}
 	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes.Value(),
-		m.opts.MaxOutstandingRequests, s.handleServerRequest)
+		m.opts.MaxOutstandingRequests, cpu, s.handleServerRequest)
 
 	workDir := p.workDir(m.opts.DataDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -208,6 +212,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		// bytes cost nothing to let through.
 		MaxStdoutBytes:         0,
 		MaxStderrBytes:         0,
+		CPUProgress:            cpu,
 		Timeout:                p.Timeout,
 		Grace:                  m.opts.StopTimeout,
 		MemoryReservationBytes: p.MemoryBudgetBytes,

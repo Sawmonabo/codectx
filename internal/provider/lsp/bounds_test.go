@@ -2,7 +2,9 @@ package lsp
 
 import (
 	"context"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,3 +135,122 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 		t.Fatalf("the ledger holds %d of %d bytes after everything released; a leaked reservation shrinks the allocation for the life of the process", reserved, allocation)
 	}
 }
+
+// fakeCPU is a hand-driven stand-in for the runner's processor-time handle, so
+// a test can say "the child is computing" and "the child is idle" without a
+// child. Unsampled is the platform that cannot observe a running tree at all.
+type fakeCPU struct {
+	ticks     atomic.Int64
+	unsampled bool
+}
+
+func (f *fakeCPU) Ticks() (int64, bool) {
+	if f.unsampled {
+		return 0, false
+	}
+	return f.ticks.Load(), true
+}
+
+// TestAHangDetectorWatchesTheServersWorkAndNotItsChatter protects the one
+// invariant the request hang detector exists for: it must never end work that
+// is progressing, and it must still end work that is not.
+//
+// Two failure modes, both of which a wire-frame-only signal has.
+//
+// A server computing an answer on a large project emits nothing for the whole
+// window -- no partial result, no progress notification -- and is cancelled
+// mid-work. That is a deadline on progressing work wearing a hang detector's
+// name, and it is why the processor-time signal has to be read.
+//
+// A genuinely wedged request is kept alive indefinitely by a chatty sibling on
+// the same connection: the byte count is per-connection while the hang is
+// per-request, so another request's answers, a diagnostics stream or a log
+// line speak for the wedged one and it is never detected at all.
+//
+// Mutation: make progress return `c.moved.Load()` unconditionally -- the
+// per-connection wire count the detector used to watch -> the silent computing
+// server below is declared stalled, and the wedged request under sibling
+// chatter below is not.
+func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
+	const window = 200 * time.Millisecond
+
+	t.Run("a silent but computing server is not cancelled", func(t *testing.T) {
+		cpu := &fakeCPU{}
+		c := newConn(nopStream{}, 1<<20, 0, 1, cpu, nil)
+		ctx, stalled, stop := c.watchProgress(context.Background(), window)
+		defer stop()
+		// Not one byte moves on the wire for several windows; only the child's
+		// processor time advances, which is exactly a server indexing.
+		deadline := time.After(3 * window)
+		tick := time.NewTicker(window / 8)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				cpu.ticks.Add(1)
+			case <-ctx.Done():
+				t.Fatalf("a server consuming processor time was cancelled after %s of silence; stalled=%v", window, stalled())
+			case <-deadline:
+				return
+			}
+		}
+	})
+
+	t.Run("a wedged request is not saved by a sibling's chatter", func(t *testing.T) {
+		cpu := &fakeCPU{}
+		c := newConn(nopStream{}, 1<<20, 0, 1, cpu, nil)
+		ctx, stalled, stop := c.watchProgress(context.Background(), window)
+		defer stop()
+		// The connection is busy -- another request's frames keep arriving --
+		// while the child does no work at all. The watched request is hung.
+		go func() {
+			tick := time.NewTicker(window / 8)
+			defer tick.Stop()
+			for {
+				select {
+				case <-tick.C:
+					c.moved.Add(4096)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			if !stalled() {
+				t.Fatal("the request ended without the detector claiming it; a caller would report this as its own cancellation")
+			}
+		case <-time.After(5 * window):
+			t.Fatalf("a request whose server consumed no processor time for %s was never declared hung while a sibling moved bytes", window)
+		}
+	})
+
+	t.Run("without processor-time sampling the wire count still speaks", func(t *testing.T) {
+		// On a platform that cannot observe a running tree there is no other
+		// signal, and killing a live session would be worse than masking a
+		// wedged request. The bytes must be watched there and only there.
+		c := newConn(nopStream{}, 1<<20, 0, 1, &fakeCPU{unsampled: true}, nil)
+		ctx, _, stop := c.watchProgress(context.Background(), window)
+		defer stop()
+		deadline := time.After(3 * window)
+		tick := time.NewTicker(window / 8)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				c.moved.Add(4096)
+			case <-ctx.Done():
+				t.Fatal("a connection moving bytes was declared hung on a platform with no processor-time signal")
+			case <-deadline:
+				return
+			}
+		}
+	})
+}
+
+// nopStream is a stream that never speaks and accepts every write: the
+// connection under test is driven by its counters, not by a peer.
+type nopStream struct{}
+
+func (nopStream) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopStream) Write(p []byte) (int, error) { return len(p), nil }
