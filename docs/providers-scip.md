@@ -291,11 +291,16 @@ guess does not hold is skipped and the capabilities are `partial` with
 
 The probe is not the guarantee, only its precondition. **Every** occurrence's
 range is then proved against the bytes it claims to describe, because a wrong
-column does not need a wrong encoding: on a line indented with spaces followed
-by a tab an indexer can count columns to a different tab stop than the file
+column does not need a wrong encoding: on a line carrying a tab after other
+characters an indexer can count columns to a different tab stop than the file
 does, so the range is shifted a few columns, stays inside its line, converts to
 a valid rune-aligned extent, and names source that is not the symbol. Measured
-on one Java project: 1,183 of 93,167 occurrences, in 79 of its 223 documents.
+on one Java project: 4,714 of 93,167 occurrences, in 91 of its 223 documents —
+3,531 refused for starting inside an identifier token and 1,183 for a column
+past the end of its line, 4,408 of them on lines indented with spaces followed
+by a tab and the remaining 306 on other lines, sampled and found to be the same
+shift. None of them is a false positive of the predicate: an identifier holding
+a `$` and one holding a non-ASCII letter are both admitted, by construction.
 
 The per-occurrence proof is one byte comparison, in two strengths. A
 **definition** occurrence whose symbol's last descriptor is a name the grammar
@@ -313,13 +318,24 @@ from the fixtures of the per-platform matrix — 308 occurrences, all nine
 languages — the proof refuses none of them, at ~8 ns per occurrence and no
 allocation.
 
-The two proofs deliberately have different outcomes. The encoding probe decides
-whether an encoding the index never stated may be used at all, so a document it
-cannot prove is skipped and counted — an unproven guess must not fail a unit the
-index never claimed. The per-occurrence proof is about a claim the index did
-make, so a range that fails it is refused: the unit fails closed under a
-verified binding, and the occurrence is skipped and counted under an unverified
-one.
+The two proofs deliberately have different outcomes, because the two failures
+have different reach. A failed **encoding probe** is a claim about the whole
+document — every column of it is read in an encoding its bytes contradict — so
+the document is dropped whole, counted under `documents_dropped_encoding` and
+named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
+proof** reaches exactly one coordinate, so exactly one occurrence is left out:
+it is counted under `refused_occurrences`, the first is named with its reason by
+`refused_occurrence_exemplar`, and the unit publishes `partial` with
+`CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
+the index describes bytes it never saw, so the same coordinate is a plain skip
+and is counted with the other unverified skips.
+
+A unit is never failed over one occurrence. Failing closed on the first refusal
+threw away all 93,167 occurrences of the project above over 4,714 wrong columns:
+every fact the indexer got right was lost with the ones it got wrong, and an
+operator was told the unit was unavailable rather than thinner. The counts are
+what makes the thinner unit honest — a partial capability that does not say how
+much it left out is indistinguishable from a whole one.
 
 `Metadata.text_document_encoding` is deliberately never consulted. All six
 indexers set it to `UTF8`, including the three whose columns are UTF-16,

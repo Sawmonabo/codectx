@@ -99,7 +99,20 @@ type importer struct {
 	skippedDocs, skippedOccurrences, truncatedEdges int64
 	outsideRoot, duplicatePaths, skippedAliases     int64
 	assumedEncoding                                 int64
-	partialCode                                     string
+	// refusedOccurrences counts occurrences whose range the pinned bytes
+	// contradict; refusedExemplar is the first one's document and reason, kept
+	// as the example an operator starts from. One exemplar, not a set: a set
+	// grows with the repository and the report is a bounded diagnostic
+	// surface.
+	refusedOccurrences int64
+	refusedExemplar    string
+	// encodingDropped counts documents whose assumed position encoding the
+	// pinned bytes contradict; encodingDroppedPath is the first of them. A
+	// failed probe is a whole-document shift, so the document is dropped
+	// rather than any one of its occurrences.
+	encodingDropped     int64
+	encodingDroppedPath string
+	partialCode         string
 	// drops is the one account of everything the wire decoder discarded for
 	// exceeding a field bound, across every pass of this import.
 	drops decodeDrops
@@ -137,6 +150,22 @@ const (
 // reproducible across runs of the same index and costs one detail slot
 // whatever crossed.
 const detailLimitsExceeded = "resource_limits_exceeded"
+
+// The capability-row details of what the pinned bytes contradicted. Counts are
+// published separately from their exemplar so a reader can compare runs on the
+// number and still be handed one place to look.
+const (
+	// detailRefusedOccurrences counts occurrences left out because their range
+	// does not describe the bytes it claims.
+	detailRefusedOccurrences = "refused_occurrences"
+	// detailRefusedExemplar is the first of them, as `<document>: <reason>`.
+	detailRefusedExemplar = "refused_occurrence_exemplar"
+	// detailEncodingDropped counts documents dropped whole because the
+	// position encoding assumed for them did not hold against their bytes,
+	// and names the first.
+	detailEncodingDropped  = "documents_dropped_encoding"
+	detailEncodingExemplar = "documents_dropped_encoding_exemplar"
+)
 
 // limitSeen records the largest figure observed at each bound. It is a
 // measurement, not a gate: nothing consults it until the run is over, which
@@ -612,7 +641,15 @@ func (im *importer) endDocument(d document) error {
 			return err
 		}
 		if !holds {
+			// A failed probe is a claim about the whole document -- its
+			// columns are read in an encoding its bytes contradict -- so the
+			// document is dropped whole and counted, which is the one shift
+			// that is not a per-occurrence refusal.
 			im.skippedDocs++
+			im.encodingDropped++
+			if im.encodingDroppedPath == "" {
+				im.encodingDroppedPath = d.path
+			}
 			im.degrade(model.CodeProviderOutputInvalid)
 			return im.dropSpool(ctx, d.index)
 		}
@@ -846,42 +883,52 @@ func (im *importer) loadSource(ctx context.Context, d docRow) (*docSource, error
 	return &docSource{doc: d, data: data, cur: source.NewCursor(data), enc: columnEncoding(d.encoding)}, nil
 }
 
-// rangeOf converts a SCIP range against the document's bytes. A coordinate
-// that does not land on these bytes is a wrong-source error under a verified
-// binding and a skipped occurrence under an unverified one; it is never
-// adjusted.
-func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, error) {
+// rangeOf converts a SCIP range against the document's bytes. It reports the
+// converted range, or nil and the reason the coordinate does not land on these
+// bytes; nothing is ever adjusted. The reason is returned rather than counted
+// here because the same conversion serves an occurrence, which is refused and
+// counted, and a definition's enclosing containment span, which is not an
+// occurrence and costs nothing when it cannot be converted.
+func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, string) {
 	if r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 {
-		return nil, im.badRange(ds, "occurrence range has a negative coordinate")
+		return nil, "occurrence range has a negative coordinate"
 	}
 	rng, err := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
 	if err != nil {
-		return nil, im.badRange(ds, err.Error())
+		return nil, err.Error()
 	}
-	return &rng, nil
+	return &rng, ""
 }
 
 // occurrenceRange converts one occurrence's range and proves it against the
 // pinned bytes it claims to describe. A range that converts cleanly is not yet
-// a fact: a column shifted by an indentation the indexer measured differently
-// from the file still lands inside the line, selects a valid rune-aligned
+// a fact: a column shifted by a tab the indexer measured to a different stop
+// than the file does still lands inside the line, selects a valid rune-aligned
 // extent, and is published at compiler precision over source that is not the
-// symbol — the wrong-bytes class nothing downstream can detect (measured: 1,183
-// of 93,167 occurrences of one Java project, in 79 of its 223 documents, over
-// lines indented with spaces followed by a tab).
+// symbol — the wrong-bytes class nothing downstream can detect (measured: 4,714
+// of 93,167 occurrences of one Java project, in 91 of its 223 documents, every
+// one of them that shift).
 //
 // So every occurrence is checked, not one per document. definition says the
 // occurrence declares its symbol, which is what makes the strict form of the
 // check available; see onPinnedBytes.
-func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32, definition bool) (*model.SourceRange, error) {
-	rng, err := im.rangeOf(ds, r)
-	if err != nil || rng == nil {
-		return nil, err
+//
+// A refused occurrence yields nil and is counted (refuse): one coordinate the
+// index got wrong costs that coordinate and nothing else. Failing the unit on
+// it would throw away every other fact of a project over shifted columns --
+// measured, 4,714 wrong of 93,167 cost all 93,167 -- and the count plus the
+// named document say exactly what was left out.
+func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32, definition bool) *model.SourceRange {
+	rng, why := im.rangeOf(ds, r)
+	if rng == nil {
+		im.refuse(ds, why)
+		return nil
 	}
 	if msg := onPinnedBytes(ds.data, sym, rng, definition); msg != "" {
-		return nil, im.badRange(ds, msg)
+		im.refuse(ds, msg)
+		return nil
 	}
-	return rng, nil
+	return rng
 }
 
 // onPinnedBytes reports why an occurrence's range does not describe the bytes
@@ -928,16 +975,28 @@ func identifierByte(b byte) bool {
 	return b >= 0x80
 }
 
-// badRange is the typed outcome of a coordinate that misses the pinned
-// bytes: nil under an unverified binding (the caller skips and counts),
-// otherwise CTX_PROVIDER_OUTPUT_INVALID that fails the unit.
-func (im *importer) badRange(ds *docSource, msg string) error {
+// refuse records one occurrence the pinned bytes contradict. The occurrence is
+// left out and the unit continues, in both bindings:
+//
+//   - under an unverified binding the index describes bytes it never saw, so
+//     the coordinate says nothing about this file and is a plain skip;
+//   - under a verified binding the index claims to describe exactly these
+//     bytes and does not, so the unit is degraded to partial under
+//     CTX_PROVIDER_OUTPUT_INVALID and the count and the first document reach
+//     the operator on the capability row.
+//
+// Nothing is adjusted and nothing is published for it: the occurrence is the
+// unit of the refusal, never the document and never the unit.
+func (im *importer) refuse(ds *docSource, msg string) {
 	if im.unverify {
 		im.skippedOccurrences++
-		return nil
+		return
 	}
-	return (&model.Error{Code: model.CodeProviderOutputInvalid, Message: "scip occurrence does not describe the pinned source bytes: " + msg}).
-		WithDetail("path", ds.doc.path)
+	im.refusedOccurrences++
+	if im.refusedExemplar == "" {
+		im.refusedExemplar = ds.doc.path + ": " + msg
+	}
+	im.degrade(model.CodeProviderOutputInvalid)
 }
 
 // defineSymbol resolves one definition occurrence and records its identity,
@@ -951,17 +1010,20 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
-	rng, err := im.occurrenceRange(ds, sym, r, true)
-	if err != nil || rng == nil {
-		return err
+	rng := im.occurrenceRange(ds, sym, r, true)
+	if rng == nil {
+		// Refused and counted: this declaration is left out, the rest of the
+		// document is not.
+		return nil
 	}
 	extent := rng
 	if enclosing != nil {
-		if extent, err = im.rangeOf(ds, *enclosing); err != nil {
-			return err
-		}
-		if extent == nil || extent.Start.Byte > rng.Start.Byte || extent.End.Byte < rng.End.Byte {
-			extent = rng
+		// A containment span is not an occurrence: it is never published as a
+		// located identity, so a span the bytes cannot carry costs the span,
+		// not a refusal, and the declaration's own range stands in for it.
+		if ext, why := im.rangeOf(ds, *enclosing); why == "" && ext != nil &&
+			ext.Start.Byte <= rng.Start.Byte && ext.End.Byte >= rng.End.Byte {
+			extent = ext
 		}
 	}
 	key := symKey(ds.doc.idx, sym)
@@ -1137,9 +1199,11 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
-			rng, err := im.occurrenceRange(ds, sym, r, false)
-			if err != nil || rng == nil {
-				return err
+			rng := im.occurrenceRange(ds, sym, r, false)
+			if rng == nil {
+				// Refused and counted: this reference is left out, the rest of
+				// the document is not.
+				return nil
 			}
 			loc := location{file: d.file, rng: rng}
 			to, err := im.targetNode(ctx, symKey(d.idx, sym), sym, loc)
@@ -1484,6 +1548,18 @@ func (im *importer) result() model.ProviderResult {
 		if im.truncatedEdges > 0 {
 			cs = cs.WithDetail(model.DetailEvidenceClipped, strconv.FormatInt(im.truncatedEdges, 10))
 		}
+		// What the pinned bytes contradicted, at the two granularities the
+		// contradiction has. Without these the operator of a partial unit
+		// reads only the diagnostic family and cannot tell one wrong
+		// coordinate from a project the indexer mis-columned throughout.
+		if im.refusedOccurrences > 0 {
+			cs = cs.WithDetail(detailRefusedOccurrences, strconv.FormatInt(im.refusedOccurrences, 10)).
+				WithDetail(detailRefusedExemplar, im.refusedExemplar)
+		}
+		if im.encodingDropped > 0 {
+			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped, 10)).
+				WithDetail(detailEncodingExemplar, im.encodingDroppedPath)
+		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}
 	return r
@@ -1498,6 +1574,8 @@ func (im *importer) report() Report {
 		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
 		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
 		SkippedOccurrences: im.skippedOccurrences, SkippedCallsiteAliases: im.skippedAliases,
-		AssumedPositionEncoding: im.assumedEncoding,
+		AssumedPositionEncoding:  im.assumedEncoding,
+		RefusedOccurrences:       im.refusedOccurrences,
+		EncodingDroppedDocuments: im.encodingDropped,
 	}
 }

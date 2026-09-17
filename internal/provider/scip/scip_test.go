@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -988,8 +987,8 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 }
 
 // TestOccurrenceMustDescribeThePinnedBytes protects the wrong-bytes guarantee
-// at the granularity the guarantee is made: every occurrence, not one probe
-// per document.
+// at the granularity the guarantee is made and at the granularity it costs:
+// every occurrence is proved, and a refusal costs that occurrence alone.
 //
 // Failure mode, silent and measured on a real project: on a line indented with
 // spaces followed by a tab an indexer can count columns to a different tab stop
@@ -1005,8 +1004,18 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // least start on a token boundary. The document leaves its position encoding
 // unspecified, so the per-document encoding probe runs and passes on the first
 // definition, which is correct in both cases; the shifted occurrence is the
-// second one. Mutation that must fail this test: probe once per document (drop
-// the range check from occurrenceRange), which republishes the defect.
+// second one.
+//
+// The second failure mode, measured on the same project and equally silent:
+// failing the unit on the first refusal threw away all 93,167 occurrences over
+// 4,714 wrong columns, so a project the indexer mis-columns anywhere publishes
+// nothing anywhere. The unit must survive, publish `partial`, and say how many
+// occurrences it left out and in which document — a silent count would make a
+// thinned unit indistinguishable from a whole one.
+//
+// Mutations that must fail this test: probe once per document (drop the range
+// check from occurrenceRange), which republishes the wrong bytes; or drop the
+// refusal count from the capability details, which republishes the silence.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 is the FX-I-T-c shape: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
@@ -1037,12 +1046,83 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 
 			h := providertest.New(t, files)
 			p := newProvider(t, "tabs.scip")
-			_, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
-			var typed *model.Error
-			if !errors.As(err, &typed) || typed.Code != model.CodeProviderOutputInvalid ||
-				!strings.Contains(typed.Message, "does not describe the pinned source bytes") {
-				t.Fatalf("shifted %s occurrence: err = %v, want CTX_PROVIDER_OUTPUT_INVALID naming the pinned source bytes", tc.name, err)
+			res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
+			if err != nil {
+				t.Fatalf("shifted %s occurrence failed the unit: %v; one wrong coordinate must cost one occurrence", tc.name, err)
+			}
+			// Exactly the shifted occurrence was left out: the document's
+			// clean first definition still reached the sink, which is what
+			// separates "one occurrence refused" from "the document dropped".
+			if res.RecordsEmitted == 0 {
+				t.Fatal("the unit published nothing: a refused occurrence must not cost the rest of its document")
+			}
+			for _, cs := range res.Capabilities {
+				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+					t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+				}
+				if got := cs.Details["refused_occurrences"]; got != "1" {
+					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, "1")
+				}
+				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, "pkg/tabs.go: ") {
+					t.Fatalf("refused_occurrence_exemplar = %q, want the document named", got)
+				}
 			}
 		})
 	}
+}
+
+// TestFailedEncodingProbeDropsTheDocument protects the one shift that is NOT a
+// per-occurrence refusal. A position encoding assumed from the tool table and
+// contradicted by the bytes shifts every column of that document, so no
+// occurrence of it can be trusted and the document is dropped whole. The
+// failure mode, silent: dropping it without a count leaves an operator reading
+// a unit that describes fewer files than the index held with nothing saying so.
+//
+// The document declares no encoding, so the scip-typescript table entry
+// (UTF-16) is assumed; its one definition sits after a 4-byte rune, where a
+// UTF-16 reading and the truth disagree, and the columns given are the UTF-8
+// ones. Mutation that must fail this test: drop the encodingDropped count (or
+// its detail), which republishes the silence.
+func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
+	// "𝄞" is one UTF-8 4-byte rune and two UTF-16 units. "Start" therefore
+	// begins at UTF-8 column 9 and UTF-16 column 7; the columns below are the
+	// UTF-8 ones, which a UTF-16 reading resolves to bytes that are not it.
+	const src = "// \U0001D11E xx\nfunc Start() {}\n"
+	const symStart = "scip-typescript npm example 1.0.0 src/`a.ts`/Start()."
+
+	files := fixture(t)
+	files["src/a.ts"] = src
+	files["a.scip"] = string(miniIndex("scip-typescript", "0.4.0",
+		documentWithText("src/a.ts", "typescript", 0, src,
+			occurrenceRecord(symStart, 1, 0, 17, 22))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "a.scip")
+	res, _, err := h.Run(t, p, scip.ImportScope("a.scip"), append([]string{"a.scip", "src/a.ts"}, sourcePaths...))
+	if err != nil {
+		t.Fatalf("a document whose encoding probe fails must be dropped, not fail the unit: %v", err)
+	}
+	for _, cs := range res.Capabilities {
+		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+		}
+		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
+			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
+		}
+		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "src/a.ts" {
+			t.Fatalf("documents_dropped_encoding_exemplar = %q, want src/a.ts", got)
+		}
+	}
+	if got := refusedDetail(res); got != "" {
+		t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not a refused occurrence", got)
+	}
+}
+
+func refusedDetail(res model.ProviderResult) string {
+	for _, cs := range res.Capabilities {
+		if v := cs.Details["refused_occurrences"]; v != "" {
+			return v
+		}
+	}
+	return ""
 }

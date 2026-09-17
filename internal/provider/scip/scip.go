@@ -560,6 +560,15 @@ type Report struct {
 	// model.DetailEvidenceClipped instead, which is where a reader of the
 	// generation can see them.
 	SkippedOccurrences, SkippedCallsiteAliases int64
+	// RefusedOccurrences are coordinates the pinned bytes contradict under a
+	// VERIFIED binding: the index claims to describe exactly these bytes and
+	// this one does not. Each costs its own occurrence and nothing else, and
+	// the unit publishes partial under CTX_PROVIDER_OUTPUT_INVALID.
+	// EncodingDroppedDocuments are documents dropped whole because the
+	// position encoding assumed for them did not hold -- a shift of every
+	// column of the document rather than of one occurrence. They are also
+	// counted in Skipped, which is the total of documents not admitted.
+	RefusedOccurrences, EncodingDroppedDocuments int64
 	// AssumedPositionEncoding counts documents that left `position_encoding`
 	// unspecified and were converted in the measured encoding of the tool that
 	// wrote the index (see toolPositionEncoding).
