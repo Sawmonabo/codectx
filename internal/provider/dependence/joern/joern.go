@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +177,37 @@ func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
 // every cached graph instead of silently reusing one built differently.
 func (b *Backend) Argv(f dependence.Family) []string {
 	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
+}
+
+// refusedComponent is the path component the Java frontend leaves out of its
+// analysis by default. Measured on this payload with the pinned parse and
+// export argv over three one-class fixtures whose code is identical and whose
+// only difference is the path: `com/x/Main.java` exported five method rows,
+// `com/test/Main.java` and `src/main/java/com/selenium/test/utils/Main.java`
+// (the frontend pointed at `src/main/java`) exported none and carried no file
+// row for the source at all. All three runs exited 0 from both steps and wrote
+// nothing to standard error, so the refusal has no diagnostic of its own.
+//
+// The component is matched anywhere in the path the frontend is given, so it
+// catches a package directory as surely as a source root, and no input
+// directory the provider could choose escapes it. The frontend's only
+// exclusion options are additive, so there is no argument that turns it off.
+const refusedComponent = "test"
+
+// RefusesInput reports whether the frontend of f leaves this file out of its
+// analysis. Only the Java frontend was measured to refuse anything: this is
+// the answer for the frontends this payload ships, not a guess about them, so
+// every other family answers false.
+func (b *Backend) RefusesInput(f dependence.Family, unitRelPath string) bool {
+	if f != dependence.FamilyJava {
+		return false
+	}
+	for _, c := range strings.Split(unitRelPath, "/") {
+		if c == refusedComponent {
+			return true
+		}
+	}
+	return false
 }
 
 // NeutralOptions is the frontend's fixed allowlist of semantics-neutral parse

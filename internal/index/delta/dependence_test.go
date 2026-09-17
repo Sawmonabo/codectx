@@ -46,6 +46,10 @@ func (fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"
 
 func (fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
 
+// This fixture's frontend takes every file it is given; a unit here never
+// fails for a refused source set.
+func (fakeBackend) RefusesInput(dependence.Family, string) bool { return false }
+
 func (fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	return dependence.Outcome{}, os.WriteFile(req.OutputPath, []byte("graph"), 0o600)
 }

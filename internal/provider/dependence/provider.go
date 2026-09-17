@@ -514,9 +514,34 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// the nested projects afterwards spent the time and the disk of every
 	// sibling project, and left another unit's source inside this unit's
 	// private tree for as long as the pruning took.
+	//
+	// The same pass counts this unit's own source files, and how many of them
+	// the frontend will leave out of its analysis by a default of its own.
+	// They are two counters, not lists, and they are what lets a unit that
+	// exports nothing name the reason: a unit every one of whose files the
+	// frontend refuses has a cause an operator can act on, one none of whose
+	// files it refuses does not, and one in between is neither.
+	//
+	// Both are taken here, over this one predicate, rather than against the
+	// planner's Unit.Files. That count is arbitrated across the whole plan --
+	// foldSizes gives each file to the first unit that claims it -- so the two
+	// are denominators over different sets, and a comparison between them
+	// would rest on their happening to agree.
+	var files, refused int64
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
-			Include: func(fv model.FileVersion) bool { return unit.Contains(fv.Path) }})
+			Include: func(fv model.FileVersion) bool {
+				if !unit.Contains(fv.Path) {
+					return false
+				}
+				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family {
+					files++
+					if p.backend.RefusesInput(unit.Family, unitRelative(unit, fv.Path)) {
+						refused++
+					}
+				}
+				return true
+			}})
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -534,10 +559,10 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// A reproducible crash is the only thing subdivision is for. Every
 		// capability of the result then says so, and says how the crash was
 		// established to reproduce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome, decision, files, refused)
 	}
 
-	exp, crash, err := p.export(ctx, req, unit, res, run, graph)
+	exp, crash, err := p.export(ctx, req, unit, res, run, graph, files, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -549,7 +574,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		// on a 4,984-file project whose export died at every heap cap while
 		// every subdivided part of it exported. Reporting it as a failed unit
 		// threw away facts the engine could still produce.
-		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed)
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed, files, refused)
 	}
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
@@ -563,9 +588,9 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // partial result naming the subdivided scope and the failing pass and
 // exception, never a failed unit.
 func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (publication, ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files, refused int64) (publication, ImportReport, error) {
 
-	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision)
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision, files, refused)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -715,7 +740,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // confirmation is the same argv a second time and what it yields is a second
 // observation of the same class, which is what subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, graph string) (ExportOutcome, Outcome, error) {
+	run *runDir, graph string, files, refused int64) (ExportOutcome, Outcome, error) {
 
 	out, err := p.runExport(ctx, req, unit, res, run, graph)
 	if err != nil {
@@ -745,17 +770,11 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 	}
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
-		// not a crash and must not be worded as one: a frontend whose own
-		// defaults exclude the directories a project keeps its sources in
-		// skips every file it was given and leaves exactly this. What the
-		// reader needs is which family it was and how many files the unit
-		// declared, so the two can be compared against what the frontend
-		// admits.
+		// not a crash and must not be worded as one, and it must not be
+		// worded as itself either: the count of the unit's files the frontend
+		// leaves out of its analysis is what turns the symptom into a reason.
 		out.Outcome.Class = FailureEmptyExport
-		return ExportOutcome{}, Outcome{}, failure(FailureEmptyExport, unit.ScopeKey, out.Outcome, res).
-			WithDetail("family", string(unit.Family)).
-			WithDetail("source_files", itoa(unit.Files)).
-			WithRemediation("check whether the frontend of this language family excludes the directories this project's sources are in")
+		return ExportOutcome{}, Outcome{}, emptyExport(unit, out.Outcome, res, files, refused)
 	}
 	return out, Outcome{}, nil
 }
@@ -861,7 +880,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision) (ImportReport, int, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files, refused int64) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
@@ -891,6 +910,10 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
+	// What the parts did, so a unit no part of which produced a method can say
+	// which of the two things happened to them rather than restating that
+	// nothing came out.
+	tally := partTally{Parts: len(children)}
 	for i, child := range children {
 		// One span per part, under the unit's: every step below nests inside
 		// it, so a subdivided unit's cost reads as the sum of its parts rather
@@ -903,6 +926,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
+			tally.Failed++
 			part.End(ledger.OutcomeFailed, measured(out), nil)
 			continue
 		}
@@ -921,7 +945,16 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			return ImportReport{}, 0, err
 		}
 		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), nil)
-		if exp.Class != FailureNone || !exp.Live {
+		if exp.Class != FailureNone {
+			tally.Failed++
+			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
+			continue
+		}
+		if !exp.Live {
+			// The part was analysed from end to end and carries no method.
+			// That is the empty export of a part, and it is counted apart from
+			// a failure so the unit's reason can tell the two apart.
+			tally.Empty++
 			part.End(ledger.OutcomeFailed, ledger.Measured{}, nil)
 			continue
 		}
@@ -942,8 +975,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
-		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, res).
-			WithDetail("reason", "no subdivided part of the unit produced an honest result")
+		return ImportReport{}, 0, subdivisionEmpty(unit, crash, res, tally, files, refused)
 	}
 	return total, overParts, nil
 }
@@ -972,7 +1004,8 @@ func childProjects(source string, unit Unit) ([]string, error) {
 	slices.Sort(out)
 	if len(out) == 0 {
 		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
-			WithDetail("reason", "the unit has no boundary below it to split along")
+			WithDetail("reason", "the unit has no boundary below it to split along").
+			WithRemediation("the failing pass and exception on the crash that forced this split are what identifies the defect upstream")
 	}
 	return out, nil
 }
@@ -1050,6 +1083,18 @@ func unitSource(root string, unit Unit) (string, error) {
 		return "", invalid("the dependence unit's project directory is not in the snapshot: " + truncate(unit.Root, 128))
 	}
 	return dir, nil
+}
+
+// unitRelative is a snapshot path as the frontend sees it: relative to the
+// directory the unit is parsed from, which is the unit's own root. The
+// frontend's own defaults are expressed over that path and not over the
+// repository path, so asking about the repository path would answer for a
+// directory the frontend never saw.
+func unitRelative(u Unit, p string) string {
+	if u.Root == "" {
+		return p
+	}
+	return strings.TrimPrefix(p, u.Root+"/")
 }
 
 // backendFailure renders the crash a subdivided unit publishes: the failing

@@ -94,7 +94,10 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
-		msg += "the analysis exported no method for a unit that has source"
+		// emptyExport below replaces this with the reason it measured. This
+		// wording is what the product knows without that measurement: which
+		// steps ran, and that nothing came of them.
+		msg += "the analysis frontend refused none of this unit's source files by path, and both steps exited cleanly without producing a method"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -137,6 +140,94 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		}
 	}
 	return err
+}
+
+// refusedRemediation is what an operator can do about source the frontend
+// will not read. It is one string because two failures name it: a whole unit
+// the frontend refuses, and a subdivided unit every part of which it refuses.
+const refusedRemediation = "the frontend refuses these paths by a default no option of it turns off; " +
+	"exclude this project from the index, or move its sources out of the path components it refuses"
+
+// unreadRemediation is what an operator can do about source the frontend read
+// and drew nothing from. Two causes remain there and the product cannot tell
+// them apart -- source with no definition the frontend parses, and a frontend
+// that failed without saying so -- so it names both rather than asserting the
+// first, which a helper that died behind a zero exit would make false.
+const unreadRemediation = "check that this unit's source files hold method definitions this language family's " +
+	"frontend can parse; if they do, the frontend failed without reporting it"
+
+// emptyExport is the typed failure for a unit whose analysis exported no
+// method at all. "the export carries no method" is the symptom, never the
+// reason, so the error names what the provider measured: how many of the
+// unit's own source files the frontend leaves out of its analysis. All three
+// answers are different reasons with different remedies, and none of them may
+// be worded as another -- a unit some of whose files were refused and some
+// analysed is not explained by the refusal, and must not claim none was
+// refused either.
+//
+// files and refused are both counted over the one predicate that decided what
+// the frontend was given, so the comparison between them is a comparison over
+// a single set.
+func emptyExport(unit Unit, o Outcome, r Reservation, files, refused int64) *model.Error {
+	err := failure(FailureEmptyExport, unit.ScopeKey, o, r).
+		WithDetail("family", string(unit.Family)).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithDetail("refused_source_files", strconv.FormatInt(refused, 10))
+	switch {
+	// files > 0 is not redundant: a unit the planner counted source for whose
+	// materialization handed the frontend none of it would otherwise satisfy
+	// 0 >= 0 and publish the refusal as the reason, which nothing measured.
+	case files > 0 && refused >= files:
+		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so nothing was analysed"
+		return err.WithRemediation(refusedRemediation)
+	case refused > 0:
+		err.Message = "the dependence unit failed: the analysis frontend left " + strconv.FormatInt(refused, 10) +
+			" of this unit's " + strconv.FormatInt(files, 10) +
+			" source files out of its analysis, and the rest produced no method"
+		return err.WithRemediation(refusedRemediation + ". For the files it did read: " + unreadRemediation)
+	}
+	return err.WithRemediation(unreadRemediation)
+}
+
+// partTally is what a subdivided unit's parts did, counted as the loop ran
+// them. It is three integers, never the parts themselves: a unit is split into
+// as many parts as it has child projects, and a list of them would grow with
+// the repository.
+type partTally struct {
+	// Parts is how many parts the unit was split into, Failed how many failed
+	// in the analysis itself, and Empty how many were analysed cleanly and
+	// carried no method.
+	Parts  int
+	Failed int
+	Empty  int
+}
+
+// subdivisionEmpty is the typed failure for a subdivided unit no part of which
+// produced a method. A unit with no part at all never reaches it: childProjects
+// refuses the split before the parts run. "no part produced an honest result" is the same
+// restatement emptyExport removes, so this names the tally instead, and names
+// the refusal when the frontend refuses the whole unit's source -- which is
+// exactly how a crashed unit of that shape ends up here.
+func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files, refused int64) *model.Error {
+	err := failure(FailureEngine, unit.ScopeKey, crash, r).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithDetail("refused_source_files", strconv.FormatInt(refused, 10)).
+		WithDetail("parts", strconv.Itoa(t.Parts)).
+		WithDetail("parts_failed", strconv.Itoa(t.Failed)).
+		WithDetail("parts_without_method", strconv.Itoa(t.Empty))
+	if files > 0 && refused >= files {
+		err.Message = "the dependence unit failed: the analysis frontend of this language family leaves every source file of this unit out of its analysis, so no part of the subdivided unit had anything to analyse"
+		return err.WithRemediation(refusedRemediation)
+	}
+	err.Message = "the dependence unit failed: no part of the subdivided unit produced a method -- " +
+		strconv.Itoa(t.Failed) + " of " + strconv.Itoa(t.Parts) + " failed in the analysis and " +
+		strconv.Itoa(t.Empty) + " were analysed cleanly and produced none"
+	if t.Empty > 0 {
+		return err.WithRemediation(unreadRemediation)
+	}
+	// Nothing was analysed cleanly: the failing pass and exception this error
+	// already carries are what a maintainer has to act on.
+	return err.WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream; no part of this unit was analysed cleanly")
 }
 
 // crashDecision is how the provider established that an engine crash
