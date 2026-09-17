@@ -970,7 +970,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		graph := run.path("graph-" + itoa(int64(i)))
 		out, err := p.parse(partCtx, req, unit, res, filepath.Join(source, child), graph, nil)
 		if err != nil {
-			part.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, bracketed(), err)
 			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
@@ -981,7 +981,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		dir := run.path("export-" + itoa(int64(i)))
 		timeout, err := remaining(partCtx)
 		if err != nil {
-			part.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, bracketed(), err)
 			return ImportReport{}, 0, err
 		}
 		exportCtx, exportSpan := ledger.Start(partCtx, stageExport, child)
@@ -989,7 +989,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
 			exportSpan.End(ledger.OutcomeFailed, unmeasured(), err)
-			part.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, bracketed(), err)
 			return ImportReport{}, 0, err
 		}
 		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), spanFailure(exp.Outcome, child, res))
@@ -1014,7 +1014,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		report, err := p.importExport(partCtx, req, unit, filepath.Join(source, child),
 			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
-			part.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, bracketed(), err)
 			return ImportReport{}, 0, err
 		}
 		total = merge(total, report)
