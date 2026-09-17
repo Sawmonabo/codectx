@@ -44,6 +44,13 @@ const readerCeiling = 3 * time.Second
 // correct.
 const padPerFile = 6000
 
+// waitPadPerFile is what the waiting leg pads with instead. That leg's holder
+// must still be running well after the fixed ten-second bound the progress
+// policy replaced, or its mutation cannot bite: at padPerFile the holder's run
+// measures about six seconds on this host, so three times the symbols puts it
+// near twenty -- twice the bound, with room for a host half this speed.
+const waitPadPerFile = 3 * padPerFile
+
 // readerPause separates one reader cycle from the next. See the call sites.
 const readerPause = 50 * time.Millisecond
 
@@ -97,7 +104,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 	// the same files, the same symbol count, the same appended byte width --
 	// so the difference between the two walls is about the readers and not
 	// about what each run had to parse.
-	padFixture(t, s.Repo, 1)
+	padFixture(t, s.Repo, 1, padPerFile)
 	aloneStart := time.Now()
 	if env, code := s.run(t, "index"); !env.OK || code != 0 {
 		t.Fatalf("the unattended index failed (exit %d): %+v", code, env.Error)
@@ -105,7 +112,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 	aloneWall := time.Since(aloneStart)
 
 	// Arm two: the same index with every reader running throughout.
-	padFixture(t, s.Repo, 2)
+	padFixture(t, s.Repo, 2, padPerFile)
 	child := exec.Command(binary, "index", "--repo", s.Repo, "--json")
 	child.Env = s.Environ
 	child.Stdout, child.Stderr = os.Stderr, os.Stderr
@@ -208,7 +215,7 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 	if env, code := s.run(t, "index"); !env.OK || code != 0 {
 		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
 	}
-	padFixture(t, s.Repo, 2)
+	padFixture(t, s.Repo, 2, padPerFile)
 	child := exec.Command(binary, "index", "--repo", s.Repo, "--json")
 	child.Env = s.Environ
 	child.Stdout, child.Stderr = os.Stderr, os.Stderr
@@ -370,7 +377,7 @@ func refusedBusy(t *testing.T, ctx context.Context, session *mcp.ClientSession) 
 // serves through its own refresh are these.
 func mcpReadsDuringOwnRefresh(t *testing.T, ctx context.Context, s *sandbox) {
 	t.Helper()
-	padFixture(t, s.Repo, 3)
+	padFixture(t, s.Repo, 3, padPerFile)
 	session := s.mcpSession(t, ctx)
 
 	refreshed := make(chan error, 1)
@@ -472,7 +479,7 @@ func merge(worst, cycle map[string]time.Duration) {
 	}
 }
 
-// padFixture rewrites the fixture and appends the same number of trivially
+// padFixture rewrites the fixture and appends the given number of trivially
 // parseable symbols to each generated source file, so an index run has work to
 // do for long enough that a second process can be inside it.
 //
@@ -481,11 +488,13 @@ func merge(worst, cycle map[string]time.Duration) {
 // parsing twice the first one's bytes, and the difference between the two walls
 // would be about the workload rather than about the readers. Each round takes
 // its own symbol numbers at a fixed width, so every round leaves every file the
-// same size while changing every byte range a fingerprint covers.
-func padFixture(t *testing.T, repo string, round int) {
+// same size while changing every byte range a fingerprint covers -- which holds
+// as long as one workspace pads at one size, so symbols is a property of the
+// row and not of the round.
+func padFixture(t *testing.T, repo string, round, symbols int) {
 	t.Helper()
 	generateTinyRepo(t, repo)
-	first := (round-1)*padPerFile + 1
+	first := (round-1)*symbols + 1
 	pad := map[string]func(int) string{
 		filepath.Join("src", "go", "store", "store.go"): func(n int) string {
 			return fmt.Sprintf("\nfunc TinyPadStore%04d() string {\n\treturn \"tiny\"\n}\n", n)
@@ -505,7 +514,7 @@ func padFixture(t *testing.T, repo string, round int) {
 		if err != nil {
 			t.Fatalf("open %s to widen it: %v", rel, err)
 		}
-		for n := first; n < first+padPerFile; n++ {
+		for n := first; n < first+symbols; n++ {
 			if _, err := f.WriteString(body(n)); err != nil {
 				f.Close()
 				t.Fatalf("widen %s: %v", rel, err)
@@ -909,5 +918,222 @@ func TestE2EAWatchingCommandLeavesTheWorkspaceToThePerson(t *testing.T) {
 	if counts["refreshes"] < 2 {
 		t.Fatalf("the watch reported %d refreshes: it did not survive the person's index beside it",
 			counts["refreshes"])
+	}
+}
+
+// waitingLine matches the machine waiting line a building command writes to its
+// stderr for each change while another process holds the workspace
+// (internal/cli/index.go waitingForHolder). It is anchored to a whole line
+// because the command's structured log shares that stream, and `stage` is
+// captured as the rest of the line rather than one field: a holder that has
+// named no stage yet legitimately renders an empty one, and the row below
+// asserts about the stages that appear rather than about the first line.
+var waitingLine = regexp.MustCompile(`(?m)^waiting holder_pid=(\d+) holder_operation=(\S+) stage=(.*)$`)
+
+// indexChild is one `codectx index --json` process: the envelope it wrote, its
+// stderr -- where the waiting and progressive lines land -- and the wall its
+// process actually took, measured around exec rather than taken from the run's
+// own accounting, because the wait for the workspace happens before the run
+// exists and is exactly what this leg measures.
+type indexChild struct {
+	cmd    *exec.Cmd
+	stdout bytes.Buffer
+	stderr serverLog
+	start  time.Time
+	env    envelope
+	code   int
+	wall   time.Duration
+	exitAt time.Time
+	done   chan struct{}
+}
+
+// startIndexChild starts `codectx index` against the sandbox and returns at
+// once. Both processes of the leg below are started this way, so the two walls
+// it reports are measured the same way.
+func startIndexChild(t *testing.T, s *sandbox) *indexChild {
+	t.Helper()
+	c := &indexChild{cmd: exec.Command(binary, "index", "--repo", s.Repo, "--json"), done: make(chan struct{})}
+	c.cmd.Env = s.Environ
+	c.cmd.Stdout, c.cmd.Stderr = &c.stdout, &c.stderr
+	c.start = time.Now()
+	if err := c.cmd.Start(); err != nil {
+		t.Fatalf("start `codectx index`: %v", err)
+	}
+	go func() {
+		defer close(c.done)
+		err := c.cmd.Wait()
+		c.wall, c.exitAt = time.Since(c.start), time.Now()
+		var exit *exec.ExitError
+		if err != nil && errors.As(err, &exit) {
+			c.code = exit.ExitCode()
+		} else if err != nil {
+			c.code = -1
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-c.done:
+		default:
+			c.cmd.Process.Kill()
+			<-c.done
+		}
+	})
+	return c
+}
+
+// await blocks until the process has exited and decodes its one envelope. A
+// non-zero exit is not fatal here: the failure envelope is still on stdout and
+// the caller asserts on it, exactly as sandbox.run does.
+func (c *indexChild) await(t *testing.T) (envelope, int) {
+	t.Helper()
+	<-c.done
+	if err := json.Unmarshal(bytes.TrimSpace(c.stdout.Bytes()), &c.env); err != nil {
+		t.Fatalf("`codectx index`: stdout is not one envelope: %v\nstdout:\n%s\nstderr:\n%s",
+			err, c.stdout.String(), c.stderr.String())
+	}
+	return c.env, c.code
+}
+
+// awaitHolderPID waits until a process has recorded itself in the workspace
+// lock file and returns its pid. The lock file is read rather than the run
+// ledger because the record is written by the acquisition itself
+// (internal/snapshot/lock.go record), so a pid read here means the holder HAS
+// the workspace -- which is what makes the second process below a waiter and
+// not a race.
+func awaitHolderPID(t *testing.T, s *sandbox, holder *indexChild) int {
+	t.Helper()
+	path := filepath.Join(s.Home, "data", "workspace.lock")
+	deadline := time.Now().Add(time.Minute)
+	for {
+		if body, err := os.ReadFile(path); err == nil {
+			if pidText, _, split := strings.Cut(strings.TrimSpace(string(body)), " "); split {
+				if pid, convErr := strconv.Atoi(pidText); convErr == nil && pid > 0 {
+					return pid
+				}
+			}
+		}
+		select {
+		case <-holder.done:
+			t.Fatalf("the holding index exited (code %d) before it recorded itself in %s\nstderr:\n%s",
+				holder.code, path, holder.stderr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no process recorded itself in %s within the wait\nholder stderr:\n%s",
+				path, holder.stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestE2EASecondBuildWaitsOutTheHolderAndReusesItsWork is the process-level
+// proof of the wait for the workspace: one built binary waits for another built
+// binary and then reuses its work.
+//
+// Failure mode it protects: a build that finds the workspace held is bounded by
+// a fixed wait and is then refused CTX_WORKSPACE_BUSY however hard the holder
+// is working -- so the person who typed `codectx index` in a second terminal,
+// or the agent whose refresh followed a person's index, is told to go away in
+// the middle of a run that is progressing normally, and the work the holder was
+// about to publish is never reused. Unit rows measure the policy
+// (internal/snapshot/lock_test.go) and pin which operation asks for it
+// (internal/index/index_test.go); nothing had ever watched two built binaries
+// do it.
+//
+// Mutation that must fail it is quoted in this lane's report: restore the fixed
+// bound the policy replaced (a ten-second deadline beside the grace in
+// internal/snapshot/lock.go LockWorkspace) and the second process is refused.
+// The fixture is padded so the holder's run outlasts that bound several times
+// over; the wait the waiter actually did is logged, so the padding is justified
+// by a measurement rather than by a symbol count.
+//
+// The stalled holder is deliberately not asked here: it is a unit row, because
+// stalling a real built index is a sleep and not a proof.
+func TestE2EASecondBuildWaitsOutTheHolderAndReusesItsWork(t *testing.T) {
+	s := newSandbox(t)
+
+	// No seeded generation: the holder is the cold index of the padded
+	// fixture, which is both the longest run this fixture can produce and one
+	// process fewer than a seeded leg would cost.
+	padFixture(t, s.Repo, 1, waitPadPerFile)
+
+	holder := startIndexChild(t, s)
+	holderPID := awaitHolderPID(t, s, holder)
+	if holderPID != holder.cmd.Process.Pid {
+		t.Fatalf("the workspace lock records process %d where the index this leg started is %d: "+
+			"the waiting line below cannot be checked against the holder's pid", holderPID, holder.cmd.Process.Pid)
+	}
+
+	// The waiter, started while the holder demonstrably has the workspace.
+	waiter := startIndexChild(t, s)
+
+	holderEnv, holderCode := holder.await(t)
+	if !holderEnv.OK || holderCode != 0 {
+		t.Fatalf("the holding index failed (exit %d): %+v\nstderr:\n%s", holderCode, holderEnv.Error, holder.stderr.String())
+	}
+	held := data[model.IndexResult](t, holderEnv, holderCode)
+
+	// (1) The waiter is not refused.
+	waiterEnv, waiterCode := waiter.await(t)
+	if !waiterEnv.OK || waiterCode != 0 {
+		t.Fatalf("the second `codectx index` was refused (exit %d) behind a progressing index: %+v -- "+
+			"a build that finds the workspace held must wait for as long as the holder is getting somewhere\nstderr:\n%s",
+			waiterCode, waiterEnv.Error, waiter.stderr.String())
+	}
+
+	// (2) It said who it was waiting for, by pid, operation and stage.
+	lines := waitingLine.FindAllStringSubmatch(waiter.stderr.String(), -1)
+	if len(lines) == 0 {
+		t.Fatalf("the waiting index printed no waiting line at all, so nobody watching it learns why it is "+
+			"sitting there\nstderr:\n%s", waiter.stderr.String())
+	}
+	staged := ""
+	for _, line := range lines {
+		if pid := mustInt(t, line[1]); int(pid) != holderPID {
+			t.Fatalf("a waiting line names process %d where the holder is %d: %q", pid, holderPID, line[0])
+		}
+		if line[2] != "index" {
+			t.Fatalf("a waiting line names operation %q where the holder is an index: %q", line[2], line[0])
+		}
+		if line[3] != "" {
+			staged = line[3]
+		}
+	}
+	if staged == "" {
+		t.Fatalf("no waiting line named a stage of the holder's run, so the line reports a process and not "+
+			"progress\nstderr:\n%s", waiter.stderr.String())
+	}
+	t.Logf("the waiter reported %d waiting changes; the last stage it named was %q", len(lines), staged)
+
+	// (3) It proceeded after the holder exited, and reused what the holder
+	// published rather than building the workspace again. The counts are the
+	// discriminator, not the generation number: nothing changed between the
+	// two runs, so reusing every unit is the whole claim.
+	if !waiter.exitAt.After(holder.exitAt) {
+		t.Fatalf("the waiter exited at %s and the holder at %s: it did not wait for the workspace",
+			waiter.exitAt, holder.exitAt)
+	}
+	reused := data[model.IndexResult](t, waiterEnv, waiterCode)
+	if reused.UnitsReused == 0 || reused.UnitsBuilt != 0 {
+		t.Fatalf("the index that waited reused %d units and built %d: it waited for the holder and then "+
+			"rebuilt the workspace instead of reusing the generation the holder published",
+			reused.UnitsReused, reused.UnitsBuilt)
+	}
+	if reused.Binding.GenerationID < held.Binding.GenerationID {
+		t.Fatalf("the index that waited is bound to generation %d, behind the holder's %d",
+			reused.Binding.GenerationID, held.Binding.GenerationID)
+	}
+
+	// (4) The walls. A waiter that rebuilt would have spent the holder's whole
+	// run again after it, landing near twice the holder's wall; half of that
+	// wall is the margin that separates "waited and reused" from "waited and
+	// rebuilt" without encoding a host speed.
+	t.Logf("holder wall %s (built %d units), waiter wall %s of which %s waiting and %s after the holder exited "+
+		"(reused %d units, built %d)",
+		holder.wall, held.UnitsBuilt, waiter.wall, holder.exitAt.Sub(waiter.start),
+		waiter.exitAt.Sub(holder.exitAt), reused.UnitsReused, reused.UnitsBuilt)
+	if ceiling := holder.wall + holder.wall/2; waiter.wall > ceiling {
+		t.Errorf("the index that waited took %s against the holder's %s, over the %s ceiling: "+
+			"it waited out the holder and then did the holder's work again", waiter.wall, holder.wall, ceiling)
 	}
 }
