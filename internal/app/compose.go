@@ -172,6 +172,24 @@ const (
 	// startup recovery and the collection pass are taken at the first
 	// operation that needs them: the refresh tool, or a watch pass.
 	modeServe
+	// modeWatch composes for a command whose whole life is a watch: `codectx
+	// watch`, and `codectx index --watch` once its base generation is built.
+	// It BUILDS, so it is one of the Section 13.2 owners, but like the server
+	// it does not take the workspace at its open.
+	//
+	// The reason is the same one and so is the mechanism. A watch is idle
+	// between its beats, and a session that owned the workspace while it was
+	// idle refused the person's own `codectx index` in the next terminal for
+	// as long as the watch happened to be running -- for nothing, because a
+	// watch between beats is building nothing. So the store opens LazyWriter,
+	// and the lock, the startup recovery and the collection pass are taken by
+	// the beat that builds (Coordinator.reconcile) and given back when that
+	// beat ends, by whichever path. A beat that cannot have the workspace is
+	// skipped and reported once for the episode; the session keeps running and
+	// the next beat starts from whatever the other process published.
+	//
+	// It opens no second read-only handle: a watch answers no questions.
+	modeWatch
 )
 
 // openOptions are the composition's variable inputs. They are one struct
@@ -204,24 +222,29 @@ type openOptions struct {
 
 // indexing reports whether this composition may build generations: it holds
 // the cross-process workspace lock while it builds, runs startup recovery
-// under it, watches the worktree and schedules collection. Both the indexing
-// commands and the server are that composition. What distinguishes the server
-// is the reader handle it opens beside the writer and WHEN it takes the lock:
-// an indexing command's whole life is the run, so it takes the lock at its
-// open and is refused there if it cannot have it, while the server takes it at
-// its first build so that everything it can answer without it keeps answering.
-func (o openOptions) indexing() bool { return o.mode == modeIndex || o.mode == modeServe }
+// under it, watches the worktree and schedules collection. The one-shot
+// indexing commands, a watch and the server are all that composition. What
+// distinguishes them is the reader handle the server opens beside the writer,
+// and WHEN each takes the lock (see locksAtOpen).
+func (o openOptions) indexing() bool {
+	return o.mode == modeIndex || o.mode == modeServe || o.mode == modeWatch
+}
 
 // locksAtOpen reports whether this composition takes the workspace lock as part
-// of opening, which is every building composition but the server's.
+// of opening, which is the ONE-SHOT indexing commands and nothing else: a
+// composition whose whole life is one run owns the workspace for that life,
+// while a session that is idle between the things it builds -- the server, a
+// watch -- takes it per operation through Hold.
 //
 // It is also what decides the WAIT POLICY, and that is why the policy is not a
-// caller's option. An indexing command is a person's own foreground command:
-// it waits for as long as whoever holds the workspace keeps getting somewhere,
-// because refusing a command that would have succeeded in a minute is the
-// defect. The server's acquisition is an agent's tool call with somebody
-// waiting on the answer, so it tries once and says the workspace is busy -- a
-// retryable answer now beats a call held open behind the person's own index.
+// caller's option. A one-shot indexing command is a person's own foreground
+// command: it waits for as long as whoever holds the workspace keeps getting
+// somewhere, because refusing a command that would have succeeded in a minute
+// is the defect. A session's acquisition is one operation of many -- an
+// agent's tool call with somebody waiting on the answer, or a watch beat that
+// the next beat repeats -- so it tries once and is told the workspace is busy:
+// a retryable answer now beats a tool call held open behind the person's own
+// index, and a skipped beat costs a watch nothing at all.
 func (o openOptions) locksAtOpen() bool { return o.mode == modeIndex }
 
 // stack is everything a workspace owns below the coordinator. It exists apart
@@ -266,8 +289,9 @@ type stack struct {
 	operation string
 	builds    bool
 	// holders is how many operations are holding the lock right now. The
-	// composition that locks at its open holds one for its whole life; the
-	// server's operations take one each and give it back when they end.
+	// composition that locks at its open holds one for its whole life; a
+	// session's operations -- a server's refresh, a watch's beat -- take one
+	// each and give it back when they end.
 	holders  int
 	resolver *toolchain.Resolver
 	toolDir  string
@@ -497,11 +521,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxEvidencePerFact: evidenceClip(cfg),
 		Synchronous:        cfg.Storage.Synchronous,
 		ReadOnly:           o.mode == modeQuery,
-		// The server's open writes nothing, so a server started while another
+		// A BUILDING session that does not lock at its open writes nothing at
+		// its open either, so a server or a watch started while another
 		// process is indexing is not refused `database is busy: begin` at the
-		// schema check. Its first actual write is its own refresh's, under the
-		// lock that refresh takes.
-		LazyWriter: o.mode == modeServe,
+		// schema check. Its first actual write is its first build's, under the
+		// lock that build takes. A report is not one of them: it takes no lock
+		// because it builds nothing, and it still records the reading session
+		// it was opened for.
+		LazyWriter: o.indexing() && !o.locksAtOpen(),
 	}); err != nil {
 		return nil, err
 	}
@@ -1067,8 +1094,8 @@ func (s *stack) collect(ctx context.Context) {
 // the last one to give it back closes it, so a capture inside a refresh and a
 // refresh inside a watch share the lock the outermost of them took, and no
 // inner operation can release one an outer one still needs. A composition that
-// locks at its open (an indexing command, whose whole life is the run) starts
-// with that one reference and gives it up in Close.
+// locks at its open (a one-shot indexing command, whose whole life is the run)
+// starts with that one reference and gives it up in Close.
 //
 // Everything the workspace owner must do before it builds happens on the way
 // in, under the lock and exactly once per acquisition: the run ledger's
@@ -1094,11 +1121,13 @@ func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error
 			Message: "this workspace was opened for reading and cannot take the workspace indexing lock"}
 	}
 	if s.lock == nil {
-		// Try once. This acquisition is only ever reached by the serving
-		// composition -- an indexing command already holds the lock from its
-		// open, so its holds only count -- and an agent asking for a refresh
-		// while the person's own index runs is answered now, with the
-		// retryable refusal, rather than held behind that index.
+		// Try once. This acquisition is only ever reached by a composition
+		// that does not lock at its open -- the server and a watch; a one-shot
+		// indexing command already holds the lock from its open, so its holds
+		// only count. An agent asking for a refresh while the person's own
+		// index runs is answered now, with the retryable refusal, rather than
+		// held behind that index, and a watch beat refused here is skipped and
+		// asks again at the next beat.
 		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.operation, snapshot.TryOnce())
 		if err != nil {
 			return nil, nil, err

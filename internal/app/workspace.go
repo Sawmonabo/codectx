@@ -20,12 +20,13 @@ import (
 
 // Workspace is one opened workspace: the composed stack plus the index
 // coordinator over it. Opened for indexing it is the single cross-process owner
-// of Section 13.2 -- the workspace lock is held from the open in a command
-// whose whole life is one run, and for the duration of each operation in a
-// serving session -- so exactly one of
-// `index`, `refresh`, `watch` and the MCP server builds at a time and a second
-// caller is told the workspace is busy rather than becoming a second writer.
-// Opened for a report it holds no lock and can build nothing.
+// of Section 13.2 -- the workspace lock is held from the open in a one-shot
+// command whose whole life is one run (`index`, `refresh`), and for the
+// duration of each operation in a session that is idle between the things it
+// builds (`watch`, `index --watch`, the MCP server) -- so exactly one of them
+// builds at a time and a second caller is told the workspace is busy rather
+// than becoming a second writer. Opened for a report it holds no lock and can
+// build nothing.
 type Workspace struct {
 	s     *stack
 	coord *index.Coordinator
@@ -64,10 +65,13 @@ type OpenOptions struct {
 	// ends. It is how a command says what it is behind instead of going
 	// silent, and it changes nothing about how long the open waits.
 	//
-	// There is nothing here to choose how long that is. An indexing open waits
-	// for as long as the holder keeps making progress and a server's build
-	// tries once; both are properties of what the composition IS, so neither
-	// is a field a caller could set wrongly.
+	// There is nothing here to choose how long that is, and only the opens
+	// that take the lock at their open -- OpenWorkspace -- read it at all. A
+	// one-shot indexing open waits for as long as the holder keeps making
+	// progress; a session's build (a server's refresh, a watch's beat) takes
+	// the lock later and tries once, so it never waits and has nothing to
+	// report. Both are properties of what the composition IS, so neither is a
+	// field a caller could set wrongly.
 	OnWaiting func(WaitingHolder)
 	// Rebuild opens an explicitly requested new cache beside the configured
 	// one and leaves the existing database untouched (Section 12.2).
@@ -106,6 +110,22 @@ func OpenWorkspaceForReport(ctx context.Context, repo string) (*Workspace, error
 // uses OpenWorkspaceForReport.
 func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error) {
 	return open(ctx, repo, openOptions{mode: modeQuery})
+}
+
+// OpenWorkspaceForWatch composes the workspace for a command whose whole life
+// is a watch -- `codectx watch`, and `codectx index --watch` once its base
+// generation is built.
+//
+// It builds, so it is one of the Section 13.2 owners, but it takes NEITHER the
+// workspace lock nor a single write to open: the beat that builds takes the
+// lock through the coordinator and gives it back when that beat ends, so a
+// watch that is between beats owns nothing and the person's own `codectx
+// index` beside it runs. A beat that finds the workspace busy is skipped and
+// the session keeps running. OpenOptions.OnWaiting is not read here: nothing
+// in this composition waits at its open.
+func OpenWorkspaceForWatch(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeWatch, operation: o.Operation, rebuild: o.Rebuild,
+		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
 // OpenWorkspaceForServer composes the workspace for the one process that both
