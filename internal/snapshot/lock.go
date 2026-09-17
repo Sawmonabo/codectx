@@ -39,22 +39,34 @@ type WorkspaceLock struct {
 // INJECTED: the evidence of progress lives in the run ledger beside the index
 // cache, and this package neither reads it nor knows it exists.
 //
+// holder is what the lock file says about the process being waited for, so a
+// probe that must diagnose the holder can name it. Its Stage is the probe's own
+// output and is always empty on the way in.
+//
 // progressing is the probe's answer to "has the holder shown a fresh stamp",
 // judged by the holder's own published deadline and never recomputed from this
 // process's configuration. stage is the innermost work the holder has named,
 // empty when it has named none.
-type HolderProbe func(context.Context) (stage string, progressing bool)
+//
+// A non-nil err ends the wait at once, and LockWorkspace returns it unchanged:
+// it is the probe saying that no amount of waiting will make this holder
+// readable, which is a different fact from "not progressing" and has a
+// different remedy. The whole diagnosis belongs to the probe, because this
+// package knows nothing about where the evidence lives; stage and progressing
+// are then ignored.
+type HolderProbe func(ctx context.Context, holder WaitingHolder) (stage string, progressing bool, err error)
 
 // A WaitingHolder is what a waiter knows about the process it is waiting for:
 // what that process recorded in the lock file, and the stage the probe last
 // saw it in. PID is zero for a holder that recorded nothing.
 //
-// Waiting is false on exactly one call: the one that says the wait is over,
-// acquired or refused. An observer rewriting one line in a terminal needs to be
-// told that, or it leaves the command's own first line of output appended to a
-// progress line. It is a field rather than the struct's zero value because a
-// holder that recorded nothing and has named no stage is otherwise
-// indistinguishable from the end of the wait.
+// Waiting is false on exactly one call: the one that says the wait is over --
+// acquired, refused, or ended by the probe's own diagnosis. An observer
+// rewriting one line in a terminal needs to be told that, or it leaves the
+// command's own first line of output appended to a progress line. It is a field
+// rather than the struct's zero value because a holder that recorded nothing
+// and has named no stage is otherwise indistinguishable from the end of the
+// wait.
 type WaitingHolder struct {
 	Waiting   bool
 	PID       int
@@ -84,9 +96,10 @@ func TryOnce() LockWait { return LockWait{} }
 
 // WaitWhileProgressing waits for as long as probe keeps saying the holder is
 // getting somewhere, and reports CTX_WORKSPACE_BUSY only once it has said
-// nothing for grace. There is no other bound: a holder that keeps working is
-// waited out however long it takes, and the operator's interrupt is what ends
-// a wait they no longer want.
+// nothing for grace. No duration bounds it: a holder that keeps working is
+// waited out however long it takes. Three things other than the grace end such
+// a wait -- the holder letting go, the operator's interrupt, and the probe
+// answering with an error, which is returned unchanged and immediately.
 //
 // grace is what makes this a progress judgement rather than a fixed wait in
 // disguise. A holder legitimately shows no fresh stamp for a while -- between
@@ -98,8 +111,11 @@ func TryOnce() LockWait { return LockWait{} }
 // late a stamp may legitimately be; it is not a second number invented here,
 // and nothing in this package may choose one.
 //
-// observe, when non-nil, is called when the wait begins, again whenever what it
-// would say changes, and once with the zero WaitingHolder when the wait ends.
+// observe, when non-nil, is called whenever what it would say changes, and
+// always once with the zero WaitingHolder when the wait ends. A wait the probe
+// ends on its first answer is reported only by that closing call: there was
+// never a wait to show, and printing a line to erase it at once would be worse
+// than printing none.
 func WaitWhileProgressing(grace time.Duration, probe HolderProbe, observe func(WaitingHolder)) LockWait {
 	return LockWait{probe: probe, observe: observe, grace: grace}
 }
@@ -108,7 +124,8 @@ func WaitWhileProgressing(grace time.Duration, probe HolderProbe, observe func(W
 // and lock file (0600) as needed. When the lock is held elsewhere it behaves as
 // wait says: it tries once, or it retries while the holder progresses. Either
 // way the failure is a retryable CTX_WORKSPACE_BUSY naming whoever recorded
-// themselves in the file.
+// themselves in the file -- unless the probe itself ends the wait, in which
+// case its error is what the caller gets, unchanged and with no grace spent.
 //
 // operation is what the acquiring process is doing, in the words a person would
 // recognise on the refusal another process is about to read -- an index, a
@@ -167,7 +184,15 @@ func LockWorkspace(ctx context.Context, dataDir, operation string, wait LockWait
 		if wait.probe == nil {
 			return refuse()
 		}
-		stage, progressing := wait.probe(ctx)
+		stage, progressing, probeErr := wait.probe(ctx, WaitingHolder{Waiting: true, PID: h.pid, Operation: h.operation})
+		if probeErr != nil {
+			// Not a refusal this package composes: the probe has diagnosed the
+			// holder and its error is the answer. Reported as the end of the
+			// wait first, so an observer rewriting one line closes it.
+			report(WaitingHolder{})
+			f.Close()
+			return nil, probeErr
+		}
 		now := time.Now()
 		if progressing {
 			lastProgress = now
