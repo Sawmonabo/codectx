@@ -28,24 +28,26 @@ func TestDiskIsAdmittedOnTheSameQueueAsMemory(t *testing.T) {
 
 	// Fits the memory allocation with room to spare and does not fit the disk
 	// one, so it must wait.
-	admitted := make(chan struct{})
+	admitted := make(chan error, 1)
 	go func() {
 		release, rerr := l.ReserveWith(ctx, Reservation{MemoryBytes: 1 << 30, DiskBytes: 6 << 30}, nil)
-		if rerr != nil {
-			return
+		admitted <- rerr
+		if rerr == nil {
+			release()
 		}
-		close(admitted)
-		release()
 	}()
 	select {
-	case <-admitted:
-		t.Fatal("a child whose staged bytes do not fit the free space was admitted beside one that holds them")
+	case rerr := <-admitted:
+		t.Fatalf("a child whose staged bytes do not fit the free space did not wait for them (error: %v)", rerr)
 	case <-time.After(50 * time.Millisecond):
 	}
 
 	first()
 	select {
-	case <-admitted:
+	case rerr := <-admitted:
+		if rerr != nil {
+			t.Fatalf("the waiting child was refused rather than admitted: %v", rerr)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the waiting child was not admitted after the disk it waited for was released")
 	}

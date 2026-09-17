@@ -31,7 +31,9 @@ func TestFreeDiskAllocationRecordsWhatWasMeasured(t *testing.T) {
 	if atFloor := freeDiskAllocation(dir, full+(1<<40)); atFloor != 0 {
 		t.Fatalf("a host below its floor yielded %d, want 0", atFloor)
 	}
-	// No figure at all: the stand-in, which is neither zero nor unlimited.
+	// No figure at all: the stand-in, which is neither zero nor unlimited. A
+	// missing leaf under a directory that exists is what the platform call
+	// actually fails on, which is the unmeasurable reading this asserts.
 	unmeasured := freeDiskAllocation(filepath.Join(dir, "no-such-directory"), 0)
 	if unmeasured != unobservedFreeDiskBytes {
 		t.Fatalf("an unmeasurable directory yielded %d, want the stand-in %d", unmeasured, unobservedFreeDiskBytes)
