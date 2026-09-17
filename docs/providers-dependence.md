@@ -539,7 +539,9 @@ carried into the new generation until the fresh one replaces it (Section 13.3).
 ## Refresh and delta
 
 The engine has no incremental mode, no merge and no per-file export
-(joern#5757), so a refreshed unit is a whole parse and export — unless the
+([upstream issue #5757](https://github.com/joernio/joern/issues/5757), answered by the
+engine's maintainer on 2026-08-28: incremental parsing is not supported), so a refreshed
+unit is a whole parse and export — unless the
 cache key still matches, in which case nothing runs at all.
 
 What is wired today, exactly. Every import derives an engine-id-independent

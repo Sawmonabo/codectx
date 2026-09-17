@@ -9,13 +9,21 @@ import (
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
-// A repository must select exactly the pinned tools its own root declares.
+// A repository must select exactly the pinned tools its own sources declare.
+// Selection reads the markers of the whole workspace traversal, not the
+// repository root alone; this fixture puts every marker at the root, and the
+// test below covers the subdirectory shape.
+//
 // Under-selecting is the failure an offline runner discovers mid-index, when a
 // payload `tools prefetch --for-repo` was supposed to have installed is fetched
 // from a host with no network; over-selecting sends the doctor's operator to
 // download gigabytes for a language the repository does not contain. Both are
 // silent until the run that needs the answer, so the mapping is proved here.
-func TestSelectedToolsIsTheRootsOwnAnswer(t *testing.T) {
+//
+// Mutation: drop the language-server names from the mapping in SelectedTools
+// -> the selection loses gopls and ty and no longer equals the lock's own
+// answer for the repository's languages.
+func TestSelectedToolsIsTheRepositorysOwnAnswer(t *testing.T) {
 	root := t.TempDir()
 	for _, name := range []string{"go.mod", "main.go", "pyproject.toml", "app.py"} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte("x\n"), 0o600); err != nil {
