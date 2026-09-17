@@ -157,3 +157,37 @@ func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 		t.Errorf("the tail is %d bytes, more than one error detail carries", len(got.StderrTail))
 	}
 }
+
+// TestClassifyReducesPunctuatedPaths protects the privacy of a durable failure
+// row. Failure mode: the child prints absolute paths inside punctuation -- a
+// backticked command line, an argument list, a quoted value -- and a reduction
+// that only fired on a field beginning with a separator let the whole
+// directory chain, including the operator's home directory and the repository
+// path, travel through the failure detail into provider_runs.failure_json,
+// which outlives every log. The other half is asserted with it: a tail whose
+// base names are gone diagnoses nothing, and a path under a directory this run
+// made keeps the part inside that directory, which says which step wrote the
+// file.
+//
+// The paths are synthetic. A fixture built from this machine's own home
+// directory would put a host-local path in a tracked file.
+func TestClassifyReducesPunctuatedPaths(t *testing.T) {
+	const home = "/home/example-user"
+	const repo = home + "/src/demo-repo"
+	stderr := "2026-09-14 08:00:00.000 ERROR Runner cmd: `" + home + "/.local/bin/analyzer-parse --language go`\n" +
+		"java.lang.RuntimeException: refused List(" + repo + "/units/unit-4, --output)\n" +
+		"\tat Importer.read(Importer.scala:88) file=\"" + repo + "/pkg/handler.go\"\n" +
+		"java.nio.file.NoSuchFileException: (private)/out/export.json\n"
+
+	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))}, nil)
+	for _, outside := range []string{"example-user", "demo-repo", "/home", ".local", "/src", "/pkg", "/units"} {
+		if strings.Contains(got.StderrTail, outside) {
+			t.Errorf("the tail publishes %q, a directory outside the workspace: %q", outside, got.StderrTail)
+		}
+	}
+	for _, kept := range []string{"`analyzer-parse", "List(unit-4,", "file=\"handler.go\"", "(private)/out/export.json"} {
+		if !strings.Contains(got.StderrTail, kept) {
+			t.Errorf("the redaction destroyed the diagnostic: %q is not in %q", kept, got.StderrTail)
+		}
+	}
+}
