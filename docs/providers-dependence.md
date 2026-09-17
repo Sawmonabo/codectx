@@ -307,6 +307,11 @@ allocation  = min(MemAvailable - base footprint - safety margin,
                   MemAvailable / 2)
 ```
 
+The base footprint is derived from the machine and the configuration -- this
+build's measured idle overhead plus the query, cache and queue reservations
+([configuration](configuration.md)) -- so a host with more cores keeps more for
+itself and offers its children less.
+
 * The cap is sized to what the unit needs, never to what the machine has. A
   frontend grows toward whatever cap it is given and does not need it: a
   157 MB JavaScript project of 4,984 files parsed in 3 m 38 s under a 4 GiB

@@ -558,10 +558,14 @@ relationships that must hold:
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.
-- (query slots on this machine) × `query_memory_bytes` + `cache_bytes` +
-  `queue_bytes` ≤ the 1 GiB base footprint this process keeps for itself. How
-  many queries run at once comes from the cores, so this is checked against the
-  machine the configuration is loaded on.
+- The base footprint this process keeps for itself is **derived**, not bounded:
+  this build's measured idle overhead + (query slots on this machine) ×
+  `query_memory_bytes` + `cache_bytes` + `queue_bytes`. How many queries run at
+  once comes from the cores, so a host with more cores has a larger base
+  footprint and leaves the analyzers and language servers it starts a smaller
+  allocation. There is no figure here for you to exceed and no core count that
+  makes the shipped defaults unresolvable; the only way this arithmetic fails
+  is by leaving 64-bit range, which names the keys that caused it.
 - `resources.max_temp_bytes` > `resources.min_free_disk_bytes`, when `max_temp_bytes` is set at all (`0` is unlimited and has nothing to exceed).
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when

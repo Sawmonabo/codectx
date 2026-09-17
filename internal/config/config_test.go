@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -413,5 +415,40 @@ func TestCPUBoundWorkIsSizedFromTheMachine(t *testing.T) {
 		if got := graphSlotsFor(cpus); got != want {
 			t.Errorf("%d CPUs give %d traversal slots, want %d", cpus, got, want)
 		}
+	}
+}
+
+// TestBaseFootprintIsDerivedFromTheMachine protects the rule that this
+// process's base footprint follows the machine instead of being compared to a
+// figure. Failure mode: the shipped defaults, unchanged, are refused at load
+// time on a machine with enough cores -- 31 query slots of 32 MiB plus the
+// cache and the queue exceed a 1 GiB constant -- and the refusal names no key
+// the operator could lower, so the product simply does not start on a large
+// host. The core count is pinned because this host has few enough that the
+// defect is invisible on it.
+//
+// Mutation: restore the comparison in validate.go --
+// `if baseline > BaseFootprintBytes { ... }` -> "Load on a 31-core machine
+// returned CTX_CONFIG_INVALID".
+func TestBaseFootprintIsDerivedFromTheMachine(t *testing.T) {
+	for _, cpus := range []int{31, 64, 128} {
+		t.Run(strconv.Itoa(cpus), func(t *testing.T) {
+			cpuCount = func() int { return cpus }
+			t.Cleanup(func() { cpuCount = runtime.NumCPU })
+			cfg, err := loadFixture(t, "", "")
+			if err != nil {
+				t.Fatalf("Load on a %d-core machine returned %v, want the shipped defaults to resolve", cpus, err)
+			}
+			// The footprint is the idle overhead plus the three reservations
+			// this process makes up front, one query slot per core. A footprint
+			// that did not grow with the cores would under-state what the
+			// parent holds and admit children against memory already spoken for.
+			want := IdleFootprintBytes +
+				int64(cpus)*cfg.Resources.QueryMemoryBytes +
+				cfg.Resources.CacheBytes + cfg.Index.QueueBytes
+			if got := BaseFootprint(cfg); got != want {
+				t.Errorf("BaseFootprint on a %d-core machine is %d, want %d", cpus, got, want)
+			}
+		})
 	}
 }
