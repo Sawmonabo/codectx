@@ -314,6 +314,14 @@ type ResourceReport struct {
 	// StagesOmitted is how many of the run's stages this page does not carry,
 	// with the same meaning it has on IndexResult.
 	StagesOmitted int64 `json:"stages_omitted"`
+	// Warnings names the parts of this block that could not be read and why.
+	// A figure this report leaves absent is indistinguishable from a figure
+	// nothing ever recorded -- an unreadable run ledger looks exactly like a
+	// workspace that has never indexed -- and an operator reading a resource
+	// block to diagnose a problem is the last person who should have to guess
+	// which of the two they are looking at. Each carries the remediation of
+	// the typed error it came from.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
@@ -375,6 +383,9 @@ func (r ResourceReport) Validate() error {
 		if err := requireNonNegative(f.field, *f.value); err != nil {
 			return err
 		}
+	}
+	if err := boundStrings("resources.warnings", r.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
 	}
 	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
 		return invalid("resources.analyzer_units holds %d rows, more than the %d a bounded response carries",
@@ -596,6 +607,18 @@ type ScratchCollection struct {
 	Pools      []ScratchPool `json:"pools"`
 	HeldBytes  uint64        `json:"held_bytes"`
 	FreedBytes uint64        `json:"freed_bytes"`
+	// StuckFrees names the removals this request could not make, each with the
+	// reason the filesystem gave. They are why freed can fall short of held
+	// without the request having failed, and an operator reading the two
+	// figures needs them to tell "the space is gone" from "the space is
+	// stuck".
+	//
+	// It belongs to the REQUEST and not to a pool: one reclaimer serves the
+	// whole process, so what it could not free is the same list whichever pool
+	// was being emptied when the request waited on it. Reported per pool, the
+	// same entries appeared under each of them and every one of those
+	// attributions but at most one was wrong.
+	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
 }
 
 // ScratchPool is one pool of ScratchCollection: the directory it serves, what
@@ -605,11 +628,6 @@ type ScratchPool struct {
 	HeldBytes     uint64            `json:"held_bytes"`
 	HeldByPurpose map[string]uint64 `json:"held_by_purpose,omitempty"`
 	FreedBytes    uint64            `json:"freed_bytes"`
-	// StuckFrees names the removals this collection could not make, each with
-	// the reason the filesystem gave. They are why freed can fall short of
-	// held without the request having failed, and an operator reading the two
-	// figures needs them to tell "the space is gone" from "the space is stuck".
-	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
 	// LeftAlone names the instances of this pool the collection did not
 	// touch, and why. An instance is a whole pool of surfaces, so held minus
 	// freed is mostly these; without them the report reads as a collection

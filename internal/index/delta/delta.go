@@ -28,7 +28,9 @@ package delta
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -178,6 +180,13 @@ func workDir(req Request) (string, error) {
 // returns an empty path and no error.
 func previousState(ctx context.Context, store *sqlite.Store, dir, name string, unit model.UnitID, kind string) (string, error) {
 	p := filepath.Join(dir, name)
+	// A predecessor's state is as large as the predecessor's unit, and the
+	// open below frees all of it at once if a previous call left one here.
+	// Emptied through the pace first, so the truncating open has nothing to
+	// give back in one act; a file that is not there costs nothing.
+	if err := paced.Shrink(p, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", internal("delta state: " + err.Error())
+	}
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", internal("delta state: " + err.Error())

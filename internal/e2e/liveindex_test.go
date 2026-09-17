@@ -3,9 +3,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,16 +102,20 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 		{"doctor", []string{"doctor"}},
 	}
 
-	// Arm one: the index alone. Both arms are handed the same shape of work --
-	// the same files, the same symbol count, the same appended byte width --
-	// so the difference between the two walls is about the readers and not
-	// about what each run had to parse.
+	// Arm one builds the generation the readers below read. Its wall is NOT
+	// compared with arm two's and is not reported: the two arms are not handed
+	// the same work. This one indexes a once-padded repository into an empty
+	// store; the next indexes a twice-padded one against a store that already
+	// holds this generation, and a counter-factual with no readers at all
+	// showed the second arm a third slower on that difference alone. A
+	// slowdown figure taken from the pair would be measuring the arm ordering,
+	// so there is no such figure here; what this test measures is what the
+	// readers answered and how long each of them took, which is per reader and
+	// needs no second arm.
 	padFixture(t, s.Repo, 1, padPerFile)
-	aloneStart := time.Now()
 	if env, code := s.run(t, "index"); !env.OK || code != 0 {
 		t.Fatalf("the unattended index failed (exit %d): %+v", code, env.Error)
 	}
-	aloneWall := time.Since(aloneStart)
 
 	// Arm two: the same index with every reader running throughout.
 	padFixture(t, s.Repo, 2, padPerFile)
@@ -171,7 +177,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 		}
 	}
 	t.Logf("reader cycles completed strictly inside the run: %d", cycles)
-	t.Logf("index wall alone %s, with the readers running throughout %s", aloneWall, withWall)
+	t.Logf("index wall with the readers running throughout %s", withWall)
 	if cycles == 0 {
 		t.Errorf("the index finished (wall %s) before one full reader cycle completed: "+
 			"the readers are being held up by the run", withWall)
@@ -526,88 +532,6 @@ func padFixture(t *testing.T, repo string, round, symbols int) {
 	}
 }
 
-// TestE2EAWatchingServerLeavesTheWorkspaceToThePerson is the product-boundary
-// proof of the other half of coexistence: the half a WATCHING session owes.
-//
-// Failure mode it protects: `mcp.watch` is the shipped default, and a watching
-// session used to take the Section 13.2 workspace lock at its first pass and
-// keep it until the session ended. The person's own `codectx index` in a
-// terminal was then refused CTX_WORKSPACE_BUSY for as long as their agent's
-// server happened to be running -- an idle process holding a workspace it is
-// not building in. Mutation that must fail this row is quoted in this lane's
-// report: give the beat's release back to the session in
-// internal/index/coordinator.go and the index below is refused.
-//
-// The beat BEFORE that index is load-bearing and not setup: a session that has
-// never beaten holds nothing under either behaviour, so a row that indexed
-// straight away would pass against the very defect it exists to catch.
-//
-// What it then asserts is that letting go costs nothing: the watch's next beat
-// REUSES the generation the person's index published rather than rebuilding
-// the workspace itself.
-func TestE2EAWatchingServerLeavesTheWorkspaceToThePerson(t *testing.T) {
-	s := newSandbox(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
-	defer cancel()
-
-	if env, code := s.run(t, "index"); !env.OK || code != 0 {
-		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
-	}
-	// --watch=true and not the sandbox default: this sandbox turns mcp.watch
-	// off so the other rows compare generations nothing moves underneath, and
-	// this row is about the watching session in particular.
-	session, serverLog, closeSession := s.mcpServer(t, ctx, "--watch=true")
-	t.Cleanup(closeSession)
-
-	touchFixture(t, s.Repo)
-	armed := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, 0)
-	t.Logf("the watching session completed a beat: generation %d, %d reused, %d built",
-		armed.generation, armed.reused, armed.built)
-
-	// The assertion: the person's own index, as a further process, while that
-	// watching session is connected and has already beaten.
-	env, code := s.run(t, "index")
-	if !env.OK || code != 0 {
-		t.Fatalf("`codectx index` was refused (exit %d) beside a connected watching server: %+v -- "+
-			"the watch is holding the workspace between its beats", code, env.Error)
-	}
-	person := data[model.IndexResult](t, env, code)
-	if int64(person.Binding.GenerationID) <= armed.generation {
-		t.Fatalf("the person's index published generation %d, which is not past the watch's beat at %d",
-			person.Binding.GenerationID, armed.generation)
-	}
-
-	// The next beat: the fixture is rewritten with the content it already has,
-	// so the notification fires and every unit hashes to what the person's
-	// index just sealed. A beat that reuses them is a beat that started from
-	// the generation that index published; one that rebuilt them started from
-	// its own.
-	touchFixture(t, s.Repo)
-	next := awaitRefreshPast(t, ctx, serverLog, refreshedRecord, int64(person.Binding.GenerationID))
-	t.Logf("the beat after the person's index: generation %d, %d reused, %d built, %d invalidated",
-		next.generation, next.reused, next.built, next.invalidated)
-	if next.reused == 0 || next.built != 0 {
-		t.Fatalf("the beat after the person's index reused %d units and built %d: "+
-			"it rebuilt the workspace rather than reusing the generation that index published",
-			next.reused, next.built)
-	}
-
-	// And the session is still answering, so what it gave up was the workspace
-	// and not the session.
-	for _, tool := range []struct {
-		name string
-		args any
-	}{
-		{"codectx_index_status", model.StatusRequest{}},
-		{"codectx_search", model.SearchRequest{Query: "TinyStore"}},
-	} {
-		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
-		if err != nil || res.IsError {
-			t.Fatalf("%s no longer answers after the person indexed beside the watching session (err %v)", tool.name, err)
-		}
-	}
-}
-
 // touchFixture rewrites one generated source file with the content it already
 // holds. The filesystem notification fires on the write, so it is what makes a
 // beat happen now rather than at the next reconcile interval, and the content
@@ -852,7 +776,14 @@ func (s *sandbox) watchCommand(t *testing.T) (*serverLog, func() (envelope, int)
 // workspace it was not building in, and the person's own `codectx index` in
 // another was made to wait out the grace and then refused by name. One watcher
 // mechanism, not two: a watch holds the workspace for the beat that builds and
-// nothing else, exactly as the server's watch already does.
+// nothing else.
+//
+// This row covers the WATCHING SERVER too, and is the only row that covers
+// either. Both front ends compose the same watching workspace (modeWatch in
+// internal/app/compose.go) and take the lock at the same place (the beat, in
+// internal/index/coordinator.go); a second row driving the same mechanism
+// through `mcp serve --watch=true` asserted nothing this one does not, at the
+// cost of several real index runs per test pass.
 //
 // The beat BEFORE that index is load-bearing and not setup: a session that has
 // never beaten holds nothing under either behaviour, so a row that indexed
@@ -1135,5 +1066,189 @@ func TestE2EASecondBuildWaitsOutTheHolderAndReusesItsWork(t *testing.T) {
 	if ceiling := holder.wall + holder.wall/2; waiter.wall > ceiling {
 		t.Errorf("the index that waited took %s against the holder's %s, over the %s ceiling: "+
 			"it waited out the holder and then did the holder's work again", waiter.wall, holder.wall, ceiling)
+	}
+}
+
+// A command that answers questions must leave the workspace byte for byte as it
+// found it -- proved here on the built binary, against the store an interrupted
+// run leaves behind, which is where the damage was found.
+//
+// `Options.ReadOnly` opened no writer connection and set `query_only`, which
+// refuses writes through SQL and leaves the handle read-WRITE at the file
+// level. The last connection to let go of one closes the write-ahead log: the
+// log is copied into the database and the log and its shared-memory index are
+// unlinked, with the database held exclusively for the whole of it. On a
+// workspace whose killed run left an 82 MB log, one `codectx status --json`
+// grew `codectx.db` from 12,865,536 to 94,973,952 bytes and removed both files.
+// `status --help` and docs/operations.md both promise that command writes
+// nothing.
+//
+// The log here is made the way an operator's is: a second run is killed in the
+// middle of its ingestion, leaving a live log beside a database that already
+// holds a published generation. A test that only ever saw a cleanly closed
+// store would not exercise the log close at all, so the log's presence is
+// asserted before the command runs.
+//
+// Mutation that fails this test: drop `mode=ro` from the read-only pools'
+// connection string in internal/storage/sqlite/open.go. The log and the
+// shared-memory index are then absent after `status`.
+func TestAnAnsweringCommandLeavesAnInterruptedRunsLogUntouched(t *testing.T) {
+	s := newSandbox(t)
+	const files = 400
+	write := func(body string) {
+		t.Helper()
+		dir := filepath.Join(s.Repo, "wide")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for i := range files {
+			src := fmt.Sprintf("package wide\n\nfunc F%d() int { return %d }\n%s\n", i, i, body)
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.go", i)), []byte(src), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write("")
+	if _, code := s.run(t, "index"); code != 0 {
+		t.Fatalf("the first index exited %d", code)
+	}
+
+	// A second run, killed while it is writing: what a machine losing power or
+	// an operator's interrupt leaves.
+	write("func pad() int { return 1 }")
+	db := filepath.Join(s.Home, "data", "codectx.db")
+	cmd := exec.Command(binary, "index", "--repo", s.Repo, "--json")
+	cmd.Env = s.Environ
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var killed bool
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, err := os.Stat(db + "-wal"); err == nil && st.Size() > 256*1024 {
+			_ = cmd.Process.Kill()
+			killed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = cmd.Wait()
+	if !killed {
+		t.Fatal("the second index never had a log of its own to leave behind, so this test would not " +
+			"exercise the close that writes")
+	}
+
+	before := storeDigest(t, db)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if before[suffix] == absentFile {
+			t.Fatalf("the killed run left no %s, so this test would not exercise the log close", suffix)
+		}
+	}
+
+	env, code := s.run(t, "status")
+	if code != 0 || !env.OK {
+		t.Fatalf("status on a workspace with an interrupted run's log exited %d: %+v", code, env.Error)
+	}
+
+	after := storeDigest(t, db)
+	for _, suffix := range []string{"", "-wal"} {
+		if before[suffix] != after[suffix] {
+			t.Fatalf("codectx status changed %q: %s before, %s after",
+				"codectx.db"+suffix, before[suffix], after[suffix])
+		}
+	}
+	// The shared-memory index is the one file a reader touches, and it holds no
+	// database content: it is the index OF the log, rebuilt from the log, and
+	// the bytes a reader writes are the read mark by which it takes its
+	// snapshot without blocking a writer -- a handful of them, in the index
+	// header and the read-mark block. What must not happen is what the log
+	// close does: the file unlinked, or resized.
+	if strings.Fields(after["-shm"])[0] != strings.Fields(before["-shm"])[0] {
+		t.Fatalf("codectx status removed or resized the shared-memory index: %s before, %s after",
+			before["-shm"], after["-shm"])
+	}
+}
+
+// absentFile is what storeDigest reports for a file that is not there, which is
+// itself an answer: the engine's log close unlinks the log and its index.
+const absentFile = "absent"
+
+// storeDigest is the length and content digest of a store's three files, keyed
+// by the suffix each carries beside the database.
+func storeDigest(t *testing.T, db string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		b, err := os.ReadFile(db + suffix)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("reading %s: %v", filepath.Base(db+suffix), err)
+			}
+			out[suffix] = absentFile
+			continue
+		}
+		sum := sha256.Sum256(b)
+		out[suffix] = fmt.Sprintf("%d bytes %x", len(b), sum[:8])
+	}
+	return out
+}
+
+// A workspace an operator has made read-only must still answer. Read-only media
+// and a locked-down data directory are the same thing to this process: it may
+// read every byte and write none.
+//
+// Two separate things refused it before anything had been read. The composition
+// created the engine's temporary directory under the data directory
+// unconditionally, so the open failed with CTX_INTERNAL, exit 10, on a
+// directory a question never needed to write; and the engine refuses to open a
+// write-ahead-log database at all when it cannot create the shared-memory index
+// beside it, which on a directory nobody may write it cannot. Both reached the
+// operator as an internal defect with nothing to act on.
+//
+// Mutations that fail this test: give the engine temp directory back to the
+// data directory unconditionally (`sqlite.SetTempDir(filepath.Join(s.dataDir,
+// engineTempDirName))` in compose) -> CTX_INTERNAL "not a writable directory";
+// or make `immutableAnswer` always report false -> CTX_INTERNAL "attempt to
+// write a readonly database (1544)".
+func TestAnsweringAWorkspaceOnReadOnlyMedia(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability writes into a directory that grants nobody write, " +
+			"so the refusal this test is built on never happens and it would pass vacuously")
+	}
+	s := newSandbox(t)
+	if _, code := s.run(t, "index"); code != 0 {
+		t.Fatalf("the index exited %d", code)
+	}
+	data := filepath.Join(s.Home, "data")
+	// Every file unwritable and every directory unwritable, restored for the
+	// harness's own cleanup.
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(data, func(path string, d os.DirEntry, err error) error {
+			if err == nil {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	if err := filepath.WalkDir(data, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.Chmod(path, 0o500)
+		}
+		return os.Chmod(path, 0o400)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := storeDigest(t, filepath.Join(data, "codectx.db"))
+	env, code := s.run(t, "status")
+	if code != 0 || !env.OK {
+		t.Fatalf("status on a read-only workspace exited %d: %+v", code, env.Error)
+	}
+	if after := storeDigest(t, filepath.Join(data, "codectx.db")); after[""] != before[""] {
+		t.Fatalf("status changed the database of a read-only workspace: %s before, %s after",
+			before[""], after[""])
 	}
 }

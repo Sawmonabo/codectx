@@ -198,12 +198,13 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 // measurement as absent when it was refused. Absence inside the block still
 // means "not measurable on this host", which is the sampler's own contract.
 //
-// It answers through the composition's READER handle on both facades, not only
-// on the read one. The report is a read in every composition, and the MCP
-// status tool is registered against the writing facade beside refresh -- so a
-// split that followed the facade would leave the single most likely question
-// an agent asks during a refresh, "is the index still running?", the one call
-// that pins on the writer and commits that refresh's ingestion group early.
+// It answers through the composition's query handle, which is a SECOND,
+// read-only handle only where the composition has one -- the serving process,
+// which both answers and builds. In every other composition that handle is the
+// composition's own store, so what this guarantees is not a separate
+// connection but that the MCP status tool, registered against the writing
+// facade beside refresh, does not pin on the writer and commit that refresh's
+// ingestion group early.
 func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.IndexStatus{}, err
@@ -365,7 +366,7 @@ func (s *Services) Path(ctx context.Context, req model.PathRequest) (model.PathR
 //
 // It returns the engine's whole model.ImpactResult rather than a page of its
 // entries. L0 froze this method as model.Page[model.ImpactEntry]; INT changed
-// it (wave-e ruling "Rulings on L7 FACADE deviations", D3) because the result
+// it (the ruling "Rulings on L7 FACADE deviations", D3) because the result
 // also carries the per-package rollup and the visited/edge accounting that
 // `codectx impact` already prints, and model.Page has no home for either. A
 // facade that silently dropped them would make the facade path a downgrade from

@@ -2,6 +2,7 @@ package scip
 
 import (
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // compileCommandsName is the compilation database the C/C++ profile reads.
@@ -124,7 +126,15 @@ func commonDirPrefix(dirs []string) string {
 }
 
 // writeFileInPlace replaces one file's contents, keeping its mode.
+//
+// What it frees is the OLD contents, whole, at the open -- a compilation
+// database is as large as the project it describes -- so the old bytes are
+// given back through the pace first and the truncating open then frees
+// nothing in one act.
 func writeFileInPlace(path string, data []byte, mode fs.FileMode) error {
+	if err := paced.Shrink(path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err

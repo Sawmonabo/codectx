@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/spf13/cobra"
 )
@@ -78,6 +79,7 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 	defer ws.Close()
 
 	report := model.ScratchCollection{Pools: []model.ScratchPool{}}
+	var stuck []paced.Stuck
 	for _, a := range gcArenas(ws.DataDir()) {
 		pool := model.ScratchPool{Directory: a.Root(), HeldByPurpose: map[string]uint64{}}
 		byPurpose, err := a.BytesByPurpose()
@@ -106,13 +108,19 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 			pool.LeftAlone = append(pool.LeftAlone, model.UntouchedInstance{Instance: left.Instance,
 				HeldBytes: uint64(max(left.HeldBytes, 0)), Reason: left.Reason})
 		}
-		for _, stuck := range collected.Stuck {
-			pool.StuckFrees = append(pool.StuckFrees,
-				model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
-		}
+		// Onto the REQUEST, not onto this pool: the reclaimer is the process's,
+		// so every pool's collection returns the same whole-process list, and
+		// filing it under whichever pool was being emptied at the time said
+		// each of those removals belonged to that pool. Collected once, from
+		// the last collection, which is the state after every pool has been
+		// emptied and waited on.
+		stuck = collected.Stuck
 		report.HeldBytes += pool.HeldBytes
 		report.FreedBytes += pool.FreedBytes
 		report.Pools = append(report.Pools, pool)
+	}
+	for _, s := range stuck {
+		report.StuckFrees = append(report.StuckFrees, model.StuckFree{Entry: s.Entry, Reason: s.Reason})
 	}
 	sort.Slice(report.Pools, func(i, j int) bool { return report.Pools[i].Directory < report.Pools[j].Directory })
 
@@ -178,9 +186,11 @@ func writeGCReport(w io.Writer, r model.ScratchCollection) error {
 		for _, left := range p.LeftAlone {
 			fmt.Fprintf(tw, "  left instance %s\t%d bytes\t%s\n", left.Instance, left.HeldBytes, left.Reason)
 		}
-		for _, stuck := range p.StuckFrees {
-			fmt.Fprintf(tw, "  could not free %s\t%s\t\n", stuck.Entry, stuck.Reason)
-		}
+	}
+	// Once, under the totals: one reclaimer serves the process, so what it
+	// could not free is the request's answer and not any one pool's.
+	for _, stuck := range r.StuckFrees {
+		fmt.Fprintf(tw, "  could not free %s\t%s\t\n", stuck.Entry, stuck.Reason)
 	}
 	fmt.Fprintf(tw, "total\t%d bytes held\t%d bytes freed\n", r.HeldBytes, r.FreedBytes)
 	flushTableInto(tw)

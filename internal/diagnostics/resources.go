@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"cmp"
 	"context"
+	"errors"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -84,7 +85,21 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 // A ledger that cannot be read leaves the two rows absent and the report
 // succeeds, for the reason the store's sizes do: the host figures the sampler
 // produced are still true, and an unreadable accounting file must not suppress
-// the memory reading an operator is diagnosing a memory problem with.
+// the memory reading an operator is diagnosing a memory problem with. What it
+// does NOT do is stay silent: the reason goes into the block's warnings, so
+// "this workspace never recorded a run" and "your ledger is unreadable" are
+// not the same answer.
+func warningText(err error) string {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		if typed.Remediation != "" {
+			return typed.Code + ": " + typed.Message + " -- " + typed.Remediation
+		}
+		return typed.Code + ": " + typed.Message
+	}
+	return err.Error()
+}
+
 func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 	if s.opts.Ledger == nil {
 		return
@@ -97,7 +112,16 @@ func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 		generation = 0
 	}
 	run, stages, omitted, err := s.opts.Ledger.LatestRun(ctx, s.opts.Repo, generation)
-	if err != nil || run == nil {
+	if err != nil {
+		// A ledger that cannot be read is not a workspace that has never
+		// recorded a run, and the two are the same picture with the rows
+		// simply absent: a schema-mismatched or corrupt ledger carries a typed
+		// error with its own remediation, and dropping it left an operator
+		// looking at a block that says nothing is wrong.
+		report.Warnings = append(report.Warnings, "the run accounting could not be read: "+warningText(err))
+		return
+	}
+	if run == nil {
 		return
 	}
 	slices.SortStableFunc(stages, func(a, b model.StageRecord) int {

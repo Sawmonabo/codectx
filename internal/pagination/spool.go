@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -143,9 +144,11 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	if leases == nil {
 		return nil, &model.Error{Code: model.CodeConfigInvalid, Message: "spools require a lease store"}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, internalErr("spool directory: " + err.Error())
-	}
+	// The directory is made by the first spool that needs it, not here: a
+	// process that answers one page of every question it is asked writes no
+	// continuation state at all, and creating the directory at composition
+	// would be that process's one write -- the one that also makes a workspace
+	// on read-only media unanswerable.
 	s := &Spools{dir: dir, maxBytes: maxBytes, leases: leases, reserved: map[string]reservation{}}
 	used, err := s.diskBytes()
 	if err != nil {
@@ -269,9 +272,19 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 	if err != nil {
 		return nil, internalErr("spool header: " + err.Error())
 	}
+	// Made here, by the first answer that does not fit one page. A workspace
+	// this process may not write cannot hold continuation state, which is a
+	// bound on the answer and not a defect in this build: it is reported as
+	// the limit it is, with what an operator can do about it.
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return nil, spoolSpaceRefused(s.dir, err)
+	}
 	path := filepath.Join(s.dir, spoolPrefix+id)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, spoolSpaceRefused(s.dir, err)
+		}
 		return nil, internalErr("spool create: " + err.Error())
 	}
 	sp := &Spool{owner: s, header: h, path: path, file: f, w: bufio.NewWriter(paced.NewWriter(f))}
@@ -613,6 +626,11 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 	s.mu.Unlock()
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
+		// Nothing has spooled here yet, so there is nothing to sweep and
+		// nothing is live. Reported as the figure it is, not as a failure.
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
 		return 0, internalErr("spool sweep: " + err.Error())
 	}
 	var errs []error
@@ -722,9 +740,25 @@ func (s *Spools) live(ctx context.Context, h SpoolHeader, now time.Time) (bool, 
 	return now.Before(expiry), nil
 }
 
+// spoolSpaceRefused is an answer that needed continuation state the workspace
+// will not take. It is the same family as the spool budget being exhausted --
+// work this process explicitly could not complete -- rather than an internal
+// defect, because the remedy is the operator's.
+func spoolSpaceRefused(dir string, cause error) error {
+	return &model.Error{Code: model.CodeResourceLimit,
+		Message: "this answer needs more than one page and " + dir + " will not take the state it needs: " +
+			cause.Error(),
+		Remediation: "narrow the query so the answer fits one page, or make the data directory writable"}
+}
+
 func (s *Spools) diskBytes() (int64, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
+		// A directory the first spool has not made yet holds nothing, which
+		// is the figure, not a failure.
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
 		return 0, internalErr("spool directory: " + err.Error())
 	}
 	var used int64

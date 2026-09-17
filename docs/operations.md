@@ -120,9 +120,50 @@ Four kinds of command, by what they may change:
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
 
-A command in the answering row opens the store without a writer connection. It
-answers throughout another process's `index` or `watch` -- that is the promise
-`status --help` makes -- and it delays that run by nothing, because a
+A command in the answering row opens the store without a writer connection, and
+it opens the file itself read-only. Both halves are needed. Without a writer
+connection it begins no write through SQL; without the read-only open the
+handle is still writable at the file level, and the last connection to let go
+of one closes the write-ahead log -- the log is copied into the database and
+the log and its shared-memory index are unlinked, holding the database
+exclusively for the whole of it. That is a rewrite of the published index, by a
+command that promises to write nothing, and on a workspace whose interrupted
+run left a large log it is also minutes during which nothing else can open it.
+
+So an answering command leaves the database and its log byte for byte as it
+found them, whether or not a run is writing and whether or not a log is lying
+beside the database, and it removes neither.
+
+What it does touch is the shared-memory index beside the log. That file holds
+no database content -- it is the index OF the log, rebuilt from the log -- and
+a reader writes its read mark there, which is how an answer is taken from a
+fixed snapshot without blocking a writer. Where the index is missing, a reader
+creates it, together with the engine's zero-length log stub, because reading a
+log at all needs it; on a workspace an operator has made read-only, an index
+already beside the log is read without being written. Neither file is ever
+removed or resized by a reader, and neither carries a byte of the published
+index.
+
+A workspace with no database at all is the answer `CTX_NO_ACTIVE_GENERATION`,
+"run `codectx index`": no answering command creates a database, and none
+creates the provider work directories -- both belong to a run. (The content
+store's own directory is still made where it is missing, which is the one
+directory such a command has always made.)
+
+That is what lets such a command answer a workspace on **read-only media**, or
+one an operator has locked down. Two things are then different, and neither is
+visible in the answer: the engine's temporary files -- sort spills, statement
+journals past their memory threshold -- go to the process temp directory
+instead of the data directory, and are given back when the command ends; and
+where no log lies beside the database, the store is read as an unchanging file,
+which is the only way a write-ahead-log database can be read without an index
+beside it. A directory a command that BUILDS cannot write is refused instead,
+as `CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
+operator's to fix, and a run whose spills went elsewhere is what this directory
+exists to prevent.
+
+It answers throughout another process's `index` or `watch` -- that is the
+promise `status --help` makes -- and it delays that run by nothing, because a
 write-ahead log reader never waits on a writer. It is also why such a command
 never reports `CTX_WORKSPACE_BUSY`: it takes no lock and begins no write that
 could queue behind one.

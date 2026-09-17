@@ -142,7 +142,7 @@ func TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary(t *testing.T) {
 }
 
 // TestChangedFileSeedsKeepReadingPastTheFirstPage is the OTHER half of the
-// bound removal, and the half wave-h review finding A5 records the test above
+// bound removal, and the half an earlier review finding A5 records the test above
 // as unable to prove.
 //
 // The test above publishes exactly one captured change, so page 1 is full and

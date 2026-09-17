@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -62,7 +63,11 @@ type Options struct {
 	// changes nothing. No writer connection is opened at all, so this process
 	// can neither wait on the write transaction another process holds nor
 	// delay it: the reader pool is `query_only` and reads a write-ahead log
-	// snapshot, which never blocks on a writer. The schema fingerprint is
+	// snapshot, which never blocks on a writer. Every connection is opened
+	// read-only at the FILE level besides, which is what query_only does not
+	// do: see openPool, and the workspace such a process would otherwise
+	// rewrite when it closed. A database that is not there is therefore not
+	// created; it is the workspace nothing has published, reported as such. The schema fingerprint is
 	// verified by reading instead of inside a write transaction, and every
 	// mutating entry point refuses with CTX_INTERNAL, because a command that
 	// mutates must be composed with the writer rather than discover at runtime
@@ -244,7 +249,20 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, internal("database path: " + err.Error())
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+	if opts.ReadOnly {
+		// A read-only open creates nothing, so there is no directory to make
+		// and a database that is not there is the workspace nothing has ever
+		// published -- reported here, in the typed answer that sends the
+		// operator to `codectx index`, because the read-only handle cannot
+		// reach the schema check to report it. The engine's read-only mode
+		// refuses to create the file at all, and without this the operator
+		// would read the driver's own "unable to open database file".
+		if _, statErr := os.Stat(abs); errors.Is(statErr, fs.ErrNotExist) {
+			return nil, notPublishedYet()
+		} else if statErr != nil {
+			return nil, internal("database path: " + statErr.Error())
+		}
+	} else if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return nil, internal("database directory: " + err.Error())
 	}
 	// The engine unlinks the write-ahead log from inside its close, and it
@@ -260,13 +278,20 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	scratch.For(filepath.Dir(abs))
 	s := &Store{path: abs, opts: opts, freeBytes: diskfree.Available}
 	busy := strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10)
-	common := []pragma{
+	// The settings that govern reading, which every connection carries, and
+	// the journal mode, which only a connection opened read-write can set: a
+	// store opened read-only at the file level is refused that pragma on
+	// exactly the database a reader is there to read, and it does not need it
+	// -- the mode is a property of the file, already recorded in it, and the
+	// read-only open is what makes the store unwritable rather than a pragma
+	// the connection carries.
+	reading := []pragma{
 		{"busy_timeout", busy, busy},
 		{"foreign_keys", "ON", "1"},
-		{"journal_mode", "WAL", "wal"},
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
 	}
+	common := slices.Concat(reading, []pragma{{"journal_mode", "WAL", "wal"}})
 	// The writer is the only connection whose synchronous mode is a choice,
 	// because it is the only connection that commits. Readers keep FULL.
 	writerSync, err := synchronousPragma(opts.Synchronous)
@@ -282,17 +307,34 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	writerPragmas := slices.Concat(common, []pragma{
 		writerSync,
 		{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
-	readerPragmas := slices.Concat(common, []pragma{
-		{"synchronous", "FULL", "2"},
+	// A reader of a store this process also writes is pinned to FULL, which
+	// says nothing about durability -- it never commits -- and keeps every
+	// pooled connection's pragma set verified. A store opened read-only at the
+	// file level cannot set that one either, for the same reason as the
+	// journal mode.
+	readerBase, readerSync := common, []pragma{{"synchronous", "FULL", "2"}}
+	if opts.ReadOnly {
+		readerBase, readerSync = reading, nil
+	}
+	readerPragmas := slices.Concat(readerBase, readerSync, []pragma{
 		{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
 		{"query_only", "ON", "1"}})
 
-	if !opts.ReadOnly {
-		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1); err != nil {
+	// Whether this read-only open must declare the database unchanging is
+	// settled before any pool is built, so every connection of every pool
+	// carries the same view of the file.
+	immutable := false
+	if opts.ReadOnly {
+		if immutable, err = immutableAnswer(ctx, abs, readerPragmas); err != nil {
 			return nil, err
 		}
 	}
-	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)
+	if !opts.ReadOnly {
+		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1, false, false); err != nil {
+			return nil, err
+		}
+	}
+	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
@@ -323,14 +365,14 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// starve the short reads (Match) the same query issues
 	// while the stream is open, which on the shared reader pool would be a
 	// deadlock as soon as two queries ran at once.
-	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)
+	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
 	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
-	s.tokenizer, err = openPool("", nil, "deferred", 1)
+	s.tokenizer, err = openPool("", nil, "deferred", 1, false, false)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
@@ -355,12 +397,30 @@ type pragma struct {
 	name, set, want string
 }
 
-func openPool(path string, pragmas []pragma, txlock string, maxConns int) (*sql.DB, error) {
+// openPool builds one connection pool over path. readOnly opens every
+// connection of it in the engine's own read-only mode; immutable additionally
+// declares the file unchanging, which is what a store on media this process
+// cannot write needs and nothing else may claim (see immutableAnswer).
+//
+// readOnly is what query_only does not do: query_only refuses writes through SQL, and leaves the handle
+// read-WRITE at the file level, so the last connection to close still runs the
+// engine's write-ahead-log close -- checkpoint the log into the database,
+// unlink the log and the shared-memory index. That is a rewrite of the whole
+// published index by a command that promises to write nothing, and it is
+// performed holding the database exclusively. The open mode is the only thing
+// that stops it.
+func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOnly, immutable bool) (*sql.DB, error) {
 	q := url.Values{}
 	for _, p := range pragmas {
 		q.Add("_pragma", p.name+"("+p.set+")")
 	}
 	q.Set("_txlock", txlock)
+	if readOnly {
+		q.Set("mode", "ro")
+	}
+	if immutable {
+		q.Set("immutable", "1")
+	}
 	var dsn string
 	if path == "" {
 		dsn = ":memory:?" + q.Encode()
@@ -380,6 +440,53 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int) (*sql.
 	db.SetConnMaxLifetime(0)
 	return db, nil
 }
+
+// immutableAnswer reports whether a read-only open of this store has to declare
+// the database unchanging, which is the one way a store on media this process
+// cannot write can be read at all.
+//
+// A write-ahead-log database is normally read through the shared-memory index
+// beside it, and a reader CREATES that index where it is missing. On a data
+// directory this process may not write -- read-only media, a workspace an
+// operator has locked down, a mount taken read-only for an audit -- it cannot,
+// and the engine refuses the open outright ("attempt to write a readonly
+// database"). Declaring the file immutable is what lets the engine read the
+// database without an index, and it is a claim about the file, so it is made
+// only where the file cannot change: when the ordinary open is refused AND no
+// log lies beside the database. A log is what a writer appends to, and creating
+// one needs write on the very directory that just refused this process, so a
+// store with no log under a directory nobody may write has nothing that could
+// change under this answer. Where a log IS there, the refusal is returned as
+// it came: reading a database a writer may be appending to as though it were
+// frozen would answer from a torn view of it.
+func immutableAnswer(ctx context.Context, path string, pragmas []pragma) (bool, error) {
+	db, err := openPool(path, pragmas, "deferred", 1, true, false)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	pingErr := db.PingContext(ctx)
+	if pingErr == nil {
+		return false, nil
+	}
+	// Only the engine REFUSING TO WRITE is the case this answers. A corrupt
+	// database, a busy one, a foreign schema, a device error: each has its own
+	// family and its own remedy, and opening any of them a second time as an
+	// unchanging file would replace the answer the operator needs with a
+	// second, stranger failure.
+	var se *sqlite.Error
+	if !errors.As(pingErr, &se) || se.Code()&0xff != sqlite3.SQLITE_READONLY {
+		return false, wrap("open read-only", pingErr)
+	}
+	if _, statErr := os.Stat(path + walSuffix); errors.Is(statErr, fs.ErrNotExist) {
+		return true, nil
+	}
+	return false, wrap("open read-only", pingErr)
+}
+
+// walSuffix names the write-ahead log beside a database, which is the engine's
+// own naming and not a choice this package makes.
+const walSuffix = "-wal"
 
 // verifiedConnector wraps the driver connector so every physical connection
 // database/sql opens has its pragmas read back before it joins the pool.

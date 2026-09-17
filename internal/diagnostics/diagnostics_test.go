@@ -476,7 +476,7 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// FX-H-X1 rows
+	// rows added with the capability-state fix
 	{
 		// Failure mode: ADR-0004 Decision 1a tells an operator that a receipt
 		// acknowledged under `normal` can be lost to a machine-level crash and
@@ -485,7 +485,7 @@ var scenarios = []scenario{
 		// operator to check was unreadable from the product. The mode is
 		// reported by BOTH readings of the storage check, because an ordinary
 		// doctor is the call an operator actually makes.
-		// FX-H-X7 (REV-H3b D4 residual): the row reported the CONFIGURED mode,
+		// The durability-mode residual: the row reported the CONFIGURED mode,
 		// which verifies nothing -- it re-prints an input. The fixture is
 		// therefore MISMATCHED on purpose: configured `normal`, live `full`.
 		// A phrase that echoes configuration prints normal and fails here.

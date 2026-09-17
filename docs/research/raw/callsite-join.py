@@ -1,8 +1,10 @@
-import json,sys,subprocess,re
+import json,os,sys,subprocess,re
 from tree_sitter import Language, Parser, Query, QueryCursor
 import tree_sitter_go, tree_sitter_python, tree_sitter_typescript, tree_sitter_java, tree_sitter_rust, tree_sitter_c
 Q='internal/provider/treesitter/lang/queries/'  # run from the repository root
-SCIP='/tmp/claude-1000/-home-sabossedgh-dev-codectx/b0d7dd67-07aa-4b1e-90f3-b5373301a26b/scratchpad/scip'
+# The SCIP fixtures this join reads: set SCIP_ROOT to wherever they were
+# produced, which is a scratch directory of the run that made them.
+SCIP=os.environ.get('SCIP_ROOT', 'scip')
 langs={
  'go':      (Language(tree_sitter_go.language()), 'go.scm', f'{SCIP}/mod/a.go', f'{SCIP}/mod/index.scip','a.go'),
  'python':  (Language(tree_sitter_python.language()), 'python.scm', f'{SCIP}/pymod/a.py', f'{SCIP}/pymod/index.scip','a.py'),
