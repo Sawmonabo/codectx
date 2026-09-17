@@ -93,156 +93,156 @@ Columns: `syntax` is the tree-sitter tier's own verdict (`in-file`, `import`, `a
 
 | id | file:line | call expression | callee | syntax | engine | class | reason |
 |---|---|---|---|---|---|---|---|
-| C1-091 | `Meteor3preUpgradeScripts/meteor-async-migration/11-propagate-async-imports.js`:518 | `root.find(j.ImportDeclaration) .forEach((imp) => { let source = imp.value.source && imp…` | `forEach` | unresolved | stub | ? | ? |
-| C1-092 | `Meteor3preUpgradeScripts/meteor-async-migration/15-numeral-to-numbro.js`:99 | `j(p).remove()` | `remove` | unresolved | stub | ? | ? |
-| C1-093 | `Meteor3preUpgradeScripts/meteor-async-migration/4-baseline-app-fixes.anchorcheck.js`:10 | `require("path")` | `require` | unresolved | stub | ? | ? |
-| C1-094 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-rank1-forms.spec.js`:1157 | `(q(`print(db.businessObjects.find({"md.type":"${QE_TYPE}","info.owner.subID":"${F.SUB}"…` | `split` | unresolved | absent | ? | ? |
-| C1-095 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-rank2-settings.spec.js`:627 | `JSON.stringify(getPath(repaired, "ofraSubTypes"))` | `stringify` | unresolved | absent | ? | ? |
-| C1-096 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-settings-editors.spec.js`:1257 | `expect(rows.filter((r) => !r.ok).map((r) => r.k), "every editor test reached its end as…` | `toEqual` | unresolved | absent | ? | ? |
-| C1-097 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-surveys-controls.spec.js`:664 | `page.locator("#nextSection").first().click({ timeout : 10000 })` | `click` | unresolved | absent | ? | ? |
-| C1-098 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/bo-type.par.spec.js`:581 | `Object.keys(window.SlickGrid \|\| {}).some((k) => { const g = window.SlickGrid[k] && wi…` | `some` | unresolved | absent | ? | ? |
-| C1-099 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/file-surface.spec.js`:348 | `B.mongo(`print(db.qExports.countDocuments({subID:"${sub}"}))`)` | `mongo` | unresolved | absent | ? | ? |
-| C1-100 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/boForm.js`:2909 | `shadow.getAttribute("aria-required")` | `getAttribute` | unresolved | absent | ? | ? |
-| C1-101 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/parallel.js`:181 | `use(await ctx.page())` | `use` | unresolved | absent | ? | ? |
-| C1-102 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/timing.js`:14 | `new Date().toTimeString()` | `toTimeString` | unresolved | absent | ? | ? |
-| C1-103 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/manage-scoring.spec.js`:96 | `test.skip(!(await btn.count()), "this tenant's scoring page offers no Score Tuning card…` | `skip` | unresolved | absent | ? | ? |
-| C1-104 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/manage-subscriptions.spec.js`:219 | `/no activity/i.test((document.querySelector(".panel-body.tabContent") \|\| {}).innerTex…` | `test` | unresolved | absent | ? | ? |
-| C1-105 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/pages-clean.spec.js`:67 | `push("Meteor._debug", a.map(String).join(" "))` | `push` | in-file | absent | ? | ? |
-| C1-106 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/probe-run4-defects.js`:101 | `h.className.slice(0, 60)` | `slice` | unresolved | absent | ? | ? |
-| C1-107 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/probes/fp-grid-columns-probe.js`:22 | `page.fill("#password", SWEEPSEC.loginPassword(), { timeout : 8000 })` | `fill` | unresolved | absent | ? | ? |
-| C1-108 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/roles-crud.spec.js`:109 | `new Event("change", { bubbles : true })` | `Event` | unresolved | absent | ? | ? |
-| C1-109 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/roles-crud.spec.js`:477 | `String(out)` | `String` | unresolved | absent | ? | ? |
-| C1-110 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/setup/clone-test-users.js`:35 | `SEC.passwordBcrypt()` | `passwordBcrypt` | unresolved | absent | ? | ? |
-| C1-111 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/system-surface.spec.js`:98 | `c.close()` | `close` | unresolved | absent | ? | ? |
-| C1-112 | `Meteor3preUpgradeScripts/meteor-async-migration/vp-codemods/6-password-method-hooks.js`:156 | `out.replace(`${a}\n`, "")` | `replace` | unresolved | stub | ? | ? |
-| C1-113 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-3.5.1.min.js`:2 | `t()` | `t` | in-file | absent | ? | ? |
-| C1-114 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-ui.min.js`:6 | `this._delay(function(){var i=!t.contains(this.element[0],t.ui.safeActiveElement(this.do…` | `_delay` | unresolved | absent | ? | ? |
-| C1-115 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script.js`:87 | `selected.previousSibling.click()` | `click` | unresolved | stub | ? | ? |
-| C1-116 | `app/both/definitions/sbomTypes.test.js`:12 | `expect(sbomTypeOptions).toHaveLength(2)` | `toHaveLength` | unresolved | absent | ? | ? |
-| C1-117 | `app/both/schemas/gridViews.js`:138 | `autoVal(this)` | `autoVal` | unresolved | stub | ? | ? |
-| C1-118 | `app/both/schemas/manageFlowEditSchema.js`:81 | `_.chain(fortress)` | `chain` | unresolved | stub | ? | ? |
-| C1-119 | `app/both/utils/dynamicOfraSchema.js`:419 | `Meteor.user()` | `user` | unresolved | absent | ? | ? |
-| C1-120 | `app/both/utils/markdownUtils.test.js`:30 | `expect(result).toContain("&lt;")` | `toContain` | unresolved | absent | ? | ? |
-| C1-121 | `app/both/utils/quickEntryUtils.js`:1755 | `tpl.get("data")` | `get` | in-file | in-repo | ? | ? |
-| C1-122 | `app/both/utils/recalcAIMScore.test.js`:107 | `shouldAIMRescore(modifier, oldRecord, SUB_ID)` | `shouldAIMRescore` | in-file | absent | ? | ? |
-| C1-123 | `app/client/components/actionButtons/bulkActions/bulkActions.js`:492 | `_.result(self, "totalCount.get")` | `result` | unresolved | absent | ? | ? |
-| C1-124 | `app/client/components/activityStream/activityMergeHsitory.js`:19 | `new Switchery(elem)` | `Switchery` | unresolved | absent | ? | ? |
-| C1-125 | `app/client/components/customAutoFormInputs/text-expandable.js`:42 | `autosize($(".expandableTextarea textarea"))` | `autosize` | unresolved | absent | ? | ? |
-| C1-126 | `app/client/components/slickGrid/boColumnDefinitions.js`:131 | `_.find(value, { label : item })` | `find` | unresolved | absent | ? | ? |
-| C1-127 | `app/client/components/slickGrid/slickGrid.js`:792 | `filters.entries()` | `entries` | unresolved | absent | ? | ? |
-| C1-128 | `app/client/components/slickGrid/slickGrid.js`:2068 | `grid.getCanvasNode()` | `getCanvasNode` | unresolved | absent | ? | ? |
-| C1-129 | `app/client/components/slickGrid/slickGrid.js`:4376 | `$(grid.getCanvasNode())` | `$` | unresolved | absent | ? | ? |
-| C1-130 | `app/client/components/workflow/simpleWorkflow.js`:38 | `$(document).on("click", function(evt) { popoverOffClick(evt); })` | `on` | unresolved | absent | ? | ? |
-| C1-131 | `app/client/components/workflow/workflow.js`:134 | `Template.instance()` | `instance` | unresolved | absent | ? | ? |
-| C1-132 | `app/client/imports/amcharts/amcharts.js`:188 | `n.click(function(a){h.handleGraphEvent(a,"clickGraph")})` | `click` | unresolved | absent | ? | ? |
-| C1-133 | `app/client/imports/amcharts/amcharts.js`:190 | `d.setCN(f,n,this.bcn+"stroke")` | `setCN` | unresolved | absent | ? | ? |
-| C1-134 | `app/client/imports/amcharts/ammap.js`:21 | `d.formatNumber(a,g)` | `formatNumber` | unresolved | absent | ? | ? |
-| C1-135 | `app/client/imports/amcharts/ammap.js`:70 | `Math.round(d.toCoordinate(this.height,e))` | `round` | unresolved | absent | ? | ? |
-| C1-136 | `app/client/imports/amcharts/gauge.js`:6 | `isNaN(K)` | `isNaN` | unresolved | absent | ? | ? |
-| C1-137 | `app/client/imports/amcharts/plugins/export/libs/fabric.js/fabric.min.js`:1 | `this._objects.filter(function(o){return o.type===type})` | `filter` | unresolved | absent | ? | ? |
-| C1-138 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `a._data.getCompressedContent()` | `getCompressedContent` | unresolved | absent | ? | ? |
-| C1-139 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `s(this.crc32(p),4)` | `s` | ambiguous | absent | ? | ? |
-| C1-140 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:7 | `Math.pow(2,-a)` | `pow` | unresolved | absent | ? | ? |
-| C1-141 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `pn(e,n,3)` | `pn` | in-file | absent | ? | ? |
-| C1-142 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `r(t,e)` | `r` | ambiguous | absent | ? | ? |
-| C1-143 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:9 | `new h(e,n,r,this.imageMeasure,this.tableLayouts,u)` | `h` | ambiguous | absent | ? | ? |
-| C1-144 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `n(71)` | `n` | ambiguous | absent | ? | ? |
-| C1-145 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readString(4)` | `readString` | unresolved | absent | ? | ? |
-| C1-146 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `T.writeUInt16(i)` | `writeUInt16` | unresolved | absent | ? | ? |
-| C1-147 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `t.charCodeAt(r)` | `charCodeAt` | unresolved | absent | ? | ? |
-| C1-148 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:17 | `n()` | `n` | ambiguous | absent | ? | ? |
-| C1-149 | `app/client/imports/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:2 | `path.toUpperCase().replace(chr0,"").replace(chr1,"!")` | `replace` | unresolved | absent | ? | ? |
-| C1-150 | `app/client/imports/amcharts/serial.js`:80 | `e.resetDateToMin(new Date(this.data[f].time),g,w,p)` | `resetDateToMin` | unresolved | absent | ? | ? |
-| C1-151 | `app/client/imports/amcharts/xy.js`:5 | `this.getAxisBounds(a,f,m,k,b)` | `getAxisBounds` | unresolved | absent | ? | ? |
-| C1-152 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:240 | `$("<div class='slick-header-columns' style='left:-1000px' />").appendTo($headerScroller)` | `appendTo` | unresolved | absent | ? | ? |
-| C1-153 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:660 | `getEditorLock()` | `getEditorLock` | in-file | absent | ? | ? |
-| C1-154 | `app/client/lib/bootstrap-daterangepicker-custom/daterangepicker.js`:458 | `moment(startDate, this.locale.format)` | `moment` | unresolved | absent | ? | ? |
-| C1-155 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:254 | `this.showForm(false)` | `showForm` | unresolved | absent | ? | ? |
-| C1-156 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:2653 | `$.proxy(function () { this.sourceData = cache.sourceData; this.doPrepend(); success.cal…` | `proxy` | unresolved | absent | ? | ? |
-| C1-157 | `app/client/lib/gojs/go.js`:57 | `this.Fa.reset()` | `reset` | unresolved | absent | ? | ? |
-| C1-158 | `app/client/lib/gojs/go.js`:103 | `Object.isFrozen(this)` | `isFrozen` | unresolved | absent | ? | ? |
-| C1-159 | `app/client/lib/gojs/go.js`:337 | `d.Df()` | `Df` | unresolved | absent | ? | ? |
-| C1-160 | `app/client/lib/gojs/go.js`:882 | `d.gt(f.gj)` | `gt` | unresolved | absent | ? | ? |
-| C1-161 | `app/client/lib/gojs/go.js`:1162 | `c.lb(a)` | `lb` | unresolved | absent | ? | ? |
-| C1-162 | `app/client/lib/gojs/go.js`:1225 | `a.rect(l,r,Math.max(m,.1),Math.max(k,.1))` | `rect` | unresolved | absent | ? | ? |
-| C1-163 | `app/client/lib/gojs/go.js`:1366 | `Ho(b,!1)` | `Ho` | in-file | absent | ? | ? |
-| C1-164 | `app/client/lib/gojs/go.js`:1718 | `l.na()` | `na` | unresolved | absent | ? | ? |
-| C1-165 | `app/client/lib/gojs/go.js`:1739 | `Wq(a.width)` | `Wq` | in-file | absent | ? | ? |
-| C1-166 | `app/client/lib/gojs/go.js`:2048 | `Ma.S.h(K,Ga)` | `h` | unresolved | absent | ? | ? |
-| C1-167 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:3668 | `parentInstance._over.call( parentInstance, event )` | `call` | unresolved | absent | ? | ? |
-| C1-168 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:4005 | `[ "padding", /ne\|nw\|n/.test( i ) ? "Top" : /se\|sw\|s/.test( i ) ? "Bottom" : /^e$/.t…` | `join` | unresolved | absent | ? | ? |
-| C1-169 | `app/client/plugins/d3/d3.min.js`:2 | `o.unshift(l)` | `unshift` | unresolved | absent | ? | ? |
-| C1-170 | `app/client/styles/framework/bootstrap3-plugins/bootstrap-tagsinput/bootstrap-tagsinput.js`:349 | `$(event.target)` | `$` | unresolved | absent | ? | ? |
-| C1-171 | `app/client/views/boImports/boImports.js`:246 | `setFileData({ file, headers, tpl })` | `setFileData` | in-file | absent | ? | ? |
-| C1-172 | `app/client/views/boSimplifiedForm/detectedVulnerabilitySimplified/dvRehashModal.js`:68 | `BusinessObjects.find({ "md.type" : "assets" }).fetch()` | `fetch` | unresolved | absent | ? | ? |
-| C1-173 | `app/client/views/campaigns/campaignStats/campaignStats.js`:60 | `_.isEmpty(existing)` | `isEmpty` | unresolved | absent | ? | ? |
-| C1-174 | `app/client/views/common/iboxTools/ibox-tools.js`:74 | `$(e.target)` | `$` | unresolved | absent | ? | ? |
-| C1-175 | `app/client/views/internalSecOps/boQuickEntry/quickEntryField.js`:566 | `relatedSet.add(key)` | `add` | ambiguous | absent | ? | ? |
-| C1-176 | `app/client/views/internalSecOps/incidents/incidentsList.js`:49 | `incidentsGrid.grid.render()` | `render` | unresolved | absent | ? | ? |
-| C1-177 | `app/client/views/internalSecOps/ofra/ofraTracking.js`:240 | `mapUsers([Meteor.user()])` | `mapUsers` | unresolved | absent | ? | ? |
-| C1-178 | `app/client/views/internalSecOps/risks/risksCreateEdit.js`:117 | `_.result(fortress, "customOfraLinks.get.risks")` | `result` | unresolved | absent | ? | ? |
-| C1-179 | `app/client/views/internalSecOps/rootIssues/edit/editRootIssues.js`:49 | `Template.editRootIssues.onRendered(function() { $('#panelCompanies').removeClass('hidde…` | `onRendered` | unresolved | absent | ? | ? |
-| C1-180 | `app/client/views/internalSecOps/rootIssues/rootIssuesGrid.js`:25 | `selectizeUtils.listSync("rootIssues-category")` | `listSync` | import | absent | ? | ? |
-| C1-181 | `app/client/views/internalSecOps/services/services.js`:200 | `tpl.get("visibleIfFields")` | `get` | unresolved | absent | ? | ? |
-| C1-182 | `app/client/views/internalSecOps/vendors/editVendorDetails/tabContent/activityShared/activityHooks.test.js`:257 | `expect(out[0].action).toBe( `updated [${STOCK_OFRA.services.label}: Engagement A]`, )` | `toBe` | unresolved | absent | ? | ? |
-| C1-183 | `app/client/views/internalSecOps/vulnSummaryPage/vulnSummaryPage.js`:78 | `_.result(tpl, "buInfo.get.noBU", false)` | `result` | unresolved | absent | ? | ? |
-| C1-184 | `app/client/views/internalSecOps/vulnerabilities/knownVulnerabilities/knownVulnsSpecificTabs/knownVulnsSpecificTabs.js`:150 | `self.disable()` | `disable` | unresolved | absent | ? | ? |
-| C1-185 | `app/client/views/manageFiles/uploadedFilesGrid.js`:183 | `modal.find(".modal-body")` | `find` | unresolved | absent | ? | ? |
-| C1-186 | `app/client/views/manageUsers/manUsers.js`:727 | `_.get(v.roles, [_.keys(v.roles)[0]])` | `get` | unresolved | absent | ? | ? |
-| C1-187 | `app/client/views/manage_subscription/catalogConfigs.js`:55 | `_.get(err, "message")` | `get` | unresolved | absent | ? | ? |
-| C1-188 | `app/client/views/recertification/createNewVendorModal/createNewVendorModal.js`:37 | `Tracker.afterFlush(() => { $(`#${MODAL_ID}`).modal("show"); $(`#${MODAL_ID}`).one("hidd…` | `afterFlush` | unresolved | absent | ? | ? |
-| C1-189 | `app/client/views/recertification/useContactCardPopover.test.jsx`:73 | `expect(valueOrEmpty("hello"))` | `expect` | unresolved | absent | ? | ? |
-| C1-190 | `app/client/views/rolesNotifications/notificationRules/recipientFields.js`:313 | `_.castArray(notificationRecipientUtils.getRecipientFieldValue(_.get(doc, "recipients"),…` | `castArray` | unresolved | absent | ? | ? |
-| C1-191 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:611 | `validateSectionRanges(scale, path, vc, section)` | `validateSectionRanges` | in-file | absent | ? | ? |
-| C1-192 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:914 | `Session.get("readOnly")` | `get` | unresolved | absent | ? | ? |
-| C1-193 | `app/client/views/system/manageKeywordMatchRules/manageKeywordMatchRules.js`:46 | `SlickGrid.keywordMatchRulesGrid.grid.getSelectionModel()` | `getSelectionModel` | unresolved | absent | ? | ? |
-| C1-194 | `app/client/views/system/manage_boConfigs/quickEntryFormBuilder/quickEntryFormBuilder.js`:825 | `_.get(o, "label")` | `get` | unresolved | absent | ? | ? |
-| C1-195 | `app/client/views/system/navigation/systemNavigation.js`:759 | `_.get(existing, "parent")` | `get` | unresolved | absent | ? | ? |
-| C1-196 | `app/client/views/threatAlerts/icsAlerts/IcsAlertsPage.test.jsx`:128 | `expect( extractCves({ cves : [ { code : "CVE-2024-1234", boID : "bo1" }, { code : "CVE-…` | `expect` | unresolved | absent | ? | ? |
-| C1-197 | `app/client/views/threatAlerts/icsAlerts/IcsAlertsPage.test.jsx`:221 | `advisoryDateOf({ ts_posted : new Date("2024-07-03T00:30:00.000Z"), ts_updated : new Dat…` | `toISOString` | unresolved | absent | ? | ? |
-| C1-198 | `app/client/views/workflowStats/workflowStats.js`:494 | `_.chain(_.cloneDeep(headerCols)) .map((p) => _.chain(p) .map("wfProcesses") .flatten() …` | `value` | unresolved | absent | ? | ? |
-| C1-199 | `app/client/views/workflowStats/workflowStats.js`:713 | `_.chain(p).get("wfProcesses", []).map(function(pr) { let steps = _.get(pr, "procSteps",…` | `map` | unresolved | absent | ? | ? |
-| C1-200 | `app/imports/ui/cm-dashboard/components/charts/findings-chart/index.test.jsx`:602 | `renderAndSettle([ { _id: "Sev-1", count: 4, sevID: "s1", toolMappings: [critical.mappin…` | `renderAndSettle` | in-file | absent | ? | ? |
-| C1-201 | `app/imports/ui/cm-dashboard/components/charts/vendors-location/create-map.test.js`:233 | `expect(getCountryFallbackCoords("VN"))` | `expect` | unresolved | absent | ? | ? |
-| C1-202 | `app/imports/ui/cm-dashboard/components/overall-filter-menu/SavedViewsPopover.jsx`:816 | `savedViews.system.map((viewItem) => { const isOwner = viewItem?.userID === Meteor.userI…` | `map` | unresolved | stub | ? | ? |
-| C1-203 | `app/imports/ui/cm-dashboard/components/overall-filters/index.jsx`:1721 | `recalcBannerHeight()` | `recalcBannerHeight` | in-file | in-repo | ? | ? |
-| C1-204 | `app/imports/ui/cm-dashboard/components/tabs/360-view/risk-profile/initial-layout.jsx`:43 | `markdownUtils.md2html(description \|\| "")` | `md2html` | import | stub | ? | ? |
-| C1-205 | `app/imports/ui/cm-dashboard/microComponents/drag-and-drop-file-upload.jsx`:724 | `prev?.some((existing) => existing?.id === file?.id)` | `some` | unresolved | stub | ? | ? |
-| C1-206 | `app/imports/ui/cm-dashboard/providers/VendorProvider.test.jsx`:229 | `new Error("Invalid vendor id")` | `Error` | unresolved | absent | ? | ? |
-| C1-207 | `app/lib/flowRouterCompat.js`:1682 | `globalWaitOn().concat( _.isFunction(controller.waitOn) ? controller.waitOn(ironParams, …` | `concat` | unresolved | stub | ? | ? |
-| C1-208 | `app/lib/flowRouterCompat.serverPaths.test.js`:595 | `dispatch(request("GET", "/api/thing"), res)` | `dispatch` | in-file | absent | ? | ? |
-| C1-209 | `app/lib/object_utils.js`:107 | `_.each(data, function(doc) { _.each(exportFields, function(field, i) { if (i > 0) { str…` | `each` | unresolved | stub | ? | ? |
-| C1-210 | `app/lib/routeControllers/campaignStatsController.js`:17 | `createController({ template : "campaignStats", waitOn(params) { return [ Meteor.subscri…` | `createController` | unresolved | stub | ? | ? |
-| C1-211 | `app/lib/routeDefinitions/samlRoutes.js`:333 | `Subscriptions.findOneAsync({ "saml.identifier" : _.get(fGroup, "sub", "") })` | `findOneAsync` | unresolved | stub | ? | ? |
-| C1-212 | `app/packages/jade-compiler/package.js`:42 | `api.addFiles(["tests/tests.js"], "server")` | `addFiles` | unresolved | absent | ? | ? |
-| C1-213 | `app/packages/meteor-amcharts/lib/amcharts.js`:39 | `a.getLabel()` | `getLabel` | unresolved | stub | ? | ? |
-| C1-214 | `app/packages/meteor-amcharts/lib/amcharts.js`:301 | `b.set()` | `set` | unresolved | stub | ? | ? |
-| C1-215 | `app/packages/meteor-amcharts/lib/plugins/animate/animate.js`:351 | `getKeysGraphs( chart.graphs, keys, seen, getKeysGraph )` | `getKeysGraphs` | in-file | in-repo | ? | ? |
-| C1-216 | `app/packages/meteor-amcharts/lib/plugins/export/export.js`:1351 | `_this.gatherClassName( group.parent, _this.setup.chart.classNamePrefix + "-legend-div",…` | `gatherClassName` | unresolved | stub | ? | ? |
-| C1-217 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.js`:329 | `this.getObjects()` | `getObjects` | unresolved | in-repo | ? | ? |
-| C1-218 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:6 | `toFixed(this.scaleX,NUM_FRACTION_DIGITS)` | `toFixed` | unresolved | absent | ? | ? |
-| C1-219 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:11 | `floor(j*ratioH)` | `floor` | unresolved | absent | ? | ? |
-| C1-220 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:2003 | `__webpack_require__(7)` | `__webpack_require__` | in-file | absent | ? | ? |
-| C1-221 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:17016 | `result.push({ x: self.rowSpanData[self.rowSpanData.length - 1].left, index: self.rowSpa…` | `push` | unresolved | absent | ? | ? |
-| C1-222 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:1 | `r.fs.bindFS(this.vfs)` | `bindFS` | unresolved | absent | ? | ? |
-| C1-223 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `s.split("\n").map(function(t){return" "+t})` | `map` | unresolved | absent | ? | ? |
-| C1-224 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:420 | `fmt.match(dec1)` | `match` | unresolved | stub | ? | ? |
-| C1-225 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:8532 | `unescapexml(Rn[3])` | `unescapexml` | unresolved | in-repo | ? | ? |
-| C1-226 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.min.js`:3 | `__utf16le(this,this.l,this.l+size)` | `__utf16le` | unresolved | absent | ? | ? |
-| C1-227 | `app/packages/meteor-apm-agent/tests/hijack/subscriptions.js`:17 | `h2.stop()` | `stop` | unresolved | absent | ? | ? |
-| C1-228 | `app/packages/meteor-apm-agent/tests/models/base_error.js`:49 | `new BaseErrorModel()` | `BaseErrorModel` | unresolved | absent | ? | ? |
-| C1-229 | `app/packages/meteor-stylus/plugin/compile-stylus.js`:213 | `absoluteImportPath(parsed)` | `absoluteImportPath` | in-file | in-repo | ? | ? |
-| C1-230 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:116 | `setTimeout(function(){b.destroy.call(b)},1E3*a)` | `setTimeout` | unresolved | absent | ? | ? |
-| C1-231 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:143 | `d.setCN(c,r,"graph-bullet")` | `setCN` | unresolved | absent | ? | ? |
-| C1-232 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:259 | `n.translate(t,p)` | `translate` | unresolved | absent | ? | ? |
-| C1-233 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:369 | `c.fire({type:"selectedObjectChanged",chart:c})` | `fire` | unresolved | absent | ? | ? |
-| C1-234 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:482 | `this.chart.coordinatesToXY(this.longitudes[b],this.latitudes[b])` | `coordinatesToXY` | unresolved | absent | ? | ? |
-| C1-235 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:15 | `h.slice(g)` | `slice` | unresolved | stub | ? | ? |
-| C1-236 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:77 | `a[b].remove()` | `remove` | unresolved | stub | ? | ? |
-| C1-237 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:95 | `d.Class({construct:function(){}})` | `Class` | unresolved | stub | ? | ? |
-| C1-238 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:126 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | stub | ? | ? |
-| C1-239 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:7920 | `ctx.setLineDash(this.strokeDashArray)` | `setLineDash` | unresolved | stub | ? | ? |
-| C1-240 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:19503 | `_this.setAngle(value)` | `setAngle` | unresolved | stub | ? | ? |
+| C1-091 | `Meteor3preUpgradeScripts/meteor-async-migration/11-propagate-async-imports.js`:518 | `root.find(j.ImportDeclaration) .forEach((imp) => { let source = imp.value.source && imp…` | `forEach` | unresolved | stub | b-lib | jscodeshift Collection.forEach on a find() result |
+| C1-092 | `Meteor3preUpgradeScripts/meteor-async-migration/15-numeral-to-numbro.js`:99 | `j(p).remove()` | `remove` | unresolved | stub | b-lib | jscodeshift Collection.remove on j(p) |
+| C1-093 | `Meteor3preUpgradeScripts/meteor-async-migration/4-baseline-app-fixes.anchorcheck.js`:10 | `require("path")` | `require` | unresolved | stub | c-platform | Node module loader require() |
+| C1-094 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-rank1-forms.spec.js`:1157 | `(q(`print(db.businessObjects.find({"md.type":"${QE_TYPE}","info.owner.subID":"${F.SUB}"…` | `split` | unresolved | absent | c-platform | String.prototype.split on a string expression |
+| C1-095 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-rank2-settings.spec.js`:627 | `JSON.stringify(getPath(repaired, "ofraSubTypes"))` | `stringify` | unresolved | absent | c-platform | JSON.stringify built-in |
+| C1-096 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-settings-editors.spec.js`:1257 | `expect(rows.filter((r) => !r.ok).map((r) => r.k), "every editor test reached its end as…` | `toEqual` | unresolved | absent | b-lib | Playwright expect() matcher |
+| C1-097 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/agent-surveys-controls.spec.js`:664 | `page.locator("#nextSection").first().click({ timeout : 10000 })` | `click` | unresolved | absent | b-lib | Playwright Locator.click |
+| C1-098 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/bo-type.par.spec.js`:581 | `Object.keys(window.SlickGrid \|\| {}).some((k) => { const g = window.SlickGrid[k] && wi…` | `some` | unresolved | absent | c-platform | Array.prototype.some on an Object.keys result |
+| C1-099 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/file-surface.spec.js`:348 | `B.mongo(`print(db.qExports.countDocuments({subID:"${sub}"}))`)` | `mongo` | unresolved | absent | a-repo | T-import: B required from a repo test lib module |
+| C1-100 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/boForm.js`:2909 | `shadow.getAttribute("aria-required")` | `getAttribute` | unresolved | absent | c-platform | DOM Element.getAttribute |
+| C1-101 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/parallel.js`:181 | `use(await ctx.page())` | `use` | unresolved | absent | d-unknown | Playwright fixture callback parameter invoked |
+| C1-102 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/lib/timing.js`:14 | `new Date().toTimeString()` | `toTimeString` | unresolved | absent | c-platform | Date.prototype.toTimeString |
+| C1-103 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/manage-scoring.spec.js`:96 | `test.skip(!(await btn.count()), "this tenant's scoring page offers no Score Tuning card…` | `skip` | unresolved | absent | b-lib | Playwright test.skip |
+| C1-104 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/manage-subscriptions.spec.js`:219 | `/no activity/i.test((document.querySelector(".panel-body.tabContent") \|\| {}).innerTex…` | `test` | unresolved | absent | c-platform | RegExp.prototype.test on a regex literal |
+| C1-105 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/pages-clean.spec.js`:67 | `push("Meteor._debug", a.map(String).join(" "))` | `push` | in-file | absent | a-repo | T-none: const push arrow defined in this file |
+| C1-106 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/probe-run4-defects.js`:101 | `h.className.slice(0, 60)` | `slice` | unresolved | absent | c-platform | String.prototype.slice on className |
+| C1-107 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/probes/fp-grid-columns-probe.js`:22 | `page.fill("#password", SWEEPSEC.loginPassword(), { timeout : 8000 })` | `fill` | unresolved | absent | b-lib | Playwright Page.fill |
+| C1-108 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/roles-crud.spec.js`:109 | `new Event("change", { bubbles : true })` | `Event` | unresolved | absent | c-platform | DOM Event constructor |
+| C1-109 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/roles-crud.spec.js`:477 | `String(out)` | `String` | unresolved | absent | c-platform | String() built-in conversion |
+| C1-110 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/setup/clone-test-users.js`:35 | `SEC.passwordBcrypt()` | `passwordBcrypt` | unresolved | absent | a-repo | T-import: SEC required from a repo test lib module |
+| C1-111 | `Meteor3preUpgradeScripts/meteor-async-migration/tests/FP/system-surface.spec.js`:98 | `c.close()` | `close` | unresolved | absent | b-lib | Playwright BrowserContext.close |
+| C1-112 | `Meteor3preUpgradeScripts/meteor-async-migration/vp-codemods/6-password-method-hooks.js`:156 | `out.replace(`${a}\n`, "")` | `replace` | unresolved | stub | c-platform | String.prototype.replace on a source string |
+| C1-113 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-3.5.1.min.js`:2 | `t()` | `t` | in-file | absent | a-repo | T-none: vendored jQuery bundle-internal helper |
+| C1-114 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script-dir/jquery-ui.min.js`:6 | `this._delay(function(){var i=!t.contains(this.element[0],t.ui.safeActiveElement(this.do…` | `_delay` | unresolved | absent | a-repo | T-hier: vendored jQuery UI widget prototype method |
+| C1-115 | `QA/SeleniumWebdriver/TestngExtentFramework/doc/script.js`:87 | `selected.previousSibling.click()` | `click` | unresolved | stub | c-platform | DOM HTMLElement.click via previousSibling |
+| C1-116 | `app/both/definitions/sbomTypes.test.js`:12 | `expect(sbomTypeOptions).toHaveLength(2)` | `toHaveLength` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-117 | `app/both/schemas/gridViews.js`:138 | `autoVal(this)` | `autoVal` | unresolved | stub | a-repo | T-field: Meteor global assigned as this.autoVal elsewhere |
+| C1-118 | `app/both/schemas/manageFlowEditSchema.js`:81 | `_.chain(fortress)` | `chain` | unresolved | stub | b-lib | lodash chain() |
+| C1-119 | `app/both/utils/dynamicOfraSchema.js`:419 | `Meteor.user()` | `user` | unresolved | absent | b-lib | Meteor.user global API |
+| C1-120 | `app/both/utils/markdownUtils.test.js`:30 | `expect(result).toContain("&lt;")` | `toContain` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-121 | `app/both/utils/quickEntryUtils.js`:1755 | `tpl.get("data")` | `get` | in-file | in-repo | a-repo | T-none: engine resolves it in-repo; syntax says in-file |
+| C1-122 | `app/both/utils/recalcAIMScore.test.js`:107 | `shouldAIMRescore(modifier, oldRecord, SUB_ID)` | `shouldAIMRescore` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
+| C1-123 | `app/client/components/actionButtons/bulkActions/bulkActions.js`:492 | `_.result(self, "totalCount.get")` | `result` | unresolved | absent | b-lib | lodash result() |
+| C1-124 | `app/client/components/activityStream/activityMergeHsitory.js`:19 | `new Switchery(elem)` | `Switchery` | unresolved | absent | b-lib | Switchery third-party toggle plugin constructor |
+| C1-125 | `app/client/components/customAutoFormInputs/text-expandable.js`:42 | `autosize($(".expandableTextarea textarea"))` | `autosize` | unresolved | absent | b-lib | autosize third-party package |
+| C1-126 | `app/client/components/slickGrid/boColumnDefinitions.js`:131 | `_.find(value, { label : item })` | `find` | unresolved | absent | b-lib | lodash find() |
+| C1-127 | `app/client/components/slickGrid/slickGrid.js`:792 | `filters.entries()` | `entries` | unresolved | absent | c-platform | Array.prototype.entries, guarded by Array.isArray |
+| C1-128 | `app/client/components/slickGrid/slickGrid.js`:2068 | `grid.getCanvasNode()` | `getCanvasNode` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
+| C1-129 | `app/client/components/slickGrid/slickGrid.js`:4376 | `$(grid.getCanvasNode())` | `$` | unresolved | absent | b-lib | jQuery factory call |
+| C1-130 | `app/client/components/workflow/simpleWorkflow.js`:38 | `$(document).on("click", function(evt) { popoverOffClick(evt); })` | `on` | unresolved | absent | b-lib | jQuery on() on a wrapped document |
+| C1-131 | `app/client/components/workflow/workflow.js`:134 | `Template.instance()` | `instance` | unresolved | absent | b-lib | Blaze Template.instance |
+| C1-132 | `app/client/imports/amcharts/amcharts.js`:188 | `n.click(function(a){h.handleGraphEvent(a,"clickGraph")})` | `click` | unresolved | absent | a-repo | T-flow: vendored AmCharts set object method |
+| C1-133 | `app/client/imports/amcharts/amcharts.js`:190 | `d.setCN(f,n,this.bcn+"stroke")` | `setCN` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-134 | `app/client/imports/amcharts/ammap.js`:21 | `d.formatNumber(a,g)` | `formatNumber` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-135 | `app/client/imports/amcharts/ammap.js`:70 | `Math.round(d.toCoordinate(this.height,e))` | `round` | unresolved | absent | c-platform | Math.round built-in |
+| C1-136 | `app/client/imports/amcharts/gauge.js`:6 | `isNaN(K)` | `isNaN` | unresolved | absent | c-platform | global isNaN built-in |
+| C1-137 | `app/client/imports/amcharts/plugins/export/libs/fabric.js/fabric.min.js`:1 | `this._objects.filter(function(o){return o.type===type})` | `filter` | unresolved | absent | c-platform | Array.prototype.filter on an object array |
+| C1-138 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `a._data.getCompressedContent()` | `getCompressedContent` | unresolved | absent | a-repo | T-flow: vendored JSZip compressed-data object method |
+| C1-139 | `app/client/imports/amcharts/plugins/export/libs/jszip/jszip.min.js`:12 | `s(this.crc32(p),4)` | `s` | ambiguous | absent | a-repo | T-flow: vendored JSZip bundle-internal local helper |
+| C1-140 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:7 | `Math.pow(2,-a)` | `pow` | unresolved | absent | c-platform | Math.pow built-in |
+| C1-141 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `pn(e,n,3)` | `pn` | in-file | absent | a-repo | T-none: vendored pdfmake bundle-internal helper |
+| C1-142 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:8 | `r(t,e)` | `r` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal local helper |
+| C1-143 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:9 | `new h(e,n,r,this.imageMeasure,this.tableLayouts,u)` | `h` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal constructor |
+| C1-144 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `n(71)` | `n` | ambiguous | absent | a-repo | T-flow: vendored bundle module require, a bound parameter |
+| C1-145 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `t.readString(4)` | `readString` | unresolved | absent | a-repo | T-flow: vendored pdfmake stream reader method |
+| C1-146 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:14 | `T.writeUInt16(i)` | `writeUInt16` | unresolved | absent | a-repo | T-flow: vendored pdfmake buffer writer method |
+| C1-147 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:15 | `t.charCodeAt(r)` | `charCodeAt` | unresolved | absent | c-platform | String.prototype.charCodeAt |
+| C1-148 | `app/client/imports/amcharts/plugins/export/libs/pdfmake/pdfmake.min.js`:17 | `n()` | `n` | ambiguous | absent | a-repo | T-flow: vendored pdfmake bundle-internal local helper |
+| C1-149 | `app/client/imports/amcharts/plugins/export/libs/xlsx/xlsx.min.js`:2 | `path.toUpperCase().replace(chr0,"").replace(chr1,"!")` | `replace` | unresolved | absent | c-platform | String.prototype.replace chained on toUpperCase |
+| C1-150 | `app/client/imports/amcharts/serial.js`:80 | `e.resetDateToMin(new Date(this.data[f].time),g,w,p)` | `resetDateToMin` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-151 | `app/client/imports/amcharts/xy.js`:5 | `this.getAxisBounds(a,f,m,k,b)` | `getAxisBounds` | unresolved | absent | a-repo | T-hier: vendored AmCharts chart prototype method |
+| C1-152 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:240 | `$("<div class='slick-header-columns' style='left:-1000px' />").appendTo($headerScroller)` | `appendTo` | unresolved | absent | b-lib | jQuery appendTo on a wrapped element |
+| C1-153 | `app/client/lib/SlickGrid - a grid/slick.grid.js`:660 | `getEditorLock()` | `getEditorLock` | in-file | absent | a-repo | T-none: vendored SlickGrid internal function |
+| C1-154 | `app/client/lib/bootstrap-daterangepicker-custom/daterangepicker.js`:458 | `moment(startDate, this.locale.format)` | `moment` | unresolved | absent | b-lib | moment factory call |
+| C1-155 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:254 | `this.showForm(false)` | `showForm` | unresolved | absent | a-repo | T-hier: vendored bootstrap-editable prototype method |
+| C1-156 | `app/client/lib/bootstrap-editable/js/bootstrap-editable.js`:2653 | `$.proxy(function () { this.sourceData = cache.sourceData; this.doPrepend(); success.cal…` | `proxy` | unresolved | absent | b-lib | jQuery.proxy |
+| C1-157 | `app/client/lib/gojs/go.js`:57 | `this.Fa.reset()` | `reset` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated field |
+| C1-158 | `app/client/lib/gojs/go.js`:103 | `Object.isFrozen(this)` | `isFrozen` | unresolved | absent | c-platform | Object.isFrozen built-in |
+| C1-159 | `app/client/lib/gojs/go.js`:337 | `d.Df()` | `Df` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-160 | `app/client/lib/gojs/go.js`:882 | `d.gt(f.gj)` | `gt` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-161 | `app/client/lib/gojs/go.js`:1162 | `c.lb(a)` | `lb` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-162 | `app/client/lib/gojs/go.js`:1225 | `a.rect(l,r,Math.max(m,.1),Math.max(k,.1))` | `rect` | unresolved | absent | a-repo | T-hier: vendored GoJS context wrapper rect, not canvas |
+| C1-163 | `app/client/lib/gojs/go.js`:1366 | `Ho(b,!1)` | `Ho` | in-file | absent | a-repo | T-none: vendored GoJS bundle-internal function |
+| C1-164 | `app/client/lib/gojs/go.js`:1718 | `l.na()` | `na` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-165 | `app/client/lib/gojs/go.js`:1739 | `Wq(a.width)` | `Wq` | in-file | absent | a-repo | T-none: vendored GoJS bundle-internal function |
+| C1-166 | `app/client/lib/gojs/go.js`:2048 | `Ma.S.h(K,Ga)` | `h` | unresolved | absent | a-repo | T-flow: vendored GoJS method on an obfuscated local |
+| C1-167 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:3668 | `parentInstance._over.call( parentInstance, event )` | `call` | unresolved | absent | c-platform | Function.prototype.call |
+| C1-168 | `app/client/lib/jquery-ui-1.12.0.custom/jquery-ui.js`:4005 | `[ "padding", /ne\|nw\|n/.test( i ) ? "Top" : /se\|sw\|s/.test( i ) ? "Bottom" : /^e$/.t…` | `join` | unresolved | absent | c-platform | Array.prototype.join on an array literal |
+| C1-169 | `app/client/plugins/d3/d3.min.js`:2 | `o.unshift(l)` | `unshift` | unresolved | absent | c-platform | Array.prototype.unshift |
+| C1-170 | `app/client/styles/framework/bootstrap3-plugins/bootstrap-tagsinput/bootstrap-tagsinput.js`:349 | `$(event.target)` | `$` | unresolved | absent | b-lib | jQuery factory call |
+| C1-171 | `app/client/views/boImports/boImports.js`:246 | `setFileData({ file, headers, tpl })` | `setFileData` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
+| C1-172 | `app/client/views/boSimplifiedForm/detectedVulnerabilitySimplified/dvRehashModal.js`:68 | `BusinessObjects.find({ "md.type" : "assets" }).fetch()` | `fetch` | unresolved | absent | b-lib | Mongo cursor fetch on a collection find |
+| C1-173 | `app/client/views/campaigns/campaignStats/campaignStats.js`:60 | `_.isEmpty(existing)` | `isEmpty` | unresolved | absent | b-lib | lodash isEmpty() |
+| C1-174 | `app/client/views/common/iboxTools/ibox-tools.js`:74 | `$(e.target)` | `$` | unresolved | absent | b-lib | jQuery factory call |
+| C1-175 | `app/client/views/internalSecOps/boQuickEntry/quickEntryField.js`:566 | `relatedSet.add(key)` | `add` | ambiguous | absent | c-platform | Set.prototype.add; sibling binding is a Map |
+| C1-176 | `app/client/views/internalSecOps/incidents/incidentsList.js`:49 | `incidentsGrid.grid.render()` | `render` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
+| C1-177 | `app/client/views/internalSecOps/ofra/ofraTracking.js`:240 | `mapUsers([Meteor.user()])` | `mapUsers` | unresolved | absent | a-repo | T-import: named import from a repo module in this file |
+| C1-178 | `app/client/views/internalSecOps/risks/risksCreateEdit.js`:117 | `_.result(fortress, "customOfraLinks.get.risks")` | `result` | unresolved | absent | b-lib | lodash result() |
+| C1-179 | `app/client/views/internalSecOps/rootIssues/edit/editRootIssues.js`:49 | `Template.editRootIssues.onRendered(function() { $('#panelCompanies').removeClass('hidde…` | `onRendered` | unresolved | absent | b-lib | Blaze Template.onRendered |
+| C1-180 | `app/client/views/internalSecOps/rootIssues/rootIssuesGrid.js`:25 | `selectizeUtils.listSync("rootIssues-category")` | `listSync` | import | absent | a-repo | T-none: syntax tier resolves the import |
+| C1-181 | `app/client/views/internalSecOps/services/services.js`:200 | `tpl.get("visibleIfFields")` | `get` | unresolved | absent | a-repo | T-hier: Blaze TemplateInstance prototype method, repo package |
+| C1-182 | `app/client/views/internalSecOps/vendors/editVendorDetails/tabContent/activityShared/activityHooks.test.js`:257 | `expect(out[0].action).toBe( `updated [${STOCK_OFRA.services.label}: Engagement A]`, )` | `toBe` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-183 | `app/client/views/internalSecOps/vulnSummaryPage/vulnSummaryPage.js`:78 | `_.result(tpl, "buInfo.get.noBU", false)` | `result` | unresolved | absent | b-lib | lodash result() |
+| C1-184 | `app/client/views/internalSecOps/vulnerabilities/knownVulnerabilities/knownVulnsSpecificTabs/knownVulnsSpecificTabs.js`:150 | `self.disable()` | `disable` | unresolved | absent | b-lib | selectize instance method in an onInitialize hook |
+| C1-185 | `app/client/views/manageFiles/uploadedFilesGrid.js`:183 | `modal.find(".modal-body")` | `find` | unresolved | absent | b-lib | jQuery find() on a wrapped modal element |
+| C1-186 | `app/client/views/manageUsers/manUsers.js`:727 | `_.get(v.roles, [_.keys(v.roles)[0]])` | `get` | unresolved | absent | b-lib | lodash get() |
+| C1-187 | `app/client/views/manage_subscription/catalogConfigs.js`:55 | `_.get(err, "message")` | `get` | unresolved | absent | b-lib | lodash get() |
+| C1-188 | `app/client/views/recertification/createNewVendorModal/createNewVendorModal.js`:37 | `Tracker.afterFlush(() => { $(`#${MODAL_ID}`).modal("show"); $(`#${MODAL_ID}`).one("hidd…` | `afterFlush` | unresolved | absent | b-lib | Meteor Tracker.afterFlush |
+| C1-189 | `app/client/views/recertification/useContactCardPopover.test.jsx`:73 | `expect(valueOrEmpty("hello"))` | `expect` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-190 | `app/client/views/rolesNotifications/notificationRules/recipientFields.js`:313 | `_.castArray(notificationRecipientUtils.getRecipientFieldValue(_.get(doc, "recipients"),…` | `castArray` | unresolved | absent | b-lib | lodash castArray() |
+| C1-191 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:611 | `validateSectionRanges(scale, path, vc, section)` | `validateSectionRanges` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
+| C1-192 | `app/client/views/surveys/surveyBuilder/newSurvey.js`:914 | `Session.get("readOnly")` | `get` | unresolved | absent | b-lib | Meteor Session.get |
+| C1-193 | `app/client/views/system/manageKeywordMatchRules/manageKeywordMatchRules.js`:46 | `SlickGrid.keywordMatchRulesGrid.grid.getSelectionModel()` | `getSelectionModel` | unresolved | absent | a-repo | T-flow: vendored SlickGrid grid method |
+| C1-194 | `app/client/views/system/manage_boConfigs/quickEntryFormBuilder/quickEntryFormBuilder.js`:825 | `_.get(o, "label")` | `get` | unresolved | absent | b-lib | lodash get() |
+| C1-195 | `app/client/views/system/navigation/systemNavigation.js`:759 | `_.get(existing, "parent")` | `get` | unresolved | absent | b-lib | lodash get() |
+| C1-196 | `app/client/views/threatAlerts/icsAlerts/IcsAlertsPage.test.jsx`:128 | `expect( extractCves({ cves : [ { code : "CVE-2024-1234", boID : "bo1" }, { code : "CVE-…` | `expect` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-197 | `app/client/views/threatAlerts/icsAlerts/IcsAlertsPage.test.jsx`:221 | `advisoryDateOf({ ts_posted : new Date("2024-07-03T00:30:00.000Z"), ts_updated : new Dat…` | `toISOString` | unresolved | absent | c-platform | Date.prototype.toISOString |
+| C1-198 | `app/client/views/workflowStats/workflowStats.js`:494 | `_.chain(_.cloneDeep(headerCols)) .map((p) => _.chain(p) .map("wfProcesses") .flatten() …` | `value` | unresolved | absent | b-lib | lodash chain terminator value() |
+| C1-199 | `app/client/views/workflowStats/workflowStats.js`:713 | `_.chain(p).get("wfProcesses", []).map(function(pr) { let steps = _.get(pr, "procSteps",…` | `map` | unresolved | absent | b-lib | lodash chain map() |
+| C1-200 | `app/imports/ui/cm-dashboard/components/charts/findings-chart/index.test.jsx`:602 | `renderAndSettle([ { _id: "Sev-1", count: 4, sevID: "s1", toolMappings: [critical.mappin…` | `renderAndSettle` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
+| C1-201 | `app/imports/ui/cm-dashboard/components/charts/vendors-location/create-map.test.js`:233 | `expect(getCountryFallbackCoords("VN"))` | `expect` | unresolved | absent | b-lib | vitest expect() matcher |
+| C1-202 | `app/imports/ui/cm-dashboard/components/overall-filter-menu/SavedViewsPopover.jsx`:816 | `savedViews.system.map((viewItem) => { const isOwner = viewItem?.userID === Meteor.userI…` | `map` | unresolved | stub | c-platform | Array.prototype.map; savedViews.system defaults to [] |
+| C1-203 | `app/imports/ui/cm-dashboard/components/overall-filters/index.jsx`:1721 | `recalcBannerHeight()` | `recalcBannerHeight` | in-file | in-repo | a-repo | T-none: syntax in-file and engine in-repo agree |
+| C1-204 | `app/imports/ui/cm-dashboard/components/tabs/360-view/risk-profile/initial-layout.jsx`:43 | `markdownUtils.md2html(description \|\| "")` | `md2html` | import | stub | a-repo | T-none: syntax tier resolves the import |
+| C1-205 | `app/imports/ui/cm-dashboard/microComponents/drag-and-drop-file-upload.jsx`:724 | `prev?.some((existing) => existing?.id === file?.id)` | `some` | unresolved | stub | c-platform | Array.prototype.some on a state array |
+| C1-206 | `app/imports/ui/cm-dashboard/providers/VendorProvider.test.jsx`:229 | `new Error("Invalid vendor id")` | `Error` | unresolved | absent | c-platform | Error constructor built-in |
+| C1-207 | `app/lib/flowRouterCompat.js`:1682 | `globalWaitOn().concat( _.isFunction(controller.waitOn) ? controller.waitOn(ironParams, …` | `concat` | unresolved | stub | c-platform | Array.prototype.concat; globalWaitOn returns an array |
+| C1-208 | `app/lib/flowRouterCompat.serverPaths.test.js`:595 | `dispatch(request("GET", "/api/thing"), res)` | `dispatch` | in-file | absent | a-repo | T-none: syntax tier resolves it in-file |
+| C1-209 | `app/lib/object_utils.js`:107 | `_.each(data, function(doc) { _.each(exportFields, function(field, i) { if (i > 0) { str…` | `each` | unresolved | stub | b-lib | lodash each() |
+| C1-210 | `app/lib/routeControllers/campaignStatsController.js`:17 | `createController({ template : "campaignStats", waitOn(params) { return [ Meteor.subscri…` | `createController` | unresolved | stub | a-repo | T-import: named import from a repo module in this file |
+| C1-211 | `app/lib/routeDefinitions/samlRoutes.js`:333 | `Subscriptions.findOneAsync({ "saml.identifier" : _.get(fGroup, "sub", "") })` | `findOneAsync` | unresolved | stub | b-lib | Mongo collection findOneAsync |
+| C1-212 | `app/packages/jade-compiler/package.js`:42 | `api.addFiles(["tests/tests.js"], "server")` | `addFiles` | unresolved | absent | b-lib | Meteor package build API api.addFiles |
+| C1-213 | `app/packages/meteor-amcharts/lib/amcharts.js`:39 | `a.getLabel()` | `getLabel` | unresolved | stub | a-repo | T-flow: vendored AmCharts axis object method |
+| C1-214 | `app/packages/meteor-amcharts/lib/amcharts.js`:301 | `b.set()` | `set` | unresolved | stub | a-repo | T-flow: vendored AmCharts container set method |
+| C1-215 | `app/packages/meteor-amcharts/lib/plugins/animate/animate.js`:351 | `getKeysGraphs( chart.graphs, keys, seen, getKeysGraph )` | `getKeysGraphs` | in-file | in-repo | a-repo | T-none: vendored amcharts plugin internal function |
+| C1-216 | `app/packages/meteor-amcharts/lib/plugins/export/export.js`:1351 | `_this.gatherClassName( group.parent, _this.setup.chart.classNamePrefix + "-legend-div",…` | `gatherClassName` | unresolved | stub | a-repo | T-hier: vendored amcharts export plugin method |
+| C1-217 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.js`:329 | `this.getObjects()` | `getObjects` | unresolved | in-repo | a-repo | T-none: vendored fabric.js method, engine says in-repo |
+| C1-218 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:6 | `toFixed(this.scaleX,NUM_FRACTION_DIGITS)` | `toFixed` | unresolved | absent | a-repo | T-field: vendored fabric.util.toFixed, not the built-in |
+| C1-219 | `app/packages/meteor-amcharts/lib/plugins/export/libs/fabric.js/fabric.min.js`:11 | `floor(j*ratioH)` | `floor` | unresolved | absent | c-platform | Math.floor via a local alias in the vendored bundle |
+| C1-220 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:2003 | `__webpack_require__(7)` | `__webpack_require__` | in-file | absent | a-repo | T-none: vendored bundle webpack module loader |
+| C1-221 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.js`:17016 | `result.push({ x: self.rowSpanData[self.rowSpanData.length - 1].left, index: self.rowSpa…` | `push` | unresolved | absent | c-platform | Array.prototype.push on a result array |
+| C1-222 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:1 | `r.fs.bindFS(this.vfs)` | `bindFS` | unresolved | absent | a-repo | T-flow: vendored pdfkit virtual filesystem method |
+| C1-223 | `app/packages/meteor-amcharts/lib/plugins/export/libs/pdfmake/pdfmake.min.js`:13 | `s.split("\n").map(function(t){return" "+t})` | `map` | unresolved | absent | c-platform | Array.prototype.map on a split() result |
+| C1-224 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:420 | `fmt.match(dec1)` | `match` | unresolved | stub | c-platform | String.prototype.match on a format string |
+| C1-225 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.js`:8532 | `unescapexml(Rn[3])` | `unescapexml` | unresolved | in-repo | a-repo | T-none: vendored xlsx function, engine says in-repo |
+| C1-226 | `app/packages/meteor-amcharts/lib/plugins/export/libs/xlsx/xlsx.min.js`:3 | `__utf16le(this,this.l,this.l+size)` | `__utf16le` | unresolved | absent | a-repo | T-flow: vendored xlsx bundle-internal helper |
+| C1-227 | `app/packages/meteor-apm-agent/tests/hijack/subscriptions.js`:17 | `h2.stop()` | `stop` | unresolved | absent | b-lib | DDP subscription handle stop, from client.subscribe |
+| C1-228 | `app/packages/meteor-apm-agent/tests/models/base_error.js`:49 | `new BaseErrorModel()` | `BaseErrorModel` | unresolved | absent | a-repo | T-import: Meteor package-scope global from a repo file |
+| C1-229 | `app/packages/meteor-stylus/plugin/compile-stylus.js`:213 | `absoluteImportPath(parsed)` | `absoluteImportPath` | in-file | in-repo | a-repo | T-none: syntax in-file and engine in-repo agree |
+| C1-230 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:116 | `setTimeout(function(){b.destroy.call(b)},1E3*a)` | `setTimeout` | unresolved | absent | c-platform | setTimeout host API |
+| C1-231 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:143 | `d.setCN(c,r,"graph-bullet")` | `setCN` | unresolved | absent | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-232 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:259 | `n.translate(t,p)` | `translate` | unresolved | absent | a-repo | T-flow: vendored AmCharts object translate method |
+| C1-233 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:369 | `c.fire({type:"selectedObjectChanged",chart:c})` | `fire` | unresolved | absent | a-repo | T-flow: vendored AmCharts event fire method |
+| C1-234 | `app/packages/mikemccrickard-ammap/web.browser-legacy/packages/mikemccrickard_ammap.js`:482 | `this.chart.coordinatesToXY(this.longitudes[b],this.latitudes[b])` | `coordinatesToXY` | unresolved | absent | a-repo | T-flow: vendored AmCharts chart method via this.chart |
+| C1-235 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:15 | `h.slice(g)` | `slice` | unresolved | stub | c-platform | String.prototype.slice inside a wordwrap loop |
+| C1-236 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:77 | `a[b].remove()` | `remove` | unresolved | stub | a-repo | T-flow: vendored AmCharts label object remove |
+| C1-237 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:95 | `d.Class({construct:function(){}})` | `Class` | unresolved | stub | a-repo | T-field: vendored AmCharts.Class factory |
+| C1-238 | `app/packages/mikemccrickard-ammap/web.browser/lib/ammap.js`:126 | `d.applyTheme(this,a,this.cname)` | `applyTheme` | unresolved | stub | a-repo | T-field: vendored AmCharts namespace helper |
+| C1-239 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:7920 | `ctx.setLineDash(this.strokeDashArray)` | `setLineDash` | unresolved | stub | c-platform | canvas 2D context setLineDash |
+| C1-240 | `app/packages/mikemccrickard-ammap/web.browser/lib/plugins/export/libs/fabric.js/fabric.js`:19503 | `_this.setAngle(value)` | `setAngle` | unresolved | stub | a-repo | T-hier: vendored fabric.js object prototype method |
 
 ### B. Reference repository — JavaScript, second half
 
