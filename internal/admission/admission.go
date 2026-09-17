@@ -1,9 +1,15 @@
-// Package admission is this process's one memory admission ledger: every heavy
+// Package admission is this process's one reservation ledger: every heavy
 // child -- analysis engine runs, external indexers, language servers -- is
-// admitted against a single machine-derived allocation by the SUM of what they
-// reserve (ADR-0010 decision 5).
+// admitted against a single machine-derived allocation of MEMORY and one of
+// DISK, by the SUM of what they reserve in each (ADR-0010 decisions 5 and 6).
 //
-// One ledger, one total, one queue. Two reservers each holding a running total
+// Two dimensions, one ledger, one total each, one queue. Disk is admitted here
+// and not by a gate of its own for the reason the memory rule gives: a second
+// gate is a second running total, and two gates over one queue would also let
+// a child holding memory wait for disk behind a child holding disk waiting for
+// memory. A waiter is admitted when BOTH dimensions fit and takes both at
+// once, so there is no order in which two reservers can hold half of what the
+// other needs. Two reservers each holding a running total
 // bounded by the same allocation is not one gate: it lets a process reserve a
 // multiple of the machine's memory and freeze the host, which is the failure
 // this package exists to make impossible. Nothing here observes the machine or
@@ -39,21 +45,32 @@ import (
 // once.
 type Ledger struct {
 	mu sync.Mutex
-	// allocation is the machine-derived allocation every admitted reservation
-	// must sum within. It is always positive, so admission is bounded by a sum
-	// of bytes on every platform and never by a count of children.
+	// allocation is the machine-derived memory allocation every admitted
+	// reservation must sum within. It is always positive, so admission is
+	// bounded by a sum of bytes on every platform and never by a count of
+	// children.
 	allocation int64
-	admitted   int
-	used       int64
-	queue      []*waiter
+	// diskAllocation is the same for the temporary disk a child stages its
+	// inputs and writes its outputs into: the free space observed under the
+	// data directory less the host-safety floor the operator set, or the
+	// conservative figure the composition root stands in where the platform
+	// reports no free space. It is never negative and never "unlimited"; zero
+	// is a real reading -- a host already at or below its floor -- and
+	// serializes every child that wants disk at all.
+	diskAllocation int64
+	admitted       int
+	used           int64
+	diskUsed       int64
+	queue          []*waiter
 }
 
 // waiter is one blocked Reserve call. granted, stuck and the queue position are
 // guarded by the ledger's mutex; ready is closed exactly once, by the grant.
 type waiter struct {
-	bytes   int64
-	granted bool
-	ready   chan struct{}
+	bytes     int64
+	diskBytes int64
+	granted   bool
+	ready     chan struct{}
 	// stuck carries one wake-up to a waiter that has reached the head of the
 	// queue, does not fit, and brought a way to free room. It is nil for a
 	// reserver that brought none, and the send is non-blocking, so a waiter
@@ -62,22 +79,35 @@ type waiter struct {
 	release sync.Once
 }
 
-// NewLedger builds the ledger over the one machine-derived allocation. A
-// non-positive allocation is refused rather than treated as unlimited: an
-// admission gate with no bound is not a gate, and every caller has a positive
-// figure to hand over (dependence.Machine.SchedulingAllocation stands in for an
-// unobservable host).
-func NewLedger(allocationBytes int64) (*Ledger, error) {
+// NewLedger builds the ledger over the one machine-derived memory allocation
+// and the one disk allocation. A non-positive memory allocation is refused
+// rather than treated as unlimited: an admission gate with no bound is not a
+// gate, and every caller has a positive figure to hand over
+// (dependence.Machine.SchedulingAllocation stands in for an unobservable host).
+//
+// The disk allocation may be zero and may not be negative. Zero is the one
+// reading that is not a stand-in: a host whose free space is already at or
+// below the floor it must keep has nothing to give a child, and every child
+// that wants disk then runs alone rather than being refused. An unobservable
+// free-space figure is NOT zero and must not be passed as one; the composition
+// root stands a conservative figure in for it, exactly as it does for memory.
+func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
 	if allocationBytes <= 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "the memory admission ledger needs a positive allocation"}
+			Message: "the reservation ledger needs a positive memory allocation"}
 	}
-	return &Ledger{allocation: allocationBytes}, nil
+	if diskAllocationBytes < 0 {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "the reservation ledger needs a disk allocation that is not negative"}
+	}
+	return &Ledger{allocation: allocationBytes, diskAllocation: diskAllocationBytes}, nil
 }
 
-// Reserve blocks until these bytes may be held: the summed reservations of
-// everything admitted plus this one within the allocation. It returns a
-// release function that is idempotent and must be called on every path.
+// Reserve blocks until these bytes of MEMORY may be held: the summed
+// reservations of everything admitted plus this one within the allocation. It
+// returns a release function that is idempotent and must be called on every
+// path. A child that also stages bytes on disk states both through
+// ReserveWith; this is that call with no disk.
 //
 // A reservation larger than the whole allocation is admitted when the ledger
 // holds nothing. Refusing it would refuse work the user never asked to have
@@ -96,10 +126,28 @@ func NewLedger(allocationBytes int64) (*Ledger, error) {
 // granted at the same moment its context ends gives the permission straight
 // back, so a canceled caller never leaks a reservation.
 func (l *Ledger) Reserve(ctx context.Context, bytes int64, makeRoom func()) (func(), error) {
+	return l.ReserveWith(ctx, Reservation{MemoryBytes: bytes}, makeRoom)
+}
+
+// Reservation is what one child holds while it runs, in both dimensions.
+// DiskBytes is the temporary space it stages its inputs and writes its outputs
+// into -- not the source it reads and not the store it publishes to, which are
+// not this child's to hold -- and is zero for a child that writes none.
+type Reservation struct {
+	MemoryBytes int64
+	DiskBytes   int64
+}
+
+// ReserveWith is Reserve in both dimensions: it blocks until this child's
+// memory AND its temporary disk may be held, and takes both in the same grant.
+// Everything Reserve documents holds here, per dimension: the runs-alone rule,
+// the makeRoom step, the idempotent release and the cancellation that leaks
+// nothing.
+func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
 	}
-	w := &waiter{bytes: bytes, ready: make(chan struct{})}
+	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, ready: make(chan struct{})}
 	if makeRoom != nil {
 		w.stuck = make(chan struct{}, 1)
 	}
@@ -129,8 +177,8 @@ func (l *Ledger) Reserve(ctx context.Context, bytes int64, makeRoom func()) (fun
 	}
 }
 
-// Snapshot is the allocation and what is reserved against it right now, read
-// together under one lock so the two figures an operator reads are a
+// Snapshot is the memory allocation and what is reserved against it right now,
+// read together under one lock so the two figures an operator reads are a
 // consistent pair rather than two moments.
 func (l *Ledger) Snapshot() (allocation, reserved int64) {
 	l.mu.Lock()
@@ -145,10 +193,14 @@ func (l *Ledger) Snapshot() (allocation, reserved int64) {
 func (l *Ledger) pump() {
 	for len(l.queue) > 0 {
 		head := l.queue[0]
-		// The sum is checked only against something already admitted: an idle
-		// ledger admits any single reservation, whatever it is, so a child
-		// larger than the whole allocation runs alone rather than never.
-		if l.admitted > 0 && l.used+head.bytes > l.allocation {
+		// The sums are checked only against something already admitted: an
+		// idle ledger admits any single reservation, whatever it is, so a
+		// child larger than the whole allocation -- of either dimension --
+		// runs alone rather than never. Both must fit, and the head takes both
+		// in one grant, so the two dimensions cannot be held against each
+		// other.
+		if l.admitted > 0 && (l.used+head.bytes > l.allocation ||
+			l.diskUsed+head.diskBytes > l.diskAllocation) {
 			if head.stuck != nil {
 				select {
 				case head.stuck <- struct{}{}:
@@ -164,6 +216,7 @@ func (l *Ledger) pump() {
 		l.queue = l.queue[1:]
 		l.admitted++
 		l.used += head.bytes
+		l.diskUsed += head.diskBytes
 		head.granted = true
 		close(head.ready)
 	}
@@ -196,6 +249,7 @@ func (l *Ledger) release(w *waiter) {
 		defer l.mu.Unlock()
 		l.admitted--
 		l.used -= w.bytes
+		l.diskUsed -= w.diskBytes
 		l.pump()
 	})
 }

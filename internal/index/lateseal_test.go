@@ -51,7 +51,7 @@ func TestDeferredUnitsOverlapWithinTheAllocation(t *testing.T) {
 	// admitted against here is the figure the product would use.
 	allocation := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}.
 		SchedulingAllocation(config.BaseFootprint(c.opts.Config))
-	ledger, err := admission.NewLedger(allocation)
+	ledger, err := admission.NewLedger(allocation, 64<<30)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}

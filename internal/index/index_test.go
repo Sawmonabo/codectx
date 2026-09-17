@@ -1504,7 +1504,7 @@ func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 // is proved where the ledger lives.
 func testAdmission(t testing.TB) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(64 << 30)
+	l, err := admission.NewLedger(64<<30, 64<<30)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
