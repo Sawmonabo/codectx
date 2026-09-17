@@ -33,6 +33,13 @@ const (
 // because no provider was ever reached to state one.
 const ReasonNotAdmitted = "the unit was planned but never reached admission"
 
+// ReasonInterrupted is the reason of a span that was still running when its run
+// ended: nobody measured how it finished, because it did not. A span with no
+// reason at all would be read as a failure whose cause was never recorded,
+// which is the one thing this account exists to replace -- so the cut-off says
+// so in the same two columns every other non-ok row uses.
+const ReasonInterrupted = "the span was still running when its run ended"
+
 // A Kind is what opened a run: an index run, the deferred publication of a
 // generation whose run had already ended, or the per-process overlay a
 // language server's startup hangs under when no run is live.

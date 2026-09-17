@@ -100,9 +100,8 @@ type Collector interface {
 func (c *Coordinator) collect(ctx context.Context) {
 	// The sweep runs before the store's own pass and outside the collection
 	// span, on the uncancellable context: it is the ledger's half of the same
-	// collection, it is what keeps the two classes of run no generation will
-	// ever reach from accumulating, and a coordinator assembled without a
-	// store-side collector still has a ledger to sweep.
+	// collection, it is the only thing that bounds that file, and a coordinator
+	// assembled without a store-side collector still has a ledger to sweep.
 	ctx = context.WithoutCancel(ctx)
 	c.sweepLedger(ctx)
 	if c.opts.Collector == nil {
@@ -110,7 +109,7 @@ func (c *Coordinator) collect(ctx context.Context) {
 	}
 	ctx, span := ledger.Start(ctx, stageCollection, "")
 	report, err := c.opts.Collector.Collect(ctx)
-	span.End(endOutcome(err), ledger.Measured{}, err)
+	span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		logTyped(c.log, "the collection pass did not finish", err,
 			"component", component, "repository_id", string(c.repo))

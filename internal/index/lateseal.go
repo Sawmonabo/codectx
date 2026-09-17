@@ -565,7 +565,7 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 	// gives it a terminal state on every path this call can take; run closes
 	// it first for a unit that reached its provider.
 	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
-	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
+	defer func() { span.End(unitEnding(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
 		return "", outcome{}, err

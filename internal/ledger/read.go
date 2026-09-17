@@ -320,7 +320,12 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		// died reports no measurement rather than an elapsed time that grows
 		// for as long as the row survives.
 		if lapsed && row.Outcome == OutcomeRunning {
+			// The same two columns a stopping collector writes, stated here
+			// rather than written: this reader must never touch the file, and
+			// a cut-off span with no reason reads as a failure whose cause was
+			// never recorded.
 			row.Outcome = OutcomeInterrupted
+			row.DiagnosticCode, row.Failure = model.CodeCanceled, ReasonInterrupted
 		}
 		if parent.Valid {
 			seq := parent.Int64
