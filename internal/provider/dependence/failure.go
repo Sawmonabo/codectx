@@ -197,7 +197,7 @@ type partTally struct {
 }
 
 // subdivisionEmpty is the typed failure for a subdivided unit no part of which
-// produced a method. A unit with no part at all never reaches it: childProjects
+// produced a method. A unit with no part at all never reaches it: subdivide
 // refuses the split before the parts run. "no part produced an honest result" is the same
 // restatement emptyExport removes, so this names the tally instead.
 func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {

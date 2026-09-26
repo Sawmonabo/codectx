@@ -213,11 +213,16 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 		// (internal/provider/scip/projects.go). The divergence is deliberate,
 		// and it is the difference between what the two lose. The precise
 		// collapse cost located facts for a project nobody had planned a unit
-		// for; this collapse keeps a unit's call closure intact, and splitting
-		// it would cut cross-package call resolution -- a unit split at a
-		// directory that declares nothing of its own loses more than half of
-		// the calls that resolve to its own methods (docs/research/
-		// 10-round3-empirical.md Section 8). Neither rule inherits the other.
+		// for; this collapse keeps the outer project whole, and the outer
+		// project is the program these frontends resolve calls across. Every
+		// file of it is parsed together, so a call from the nested directory
+		// into the rest of the project, or back, resolves to the method it
+		// names, which a separate parse of the nested directory could only
+		// publish as a call to a stub outside its graph. No split at a nested
+		// manifest has been measured; the measured splits are at directories
+		// inside one project (docs/research/10-round3-empirical.md Section 8),
+		// and they lose cross-directory calls for exactly this reason. Neither
+		// rule inherits the other.
 		dirs = slices.DeleteFunc(dirs, func(d string) bool {
 			for _, outer := range dirs {
 				if outer != d && within(d, outer) {

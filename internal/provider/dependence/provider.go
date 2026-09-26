@@ -1026,9 +1026,17 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
 	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (ImportReport, int, error) {
 
-	children, err := childProjects(source, unit)
+	children, err := childProjects(source)
 	if err != nil {
 		return ImportReport{}, 0, err
+	}
+	if len(children) == 0 {
+		// The unit fails on the crash that forced the split, so the error
+		// carries that crash's own figures -- its exit code, pass, exception
+		// and last words -- and not a step that never ran.
+		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, adm.res).
+			WithDetail("reason", "the unit has no boundary below it to split along").
+			WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream")
 	}
 	// The parts are all parsed and imported whatever the count. A user-set
 	// providers.dependence.max_units_per_family says how many parts of one
@@ -1168,8 +1176,9 @@ func outsideParts(ctx context.Context, view model.SnapshotView, unit Unit, impor
 // crashed unit's source from the only run that can still analyse it, and would
 // do it without a word: the unit would seal, partial for the subdivision, with
 // no sign that the tail of its source was never parsed. The caller reports the
-// count against the user's threshold instead.
-func childProjects(source string, unit Unit) ([]string, error) {
+// count against the user's threshold instead. An empty list is the caller's
+// to refuse: only it holds the crash the refusal must report.
+func childProjects(source string) ([]string, error) {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return nil, internalErr("the dependence unit could not be subdivided: " + err.Error())
@@ -1182,11 +1191,6 @@ func childProjects(source string, unit Unit) ([]string, error) {
 		out = append(out, e.Name())
 	}
 	slices.Sort(out)
-	if len(out) == 0 {
-		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
-			WithDetail("reason", "the unit has no boundary below it to split along").
-			WithRemediation("the failing pass and exception on the crash that forced this split are what identifies the defect upstream")
-	}
 	return out, nil
 }
 

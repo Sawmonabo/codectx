@@ -25,7 +25,7 @@ func TestChildProjectsKeepsEveryPart(t *testing.T) {
 			t.Fatalf("MkdirAll: %v", err)
 		}
 	}
-	children, err := childProjects(root, Unit{ScopeKey: "pkg:go:", Family: FamilyGo})
+	children, err := childProjects(root)
 	if err != nil {
 		t.Fatalf("childProjects: %v", err)
 	}
