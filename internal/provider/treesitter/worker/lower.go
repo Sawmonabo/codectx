@@ -146,7 +146,9 @@ func Grammar(name string) (*ts.Language, bool) {
 // a write that may leave the old value in place: a write through an address
 // (see Address-taking), a mutable borrow, a field, an index or a pointer; a
 // closure's write to an enclosing variable, at the node that creates it; and
-// a binding a C preprocessor conditional leaves undecided. Every other
+// such a write to a name a C preprocessor conditional leaves bound to
+// several variables, which may-defines each (a plain assignment through
+// the name defines each, killing). Every other
 // definition, an owned result or a hand-off's earlier value included, is
 // killing.
 //
