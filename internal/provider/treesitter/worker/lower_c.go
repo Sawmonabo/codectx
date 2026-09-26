@@ -65,11 +65,11 @@ const (
 //     value is indeterminate, C17 §6.7.9p10), unless a variable-length array
 //     size is evaluated there: then one Stmt node spans the declarator and
 //     reads the size. In C++ a declarator without an initializer whose
-//     declaration type is not a fundamental or enumeration type specifier
-//     declares an object of class type, which its default constructor
-//     initializes ([dcl.init]/7): one Stmt node spans the declarator, defines
-//     the name and may throw; a type name that aliases a scalar is counted
-//     too, an over-approximation. A structured binding is one defining node
+//     declaration type is not a fundamental or enumeration type specifier,
+//     outside an `extern` declaration, declares an object of class type,
+//     which its default constructor initializes ([dcl.init]/7): one Stmt
+//     node spans the declarator, defines the name and may throw; a type name
+//     that aliases a scalar is counted too, an over-approximation. A structured binding is one defining node
 //     per name, spanning the name, each reading the initializer. A `static`
 //     local is a variable whose initializer is a defining node at its
 //     position; the value it keeps across calls is not modelled.
@@ -980,17 +980,26 @@ func (c *cLower) arraySizes(d *ts.Node, v int32, ctor uint16) {
 	c.shaped(v, s)
 }
 
-// classType reports whether declaration n's type may be a class type: it is
-// not a fundamental or enumeration type specifier. A type name that aliases
-// a scalar is counted, an over-approximation.
+// classType reports whether declaration n defines an object whose type may
+// be a class type: its type is not a fundamental or enumeration type
+// specifier, and it is not `extern`, which declares without constructing. A
+// type name that aliases a scalar is counted, an over-approximation.
 func (c *cLower) classType(n *ts.Node) bool {
-	t := n.ChildByFieldId(c.k.fType)
+	k := c.k
+	t := n.ChildByFieldId(k.fType)
 	if t == nil {
 		return false
 	}
 	switch t.KindId() {
-	case c.k.primitiveType, c.k.sizedTypeSpecifier, c.k.enumSpecifier:
+	case k.primitiveType, k.sizedTypeSpecifier, k.enumSpecifier:
 		return false
+	}
+	start, list := c.kids(n)
+	defer c.done(start)
+	for i := range list {
+		if list[i].KindId() == k.storageClassSpecifier && string(c.text(&list[i])) == "extern" {
+			return false
+		}
 	}
 	return true
 }
@@ -2202,7 +2211,7 @@ type cSyntax struct {
 	offsetofExpression, initializerList, initializerPair, asmExpression, asmOutputOperand,
 	asmGotoList, trueLit, numberLiteral, genericExpression, typeDescriptor, typeIdentifier,
 	abstractArrayDeclarator, abstractPointerDeclarator, abstractParenthesizedDeclarator, primitiveType,
-	sizedTypeSpecifier, enumSpecifier uint16
+	sizedTypeSpecifier, enumSpecifier, storageClassSpecifier uint16
 
 	// C++ only.
 	lambdaExpression, lambdaCaptureInitializer, lambdaDefaultCapture, tryStatement, catchClause,
@@ -2269,6 +2278,7 @@ func resolveCSyntax(language string) *cSyntax {
 	s.abstractArrayDeclarator, s.abstractPointerDeclarator = kind("abstract_array_declarator"), kind("abstract_pointer_declarator")
 	s.abstractParenthesizedDeclarator, s.primitiveType = kind("abstract_parenthesized_declarator"), kind("primitive_type")
 	s.sizedTypeSpecifier, s.enumSpecifier = kind("sized_type_specifier"), kind("enum_specifier")
+	s.storageClassSpecifier = kind("storage_class_specifier")
 	s.and, s.or, s.assign, s.star, s.arrow, s.amp = tok("&&"), tok("||"), tok("="), tok("*"), tok("->"), tok("&")
 	s.fAlternative, s.fArgument, s.fBody, s.fCondition = field("alternative"), field("argument"), field("body"), field("condition")
 	s.fConsequence, s.fDeclarator, s.fFilter, s.fGotoLabels = field("consequence"), field("declarator"), field("filter"), field("goto_labels")
