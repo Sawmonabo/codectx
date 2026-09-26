@@ -20,7 +20,9 @@ func Grammar(name string) (*ts.Language, bool) {
 }
 
 // Lowering turns one language's callables into flow graphs. A callable is a
-// function, method or function-valued literal; each one, nested or not, is
+// function, method, function-valued literal, or a unit a language runs as
+// code of its own (a JavaScript class body: its field initializers and static
+// blocks); each one, nested or not, is
 // its own function, and its enclosing function sees only the expression that
 // creates it. A Lowering holds no per-function state and is safe to share.
 type Lowering struct {
@@ -117,7 +119,9 @@ func (l *Lowering) unparen(n *ts.Node) *ts.Node {
 
 // Functions calls visit with every callable under root, root included, in
 // preorder, nested callables included, in one tree-cursor walk. It stops at
-// and returns the first error visit returns.
+// and returns the first error visit returns. A unit with no code of its own
+// (a class body without initializers or static blocks) is still visited and
+// lowers to Entry -> Exit, so a count of callables counts it.
 func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error {
 	c := root.Walk()
 	defer c.Close()
