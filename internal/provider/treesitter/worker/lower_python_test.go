@@ -216,16 +216,20 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"x@28 -> x@37", "y@31 -> r = y@43", "r = y@43 -> return r@69", "r = 0@62 -> return r@69"},
 		},
 		{
-			// §6.2.4. Lines at 0, 14. Nodes: xs@6, k@10, the comprehension
-			// node@22 (its first iterable xs is evaluated here; k is a
-			// capture; x is the comprehension's own), return …@15.
+			// §6.2.4: the leftmost for clause's iterable is evaluated in the
+			// enclosing scope. Lines at 0, 14. Nodes: xs@6, k@10, the
+			// comprehension node@22 (its first iterable xs is evaluated
+			// here; k is a capture; x is the comprehension's own), return
+			// …@15, which Uses the first iterable's read, a part of its own
+			// statement's evaluation, and not the capture k, which the
+			// creating node carries.
 			name:     "a comprehension's first iterable and captures are uses of its creating node",
-			protects: "the enclosing function evaluates the first iterable, and the comprehension's own target shadows nothing outside it",
-			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node)",
+			protects: "the enclosing function evaluates the first iterable, the comprehension's own target shadows nothing outside it, and the return consuming the comprehension does not repeat its captures",
+			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node), or keep the captures in the consuming statement's reads (k@10 -> return [x + k for x in xs if x]@15 appears)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       1,
 			du: []string{"xs@6 -> [x + k for x in xs if x]@22", "k@10 -> [x + k for x in xs if x]@22",
-				"xs@6 -> return [x + k for x in xs if x]@15", "k@10 -> return [x + k for x in xs if x]@15"},
+				"xs@6 -> return [x + k for x in xs if x]@15"},
 		},
 		{
 			// §6.2.4, the comprehension itself (callable 2). Nodes: for x in
@@ -244,13 +248,14 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §6.14. Lines at 0, 10, 31. Nodes: a@6, lambda b: a + b@15
-			// (captures a), g = lambda b: a + b@11, return g@32.
+			// (captures a), g = lambda b: a + b@11 (consumes the created
+			// value, not the capture: it Uses nothing), return g@32.
 			name:     "a lambda's creating node uses its captures",
-			protects: "a lambda is its own callable and the enclosing function sees only its creation, which reads the enclosing variables it references",
-			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6)",
+			protects: "a lambda is its own callable and the enclosing function sees only its creation, whose node reads the enclosing variables it references and whose consumer does not repeat them",
+			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6), or keep the captures in the assignment's reads (a@6 -> g = lambda b: a + b@11 appears)",
 			src:      "def f(a):\n g = lambda b: a + b\n return g\n",
 			fn:       1,
-			du: []string{"a@6 -> lambda b: a + b@15", "a@6 -> g = lambda b: a + b@11",
+			du: []string{"a@6 -> lambda b: a + b@15",
 				"g = lambda b: a + b@11 -> return g@32"},
 		},
 		{
