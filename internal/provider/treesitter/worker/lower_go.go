@@ -92,7 +92,10 @@ var goLowering = Lowering{
 //     keyword; then one node per key/value target. The head and every
 //     key/value node Use the iteration variable and none of x's reads, so
 //     they depend on x as it was evaluated, never on a write to its
-//     variables in the body. An identifier target, declared by `:=` or
+//     variables in the body. A `_` target makes no node, since `_` is never
+//     a variable (for `for _, v := range xs` the value node v follows the
+//     head directly; the specification makes a trailing `_` equivalent to
+//     omitting it). An identifier target, declared by `:=` or
 //     assigned by `=`, spans the identifier and defines it; a field, index or
 //     indirect target (`for a[i] = range xs`) spans the target, Uses its own
 //     operands, which Go evaluates on every iteration as in an assignment,
@@ -800,7 +803,7 @@ func (g *goLower) forStmt(s *ts.Node, labels []string) {
 // Uses x's reads and defines an iteration variable of its own that the head
 // and every key and value node, of every target form, Use, so each depends
 // on x as it was evaluated before the loop, never on a definition of x in
-// the body.
+// the body. A `_` target makes no node.
 func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 	b, k := g.b, g.k
 	right := rc.ChildByFieldId(k.fRight)
