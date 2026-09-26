@@ -1172,12 +1172,15 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 // document-level probe ignore a name mismatch while the per-occurrence path
 // keeps it, i.e. in `encodingHolds` replace
 //
-//	holds = ds.onPinnedBytes(sym, &rng) == ""
+//	if rng != nil && ds.onPinnedBytes(sym, rng) == "" {
 //
 // with
 //
-//	msg := ds.onPinnedBytes(sym, &rng)
-//	holds = msg == "" || msg == "the occurrence does not select the identifier its symbol names"
+//	msg := ""
+//	if rng != nil {
+//		msg = ds.onPinnedBytes(sym, rng)
+//	}
+//	if rng != nil && (msg == "" || msg == "the occurrence does not select the identifier its symbol names") {
 //
 // The document is then admitted, the declaration is refused as one occurrence,
 // the reference after it publishes its call-site alias and the manifest gains a
