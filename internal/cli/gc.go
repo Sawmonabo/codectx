@@ -119,10 +119,15 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 		report.FreedBytes += pool.FreedBytes
 		report.Pools = append(report.Pools, pool)
 	}
+	all := make([]model.StuckFree, 0, len(stuck))
 	for _, s := range stuck {
-		report.StuckFrees = append(report.StuckFrees, model.StuckFree{Entry: s.Entry, Reason: s.Reason})
+		all = append(all, model.StuckFree{Entry: s.Entry, Reason: s.Reason})
 	}
+	report.StuckFrees, report.StuckFreesOmitted = model.PageStuckFrees(all)
 	sort.Slice(report.Pools, func(i, j int) bool { return report.Pools[i].Directory < report.Pools[j].Directory })
+	if err := report.Validate(); err != nil {
+		return err
+	}
 
 	out := cmd.OutOrStdout()
 	if jsonRequested(cmd, args) {
@@ -191,6 +196,9 @@ func writeGCReport(w io.Writer, r model.ScratchCollection) error {
 	// could not free is the request's answer and not any one pool's.
 	for _, stuck := range r.StuckFrees {
 		fmt.Fprintf(tw, "  could not free %s\t%s\t\n", stuck.Entry, stuck.Reason)
+	}
+	if r.StuckFreesOmitted > 0 {
+		fmt.Fprintf(tw, "  could not free %d more\t\t\n", r.StuckFreesOmitted)
 	}
 	fmt.Fprintf(tw, "total\t%d bytes held\t%d bytes freed\n", r.HeldBytes, r.FreedBytes)
 	flushTableInto(tw)

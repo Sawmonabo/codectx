@@ -977,6 +977,9 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	for _, stuck := range r.StuckFrees {
 		fmt.Fprintf(tw, "    stuck %s\t%s\n", stuck.Entry, stuck.Reason)
 	}
+	if r.StuckFreesOmitted > 0 {
+		fmt.Fprintf(tw, "    stuck %d more\t\n", r.StuckFreesOmitted)
+	}
 	// One line per heavy analysis unit: what it was admitted against, the cap
 	// it ran under, and what its process tree actually reached. Reading the
 	// three together is the whole point -- a peak far under the cap says the
