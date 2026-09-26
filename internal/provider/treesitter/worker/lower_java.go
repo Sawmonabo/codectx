@@ -50,8 +50,8 @@ const yieldLabel = " yield"
 //     nothing (JLS §14.4.2), and the variable is not definitely assigned.
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do, for. It is always made, after the nodes
-//     its own evaluation makes (an `&&` or `||` operand's nodes, a pattern
-//     variable's defining node), and the back edge of a while or basic for
+//     its own evaluation makes (an `&&` or `||` operand's nodes, an
+//     instanceof's tested value and pattern variables), and the back edge of a while or basic for
 //     re-enters the first of those, since the condition is evaluated again
 //     (JLS §14.12, §14.14.1.2). A loop whose condition is the literal
 //     `true`, or a for without one, has no exit edge: its head is a Stmt node
@@ -101,10 +101,12 @@ const yieldLabel = " yield"
 //     operand's node, for `c ? a : b` each arm's node, define the owned
 //     result variable the consumer Uses, in a condition as in any other
 //     position.
-//   - `x instanceof T v` and a record pattern define each pattern variable on
-//     one node spanning its identifier, using the variables of the tested
-//     expression, before the node that decides on the test, into which the
-//     test itself is folded.
+//   - `x instanceof T v` and a record pattern evaluate the tested expression
+//     once, at a Stmt node spanning it that defines an owned variable, then
+//     define each pattern variable on one node spanning its identifier,
+//     using that variable, before the node that decides on the test, into
+//     which the test itself is folded. An instanceof without a pattern is
+//     folded whole.
 //   - try (JLS §14.20): each catch clause's type test is a Branch node
 //     spanning its catch type (a multi-catch `A | B` is one test), in order;
 //     its match path defines the parameter on a node spanning its name; the
@@ -192,16 +194,19 @@ const yieldLabel = " yield"
 //     defines one (an embedded assignment to a local, an arm's result node
 //     that is itself one or a creation) may-defines the construct's result
 //     instead (see Lowering).
-//   - The node deciding on `x instanceof P` Uses the tested expression's
-//     reads: the test is folded into it. Each pattern variable's defining
-//     node Uses them too.
+//   - The node deciding on `x instanceof P` with a pattern Uses the tested
+//     value's owned variable, as each pattern variable's defining node does:
+//     the tested expression is evaluated once, at its own node (JLS
+//     §15.20.2).
 //   - A resource's close Uses only its variable, or, for a resource naming
 //     an existing variable or field, that expression's reads: the
 //     initializer was evaluated once, at the acquiring node.
 //
-// A defining node Uses only what its own evaluation reads: `x = x + 1`
-// Uses x, and `y = x + (x = 2)` does not make `x = 2` Use x, since that read
-// is the declarator's. A write through a
+// An assignment or update of a local carries the reads of the local that
+// its statement made before it and no node carries (see Lowering): in `y =
+// x + (x = 2)` the node `x = 2` Uses x's earlier value and may-defines an
+// owned variable holding it, which the declarator Uses in place of x, since
+// Java evaluates the left operand first (JLS §15.7.1). A write through a
 // field or array element of a local (`o.f = v`, `a[i] += v`, `a[i]++`) is a
 // Stmt node spanning the assignment that uses its operands and may-defines
 // (MayDef, non-killing) the local at the base of the target.
@@ -334,8 +339,11 @@ type javaLower struct {
 	// declarations then bind -1 and no node is created.
 	shadow int
 	// reads are the variables the current statement has read that no node
-	// carries yet, in evaluation order.
+	// carries yet, in evaluation order. at[v] is the index of v's first read
+	// among them while reads[at[v]] is v (see holds); a read a node took
+	// away with the reads after it leaves a stale index, which holds rejects.
 	reads []int32
+	at    []int32
 	// stack saves the enclosing statement's reads across a switch
 	// expression's statements.
 	stack []int32
@@ -484,7 +492,42 @@ func (j *javaLower) read(v int32) {
 	if v < 0 {
 		return
 	}
+	if int(v) >= len(j.at) {
+		j.at = append(j.at, make([]int32, int(v)+1-len(j.at))...)
+	}
+	if !j.holds(v) {
+		j.at[v] = int32(len(j.reads))
+	}
 	j.reads = append(j.reads, v)
+}
+
+// holds reports whether reads hold v, first at reads[at[v]].
+func (j *javaLower) holds(v int32) bool {
+	return int(v) < len(j.at) && int(j.at[v]) < len(j.reads) && j.reads[j.at[v]] == v
+}
+
+// earlier makes node id, which defines the local v and whose own reads
+// begin at m, carry the reads of v the statement made before it and no node
+// carries (`y = x + (x = 1)`, `f(x, x = 1)`): id Uses v's earlier value and
+// may-defines an owned variable holding it, which replaces those reads, so
+// the node folding them pairs with the definition that reached them (see
+// Uses in Lowering).
+func (j *javaLower) earlier(id, v int32, m int) {
+	if !j.holds(v) || int(j.at[v]) >= m {
+		return
+	}
+	j.b.Use(id, v)
+	t := j.b.Var()
+	j.define(id, t)
+	for i := int(j.at[v]); i < m; i++ {
+		if j.reads[i] == v {
+			j.reads[i] = t
+		}
+	}
+	if int(t) >= len(j.at) {
+		j.at = append(j.at, make([]int32, int(t)+1-len(j.at))...)
+	}
+	j.at[t] = j.at[v]
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
@@ -555,8 +598,8 @@ func (j *javaLower) exprNode(n *ts.Node) (int32, int) {
 	m, last := len(j.reads), j.last
 	mid := j.expr(n)
 	id := j.last
-	if j.last == last || j.lastSpan != spanOf(j.l.unparen(n)) || j.thrown != j.throws {
-		id = j.node(flow.Stmt, n, m, len(j.reads))
+	if u := j.l.unparen(n); j.last == last || j.lastSpan != spanOf(u) || j.thrown != j.throws {
+		id = j.node(flow.Stmt, u, m, len(j.reads))
 	}
 	j.reads = j.reads[:m]
 	return id, mid
@@ -1759,13 +1802,21 @@ func (j *javaLower) expr(n *ts.Node) int {
 		j.throws++
 	case k.instanceofExpr:
 		// JLS §6.3.1.5: the pattern's variables are introduced when true.
-		r := len(j.reads)
-		j.value(n.ChildByFieldId(k.fLeft))
-		if name := n.ChildByFieldId(k.fName); name != nil {
-			j.bindPattern(name, r, len(j.reads))
-		} else if p := n.ChildByFieldId(k.fPattern); p != nil {
-			j.bindPattern(p, r, len(j.reads))
+		left, p := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fName)
+		if p == nil {
+			p = n.ChildByFieldId(k.fPattern)
 		}
+		if p == nil {
+			j.value(left)
+			break
+		}
+		// The tested value is evaluated once, at its node, which defines an
+		// owned variable the pattern variable nodes and the test Use.
+		tv := j.b.Var()
+		j.define(j.valueNode(left), tv)
+		r := len(j.reads)
+		j.read(tv)
+		j.bindPattern(p, r, len(j.reads))
 	case k.switchExpr:
 		j.switchValue(n)
 	case k.methodReference:
@@ -1794,7 +1845,10 @@ func (j *javaLower) switchValue(n *ts.Node) {
 	j.results = append(j.results, res)
 	j.switchBlock(n, nil, true)
 	j.results = j.results[:len(j.results)-1]
-	j.reads = append(j.reads[:0], j.stack[base:]...)
+	j.reads = j.reads[:0]
+	for _, v := range j.stack[base:] {
+		j.read(v)
+	}
 	j.stack = j.stack[:base]
 	j.read(res)
 	j.throws, j.thrown = throws, thrown
@@ -1879,6 +1933,7 @@ func (j *javaLower) assign(n *ts.Node) int32 {
 		j.value(right)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
+		j.earlier(id, v, m)
 		return id
 	}
 	j.reference(left)
@@ -1910,6 +1965,7 @@ func (j *javaLower) update(n *ts.Node) int32 {
 		j.read(v)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
+		j.earlier(id, v, m)
 		return id
 	}
 	j.reference(arg)

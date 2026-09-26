@@ -198,18 +198,21 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"x@31 -> x > 0@43", "x@31 -> x@51", "o@24 -> o@68", "x@31 -> g(x)@73"},
 		},
 		{
-			// §15.20.2, §6.3.2.2. Nodes: o@23, s@54 (the pattern variable,
-			// defined from o), !(o instanceof String s)@32 (the condition),
-			// return 0;@58, return s.length();@68. The pattern variable of a
-			// negated test is in scope after the if whose then branch cannot
-			// complete normally.
+			// §15.20.2, §6.3.2.2. Nodes: o@23, o@34 (the tested value,
+			// evaluated once: Uses o, defines an owned variable), s@54 (the
+			// pattern variable, defined from that variable), !(o instanceof
+			// String s)@32 (the condition, the test folded into it: Uses the
+			// variable), return 0;@58, return s.length();@68. The pattern
+			// variable of a negated test is in scope after the if whose then
+			// branch cannot complete normally.
 			name:     "an instanceof pattern variable is defined by the test and in scope after the if",
-			protects: "a use of a pattern variable after an if that exits on the failed test resolves to the pattern's definition",
-			mutation: "scope the pattern variable to the if statement (loses s@54 -> return s.length();@68)",
+			protects: "a use of a pattern variable after an if that exits on the failed test resolves to the pattern's definition, and the tested value is read once, at its own node",
+			mutation: "scope the pattern variable to the if statement (loses s@54 -> return s.length();@68), or let the binding and the test read the tested expression's names (o@23 -> s@54 and o@23 -> !(o instanceof String s)@32 replace the o@34 pairs)",
 			src:      "class A { int f(Object o) { if (!(o instanceof String s)) return 0; return s.length(); } }",
 			fn:       1,
 			cd:       []string{"!(o instanceof String s)@32 -> return 0;@58", "!(o instanceof String s)@32 -> return s.length();@68"},
-			du:       []string{"o@23 -> s@54", "o@23 -> !(o instanceof String s)@32", "s@54 -> return s.length();@68"},
+			du: []string{"o@23 -> o@34", "o@34 -> s@54", "o@34 -> !(o instanceof String s)@32",
+				"s@54 -> return s.length();@68"},
 		},
 		{
 			// §14.11.1, §15.28 (guards). Nodes: o@23, o@43 (selector), case
@@ -398,23 +401,31 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"y = 1@59 -> return y;@87", "y = 2@78 -> return y;@87"},
 		},
 		{
-			// §6.3.2.5, §6.3.1.3, §6.3.1.5. Nodes: o@23, s@57 (the pattern
-			// variable, defined from o, the loop head's first node),
-			// !(o instanceof String s)@35 (the condition), return
-			// s.length();@65. Succ: s→condition→{s (back edge through the
-			// empty body), return}. The condition introduces s when false and
-			// the body holds no break, so s is in scope after the loop.
+			// §6.3.2.5, §6.3.1.3, §6.3.1.5, §14.14.1.2. Nodes: o@23, o@37
+			// (the tested value, the loop head's first node: Uses o, defines
+			// an owned variable), s@57 (the pattern variable, defined from
+			// it), !(o instanceof String s)@35 (the condition, Using it),
+			// return s.length();@65. Succ: o@37→s→condition→{o@37 (back edge
+			// through the empty body: the condition is evaluated again),
+			// return}. IPDom: o@37 → s → condition → return. Frontier walk:
+			// the condition over o@37, s and itself. The condition
+			// introduces s when false and the body holds no break, so s is in
+			// scope after the loop.
 			name:     "a basic for condition's when-false pattern variable is in scope after a loop no break leaves",
 			protects: "a use after the loop resolves to the pattern variable the negated test defines, while only the header's locals end with the loop",
-			mutation: "truncate the condition's pattern variables with the header's locals at the loop's end (loses s@57 -> return s.length();@65)",
+			mutation: "truncate the condition's pattern variables with the header's locals at the loop's end (loses s@57 -> return s.length();@65), or send the back edge to the condition's Branch (loses !(o instanceof String s)@35 -> o@37 and -> s@57)",
 			src:      "class A { int f(Object o) { for (; !(o instanceof String s);) {} return s.length(); } }",
 			fn:       1,
-			cd:       []string{"!(o instanceof String s)@35 -> s@57", "!(o instanceof String s)@35 -> !(o instanceof String s)@35"},
-			du:       []string{"o@23 -> s@57", "o@23 -> !(o instanceof String s)@35", "s@57 -> return s.length();@65"},
+			cd: []string{"!(o instanceof String s)@35 -> o@37", "!(o instanceof String s)@35 -> s@57",
+				"!(o instanceof String s)@35 -> !(o instanceof String s)@35"},
+			du: []string{"o@23 -> o@37", "o@37 -> s@57", "o@37 -> !(o instanceof String s)@35",
+				"s@57 -> return s.length();@65"},
 		},
 		{
-			// §6.3.1.1, §6.3.2.2, §8.3. Nodes: o@33, s@62 (the pattern
-			// variable), o instanceof String s@42 (the && left operand),
+			// §6.3.1.1, §6.3.2.2, §8.3, §15.20.2. Nodes: o@33, o@42 (the
+			// tested value: Uses o, defines an owned variable), s@62 (the
+			// pattern variable, Using it), o instanceof String s@42 (the &&
+			// left operand, the test folded into it: Uses it),
 			// s.isEmpty()@67, o instanceof String s && s.isEmpty()@42 (the
 			// if's condition), g(s)@82, return s.length();@90. s is in scope
 			// in the && right operand and the then block; the if introduces
@@ -424,11 +435,11 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// the if's Branch Uses.
 			name:     "a pattern variable is in scope only where its test is true, not after the if",
 			protects: "a when-true pattern variable reaches the && right operand and the then statement, and a later use of the same name resolves to the field",
-			mutation: "keep an instanceof pattern variable in scope for the rest of the block (gains s@62 -> return s.length();@90), or let the if's Branch read the operands' names instead of the operator's result (o@33 and s@62 -> o instanceof String s && s.isEmpty()@42 replace the operands' pairs to it)",
+			mutation: "keep an instanceof pattern variable in scope for the rest of the block (gains s@62 -> return s.length();@90), let the if's Branch read the operands' names instead of the operator's result (o@42 and s@62 -> o instanceof String s && s.isEmpty()@42 replace the operands' pairs to it), or let the test read the tested expression's names (o@33 -> o instanceof String s@42 replaces o@42's pair to it)",
 			src:      "class A { String s; int f(Object o) { if (o instanceof String s && s.isEmpty()) { g(s); } return s.length(); } }",
 			fn:       1,
 			cd:       []string{"o instanceof String s@42 -> s.isEmpty()@67", "o instanceof String s && s.isEmpty()@42 -> g(s)@82"},
-			du: []string{"o@33 -> s@62", "o@33 -> o instanceof String s@42", "o instanceof String s@42 -> o instanceof String s && s.isEmpty()@42",
+			du: []string{"o@33 -> o@42", "o@42 -> s@62", "o@42 -> o instanceof String s@42", "o instanceof String s@42 -> o instanceof String s && s.isEmpty()@42",
 				"s@62 -> s.isEmpty()@67", "s.isEmpty()@67 -> o instanceof String s && s.isEmpty()@42", "s@62 -> g(s)@82"},
 		},
 		{
@@ -580,6 +591,22 @@ func TestJavaLoweringGolden(t *testing.T) {
 			src:      "class A { int f() { int x; int y = (x = 1) + (x = 2); return y; } }",
 			fn:       1,
 			du:       []string{"x = 1@36 -> y = (x = 1) + (x = 2)@31", "x = 2@46 -> y = (x = 1) + (x = 2)@31", "y = (x = 1) + (x = 2)@31 -> return y;@54"},
+		},
+		{
+			// §15.7.1, §15.26.1. Nodes: x@20, x = 1@38 (defines x; it
+			// carries the declarator's earlier read of x: Uses x's value from
+			// before it and may-defines an owned variable holding it, and
+			// may-defines its own result), y = x + (x = 1)@29 (Uses both owned
+			// variables, defines y), return y;@46. Succ: a straight line.
+			// Java evaluates the left operand x before the assignment, so
+			// that read sees the parameter, which reaches the declarator
+			// through x = 1's carried value, not x = 1's definition of x.
+			name:     "a read made before an embedded assignment redefines its variable sees the earlier value",
+			protects: "the value a consumer read before an embedded assignment overwrote the variable reaches the consumer from the definition that preceded the assignment",
+			mutation: "leave the declarator's read of x to pair with the nearest definition (loses x@20 -> x = 1@38, so the parameter no longer reaches the declarator)",
+			src:      "class A { int f(int x) { int y = x + (x = 1); return y; } }",
+			fn:       1,
+			du:       []string{"x@20 -> x = 1@38", "x = 1@38 -> y = x + (x = 1)@29", "y = x + (x = 1)@29 -> return y;@46"},
 		},
 	})
 }
