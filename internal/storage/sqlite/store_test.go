@@ -1831,6 +1831,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		if err := w2.Fail(f.ctx); err != nil {
 			t.Fatalf("Fail: %v", err)
 		}
+		// UnitState answers from the last commit.
+		flushed(t, f.s)
 		if state, exists, err := f.s.UnitState(f.ctx, w2.UnitID()); err != nil || exists {
 			t.Errorf("failed delta unit is %s/exists=%v (err %v), want gone", state, exists, err)
 		}

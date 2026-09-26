@@ -10,20 +10,25 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// Read paths for the provider runtime (Section 11.1, 9.4). Both are bounded,
-// read-only and run in one short read transaction; neither can see a unit that
+// Read paths for the provider runtime (Section 11.1, 9.4). Each is bounded,
+// read-only and runs in one short read transaction; none can see a unit that
 // is not sealed, so a building or failed unit's aliases never influence
-// resolution.
+// resolution. UnitState and DependencyAliases read on the reader pool, so they
+// answer from the last commit and never hold the ingestion group.
 
 // UnitState reports the lifecycle state of the unit keyed by id and whether the
-// row exists at all. The coordinator consults it before BeginUnit: a sealed
-// unit with a matching key is reused through AttachUnit, never rebuilt.
+// row exists at all, as of the last commit: a unit the open ingestion group
+// has begun, sealed or failed is answered as the last commit left it. The
+// coordinator consults it before BeginUnit: a sealed unit with a matching key
+// is reused through AttachUnit, never rebuilt. Every unit it can meet sealed
+// was sealed by an earlier run or tick, and each of those ends in a committing
+// Activate or Abort.
 func (s *Store) UnitState(ctx context.Context, id model.UnitID) (state model.UnitState, exists bool, err error) {
 	key, err := idBlob("unit_id", string(id))
 	if err != nil {
 		return "", false, err
 	}
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE unit_key = ?`, key).Scan(&state)
 		if isNoRows(err) {
 			return nil
