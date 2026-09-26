@@ -220,7 +220,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			name:     "a closure's write to an enclosing variable is a may-definition where it is created",
-			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation",
+			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation (the xs pairs to the arrow come from the receiver read pending when it is created)",
 			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pairs to the call and to return n), or as a killing definition (return n loses n = 0@21)",
 			src:      "function f(xs) { let n = 0; xs.forEach(x => { n += x }); return n; }",
 			fn:       1,
