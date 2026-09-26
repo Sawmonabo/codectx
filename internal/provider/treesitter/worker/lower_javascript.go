@@ -14,11 +14,28 @@ import (
 // modifier of these kinds), class bodies, and the program itself, whose
 // top-level code is one function. A class body is the unit of the class's
 // field initializers and static blocks.
-var javascriptLowering = Lowering{
-	language: "javascript",
-	callables: []string{"program", "function_declaration", "function_expression", "arrow_function",
-		"method_definition", "generator_function", "generator_function_declaration", "class_body"},
-	lower: lowerJavaScript,
+var javascriptLowering = Lowering{language: "javascript", callables: jsCallables, lower: jsJavaScript.lower}
+
+// jsCallables are the callable kinds of every grammar the JavaScript lowering
+// runs on.
+var jsCallables = []string{"program", "function_declaration", "function_expression", "arrow_function",
+	"method_definition", "generator_function", "generator_function_declaration", "class_body"}
+
+// jsJavaScript is the JavaScript grammar's syntax table.
+var jsJavaScript = jsGrammar{language: "javascript"}
+
+// jsGrammar is the syntax table of one grammar the JavaScript lowering runs
+// on, resolved once, on first use.
+type jsGrammar struct {
+	language string
+	once     sync.Once
+	s        *jsSyntax
+}
+
+// lower is the Lowering.lower of the grammar: lowerJavaScript over its table.
+func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+	g.once.Do(func() { g.s = resolveJSSyntax(g.language) })
+	lowerJavaScript(l, b, fn, src, g.s)
 }
 
 // lowerJavaScript lowers one JavaScript callable's parameters and body into b.
@@ -144,11 +161,10 @@ var javascriptLowering = Lowering{
 // start (the strict-mode rule, which modules and classes impose); a catch
 // parameter is scoped to its clause and a `for (let …)` binding to its loop;
 // a switch body is one block. Parameter defaults see the parameters only.
-func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k *jsSyntax) {
 	cur := fn.Walk()
 	defer cur.Close()
-	j := jsLower{l: l, b: b, src: src, k: jsSyntaxOf(), cur: cur, first: -1, last: -1, stmtNo: 1}
-	k := j.k
+	j := jsLower{l: l, b: b, src: src, k: k, cur: cur, first: -1, last: -1, stmtNo: 1}
 	switch fn.KindId() {
 	case k.program:
 		j.hoistVars(fn)
@@ -1530,8 +1546,12 @@ func (j *jsLower) jsxElement(n *ts.Node, lower bool) {
 }
 
 // jsSyntax holds the kind and field ids the JavaScript lowering matches,
-// resolved once by name against the pinned grammar so the walk compares
-// integers rather than converting every node's kind to a string.
+// resolved once per grammar by name so the walk compares integers rather
+// than converting every node's kind to a string. A kind only some of the
+// grammars define (a JSX kind, a TypeScript kind) is optional: in a grammar
+// without it its id is 0, the end-of-input symbol, which no named node ever
+// has, so a comparison against it never matches and the construct simply
+// cannot occur. Every other kind is one every grammar must define.
 type jsSyntax struct {
 	program, statementBlock, expressionStatement, lexicalDeclaration, variableDeclaration, usingDeclaration,
 	variableDeclarator, functionDeclaration, generatorFunctionDeclaration, classDeclaration, class, classHeritage,
@@ -1554,60 +1574,52 @@ type jsSyntax struct {
 	fOperator, fOptionalChain, fParameter, fParameters, fRight, fValue uint16
 }
 
-var (
-	jsSyntaxOnce  sync.Once
-	jsSyntaxTable *jsSyntax
-)
-
-// jsSyntaxOf resolves the table once. A name the grammar does not define is
-// a lowering defect and panics, so a misspelt kind can never silently match
-// nothing.
-func jsSyntaxOf() *jsSyntax {
-	jsSyntaxOnce.Do(func() {
-		const language = "javascript"
-		tl := mustGrammar(language)
-		kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
-		tok := func(name string) uint16 { return mustKind(tl, language, name, false) }
-		field := func(name string) uint16 { return mustField(tl, language, name) }
-		s := &jsSyntax{}
-		s.program, s.statementBlock, s.expressionStatement = kind("program"), kind("statement_block"), kind("expression_statement")
-		s.lexicalDeclaration, s.variableDeclaration, s.usingDeclaration = kind("lexical_declaration"), kind("variable_declaration"), kind("using_declaration")
-		s.variableDeclarator, s.functionDeclaration = kind("variable_declarator"), kind("function_declaration")
-		s.generatorFunctionDeclaration, s.classDeclaration = kind("generator_function_declaration"), kind("class_declaration")
-		s.class, s.classHeritage, s.ifStatement, s.elseClause = kind("class"), kind("class_heritage"), kind("if_statement"), kind("else_clause")
-		s.forStatement, s.forInStatement, s.whileStatement = kind("for_statement"), kind("for_in_statement"), kind("while_statement")
-		s.doStatement, s.switchStatement, s.switchBody = kind("do_statement"), kind("switch_statement"), kind("switch_body")
-		s.switchCase, s.switchDefault, s.tryStatement = kind("switch_case"), kind("switch_default"), kind("try_statement")
-		s.catchClause, s.finallyClause, s.labeledStatement = kind("catch_clause"), kind("finally_clause"), kind("labeled_statement")
-		s.breakStatement, s.continueStatement, s.returnStatement = kind("break_statement"), kind("continue_statement"), kind("return_statement")
-		s.throwStatement, s.emptyStatement, s.debuggerStatement = kind("throw_statement"), kind("empty_statement"), kind("debugger_statement")
-		s.withStatement, s.importStatement, s.exportStatement = kind("with_statement"), kind("import_statement"), kind("export_statement")
-		s.hashBangLine, s.importClause, s.namespaceImport, s.namedImports = kind("hash_bang_line"), kind("import_clause"), kind("namespace_import"), kind("named_imports")
-		s.identifier, s.shorthandPropertyIdentifier = kind("identifier"), kind("shorthand_property_identifier")
-		s.shorthandPropertyIdentifierPattern = kind("shorthand_property_identifier_pattern")
-		s.parenthesizedExpression, s.sequenceExpression = kind("parenthesized_expression"), kind("sequence_expression")
-		s.assignmentExpression, s.augmentedAssignmentExpression = kind("assignment_expression"), kind("augmented_assignment_expression")
-		s.binaryExpression, s.ternaryExpression, s.updateExpression = kind("binary_expression"), kind("ternary_expression"), kind("update_expression")
-		s.callExpression, s.newExpression, s.awaitExpression = kind("call_expression"), kind("new_expression"), kind("await_expression")
-		s.yieldExpression, s.memberExpression, s.subscriptExpression = kind("yield_expression"), kind("member_expression"), kind("subscript_expression")
-		s.spreadElement, s.functionExpression, s.generatorFunction = kind("spread_element"), kind("function_expression"), kind("generator_function")
-		s.methodDefinition, s.classStaticBlock, s.trueLit = kind("method_definition"), kind("class_static_block"), kind("true")
-		s.classBody, s.fieldDefinition = kind("class_body"), kind("field_definition")
-		s.objectPattern, s.arrayPattern, s.assignmentPattern = kind("object_pattern"), kind("array_pattern"), kind("assignment_pattern")
-		s.objectAssignmentPattern, s.pairPattern, s.restPattern = kind("object_assignment_pattern"), kind("pair_pattern"), kind("rest_pattern")
-		s.computedPropertyName, s.jsxOpeningElement = kind("computed_property_name"), kind("jsx_opening_element")
-		s.jsxSelfClosingElement, s.jsxClosingElement = kind("jsx_self_closing_element"), kind("jsx_closing_element")
-		s.and, s.or, s.nullish = tok("&&"), tok("||"), tok("??")
-		s.andAssign, s.orAssign, s.nullishAssign = tok("&&="), tok("||="), tok("??=")
-		s.varKw, s.ofKw = tok("var"), tok("of")
-		s.fAlias, s.fAlternative, s.fArgument, s.fArguments = field("alias"), field("alternative"), field("argument"), field("arguments")
-		s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
-		s.fFinalizer, s.fFunction, s.fHandler, s.fIncrement = field("finalizer"), field("function"), field("handler"), field("increment")
-		s.fIndex, s.fInitializer, s.fKey, s.fKind, s.fLabel = field("index"), field("initializer"), field("key"), field("kind"), field("label")
-		s.fLeft, s.fName, s.fObject, s.fOperator = field("left"), field("name"), field("object"), field("operator")
-		s.fOptionalChain, s.fParameter, s.fParameters = field("optional_chain"), field("parameter"), field("parameters")
-		s.fRight, s.fValue = field("right"), field("value")
-		jsSyntaxTable = s
-	})
-	return jsSyntaxTable
+// resolveJSSyntax resolves language's table. A required name the grammar
+// does not define is a lowering defect and panics, so a misspelt kind can
+// never silently match nothing.
+func resolveJSSyntax(language string) *jsSyntax {
+	tl := mustGrammar(language)
+	kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
+	opt := func(name string) uint16 { return tl.IdForNodeKind(name, true) }
+	tok := func(name string) uint16 { return mustKind(tl, language, name, false) }
+	field := func(name string) uint16 { return mustField(tl, language, name) }
+	s := &jsSyntax{}
+	s.program, s.statementBlock, s.expressionStatement = kind("program"), kind("statement_block"), kind("expression_statement")
+	s.lexicalDeclaration, s.variableDeclaration, s.usingDeclaration = kind("lexical_declaration"), kind("variable_declaration"), opt("using_declaration")
+	s.variableDeclarator, s.functionDeclaration = kind("variable_declarator"), kind("function_declaration")
+	s.generatorFunctionDeclaration, s.classDeclaration = kind("generator_function_declaration"), kind("class_declaration")
+	s.class, s.classHeritage, s.ifStatement, s.elseClause = kind("class"), kind("class_heritage"), kind("if_statement"), kind("else_clause")
+	s.forStatement, s.forInStatement, s.whileStatement = kind("for_statement"), kind("for_in_statement"), kind("while_statement")
+	s.doStatement, s.switchStatement, s.switchBody = kind("do_statement"), kind("switch_statement"), kind("switch_body")
+	s.switchCase, s.switchDefault, s.tryStatement = kind("switch_case"), kind("switch_default"), kind("try_statement")
+	s.catchClause, s.finallyClause, s.labeledStatement = kind("catch_clause"), kind("finally_clause"), kind("labeled_statement")
+	s.breakStatement, s.continueStatement, s.returnStatement = kind("break_statement"), kind("continue_statement"), kind("return_statement")
+	s.throwStatement, s.emptyStatement, s.debuggerStatement = kind("throw_statement"), kind("empty_statement"), kind("debugger_statement")
+	s.withStatement, s.importStatement, s.exportStatement = kind("with_statement"), kind("import_statement"), kind("export_statement")
+	s.hashBangLine, s.importClause, s.namespaceImport, s.namedImports = kind("hash_bang_line"), kind("import_clause"), kind("namespace_import"), kind("named_imports")
+	s.identifier, s.shorthandPropertyIdentifier = kind("identifier"), kind("shorthand_property_identifier")
+	s.shorthandPropertyIdentifierPattern = kind("shorthand_property_identifier_pattern")
+	s.parenthesizedExpression, s.sequenceExpression = kind("parenthesized_expression"), kind("sequence_expression")
+	s.assignmentExpression, s.augmentedAssignmentExpression = kind("assignment_expression"), kind("augmented_assignment_expression")
+	s.binaryExpression, s.ternaryExpression, s.updateExpression = kind("binary_expression"), kind("ternary_expression"), kind("update_expression")
+	s.callExpression, s.newExpression, s.awaitExpression = kind("call_expression"), kind("new_expression"), kind("await_expression")
+	s.yieldExpression, s.memberExpression, s.subscriptExpression = kind("yield_expression"), kind("member_expression"), kind("subscript_expression")
+	s.spreadElement, s.functionExpression, s.generatorFunction = kind("spread_element"), kind("function_expression"), kind("generator_function")
+	s.methodDefinition, s.classStaticBlock, s.trueLit = kind("method_definition"), kind("class_static_block"), kind("true")
+	s.classBody, s.fieldDefinition = kind("class_body"), opt("field_definition")
+	s.objectPattern, s.arrayPattern, s.assignmentPattern = kind("object_pattern"), kind("array_pattern"), kind("assignment_pattern")
+	s.objectAssignmentPattern, s.pairPattern, s.restPattern = kind("object_assignment_pattern"), kind("pair_pattern"), kind("rest_pattern")
+	s.computedPropertyName, s.jsxOpeningElement = kind("computed_property_name"), opt("jsx_opening_element")
+	s.jsxSelfClosingElement, s.jsxClosingElement = opt("jsx_self_closing_element"), opt("jsx_closing_element")
+	s.and, s.or, s.nullish = tok("&&"), tok("||"), tok("??")
+	s.andAssign, s.orAssign, s.nullishAssign = tok("&&="), tok("||="), tok("??=")
+	s.varKw, s.ofKw = tok("var"), tok("of")
+	s.fAlias, s.fAlternative, s.fArgument, s.fArguments = field("alias"), field("alternative"), field("argument"), field("arguments")
+	s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
+	s.fFinalizer, s.fFunction, s.fHandler, s.fIncrement = field("finalizer"), field("function"), field("handler"), field("increment")
+	s.fIndex, s.fInitializer, s.fKey, s.fKind, s.fLabel = field("index"), field("initializer"), field("key"), field("kind"), field("label")
+	s.fLeft, s.fName, s.fObject, s.fOperator = field("left"), field("name"), field("object"), field("operator")
+	s.fOptionalChain, s.fParameter, s.fParameters = field("optional_chain"), field("parameter"), field("parameters")
+	s.fRight, s.fValue = field("right"), field("value")
+	return s
 }
