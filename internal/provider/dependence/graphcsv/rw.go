@@ -8,7 +8,7 @@ import (
 )
 
 // Every frontend lowers every write form into an operator call whose first
-// argument is the written operand (docs/research/10-round3-empirical.md §3,
+// argument is the written operand (docs/research/10-engine-empirical.md §3,
 // reproduced here for all six frontends). These are the operator names that
 // carry a write.
 const (

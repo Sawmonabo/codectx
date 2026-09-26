@@ -32,7 +32,7 @@ package scip
 //     split the empirical round measured: cutting one `tsconfig` project at
 //     subdirectories holding no `tsconfig` of their own loses more than half
 //     of the calls that resolve to the project's own methods
-//     (docs/research/10-round3-empirical.md Section 8). A Python package, a
+//     (docs/research/10-engine-empirical.md Section 8). A Python package, a
 //     Cargo workspace and a compilation database are whole for the same
 //     reason -- whole up to the next directory that declares itself, and no
 //     further.

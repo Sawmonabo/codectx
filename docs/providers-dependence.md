@@ -145,7 +145,7 @@ as CSV into a private export directory.
   on a 1.05M-line Python tree: 23% more parse time, 3% more memory, every
   skipped method removed, and no change to any other fact count beyond the
   run-to-run variance below — the measured control-dependence and call counts
-  were equal (`docs/research/10-round3-empirical.md` §9a). It is part of the
+  were equal (`docs/research/10-engine-empirical.md` §9a). It is part of the
   cache key and there is no second parse at a higher limit.
 * The single export of every representation carries every edge family the
   importer reads (calls, control dependence, reaching definitions and
@@ -160,7 +160,7 @@ produced `nodes=13675 relations=52310 aliases=16922` and
 `nodes=13677 relations=52311 aliases=16926` — a band of about 0.01%, also seen
 as control dependence −4 / reaching definitions −6 on a 1.5M-line Java
 repository
-(`docs/research/10-round3-empirical.md` §4). Nothing in the provider assumes
+(`docs/research/10-engine-empirical.md` §4). Nothing in the provider assumes
 two runs are equal: the graph cache replays a stored graph rather than
 reparsing, fact keys are derived from source-side identity rather than from
 engine node ids, and every parity claim in this document and in the code is
@@ -273,7 +273,7 @@ helper, so loose `.rs` files are left unanalysed rather than published as an
 empty unit.
 
 These rules are parity measurements, not preferences
-(`docs/research/10-round3-empirical.md` §5–§8): splitting one TypeScript
+(`docs/research/10-engine-empirical.md` §5–§8): splitting one TypeScript
 project four ways kept 99.7% of control-dependence edges but only 46% of the
 calls that resolved to internal methods; Python packages keep 100% of methods
 and dependence edges and alias their cross-package calls by full name; a
@@ -514,7 +514,7 @@ the tree sum at one instant, never a sum of per-process high-water marks
 reached at different instants, and it is therefore higher than
 `/usr/bin/time %M`, which reports the largest single process — by tens to
 hundreds of megabytes on this engine, whose orchestrator JVM, frontend and
-helpers are separate processes (`docs/research/10-round3-empirical.md` §1).
+helpers are separate processes (`docs/research/10-engine-empirical.md` §1).
 The figure is what the memory governor's estimate is checked against. Where
 the platform cannot observe a running tree — anything but Linux today — the
 detail is absent and a memory failure says so under

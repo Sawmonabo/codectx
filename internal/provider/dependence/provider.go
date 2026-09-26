@@ -49,7 +49,7 @@ var dependsOn = []string{"filesystem", "treesitter"}
 // maxMaterializationBytes is the product-owned bound on what one unit may
 // materialize on disk before it is analysed. It is not a configuration knob:
 // it is the shape Section 6 requires a finite bound for, sized from the
-// largest repositories measured in docs/research/10-round3-empirical.md (a
+// largest repositories measured in docs/research/10-engine-empirical.md (a
 // 1.8M-line C repository is about 54 MB of source).
 //
 // The export has no such bound. An export the disk cannot hold is a disk that
@@ -709,7 +709,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // would publish data_flows_to as fresh for a unit whose data dependence is
 // missing whole method bodies. Not caching it costs a reparse for units that
 // skip at all, which the pinned definition cap makes rare (docs/research/
-// 10-round3-empirical.md Section 9a); caching it would cost the truth.
+// 10-engine-empirical.md Section 9a); caching it would cost the truth.
 //
 // Failing to store is never an error the unit fails on -- the graph was
 // produced and the export read it -- so the only consequence is the reparse

@@ -23,11 +23,11 @@ is still `syntax`. This is a product-visible downgrade and is the single largest
 | mechanism the engine forces | where | native-engine equivalent |
 |---|---|---|
 | per-unit heap cap sized from unit source bytes | providers-dependence.md §Memory | none — memory is one function at a time |
-| per-family resident allowance C/C++ 2.6 GB, Python 1.9 GB, JS/TS 0.3 GB + 1.7 GB helper on a 4,984-file project | providers-dependence.md §Memory; 10-round3 §10 | none — no JVM, no per-language helper process |
+| per-family resident allowance C/C++ 2.6 GB, Python 1.9 GB, JS/TS 0.3 GB + 1.7 GB helper on a 4,984-file project | providers-dependence.md §Memory; 10-engine-empirical §10 | none — no JVM, no per-language helper process |
 | `max_concurrent_heavy_analyzers = 1` (default), reservations serialise units | providers-dependence.md §Memory | parallel across cores; the unit of work is a function |
 | one OOM retry at the machine-derived allocation | providers-dependence.md §Memory | not reachable |
 | subdivision as last-resort crash recovery, `partial: subdivided` | providers-dependence.md §Subdivision; 00-synthesis §8 | a crash is one function, not a project |
-| unit = frontend-native project; JS/TS never split (46% of resolved calls die if it is) | providers-dependence.md §Units; 10-round3 §8 | unit = file for dependence; project only for calls |
+| unit = frontend-native project; JS/TS never split (46% of resolved calls die if it is) | providers-dependence.md §Units; 10-engine-empirical §8 | unit = file for dependence; project only for calls |
 | CSV export of the whole graph, then import | providers-dependence.md §The engine | facts stream straight into the store |
 
 ## The direction ruling this report is written under (00-synthesis.md §8, 2026-09-13)
@@ -83,7 +83,7 @@ Source: `docs/providers-dependence.md` §The staging database; ADR-0009.
   about a minute later, unobservably" — the paced reclaimer exists for this.
 
 **The whole subsystem is a consequence of the export format.** The engine hands the product
-gigabytes of Neo4j CSV (2.02 GB for postgres, 4.95 GB for a 1.05M-line Python tree, `10-round3` §4)
+gigabytes of Neo4j CSV (2.02 GB for postgres, 4.95 GB for a 1.05M-line Python tree, `10-engine-empirical` §4)
 and the product must turn that into facts without holding it in heap. A native engine produces facts
 **in projection order, in process, one function at a time**, so there is nothing to stage: the CSV,
 the staging database, its 256 MiB cache, its pool, its lock, its retirement rule and the paced

@@ -63,5 +63,5 @@ locations cold and still 2 after 15, 40 and 60 s — so the cold gap is **wider*
 
 So the engine's `calls` is **not** simply replaceable on the reference repository today. That is an argument for keeping
 the engine's call graph, not against a native dependence engine — the two fact groups separate
-cleanly, and it is exactly the separation the subdivision parity table already shows (`10-round3` §8:
+cleanly, and it is exactly the separation the subdivision parity table already shows (`10-engine-empirical` §8:
 CDG 99.7% / REACHING_DEF 99.9% survive a split, resolved calls 46% do not).

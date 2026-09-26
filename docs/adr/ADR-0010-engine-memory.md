@@ -20,7 +20,7 @@ a run that plans to hold nearly all of the host's memory is not a run that coexi
 
 The research already held the decisive observation: a heap ceiling is lossless everywhere the run
 succeeds, and an engine given a high ceiling grows toward it rather than to what it needs
-([10-round3-empirical §4](../research/10-round3-empirical.md), observations 1 and 3: caps are
+([10-engine-empirical §4](../research/10-engine-empirical.md), observations 1 and 3: caps are
 lossless where they succeed; a cap close to the live set costs time, not memory). What was missing
 was the measurement for this family at this size.
 
@@ -38,7 +38,7 @@ was the measurement for this family at this size.
    more for this process and offers its children less, and no core count can make the shipped
    defaults unresolvable. The share is a constant with its reason in the code, not a setting. A unit whose reservation exceeds even that runs whole at the allocation,
    as [ADR-0001](ADR-0001-scale-posture.md) and the empirical research require; it is never split for
-   memory ([10-round3-empirical §8](../research/10-round3-empirical.md): splitting the JavaScript
+   memory ([10-engine-empirical §8](../research/10-engine-empirical.md): splitting the JavaScript
    project loses more than half of the resolved calls).
 3. **Only the hard ceiling sizes a unit.** A soft ceiling under a high hard ceiling does not hold
    the engine near its live set on its pinned runtime (measured below), so the product sets
@@ -192,7 +192,7 @@ disclosure in decision 4 is what makes a drift visible.
 
 ## Sources
 
-- [10-round3-empirical.md §4, §4a, §8, §10](../research/10-round3-empirical.md) (ceilings lossless
+- [10-engine-empirical.md §4, §4a, §8, §10](../research/10-engine-empirical.md) (ceilings lossless
   where they succeed; a near-live-set ceiling costs time; the JavaScript project must not be split;
   the per-frontend memory model).
 - [00-synthesis.md §8](../research/00-synthesis.md) (no default memory ceiling as a *rejection*

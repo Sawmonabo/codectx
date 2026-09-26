@@ -71,7 +71,7 @@ What remains:
 1. The corpus — pinned by commit in Task 21, which `00-synthesis.md` §8 already names as "the
    differential oracle for any future native engine".
 2. **The band.** Two engine runs over the same unmodified tree differ by ~0.01%
-   (`10-round3` §9b), and `providers-dependence.md` makes a claim of equality between two engine runs
+   (`10-engine-empirical` §9b), and `providers-dependence.md` makes a claim of equality between two engine runs
    a defect. So the oracle establishes the band from two engine runs *first*, then judges the native
    run against the band. A native-vs-engine diff inside the band is not a finding.
 3. Per-family thresholds, because the families diverge for different reasons: CDG divergence is a

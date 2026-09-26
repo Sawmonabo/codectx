@@ -49,7 +49,7 @@ const MaxReportedSkips = 32
 // FailureClass is the typed reason a unit did not produce an admissible
 // result. Section 11.6 requires each to be classified, never guessed: every
 // one of them was reproduced against the real engine and is recorded in
-// docs/research/10-round3-empirical.md Section 6.
+// docs/research/10-engine-empirical.md Section 6.
 type FailureClass string
 
 const (

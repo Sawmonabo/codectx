@@ -6,7 +6,7 @@ package dependence
 // workspace. C and C++ are one unit per repository because header resolution
 // spans the whole tree.
 //
-// The rules are the parity results of docs/research/10-round3-empirical.md
+// The rules are the parity results of docs/research/10-engine-empirical.md
 // Sections 5 to 8, not preferences. A TypeScript project is never split: the
 // four-way split of one project kept 99.7% of control-dependence edges but
 // only 46% of the calls that resolved to internal methods, because the
@@ -220,7 +220,7 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 		// names, which a separate parse of the nested directory could only
 		// publish as a call to a stub outside its graph. No split at a nested
 		// manifest has been measured; the measured splits are at directories
-		// inside one project (docs/research/10-round3-empirical.md Section 8),
+		// inside one project (docs/research/10-engine-empirical.md Section 8),
 		// and they lose cross-directory calls for exactly this reason. Neither
 		// rule inherits the other.
 		dirs = slices.DeleteFunc(dirs, func(d string) bool {

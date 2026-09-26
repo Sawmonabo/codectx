@@ -1,7 +1,7 @@
 # Native-engine research, raw evidence — the parity asymmetry and the oracle's error band
 
 All figures already measured by the product's own research; reproduced here verbatim so the
-post-MVP report can cite them without re-running anything. Source: `docs/research/10-round3-empirical.md`.
+post-MVP report can cite them without re-running anything. Source: `docs/research/10-engine-empirical.md`.
 
 ## §8 — what subdividing a unit costs (the asymmetry that decides the design)
 ```

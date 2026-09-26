@@ -173,7 +173,7 @@ is 7,342 lines over five families).
 
 ### The operator target algebra, as measured
 
-From `docs/research/10-round3-empirical.md` §3 (`raw/rw-fixtures`), reproduced in code at
+From `docs/research/10-engine-empirical.md` §3 (`raw/rw-fixtures`), reproduced in code at
 `rw.go:10-60`: **every frontend lowers every write form into an operator call whose argument 1 is the
 written operand.**
 

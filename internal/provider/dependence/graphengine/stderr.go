@@ -21,7 +21,7 @@ package graphengine
 //     throwable attached, at WARN, and a pass that throws before it is timed
 //     is logged as `Pass %s failed` at ERROR instead. The format string and
 //     the log level were read out of the pinned payload's bytecode; the two
-//     reproductions are recorded in docs/research/10-round3-empirical.md
+//     reproductions are recorded in docs/research/10-engine-empirical.md
 //     Section 6, and the untimed form is recorded verbatim in
 //     testdata/linker-pass-crash.stderr.
 //   - Zero-exit helper crash: the orchestrator prints `Process exited with

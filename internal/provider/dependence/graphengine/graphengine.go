@@ -51,7 +51,7 @@ var frontend = map[dependence.Family]string{
 
 // maxNumDef is the per-method definition cap the pinned parse always passes.
 // Measured on a 1.05M-line Python tree against the engine default of 4000
-// (docs/research/10-round3-empirical.md Section 9a): 23% more parse time, 3%
+// (docs/research/10-engine-empirical.md Section 9a): 23% more parse time, 3%
 // more memory, every skipped method removed, and no change to any other fact
 // count beyond the engine's own run-to-run variance (Section 9a's CDG and CALL
 // counts were equal; the variance band is recorded in

@@ -26,7 +26,7 @@ const treeSampled = true
 // summing them describes a moment that never existed (Section 22). The figure
 // this produces is the tree sum, which is strictly above what /usr/bin/time
 // reports, because that is the largest single process and not the tree
-// (docs/research/10-round3-empirical.md §1).
+// (docs/research/10-engine-empirical.md §1).
 type treeSampler struct {
 	stop chan struct{}
 	done chan struct{}

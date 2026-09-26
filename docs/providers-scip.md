@@ -58,7 +58,7 @@ coordinator exists.
   like any other, planned beside the projects below it. What is never done is
   splitting a project at a directory that declares nothing — that split loses
   more than half of the calls that resolve to the project's own methods
-  (`docs/research/10-round3-empirical.md` §8), so a Python package, a Cargo
+  (`docs/research/10-engine-empirical.md` §8), so a Python package, a Cargo
   workspace and a compilation database are whole up to the next directory that
   declares itself and no further. A trigger inside a dependency directory
   (`node_modules`, `vendor`, `third_party`, `bower_components`, `Godeps`) is not

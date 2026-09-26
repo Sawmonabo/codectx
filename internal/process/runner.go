@@ -219,7 +219,7 @@ type treeSample struct {
 
 // treeSampleInterval is how often the process tree's resident memory is summed
 // while the child runs. It is the sampling period of the method measured in
-// docs/research/10-round3-empirical.md §1: fine enough to catch an analysis
+// docs/research/10-engine-empirical.md §1: fine enough to catch an analysis
 // pass's peak, coarse enough that the sweep costs nothing against a run
 // measured in minutes. It is the upper bound on the period, not the period
 // itself: a run with a stall timeout short enough to poll faster than this
