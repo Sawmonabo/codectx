@@ -99,7 +99,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
-		// emptyExport below names the two causes that remain. This wording is
+		// emptyExport below names the three causes that remain. This wording is
 		// what the product knows without them: which steps ran, and that
 		// nothing came of them.
 		msg += "both analysis steps exited cleanly and produced no method for a unit that has source"
@@ -147,20 +147,24 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	return err
 }
 
-// unreadRemediation is what an operator can do about source the frontend read
-// and drew nothing from. Two causes remain there and the product cannot tell
-// them apart -- source with no definition the frontend parses, and a frontend
-// that failed without saying so -- so it names both rather than asserting the
-// first, which a helper that died behind a zero exit would make false.
+// unreadRemediation is what an operator can do about source the frontend was
+// handed and drew nothing from. Three causes remain there and the product
+// cannot tell them apart -- source with no definition the frontend parses, a
+// frontend whose own fixed rules drop every file of the unit (the
+// JavaScript/TypeScript and C/C++ frontends drop whole classes of path, such
+// as test directories), and a frontend that failed without saying so -- so it
+// names all three rather than asserting the first, which a helper that died
+// behind a zero exit would make false.
 const unreadRemediation = "check that this unit's source files hold method definitions this language family's " +
-	"frontend can parse; if they do, the frontend failed without reporting it"
+	"frontend can parse and lie outside the paths that frontend drops by its own rules " +
+	"(docs/providers-dependence.md, default path exclusions); if they do, the frontend failed without reporting it"
 
 // emptyExport is the typed failure for a unit whose analysis exported no
 // method at all. "the export carries no method" is the symptom, never the
-// reason, so the error names the two causes that remain once the frontend has
-// been given every file of the unit -- source it finds no definition in, and a
-// frontend that failed without reporting it -- and publishes how much source
-// it was handed.
+// reason, so the error names the three causes that remain once the frontend
+// has been given every file of the unit -- source it finds no definition in,
+// a frontend whose own rules dropped every file, and a frontend that failed
+// without reporting it -- and publishes how much source it was handed.
 //
 // files is counted over the one pass that decided what the frontend was
 // given, so a zero there is "nothing reached the frontend" and not a guess.

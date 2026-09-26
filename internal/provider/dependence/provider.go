@@ -934,7 +934,7 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
 		// not a crash and must not be worded as one, and it must not be
-		// worded as itself either: the failure names the two causes that
+		// worded as itself either: the failure names the three causes that
 		// remain and how much source the frontend was handed.
 		out.Outcome.Class = FailureEmptyExport
 		return ExportOutcome{}, out.Outcome, emptyExport(unit, out.Outcome, adm.res, files)

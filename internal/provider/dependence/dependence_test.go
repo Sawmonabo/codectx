@@ -254,7 +254,7 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		{
 			// Both steps exited cleanly and the export holds no method. It is
 			// classified as what it is rather than as a crash, and it names
-			// the two causes that remain together with how much source the
+			// the three causes that remain together with how much source the
 			// frontend was handed, rather than restating that nothing came
 			// out.
 			name:    "an export with no methods names the causes and the source it was handed",
