@@ -68,11 +68,13 @@ earlier run built.** After each retention sweep the ledger keeps the run behind
 every generation retention kept (`index.retain_refs`, `index.max_retained_bytes`)
 and every run that started since the oldest of them -- a tick that published
 nothing and a run that failed included -- and deletes the runs before it. No
-count is involved. One consequence follows from retention keeping only the
-newest generation of each ref: when a deferred publication extends an index
-run's generation on the same ref, that index run's account goes with the
-superseded generation unless an older retained ref's run precedes it, and the
-deferred run is the one behind the active store. A live run is never deleted,
+count is involved. Retention keeps only the newest generation of each ref, so
+on a workspace indexed on one ref the run behind that generation is the oldest
+kept: each publication deletes the account of every earlier finished run, and
+a failed run survives until the next publication. Likewise, when a deferred
+publication extends an index run's generation on the same ref, that index
+run's account goes with the superseded generation unless an older retained
+ref's run precedes it, and the deferred run is the one behind the active store. A live run is never deleted,
 and when no run names a generation the store still holds, nothing is deleted.
 Overlay runs are collected as soon as the process that opened them is gone.
 
