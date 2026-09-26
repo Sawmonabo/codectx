@@ -223,13 +223,19 @@ const (
 // may-defines an owned variable that replaces the held read, so the folded
 // read pairs with the definition that reached it. The hand-off is made only
 // when the defining node runs whenever the consumer does: a definition in
-// the right operand of `&&` or `||`, in an arm of `?:`, or in a statement
-// of a statement expression other than its last, which a jump inside it may
-// skip, leaves the read on the consumer. Given up for the last case: when no
-// jump skips that statement, the consumer's read pairs with the definition
-// inside the statement expression only, losing the earlier one; most shapes
-// that reach it, such as `x + ({ x = 1; 0; })`, leave the read and the
-// definition unsequenced. Given up: the order of
+// the right operand of `&&` or `||` or in an arm of `?:` leaves the read on
+// the consumer. So does a definition in a statement of a statement
+// expression other than its last, unless that statement lies on every path
+// from the expression's start to its value, which the lowering decides by
+// syntax: the statement is an expression statement or a declaration of the
+// expression's own list, and no labelled statement follows it at any depth
+// inside the statement expression. A jump out of the expression reaches no
+// value and the extension forbids a jump into it, so only a goto to a later
+// label can skip such a statement; `g(x, ({ x = 1; 0; }))` hands the call's read of x
+// to x = 1. Every other statement (compound, selection, iteration, labelled,
+// jump) is taken as skippable as a whole: a definition in its body runs on
+// some paths only, and one in an if statement's condition, which runs on
+// every path, is treated alike, which is conservative. Given up: the order of
 // operands the language leaves unsequenced (`x + (x = 1)`, C17 §6.5p2,
 // [intro.execution]) or indeterminately sequenced (the arguments of a call,
 // [expr.call]). The lowering takes one order: left to right, except that
@@ -2155,12 +2161,23 @@ func (c *cLower) stmtExpr(n *ts.Node) int32 {
 	r := int32(-1)
 	s := c.open()
 	start, list := c.kids(n)
+	// skip is the last statement holding a label, or -1: a goto to that
+	// label can skip every statement before it.
+	skip := -1
+	for j := len(list) - 1; j > 0; j-- {
+		if c.labelled(&list[j]) {
+			skip = j
+			break
+		}
+	}
 	for i := range list {
-		if i < len(list)-1 || list[i].KindId() != c.k.expressionStatement {
-			// A jump inside the statement expression may skip this
-			// statement on a path that still reaches the value, so its
-			// definitions hand on none of the enclosing reads.
-			c.sure = c.base
+		if kind := list[i].KindId(); i < len(list)-1 || kind != c.k.expressionStatement {
+			// Only an expression statement or a declaration that no jump
+			// can skip lies on every path to the value, so only its
+			// definitions hand on the enclosing reads.
+			if i < skip || kind != c.k.expressionStatement && kind != c.k.declaration {
+				c.sure = c.base
+			}
 			c.stmt(&list[i])
 			c.sure = sure
 			continue
@@ -2179,6 +2196,26 @@ func (c *cLower) stmtExpr(n *ts.Node) int32 {
 	c.base, c.throws, c.thrown = base, throws, thrown
 	c.read(r)
 	return r
+}
+
+// labelled reports whether a labelled statement lies anywhere in n's
+// subtree, n included.
+func (c *cLower) labelled(n *ts.Node) bool {
+	cur := c.cur
+	cur.Reset(*n)
+	for {
+		if cur.Node().KindId() == c.k.labeledStatement {
+			return true
+		}
+		if cur.GotoFirstChild() {
+			continue
+		}
+		for !cur.GotoNextSibling() {
+			if !cur.GotoParent() {
+				return false
+			}
+		}
+	}
 }
 
 // tail lowers e, the expression of a statement expression's last statement,
