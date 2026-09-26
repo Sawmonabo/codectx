@@ -198,7 +198,7 @@ func readSource(t *testing.T, dir string) (map[string]string, []string) {
 	return files, paths
 }
 
-// TestImport is the import half of Task 11 Step 1. Every fixture under
+// TestImport drives the import over the recorded exports. Every fixture under
 // testdata is a real `--repr=all --format=neo4jcsv` export of the matching
 // source tree, produced by the pinned engine; the cases below protect the
 // behaviors whose silent breakage would publish facts about the wrong bytes,
@@ -832,8 +832,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	}
 	// A refresh is a new generation: one generation selects one unit per
 	// provider and scope, so the successor cannot be sealed beside the unit it
-	// carries over from. (L1 widens BeginGeneration with a ref parameter; this
-	// call site is listed in the lane report.)
+	// carries over from.
 	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"), "refs/heads/providertest")
 	if err != nil {
 		t.Fatalf("BeginGeneration: %v", err)

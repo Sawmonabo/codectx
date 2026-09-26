@@ -51,7 +51,7 @@ const ProviderID = "dependence"
 
 // Evidence details. They name the graph relation the fact was derived from in
 // neutral terms and are the only vocabulary published on an evidence row
-// (Section 11.6 and the Task 11 contract).
+// (Section 11.6).
 const (
 	detailCDG        = "cdg"
 	detailReachDef   = "reaching_def"

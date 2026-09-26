@@ -1176,7 +1176,7 @@ func outsideParts(ctx context.Context, view model.SnapshotView, unit Unit, impor
 	var n int64
 	var first string
 	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		if fv.Status == model.FileDeleted || !handed(fv) {
+		if !handed(fv) {
 			return nil
 		}
 		rel := fv.Path
