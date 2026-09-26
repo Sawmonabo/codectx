@@ -208,8 +208,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			// Go spec, Assignment statements and Selectors: the left operand s.f is
 			// a field selector, written through s.
 			// Nodes: s@17, v@22, s.f = v@33 (uses s and v, may-defines s),
-			// return s@42. A may-definition kills nothing, so both the write
-			// and the parameter reach the return.
+			// return s@42. The may-definition is a χ: the return pairs with
+			// the write and, through it, with the parameter it passes on.
 			name:     "a field write updates its base variable without killing it",
 			protects: "a write to s.f reaches a later use of s, and so does s's earlier definition",
 			mutation: "record no definition of the base (loses s.f = v@33 -> return s@42), or a killing one (loses s@17 -> return s@42)",
@@ -298,8 +298,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			// Go spec, Address operators: `&x` yields a pointer through which
 			// the callee may write x. Nodes: x := 1@25 (defines x), g(&x)@33
 			// (Uses x, may-defines x), return x@40. Straight line, so no
-			// control dependence; the may-definition kills nothing, so the
-			// return's x pairs with both x := 1 and g(&x).
+			// control dependence; the may-definition is a χ, so the return's
+			// x pairs with g(&x) and, through it, with x := 1.
 			name:     "taking an address is a may-definition of the variable",
 			protects: "a use after a call that received a variable's address sees the write the call may make through it",
 			mutation: "drop the address-taking may-definition in collect (g(&x)@33 -> return x@40 vanishes), or make it a killing Def (x := 1@25 -> return x@40 vanishes)",
@@ -327,7 +327,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			// variable holding the operands; the clause node ch <- &x@59 Uses
 			// that variable and writes nothing. The head has one
 			// successor, so there is no control dependence. return x@72 is
-			// reached by x := 0@37 and the head's non-killing may-definition.
+			// reached by the head's may-definition, a χ, and through it by
+			// x := 0@37.
 			name:     "a select clause's address-taking is may-defined once, at the head",
 			protects: "an address taken in a select's channel operand or sent value is a may-definition of the head that evaluates it, not of the clause",
 			mutation: "collect a send clause's operands with their may-definitions on its node (ch <- &x@59 -> return x@72 appears)",

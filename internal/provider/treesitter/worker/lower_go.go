@@ -45,8 +45,9 @@ var goLowering = Lowering{
 //   - A field, index or indirect target (`x.f = e`, `a[i] = e`, `*p = e`,
 //     `x.f++`, `for a[i] = range xs`) writes through its base variable (The
 //     Go Programming Language Specification, "Assignment statements"): the
-//     write uses the base and is a non-killing may-definition of it, so a
-//     later use sees the write and every definition before it. For a struct
+//     write uses the base and may-defines it, a χ (see Lowering,
+//     May-definitions): a later use pairs with the write and, through it,
+//     with the killing definitions of the base that reach it. For a struct
 //     or array base the write is to part of the variable; for a pointer,
 //     slice or map base it lands in the object the base refers to, and the
 //     may-definition of the base is the conservative account of it that
@@ -251,12 +252,14 @@ var goLowering = Lowering{
 // free. In the enclosing function it is part of the expression that creates
 // it, resolved with the literal's own declarations shadowing: the node owning
 // that expression uses every enclosing variable the literal (or a literal
-// nested in it) reads, and carries a non-killing may-definition of every
-// enclosing variable it writes (by assignment, op=, ++/--, a range or
-// receive target, through a field, index or pointer, or by taking its
-// address). The literal may run
-// at any later point, or never, so a use after the creating node sees that
-// may-definition and every definition that reached the creating node.
+// nested in it) reads, and carries a may-definition of every enclosing
+// variable it writes (by assignment, op=, ++/--, a range or receive target,
+// through a field, index or pointer, or by taking its address). The literal
+// may run at any later point, or never, so the may-definition is a χ (see
+// Lowering, May-definitions): the creating node pairs with the definitions
+// of the variable that reach it, whether or not the literal reads it, and a
+// use after the creating node pairs with that may-definition and, through
+// it, with the killing definitions that reached the creating node.
 // `defer func() {...}()` is therefore one node carrying the captures.
 func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	// The state is s.gol, reset in place: every list keeps its capacity, and
