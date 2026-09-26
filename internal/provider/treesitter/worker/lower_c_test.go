@@ -223,13 +223,15 @@ func TestCLoweringGolden(t *testing.T) {
 			// declaration in the #ifdef group does not exist in the #else
 			// group, whose x is the parameter. Nodes: x@10, A@24, x = 1@32,
 			// g(x)@41, #else@47, g(x)@55, return x;@70. After the directive x
-			// names the #ifdef group's variable.
+			// names the #ifdef group's variable in the build that keeps that
+			// group and the parameter in the build that keeps #else, which
+			// does not rebind x: return x Uses both.
 			name:     "a preprocessor arm does not see a sibling arm's declarations",
-			protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter",
-			mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(x)@55)",
+			protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter, and after the directive x stands for every binding it has in some build",
+			mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(x)@55), or bind a name after the directive to the arms' variable alone (loses x@10 -> return x;@70)",
 			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n  g(x);\n#else\n  g(x);\n#endif\n  return x; } }",
 			cd:       []string{"A@24 -> x = 1@32", "A@24 -> g(x)@41", "A@24 -> #else@47", "A@24 -> g(x)@55"},
-			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70"},
+			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70", "x@10 -> return x;@70"},
 		},
 		{
 			// GNU C extension, Statements and Declarations in Expressions:
@@ -408,6 +410,36 @@ func TestCLoweringGolden(t *testing.T) {
 			src:      "int f(int x) { if ((x = g())) return x; return 0; }",
 			cd:       []string{"x = g()@20 -> return x;@30", "x = g()@20 -> return 0;@40"},
 			du:       []string{"x = g()@20 -> return x;@30"},
+		},
+		{
+			// C17 §6.2.1p4: g, declared outside any block, has file scope, so
+			// it is no variable of f. Nodes: y@18, g = y@23 (Uses y, defines
+			// nothing), g += y@30 (Uses y only), g++@38 (Uses nothing), g =
+			// y@45 (the embedded assignment: Uses y, defines the owned result),
+			// h(g = y)@43 (Uses that result), h(&g)@53 (Uses and may-defines
+			// nothing), return g;@60 (Uses nothing). Succ: a straight line to
+			// EXIT.
+			name:     "a name with file scope is no variable in any position",
+			protects: "an assignment, compound assignment, update, embedded assignment, address-taking and read of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
+			mutation: "drop read's filter (Builder.Use panics on g's -1 at g += y@30), def's (Builder.Def panics at g = y@23), or mayDef's (Builder.MayDef panics at h(&g)@53), or fold the embedded assignment into its consumer (loses g = y@45 -> h(g = y)@43)",
+			src:      "int g; void f(int y) { g = y; g += y; g++; h(g = y); h(&g); return g; }",
+			du:       []string{"y@18 -> g = y@23", "y@18 -> g += y@30", "y@18 -> g = y@45", "g = y@45 -> h(g = y)@43"},
+		},
+		{
+			// C17 §6.10.1p6: a conditional without #else keeps no group when
+			// A is undefined, so after the directive x is the #ifdef group's
+			// variable in one build and the parameter in the other. Nodes:
+			// x@10, A@24 (Branch), x = 1@32, g(x)@48 (Uses both variables),
+			// x = 2@56 (defines the group's variable and may-defines the
+			// parameter), return x;@66 (after the block, the parameter).
+			// Succ: A→{x = 1, g(x)}; x = 1→g(x)→x = 2→return x. IPDom: A →
+			// g(x).
+			name:     "a name only one arm declares stands for both bindings after the directive",
+			protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there may write either without killing the enclosing variable's earlier value",
+			mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(x)@48 and x = 2@56 -> return x;@66), or let the write define the enclosing variable instead of may-defining it (loses x@10 -> return x;@66)",
+			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(x);\n  x = 2;\n } return x; }",
+			cd:       []string{"A@24 -> x = 1@32"},
+			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x@10 -> return x;@66", "x = 2@56 -> return x;@66"},
 		},
 	})
 }
