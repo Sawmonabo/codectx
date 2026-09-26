@@ -89,6 +89,26 @@ type Hello struct {
 	PID         int      `json:"pid"`
 	Fingerprint string   `json:"fingerprint"`
 	Languages   []string `json:"languages"`
+	// Memory is the worker's standing memory once it has started and before
+	// its first file: BaseBytes and AnonBytes, never NeedBytes.
+	Memory Memory `json:"memory"`
+}
+
+// Memory is one file-boundary reading the worker takes of itself. Every
+// field is absent (nil) when the platform cannot supply it, never zero.
+type Memory struct {
+	// NeedBytes is the file's need: the worker's resident peak over the file
+	// less the base it started the file from. It is absent where the platform
+	// offers no resettable per-process peak, and then nothing is learned from
+	// the file.
+	NeedBytes *uint64 `json:"need_bytes,omitempty"`
+	// BaseBytes is the worker's resident set once this file's memory has been
+	// returned and its peak reset: what the worker holds between files, and
+	// the base the next file's need is measured from.
+	BaseBytes *uint64 `json:"base_bytes,omitempty"`
+	// AnonBytes is the anonymous part of that resident set, the memory that
+	// is this worker's alone rather than pages of the executable it shares.
+	AnonBytes *uint64 `json:"anon_bytes,omitempty"`
 }
 
 // Request opens one parse. The source follows as one KindSource message of
@@ -170,9 +190,8 @@ type Done struct {
 	// Truncated reports that the query cursor exceeded its match limit, so
 	// the query did not see every match in the tree.
 	Truncated bool `json:"truncated,omitempty"`
-	// RSSBytes is the worker's resident set after this parse, or 0 when the
-	// platform cannot report it (recorded as unavailable, not zero, upstream).
-	RSSBytes uint64 `json:"rss_bytes,omitempty"`
+	// Memory is the worker's reading of itself at the end of this file.
+	Memory Memory `json:"memory"`
 }
 
 // Error is a per-request failure that leaves the worker healthy.

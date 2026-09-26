@@ -926,7 +926,9 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
-			w.rss.Store(ex.done.RSSBytes)
+			if base := ex.done.Memory.BaseBytes; base != nil {
+				w.rss.Store(*base)
+			}
 			return ex, nil
 		case wire.KindError:
 			var e wire.Error

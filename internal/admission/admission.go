@@ -157,6 +157,11 @@ func (l *Ledger) Reserve(ctx context.Context, bytes int64, makeRoom func()) (fun
 type Reservation struct {
 	MemoryBytes int64
 	DiskBytes   int64
+	// Parse marks one parser file's per-file increment. At the head of the
+	// queue it is granted whenever no other Parse reservation is held,
+	// whatever the sum: the forward-progress rule, under which a file larger
+	// than the whole allocation still runs, alone among the parses.
+	Parse bool
 }
 
 // ReserveWith is Reserve in both dimensions: it blocks until this child's
@@ -348,4 +353,34 @@ func (l *Ledger) release(w *waiter) {
 		l.diskUsed -= w.diskBytes
 		l.pump()
 	})
+}
+
+// Holding is one admitted reservation whose memory can be adjusted while it is
+// held. Release returns it exactly once.
+type Holding struct {
+	l *Ledger
+	w *waiter
+}
+
+// Hold is ReserveWith returning an adjustable holding.
+func (l *Ledger) Hold(ctx context.Context, r Reservation, makeRoom func()) (*Holding, error) {
+	panic("admission: Hold is not built yet")
+}
+
+// Adjust sets the holding's memory to memoryBytes: upward at once, without
+// waiting and whatever the sum, downward by returning the difference, which
+// pumps the queue.
+func (h *Holding) Adjust(memoryBytes int64) {
+	panic("admission: Adjust is not built yet")
+}
+
+// Release returns the holding, once, however often it is called.
+func (h *Holding) Release() {
+	panic("admission: Release is not built yet")
+}
+
+// SetAllocation replaces the memory allocation with a re-derived figure and
+// pumps the queue. Nothing already admitted is taken back.
+func (l *Ledger) SetAllocation(memoryBytes int64) {
+	panic("admission: SetAllocation is not built yet")
 }

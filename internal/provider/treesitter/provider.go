@@ -83,6 +83,10 @@ type Options struct {
 	// the reservation the runner accounts it under. It is one figure for every
 	// worker and every file; it is required and positive.
 	WorkerMemoryBytes int64
+	// Rederive re-derives the admission allocation from the kernel's figure
+	// and the product's own residency, of which workerResidentBytes is the
+	// parser workers' part; the pool calls it between files. It is required.
+	Rederive func(workerResidentBytes int64)
 	// Admission is the process's one reservation ledger. Each worker reserves
 	// WorkerMemoryBytes on it before it is started and gives the reservation
 	// back once the runner has reaped it, so parser workers are admitted
@@ -230,6 +234,13 @@ func (p *Provider) Stats() Stats { return p.pool.stats() }
 
 // Close stops every worker and waits for the runner to reap each one.
 func (p *Provider) Close() { p.pool.close() }
+
+// OpenStage opens one parse stage that holds the pool across every unit
+// indexed before closeStage is called. IndexUnit keeps its own bracket, so a
+// caller that never opens a stage is served exactly as before.
+func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.Context)) {
+	panic("treesitter: OpenStage is not built yet")
+}
 
 // IndexUnit indexes the one file the unit's scope key names. The run always
 // reports succeeded when facts were produced or the file was honestly

@@ -161,9 +161,6 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 		return err
 	}
 	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated}
-	if rss, ok := wire.ResidentBytes(); ok {
-		done.RSSBytes = uint64(rss)
-	}
 	return wire.WriteJSON(out, wire.KindDone, done)
 }
 
