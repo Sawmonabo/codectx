@@ -10,9 +10,9 @@ design derives each quantity from the repository and machine in front of it.
 
 ### The observation, and the run behind it
 
-The figure comes from the run ledger's `stage finished` lines (`internal/ledger`) printed by the `internal/e2e`
-package during a capped test pass on 2026-09-25, 23:33–23:38 local time, over the tree of commit `b7b8815`
-(`go test -count=1 ./internal/e2e` under `ulimit -v 6000000`, `GOMEMLIMIT=3GiB`, `GOMAXPROCS=4`). Two index runs in
+The figure comes from the run ledger's `stage finished` lines (`internal/ledger`), printed by the product while the
+`internal/e2e` package's tests ran during a capped test pass on 2026-09-25, 23:33–23:38 local time, over the tree of
+commit `b7b8815` (`go test -count=1 ./internal/e2e` under `ulimit -v 6000000`, `GOMEMLIMIT=3GiB`, `GOMAXPROCS=4`). Two index runs in
 that log carry `structural_parse` worker spans; each has four worker spans and one stage span. The lines are
 reproduced here with the run id cut to 12 hex digits, the timestamp dropped, and nothing else changed:
 

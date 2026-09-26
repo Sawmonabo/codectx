@@ -258,8 +258,8 @@ aggregate:
 | ≥ 64 KiB | 3,827 | 0 | 89.25 (a 78,294-byte Rust file, rust-lang/rust) |
 | ≥ 4 KiB | 74,059 | 9 | 302.8 (a 10,479-byte C++ file, llvm-project) |
 
-The nine, by the same quantity: 302.8 C++ and 262.1 C (llvm-project), 152.4 JavaScript (vscode), 149.8, 144.1 and
-125.5 Rust (rust-lang/rust), 113.9 C (llvm-project), 111.2 JavaScript (the TypeScript checkout, with a syntax error),
+The nine, by the same quantity: 302.8 C++ and 262.1 C (llvm-project), 152.4 JavaScript (vscode, with a syntax error), 149.8, 144.1 and
+125.5 Rust (rust-lang/rust), 113.9 C (llvm-project), 111.2 JavaScript (the TypeScript checkout, also with a syntax error),
 108.0 Rust (rust-lang/rust). The counted native peak alone exceeds 107 B/B on 8 of the 74,059 (the 106.0 B/B Rust file
 drops out) and on none of the 3,827, whose largest is 87.25 B/B (the same Rust file; the TypeScript checkout's largest
 is 76.4).

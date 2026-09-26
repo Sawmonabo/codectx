@@ -103,9 +103,9 @@ were the four KB-scale probes of `00`.
   - Nothing in the prior is fitted to a repository.
   - Each file is compared on the prior's own three terms: counted native peak + measured input copies + source bytes,
     against 107 × source bytes (`01` §3, counted per file over the row files behind `06`).
-  - It holds on all 3,827 files of 64 KiB or more across the seven corpora; the largest is 89.25 B/B.
-  - It is exceeded by 9 of 74,059 files of 4 KiB or more (the worst is 302.8 B/B, a 10,479-byte C++ file). That is
-    acceptable because an overrun runs; it is never refused.
+  - It holds on all 3,827 files of 64 KiB or more across the seven corpora; the largest is 89.25 B/B (`01` §3).
+  - It is exceeded by 9 of 74,059 files of 4 KiB or more (the worst is 302.8 B/B, a 10,479-byte C++ file; `01` §3).
+    That is acceptable because an overrun runs; it is never refused.
   - The copy term is a prior, not a bound: a re-read chunk is copied again, and copies reach 51.6× the source on
     small files (`01` §3).
   - Longest-first dispatch pays the prior on the largest file of each language: about 1.7 GB reserved against
@@ -158,14 +158,16 @@ too while a group is open (`open.go:829-834`), which during a cold build is alwa
 - `CompleteProviderRun`.
 
 Every call is a savepoint of one open group. With a 1 GiB writer cache and `synchronous=NORMAL` (ADR-0004), a unit
-commits nothing and syncs nothing.
+commits nothing and syncs nothing (`02` §a, commits and fsyncs per unit).
 
 **Contributing causes.**
 - **Drain and re-exec.** The stage can drain mid-provider: `leaveStage` runs when `IndexUnit` returns
   (`provider.go:244`), before flush, seal and run completion, so all in-flight units can be outside the stage at once.
   The pool then drains (`pool.go:411`) and the next unit re-executes a worker.
-- **Worker start.** Each worker re-executes the whole binary (`cmd/codectx/main.go:22`) and verifies nine grammars.
-- **The wire.** It makes one JSON message and four synchronous `io.Pipe` hand-offs per record.
+- **Worker start.** Each worker re-executes the whole binary (`cmd/codectx/main.go:22`) and verifies nine grammars
+  (`02` §a, contributing cause 2).
+- **The wire.** It makes one JSON message and four synchronous `io.Pipe` hand-offs per record (`02` §a, contributing
+  cause 3).
 - **The provider barrier.** `generation.go:771-778` holds the next provider until the previous one has sealed.
 
 **Shares.** Parse plus start is at most 2% of the stage. The other 98% is unit work outside the exchange (`02` §a,
@@ -314,7 +316,7 @@ code).
 - Each line of the key file carries the digest and its pre-image, so every mismatch can be classified into a signed
   cause.
 - `data_flows_to` causes: φ-depth, engine over-kill, substring over-connection, the depth-8 cutoff, call-site endpoints,
-  the Go package initialiser, byte range only, and cross-file globals.
+  the Go package initialiser, byte range only, and cross-file globals (`04` §c).
 - Control-dependence causes: exit augmentation (29 of 228,765 kubernetes Go functions need it, `04`, "What the code
   says"), try-block modelling, and operator conditions.
 
