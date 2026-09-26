@@ -206,7 +206,11 @@ const yieldLabel = " yield"
 // its statement made before it and no node carries (see Lowering): in `y =
 // x + (x = 2)` the node `x = 2` Uses x's earlier value and may-defines an
 // owned variable holding it, which the declarator Uses in place of x, since
-// Java evaluates the left operand first (JLS §15.7.1). A write through a
+// Java evaluates the left operand first (JLS §15.7.1). The hand-off is made
+// only when the assignment runs whenever the read's consumer does: in `y = x
+// + (c ? (x = 1) : 0)`, and inside an `&&` or `||` right operand, the
+// declarator keeps its read of x, which sees the parameter when the arm is
+// skipped and the assignment when it runs. A write through a
 // field or array element of a local (`o.f = v`, `a[i] += v`, `a[i]++`) is a
 // Stmt node spanning the assignment that uses its operands and may-defines
 // (MayDef, non-killing) the local at the base of the target.
@@ -344,6 +348,11 @@ type javaLower struct {
 	// away with the reads after it leaves a stale index, which holds rejects.
 	reads []int32
 	at    []int32
+	// conds holds, innermost last, where reads stood when each conditionally
+	// evaluated operand being lowered began (an `&&` or `||` right operand,
+	// a conditional's arm): a read before it belongs to a consumer that runs
+	// when the operand is skipped.
+	conds []int
 	// stack saves the enclosing statement's reads across a switch
 	// expression's statements.
 	stack []int32
@@ -403,6 +412,7 @@ func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.Tree
 	clear(j.pats)
 	j.buf, j.labels, j.caseBinds, j.pats = j.buf[:0], j.labels[:0], j.caseBinds[:0], j.pats[:0]
 	j.reads, j.stack, j.writes, j.hide, j.results = j.reads[:0], j.stack[:0], j.writes[:0], j.hide[:0], j.results[:0]
+	j.conds = j.conds[:0]
 	j.defined = j.defined[:0]
 	j.arms, j.groupAt, j.frames = j.arms[:0], j.groupAt[:0], j.frames[:0]
 }
@@ -511,23 +521,34 @@ func (j *javaLower) holds(v int32) bool {
 // carries (`y = x + (x = 1)`, `f(x, x = 1)`): id Uses v's earlier value and
 // may-defines an owned variable holding it, which replaces those reads, so
 // the node folding them pairs with the definition that reached them (see
-// Uses in Lowering).
+// Uses in Lowering). Only the reads made since the innermost conditionally
+// evaluated operand began are handed off: their consumer runs only when id
+// does, while an earlier read's consumer also runs on the path that skips
+// id, where v keeps its earlier definition.
 func (j *javaLower) earlier(id, v int32, m int) {
-	if !j.holds(v) || int(j.at[v]) >= m {
+	if !j.holds(v) {
 		return
 	}
-	j.b.Use(id, v)
-	t := j.b.Var()
-	j.define(id, t)
-	for i := int(j.at[v]); i < m; i++ {
-		if j.reads[i] == v {
-			j.reads[i] = t
+	from := int(j.at[v])
+	if c := len(j.conds); c > 0 && j.conds[c-1] > from {
+		from = j.conds[c-1]
+	}
+	t := int32(-1)
+	for i := from; i < m; i++ {
+		if j.reads[i] != v {
+			continue
 		}
+		if t < 0 {
+			j.b.Use(id, v)
+			t = j.b.Var()
+			j.define(id, t)
+			if int(t) >= len(j.at) {
+				j.at = append(j.at, make([]int32, int(t)+1-len(j.at))...)
+			}
+			j.at[t] = int32(i)
+		}
+		j.reads[i] = t
 	}
-	if int(t) >= len(j.at) {
-		j.at = append(j.at, make([]int32, int(t)+1-len(j.at))...)
-	}
-	j.at[t] = j.at[v]
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
@@ -603,6 +624,14 @@ func (j *javaLower) exprNode(n *ts.Node) (int32, int) {
 	}
 	j.reads = j.reads[:m]
 	return id, mid
+}
+
+// arm is valueNode for a conditionally evaluated operand (see earlier).
+func (j *javaLower) arm(n *ts.Node) int32 {
+	j.conds = append(j.conds, len(j.reads))
+	id := j.valueNode(n)
+	j.conds = j.conds[:len(j.conds)-1]
+	return id
 }
 
 // hand makes node id, which holds the value of a nested construct whose
@@ -1708,7 +1737,9 @@ func (j *javaLower) expr(n *ts.Node) int {
 			mark := j.binds.mark()
 			j.scopePats(m, lo)
 			p := j.b.Push()
+			j.conds = append(j.conds, len(j.reads))
 			id, mid := j.exprNode(right)
+			j.conds = j.conds[:len(j.conds)-1]
 			j.define(id, res)
 			end := j.keep(lo, mid, and)
 			j.b.Merge(p)
@@ -1736,12 +1767,12 @@ func (j *javaLower) expr(n *ts.Node) int {
 		mark := j.binds.mark()
 		p := j.b.Push()
 		j.scopePats(m, mid)
-		j.define(j.valueNode(n.ChildByFieldId(k.fConsequence)), res)
+		j.define(j.arm(n.ChildByFieldId(k.fConsequence)), res)
 		j.binds.truncate(mark)
 		t := j.b.Push()
 		j.b.Restore(p)
 		j.scopePats(mid, len(j.pats))
-		j.define(j.valueNode(n.ChildByFieldId(k.fAlternative)), res)
+		j.define(j.arm(n.ChildByFieldId(k.fAlternative)), res)
 		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(p)
