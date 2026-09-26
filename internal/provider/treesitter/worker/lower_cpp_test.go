@@ -56,15 +56,16 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [expr.prim.lambda.capture]/10–12: `&a` captures by reference, `b`
 			// by copy, so only the write to a changes the enclosing variable.
 			// Nodes: a@10, b@17, the lambda @31 (Uses its captures a and b,
-			// may-defines a only), g = …@27 (defines g and Uses nothing: the
-			// captures are the creating node's), g()@68, h(a)@73, return
-			// b;@79. Succ: a straight line to EXIT. h(a) sees a@10 and the
+			// may-defines a only, defines the created closure's owned
+			// result), g = …@27 (defines g, Uses that result and none of the
+			// captures), g()@68, h(a)@73, return b;@79. Succ: a straight line to EXIT. h(a) sees a@10 and the
 			// lambda's non-killing may-definition; return b sees b@17 alone.
 			name:     "a lambda's by-reference capture is a may-definition, a by-copy capture is not",
 			protects: "a write through a by-reference capture reaches later uses of the variable, while a write to a by-copy capture stays inside the closure, and the declarator consuming the lambda does not repeat its captures",
-			mutation: "may-define every captured variable written (adds [&a, b]() mutable { a = b; b = 0; }@31 -> return b;@79), or none (loses the lambda's pair with h(a)@73), or leave the captures to the declarator consuming the lambda (adds a@10, b@17 and [&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27)",
+			mutation: "may-define every captured variable written (adds [&a, b]() mutable { a = b; b = 0; }@31 -> return b;@79), or none (loses the lambda's pair with h(a)@73), let the declarator re-read the captures (adds a@10 and b@17 -> g = [&a, b]() mutable { a = b; b = 0; }@27), or give the creating node no result (loses [&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27)",
 			src:      "int f(int a, int b) { auto g = [&a, b]() mutable { a = b; b = 0; }; g(); h(a); return b; }",
 			du: []string{"a@10 -> [&a, b]() mutable { a = b; b = 0; }@31", "b@17 -> [&a, b]() mutable { a = b; b = 0; }@31",
+				"[&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27",
 				"g = [&a, b]() mutable { a = b; b = 0; }@27 -> g()@68",
 				"a@10 -> h(a)@73", "[&a, b]() mutable { a = b; b = 0; }@31 -> h(a)@73", "b@17 -> return b;@79"},
 		},
@@ -72,13 +73,14 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [expr.prim.lambda.capture]/7, 12: under a `&` default an
 			// odr-used variable is captured by reference, and binding the
 			// reference Uses a, as taking its address does. Nodes: a@10, the
-			// lambda @24 (Uses a, may-defines a), g = …@20 (defines g, Uses
-			// nothing), g()@42, return a;@47. Succ: a straight line to EXIT.
+			// lambda @24 (Uses a, may-defines a, defines its owned result),
+			// g = …@20 (defines g, Uses the result), g()@42, return a;@47. Succ: a straight line to EXIT.
 			name:     "an implicit by-reference capture that is written is a may-definition",
 			protects: "a variable captured implicitly under [&] and written in the body is may-defined where the lambda is created",
-			mutation: "treat an implicit capture as by copy (loses [&]() { a = 1; }@24 -> return a;@47), or leave the captures to the declarator consuming the lambda (adds a@10 and [&]() { a = 1; }@24 -> g = [&]() { a = 1; }@20)",
+			mutation: "treat an implicit capture as by copy (loses [&]() { a = 1; }@24 -> return a;@47), or let the declarator re-read the captures (adds a@10 -> g = [&]() { a = 1; }@20)",
 			src:      "int f(int a) { auto g = [&]() { a = 1; }; g(); return a; }",
-			du: []string{"a@10 -> [&]() { a = 1; }@24", "g = [&]() { a = 1; }@20 -> g()@42",
+			du: []string{"a@10 -> [&]() { a = 1; }@24", "[&]() { a = 1; }@24 -> g = [&]() { a = 1; }@20",
+				"g = [&]() { a = 1; }@20 -> g()@42",
 				"a@10 -> return a;@47", "[&]() { a = 1; }@24 -> return a;@47"},
 		},
 		{
@@ -123,16 +125,18 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [lex.digraph]/2: `and` and `or` are the same operators as &&
 			// and ||, which evaluate the right operand only when the left
 			// does not decide ([expr.log.and]/1, [expr.log.or]/1). Nodes:
-			// p@11, p@23 (Branch), g(*p)@29, p and g(*p)@23 (Branch), h()@38,
-			// return …@16. Succ: p@23→{g(*p), p and g(*p)}; g(*p)→p and
-			// g(*p)→{h(), return}; h()→return.
+			// p@11, p@23 (Branch, Uses p, defines the and result), g(*p)@29
+			// (Uses p, defines the and result), p and g(*p)@23 (Branch, Uses
+			// the and result, defines the or result), h()@38 (defines the or
+			// result), return …@16 (Uses the or result). Succ: p@23→{g(*p),
+			// p and g(*p)}; g(*p)→p and g(*p)→{h(), return}; h()→return.
 			name:     "the alternative tokens and and or short-circuit",
 			protects: "`p and g(*p)` evaluates g(*p) only when p is nonzero, so the dereference depends on the test",
-			mutation: "match only the && and || tokens (both Branch nodes and their control dependences vanish)",
+			mutation: "match only the && and || tokens (both Branch nodes and their control dependences vanish), or let each consumer re-read the operands' names (p@11 pairs with p and g(*p)@23 and the return, and the pairs from p@23, g(*p)@29, p and g(*p)@23 and h()@38 to their consumers vanish)",
 			src:      "int f(int *p) { return p and g(*p) or h(); }",
 			cd:       []string{"p@23 -> g(*p)@29", "p and g(*p)@23 -> h()@38"},
-			du: []string{"p@11 -> p@23", "p@11 -> g(*p)@29", "p@11 -> p and g(*p)@23",
-				"p@11 -> return p and g(*p) or h();@16"},
+			du: []string{"p@11 -> p@23", "p@11 -> g(*p)@29", "p@23 -> p and g(*p)@23", "g(*p)@29 -> p and g(*p)@23",
+				"p and g(*p)@23 -> return p and g(*p) or h();@16", "h()@38 -> return p and g(*p) or h();@16"},
 		},
 		{
 			// [dcl.init.ref]/5: `int &r = x` binds r to x, so a write through

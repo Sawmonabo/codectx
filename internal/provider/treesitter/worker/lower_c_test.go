@@ -30,38 +30,42 @@ func TestCLoweringGolden(t *testing.T) {
 		{
 			// C17 §6.8.4.2: the labels are tested against the controlling
 			// expression, default taken when none matches, and a body falls
-			// into the next one. Nodes: x@10, y = 0@19, x@34 (head), 1@60,
-			// 2@82 (case tests, each Using x), y = 1@48 (default body),
+			// into the next one; the controlling expression is evaluated once.
+			// Nodes: x@10, y = 0@19, x@34 (head, Uses x and defines the owned
+			// switch value), 1@60, 2@82 (case tests, each Using the switch
+			// value only), y = 1@48 (default body),
 			// y = 2@63, break;@70, return y;@85, return y;@97. Succ: x@34→1→
 			// {y = 2, 2}; 2→{return y@85, y = 1}; y = 1→y = 2→break→
 			// return y@97→EXIT; return y@85→EXIT. IPDom: 1, 2 → EXIT; y = 1 →
 			// y = 2 → break → return y@97. y = 2 kills y = 0 and y = 1.
 			name:     "switch with default first and fallthrough into a case",
 			protects: "default is taken only when no label matches, whatever its position, and its body falls into the next case body",
-			mutation: "test default in source order (x@34 reaches y = 1 before any test), or end every body with a break (y = 1 flows out of the switch and pairs with return y@97)",
+			mutation: "test default in source order (x@34 reaches y = 1 before any test), end every body with a break (y = 1 flows out of the switch and pairs with return y@97), or let the case tests re-read the controlling expression's names (x@34 -> 1@60 and x@34 -> 2@82 become x@10 -> 1@60 and x@10 -> 2@82)",
 			src:      "int f(int x) { int y = 0; switch (x) { default: y = 1; case 1: y = 2; break; case 2: return y; } return y; }",
 			cd: []string{"1@60 -> y = 2@63", "1@60 -> break;@70", "1@60 -> return y;@97", "1@60 -> 2@82",
 				"2@82 -> return y;@85", "2@82 -> y = 1@48", "2@82 -> y = 2@63", "2@82 -> break;@70", "2@82 -> return y;@97"},
-			du: []string{"x@10 -> x@34", "x@10 -> 1@60", "x@10 -> 2@82", "y = 0@19 -> return y;@85",
+			du: []string{"x@10 -> x@34", "x@34 -> 1@60", "x@34 -> 2@82", "y = 0@19 -> return y;@85",
 				"y = 2@63 -> return y;@97"},
 		},
 		{
 			// C17 §6.8.4.2p4 (a case label anywhere in the switch body) and
-			// §6.8.5.2 (do). Nodes: n@11, n@24 (head), 0@34, 1@52 (the nested
-			// label's test), g()@42, case@47 (the nested label's own node),
-			// h()@55, --n@69, --n > 0@69. Succ: n@24→0→{g(), 1}; 1→{case@47,
+			// §6.8.5.2 (do). Nodes: n@11, n@24 (head, defining the owned
+			// switch value), 0@34, 1@52 (the nested label's test; both tests
+			// Use the switch value), g()@42, case@47 (the nested label's own
+			// node), h()@55, --n@69 (defining n and its result), --n > 0@69
+			// (Using the result). Succ: n@24→0→{g(), 1}; 1→{case@47,
 			// EXIT (no match leaves the switch)}; g()→case→h()→--n→--n > 0→
 			// {g() (back edge to the body's first node), EXIT}. IPDom: 0, 1,
 			// --n > 0 → EXIT; g() → case → h() → --n → --n > 0.
 			name:     "a case label nested in a loop of the switch body",
 			protects: "a case label below another statement of its switch is entered from its test, into the middle of the loop, and the loop's back edge targets the body's start",
-			mutation: "ignore nested case labels (1@52 and its dependences vanish), or target the do loop's back edge at its condition (--n > 0 loses control of g()@42)",
+			mutation: "ignore nested case labels (1@52 and its dependences vanish), target the do loop's back edge at its condition (--n > 0 loses control of g()@42), or let a nested test re-read the controlling expression's names (n@24 -> 1@52 becomes n@11 -> 1@52)",
 			src:      "void f(int n) { switch (n) { case 0: do { g(); case 1: h(); } while (--n > 0); } }",
 			cd: []string{"0@34 -> g()@42", "0@34 -> case@47", "0@34 -> h()@55", "0@34 -> --n@69", "0@34 -> --n > 0@69",
 				"0@34 -> 1@52", "1@52 -> case@47", "1@52 -> h()@55", "1@52 -> --n@69", "1@52 -> --n > 0@69",
 				"--n > 0@69 -> g()@42", "--n > 0@69 -> case@47", "--n > 0@69 -> h()@55", "--n > 0@69 -> --n@69",
 				"--n > 0@69 -> --n > 0@69"},
-			du: []string{"n@11 -> n@24", "n@11 -> 0@34", "n@11 -> 1@52", "n@11 -> --n@69", "--n@69 -> --n@69",
+			du: []string{"n@11 -> n@24", "n@24 -> 0@34", "n@24 -> 1@52", "n@11 -> --n@69", "--n@69 -> --n@69",
 				"--n@69 -> --n > 0@69"},
 		},
 		{
@@ -234,21 +238,21 @@ func TestCLoweringGolden(t *testing.T) {
 			// GNU C extension, Statements and Declarations in Expressions:
 			// jumping out of a statement expression is permitted, so a break
 			// in a for loop's third expression ends that loop (C17 §6.8.5.3,
-			// §6.8.6.3). The update is an expression statement whose last
-			// node, j++, does not span it, so it ends with a Stmt node
-			// spanning it that Uses the last statement's j. Nodes: n@10, j =
-			// 0@27, j < n@34, g(j)@71, j > 5@48, break;@55, j++@62, the
-			// update ({ … })@41, return j;@77. Succ: j < n→{g(j), return j};
-			// g(j)→j > 5→{break, j++}; break→return j; j++→({ … })→j < n.
-			// IPDom: j < n, j > 5 → return j; g(j) → j > 5.
+			// §6.8.6.3). The update's value is discarded: its last statement's
+			// node j++ yields the statement expression's result, which no
+			// node reads, so the update makes no node of its own. Nodes:
+			// n@10, j = 0@27, j < n@34, g(j)@71, j > 5@48, break;@55,
+			// j++@62, return j;@77. Succ: j < n→{g(j), return j};
+			// g(j)→j > 5→{break, j++}; break→return j; j++→j < n. IPDom:
+			// j < n, j > 5 → return j; g(j) → j > 5; j++ → j < n.
 			name:     "a break in a for update's statement expression leaves that loop",
 			protects: "a break lowered in the update clause targets the loop whose update holds it and lands after the loop",
-			mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34)",
+			mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34), or end the discarded update with a node Using its result (adds ({ if (j > 5) break; j++; })@41, with j > 5@48 -> it and j++@62 -> it)",
 			src:      "int f(int n) { int j; for (j = 0; j < n; ({ if (j > 5) break; j++; })) g(j); return j; }",
 			cd: []string{"j < n@34 -> g(j)@71", "j < n@34 -> j > 5@48", "j > 5@48 -> break;@55", "j > 5@48 -> j++@62",
-				"j > 5@48 -> ({ if (j > 5) break; j++; })@41", "j > 5@48 -> j < n@34"},
+				"j > 5@48 -> j < n@34"},
 			du: []string{"n@10 -> j < n@34", "j = 0@27 -> j < n@34", "j = 0@27 -> g(j)@71", "j = 0@27 -> j > 5@48",
-				"j = 0@27 -> j++@62", "j = 0@27 -> return j;@77", "j++@62 -> ({ if (j > 5) break; j++; })@41",
+				"j = 0@27 -> j++@62", "j = 0@27 -> return j;@77",
 				"j++@62 -> j < n@34", "j++@62 -> g(j)@71", "j++@62 -> j > 5@48", "j++@62 -> j++@62",
 				"j++@62 -> return j;@77"},
 		},
@@ -259,39 +263,41 @@ func TestCLoweringGolden(t *testing.T) {
 			// out of the condition is permitted. The condition strips the do's
 			// parentheses and the statement expression's own. Nodes: n@10,
 			// n--@18, n & 1@37, continue;@44, n > 0@54, the condition
-			// { … }@31 (a Branch Using n > 0's n),
-			// return n;@66. Succ: n--→n & 1→{continue, n > 0}; continue→
+			// { … }@31 (a Branch Using the statement expression's result,
+			// which n > 0@54, the last statement's node, defines), return
+			// n;@66. Succ: n--→n & 1→{continue, n > 0}; continue→
 			// n & 1; n > 0→{ … }→{n--, return n}. IPDom: n & 1 → n > 0;
 			// { … } → return n.
 			name:     "a continue in a do loop's condition re-evaluates the condition",
 			protects: "a continue issued on the loop's continue path lands on the first node of the condition instead of panicking or re-entering the body",
-			mutation: "land the continue on the loop head (continue;@44 -> n--@18: n & 1@37 gains control of n--@18), or call ContinueHere only once (CloseFrame panics)",
+			mutation: "land the continue on the loop head (continue;@44 -> n--@18: n & 1@37 gains control of n--@18), call ContinueHere only once (CloseFrame panics), or let the condition re-read its last statement's names (n > 0@54 -> { … }@31 becomes n--@18 -> { … }@31)",
 			src:      "int f(int n) { do n--; while (({ if (n & 1) continue; n > 0; })); return n; }",
 			cd: []string{"n & 1@37 -> continue;@44", "n & 1@37 -> n & 1@37",
 				"{ if (n & 1) continue; n > 0; }@31 -> n--@18", "{ if (n & 1) continue; n > 0; }@31 -> n & 1@37",
 				"{ if (n & 1) continue; n > 0; }@31 -> n > 0@54",
 				"{ if (n & 1) continue; n > 0; }@31 -> { if (n & 1) continue; n > 0; }@31"},
 			du: []string{"n@10 -> n--@18", "n--@18 -> n--@18", "n--@18 -> n & 1@37", "n--@18 -> n > 0@54",
-				"n--@18 -> { if (n & 1) continue; n > 0; }@31", "n--@18 -> return n;@66"},
+				"n > 0@54 -> { if (n & 1) continue; n > 0; }@31", "n--@18 -> return n;@66"},
 		},
 		{
 			// C17 §6.5.13p4 (&& evaluates its right operand only when the left
 			// is nonzero), §6.5.15p4 (only the selected operand of ?: is
 			// evaluated), §6.5.17p2 (the comma operator's left operand is
-			// evaluated first). Nodes: a@10, b@17, a@30 (Branch, Uses a),
-			// g(b)@35 (Uses b), r = a && g(b)@26 (Uses a and b, both &&
-			// operands being consumed), r@45 (Branch, Uses r), a@49, b@53,
-			// r = r ? a : b@41 (Uses the arms' a and b, not the condition's
-			// r, which its own node consumed), a = 1@56, b = 2@63, return
-			// a + b + r;@70.
+			// evaluated first). Nodes: a@10, b@17, a@30 (Branch, Uses a,
+			// defines the && result), g(b)@35 (Uses b, defines the result on
+			// the path that evaluates it), r = a && g(b)@26 (Uses the
+			// result), r@45 (Branch, Uses r), a@49, b@53 (arm nodes, each
+			// defining the ?: result), r = r ? a : b@41 (Uses that result),
+			// a = 1@56, b = 2@63, return a + b + r;@70. Succ: a@30→{g(b),
+			// r = a && g(b)}; r@45→{a@49, b@53}→r = r ? a : b.
 			name:     "&&, ?: and the comma operator in C",
-			protects: "a conditionally evaluated operand depends on the operand that decides it, a node consuming ?: takes its arms' reads and not its condition's, and each comma operand is its own defining statement",
-			mutation: "lower && as a plain binary (a@30 and its control of g(b)@35 vanish), evaluate both ?: operands unconditionally (r@45 loses control of a@49 and b@53), leave the ?: condition's reads to the assignment consuming it (adds r = a && g(b)@26 -> r = r ? a : b@41), or lower a comma statement as one node (a = 1@56 and b = 2@63 are replaced by one node spanning both)",
+			protects: "a conditionally evaluated operand depends on the operand that decides it, the value of && and ?: reaches its consumer from the nodes that yield it and not by re-reading their names, and each comma operand is its own defining statement",
+			mutation: "lower && as a plain binary (a@30 and its control of g(b)@35 vanish), evaluate both ?: operands unconditionally (r@45 loses control of a@49 and b@53), let the consumer re-read the operands' names instead of the result (a@10 and b@17 pair with r = a && g(b)@26 and r = r ? a : b@41, and the pairs from a@30, g(b)@35, a@49 and b@53 to them vanish), or lower a comma statement as one node (a = 1@56 and b = 2@63 are replaced by one node spanning both)",
 			src:      "int f(int a, int b) { int r = a && g(b); r = r ? a : b; a = 1, b = 2; return a + b + r; }",
 			cd:       []string{"a@30 -> g(b)@35", "r@45 -> a@49", "r@45 -> b@53"},
-			du: []string{"a@10 -> a@30", "b@17 -> g(b)@35", "a@10 -> r = a && g(b)@26", "b@17 -> r = a && g(b)@26",
-				"r = a && g(b)@26 -> r@45", "a@10 -> a@49", "b@17 -> b@53", "a@10 -> r = r ? a : b@41",
-				"b@17 -> r = r ? a : b@41", "a = 1@56 -> return a + b + r;@70",
+			du: []string{"a@10 -> a@30", "b@17 -> g(b)@35", "a@30 -> r = a && g(b)@26", "g(b)@35 -> r = a && g(b)@26",
+				"r = a && g(b)@26 -> r@45", "a@10 -> a@49", "b@17 -> b@53", "a@49 -> r = r ? a : b@41",
+				"b@53 -> r = r ? a : b@41", "a = 1@56 -> return a + b + r;@70",
 				"b = 2@63 -> return a + b + r;@70", "r = r ? a : b@41 -> return a + b + r;@70"},
 		},
 		{
