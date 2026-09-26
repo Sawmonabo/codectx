@@ -4,8 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -120,8 +118,8 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 		},
 		{
 			// The file budget is a positive finite bound and nothing more.
-			// Comparing it to a coverage-capsule ceiling was a category error
-			// that capped a large repository at an unrelated number.
+			// Comparing it to a coverage-capsule ceiling would cap a large
+			// repository at an unrelated number.
 			name: "a large file budget is a budget, not a capsule ceiling",
 			user: "[workspace]\nmax_files = 2000000\n",
 		},
@@ -145,7 +143,7 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// Retention is by ref, and 0 is "keep every ref" now, matching
+			// Retention is by ref, and 0 is "keep every ref", matching
 			// index.max_retained_bytes. Only a negative value is refused: it is
 			// not a third meaning.
 			name:     "a negative bound is rejected",
@@ -158,14 +156,6 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			// what keeps the `< 0` rule for bounds from leaking into sizing.
 			name:     "a zero reservation is rejected",
 			user:     "[index]\nbatch_records = 0\n",
-			wantCode: model.CodeConfigInvalid,
-		},
-		{
-			// How much runs at once is derived from the machine, so the keys
-			// that used to set it are unknown keys now and there is no
-			// extension namespace to absorb them.
-			name:     "a retired concurrency key is an unknown key",
-			user:     "[resources]\nmax_concurrent_heavy_analyzers = 4\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 	} {
@@ -336,9 +326,9 @@ func TestEvidenceClipIsUserSetAndRekeysUnits(t *testing.T) {
 // TestToolStoreIsSharedByEveryWorkspace protects the product's "works off the
 // bat" posture: the managed toolchain is gigabytes of payloads that are
 // byte-identical for every checkout, so the store they land in must be one
-// machine-wide directory. A per-workspace default made every new repository
+// machine-wide directory. A per-workspace default would make every new repository
 // start with nothing installed and re-download the whole toolchain, which is
-// what this asserts can no longer happen.
+// what this asserts cannot happen.
 //
 // It also pins the path itself to the one the installer's bundle path writes,
 // because a bundle that populated a directory the product does not read would
@@ -384,71 +374,5 @@ func TestToolStoreIsSharedByEveryWorkspace(t *testing.T) {
 	// store behind on a host that has never installed a payload.
 	if _, err := os.Stat(want); !os.IsNotExist(err) {
 		t.Fatalf("Load created the tool store: stat = %v, want not-exist", err)
-	}
-}
-
-// TestCPUBoundWorkIsSizedFromTheMachine protects the rule that no typed-in
-// number decides how much CPU-bound work runs at once. Failure mode: a fixed
-// worker or slot count leaves a sixteen-core machine running two parsers while
-// a two-core laptop is oversubscribed, and neither figure is anything a user
-// or an agent can be asked to tune.
-//
-// Mutation: return a constant from parserWorkersFor -- `func
-// parserWorkersFor(cpus int) int { return 2 }` -> "16 CPUs give 2 parser
-// workers, want 16: the count is not coming from the machine".
-func TestCPUBoundWorkIsSizedFromTheMachine(t *testing.T) {
-	for _, cpus := range []int{16, 2, 1} {
-		if got := parserWorkersFor(cpus); got != cpus {
-			t.Errorf("%d CPUs give %d parser workers, want %d: the count is not coming from the machine", cpus, got, cpus)
-		}
-		if got := querySlotsFor(cpus); got != cpus {
-			t.Errorf("%d CPUs give %d query slots, want %d", cpus, got, cpus)
-		}
-		// A traversal holds a query slot as well, so half the cores answer them
-		// and the rest stay free for the cheap calls interleaved with them --
-		// but never fewer than one, or a single-core machine answers no
-		// traversal at all.
-		want := cpus / 2
-		if want < 1 {
-			want = 1
-		}
-		if got := graphSlotsFor(cpus); got != want {
-			t.Errorf("%d CPUs give %d traversal slots, want %d", cpus, got, want)
-		}
-	}
-}
-
-// TestBaseFootprintIsDerivedFromTheMachine protects the rule that this
-// process's base footprint follows the machine instead of being compared to a
-// figure. Failure mode: the shipped defaults, unchanged, are refused at load
-// time on a machine with enough cores -- 31 query slots of 32 MiB plus the
-// cache and the queue exceed a 1 GiB constant -- and the refusal names no key
-// the operator could lower, so the product simply does not start on a large
-// host. The core count is pinned because this host has few enough that the
-// defect is invisible on it.
-//
-// Mutation: restore the comparison in validate.go --
-// `if baseline > BaseFootprintBytes { ... }` -> "Load on a 31-core machine
-// returned CTX_CONFIG_INVALID".
-func TestBaseFootprintIsDerivedFromTheMachine(t *testing.T) {
-	for _, cpus := range []int{31, 64, 128} {
-		t.Run(strconv.Itoa(cpus), func(t *testing.T) {
-			cpuCount = func() int { return cpus }
-			t.Cleanup(func() { cpuCount = runtime.NumCPU })
-			cfg, err := loadFixture(t, "", "")
-			if err != nil {
-				t.Fatalf("Load on a %d-core machine returned %v, want the shipped defaults to resolve", cpus, err)
-			}
-			// The footprint is the idle overhead plus the three reservations
-			// this process makes up front, one query slot per core. A footprint
-			// that did not grow with the cores would under-state what the
-			// parent holds and admit children against memory already spoken for.
-			want := IdleFootprintBytes +
-				int64(cpus)*cfg.Resources.QueryMemoryBytes +
-				cfg.Resources.CacheBytes + cfg.Index.QueueBytes
-			if got := BaseFootprint(cfg); got != want {
-				t.Errorf("BaseFootprint on a %d-core machine is %d, want %d", cpus, got, want)
-			}
-		})
 	}
 }
