@@ -223,13 +223,15 @@ func TestCLoweringGolden(t *testing.T) {
 			// declaration in the #ifdef group does not exist in the #else
 			// group, whose x is the parameter. Nodes: x@10, A@24, x = 1@32,
 			// g(x)@41, #else@47, g(x)@55, return x;@70. After the directive x
-			// names the #ifdef group's variable.
+			// names the #ifdef group's variable in the build that keeps that
+			// group and the parameter in the build that keeps #else, which
+			// does not rebind x: return x Uses both.
 			name:     "a preprocessor arm does not see a sibling arm's declarations",
-			protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter",
-			mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(x)@55)",
+			protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter, and after the directive x stands for every binding it has in some build",
+			mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(x)@55), or bind a name after the directive to the arms' variable alone (loses x@10 -> return x;@70)",
 			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n  g(x);\n#else\n  g(x);\n#endif\n  return x; } }",
 			cd:       []string{"A@24 -> x = 1@32", "A@24 -> g(x)@41", "A@24 -> #else@47", "A@24 -> g(x)@55"},
-			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70"},
+			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70", "x@10 -> return x;@70"},
 		},
 		{
 			// GNU C extension, Statements and Declarations in Expressions:
@@ -367,6 +369,22 @@ func TestCLoweringGolden(t *testing.T) {
 			src:      "int f(int x) { if ((x = g())) return x; return 0; }",
 			cd:       []string{"x = g()@20 -> return x;@30", "x = g()@20 -> return 0;@40"},
 			du:       []string{"x = g()@20 -> return x;@30"},
+		},
+		{
+			// C17 §6.10.1p6: a conditional without #else keeps no group when
+			// A is undefined, so after the directive x is the #ifdef group's
+			// variable in one build and the parameter in the other. Nodes:
+			// x@10, A@24 (Branch), x = 1@32, g(x)@48 (Uses both variables),
+			// x = 2@56 (defines the group's variable and may-defines the
+			// parameter), return x;@66 (after the block, the parameter).
+			// Succ: A→{x = 1, g(x)}; x = 1→g(x)→x = 2→return x. IPDom: A →
+			// g(x).
+			name:     "a name only one arm declares stands for both bindings after the directive",
+			protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there may write either without killing the enclosing variable's earlier value",
+			mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(x)@48 and x = 2@56 -> return x;@66), or let the write define the enclosing variable instead of may-defining it (loses x@10 -> return x;@66)",
+			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(x);\n  x = 2;\n } return x; }",
+			cd:       []string{"A@24 -> x = 1@32"},
+			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x@10 -> return x;@66", "x = 2@56 -> return x;@66"},
 		},
 	})
 }

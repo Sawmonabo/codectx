@@ -147,14 +147,28 @@ const (
 //     macro name of an `#ifdef` form, the `#else` keyword for `#else`), each
 //     arm is a path from it and the arms are merged after the directive, so
 //     no arm sees another arm's definitions, nor its declarations: each arm
-//     resolves names against the bindings made before the directive, and the
-//     code after it sees every arm's declarations. A declaration in one arm
-//     and a redeclaration of the same name in a sibling arm at the same
-//     block level are one variable, so a use after the directive sees both.
-//     The condition reads no variable. The `#else` node's only successor is
-//     its arm, since nothing skips the last arm: it controls nothing, and
-//     the condition of the directive before it controls that arm. Every
-//     other preprocessor line inside a body produces no node.
+//     resolves names against the bindings made before the directive. A
+//     declaration in one arm and a redeclaration of the same name in a
+//     sibling arm at the same block level are one variable. The `#else`
+//     node is a Branch node too, whose only successor is its arm, since
+//     nothing skips the last arm: it controls nothing, and the condition of
+//     the directive before it controls that arm. A conditional whose last
+//     arm is not `#else` has one more arm, the empty group a build takes
+//     when no condition holds (C17 §6.10.1p6), which binds nothing. The
+//     condition reads no variable. Every other preprocessor line inside a
+//     body produces no node. After the directive a name any arm binds stands for every binding it
+//     has in some build: the arms' variable, and, when some arm (the empty
+//     one included) does not bind the name, the variable it named before the
+//     directive, if any. A read through the name Uses each, and taking its
+//     address, binding a reference to it or writing it by reference from a
+//     callable may-defines each. A definition through it (an assignment, an
+//     update) defines the arms' variable and may-defines the one from before
+//     the directive, since a node defines one variable. Given up against
+//     killing both: that earlier variable's definitions still reach a later
+//     read through the name. A name the arms bind only as no variable (a
+//     function prototype) is no variable after the directive when every arm
+//     binds it, and otherwise keeps the binding from before it. Inside an
+//     arm that redeclares the name, the name is the arms' variable alone.
 //   - A lambda or a nested function definition is its own function; in the
 //     enclosing function its creating expression is one Stmt node spanning
 //     it (see Captures).
@@ -400,8 +414,17 @@ type cLower struct {
 	ppArm     int
 	// parked holds the bindings the finished arms of the open preprocessor
 	// conditionals declared, hidden from their sibling arms and bound again
-	// after the directive (see preproc).
+	// after the directive (see preproc); ends holds the mark in parked where
+	// each finished arm's bindings end.
 	parked scope
+	ends   []int
+	// join[v] is 1 + the variable a name bound to v after a preprocessor
+	// conditional also stands for, the binding it keeps in a build that
+	// selects an arm not rebinding it, or 0 (see preproc). susp holds the
+	// links suspended while a sibling arm redeclares v, restored when the
+	// outermost conditional at that block level ends.
+	join []int32
+	susp []cJoin
 	// shadow is non-zero while walking a nested callable for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
@@ -451,6 +474,9 @@ type cMay struct {
 	v  int32
 }
 
+// cJoin is a suspended link from variable v to the enclosing variable e.
+type cJoin struct{ v, e int32 }
+
 // Declaration shapes recorded in cLower.shape.
 const (
 	cArray uint8 = 1 << iota
@@ -465,6 +491,7 @@ func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k 
 	c.buf = c.buf[:0]
 	c.blockMark, c.pp, c.ppArm, c.shadow, c.base, c.sure = 0, -1, -1, 0, 0, 0
 	c.parked.truncate(0)
+	c.ends, c.join, c.susp = c.ends[:0], c.join[:0], c.susp[:0]
 	c.reads, c.held, c.may, c.shape, c.writes, c.names, c.hs =
 		c.reads[:0], c.held[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
 	c.throws, c.thrown, c.seh = 0, 0, 0
@@ -530,16 +557,51 @@ func (c *cLower) declare(name *ts.Node) int32 {
 	switch {
 	case c.shadow > 0:
 	case c.pp >= 0 && c.pp >= c.blockMark:
-		if i := c.parked.find(t, c.ppArm); i >= 0 {
-			v = c.parked.at(i).v
-			break
-		}
-		v = c.b.Var()
+		v = c.shared(t)
 	default:
 		v = c.b.Var()
 	}
 	c.binds.push(t, v)
 	return v
+}
+
+// shared is the variable a finished sibling arm of the open preprocessor
+// conditionals at this block level declared under name, or a new one; a
+// sibling arm's function prototype of that name is no variable and is
+// skipped. In the declaring arm the name is that variable alone, so a link
+// an inner conditional of an earlier arm gave it is suspended until the
+// outermost conditional ends (see preproc).
+func (c *cLower) shared(name []byte) int32 {
+	for i := c.parked.find(name, c.ppArm); i >= c.ppArm; i = c.parked.shadowed(i) {
+		v := c.parked.at(i).v
+		if v < 0 {
+			continue
+		}
+		if e := c.joined(v); e >= 0 {
+			c.susp = append(c.susp, cJoin{v: v, e: e})
+			c.link(v, -1)
+		}
+		return v
+	}
+	return c.b.Var()
+}
+
+// joined is the enclosing variable a name bound to v also stands for after
+// a preprocessor conditional (see preproc), or -1.
+func (c *cLower) joined(v int32) int32 {
+	if int(v) < len(c.join) {
+		return c.join[v] - 1
+	}
+	return -1
+}
+
+// link records that a name bound to v also stands for e, or for nothing more
+// when e is -1.
+func (c *cLower) link(v, e int32) {
+	if int(v) >= len(c.join) {
+		c.join = append(c.join, make([]int32, int(v)+1-len(c.join))...)
+	}
+	c.join[v] = e + 1
 }
 
 // hide binds name to no variable.
@@ -549,16 +611,16 @@ func (c *cLower) lookup(name *ts.Node) int32 { return c.binds.lookup(c.text(name
 
 func (c *cLower) ref(name *ts.Node) { c.read(c.lookup(name)) }
 
-// read records a read of v, unless v is -1.
+// read records a read of v and of every variable v's name also stands for
+// (joined), unless v is -1.
 func (c *cLower) read(v int32) {
-	if v < 0 {
-		return
+	for ; v >= 0; v = c.joined(v) {
+		c.reads = append(c.reads, v)
+		if int(v) >= len(c.held) {
+			c.held = append(c.held, make([]int32, int(v)+1-len(c.held))...)
+		}
+		c.held[v]++
 	}
-	c.reads = append(c.reads, v)
-	if int(v) >= len(c.held) {
-		c.held = append(c.held, make([]int32, int(v)+1-len(c.held))...)
-	}
-	c.held[v]++
 }
 
 // drop removes reads[m:]: a node carries them, or nothing reads them.
@@ -631,15 +693,26 @@ func (c *cLower) pending(from int) bool {
 	return false
 }
 
-// mayDef records a pending may-definition of v by an operand whose reads
-// begin at reads[at], unless v is -1.
+// mayDef records a pending may-definition of v, and of every variable v's
+// name also stands for (joined), by an operand whose reads begin at
+// reads[at], unless v is -1.
 func (c *cLower) mayDef(at int, v int32) {
-	if v >= 0 {
+	for ; v >= 0; v = c.joined(v) {
 		c.may = append(c.may, cMay{at: at, v: v})
 	}
 }
 
-// def records that node n defines v, unless v is -1. When the statement
+// mayDefs records that node n may define v and every variable v's name also
+// stands for (joined), unless v is -1.
+func (c *cLower) mayDefs(n, v int32) {
+	for ; v >= 0; v = c.joined(v) {
+		c.b.MayDef(n, v)
+	}
+}
+
+// def records that node n defines v, unless v is -1, and may-defines every
+// variable v's name also stands for (joined): a node defines one variable,
+// so those keep their earlier definitions. When the statement
 // still holds a read of v that no node carries, made before n by an
 // enclosing expression (`f(x, x = 1)`) on every path reaching n (from
 // reads[sure] on), n reads that earlier value before overwriting it and
@@ -650,6 +723,7 @@ func (c *cLower) def(n, v int32) {
 		return
 	}
 	c.b.Def(n, v)
+	c.mayDefs(n, c.joined(v))
 	if int(v) >= len(c.held) || c.held[v] == 0 {
 		return
 	}
@@ -1552,9 +1626,7 @@ func (c *cLower) element(name *ts.Node, iter, elem int32) {
 	id := c.node(flow.Stmt, name, c.base)
 	c.def(id, v)
 	c.b.Use(id, iter)
-	if elem >= 0 {
-		c.b.MayDef(id, elem)
-	}
+	c.mayDefs(id, elem)
 }
 
 // caseName is the goto label of a nested case or default label: cCasePrefix
@@ -1712,22 +1784,69 @@ func (c *cLower) nestedCases(n *ts.Node, tag int32, dflt *ts.Node) *ts.Node {
 // preproc lowers a preprocessor conditional inside a body: every arm is a
 // path (see Node granularity). Each arm sees only the bindings made before
 // the directive: when an arm ends, the bindings it made are parked and
-// truncated away, and after the last arm every parked binding is bound
-// again, so the code after the directive sees the union.
+// truncated away, and after the last arm each parked name is bound again
+// (see rebind), so the code after the directive sees every arm's.
 func (c *cLower) preproc(n *ts.Node) {
 	saved, savedArm := c.pp, c.ppArm
-	cond, arm := c.binds.mark(), c.parked.mark()
-	if c.pp < c.blockMark {
+	cond, arm, ends, susp := c.binds.mark(), c.parked.mark(), len(c.ends), len(c.susp)
+	outermost := c.pp < c.blockMark
+	if outermost {
 		c.pp, c.ppArm = cond, arm
 	}
-	c.arms(n, cond)
-	c.park(cond)
-	for i := arm; i < c.parked.mark(); i++ {
-		b := c.parked.at(i)
-		c.binds.bind(b.name, b.v)
+	arms := c.arms(n, cond)
+	if outermost {
+		for i := len(c.susp) - 1; i >= susp; i-- {
+			c.link(c.susp[i].v, c.susp[i].e)
+		}
+		c.susp = c.susp[:susp]
 	}
+	c.rebind(arm, arms, c.ends[ends:])
+	c.ends = c.ends[:ends]
 	c.parked.truncate(arm)
 	c.pp, c.ppArm = saved, savedArm
+}
+
+// rebind binds again each name parked[arm:] holds, the bindings of a
+// conditional's arms, of which there are arms and whose i-th parked
+// bindings end at ends[i]. The name is bound to the variable its arms share
+// (the innermost one, when an arm redeclares it), or to no variable when
+// the arms bind it only as something else. When some arm does not bind the
+// name, a build selecting that arm keeps the binding from before the
+// directive: the name then also stands for that binding's variable (link),
+// and a name the arms bind only as no variable keeps that binding alone.
+func (c *cLower) rebind(arm, arms int, ends []int) {
+	for i := arm; i < c.parked.mark(); i++ {
+		b := c.parked.at(i)
+		if c.parked.index[b.name] != int32(i) {
+			// A later binding of the name, in this arm or a later one, is the
+			// innermost and stands for it.
+			continue
+		}
+		v, bound, k, seen := int32(-1), 0, len(ends)-1, -1
+		for j := i; j >= arm; j = c.parked.shadowed(j) {
+			for k > 0 && j < ends[k-1] {
+				k--
+			}
+			if k != seen {
+				bound, seen = bound+1, k
+			}
+			if v < 0 {
+				v = c.parked.at(j).v
+			}
+		}
+		if bound < arms && v < 0 {
+			continue
+		}
+		c.binds.bind(b.name, v)
+		if bound == arms {
+			continue
+		}
+		if p := c.binds.shadowed(c.binds.mark() - 1); p >= 0 {
+			if e := c.binds.at(p).v; e >= 0 && e != v {
+				c.link(v, e)
+			}
+		}
+	}
 }
 
 // park moves the bindings an arm made, binds[cond:], into parked.
@@ -1739,7 +1858,12 @@ func (c *cLower) park(cond int) {
 	c.binds.truncate(cond)
 }
 
-func (c *cLower) arms(n *ts.Node, cond int) {
+// arms lowers the arm n of a conditional and the arms after it, parking
+// each arm's bindings and recording where they end, and returns how many
+// arms there are: a conditional whose last arm is not `#else` has one more,
+// the empty group a build takes when no condition holds, which rebinds
+// nothing.
+func (c *cLower) arms(n *ts.Node, cond int) int {
 	k := c.k
 	var at flow.Span
 	last := false
@@ -1760,16 +1884,20 @@ func (c *cLower) arms(n *ts.Node, cond int) {
 		c.stmt(&list[i])
 	}
 	c.done(start)
+	c.park(cond)
+	c.ends = append(c.ends, c.parked.mark())
+	count := 1
 	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
-		c.park(cond)
 		t := c.b.Push()
 		c.b.Restore(p)
-		c.arms(alt, cond)
+		count += c.arms(alt, cond)
 		c.b.Merge(t)
 	} else if !last {
 		c.b.Merge(p)
+		count++
 	}
 	c.b.Pop(p)
+	return count
 }
 
 // tryStmt lowers a C++ try statement or function-try-block; rethrow makes
@@ -2288,7 +2416,7 @@ func (c *cLower) closure(n *ts.Node) int32 {
 	c.capture(n)
 	id := c.node(flow.Stmt, n, m)
 	for _, v := range c.writes[w:] {
-		c.b.MayDef(id, v)
+		c.mayDefs(id, v)
 	}
 	c.writes = c.writes[:w]
 	return id
