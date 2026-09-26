@@ -220,15 +220,28 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // noninteractively, so name, version and digest come from the resolved
 // payload, which is where the lock recorded them.
 //
-// Detection reads only the repository's project markers, stops at the bound,
-// and never walks the tree into memory: it accumulates at most
-// provider.MaxDetectionInputs paths and one boolean, whatever the repository's
-// size. It traverses where the filesystem and treesitter providers answer from
-// a constant because neither question it must answer — which projects exist,
-// and whether any analysable source exists at all — can be answered without
-// looking.
+// Detection reads only the repository's project markers, stops once it has
+// what it needs, and never walks the tree into memory: it accumulates at most
+// provider.MaxDetectionInputs paths and two booleans, whatever the
+// repository's size. It traverses where the filesystem and treesitter
+// providers answer from a constant because neither question it must answer —
+// which projects exist, and whether any analysable source exists at all — can
+// be answered without looking.
+//
+// The walk is workspace.Walk under the policy the caller hands in, and Walk
+// honours the policy's ForceInclude and ForceIncludeDir hooks: a caller that
+// passes the capture's hooks has every tracked path under an excluded
+// directory -- a vendored `third_party/` project -- seen here exactly as the
+// capture saw it. A caller that passes none has such a path skipped, and a
+// repository whose only analysable source lies there is reported unavailable.
+//
+// InputPaths names the recognized markers and plans nothing: every unit is
+// planned from the pinned snapshot (PlanUnits). A workspace with more markers
+// than the bound lists the first provider.MaxDetectionInputs the walk met, in
+// path order, and says so under detailInputPaths; no project loses its unit
+// to the bound.
 func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy workspace.Policy) (provider.Detection, error) {
-	inputs, languages, err := detectInputs(ctx, root, policy)
+	inputs, languages, truncated, err := detectInputs(ctx, root, policy)
 	if err != nil {
 		return provider.Detection{}, err
 	}
@@ -240,20 +253,33 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	// engine is never named on one (Section 11.6). The version
 	// and the payload digest are the whole of the provenance a reader needs:
 	// docs/providers-dependence.md maps a digest to its release.
-	return provider.Detection{Available: true, Capabilities: Capabilities, InputPaths: inputs,
-		ObservedVersion: truncate("engine "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}, nil
+	det := provider.Detection{Available: true, Capabilities: Capabilities, InputPaths: inputs,
+		ObservedVersion: truncate("engine "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}
+	if truncated {
+		// A marker, not a refusal: the value is not a CTX_ code, so the
+		// registry publishes no degraded row for it. Nothing was refused.
+		det = det.WithDetail(detailInputPaths, "the workspace holds more than "+itoa(int64(provider.MaxDetectionInputs))+
+			" project markers; the first the walk met are listed, and every project is planned from the snapshot")
+	}
+	return det, nil
 }
+
+// detailInputPaths is the detection detail that says InputPaths stopped at
+// its bound.
+const detailInputPaths = "input_paths"
 
 // stopWalk ends a bounded detection walk without making an early stop look
 // like a failure.
 var stopWalk = errors.New("detection input bound reached")
 
-// detectInputs collects the project markers detection recognized, bounded by
-// provider.MaxDetectionInputs, and reports whether any analysable source
-// exists at all.
-func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Policy) ([]string, bool, error) {
+// detectInputs collects the project markers detection recognized, at most
+// provider.MaxDetectionInputs of them, reports whether any analysable source
+// exists at all, and whether a marker past the bound was met. The walk stops
+// as soon as both further questions are settled: a marker past the bound has
+// been seen and so has analysable source.
+func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Policy) ([]string, bool, bool, error) {
 	var inputs []string
-	var languages bool
+	var languages, truncated bool
 	err := workspace.Walk(ctx, root, policy, func(f workspace.File) error {
 		if !languages && FamilyOf(lang.Of(f.Path)) != "" {
 			languages = true
@@ -261,23 +287,24 @@ func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Pol
 		base := filepath.Base(f.Path)
 		for _, fam := range Families {
 			if slices.Contains(projectMarkers[fam], base) {
-				inputs = append(inputs, f.Path)
+				if len(inputs) < provider.MaxDetectionInputs {
+					inputs = append(inputs, f.Path)
+				} else {
+					truncated = true
+				}
 				break
 			}
 		}
-		if len(inputs) >= provider.MaxDetectionInputs && languages {
+		if truncated && languages {
 			return stopWalk
 		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, stopWalk) {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	slices.Sort(inputs)
-	if len(inputs) > provider.MaxDetectionInputs {
-		inputs = inputs[:provider.MaxDetectionInputs]
-	}
-	return inputs, languages, nil
+	return inputs, languages, truncated, nil
 }
 
 // ImportOptions carry what the provider.Provider interface has no room for:
