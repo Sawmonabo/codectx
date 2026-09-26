@@ -207,7 +207,12 @@ var pythonLowering = Lowering{
 //     a variable of the lowering's own that it may-defines, which replaces
 //     the held read, so the consumer pairs with that node and a later
 //     definition of x in the statement (`(x := 2)`) neither re-reads nor
-//     receives it. A read a node of its own carries (a capture, a
+//     receives it. The hand-off is made only when that node runs whenever
+//     the consumer does: an assignment expression inside a conditionally
+//     evaluated operand (the operand after `and`'s or `or`'s deciding one,
+//     a conditional expression's arm, a later operand of a chained
+//     comparison) leaves the read on the consumer, where the name keeps its
+//     earlier definition on the path that skips the assignment. A read a node of its own carries (a capture, a
 //     condition, an operand) is not held, so `k = lambda: k` makes the
 //     assignment Use the result variable only.
 //   - A value evaluated once and used by several later nodes is a node of
@@ -325,6 +330,10 @@ type pyLower struct {
 	reads  []int32
 	seen   []pySeen
 	stmtNo int
+	// region is where the reads of the innermost conditionally evaluated
+	// operand being lowered begin (0 outside one): a held read before it
+	// belongs to a consumer that runs when the operand does not.
+	region int
 	// writes are the enclosing variables assigned inside the nested callable
 	// whose captures are being collected; closure may-defines them.
 	writes []int32
@@ -939,7 +948,7 @@ func (j *pyLower) pending(v int32) bool {
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (j *pyLower) reset() {
-	j.reads, j.throws, j.thrown = j.reads[:0], 0, 0
+	j.reads, j.throws, j.thrown, j.region = j.reads[:0], 0, 0, 0
 	j.stmtNo++
 }
 
@@ -966,14 +975,17 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 }
 
 // def records that node n defines v. When the statement still holds a read
-// of v from before n, n Uses v and hands that earlier value on through a
-// variable of the lowering's own (see Uses).
+// of v from before n for a consumer that runs whenever n does, n Uses v and
+// hands that earlier value on through a variable of the lowering's own (see
+// Uses).
 func (j *pyLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
 	j.b.Def(n, v)
-	if !j.pending(v) {
+	if !j.pending(v) || int(j.seen[v].at) < j.region {
+		// A read held for a consumer that runs when n does not stays on
+		// that consumer (see Uses).
 		return
 	}
 	// n reads the earlier value before overwriting it and hands it on
@@ -2153,7 +2165,10 @@ func (j *pyLower) shortCircuit(n *ts.Node, dst int32) {
 	j.def(j.node(flow.Branch, left, m, len(j.reads)), dst)
 	j.reads = j.reads[:m]
 	p := j.b.Push()
+	saved := j.region
+	j.region = len(j.reads)
 	j.yield(n.ChildByFieldId(j.k.fRight), dst)
+	j.region = saved
 	j.b.Merge(p)
 	j.b.Pop(p)
 }
@@ -2166,11 +2181,14 @@ func (j *pyLower) conditional(n *ts.Node, dst int32) {
 	m := len(j.reads)
 	j.cond(&list[1])
 	j.reads = j.reads[:m]
+	saved := j.region
+	j.region = m
 	p := j.b.Push()
 	j.yield(&list[0], dst)
 	t := j.b.Push()
 	j.b.Restore(p)
 	j.yield(&list[2], dst)
+	j.region = saved
 	j.b.Merge(t)
 	j.b.Pop(p)
 	j.done(start)
@@ -2230,6 +2248,8 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 	base := len(j.hold)
 	mark := j.b.Push()
 	j.hold = append(j.hold, mark)
+	saved := j.region
+	j.region = m
 	for i := 2; i < len(ops); i++ {
 		o := j.l.unparen(&ops[i])
 		j.value(o)
@@ -2249,6 +2269,7 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 		held = next
 		j.hold = append(j.hold, j.b.Push())
 	}
+	j.region = saved
 	j.merge(base)
 	j.b.Pop(mark)
 	j.done(start)
