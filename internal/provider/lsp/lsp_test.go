@@ -584,6 +584,95 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 	}
 }
 
+// TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited protects the
+// host-freeze invariant on the way out: the room a language server reserved
+// goes back to the admission ledger only after its process has exited and its
+// materialization is removed, on every path that stops it.
+//
+// Failure mode: a stop that gives the room back first lets the ledger admit
+// the next child -- here a 6 GiB unit waiting beside a 4 GiB server in an 8 GiB
+// allocation -- while the stopping server still holds its memory and its tree
+// on disk, so the process briefly holds more than the machine was measured to
+// have.
+//
+// Mutation: give the room back where the entry is removed (stopIdle, expire or
+// Close) instead of in onExit -> the waiting unit is granted while the
+// server's materialization still exists.
+func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*Manager, *server)
+	}{
+		{"make room", func(m *Manager, _ *server) { m.stopIdle() }},
+		{"idle expiry", func(m *Manager, s *server) { m.expire(s) }},
+		{"close", func(m *Manager, _ *server) { _ = m.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := providertest.New(t, map[string]string{"main.go": mainGo})
+			runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CODECTX_LSP_FAKE", "1")
+			t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+			resolver := offlineResolver(t, map[string]toolchain.Override{
+				"gopls": {Executable: exe, Version: "1.2.3", Checksum: fileDigest(t, exe)},
+			})
+			ctx := context.Background()
+			profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
+			const giB int64 = 1 << 30
+			if profile.MemoryBudgetBytes != 4*giB {
+				t.Fatalf("the server reserves %d bytes, want %d; this test's arithmetic no longer holds", profile.MemoryBudgetBytes, 4*giB)
+			}
+			led := testAdmission(t, 8*giB)
+			// The idle timer is kept out of the way: every case stops the server itself.
+			mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: led, IdleTTL: time.Hour,
+				StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mgr.Close()
+			ov, err := mgr.Open(ctx, h.View, profile)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			srv := ov.s
+			ov.Close()
+			if materializations(t, h.Policy.DataDir) != 1 {
+				t.Fatal("the running server has no materialization; the check below would prove nothing")
+			}
+
+			// A unit that does not fit beside the server waits at the head of
+			// the queue; its make-room step reports that it is there.
+			queued := make(chan struct{})
+			var once sync.Once
+			granted := make(chan int, 1)
+			go func() {
+				release, err := led.Reserve(ctx, 6*giB, func() { once.Do(func() { close(queued) }) })
+				if err != nil {
+					granted <- -1
+					return
+				}
+				granted <- materializations(t, h.Policy.DataDir)
+				release()
+			}()
+			<-queued
+			tc.stop(mgr, srv)
+			if left := <-granted; left != 0 {
+				t.Fatalf("the waiting unit was granted with %d materializations still on disk; the stopped server's room was given back before its process exited", left)
+			}
+		})
+	}
+}
+
 // testAdmission is the process memory admission ledger a test manager admits
 // its servers against. Production composes exactly one and hands it to every
 // reserver; a test that only drives the manager composes its own.

@@ -59,6 +59,12 @@ type server struct {
 	// binding labels every result: provider, server version and input digest.
 	binding model.OverlayBinding
 
+	// room gives the server's reservation back to the admission ledger. It is
+	// called once, by onExit, after the process tree is reaped and the
+	// materialization released: the ledger admits the next child only once
+	// this one no longer holds what it reserved.
+	room func()
+
 	runCancel context.CancelFunc
 	stdinR    *io.PipeReader
 	stdinW    *io.PipeWriter
@@ -111,16 +117,25 @@ func (p pipeStream) Write(b []byte) (int, error) { return p.w.Write(b) }
 var errServerGone = errors.New("the language server process has exited")
 
 // startServer takes a reference to the snapshot's shared tree, starts the
-// pinned payload through the
-// shared runner, performs the initialize/initialized handshake and negotiates
-// the position encoding. Any failure releases the process, the pipes and the
-// materialization before returning.
+// pinned payload through the shared runner, performs the initialize/initialized
+// handshake and negotiates the position encoding. Any failure releases the
+// process, the pipes and the materialization before returning.
+//
+// room is the reservation the server was admitted with, and startServer owns
+// it on every path: a failure before a process exists gives it back at once,
+// and from the launch on it belongs to the server, whose exit gives it back.
 //
 // The executable is not re-hashed here: internal/toolchain hashed the entry at
 // resolution and Profile.Tool carries that digest, so a second read of the same
 // file would prove nothing the fingerprint in the overlay binding does not
 // already commit to.
-func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (srv *server, err error) {
+func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile, room func()) (srv *server, err error) {
+	launched := false
+	defer func() {
+		if !launched {
+			room()
+		}
+	}()
 	snap := view.Header()
 	// A start is lazy, pooled and shared between generations, so it hangs off
 	// the process's overlay run and never off a generation's. It spans the
@@ -219,8 +234,10 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	}
 	// From here a process tree exists (or is about to) and onExit will run, so
 	// the manager tracks the server until that happens even if it never
-	// becomes a usable entry. Registering before the goroutine starts means
-	// untrack can never run before track.
+	// becomes a usable entry, and the room is the server's to give back.
+	// Registering before the goroutine starts means untrack can never run
+	// before track.
+	s.room, launched = room, true
 	m.track(s)
 	started := make(chan error, 1)
 	go func() {
@@ -373,8 +390,8 @@ func (s *server) handleServerRequest(method string, params json.RawMessage) (any
 // stream on both sides so the reader sees end of file and any writer fails
 // instead of blocking on a pipe nobody drains, gives back this server's
 // reference to the shared materialization -- which is removed once the last
-// server of the snapshot has exited -- and reports the exit as a failure
-// unless this was a requested stop.
+// server of the snapshot has exited -- reports the exit as a failure unless
+// this was a requested stop, and gives the server's room back to the ledger.
 func (s *server) onExit(runErr error) {
 	s.stdoutW.Close()
 	s.stdinR.CloseWithError(errServerGone)
@@ -392,6 +409,10 @@ func (s *server) onExit(runErr error) {
 		}
 		s.fail(err)
 	}
+	// The process is gone and the materialization released, so the room it
+	// held is free: given back before exited closes, so every stop that waits
+	// on exited returns with the room already in the ledger.
+	s.room()
 	close(s.exited)
 	// Only now, with the tree reaped and the materialization gone, does Close
 	// no longer have to wait for this server.

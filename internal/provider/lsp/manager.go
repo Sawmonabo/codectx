@@ -152,16 +152,24 @@ type materialization struct {
 	refs  int
 }
 
-// entry is one server slot: ready is closed once the start attempt finished,
-// with either srv or err set. release gives the room it holds in the ledger
-// back; the ledger's own release is idempotent, so an entry removed twice -- a
-// failed start that is both forgotten and dropped by Open -- returns its room
-// once.
+// entry is one server slot. It is published before its room is reserved, so a
+// second open of the same server waits on it instead of queuing a reservation
+// of its own. ready is closed once the attempt finished, with either srv or
+// err set. abandoned marks an attempt that ended while it was still waiting
+// for room because the open reserving it stopped waiting: a waiter whose own
+// context is live asks again rather than returning another caller's
+// cancellation. cancel ends that wait; Close uses it so it never waits on room
+// that may not be granted until other work ends.
+//
+// The room itself is never held by the entry: slot hands it to the starter,
+// and startServer hands it to the server, which gives it back when its process
+// has exited.
 type entry struct {
-	ready   chan struct{}
-	srv     *server
-	err     error
-	release func()
+	ready     chan struct{}
+	srv       *server
+	err       error
+	abandoned bool
+	cancel    context.CancelFunc
 }
 
 // New validates and defaults the options.
@@ -242,27 +250,28 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	}
 	key := serverKey{snapshot: view.Header().ID, profile: profile.Name, root: profile.Root}
 	// Two attempts: the second covers a shared server that failed or began
-	// stopping between being found and being acquired.
-	for attempt := 0; attempt < 2; attempt++ {
-		e, starter, err := m.slot(ctx, key, admission.Reservation{
+	// stopping between being found and being acquired. A wait on a start that
+	// was abandoned before it had room is not an attempt: nothing was found.
+	for attempt := 0; ; {
+		e, room, err := m.slot(ctx, key, admission.Reservation{
 			MemoryBytes: profile.MemoryBudgetBytes,
 			DiskBytes:   profile.DiskBudgetBytes,
 		})
 		if err != nil {
 			return nil, err
 		}
-		if starter {
-			srv, err := startServer(ctx, m, view, profile)
+		if room != nil {
+			srv, err := startServer(ctx, m, view, profile, room)
 			m.mu.Lock()
 			e.srv, e.err = srv, err
 			// A server that failed between starting and being recorded has
 			// already been through forget, which found no entry to remove
 			// because e.srv was still nil. Removing it here, under the same
 			// lock that publishes it, is what keeps the dead entry from being
-			// handed to every later Open. The identity check matters: expire
-			// or forget may have replaced this entry already.
-			if e2, ok := m.servers[key]; ok && e2 == e && (err != nil || srv.running() != nil) {
-				m.dropLocked(key, e2)
+			// handed to every later Open. The identity check matters: Close may
+			// have removed this entry already.
+			if cur, ok := m.servers[key]; ok && cur == e && (err != nil || srv.running() != nil) {
+				delete(m.servers, key)
 			}
 			m.mu.Unlock()
 			close(e.ready)
@@ -272,43 +281,63 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 			case <-ctx.Done():
 				return nil, model.Canceled(ctx.Err())
 			}
+			if e.abandoned {
+				continue
+			}
 		}
 		if e.err != nil {
 			return nil, e.err
 		}
-		if err := e.srv.acquire(); err != nil {
+		// Acquired under the manager's lock, and only while the entry is still
+		// published: stopIdle and expire judge a server idle and remove it
+		// under the same lock, so a server one of them is stopping is never
+		// handed out as a live one.
+		m.mu.Lock()
+		err = unavailable("the language server is stopping")
+		if cur, ok := m.servers[key]; ok && cur == e {
+			err = e.srv.acquire()
+		}
+		m.mu.Unlock()
+		if err != nil {
 			m.forget(e.srv)
-			if attempt == 0 {
+			if attempt++; attempt < 2 {
 				continue
 			}
 			return nil, err
 		}
 		return &Overlay{s: e.srv}, nil
 	}
-	return nil, unavailable("the language server could not be acquired")
 }
 
-// slot finds or reserves the entry for key, admitting bytes against the
-// process's admission ledger. The reservation carries both dimensions: a
-// server holds memory while it runs and disk while it indexes, and the two are
-// granted in one act so no server holds half of what another needs. starter is
-// true when the caller must start the server and complete the entry.
+// slot finds the entry for key, or publishes one and reserves its room
+// against the process's admission ledger. The reservation carries both
+// dimensions: a server holds memory while it runs and disk while it indexes,
+// and the two are granted in one act so no server holds half of what another
+// needs. A non-nil room means the caller is the starter: it must start the
+// server, hand room to it and complete the entry. Otherwise the caller waits
+// on the entry it was given.
 //
-// The ledger is never asked for room while this manager's mutex is held: the
-// wait can be long, and the ledger calls stopIdle back, which takes that
-// mutex. The entry is therefore published after the room is granted, and the
-// map is re-checked then -- another Open may have started this very server
-// while this one queued, and the room it took is handed straight back.
-func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reservation) (*entry, bool, error) {
+// The entry is published BEFORE the room is asked for, so one server is one
+// reservation however many opens ask for it at once: a second open that
+// queued a reservation of its own would hold the head of the ledger's queue,
+// and every engine unit behind it, for room it would hand straight back. The
+// ledger is never asked while this manager's mutex is held: the wait can be
+// long, and the ledger calls stopIdle back, which takes that mutex. A wait
+// that ends without room removes the entry and wakes its waiters, so none of
+// them is left waiting on it.
+func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reservation) (*entry, func(), error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return nil, false, unavailable("the lsp manager is closed")
+		return nil, nil, unavailable("the lsp manager is closed")
 	}
 	if e, ok := m.servers[key]; ok {
 		m.mu.Unlock()
-		return e, false, nil
+		return e, nil, nil
 	}
+	reserving, cancel := context.WithCancel(ctx)
+	e := &entry{ready: make(chan struct{}), cancel: cancel}
+	m.servers[key] = e
 	m.mu.Unlock()
 
 	// Queued first-in-first-out behind every other heavy child of this process,
@@ -316,30 +345,40 @@ func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reserva
 	// may still do, when it reaches the head and does not fit, is stop a server
 	// nobody is using: another project's server already running is never an
 	// answer of CTX_RESOURCE_LIMIT.
-	release, err := m.opts.Admission.ReserveWith(ctx, res, m.stopIdle)
-	if err != nil {
-		return nil, false, err
-	}
+	room, err := m.opts.Admission.ReserveWith(reserving, res, m.stopIdle)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	cancel()
+	e.cancel = nil
 	if m.closed {
-		release()
-		return nil, false, unavailable("the lsp manager is closed")
+		// Close removed the entry and ended the wait, or the room was granted
+		// just as it closed; either way no server starts.
+		if err == nil {
+			room()
+		}
+		err = unavailable("the lsp manager is closed")
+	} else if err != nil {
+		e.abandoned = true
 	}
-	if e, ok := m.servers[key]; ok {
-		release()
-		return e, false, nil
+	if err != nil {
+		if cur, ok := m.servers[key]; ok && cur == e {
+			delete(m.servers, key)
+		}
+		e.err = err
+		close(e.ready)
+		return nil, nil, err
 	}
-	e := &entry{ready: make(chan struct{}), release: release}
-	m.servers[key] = e
-	return e, true, nil
+	return e, room, nil
 }
 
 // stopIdle stops one server nobody is using, which gives its room back to the
-// ledger. It is the make-room step the ledger runs for a server open that has
-// reached the head of the queue and does not fit; a manager holding nothing
-// idle frees nothing and the open simply waits its turn.
+// ledger once its process has exited -- never before, or the ledger would
+// admit the next child while the stopping one still holds the memory. It is
+// the make-room step the ledger runs for a server open that has reached the
+// head of the queue and does not fit; a manager holding nothing idle frees
+// nothing and the open simply waits its turn. An entry still starting, or
+// still waiting for room, is not ready and is never chosen.
 func (m *Manager) stopIdle() {
 	m.mu.Lock()
 	var idle *server
@@ -351,7 +390,7 @@ func (m *Manager) stopIdle() {
 		}
 		if e.srv != nil && e.srv.isIdle() {
 			idle = e.srv
-			m.dropLocked(k, e)
+			delete(m.servers, k)
 			break
 		}
 	}
@@ -423,17 +462,6 @@ func (m *Manager) releaseMat(id model.SnapshotID) error {
 	return shared.mat.Close()
 }
 
-// dropLocked removes an entry and gives its room back to the ledger, which
-// admits whatever now fits -- an open of this manager's or an engine unit's,
-// the ledger does not distinguish them. The mutex must be held; the ledger's
-// release is idempotent, so an entry dropped twice returns its room once.
-func (m *Manager) dropLocked(key serverKey, e *entry) {
-	delete(m.servers, key)
-	if e.release != nil {
-		e.release()
-	}
-}
-
 // isIdle reports a running server with no overlay open on it.
 func (s *server) isIdle() bool {
 	s.mu.Lock()
@@ -442,6 +470,7 @@ func (s *server) isIdle() bool {
 }
 
 // expire is the idle timer's action: stop the server if it is still unused.
+// Its room comes back when the process has exited.
 func (m *Manager) expire(s *server) {
 	m.mu.Lock()
 	e, ok := m.servers[s.key]
@@ -449,18 +478,20 @@ func (m *Manager) expire(s *server) {
 		m.mu.Unlock()
 		return
 	}
-	m.dropLocked(s.key, e)
+	delete(m.servers, s.key)
 	m.mu.Unlock()
 	s.stop()
 }
 
 // forget removes a server that failed or is stopping, so the next Open
-// starts a fresh one instead of finding the dead entry.
+// starts a fresh one instead of finding the dead entry. Its room comes back
+// when the process has exited, which the failure path is already bringing
+// about.
 func (m *Manager) forget(s *server) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if e, ok := m.servers[s.key]; ok && e.srv == s {
-		m.dropLocked(s.key, e)
+		delete(m.servers, s.key)
 	}
 }
 
@@ -516,10 +547,9 @@ func (m *Manager) overlayContext(ctx context.Context, repositoryID string) conte
 	return m.overlay.Context(ctx)
 }
 
-// endOverlay ends this process's overlay run and removes it. An overlay run
-// belongs to no generation, so the retention that deletes a generation's runs
-// would never reach it: a process that exits cleanly takes its own row with it,
-// and the collection pass takes the rows of the processes that did not.
+// endOverlay ends this process's overlay run and removes it. A process that
+// exits cleanly takes its own row with it; the ledger's collection pass takes
+// the rows of the processes that did not.
 func (m *Manager) endOverlay() error {
 	m.mu.Lock()
 	run := m.overlay
@@ -533,16 +563,20 @@ func (m *Manager) endOverlay() error {
 }
 
 // Close stops every server and refuses further opens. It returns once every
-// process tree is reaped and every materialization removed, including the
-// trees of servers that failed and were forgotten: those are stopped through
-// the same path, which for an already dying server is the wait for its exit.
+// process tree is reaped, its room given back and every materialization
+// removed, including the trees of servers that failed and were forgotten:
+// those are stopped through the same path, which for an already dying server
+// is the wait for its exit. A start still waiting for room stops waiting.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	m.closed = true
 	entries := make([]*entry, 0, len(m.servers))
 	for k, e := range m.servers {
 		entries = append(entries, e)
-		m.dropLocked(k, e)
+		delete(m.servers, k)
+		if e.cancel != nil {
+			e.cancel()
+		}
 	}
 	live := make([]*server, 0, len(m.live))
 	for s := range m.live {
@@ -562,7 +596,8 @@ func (m *Manager) Close() error {
 	return m.endOverlay()
 }
 
-// Servers reports how many servers are currently running or starting.
+// Servers reports how many servers are currently running, starting or waiting
+// for room.
 func (m *Manager) Servers() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
