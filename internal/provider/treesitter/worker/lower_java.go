@@ -55,7 +55,7 @@ const yieldLabel = " yield"
 //     re-enters the first of those, since the condition is evaluated again
 //     (JLS §14.12, §14.14.1.2). A loop whose condition is the literal
 //     `true`, or a for without one, has no exit edge: its head is a Stmt node
-//     spanning `true` or the `for` keyword (JLS §14.21).
+//     spanning `true` or the `for` keyword (JLS §14.22).
 //   - An enhanced for (JLS §14.14.2) follows the iteration model (see
 //     Iteration in Lowering): a Stmt node spanning the iterated expression,
 //     evaluated once, which Uses its reads and defines an iteration variable
