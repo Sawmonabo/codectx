@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -349,15 +350,17 @@ func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
 // failed, with reason publication_failed, the publication error's code and
 // that run's id, and only while the generation the marker names is active.
 //
-// The deferred run is recorded here exactly as tickHeld records it (a unit
-// span per popped unit, then abandon and markAbandoned), since no fixture
-// provider can make a real publication fail. The reader is built as another
-// process builds one: a second, read-only store handle, a ledger handle that
-// was never attached, and no deferred sealer.
+// The tick is real and its publication really fails: its units seal, and
+// publishOnce's plan is built from the tick's own selection, which here
+// carries an active provider with no detection, so plan.Build refuses it.
+// Nothing in the tick before the publication reads that selection. The reader
+// is built as another process builds one: a second, read-only store handle, a
+// run-ledger reader over the data directory that was never attached, and no
+// deferred sealer.
 //
-// Mutation: skip markAbandoned in tickHeld, or drop the scope_key match from
-// MarkedUnits, and the row still reports two units running, or a row over
-// another generation is rewritten.
+// Mutation: remove the markAbandoned call from tickHeld's publication-failure
+// path, or drop the scope_key match from MarkedUnits, and the row still
+// reports two units running, or a row over another generation is rewritten.
 func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n"})
 	ctx := f.ctx
@@ -366,25 +369,27 @@ func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
+	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, c.policy, c.enablement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sel.Active) == 0 {
+		t.Fatal("the selection holds no active provider to strip a detection from")
+	}
+	broken := sel
+	broken.Detections = maps.Clone(sel.Detections)
+	delete(broken.Detections, sel.Active[0].Descriptor().ID)
 	units := deferredScopes("lost", 2)
+	if err := f.tick(ctx, c, units, res.Binding.SnapshotID, broken); err == nil {
+		t.Fatal("the tick's publication succeeded over a selection plan.Build refuses")
+	}
 	c.late.mu.Lock()
-	c.late.state = queueState{snap: res.Binding.SnapshotID, epoch: c.late.state.epoch + 1}
-	epoch := c.late.state.epoch
+	lost, ok := c.late.abandoned[plan.Key(heavyProviderID, units[0].unit.ScopeKey)]
 	c.late.mu.Unlock()
-	run := c.newRun(ledger.KindDeferred)
-	runCtx := run.Context(ctx)
-	for _, d := range units {
-		span := ledger.Plan(runCtx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
-		span.Begin(runCtx)
-		span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
-	}
-	cause := &model.Error{Code: model.CodeDiskFull, Message: "the store is full"}
-	failure, ok := c.late.abandon(epoch, units, cause, run.ID())
 	if !ok {
-		t.Fatal("abandon recorded nothing for the queue's own epoch")
+		t.Fatal("the failed publication abandoned nothing in the process that ran it")
 	}
-	markAbandoned(runCtx, res.Binding.GenerationID, len(units), failure, cause)
-	run.Finish(ledger.OutcomeFailed)
+	runID, code := lost.failure.details[detailRunID], lost.failure.code
 	if err := f.ledger.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
@@ -403,6 +408,9 @@ func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if active != res.Binding.GenerationID {
+		t.Fatalf("the failed publication moved the active generation to %d from %d", active, res.Binding.GenerationID)
+	}
 	rows := []model.CapabilityState{{ProviderID: heavyProviderID, Capability: "structure",
 		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
 		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: 2,
@@ -412,11 +420,11 @@ func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
 		t.Fatalf("recordedAbandonment: %v", err)
 	}
 	row := projectAbandoned(rows, abandoned)[0]
-	if row.State != model.CapabilityFailed || row.UnitsRunning != 0 || row.DiagnosticCode != model.CodeDiskFull ||
-		row.Details["reason"] != reasonPublicationFailed || row.Details[detailRunID] != run.ID() ||
+	if row.State != model.CapabilityFailed || row.UnitsRunning != 0 || row.DiagnosticCode != code ||
+		row.Details["reason"] != reasonPublicationFailed || runID == "" || row.Details[detailRunID] != runID ||
 		row.Details[model.DetailUnitsFailed] != "2" {
-		t.Fatalf("another process reads the abandoned units as %+v, want failed, none running, %s, %s and run %s",
-			row, model.CodeDiskFull, reasonPublicationFailed, run.ID())
+		t.Fatalf("another process reads the abandoned units as %+v, want failed, none running, %s, %s and run %q",
+			row, code, reasonPublicationFailed, runID)
 	}
 	if err := row.Validate(); err != nil {
 		t.Fatalf("the projected row does not validate: %v", err)
