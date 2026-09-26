@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"sync"
+	"unsafe"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
@@ -82,10 +83,11 @@ type Lowering struct {
 	// never code that runs (a TypeScript `declare` block): Functions does not
 	// descend into them, so a callable written there is not a function.
 	ambient []string
-	// lower drives b over fn's parameters and body in source order. It must
-	// not descend into a nested callable (l.isCallable reports one) beyond
-	// the expression that creates it. Begin and Finish are Lower's.
-	lower func(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
+	// lower drives b over fn's parameters and body in source order, keeping
+	// every reusable list in s. It must not descend into a nested callable
+	// (l.isCallable reports one) beyond the expression that creates it.
+	// Begin and Finish are Lower's.
+	lower func(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch)
 
 	// once resolves callable and paren against the grammar, so every shared
 	// helper compares kind ids rather than kind strings.
@@ -223,11 +225,56 @@ func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error
 
 // Lower builds fn's graph in a: Begin over fn's byte range, the language's
 // lowering, Finish. fn must be a node Functions visited, and src the source
-// its tree was parsed from. The graph is valid until the next a.Begin.
-func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena) *flow.Graph {
+// its tree was parsed from, unchanged while fn is lowered. The graph is valid
+// until the next a.Begin. s is the worker's lowering scratch; one Scratch
+// serves every language and every function a worker lowers.
+func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *flow.Graph {
 	b := a.Begin(spanOf(fn))
-	l.lower(l, b, fn, src)
+	l.lower(l, b, fn, src, s)
 	return b.Finish()
+}
+
+// Scratch is one worker's reusable lowering state, the pointer-bearing
+// counterpart of flow.Arena: the tree cursor every lowering walks with, and
+// each language's lowering state, whose lists keep their capacity from one
+// function to the next. The zero value is ready to use; Close releases the
+// cursor. It is not safe for concurrent use: one Scratch per worker, beside
+// its Arena.
+//
+// Each language's state is created on first use and, at the start of every
+// function, reset in place: every scalar is set anew and every list is
+// truncated to length zero, never reallocated, so a worker in steady state
+// allocates nothing per function beyond what a larger function than any
+// before it needs. c serves c and cpp; js serves javascript, typescript and
+// tsx.
+type Scratch struct {
+	// cur is the cursor, created by the first Lower and Reset to each
+	// function's node after it.
+	cur  *ts.TreeCursor
+	c    cLower
+	gol  goLower
+	java javaLower
+	js   jsLower
+	py   pyLower
+	rs   rsLower
+}
+
+// cursor is s's tree cursor reset to fn.
+func (s *Scratch) cursor(fn *ts.Node) *ts.TreeCursor {
+	if s.cur == nil {
+		s.cur = fn.Walk()
+	} else {
+		s.cur.Reset(*fn)
+	}
+	return s.cur
+}
+
+// Close releases the cursor. s stays usable: the next Lower creates another.
+func (s *Scratch) Close() {
+	if s.cur != nil {
+		s.cur.Close()
+		s.cur = nil
+	}
 }
 
 // spanOf is n's byte range.
@@ -237,6 +284,13 @@ func spanOf(n *ts.Node) flow.Span {
 
 // textOf is n's source text in src, the source its tree was parsed from.
 func textOf(src []byte, n *ts.Node) []byte { return src[n.StartByte():n.EndByte()] }
+
+// view is b as a string without a copy: a label or a scope key names the
+// source bytes themselves. It is sound because the source is not modified
+// while a file is lowered, and nothing holds a view past the function it was
+// made for: the builder and every Scratch list drop or overwrite them at the
+// next function.
+func view(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
 // firstNamed is n's first named child that is not an extra (a comment), or
 // nil.

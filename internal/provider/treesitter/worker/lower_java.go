@@ -166,9 +166,8 @@ const yieldLabel = " yield"
 // instanceof is bound in the innermost enclosing block from its test on
 // (an over-approximation of the flow scoping of JLS §6.3.1: a later pattern
 // of the same name is a new variable that shadows it).
-func lowerJava(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
-	cur := fn.Walk()
-	defer cur.Close()
+func lowerJava(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+	cur := s.cursor(fn)
 	j := javaLower{l: l, b: b, src: src, k: javaSyntaxOf(), cur: cur, first: -1, last: -1, stmtNo: 1}
 	k := j.k
 	switch fn.KindId() {
@@ -578,7 +577,7 @@ func (j *javaLower) stmt(n *ts.Node) {
 // label is a break or continue statement's label, or "".
 func (j *javaLower) label(n *ts.Node) string {
 	if l := firstNamed(n); l != nil {
-		return string(j.text(l))
+		return view(j.text(l))
 	}
 	return ""
 }
@@ -1084,7 +1083,7 @@ func (j *javaLower) labeled(n *ts.Node, labels []string) {
 		j.valueNode(n)
 		return
 	}
-	labels = append(labels, string(j.text(&list[0])))
+	labels = append(labels, view(j.text(&list[0])))
 	body := &list[len(list)-1]
 	switch body.KindId() {
 	case k.whileStmt, k.doStmt, k.forStmt, k.enhancedFor, k.switchExpr, k.labeledStmt:

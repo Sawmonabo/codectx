@@ -107,9 +107,8 @@ var goLowering = Lowering{
 // at any later point, or never, so a use after the creating node sees that
 // may-definition and every definition that reached the creating node.
 // `defer func() {...}()` is therefore one node carrying the captures.
-func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
-	cur := fn.Walk()
-	defer cur.Close()
+func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+	cur := s.cursor(fn)
 	g := &goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: cur}
 	k := g.k
 	g.open()
@@ -454,7 +453,7 @@ func (g *goLower) stmts(n *ts.Node) (fell bool) {
 func (g *goLower) label(s *ts.Node) string {
 	for i := range s.NamedChildCount() {
 		if c := s.NamedChild(i); c.KindId() == g.k.labelName {
-			return string(g.text(c))
+			return view(g.text(c))
 		}
 	}
 	return ""
@@ -573,7 +572,7 @@ func (g *goLower) isPanic(e *ts.Node) bool {
 func (g *goLower) labeled(s *ts.Node, labels []string) {
 	k := g.k
 	id := s.ChildByFieldId(k.fLabel)
-	name := string(g.text(id))
+	name := view(g.text(id))
 	labels = append(labels, name)
 	g.b.Label(name, g.span(id))
 	var inner *ts.Node

@@ -166,9 +166,8 @@ var pythonLowering = Lowering{
 // A class body's names are visible only to the class body itself, never to
 // the callables nested in it (§4.2.2), and a comprehension's for targets are
 // its own. Blocks introduce no scope.
-func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
-	cur := fn.Walk()
-	defer cur.Close()
+func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+	cur := s.cursor(fn)
 	j := pyLower{l: l, b: b, src: src, k: pySyntaxOf(), cur: cur, first: -1, last: -1, stmtNo: 1}
 	k := j.k
 	id := fn.KindId()

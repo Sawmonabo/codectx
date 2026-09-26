@@ -195,10 +195,9 @@ const (
 // on the creating node; a by-copy capture never is. A nested function
 // definition (a GNU extension) accesses every enclosing variable by
 // reference.
-func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	k := cSyntaxOf(l.language)
-	cur := fn.Walk()
-	defer cur.Close()
+	cur := s.cursor(fn)
 	c := cLower{l: l, b: b, src: src, k: k, cur: cur, pp: -1, first: -1, last: -1, stmtNo: 1}
 	if fn.KindId() == k.lambdaExpression {
 		if d := fn.ChildByFieldId(k.fDeclarator); d != nil {
@@ -632,7 +631,7 @@ func (c *cLower) stmt(n *ts.Node) {
 		c.caseBody(n)
 	case k.labeledStatement:
 		name := n.ChildByFieldId(k.fLabel)
-		c.b.Label(string(c.text(name)), spanOf(name))
+		c.b.Label(view(c.text(name)), spanOf(name))
 		start, list := c.body(n, k.fLabel, 0, 0)
 		for i := range list {
 			c.stmt(&list[i])
@@ -648,7 +647,7 @@ func (c *cLower) stmt(n *ts.Node) {
 		c.done(start)
 	case k.gotoStatement:
 		c.node(flow.Jump, n, c.base, c.base)
-		c.b.Goto(string(c.text(n.ChildByFieldId(k.fLabel))))
+		c.b.Goto(view(c.text(n.ChildByFieldId(k.fLabel))))
 	case k.breakStatement:
 		c.node(flow.Jump, n, c.base, c.base)
 		c.b.Break("")
@@ -724,7 +723,7 @@ func (c *cLower) asm(e *ts.Node) {
 	start, list := c.kids(labels)
 	for i := range list {
 		p := c.b.Push()
-		c.b.Goto(string(c.text(&list[i])))
+		c.b.Goto(view(c.text(&list[i])))
 		c.b.Restore(p)
 		c.b.Pop(p)
 	}

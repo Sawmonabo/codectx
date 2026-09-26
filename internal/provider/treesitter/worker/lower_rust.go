@@ -158,9 +158,8 @@ const rsTryLabel = " try"
 // capture locals: it creates no node in the enclosing function and its name
 // shadows as a non-variable. Every identifier in a pattern binds, except the
 // path of a tuple-struct or struct pattern.
-func lowerRust(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
-	cur := fn.Walk()
-	defer cur.Close()
+func lowerRust(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+	cur := s.cursor(fn)
 	r := rsLower{l: l, b: b, src: src, k: rsSyntaxOf(), cur: cur, first: -1, last: -1}
 	k := r.k
 	switch fn.KindId() {
@@ -334,7 +333,7 @@ func (r *rsLower) spans(last int32, n *ts.Node) bool {
 // labelOf is the label of a loop, block, break or continue, or "".
 func (r *rsLower) labelOf(n *ts.Node) string {
 	if c := r.firstKid(n); c != nil && c.KindId() == r.k.label {
-		return string(r.text(c))
+		return view(r.text(c))
 	}
 	return ""
 }
@@ -466,7 +465,7 @@ func (r *rsLower) block(n *ts.Node) {
 	for i := range list {
 		c := &list[i]
 		if c.KindId() == k.label {
-			f, labelled = r.b.OpenBlock(string(r.text(c))), true
+			f, labelled = r.b.OpenBlock(view(r.text(c))), true
 			continue
 		}
 		r.stmt(c)
@@ -995,7 +994,7 @@ func (r *rsLower) jump(n *ts.Node) {
 	start, list := r.kids(n)
 	for i := range list {
 		if c := &list[i]; c.KindId() == k.label {
-			label = string(r.text(c))
+			label = view(r.text(c))
 		} else {
 			r.value(c)
 		}

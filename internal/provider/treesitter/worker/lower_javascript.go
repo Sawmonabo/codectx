@@ -52,9 +52,9 @@ type jsGrammar struct {
 }
 
 // lower is the Lowering.lower of the grammar: lowerJavaScript over its table.
-func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	g.once.Do(func() { g.s = resolveJSSyntax(g.language) })
-	lowerJavaScript(l, b, fn, src, g.s)
+	lowerJavaScript(l, b, fn, src, s, g.s)
 }
 
 // lowerJavaScript lowers one JavaScript callable's parameters and body into b.
@@ -228,9 +228,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 //     and may throw; `import x = A.B` is one spanning x that Uses A and
 //     defines x, and may throw when it reads a property.
 //   - `export = e` evaluates e like a default export.
-func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k *jsSyntax) {
-	cur := fn.Walk()
-	defer cur.Close()
+func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch, k *jsSyntax) {
+	cur := s.cursor(fn)
 	j := jsLower{l: l, b: b, src: src, k: k, cur: cur, first: -1, last: -1, stmtNo: 1}
 	switch fn.KindId() {
 	case k.program:
@@ -981,7 +980,7 @@ func (j *jsLower) sub(n *ts.Node) {
 // label is a break or continue statement's label, or "".
 func (j *jsLower) label(n *ts.Node) string {
 	if l := n.ChildByFieldId(j.k.fLabel); l != nil {
-		return string(j.text(l))
+		return view(j.text(l))
 	}
 	return ""
 }
@@ -1334,7 +1333,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 // targets.
 func (j *jsLower) labeled(n *ts.Node, labels []string) {
 	k := j.k
-	labels = append(labels, string(j.text(n.ChildByFieldId(k.fLabel))))
+	labels = append(labels, view(j.text(n.ChildByFieldId(k.fLabel))))
 	body := n.ChildByFieldId(k.fBody)
 	switch body.KindId() {
 	case k.forStatement, k.forInStatement, k.whileStatement, k.doStatement, k.switchStatement, k.labeledStatement:
