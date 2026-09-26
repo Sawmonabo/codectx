@@ -627,5 +627,19 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"c@24 -> c@49", "x@31 -> y = x + (c ? (x = 1) : 0)@40", "x = 1@54 -> y = x + (c ? (x = 1) : 0)@40", "0@63 -> y = x + (c ? (x = 1) : 0)@40",
 				"y = x + (c ? (x = 1) : 0)@40 -> return y;@67"},
 		},
+		{
+			// JLS §6.5.6.1 (a simple name that is not a local variable or
+			// parameter in scope names a field), §15.26.1, §15.26.2. Nodes:
+			// a@28 (the parameter), x = a@33, x += a@40. x is the field, no
+			// variable of this function, so neither assignment defines one
+			// and the compound one reads only a. Straight line: no control
+			// dependence.
+			name:     "an assignment to a field named without this defines no local",
+			protects: "an assignment whose simple name resolves to no local or parameter is lowered as a write that defines nothing, and the lowering never treats the unresolved name as a variable",
+			mutation: "drop the unresolved-name guard in holds (the lowering indexes before the start of its read table and panics on the first such assignment)",
+			src:      "class A { int x; void f(int a) { x = a; x += a; } }",
+			fn:       1,
+			du:       []string{"a@28 -> x = a@33", "a@28 -> x += a@40"},
+		},
 	})
 }

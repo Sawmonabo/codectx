@@ -511,9 +511,11 @@ func (j *javaLower) read(v int32) {
 	j.reads = append(j.reads, v)
 }
 
-// holds reports whether reads hold v, first at reads[at[v]].
+// holds reports whether reads hold v, first at reads[at[v]]. A name that
+// resolves to no variable of this function (v is -1: a field named without
+// `this`, an undeclared name) is never held, as read never records it.
 func (j *javaLower) holds(v int32) bool {
-	return int(v) < len(j.at) && int(j.at[v]) < len(j.reads) && j.reads[j.at[v]] == v
+	return v >= 0 && int(v) < len(j.at) && int(j.at[v]) < len(j.reads) && j.reads[j.at[v]] == v
 }
 
 // earlier makes node id, which defines the local v and whose own reads
