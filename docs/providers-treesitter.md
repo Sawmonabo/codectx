@@ -432,6 +432,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@def.<kind>` | a declaration of `<kind>` (function, method, class, interface, struct, enum, field, variable, constant, module, namespace, test); its `@name` (or `@declarator` for C) names it, `@body` marks where the signature ends |
 | `@scope` + `@scope.name` | a non-declaration container that contributes to qualified names and turns functions into methods (Rust `impl`) |
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
+| `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
 | `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |

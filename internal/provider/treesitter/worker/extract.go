@@ -51,6 +51,14 @@ type importRec struct {
 	seen map[string]bool
 }
 
+// add appends one local name the statement binds, once.
+func (r *importRec) add(name string) {
+	if name != "" && !r.seen[name] {
+		r.seen[name] = true
+		r.names = append(r.names, name)
+	}
+}
+
 type refRec struct {
 	span
 	// nameSpan is the callee/type identifier token alone, inside span. The
@@ -196,9 +204,43 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
 	}
 	for _, n := range caps["import.name"] {
-		if t := n.Utf8Text(e.src); t != "" && !rec.seen[t] {
-			rec.seen[t] = true
-			rec.names = append(rec.names, t)
+		rec.add(n.Utf8Text(e.src))
+	}
+	for _, c := range caps["import.clause"] {
+		importClauseBindings(c, func(id *ts.Node) { rec.add(id.Utf8Text(e.src)) })
+	}
+}
+
+// importClauseBindings calls bind with every local name an ECMAScript import
+// clause binds, in source order: the default binding, the namespace binding,
+// and each named specifier's alias, or its name when it has none. A specifier
+// whose local name is not an identifier binds nothing. The query captures the
+// clause once per statement and this walks it with one tree cursor, so a
+// statement naming any number of specifiers costs time linear in their count.
+func importClauseBindings(clause ts.Node, bind func(id *ts.Node)) {
+	cur := clause.Walk()
+	defer cur.Close()
+	for _, part := range clause.NamedChildren(cur) {
+		switch part.Kind() {
+		case "identifier":
+			bind(&part)
+		case "namespace_import":
+			if id := childOfKind(part, "identifier"); id != nil {
+				bind(id)
+			}
+		case "named_imports":
+			for _, spec := range part.NamedChildren(cur) {
+				if spec.Kind() != "import_specifier" {
+					continue // a comment between specifiers
+				}
+				local := spec.ChildByFieldName("alias")
+				if local == nil {
+					local = spec.ChildByFieldName("name")
+				}
+				if local != nil && local.Kind() == "identifier" {
+					bind(local)
+				}
+			}
 		}
 	}
 }
