@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"bytes"
 	"sync"
 	"unsafe"
 
@@ -230,13 +229,16 @@ func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error
 // serves every language and every function a worker lowers.
 func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *flow.Graph {
 	b := a.Begin(spanOf(fn))
+	s.scope.truncate(0)
 	l.lower(l, b, fn, src, s)
+	s.scope.truncate(0)
 	return b.Finish()
 }
 
 // Scratch is one worker's reusable lowering state, the pointer-bearing
-// counterpart of flow.Arena: the tree cursor every lowering walks with, and
-// each language's lowering state, whose lists keep their capacity from one
+// counterpart of flow.Arena: the tree cursor every lowering walks with, the
+// scope chain every lowering resolves names through, and each language's
+// lowering state, whose lists keep their capacity from one
 // function to the next. The zero value is ready to use; Close releases the
 // cursor. It is not safe for concurrent use: one Scratch per worker, beside
 // its Arena.
@@ -250,13 +252,16 @@ func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *fl
 type Scratch struct {
 	// cur is the cursor, created by the first Lower and Reset to each
 	// function's node after it.
-	cur  *ts.TreeCursor
-	c    cLower
-	gol  goLower
-	java javaLower
-	js   jsLower
-	py   pyLower
-	rs   rsLower
+	cur *ts.TreeCursor
+	// scope is the scope chain of the function being lowered, empty between
+	// functions.
+	scope scope
+	c     cLower
+	gol   goLower
+	java  javaLower
+	js    jsLower
+	py    pyLower
+	rs    rsLower
 }
 
 // cursor is s's tree cursor reset to fn.
@@ -303,34 +308,93 @@ func firstNamed(n *ts.Node) *ts.Node {
 	return nil
 }
 
-// binding is one name in scope: name, a slice of the source, resolves to
+// binding is one name in scope: name, a view of the source, resolves to
 // variable v, or v is -1 for a name that shadows without being a variable of
 // the function being lowered (a constant, a type, or a name a nested
-// callable declares while its captures are resolved).
+// callable declares while its captures are resolved). prev is the index of
+// the binding of the same name it shadows, or -1.
 type binding struct {
-	name []byte
+	name string
 	v    int32
+	prev int32
 }
 
-// scope is a lowering's scope chain, innermost binding last; a block's
-// bindings are truncated away when it closes.
-type scope []binding
+// scope is the scope chain every lowering resolves names through, innermost
+// binding last, with a hash index from each name to its innermost binding. A
+// block's bindings are truncated away when it closes, and truncation restores
+// the bindings they shadowed from their prev links, so a lookup is O(1)
+// expected and a truncation costs O(bindings removed). It lives in the
+// worker's Scratch and is emptied for every function; its keys are views of
+// the source, like its names.
+type scope struct {
+	binds []binding
+	// index maps a name to the index of its innermost binding; it holds an
+	// entry for exactly the names binds holds.
+	index map[string]int32
+}
 
-// find is the index of the innermost binding of name in s[from:], or -1.
-func (s scope) find(name []byte, from int) int {
-	for i := len(s) - 1; i >= from; i-- {
-		if bytes.Equal(s[i].name, name) {
-			return i
+// mark is the scope's length, the point truncate returns to.
+func (s *scope) mark() int { return len(s.binds) }
+
+// push binds name, a slice of the source, to v in the innermost scope.
+func (s *scope) push(name []byte, v int32) { s.bind(view(name), v) }
+
+// bind is push for a name that is already a view of the source.
+func (s *scope) bind(name string, v int32) {
+	if s.index == nil {
+		s.index = make(map[string]int32)
+	}
+	prev, ok := s.index[name]
+	if !ok {
+		prev = -1
+	}
+	s.index[name] = int32(len(s.binds))
+	s.binds = append(s.binds, binding{name: name, v: v, prev: prev})
+}
+
+// truncate drops every binding from index m on, innermost first, restoring
+// the index entry each one shadowed.
+func (s *scope) truncate(m int) {
+	for i := len(s.binds) - 1; i >= m; i-- {
+		if b := s.binds[i]; b.prev < 0 {
+			delete(s.index, b.name)
+		} else {
+			s.index[b.name] = b.prev
 		}
+	}
+	clear(s.binds[m:])
+	s.binds = s.binds[:m]
+}
+
+// innermost is the index of name's innermost binding, or -1.
+func (s *scope) innermost(name []byte) int {
+	if i, ok := s.index[string(name)]; ok {
+		return int(i)
+	}
+	return -1
+}
+
+// shadowed is the index of the binding binding i shadows, or -1.
+func (s *scope) shadowed(i int) int { return int(s.binds[i].prev) }
+
+// at is binding i.
+func (s *scope) at(i int) binding { return s.binds[i] }
+
+// find is the index of the innermost binding of name in binds[from:], or -1:
+// the innermost binding has the largest index, so none lies at or past from
+// when it does not.
+func (s *scope) find(name []byte, from int) int {
+	if i := s.innermost(name); i >= from {
+		return i
 	}
 	return -1
 }
 
 // lookup is the variable name resolves to, or -1 when it is not a variable
 // of the function being lowered.
-func (s scope) lookup(name []byte) int32 {
-	if i := s.find(name, 0); i >= 0 {
-		return s[i].v
+func (s *scope) lookup(name []byte) int32 {
+	if i := s.innermost(name); i >= 0 {
+		return s.binds[i].v
 	}
 	return -1
 }

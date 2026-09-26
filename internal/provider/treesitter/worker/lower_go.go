@@ -109,7 +109,7 @@ var goLowering = Lowering{
 // `defer func() {...}()` is therefore one node carrying the captures.
 func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	cur := s.cursor(fn)
-	g := &goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: cur}
+	g := &goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: cur, binds: &s.scope}
 	k := g.k
 	g.open()
 	if r := fn.ChildByFieldId(k.fReceiver); r != nil {
@@ -146,7 +146,7 @@ type goLower struct {
 	// cur walks one node's children at a time; eachField resets it.
 	cur *ts.TreeCursor
 	// binds is the scope chain; marks are block starts.
-	binds scope
+	binds *scope
 	marks []int
 	// results are the named result variables a bare return uses.
 	results []int32
@@ -191,18 +191,18 @@ func (g *goLower) token(n *ts.Node, id uint16) *ts.Node {
 	return nil
 }
 
-func (g *goLower) open() { g.marks = append(g.marks, len(g.binds)) }
+func (g *goLower) open() { g.marks = append(g.marks, g.binds.mark()) }
 
 func (g *goLower) close() {
 	top := len(g.marks) - 1
-	g.binds = g.binds[:g.marks[top]]
+	g.binds.truncate(g.marks[top])
 	g.marks = g.marks[:top]
 }
 
 // bind makes name resolve to v in the innermost block; _ binds nothing.
 func (g *goLower) bind(name []byte, v int32) {
 	if !g.blank(name) {
-		g.binds = append(g.binds, binding{name: name, v: v})
+		g.binds.push(name, v)
 	}
 }
 
@@ -282,7 +282,7 @@ func (g *goLower) collect(n *ts.Node) {
 			g.buf = append(g.buf, v)
 		}
 	case g.l.isCallable(n):
-		g.scan(n, len(g.binds))
+		g.scan(n, g.binds.mark())
 	case g.isAddress(n):
 		if e := n.ChildByFieldId(g.k.fOperand); e != nil {
 			g.collect(e)
@@ -1209,7 +1209,7 @@ func (g *goLower) scan(n *ts.Node, base int) {
 // function literal whose own bindings start at base, or -1.
 func (g *goLower) captured(id *ts.Node, base int) int32 {
 	if i := g.binds.find(g.text(id), 0); i >= 0 && i < base {
-		return g.binds[i].v
+		return g.binds.at(i).v
 	}
 	return -1
 }

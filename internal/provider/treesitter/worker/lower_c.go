@@ -198,7 +198,7 @@ const (
 func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	k := cSyntaxOf(l.language)
 	cur := s.cursor(fn)
-	c := cLower{l: l, b: b, src: src, k: k, cur: cur, pp: -1, first: -1, last: -1, stmtNo: 1}
+	c := cLower{l: l, b: b, src: src, k: k, cur: cur, binds: &s.scope, pp: -1, first: -1, last: -1, stmtNo: 1}
 	if fn.KindId() == k.lambdaExpression {
 		if d := fn.ChildByFieldId(k.fDeclarator); d != nil {
 			c.params(d.ChildByFieldId(k.fParameters))
@@ -237,7 +237,7 @@ type cLower struct {
 	// binds is the scope chain; blockMark is where the innermost block's
 	// bindings begin, and pp where the innermost preprocessor conditional at
 	// that block level began, or -1.
-	binds     scope
+	binds     *scope
 	blockMark int
 	pp        int
 	// shadow is non-zero while walking a nested callable for its captures:
@@ -309,12 +309,15 @@ func (c *cLower) text(n *ts.Node) []byte { return textOf(c.src, n) }
 type cScope struct{ mark, block int }
 
 func (c *cLower) open() cScope {
-	s := cScope{mark: len(c.binds), block: c.blockMark}
-	c.blockMark = len(c.binds)
+	s := cScope{mark: c.binds.mark(), block: c.blockMark}
+	c.blockMark = c.binds.mark()
 	return s
 }
 
-func (c *cLower) close(s cScope) { c.binds, c.blockMark = c.binds[:s.mark], s.block }
+func (c *cLower) close(s cScope) {
+	c.binds.truncate(s.mark)
+	c.blockMark = s.block
+}
 
 // declare binds name in the innermost scope: a new variable, the variable a
 // sibling arm of the enclosing preprocessor conditional declared under the
@@ -326,19 +329,19 @@ func (c *cLower) declare(name *ts.Node) int32 {
 	case c.shadow > 0:
 	case c.pp >= 0 && c.pp >= c.blockMark:
 		if i := c.binds.find(t, c.pp); i >= 0 {
-			v = c.binds[i].v
+			v = c.binds.at(i).v
 			break
 		}
 		v = c.b.Var()
 	default:
 		v = c.b.Var()
 	}
-	c.binds = append(c.binds, binding{name: t, v: v})
+	c.binds.push(t, v)
 	return v
 }
 
 // hide binds name to no variable.
-func (c *cLower) hide(name *ts.Node) { c.binds = append(c.binds, binding{name: c.text(name), v: -1}) }
+func (c *cLower) hide(name *ts.Node) { c.binds.push(c.text(name), -1) }
 
 func (c *cLower) lookup(name *ts.Node) int32 { return c.binds.lookup(c.text(name)) }
 
@@ -1179,7 +1182,7 @@ func (c *cLower) nestedCases(n *ts.Node, tag [2]int, dflt *ts.Node) *ts.Node {
 func (c *cLower) preproc(n *ts.Node) {
 	saved := c.pp
 	if c.pp < c.blockMark {
-		c.pp = len(c.binds)
+		c.pp = c.binds.mark()
 	}
 	c.arms(n)
 	c.pp = saved

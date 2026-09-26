@@ -168,7 +168,7 @@ const yieldLabel = " yield"
 // of the same name is a new variable that shadows it).
 func lowerJava(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	cur := s.cursor(fn)
-	j := javaLower{l: l, b: b, src: src, k: javaSyntaxOf(), cur: cur, first: -1, last: -1, stmtNo: 1}
+	j := javaLower{l: l, b: b, src: src, k: javaSyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1, stmtNo: 1}
 	k := j.k
 	switch fn.KindId() {
 	case k.classBody, k.enumBody, k.interfaceBody, k.annotationTypeBody:
@@ -225,7 +225,7 @@ type javaLower struct {
 	// pops it.
 	buf []ts.Node
 	// binds is the scope chain, innermost last.
-	binds scope
+	binds *scope
 	// shadow is non-zero while walking nested code for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
@@ -320,7 +320,7 @@ func (j *javaLower) declare(name *ts.Node) int32 {
 	if j.shadow == 0 {
 		v = j.b.Var()
 	}
-	j.binds = append(j.binds, binding{name: j.text(name), v: v})
+	j.binds.push(j.text(name), v)
 	return v
 }
 
@@ -475,21 +475,21 @@ func (j *javaLower) typeBody(n *ts.Node) {
 
 // block lowers a statement list in its own scope.
 func (j *javaLower) block(n *ts.Node) {
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
 		j.stmt(&list[i])
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // sub lowers n, a statement standing alone as the body of an if, else, loop
 // or label, in a scope of its own.
 func (j *javaLower) sub(n *ts.Node) {
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	j.stmt(n)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // stmt lowers one statement.
@@ -692,7 +692,7 @@ func (j *javaLower) doStmt(n *ts.Node, labels []string) {
 
 func (j *javaLower) forStmt(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, inits := j.fieldKids(n, k.fInit)
 	for i := range inits {
 		if inits[i].KindId() == k.localVarDecl {
@@ -726,13 +726,13 @@ func (j *javaLower) forStmt(n *ts.Node, labels []string) {
 	}
 	j.done(start)
 	j.loopEnd(f, h, exits, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // enhancedFor lowers `for (T x : e) body` (see Node granularity).
 func (j *javaLower) enhancedFor(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	val := n.ChildByFieldId(k.fValue)
 	j.value(val)
 	it := j.b.Var()
@@ -753,7 +753,7 @@ func (j *javaLower) enhancedFor(n *ts.Node, labels []string) {
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // switchBlock lowers a switch statement (expr false) or a switch expression
@@ -815,8 +815,10 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 				j.b.Restore(noMatch)
 			}
 		}
-		mark := len(j.binds)
-		j.binds = append(j.binds, j.caseBinds[j.groupAt[gBase+g]:j.groupAt[gBase+g+1]]...)
+		mark := j.binds.mark()
+		for _, cb := range j.caseBinds[j.groupAt[gBase+g]:j.groupAt[gBase+g+1]] {
+			j.binds.bind(cb.name, cb.v)
+		}
 		s, list := j.kids(grp)
 		for i := range list {
 			c := &list[i]
@@ -838,7 +840,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			}
 		}
 		j.done(s)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	}
 	if dflt < 0 {
 		if expr {
@@ -880,7 +882,7 @@ func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) {
 	}
 	j.node(flow.Branch, c, 0, len(j.reads))
 	p := j.b.Push()
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	if pattern != nil {
 		j.bindPattern(pattern, 0, sel)
 	}
@@ -899,8 +901,10 @@ func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) {
 			j.b.Merge(arm)
 		}
 	}
-	j.caseBinds = append(j.caseBinds, j.binds[mark:]...)
-	j.binds = j.binds[:mark]
+	for i := mark; i < j.binds.mark(); i++ {
+		j.caseBinds = append(j.caseBinds, j.binds.at(i))
+	}
+	j.binds.truncate(mark)
 	j.done(start)
 }
 
@@ -994,13 +998,13 @@ func (j *javaLower) tryStmt(n *ts.Node) {
 				j.node(kind, ct, 0, 0)
 			}
 			p := j.b.Push()
-			mark := len(j.binds)
+			mark := j.binds.mark()
 			if name := param.ChildByFieldId(k.fName); name.KindId() == k.identifier {
 				v := j.declare(name)
 				j.def(j.node(flow.Stmt, name, 0, 0), v)
 			}
 			j.block(c.ChildByFieldId(k.fBody))
-			j.binds = j.binds[:mark]
+			j.binds.truncate(mark)
 			j.b.Merge(acc)
 			acc = j.b.Push()
 			if all {
@@ -1034,7 +1038,7 @@ func (j *javaLower) catchesAll(ct *ts.Node) bool {
 // closed in reverse order (JLS §14.20.3.2).
 func (j *javaLower) resources(spec, body *ts.Node) {
 	k := j.k
-	mark, fBase := len(j.binds), len(j.frames)
+	mark, fBase := j.binds.mark(), len(j.frames)
 	start, list := j.kids(spec)
 	for i := range list {
 		r := &list[i]
@@ -1070,7 +1074,7 @@ func (j *javaLower) resources(spec, body *ts.Node) {
 	}
 	j.done(start)
 	j.frames = j.frames[:fBase]
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // labeled hands a loop or switch its labels; any other statement is a block
@@ -1245,12 +1249,13 @@ func (j *javaLower) switchValue(n *ts.Node) {
 	for _, v := range j.reads {
 		j.seen[v] = j.stmtNo
 	}
-	mark, w := len(j.binds), len(j.writes)
+	mark, w := j.binds.mark(), len(j.writes)
 	j.shadow++
 	j.cap(n)
 	j.shadow--
 	// The switch expression's own writes were lowered as nodes already.
-	j.binds, j.writes = j.binds[:mark], j.writes[:w]
+	j.binds.truncate(mark)
+	j.writes = j.writes[:w]
 	j.throws, j.thrown = throws, thrown
 }
 
@@ -1380,7 +1385,7 @@ func (j *javaLower) update(n *ts.Node) int32 {
 // and a scope's bindings are dropped when it ends.
 func (j *javaLower) cap(n *ts.Node) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	switch n.KindId() {
 	case k.identifier:
 		j.ref(n)
@@ -1487,7 +1492,7 @@ func (j *javaLower) cap(n *ts.Node) {
 			return
 		}
 	}
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // capName declares a name a capture walk meets, unless it is `_`.
@@ -1501,21 +1506,21 @@ func (j *javaLower) capName(name *ts.Node) {
 // components (fields of its body) and its body.
 func (j *javaLower) capType(n *ts.Node) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	if ps := n.ChildByFieldId(k.fParameters); ps != nil {
 		j.cap(ps)
 	}
 	if body := n.ChildByFieldId(k.fBody); body != nil {
 		j.cap(body)
 	}
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // capBody collects a type body's captures. Its fields and enum constants
 // shadow an enclosing local throughout the body, whatever their position.
 func (j *javaLower) capBody(n *ts.Node) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
 		switch m := &list[i]; m.KindId() {
@@ -1544,7 +1549,7 @@ func (j *javaLower) capBody(n *ts.Node) {
 		}
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // javaSyntax holds the kind and field ids the Java lowering matches,

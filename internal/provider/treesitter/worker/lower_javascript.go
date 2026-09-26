@@ -230,7 +230,7 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //   - `export = e` evaluates e like a default export.
 func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch, k *jsSyntax) {
 	cur := s.cursor(fn)
-	j := jsLower{l: l, b: b, src: src, k: k, cur: cur, first: -1, last: -1, stmtNo: 1}
+	j := jsLower{l: l, b: b, src: src, k: k, cur: cur, binds: &s.scope, first: -1, last: -1, stmtNo: 1}
 	switch fn.KindId() {
 	case k.program:
 		j.hoistVars(fn)
@@ -284,12 +284,12 @@ func (j *jsLower) classBody(n *ts.Node) {
 				j.node(flow.Stmt, m, 0, len(j.reads))
 			}
 		case k.classStaticBlock:
-			mark := len(j.binds)
+			mark := j.binds.mark()
 			j.fnMark = mark
 			body := m.ChildByFieldId(k.fBody)
 			j.hoistVars(body)
 			j.block(body)
-			j.binds = j.binds[:mark]
+			j.binds.truncate(mark)
 		}
 	}
 	j.done(start)
@@ -306,7 +306,7 @@ type jsLower struct {
 	buf []ts.Node
 	// binds is the scope chain, innermost last; fnMark is where the
 	// innermost function scope begins, the target of var hoisting.
-	binds  scope
+	binds  *scope
 	fnMark int
 	// shadow is non-zero while walking a nested callable or class for its
 	// captures: declarations then bind -1 and no node is created.
@@ -374,7 +374,7 @@ func (j *jsLower) declare(name *ts.Node) int32 {
 	if j.shadow == 0 {
 		v = j.b.Var()
 	}
-	j.binds = append(j.binds, binding{name: j.text(name), v: v})
+	j.binds.push(j.text(name), v)
 	return v
 }
 
@@ -581,14 +581,14 @@ func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
 	if body == nil {
 		return
 	}
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(body)
 	for i := range list {
 		member := &list[i]
 		if member.KindId() == k.enumAssignment {
 			member = member.ChildByFieldId(k.fName)
 		}
-		j.binds = append(j.binds, binding{name: j.text(member), v: -1})
+		j.binds.push(j.text(member), -1)
 	}
 	for i := range list {
 		m := &list[i]
@@ -605,7 +605,7 @@ func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
 		}
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // namespace lowers a namespace with a body inline (see TypeScript in
@@ -619,11 +619,12 @@ func (j *jsLower) namespace(n *ts.Node) {
 	v := j.lookup(name)
 	j.read(v)
 	j.def(j.node(flow.Stmt, name, 0, 0), v)
-	mark, savedFn := len(j.binds), j.fnMark
+	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	j.hoistVars(body)
 	j.block(body)
-	j.binds, j.fnMark = j.binds[:mark], savedFn
+	j.binds.truncate(mark)
+	j.fnMark = savedFn
 }
 
 // importEquals lowers `import x = require(m)` and `import x = A.B`.
@@ -725,7 +726,7 @@ func (j *jsLower) close(saved int32) int32 {
 // block lowers a statement list in its own lexical scope: its lexical names
 // are bound from the start and its function declarations defined there.
 func (j *jsLower) block(n *ts.Node) {
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
 		j.predeclare(&list[i])
@@ -737,7 +738,7 @@ func (j *jsLower) block(n *ts.Node) {
 		j.stmt(&list[i])
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // predeclare binds the block-scoped names statement n declares.
@@ -970,11 +971,11 @@ func (j *jsLower) stmt(n *ts.Node) {
 // with or label, in an implicit block of its own: a declaration there binds
 // its names in that block, and a function declaration is hoisted within it.
 func (j *jsLower) sub(n *ts.Node) {
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	j.predeclare(n)
 	j.hoistFunction(n)
 	j.stmt(n)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // label is a break or continue statement's label, or "".
@@ -1124,7 +1125,7 @@ func (j *jsLower) doStmt(n *ts.Node, labels []string) {
 
 func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	switch init := n.ChildByFieldId(k.fInitializer); init.KindId() {
 	case k.lexicalDeclaration:
 		j.predeclare(init)
@@ -1157,13 +1158,13 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 		j.exprStmt(inc)
 	}
 	j.loopEnd(f, h, exits, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // forIn lowers for…in, for…of and for await…of.
 func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	left := j.strip(n.ChildByFieldId(k.fLeft))
 	kw := n.ChildByFieldId(k.fKind)
 	if kw != nil && kw.KindId() != k.varKw {
@@ -1203,7 +1204,7 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
@@ -1217,7 +1218,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	hb := len(j.held)
 	j.held = append(j.held, j.reads...)
 	he := len(j.held)
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, cases := j.kids(n.ChildByFieldId(k.fBody))
 	// A case's statements are its named children after the test value.
 	body := func(c *ts.Node) (int, []ts.Node) {
@@ -1293,7 +1294,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	j.b.Pop(firstPush)
 	j.match = j.match[:fb]
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 func (j *jsLower) tryStmt(n *ts.Node) {
@@ -1310,14 +1311,14 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 	if handler != nil {
 		t := j.b.Push()
 		j.b.EnterHandler(cf, spanOf(handler.Child(0)))
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if p := handler.ChildByFieldId(k.fParameter); p != nil {
 			j.reset()
 			j.declarePattern(p, false)
 			j.bind(p, 0, 0)
 		}
 		j.block(handler.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(t)
 	}
@@ -1687,7 +1688,7 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 		j.done(start)
 	}
 	j.shadow++
-	mark, savedFn := len(j.binds), j.fnMark
+	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	if id == k.functionExpression || id == k.generatorFunction {
 		if nm := fn.ChildByFieldId(k.fName); nm != nil {
@@ -1711,7 +1712,8 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 		j.hoistVars(body)
 	}
 	j.cap(body)
-	j.binds, j.fnMark = j.binds[:mark], savedFn
+	j.binds.truncate(mark)
+	j.fnMark = savedFn
 	j.shadow--
 }
 
@@ -1731,7 +1733,7 @@ func (j *jsLower) capClass(n *ts.Node) {
 	}
 	dec := j.decorated
 	j.shadow++
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	if nm := n.ChildByFieldId(k.fName); nm != nil {
 		j.declare(nm)
 	}
@@ -1745,7 +1747,7 @@ func (j *jsLower) capClass(n *ts.Node) {
 		}
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 	j.shadow--
 	if j.shadow == 0 && j.decorated > dec {
 		j.throws++
@@ -1801,11 +1803,12 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.enumMembers(n, false)
 	case k.internalModule, k.module:
 		if body := n.ChildByFieldId(k.fBody); body != nil {
-			mark, savedFn := len(j.binds), j.fnMark
+			mark, savedFn := j.binds.mark(), j.fnMark
 			j.fnMark = mark
 			j.hoistVars(body)
 			j.cap(body)
-			j.binds, j.fnMark = j.binds[:mark], savedFn
+			j.binds.truncate(mark)
+			j.fnMark = savedFn
 		}
 	case k.assignmentExpression, k.augmentedAssignmentExpression:
 		j.capWrite(n.ChildByFieldId(k.fLeft))
@@ -1818,7 +1821,7 @@ func (j *jsLower) cap(n *ts.Node) {
 	case k.classStaticBlock:
 		j.capFunction(n)
 	case k.statementBlock:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		start, list := j.kids(n)
 		for i := range list {
 			j.predeclare(&list[i])
@@ -1827,10 +1830,10 @@ func (j *jsLower) cap(n *ts.Node) {
 			j.cap(&list[i])
 		}
 		j.done(start)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.switchStatement:
 		j.cap(n.ChildByFieldId(k.fValue))
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		body := n.ChildByFieldId(k.fBody)
 		start, cases := j.kids(body)
 		for c := range cases {
@@ -1842,16 +1845,16 @@ func (j *jsLower) cap(n *ts.Node) {
 		}
 		j.done(start)
 		j.cap(body)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.forStatement:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if init := n.ChildByFieldId(k.fInitializer); init.KindId() == k.lexicalDeclaration {
 			j.predeclare(init)
 		}
 		j.children(n, false)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.forInStatement:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		left := j.strip(n.ChildByFieldId(k.fLeft))
 		if kw := n.ChildByFieldId(k.fKind); kw == nil {
 			j.capWrite(left)
@@ -1867,15 +1870,15 @@ func (j *jsLower) cap(n *ts.Node) {
 		}
 		j.cap(n.ChildByFieldId(k.fRight))
 		j.cap(n.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.catchClause:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if p := n.ChildByFieldId(k.fParameter); p != nil {
 			j.declarePattern(p, false)
 			j.patternExprs(p)
 		}
 		j.cap(n.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.variableDeclarator:
 		j.patternExprs(n.ChildByFieldId(k.fName))
 		if v := n.ChildByFieldId(k.fValue); v != nil {

@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"bytes"
 	"sync"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -168,7 +167,7 @@ var pythonLowering = Lowering{
 // its own. Blocks introduce no scope.
 func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	cur := s.cursor(fn)
-	j := pyLower{l: l, b: b, src: src, k: pySyntaxOf(), cur: cur, first: -1, last: -1, stmtNo: 1}
+	j := pyLower{l: l, b: b, src: src, k: pySyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1, stmtNo: 1}
 	k := j.k
 	id := fn.KindId()
 	j.module = id == k.module
@@ -203,7 +202,7 @@ type pyLower struct {
 	// each callable's bindings begin. frames[0] is the callable being
 	// lowered; the frames above it belong to nested callables whose captures
 	// are being collected, and bind -1.
-	binds  scope
+	binds  *scope
 	frames []pyFrame
 	// module reports that the callable being lowered is the module, whose
 	// variables a nested callable's global declaration names.
@@ -295,34 +294,40 @@ func (j *pyLower) hasToken(n *ts.Node, id uint16) bool {
 // variables of the function being lowered when it is the first frame,
 // shadows (-1) for a nested callable.
 func (j *pyLower) pushFrame(fn *ts.Node) {
-	j.frames = append(j.frames, pyFrame{mark: len(j.binds), class: fn.KindId() == j.k.classDefinition})
+	j.frames = append(j.frames, pyFrame{mark: j.binds.mark(), class: fn.KindId() == j.k.classDefinition})
 	j.collect(fn)
 }
 
 // popFrame closes the innermost scope.
 func (j *pyLower) popFrame() {
 	f := j.frames[len(j.frames)-1]
-	j.binds = j.binds[:f.mark]
+	j.binds.truncate(f.mark)
 	j.frames = j.frames[:len(j.frames)-1]
 }
 
 // resolve is the variable name resolves to, searching the frames from index
-// from outward and skipping every class frame but the innermost one.
+// from outward and skipping every class frame but the innermost one. It
+// follows name's shadowing chain from its innermost binding, so it visits
+// only the bindings of name.
 func (j *pyLower) resolve(name []byte, from int) int32 {
 	inner := len(j.frames) - 1
-	for i := from; i >= 0; i-- {
-		f := j.frames[i]
-		if f.class && i != inner {
+	end := j.binds.mark()
+	if from+1 < len(j.frames) {
+		end = j.frames[from+1].mark
+	}
+	i := from
+	for x := j.binds.innermost(name); x >= 0; x = j.binds.shadowed(x) {
+		if x >= end {
 			continue
 		}
-		end := len(j.binds)
-		if i+1 < len(j.frames) {
-			end = j.frames[i+1].mark
+		for i >= 0 && j.frames[i].mark > x {
+			i--
 		}
-		for x := end - 1; x >= f.mark; x-- {
-			if bytes.Equal(j.binds[x].name, name) {
-				return j.binds[x].v
-			}
+		if i < 0 {
+			return -1
+		}
+		if f := j.frames[i]; !f.class || i == inner {
+			return j.binds.at(x).v
 		}
 	}
 	return -1
@@ -338,7 +343,7 @@ func (j *pyLower) frameMark() int { return j.frames[len(j.frames)-1].mark }
 // bindAs binds name in the innermost frame to v unless it is bound there.
 func (j *pyLower) bindAs(name []byte, v int32) {
 	if j.binds.find(name, j.frameMark()) < 0 {
-		j.binds = append(j.binds, binding{name: name, v: v})
+		j.binds.push(name, v)
 	}
 }
 
@@ -348,8 +353,8 @@ func (j *pyLower) bindAs(name []byte, v int32) {
 func (j *pyLower) site(name *ts.Node) {
 	t := j.text(name)
 	if i := j.binds.find(t, j.frameMark()); i >= 0 {
-		if j.shadow > 0 && j.binds[i].v >= 0 {
-			j.writes = append(j.writes, j.binds[i].v)
+		if j.shadow > 0 && j.binds.at(i).v >= 0 {
+			j.writes = append(j.writes, j.binds.at(i).v)
 		}
 		return
 	}
@@ -357,7 +362,7 @@ func (j *pyLower) site(name *ts.Node) {
 	if j.shadow == 0 {
 		v = j.b.Var()
 	}
-	j.binds = append(j.binds, binding{name: t, v: v})
+	j.binds.push(t, v)
 }
 
 // collect binds callable fn's locals in the innermost frame: first its
@@ -434,13 +439,13 @@ func (j *pyLower) declarations(n *ts.Node) {
 
 // frameVar is name's binding in frame i alone, or -1.
 func (j *pyLower) frameVar(i int, name []byte) int32 {
-	end := len(j.binds)
+	end := j.binds.mark()
 	if i+1 < len(j.frames) {
 		end = j.frames[i+1].mark
 	}
-	for x := end - 1; x >= j.frames[i].mark; x-- {
-		if bytes.Equal(j.binds[x].name, name) {
-			return j.binds[x].v
+	for x := j.binds.innermost(name); x >= j.frames[i].mark; x = j.binds.shadowed(x) {
+		if x < end {
+			return j.binds.at(x).v
 		}
 	}
 	return -1

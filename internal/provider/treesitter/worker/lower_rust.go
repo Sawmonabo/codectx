@@ -160,7 +160,7 @@ const rsTryLabel = " try"
 // path of a tuple-struct or struct pattern.
 func lowerRust(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	cur := s.cursor(fn)
-	r := rsLower{l: l, b: b, src: src, k: rsSyntaxOf(), cur: cur, first: -1, last: -1}
+	r := rsLower{l: l, b: b, src: src, k: rsSyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1}
 	k := r.k
 	switch fn.KindId() {
 	case k.functionItem, k.closureExpression:
@@ -183,7 +183,7 @@ type rsLower struct {
 	// buf is a stack of child lists; kids pushes one and done pops it.
 	buf []ts.Node
 	// binds is the scope chain, innermost last.
-	binds scope
+	binds *scope
 	// shadow is non-zero while walking a nested callable for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
@@ -247,7 +247,7 @@ func (r *rsLower) declare(name *ts.Node) int32 {
 	if r.shadow == 0 {
 		v = r.b.Var()
 	}
-	r.binds = append(r.binds, binding{name: r.text(name), v: v})
+	r.binds.push(r.text(name), v)
 	return v
 }
 
@@ -444,7 +444,7 @@ func (r *rsLower) predeclare(n *ts.Node) {
 	switch n.KindId() {
 	case k.functionItem, k.constItem, k.staticItem, k.structItem:
 		if name := n.ChildByFieldId(k.fName); name != nil {
-			r.binds = append(r.binds, binding{name: r.text(name), v: -1})
+			r.binds.push(r.text(name), -1)
 		}
 	}
 }
@@ -455,7 +455,7 @@ func (r *rsLower) block(n *ts.Node) {
 		return
 	}
 	k := r.k
-	mark := len(r.binds)
+	mark := r.binds.mark()
 	start, list := r.kids(n)
 	for i := range list {
 		r.predeclare(&list[i])
@@ -474,7 +474,7 @@ func (r *rsLower) block(n *ts.Node) {
 		r.b.CloseFrame(f)
 	}
 	r.done(start)
-	r.binds = r.binds[:mark]
+	r.binds.truncate(mark)
 }
 
 // stmt lowers one statement of a block, or its tail expression.
@@ -742,10 +742,10 @@ func (r *rsLower) release(mark int) {
 
 func (r *rsLower) ifExpr(n *ts.Node) {
 	k := r.k
-	mark := len(r.binds)
+	mark := r.binds.mark()
 	fm := r.cond(n.ChildByFieldId(k.fCondition))
 	r.block(n.ChildByFieldId(k.fConsequence))
-	r.binds = r.binds[:mark]
+	r.binds.truncate(mark)
 	t := r.b.Push()
 	r.falses(fm)
 	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
@@ -777,12 +777,12 @@ func (r *rsLower) loopExpr(n *ts.Node) {
 func (r *rsLower) whileExpr(n *ts.Node) {
 	k := r.k
 	f := r.openLoop(n)
-	mark := len(r.binds)
+	mark := r.binds.mark()
 	saved := r.open()
 	fm := r.cond(n.ChildByFieldId(k.fCondition))
 	h := r.close(saved)
 	r.block(n.ChildByFieldId(k.fBody))
-	r.binds = r.binds[:mark]
+	r.binds.truncate(mark)
 	r.b.ContinueHere(f)
 	r.b.Close(h)
 	r.falses(fm)
@@ -805,12 +805,12 @@ func (r *rsLower) forExpr(n *ts.Node) {
 	h := r.node(flow.Branch, spanOf(r.token(n, k.forKw)), 0, 0)
 	r.b.Use(h, iter)
 	exit := r.b.Push()
-	mark, im := len(r.binds), len(r.reads)
+	mark, im := r.binds.mark(), len(r.reads)
 	r.reads = append(r.reads, iter)
 	r.pattern(n.ChildByFieldId(k.fPattern), im, im+1, true)
 	r.reads = r.reads[:im]
 	r.block(n.ChildByFieldId(k.fBody))
-	r.binds = r.binds[:mark]
+	r.binds.truncate(mark)
 	r.b.ContinueHere(f)
 	r.b.Close(h)
 	r.b.Restore(exit)
@@ -848,7 +848,7 @@ func (r *rsLower) matchExpr(n *ts.Node) {
 			continue
 		}
 		pat, guard := r.armPattern(arm.ChildByFieldId(k.fPattern))
-		mark := len(r.binds)
+		mark := r.binds.mark()
 		switch {
 		case pat == nil:
 		case pat.KindId() == k.identifier && i == len(arms)-1:
@@ -866,7 +866,7 @@ func (r *rsLower) matchExpr(n *ts.Node) {
 			r.cond(guard)
 		}
 		r.sub(arm.ChildByFieldId(k.fValue))
-		r.binds = r.binds[:mark]
+		r.binds.truncate(mark)
 		r.ends = append(r.ends, r.b.Push())
 		if len(r.hs) == base {
 			live = false
@@ -1035,7 +1035,7 @@ func (r *rsLower) baseVar(t *ts.Node) int32 {
 func (r *rsLower) capFunction(fn *ts.Node) {
 	k := r.k
 	r.shadow++
-	mark := len(r.binds)
+	mark := r.binds.mark()
 	if fn.KindId() == k.closureExpression {
 		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
 			r.params(ps)
@@ -1046,7 +1046,7 @@ func (r *rsLower) capFunction(fn *ts.Node) {
 	} else if body := r.firstKid(fn); body != nil {
 		r.cap(body)
 	}
-	r.binds = r.binds[:mark]
+	r.binds.truncate(mark)
 	r.shadow--
 }
 
@@ -1077,7 +1077,7 @@ func (r *rsLower) cap(n *ts.Node) {
 		r.capWrite(n.ChildByFieldId(k.fLeft), true)
 		r.cap(n.ChildByFieldId(k.fRight))
 	case k.block:
-		mark := len(r.binds)
+		mark := r.binds.mark()
 		start, list := r.kids(n)
 		for i := range list {
 			r.predeclare(&list[i])
@@ -1086,7 +1086,7 @@ func (r *rsLower) cap(n *ts.Node) {
 			r.cap(&list[i])
 		}
 		r.done(start)
-		r.binds = r.binds[:mark]
+		r.binds.truncate(mark)
 	case k.letDeclaration:
 		if v := n.ChildByFieldId(k.fValue); v != nil {
 			r.cap(v)
@@ -1099,7 +1099,7 @@ func (r *rsLower) cap(n *ts.Node) {
 		r.cap(n.ChildByFieldId(k.fValue))
 		r.pattern(n.ChildByFieldId(k.fPattern), 0, 0, false)
 	case k.ifExpression, k.whileExpression:
-		mark := len(r.binds)
+		mark := r.binds.mark()
 		r.cap(n.ChildByFieldId(k.fCondition))
 		if c := n.ChildByFieldId(k.fConsequence); c != nil {
 			r.cap(c)
@@ -1107,18 +1107,18 @@ func (r *rsLower) cap(n *ts.Node) {
 		if body := n.ChildByFieldId(k.fBody); body != nil {
 			r.cap(body)
 		}
-		r.binds = r.binds[:mark]
+		r.binds.truncate(mark)
 		if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
 			r.cap(alt)
 		}
 	case k.forExpression:
 		r.cap(n.ChildByFieldId(k.fValue))
-		mark := len(r.binds)
+		mark := r.binds.mark()
 		r.pattern(n.ChildByFieldId(k.fPattern), 0, 0, false)
 		r.cap(n.ChildByFieldId(k.fBody))
-		r.binds = r.binds[:mark]
+		r.binds.truncate(mark)
 	case k.matchArm:
-		mark := len(r.binds)
+		mark := r.binds.mark()
 		pat, guard := r.armPattern(n.ChildByFieldId(k.fPattern))
 		if pat != nil {
 			r.pattern(pat, 0, 0, false)
@@ -1127,7 +1127,7 @@ func (r *rsLower) cap(n *ts.Node) {
 			r.cap(guard)
 		}
 		r.cap(n.ChildByFieldId(k.fValue))
-		r.binds = r.binds[:mark]
+		r.binds.truncate(mark)
 	case k.typeCastExpression:
 		r.cap(n.ChildByFieldId(k.fValue))
 	case k.genericFunction:
