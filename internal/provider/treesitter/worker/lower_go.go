@@ -186,7 +186,10 @@ var goLowering = Lowering{
 //     captures, as a creating node does); every other expression, a call, a
 //     composite literal and an address-taking included; the uses of a
 //     statement's field, index, indirect and `_` targets, which ride on its
-//     first node.
+//     first node. An `&&`/`||` expression the walk had not hoisted would be
+//     folded too, its operands' reads and may-definitions the collecting
+//     node's own, so no read is dropped; no source reaches that, since every
+//     node hoists the expression it evaluates before collecting its reads.
 //   - An if, for or switch init statement is a node of its own, lowered in
 //     the statement's implicit block before the condition or tag; the
 //     condition or tag does not Use the init statement's reads, and a
@@ -419,8 +422,13 @@ func (g *goLower) isShort(n *ts.Node) bool {
 // collect appends to buf every variable n reads and to may the base
 // variable of every address n takes; it resolves a function literal's
 // captures: its reads into buf, its writes into may. A short-circuit
-// expression has been hoisted to operand nodes of their own, which carry its
-// reads and may-definitions, so collecting it adds only its result variable.
+// expression hoist lowered to operand nodes, which carry its reads and
+// may-definitions, adds only its result variable; one hoist did not lower is
+// folded, its operands' reads and may-definitions collected as the node's
+// own, so no read is dropped whatever the caller. No source reaches the
+// fold today: every caller hoists the subtree it collects first, and hoist
+// descends into every named child collect does except a function literal,
+// which collect resolves through scan rather than through this case.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
 	case n.KindId() == g.k.identifier:
@@ -432,6 +440,12 @@ func (g *goLower) collect(n *ts.Node) {
 	case g.isShort(n):
 		if r, ok := g.shorts[n.Id()]; ok {
 			g.buf = append(g.buf, r)
+			return
+		}
+		// Not hoisted: the expression is folded into the collecting node, and
+		// its operands' reads and may-definitions are that node's own.
+		for i := range n.NamedChildCount() {
+			g.collect(n.NamedChild(i))
 		}
 	case g.isAddress(n):
 		if e := n.ChildByFieldId(g.k.fOperand); e != nil {
