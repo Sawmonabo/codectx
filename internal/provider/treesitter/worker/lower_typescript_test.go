@@ -188,14 +188,15 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// The compiler's emit of `x as T` is x: the type `typeof y`
 			// evaluates nothing. Nodes: x@11, y@19, the arrow
 			// () => x as typeof y@39 (Uses its capture x), the declarator
-			// g = () => x as typeof y@35 (Uses x, defines g), return g;@60.
+			// g = () => x as typeof y@35 (defines g and Uses nothing: the
+			// captures are the arrow's), return g;@60.
 			name:     "a closure's captures skip the type of an as expression",
 			protects: "the capture collection walks only the operand of a transparent wrapper, never its type",
-			mutation: "walk every child of an as expression in cap (y@19 pairs with the arrow and the declarator)",
+			mutation: "walk every child of an as expression in cap (y@19 -> () => x as typeof y@39 appears)",
 			src:      "function f(x: any, y: any) { const g = () => x as typeof y; return g; }",
 			fn:       1,
 			du: []string{
-				"x@11 -> () => x as typeof y@39", "x@11 -> g = () => x as typeof y@35",
+				"x@11 -> () => x as typeof y@39",
 				"g = () => x as typeof y@35 -> return g;@60",
 			},
 		},
@@ -259,7 +260,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// the same name.
 			name:     "a compound property assignment reads the property before its right side",
 			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25)",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the condition's reads (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -270,7 +271,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"o@11 -> o.p@25", "c@14 -> c@32",
-				"o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25",
+				"o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		goldenCase{

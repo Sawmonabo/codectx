@@ -115,14 +115,13 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			name:     "destructuring default and a closure that shadows",
 			protects: "one defining node per bound name, a default as a conditional definition, and a closure's own parameter shadowing the enclosing name",
-			mutation: "resolve names inside the arrow against the enclosing scope only (a@24 gains uses at the arrow and at g), or bind the default unconditionally",
+			mutation: "resolve names inside the arrow against the enclosing scope only (a@24 gains a use at the arrow), bind the default unconditionally, or give the declarator the arrow's captures (b = a@27 -> g = (a) => a + b@46 and a@31 -> g = (a) => a + b@46 appear)",
 			src:      "function f(o) { const { a, b = a } = o; const g = (a) => a + b; return g; }",
 			fn:       1,
 			cd:       []string{"b = a@27 -> a@31"},
 			du: []string{
 				"o@11 -> a@24", "o@11 -> b = a@27", "a@24 -> a@31",
 				"b = a@27 -> (a) => a + b@50", "a@31 -> (a) => a + b@50",
-				"b = a@27 -> g = (a) => a + b@46", "a@31 -> g = (a) => a + b@46",
 				"g = (a) => a + b@46 -> return g;@64",
 			},
 		},
@@ -232,7 +231,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			name:     "a property write whose right side branches is its own throwing node",
 			protects: "a property write is one node after its right side, and only it throws for the store, so the right side's decision does not control the catch",
-			mutation: "count the store's throw before the right side (c@31 gains control of catch@43, e@50 and h()@55), or skip the write node when the right side made a node (the write node and its pairs vanish)",
+			mutation: "count the store's throw before the right side (c@31 gains control of catch@43, e@50 and h()@55), skip the write node when the right side made a node (the write node and its pairs vanish), or give the write the condition's reads (c@14 -> o.p = c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p = c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -241,7 +240,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"c@14 -> c@31",
-				"o@11 -> o.p = c ? 1 : 2@25", "c@14 -> o.p = c ? 1 : 2@25",
+				"o@11 -> o.p = c ? 1 : 2@25",
 			},
 		},
 		{
@@ -257,14 +256,13 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			name:     "a closure's write to an enclosing variable is a may-definition where it is created",
-			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation, and the closure node reads only its captures, not the call receiver read before it",
-			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pairs to the call and to return n), as a killing definition (return n loses n = 0@21), or attach a read no node evaluated to the next node made (xs@11 -> x => { n += x }@39 appears)",
+			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation, the closure node reads only its captures, not the call receiver read before it, and the call consuming the closure does not repeat them",
+			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pair to return n), as a killing definition (return n loses n = 0@21), attach a read no node evaluated to the next node made (xs@11 -> x => { n += x }@39 appears), or give the call the arrow's captures (n = 0@21 and x => { n += x }@39 pair with xs.forEach(x => { n += x })@28)",
 			src:      "function f(xs) { let n = 0; xs.forEach(x => { n += x }); return n; }",
 			fn:       1,
 			du: []string{
 				"xs@11 -> xs.forEach(x => { n += x })@28",
-				"n = 0@21 -> x => { n += x }@39", "n = 0@21 -> xs.forEach(x => { n += x })@28",
-				"x => { n += x }@39 -> xs.forEach(x => { n += x })@28",
+				"n = 0@21 -> x => { n += x }@39",
 				"n = 0@21 -> return n;@57", "x => { n += x }@39 -> return n;@57",
 			},
 		},
@@ -287,14 +285,13 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			name:     "an optional call and a callable operand are one node each",
-			protects: "an expression whose own lowering already made the node spanning it takes no second node with the same span",
-			mutation: "always end an expression statement or a conditional operand with its own node (a?.b()@19 and () => a@38 are each made twice, doubling their pairs)",
+			protects: "an expression whose own lowering already made the node spanning it takes no second node with the same span, and a return consuming a conditional Uses neither its condition nor an arm's captures",
+			mutation: "always end an expression statement or a conditional operand with its own node (a?.b()@19 and () => a@38 are each made twice: a@11 -> a?.b()@19 and c@34 -> () => a@38 appear twice), or give the return the condition's reads or the arrow's captures (c@14 -> return c ? () => a : 0;@27 or a@11 -> return c ? () => a : 0;@27 appears)",
 			src:      "function f(a, c) { a?.b(); return c ? () => a : 0; }",
 			fn:       1,
 			cd:       []string{"a@19 -> a?.b()@19", "c@34 -> () => a@38", "c@34 -> 0@48"},
 			du: []string{
 				"a@11 -> a@19", "a@11 -> a?.b()@19", "c@14 -> c@34", "a@11 -> () => a@38",
-				"a@11 -> return c ? () => a : 0;@27", "c@14 -> return c ? () => a : 0;@27",
 			},
 		},
 		{
@@ -328,15 +325,15 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// evaluated and its value read (GetValue) before the right side,
 			// and PutValue stores after it. Nodes: the property read o.p@25
 			// (Uses o, may throw), the right side's Branch c@32 and its arms
-			// 1@36 and 2@40, then the write o.p += c ? 1 : 2@25 (Uses o and
-			// c, may throw). Both throwing nodes reach the catch's Handler
+			// 1@36 and 2@40, then the write o.p += c ? 1 : 2@25 (Uses o, not
+			// the condition's c, may throw). Both throwing nodes reach the catch's Handler
 			// catch@44, then e@51 and h()@56. The read's successors are c@32
 			// and the Handler; c@32 is post-dominated by the write, the
 			// Handler by e and h(), so the read controls those five; the
 			// write controls the Handler's three; c controls its arms.
 			name:     "a compound property assignment reads the property before its right side",
 			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25)",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the condition's reads (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -347,7 +344,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"o@11 -> o.p@25", "c@14 -> c@32",
-				"o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25",
+				"o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		{
@@ -373,7 +370,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// dependence.
 			name:     "a closure's plain assignment writes an enclosing variable without reading it",
 			protects: "the creating node of a closure that only assigns an enclosing variable does not Use it, so no earlier definition flows into the closure",
-			mutation: "collect a plain assignment's target as a read in cap (x@11 -> () => { x = 1; }@26 and x@11 -> g = () => { x = 1; }@22 appear)",
+			mutation: "collect a plain assignment's target as a read in cap (x@11 -> () => { x = 1; }@26 appears)",
 			src:      "function f(x) { const g = () => { x = 1; }; return x; }",
 			fn:       1,
 			du:       []string{"x@11 -> return x;@44", "() => { x = 1; }@26 -> return x;@44"},
