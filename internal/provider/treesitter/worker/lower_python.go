@@ -56,11 +56,14 @@ var pythonLowering = Lowering{
 //     is a Stmt node spanning True. A loop's else body is lowered from the
 //     head's false edge after the loop's frame closes, so a break skips it
 //     and a break or continue inside it targets the enclosing loop.
-//   - `for t in e:` is a Stmt node spanning e, evaluated once, then a Branch
-//     head spanning from the start of t to the end of e (whether another
-//     element is assigned), which defines nothing: each name t binds is
-//     defined on the body path by the unpacking rule above, so the exit edge
-//     carries the definitions from before the loop. async for is the same.
+//   - `for t in e:` (§8.3) follows Iteration (see Lowering): a Stmt node
+//     spanning e, evaluated once, defines the loop's iteration variable; the
+//     Branch head, spanning from the start of t to the end of e (whether
+//     another element is assigned), Uses only that variable and defines
+//     nothing. Each name t binds is defined on the body path by the
+//     unpacking rule above, each binding node Using the iteration variable
+//     and none of e's reads, so the exit edge carries the definitions from
+//     before the loop. async for is the same.
 //   - `and`, `or` and the conditional expression: the deciding operand is a
 //     Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -1324,13 +1327,17 @@ func (j *pyLower) forStmt(n *ts.Node) {
 	left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
 	j.value(right)
 	j.throws++ // iter()
-	j.node(flow.Stmt, right, 0, len(j.reads))
-	rEnd := len(j.reads)
+	it := j.b.Var()
+	j.def(j.node(flow.Stmt, right, 0, len(j.reads)), it)
 	f := j.b.OpenLoop()
+	j.reset()
 	j.throws++ // next()
-	h := j.nodeAt(flow.Branch, flow.Span{Start: uint32(left.StartByte()), End: uint32(right.EndByte())}, 0, rEnd)
+	h := j.nodeAt(flow.Branch, flow.Span{Start: uint32(left.StartByte()), End: uint32(right.EndByte())}, 0, 0)
+	j.b.Use(h, it)
 	exit := j.b.Push()
-	j.bind(left, nil, 0, rEnd)
+	j.reset()
+	j.read(it)
+	j.bind(left, nil, 0, len(j.reads))
 	j.block(n.ChildByFieldId(k.fBody))
 	j.loopEnd(n, f, h, true, exit)
 }

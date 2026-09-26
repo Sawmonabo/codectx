@@ -54,21 +54,46 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"i = -1@69 -> return i@77"},
 		},
 		{
-			// §8.3. Lines at 0, 11, 25, 33, 42, 49, 57. Nodes: xs@6, xs@21
-			// (the iterable, evaluated once), x in xs@16 (head), x@16 (the
-			// target, on the body path), x@30 (if), break@36, x = 0@51
-			// (else), return x@58. Succ: head→{x@16, x = 0}; x@16→x@30;
-			// x@30→{break, head}; break→return x; x = 0→return x. IPDom:
-			// x@16 → x@30; x@30, head, x = 0 → return x.
+			// §8.3: the iterable is evaluated once, then each item is
+			// assigned to the target. Lines at 0, 11, 25, 33, 42, 49, 57.
+			// Nodes: xs@6, xs@21 (the iterable: Uses xs, defines the
+			// iteration variable), x in xs@16 (head, Using only the
+			// iteration variable), x@16 (the target, on the body path, Using
+			// the iteration variable), x@30 (if), break@36, x = 0@51 (else),
+			// return x@58. Succ: head→{x@16, x = 0}; x@16→x@30; x@30→{break,
+			// head}; break→return x; x = 0→return x. IPDom: x@16 → x@30;
+			// x@30, head, x = 0 → return x.
 			name:     "a for loop's target is defined on the body path and its else on the exhausted path",
-			protects: "the head defines nothing, the target reads the iterable, and a break carries the target's value past the else",
-			mutation: "define the target on the head (x = 0@51 no longer kills it and x@16 -> x@30 becomes x in xs@16 -> x@30), or run the else after a break",
+			protects: "the head defines nothing, the head and the target read the iteration variable the iterable's node defines, not the iterable's names, and a break carries the target's value past the else",
+			mutation: "define the target on the head (x = 0@51 no longer kills it and x@16 -> x@30 becomes x in xs@16 -> x@30), or make the head and the target Use the iterable's reads (xs@6 -> x in xs@16 and xs@6 -> x@16 appear), or run the else after a break",
 			src:      "def f(xs):\n for x in xs:\n  if x:\n   break\n else:\n  x = 0\n return x\n",
 			fn:       1,
 			cd: []string{"x in xs@16 -> x@16", "x in xs@16 -> x@30", "x in xs@16 -> x = 0@51",
 				"x@30 -> break@36", "x@30 -> x in xs@16"},
-			du: []string{"xs@6 -> xs@21", "xs@6 -> x in xs@16", "xs@6 -> x@16",
+			du: []string{"xs@6 -> xs@21", "xs@21 -> x in xs@16", "xs@21 -> x@16",
 				"x@16 -> x@30", "x@16 -> return x@58", "x = 0@51 -> return x@58"},
+		},
+		{
+			// §8.3: the iterable is evaluated once and an iterator created
+			// for it, so a body that changes d does not change what the head
+			// steps. Lines at 0, 10, 23, 37. Nodes: d@6, d@20 (the iterable:
+			// Uses d, defines the iteration variable), k in d@15 (head,
+			// Using only the iteration variable), k@15 (the target, Using
+			// the iteration variable), d[k] = g(k)@25 (Uses k and d,
+			// may-defines d, its base variable, §7.2), return d@38. Succ:
+			// d@20→head→{k@15, return d}; k@15→d[k] = g(k)→head. IPDom:
+			// k@15 → d[k] = g(k) → head → return d. The subscript write's
+			// may-definition kills nothing, so d@6 and it both reach it
+			// around the loop and reach return d.
+			name:     "a body that writes through the iterated name does not reach the loop head",
+			protects: "the head reads the iterator made once from d, so a subscript write to d in the body, a may-definition of d, pairs with the later reads of d and never with the head",
+			mutation: "make the head Use the iterable's reads (d@6 -> k in d@15 and d[k] = g(k)@25 -> k in d@15 appear)",
+			src:      "def f(d):\n for k in d:\n  d[k] = g(k)\n return d\n",
+			fn:       1,
+			cd:       []string{"k in d@15 -> k@15", "k in d@15 -> d[k] = g(k)@25", "k in d@15 -> k in d@15"},
+			du: []string{"d@6 -> d@20", "d@20 -> k in d@15", "d@20 -> k@15", "k@15 -> d[k] = g(k)@25",
+				"d@6 -> d[k] = g(k)@25", "d[k] = g(k)@25 -> d[k] = g(k)@25",
+				"d@6 -> return d@38", "d[k] = g(k)@25 -> return d@38"},
 		},
 		{
 			// §8.2. Lines at 0, 9, 22, 32, 41. Nodes: True@16 (a Stmt head
@@ -390,8 +415,9 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §8.3, §8.2. Lines at 0, 10, 20, 34, 43, 51, 63, 71. Nodes:
-			// a@6, a@17 (while head), a@31 (the iterable), y in a@26 (for
-			// head), y@26 (target), break@37, continue@54 (the for's else),
+			// a@6, a@17 (while head), a@31 (the iterable: Uses a, defines
+			// the iteration variable), y in a@26 (for head) and y@26
+			// (target), each Using only the iteration variable, break@37, continue@54 (the for's else),
 			// a = 0@65, return a@72. The for's frame is closed when its else
 			// runs, so the continue targets the while. Succ: a@17→{a@31,
 			// return a}; a@31→y in a→{y@26, continue}; y@26→break→a = 0→
@@ -404,12 +430,15 @@ func TestPythonLoweringGolden(t *testing.T) {
 			fn:       1,
 			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> a@17",
 				"y in a@26 -> y@26", "y in a@26 -> break@37", "y in a@26 -> a = 0@65", "y in a@26 -> continue@54"},
-			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@72",
-				"a = 0@65 -> a@17", "a = 0@65 -> a@31", "a = 0@65 -> y in a@26", "a = 0@65 -> y@26", "a = 0@65 -> return a@72"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> return a@72",
+				"a@31 -> y in a@26", "a@31 -> y@26",
+				"a = 0@65 -> a@17", "a = 0@65 -> a@31", "a = 0@65 -> return a@72"},
 		},
 		{
 			// §8.3, §8.2. Lines at 0, 10, 20, 34, 42, 50, 59. Nodes: a@6,
-			// a@17 (while head), a@31, y in a@26 (for head), y@26, break@53
+			// a@17 (while head), a@31 (the iterable, defining the iteration
+			// variable), y in a@26 (for head) and y@26, each Using only the
+			// iteration variable, break@53
 			// (the for's else), return a@60. Succ: a@17→{a@31, return a};
 			// a@31→y in a→{y@26, break}; y@26→y in a; break→return a.
 			// IPDom: a@17 → return a; a@31 → y in a → break → return a;
@@ -421,7 +450,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			fn:       1,
 			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> break@53",
 				"y in a@26 -> y@26", "y in a@26 -> y in a@26"},
-			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@60"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@31 -> y in a@26", "a@31 -> y@26", "a@6 -> return a@60"},
 		},
 		{
 			// §8.4.2. Lines at 0, 9, 16, 22, 28, 40, 48, 60, 67. Nodes:
