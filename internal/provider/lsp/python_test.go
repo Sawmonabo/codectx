@@ -18,8 +18,7 @@ import (
 // TestPythonServerRunsAsItself pins the Definition ADR-0006 chose for python
 // and, more importantly, the shape of its launch: the payload is a native
 // binary, so the resolved argv is the executable itself with the definition's
-// arguments after it and nothing composed in front. The previous python server
-// was hosted by the managed Node runtime, and a definition that kept a
+// arguments after it and nothing composed in front. A definition with a hosted
 // runtime's argument shape would start the wrong process with no test failing.
 func TestPythonServerRunsAsItself(t *testing.T) {
 	def, ok := definitions["ty"]
@@ -117,7 +116,7 @@ func TestBindingCarriesTheServerReportAndEncoding(t *testing.T) {
 		profile.EnvAllowlist = append(profile.EnvAllowlist,
 			"CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
 		mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
-			StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+			StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
 		if err != nil {
 			t.Fatal(err)
 		}
