@@ -26,54 +26,82 @@ func Grammar(name string) (*ts.Language, bool) {
 // function sees only the expression that creates it. A Lowering holds no
 // per-function state and is safe to share.
 //
-// # Uses: the consumption rule
+// # Uses: values travel through variables
 //
-// Every lowering applies one rule for which variables a node Uses. A node
-// Uses what its own evaluation reads, plus the reads of every nested
-// value-producing construct whose value it consumes:
+// Every lowering applies one rule for which variables a node Uses. A value
+// computed at one node and used at another always travels through a
+// variable: a named one, or one the lowering owns (flow.Builder.Var, bound to
+// no name). No node re-reads names on another node's behalf. A node Uses
+// what its own evaluation reads: the reads that no node of their own
+// carries.
 //
-//   - a switch or match expression's selector and its arm results (an arm's
-//     value expression, the operand of the `yield` or valued `break` that
-//     leaves it, a block's tail expression), and in the same way the operand
-//     of a valued `break` a consumed loop or labelled block is left by, and
-//     of a `?` that completes a consumed try block with its error;
-//   - a conditional expression's arms (`c ? a : b`, a Python `a if c else b`,
-//     a valued `if` in Rust): the arm values, not the condition, which is a
-//     node of its own evaluated before either arm;
-//   - a statement expression's value, the value of its last statement;
-//   - a short-circuit operand of `&&`, `||`, `and`, `or`, `??`, whose value
-//     is the operator's value.
+// A nested value-producing construct that a lowering lowers to nodes of its
+// own hands its value to the node consuming it through an owned result
+// variable. Every node that yields the value defines that variable, and the
+// consumer Uses it:
 //
-// A node does not Use the reads of a nested node that is evaluated
-// separately and only sits inside its span. Such a node carries its reads
-// itself. That covers a loop's iterated expression (see Iteration), a
-// condition or loop head inside a consumed block, a statement of a consumed
-// block other than the one producing its value, and a nested callable's
-// body: the node that creates a callable (a lambda, closure, local
-// function, anonymous class, generator or comprehension, an async block)
-// Uses the enclosing variables it captures, and a node consuming the
-// created value does not repeat them.
+//   - a switch or match expression: each arm's result node, and the `yield`
+//     or valued `break` that leaves it;
+//   - a conditional (`c ? a : b`, a Python `a if c else b`, a valued `if` in
+//     Rust): each arm's result node;
+//   - a block, loop or labelled block consumed as a value: its tail node,
+//     and each valued `break` that leaves it;
+//   - a try block consumed as a value: its tail node, and each `?` that
+//     completes it with its error;
+//   - a GNU C statement expression: the node of its last statement;
+//   - a short-circuit operator (`&&`, `||`, `and`, `or`, `??`) in value
+//     position: each operand node, on the path where it decides the value:
+//     the deciding operand's node defines the variable, and the operand
+//     evaluated after it defines it again, so SSA merges the two;
+//   - an embedded assignment (`y = (x = a) * 2`, `f(o.f = a)`, `x := e`): the
+//     assignment's node, which also defines its target (or may-defines a
+//     field or element target's base);
+//   - a callable's creation (a lambda, closure, local function, anonymous
+//     class, generator, comprehension, async block): the creating node,
+//     whose value is the created callable; it Uses the enclosing variables
+//     the callable captures, since reading them is its own evaluation.
 //
-// Each read is resolved in the scope where it occurs. A binding scoped to
-// an arm (a pattern variable, a guard's binding, a match capture) resolves
-// in that arm, never in the consumer's scope, where it may be out of scope
-// or name another variable: `return switch (o) { case Integer i when i > 0
-// -> i; … }` makes the return Use the arm's i.
+// SSA merges the yielding definitions at the consumer, and the yielding
+// nodes carry the control dependence on the selector or condition that
+// chose them, as `if (c) y = 1; else y = 2;` already does: in `y = switch
+// (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }` the
+// declarator depends on both yields and on the default arm's node through
+// the result variable, the yields depend on c through control, and the
+// selector is read once, at its own node.
+//
+// A lowering may instead fold a construct into one node, with no nodes for
+// its parts: the construct's reads are then that node's own evaluation, and
+// no owned variable exists. Each lowering states exactly which constructs it
+// folds and which it lowers to nodes.
+//
+// A value evaluated once and used by several later nodes is evaluated at a
+// node of its own, which defines an owned variable; the later nodes Use that
+// variable, never the names the value was computed from. That covers a
+// switch's selector and its case labels, a match scrutinee or subject and
+// its arms and patterns, a with statement's entered value and its targets, a
+// Go select clause's operands, and a loop's iterable (see Iteration).
+//
+// Each read is resolved in the scope where it occurs, on the node that
+// carries it: a binding scoped to an arm (a pattern variable, a guard's
+// binding, a match capture) is read by the arm's own nodes, so `return
+// switch (o) { case Integer i when i > 0 -> i; … }` pairs the arm's result
+// node i with the return through the result variable.
 //
 // # Iteration
 //
 // Every loop over an iterable evaluates the iterable once, before the first
 // iteration, at a node of its own, in every language: the Java enhanced for
 // (JLS §14.14.2), the C++ range for ([stmt.ranged]), the Python for and
-// async for (Language Reference §8.3), the JavaScript for…in, for…of and for
-// await…of (ECMA-262 §14.7.5.6, ForIn/OfHeadEvaluation), the Rust for (The
-// Rust Reference, Iterator loops: `IntoIterator::into_iter` once) and the Go
-// range clause (The Go Programming Language Specification, For statements
-// with range clause). That node is a Stmt node spanning the iterated
-// expression; it Uses the expression's reads and defines an iteration
-// variable the lowering owns (flow.Builder.Var, bound to no name). The loop
-// head Uses only that variable, never the names read in the iterated
-// expression, and each per-iteration binding node Uses it too.
+// async for (Language Reference §8.3) and each for clause of a comprehension
+// (§6.2.4; a later clause's iterable once per iteration of the clause
+// before it), the JavaScript for…in, for…of and for await…of (ECMA-262
+// §14.7.5.6, ForIn/OfHeadEvaluation), the Rust for (The Rust Reference,
+// Iterator loops: `IntoIterator::into_iter` once) and the Go range clause
+// (The Go Programming Language Specification, For statements with range
+// clause). That node is a Stmt node spanning the iterated expression; it
+// Uses the expression's reads and defines an iteration variable the lowering
+// owns. The loop head Uses only that variable, never the names read in the
+// iterated expression, and each per-iteration binding node Uses it too.
 //
 // The iterator is created once, so a body that rebinds the iterated name
 // does not change the iteration, and `for k in d: d[k] = f(k)`, whose body
@@ -84,12 +112,13 @@ func Grammar(name string) (*ts.Language, bool) {
 //
 // # Spans
 //
-// A condition, and a switch's or match's selector, spans its expression
-// with every enclosing pair of parentheses stripped (unparen): each pair the
-// grammar parses as a parenthesized expression, the statement's own
-// parentheses included, however deeply they nest. A GNU C statement
-// expression's own `(` `)` is such a pair, so a condition `({ …; e; })`
-// spans the compound statement `{ …; e; }`.
+// Every node that spans an expression (a condition, a selector, a case
+// label's value, an operand, an arm's result) spans it with every enclosing
+// pair of parentheses stripped (unparen): each pair the grammar parses as a
+// parenthesized expression, the statement's own parentheses included,
+// however deeply they nest. A GNU C statement expression's own `(` `)` is
+// such a pair, so a condition `({ …; e; })` spans the compound statement
+// `{ …; e; }`.
 //
 // # Address-taking
 //
