@@ -11,7 +11,7 @@
 
 **Architecture:** A Go application with immutable source snapshots, reusable immutable analysis units, generation-qualified canonical facts, SQLite/FTS5, bounded local analyzer workers, a query engine, a deterministic context compiler, and an actor-scoped source-coverage and workflow gate. CLI and MCP share typed application services.
 
-**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; SQLite FTS5; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; optional local Joern; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
+**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; SQLite FTS5; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; an optional local CPG engine; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
 
 **Reading this revision:** All 33 design sections and all 21 implementation tasks are included. The product scope remains intact. Changes remove contradictory migration requirements, avoid whole-graph duplication, specify measurable aggregate resource budgets, close source/provenance/workflow gaps, and repair implementation dependencies. Performance figures are engineering acceptance targets, not measured claims. The supplied material is a specification, not an application repository; no claim of a bug-free executable is made.
 
@@ -137,6 +137,7 @@
    - [Task 21: Complete End-to-End, Performance, Offline, Documentation, Packaging, and Release Gates](#task-21-complete-end-to-end-performance-offline-documentation-packaging-and-release-gates)
    - [Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix](#task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix)
    - [Task 23: Implement Early Cutoff on Declaration-Only Signature Digests](#task-23-implement-early-cutoff-on-declaration-only-signature-digests)
+   - [Task 24: Scale posture](#task-24-scale-posture)
 - [31. Verification Matrix](#31-verification-matrix)
 - [32. Definition of Done](#32-definition-of-done)
 - [33. Authoritative References](#33-authoritative-references)
@@ -353,7 +354,7 @@ These constraints apply to every task and to all dispatched workers.
 | No paid dependencies | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation other than lock-pinned tool fetches through the one toolchain owner. Analyzer-internal networking is declared per profile and reported. |
 | Repository safety | No source writes; safe root-relative opens, not string validation alone. Analyzer materializations cannot share writable hard links with source or CAS. |
 | Memory | No whole-repository file list, graph, protobuf index, token corpus, or result set retained in Go heap. Memory admission counts bytes, concurrency, parser processes, SQLite buffers, caches, and output serialization. |
-| Resource limits | Every queue, batch, cache, record, request, traversal, process, temporary tree, and response has an explicit finite bound. Limits never masquerade as complete results. |
+| Resource limits | **Bounded per page, unlimited in total, user-set limits reported.** Every queue, batch, cache, record, request, traversal, process, temporary tree and response is bounded for one page or one batch, so peak memory is a function of page or batch size and never of repository size; no built-in default refuses a repository, skips a file, fails a unit, drops a row or truncates an answer. A count or size bound is a configuration key where `0` (or `"unlimited"`) means no bound and is the default; only a negative value is rejected. Exceeding a user-set limit is always reported — a named file, a reason, a count — never a silent clamp or a silent drop, and a stop that leaves work standing mints a continuation cursor. Limits never masquerade as complete results. |
 | Indexing | One cross-process indexing owner per workspace; completed immutable units may be reused only when their entire input/dependency fingerprint matches. Failed or unsealed units are invisible. |
 | Publication | The active-generation pointer changes atomically only after validation. Optional failure cannot leak partial invalid facts or promote stale evidence as fresh. |
 | Queries | Pin a generation and retention lease at request start; all reads, pages, evidence, and source references use that binding. Public lists are paginated and all graph work is bounded. |
@@ -554,6 +555,7 @@ const (
     NodeDependency    NodeKind = "dependency"
     NodeConfiguration NodeKind = "configuration"
     NodeDocument      NodeKind = "document"
+    NodeSection       NodeKind = "section"
     NodeEndpoint      NodeKind = "endpoint"
     NodeDatabaseEntity NodeKind = "database_entity"
 )
@@ -871,7 +873,7 @@ LSP provides on-demand document/workspace symbols, definition, references, imple
 
 The LSP client owns Content-Length framing, initialize/initialized and shutdown/exit lifecycle, bounded outstanding requests, out-of-order responses, cancellation, document synchronization, and negotiated position encoding. LSP lifecycle is distinct from the MCP 2026 protocol. Treat server-initiated requests explicitly: return supported bounded read-only configuration, otherwise a protocol error; never perform `workspace/applyEdit`, run project commands, or follow external URIs. Validate returned ranges and locations against the materialization. [7](#ref-7)
 
-The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the dependence provider. The complete advertised live-query feature set remains available as a labeled overlay.
+The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `ty`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the dependence provider. The complete advertised live-query feature set remains available as a labeled overlay.
 
 <a id="116-dependence-provider"></a>
 ### 11.6 Dependence Provider
@@ -887,7 +889,7 @@ One parse handles exactly one language, so the coordinator schedules one unit pe
 
 The provider never delays base readiness. Nothing runs before the base generation is active, and nothing is installed when the workspace is opened: the backend construction resolves the analysis payload only if the store already holds it, keeps the payload's pinned identity otherwise, and the first unit that needs the engine fetches it at unit time. With `providers.dependence.enabled = "auto"` (the default), the coordinator then enqueues every dependence unit as low-priority background work under the resource governor; a query that asks for a dependence fact promotes its units to the front of that queue and answers with a typed `pending` capability (unit count, position, estimate) until they seal. A one-shot building command is not exempt from that queue: `codectx index` and `codectx refresh` alike print their own generation as soon as it activates, then drain the deferred queue to empty, printing one line per publication, and exit. An interrupted run keeps that generation and every generation already published and reports the pending unit count; `providers.dependence.enabled = false` is the opt-out, and there is no flag that skips the drain while still planning the work. `true` blocks the index on the units; `false` disables the provider. A sealed dependence unit never mutates the active generation: the coordinator builds a new generation from the active generation's units plus the sealed unit, validates it, and activates it atomically through the same path a refresh uses (Section 13.1); seals landing in one scheduler tick coalesce into one generation, and the `pending` answer becomes a real answer exactly at activation. The parsed graph is cached per unit under the private data directory and reused across generations, so unchanged code pays nothing on refresh. The cache key is the complete semantic closure: the unit's source file hashes, its manifest and lock files (`go.mod`/`go.sum`, `package.json`/lockfile/`tsconfig.json`, `pyproject.toml`/`requirements*.txt`, `Cargo.toml`/`Cargo.lock`, `compile_commands.json` and include paths), the frontend argv including excludes and the definition cap, the engine payload digest, and the runtime payload digest. Any of these changing invalidates the unit.
 
-Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin, further bounded only by an explicit user limit (`unit_memory_ceiling_bytes` set by the user; `0` means machine-derived). Only that explicit user limit may reject a unit before it runs. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. Heavy analyzers run one at a time by default (`max_concurrent_heavy_analyzers = 1`); the scheduler admits a second only when the sum of reservations fits the machine-derived allocation. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-round3-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. The provider captures stderr, parses any remaining skip warnings, and publishes `data_flows_to` as `partial` with the count and the skipped method names.
+Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin and never more than half of what the machine had available. Nothing rejects a unit for the memory it asks for: there is no ceiling and no setting that could be one, and the allocation only bounds the cap. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. How many heavy analyzers run at once is decided by that one observation of the machine and by nothing else: the scheduler admits each while the summed reservations of everything already running plus this one fit the allocation, with no count beside the sum, and a unit whose reservation exceeds the whole allocation runs alone rather than never. The same allocation admits the external indexers and the language servers, so one process's children are weighed against one figure. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-round3-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. The provider captures stderr, parses any remaining skip warnings, and publishes `data_flows_to` as `partial` with the count and the skipped method names.
 
 Reads and writes are published by this provider from the graph's assignment operators: the written operand with a resolved reference becomes `writes`, other resolved identifier uses become `reads`, both at `static_analysis` precision. No SCIP indexer sets a write role and syntax alone cannot resolve the target, so this is the only honest source. Provenance is never lost behind the neutral name: every evidence row's `provider_version` carries the adapter version and the engine payload digest, `Detection.ObservedVersion` reports the engine version and payload digest (never the engine name) to `status`, `doctor` and the ledger, and `docs/providers-dependence.md` maps digests to releases.
 
@@ -928,7 +930,7 @@ A user installs codectx and every supported language works at its best available
 | `scip-clang` | indexer | c, cpp | — | `sourcegraph/scip-clang` release binaries | linux and darwin only; Windows uses `clangd` for precise C/C++ |
 | `gopls` | server | go | — | built at release time from `golang.org/x/tools/gopls` at the pinned version | all six |
 | `typescript-language-server` | server | typescript, tsx, javascript | node | npm `typescript-language-server` with `typescript` | all six |
-| `pyright` | server | python | node | npm `pyright` | all six |
+| `ty` | server | python | — | upstream static binary | all six |
 | `clangd` | server | c, cpp | — | `clangd/clangd` release archives | as published upstream |
 | `jdtls` | server | java | jdk | `download.eclipse.org/jdtls/milestones` tarball | all six |
 | `joern` | cpg (backend of the `dependence` provider) | all nine languages; Rust requires `cargo` on the allowlisted PATH | jdk | `joernio/joern` per-platform `joern-cli` archives (astgen helpers bundled) | all six (upstream publishes linux amd64/arm64, macOS amd64/arm64, windows amd64/arm64) |
@@ -950,18 +952,18 @@ Use one private SQLite database per workspace with `modernc.org/sqlite` v1.58.0 
 ```sql
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
+PRAGMA synchronous = NORMAL;   -- writer default; storage.synchronous = "full" restores FULL (ADR-0004)
 PRAGMA busy_timeout = 5000;
 PRAGMA temp_store = FILE;
 PRAGMA mmap_size = 0;
 -- Writer connection, KiB budget:
-PRAGMA cache_size = -8192;
+PRAGMA cache_size = -1048576;
 -- Each read connection uses cache_size = -4096 instead.
 ```
 
 One write connection and at most two read connections are the default **per workspace owner process**. Separate short-lived CLI readers have their own small budget; report them where observable and avoid a background service solely to centralize every command. Configure per-connection pragmas using a supported driver hook/connector or DSN mechanism and verify them on new pooled connections. Setting a pragma on one arbitrary pooled connection is insufficient. Foreign keys and database ownership are validated before serving. [11](#ref-11) [13](#ref-13) [28](#ref-28)
 
-Use short transactions and prepared statements. No large transaction contains an entire analyzer run. `FULL` is the conservative default for acknowledged user-visible session/receipt state; batching amortizes write synchronization. A future less-durable index-only mode must not silently weaken receipt durability. `quick_check`, full FTS integrity checking, VACUUM, and whole-CAS verification run on initialization, explicit doctor/deep checks, recovery, or scheduled maintenance, not every short-lived query invocation.
+Use short transactions and prepared statements. No large transaction contains an entire analyzer run. The WAL writer opens with `PRAGMA synchronous = NORMAL` by default and `storage.synchronous = "full"` opts back into a per-commit fsync (ADR-0004); readers are pinned to `FULL`. Batching amortizes write synchronization. Because there is one writer connection, this setting covers session and receipt writes too: under NORMAL a receipt is durable against an application crash or kill at commit, and against a power loss only from the next checkpoint or clean close. That window is stated, not implied, and `storage.synchronous = "full"` closes it (ADR-0004 Decision 1a). A future less-durable index-only mode must not weaken receipt durability further than that, and must not weaken it silently. `quick_check`, full FTS integrity checking, VACUUM, and whole-CAS verification run on initialization, an explicit `doctor --deep`, recovery, or scheduled maintenance, not every short-lived query invocation; an ordinary `doctor` reads the header, the schema fingerprint and the journal mode and reports the content walk `unverified`.
 
 A writer-owned passive checkpoint runs outside latency-sensitive queries. Monitor WAL size and checkpoint progress; long-lived read transactions must not pin WAL indefinitely. A WAL high-water threshold triggers checkpointing and indexing backpressure. `journal_size_limit` is not represented as a hard live-WAL cap. The operating disk quota includes DB, WAL, CAS, temporary files, and analyzer artifacts, with a reserved free-space margin.
 
@@ -1210,8 +1212,9 @@ CREATE TABLE evidence (
 CREATE TABLE unit_delta_state (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
+    part INTEGER NOT NULL,
     payload BLOB NOT NULL,
-    PRIMARY KEY(unit_id, kind)
+    PRIMARY KEY(unit_id, kind, part)
 ) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -1494,7 +1497,7 @@ Independent ready units run only when global byte/worker/disk admission permits.
 <a id="132-watch-mode-and-cross-process-coordination"></a>
 ### 13.2 Watch Mode and Cross-Process Coordination
 
-Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce paths; cap pending path count and bytes; overflow collapses to one full-reconciliation flag. During a run, new changes accumulate for the next pass. A cross-process workspace lock prevents concurrent `index`, `refresh`, and watch/MCP builds; a second explicit caller receives `busy` or joins a bounded wait, not another writer coordinator.
+Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce paths; cap pending path count and bytes; overflow collapses to one full-reconciliation flag. During a run, new changes accumulate for the next pass. A cross-process workspace lock prevents concurrent `index`, `refresh`, and watch/MCP builds; a second explicit caller waits while the holder's own liveness stamp keeps advancing and is refused `busy` when it stops, never becoming another writer coordinator.
 
 `fsnotify` does not recursively watch an entire tree automatically. Add permitted directories, handle new/deleted directories, prefer directory watches for atomic editor replacement, and fall back to bounded polling/reconciliation when OS watch limits or filesystem support prevent coverage. Git status alone is not the source of truth for non-Git/untracked or timestamp-preserving changes. Report watch coverage, last successful reconciliation, and pending state. [14](#ref-14)
 
@@ -1513,7 +1516,7 @@ An active generation is coherent with its own snapshot even when the worktree is
 <a id="141-typed-requests-and-bounded-results"></a>
 ### 14.1 Typed Requests and Bounded Results
 
-Every result has a `Binding`, per-capability completeness, `truncated`, a reason when truncated, and a continuation cursor when safe continuation exists. Query deadlines and hard work budgets are distinct from page size. Explicitly resolve ambiguous names; never select the first candidate silently.
+Every result has a `Binding`, per-capability completeness, `truncated`, a reason when truncated, and a continuation cursor when safe continuation exists. Results are **bounded per page, unlimited in total, user-set limits reported**: `MaxVisited` and `MaxEdges` are per-page work budgets rather than ceilings on a walk, so a page that spends one ends with its reason and a continuation cursor and the next page resumes the walk from the persisted frontier, while the reported counts stay cumulative across the pages of that walk. Query deadlines are distinct from both page size and work budgets: a deadline fails the request rather than serving a short page. Explicitly resolve ambiguous names; never select the first candidate silently.
 
 ```go
 type PageRequest struct {
@@ -1992,14 +1995,13 @@ follow_symlinks = false
 include_untracked = true
 index_generated = false
 index_vendor = false
-max_files = 250000
-max_parse_file_bytes = 5242880
-max_search_file_bytes = 26214400
+max_files = 0                  # 0 or "unlimited" = no bound; the default for every count/size key
+max_parse_file_bytes = 0       # 0 = unlimited; a value you set reports each skipped file
+max_search_file_bytes = 0      # 0 = unlimited; a value you set reports each skipped file
 
 [index]
 # 0 = choose from available CPUs and memory reservations, never "unlimited".
 workers = 0
-max_parser_workers = 2
 batch_records = 1000
 batch_bytes = 4194304
 queue_bytes = 16777216
@@ -2008,36 +2010,39 @@ watch_pending_bytes = 2097152
 watch_debounce = "250ms"
 reconcile_interval = "30s"
 # Results of the last N distinct refs (branches/commits) you indexed stay on disk; A -> B -> C -> A reuses A.
-retain_refs = 8
+retain_refs = 8                # lifecycle retention, not a row drop; 0 keeps every ref
 # 0 = no size limit. User-set only; when set, evicts least-recently-used refs first, never the active one.
 max_retained_bytes = 0
 
 [resources]
-base_memory_budget_bytes = 805306368
+# How much runs at once is not here and is not settable. Heavy children -- an
+# analysis engine run, an external indexer, a language server -- are admitted
+# while the sum of the memory they reserve fits the machine-derived allocation
+# (available memory less this process's own footprint and a safety margin, and
+# never more than half of what was available); one larger than the whole
+# allocation runs alone. The parser workers and the query and traversal gates
+# come from the machine's cores. Nothing there refuses work: it waits.
 query_memory_bytes = 33554432
 cache_bytes = 33554432
-max_concurrent_queries = 4
-max_concurrent_graph_queries = 2
-max_concurrent_heavy_analyzers = 1
-max_temp_bytes = 4294967296
+max_temp_bytes = 0
 min_free_disk_bytes = 1073741824
 max_metadata_response_bytes = 262144
 max_source_response_bytes = 7340032
 query_timeout = "10s"
 max_query_text_bytes = 8192
-max_query_terms = 32
+max_query_terms = 0            # 0 = unlimited
 max_page_items = 200
-max_provider_record_bytes = 4194304
+max_provider_record_bytes = 0  # 0 = unlimited; when set, must fit index.batch_bytes
 
 [storage]
 data_dir = ""
 busy_timeout = "5s"
 read_connections = 2
-writer_cache_kib = 8192
+writer_cache_kib = 1048576
 reader_cache_kib = 4096
-wal_high_water_bytes = 67108864
 closed_session_retention = "7d"
 query_cursor_ttl = "15m"
+synchronous = "normal"          # WAL writer sync mode; "full" opts back into per-commit fsync (ADR-0004)
 
 [tools]
 # Managed analyzer toolchain (Section 11.7). Nothing here is required.
@@ -2045,21 +2050,31 @@ offline = false
 cache_dir = ""
 mirror = ""
 max_fetch_bytes = 2147483648
-fetch_timeout = "10m"
+# fetch_timeout was removed: a download is watched for bytes received, not
+# for elapsed time (ADR-0010 round, review finding I-16). No key replaces it.
 
 [providers.tree_sitter]
 enabled = true
 languages = ["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]
-worker_idle_ttl = "60s"
+# Parser workers start on demand and exit when the indexing stage ends, so a
+# machine that has stopped indexing holds none. There is no idle timer.
 
 [providers.scip]
 enabled = "auto"
-timeout = "20m"
+timeout = "0s"                 # no wall-clock limit; stall_timeout catches a wedged run
+stall_timeout = "5m"           # hang detector: no stdout/stderr/CPU/output growth for this long
 
 [providers.lsp]
 enabled = "auto"
-request_timeout = "15s"
-max_servers = 1
+# Hang detector for one request: the connection moving no bytes in either
+# direction for this long. There is no deadline on an answer -- a server still
+# indexing a monorepo before its first reply is working, not wedged.
+stall_timeout = "5m"
+# How many servers run at once is the machine's: each is admitted against the
+# same allocation by what its pinned definition reserves. One that does not fit
+# waits, or an idle server is stopped to make room; another project's server
+# already running is never a refusal. Every server of one snapshot reads one
+# shared materialization of it, rooted at its own project directory.
 max_outstanding_requests = 8
 idle_ttl = "60s"
 
@@ -2067,25 +2082,26 @@ idle_ttl = "60s"
 # auto = low-priority background units after the base index activates, queried units first;
 # true = block the index on them; false = off.
 enabled = "auto"
-timeout = "45m"
+timeout = "0s"                 # no wall-clock limit
+stall_timeout = "5m"           # hang detector, as for scip
 cache_bytes = 4294967296
+# The smallest heap cap a unit is given. There is no ceiling: nothing rejects a
+# unit for the memory it asks for, and the machine-derived allocation only
+# bounds the cap.
 unit_memory_floor_bytes = 805306368
-# 0 = machine-derived (free memory minus base footprint minus safety margin).
-# Only a non-zero user value may reject a unit before it runs.
-unit_memory_ceiling_bytes = 0
 
 [context]
 default_phase = "sweep"
 default_estimated_tokens = 80000
 default_max_bytes = 524288
-default_max_files = 200
+default_max_files = 200   # caller budget: keeps a non-zero default so a plan fits a window
 max_slices = 16
-max_graph_depth = 3
-max_visited_nodes = 50000
-max_graph_edges = 100000
-max_reason_paths_per_entry = 3
-max_manifest_bytes = 8388608
-max_capsule_bytes = 8388608
+max_graph_depth = 0            # 0 = unlimited; a bound you set ends a page and returns a cursor
+max_visited_nodes = 0          # 0 = unlimited, resumable
+max_graph_edges = 0            # 0 = unlimited, resumable
+max_reason_paths_per_entry = 0 # 0 = unlimited
+max_manifest_bytes = 0         # 0 = unlimited
+max_capsule_bytes = 0          # 0 = unlimited
 strict_read_gate = true
 allow_exploratory_waiver_consolidation = false
 
@@ -2094,16 +2110,16 @@ chunk_bytes = 65536
 max_chunk_bytes = 1048576
 session_ttl = "24h"
 max_receipts_per_confirmation = 16
-max_unconfirmed_chunks_per_session = 64
+max_unconfirmed_chunks_per_session = 0  # 0 = unlimited
 
 [mcp]
 transport = "stdio"
 watch = true
 ```
 
-Parse/search file thresholds are explicit analysis admission limits, not snapshot retention limits. Report a skipped analysis with file/scope/capability reason; users may raise the limit with sufficient reservations. A resource budget is neither permission to omit required context nor proof that a native process cannot temporarily exceed it. Low-memory operation reduces concurrency and caches before it rejects work. All mandatory and optional capabilities remain implemented.
+Parse/search file thresholds are explicit analysis admission limits, not snapshot retention limits, and they are unlimited by default: a *shipped* value that skips a file is exactly what the scale posture forbids. When a user sets one, report every skipped analysis with its file/scope/capability reason. A resource budget is neither permission to omit required context nor proof that a native process cannot temporarily exceed it. Low-memory operation reduces concurrency and caches before it rejects work. All mandatory and optional capabilities remain implemented.
 
-Validate related values together: source chunk plus worst-case wire encoding must fit the source response budget; batches must fit queue/memory reservations; baseline concurrency must fit aggregate memory; file and result arithmetic must not overflow; disk budgets must leave the free-space reserve. No zero/negative setting means unlimited. Log only effective numeric policy, not credentials or source paths.
+Validate related values together: source chunk plus worst-case wire encoding must fit the source response budget; batches must fit queue/memory reservations; baseline concurrency must fit aggregate memory; file and result arithmetic must not overflow; disk budgets must leave the free-space reserve. `0`, or the string `"unlimited"`, means unlimited for every count and size bound, and that is the default for all of them: no shipped value refuses a repository, skips a file, fails an analysis unit, drops a row or truncates an answer. Exceeding a bound the user set is always reported, never a silent clamp or drop; a negative value is rejected everywhere. Three families are not bounds and stay positive — reservations (worker counts, batch and queue sizes, memory budgets, connection counts), which size the machine rather than the repository and serialise work instead of refusing it; caller budgets (`context.default_max_bytes`, `default_estimated_tokens`, `default_max_files`, `max_slices`), which keep non-zero defaults because a plan must fit a window and which name every excluded file with a reason; and per-page wire and pagination ceilings, which are lossless because the next page carries the rest. The two analysis timeouts and `resources.query_timeout` default to `0` = no wall clock, with a finite `stall_timeout` hang detector in the analyzers' place; a call that carries no deadline of its own returns the complete answer, and a user-set query deadline ends a page with a cursor, never an answer. Cross-field pairings against a bound apply only when that bound is set. Log only effective numeric policy, not credentials or source paths.
 
 <a id="202-trust-and-fingerprints"></a>
 ### 20.2 Trust and Fingerprints
@@ -2151,22 +2167,23 @@ Stable error families include:
 
 ```text
 CTX_WORKSPACE_NOT_FOUND       CTX_CONFIG_INVALID
-CTX_TRUST_REQUIRED           CTX_PATH_ESCAPE
+CTX_TRUST_REQUIRED            CTX_PATH_ESCAPE
 CTX_SCHEMA_MISMATCH           CTX_SNAPSHOT_UNSTABLE
 CTX_SNAPSHOT_CHANGED          CTX_SOURCE_INTEGRITY
 CTX_NO_ACTIVE_GENERATION      CTX_PROVIDER_UNAVAILABLE
 CTX_PROVIDER_OUTPUT_INVALID   CTX_PROVIDER_TIMEOUT
-CTX_SOURCE_BINDING_UNVERIFIED CTX_QUERY_TRUNCATED
-CTX_QUERY_DEADLINE            CTX_RESOURCE_LIMIT
-CTX_MINIMUM_BUDGET            CTX_COVERAGE_INCOMPLETE
-CTX_SCOPE_INCOMPLETE          CTX_SCOPE_CHANGED
-CTX_SESSION_SUPERSEDED        CTX_SESSION_EXPIRED
-CTX_ACTOR_MISMATCH            CTX_CURSOR_INVALID
-CTX_VERSION_CONFLICT          CTX_WORKSPACE_BUSY
-CTX_DISK_FULL                 CTX_STORAGE_CORRUPT
-CTX_TOOL_OFFLINE              CTX_TOOL_UNSUPPORTED_PLATFORM
-CTX_TOOL_FETCH_FAILED         CTX_TOOL_DIGEST_MISMATCH
-CTX_TOOL_CORRUPT              CTX_TOOL_OVERRIDE_INVALID
+CTX_BINARY_CONTENT            CTX_SOURCE_BINDING_UNVERIFIED
+CTX_QUERY_TRUNCATED           CTX_QUERY_DEADLINE
+CTX_RESOURCE_LIMIT            CTX_MINIMUM_BUDGET
+CTX_COVERAGE_INCOMPLETE       CTX_SCOPE_INCOMPLETE
+CTX_SCOPE_CHANGED             CTX_SESSION_SUPERSEDED
+CTX_SESSION_EXPIRED           CTX_ACTOR_MISMATCH
+CTX_CURSOR_INVALID            CTX_VERSION_CONFLICT
+CTX_WORKSPACE_BUSY            CTX_DISK_FULL
+CTX_STORAGE_CORRUPT           CTX_TOOL_OFFLINE
+CTX_TOOL_UNSUPPORTED_PLATFORM CTX_TOOL_FETCH_FAILED
+CTX_TOOL_DIGEST_MISMATCH      CTX_TOOL_CORRUPT
+CTX_TOOL_OVERRIDE_INVALID
 ```
 
 Errors have a typed code, safe message, bounded structured details, retryability and remediation. Cancellation is not logged as an unexpected crash. Retry only transient operations with a fixed attempt/deadline budget; never retry a malformed input, bad source hash or denied trust decision as if it were a temporary network fault.
@@ -2430,7 +2447,7 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Syntax parsing | Official Tree-sitter Go binding and grammars | Mature syntax engine; own extraction queries and bounded worker lifecycle. |
 | Precise interchange | Official SCIP schema/bindings and protobuf primitives | Stream validated records, do not invent a competing symbol protocol. |
 | Live semantics | Small bounded LSP client/manager | Only required read-only methods and profiles, not an editor or generic command executor. |
-| Deep analysis | Managed Joern behind the neutral `dependence` provider | Integrate built-in exports; no copied CPG engine or product Scala code; engine swappable without a product-surface change. |
+| Deep analysis | A managed CPG engine behind the neutral `dependence` provider | Integrate built-in exports; no copied CPG engine or product Scala code; engine swappable without a product-surface change. |
 | Analyzer distribution | Product-owned tool lock with re-hosted payloads and a stdlib fetch/verify/extract path | No package manager, npm, coursier or `go install` at runtime; runtimes (Node, JDK) are lock entries too. |
 | Database/FTS | SQLite through `modernc.org/sqlite`, FTS5 | Embedded indexed store; own generation membership/scoped ranking where required. |
 | Watch | `fsnotify` with reconciliation | Notifications are hints; avoid a bespoke filesystem watcher. |
@@ -2612,7 +2629,7 @@ git diff --check
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One storage integration scenario proves staging invisibility, unchanged unit reuse across two snapshots, changed-input rejection, failed activation rollback, retained original provider provenance, cross-snapshot FK rejection, FTS-aware deletion and a lease/GC race. Exercise schema initialization/mismatch, not migration history.
-- [ ] **Step 2: Implement the complete production path.** Pin the Section 12 driver/libc versions, verify the embedded SQLite WAL-reset fix/version, and implement the complete Section 12 DDL, per-connection pragmas, bounded read/write pools, prepared byte-limited batches and strict typed JSON columns. Store source manifest rows instead of a whole JSON manifest. Facts join via generation_units; orphan identities never imply visible facts. Validate whole-unit evidence/aliases/endpoints/source inputs before seal. Preserve provider run provenance across generation deletion. Configure durable session/receipt writes, short read transactions and scheduled passive checkpoint/backpressure. Store/schema fingerprint mismatch fails closed; rebuild is explicit and creates a separate cache.
+- [ ] **Step 2: Implement the complete production path.** Pin the Section 12 driver/libc versions, verify the embedded SQLite WAL-reset fix/version, and implement the complete Section 12 DDL, per-connection pragmas, bounded read/write pools, prepared byte-limited batches and strict typed JSON columns. Store source manifest rows instead of a whole JSON manifest. Facts join via generation_units; orphan identities never imply visible facts. Validate whole-unit evidence/aliases/endpoints/source inputs before seal. Preserve provider run provenance across generation deletion. Configure session/receipt writes under the store's stated durability window (ADR-0004 Decision 1a), short read transactions and scheduled passive checkpoint/backpressure. Store/schema fingerprint mismatch fails closed; rebuild is explicit and creates a separate cache.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Implement signed bounded cursors, keyset/spool storage and TTL leases before parallel query tasks. Do not maintain FTS only through cascades or row counts: explicit index/content updates share a transaction. Pin acquisition and GC publication use one coordination protocol. Schema SQL and Go constraints must agree on partial-null ranges, current manifest binding and invalid state changes. Update storage/operations docs and prove every public read excludes unsealed units.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
@@ -2925,9 +2942,9 @@ git diff --check
 **Produces / contract:** Advance/Include/Record/Waive/Close with version guards; capsule builder; concrete app composition and narrow typed consumer interfaces for all Section 18/19 operations.
 
 - [x] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the single workflow fixture for direct verify, scope-version review invalidation, conflicting transitions, unserved files, a required waiver that never grants strict readiness, blocking unresolved boundaries, wrong-actor mutations, supersession and idempotent capsule retrieval. *(Re-checked at the Task 17 fix-round merge: the §17.1 guard rows -- resolved scope, consolidation readiness with its waiver branch, blocking review entry -- are in `internal/workflow/workflow_test.go`, each mutation-proved; see FX-E17-A-report.md.)*
+- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the single workflow fixture for direct verify, scope-version review invalidation, conflicting transitions, unserved files, a required waiver that never grants strict readiness, blocking unresolved boundaries, wrong-actor mutations, supersession and idempotent capsule retrieval. *(Re-checked after Task 17: the §17.1 guard rows -- resolved scope, consolidation readiness with its waiver branch, blocking review entry -- are in `internal/workflow/workflow_test.go`, each mutation-proved.)*
 - [x] **Step 2: Implement the complete production path.** Implement state/current-manifest/history changes atomically. Source-backed scope review covers every category in Section 17 and requires confirmed same-actor full files. Include adds discovered pinned scope and invalidates old review. Readiness requires complete scope, required reads, no bypass and current-source validation; completed historical reads alone are not write permission. Validate observation IDs/reference membership and use semantic hashes for duplicate idempotency.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Build capsules from stored explicit observations/evidence/coverage/waivers only and preserve all timestamps as audit metadata outside the canonical hash. Add per-request or immediately-before-write source revalidation for strict readiness and expose the guarantee limits. Define typed app methods for overview, symbol/reference/graph, context pages/next/include/close, diagnostics and export as well as the original operations. Wire the explicit canonical/LSP semantic-source selector and symbol/reference operation enums so the full LSP query manager has actual CLI/MCP consumers. Interface declarations depend only on model contracts; app must not import CLI/MCP, preventing cycles. *(Left unchecked deliberately: capsules, per-request revalidation, the exposed guarantee limit, the semantic-source selector and the operation enums all landed, but `Overview` and `Doctor` have no producer in this repository and stand as typed purpose-named refusals ledgered for Task 20, and `Close` still does not release the session lease -- `pagination.Leases` offers no lookup from a session to the lease `OpenSession` minted, so releasing it needs the Task 20 retention work. See T17-INT-report.md.)*
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Build capsules from stored explicit observations/evidence/coverage/waivers only and preserve all timestamps as audit metadata outside the canonical hash. Add per-request or immediately-before-write source revalidation for strict readiness and expose the guarantee limits. Define typed app methods for overview, symbol/reference/graph, context pages/next/include/close, diagnostics and export as well as the original operations. Wire the explicit canonical/LSP semantic-source selector and symbol/reference operation enums so the full LSP query manager has actual CLI/MCP consumers. Interface declarations depend only on model contracts; app must not import CLI/MCP, preventing cycles. *(Left unchecked deliberately: capsules, per-request revalidation, the exposed guarantee limit, the semantic-source selector and the operation enums all landed, but `Overview` and `Doctor` have no producer in this repository and stand as typed purpose-named refusals ledgered for Task 20, and `Close` still does not release the session lease -- `pagination.Leases` offers no lookup from a session to the lease `OpenSession` minted, so releasing it needs the Task 20 retention work.)*
 - [x] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -2951,9 +2968,9 @@ git diff --check
 **Produces / contract:** The full Section 18 command/options/exit contract, including actor identity, receipt confirmation, scope include, page/export and close.
 
 - [x] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one table-driven adapter test to assert representative command-to-service translation, mandatory flags, bounds and JSON error channels, then the shared E2E flow for real behavior. Do not repeat service algorithm tests behind CLI mocks. *(Two cases in the existing `internal/cli/root_test.go` -- `init` refusing to overwrite project configuration without `--force`, and a broken stdout pipe failing the command without confirming a receipt. Both are top-level funcs rather than `TestCommandEnvelope` rows because that table asserts exactly one envelope on a buffer, which a broken pipe makes impossible by construction. The broken-pipe row pins the exit class only: its write end is not fd 1, so `signal.Ignore(SIGPIPE)` is not exercised there. The shared E2E flow was the wave VERIFY lane's row and has now run against the real store -- wave-f-verify-T18.md: golden `--json` stability over 28 runs of every read command, every documented exit code driven for real except 10 (including `status --json | head -c 0` -> 7, the 141 -> 7 signal path), the managed-LSP route against real gopls v0.23.0, the metadata bound and the database-free `version`/`--help`.)*
+- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one table-driven adapter test to assert representative command-to-service translation, mandatory flags, bounds and JSON error channels, then the shared E2E flow for real behavior. Do not repeat service algorithm tests behind CLI mocks. *(Two cases in the existing `internal/cli/root_test.go` -- `init` refusing to overwrite project configuration without `--force`, and a broken stdout pipe failing the command without confirming a receipt. Both are top-level funcs rather than `TestCommandEnvelope` rows because that table asserts exactly one envelope on a buffer, which a broken pipe makes impossible by construction. The broken-pipe row pins the exit class only: its write end is not fd 1, so `signal.Ignore(SIGPIPE)` is not exercised there. The shared E2E flow has now run against the real store: golden `--json` stability over 28 runs of every read command, every documented exit code driven for real except 10 (including `status --json | head -c 0` -> 7, the 141 -> 7 signal path), the managed-LSP route against real gopls v0.23.0, the metadata bound and the database-free `version`/`--help`.)*
 - [x] **Step 2: Implement the complete production path.** Parse/validate flags and bounded observation input, call services and render results. Add all pagination/generation/timeout controls to applicable commands. Keep source only in the explicit read/export path; export output is an explicit destination, not permission to overwrite source. Enforce mutually exclusive receipt/file acknowledgment and JSON/file observation modes. Match minimum-budget, trust, conflict, partial-result and provider errors to typed exit codes. *(Every Section 18.1 spelling except `repo-map` and `doctor`, which are not registered: `ExploreService.Overview` and `DiagnoseService.Doctor` are typed refusals whose producers Task 20 owns, so a registered command would always refuse. Ledgered here by name rather than shipped as a placeholder -- see Task 20. Two more entries on the same ledger. `init --json` reports the absolute repository path it wrote to, the same Section 5 exemption `status --json`'s tool-store path already carries: both name the operator's own location, which is the fact the field exists to report. And `index --scip-index <typo>` exits 0 with completeness rows byte-identical to a run with no flag, so a mistyped path is indistinguishable from supplying none at the provider; the generation now records the supplied path and whether it resolved, and `doctor`'s `supplied_index` check is where that difference is reported.)*
-- [x] **Step 3: Wire consumers, failure handling and documentation.** Wire signal context, one-envelope JSON errors, stderr logs, broken-pipe handling and stable human omission indicators. Init is explicit and safe; rebuild creates an explicit separate cache, not migration. Help/version remain independent of database/provider startup. Update examples to confirm each final source receipt and provide a scope review before claiming readiness. *(Signal cancellation, `signal.Ignore(SIGPIPE)` so a broken stdout pipe reaches the typed EPIPE path and exits 7 instead of being killed with 141, one-envelope JSON errors, stderr logs, `init --force` and `index --rebuild`'s separate cache all landed. Examples confirming each final source receipt and the pre-readiness scope review were exercised by the wave VERIFY lane against the real store (wave-f-verify-T18.md): `context read` issued a chunk with its receipt, `context status` reported `fully_served_files: 0` for receipts that were never confirmed, `context advance <sid> consolidate` refused with `CTX_COVERAGE_INCOMPLETE "0 of 17 required files"` (exit 6) and `--expected-version 99` with `CTX_VERSION_CONFLICT` (exit 8) -- the scope review before readiness is the gate, not a claim in this document. One row remains unproven and is scheduled by the controller rather than claimed here: rendering a SEALED capsule through L5's rewritten `context.go` renderers needs a fully-read session, which that lane's budget could not reach; the exit-2 "session has no capsule" refusal did exercise the new `runService` path.)*
+- [x] **Step 3: Wire consumers, failure handling and documentation.** Wire signal context, one-envelope JSON errors, stderr logs, broken-pipe handling and stable human omission indicators. Init is explicit and safe; rebuild creates an explicit separate cache, not migration. Help/version remain independent of database/provider startup. Update examples to confirm each final source receipt and provide a scope review before claiming readiness. *(Signal cancellation, `signal.Ignore(SIGPIPE)` so a broken stdout pipe reaches the typed EPIPE path and exits 7 instead of being killed with 141, one-envelope JSON errors, stderr logs, `init --force` and `index --rebuild`'s separate cache all landed. Examples confirming each final source receipt and the pre-readiness scope review were exercised against the real store: `context read` issued a chunk with its receipt, `context status` reported `fully_served_files: 0` for receipts that were never confirmed, `context advance <sid> consolidate` refused with `CTX_COVERAGE_INCOMPLETE "0 of 17 required files"` (exit 6) and `--expected-version 99` with `CTX_VERSION_CONFLICT` (exit 8) -- the scope review before readiness is the gate, not a claim in this document. One row remains unproven and is scheduled rather than claimed here: rendering a SEALED capsule through the rewritten `internal/cli/context.go` renderers needs a fully-read session, which was not reached; the exit-2 "session has no capsule" refusal did exercise the new `runService` path.)*
 - [x] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -2979,9 +2996,9 @@ git diff --check
 **Produces / contract:** Every tool in Section 19 with concrete schemas, typed results, resource/actor gates, source isolation and protocol-correct errors.
 
 - [x] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One actual SDK transport scenario checks current discovery/request metadata, tools/list and representative typed calls, receipt echo, wrong actor/source denial, oversized input, canceled call and clean shutdown. One schema snapshot checks names/required fields; do not write a mock-only handler test for every trivial forwarding line. *(The in-package scenario table and snapshot cover typed dispatch, receipt echo, wrong-actor denial, oversized input and cancellation; `server/discover`, the negotiated protocol version and clean shutdown over real stdio are the wave VERIFY lane's rows.)*
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One actual SDK transport scenario checks current discovery/request metadata, tools/list and representative typed calls, receipt echo, wrong actor/source denial, oversized input, canceled call and clean shutdown. One schema snapshot checks names/required fields; do not write a mock-only handler test for every trivial forwarding line. *(The in-package scenario table and snapshot cover typed dispatch, receipt echo, wrong-actor denial, oversized input and cancellation; `server/discover`, the negotiated protocol version and clean shutdown over real stdio are verified separately against real stdio.)*
 - [x] **Step 2: Implement the complete production path.** Register through the SDK using concrete Go structs and explicit descriptions/tags. Use the current protocol rather than an old initialize-handshake assertion. Let SDK code handle framing and its own compatibility behavior; add no legacy facade. Separate app sessions from MCP wire state. Tool inputs and outstanding calls obey global byte/concurrency reservations; answers are bounded by `resources.max_page_items` plus each record type's own field bounds, and `codectx_read_source` -- the only tool returning source bytes -- by `resources.max_source_response_bytes`.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Only read_source returns source content; context_next is metadata and context_entries/capsule are bounded pages. Shared app methods perform receipt/scope/version validation. Route all logs to stderr, do not print startup text to stdout, and convert typed errors without raw paths/SQL/secrets. Verify CLI/MCP canonical result parity through the shared fixture once both adapters land. *(Left unchecked deliberately: everything but the last clause landed. CLI/MCP canonical result parity needs the shared `internal/e2e` fixture and the CLI adapter Task 18 is still building, so it cannot be verified from this task. `codectx_repo_overview` additionally surfaces `Overview`'s typed refusal as a tool error rather than an empty page -- its producer is Task 20's, the same ledger Task 17 Step 3 carries. See T19-INT-report.md.)*
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Only read_source returns source content; context_next is metadata and context_entries/capsule are bounded pages. Shared app methods perform receipt/scope/version validation. Route all logs to stderr, do not print startup text to stdout, and convert typed errors without raw paths/SQL/secrets. Verify CLI/MCP canonical result parity through the shared fixture once both adapters land. *(Left unchecked deliberately: everything but the last clause landed. CLI/MCP canonical result parity needs the shared `internal/e2e` fixture and the CLI adapter Task 18 is still building, so it cannot be verified from this task. `codectx_repo_overview` additionally surfaces `Overview`'s typed refusal as a tool error rather than an empty page -- its producer is Task 20's, the same ledger Task 17 Step 3 carries.)*
 - [x] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -3005,8 +3022,8 @@ git diff --check
 **Produces / contract:** Typed Doctor report including the toolchain status of every lock entry, live/peak resource report, retention collector (which also sweeps tool-store staging and versions the lock no longer names) and recovery procedure with explicit unsupported-metric/platform limitations.
 
 - [x] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the existing storage/process/pagination fault tables for disk full, corrupt active pointer/blob, long reader/WAL pressure, canceled writes, child process tree, stale lease/GC and structured diagnostic privacy, and give each of the two new packages one in-package scenario table. Add only uncovered critical cases, not another parallel adversarial suite. *(Reworded from "the existing E2E fixture": `internal/e2e` does not exist at this task — Task 21 owns it — so there is no shared E2E fixture to extend and naming one would have made this step unsatisfiable by construction. The rows landed instead in `internal/storage/sqlite/store_test.go`, `internal/process/runner_test.go`, `internal/graph/graph_test.go`, `internal/cli/root_test.go` and the two new in-package tables `internal/diagnostics/diagnostics_test.go` and `internal/retention/retention_test.go`; each row is mutation-proved in its lane report.)*
-- [x] **Step 2: Implement the complete production path.** Implement metadata-only diagnostics, optional expensive deep checks and typed safe remediation. Track parent/base-worker/optional/full-tree memory distinctly with simultaneous sampling. Count queues, cached capacity, native resources, temporaries and DB/WAL. GC acquires the indexing/GC coordination lock so capture and collection cannot race; recheck leases/reachability before trash/final deletion. Prune finite closed-session audit data in dependency order. Recover abandoned staging and unreferenced temp artifacts without deleting retained source. *(`internal/diagnostics` and `internal/retention` landed with the `codectx doctor`, `codectx repo-map` and `codectx status --resources` commands behind them. One figure in the Section 23 block is reported `unavailable` rather than measured, and deliberately: per-run unit reuse/parse counts are not process-wide totals. It is recorded in `docs/operations.md`'s unsupported-metric table. Recording the supplied `--scip-index` path against the generation **has landed**: `generation_supplied_indexes` records every supplied path and whether this generation holds the unit it produced, so `doctor`'s `supplied_index` check now tells "no index was supplied" from "the supplied path matched nothing". The persisted watch heartbeat has landed too: a running watch publishes one `watch_heartbeat` row carrying its process id, last completed pass, pending event count and its **own** expiry, refreshed while it lives and withdrawn when it ends, so `status --resources` reports the pending count from another process while the row is live and reports nothing once it expires, and `doctor`'s `watch_heartbeat` check passes on a live row, warns on an expired one and is `unavailable` where no watch has ever run. Expiry is the death signal: a stale row is never reported as live coverage, and no pid is probed.)*
+- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the existing storage/process/pagination fault tables for disk full, corrupt active pointer/blob, long reader/WAL pressure, canceled writes, child process tree, stale lease/GC and structured diagnostic privacy, and give each of the two new packages one in-package scenario table. Add only uncovered critical cases, not another parallel adversarial suite. *(Reworded from "the existing E2E fixture": `internal/e2e` does not exist at this task — Task 21 owns it — so there is no shared E2E fixture to extend and naming one would have made this step unsatisfiable by construction. The rows landed instead in `internal/storage/sqlite/store_test.go`, `internal/process/runner_test.go`, `internal/graph/graph_test.go`, `internal/cli/root_test.go` and the two new in-package tables `internal/diagnostics/diagnostics_test.go` and `internal/retention/retention_test.go`; each row is mutation-proved.)*
+- [x] **Step 2: Implement the complete production path.** Implement metadata-only diagnostics, optional expensive deep checks and typed safe remediation. Track parent/base-worker/optional/full-tree memory distinctly with simultaneous sampling. Count queues, cached capacity, native resources, temporaries and DB/WAL. GC acquires the indexing/GC coordination lock so capture and collection cannot race; recheck leases/reachability before trash/final deletion. Prune finite closed-session audit data in dependency order. Recover abandoned staging and unreferenced temp artifacts without deleting retained source. *(`internal/diagnostics` and `internal/retention` landed with the `codectx doctor`, `codectx repo-map` and `codectx status --resources` commands behind them. One figure in the Section 23 block is reported `unavailable` rather than measured, and deliberately: per-run unit reuse/parse counts are not process-wide totals. It is recorded in `docs/operations.md`'s unsupported-metric table. Recording the supplied `--scip-index` path against the generation **has landed**: `generation_supplied_indexes` records every supplied path and whether this generation holds the unit it produced, so `doctor`'s `supplied_index` check now tells "no index was supplied" from "the supplied path matched nothing". The persisted watch heartbeat has landed too: every watching process publishes its own `watch_heartbeat` row, keyed by the workspace and the watch's own session identity, carrying its process id, its last beat, last completed pass, pending event count and its **own** expiry, refreshed while it lives and withdrawn when it ends, so `codectx status` lists every live watcher from another process, `status --resources` reports the pending count of a covering watch while its row is live and reports nothing once it expires, and `doctor`'s `watch_heartbeat` check passes on a live row, warns on an expired one and is `unavailable` where no watch has ever run. Expiry is the death signal: a stale row is never reported as live coverage, and no pid is probed.)*
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Ordinary logs use known typed fields, not raw analyzer text passed through guess-based redaction. Report whether real OS network/memory controls are active. Verify no provider can escape source/materialization boundaries, no platform silently skips process-tree cleanup, and no metric is zero merely because unsupported. Profile actual hot paths and reuse existing helper implementations for fixes discovered here. *(Left unchecked deliberately, for one clause. Typed-field logging, the source/materialization boundaries and the no-zero-for-unsupported rule all landed, and no platform silently skips process-tree cleanup. But "report whether real OS network/memory controls are active" is **not** measured: nothing in this build reads a sandbox, seccomp filter, job-object restriction or container policy, so `codectx doctor` publishes an `analyzer_restriction` check in state `unavailable` saying exactly that. An `unavailable` check is an honest answer and not a defect, but it is not the measurement this step asks for, so the box stays open.)*
 - [x] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
@@ -3106,7 +3123,8 @@ type Options struct {
     Offline       bool
     Mirror        string        // optional URL prefix; the lock URL's host is replaced and its full path kept, so one mirror serves upstream and hosted assets
     MaxFetchBytes int64
-    FetchTimeout  time.Duration
+    // FetchTimeout removed with tools.fetch_timeout; the stall bound is a
+    // package constant beside the watcher that uses it.
     Overrides     map[string]config.ToolOverride
     Log           *slog.Logger
 }
@@ -3118,7 +3136,7 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error
 func (r *Resolver) Verify(ctx context.Context) ([]Status, error)
 func (r *Resolver) GC(ctx context.Context) (removed int, err error)
 
-type State string // "installed" | "available" | "unsupported_platform" | "override" | "corrupt"
+type State string // "installed" | "available" | "unsupported_platform" | "override" | "corrupt" | "unlisted"
 type Status struct{ Name, Version string; State State; Languages []string; Detail string }
 ```
 
@@ -3130,7 +3148,7 @@ type Tools struct {
     CacheDir      string             `toml:"cache_dir"`
     Mirror        string             `toml:"mirror"`
     MaxFetchBytes int64              `toml:"max_fetch_bytes"`
-    FetchTimeout  Duration           `toml:"fetch_timeout"`
+    // fetch_timeout removed; see the resolver note above.
     Override      map[string]ToolOverride `toml:"override"` // user configuration only
 }
 type ToolOverride struct {
@@ -3186,6 +3204,41 @@ git diff --check
 ```
 
 - [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate.
+
+---
+
+### Task 24: Scale posture
+
+**Deliverable:** No built-in default refuses a repository, skips a file, fails an analysis unit, drops a row or truncates an answer; every count and size bound is a configuration key whose default is unlimited, every legitimate stop is resumable, and peak memory stays a function of page or batch size rather than of repository size.
+
+**Files and ownership:** `internal/config` (`config.Limit` with `0` / `"unlimited"` as one value, `Exceeded`, `ValueOr`, `Min`; the validator loop that now rejects only negative values), `internal/graph` (per-page visited and edge work budgets, the spilling frontier and the server-side spooled resumable continuation), `internal/context` (budget and rank sites reading a bound through `config.Limit` instead of `> 0`), `internal/provider/*` (admission bounds that report a skip instead of failing a unit; progress-based stall detection in place of wall-clock unit timeouts), `internal/process` (the stall watchdog), `internal/search`, `internal/storage/sqlite`, `internal/index`, docs (`docs/configuration.md`, `docs/queries.md`, `docs/context-sessions.md`, `docs/adr/ADR-0001-scale-posture.md`, `docs/research/15-scale-posture.md`).
+
+**Dependencies / consumes:** Task 3 configuration, Task 14 bounded graph traversal and pagination, Task 15 context budgets, Task 11 dependence admission, Task 20 resource accounting.
+
+**Produces / contract:** `config.Limit` as the single owner of the unlimited convention; fifteen configuration keys defaulting to unlimited; per-page `max_visited_nodes` and `max_graph_edges` with a continuation cursor and a page-end reason; `providers.*.stall_timeout` as a progress-based hang detector with failure reason `stalled`; a reported, never silent, breach of any user-set limit.
+
+**Rulings applied:** [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md). Bounds were classified before anything changed: lossless cursor pagination, wire and pre-allocation security bounds, and memory admission that defers rather than refuses all stay; scale refusal, work truncation, unit-failing field bounds and row-dropping reports do not. "Unlimited" never means loading a repository into heap.
+
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** The full inventory of 69 bounds in the tree, with a class per row, is in `docs/research/15-scale-posture.md`.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** The identity of the two unlimited spellings, the strict `Exceeded` comparison and `Min` with unlimited as the top of the lattice; the per-page budget mutation that proves a continuation resumes a walk rather than truncating it; the manifest mutation that proves every budget-excluded file is named with a reason.
+- [ ] **Step 2: Implement the complete production path.** The validator loop inverted, `config.Limit` adopted at every enforcement site, the graph frontier spilled to a continuation spool, the visited and edge budgets made per-page, wall-clock provider timeouts replaced by progress-based stall detection.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** `docs/configuration.md` lists every key that defaults to unlimited, describes the caller-budget family as the one family of non-zero defaults deliberately kept, documents the stall detectors as hang detectors rather than size limits, and states the capsule-cap posture plainly; `docs/queries.md` and `docs/context-sessions.md` carry the same posture.
+- [ ] **Step 4: Run the focused verification below.**
+
+```bash
+go test ./internal/config ./internal/graph ./internal/context -count=1
+go test ./... -count=1
+go vet ./...
+```
+
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate.
+
+**What was left open at this step, and where each item stands.** The first two have since closed; the last two are still open:
+
+- **Capsule pagination — closed since.** It was left to its own sub-track rather than half-landed here, because making the capsule a paginated, resumable surface is a schema append plus changes across the workflow, MCP and CLI layers. Until it landed, two finite default bounds — a 250 000-file coverage ceiling and a 1 000-record ceiling on every other capsule list — refused to seal an over-large capsule, explicitly (`CTX_RESOURCE_LIMIT`, naming the list and the bound) and never by truncating it; they were the last default caps in the tree. Both are gone. The capsule's lists are now durable per-list rows read one page at a time, and the two ceilings are the configuration keys `context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`, unlimited by default. No default cap remains.
+- **The storage-amplification redesign — landed since.** It ran as a separate track with its own verification gate: integer surrogate row identities and two interned string dictionaries. On a real 4 019-file repository indexed twice, once by each binary and with identical row counts in every identity table, 1 005 887 488 → 632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. The decision and the alternatives refused on the way are [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
+- **Reference-scale miss: indexing memory.** Process-tree peak measured **912.6 MiB** against a **768 MiB** envelope on the 1M-line reference corpus (the cold index itself passed, at 2m56s). Open.
+- **Reference-scale miss: storage amplification.** **16.10×** stored bytes over eligible source bytes against a **3.5×** budget, measured on the corrected ~8 KiB/file reference corpus. Still open: the redesign that attacks it has landed (above), but the ratio has not been re-measured since, and bytes-per-indexed-symbol — not this ratio — is the regression metric the storage track gates on.
 
 ---
 

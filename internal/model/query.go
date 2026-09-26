@@ -1,5 +1,10 @@
 package model
 
+import (
+	"context"
+	"time"
+)
+
 // PageRequest is the shared pagination input. A supplied cursor already selects
 // its pinned generation, so a request that also names a generation or changes a
 // filter is rejected rather than silently repinned (Sections 14.1, 14.4).
@@ -93,6 +98,15 @@ type QueryMeta struct {
 	// Overlay is set only when the result came from the LSP overlay; a nil
 	// overlay means every record in the result is a canonical fact.
 	Overlay *OverlayBinding `json:"overlay,omitempty"`
+	// Notices are the answer's non-fatal disclosures: a request that asked for
+	// a bound larger than the configuration allows reports "requested N,
+	// effective M" here rather than being silently clamped, and a surface that
+	// skipped or cut something for a user-set reason names it here.
+	//
+	// A notice is not a truncation: Truncated says the ANSWER is short, a
+	// notice says the answer was produced under a bound the caller did not
+	// choose. Both can hold at once and neither implies the other.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Validate enforces the result metadata contract, including the rule that a
@@ -112,6 +126,18 @@ func (m QueryMeta) Validate() error {
 	}
 	if err := boundField("meta.next_cursor", m.NextCursor, MaxTokenBytes); err != nil {
 		return err
+	}
+	// Notices are bounded per ROW, not in total: the count is a function of how
+	// many bounds the caller asked to raise, which is small and bounded by the
+	// request shape, while an aggregate cap would be exactly the report-row
+	// drop this contract exists to prevent.
+	for i, note := range m.Notices {
+		if note == "" {
+			return invalid("meta.notices[%d] is empty", i)
+		}
+		if err := boundField("meta.notices", note, MaxReasonBytes); err != nil {
+			return err
+		}
 	}
 	if m.Overlay != nil {
 		if err := m.Overlay.Validate(); err != nil {
@@ -308,6 +334,30 @@ type SearchHit struct {
 	Range           *SourceRange `json:"range,omitempty"`
 	OccurrenceCount int64        `json:"occurrence_count"`
 	Reasons         []string     `json:"reasons,omitempty"`
+	// UnresolvedFields names the fields of THIS hit that could not be
+	// resolved, against the typed reason each failed with. It is the search
+	// counterpart of the truncated-fields map a stored record carries: a hit
+	// whose `range` is absent because the content store no longer holds the
+	// blob says so, instead of presenting a missing range as "this hit has no
+	// position" or costing the caller every other hit in the answer. The key
+	// set is fixed by this package (SearchHitFieldRange today), so the map is
+	// bounded by the code rather than by the repository.
+	UnresolvedFields map[string]string `json:"unresolved_fields,omitempty"`
+}
+
+// SearchHitFieldRange is the reserved UnresolvedFields key for SearchHit.Range.
+// A hit carrying it has a nil Range and the reason it stayed nil.
+const SearchHitFieldRange = "range"
+
+// MarkUnresolved records that one field of the hit could not be resolved and
+// why. It is the only writer of UnresolvedFields: a caller that assigned the
+// map directly would be one unbounded reason away from writing a provider's
+// error text onto the wire.
+func (h *SearchHit) MarkUnresolved(field, reason string) {
+	if h.UnresolvedFields == nil {
+		h.UnresolvedFields = make(map[string]string, 1)
+	}
+	h.UnresolvedFields[field] = truncateUTF8(reason, MaxDetailBytes)
 }
 
 // Validate enforces the hit's bounds; reasons are bounded because Section 14.3
@@ -347,6 +397,20 @@ func (h SearchHit) Validate() error {
 	}
 	if err := boundStrings("search_hit.reasons", h.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
+	}
+	// The same wire bound Error.Details and CapabilityState.Details carry: the
+	// map names fields of one hit, so it is small by construction and this
+	// rejects a producer defect rather than limiting any work.
+	if err := boundCount("search_hit.unresolved_fields", len(h.UnresolvedFields), MaxErrorDetails); err != nil {
+		return err
+	}
+	for k, v := range h.UnresolvedFields {
+		if err := requireField("search_hit.unresolved_fields key", k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := boundField("search_hit.unresolved_fields["+k+"]", v, MaxDetailBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -603,7 +667,7 @@ func (r GraphResult) Validate() error {
 	if !r.Direction.Valid() {
 		return invalid("graph_result.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
 	}
-	if err := boundCount("graph_result.nodes", len(r.Nodes), MaxRecordsPerResult); err != nil {
+	if err := boundPage("graph_result.nodes", len(r.Nodes)); err != nil {
 		return err
 	}
 	for _, n := range r.Nodes {
@@ -611,7 +675,7 @@ func (r GraphResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("graph_result.relations", len(r.Relations), MaxRecordsPerResult); err != nil {
+	if err := boundPage("graph_result.relations", len(r.Relations)); err != nil {
 		return err
 	}
 	for _, rel := range r.Relations {
@@ -638,15 +702,30 @@ type PathRequest struct {
 	From         NodeID         `json:"from"`
 	To           NodeID         `json:"to"`
 	Relations    []RelationKind `json:"relations,omitempty"`
-	MaxDepth     int            `json:"max_depth"`
-	MaxVisited   int            `json:"max_visited"`
+	// Direction is the orientation the search follows edges in. The empty
+	// value means DirectionOutgoing, which is what every caller got before
+	// this field existed: "what does From depend on, on the way to To".
+	//
+	// It exists because an outgoing-only search answers "no path" for a pair
+	// that IS connected against the edge direction -- a hub reached only by
+	// its callers is the ordinary case -- and "no path exists" is the one
+	// answer a path search may not get wrong. DirectionIncoming follows edges
+	// backwards and DirectionBoth follows them either way, which makes the
+	// result the undirected cheapest route.
+	Direction  Direction `json:"direction,omitempty"`
+	MaxDepth   int       `json:"max_depth"`
+	MaxVisited int       `json:"max_visited"`
+	// Page carries the continuation of a path search whose earlier page spent
+	// its work budget or its deadline before the walk reached the target. The
+	// external-memory walk persists its own state, so a resumed page carries
+	// on settling cost buckets rather than restarting; Limit is unused here
+	// (a path answer is one route list, not a keyset page) and is validated
+	// only so a caller that sets it is told so rather than ignored.
+	Page PageRequest `json:"page"`
 }
 
 // Validate enforces the request shape.
 func (r PathRequest) Validate() error {
-	if err := requireNonNegative("path.generation_id", int64(r.GenerationID)); err != nil {
-		return err
-	}
 	if err := requireID("path.from", string(r.From)); err != nil {
 		return err
 	}
@@ -661,10 +740,21 @@ func (r PathRequest) Validate() error {
 			return invalid("%s %q is not a known relation kind", indexed("path.relations", i), truncateForMessage(string(k)))
 		}
 	}
+	// The empty direction is the outgoing default, so it is accepted here and
+	// normalized by the engine; any other unknown spelling is refused rather
+	// than silently walked in a direction the caller did not ask for.
+	if r.Direction != "" && !r.Direction.Valid() {
+		return invalid("path.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
+	}
 	if err := requireNonNegative("path.max_depth", int64(r.MaxDepth)); err != nil {
 		return err
 	}
 	if err := requireNonNegative("path.max_visited", int64(r.MaxVisited)); err != nil {
+		return err
+	}
+	// The same rule GraphRequest keeps: a cursor already pins its generation,
+	// so a request that names both is rejected rather than silently repinned.
+	if err := r.Page.ValidatePinned("path", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
@@ -729,7 +819,7 @@ func (r PathResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("path_result.nodes", len(r.Nodes), MaxRecordsPerResult); err != nil {
+	if err := boundPage("path_result.nodes", len(r.Nodes)); err != nil {
 		return err
 	}
 	for _, n := range r.Nodes {
@@ -865,4 +955,33 @@ func (i OverviewItem) Validate() error {
 		return err
 	}
 	return nil
+}
+
+// QueryDeadline installs the configured per-request deadline on ctx and returns
+// the context to run the request under, plus the cancel that releases it.
+//
+// resources.query_timeout is a DEFAULT and never a ceiling, and its default is
+// zero, which means NO deadline at all. Two rules follow, and this helper is
+// the single place the services that answer queries spell them:
+//
+//   - A ctx that ALREADY carries a deadline -- the operator's `--timeout`, an
+//     MCP client's own budget -- keeps it untouched, whether it is shorter or
+//     longer than the configured value. context.WithTimeout would silently take
+//     the smaller of the two, so a raised budget would expire at the configured
+//     default and report the call as out of time at a fraction of the time the
+//     caller granted it.
+//   - A non-positive timeout installs nothing. `now + 0` is an instant that has
+//     already passed, so applying it would refuse every request rather than run
+//     it unbounded, and an unbounded call is what returns the COMPLETE answer.
+//     Cancellation remains the caller's stop in that case.
+//
+// The returned cancel is always non-nil and is always safe to defer.
+func QueryDeadline(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }

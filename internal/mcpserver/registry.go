@@ -26,7 +26,9 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_index_status", "Index status",
 		"Active generation, health, coherence and capability completeness. Set resources=true for the accounting block.", h.indexStatus)
 	addTool(s, "codectx_refresh_index", "Refresh index",
-		"Build an incremental generation over the current workspace.", h.refreshIndex)
+		"Build an incremental generation over the current workspace. Pass a progress token to "+
+			"receive one progress notification per finished stage, at most one a second; ask for a "+
+			"logging level to receive each finished stage as a log message carrying its row.", h.refreshIndex)
 	addTool(s, "codectx_repo_overview", "Repository overview",
 		"Bounded repository, package, module and language map.", h.repoOverview)
 	addTool(s, "codectx_search", "Search",
@@ -48,7 +50,11 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_callees", "Callees",
 		"Bounded outbound call neighborhood of one or more nodes.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
-		"Bounded shortest dependency path between two resolved nodes.", h.dependencyPath)
+		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
+			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+
+			"\"incoming\" (what depends on it) or \"both\" (either way). A node that is only ever "+
+			"called has no outgoing route to its callers, so a pair connected against the edge "+
+			"direction reports no path until `direction` is incoming or both.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness.", h.impact)
 
@@ -76,7 +82,8 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_context_advance", "Advance workflow",
 		"Move the session to a target workflow state under its version.", h.contextAdvance)
 	addTool(s, "codectx_context_capsule", "Context capsule",
-		`One bounded capsule view, or view="export" for canonical export metadata.`, h.contextCapsule)
+		`One keyset page of one capsule list named by view, continued with meta.next_cursor; `+
+			`view="export" returns the capsule's identity and per-list record counts instead.`, h.contextCapsule)
 	addTool(s, "codectx_context_close", "Close session",
 		"Close a session under its expected state version.", h.contextClose)
 }
@@ -138,7 +145,7 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 	reflect.TypeFor[model.ContextView](): stringEnum(
 		string(model.ViewEntries), string(model.ViewSlices), string(model.ViewExcluded)),
 	// The capsule view carries one spelling the model type does not: "export"
-	// selects the canonical metadata projection rather than a bounded page.
+	// selects the identity-and-counts projection rather than a page of one list.
 	reflect.TypeFor[model.CapsuleView](): stringEnum(
 		string(model.CapsuleViewAcceptedFacts), string(model.CapsuleViewRejectedFacts),
 		string(model.CapsuleViewContradictions), string(model.CapsuleViewUnresolved),
@@ -160,7 +167,8 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 }
 
 // capsuleViewExport is the codectx_context_capsule spelling that routes to
-// Export's canonical metadata instead of Capsule's bounded page (digest §4).
+// Export's identity-and-counts metadata instead of one keyset page of one
+// capsule list (digest §4).
 const capsuleViewExport = "export"
 
 // stringEnum is the one schema shape in the table above.

@@ -7,9 +7,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -64,7 +66,7 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerIdleTTL: 2 * time.Second, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -86,6 +88,11 @@ func newProvider(t *testing.T) *treesitter.Provider {
 // boundary would publish a range that does not match the bytes; the second
 // conformance run with a flush after every Put would catch a relation or
 // alias handed over before the node it references.
+//
+// Mutation: make the parent trust the worker's reported byte range instead of
+// validating it against the pinned bytes it streamed -> a declaration's
+// published range no longer selects that declaration's source and the product
+// serves wrong bytes for a correct-looking fact.
 func TestLanguageFixtures(t *testing.T) {
 	p := newProvider(t)
 	for _, fx := range fixtures {
@@ -332,4 +339,227 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 		t.Fatalf("fixture has no call to %q", token)
 	}
 	return strconv.Itoa(i+1) + "-" + strconv.Itoa(i+len(token))
+}
+
+// TestPoolLazyAndDrainedWhenTheStageEnds pins the two lifetime properties an
+// idle process's footprint rests on, and that nothing else asserts: the pool
+// starts NO worker until a unit demands one, and every worker has EXITED by
+// the time the last unit returns -- with no wait, because nothing is waited on.
+//
+// They are what makes the worker count a concurrency FIGURE and not a resident
+// cost: a worker process costs ~18 MiB of resident set before it has parsed
+// anything (the binary's mapped pages dominate), and the count is now one per
+// core, so a pool that spawned its ceiling eagerly, or held workers after the
+// work, would charge cores x 18 MiB -- about 320 MB on a sixteen-core host --
+// to every process holding a provider, for as long as it held them. A timer
+// here would only choose how long that lasts, which is why there is none.
+//
+// Failure mode: pre-warming the pool in New, or returning a worker to an idle
+// set that nothing empties until Close, both leave every product test passing
+// and a resting machine carrying the whole ceiling.
+//
+// Mutation: put the timer back -- keep `w.timer = time.AfterFunc(idleTTL, ...)`
+// in release and drop the drain from leaveStage -> "the parse stage ended with
+// 2 worker process(es) still alive".
+func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := treesitter.New(treesitter.Options{
+		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
+		Runner: runner, WorkDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if s := p.Stats(); s.Processes != 0 || s.WorkersStarted != 0 {
+		t.Fatalf("a provider that has been asked for nothing holds %+v; it must start no worker until a unit demands one", s)
+	}
+
+	const file = "sample.go"
+	src, err := os.ReadFile(filepath.Join("testdata", file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{file: string(src)}
+	h := providertest.New(t, files)
+	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
+	if _, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool); err != nil {
+		t.Fatalf("RunUnit: %v", err)
+	}
+	// Read immediately, with no sleep and no poll: the drain runs on the last
+	// caller's way out of the unit, so by the time RunUnit has returned the
+	// processes are already reaped. A poll here would pass against a timer too.
+	s := p.Stats()
+	if s.WorkersStarted == 0 {
+		t.Fatalf("after one unit %+v; a worker must be started on demand", s)
+	}
+	if s.Processes != 0 {
+		t.Fatalf("the parse stage ended with %d worker process(es) still alive: %+v", s.Processes, s)
+	}
+	if s.WorkersExited != s.WorkersStarted {
+		t.Fatalf("no worker is live but %d started and %d exited", s.WorkersStarted, s.WorkersExited)
+	}
+}
+
+// ledgerRepository is a fixed 32-byte identity in the wire shape every
+// repository id has; the ledger never interprets it.
+const ledgerRepository = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// TestStructuralParseIsRecordedPerWorker protects the attribution of the most
+// expensive stage of a run. Two failure modes: recording a span per parsed
+// file, which makes the ledger grow with the repository -- tens of thousands
+// of rows for a stage whose cost belongs to a handful of processes -- and
+// ending a worker's span without the measurements the runner reaped, which
+// leaves the stage attributed to nothing and its processor time, tree peak and
+// transferred bytes lost at the one moment they exist.
+//
+// Mutation: start and end a ledger span around each parse instead of around
+// the worker process -> the row count grows with the file count, and the
+// runner's reaped measurements, which only exist once the process is gone,
+// are attributed to nothing.
+func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
+	ctx := context.Background()
+	l := ledger.New(t.TempDir())
+	err := l.Attach(ctx)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	defer l.Stop()
+	var mu sync.Mutex
+	var rows []ledger.SpanRow
+	l.Subscribe(func(row ledger.SpanRow) {
+		mu.Lock()
+		rows = append(rows, row)
+		mu.Unlock()
+	})
+	run, err := l.NewRun(ledger.KindIndex, ledgerRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	ctx = run.Context(ctx)
+
+	src, err := os.ReadFile(filepath.Join("testdata", "sample.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One worker, five files: the parses must be the counters of the one span
+	// that measures the process which ran them. ParseProbe is the diagnostic
+	// parse surface, not a path any product caller takes, but it runs through
+	// the same pool, framing and span as IndexUnit -- and it needs no unit,
+	// which is the only way one test can put several files through one worker:
+	// a treesitter unit is one file. The unit loop below is the product path.
+	probes := newSingleWorkerProvider(t)
+	for i := range 5 {
+		if _, err := probes.ParseProbe(ctx, "sample.go", src); err != nil {
+			t.Fatalf("parse %d: %v", i, err)
+		}
+	}
+	probes.Close()
+
+	// A unit's parse, which is what an index run does: the same one span per
+	// worker, under one total for the stage.
+	units := newSingleWorkerProvider(t)
+	h := providertest.New(t, map[string]string{"sample.go": string(src)})
+	u := h.Plan(t, units, treesitter.ScopePrefix+"sample.go", []string{"sample.go"})
+	cap := &capture{UnitOutput: h.Begin(t, u, []string{"sample.go"})}
+	if _, err := provider.RunUnit(ctx, units, u.Request, cap, providertest.Limits, h.Pool); err != nil {
+		t.Fatalf("RunUnit: %v", err)
+	}
+	units.Close()
+	// Stop drains the bus, flushes and publishes before it returns, so what
+	// the subscriber holds afterwards is every span this run recorded and the
+	// count below is exact rather than a poll that stopped early.
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop the ledger: %v", err)
+	}
+	mu.Lock()
+	all := slices.Clone(rows)
+	mu.Unlock()
+	// Only the parse stage's own spans. A unit records other stages of its own
+	// -- its seal is one -- and counting those here would make this assertion
+	// fail whenever a unit gains a stage, which is not what it is guarding.
+	var got []ledger.SpanRow
+	for _, row := range all {
+		if row.Stage == "structural_parse" {
+			got = append(got, row)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("six parsed files on two workers recorded %d structural_parse spans, want 3 -- one per worker "+
+			"process plus the unit stage's total: a span per file makes the ledger grow with the repository", len(got))
+	}
+	var total, child, probe ledger.SpanRow
+	for _, row := range got {
+		switch {
+		case row.ParentSeq != nil:
+			child = row
+		case row.ItemsIn == 5:
+			probe = row
+		default:
+			total = row
+		}
+	}
+	if probe.Stage != "structural_parse" || probe.ItemsIn != 5 {
+		t.Fatalf("the five parses are recorded as %q over %d files, want one structural_parse span over 5",
+			probe.Stage, probe.ItemsIn)
+	}
+	if child.ParentSeq == nil || *child.ParentSeq != total.Seq || total.Stage != "structural_parse" {
+		t.Fatalf("the unit's worker span (%q, parent %v) does not hang off the stage total (%q, seq %d)",
+			child.Stage, child.ParentSeq, total.Stage, total.Seq)
+	}
+	if total.ItemsIn != 1 || child.ItemsIn != 1 {
+		t.Fatalf("the unit's total counted %d files over a worker that counted %d", total.ItemsIn, child.ItemsIn)
+	}
+	// The reaped child's cost, on every worker span. CPU comes from the reap
+	// and is available wherever a child can be waited for; the tree peak and
+	// the byte counters come from the sampler, which only some platforms have
+	// -- an absent one is recorded absent rather than as zero.
+	for _, row := range []ledger.SpanRow{probe, child} {
+		if row.CPUUserMS == nil || row.CPUSysMS == nil || row.CPUUnattributed != ledger.CPUAttributed {
+			t.Fatalf("a worker span carries no processor time (%q): the cost of the run's most expensive stage "+
+				"is attributed to nothing", row.CPUUnattributed)
+		}
+	}
+	if probe.PeakRSSBytes == nil && probe.ReadBytes == nil {
+		t.Log("this platform samples neither the tree peak nor the transferred bytes; both are recorded absent")
+	}
+}
+
+// newSingleWorkerProvider is newProvider with one worker, so a test can state
+// how many processes ran its files.
+func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := treesitter.New(treesitter.Options{
+		MaxWorkers: 1, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
+		Runner: runner, WorkDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

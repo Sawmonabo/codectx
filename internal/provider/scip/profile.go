@@ -13,6 +13,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -66,8 +67,8 @@ type argPaths struct {
 	WorkDir string
 }
 
-// kindSpec is everything about one indexer that used to live in a user's
-// `[analyzers.<name>]` table and is now product code (Section 20.2): the lock
+// kindSpec is everything about one indexer, as product code rather than as a
+// user's `[analyzers.<name>]` table (Section 20.2): the lock
 // entry to resolve, the manifests that make a workspace a candidate, the exact
 // argument array, the parent environment variables the child may see, the
 // declared network posture, the runner reservations and the run's own bound.
@@ -113,14 +114,28 @@ var kindSpecs = map[Kind]kindSpec{
 		diskBudgetBytes:   1 << 30,
 		timeout:           20 * time.Minute,
 	},
-	// scip-typescript reads the project's own node_modules out of the
-	// materialization; it resolves nothing itself, so its posture is denied
-	// and it needs no PATH. The progress bar is disabled because the child's
-	// streams are bounded diagnostics, not a terminal.
+	// scip-typescript resolves nothing of its own: it carries its own compiler
+	// and reads only what the materialization holds, so its posture is denied
+	// and it needs no PATH. Dependency directories are not part of a snapshot,
+	// so a symbol that belongs to an installed package resolves to no
+	// definition; what the unit publishes is the project's own definitions and
+	// the references among them. The progress bar is disabled because the
+	// child's streams are bounded diagnostics, not a terminal.
+	//
+	// --infer-tsconfig is what makes a project the trigger list admits
+	// indexable at all. Two of the three triggers -- jsconfig.json and
+	// package.json -- name a project that has no tsconfig.json, and without
+	// this flag the indexer prints "(missing tsconfig.json)", indexes nothing
+	// and exits 1, so every plain-JavaScript project in a repository fails as a
+	// unit. With it the indexer writes the config it infers into the private
+	// materialization (never the repository) and indexes the project. A project
+	// that already has a tsconfig.json is unaffected: the flag is only consulted
+	// when the file is absent.
 	KindTypeScript: {
 		triggers: []string{"tsconfig.json", "jsconfig.json", "package.json"},
 		args: func(a argPaths) []string {
-			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile, "--no-progress-bar"}
+			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile,
+				"--no-progress-bar", "--infer-tsconfig"}
 		},
 		env:               []string{"HOME"},
 		network:           NetworkDenied,
@@ -230,6 +245,12 @@ var Kinds = []Kind{KindClang, KindGo, KindJava, KindPython, KindRust, KindTypeSc
 type Profile struct {
 	Kind Kind
 	Tool toolchain.Tool
+	// Root is the root-relative project directory this unit indexes; the
+	// empty string is the workspace root. The indexer runs over that
+	// directory of the materialization, and the document paths its index
+	// carries are relative to it, so it is also what the importer prefixes
+	// them with to get back to workspace-relative paths.
+	Root string
 }
 
 // Name is the profile's name on every surface: the scope key, the diagnostic
@@ -394,7 +415,7 @@ func codeOf(err error) string {
 // digest is the durable record and is carried on every diagnostic this path
 // returns. The unit's durable binding is UnitSpec.InputHash, which the
 // coordinator computes over the declared inputs.
-func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string) (indexPath, manifestSHA string, err error) {
+func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string, seen *limitSeen) (indexPath, manifestSHA string, err error) {
 	if p.runner == nil {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"})
 	}
@@ -405,41 +426,81 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	// installed distributions, the headers -- and the unit's scope is the
 	// workspace, so a copy narrowed to some subset of files would produce an
 	// index that describes less than the unit claims. See docs/providers-scip.md.
-	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes})
+	// max_materialize_bytes is unlimited by default, so the copy is the whole
+	// snapshot unless an operator asks otherwise. A user-set budget leaves
+	// files out, and the materializer is what reports those exclusions --
+	// count and exemplars, to the operator, from the one place that knows
+	// which files they were. It is deliberately not tallied here: this
+	// provider would only be able to repeat the figure the operator set.
+	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes.Value()})
 	if err != nil {
 		return "", "", p.profileError(prof, "", err)
 	}
 	defer mat.Close()
+	// The copy is the whole snapshot; the indexer is pointed at this unit's
+	// own project inside it. The two are not the same decision: a project
+	// resolves symbols through files outside itself (a parent `tsconfig`, a
+	// sibling module, a lock file above it), so narrowing the COPY would
+	// change what the index can say, while narrowing what the indexer is RUN
+	// over is what makes the unit a project rather than a repository.
+	input := mat.Root()
+	if prof.Root != "" {
+		input = filepath.Join(mat.Root(), filepath.FromSlash(prof.Root))
+		if info, err := os.Stat(input); err != nil || !info.IsDir() {
+			return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable,
+				Message: "the snapshot holds no project directory at " + prof.Root})
+		}
+	}
 	switch prof.Kind {
 	case KindClang:
-		if err := normalizeCompileCommands(mat.Root(), p.limits.MaxManifestBytes); err != nil {
+		if err := normalizeCompileCommands(input, p.limits.MaxManifestBytes, seen); err != nil {
+			return "", "", p.profileError(prof, "", err)
+		}
+	case KindTypeScript:
+		// Refused before node starts, not diagnosed from its exit status. A
+		// package directory holding only a manifest and a lock file -- the
+		// measured second failure of this profile -- has nothing for this indexer to
+		// describe. node_modules is skipped: a dependency's own sources are
+		// not this project's.
+		if err := requireSources(input, "TypeScript", []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}, []string{"node_modules"}); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindJava:
 		// Refused before the JVM starts, not diagnosed from its exit status.
-		if err := requireJavaSources(mat.Root()); err != nil {
+		if err := requireSources(input, "Java", []string{".java"}, nil); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
-		if err := writeScipJavaConfig(mat.Root()); err != nil {
+		if err := writeScipJavaConfig(input); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	}
 	output := filepath.Join(runDir, "index.scip")
 	manifestPath := filepath.Join(runDir, "inputs.manifest")
-	path, args := prof.argv(argPaths{InputDir: mat.Root(), OutputFile: output, WorkDir: runDir})
-	timeout := prof.spec().timeout
-	if p.timeout > 0 && p.timeout < timeout {
-		timeout = p.timeout
+	path, args := prof.argv(argPaths{InputDir: input, OutputFile: output, WorkDir: runDir})
+	// The configured value is authoritative: zero, the default, is no wall
+	// clock at all, and the profile's own figure is a built-in ceiling that
+	// would otherwise reinstate the refusal the configuration removed. A
+	// wedged indexer is caught by the stall detector instead, at any repository
+	// size.
+	timeout := p.timeout
+	if spec := prof.spec().timeout; timeout > 0 && spec > 0 && spec < timeout {
+		timeout = spec
 	}
-	_, err = p.runner.Run(ctx, process.Spec{
-		Path: path, Args: args, Dir: mat.Root(), Env: prof.env(p.lookupEnv),
+	_, span := ledger.Start(ctx, stageRun, prof.Name())
+	res, err := p.runner.Run(ctx, process.Spec{
+		Path: path, Args: args, Dir: input, Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
-		Timeout: timeout, Grace: toolGrace,
+		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
 	})
+	// What the indexer cost is recorded on both paths: a run that failed on
+	// its deadline or its memory is the one an operator most needs the figures
+	// for, and the runner measured it either way.
 	if err != nil {
+		span.End(ledger.OutcomeFailed, measured(res), err)
 		return "", "", p.profileError(prof, "", err)
 	}
+	span.End(ledger.OutcomeOK, measured(res), nil)
 	// The output must be a regular file the tool wrote inside the run
 	// directory, within the index bound. A symlink is refused: the decoder
 	// would otherwise read whatever it points at as the tool's output.
@@ -450,9 +511,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if !info.Mode().IsRegular() {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.Name() + " output is not a regular file"})
 	}
-	if info.Size() > p.limits.MaxIndexBytes {
-		return "", "", p.profileError(prof, "", overLimit("index bytes", info.Size(), p.limits.MaxIndexBytes))
-	}
+	seen.note(limitIndexBytes, info.Size())
 	indexSHA, err := fileSHA256(output)
 	if err != nil {
 		return "", "", p.profileError(prof, "", err)
@@ -481,6 +540,11 @@ func (p *Provider) profileError(prof Profile, manifestSHA string, err error) err
 	typed = typed.WithDetail("profile", prof.Name()).
 		WithDetail("tool", prof.Tool.Fingerprint()).
 		WithDetail("network", string(prof.Network()))
+	if prof.Root != "" {
+		// Which project failed. One indexer runs over several projects of one
+		// repository, so the profile name alone no longer identifies the run.
+		typed = typed.WithDetail("project", model.TruncateDetail(prof.Root))
+	}
 	if manifestSHA != "" {
 		typed = typed.WithDetail("input_manifest_sha256", manifestSHA)
 	}

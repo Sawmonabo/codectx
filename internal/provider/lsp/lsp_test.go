@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ func offlineResolver(t *testing.T, overrides map[string]toolchain.Override) *too
 	t.Helper()
 	r, err := toolchain.New(toolchain.Options{
 		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
-		FetchTimeout: time.Second, Overrides: overrides,
+		Overrides: overrides,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,10 +103,10 @@ const utilGo = "package main\n" +
 //   - a crashed server releases the pending call and the overlay reports
 //     failure (resource leak, false readiness);
 //   - a server that reports no serverInfo still opens, bound to the version of
-//     the payload the lock pinned (false readiness: pyright and
-//     typescript-language-server both answer initialize with no serverInfo, and
-//     an empty ProviderVersion fails OverlayBinding.Validate, which made the
-//     overlay permanently unavailable for four of the nine languages).
+//     the payload the lock pinned (false readiness: typescript-language-server
+//     answers initialize with no serverInfo, and an empty ProviderVersion fails
+//     OverlayBinding.Validate, which made the overlay permanently unavailable
+//     for the languages it serves).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
@@ -138,8 +139,8 @@ func runSilentServerScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
-		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +193,8 @@ func runScenario(t *testing.T, enc string) {
 	}
 	// In-package: the fake needs two variables no real gopls does.
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
-	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
-		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,4 +450,148 @@ func (e eventLog) pid() int {
 		e.t.Fatal(err)
 	}
 	return pid
+}
+
+// A repository whose projects live in subdirectories gets one server per
+// project, each rooted at its own directory.
+//
+// A language server resolves a project from the directory it was started in.
+// Rooted at the workspace root of a monorepo, it is handed a directory whose
+// manifest declares none of the projects beneath it: it builds no project
+// model and answers about a file with whatever that file alone tells it, which
+// is a silently degraded answer labelled exactly like a good one. The overlay
+// therefore keys a server by the project as well as by the snapshot and the
+// profile, and the label it publishes carries that project too.
+//
+// Mutation: drop `root` from serverKey (or set RootURI back to
+// s.uris.rootURI()) -> "two projects share one server (1 running)" / the two
+// overlays' input digests are equal.
+func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
+	h := providertest.New(t, map[string]string{
+		"app/go.mod":  "module app\n",
+		"app/main.go": mainGo,
+		"svc/go.mod":  "module svc\n",
+		"svc/main.go": mainGo,
+	})
+	appFile := h.File(t, "app/main.go")
+	svcFile := h.File(t, "svc/main.go")
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 2, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODECTX_LSP_FAKE", "1")
+	t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+	resolver := offlineResolver(t, map[string]toolchain.Override{
+		"gopls": {Executable: exe, Version: "1.2.3", Checksum: fileDigest(t, exe)},
+	})
+	ctx := context.Background()
+	profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: time.Minute,
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	// The project of a file is the deepest directory above it that declares
+	// one, read from the pinned snapshot and not from the live checkout.
+	open := func(t *testing.T, path string) (*Overlay, Profile) {
+		t.Helper()
+		root, err := profile.ProjectRoot(ctx, h.View, path)
+		if err != nil {
+			t.Fatalf("ProjectRoot(%s): %v", path, err)
+		}
+		p := profile
+		p.Root = root
+		ov, err := mgr.Open(ctx, h.View, p)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", path, err)
+		}
+		return ov, p
+	}
+	appOv, appProfile := open(t, "app/main.go")
+	defer appOv.Close()
+	svcOv, svcProfile := open(t, "svc/main.go")
+	defer svcOv.Close()
+
+	if appProfile.Root != "app" || svcProfile.Root != "svc" {
+		t.Fatalf("project roots = %q / %q, want \"app\" / \"svc\"", appProfile.Root, svcProfile.Root)
+	}
+	if got := mgr.Servers(); got != 2 {
+		t.Fatalf("two projects share one server (%d running), want one server per project", got)
+	}
+	// One tree per snapshot, shared read-only by both servers. Failure mode:
+	// each server copies the whole snapshot for itself, so a monorepo with
+	// several projects holds several full copies of the repository on disk to
+	// serve trees nobody writes to.
+	//
+	// Mutation: materialize per server -- call snapshot.Materialize directly in
+	// startServer instead of m.materialize -> "2 materialization trees on disk
+	// for 2 servers of one snapshot, want 1 shared read-only tree".
+	trees, err := os.ReadDir(snapshot.MaterializeDir(h.Policy.DataDir))
+	if err != nil {
+		t.Fatalf("read the materialization directory: %v", err)
+	}
+	var dirs int
+	for _, e := range trees {
+		if e.IsDir() {
+			dirs++
+		}
+	}
+	if dirs != 1 {
+		t.Fatalf("%d materialization trees on disk for %d servers of one snapshot, want 1 shared read-only tree",
+			dirs, mgr.Servers())
+	}
+	if appOv.Binding().InputDigest == svcOv.Binding().InputDigest {
+		t.Fatalf("both projects' answers carry input digest %q, so nothing tells them apart",
+			appOv.Binding().InputDigest)
+	}
+	for _, c := range []struct {
+		name string
+		p    Profile
+	}{{"app", appProfile}, {"svc", svcProfile}} {
+		events := eventLog{t: t, path: filepath.Join(c.p.workDir(h.Policy.DataDir), "events.log")}
+		got := events.wait("root=")
+		if !strings.HasSuffix(got, "/"+c.name) {
+			t.Fatalf("the %s server was started at %q, want its own project directory", c.name, got)
+		}
+	}
+
+	// Each server answers about a position in its own project, and the answer
+	// binds to that project's file.
+	byteOf := func(needle string) uint64 { return uint64(strings.Index(mainGo, needle)) }
+	appDef, err := appOv.Definition(ctx, At{File: appFile.ID, Byte: byteOf("y = 1")}, 10)
+	if err != nil {
+		t.Fatalf("app Definition: %v", err)
+	}
+	svcDef, err := svcOv.Definition(ctx, At{File: svcFile.ID, Byte: byteOf("y = 1")}, 10)
+	if err != nil {
+		t.Fatalf("svc Definition: %v", err)
+	}
+	if len(appDef.Items) != 1 || appDef.Items[0].Path != "app/main.go" {
+		t.Fatalf("app definition = %+v, want exactly app/main.go", appDef.Items)
+	}
+	if len(svcDef.Items) != 1 || svcDef.Items[0].Path != "svc/main.go" {
+		t.Fatalf("svc definition = %+v, want exactly svc/main.go", svcDef.Items)
+	}
+}
+
+// testAdmission is the process memory admission ledger a test manager admits
+// its servers against. Production composes exactly one and hands it to every
+// reserver; a test that only drives the manager composes its own.
+func testAdmission(t *testing.T, allocation int64) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(allocation, 64<<30)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
 }

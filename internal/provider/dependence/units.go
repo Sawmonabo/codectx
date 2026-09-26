@@ -39,12 +39,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// MaxUnitsPerFamily bounds how many projects of one family a plan may hold.
-// A repository with more is refused with a typed resource limit rather than
-// collapsed into a coarser unit, because collapsing would silently change
-// which facts the analysis can resolve.
-const MaxUnitsPerFamily = 512
-
 // Unit is one planned frontend-native project.
 type Unit struct {
 	// ScopeKey is `pkg:<family>:<root>` for a project unit and `workspace` for
@@ -117,6 +111,14 @@ func FamilyOf(language string) Family {
 type Plan struct {
 	// Units are the planned units, sorted by scope key.
 	Units []Unit
+	// Projects counts, per family, the frontend-native projects the planner
+	// found -- before a scope key refuses one and before an empty unit is
+	// dropped, so it is the repository's project count and not the surviving
+	// unit count. Nothing bounds it: a plan holds one descriptor per project
+	// whatever the count, and `providers.dependence.max_units_per_family` is a
+	// reporting threshold the provider compares this against, never a refusal
+	// (it holds one int per family, of which there are five).
+	Projects map[Family]int
 	// Unplanned counts, per family, the projects planFamily refused because
 	// their scope key does not fit model.MaxScopeKeyBytes. Their files are
 	// analysed by the unit that encloses them, so nothing is lost, but at a
@@ -162,11 +164,17 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 		if !present[f] {
 			continue
 		}
-		units, unplanned, err := planFamily(f, roots[f])
+		units, unplanned, projects, err := planFamily(f, roots[f])
 		if err != nil {
 			return Plan{}, err
 		}
 		plan.Units = append(plan.Units, units...)
+		if projects > 0 {
+			if plan.Projects == nil {
+				plan.Projects = map[Family]int{}
+			}
+			plan.Projects[f] = projects
+		}
 		if unplanned > 0 {
 			if plan.Unplanned == nil {
 				plan.Unplanned = map[Family]int{}
@@ -183,12 +191,13 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 }
 
 // planFamily turns one family's marker directories into unit descriptors and
-// reports how many projects it had to refuse.
-func planFamily(f Family, roots map[string]bool) ([]Unit, int, error) {
+// reports how many projects it had to refuse, and how many projects the family
+// holds at all.
+func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	if f == FamilyC {
 		// Header resolution spans the tree, so C and C++ are the one family
 		// whose unit is the repository itself.
-		return []Unit{{ScopeKey: ScopeWorkspace, Family: f}}, 0, nil
+		return []Unit{{ScopeKey: ScopeWorkspace, Family: f}}, 0, 1, nil
 	}
 	dirs := make([]string, 0, len(roots))
 	for d := range roots {
@@ -198,6 +207,17 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, error) {
 	if !nestedFamilies[f] {
 		// Never split a project: a marker inside another project's directory
 		// belongs to the outer project.
+		//
+		// The precise provider answers the same question the other way round:
+		// there a nested manifest is its own project, whatever encloses it
+		// (internal/provider/scip/projects.go). The divergence is deliberate,
+		// and it is the difference between what the two lose. The precise
+		// collapse cost located facts for a project nobody had planned a unit
+		// for; this collapse keeps a unit's call closure intact, and splitting
+		// it would cut cross-package call resolution -- a unit split at a
+		// directory that declares nothing of its own loses more than half of
+		// the calls that resolve to its own methods (docs/research/
+		// 10-round3-empirical.md Section 8). Neither rule inherits the other.
 		dirs = slices.DeleteFunc(dirs, func(d string) bool {
 			for _, outer := range dirs {
 				if outer != d && within(d, outer) {
@@ -207,11 +227,13 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, error) {
 			return false
 		})
 	}
-	if len(dirs) > MaxUnitsPerFamily {
-		return nil, 0, resourceLimit("the repository holds more dependence projects of one family than the plan bounds").
-			WithDetail("family", string(f)).WithDetail("projects", itoa(int64(len(dirs)))).
-			WithDetail("limit", "MaxUnitsPerFamily").WithDetail("bound", itoa(MaxUnitsPerFamily))
-	}
+	// How many projects one family holds is a property of the repository. A
+	// monorepo is planned whole: every project gets its own unit, because
+	// collapsing them into a coarser one would silently change which facts the
+	// analysis can resolve, and refusing the plan would refuse the repository.
+	// The count travels out as Plan.Projects and the provider reports it
+	// against a user-set `providers.dependence.max_units_per_family`.
+	projects := len(dirs)
 	// A project whose scope key does not fit is refused as a project, not as
 	// source. Refusing here is what keeps the failure in the planner: the unit
 	// would otherwise be admitted and fail at BeginUnit, where the scope key is
@@ -268,7 +290,7 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, error) {
 		key, _ := scopeKey(f, "")
 		units = append(units, Unit{ScopeKey: key, Family: f, Excluded: planned})
 	}
-	return units, unplanned, nil
+	return units, unplanned, projects, nil
 }
 
 // foldSizes counts each unit's own files and bytes in one streaming pass.
@@ -328,6 +350,18 @@ func (u Unit) OwnsInput(p string) bool {
 	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base)
 }
 
+// ScopeKeyPrefix is what every scope key of a family begins with, and the one
+// place the family's position in that key is spelled. A caller holding a scope
+// key and a family -- the planner matching this repository's recorded history
+// to the language it was recorded for -- tests it against this rather than
+// rebuilding the key format for itself, so the format cannot drift between the
+// package that writes it and the package that reads it.
+//
+// It ends in the separator, so a prefix test can never match a family whose
+// name merely starts with another's. The whole-family unit's own key is
+// exactly this prefix, with an empty root.
+func ScopeKeyPrefix(f Family) string { return "pkg:" + string(f) + ":" }
+
 // scopeKey is the unit's capability and alias scope. It names the family in
 // the product's own vocabulary, never the engine's frontend name.
 //
@@ -338,7 +372,7 @@ func (u Unit) OwnsInput(p string) bool {
 // The planner drops such a project instead, which loses one project's facts
 // openly rather than mixing two projects' facts silently.
 func scopeKey(f Family, root string) (string, bool) {
-	key := "pkg:" + string(f) + ":" + root
+	key := ScopeKeyPrefix(f) + root
 	if len(key) > model.MaxScopeKeyBytes {
 		return "", false
 	}

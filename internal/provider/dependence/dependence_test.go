@@ -4,16 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -49,7 +52,16 @@ type fakeBackend struct {
 	deadExport bool
 	// noGraph makes a nominally clean parse leave no graph.
 	noGraph bool
-	parses  int
+	// wholeExportCrash is the engine crash the WHOLE unit's export dies on
+	// while every subdivided part's export succeeds -- the measured shape of a
+	// 4,984-file project whose export died at every heap cap.
+	wholeExportCrash dependence.Outcome
+	// wholeParseCrash is the engine crash the WHOLE unit's parse dies on while
+	// every subdivided part parses cleanly, which is the shape of the
+	// reproducible linker fault a real monorepo unit crashed on twice.
+	wholeParseCrash dependence.Outcome
+	parses          int
+	exports         int
 }
 
 func (b *fakeBackend) Engine() dependence.Engine {
@@ -65,6 +77,11 @@ func (b *fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
 
 func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	b.parses++
+	// A subdivided part's graph is "graph-<n>"; anything else is the whole
+	// unit's, exactly as in Export below.
+	if b.wholeParseCrash.Class != dependence.FailureNone && !strings.HasPrefix(filepath.Base(req.OutputPath), "graph-") {
+		return b.wholeParseCrash, nil
+	}
 	if b.parse.Class == dependence.FailureNone && !b.noGraph {
 		if err := os.WriteFile(req.OutputPath, []byte("graph"), 0o600); err != nil {
 			return dependence.Outcome{}, err
@@ -74,7 +91,13 @@ func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dep
 }
 
 func (b *fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (dependence.ExportOutcome, error) {
+	b.exports++
 	out := b.export
+	// A subdivided part's graph is "graph-<n>"; anything else is the whole
+	// unit's graph, which after a clean parse may be the cache's own entry.
+	if b.wholeExportCrash.Class != dependence.FailureNone && !strings.HasPrefix(filepath.Base(req.GraphPath), "graph-") {
+		return dependence.ExportOutcome{Outcome: b.wholeExportCrash}, nil
+	}
 	if out.Class != dependence.FailureNone {
 		return out, nil
 	}
@@ -192,9 +215,16 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		backend *fakeBackend
 		code    string
 		detail  map[string]string
+		// reason and remediation are substrings the failure's own text must
+		// carry. A classified failure whose message restates its class tells
+		// an operator nothing they did not already have from the class.
+		reason      string
+		remediation string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
-		// permits for that class, plus one per subdivided part.
+		// permits for that class -- which a crash that named its failing pass
+		// and its exception does not get, because it reproduces on sight --
+		// plus one per subdivided part.
 		parses int
 	}{
 		{
@@ -204,9 +234,14 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			name: "a reproducible pass crash fails the unit and names the pass",
 			backend: &fakeBackend{parse: dependence.Outcome{Class: dependence.FailureEngine,
 				Pass: "CfgCreationPass", Exception: "java.util.NoSuchElementException", ExitCode: 1}},
-			code:   model.CodeProviderOutputInvalid,
-			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass"},
-			parses: 3,
+			code: model.CodeProviderOutputInvalid,
+			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass",
+				"parts": "1", "parts_failed": "1", "parts_without_method": "0"},
+			// The tally is the reason -- not "no part produced an honest
+			// result", which restates the failure the class already names.
+			reason:      "1 of 1 failed in the analysis and 0 were analysed cleanly",
+			remediation: "identifies the defect upstream",
+			parses:      2,
 		},
 		{
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
@@ -217,13 +252,19 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			parses: 2,
 		},
 		{
-			// The zero-exit helper crash: the engine reports success and
-			// writes a graph with nothing in it.
-			name:    "an export with no methods for a unit that has source is an engine failure",
+			// Both steps exited cleanly and the export holds no method. It is
+			// classified as what it is rather than as a crash, and it names
+			// the two causes that remain together with how much source the
+			// frontend was handed, rather than restating that nothing came
+			// out.
+			name:    "an export with no methods names the causes and the source it was handed",
 			backend: &fakeBackend{deadExport: true},
 			code:    model.CodeProviderOutputInvalid,
-			detail:  map[string]string{"failure_class": "engine"},
-			parses:  1,
+			detail: map[string]string{"failure_class": "empty_export", "family": "go",
+				"source_files": "1"},
+			reason:      "produced no method for a unit that has source",
+			remediation: "hold method definitions",
+			parses:      1,
 		},
 		{
 			name:    "a clean exit that left no graph is an engine failure, not a success",
@@ -251,6 +292,12 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 				if typed.Details[k] != want {
 					t.Errorf("detail %q = %q, want %q", k, typed.Details[k], want)
 				}
+			}
+			if c.reason != "" && !strings.Contains(typed.Message, c.reason) {
+				t.Errorf("the failure message is %q, which does not name the reason %q", typed.Message, c.reason)
+			}
+			if c.remediation != "" && !strings.Contains(typed.Remediation, c.remediation) {
+				t.Errorf("the failure remediation is %q, which does not carry %q", typed.Remediation, c.remediation)
 			}
 			if result.State == model.RunSucceeded {
 				t.Errorf("run state = %s, want a failed state", result.State)
@@ -505,18 +552,24 @@ func dependenceUnitID(t *testing.T, files map[string]string) model.UnitID {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, u := range p.Units {
-		if u.ScopeKey != rootScope {
-			continue
+	var found model.UnitID
+	if err := p.Units(func(u plan.Unit) error {
+		if u.ScopeKey != rootScope || found != "" {
+			return nil
 		}
 		spec, err := u.Spec(cfg.AnalysisConfigHash())
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
-		return spec.ID
+		found = spec.ID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("the planner planned no %s unit", rootScope)
-	return ""
+	if found == "" {
+		t.Fatalf("the planner planned no %s unit", rootScope)
+	}
+	return found
 }
 
 // edited is files with one path's content replaced. It copies, because the
@@ -528,12 +581,12 @@ func edited(files map[string]string, path, content string) map[string]string {
 }
 
 // TestGovernorRetriesOnceAndOnlyHigher protects the memory ruling: there is no
-// default ceiling, a retry happens only when it could succeed, and only an
-// explicit user ceiling rejects work. Failure mode: a retry at the cap that
-// just failed costs a full parse and cannot succeed; a bound invented when the
-// machine is unreadable is a default memory ceiling by another name.
+// ceiling at all, and a retry happens only when it could succeed. Failure
+// mode: a retry at the cap that just failed costs a full parse and cannot
+// succeed; a bound invented when the machine is unreadable is a default memory
+// ceiling by another name.
 func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
-	g := dependence.NewGovernor(0, 0)
+	g := dependence.NewGovernor(0, testBaseFootprintBytes)
 	plenty := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}
 
 	small := g.Reserve(dependence.FamilyGo, 1<<20, plenty)
@@ -554,6 +607,27 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 		t.Errorf("retry cap = %d, want none: the failed attempt already peaked at the whole allocation", got)
 	}
 
+	// The host keeps at least half of what was available when the run began.
+	// Failure mode: an allocation of "everything but two gigabytes" handed one
+	// analyzer a 42 GB heap cap on a 47 GB machine, which then serialized
+	// every other unit behind it and left nothing for the editor, the agents
+	// and the browser the person is using while they index.
+	if small.AllocationBytes > plenty.AvailableBytes/2 {
+		t.Errorf("allocation %d of %d available leaves the host less than half",
+			small.AllocationBytes, plenty.AvailableBytes)
+	}
+	// And the cap comes from what the unit needs, not from what the machine
+	// has: the largest JavaScript project measured ran at full speed under
+	// 4 GiB, so a 157 MB one must not be handed the whole allocation.
+	big := g.Reserve(dependence.FamilyJavaScript, 157<<20, plenty)
+	if big.HeapCapBytes >= big.AllocationBytes {
+		t.Errorf("a 157 MB JavaScript unit was capped at the allocation (%d of %d): the cap is sized to the machine, not to the need",
+			big.HeapCapBytes, big.AllocationBytes)
+	}
+	if big.HeapCapBytes < 4<<30 {
+		t.Errorf("a 157 MB JavaScript unit was capped at %d, below the 4 GiB the measured project needed", big.HeapCapBytes)
+	}
+
 	huge := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
 	if huge.HeapCapBytes != huge.AllocationBytes {
 		t.Errorf("cap %d is not bounded by the machine-derived allocation %d", huge.HeapCapBytes, huge.AllocationBytes)
@@ -569,50 +643,378 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if unknown.HeapCapBytes != unknown.EstimatedBytes {
 		t.Error("an unobserved machine bounded the cap; that would be a default memory ceiling")
 	}
-	if g.Reject(unknown, rootScope) != nil {
-		t.Error("a machine-derived allocation rejected a unit; only an explicit user ceiling may")
+}
+
+// TestAdmissionIsTheAllocationAndNeverACount protects the rule that how much
+// heavy work runs at once is decided by one observation of the machine: heavy
+// children are admitted while the sum of their reservations fits the
+// machine-derived allocation, and nothing counts them. Failure mode: a count
+// serialises every analysis unit on a machine with room for four of them, and
+// on a small machine a count admits work whose summed reservations the host
+// cannot hold.
+//
+// Mutation: give the admission ledger a maxHeavy of 1 again -- add
+// `maxHeavy int` set to 1 by NewLedger and `if l.admitted >= l.maxHeavy
+// { return }` at the head of pump -> "a 32 GiB machine admitted 1 of four
+// 4 GiB reservations at once; how much runs at once is being decided by a
+// count, not by the allocation".
+func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
+	// The reservation is built directly so the figures in this test are the
+	// ones being asserted about, not a family estimate that would move with a
+	// re-measurement.
+	const fourGiB = 4 << 30
+	unit := dependence.Reservation{HeapCapBytes: fourGiB}
+	if unit.Bytes() != fourGiB {
+		t.Fatalf("reservation is %d bytes, want %d; this test's arithmetic no longer holds", unit.Bytes(), fourGiB)
 	}
 
-	capped := dependence.NewGovernor(0, 1<<30)
-	if capped.Reject(capped.Reserve(dependence.FamilyC, 1<<30, plenty), rootScope) == nil {
-		t.Error("an explicit ceiling did not reject a unit that does not fit it")
-	}
-
-	// Admission is the other half of the same ruling: a reservation orders and
-	// serializes heavy work, and two heavy analyzers run together only when
-	// their reservations sum inside the machine-derived allocation. Failure
-	// mode: admission grants two heavy analyzers whose summed reservations
-	// exceed the allocation, so an indexing run OOM-kills the machine.
-	//
-	// maxHeavy is 2 here on purpose: at the default of 1 the count alone would
-	// serialize the second unit and the memory gate would never be exercised.
-	sched := plan.NewScheduler(2, plenty)
-	heavy := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
-	if 2*heavy.Bytes() <= heavy.AllocationBytes {
-		t.Fatalf("two %d-byte reservations fit the %d-byte allocation; this row no longer proves the gate",
-			heavy.Bytes(), heavy.AllocationBytes)
-	}
-	release, err := sched.Admit(context.Background(), heavy)
-	if err != nil {
-		t.Fatalf("Admit: %v", err)
+	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
+	// four of these reservations.
+	big := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 32 << 30, Observed: true}))
+	var releases []func()
+	for i := 0; i < 4; i++ {
+		admitted, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		release, err := big.Admit(admitted, unit)
+		cancel()
+		if err != nil {
+			t.Fatalf("a 32 GiB machine admitted %d of four 4 GiB reservations at once; how much runs at once is being decided by a count, not by the allocation", i)
+		}
+		releases = append(releases, release)
 	}
 	blocked, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, err := sched.Admit(blocked, heavy); err == nil {
-		t.Error("admission granted a second heavy analyzer whose reservation does not fit beside the first")
+	if _, err := big.Admit(blocked, unit); err == nil {
+		t.Error("a fifth 4 GiB reservation was admitted into a 16 GiB allocation")
 	}
-	// The first slot back is what lets the queue move: a reservation never
-	// refuses work, it only orders it.
-	release()
-	release() // releasing twice must not free a slot that was never taken
-	second, err := sched.Admit(context.Background(), heavy)
+	// A waiter is never refused, only ordered: one release lets it through.
+	releases[0]()
+	fifth, err := big.Admit(context.Background(), unit)
 	if err != nil {
-		t.Fatalf("Admit after release: %v", err)
+		t.Fatalf("the waiting reservation was not admitted once room was given back: %v", err)
 	}
-	stillBlocked, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	fifth()
+	for _, release := range releases[1:] {
+		release()
+	}
+
+	// The same reservation on an 8 GiB machine: the allocation is 4 GiB, so
+	// exactly one runs, and it runs because an idle scheduler admits any single
+	// unit whatever it reserves -- work is never refused for memory.
+	small := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 8 << 30, Observed: true}))
+	release, err := small.Admit(context.Background(), unit)
+	if err != nil {
+		t.Fatalf("an 8 GiB machine admitted nothing: %v", err)
+	}
+	second, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel2()
-	if _, err := sched.Admit(stillBlocked, heavy); err == nil {
-		t.Error("releasing one admission twice freed a slot that was never taken")
+	if _, err := small.Admit(second, unit); err == nil {
+		t.Error("an 8 GiB machine admitted two 4 GiB reservations at once")
 	}
-	second()
+	release()
+}
+
+// splittable is one module whose own subdirectory holds source, so the unit
+// has a frontend-native boundary to be split along.
+var splittable = map[string]string{
+	"go.mod":         "module example.com/app\n\ngo 1.27\n",
+	"app.go":         "package app\n\nfunc Run(x int) int {\n\ty := x + 1\n\treturn y\n}\n",
+	"inner/inner.go": "package inner\n\nfunc Helper() int { return 1 }\n",
+}
+
+// A unit the engine cannot export is recovered by subdivision, not reported as
+// a crashed unit.
+//
+// Failure mode: a project whose parse succeeds at every heap cap and whose
+// export then dies on the engine's own exception -- measured on a real
+// 4,984-file project, whose every subdivided part exported cleanly -- was
+// published as a failed unit. Every fact the engine could still produce for
+// that project was thrown away, and five capabilities went unavailable for a
+// repository the engine could analyse. The recovery is the one a reproducible
+// parse crash already has, and the result must say what it is: partial, naming
+// the subdivided scope and the failing pass and exception, never memory and
+// never a crash of the unit.
+//
+// Mutation: in export, return failure(out.Class, ...) for the engine class
+// instead of confirming and handing the crash back ->
+// "the unit failed: CTX_PROVIDER_OUTPUT_INVALID: the dependence unit failed:
+// the analysis backend crashed"
+func TestADeadExportIsRecoveredBySubdivision(t *testing.T) {
+	b := &fakeBackend{wholeExportCrash: dependence.Outcome{Class: dependence.FailureEngine,
+		Pass: "Base", Exception: "java.util.NoSuchElementException", ExitCode: 1}}
+	h := providertest.New(t, splittable)
+	result, unit, err := h.Run(t, newProvider(t, b), rootScope, []string{"app.go", "go.mod", "inner/inner.go"})
+	if err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	if result.State != model.RunSucceeded {
+		t.Fatalf("run state = %s, want succeeded: subdivision is a recovery, not a failure", result.State)
+	}
+	if state, ok := h.UnitState(t, unit); !ok || state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed: the parts the engine could export are facts", state)
+	}
+	// The dead export is confirmed before anything is split, exactly as a
+	// parse crash is: one export of the whole unit, one confirmation of it,
+	// and one per subdivided part.
+	if b.exports != 3 {
+		t.Errorf("the unit cost %d export steps, want 3 (the export, its confirmation, one part)", b.exports)
+	}
+	rows := byCapability(result.Capabilities)
+	for _, c := range dependence.Capabilities {
+		row := rows[c]
+		if row.State != model.CapabilityPartial {
+			t.Errorf("%s = %q, want partial: a subdivided unit is never fresh", c, row.State)
+		}
+		if row.DiagnosticCode == model.CodeResourceLimit {
+			t.Errorf("%s reports %q: a dead export is not memory", c, row.DiagnosticCode)
+		}
+		if row.Details["subdivided"] != rootScope {
+			t.Errorf("%s names subdivided=%q, want %q", c, row.Details["subdivided"], rootScope)
+		}
+		// The export step has no first-sight rule: its crash was observed twice
+		// before the unit was split, and the row says which it was.
+		if got := row.Details["backend_failure"]; got != "Base/java.util.NoSuchElementException (failure class observed twice)" {
+			t.Errorf("%s reports backend_failure=%q, want the pass, its exception and how the crash was established", c, got)
+		}
+	}
+}
+
+// TestANamedCrashIsSubdividedWithoutASecondParse protects the most expensive
+// decision this provider makes. Failure mode: a crash whose standard error had
+// already named the failing pass and the exception class was parsed a second
+// time before the unit was split — on a real monorepo that second parse cost
+// three minutes and twenty-two seconds of machine time and only re-proved the
+// same deterministic fault, and the unit was subdivided anyway. The report must
+// also say which way the decision went, so nobody has to infer from a duration
+// why one crash was re-parsed and another was not.
+//
+// Mutation: make the first-sight branch in graphFor unreachable
+// (`if false && reproducibleOnSight(outcome)`) so every crash is confirmed ->
+// "the unit cost 3 parse steps, want 2".
+func TestANamedCrashIsSubdividedWithoutASecondParse(t *testing.T) {
+	b := &fakeBackend{wholeParseCrash: dependence.Outcome{Class: dependence.FailureEngine,
+		Pass: "ObjectPropertyCallLinker", Exception: "java.lang.RuntimeException", ExitCode: 1}}
+	h := providertest.New(t, splittable)
+	result, unit, err := h.Run(t, newProvider(t, b), rootScope, []string{"app.go", "go.mod", "inner/inner.go"})
+	if err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	if state, ok := h.UnitState(t, unit); !ok || state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed: the parts the engine could parse are facts", state)
+	}
+	if b.parses != 2 {
+		t.Errorf("the unit cost %d parse steps, want 2 (the crash, one part): a crash that named its pass and its exception reproduces on sight",
+			b.parses)
+	}
+	const want = "ObjectPropertyCallLinker/java.lang.RuntimeException (named pass and exception, taken on first sight)"
+	for _, c := range dependence.Capabilities {
+		row := byCapability(result.Capabilities)[c]
+		if row.State != model.CapabilityPartial {
+			t.Errorf("%s = %q, want partial: a subdivided unit is never fresh", c, row.State)
+		}
+		if got := row.Details["backend_failure"]; got != want {
+			t.Errorf("%s reports backend_failure=%q, want %q", c, got, want)
+		}
+	}
+}
+
+// inLedgerRun attaches a run to the unit's context, which is what the
+// coordinator does in a real index run. The provider finds it there and needs
+// to know nothing about it.
+type inLedgerRun struct {
+	provider.Provider
+	run *ledger.Run
+}
+
+func (w inLedgerRun) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	return w.Provider.IndexUnit(w.run.Context(ctx), req, sink)
+}
+
+// TestAChildsCostReachesTheSpanThatRanIt protects the claim the run ledger
+// exists to make: that the product can say which part of a unit was expensive
+// and why. The analyzer's steps are child processes and the runner measures
+// every one of them, but the measurements travel only as far as the neutral
+// outcome carries them -- so a step that dropped them would leave the
+// expensive units of a run reading as costless, with nothing in the record to
+// say the figure was never taken rather than taken and zero.
+//
+// It asserts both halves: the measured figures reach the span of the step that
+// ran the child, and a figure the platform did not sample is ABSENT on that
+// span rather than an observed zero.
+//
+// Mutation proof: drop the measured values when ending the parse span
+// (`span.End(spanOutcome(out), ledger.Measured{}, nil)` in provider.parse) and
+// the parse stage reports no processor time.
+func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
+	led := ledger.New(t.TempDir())
+	err := led.Attach(context.Background())
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	var mu sync.Mutex
+	rows := map[string]ledger.SpanRow{}
+	led.Subscribe(func(r ledger.SpanRow) {
+		mu.Lock()
+		defer mu.Unlock()
+		rows[r.Stage] = r
+	})
+	h := providertest.New(t, repo)
+	run, err := led.NewRun(ledger.KindIndex, string(h.Repo))
+	if err != nil {
+		t.Fatalf("open a run: %v", err)
+	}
+	// The tree peak and the processor time were sampled; the transferred bytes
+	// were not, which is the platform this provider also runs on.
+	const userMS, sysMS, peak = 90, 40, int64(700) << 20
+	b := &fakeBackend{parse: dependence.Outcome{CPUUserMS: userMS, CPUSysMS: sysMS,
+		PeakBytes: peak, IOUnsampled: true}}
+	p := inLedgerRun{Provider: newProviderIn(t, b, t.TempDir()), run: run}
+	if _, _, err := h.Run(t, p, rootScope, []string{"app.go", "go.mod"}); err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	run.Finish(ledger.OutcomeOK)
+	if err := led.Stop(); err != nil {
+		t.Fatalf("stop the ledger: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got, ok := rows["parse"]
+	if !ok {
+		t.Fatalf("the unit recorded no parse stage; it recorded %v", slices.Sorted(maps.Keys(rows)))
+	}
+	if got.CPUUserMS == nil || got.CPUSysMS == nil || *got.CPUUserMS != userMS || *got.CPUSysMS != sysMS {
+		t.Errorf("the parse stage reports processor time %v/%v (%q), want the child's %d/%d ms",
+			got.CPUUserMS, got.CPUSysMS, got.CPUUnattributed, userMS, sysMS)
+	}
+	if got.PeakRSSBytes == nil || *got.PeakRSSBytes != uint64(peak) {
+		t.Errorf("the parse stage reports a tree peak of %v, want the child's %d bytes", got.PeakRSSBytes, peak)
+	}
+	if got.ReadBytes != nil || got.WriteBytes != nil {
+		t.Errorf("the parse stage reports %v/%v transferred bytes for a child nothing counted them for: "+
+			"an unsampled figure must be absent, never an observed zero", got.ReadBytes, got.WriteBytes)
+	}
+}
+
+// schedulerLedger is the process admission ledger a scheduler front is bound
+// to, over the allocation this machine observation derives. The scheduler no
+// longer observes a machine itself: the allocation and the running total
+// belong to the one ledger every heavy child of the process shares.
+func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes), testDiskAllocationBytes)
+	if err != nil {
+		t.Fatalf("the admission ledger was refused: %v", err)
+	}
+	return l
+}
+
+// testDiskAllocationBytes is a disk allocation wide enough that no unit in
+// these tests ever waits on the ledger's second dimension: what they prove is
+// the memory sizing, and a disk figure that bound anything here would make
+// them prove something else.
+const testDiskAllocationBytes int64 = 64 << 30
+
+// testBaseFootprintBytes stands in for what the composition derives from the
+// machine and the configuration (config.BaseFootprint). It is the shipped
+// defaults on a 16-core host -- 32 MiB idle + 16 query slots x 32 MiB + 32 MiB
+// cache + 16 MiB queue -- stated here rather than imported so this package's
+// tests do not resolve a configuration to size a reservation.
+const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
+
+// TestAllocationSubtractsTheDerivedBaseFootprint protects the rule that the
+// scheduling allocation is derived from THIS machine and THIS process's own
+// footprint: half of what was available, less what this process already holds.
+//
+// Failure mode it guards: a base footprint that does not reach the allocation
+// -- a constant, or a figure that does not follow the core count -- hands the
+// children memory the parent has already promised itself, so every heavy child
+// is admitted against bytes that are not there and the host is over-committed.
+//
+// Both branches of the min() are exercised deliberately. On a large host the
+// host-share branch binds and the footprint is invisible, which is why a
+// test that only looked at a roomy machine would pass with the base footprint
+// ignored entirely; the small-memory, many-core row is the one that binds on
+// the subtraction, and it is also the shape that used to be refused outright.
+func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
+	const margin = dependence.DefaultSafetyMarginBytes
+	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
+	const base128 = 32<<20 + 128*(32<<20) + 32<<20 + 16<<20
+
+	for _, c := range []struct {
+		name      string
+		available int64
+		base      int64
+		want      int64
+		binds     string
+	}{
+		{"64 GiB, 16 cores: the host keeps half", 64 << 30, testBaseFootprintBytes, 32 << 30, "host share"},
+		{"8 GiB, 128 cores: the footprint binds", 8 << 30, base128, 8<<30 - base128 - margin, "subtraction"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := dependence.Machine{AvailableBytes: c.available, Observed: true}
+			got := m.SchedulingAllocation(c.base)
+			if got != c.want {
+				t.Errorf("allocation is %d, want %d (the %s branch binds): the allocation is not "+
+					"available memory less this process's own footprint, bounded by the host's share",
+					got, c.want, c.binds)
+			}
+		})
+	}
+	// The same machine, a larger base footprint, must leave the children less.
+	// This is the whole point of deriving it: a host with more cores reserves
+	// more for itself.
+	m := dependence.Machine{AvailableBytes: 8 << 30, Observed: true}
+	if bigger, smaller := m.SchedulingAllocation(testBaseFootprintBytes), m.SchedulingAllocation(base128); bigger <= smaller {
+		t.Errorf("a %d-byte base footprint left the children %d and a %d-byte one left them %d; "+
+			"a larger footprint must leave a smaller allocation",
+			testBaseFootprintBytes, bigger, base128, smaller)
+	}
+}
+
+// TestLargestChildFitsTheRunnerBeneathTheGate protects the rule that nothing
+// below the admission gate refuses what the gate admitted.
+//
+// Failure mode it guards: the gate runs a unit larger than the whole
+// allocation ALONE rather than refusing it, but a unit's reservation is its
+// heap cap -- already bounded by the allocation -- PLUS the memory its family
+// keeps outside the heap, so the largest reservation always exceeds the
+// allocation. A process runner budgeted at the allocation therefore refuses
+// exactly the unit the gate just admitted, and the unit fails with a resource
+// limit instead of running. That is "refusing work for memory", which this
+// package's own ruling says the product never does. It is invisible on a host
+// roomy enough that no unit's estimate reaches the allocation, which is why it
+// is asserted here rather than left to a run to discover.
+func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
+	for _, available := range []int64{8 << 30, 16 << 30, 64 << 30} {
+		m := dependence.Machine{AvailableBytes: available, Observed: true}
+		allocation := m.SchedulingAllocation(testBaseFootprintBytes)
+		budget := dependence.MaxChildReservationBytes(allocation)
+		g := dependence.NewGovernor(0, testBaseFootprintBytes)
+
+		// A unit far too large for any host: its estimate clamps to the
+		// allocation, which is the case that produces the largest reservation.
+		for _, f := range []dependence.Family{
+			dependence.FamilyC, dependence.FamilyGo, dependence.FamilyJava,
+			dependence.FamilyJavaScript, dependence.FamilyPython, dependence.FamilyRust,
+		} {
+			r := g.Reserve(f, 1<<40, m)
+			if r.Bytes() > budget {
+				t.Errorf("on a %d-byte machine a %s unit reserves %d, over the %d-byte runner budget: "+
+					"the runner beneath the gate would refuse a unit the gate admitted",
+					available, f, r.Bytes(), budget)
+			}
+			// The cap itself never exceeds the allocation the unit is admitted
+			// against, or it is sized against one figure and admitted against
+			// another.
+			if r.HeapCapBytes > allocation {
+				t.Errorf("on a %d-byte machine a %s unit is capped at %d, over the %d-byte allocation "+
+					"it is admitted against", available, f, r.HeapCapBytes, allocation)
+			}
+		}
+	}
+	// The unobservable host is deliberately NOT covered here: sizing invents no
+	// bound there (a ceiling for an unreadable machine is what synthesis
+	// Section 8 forbids) while admission stands one in, so a unit is sized
+	// without a bound and admitted against the stand-in. Resolving that
+	// asymmetry is a ruling, not an assertion; it is recorded as an open
+	// question rather than pinned by a test that would fix one answer.
 }

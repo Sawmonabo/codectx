@@ -5,9 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // safeTree is the one shared workspace safety fixture. It builds a repository
@@ -239,5 +243,175 @@ func assertWalkDirs(t *testing.T, root Root, policy Policy, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("WalkDirs yielded %v, want %v", got, want)
 		}
+	}
+}
+
+// TestFileBudgetIsReportedNotRefused protects the scale-posture ruling at the
+// walk's own budget: a repository holding more files than a user-set
+// workspace.max_files is captured in full, and the operator learns the budget
+// was passed. The behaviour this replaces refused the whole repository, so a
+// test that asserts only the refusal would pin the defect.
+func TestFileBudgetIsReportedNotRefused(t *testing.T) {
+	root, _ := safeTree(t)
+	for i := range 5 {
+		mustWrite(t, filepath.Join(root.Path, "f"+strconv.Itoa(i)+".go"), "package p\n")
+	}
+	// Unlimited is the default: it emits the whole tree and reports nothing.
+	policy := testPolicy(root)
+	var reports []string
+	policy.OnSkip = func(rel, reason string) { reports = append(reports, reason+" "+rel) }
+	whole := 0
+	if err := Walk(t.Context(), root, policy, func(File) error { whole++; return nil }); err != nil {
+		t.Fatalf("Walk with an unlimited budget: %v", err)
+	}
+	if whole < 5 || len(reports) != 0 {
+		t.Fatalf("unlimited walk emitted %d files with reports %q, want the whole tree and no report", whole, reports)
+	}
+
+	// A user-set budget far below the tree emits exactly the same files and
+	// reports the budget once.
+	policy.MaxFiles, reports = 2, nil
+	emitted := 0
+	if err := Walk(t.Context(), root, policy, func(File) error { emitted++; return nil }); err != nil {
+		t.Fatalf("Walk over a repository past its file budget: %v", err)
+	}
+	if emitted != whole {
+		t.Fatalf("the walk emitted %d files under a budget of 2, want all %d: a budget reports, it never clamps", emitted, whole)
+	}
+	if len(reports) != 1 || !strings.HasPrefix(reports[0], SkipFileBudget+" ") {
+		t.Fatalf("reports = %q, want exactly one %s report", reports, SkipFileBudget)
+	}
+}
+
+// TestLongPathSkipsOnePathNotTheWalk protects the skip-and-report contract for
+// model.MaxPathBytes: one unrepresentable path must cost that path and nothing
+// else. Failing the walk -- the behaviour this replaces -- turned a single deep
+// generated path into a repository that cannot be captured at all.
+//
+// The tree is built by descending one component at a time, because the whole
+// path is longer than the PATH_MAX a single syscall argument may carry.
+func TestLongPathSkipsOnePathNotTheWalk(t *testing.T) {
+	root, _ := safeTree(t)
+	mustWrite(t, filepath.Join(root.Path, "ok.go"), "package p\n")
+
+	component := strings.Repeat("d", 200)
+	func() {
+		t.Chdir(root.Path)
+		for depth := 0; depth*(len(component)+1) <= model.MaxPathBytes; depth++ {
+			if err := os.Mkdir(component, 0o700); err != nil {
+				t.Fatalf("mkdir at depth %d: %v", depth, err)
+			}
+			if err := os.Chdir(component); err != nil {
+				t.Fatalf("chdir at depth %d: %v", depth, err)
+			}
+		}
+		if err := os.WriteFile("buried.go", []byte("package p\n"), 0o600); err != nil {
+			t.Fatalf("write the buried file: %v", err)
+		}
+	}()
+
+	policy := testPolicy(root)
+	var reports []string
+	policy.OnSkip = func(_, reason string) { reports = append(reports, reason) }
+	var seen []string
+	if err := Walk(t.Context(), root, policy, func(f File) error { seen = append(seen, f.Path); return nil }); err != nil {
+		t.Fatalf("Walk over a tree holding one over-long path: %v", err)
+	}
+	if !slices.Contains(seen, "ok.go") {
+		t.Fatalf("the walk emitted %d files and not ok.go; one over-long path must not cost the rest of the repository", len(seen))
+	}
+	if !slices.Contains(reports, SkipPathTooLong) {
+		t.Fatalf("reports = %q, want a %s report: a skipped path that nothing reports is a silent loss", reports, SkipPathTooLong)
+	}
+}
+
+// TestDiscoveryAscendsPastAnyNestingDepth protects the discovery invariant a
+// fixed ascent cap silently broke: a workspace nested deeper than the cap was
+// answered with itself as the root and HasGit false -- a wrong answer, not a
+// refused one, so every command that traverses it captured the wrong tree. The
+// ascent needs no cap because filepath.Dir is lexical and strictly shortens the
+// path, so the parent == dir test is the only termination the loop can need.
+func TestDiscoveryAscendsPastAnyNestingDepth(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	mustWrite(t, filepath.Join(root, ".git", "config"), "[core]\n")
+
+	const depth = 300 // past the 256-component cap this replaces.
+	deepest := root
+	func() {
+		t.Chdir(root)
+		for range depth {
+			if err := os.Mkdir("d", 0o700); err != nil {
+				t.Fatalf("mkdir at depth: %v", err)
+			}
+			if err := os.Chdir("d"); err != nil {
+				t.Fatalf("chdir: %v", err)
+			}
+			deepest = filepath.Join(deepest, "d")
+		}
+	}()
+
+	opened, err := Discover(deepest)
+	if err != nil {
+		t.Fatalf("Discover %d components below the root: %v", depth, err)
+	}
+	defer opened.Close()
+	if opened.Path != root || !opened.HasGit {
+		t.Fatalf("Discover(%d deep) = %q hasGit=%v, want the repository root %q with its Git directory",
+			depth, opened.Path, opened.HasGit, root)
+	}
+}
+
+// TestWideDirectoryIsStreamedNotBuffered protects the memory invariant of a
+// flat repository: one directory's width must not be a heap structure. A level
+// wider than the sort buffer spills to a sorted run, so the live entry set
+// stays inside the buffer plus the merge's fan-in however many children the
+// directory holds -- and the order it yields is byte-identical to the order the
+// in-memory sort produces, which is what the capture's digest is pinned to.
+func TestWideDirectoryIsStreamedNotBuffered(t *testing.T) {
+	root, _ := safeTree(t)
+	const width = 500
+	for i := range width {
+		// Names in a deliberately unsorted arrival order: the listing's order
+		// is the filesystem's, and the walk's order must be the key's.
+		mustWrite(t, filepath.Join(root.Path, "wide", "f"+strconv.Itoa((i*7919)%width)+".go"), "package p\n")
+	}
+	policy := testPolicy(root)
+	policy.MaxFiles = 0
+
+	walkWith := func(sortBuf int) ([]string, int) {
+		t.Helper()
+		var got []string
+		w := &walker{root: root, policy: policy, sortBuf: sortBuf,
+			dataDirRel: dataDirRelative(root.Path, policy.DataDir),
+			visit:      func(f File) error { got = append(got, f.Path); return nil }}
+		if err := w.walkDir(t.Context(), ".", 0, false); err != nil {
+			t.Fatalf("walk with sort buffer %d: %v", sortBuf, err)
+		}
+		return got, w.peakLive
+	}
+
+	// The whole tree in one buffer: the reference order and the reference the
+	// spilling walk must reproduce exactly.
+	whole, wholePeak := walkWith(width * 4)
+	if len(whole) < width {
+		t.Fatalf("the reference walk emitted %d files, want at least the %d wide children", len(whole), width)
+	}
+
+	const buf = 32
+	spilled, peak := walkWith(buf)
+	if !slices.Equal(whole, spilled) {
+		t.Fatalf("a spilled level yielded a different order than the buffered one:\n spilled %v\n whole   %v", spilled, whole)
+	}
+	// The envelope: the buffer, the merge's live records, and the handful of
+	// entries the small directories on the path to "wide" retain.
+	envelope := buf + pagination.MaxSortFanIn + 64
+	if peak > envelope {
+		t.Fatalf("a %d-child directory held %d entries live at once (buffer %d, envelope %d); "+
+			"one directory's width is a repository-sized heap structure again", width, peak, buf, envelope)
+	}
+	if wholePeak <= envelope {
+		t.Fatalf("the reference walk held %d entries live with a buffer of %d, want more than the envelope %d: "+
+			"the assertion above would pass even if nothing streamed", wholePeak, width*4, envelope)
 	}
 }

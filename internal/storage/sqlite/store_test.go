@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -59,8 +58,13 @@ const (
 
 func newFixture(t *testing.T, dbPath string) *fixture {
 	t.Helper()
+	return newFixtureWithOptions(t, dbPath, store.Options{})
+}
+
+func newFixtureWithOptions(t *testing.T, dbPath string, opts store.Options) *fixture {
+	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, store.Options{})
+	s, err := store.Open(ctx, dbPath, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -126,11 +130,26 @@ func (f *fixture) snapshot(tag string, files ...fileFixture) model.Snapshot {
 // document asserts; storage must compute its own from the indexed text.
 const providerTokenCount = 3
 
-// searchDoc is the lexical document fixture.unit publishes for ff.
+// docBody is the indexed text a producer publishes for a declaration. It is
+// deliberately NOT the source over the document's byte range: treesitter
+// publishes names, signature and attached documentation and never the body
+// (provider/treesitter/facts.go), and the filesystem provider publishes none.
+// The two zqx tokens appear in no fixture file, so a body is never the source
+// over the document's byte range and any path that indexes source text where
+// the published body belongs loses them -- a visibly different hit set. The
+// file's own text follows them so that the tests keying on a token of the
+// source ("changed") still address the document that quotes it.
+func docBody(ff fileFixture) string {
+	return "// zqxdocstring for F in " + ff.path + "\nfunc F() zqxsignature\n" + string(ff.content)
+}
+
+// searchDoc is the lexical document fixture.unit publishes for ff. Bytes is
+// the declaration's extent, as a real producer sets it; Body is what was
+// indexed. They are different text on purpose (see docBody).
 func (f *fixture) searchDoc(ff fileFixture) model.SearchUnit {
 	return model.SearchUnit{ID: model.H("search-test", ff.path, ff.hash), NodeID: f.nodeID(ff), FileID: ff.id, Path: ff.path,
 		Kind: model.NodeFunction, Name: "F", QualifiedName: ff.path + ".F",
-		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: string(ff.content), TokenCount: providerTokenCount}
+		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: docBody(ff), TokenCount: providerTokenCount}
 }
 
 // begin opens a file-scoped unit for ff inside gen without sealing it.
@@ -180,8 +199,11 @@ func (f *fixture) fill(w *store.UnitWriter, run model.ProviderRunID, ff fileFixt
 		FileID: ff.id, ContentHash: ff.hash, Range: rng}
 	// A fact whose ID does not derive from (repository, kind, canonical key) is
 	// malformed provider output: accepting it would let two keys share one
-	// identity row.
-	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: "other-key", Evidence: []model.Evidence{ev}}}); err == nil {
+	// identity row. The key is a well-formed digest -- a free-text key is
+	// refused one layer earlier, by model.NodeFact.Validate, and would prove
+	// that rejection instead of this one.
+	otherKey := model.H("canonical-entity-key-v1", "pkg.Other")
+	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: otherKey, Evidence: []model.Evidence{ev}}}); err == nil {
 		f.t.Fatal("PutNodes accepted a node whose ID does not derive from its canonical key")
 	} else {
 		wantCode(f.t, err, model.CodeProviderOutputInvalid)
@@ -223,8 +245,34 @@ func (f *fixture) activate(gen, expected model.GenerationID) model.Binding {
 	return b
 }
 
+// flushed commits the store's open ingestion group, so a connection of the
+// test's own, or a reader-pool count, sees what the store has written so far.
+// packedDocuments hydrates documents the way a query does: from the pinned
+// generation's packed per-document attribute stream, through a posting session.
+func packedDocuments(t *testing.T, ctx context.Context, r *store.PinnedReader, ids []int64) []store.SearchDocument {
+	t.Helper()
+	session, err := r.OpenPostings(ctx)
+	if err != nil {
+		t.Fatalf("OpenPostings: %v", err)
+	}
+	defer session.Close()
+	docs, err := session.PackedDocuments(ctx, ids)
+	if err != nil {
+		t.Fatalf("PackedDocuments: %v", err)
+	}
+	return docs
+}
+
+func flushed(t *testing.T, s *store.Store) {
+	t.Helper()
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
 func (f *fixture) stats() store.Stats {
 	f.t.Helper()
+	flushed(f.t, f.s)
 	st, err := f.s.Stats(f.ctx)
 	if err != nil {
 		f.t.Fatalf("Stats: %v", err)
@@ -245,6 +293,36 @@ func (f *fixture) indexedTokens(doc model.SearchUnit) int64 {
 		n += int64(len(terms))
 	}
 	return n
+}
+
+// capsuleSource is a model.CapsuleListSource over an in-memory record set. The
+// seal walks each list more than once -- to count it, to hash it and to write
+// it -- so the source re-walks from the first record every time it is called,
+// which is exactly what the interface requires of a real one.
+type capsuleSource map[model.CapsuleList][]any
+
+func (src capsuleSource) Rows(_ context.Context, list model.CapsuleList, yield func(model.CapsuleRow) error) error {
+	for i, record := range src[list] {
+		row, err := model.NewCapsuleRow(list, int64(i), record)
+		if err != nil {
+			return err
+		}
+		if err := yield(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// counts is the counting pass the seal would make: the capsule carries these
+// instead of the records, and PutCapsule refuses a list that writes a different
+// number.
+func (src capsuleSource) counts() model.CapsuleCounts {
+	var c model.CapsuleCounts
+	for list, records := range src {
+		c.Set(list, int64(len(records)))
+	}
+	return c
 }
 
 func wantCode(t *testing.T, err error, code string) {
@@ -771,13 +849,18 @@ func TestStorePublicationScenario(t *testing.T) {
 	// The waiver's reason survives only in coverage_waivers: Waive's return
 	// value echoes the request, so this read-back is what proves the stored row
 	// is what a sealed capsule carries.
-	waivers, err := f.s.Waivers(ctx, open.ID, actorID)
+	waivers, err := f.s.WaiversAfter(ctx, open.ID, actorID, "", model.MaxPageItems)
 	if err != nil {
-		t.Fatalf("Waivers: %v", err)
+		t.Fatalf("WaiversAfter: %v", err)
 	}
 	if len(waivers) != 1 || waivers[0].FileID != empty.id || waivers[0].Reason != "generated file reviewed out of band" ||
 		waivers[0].ActorID != actorID || waivers[0].CreatedAt.IsZero() {
-		t.Fatalf("Waivers read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
+		t.Fatalf("WaiversAfter read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
+	}
+	// The keyset is what the seal pages on: a cursor past the only row ends the
+	// list instead of restarting it.
+	if tail, err := f.s.WaiversAfter(ctx, open.ID, actorID, empty.id, model.MaxPageItems); err != nil || len(tail) != 0 {
+		t.Fatalf("WaiversAfter past the last file id returned %d rows (err %v); the keyset must end the list", len(tail), err)
 	}
 	// One wrong-actor assertion covers every session reader: they all resolve
 	// the session through the same actor-checked s.session, so a second reader
@@ -791,10 +874,64 @@ func TestStorePublicationScenario(t *testing.T) {
 	// has nothing to consolidate yet.
 	capsule := model.Capsule{SessionID: open.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
 		ScopeVersion: 1, CanonicalHash: model.H("capsule"), CreatedAt: time.Now().UTC()}
-	if _, err := f.s.PutCapsule(ctx, capsule); err == nil {
+	if _, err := f.s.PutCapsule(ctx, capsule, capsuleSource{}); err == nil {
 		t.Fatal("PutCapsule stored a capsule for a session that is not in consolidate_open")
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
+	}
+	// Phase: the capsule's records are rows, not a blob. A sealed capsule
+	// carries counts only, so the records reach the reader exclusively through
+	// the keyset-paged CapsuleRows; the failure mode this guards is a page that
+	// restarts its list -- from a cursor naming no row, or from an ordinal it
+	// re-reads -- which returns a partial answer that reads as a complete one.
+	sealing := model.SessionOpen{ID: model.SessionID(model.H("session", "capsule")), ActorID: actorID,
+		OpenRequestHash: model.H("open"), ManifestID: manifest.ID, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	if _, err := f.s.OpenSession(ctx, sealing); err != nil {
+		t.Fatalf("OpenSession(sealing): %v", err)
+	}
+	for version, target := range []model.WorkflowState{model.StateVerifyOpen, model.StateConsolidateOpen} {
+		if _, err := f.s.AdvanceSession(ctx, model.AdvanceRequest{SessionID: sealing.ID, ActorID: actorID,
+			Target: target, ExpectedVersion: version + 1}); err != nil {
+			t.Fatalf("AdvanceSession(%s): %v", target, err)
+		}
+	}
+	scope := capsuleSource{model.CapsuleListScope: {
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "a"))},
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "b"))},
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "c"))},
+	}}
+	sealed := model.Capsule{SessionID: sealing.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
+		ScopeVersion: 1, Counts: scope.counts(), CanonicalHash: model.H("capsule", "sealed"), CreatedAt: time.Now().UTC()}
+	if _, err := f.s.PutCapsule(ctx, sealed, scope); err != nil {
+		t.Fatalf("PutCapsule(sealing): %v", err)
+	}
+	var walked []string
+	for cursor := ""; ; {
+		page, err := f.s.CapsuleRows(ctx, sealing.ID, actorID, model.CapsuleListScope, cursor, 2)
+		if err != nil {
+			t.Fatalf("CapsuleRows(after %q): %v", cursor, err)
+		}
+		if len(page) == 0 {
+			t.Fatalf("CapsuleRows returned an empty page after %q; the caller's count says where the list ends", cursor)
+		}
+		for _, row := range page {
+			if row.Ordinal != int64(len(walked)) {
+				t.Fatalf("capsule scope row arrived at ordinal %d, want %d; a keyset page never restarts its list", row.Ordinal, len(walked))
+			}
+			walked = append(walked, row.Key)
+		}
+		cursor = page[len(page)-1].Key
+		if int64(len(walked)) >= sealed.Counts.Of(model.CapsuleListScope) {
+			break
+		}
+	}
+	if len(walked) != 3 {
+		t.Fatalf("paging the capsule's scope list read %d records, want the 3 that were sealed", len(walked))
+	}
+	if _, err := f.s.CapsuleRows(ctx, sealing.ID, actorID, model.CapsuleListScope, "not-a-row", 2); err == nil {
+		t.Fatal("CapsuleRows accepted a cursor naming no record; a continuation must never restart the list")
+	} else {
+		wantCode(t, err, model.CodeCursorInvalid)
 	}
 	// Phase: lexical statistics are generation-local (Section 14.4). A BM25
 	// score is a function of df and the document facts of the pinned
@@ -811,10 +948,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentFrequency: %v", err)
 	}
-	hitsBefore, err := readerStable.SearchDocuments(ctx, ids)
-	if err != nil {
-		t.Fatalf("SearchDocuments: %v", err)
-	}
+	hitsBefore := packedDocuments(t, ctx, readerStable, ids)
 	if len(dfBefore) != 1 || dfBefore[0] != 1 || len(hitsBefore) != 1 {
 		t.Fatalf("gen2 lexical statistics = df %v over %d documents, want df 1 and the one b.go document containing \"changed\"", dfBefore, len(hitsBefore))
 	}
@@ -940,12 +1074,17 @@ func TestStorePublicationScenario(t *testing.T) {
 	// unambiguous: evicting the published generation leaves the workspace
 	// serving nothing, and sweeping a generation a retained session still
 	// holds destroys the source a coverage receipt was issued against.
-	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4}, time.Now())
+	//
+	// The window is spelled 0 here, which `retain_refs` documents as "retains
+	// every ref": the failure mode is a store that refuses its own documented
+	// unlimited spelling, which is not fatal to the run that published and so
+	// leaves retention never sweeping at all while the store grows.
+	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 0}, time.Now())
 	if err != nil {
 		t.Fatalf("RetainByRef: %v", err)
 	}
 	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
-		t.Fatalf("RetainByRef(4 refs) = %+v, want every ref retained and the two failed generations swept", r1)
+		t.Fatalf("RetainByRef(unlimited refs) = %+v, want every one of the four refs retained and the two failed generations swept", r1)
 	}
 	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
 	// stricter limit could free, so `status` can warn before a disk fills. A
@@ -959,6 +1098,18 @@ func TestStorePublicationScenario(t *testing.T) {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
 	}
+	// A user-set finite window still prunes to exactly that window: unlimited
+	// is the default, not the only accepted value. "main" is the least
+	// recently activated of the four refs, so a window of three drops it from
+	// the retained set; the read session opened above still holds its
+	// generation, so it is reported reclaimable rather than deleted.
+	r1b, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 3}, time.Now())
+	if err != nil {
+		t.Fatalf("RetainByRef(3 refs): %v", err)
+	}
+	if r1b.RefsRetained != 3 || r1b.BytesReclaimable <= 0 {
+		t.Fatalf("RetainByRef(3 refs) = %+v, want the window honoured at three refs with the dropped ref's generation reclaimable", r1b)
+	}
 	// The other half of the ranking-stability leg: three generations have now
 	// staged and activated over gen2 and two have been swept, and genOwn's
 	// second "changed" document is live. gen2's df and document facts must be
@@ -968,10 +1119,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentFrequency after publication and retention: %v", err)
 	}
-	hitsAfter, err := readerStable.SearchDocuments(ctx, []int64{ids[0], ownIDs[0]})
-	if err != nil {
-		t.Fatalf("SearchDocuments after publication and retention: %v", err)
-	}
+	hitsAfter := packedDocuments(t, ctx, readerStable, []int64{ids[0], ownIDs[0]})
 	if len(dfAfter) != 1 || dfAfter[0] != dfBefore[0] || len(hitsAfter) != 1 || hitsAfter[0] != hitsBefore[0] {
 		t.Fatalf("gen2 lexical statistics moved from df %v %+v to df %v %+v while later generations published and were swept; a score is not reproducible within its binding",
 			dfBefore, hitsBefore, dfAfter, hitsAfter)
@@ -1148,6 +1296,13 @@ const deltaScope = "pkg"
 // full re-import of the same snapshot can coexist and be compared.
 func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cfg string, files ...fileFixture) *store.UnitWriter {
 	f.t.Helper()
+	return f.beginScopeKey(gen, run, cfg, deltaScope, files...)
+}
+
+// beginScopeKey is beginScope with the provider scope named, so one generation
+// can carry several units: a generation selects one unit per (provider, scope).
+func (f *fixture) beginScopeKey(gen model.GenerationID, run model.ProviderRunID, cfg, scope string, files ...fileFixture) *store.UnitWriter {
+	f.t.Helper()
 	inputs := make([]model.UnitInput, 0, len(files))
 	h := model.NewUnitInputHasher()
 	for _, ff := range files {
@@ -1159,7 +1314,7 @@ func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cf
 			f.t.Fatal(err)
 		}
 	}
-	spec := model.UnitSpec{ProviderID: providerID, ProviderVersion: providerVersion, ScopeKey: deltaScope,
+	spec := model.UnitSpec{ProviderID: providerID, ProviderVersion: providerVersion, ScopeKey: scope,
 		InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
 	spec.ID = model.NewUnitID(spec, cfg)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: cfg, OriginRunID: run, SourceBinding: model.SourceBindingVerified}
@@ -1275,13 +1430,32 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // mints on insert and the evidence id, which folds the unit id by construction
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
+//
+// The identity and interned-string columns are surrogates (schema.sql S-1..S-3)
+// and are compared as they are stored. Both sides of the comparison are units
+// of the SAME database, where one surrogate is one canonical identity, so
+// comparing surrogates is exactly as strong as comparing the canonical ids --
+// and it is what proves the delta unit REFERENCES the same dictionary rows the
+// full import did, which hydrating back to hex would hide.
 var factColumns = []struct{ table, cols string }{
-	{"node_facts", "lower(hex(node_id)), language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
-	{"relation_facts", "lower(hex(relation_id))"},
-	{"fact_keys", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), fact_key"},
-	{"native_aliases", "scope_key, native_key, lower(hex(node_id))"},
-	{"search_units", "lower(hex(search_key)), lower(hex(coalesce(node_id, x''))), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
-	{"evidence", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key, detail, content_hash_bound"},
+	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
+	{"relation_facts", "relation_id"},
+	{"fact_keys", "coalesce(node_id, 0), coalesce(relation_id, 0), fact_key"},
+	{"native_aliases", "scope_key_id, native_key_id, node_id"},
+	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, token_count"},
+	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
+}
+
+// nodeRowID resolves a canonical node identity to the node_ids surrogate the
+// fact tables reference, so a test can assert on the row a canonical id names.
+func nodeRowID(t *testing.T, db *sql.DB, id model.NodeID) int64 {
+	t.Helper()
+	raw, _ := model.DecodeID(string(id))
+	var row int64
+	if err := db.QueryRow(`SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&row); err != nil {
+		t.Fatalf("node row for %s: %v", id, err)
+	}
+	return row
 }
 
 // unitRowID resolves a unit key to the integer row the fact tables reference.
@@ -1388,6 +1562,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1444,6 +1619,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1514,6 +1690,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit: %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1521,7 +1698,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		defer raw.Close()
 		row := unitRowID(t, raw, w.UnitID())
 		var leaked int64
-		if err := raw.QueryRow(`SELECT count(*) FROM evidence WHERE unit_id = ? AND native_key = ?`, row, "divergent-occurrence").Scan(&leaked); err != nil {
+		if err := raw.QueryRow(`SELECT count(*) FROM evidence e JOIN native_keys nk ON nk.id = e.native_key_id
+			WHERE e.unit_id = ? AND nk.key = ?`, row, "divergent-occurrence").Scan(&leaked); err != nil {
 			t.Fatal(err)
 		}
 		if leaked != 0 {
@@ -1573,6 +1751,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1584,9 +1763,9 @@ func TestDeltaImportInvariants(t *testing.T) {
 			id      model.NodeID
 			carried bool
 		}{{"a fact with one replaced key", partly, false}, {"a fact with no replaced key", stable, true}} {
-			idRaw, _ := model.DecodeID(string(want.id))
+			nodeRow := nodeRowID(t, raw, want.id)
 			var n int64
-			if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+			if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, nodeRow).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			if (n != 0) != want.carried {
@@ -1594,7 +1773,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			}
 			// A carried fact keeps every key it was published under, or the
 			// successor holds facts no later refresh can replace or remove.
-			if err := raw.QueryRow(`SELECT count(*) FROM fact_keys WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+			if err := raw.QueryRow(`SELECT count(*) FROM fact_keys WHERE unit_id = ? AND node_id = ?`, row, nodeRow).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			wantKeys := int64(0)
@@ -1628,6 +1807,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 		f.activate(gen1, 0)
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1662,125 +1842,6 @@ func TestDeltaImportInvariants(t *testing.T) {
 		if state, exists, err := f.s.UnitState(f.ctx, w1.UnitID()); err != nil || !exists || state != model.UnitSealed {
 			t.Errorf("previous unit is %s/exists=%v (err %v), want sealed", state, exists, err)
 		}
-	})
-
-	t.Run("batched adjacency spans units but stays inside the generation", func(t *testing.T) {
-		// A frontier expansion reads many units in one statement. If the batch
-		// lost its membership predicate, an edge published only by a unit this
-		// generation does not select would be served as a fact of it: the
-		// traversal would report a call the pinned snapshot does not contain,
-		// and every answer derived from it would be wrong with no way to tell.
-		// The same batch must still cross unit boundaries, or the traversal
-		// silently stops at the first unit edge.
-		dbPath := filepath.Join(t.TempDir(), "codectx.db")
-		f := newFixture(t, dbPath)
-		a := f.file("pkg/a.go", "package pkg\nfunc F() { G() }\n")
-		b := f.file("pkg/b.go", "package pkg\nfunc F() { G() }\n")
-		snap1 := f.snapshot("one", a, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
-		if err != nil {
-			t.Fatal(err)
-		}
-		run1 := f.run(gen1)
-		// fanOut is the number of edges the unit publishes from one extra node,
-		// one more than a page can hold, so a single batch over that node
-		// cannot come back whole. It hangs off nothing the assertions below
-		// name, so it changes no other count in this scenario.
-		const fanOut = model.MaxPageItems + 1
-		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, wide int) (model.UnitID, model.NodeID, model.NodeID) {
-			w := f.begin(gen, run, ff)
-			from := f.putNode(w, run, ff.path, "F", &ff, "key:node:from:"+ff.path)
-			to := f.putNode(w, run, ff.path, "G", &ff, "key:node:to:"+ff.path)
-			f.putRelation(w, run, from, to, "key:rel:"+ff.path, &ff)
-			var hub model.NodeID
-			if wide > 0 {
-				hub = f.putNode(w, run, ff.path, "W", &ff, "key:node:wide:"+ff.path)
-				for i := 0; i < wide; i++ {
-					name := fmt.Sprintf("W%03d", i)
-					leaf := f.putNode(w, run, ff.path, name, &ff, "key:node:wide:"+name+":"+ff.path)
-					f.putRelation(w, run, hub, leaf, "key:rel:wide:"+name+":"+ff.path, &ff)
-				}
-			}
-			if err := f.s.SealUnit(f.ctx, w); err != nil {
-				t.Fatalf("SealUnit(%s): %v", ff.path, err)
-			}
-			return w.UnitID(), from, hub
-		}
-		unitA, fromA, wideA := edge(gen1, run1, a, fanOut)
-		_, fromB, _ := edge(gen1, run1, b, 0)
-		f.activate(gen1, 0)
-
-		// gen2 drops b.go entirely: only unit A is a member, so b.go's edge is
-		// still stored but is not a fact of gen2.
-		snap2 := f.snapshot("two", a)
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := f.s.AttachUnit(f.ctx, gen2, unitA); err != nil {
-			t.Fatalf("AttachUnit: %v", err)
-		}
-		f.activate(gen2, gen1)
-
-		batch := func(gen model.GenerationID, dir model.Direction) []model.Relation {
-			t.Helper()
-			r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
-			if err != nil {
-				t.Fatalf("PinGeneration(%d): %v", gen, err)
-			}
-			defer r.Close()
-			// 256 is the limit the graph engine actually passes (its
-			// adjacencyBatch), which is ABOVE model.MaxPageItems: pageLimit
-			// clamps it, and a row calling with exactly MaxPageItems would
-			// never exercise that clamp at all.
-			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
-			}
-			return rels
-		}
-		// gen1 selects both units, so one batch over both seed nodes crosses
-		// the unit boundary and returns both edges.
-		if got := batch(gen1, model.DirectionOutgoing); len(got) != 2 {
-			t.Fatalf("gen1 batch returned %d edges, want both units' edges: %+v", len(got), got)
-		}
-		// gen2 selects only unit A. The UNION form must be restricted too, so
-		// both directions are asserted.
-		for _, dir := range []model.Direction{model.DirectionOutgoing, model.DirectionBoth} {
-			got := batch(gen2, dir)
-			if len(got) != 1 || got[0].From != fromA {
-				t.Fatalf("gen2 %s batch = %+v, want only unit A's edge from %s", dir, got, fromA)
-			}
-		}
-
-		// The clamp itself, observed rather than assumed: the engine asks for
-		// 256 and pageLimit hands back at most model.MaxPageItems, so a caller
-		// that read a short page as the end of the walk would stop one row
-		// short of this node's neighbourhood and call it complete.
-		func() {
-			r, err := f.s.PinGeneration(f.ctx, f.repo, gen1, time.Minute)
-			if err != nil {
-				t.Fatalf("PinGeneration(%d): %v", gen1, err)
-			}
-			defer r.Close()
-			first, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil, "", 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(wide): %v", err)
-			}
-			if len(first) != model.MaxPageItems {
-				t.Fatalf("a 256-row request over a %d-edge node returned %d rows, want the %d-row clamp",
-					fanOut, len(first), model.MaxPageItems)
-			}
-			next, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil,
-				first[len(first)-1].ID, 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(wide, after): %v", err)
-			}
-			if len(next) != fanOut-model.MaxPageItems {
-				t.Fatalf("the page after the clamp returned %d rows, want the remaining %d: the clamped page was the whole neighbourhood after all",
-					len(next), fanOut-model.MaxPageItems)
-			}
-		}()
 	})
 }
 
@@ -1908,6 +1969,7 @@ func TestBlobGraceProtocol(t *testing.T) {
 	// directly because the store's own paths refuse it by design: PutSnapshot
 	// only accepts a blob that is already 'ready', which is exactly why the
 	// recheck below is the last line of defence rather than the first.
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

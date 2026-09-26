@@ -182,9 +182,12 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `references` | enclosing declaration → type declaration | a type reference to a class/struct/interface/enum declared in this file; a type this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 
-Occurrences past `MaxEvidencePerFact` (64) on one relation or node are
+Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
-silently. The unresolved callees one file may mint are bounded the same way: at
+silently. That count is disclosed on its own, under the `evidence_clipped`
+capability detail -- the same key the filesystem provider reports the same
+bound with -- so an operator can tell how many occurrences their clip cut apart
+from every other bound this file reached. The unresolved callees one file may mint are bounded the same way: at
 most 2000 distinct placeholders, after which a cross-file call is counted, not
 minted, and the file is `partial`. Without that bound a generated or minified
 file with tens of thousands of distinct callee names would publish a node, a
@@ -203,7 +206,7 @@ recorded) with one `structure` capability state at the file's scope:
 | State | DiagnosticCode | Meaning |
 |---|---|---|
 | `fresh` | – | parsed without syntax errors, every record within bounds |
-| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was dropped, the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
+| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was cut (counted under the `evidence_clipped` detail), the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
 | `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than `workspace.max_parse_file_bytes`; not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
 
@@ -245,7 +248,7 @@ MemoryReservationBytes  Options.WorkerMemoryBytes (default 256 MiB)
 
 The runner holds one concurrency slot per live worker for the worker's whole
 lifetime, so `process.Limits.MaxConcurrent` must exceed
-`index.max_parser_workers` by the number of other children expected to run
+the worker count by the number of other children expected to run
 concurrently.
 
 Wiring for `cmd/codectx/main.go` (the controller applies it; this package does
@@ -263,9 +266,8 @@ and in application composition:
 exe, _ := os.Executable()          // then filepath.EvalSymlinks
 ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
-	MaxWorkers:        cfg.Index.MaxParserWorkers,
+	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-	WorkerIdleTTL:     time.Duration(cfg.Providers.TreeSitter.WorkerIdleTTL),
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 	Runner:            sharedRunner,
 	WorkDir:           filepath.Join(dataDir, "workers", "treesitter"),
@@ -285,7 +287,7 @@ frame at the `SourceBytes` the request declared, itself at most
 
 The frame cap does not bound the sink record a frame becomes; the parent's own
 bounds do. The largest fact the parent can build is one node or relation
-carrying `MaxEvidencePerFact` (64) evidence rows of roughly 620 bytes of
+carrying `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) evidence rows of roughly 620 bytes of
 identifiers and positions plus a native key of at most `MaxNativeKeyBytes`
 (2048): about 167 KiB, well under the 4 MiB `max_provider_record_bytes` a sink
 is configured with. Facts are handed to the sink in slices of at most 1000
@@ -317,10 +319,12 @@ Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
 position implementation), rejects offsets inside a UTF-8 sequence, checks
 range containment and every string bound, and maps declaration kinds through
-a closed vocabulary. Per-file record bounds (`MaxDeclsPerFile` 20000,
-`MaxImportsPerFile` 4000, `MaxRefsPerFile` 60000) are applied by the worker
-when extracting and by the parent when reading, so a misbehaving child cannot
-make the parent buffer more than a healthy one would send. A record whose
+a closed vocabulary. The per-file record bound
+`providers.tree_sitter.max_records_per_file` -- unlimited by default -- is
+carried on the parse request and applied by the worker when extracting and by
+the parent when reading, from the one configured number, so a misbehaving child
+cannot make the parent buffer more than a healthy one would send and raising the
+bound can never make the parent reject a healthy worker's output. A record whose
 encoding would exceed the frame cap is dropped by the worker and reported as
 truncation, never sent oversize.
 
@@ -331,12 +335,18 @@ truncation, never sent oversize.
   reaped it, so an idle worker and one still shutting down both still count. A
   unit reuses an idle worker, starts one when the pool is under its bound, or
   waits (promptly returning on cancellation) until a worker goes idle or a
-  process exits; it then reads the hello within 30 seconds. Bounding callers
+  process exits; it then reads the hello within 30 seconds. A worker stays warm
+  only while there is parse work in flight: the last unit to finish drains the
+  pool, so a process that has stopped parsing holds none. There is no idle
+  timer, because a timer would only choose how long a resting machine carries
+  one worker per core to save the milliseconds a restart costs. Bounding callers
   instead would let a caller start a fresh worker while an expiring one still
   held its runner slot and memory reservation, and the runner would then refuse
   an admission the pool itself caused.
-- A healthy worker returns to the idle list under `WorkerIdleTTL`; expiry
-  closes its stdin, the worker exits on EOF and the runner reaps it.
+- A healthy worker that has not exhausted a lifetime bound returns to the idle
+  list, where the next parse of the stage reuses it; the drain that follows the
+  last caller closes its stdin, the worker exits on EOF and the runner reaps
+  it. An unhealthy or exhausted worker is stopped at release instead.
 - A worker is recycled (stopped after its current parse) when it has done
   2048 parses, consumed three quarters of its stdin or stdout lifetime budget,
   or lived three quarters of its hour, so a healthy worker is never killed by
@@ -357,7 +367,7 @@ truncation, never sent oversize.
   kills every worker that is not idle, and waits for the runner to reap each.
 - `Stats()` is the aggregate accounting of Section 22: `Processes` (every
   worker process the runner has not yet reaped, idle ones included, never more
-  than `index.max_parser_workers`), `IdleWorkers` (its reusable subset) and
+  than the worker count), `IdleWorkers` (its reusable subset) and
   `BusyWorkers` (the rest: parsing, or on their way out), started and exited
   counts, parses, retries, the sum of the resident set each live worker last
   reported, the parent's own resident set and the live worker PIDs. Both sides
@@ -431,7 +441,7 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
 | signature | `MaxSignatureBytes` (4 KiB), whitespace-collapsed | parent |
-| workers | `index.max_parser_workers` (default 2) | pool |
+| workers | one per CPU (`config.ParserWorkers()`) | pool |
 | parse time | `Options.ParseTimeout` (default 60 s) | pool; kills the worker |
 | worker lifetime | 1 h / 2048 parses / 1 GiB each way | pool; recycled at three quarters |
 | hello | 30 s | pool |

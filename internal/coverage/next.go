@@ -23,13 +23,19 @@ import (
 // pages ordinals ascending and stops at the first entry that is not
 // required_full. It never sorts and never re-ranks; re-deriving an order here
 // would be a second ranking implementation.
-func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.NextContextItem, error) {
+func (s *Service) Next(ctx context.Context, req model.SessionRequest) (_ model.NextContextItem, err error) {
 	if err := req.Validate(); err != nil {
 		return model.NextContextItem{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage next", err) }()
 
 	// Gate the actor before anything else: Store.Session skips its actor check
 	// on an empty actor, and UnconfirmedChunks below takes no actor at all.
@@ -186,9 +192,10 @@ func (s *Service) nextAction(ctx context.Context, rec sqlite.SessionRecord, atEO
 	if err != nil {
 		return "", err
 	}
-	capped := s.limits.MaxUnconfirmedChunksPerSession > 0 &&
-		unconfirmed >= int64(s.limits.MaxUnconfirmedChunksPerSession)
-	if (atEOF && unconfirmed > 0) || capped {
+	// Zero is unlimited (Limits.MaxUnconfirmedChunksPerSession); the one
+	// spelling of that comparison lives on Limits, so this endpoint and the
+	// read endpoint cannot drift about what "capped" means.
+	if (atEOF && unconfirmed > 0) || s.limits.unconfirmedCapped(unconfirmed) {
 		return actionAcknowledgeReceipt, nil
 	}
 	return actionReadSource, nil

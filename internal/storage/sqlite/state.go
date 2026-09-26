@@ -17,6 +17,18 @@ import (
 // versioned workflow state are the explicitly mutable rows, and every
 // transition is a compare-and-swap on state_version in one transaction.
 
+// ExcludedEntries is a manifest's exclusion projection as a push sequence: it
+// yields every excluded entry in ordinal order and returns the first error
+// yield reported, or its own read failure, unchanged.
+//
+// It must be RESTARTABLE -- callable more than once, yielding the identical
+// sequence each time -- because the compiler folds the canonical manifest hash
+// over the same exclusions it then writes, and a one-shot cursor would hash a
+// sequence and persist an empty one. A sorted run over a spooled projection
+// satisfies this; a channel drained by the first caller does not. A nil
+// sequence is a manifest with no exclusions.
+type ExcludedEntries func(yield func(model.ExcludedContextEntry) error) error
+
 // PutManifest stores an immutable compiled manifest: header, ordered entries,
 // slices and exclusions in one transaction. Every entry's node must be visible
 // in the manifest's generation and every file must be in its snapshot.
@@ -28,8 +40,16 @@ import (
 // descending within a rank. The workflow walks those ordinals directly, so an
 // order this method accepted and never checked would be a defect visible only
 // one task later.
+//
+// Exclusions arrive as a SEQUENCE and not as a slice. An entry list is bounded
+// by the compile's resolved budget -- the caller's own declared window -- but
+// the exclusion list is bounded only by the repository, so materializing it
+// here would put a repository-sized slice in heap for the length of the
+// transaction. Rows are validated and inserted one at a time as the sequence
+// yields them, against a prepared statement inside the manifest's single
+// transaction, so peak heap is one row however many were excluded.
 func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, requestJSON []byte,
-	entries []model.ContextEntry, slices []model.ContextSlice, excluded []model.ExcludedContextEntry) error {
+	entries []model.ContextEntry, slices []model.ContextSlice, excluded ExcludedEntries) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
@@ -78,14 +98,6 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			return invalid("manifest slices must be ordered 0..n-1; slice %d has index %d", i, sl.Index)
 		}
 	}
-	for i, x := range excluded {
-		if err := x.Validate(); err != nil {
-			return err
-		}
-		if x.Ordinal != i {
-			return invalid("excluded entries must be ordered 0..n-1; entry %d has ordinal %d", i, x.Ordinal)
-		}
-	}
 	idRaw, _ := model.DecodeID(string(m.ID))
 	snapRaw, _ := model.DecodeID(string(m.Binding.SnapshotID))
 	keyRaw, _ := model.DecodeID(string(m.Binding.AnalysisKey))
@@ -130,7 +142,8 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			idRaw, g.id, snapRaw, string(m.Phase), m.RequestHash, m.PolicyVersion, string(requestJSON), string(header), m.CanonicalHash, formatTime(m.CreatedAt)); err != nil {
 			return wrap("context_manifests", err)
 		}
-		nodeVisible, err := tx.PrepareContext(ctx, `SELECT 1 FROM node_facts nf JOIN generation_units gu ON gu.unit_id = nf.unit_id WHERE gu.generation_id = ? AND nf.node_id = ? LIMIT 1`)
+		nodeVisible, err := tx.PrepareContext(ctx, `SELECT ni.id FROM node_ids ni JOIN node_facts nf ON nf.node_id = ni.id
+			JOIN generation_units gu ON gu.unit_id = nf.unit_id WHERE gu.generation_id = ? AND ni.canonical = ? LIMIT 1`)
 		if err != nil {
 			return wrap("node_facts", err)
 		}
@@ -149,9 +162,10 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		for _, e := range entries {
 			nodeRaw, _ := optionalBlob("node_id", string(e.NodeID))
 			fileRaw, _ := optionalBlob("file_id", string(e.FileID))
+			var node nodeRef
 			var one int
 			if nodeRaw != nil {
-				if err := nodeVisible.QueryRowContext(ctx, g.id, nodeRaw).Scan(&one); err != nil {
+				if err := nodeVisible.QueryRowContext(ctx, g.id, nodeRaw).Scan(&node); err != nil {
 					if isNoRows(err) {
 						return &model.Error{Code: model.CodeScopeIncomplete, Message: fmt.Sprintf("manifest entry %d names a node that is not visible in generation %d", e.Ordinal, g.id)}
 					}
@@ -173,7 +187,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			if e.EvidencePaths != nil {
 				paths, _ = json.Marshal(e.EvidencePaths)
 			}
-			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nodeRaw, fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), string(paths)); err != nil {
+			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nullNode(node), fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), string(paths)); err != nil {
 				return wrap("context_entries", err)
 			}
 		}
@@ -202,10 +216,28 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			return wrap("excluded_context_entries", err)
 		}
 		defer excl.Close()
-		for _, x := range excluded {
-			ref, _ := json.Marshal(x.Reference)
-			if _, err := excl.ExecContext(ctx, idRaw, x.Ordinal, string(ref), x.Reason); err != nil {
-				return wrap("excluded_context_entries", err)
+		// The ordinal check the slice form ran up front runs HERE instead,
+		// against a counter rather than a length: the same rule (exclusions are
+		// ordered 0..n-1), enforced at the row that breaks it, without holding
+		// the rows to count them first. A sequence that yields nothing is a
+		// manifest with no exclusions, which is legal.
+		if excluded != nil {
+			ordinal := 0
+			if err := excluded(func(x model.ExcludedContextEntry) error {
+				if err := x.Validate(); err != nil {
+					return err
+				}
+				if x.Ordinal != ordinal {
+					return invalid("excluded entries must be ordered 0..n-1; entry %d has ordinal %d", ordinal, x.Ordinal)
+				}
+				ordinal++
+				ref, _ := json.Marshal(x.Reference)
+				if _, err := excl.ExecContext(ctx, idRaw, x.Ordinal, string(ref), x.Reason); err != nil {
+					return wrap("excluded_context_entries", err)
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -276,17 +308,85 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 	return m, err
 }
 
+// ManifestScopeNodes pages the DISTINCT node ids a manifest's entries name, in
+// node-id order, by keyset on the node id itself.
+//
+// The capsule's scope list is exactly this set, and deriving it in SQL is what
+// keeps the seal's memory a function of the page size: a Go-side walk of
+// ManifestEntries would have to hold a dedup set and a sort buffer over every
+// entry the manifest carries, and context.max_manifest_bytes is unlimited by
+// default. Entries that name no node (a file pulled in whole) contribute
+// nothing and are excluded here rather than skipped by the caller.
+//
+// The rows carry node_ids.id surrogates, which are storage-internal and
+// meaningless outside this database file, so the page is both ordered and
+// keyset on the CANONICAL 32-byte id reached through node_ids: the caller
+// (workflow's capsule scope collector) feeds the last id it received back as
+// `after`, and a cursor must carry a canonical identity. node_id is not
+// indexed on context_entries (the primary key is (manifest_id, ordinal)) and
+// the ordering column lives in the joined dictionary, so SQLite satisfies the
+// DISTINCT and the ORDER BY from a temporary b-tree over one manifest's
+// entries, each row's canonical fetched by the node_ids integer primary key.
+// That cost is the database's, not the process heap's, and it is bounded by
+// the manifest.
+func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
+	after model.NodeID, limit int) ([]model.NodeID, error) {
+	raw, err := idBlob("manifest_id", string(id))
+	if err != nil {
+		return nil, err
+	}
+	// An empty cursor must admit the lowest node id, and a zero-length blob
+	// sorts below every real 32-byte canonical identifier, so it is the
+	// natural "before the first row" sentinel for the canonical column this
+	// keyset compares against. (It is NOT a sentinel for the INTEGER
+	// surrogate: SQLite orders every integer below every blob, so comparing
+	// the surrogate against it excludes every row.)
+	afterRaw := []byte{}
+	if after != "" {
+		if afterRaw, err = idBlob("after", string(after)); err != nil {
+			return nil, err
+		}
+	}
+	limit = pageLimit(ctx, limit)
+	var out []model.NodeID
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ni.canonical FROM context_entries ce
+			JOIN node_ids ni ON ni.id = ce.node_id
+			WHERE ce.manifest_id = ? AND ce.node_id IS NOT NULL AND ni.canonical > ?
+			ORDER BY ni.canonical LIMIT ?`,
+			raw, afterRaw, limit)
+		if err != nil {
+			return wrap("context_entries", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var node []byte
+			if err := rows.Scan(&node); err != nil {
+				return wrap("context_entries", err)
+			}
+			out = append(out, model.NodeID(idHex(node)))
+		}
+		return wrap("context_entries", rows.Err())
+	})
+	return out, err
+}
+
 // ManifestEntries pages a manifest's entries by ordinal.
 func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error) {
 	raw, err := idBlob("manifest_id", string(id))
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ContextEntry
 	err = s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT ordinal, node_id, file_id, requirement, score_micros, estimated_bytes, estimated_tokens, reasons_json, evidence_paths_json
-			FROM context_entries WHERE manifest_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?`, raw, afterOrdinal, limit)
+		// context_entries.node_id is a node_ids.id surrogate; the entry that
+		// leaves this package must name the canonical identity, so the read
+		// hydrates it through the dictionary. LEFT JOIN because an entry that
+		// pulls a whole file in names no node.
+		rows, err := tx.QueryContext(ctx, `SELECT ce.ordinal, ni.canonical, ce.file_id, ce.requirement, ce.score_micros, ce.estimated_bytes, ce.estimated_tokens, ce.reasons_json, ce.evidence_paths_json
+			FROM context_entries ce LEFT JOIN node_ids ni ON ni.id = ce.node_id
+			WHERE ce.manifest_id = ? AND ce.ordinal > ? ORDER BY ce.ordinal LIMIT ?`, raw, afterOrdinal, limit)
 		if err != nil {
 			return wrap("context_entries", err)
 		}
@@ -320,7 +420,7 @@ func (s *Store) ManifestSlices(ctx context.Context, id model.ManifestID, afterIn
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ContextSlice
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT slice_index, estimated_bytes, estimated_tokens FROM context_slices WHERE manifest_id = ? AND slice_index > ? ORDER BY slice_index LIMIT ?`, raw, afterIndex, limit)
@@ -368,7 +468,7 @@ func (s *Store) ManifestExcluded(ctx context.Context, id model.ManifestID, after
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ExcludedContextEntry
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT ordinal, reference_json, reason FROM excluded_context_entries WHERE manifest_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?`, raw, afterOrdinal, limit)
@@ -408,15 +508,39 @@ type SessionRecord struct {
 	ClosedAt     *time.Time
 }
 
+// requirementRankSQL ranks a requirement so the STRONGEST is the smallest
+// number. It is one expression used twice -- once to collapse a manifest's own
+// entries for a file, once to compare an arriving requirement against the one
+// the session already holds -- so the two can never disagree about which of two
+// requirements is stronger.
+const requirementRankSQL = `CASE %s WHEN 'required_full' THEN 0 WHEN 'required_symbol' THEN 1 ` +
+	`WHEN 'recommended' THEN 2 ELSE 3 END`
+
 // sessionFilesSQL derives session_files from the manifest's entries joined to
 // the session's own snapshot, keeping the strongest requirement per file. The
 // snapshot join is what makes a file from another snapshot impossible here.
-const sessionFilesSQL = `INSERT OR IGNORE INTO session_files(session_id, snapshot_id, file_id, content_hash, requirement)
-	SELECT ?1, ?2, ce.file_id, sf.content_hash,
-		CASE min(CASE ce.requirement WHEN 'required_full' THEN 0 WHEN 'required_symbol' THEN 1 WHEN 'recommended' THEN 2 ELSE 3 END)
-			WHEN 0 THEN 'required_full' WHEN 1 THEN 'required_symbol' WHEN 2 THEN 'recommended' ELSE 'optional' END
-	FROM context_entries ce JOIN snapshot_files sf ON sf.snapshot_id = ?2 AND sf.file_id = ce.file_id AND sf.content_hash IS NOT NULL
-	WHERE ce.manifest_id = ?3 AND ce.file_id IS NOT NULL GROUP BY ce.file_id`
+//
+// It UPSERTS rather than INSERT OR IGNORE, and the upsert may only UPGRADE a
+// requirement. A session grows by `context include`, which recompiles over
+// further seeds and unions the result in: with OR IGNORE, whatever the FIRST
+// manifest said about a file was frozen forever, so a file that arrived as an
+// optional captured change stayed optional even after a later include named it
+// as a required seed. The session then under-reported its own required scope --
+// coverage read as smaller than the work the actor had actually been told to
+// do. The rank guard is what keeps the union monotonic in the other direction:
+// a later manifest that mentions a file only in passing can never weaken a
+// requirement an earlier one established.
+var sessionFilesSQL = `INSERT INTO session_files(session_id, snapshot_id, file_id, content_hash, requirement)
+	SELECT * FROM (
+		SELECT ?1, ?2, ce.file_id, sf.content_hash,
+			CASE min(` + fmt.Sprintf(requirementRankSQL, "ce.requirement") + `)
+				WHEN 0 THEN 'required_full' WHEN 1 THEN 'required_symbol' WHEN 2 THEN 'recommended' ELSE 'optional' END
+		FROM context_entries ce JOIN snapshot_files sf ON sf.snapshot_id = ?2 AND sf.file_id = ce.file_id AND sf.content_hash IS NOT NULL
+		WHERE ce.manifest_id = ?3 AND ce.file_id IS NOT NULL GROUP BY ce.file_id
+	) WHERE true ON CONFLICT(session_id, file_id, content_hash) DO UPDATE SET
+		requirement = CASE WHEN ` + fmt.Sprintf(requirementRankSQL, "excluded.requirement") +
+	` < ` + fmt.Sprintf(requirementRankSQL, "session_files.requirement") +
+	` THEN excluded.requirement ELSE session_files.requirement END`
 
 // OpenSession creates an actor-specific session over a manifest and populates
 // its file scope. With an idempotency key, a retry by the same actor with the
@@ -818,7 +942,7 @@ func mergeServedRange(ctx context.Context, tx *sql.Tx, session, file, hash []byt
 // A nonempty file is full_served only when the union is exactly [0,size); an
 // empty file requires a confirmed zero-length EOF receipt.
 func (s *Store) Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -995,7 +1119,7 @@ func (s *Store) PutObservation(ctx context.Context, o model.Observation) error {
 // one scope version (zero means every version).
 func (s *Store) Observations(ctx context.Context, session model.SessionID, actor string, kind model.ObservationKind, scopeVersion int,
 	after model.ObservationID, limit int) ([]model.Observation, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -1044,7 +1168,13 @@ func (s *Store) Observations(ctx context.Context, session model.SessionID, actor
 // PutCapsule stores the deterministic completion record once, for a session
 // whose consolidate phase is open. A second call returns the first stored
 // capsule unchanged (Section 17.3).
-func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule, error) {
+//
+// The capsule blob carries identity and counts; src streams the records
+// themselves into context_capsule_rows inside this same write transaction,
+// after the "a capsule already exists" check, so the seal stays write-once and
+// a capsule is never committed without the rows its identity was derived from.
+// A second call returns the stored capsule and writes no rows.
+func (s *Store) PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error) {
 	if err := c.Validate(); err != nil {
 		return model.Capsule{}, err
 	}
@@ -1085,7 +1215,10 @@ func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule,
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO context_capsules(session_id, canonical_hash, capsule_json, created_at) VALUES(?, ?, ?, ?)`,
 			sessionRaw, c.CanonicalHash, string(payload), formatTime(c.CreatedAt))
-		return wrap("context_capsules", err)
+		if err != nil {
+			return wrap("context_capsules", err)
+		}
+		return writeCapsuleRows(ctx, tx, sessionRaw, c.Counts, src)
 	})
 	return stored, err
 }
@@ -1121,7 +1254,7 @@ func (s *Store) Capsule(ctx context.Context, session model.SessionID, actor stri
 // batch, and reports how many it closed. Closing stops mutations; the audit
 // artifacts stay until PruneSessions.
 func (s *Store) ExpireSessions(ctx context.Context, now time.Time, limit int) (int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var n int64
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE read_sessions SET workflow_state = 'closed', closed_at = ?, state_version = state_version + 1
@@ -1140,7 +1273,7 @@ func (s *Store) ExpireSessions(ctx context.Context, now time.Time, limit int) (i
 // than retention, in one bounded batch. Their chunks, ranges, observations and
 // capsules cascade; their manifests become collectable with their generation.
 func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time.Duration, limit int) (int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if retention < 0 {
 		return 0, invalid("closed-session retention must not be negative")
 	}
@@ -1369,28 +1502,43 @@ func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, a
 	return out, nil
 }
 
-// Waivers reads this session's recorded coverage exceptions, in file-id order.
-// Waive is a writer whose returned record echoes the request's reason, and
-// FileCoverage carries only the Waived flag, so this is the only reader of the
-// stored reasons -- the text a sealed capsule has to carry to be an honest
-// durable artifact (Section 17.3).
+// WaiversAfter pages this session's recorded coverage exceptions by keyset on
+// file_id, the key Coverage pages session_files on. Waive is a writer whose
+// returned record echoes the request's reason, and FileCoverage carries only
+// the Waived flag, so this is the only reader of the stored reasons -- the text
+// a sealed capsule has to carry to be an honest durable artifact (Section 17.3).
 //
 // coverage_waivers is append-only and has no actor column: the exception is a
 // property of the session, so ActorID comes from the resolved session record
-// exactly as Waive sets it. The page loop runs inside one read transaction, so
-// every page is read from the same snapshot and the assembled list is the set
-// one consistent read would have returned. Like Coverage and CoverageSummary it
-// answers honestly beside CTX_SESSION_EXPIRED: a capsule is sealed from what the
-// session recorded, and an expired session still recorded it.
+// exactly as Waive sets it. Like Coverage, Observations and ManifestScopeNodes
+// each page is its own read transaction rather than one loop inside a single
+// snapshot: coverage_waivers is only ever appended to, and a Waive that lands
+// between a seal's counting pass and its digest pass is caught by
+// CapsuleCanonicalHash's count-versus-stream refusal instead of being sealed.
+// The caller therefore never holds a session-sized list, which is the property
+// a whole-list read could not give.
 //
-// The keyset is file_id alone, the key Coverage pages session_files on. Both
-// tables are keyed (session_id, file_id, content_hash), so both carry the same
-// latent boundary if one session ever pinned one file at two content hashes;
-// nothing in the writer path produces that today, and answering it differently
-// here would be the only place in the package that does.
-func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+// Like Coverage and CoverageSummary it answers honestly beside
+// CTX_SESSION_EXPIRED: a capsule is sealed from what the session recorded, and
+// an expired session still recorded it.
+//
+// The keyset is file_id alone. Both coverage_waivers and session_files are keyed
+// (session_id, file_id, content_hash), so both carry the same latent boundary if
+// one session ever pinned one file at two content hashes; nothing in the writer
+// path produces that today, and answering it differently here would be the only
+// place in the package that does.
+func (s *Store) WaiversAfter(ctx context.Context, session model.SessionID, actor string,
+	after model.FileID, limit int) ([]model.WaiverRecord, error) {
+	limit = pageLimit(ctx, limit)
+	afterRaw, err := optionalBlob("after", string(after))
+	if err != nil {
+		return nil, err
+	}
+	if afterRaw == nil {
+		afterRaw = []byte{}
+	}
 	var out []model.WaiverRecord
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
 			// Digest Section 11: errors.As, never a type assertion, so a
@@ -1402,38 +1550,25 @@ func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor stri
 			}
 		}
 		sessionRaw, _ := model.DecodeID(string(rec.ID))
-		after := []byte{}
-		for {
-			rows, err := tx.QueryContext(ctx, waiversSQL, sessionRaw, after, model.MaxPageItems)
-			if err != nil {
-				return wrap("coverage_waivers", err)
-			}
-			n := 0
-			for rows.Next() {
-				var file, hash []byte
-				var created string
-				w := model.WaiverRecord{SessionID: rec.ID, ActorID: rec.ActorID}
-				if err := rows.Scan(&file, &hash, &w.Reason, &created); err != nil {
-					rows.Close()
-					return wrap("coverage_waivers", err)
-				}
-				if w.CreatedAt, err = parseTime(created); err != nil {
-					rows.Close()
-					return wrap("coverage_waivers", err)
-				}
-				w.FileID, w.ContentHash = model.FileID(idHex(file)), idHex(hash)
-				out = append(out, w)
-				after, n = file, n+1
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return wrap("coverage_waivers", err)
-			}
-			rows.Close()
-			if n < model.MaxPageItems {
-				return nil
-			}
+		rows, err := tx.QueryContext(ctx, waiversSQL, sessionRaw, afterRaw, limit)
+		if err != nil {
+			return wrap("coverage_waivers", err)
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var file, hash []byte
+			var created string
+			w := model.WaiverRecord{SessionID: rec.ID, ActorID: rec.ActorID}
+			if err := rows.Scan(&file, &hash, &w.Reason, &created); err != nil {
+				return wrap("coverage_waivers", err)
+			}
+			if w.CreatedAt, err = parseTime(created); err != nil {
+				return wrap("coverage_waivers", err)
+			}
+			w.FileID, w.ContentHash = model.FileID(idHex(file)), idHex(hash)
+			out = append(out, w)
+		}
+		return wrap("coverage_waivers", rows.Err())
 	})
 	if err != nil {
 		return nil, err

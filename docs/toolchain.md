@@ -62,7 +62,7 @@ where none does.
 | Hosted on `tools-v1` (no upstream binary exists) | Pinned at the upstream URL |
 |---|---|
 | `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `joern`, `jdtls`, `clangd`, `scip-java`, `scip-clang`, `rust-analyzer` |
-| `scip-typescript`, `scip-python`, `typescript-language-server`, `pyright` — npm packages, prebuilt so the user never runs npm | |
+| `scip-typescript`, `scip-python`, `typescript-language-server` — npm packages, prebuilt so the user never runs npm | `ty` — a static binary per platform, with a per-asset `.sha256` sidecar |
 | `scip-go` — darwin amd64 and both Windows targets only; cross-built | `scip-go` — linux amd64/arm64 and darwin arm64 |
 
 The hosted payloads are normalized deterministically: entries sorted by
@@ -105,11 +105,11 @@ and a path, which the lock's own validation enforces. The hosts in use are
 | `scip-typescript` | 0.4.0 | indexer | node | typescript, tsx, javascript | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-python` | 0.6.6 | indexer | node | python | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-java` | 0.13.1 | indexer | jdk | java | all six | upstream launcher jar, sidecar `.sha256` |
-| `rust-analyzer` | 2026-08-17.4 | indexer (also the Rust server) | — | rust | all six | upstream; upstream publishes no digest |
+| `rust-analyzer` | 2026-09-14 | indexer (also the Rust server) | — | rust | all six | upstream; upstream publishes no digest |
 | `scip-clang` | 0.4.0 | indexer | — | c, cpp | linux amd64, darwin arm64 | upstream; upstream publishes no digest |
 | `gopls` | 0.23.0 | server | — | go | all six | hosted; cross-built, upstream ships no binaries |
 | `typescript-language-server` | 6.0.0 | server | node | typescript, tsx, javascript | all six | hosted; with TypeScript 5.9.3 |
-| `pyright` | 1.1.414 | server | node | python | all six | hosted; `npm ci --omit=dev` at release time |
+| `ty` | 0.0.81 | server | — | python | all six | upstream; per-asset `.sha256` sidecar |
 | `clangd` | 22.1.6 | server | — | c, cpp | linux amd64, darwin amd64, windows amd64 | upstream; upstream publishes no digest |
 | `jdtls` | 1.61.0 | server | jdk | java | all six | upstream Eclipse tarball, sidecar `.sha256` |
 | `joern` | 4.0.627 | cpg | jdk | all nine | all six | upstream `joern-cli` archives, sidecar `.sha512` |
@@ -143,6 +143,18 @@ the engine is a backend swap rather than a product change.
   The module declares itself as `github.com/scip-code/scip-go` while the release
   assets still live under `github.com/sourcegraph/scip-go`; the project moved
   owner and both spellings name scip-go 0.2.7.
+- **`ty` is the Python server, and it runs as itself.** The Python row was
+  moved from a Node-hosted npm package to this native checker by
+  [ADR-0006](adr/ADR-0006-language-servers.md): on a cold session — the only
+  kind the overlay has — it answers whole-workspace `references` where the
+  previous server answered only the opened file's import closure, at less
+  memory and with no settle window. Upstream ships one static binary per
+  target, each with a `.sha256` sidecar, so all six platform keys are pinned
+  upstream with a publisher-declared `upstream_digest` and none needs hosting.
+  It is pre-1.0 and warns that any two releases may differ incompatibly, so
+  this is the one entry whose pin is re-cut on a faster cadence than the rest
+  of the lock; the pin is exact, so the product never sees an unreviewed
+  change. `node` stays pinned for the three payloads that still need it.
 - **`rust-analyzer`, `clangd`, `scip-clang`: no upstream digest.** These
   projects publish release assets with no checksum sidecar. The lock pins the
   SHA-256 observed at generation time, which from that point forward is what
@@ -170,7 +182,7 @@ is on this machine and is it still intact".
 codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
 codectx tools prefetch [--all | --for-repo PATH | NAME...] [--json]
                                                        # install ahead of time
-codectx tools verify [--json]                          # rehash every installed entry against the lock
+codectx tools verify [--json]                          # rehash every installed entry, and list what the lock does not name
 codectx tools gc [--json]                              # remove versions the current lock does not name
 ```
 
@@ -179,7 +191,14 @@ presence of its executable, and never rehashes, so it stays usable for a store
 holding the 1.8 GB engine. Each entry is reported in one of five states —
 `installed`, `available` (pinned but not fetched yet), `unsupported_platform`
 (the lock carries no payload here, which is honest absence and not a failure),
-`override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
+`override` (a `[tools.override.<name>]` replaces it) or `corrupt`. `verify`
+adds a sixth, `unlisted`: a payload directory the store holds that no lock entry
+names — a superseded entry a binary upgrade left behind, or a directory
+something else wrote. It carries no version and no digest, because nothing in
+this binary pins it. When a report has no installed entry at all, the human
+output says so on its last line and names `codectx tools prefetch`: verifying
+verifies what is installed, so an empty store is `ok` and exit 0, and the
+state counts alone would read as a clean bill of health.
 
 `prefetch` requires one of `--all`, `--for-repo PATH` or explicit names, so a
 bare invocation cannot start a multi-gigabyte download by accident. A name the
@@ -188,49 +207,58 @@ payload for this platform is skipped rather than failed. Each completed fetch
 logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
 report of what is now installed goes to stdout.
 
-`--for-repo PATH` installs what that repository's **root** selects, which on a Go
+`--for-repo PATH` installs what that repository selects, which on a Go
 repository is four payloads rather than fourteen. The selection is read from the
 mappings that already decide it — the SCIP indexers' trigger manifests, the
 language servers' root markers, the dependence families' project markers, and
 the path-to-language table for the source check below — plus each selected
 entry's `runtime` from the lock, so no second copy of any of them exists
-anywhere in the CLI. Everything is read at the repository root, by metadata or
-by filename, through the confined root handle for the markers and as one listing
-of the root directory for the sources: nothing is opened, nothing is started,
-and nothing below the root is walked, so the work is bounded by the number of
-markers plus the entries of one directory rather than by the size of the
-repository. A root that selects nothing is an argument error rather than a
-silent no-op.
+anywhere in the CLI. The whole repository is read, by filename only and in two
+passes: a traversal under the configuration's own traversal policy, then the
+paths Git's index names. Nothing is opened and nothing is started. An
+**untracked** manifest inside an excluded tree (`node_modules`, `vendor`, a
+build directory) is not a project and selects nothing; a **tracked** one selects
+its tools, because Section 10.2 forces a tracked path past every exclusion: it
+is in the snapshot manifest a capture builds, it roots a project and it plans a
+unit. That is the same force-include a capture applies, from the same index
+listing, and the two passes read the repository without holding any part of it:
+each ends as soon as every marker has been seen and a source found, because at
+that moment the answer is complete. A workspace carrying a `.git` entry whose
+Git cannot be run is a typed failure rather than the quieter answer that would
+under-select. A repository that selects nothing is an argument error rather than
+a silent no-op.
 
-The root is the whole of what the command can see, and that is the planner's
-answer for two of the three providers but not the third:
+`prefetch` also removes every payload directory the lock does not name — the
+`unlisted` rows of `verify`. Its post-condition is a store holding what this
+binary pins, and bytes no lock entry vouches for are not part of that. It leaves
+superseded **versions** of pinned tools alone; reclaiming those is `gc`'s job,
+because another workspace may still be resolving one.
 
-- **SCIP and LSP are root-only too.** Both detect from manifests at the
-  repository root, so what `--for-repo` selects for them is exactly what an
-  index run resolves. A nested `svc/pom.xml` selects no Java payload here, and
-  it selects none at index time either.
+What the command sees is what the planners see, for all three providers:
+
+- **The precise indexers and the language servers are planned per project.**
+  Both find their manifests anywhere the traversal admits, so what `--for-repo`
+  selects for them is exactly what an index run resolves. A nested
+  `svc/pom.xml` selects the Java payloads here, and it plans a unit and roots a
+  server at `svc/` at index time. A repository whose every project sits in a
+  subdirectory — the ordinary monorepo — selected nothing at all while a
+  root-only check decided this.
 - **The dependence provider walks for sources.** Its C/C++ family declares no
-  project marker at all — its unit is the repository itself, planned
-  unconditionally — and its other families' units are found by walking the
-  tree. `--for-repo` therefore selects the graph engine and its JDK on three
-  signals: a project marker of one of the other families at the root
-  (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
+  project marker at all — its unit is the repository itself — and its other
+  families' units are found by walking the tree. `--for-repo` therefore selects
+  the graph engine and its JDK on either of two signals anywhere in the
+  repository: a project marker of one of the other families (`go.mod`,
+  `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
   `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `Cargo.toml`), a C or C++ build declaration at the root (`CMakeLists.txt` or
-  `compile_commands.json`, which also cover the out-of-source layout with
-  sources under `src/`; a bare `Makefile` does not count, since it is common at
-  roots of every language), or a source file of any of the families lying at
-  the root itself. This over-selects in one direction only: a root carrying
-  `CMakeLists.txt` or a project marker with no source of that family anywhere
-  in the tree still prefetches the engine, because the planner gates on sources
-  while this command reads only the root.
+  `Cargo.toml`), or a source file of any of the families. The C and C++ family
+  is selected by its sources, which is what the planner gates on; a build
+  declaration with no source of that family anywhere selects nothing, because
+  no unit would analyse it.
 
-  One root shape is therefore still under-served and fetches the graph engine
-  and its JDK at index time after a `--for-repo` prefetch reported success: a
-  root that declares nothing at all while its sources live further down.
-  Closing it would need a walk, which this command refuses so a prefetch's
-  work stays bounded. When prefetching for an air-gapped runner from that
-  shape, name the tools explicitly or use `--all`.
+The Git ignore predicate an index run installs on top of the traversal policy is
+not built here — it needs a Git process runner this command has none of — so the
+walk may see a handful of paths a capture excludes. That direction can only
+select a payload the repository does not need; it can never miss one.
 
 ```console
 $ codectx tools prefetch --for-repo .
@@ -259,12 +287,22 @@ tool's own state at its run's work directory — and why an operator who suspect
 tampered tree reinstalls it with `prefetch` rather than trusting a green
 `verify`.
 
-`--repo` selects which workspace's resolved configuration is used, because the
-data directory is per workspace by default and the store under it is
-`<data_dir>/tools`. Set `tools.cache_dir` in the user configuration to give every
-checkout on the machine one shared store: the path it names **is** the store,
-used verbatim, not a parent that `tools` appends to. The path the reports print
-is the one the resolver actually reads, so the two can never disagree.
+The store is **one machine-wide directory shared by every workspace**:
+`$XDG_DATA_HOME/codectx/tools`, or `~/.local/share/codectx/tools` when
+`XDG_DATA_HOME` is unset or not absolute. That is the default, and it is the same
+path the installer populates from a bundle, so a payload installed once is
+installed for every repository on the host. The payloads are gigabytes and are
+byte-identical for every checkout; a per-workspace store would fetch them again
+for each one and leave a fresh clone with nothing installed.
+
+`tools.cache_dir` in the user configuration overrides it. The path it names **is**
+the store, used verbatim, not a parent that `tools` appends to. `--repo` selects
+which workspace's resolved configuration is read, which matters only on a host
+whose user configuration varies by repository. The path the reports print is the
+one the resolver actually reads, so the two can never disagree.
+
+Older builds put the store at `<data_dir>/tools`, which was per workspace. Those
+directories are inert: nothing reads them any more, and each may be deleted.
 
 None of the four commands creates anything it only reports on: `status`,
 `verify` and `gc` leave a machine with no store exactly as they found it, and the
@@ -282,8 +320,9 @@ both: **codectx never fetches anything the embedded lock does not name**, so
 "offline" is a refusal path, not a best-effort degradation.
 
 **A bundle archive** (`codectx-bundle_<version>_<os>_<arch>.tar.gz`) carries the
-binary with the tool store already populated for that one platform. Install it,
-point `[tools] cache_dir` at the unpacked store, and nothing ever dials out.
+binary with the tool store already populated for that one platform. The
+installer unpacks it into the shared store the default already resolves to, so
+only `[tools] offline = true` has to be set, and nothing ever dials out.
 Each bundle is built natively for its own target, so one host cannot produce
 another platform's bundle.
 
@@ -300,7 +339,7 @@ codectx tools verify           # rehash the store against the lock
 
 `prefetch --all` installs every entry the lock carries **for this platform**;
 there is no target flag, for the same reason there is no cross-built bundle.
-`--for-repo PATH` narrows it to what that repository's root actually selects,
+`--for-repo PATH` narrows it to what that repository actually selects,
 which is usually a much smaller store.
 
 With `[tools] offline = true` every fetch becomes a typed refusal that opens no
@@ -309,6 +348,15 @@ functional for every entry it holds and honestly unavailable for the rest —
 `codectx tools status` names which is which, and `codectx doctor --offline`
 reports the offline-policy checks. What that report says is what those checks
 found; the flag itself asserts nothing about the installation.
+
+`codectx doctor`'s `toolchain:` rows are the **actionable subset**, not an
+inventory: one row per pinned tool this repository selects -- the same selection
+`prefetch --for-repo` installs -- and cannot currently use. A tool the
+repository does not select is not listed, because nothing will ever run it
+here; a selected tool that is installed is not listed either, because there is
+nothing to do about it. A selected payload that is damaged **is** listed, and
+fails the report, although it is installed: doctor is the only place a corrupt
+store surfaces. `codectx tools status` is the inventory.
 
 `[tools] mirror` is the third option, for a host that has a network but not the
 publishers': it relocates bytes and never changes which bytes are accepted,
@@ -353,7 +401,15 @@ outside the input directory, a private scratch root per run. A matrix that ran a
 different argv would prove that some invocation works on the platform rather
 than that the one the product issues does. The fixture and the assertion that
 each index names the documents it was given are the smoke's own. C++ and TSX are exercised
-explicitly because the research rounds covered only C and TypeScript. A language
+explicitly because the research rounds covered only C and TypeScript. One
+project — the JavaScript one — carries **no compiler configuration at all**,
+only a `package.json`, because a matrix whose every project is configured proves
+the argument array for the configured half of a repository and no more: that gap
+is how an argv that failed every configuration-less JavaScript project passed
+this matrix and shipped. The indexer writes the configuration it infers into the
+directory it is given, so the materialization removes it before each run;
+otherwise a kept or reused fixture would carry it into the next one and the leg
+would pass while proving the opposite. A language
 no run covers fails the job, so a payload that silently stopped working cannot
 leave a green matrix behind it.
 
@@ -403,6 +459,27 @@ on a user's machine.
 The generator resumes: each finished platform is recorded, so an interrupted
 run does not repeat work that already succeeded, and a hosted asset that is
 already published at the right size is not uploaded again.
+
+`-check` runs **daily** in `.github/workflows/lock-check.yml`, and on any change
+to `internal/toolchain/tools.lock.json`. A published tag is not immutable: an
+upstream project re-uploaded the assets of an already-published release three
+hours after the lock had recorded their digests, and the lock — honest when it
+was written — was discovered to be stale only by a user's index refusing to
+fetch the analyzer mid-run. A gate that runs only when we change the lock cannot
+see a change upstream makes, so this one runs on a clock. It checks every
+pinned payload and names each one it could not confirm -- served bytes that
+disagree, or a payload it could not fetch at all -- on its own `DIFFERS
+<tool>/<platform>` line, then exits once with the count; re-pin each tool named
+there with `-tools <name>`. One run reports the whole drift, so a re-upload that
+moved all six platform keys of an entry is one re-pin, not six re-runs.
+
+The same drift is visible **locally, without a network call**, in
+`codectx tools verify`: each row carries `lock:` — the digest this binary pins
+for the entry executable — beside `disk:`, the digest the installed bytes hash
+to, with the full pair in the `--json` envelope as `entry_sha256` and
+`installed_sha256`. `disk:-` is an entry nothing on disk hashed: not installed,
+or corrupt, and the row beside it says which. `tools status` never prints a
+`disk:` digest, because it does not rehash.
 
 ## Licenses
 

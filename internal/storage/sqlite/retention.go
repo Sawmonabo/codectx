@@ -17,23 +17,41 @@ import (
 // is among the last retain_refs worked on, and every unit a retained
 // generation selects is retained with it.
 
-// maxRetainRefs bounds the configured ref window. Retention walks one query
-// per retained ref, so the window is a finite loop bound, not an open number.
-const maxRetainRefs = 1024
-
 // maxSweptGenerations bounds one retention pass. A pass runs at activation, so
 // a backlog drains over calls rather than turning one pass into an unbounded
 // deletion loop.
 const maxSweptGenerations = model.MaxRecordsPerResult
 
-// RetentionPolicy is the user-set retention window of Section 20.1.
-// MaxRetainedBytes is the second setting where 0 is meaningful: the retained
-// store has no default size limit, so 0 leaves retention governed by
-// RetainRefs alone. A nonzero value evicts least-recently-used refs first and
-// never the active generation's ref.
+// RetentionPolicy is the user-set retention window of Section 20.1. Both
+// settings spell 0 as "unlimited", exactly as the `retain_refs` and
+// `max_retained_bytes` configuration keys document it: 0 refs retains every
+// ref the repository has ever activated, and 0 bytes leaves retention governed
+// by RetainRefs alone. A nonzero MaxRetainedBytes evicts least-recently-used
+// refs first and never the active generation's ref.
 type RetentionPolicy struct {
 	RetainRefs       int
 	MaxRetainedBytes int64
+}
+
+// bytesBounded and overRetained are the one place this package spells the
+// zero-means-unlimited comparison for MaxRetainedBytes, mirroring
+// config.Limit's own accessors (IsUnlimited and Exceeded -- strictly greater)
+// exactly. The field arrives here as an int64 because this package takes its
+// policy from a caller rather than from configuration, so the semantics travel
+// as these two methods rather than as a hand-rolled `== 0` at each comparison.
+func (p RetentionPolicy) bytesBounded() bool { return p.MaxRetainedBytes > 0 }
+
+// refsBounded and refWindow are the same spelling for RetainRefs. A window of
+// 0 is the documented "retain every ref": the ranking query then runs with no
+// LIMIT and keeps every ref the repository has activated. One query per
+// retained ref is a cost, not a correctness bound, so nothing here caps the
+// window a user set.
+func (p RetentionPolicy) refsBounded() bool { return p.RetainRefs > 0 }
+
+func (p RetentionPolicy) refWindow() int { return p.RetainRefs }
+
+func (p RetentionPolicy) overRetained(total int64) bool {
+	return p.bytesBounded() && total > p.MaxRetainedBytes
 }
 
 // RetentionReport is what one pass did and what a stricter limit could still
@@ -59,10 +77,17 @@ type RetentionReport struct {
 	UnitsDeleted     int
 	BytesReclaimed   int64
 	BytesReclaimable int64
+	// GenerationsDeleted names the generations this pass actually deleted, so
+	// a caller that keeps its own rows against a generation can delete them
+	// with it. It holds exactly the swept generations, which is what this pass
+	// already materialized as its candidates, and never a repository-sized
+	// list.
+	GenerationsDeleted []int64
 }
 
 // RetainByRef applies the policy to repo and reports what it did. It keeps the
-// most recent generation of each of the last p.RetainRefs distinct refs, and
+// most recent generation of each of the last p.RetainRefs distinct refs (every
+// ref, when the window is the unlimited 0), and
 // when p.MaxRetainedBytes is set evicts the least recently used of those refs
 // until the accounted retained size fits, never evicting the active
 // generation's ref and never touching a staging generation (Recover owns
@@ -77,8 +102,8 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 	if err != nil {
 		return RetentionReport{}, err
 	}
-	if p.RetainRefs < 1 || p.RetainRefs > maxRetainRefs {
-		return RetentionReport{}, invalid("retain_refs must be between 1 and %d", maxRetainRefs)
+	if p.RetainRefs < 0 {
+		return RetentionReport{}, invalid("retain_refs must not be negative")
 	}
 	if p.MaxRetainedBytes < 0 {
 		return RetentionReport{}, invalid("max_retained_bytes must not be negative")
@@ -132,6 +157,7 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 			return RetentionReport{}, err
 		}
 		report.GenerationsSwept++
+		report.GenerationsDeleted = append(report.GenerationsDeleted, gen)
 		report.BytesReclaimed += bytes
 	}
 	// The collection tail: leases that expired by now, the snapshots nothing
@@ -172,7 +198,8 @@ type retainedRef struct {
 
 // keepByRef ranks the repository's refs by the most recent generation each was
 // activated for, keeps the newest generation of the first p.RetainRefs of
-// them, and then, when p.MaxRetainedBytes is set, drops the least recently
+// them (all of them when the window is unlimited), and then, when
+// p.MaxRetainedBytes is set, drops the least recently
 // used of those until the accounted retained size fits. That size is what the
 // store is holding, so it counts every unit a retained generation selects,
 // including units it shares with another retained generation. The active
@@ -181,11 +208,19 @@ type retainedRef struct {
 // by generation id, so two generations published in the same clock tick still
 // order deterministically.
 func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p RetentionPolicy) ([]retainedRef, error) {
+	// An unlimited window drops the LIMIT clause rather than passing a
+	// stand-in row count: a large sentinel would be a hidden cap on a setting
+	// the user spelled as unlimited.
+	const rank = `SELECT ref FROM generations
+			WHERE repository_id = ? AND status IN ('active','superseded') AND activated_at IS NOT NULL
+			GROUP BY ref ORDER BY max(activated_at) DESC, max(id) DESC`
+	query, args := rank, []any{repoRaw}
+	if p.refsBounded() {
+		query, args = rank+` LIMIT ?`, []any{repoRaw, p.refWindow()}
+	}
 	var kept []retainedRef
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT ref FROM generations
-			WHERE repository_id = ? AND status IN ('active','superseded') AND activated_at IS NOT NULL
-			GROUP BY ref ORDER BY max(activated_at) DESC, max(id) DESC LIMIT ?`, repoRaw, p.RetainRefs)
+		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return wrap("generations", err)
 		}
@@ -212,7 +247,7 @@ func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p R
 			return nil, err
 		}
 	}
-	if p.MaxRetainedBytes == 0 {
+	if !p.bytesBounded() {
 		return kept, nil
 	}
 	var total int64
@@ -223,7 +258,7 @@ func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p R
 		total += kept[i].bytes
 	}
 	// kept is most-recent first, so eviction walks it from the back.
-	for i := len(kept) - 1; i >= 0 && total > p.MaxRetainedBytes; i-- {
+	for i := len(kept) - 1; i >= 0 && p.overRetained(total); i-- {
 		if kept[i].generation == active {
 			continue
 		}
@@ -282,6 +317,15 @@ func (s *Store) countUnits(ctx context.Context, repoRaw []byte) (int64, error) {
 // own record accounting (recordOverhead per row plus the stored text, in
 // bytes: length() counts characters, so text columns are cast to BLOB first).
 //
+// The alias and evidence rows no longer carry their scope key and native key as
+// text: S-3 interned both into scope_keys / native_keys and the rows hold an
+// INTEGER reference, which recordOverhead already covers. Those strings are
+// therefore no longer counted here, and deliberately not replaced by a join
+// back to the dictionary: a dictionary row is shared by every generation that
+// ever used the key, so charging its bytes to one generation would both
+// over-count what that generation holds and claim as reclaimable bytes that
+// deleting it cannot free.
+//
 // With exclusive set it counts only the units no other generation selects —
 // exactly the units that become collectable when this generation is deleted,
 // which is what "reclaimed" and "reclaimable" mean. Without it, it counts
@@ -301,14 +345,13 @@ func (s *Store) generationBytes(ctx context.Context, gen int64, exclusive bool) 
 			+ length(cast(qualified_name AS BLOB)) + length(cast(signature AS BLOB)) + length(cast(metadata_json AS BLOB))), 0)
 			FROM node_facts WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM relation_facts WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(native_key AS BLOB)) + length(cast(detail AS BLOB))), 0)
+	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(detail AS BLOB))), 0)
 			FROM evidence WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(fact_key AS BLOB))), 0)
 			FROM fact_keys WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(scope_key AS BLOB)) + length(cast(native_key AS BLOB))), 0)
-			FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
+	  + (SELECT count(*) * ?2 FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(name AS BLOB)) + length(cast(qualified_name AS BLOB))
-			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB)) + length(cast(body AS BLOB))), 0)
+			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB))), 0)
 			FROM search_units WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(payload)), 0) FROM unit_delta_state WHERE unit_id IN (SELECT id FROM ex))`
 	cte := members

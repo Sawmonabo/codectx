@@ -27,13 +27,27 @@ type LeaseStore interface {
 	LeaseExpiry(ctx context.Context, id string) (time.Time, error)
 }
 
+// LeaseRetainer is the optional half of LeaseStore: a store that knows it
+// cannot record a lease at all reports so here. A process that opened its
+// database read-only is the case that matters -- every write it attempts
+// fails -- and an endpoint that asks BEFORE it mints serves its page and says
+// there is no continuation, instead of failing the page on the lease write.
+//
+// It is optional because the contract is the store's own knowledge, not a
+// requirement on every implementation: a store that stays silent is taken to
+// retain, which is what it did before it was asked.
+type LeaseRetainer interface {
+	RetainsLeases() bool
+}
+
 // Leases acquires, renews and releases retention leases with one configured
 // TTL, so every cursor and query in the process retains its generation for the
 // same window.
 type Leases struct {
-	store LeaseStore
-	ttl   time.Duration
-	now   func() time.Time
+	store   LeaseStore
+	ttl     time.Duration
+	now     func() time.Time
+	retains bool
 }
 
 // NewLeases wraps store with ttl; a non-positive ttl selects DefaultCursorTTL.
@@ -41,8 +55,19 @@ func NewLeases(store LeaseStore, ttl time.Duration) *Leases {
 	if ttl <= 0 {
 		ttl = DefaultCursorTTL
 	}
-	return &Leases{store: store, ttl: ttl, now: time.Now}
+	retains := true
+	if r, ok := store.(LeaseRetainer); ok {
+		retains = r.RetainsLeases()
+	}
+	return &Leases{store: store, ttl: ttl, now: time.Now, retains: retains}
 }
+
+// Retains reports whether a lease taken here would actually be recorded. A nil
+// *Leases -- an endpoint composed with no lease store at all -- retains
+// nothing, so the one test answers both "there is no lease store" and "the
+// lease store cannot write", which are the same fact to a caller deciding
+// whether it may hand back a continuation.
+func (l *Leases) Retains() bool { return l != nil && l.retains }
 
 // Acquire retains gen (and optionally its snapshot) for one TTL on behalf of
 // kind and returns the lease, whose ID a cursor carries. The lease is owned by

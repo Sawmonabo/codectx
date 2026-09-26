@@ -49,9 +49,14 @@ const (
 	budgetNoChangeRefreshP95      = 250 * time.Millisecond
 	budgetColdIndexReference      = 3 * time.Minute
 	budgetIdleMCPRSSBytes         = 128 << 20
-	budgetInteractivePeakBytes    = 256 << 20
-	budgetIndexingPeakBytes       = 768 << 20
-	budgetStorageRatio            = 3.5
+	// idleMCPSettle is the time the session is given to open the workspace and
+	// stand the server up before the idle row opens its window; idleMCPSample
+	// is the window itself. Standing up is startup, and this row is not.
+	idleMCPSettle              = 2 * time.Second
+	idleMCPSample              = 2 * time.Second
+	budgetInteractivePeakBytes = 256 << 20
+	budgetIndexingPeakBytes    = 768 << 20
+	budgetStorageRatio         = 3.5
 )
 
 // --- the generated corpus ---------------------------------------------------
@@ -308,7 +313,7 @@ func openCorpus(t *testing.T, ctx context.Context, repo string, languages []stri
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
 
-	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{})
+	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{Operation: "index"})
 	if err != nil {
 		t.Fatalf("open workspace: %v", err)
 	}

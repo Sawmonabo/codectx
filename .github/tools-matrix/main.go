@@ -10,16 +10,19 @@
 // ran did not install what it reported. It then indexes a nine-language
 // fixture -- Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust,
 // every one of them carrying non-ASCII identifiers and string literals -- and
-// requires each indexer to name the documents it was given.
+// requires each indexer to name the documents it was given. One of the
+// projects carries no compiler configuration at all, because a matrix whose
+// every project is configured proves the argv only for the configured half of
+// a repository.
 //
 // Two deliberate limits, so nobody reads more into a green run than it proves:
 //
 //   - The index check is a byte-level presence check on the document paths, not
 //     a protobuf parse. The wire format is the SCIP provider's own test surface.
-//   - The five language servers are exercised only as far as an identity
-//     invocation reaches: gopls, clangd and typescript-language-server print a
-//     version, while pyright and jdtls speak nothing but LSP over stdio and are
-//     proved here only to the extent that their payloads install and verify.
+//   - The language servers are exercised only as far as an identity
+//     invocation reaches: gopls, clangd, ty and typescript-language-server
+//     print a version, while jdtls speaks nothing but LSP over stdio and is
+//     proved here only to the extent that its payload installs and verifies.
 //     A real initialize/shutdown handshake belongs to the LSP provider.
 //
 // The argv of each indexer is the product's own: every run below is built by
@@ -114,6 +117,18 @@ var indexChecks = []check{
 		documents: []string{"src/sample.ts", "src/sample.tsx", "src/sample.js"},
 	},
 	{
+		// A project whose only manifest is package.json: no tsconfig.json, no
+		// jsconfig.json, nothing that says how to compile it. Two of the three
+		// triggers of the TypeScript profile name exactly this project, and the
+		// leg above cannot prove it because its fixture carries a tsconfig.json
+		// -- which is why an argv that failed every configuration-less project
+		// passed this matrix and shipped. The languages it covers are already
+		// covered by that leg; what this one proves is the profile's own
+		// argument array over a project with no compiler configuration.
+		kind: scip.KindTypeScript, languages: []string{"javascript"}, dir: "js",
+		documents: []string{"src/index.js"},
+	},
+	{
 		kind: scip.KindPython, languages: []string{"python"}, dir: "py",
 		documents: []string{"sample.py"}, needs: "pip3",
 	},
@@ -152,10 +167,11 @@ var engineFrontends = []struct {
 }
 
 // serverIdentity is the subset of managed language servers that answer an
-// identity invocation. pyright and jdtls speak only LSP and are deliberately
-// absent; see the package comment.
+// identity invocation. jdtls speaks only LSP and is deliberately absent; see
+// the package comment.
 var serverIdentity = map[string][]string{
 	"gopls":                      {"version"},
+	"ty":                         {"--version"},
 	"clangd":                     {"--version"},
 	"typescript-language-server": {"--version"},
 }
@@ -208,7 +224,6 @@ func run(store, work string, keep bool) error {
 		// `codectx tools prefetch --all` immediately before this program.
 		Offline:       true,
 		MaxFetchBytes: 1 << 31,
-		FetchTimeout:  runTimeout,
 	})
 	if err != nil {
 		return err
@@ -456,6 +471,14 @@ func materialize(root string) error {
 ]
 `, cDir, cDir)
 	if err := os.WriteFile(filepath.Join(root, "c", "compile_commands.json"), []byte(compdb), 0o644); err != nil {
+		return err
+	}
+	// The JavaScript leg's whole point is a project with no compiler
+	// configuration, and the TypeScript profile's argv makes the indexer write
+	// the configuration it infers into the directory it is pointed at. A
+	// materialization that is kept (--keep) or reused (--work) would carry that
+	// file into the next run, where the leg would pass while proving nothing.
+	if err := os.Remove(filepath.Join(root, "js", "tsconfig.json")); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 

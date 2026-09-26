@@ -8,6 +8,11 @@ budget that was missed is written with its number, and a platform that could not
 be built on the measuring host is named as an unproven platform rather than
 being reported as a pass.
 
+The scale posture these budgets are measured against — unlimited by default,
+bounded by page — and the reasoning behind the two open misses on this page
+(the indexing process-tree peak and the storage ratio) are recorded in
+[ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md).
+
 The rule that governs every figure below is Section 23.5's: **no target may be
 met by excluding the failing feature or by rewriting the benchmark after seeing
 the results.**
@@ -44,7 +49,7 @@ a run reproducible on any host.
 
 | Scale | Spec | Files | Used by |
 |---|---|---|---|
-| `corpusTiny` | (L0/L3 default) | small | the end-to-end scenario's sizing |
+| `corpusTiny` | `{Packages: 4, Seed: 21}` | small | the end-to-end scenario's sizing |
 | `corpusSmallReal` | `{Packages: 40, Seed: 2101}` | 124 | **every measured row in Section 3** |
 | `corpusOver200Files` | `{Packages: 120, Seed: 2102}` | 364 | the session-status clamp row (Section 3, row 15) |
 | `corpusReference` | `{Packages: 3332, Seed: 2103}` | 10 000 | the Section 23.1 reference workload — measured by the verification pass, not on a bench row (Section 3, rows 9 and 13) |
@@ -87,27 +92,30 @@ Each row builds its own workspace from the generator, opens it through
 measurement describes the product and not a private helper — and samples the
 operation `n` times. Latency rows report **p95 over the stated sample count**;
 memory rows report the sampled peak of the **whole process tree** (parent plus
-parser workers), read by the Task 20 host sampler.
+parser workers), read by the host sampler.
 
-`internal/bench` contains no production code. It holds `doc.go`,
-`plateau_test.go` (whose `TestMain` makes the test binary the parser worker, so
-`app.OpenWorkspace` can spawn parsers through `os.Executable`),
-`corpus_test.go` (generator, the frozen Section 23.2 budget constants, the
-fingerprint-parity rows and the corpora manifest rows) and `budgets_test.go`
-(`TestResourceBudgets` and the published `Benchmark*` functions). Selectors are
-by function name, not by file:
+### What one parser worker costs
 
-```bash
-go test ./internal/bench -run TestResourceBudgets -count=1
-go test ./internal/bench -run '^$' -bench . -benchmem -count=5
-```
+The parser worker count is a CONCURRENCY figure, not a resident cost: the
+pool starts no process until a unit demands one and drains every worker when the
+last unit returns, so a process that has stopped parsing holds no worker at all
+(`TestPoolLazyAndDrainedWhenTheStageEnds`), and the number alive is the concurrent
+parse demand rather than the ceiling. What one live worker costs was measured on
+the measuring host from `/proc/<pid>/smaps_rollup`, on a worker that had sent its
+hello and parsed nothing: **18.2 MiB RSS, 9.4 MiB PSS**.
 
-Every row names the failure mode it protects, and a row is accepted only when a
-one-line mutation makes it fail. The mutation proof for the budget table is that
-tightening a row's target makes the row fail **with the measured number**:
-`budgetExactQueryP95` set to one microsecond produced
-`BUDGET MISSED: p95 790µs over 50 samples (target 1µs)`, and reverting restored
-the pass below.
+A parse adds nothing lasting **for the file's size** — the worker closes each
+tree as the file is finished — so the figure does not grow with the largest file
+in the repository. It is not flat in the number of LANGUAGES a worker has served:
+`state.parsers` and `state.queries` hold one parser and one compiled query per
+language until the worker exits, and the figure above is a worker holding none of
+them. The rest is the binary's mapped pages and the Go runtime.
+
+The resident bound is therefore **live workers x ~18 MiB RSS and up**. RSS is
+what the tree-peak rows sum, and it double counts: every worker is a
+re-execution of the same binary, so the MARGINAL cost of one more worker is the
+~9.4 MiB PSS figure and a summed-RSS bound overstates a large ceiling by roughly
+a factor of two.
 
 ## 3. Section 23.2 — measured against target
 
@@ -121,20 +129,30 @@ percentile over `n` samples.
 |---|---|---|---|---|
 | 1 | `version --json` startup | 50 ms | p95 **2.96 ms** / 20 | PASS |
 | 2 | Exact symbol/path query | 50 ms | p95 **1.09 ms** / 50 | PASS |
-| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS |
+| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS — at enterprise scale see the first-page table below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
 | 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
 | 7 | Ten-file base refresh after debounce | 1.5 s | p95 **144 ms** / 5 | PASS |
 | 8 | No-change refresh: no parser work, no FTS body rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
-| 9 | Cold base index of the reference fixture | 3 min | **2 min 56.3 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **912.6 MiB** | PASS on wall clock with 3.7 s of headroom; the peak is row 10's MISS — Section 4 |
-| 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** at small-real scale; **912.6 MiB** on the corrected reference corpus | **MISS at reference scale** — Section 4 |
-| 11 | Idle MCP RSS | 128 MiB | **61.5 MiB** | PASS |
+| 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS — re-measured after the external-merge planner and batched provider sinks landed (earlier: 2 min 56.3 s / 912.6 MiB) |
+| 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** at small-real scale; **145.3 MiB** on the corrected reference corpus (sampled at 250 ms and 50 ms, two cold runs within 0.1 MiB) | PASS — the earlier 912.6 MiB at reference scale was measured before the planner's external merge sort and the batched provider sinks |
+| 11 | Idle MCP RSS | 128 MiB | **64.0 MiB** | PASS — re-measured under the corrected semantics (see below); the earlier 61.5 MiB was a startup-window sample |
 | 12 | Interactive process-tree peak | 256 MiB | **60.5 MiB** | PASS |
 | 13 | Base storage vs eligible source bytes | 3.5× | **16.10×** on the corrected reference corpus: 1 385 729 099 stored over 86 064 203 eligible source bytes (db 1 299 664 896 + wal 0 + CAS 86 064 203; **CAS alone = 1.00×**). Earlier, on the undersized ~570 B/file corpus: 75.00× / 73.86×; 149.0× at small-real scale | **MISS by 4.6×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
 | 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
+
+Row 11 measures a RESTING session, which is what "idle" claims. It used to open
+its sampling window at process start with `mcp.watch` at its default, so the
+window covered the initial refresh and its parser workers — a startup peak
+reported under an idle label, and a low default worker count was once
+reverted on the strength of it. The row now starts the session with
+`--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
+the server at rest: workspace open, no refresh running. The refresh peak is row
+10's subject and is measured there under `index --full`. The 128 MiB target is
+unchanged.
 
 Row 15's two counts are the recorded run's, not a fixed point: plan selection
 order among equally scored candidates is not bit-stable at this scale, and a
@@ -195,6 +213,59 @@ and one is not:
   work limit like this one should default to unlimited at all is a separate
   question and is not answered by this measurement.
 
+### Row 3 at enterprise scale — first-page latency on a 13 223-file repository
+
+Row 3's 150 ms target is measured at small-real scale. On a 13 223-file,
+1.36 GiB store the first page of a corpus-frequent term costs far more, and
+the dominant term was never the ranking: a first page hydrated the *whole*
+answer -- every hit past the page was read out of the CAS, block-hash
+verified and scanned for line and column positions on its way into the
+continuation spool. Hydration is now paid by the page that serves a hit.
+
+Two further costs have since been taken out of the ranking itself. The
+lexical tier read every column of a candidate page to get its token count
+and then threw the row away, so the ranker re-read the identical page for
+path, kind, name and identity: one read per page now carries both. And the
+two-pass external sort that deduplicates and orders the candidate set
+encoded every candidate as JSON; a packed, fixed-order codec replaced it.
+
+| Query | Before hydration fix | After hydration fix | After one read + packed sort |
+|---|---|---|---|
+| `search function` | 4.17 s | 1.71 s | **1.27 s** |
+| `search <global>` (a framework global name) | 4.94 s | 2.10 s | **1.18 s** |
+| `search return` | 1.49 s | 0.79 s | **0.60 s** |
+| `search user` | 0.87 s | 0.40 s | **0.38 s** |
+| `search <rare>` (an application identifier, 6 hits) | 0.08 s | 0.11 s | **0.14 s** |
+| continuation page 2 | 0.17 s | 0.20 s | not re-measured |
+
+Warm, median of three, default config, same store and same battery in every
+column. `<rare>` matches six hits and never reaches the ranking work
+these two changes touch; its three runs spread 0.11-0.17 s, so its column is
+run-to-run noise on a query that is already two orders of magnitude inside
+the target. Peak RSS is unchanged within noise (32-125 MB across the five
+terms); the ranking fold holds one candidate page less than it did.
+
+Every page of every one of the five queries is byte-identical before and
+after -- each was paged to completion and the ordered item sequence
+compared byte for byte (30 022 items over 151 pages for `function`, 44 448
+over 223 for `<global>`), together with each page's meta minus `next_cursor`,
+whose per-run lease id and expiry can never match across processes. The set,
+the global ranking, every served field, every reason and every page boundary
+are unchanged.
+
+`function` and `<global>` still miss the 1 s first-page target. What is left
+is measured, and it is not addressable inside the search package: of the
+1.27 s `function` profile, 0.33 s is the posting-list walk that scores each
+candidate, 0.18 s the per-term document frequencies, 0.16 s the candidate
+page read, 0.09 s the match page and 0.09 s the corpus statistics -- all of
+it stepping the index, and none of it absorbed by the tier's statistics
+cache, which a one-shot process always starts cold -- and 0.21 s the
+two-pass external sort. The two
+schema-level alternatives that would touch the posting walk (pushing the
+ranking function down into the index, and a persisted per-term index) were
+measured earlier and rejected: neither can reproduce the served ranking
+byte for byte.
+
 ## 4. Misses, skips and unproven platforms
 
 Nothing in this section clears the obligation as written. A row here may carry
@@ -203,8 +274,8 @@ and the difference is stated rather than rounded away.
 
 | Item | State | What it would take |
 |---|---|---|
-| **Row 9 — cold index of the Section 23.1 reference fixture (1M lines / 10k files / ~80 MiB) within 3 min** | **Measured at the file count, not at the line and byte count.** The verification pass cold-indexed `corpusReference` in 1 min 14.8 s with an 85.2 MiB process-tree peak — but that corpus yields **262 551 lines / 5.70 MiB**, where Section 23.1 specifies ≈1M lines and ≈80 MiB. The corpus is ~3.8× short on lines and ~14× short on bytes, so row 9's PASS stands for the 10 000-file shape only. | Done: the generator now yields 10 000 files / 1 052 933 lines / 82.08 MiB, and the cold index at that size measured **2 min 56.3 s (PASS)** with a **912.6 MiB process-tree peak (row 10 MISS)**. The peak is carried to the scale-posture work as a memory item: indexing must stay under 768 MiB at reference scale. |
-| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **MISS, by 21×.** On the 10 000-file generated corpus the store held 427 282 345 bytes over 5 697 273 eligible source bytes — **75.00×**, re-measured at **73.86×**: a 421 MB database over 5.70 MiB of source. The content store itself is exactly source-sized (1.00×). Two facts bound how this number should be read. The corpus averages ~570 bytes per file where Section 23.1's reference is ~8 KiB per file, so per-file fixed cost dominates it more than it would at the specified size (see row 9). And the amplifier is identified, not guessed: **per-row identity width** — 32-byte BLOB identities and wide TEXT keys replicated into every secondary index, with `WITHOUT ROWID` secondary indexes re-storing the full primary key. Per-table accounting puts relations at ~22% of the file, evidence ~22%, native_aliases ~20% and nodes ~20%. FTS content duplication, JSON payloads, WAL size and page fill were each measured and ruled out. The earlier explanation on this page — that small generated files simply cannot amortise a fixed cost — is withdrawn; it does not survive a 421 MB database. | Re-measured on the corrected reference corpus: **16.10×** (1.30 GB database over 82.08 MiB of source) — still a MISS by 4.6×, with the same amplifier. A storage-layout redesign (integer surrogate identities and key interning) is scheduled as its own task; the ratio is then re-measured on the reference corpus **and** on real repositories, and this row is re-recorded from those runs. |
+| **Row 9 — cold index of the Section 23.1 reference fixture (1M lines / 10k files / ~80 MiB) within 3 min** | **Measured at the file count, not at the line and byte count.** The verification pass cold-indexed `corpusReference` in 1 min 14.8 s with an 85.2 MiB process-tree peak — but that corpus yields **262 551 lines / 5.70 MiB**, where Section 23.1 specifies ≈1M lines and ≈80 MiB. The corpus is ~3.8× short on lines and ~14× short on bytes, so row 9's PASS stands for the 10 000-file shape only. | Done: the generator now yields 10 000 files / 1 052 933 lines / 82.08 MiB. The first cold index at that size measured 2 min 56.3 s with a 912.6 MiB process-tree peak (a row 10 MISS); after the planner's external merge sort and the batched provider sinks landed it measures **1 min 32.1 s** with a **145.3 MiB** peak, and both rows PASS. |
+| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **MISS, by 21×.** On the 10 000-file generated corpus the store held 427 282 345 bytes over 5 697 273 eligible source bytes — **75.00×**, re-measured at **73.86×**: a 421 MB database over 5.70 MiB of source. The content store itself is exactly source-sized (1.00×). Two facts bound how this number should be read. The corpus averages ~570 bytes per file where Section 23.1's reference is ~8 KiB per file, so per-file fixed cost dominates it more than it would at the specified size (see row 9). And the amplifier is identified, not guessed: **per-row identity width** — 32-byte BLOB identities and wide TEXT keys replicated into every secondary index, with `WITHOUT ROWID` secondary indexes re-storing the full primary key. Per-table accounting puts relations at ~22% of the file, evidence ~22%, native_aliases ~20% and nodes ~20%. FTS content duplication, JSON payloads, WAL size and page fill were each measured and ruled out. The earlier explanation on this page — that small generated files simply cannot amortise a fixed cost — is withdrawn; it does not survive a 421 MB database. | Re-measured on the corrected reference corpus: **16.10×** (1.30 GB database over 82.08 MiB of source) — still a MISS by 4.6×, with the same amplifier. The storage-layout redesign (integer surrogate identities and key interning) has **landed**; the decision, the alternatives refused on the way and its sources are recorded in [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md). Measured on a real 4 019-file repository indexed twice, once by each binary, with identical row counts in every identity table: 1 005 887 488 → 632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. That is the per-symbol regression metric, not this row: the ratio has **not** been re-measured since, so row 13 stays a MISS and is re-recorded only from a re-run on the reference corpus **and** on real repositories. |
 | **`darwin/amd64` and `darwin/arm64`** | **UNPROVEN PLATFORM.** No macOS SDK or macOS host was available to the measuring environment, and the release rule forbids a cross-built binary or bundle. Nothing on this page was measured on darwin, and no darwin archive or bundle was produced or exercised here. These targets are **built only by the release workflow's native legs; unproven on the measuring host.** | A native macOS leg of the release workflow. Until one runs, darwin is declared, not proved. |
 | **`windows/arm64`** | **UNPROVEN PLATFORM.** The structural parser is CGo, so every target needs a native C toolchain, and the measuring host's toolchain set carries no aarch64 Windows cross-compiler — only the i686 and x86_64 ones. The target is therefore **built only by the release workflow's native legs; unproven on the measuring host.** | A native `windows/arm64` leg of the release workflow. |
 | **Section 3 figures on any platform but `linux/amd64`** | **Not measured.** Every latency and memory number in Section 3 is `linux/amd64`. Of the build proof: `linux/amd64` was built and run natively, `linux/arm64` was built and run under emulation, and `windows/amd64` was built but not executed. No Section 3 figure was taken on any of them, and none is accepted from a cross-compiled binary. | Native legs per target, each reporting its own figures. |
@@ -278,6 +349,99 @@ Two rules bind the interpretation:
   investigation and a written explanation, even when the absolute budget is
   still met.
 
+### 3.3 The context compile's memory: what the peak is a function of
+
+The streamed context compile claims that its live working set is the sort run
+buffer and not the repository. Two measurements on the host of Section 1, both
+from `internal/context`:
+
+| What was pushed | Records | Peak live records per sort | Heap in use, live, after the push | Spilled runs |
+|---|---|---|---|---|
+| Seed push sink, 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
+| Seed push sink, 50 000 entities offered twice | 100 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +144 KiB | seed sorts spill |
+| One compile sort at the primitive's floor run budget | 20 000 | 401 (~2× the run budget in bytes, the record that triggers the spill included) | — | 50 |
+
+Ten times the seeds, the same peak per sort and the same order of live bytes:
+the sink holds one run buffer whatever discovery finds. Both rows come from
+`TestTheSeedSinkPeaksOnTheRunBufferAtEitherSeedCount`; the third is
+`TestACompileSortHoldsItsRunBudgetAndSpills`. Each figure is asserted by the
+test that produced it, so a regression fails rather than being noticed here.
+
+**The whole-compile scale curve.** `TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale`
+publishes a fan-out fixture of N leaf entities, compiles it, and pages the
+persisted manifest back. Publication is timed separately from the compile: it is
+the fixture's cost and never the product's. The compile column below was taken
+under the DEFAULT admission (`resources.query_memory_bytes`, 32 MiB), where a
+sort of a few tens of thousands of these records never fills its 8 MiB run
+buffer and nothing spills; the peak/spill column comes from the committed proof,
+which sets a 1 MiB admission so both sizes are past the spill threshold, since
+"the peak is the run buffer" is only a claim once the buffer binds.
+
+| N (leaves) | Fixture publish | Compile | Page latency, persisted manifest (200 rows/page) |
+|---|---|---|---|
+| 500 | — | 105 ms | 0.27–0.56 ms |
+| 1 000 | — | 152 ms | 0.50–0.62 ms |
+| 2 000 | — | 247 ms | 0.52–0.70 ms |
+| 4 000 | — | 536 ms | 0.57–1.22 ms |
+| 8 000 | — | 1.272 s | 0.51–1.61 ms |
+| 16 000 | — | 4.116 s | 0.48–1.64 ms |
+| 2 000 (1 MiB admission) | 2.8 s | 469 ms | 0.48–0.88 ms |
+| 4 000 (1 MiB admission) | 6.8 s | 849 ms | 0.45–1.07 ms |
+
+Page latency is FLAT across the whole range — a page of the persisted plan costs
+about half a millisecond whether the plan holds 509 rows or 16 009 — which is the
+paging claim. The peak, at the 1 MiB admission, is likewise flat while the
+spilled-run count is the thing that grows:
+
+| N (leaves) | `scope-cand` / `scope-entity` peak | Spilled runs |
+|---|---|---|
+| 2 000 | 774 records | 3 |
+| 4 000 | 774 records | 6 |
+
+**The compile is superlinear, and where.** The per-doubling wall ratios are
+1.45, 1.62, 2.17, 2.37, 3.24 — increasing, not constant: the local exponent at
+the top of the measured range (8 000 → 16 000) is log₂ 3.24 ≈ **1.70**. The
+cause WAS the ranked-impact continuation in `internal/graph`, not the context
+compile's own sorts. `Engine.serveRankedImpact` served each later page by
+opening the ranked spool FROM THE START and then copying every record after the
+page into a fresh spool, so each page cost O(records remaining) and a walk of N
+entries read to exhaustion at a 200-row page cost Θ(N²/400) record reads and
+writes. A CPU profile of the 500/1 000/2 000 and 4 000/8 000/16 000 runs
+attributed 0.69 s of the 1.13 s spent in `Engine.walkImpact` to
+`serveRankedImpact`, of which 0.55 s was `pagination.Spools.Open` — the re-read
+and the re-copy — and that share rose with N. Nothing in `internal/context` is
+quadratic.
+
+That continuation is now O(page) per page: the spool is written once, by the
+page that settles the order, and every later page seeks to the byte offsets its
+cursor carries and reads only its own page (`pagination.Spools.OpenAt`,
+`RankOffset`/`PairOffset`, cursor payload version 6). Measured on the
+20 101-node deadline-split fixture at 200 rows a page
+(`graph.TestADeadlineSplitWalkAlwaysAdvances`), spool bytes read per page are
+flat at 88 046 on pages 3, 50 and 100 and nothing is written after the spill,
+where the per-page latency used to FALL with the shrinking remainder — 18.9 ms
+at page 3, 10.7 ms at page 50, 1.9 ms at page 100 — and is now ~0.39 ms
+throughout. The exponent above is the "before" figure and has not been
+re-measured.
+
+**What the fixture costs, and why it is not the product.** Publishing the
+fixture dominates the test's wall clock: at 16 000 leaves it is 74.3 s of the
+82.7 s of CPU the test spends, almost all of it in
+`storage/sqlite.(*Store).SealUnit` under `contextFixture.sealRelations` (44.2 s)
+and `sealUnit` (26.9 s), with `_sqlite3BtreeIndexMoveto` alone at 39.0 s. This
+is what C-FIX2 recorded as "the compile had not finished after twelve minutes":
+`t.Logf` output is buffered until the test ends, so the publication of two
+fixtures was indistinguishable from a hung compile. The compile at 16 000 leaves
+is 4.1 s.
+
+Reproduce with:
+
+```bash
+CODECTX_SCALE_PROOF=1 go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+CODECTX_SCALE_PROOF=1 CODECTX_SCALE_LEAVES=2000,4000,8000 \
+  go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+```
+
 ## 7. Reproducing this page
 
 ```bash
@@ -286,7 +450,13 @@ go test ./internal/bench -run TestResourceBudgets -count=1
 go test ./internal/bench -run TestSessionStatusClamp -count=1 -v
 go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
+go test ./internal/context -run 'TestTheSeedSinkPeaks|TestACompileSortHolds' -count=1 -v
+CODECTX_SCALE_PROOF=1 go test ./internal/context \
+  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 30m
 ```
+
+The two `internal/context` lines produce Section 3.3: the first its measured
+rows, the second the compile-level rows of the same table.
 
 That block produces every row of Section 3 except three. Rows 9 and 13 need a
 cold index of the reference corpus, and row 16 needs a real workspace; both are

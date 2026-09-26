@@ -3,15 +3,20 @@ package index
 import (
 	"context"
 	"errors"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -58,27 +63,170 @@ type generation struct {
 	builtRef string
 
 	started time.Time
-	caps    *capabilityReport
-	// sealed holds the plan keys of the deferred units a publication
-	// generation attaches (Section 11.6). They are members of this generation
-	// even though the plan still marks their scopes deferred, because the plan
-	// only reuses units the previous generation selected and these sealed into
-	// a staging generation instead. It is nil on the indexing path.
-	sealed map[string]bool
+	// ledgerRun is this pass's ledger run. It is opened before the capture, so
+	// a pass that fails before a generation exists is still a recorded run.
+	ledgerRun *ledger.Run
+	caps      *capabilityReport
+	// failedScopes holds, per plan key, the typed reason a DEFERRED unit did
+	// not seal -- every one the background queue this publication drains has
+	// recorded, not only the batch it is publishing. A deferred scope that
+	// failed is neither covered nor still running, and telling the three apart
+	// is what keeps a provider whose other scopes published from being
+	// reported as though none of them had; a failure from an earlier tick that
+	// was not carried here would be re-planned deferred and published as still
+	// running for ever. It is nil on the indexing path.
+	failedScopes map[string]unitFailure
+
+	// failures aggregates the units that failed, per provider. It is the
+	// indexing path's record of what did not seal, and a publication
+	// generation is seeded with the foreground generation's copy of it:
+	// those scopes are re-planned by the publication and still have nothing
+	// behind them, so losing them here republishes them as coverage -- which
+	// is how a provider whose every precise unit failed came back `fresh`.
+	//
+	// It is an aggregate and not a per-unit map because it outlives the run:
+	// a repository can fail thousands of scopes, and what the report needs is
+	// a count, a planned total and a bounded sample, all of which are one
+	// small entry per provider whatever failed.
+	failures map[string]*providerFailures
 
 	// mu guards everything the unit workers accumulate.
-	mu          sync.Mutex
-	runs        []model.ProviderResult
+	mu sync.Mutex
+	// published holds the providers a unit of this generation actually
+	// succeeded for -- ran or attached. It is not the same question as "the
+	// plan gave this provider a unit": a provider whose every unit failed was
+	// planned and holds nothing, and softening its failure row on that basis
+	// would report a capability with no facts as partial.
+	published map[string]bool
+	runs      []model.ProviderResult
+	// runsTotal counts every run the generation produced, including the ones
+	// past the per-result wire ceiling that runs does not carry. The ceiling is
+	// a page-sized bound on one response (class B); the omitted count is what
+	// keeps it from being a silent drop.
+	runsTotal   int64
 	reused      int64
 	built       int64
 	carried     int64
 	invalidated int64
 	parsed      int64
+	// planned, failed and subdivided are the run row's remaining totals.
+	// Nothing else counted them: the result publishes what this generation
+	// holds, and these are what it attempted and what it lost on the way.
+	planned    int64
+	failed     int64
+	subdivided int64
+
+	// walked is how many of the plan's units the build walk reached, and
+	// walkDone says it reached all of them. Together they are where a run that
+	// ended early resumes the plan to account for what it never got to: the
+	// unit sequence is re-iterable and answers in one fixed order, so the
+	// units past walked are exactly the ones nothing ever started.
+	walked   int64
+	walkDone bool
+}
+
+// unitFailure is the typed reason one unit did not seal: the diagnostic
+// family, the safe message and the bounded particulars the provider attached.
+// The code alone cannot tell an analyzer that could not be started from one
+// that exited nonzero, which is the distinction an operator acts on.
+type unitFailure struct {
+	code    string
+	message string
+	// remediation is what the provider said an operator can do about this
+	// failure. It travels with the message rather than inside details: the
+	// detail map is the provider's own bounded budget, and a remediation
+	// charged to it could be the entry a busy row drops.
+	remediation string
+	details     map[string]string
+}
+
+// maxFailedScopesNamed bounds the failed scope keys one capability row names.
+// A repository can fail thousands of scopes and the row must fit the same
+// detail bound either way, so past this many the row publishes the count in
+// units_failed and flags the list as cut rather than growing with the failure.
+const maxFailedScopesNamed = 8
+
+// providerFailures aggregates one provider's failed scopes for the capability
+// fold: how many failed, how many were planned, and a bounded, sorted sample
+// of the scope keys with the reason each carried.
+//
+// THE COUNTING RULE, stated once for every surface that reports these figures:
+// a capability's planned total is every scope the plan assigned to its
+// provider for this generation -- the units it runs, the stale predecessors it
+// carries and the sealed units it reuses -- and its failed total is those of
+// them that did not seal. Both are counted in exactly one place,
+// coveredProviders, and published in exactly one place, failureRow.publish, as
+// the units_planned and units_failed details of the capability row. The
+// completion block of `codectx index`, `codectx status` and the index-status
+// tool all render that row and none of them recounts, so one generation cannot
+// read differently on two of them.
+//
+// Counting only the units the build walks is what published "2 planned, 2
+// failed" for a provider that sealed nine scopes and failed two: a row saying
+// every unit failed over a capability that answers most queries.
+type providerFailures struct {
+	units   int
+	planned int
+	named   []failedScope
+}
+
+// add folds one failed scope in, keeping the lexicographically first
+// maxFailedScopesNamed of them. The sample is ordered by scope key and never
+// by arrival: the units of one provider are built concurrently, and both
+// details_json and diagnostic_code fold into the AnalysisKey, so an
+// arrival-ordered sample would key two identical runs differently.
+func (f *providerFailures) add(scopeKey string, failure unitFailure) {
+	f.units++
+	at := len(f.named)
+	for at > 0 && f.named[at-1].scopeKey > scopeKey {
+		at--
+	}
+	if at == maxFailedScopesNamed {
+		return
+	}
+	f.named = slices.Insert(f.named, at, failedScope{scopeKey: scopeKey, failure: failure})
+	if len(f.named) > maxFailedScopesNamed {
+		f.named = f.named[:maxFailedScopesNamed]
+	}
 }
 
 // attempt captures, plans, builds and publishes exactly once.
-func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
+//
+// The ledger run is opened here and not at publication: the capture, the plan
+// and the ref all run before any generation id exists, and a pass that fails in
+// one of them would otherwise be a run nothing recorded. The generation is
+// attached to the run row once BeginGeneration returns and stays null
+// otherwise, and the deferred finish closes the run on every exit path --
+// including the one that aborts the staging generation.
+func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res model.IndexResult, err error) {
 	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
+	g.ledgerRun = c.newRun(ledger.KindIndex)
+	ctx = g.ledgerRun.Context(ctx)
+	// The reclaimer's own total when this run opened. What it gave back while
+	// the run was open is the difference, read at the finish.
+	freedBefore := paced.FreedBytes()
+	defer func() {
+		// Reported again at the finish so a pass that failed still states what
+		// it got through, not zeros. The publish path reports at activation as
+		// well, which is what a live reader sees while retention still runs.
+		// The peak is read HERE and not at the activation report: retention,
+		// collection and the reclaim below all run after activation, and a
+		// high-water mark read before them would silently leave them out. It
+		// is the kernel's mark for the whole process, so a freed byte cannot
+		// lower it and reading it before the reclaim loses nothing.
+		g.report(diagnostics.PeakParentRSSBytes())
+		recordReclaim(ctx, freedBefore)
+		g.ledgerRun.Finish(endOutcome(err))
+		c.attachRunLedger(ctx, &res, g.ledgerRun, err)
+	}()
+	// The plan's whole-snapshot input run is a file under the work directory
+	// for as long as the units that stream from it are running, and no longer.
+	defer func() { _ = g.plan.Close() }()
+	// Registered after the close above and so running before it: the account
+	// below walks the plan's units, which must not be called once the plan is
+	// closed. It is what makes a run that died between the plan and the build
+	// still say what it had planned.
+	defer func() { g.accountUnwalkedUnits(ctx) }()
 	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -97,7 +245,8 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 		return model.IndexResult{}, err
 	}
 	g.gen, g.builtRef = gen, ref
-	res, err := g.publish(ctx)
+	g.ledgerRun.AttachGeneration(int64(gen))
+	res, err = g.publish(ctx)
 	if err != nil {
 		// The staging generation is aborted under a context that survives the
 		// cancellation that may have caused the failure: a generation left
@@ -112,18 +261,51 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 	return res, nil
 }
 
+// captureBuilder is the snapshot builder this generation captures with. It is
+// its own function so the operator settings it carries -- index.capture_max_retries
+// and index.capture_retry_deadline, the only escape hatch from a worktree that
+// never settles -- are reachable by a test without running a capture.
+//
+// The workspace lock is passed in rather than read from the options: this
+// composition may have taken it at its first build rather than at its open,
+// and the builder must be handed the lock this run actually holds. A nil one
+// would make the builder take a second lock of its own and release it under
+// the run.
+func (g *generation) captureBuilder(lock *snapshot.WorkspaceLock) *snapshot.Builder {
+	c := g.c
+	return &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
+		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
+		Git: c.opts.Git, Lock: lock, Logger: c.log,
+		MaxRetries:    c.opts.Config.Index.CaptureMaxRetries.Value(),
+		RetryDeadline: c.opts.Config.Index.CaptureRetryDeadline.Std()}
+}
+
 // capture builds the immutable snapshot this generation is about and reads the
 // active pointer it will publish over.
-func (g *generation) capture(ctx context.Context) error {
+func (g *generation) capture(ctx context.Context) (err error) {
 	c := g.c
-	b := &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
-		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
-		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log}
-	snap, err := b.Build(ctx)
+	ctx, span := ledger.Start(ctx, stageCapture, "")
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
+	// The caller took the lock before this generation began; asking for it
+	// again is how the builder names the one this process holds, and it
+	// acquires nothing a second time. It sits inside the span so a capture
+	// that was refused the workspace is recorded as the failed capture it is,
+	// and the release runs before the span closes.
+	lock, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
+		return err
+	}
+	defer release()
+	b := g.captureBuilder(lock)
+	walkCtx, walk := ledger.Start(ctx, stageWalk, "")
+	snap, err := b.Build(walkCtx)
+	walk.AddOut(int64(snap.FileCount))
+	walk.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		return err
 	}
 	g.snap = snap
+	span.AddOut(int64(snap.FileCount))
 	if g.prev, err = c.activeGeneration(ctx); err != nil {
 		return err
 	}
@@ -140,8 +322,10 @@ func (g *generation) capture(ctx context.Context) error {
 // imports a delta; a unit whose identity is nevertheless already sealed is
 // still attached rather than rebuilt, because an immutable unit with the same
 // key is the same bytes by construction (see build).
-func (g *generation) planUnits(ctx context.Context) error {
+func (g *generation) planUnits(ctx context.Context) (err error) {
 	c := g.c
+	ctx, span := ledger.Start(ctx, stagePlan, "")
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	// Detection walks the workspace itself, so it is given the same Git
 	// exclusion the capture applies. The configured policy alone has no ignore
 	// hook at all, which had detection proposing scopes over every ignored
@@ -150,6 +334,7 @@ func (g *generation) planUnits(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	span.AddIn(int64(g.snap.FileCount))
 	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, policy, c.enablement)
 	if err != nil {
 		return err
@@ -159,15 +344,26 @@ func (g *generation) planUnits(ctx context.Context) error {
 	if g.req.Full || g.req.Rebuild {
 		prev = 0
 	}
-	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev, Config: c.opts.Config}
+	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev,
+		Config: c.opts.Config, TempDir: c.workDir}
 	if prev != 0 {
 		in.CarriedPage = c.carriedPage(prev)
+	}
+	if c.opts.RunLedgerReader != nil {
+		// What this workspace has already measured its heavy units to cost.
+		// It is wired whatever the previous generation is -- unlike the carry
+		// pages, which are about one generation's rows -- because the ledger
+		// outlives generations: a rebuild starts from no previous generation
+		// and must still not under-reserve what the last run measured.
+		in.RecordedPeaks = c.opts.RunLedgerReader.RecordedPeaks
 	}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return err
 	}
 	g.plan = p
+	g.planned = int64(len(p.Reuse) + len(p.Carry))
+	span.AddOut(g.planned)
 	for _, s := range p.States {
 		g.caps.add(s)
 	}
@@ -186,16 +382,24 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	if err != nil {
 		return model.IndexResult{}, err
 	}
-	g.coverage()
+	if err := g.coverage(ctx); err != nil {
+		return model.IndexResult{}, err
+	}
 	if err := g.c.recordSuppliedIndexes(ctx, g.gen); err != nil {
 		return model.IndexResult{}, err
 	}
-	states, _ := g.caps.finish(g.c.log)
+	states := g.caps.finish(g.c.log)
 	health := healthOf(states)
-	binding, err := g.c.opts.Store.Activate(ctx, g.gen, g.prev, health, states, NormalizationVersion)
+	activateCtx, activation := ledger.Start(ctx, stageActivation, "")
+	binding, err := g.c.opts.Store.Activate(activateCtx, g.gen, g.prev, health, states, NormalizationVersion)
+	activation.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		return model.IndexResult{}, err
 	}
+	// No peak yet: the run has not ended, and a mark taken here would be
+	// reported as the run's own while retention and collection are still to
+	// come. The finish above reports it.
+	g.report(nil)
 	g.c.retain(ctx)
 	g.c.collect(ctx)
 	// Deferred work is enqueued only after the base generation is published:
@@ -203,16 +407,186 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	// readiness, and ruling Q9 makes the background tick run it even when no
 	// query ever asks.
 	g.c.late.enqueue(g, deferred)
+	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, StartedAt: g.started, CompletedAt: g.c.now()}, nil
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(g.c.opts.Config),
+		StartedAt: g.started, CompletedAt: g.c.now()}, nil
+}
+
+// RunLedgerReader reads one recorded run back as the model carries it: the run
+// row, one page of its stages, and how many stages that page left out. It is
+// an interface here and satisfied in the composition, so the one conversion
+// from a recorded span to a stage row stays where every other surface's
+// conversion is and this package never grows a second.
+//
+// RecordedPeaks is the second thing this process asks of its own recorded
+// history, and the reason the interface is not named after one run: the
+// largest process-tree peak this workspace has measured for each scope key,
+// which is what stops the second index of a repository reserving less for a
+// unit than the first one watched it use. It is advisory and never a refusal,
+// so an implementation that cannot read its ledger answers no rows.
+type RunLedgerReader interface {
+	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
+	RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error)
+}
+
+// attachRunLedger states on a result what the run that produced it just did:
+// the run row and its stages, read back from the ledger by that run's own id.
+// Both a pass and a deferred publication report through it, each with its own
+// run, which is the whole point of reading by id.
+//
+// It reads after the finish, and behind a flush, because finishing a run only
+// moves in-memory state: the row turns terminal at the collector's next write,
+// so a read without the barrier would render a finished run as still running
+// and leave out the stages that ended last. And it reads BY ID, because the
+// latest run of this repository may be another run of this same process -- a
+// deferred publication is live while an index runs -- which would answer for
+// the run that asked.
+//
+// A failed pass attaches nothing: its result is discarded by the caller, and
+// the run it recorded is read through the status surfaces like any other. A
+// failure to flush or to read leaves the result without a run rather than with
+// half of one, and says so in the log: the block is an account of the run, and
+// an account that is silently partial is worse than one that is absent.
+func (c *Coordinator) attachRunLedger(ctx context.Context, res *model.IndexResult, run *ledger.Run, runErr error) {
+	if runErr != nil || c.opts.RunLedgerReader == nil || run.ID() == "" {
+		return
+	}
+	if err := c.opts.Ledger.Flush(ctx); err != nil {
+		logTyped(c.log, "the run could not report on itself: its accounting was not written", err,
+			"component", component, "run_id", run.ID())
+		return
+	}
+	row, stages, omitted, err := c.opts.RunLedgerReader.Run(ctx, run.ID())
+	if err != nil {
+		logTyped(c.log, "the run could not report on itself: its accounting could not be read", err,
+			"component", component, "run_id", run.ID())
+		return
+	}
+	res.Run, res.Stages, res.StagesOmitted = row, stages, omitted
+}
+
+// report hands the run row its totals. It is called once activation has
+// succeeded, when every count the result publishes is final, so the ledger's
+// figures and model.IndexResult's are the same counters and cannot disagree.
+//
+// peak is the process's high-water resident size, and is nil everywhere but at
+// the run's end: it is a measurement of the whole run, so only the caller that
+// knows the run is over has one to give.
+func (g *generation) report(peak *uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ledgerRun.Report(ledger.Totals{
+		FileCount:           int64(g.snap.FileCount),
+		SourceBytes:         int64(g.snap.SourceBytes),
+		UnitsPlanned:        g.planned,
+		UnitsSucceeded:      g.reused + g.carried + g.built,
+		UnitsFailed:         g.failed,
+		UnitsSubdivided:     g.subdivided,
+		ProcessPeakRSSBytes: peak,
+	})
+}
+
+// endOutcome is how a run or a stage ended. A unit has a third ending and
+// spells it in unitOutcome.
+func endOutcome(err error) ledger.Outcome {
+	if err != nil {
+		return ledger.OutcomeFailed
+	}
+	return ledger.OutcomeOK
+}
+
+// unitOutcome tells a unit's three endings apart. A subdivided unit succeeded
+// in parts and is neither a plain success nor a failure, and reporting it as
+// either would hide the one full-build reason an operator acts on.
+func unitOutcome(res outcome, err error) ledger.Outcome {
+	switch {
+	case err != nil && absent(provider.CodeOf(err)):
+		return ledger.OutcomeUnavailable
+	case err != nil:
+		return ledger.OutcomeFailed
+	case res.subdivided:
+		return ledger.OutcomeSubdivided
+	default:
+		return ledger.OutcomeOK
+	}
+}
+
+// unitEnding is how a unit ended on a path that never reached its provider: a
+// unit already sealed under the same key is attached rather than rebuilt, and
+// anything else here failed before the run.
+//
+// Success means attached and nothing else, because the two other ways a unit
+// returns no error -- a run that succeeded, and an optional provider's failure
+// that the generation absorbs -- have both already closed the span with their
+// own outcome, and a span records one end.
+func unitEnding(err error) ledger.Outcome {
+	if err == nil {
+		return ledger.OutcomeReused
+	}
+	return endingFor(provider.CodeOf(err))
+}
+
+// endingFor is the terminal state a unit that produced nothing takes, decided
+// by its diagnostic code alone: a unit that reached no output because
+// something it needed was not there is unavailable, and one that was asked to
+// do its work and could not is failed. Keeping the two apart is the whole
+// value of the row -- "unavailable" that cannot say which scope and why is the
+// assertion this account exists to replace -- so every path that closes a
+// unit's span decides it here rather than naming an outcome directly.
+func endingFor(code string) ledger.Outcome {
+	if absent(code) {
+		return ledger.OutcomeUnavailable
+	}
+	return ledger.OutcomeFailed
+}
+
+// absent reports whether a diagnostic code says the unit reached no output
+// because something it needed was not there -- a provider with nothing to run
+// against, or a tool this machine cannot supply -- rather than because work
+// that ran went wrong. The two are the difference between "this machine cannot
+// do it" and "this repository broke it", and an operator acts on them
+// differently.
+func absent(code string) bool {
+	switch code {
+	case model.CodeProviderUnavailable, model.CodeToolOffline, model.CodeToolUnsupportedPlatform,
+		model.CodeToolFetchFailed, model.CodeToolDigestMismatch, model.CodeToolCorrupt,
+		model.CodeToolOverrideInvalid:
+		return true
+	}
+	return false
+}
+
+// reasonDeferred is what a unit's row says when this run handed it to the
+// background sealer instead of running it.
+const reasonDeferred = "the unit is deferred to background work after activation"
+
+// int64Ptr is the address of a count a span reports at its end. Measured's
+// fields are pointers because an unavailable measurement is absent and never
+// zero; a count the caller has is always available.
+func int64Ptr(n int64) *int64 { return &n }
+
+// runsPage is the run list the result publishes and the number of runs that
+// did not fit it. Runs is a wire-sized page -- at most model.MaxRecordsPerResult
+// summaries -- and a generation with more runs than that must say so rather
+// than serve a short list as the whole of it. It is a method and not two
+// expressions at the publish site so the honesty of the count is reachable by
+// a test without rebuilding a generation's whole publish path.
+func (g *generation) runsPage() ([]model.ProviderResult, int64) {
+	return g.runs, g.runsTotal - int64(len(g.runs))
 }
 
 // attachReused makes every unit the plan proved identical a member of this
 // generation. Storage re-checks each one's inputs against the snapshot, so a
 // plan that was wrong about reuse is refused here rather than published.
-func (g *generation) attachReused(ctx context.Context) error {
+func (g *generation) attachReused(ctx context.Context) (err error) {
+	ctx, span := ledger.Start(ctx, stageAttachReused, "")
+	defer func() {
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+			ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
+	}()
 	for _, unit := range g.plan.Reuse {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
 			return err
@@ -226,7 +600,12 @@ func (g *generation) attachReused(ctx context.Context) error {
 // scope into this generation (Section 13.3, ruling Q4): the capability keeps
 // answering as `stale` with its provenance distance while the fresh unit is
 // built in the background, and is replaced at the next activation.
-func (g *generation) attachCarried(ctx context.Context) error {
+func (g *generation) attachCarried(ctx context.Context) (err error) {
+	ctx, span := ledger.Start(ctx, stageAttachCarried, "")
+	defer func() {
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+			ItemsIn: int64Ptr(int64(len(g.plan.Carry))), ItemsOut: &g.carried}, err)
+	}()
 	for _, carried := range g.plan.Carry {
 		err := g.c.opts.Store.AttachCarried(ctx, g.gen, carried.Unit,
 			sqlite.Carry{DistanceGenerations: carried.DistanceGenerations, DistanceFiles: carried.DistanceFiles})
@@ -255,81 +634,210 @@ func (g *generation) attachCarried(ctx context.Context) error {
 // provider's units run concurrently; the next provider starts only when the
 // previous one's units are sealed, because storage refuses to open a unit
 // whose declared dependency is not yet sealed.
-func (g *generation) build(ctx context.Context) ([]plan.Unit, error) {
+func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
+	ctx, span := ledger.Start(ctx, stageBuild, "")
+	defer func() {
+		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &g.built}, err)
+	}()
 	var deferred []plan.Unit
-	for i := 0; i < len(g.plan.Units); {
-		id := g.plan.Units[i].ProviderID
-		j := i
-		for j < len(g.plan.Units) && g.plan.Units[j].ProviderID == id {
-			j++
-		}
-		group := g.plan.Units[i:j]
-		i = j
-		var run []plan.Unit
-		for _, u := range group {
-			if u.Deferred {
-				deferred = append(deferred, u)
-				continue
+	var group *unitGroup
+	current := ""
+	// The plan streams its units, so no provider's whole unit list is ever in
+	// heap: a group is opened when its first unit arrives and drained when the
+	// provider changes. The units arrive grouped by provider by construction --
+	// Plan.Units answers in Selection.Active order -- which is what makes a
+	// provider change the end of its group.
+	walkErr := g.eachUnit(func(u plan.Unit) error {
+		// The previous provider's group is drained before this unit is
+		// counted or given a row: a group whose failure ends the walk here
+		// leaves this unit one the walk never reached, which is what the
+		// end-of-run account writes the row for. Counting it first would
+		// leave a row nothing ever closed.
+		if u.ProviderID != current {
+			if group != nil {
+				err := group.wait()
+				group = nil
+				if err != nil {
+					return err
+				}
 			}
-			run = append(run, u)
+			current = u.ProviderID
 		}
-		if err := g.buildGroup(ctx, run); err != nil {
+		g.planned++
+		g.walked++
+		span.AddIn(1)
+		// The unit's row exists from the moment the plan names it, before
+		// admission and before any provider is reached. A unit that never
+		// runs is then a row that says so with its reason, instead of a
+		// capability reported unavailable that nothing can substantiate.
+		unitSpan := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
+		if u.Deferred {
+			// Not this run's work: it is queued for the background sealer,
+			// which records it under its own run. Leaving the row planned
+			// would have this run report it as never admitted.
+			unitSpan.End(ledger.OutcomeSkipped, ledger.Measured{Failure: reasonDeferred}, nil)
+			deferred = append(deferred, u)
+			return nil
+		}
+		if group == nil {
+			group = g.newUnitGroup(ctx)
+		}
+		return group.submit(u, unitSpan)
+	})
+	err = walkErr
+	if walkErr == nil {
+		// The walk reached every unit the plan named, so nothing is left for
+		// the end-of-run account to pick up.
+		g.walkDone = true
+	}
+	if walkErr != nil {
+		// A group left running by the failing walk is drained before the error
+		// is reported, so no unit outlives the call that started it. Its own
+		// error is the one submit or wait already returned.
+		if group != nil {
+			_ = group.wait()
+		}
+		return nil, walkErr
+	}
+	if group != nil {
+		if err = group.wait(); err != nil {
 			return nil, err
 		}
 	}
 	return deferred, nil
 }
 
-// buildGroup builds one provider's units with bounded concurrency. The first
-// failure that must abort the generation cancels the rest; an optional
-// provider's failure is recorded and the group continues, because Section 13.3
-// forbids a disabled or failing optional tool from taking a healthy base
-// generation down with it.
-func (g *generation) buildGroup(ctx context.Context, units []plan.Unit) error {
-	if len(units) == 0 {
+// eachUnit walks the plan's units. A plan assembled by hand rather than by
+// plan.Build may carry no unit sequence at all, which is a plan that runs
+// nothing -- the late-seal work generation is exactly that.
+func (g *generation) eachUnit(yield func(plan.Unit) error) error {
+	if g.plan.Units == nil {
 		return nil
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	sem := make(chan struct{}, g.c.workers)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var fatal error
-	for _, u := range units {
-		select {
-		case sem <- struct{}{}:
-		case <-runCtx.Done():
-			wg.Wait()
-			if fatal != nil {
-				return fatal
-			}
-			return model.Canceled(runCtx.Err())
-		}
-		wg.Add(1)
-		go func(u plan.Unit) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := g.unit(runCtx, u); err != nil {
-				once.Do(func() { fatal = err; cancel() })
-			}
-		}(u)
+	return g.plan.Units(yield)
+}
+
+// accountUnwalkedUnits gives every unit the plan named but the build walk
+// never reached a row that says so, at the end of the run that planned them.
+//
+// A run that dies after the plan is derived and before the walk gets to a unit
+// -- a ref that could not be read, a generation that could not be opened, a
+// required provider's first unit failing and cancelling the rest -- would
+// otherwise leave those units with no trace at all, which is exactly the
+// invisibility the planned-unit row exists to remove, in the run an operator
+// most wants to account for. Each row is written already terminal: nothing
+// started the unit, so there is no wall to measure and no provider to name a
+// reason, and the ledger's own reason for work that was never admitted is what
+// it carries.
+//
+// The plan's unit sequence is re-iterable and answers in one fixed order, so
+// resuming it past the units the walk reached names exactly the ones it did
+// not. It must not be called after the plan is closed.
+func (g *generation) accountUnwalkedUnits(ctx context.Context) {
+	if g.walkDone {
+		return
 	}
-	wg.Wait()
-	return fatal
+	var seen int64
+	err := g.eachUnit(func(u plan.Unit) error {
+		seen++
+		if seen <= g.walked {
+			return nil
+		}
+		span := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
+		span.End(ledger.OutcomeUnavailable, ledger.Measured{
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		g.mu.Lock()
+		g.planned++
+		g.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		// The plan's own sequence could not be re-read, so this run cannot say
+		// what it had left to do. The operator is told that much rather than
+		// being left with a unit count that quietly stops short.
+		logTyped(g.c.log, "the units this run never reached could not be accounted for", err,
+			"component", component, "run_id", g.ledgerRun.ID())
+	}
+}
+
+// unitGroup runs one provider's units with bounded concurrency as the plan
+// hands them over. It is the streaming shape of what was one []plan.Unit per
+// provider: the same worker bound, the same first-fatal-failure-cancels-the
+// -rest precedence, and a live set of at most workers units.
+type unitGroup struct {
+	g      *generation
+	ctx    context.Context
+	cancel context.CancelFunc
+	sem    chan struct{}
+	wg     sync.WaitGroup
+	once   sync.Once
+	fatal  error
+}
+
+func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
+	runCtx, cancel := context.WithCancel(ctx)
+	return &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers)}
+}
+
+// submit admits one unit against the group's worker slots, blocking while they
+// are all busy. A group whose first fatal failure has already cancelled it
+// stops admitting and reports that failure, which ends the plan walk.
+func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
+	select {
+	case u.sem <- struct{}{}:
+	case <-u.ctx.Done():
+		u.wg.Wait()
+		err := u.fatal
+		if err == nil {
+			err = model.Canceled(u.ctx.Err())
+		}
+		// The group stopped admitting before this unit had a worker, so it
+		// never reached its work and says exactly that.
+		span.End(ledger.OutcomeUnavailable, ledger.Measured{
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		return err
+	}
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		defer func() { <-u.sem }()
+		if err := u.g.unit(u.ctx, unit, span); err != nil {
+			u.once.Do(func() { u.fatal = err; u.cancel() })
+		}
+	}()
+	return nil
+}
+
+// wait drains the group and reports its first fatal failure. It releases the
+// group's context whatever the outcome, so an abandoned group leaks nothing.
+func (u *unitGroup) wait() error {
+	u.wg.Wait()
+	u.cancel()
+	return u.fatal
 }
 
 // unit builds one unit. The returned error is nonnil only when the failure
 // must abort the whole generation: a required provider's unit, a storage
 // failure, or a cancellation.
-func (g *generation) unit(ctx context.Context, u plan.Unit) error {
+func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (err error) {
+	// Every path out of this call closes the unit's planned row. run closes it
+	// first for a unit that reached a provider and End is idempotent, so this
+	// states the outcome only for the paths that never do: the attach of a
+	// unit already sealed, and the failures before the run.
+	defer func() { span.End(unitEnding(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	spec, err := u.Spec(g.c.cfgHash)
 	if err != nil {
 		return err
 	}
 	if u.Heavy {
-		release, err := g.c.sched.Admit(ctx, u.Reservation)
-		if err != nil {
-			return err
+		release, admitErr := g.c.sched.Admit(ctx, u.Reservation)
+		if admitErr != nil {
+			// The admission gate refused or was cancelled, so the unit never
+			// reached its work: unavailable with that reason, not a failure of
+			// a provider that was never asked.
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return admitErr
 		}
 		defer release()
 	}
@@ -348,15 +856,16 @@ func (g *generation) unit(ctx context.Context, u plan.Unit) error {
 		}
 		g.mu.Lock()
 		g.reused++
+		g.markPublished(u.ProviderID)
 		g.mu.Unlock()
 		return nil
 	}
-	out, err := g.run(ctx, u, spec)
-	if err == nil {
-		g.record(out)
+	out, runErr := g.run(ctx, u, spec, span)
+	if runErr == nil {
+		g.record(u, out)
 		return nil
 	}
-	return g.failure(ctx, u, out.result, err)
+	return g.failure(ctx, u, out, runErr)
 }
 
 // outcome is one unit's run: what the provider reported, how many files it
@@ -366,12 +875,38 @@ type outcome struct {
 	result      model.ProviderResult
 	parsed      int64
 	invalidated bool
+	// subdivided reports the one full-build reason that is not an
+	// invalidation, which the run row counts separately from a failure.
+	subdivided bool
+	// span is the unit's own span. It is still open when the unit failed:
+	// the failure path ends it with the one typed reason it also writes to
+	// the provider-run row, so the two records of one failure cannot
+	// disagree about it.
+	span *ledger.Span
 }
 
 // run executes one unit through its delta applier when the provider has one,
 // and through the provider runtime otherwise.
-func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) (outcome, error) {
+func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span) (res outcome, err error) {
 	c := g.c
+	// The unit's span was opened when the plan named it and begins here: the
+	// providers' own inner spans find it in the context they are handed and
+	// nest under it without naming it, so a unit's cost is the sum of parts
+	// recorded by code that knows nothing about this package.
+	ctx = span.Begin(ctx)
+	defer func() {
+		// The span travels out on every path, because a unit that failed is
+		// ended by the failure path instead: that is where the typed reason
+		// is built, and typing the same error here as well would produce two
+		// records of one failure that can disagree.
+		res.span = span
+		if err != nil {
+			return
+		}
+		span.End(unitOutcome(res, nil),
+			ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+				ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
+	}()
 	p, ok := c.opts.Registry.Lookup(u.ProviderID)
 	if !ok {
 		return outcome{}, internalErr("the plan names provider " + u.ProviderID + ", which is not registered")
@@ -397,7 +932,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if applier, ok := c.appliers[u.ProviderID]; ok {
 		previous := g.plan.Previous[plan.Key(u.ProviderID, u.ScopeKey)]
 		req := delta.Request{Generation: g.gen, Previous: previous,
-			Build: build, Inputs: inputsOf(u.Inputs), Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
+			Build: build, Inputs: u.Inputs, Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
 		// The applier calls CompleteProviderRun itself, on both paths and
 		// under a context that survives cancellation; calling it again here
 		// would fail as "run is not running".
@@ -410,7 +945,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 			return outcome{result: out.Result}, err
 		}
 		return outcome{result: annotate(out), parsed: parsedBy(applier, u, out),
-			invalidated: previous != "" && !subdivided(out)}, nil
+			invalidated: previous != "" && !subdivided(out), subdivided: subdivided(out)}, nil
 	}
 	// A file-invalidated unit has no delta applier and no recorded
 	// predecessor, so whether it replaced one is asked of the previous
@@ -420,7 +955,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if err != nil {
 		return outcome{}, err
 	}
-	w, err := c.opts.Store.BeginUnit(ctx, g.gen, build, inputsOf(u.Inputs))
+	w, err := c.opts.Store.BeginUnit(ctx, g.gen, build, u.Inputs)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -431,7 +966,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if err := c.opts.Store.CompleteProviderRun(context.WithoutCancel(ctx), result, provider.CodeOf(runErr)); err != nil {
 		runErr = errors.Join(runErr, err)
 	}
-	return outcome{result: result, parsed: int64(len(u.Inputs)), invalidated: invalidated && runErr == nil}, runErr
+	return outcome{result: result, parsed: u.InputCount, invalidated: invalidated && runErr == nil}, runErr
 }
 
 // parsedBy is how many of a delta-built unit's files were actually read. A
@@ -444,7 +979,7 @@ func parsedBy(a delta.Applier, u plan.Unit, out delta.Result) int64 {
 	if a.Kind() == delta.KindSCIP && !out.Full {
 		return out.Delta.Changed
 	}
-	return int64(len(u.Inputs))
+	return u.InputCount
 }
 
 // replacesPredecessor reports whether the previous generation selected a
@@ -508,15 +1043,29 @@ func (g *generation) sourceBinding(ctx context.Context, p provider.Provider, sco
 	return verifier.Verify(ctx, g.view, scopeKey)
 }
 
+// markPublished records that this generation holds a member for a provider.
+// The caller holds g.mu.
+func (g *generation) markPublished(providerID string) {
+	if g.published == nil {
+		g.published = map[string]bool{}
+	}
+	g.published[providerID] = true
+}
+
 // record folds one successful unit into the run's metrics and capability rows.
-func (g *generation) record(out outcome) {
+func (g *generation) record(u plan.Unit, out outcome) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.markPublished(u.ProviderID)
 	g.built++
+	if out.subdivided {
+		g.subdivided++
+	}
 	g.parsed += out.parsed
 	if out.invalidated {
 		g.invalidated++
 	}
+	g.runsTotal++
 	if len(g.runs) < model.MaxRecordsPerResult {
 		g.runs = append(g.runs, out.result)
 	}
@@ -528,7 +1077,16 @@ func (g *generation) record(out outcome) {
 // failure decides what one unit's failure does to the generation. A required
 // provider takes the generation down; an optional one publishes a failed
 // capability and the generation continues degraded (Section 13.3).
-func (g *generation) failure(ctx context.Context, u plan.Unit, res model.ProviderResult, cause error) error {
+func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, cause error) error {
+	res := out.result
+	// The unit's span ends here whatever its failure does to the generation:
+	// one left open reads as interrupted and the unit's cost simply vanishes
+	// from the breakdown. recordFailure ends it first, with the reason it also
+	// writes to the run row, and an end is once-only -- so this is the backstop
+	// for the two exits below, neither of which records a row to agree with.
+	m := ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
+	defer func() { out.span.End(endingFor(provider.CodeOf(cause)), m, cause) }()
 	if ctx.Err() != nil && errors.Is(cause, ctx.Err()) {
 		return cause
 	}
@@ -536,37 +1094,127 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 	if !ok || p.Descriptor().Required {
 		return cause
 	}
-	code := provider.CodeOf(cause)
+	f := g.recordFailure(ctx, u, out, cause)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if res.RunID != "" && len(g.runs) < model.MaxRecordsPerResult {
-		g.runs = append(g.runs, res)
+	g.failed++
+	if res.RunID != "" {
+		g.runsTotal++
+		if len(g.runs) < model.MaxRecordsPerResult {
+			g.runs = append(g.runs, res)
+		}
 	}
-	for _, capability := range p.Descriptor().Capabilities {
-		g.caps.addFailure(u.ProviderID, capability, u.ScopeKey, code)
+	// The reason is aggregated per provider and folded into the capability
+	// rows by coverage, which publishes a count, a planned total and a
+	// bounded sample of the scopes instead of one row per failed unit.
+	if g.failures == nil {
+		g.failures = map[string]*providerFailures{}
 	}
-	// The scope key is the only identifier logged; a provider's own output,
-	// source bytes and native keys never reach an ordinary log line.
-	g.c.log.Warn("an optional provider unit failed; its capability is published failed",
-		"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
-		"generation_id", int64(g.gen), "diagnostic_code", code)
+	agg, ok := g.failures[u.ProviderID]
+	if !ok {
+		agg = &providerFailures{}
+		g.failures[u.ProviderID] = agg
+	}
+	agg.add(u.ScopeKey, f)
 	return nil
+}
+
+// recordFailure types one unit's failure, keeps it on the run row and tells
+// the operator. The durable row is what survives the log: a capability row
+// carries one exemplar per provider capability and never the tool output, so
+// without it the particulars of every other failed scope are lost the moment
+// the process exits.
+//
+// The log line carries the message and the bounded particulars, but never the
+// standard-error tail: that is raw analyzer output, which Section 6 keeps out
+// of ordinary logs. The tail is on the run row alone. The scope key is the
+// only identifier logged; a provider's own source bytes and native keys never
+// reach a log line at all.
+func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome, cause error) unitFailure {
+	res := out.result
+	f := typedFailure(cause)
+	stored := model.RunFailure{ProviderID: u.ProviderID, ScopeKey: u.ScopeKey, Code: f.code,
+		Message: f.message, Remediation: f.remediation, Details: f.details}
+	// One value, two records: the unit's span publishes the reason the run row
+	// publishes, so the ledger and the store can never disagree about why a
+	// unit failed. The error is not handed to End -- it would fill the span
+	// from the error's own text, which is what typedFailure deliberately drops
+	// for an untyped error, and the two records would then diverge on exactly
+	// the failures nobody has a safe message for.
+	out.span.End(endingFor(stored.Code), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
+		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed),
+		DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
+	if res.RunID != "" {
+		// Under a context that survives the cancellation the failure may have
+		// arrived with: a reason dropped because the run was cancelled is the
+		// case the operator most needs the row for.
+		if err := g.c.opts.Store.RecordRunFailure(context.WithoutCancel(ctx), res.RunID, stored); err != nil {
+			logTyped(g.c.log, "the reason a provider unit failed could not be recorded", err,
+				"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey)
+		}
+	}
+	args := []any{"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey,
+		"generation_id", int64(g.gen), "diagnostic_code", f.code, "message", f.message}
+	if f.remediation != "" {
+		args = append(args, "remediation", f.remediation)
+	}
+	for _, k := range slices.Sorted(maps.Keys(f.details)) {
+		if k != model.DetailStderrTail {
+			args = append(args, k, f.details[k])
+		}
+	}
+	g.c.log.Warn("an optional provider unit failed; its capability is published failed", args...)
+	return f
+}
+
+// typedFailure projects an error onto the reason a capability row and a run
+// row publish. An untyped error has no safe message to publish -- it is a
+// defect's text, not a diagnostic -- so only its family is kept.
+func typedFailure(cause error) unitFailure {
+	f := unitFailure{code: provider.CodeOf(cause)}
+	var typed *model.Error
+	if errors.As(cause, &typed) {
+		f.message, f.details, f.remediation = typed.Message, typed.Details, typed.Remediation
+	}
+	return f
 }
 
 // coverage publishes the fresh rows and the one degradation that is otherwise
 // invisible: a provider that is available and produced no unit at all
 // (residual 113). "Available, zero units" is not fresh coverage, and without a
 // row for it status would report a capability nothing answers as healthy.
-func (g *generation) coverage() {
-	covered, deferred := g.coveredProviders()
+func (g *generation) coverage(ctx context.Context) (err error) {
+	_, span := ledger.Start(ctx, stageCoverage, "")
+	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
+	covered, deferred, failed, published, err := g.coveredProviders(ctx)
+	if err != nil {
+		return err
+	}
 	for _, p := range g.sel.Active {
 		d := p.Descriptor()
 		for _, capability := range d.Capabilities {
+			// A scope that failed is published as the failure it is, naming
+			// that scope and its reason, before the three coverage answers
+			// below: none of them may speak for a capability one of whose
+			// scopes is a known failure. It is recorded first so `reported`
+			// sees it.
+			if f, ok := failed[d.ID]; ok {
+				g.caps.addFailures(d.ID, capability, f, deferred[d.ID])
+			}
+			// And a capability that did publish a scope is partial, not
+			// failed: the facts of that scope are in this generation and
+			// answer queries. The test is whether a member exists, not
+			// whether a unit was planned -- a provider whose every unit
+			// failed published nothing and stays failed.
+			if published[d.ID] {
+				g.caps.coveredElsewhere(d.ID, capability)
+			}
 			switch {
-			// Deferred wins over covered: a provider with one scope still
-			// running is not fresh coverage, whatever its other scopes did.
-			case deferred[d.ID]:
-				g.caps.addDeferred(d.ID, capability)
+			// Deferred is a scope still running and nothing else: a provider
+			// with work in flight is not fresh coverage, whatever its other
+			// scopes did.
+			case deferred[d.ID] > 0:
+				g.caps.addDeferred(d.ID, capability, deferred[d.ID])
 			case covered[d.ID]:
 				g.caps.addFresh(d.ID, capability)
 			default:
@@ -574,6 +1222,13 @@ func (g *generation) coverage() {
 			}
 		}
 	}
+	return nil
+}
+
+// failedScope is one scope of a provider that did not seal, with the reason.
+type failedScope struct {
+	scopeKey string
+	failure  unitFailure
 }
 
 // coveredProviders is the set of providers this generation actually holds a
@@ -584,31 +1239,141 @@ func (g *generation) coverage() {
 // been written for it, which is the false readiness Section 11.6 forbids. The
 // Reuse key is the provider id and the scope key joined by NUL, which is the
 // frozen shape of plan.Key.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool) {
+//
+// deferred is a COUNT per provider and not a flag: it is published on the
+// capability row, where it is the only way a process other than the one doing
+// the work learns that a scope of this capability is still being built. "One
+// scope outstanding" and "forty" are different reports of the same generation.
+// Which deferred scopes it excludes is decided by holdsFreshUnit, against the
+// generation's own unit rows: the count is an assertion about the whole
+// generation for every provider, so no in-process record of what one batch
+// sealed may be its authority.
+//
+// published is the narrower question the partial ruling needs: the providers a
+// member was actually written or attached for. Coverage counts a planned unit,
+// because "available and produced no unit at all" is the degradation it exists
+// to catch; a failure row may only be softened by facts that exist.
+func (g *generation) coveredProviders(ctx context.Context) (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
-	deferred = make(map[string]bool, len(g.sel.Active))
-	for _, u := range g.plan.Units {
+	deferred = make(map[string]int, len(g.sel.Active))
+	failed = make(map[string]*providerFailures, len(g.sel.Active))
+	published = make(map[string]bool, len(g.sel.Active))
+	g.mu.Lock()
+	for id := range g.published {
+		published[id] = true
+	}
+	g.mu.Unlock()
+	// Streamed, not ranged: the plan's unit list is repository-sized, and the
+	// three answers here are one bounded entry per provider whatever it holds.
+	g.mu.Lock()
+	for id, agg := range g.failures {
+		clone := *agg
+		clone.named = slices.Clone(agg.named)
+		failed[id] = &clone
+	}
+	g.mu.Unlock()
+	record := func(u plan.Unit, f unitFailure) {
+		agg, ok := failed[u.ProviderID]
+		if !ok {
+			agg = &providerFailures{}
+			failed[u.ProviderID] = agg
+		}
+		agg.add(u.ScopeKey, f)
+	}
+	planned := make(map[string]int, len(g.sel.Active))
+	if err := g.eachUnit(func(u plan.Unit) error {
+		planned[u.ProviderID]++
 		if u.Deferred {
-			// A publication generation holds the deferred units that have
-			// already sealed; the rest are still background work.
-			if g.sealed[plan.Key(u.ProviderID, u.ScopeKey)] {
-				out[u.ProviderID] = true
-			} else {
-				deferred[u.ProviderID] = true
+			key := plan.Key(u.ProviderID, u.ScopeKey)
+			// The generation's own unit rows say which deferred scopes it
+			// already holds; of the rest, the ones this batch tried and
+			// could not seal are failures, and only what is left is still
+			// background work.
+			held, heldErr := g.holdsFreshUnit(ctx, u)
+			if heldErr != nil {
+				return heldErr
 			}
-			continue
+			switch {
+			case held:
+				out[u.ProviderID] = true
+				published[u.ProviderID] = true
+			case g.failedScopes[key].code != "":
+				record(u, g.failedScopes[key])
+			default:
+				deferred[u.ProviderID]++
+			}
+			return nil
 		}
 		out[u.ProviderID] = true
+		return nil
+	}); err != nil {
+		return nil, nil, nil, nil, err
 	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true
+		published[c.ProviderID] = true
 	}
 	for key := range g.plan.Reuse {
 		if id, _, ok := strings.Cut(key, "\x00"); ok {
 			out[id] = true
+			published[id] = true
+			// A reused scope is a scope the plan assigned this provider: it
+			// is sealed already, so the walk above never yields it, and
+			// leaving it out of the total is what let a provider that sealed
+			// nine scopes and failed two publish "2 planned, 2 failed". A
+			// carried scope needs no such addition -- the planner emits its
+			// unit as well as its carry row, so the walk has already counted
+			// it.
+			planned[id]++
 		}
 	}
-	return out, deferred
+	// The planned total is settled only here, once every source of a planned
+	// scope has been folded in.
+	for id, agg := range failed {
+		agg.planned = planned[id]
+	}
+	return out, deferred, failed, published, nil
+}
+
+// holdsFreshUnit answers whether this generation already selects the unit the
+// plan derives for a deferred scope. It reads the generation's own
+// generation_units rows, so "this scope is no longer running" is settled by
+// the durable membership every process can see rather than by a record of
+// what one background batch happened to seal -- which is what makes
+// units_running an assertion about the whole generation, for every provider,
+// wherever it is published from.
+//
+// The test is against the scope's freshly planned unit and not against
+// membership alone: a scope whose rebuild is still running is a member too,
+// through the stale predecessor AttachCarried keeps for it, and reading that
+// row as coverage would publish a stale answer as a fresh one. Only deferred
+// scopes reach here, and they are the heavy units the planner gates, so the
+// lookups are bounded by that set and not by the repository.
+func (g *generation) holdsFreshUnit(ctx context.Context, u plan.Unit) (bool, error) {
+	if g.gen == 0 {
+		// A generation that has no row of its own selects no unit: the
+		// coverage projection is run over a plan before the generation is
+		// begun on no path, and asking storage about generation zero would
+		// be a malformed lookup rather than the empty answer it means.
+		return false, nil
+	}
+	spec, err := u.Spec(g.c.cfgHash)
+	if err != nil {
+		return false, err
+	}
+	selected, err := g.c.opts.Store.SelectedUnit(ctx, g.gen, u.ProviderID, u.ScopeKey)
+	if err != nil {
+		// "This generation selects no unit for the scope" is the ordinary
+		// answer for work still queued, not a fault; storage marks it with
+		// this detail, which is what tells it from a malformed argument under
+		// the same code.
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Details["reason"] == sqlite.ReasonNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return selected == spec.ID, nil
 }
 
 // capabilitiesOf is one provider's declared capability list, empty when the
@@ -625,17 +1390,6 @@ func (g *generation) capabilitiesOf(providerID string) []string {
 // require: every walk yields the same inputs, in the ascending FileID order
 // the planner already sorted them into. The slice is the plan's own and is
 // never mutated here.
-func inputsOf(inputs []model.UnitInput) func(yield func(model.UnitInput) error) error {
-	return func(yield func(model.UnitInput) error) error {
-		for _, in := range inputs {
-			if err := yield(in); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
 // healthOf is Section 13.3's whole-generation health. An unavailable optional
 // capability leaves a base generation fresh; anything partial, stale or failed
 // makes it degraded. A generation with no coverage at all is not published:

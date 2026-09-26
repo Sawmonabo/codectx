@@ -19,14 +19,38 @@ const ProjectConfigName = ".codectx.toml"
 const (
 	appDirName     = "codectx"
 	userConfigName = "config.toml"
+	// toolStoreDirName is the store's directory name under the user data
+	// directory. It matches the name the toolchain package uses under a data
+	// directory and the one the installer's bundle path creates.
+	toolStoreDirName = "tools"
 )
 
-// userConfigDir and userCacheDir are indirected so the layered resolution can
-// be exercised without depending on the developer's real home directory.
+// userConfigDir, userCacheDir and userDataDir are indirected so the layered
+// resolution can be exercised without depending on the developer's real home
+// directory.
 var (
 	userConfigDir = os.UserConfigDir
 	userCacheDir  = os.UserCacheDir
+	userDataDir   = osUserDataDir
 )
+
+// osUserDataDir is the XDG user data directory. The standard library has no
+// os.UserDataDir, and the installer already writes the shared tool store to
+// ${XDG_DATA_HOME:-$HOME/.local/share}/codectx/tools, so this resolves the same
+// base by the same rule. A relative XDG_DATA_HOME is ignored rather than
+// honoured: the specification requires an absolute path, and a relative one
+// would produce a tool store that changes with the process working directory
+// and that validate rejects for not being absolute.
+func osUserDataDir() (string, error) {
+	if dir := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share"), nil
+}
 
 // projectPermitted is the closed set of keys a repository's own file may set:
 // source inclusion, language selection and safe query preferences (Section
@@ -44,6 +68,7 @@ var projectPermitted = map[string]bool{
 	"workspace.max_files":              true,
 	"workspace.max_parse_file_bytes":   true,
 	"workspace.max_search_file_bytes":  true,
+	"index.max_evidence_per_fact":      true,
 	"providers.tree_sitter.languages":  true,
 	"context.default_phase":            true,
 	"context.default_estimated_tokens": true,
@@ -85,10 +110,46 @@ func Load(root string) (Config, error) {
 		cfg.Storage.DataDir = filepath.Clean(cfg.Storage.DataDir)
 	}
 
+	// The tool store is resolved after the layered merge, and it is resolved to
+	// a machine-wide path rather than to a subdirectory of the data directory
+	// above. The payloads are many gigabytes and are identical for every
+	// checkout, so a per-workspace store would install them again for each one
+	// and leave a fresh repository with nothing installed. `[tools]` is
+	// user-configuration-only, so nothing a project file wrote can reach here.
+	if cfg.Tools.CacheDir == "" {
+		dir, err := DefaultToolStoreDir()
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Tools.CacheDir = dir
+	} else {
+		// Cleaned, not checked: validateTools already owns "must be absolute"
+		// for this key, and Clean leaves a relative path relative, so it still
+		// reaches that refusal with the key named.
+		cfg.Tools.CacheDir = filepath.Clean(cfg.Tools.CacheDir)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// DefaultToolStoreDir is the machine-wide managed tool store: one store shared
+// by every workspace on the host, outside every repository and outside the
+// per-workspace data directory. It is the same path the installer populates
+// from the offline bundle, so a bundle install and an on-demand install fill
+// one store rather than two.
+//
+// Load does not create it. The toolchain owner creates it user-private on the
+// first install, which is what keeps a read-only report from materializing a
+// directory on a host that has never installed anything.
+func DefaultToolStoreDir() (string, error) {
+	base, err := userDataDir()
+	if err != nil {
+		return "", configInvalid("the user data directory is unavailable: %v", err)
+	}
+	return filepath.Join(base, appDirName, toolStoreDirName), nil
 }
 
 // UserConfigPath is the user-level configuration file location. It lives in the
@@ -180,11 +241,13 @@ func applyProjectKey(cfg, scratch *Config, key string) error {
 	case "workspace.index_vendor":
 		cfg.Workspace.IndexVendor = scratch.Workspace.IndexVendor
 	case "workspace.max_files":
-		return lowerOnly(key, &cfg.Workspace.MaxFiles, scratch.Workspace.MaxFiles)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxFiles, scratch.Workspace.MaxFiles)
 	case "workspace.max_parse_file_bytes":
-		return lowerOnly(key, &cfg.Workspace.MaxParseFileBytes, scratch.Workspace.MaxParseFileBytes)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxParseFileBytes, scratch.Workspace.MaxParseFileBytes)
 	case "workspace.max_search_file_bytes":
-		return lowerOnly(key, &cfg.Workspace.MaxSearchFileBytes, scratch.Workspace.MaxSearchFileBytes)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxSearchFileBytes, scratch.Workspace.MaxSearchFileBytes)
+	case "index.max_evidence_per_fact":
+		return lowerOnlyLimit(key, &cfg.Index.MaxEvidencePerFact, scratch.Index.MaxEvidencePerFact)
 	case "providers.tree_sitter.languages":
 		cfg.Providers.TreeSitter.Languages = scratch.Providers.TreeSitter.Languages
 	case "context.default_phase":
@@ -208,7 +271,9 @@ func applyProjectKey(cfg, scratch *Config, key string) error {
 	return nil
 }
 
-// lowerOnly applies a project value only when it narrows the effective limit.
+// lowerOnly applies a project value only when it narrows the effective caller
+// budget. It is for the plain positive settings; a bound uses lowerOnlyLimit,
+// where 0 does not mean "the smallest possible value".
 func lowerOnly(key string, current *int64, proposed int64) error {
 	if proposed > *current {
 		return trustRequired("%s raises %q from %d to %d; a project file may only lower a limit",
@@ -216,6 +281,21 @@ func lowerOnly(key string, current *int64, proposed int64) error {
 	}
 	*current = proposed
 	return nil
+}
+
+// lowerOnlyLimit is lowerOnly over the unlimited-aware ordering. Unlimited is
+// the TOP of the lattice, not the bottom: a project file naming any finite
+// bound against an unlimited one is narrowing what this tool does to the
+// repository, which is exactly what a project file is allowed to do. Only the
+// reverse -- proposing unlimited, or a larger finite bound, over a finite one
+// -- raises a ceiling the user set, and that is the escalation.
+func lowerOnlyLimit(key string, current *Limit, proposed Limit) error {
+	if current.IsUnlimited() || (!proposed.IsUnlimited() && proposed <= *current) {
+		*current = proposed
+		return nil
+	}
+	return trustRequired("%s raises %q from %s to %s; a project file may only lower a limit",
+		ProjectConfigName, key, *current, proposed)
 }
 
 // decodeFile decodes path into v, merging only the fields the file actually

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -26,14 +27,6 @@ const (
 	maxDocBytes    = 8 << 10
 	capabilityName = "structure"
 	searchDomain   = "treesitter-search-v1"
-	// maxCalleeReferences bounds the distinct callee reference nodes one file
-	// may mint: the callees no single declaration of this file can be. A
-	// generated or minified file can hold tens of thousands of distinct such
-	// names, each of which would be a node, a relation and evidence; past the
-	// bound the call is counted and the file's structural coverage is reported
-	// partial instead. The call-site aliases a file publishes are bounded with
-	// it and by wire.MaxRefsPerFile, which bounds its references outright.
-	maxCalleeReferences = 2000
 	// maxPutRecords bounds one hand-off to the sink, so a unit's facts stream
 	// through it in bounded slices rather than one slice the size of the whole
 	// file's output. provider.Sink does not expose the sink's Limits, so this
@@ -73,11 +66,28 @@ type builder struct {
 	relOrder []model.RelationID
 	aliases  []model.NativeAlias
 	search   []model.SearchUnit
-	// dropped counts what this file's bounds kept out of the facts:
-	// occurrences past the per-fact evidence bound, calls past the
-	// callee-reference bound, and declaration or call-site keys over
-	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
+	// dropped counts what this file's bounds kept out of the facts: calls
+	// past the callee-reference bound, and declaration or call-site keys
+	// over MaxNativeKeyBytes. Occurrences cut by the per-fact evidence clip
+	// are counted in clipped instead, so the operator can attribute them.
+	// Any of it makes the file's coverage partial.
 	dropped int
+	// clipped counts the evidence occurrences the per-fact clip kept out.
+	// It is disclosed on the file's capability as `evidence_clipped`, the
+	// same detail key the filesystem provider uses for the same bound, so a
+	// clip is attributable instead of folded into the generic dropped count.
+	clipped int
+	// evidenceClip is the effective per-fact evidence bound (Options
+	// MaxEvidencePerFact); 0 means the model's record ceiling.
+	evidenceClip int
+
+	// maxCallees is tree_sitter.max_callee_references, the bound on the
+	// distinct callee reference nodes this file may mint: the callees no
+	// single declaration of this file can be. Unlimited by default -- a
+	// generated file names what it names -- and bounded in any case by the
+	// file's own references. Past a user-set bound the call is counted into
+	// dropped and the file reports partial.
+	maxCallees config.Limit
 }
 
 // declFact is one validated declaration and its resolved identity.
@@ -88,6 +98,28 @@ type declFact struct {
 	sig  string
 	doc  string
 	res  model.Resolution
+	// truncated names the fields this declaration's storage ceilings cut,
+	// with the original byte length of each. It is index-time truncation of
+	// a stored value and is published as its own attribute, never merged
+	// with a result page's transient truncation flag.
+	truncated map[string]int
+
+	// body is the search document's text: the attached documentation and the
+	// signature, composed and bounded once at extraction so a cut is recorded
+	// in truncated before the node's metadata is built.
+	body string
+}
+
+// truncate bounds one of this declaration's fields and records the cut.
+func (d *declFact) truncate(field, value string, max int) string {
+	bounded, original := model.TruncateField(value, max)
+	if original > len(bounded) {
+		if d.truncated == nil {
+			d.truncated = map[string]int{}
+		}
+		d.truncated[field] = original
+	}
+	return bounded
 }
 
 // outputInvalid is the parent's verdict on a fact the worker sent that does
@@ -168,10 +200,13 @@ func (b *builder) validateDecls() error {
 		if d.Parent < -1 || d.Parent >= i {
 			return outputInvalid("declaration names a parent that does not precede it")
 		}
-		if d.Name == "" || len(d.Name) > model.MaxNameBytes || !utf8.ValidString(d.Name) ||
-			len(d.Qualified) > model.MaxQualifiedNameBytes || !utf8.ValidString(d.Qualified) ||
-			len(d.Impl) > model.MaxNameBytes {
-			return outputInvalid("declaration name is empty, over its bound or not UTF-8")
+		// Emptiness and encoding still refuse the fact: a missing name has
+		// nothing to store and truncating invalid UTF-8 does not make it
+		// valid. Length does not, because generated code clears these
+		// ceilings routinely and refusing there publishes nothing for the
+		// whole file. The over-long values are cut and flagged below.
+		if d.Name == "" || !utf8.ValidString(d.Name) || !utf8.ValidString(d.Qualified) {
+			return outputInvalid("declaration name is empty or not UTF-8")
 		}
 		if d.Qualified == "" {
 			d.Qualified = d.Name
@@ -196,15 +231,25 @@ func (b *builder) validateDecls() error {
 		if _, err := b.rangeOf(d.Start, d.SigEnd); err != nil {
 			return err
 		}
-		f := declFact{Decl: d, kind: kind, rng: rng, sig: collapse(string(b.src[d.Start:d.SigEnd]), model.MaxSignatureBytes)}
+		f := declFact{Decl: d, kind: kind, rng: rng}
+		f.sig = f.truncate("signature", collapse(string(b.src[d.Start:d.SigEnd])), model.MaxSignatureBytes)
+		f.Name = f.truncate("name", d.Name, model.MaxNameBytes)
+		f.Qualified = f.truncate("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
+		f.Impl = f.truncate("receiver", d.Impl, model.MaxNameBytes)
 		if d.DocEnd > 0 {
 			if _, err := b.rangeOf(d.DocStart, d.DocEnd); err != nil {
 				return err
 			}
-			f.doc = cleanDoc(string(b.src[d.DocStart:d.DocEnd]))
+			f.doc = f.truncate("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
 		}
+		// The search body is composed and bounded here, not in searchUnit,
+		// because the node's metadata is built before searchUnit runs: a cut
+		// made later would never reach truncated_fields. A doc and a
+		// signature each at their own ceiling compose to more than one body
+		// holds, so this bound really does cut and must disclose it.
+		f.body = f.truncate("body", searchBody(f.doc, f.sig), maxDocBytes)
 		b.decls = append(b.decls, f)
-		b.byName[d.Name] = append(b.byName[d.Name], i)
+		b.byName[f.Name] = append(b.byName[f.Name], i)
 	}
 	return nil
 }
@@ -236,7 +281,7 @@ func (b *builder) resolveDecls() error {
 	for i := range b.decls {
 		d := &b.decls[i]
 		res, err := b.resolve(model.NodeCandidate{
-			ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: d.Qualified, Kind: d.kind, Language: b.lang.Name,
+			ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.identityKey(d), Kind: d.kind, Language: b.lang.Name,
 			Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
 			FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: d.rng,
 		})
@@ -257,6 +302,12 @@ func (b *builder) resolveDecls() error {
 		if d.Impl != "" {
 			meta["receiver"] = d.Impl
 		}
+		if len(d.truncated) > 0 {
+			// Index-time field truncation, reported on the fact itself so an
+			// answer built from it says which stored values were cut and how
+			// long they were. Distinct from result truncation by name.
+			meta["truncated_fields"] = d.truncated
+		}
 		b.putNode(res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
 
@@ -269,7 +320,16 @@ func (b *builder) resolveDecls() error {
 		if d.Exported && d.Parent < 0 {
 			b.putRelation(b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
 		}
-		b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		if _, cut := d.truncated["qualified_name"]; !cut {
+			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		} else {
+			// The qualified name was cut to its storage ceiling, so it is no
+			// longer an identity: publishing it as an alias would claim that
+			// every declaration sharing the first MaxQualifiedNameBytes is
+			// the same symbol. It is omitted and counted, exactly as declKey
+			// omits an over-long key.
+			b.dropped++
+		}
 		if key := b.declKey(d); key != "" {
 			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: res.Node.ID})
 		} else {
@@ -284,7 +344,7 @@ func (b *builder) resolveDecls() error {
 		if d.Parent < 0 {
 			pkg, over := b.packageScope()
 			switch {
-			case pkg != "":
+			case pkg != "" && d.truncated["qualified_name"] == 0:
 				b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
 			case over:
 				// The package alias scope did not fit and was omitted rather
@@ -298,6 +358,23 @@ func (b *builder) resolveDecls() error {
 		b.search = append(b.search, b.searchUnit(d))
 	}
 	return nil
+}
+
+// identityKey is the native key the declaration's node is resolved under.
+// The qualified name is that key while it fits: it is the identity every
+// other provider joins on. Once it has been cut to its storage ceiling it is
+// a prefix, not an identity, so the file-local declaration key stands in --
+// unique within this file and already the cross-provider key. Should that
+// not fit either, the cut qualified name is the last resort and the caller's
+// b.dropped count is what reports the weakened identity.
+func (b *builder) identityKey(d *declFact) string {
+	if _, cut := d.truncated["qualified_name"]; !cut {
+		return d.Qualified
+	}
+	if key := b.declKey(d); key != "" {
+		return key
+	}
+	return d.Qualified
 }
 
 // declKey is the cross-provider declaration key of the controller's ruling,
@@ -490,7 +567,7 @@ func (b *builder) refs() error {
 			resolution, candidates := calleeResolution(r, targets)
 			res, ok := callees[key]
 			if !ok {
-				if len(callees) >= maxCalleeReferences {
+				if b.maxCallees.Exceeded(int64(len(callees) + 1)) {
 					// Past the bound the call is counted, not minted: a file
 					// with more distinct cross-file callees than this is
 					// reported partial rather than allowed to publish an
@@ -509,7 +586,16 @@ func (b *builder) refs() error {
 			}
 			callee = res.Node.ID
 			b.putRelation(from, model.RelCalls, callee, rng, key, resolution)
-			for _, t := range targets[:min(len(targets), model.MaxAmbiguousCandidates)] {
+			kept := min(len(targets), model.MaxAmbiguousCandidates)
+			if kept < len(targets) {
+				// The candidate list is cut to the model's ambiguity bound.
+				// Each candidate past it is a `may_refer_to` edge this file
+				// should have published and did not, so it is counted like
+				// every other loss and the file reports partial rather than
+				// claiming complete structural coverage.
+				b.dropped += len(targets) - kept
+			}
+			for _, t := range targets[:kept] {
 				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
 		}
@@ -651,11 +737,36 @@ func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey
 	if !ok {
 		return
 	}
-	if len(b.nodes[i].Evidence) >= model.MaxEvidencePerFact {
-		b.dropped++
+	if b.evidenceFull(len(b.nodes[i].Evidence)) {
+		b.clipped++
 		return
 	}
 	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(b.nodes[i].Node.ID, "", rng, nativeKey, ""))
+}
+
+// bounds folds this file's bound accounting into the capability state it is
+// reported on. The evidence clip is attributed under
+// model.DetailEvidenceClipped instead of the generic dropped count, so an operator can tell a clip they
+// configured from any other bound; the bool reports whether any bound -- clip
+// or otherwise -- made this file's coverage partial, so attributing the clip
+// never costs the partial signal.
+func (b *builder) bounds(state model.CapabilityState) (model.CapabilityState, bool) {
+	if b.clipped > 0 {
+		state = state.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(b.clipped))
+	}
+	return state, b.dropped > 0 || b.clipped > 0
+}
+
+// evidenceFull reports whether a fact already carries every occurrence this
+// run may publish for it. A zero clip is the unset index.max_evidence_per_fact
+// and resolves to the model's record ceiling: no configuration means every
+// occurrence the record tolerates, never none.
+func (b *builder) evidenceFull(n int) bool {
+	clip := b.evidenceClip
+	if clip <= 0 {
+		clip = model.MaxEvidencePerFact
+	}
+	return n >= clip
 }
 
 // ambiguous retains the equally supported identities a resolution reported
@@ -676,8 +787,8 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 		b.rels[id] = f
 		b.relOrder = append(b.relOrder, id)
 	}
-	if len(f.Evidence) >= model.MaxEvidencePerFact {
-		b.dropped++
+	if b.evidenceFull(len(f.Evidence)) {
+		b.clipped++
 		return
 	}
 	f.Evidence = append(f.Evidence, b.evidence("", id, rng, nativeKey, detail))
@@ -687,11 +798,7 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 // attached documentation, never the body (Section 11.2 stores bodies once, in
 // the filesystem unit).
 func (b *builder) searchUnit(d *declFact) model.SearchUnit {
-	body := d.sig
-	if d.doc != "" {
-		body = d.doc + "\n" + d.sig
-	}
-	body = bound(body, maxDocBytes)
+	body := d.body
 	return model.SearchUnit{
 		ID: model.H(searchDomain, string(b.fv.ID), string(d.res.Node.ID)), NodeID: d.res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 		Kind: d.res.Node.Kind, Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
@@ -745,8 +852,11 @@ func putChunked[T any](ctx context.Context, items []T, put func(context.Context,
 }
 
 // collapse trims s, folds runs of whitespace into one space and bounds it.
-func collapse(s string, max int) string {
-	return bound(strings.Join(strings.Fields(s), " "), max)
+// collapse folds a declaration's signature bytes onto one line. It does not
+// bound the result: the caller truncates through declFact.truncate, so a cut
+// signature is flagged in truncated_fields rather than shortened in silence.
+func collapse(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // cleanDoc strips comment syntax from an attached comment or docstring and
@@ -774,7 +884,10 @@ func cleanDoc(s string) string {
 	for len(out) > 0 && out[len(out)-1] == "" {
 		out = out[:len(out)-1]
 	}
-	return bound(strings.Join(out, "\n"), maxDocBytes)
+	// Unbounded: the caller truncates through declFact.truncate so the cut is
+	// counted. Bounding here is what made an over-long docstring vanish
+	// silently.
+	return strings.Join(out, "\n")
 }
 
 // bound truncates s to at most max bytes on a rune boundary.
@@ -804,4 +917,14 @@ func lastPathSegment(p string) string {
 		return "."
 	}
 	return bound(p, model.MaxNameBytes)
+}
+
+// searchBody composes a declaration's search text: its attached documentation
+// above its signature, or the signature alone when it has none. The caller
+// bounds the result through declFact.truncate so a cut is flagged.
+func searchBody(doc, sig string) string {
+	if doc == "" {
+		return sig
+	}
+	return doc + "\n" + sig
 }

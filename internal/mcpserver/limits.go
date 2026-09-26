@@ -12,27 +12,19 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// graphTools is the traversal set that takes the SECOND concurrency gate.
-//
-// It is the traversal tools only — codectx_symbol_info is Section 19.2 row 6
-// and is two explore calls (Symbol then References) composed on one generation,
-// not a graph walk, so it is bounded by the general gate alone. Keeping the set
-// literal rather than deriving it from a name prefix is what lets a reviewer
-// check the classification instead of guessing it.
-var graphTools = map[string]bool{
-	"codectx_callers":         true,
-	"codectx_callees":         true,
-	"codectx_dependency_path": true,
-	"codectx_impact":          true,
-}
-
 // limits is the Section 19.3 bound set, resolved from configuration once at
 // construction so no per-call path re-reads or re-derives it.
 //
-// The two semaphores are buffered channels rather than a counter: a channel
-// send is the only acquire primitive that can be selected against ctx.Done(),
-// and an acquire that cannot be abandoned is the unbounded wait Section 6
-// forbids.
+// The semaphore is a buffered channel rather than a counter: a channel send is
+// the only acquire primitive that can be selected against ctx.Done(), and an
+// acquire that cannot be abandoned is the unbounded wait Section 6 forbids.
+//
+// There is ONE traversal gate in this process and it is not here. How many
+// graph traversals run at once (config.GraphSlots) is held by the engine's own
+// gate in internal/app, which every caller passes through -- a command as well
+// as a tool call -- and a second gate over the same slot count, sized from the
+// same figure and reachable only from this server, could only drift from it or
+// refuse a call the one gate would have admitted.
 type limits struct {
 	// maxParamsBytes caps the RAW tools/call arguments frame, before any
 	// decoding. resources.max_metadata_response_bytes serves as the MCP REQUEST
@@ -52,14 +44,17 @@ type limits struct {
 	// which is the speculative infrastructure policy.md forbids, and at 256 KiB
 	// it would refuse every source chunk above that.
 	maxParamsBytes int64
-	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency
-	// (index.max_parser_workers): a query gate and an indexing gate are
-	// different resources and sharing one would let either starve the other.
+	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency:
+	// a query gate and an indexing gate are different resources and sharing one
+	// would let either starve the other. Both are derived from this machine's
+	// cores (config.QuerySlots, config.ParserWorkers) and neither refuses a
+	// call -- a call that finds no slot waits.
 	calls chan struct{}
-	// graph additionally bounds the traversal tools, which are the expensive
-	// ones. A traversal holds a slot in both.
-	graph chan struct{}
-	// timeout is the per-call deadline every tool handler runs under.
+	// timeout is the per-call deadline a tool handler runs under when neither
+	// the client's request nor the configuration asks for something else. Zero
+	// is "no deadline", which is what resources.query_timeout defaults to: the
+	// answer is complete or it is nothing, never a page the client has to tune
+	// a bound to get past.
 	timeout time.Duration
 }
 
@@ -76,10 +71,11 @@ func newLimits(cfg config.Config) (limits, error) {
 		v   int64
 	}{
 		{"resources.max_metadata_response_bytes", r.MaxMetadataResponseBytes},
-		{"resources.max_concurrent_queries", int64(r.MaxConcurrentQueries)},
-		{"resources.max_concurrent_graph_queries", int64(r.MaxConcurrentGraphQueries)},
 		{"resources.max_page_items", int64(r.MaxPageItems)},
-		{"resources.query_timeout", int64(r.QueryTimeout)},
+		// resources.query_timeout is deliberately absent: zero is its
+		// "unlimited" spelling and its default, and a tool call that carries no
+		// deadline of its own is meant to return the COMPLETE answer rather
+		// than a page the client has to tune a timeout to get past.
 	} {
 		if b.v <= 0 {
 			return limits{}, &model.Error{
@@ -90,33 +86,23 @@ func newLimits(cfg config.Config) (limits, error) {
 	}
 	return limits{
 		maxParamsBytes: r.MaxMetadataResponseBytes,
-		calls:          make(chan struct{}, r.MaxConcurrentQueries),
-		graph:          make(chan struct{}, r.MaxConcurrentGraphQueries),
+		calls:          make(chan struct{}, config.QuerySlots()),
 		timeout:        r.QueryTimeout.Std(),
 	}, nil
 }
 
-// acquire takes the general gate and, for a traversal tool, the graph gate too.
-// The order is fixed (general first) and every slot taken is released by the
-// returned function, so the two gates cannot deadlock against each other.
+// acquire takes the tool-call gate. The slot it takes is released by the
+// returned function; a traversal takes the process's one graph slot further
+// down, inside the engine, where every caller takes it.
 //
 // Waiting is bounded by ctx: a caller that goes away, or a call that has spent
 // its deadline queuing, is refused rather than parked forever.
-func (l limits) acquire(ctx context.Context, tool string) (func(), *model.Error) {
+func (l limits) acquire(ctx context.Context) (func(), *model.Error) {
 	select {
 	case l.calls <- struct{}{}:
+		return func() { <-l.calls }, nil
 	case <-ctx.Done():
 		return nil, waitFailed(ctx, "waiting for a tool-call slot")
-	}
-	if !graphTools[tool] {
-		return func() { <-l.calls }, nil
-	}
-	select {
-	case l.graph <- struct{}{}:
-		return func() { <-l.graph; <-l.calls }, nil
-	case <-ctx.Done():
-		<-l.calls
-		return nil, waitFailed(ctx, "waiting for a graph-query slot")
 	}
 }
 
@@ -171,10 +157,18 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			// wait as well as the handler: time spent waiting for a slot is time
 			// the caller is waiting, and a gate that could be queued on without
 			// a deadline is the unbounded wait Section 6 forbids.
-			ctx, cancel := context.WithTimeout(ctx, s.limits.timeout)
+			// resources.query_timeout is the DEFAULT deadline and not a
+			// ceiling: a client whose request already carries one has said how
+			// long the call may run, and context.WithTimeout would silently
+			// take the smaller of the two, expiring a raised budget at the
+			// configured default. Zero is "no deadline", the default: a tool
+			// call answers in full rather than handing back a continuation the
+			// client never asked for.
+			var cancel context.CancelFunc
+			ctx, cancel = model.QueryDeadline(ctx, s.limits.timeout)
 			defer cancel()
 
-			release, failed := s.limits.acquire(ctx, call.Params.Name)
+			release, failed := s.limits.acquire(ctx)
 			if failed != nil {
 				return refusal(failed), nil
 			}

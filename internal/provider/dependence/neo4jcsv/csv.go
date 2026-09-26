@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -20,6 +21,12 @@ import (
 // since the last record boundary — before the csv reader has grown its buffer
 // to hold them. csv.Reader returns the underlying error unwrapped, so the
 // typed limit surfaces to the caller.
+//
+// A limit of zero is unlimited, which is the shipped default: the reader then
+// hands every byte through untouched. Without that arm a zero limit truncates
+// every Read to zero bytes, which is a reader that never progresses -- every
+// import would fail at the default configuration on an error naming neither
+// the bound nor the record.
 type boundedRecordReader struct {
 	r        io.Reader
 	limit    int64
@@ -29,7 +36,8 @@ type boundedRecordReader struct {
 }
 
 func (b *boundedRecordReader) Read(p []byte) (int, error) {
-	if int64(len(p)) > b.limit {
+	bounded := b.limit > 0
+	if bounded && int64(len(p)) > b.limit {
 		p = p[:b.limit]
 	}
 	n, err := b.r.Read(p)
@@ -43,7 +51,7 @@ func (b *boundedRecordReader) Read(p []byte) (int, error) {
 			}
 		}
 		b.since++
-		if b.since > b.limit {
+		if bounded && b.since > b.limit {
 			return 0, resourceLimit("an export record exceeds %d bytes", b.limit).WithDetail("limit", "max_provider_record_bytes")
 		}
 	}
@@ -142,13 +150,16 @@ func classify(name string) (kind string, label string, part string, ok bool) {
 // importExport streams every recognized CSV file of one export directory into
 // the scratch, in sorted name order so a run reads them the same way every
 // time. Returns the bytes consumed.
-func importExport(ctx context.Context, sc *scratch, dir string, maxRecordBytes int64) (int64, error) {
+func importExport(ctx context.Context, sc *scratch, dir string, maxRecordBytes int64,
+	maxExportFiles config.Limit) (int64, error) {
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, outputInvalid("the export directory cannot be read: %v", err)
 	}
-	if len(entries) > maxExportFiles {
-		return 0, resourceLimit("the export has %d entries, over the %d bound", len(entries), maxExportFiles).WithDetail("limit", "max_export_files")
+	if maxExportFiles.Exceeded(int64(len(entries))) {
+		return 0, resourceLimit("the export has %d entries, over the %d bound the user set",
+			len(entries), maxExportFiles.Value()).WithDetail("limit", "max_export_files")
 	}
 	files := map[string]*exportFile{}
 	for _, ent := range entries {
@@ -269,22 +280,28 @@ func importCSVFile(ctx context.Context, sc *scratch, path, label string, edge bo
 			if cols.typ >= 0 && rec[cols.typ] != "" {
 				kind = rec[cols.typ]
 			}
-			if len(kind) > maxLabelBytes || rec[cols.start] == "" || rec[cols.end] == "" {
-				return br.consumed, outputInvalid("export CSV %s has an edge row with an empty endpoint or an oversized type", filepath.Base(path))
+			if len(kind) > maxLabelBytes {
+				return br.consumed, outputInvalid("export CSV %s has an edge row with an oversized type", filepath.Base(path))
 			}
-			if err := sc.putEdge(ctx, rec[cols.start], rec[cols.end], kind, cols.get(rec, "VARIABLE")); err != nil {
+			src, srcOK := nullInt(rec[cols.start])
+			dst, dstOK := nullInt(rec[cols.end])
+			if !srcOK || !dstOK {
+				return br.consumed, outputInvalid("export CSV %s has an edge row whose endpoint is not an integer node id", filepath.Base(path))
+			}
+			if err := sc.putEdge(ctx, src, dst, kind); err != nil {
 				return br.consumed, err
 			}
 			continue
 		}
-		n := graphNode{id: rec[cols.id], label: label}
+		id, idOK := nullInt(rec[cols.id])
+		n := graphNode{id: id, label: label}
 		if cols.label >= 0 && rec[cols.label] != "" {
 			// A node may carry several labels separated by ';'; the engine
 			// writes one.
 			n.label, _, _ = strings.Cut(rec[cols.label], ";")
 		}
-		if n.id == "" || len(n.label) > maxLabelBytes {
-			return br.consumed, outputInvalid("export CSV %s has a node row with an empty id or an oversized label", filepath.Base(path))
+		if !idOK || len(n.label) > maxLabelBytes {
+			return br.consumed, outputInvalid("export CSV %s has a node row whose id is not an integer or whose label is oversized", filepath.Base(path))
 		}
 		if n.label == labelMetaData {
 			if lang := cols.get(rec, "LANGUAGE"); lang != "" {
@@ -303,6 +320,7 @@ func importCSVFile(ctx context.Context, sc *scratch, path, label string, edge bo
 		n.col = optInt(cols.get(rec, "COLUMN_NUMBER"))
 		n.argIndex = optInt(cols.get(rec, "ARGUMENT_INDEX"))
 		n.isExternal = strings.EqualFold(strings.TrimSpace(cols.get(rec, "IS_EXTERNAL")), "true")
+		n.astParent = cols.get(rec, "AST_PARENT_FULL_NAME")
 		if err := sc.putNode(ctx, n); err != nil {
 			return br.consumed, err
 		}

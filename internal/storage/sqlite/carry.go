@@ -53,7 +53,7 @@ func (s *Store) AttachCarried(ctx context.Context, gen model.GenerationID, unit 
 	if err := c.validate(); err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -111,7 +111,7 @@ type CarriedUnit struct {
 // generation, well past any single page. Page until a short page arrives.
 func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID,
 	afterProviderID, afterScopeKey string, limit int) ([]CarriedUnit, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if len(afterProviderID) > model.MaxIdentifierBytes {
 		return nil, invalid("after_provider_id is %d bytes, limit %d", len(afterProviderID), model.MaxIdentifierBytes)
 	}
@@ -119,7 +119,7 @@ func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID,
 		return nil, invalid("after_scope_key is %d bytes, limit %d", len(afterScopeKey), model.MaxScopeKeyBytes)
 	}
 	var out []CarriedUnit
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		out = out[:0]
 		rows, err := tx.QueryContext(ctx, `SELECT lower(hex(u.unit_key)), gu.provider_id, gu.scope_key, gu.distance_generations, gu.distance_files
 			FROM generation_units gu JOIN units u ON u.id = gu.unit_id

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -52,6 +54,11 @@ func TestMain(m *testing.M) {
 	// release the root its parent is measuring against.
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
+	}
+	// One arm of the ledger cost measurement, for the same reason: it runs no
+	// row, and the root it measures against is its parent's.
+	if len(os.Args) > 1 && os.Args[1] == ledgerArmSubcommand {
+		os.Exit(ledgerArmMain(os.Args[2:]))
 	}
 	if err := os.RemoveAll(benchRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "clear the bench root %s: %v\n", benchRoot, err)
@@ -106,7 +113,7 @@ func TestParserResourcePlateau(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		MaxWorkers: 1, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
@@ -198,6 +205,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if testing.Short() {
 		t.Skip("incremental reuse benchmark; run without -short")
 	}
+	testenv.SkipIfLoaded(t)
 	const files = 400
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -225,16 +233,16 @@ func TestIncrementalReuse(t *testing.T) {
 	cfg.Providers.LSP.Enabled = config.Disabled
 	cfg.Providers.Dependence.Enabled = config.Disabled
 
+	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock, err := snapshot.LockWorkspace(ctx, dataDir, 0)
+	lock, err := snapshot.LockWorkspace(ctx, dataDir, "index", snapshot.TryOnce())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +269,7 @@ func TestIncrementalReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		t.Fatal(err)
@@ -283,8 +291,8 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
-		CAS: cas, Lock: lock, Pool: pool})
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
+		CAS: cas, Lock: heldLock{lock}, Pool: pool})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,4 +327,29 @@ func TestIncrementalReuse(t *testing.T) {
 	if refreshFor*4 > coldFor {
 		t.Fatalf("the no-op refresh took %s against a %s cold index; reuse is not paying for itself", refreshFor, coldFor)
 	}
+}
+
+// heldLock presents a lock this benchmark already holds as the coordinator's
+// Locker. The composition root's own implementation takes the lock when a
+// build needs it; a run that took it in its setup has nothing left to
+// take and nothing to give back, so Hold is the lock itself.
+type heldLock struct{ l *snapshot.WorkspaceLock }
+
+func (h heldLock) Hold(context.Context, index.HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	return h.l, func() error { return nil }, nil
+}
+
+// benchAdmission is the process memory admission ledger heavy units are
+// admitted against. Production composes exactly one and hands it to every
+// reserver; these tests run fake units, so the allocation is simply wide
+// enough that admission never orders them -- what the ledger admits and when
+// is proved where the ledger lives.
+func benchAdmission() *admission.Ledger {
+	l, err := admission.NewLedger(64<<30, 64<<30)
+	if err != nil {
+		// A positive allocation is the constructor's only requirement and this
+		// one is a constant, so a failure here is this helper being wrong.
+		panic(err)
+	}
+	return l
 }

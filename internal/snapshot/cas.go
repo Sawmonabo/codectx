@@ -9,11 +9,18 @@ import (
 	"hash"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sync"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -24,7 +31,19 @@ import (
 // which verify the bytes they expose against it.
 type CAS struct {
 	dir string
-	tmp string
+	// arena is where a put's temporary comes from. A capture streams every
+	// file in the workspace through one of these before it can know whether
+	// the store already holds that content, so a re-index of an unchanged
+	// repository used to write the whole repository into temporaries and then
+	// free every one of them. Taking the temporary from the pool instead
+	// makes that pass free nothing at all.
+	arena *scratch.Arena
+	// readOnly is a store opened by a process that answers questions and
+	// changes nothing. It creates no directory and every entry point that
+	// would write refuses typed, because a command that stores content must
+	// be composed with a writing store rather than discover at runtime that
+	// it cannot -- the same contract the database store keeps.
+	readOnly bool
 }
 
 // OpenCAS opens or creates the store at dir (0700).
@@ -32,11 +51,43 @@ func OpenCAS(dir string) (*CAS, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, invalid("the CAS directory must be an absolute path")
 	}
-	tmp := filepath.Join(dir, casTmpDirName)
-	if err := os.MkdirAll(tmp, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, ioError("CAS directory", err)
 	}
-	return &CAS{dir: dir, tmp: tmp}, nil
+	// The pool belongs to the data directory, not to the CAS inside it, so
+	// one arena serves the whole store and reports one figure.
+	return &CAS{dir: dir, arena: scratch.For(filepath.Dir(dir))}, nil
+}
+
+// OpenCASForReading opens the store at dir for a process that answers
+// questions. It creates nothing: no directory, no bucket, not the store
+// itself. A store that is not there is the workspace nothing has published --
+// the first thing an index makes is this directory -- and it is reported as
+// that, with the remedy, rather than brought into being so that the command
+// can report it empty. On a workspace an operator has made read-only, creating
+// it is also the one thing that would make the workspace unanswerable.
+func OpenCASForReading(dir string) (*CAS, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, invalid("the CAS directory must be an absolute path")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, &model.Error{Code: model.CodeNoActiveGeneration,
+				Message:     "nothing has been published in this workspace yet",
+				Remediation: "run `codectx index`"}
+		}
+		return nil, ioError("CAS directory", err)
+	}
+	return &CAS{dir: dir, arena: scratch.For(filepath.Dir(dir)), readOnly: true}, nil
+}
+
+// refuseWrite is what every storing entry point of a read-only store answers
+// with. It names the composition rather than the filesystem: the caller was
+// given a store that cannot write, which is a composition defect and not a
+// state an operator can act on.
+func (c *CAS) refuseWrite(op string) error {
+	return &model.Error{Code: model.CodeInternal,
+		Message: "this process opened the content store read-only and cannot " + op}
 }
 
 // path derives the blob location from a validated digest and nothing else.
@@ -64,12 +115,16 @@ func (c *CAS) Has(hash string) (bool, error) {
 	return false, ioError("CAS stat", err)
 }
 
-// Put streams r into a private temporary file while computing the whole-file
-// digest, the 64-KiB block digests and the sparse line checkpoints in one pass
-// (source.BuildIndex), flushes it, and publishes it under its digest without
-// replacing content already there. The returned record is what the caller
-// persists with storage.PutBlob before any manifest names it.
+// Put streams r into the store and makes it durable before returning. It is
+// the single-blob form of a batch: callers that publish many blobs under one
+// generation use NewBatch, which pays the durability cost once for the group.
+// Repair is the caller that needs this form, because it publishes into a
+// manifest that is already committed and so has no later barrier to order
+// against.
 func (c *CAS) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
+	if c.readOnly {
+		return model.BlobRecord{}, c.refuseWrite("store content")
+	}
 	return c.put(ctx, r, "")
 }
 
@@ -77,56 +132,323 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
 // digest differs is discarded unpublished and reported as an integrity
 // failure. Repair uses this so a wrong reconstruction never enters the store.
 func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
-	if err := ctx.Err(); err != nil {
-		return model.BlobRecord{}, model.Canceled(err)
-	}
-	tmp, err := os.CreateTemp(c.tmp, casTmpPrefix+"*")
+	b := c.NewBatch()
+	defer b.Discard()
+	rec, err := b.put(ctx, r, want)
 	if err != nil {
-		return model.BlobRecord{}, ioError("CAS temporary file", err)
+		return model.BlobRecord{}, err
 	}
-	published := false
-	defer func() {
+	if err := b.Barrier(ctx); err != nil {
+		return model.BlobRecord{}, err
+	}
+	return rec, nil
+}
+
+// Batch stages blobs for one publication and makes them durable as a group.
+//
+// Section 10.3 requires that everything a published generation names is on
+// disk before that generation is visible; it does not require each blob to be
+// durable the instant it is written. A batch keeps that invariant and pays for
+// it once: bytes are written to private temporaries under <cas>/tmp, the
+// temporaries are fsynced in parallel groups, and only a synced temporary is
+// linked into its bucket. Barrier flushes whatever is still staged and then
+// fsyncs each bucket directory the batch touched -- at most 256, one per
+// two-hex-digit prefix, instead of one per blob. The caller commits the
+// manifest or generation that names the blobs only after Barrier returns.
+//
+// Publishing after the fsync rather than ahead of it is what keeps a crash
+// recoverable: an interrupted batch leaves nothing in the buckets, only
+// temporaries that Sweep already removes. A bucket entry whose bytes had not
+// reached the disk would survive as a short file and fail every later capture
+// of the same content as an integrity error.
+//
+// A batch is used by one goroutine at a time, like the capture that owns it.
+type Batch struct {
+	c *CAS
+	// window is how many staged temporaries are held open before a group is
+	// flushed, and parallel how many fsyncs run at once. Both are derived from
+	// the hardware. Neither bounds how much work a batch accepts -- every blob
+	// staged is synced before Barrier returns -- so this is a batch size in
+	// the sense a read page is, not a limit on a repository's size. Peak
+	// descriptors and peak memory are a function of the window, not of the
+	// number of files captured.
+	window   int
+	parallel int
+	open     []staged
+	// dirty is the set of bucket directories this batch has published into
+	// since the last barrier. It doubles as the record of which buckets have
+	// been created, so MkdirAll runs once per bucket rather than once per
+	// blob. Barrier clears it, so a bucket written to again afterwards is
+	// created (a no-op) and synced again, which is what a second barrier owes.
+	dirty map[string]struct{}
+	// pending is the digests staged since the last flush. Content the capture
+	// meets twice inside one window -- a vendored copy, a repeated licence --
+	// is written once and synced once. It is bounded by the window like the
+	// open descriptors are, and cleared with them.
+	pending map[string]struct{}
+	// onSync reports each blob as it becomes durable and published. It exists
+	// for the durability-barrier test and is nil in production.
+	onSync func(hash string)
+}
+
+// staged is one temporary awaiting its group flush. The descriptor stays open
+// so the flush can fsync it without reopening: on Windows a read-only handle
+// cannot be flushed at all.
+type staged struct {
+	lease *scratch.Lease
+	f     *os.File
+	final string
+	hash  string
+	size  int64
+}
+
+// NewBatch opens a batch against the store, sized from the machine.
+func (c *CAS) NewBatch() *Batch {
+	window, parallel := syncWindow()
+	return &Batch{c: c, window: window, parallel: parallel, dirty: map[string]struct{}{}, pending: map[string]struct{}{}}
+}
+
+// maxSyncWindow caps the window on a machine with very many cores: beyond a
+// few hundred concurrent fsyncs the journal commits they share stop getting
+// cheaper and the open descriptors stop being free.
+const maxSyncWindow = 1024
+
+// syncWindow derives the group flush size and its parallelism from the CPU
+// count and the process descriptor limit. A quarter of the limit leaves the
+// rest for the worktree reads, the store and the provider processes.
+func syncWindow() (window, parallel int) {
+	parallel = max(runtime.NumCPU(), 1)
+	window = min(parallel*32, maxSyncWindow)
+	if lim := openFileLimit(); lim > 0 {
+		window = min(window, lim/4)
+	}
+	window = max(window, 1)
+	parallel = min(parallel, window)
+	return window, parallel
+}
+
+// Put streams r into the store as Put does, but leaves it staged: the bytes
+// are durable and the blob published only once Barrier returns.
+func (b *Batch) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
+	return b.put(ctx, r, "")
+}
+
+// put stages one blob, flushing the group first when the window is full.
+func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
+	rec, lease, tmp, final, err := b.c.stage(ctx, r, want)
+	if err != nil {
+		return model.BlobRecord{}, err
+	}
+	if tmp == nil {
+		// Already published by an earlier generation, so the BYTES cost no
+		// sync. The bucket DIRENT still does: the batch that published it may
+		// have died before its own Barrier, leaving a file whose name is not
+		// durable, and this batch is about to commit a manifest that names it.
+		// Recording the bucket costs one fsync per two-hex prefix and is what
+		// the pre-batch put did unconditionally. The directory exists (the
+		// blob is in it), so the MkdirAll this skips is not owed.
+		b.dirty[filepath.Dir(final)] = struct{}{}
+		return rec, nil
+	}
+	if _, ok := b.pending[rec.Hash]; ok {
+		// The identical blob is already staged in this group and will be
+		// published and synced by the same flush, before the same barrier.
 		tmp.Close()
-		if !published {
-			os.Remove(tmp.Name())
+		lease.Release()
+		return rec, nil
+	}
+	dir := filepath.Dir(final)
+	if _, ok := b.dirty[dir]; !ok {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			tmp.Close()
+			lease.Release()
+			return model.BlobRecord{}, ioError("CAS bucket", err)
+		}
+		b.dirty[dir] = struct{}{}
+	}
+	b.open = append(b.open, staged{lease: lease, f: tmp, final: final, hash: rec.Hash, size: rec.Size})
+	b.pending[rec.Hash] = struct{}{}
+	if len(b.open) >= b.window {
+		if err := b.flush(ctx); err != nil {
+			return model.BlobRecord{}, err
+		}
+	}
+	return rec, nil
+}
+
+// Barrier is the batch's single durability point: when it returns without
+// error every blob staged through it is on disk and linked into its bucket,
+// and every bucket entry naming one is on disk too. Nothing that names these
+// blobs may be committed before it returns.
+func (b *Batch) Barrier(ctx context.Context) error {
+	if err := b.flush(ctx); err != nil {
+		return err
+	}
+	// Sorted so the syncs are ordered the same way on every run, which makes a
+	// failure reproducible rather than map-order dependent.
+	for _, dir := range slices.Sorted(maps.Keys(b.dirty)) {
+		if err := fslock.SyncDir(dir); err != nil {
+			return ioError("CAS directory sync", err)
+		}
+	}
+	clear(b.dirty)
+	return nil
+}
+
+// Discard drops the temporaries of blobs staged but never made durable. It is
+// the failure-path counterpart of Barrier, so an abandoned capture does not
+// leave its temporaries for the next startup sweep to find; Sweep remains the
+// backstop for a process that dies before either runs.
+func (b *Batch) Discard() {
+	for i := range b.open {
+		b.open[i].f.Close()
+		b.open[i].lease.Release()
+	}
+	b.open = b.open[:0]
+	clear(b.pending)
+}
+
+// flush makes every staged temporary durable and publishes it. The fsyncs run
+// concurrently on already-open descriptors: a journalling filesystem folds
+// concurrent fsyncs into shared commits, which is the entire saving over
+// syncing each blob where it was written. Publication is sequential because it
+// is metadata only.
+func (b *Batch) flush(ctx context.Context) error {
+	if len(b.open) == 0 {
+		return nil
+	}
+	group := b.open
+	b.open = b.open[:0]
+	clear(b.pending)
+	published := make([]bool, len(group))
+	defer func() {
+		// Whatever happened, no descriptor and no pooled surface outlives the
+		// group. A Close after a successful Close fails harmlessly.
+		//
+		// A surface that was NOT published still holds only this batch's own
+		// bytes, so it goes back to the pool and frees nothing -- at the mode
+		// the pool hands out, because a blob is set read-only BEFORE it is
+		// published and a surface left at that mode could never be opened for
+		// writing again. A surface that
+		// WAS published is a second name for the object now in the bucket: its
+		// blocks belong to the store from here on, so the pool gives up the
+		// slot and only the temporary's directory entry goes. That unlink must
+		// not be paced, because pacing a removal empties the file first and
+		// the file is the published blob.
+		for i := range group {
+			group[i].f.Close()
+			if !published[i] {
+				if err := os.Chmod(group[i].lease.Path(), 0o600); err != nil {
+					group[i].lease.Unusable()
+					continue
+				}
+				group[i].lease.Release()
+				continue
+			}
+			os.Remove(group[i].lease.Path())
+			group[i].lease.Discard()
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return model.Canceled(err)
+	}
+	errs := make([]error, len(group))
+	sem := make(chan struct{}, b.parallel)
+	var wg sync.WaitGroup
+	for i := range group {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = group[i].f.Sync()
+		}(i)
+	}
+	wg.Wait()
+	for i := range group {
+		s := &group[i]
+		if errs[i] != nil {
+			return ioError("CAS sync", errs[i])
+		}
+		// The pool never truncates, so the surface may still carry the tail
+		// of a larger blob staged into it earlier. The published object is
+		// this file, and a reader proves an object by its length, so the tail
+		// goes before the object exists -- a window at a time, and only the
+		// excess over what this blob wrote.
+		if err := paced.Shrink(s.f.Name(), s.size); err != nil {
+			return ioError("CAS trim", err)
+		}
+		if err := s.f.Chmod(0o400); err != nil {
+			return ioError("CAS chmod", err)
+		}
+		if err := s.f.Close(); err != nil {
+			return ioError("CAS close", err)
+		}
+		if err := b.c.publish(s.f.Name(), s.final, s.size); err != nil {
+			return err
+		}
+		published[i] = true
+		if b.onSync != nil {
+			b.onSync(s.hash)
+		}
+	}
+	return nil
+}
+
+// stage streams r into a surface of the store's scratch pool while computing
+// the whole-file
+// digest, the 64-KiB block digests and the sparse line checkpoints in one pass
+// digests and the sparse line checkpoints in one pass (source.BuildIndex).
+// When want is set, content hashing to anything else is discarded unpublished
+// and reported as an integrity failure. Content already published under the
+// same digest is durable by construction, so the surface goes straight back
+// to the pool and a nil file is returned: the caller has nothing to sync and
+// nothing was freed. The returned record is what the caller persists with
+// storage.PutBlob before any manifest names it.
+func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *scratch.Lease, *os.File, string, error) {
+	// Every blob that reaches this store passes here, whether it came through
+	// Put or through a batch, so this is the one place a read-only store has
+	// to refuse for none of them to be written.
+	if c.readOnly {
+		return model.BlobRecord{}, nil, nil, "", c.refuseWrite("store content")
+	}
+	if err := ctx.Err(); err != nil {
+		return model.BlobRecord{}, nil, nil, "", model.Canceled(err)
+	}
+	lease, tmp, err := c.arena.TakeFile(scratch.ContentTemp)
+	if err != nil {
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS temporary file", err)
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			tmp.Close()
+			lease.Release()
 		}
 	}()
 
 	idx, err := source.BuildIndex(io.TeeReader(r, tmp))
 	if err != nil {
-		return model.BlobRecord{}, ioError("CAS write", err)
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS write", err)
 	}
 	if want != "" && idx.ContentHash != want {
-		return model.BlobRecord{}, integrity("reconstructed content hashes to a different digest than the manifest records")
-	}
-	if err := tmp.Sync(); err != nil {
-		return model.BlobRecord{}, ioError("CAS sync", err)
-	}
-	if err := tmp.Chmod(0o400); err != nil {
-		return model.BlobRecord{}, ioError("CAS chmod", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return model.BlobRecord{}, ioError("CAS close", err)
+		return model.BlobRecord{}, nil, nil, "", integrity("reconstructed content hashes to a different digest than the manifest records")
 	}
 	rec := recordOf(idx)
 	final, err := c.path(rec.Hash)
 	if err != nil {
-		return model.BlobRecord{}, err
+		return model.BlobRecord{}, nil, nil, "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
-		return model.BlobRecord{}, ioError("CAS bucket", err)
+	if _, err := os.Lstat(final); err == nil {
+		if err := c.checkExisting(final, rec.Size); err != nil {
+			return model.BlobRecord{}, nil, nil, "", err
+		}
+		return rec, nil, nil, final, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return model.BlobRecord{}, nil, nil, "", ioError("CAS stat", err)
 	}
-	if err := c.publish(tmp.Name(), final, rec.Size); err != nil {
-		return model.BlobRecord{}, err
-	}
-	published = true
-	// The temporary name is gone after a rename and redundant after a link;
-	// either way nothing else references it.
-	os.Remove(tmp.Name())
-	if err := fslock.SyncDir(filepath.Dir(final)); err != nil {
-		return model.BlobRecord{}, ioError("CAS directory sync", err)
-	}
-	return rec, nil
+	keep = true
+	return rec, lease, tmp, final, nil
 }
 
 // publish links tmp to final atomically. An existing final is the same
@@ -134,8 +456,11 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 // checked. A filesystem without hard links falls back to a rename, attempted
 // only while final is absent; a publisher racing into that window replaces
 // the object with byte-identical content, which changes nothing a reader can
-// observe. A temporary that vanished is the startup sweep running without the
-// workspace lock held here (Repair): retryable, not corruption.
+// observe.
+//
+// tmp is a surface of the store's scratch pool. Nothing sweeps that pool, so
+// unlike the private temporary this replaced, it cannot be taken away between
+// the write and the link.
 func (c *CAS) publish(tmp, final string, size int64) error {
 	err := os.Link(tmp, final)
 	if err == nil {
@@ -147,22 +472,10 @@ func (c *CAS) publish(tmp, final string, size int64) error {
 	if _, statErr := os.Lstat(final); statErr == nil {
 		return c.checkExisting(final, size)
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return sweptTemporary()
-	}
 	if err := os.Rename(tmp, final); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return sweptTemporary()
-		}
 		return ioError("CAS publish", err)
 	}
 	return nil
-}
-
-func sweptTemporary() error {
-	return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
-		Message:     "the object's temporary file was removed by a concurrent recovery sweep before publication",
-		Remediation: "retry; run repair under the workspace lock to exclude the sweep"}
 }
 
 func (c *CAS) checkExisting(final string, size int64) error {
@@ -212,14 +525,195 @@ func indexOf(rec model.BlobRecord) source.Index {
 // derivation of an object's location; rebuilding <data>/cas/<hh>/<hash> in the
 // collector would be a second copy of the layout that can drift from this one.
 func (c *CAS) Remove(hash string) error {
+	if c.readOnly {
+		return c.refuseWrite("remove content")
+	}
 	p, err := c.path(hash)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return ioError("CAS remove", err)
 	}
 	return nil
+}
+
+// SweepOrphans removes published objects that no blobs row names: content that
+// reached the disk and whose naming commit never landed, which is the exact
+// state a rolled-back generation tail (ADR-0004 Decision 1) and a crashed
+// capture leave behind. It is the Section 10.4 collector's second reclaim, the
+// counterpart of Remove: Remove deletes an object whose row the grace protocol
+// just deleted, this deletes an object that never had a row at all.
+//
+// known reports which of a batch of hashes the index still holds a blobs row
+// for, in ANY state -- quarantined and trashed rows are mid-grace, not orphans.
+// It is a bare func rather than a named interface so internal/retention can
+// declare this method structurally without importing this package. Its result
+// is a SET: a hash present in the map is named, and absence means no row. An
+// error from it aborts the chunk without removing anything, because an empty
+// answer read as "nothing is named" would delete the whole store.
+//
+// grace is the safety margin for the publish-before-commit window: Put and
+// Batch.Barrier make an object durable BEFORE the commit that names it, so an
+// object younger than the grace may be a publication whose commit has not
+// landed yet. The lock order in internal/retention (the workspace lock and the
+// indexing mutex) is what excludes an indexing run from overlapping a pass;
+// the mtime grace is the second line for the publishers that lock order does
+// not cover -- Repair publishes outside the workspace lock -- and for a
+// writer some later caller adds. Repair's own objects are additionally
+// row-backed, so known already keeps them. The window is measured from first
+// publication: the dedup path (checkExisting) deliberately leaves an existing
+// object's mtime alone, so a re-published object does not restart its grace.
+//
+// batch bounds MEMORY, never work: the walk visits every bucket and every
+// entry in it, reading one directory chunk and asking one known() batch at a
+// time, so peak is a chunk plus its answer rather than the size of the store.
+// Nothing is truncated and no pass leaves a known orphan behind for a later
+// one -- except an entry a concurrent removal moved past the readdir cursor,
+// which the next pass sees, which is why this is written as an idempotent
+// re-walk rather than relying on any readdir-during-unlink guarantee.
+//
+// It returns how many objects it removed. An object that cannot be removed is
+// joined into the error with the rest rather than aborting the walk: it is a
+// leftover file, not lost source.
+func (c *CAS) SweepOrphans(ctx context.Context, known func(context.Context, []string) (map[string]struct{}, error),
+	now time.Time, grace time.Duration, batch int) (int64, error) {
+	if c.readOnly {
+		return 0, c.refuseWrite("sweep orphans")
+	}
+	if batch <= 0 {
+		batch = defaultOrphanBatch
+	}
+	buckets, err := os.ReadDir(c.dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, ioError("CAS sweep", err)
+	}
+	var removed int64
+	var errs []error
+	for _, b := range buckets {
+		// Only the two-hex-digit buckets path derives are objects. <cas>/tmp is
+		// snapshot.Sweep's to reclaim and holds the temporaries a live batch is
+		// still filling; widening this filter would delete them mid-publication.
+		if !b.IsDir() || !isBucketName(b.Name()) {
+			continue
+		}
+		n, err, stop := c.sweepBucket(ctx, filepath.Join(c.dir, b.Name()), known, now, grace, batch)
+		removed += n
+		if err != nil {
+			errs = append(errs, err)
+		}
+		// A cancelled context or an index that cannot answer is not this
+		// bucket's problem: walking the remaining 255 would re-ask a store
+		// that is still broken and report the same failure up to 256 times.
+		if stop {
+			break
+		}
+	}
+	return removed, errors.Join(errs...)
+}
+
+// defaultOrphanBatch is the chunk SweepOrphans holds in memory when the caller
+// states none. Like retention's own batch limit it is a working-set size, not a
+// bound on how much the pass reclaims.
+const defaultOrphanBatch = 200
+
+// isBucketName reports whether name is one of the 256 two-lowercase-hex-digit
+// bucket directories CAS.path derives.
+func isBucketName(name string) bool {
+	if len(name) != 2 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepBucket walks one bucket in ReadDir chunks, returning what it removed,
+// what went wrong and whether the whole sweep must stop. Emptied buckets are
+// left in place: removing one races a concurrent publication that has just
+// created it and is about to link into it.
+//
+// Order within a chunk is deliberate: the index is asked about every name the
+// readdir returned -- names cost no syscall -- and only the hashes it reports
+// as UNNAMED are then stat'ed for their age. A healthy store has none, so the
+// pass costs one query per chunk and no lstat at all, instead of one lstat per
+// object in the store on every invocation. The grace still gates every
+// removal; it is only consulted for the objects that could actually go.
+func (c *CAS) sweepBucket(ctx context.Context, dir string, known func(context.Context, []string) (map[string]struct{}, error),
+	now time.Time, grace time.Duration, batch int) (int64, error, bool) {
+	d, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil, false
+		}
+		return 0, ioError("CAS sweep", err), false
+	}
+	defer d.Close()
+	var removed int64
+	var errs []error
+	for {
+		if err := ctx.Err(); err != nil {
+			return removed, errors.Join(append(errs, model.Canceled(err))...), true
+		}
+		ents, err := d.ReadDir(batch)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return removed, errors.Join(append(errs, ioError("CAS sweep", err))...), false
+		}
+		// A name path never derives is not this sweep's to judge, and a
+		// directory inside a bucket is not an object.
+		candidates := make([]fs.DirEntry, 0, len(ents))
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			if e.IsDir() || !model.ValidHexID(e.Name()) {
+				continue
+			}
+			candidates = append(candidates, e)
+			names = append(names, e.Name())
+		}
+		if len(names) > 0 {
+			named, kerr := known(ctx, names)
+			if kerr != nil {
+				// No removal on an unreadable answer: an empty set read as
+				// "nothing is named" would delete the whole store.
+				return removed, errors.Join(append(errs, kerr)...), true
+			}
+			for _, e := range candidates {
+				if _, ok := named[e.Name()]; ok {
+					continue
+				}
+				info, statErr := e.Info()
+				if statErr != nil {
+					if !errors.Is(statErr, fs.ErrNotExist) {
+						errs = append(errs, ioError("CAS sweep", statErr))
+					}
+					continue
+				}
+				// Younger than the grace: a publication whose naming commit
+				// may still be in flight. Dropping this check is what makes
+				// the sweep delete content a generation is about to
+				// reference.
+				if info.ModTime().Add(grace).After(now) {
+					continue
+				}
+				if err := c.Remove(e.Name()); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				removed++
+			}
+		}
+		if errors.Is(err, io.EOF) || len(ents) == 0 {
+			break
+		}
+	}
+	return removed, errors.Join(errs...), false
 }
 
 // Open streams the blob described by rec, verifying each 64-KiB block digest

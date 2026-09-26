@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	arena "github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -31,6 +32,47 @@ type counts struct {
 	// relKey is the fact key list the import published for one relation,
 	// under edgeID(from, kind, to). Only a keyed put carries it.
 	relKey map[string][]string
+	// sig is the signature each published node carried, by node name, so a
+	// test can read what actually reached the sink rather than what the
+	// export held.
+	sig map[string]string
+	// id holds the identities published under one `<kind>:<name>`: keyed by
+	// kind because a fixture may publish a method and a variable of one name,
+	// and a list because a name may be declared in several scopes. meta is the
+	// metadata each node carried, by node name.
+	id   map[string][]model.NodeID
+	meta map[string]string
+	// edges are the published edges themselves, so a test can ask which
+	// entities one names rather than only how many were published.
+	edges []model.Relation
+}
+
+func newCounts() counts {
+	return counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
+		sig: map[string]string{}, id: map[string][]model.NodeID{}, meta: map[string]string{}}
+}
+
+// has reports whether the edge from -> to of kind k was published, naming its
+// endpoints `<node kind>:<name>` as they were published.
+func (c counts) has(kind model.RelationKind, from, to string) bool {
+	for _, e := range c.edges {
+		if e.Kind == kind && slices.Contains(c.id[from], e.From) && slices.Contains(c.id[to], e.To) {
+			return true
+		}
+	}
+	return false
+}
+
+// names reports whether any edge of kind k has a node published under the given
+// `<kind>:<name>` at either end.
+func (c counts) names(kind model.RelationKind, node string) bool {
+	for _, e := range c.edges {
+		if e.Kind == kind && (slices.Contains(c.id[node], e.From) || slices.Contains(c.id[node], e.To)) {
+			return true
+		}
+	}
+	return false
 }
 
 // edgeID names one published edge independently of the run that published it.
@@ -53,6 +95,10 @@ func (r recorder) PutNodes(ctx context.Context, f []model.NodeFact) error {
 func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys [][]string) error {
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
+		r.c.sig[n.Node.Name] = n.Node.Signature
+		key := string(n.Node.Kind) + ":" + n.Node.Name
+		r.c.id[key] = append(r.c.id[key], n.Node.ID)
+		r.c.meta[n.Node.Name] = string(n.Node.Metadata)
 	}
 	if d, ok := r.Sink.(provider.DeltaSink); ok {
 		return d.PutKeyedNodes(ctx, f, keys)
@@ -69,6 +115,7 @@ func (r recorder) PutRelations(ctx context.Context, f []model.RelationFact) erro
 func (r recorder) PutKeyedRelations(ctx context.Context, f []model.RelationFact, keys [][]string) error {
 	for i, x := range f {
 		r.c.rel[x.Relation.Kind]++
+		r.c.edges = append(r.c.edges, x.Relation)
 		for _, ev := range x.Evidence {
 			r.c.detail[ev.Detail]++
 		}
@@ -95,8 +142,7 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 	t.Helper()
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
-	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
+	c := newCounts()
 	var rep neo4jcsv.Report
 	var importErr error
 	p := providertest.Func{
@@ -106,7 +152,9 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 			o.UnitScopeKey, o.ProjectRoot = req.Unit.ScopeKey, t.TempDir()
 			o.Limits = providertest.Limits
 			o.Repository, o.Unit, o.Run, o.Content = req.Binding.RepositoryID, req.Unit, req.Run, req.Content
-			o.ScratchDir = t.TempDir()
+			if o.ScratchDir == "" {
+				o.ScratchDir = t.TempDir()
+			}
 			rep, importErr = neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o)
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
@@ -177,6 +225,15 @@ func TestImport(t *testing.T) {
 			if c.detail["reaching_def capture"] == 0 {
 				t.Errorf("no capture detail published; a flow through a global was labelled intraprocedural")
 			}
+			// Failure mode: a method taken as a value never anchors, so every
+			// fact that would name the method the value carries -- and with it
+			// any call made through that value -- is silently dropped. The
+			// export's METHOD_REF for `run` is the only node here whose REF
+			// edge names a method rather than a declaration.
+			if !c.has(model.RelDataFlowsTo, "function:<global>", "function:run") {
+				t.Errorf("the method the reference names is not an endpoint of the flow that reaches it; "+
+					"the method reference did not anchor (edges = %d)", len(c.edges))
+			}
 		},
 	}, {
 		name: "go reads and writes", src: "src/golang", export: "golang",
@@ -196,6 +253,20 @@ func TestImport(t *testing.T) {
 			// a precise write against a guessed declaration.
 			if rep.UnresolvedWrites == 0 {
 				t.Errorf("no unresolved write shape reported; a guessed target would be published as a precise write")
+			}
+			// Failure mode: the export marks a callee it invented -- a method
+			// it emitted with no definition anywhere in the graph, so that an
+			// unresolved site still has a target -- and the import drops the
+			// mark, so a consumer of the callees answer cannot tell a guess
+			// from a real dependency. `__ecma.Array:` is the invented callee
+			// of this export.
+			if c.detail["call speculated"] == 0 {
+				t.Errorf("evidence details = %v; the call edge to an invented callee is indistinguishable from a real one", c.detail)
+			}
+			// A traversal answers with nodes and relations and never with the
+			// evidence behind them, so the node has to carry it too.
+			if !strings.Contains(c.meta["__ecma.Array:"], `"resolution":"speculated"`) {
+				t.Errorf("the invented callee's node metadata = %q, want a speculated resolution", c.meta["__ecma.Array:"])
 			}
 		},
 	}, {
@@ -228,6 +299,57 @@ func TestImport(t *testing.T) {
 				model.RelReads, model.RelWrites)
 			if c.detail["cdg"] == 0 || c.detail["call"] == 0 {
 				t.Errorf("evidence details = %v; want cdg and call", c.detail)
+			}
+		},
+	}, {
+		// Failure mode: a method reached through a variable (`const f =
+		// helper; f(i)`) leaves no fact at all, because the method reference
+		// the export binds to the method never anchors. What the export does
+		// NOT carry is the call: `f(i)` is bound to an invented callee named
+		// `f`, never to `helper`, so the dependence on `helper` exists only as
+		// the flow of the method value into the name that is called.
+		name: "javascript method reached through a value", src: "src/jsvalue", export: "jsvalue",
+		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
+				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
+			}
+			if !c.has(model.RelCalls, "function:run", "function:f") || c.names(model.RelCalls, "function:helper") {
+				t.Errorf("the call through the value resolved to something other than the export's invented callee")
+			}
+			// Failure mode: this invented callee is the one the engine parks
+			// under the enclosing program rather than under its speculated
+			// namespace, so a marker read off that namespace publishes it as a
+			// real import -- a dependency on `f` the source never states. It
+			// is the only external method this export publishes, so no node
+			// here may carry an import resolution.
+			//
+			// NOT RUN in this round. Mutation that fails it: in project
+			// (scratch.go), drop the second arm of the invented table's
+			// INSERT, leaving only the speculated-namespace test; `f` is then
+			// published with a resolution of import.
+			var speculated int
+			for name, meta := range c.meta {
+				if strings.Contains(meta, `"resolution":"import"`) {
+					t.Errorf("node %q published as a real import; the export invented it for the call through the value", name)
+				}
+				if strings.Contains(meta, `"resolution":"speculated"`) {
+					speculated++
+				}
+			}
+			if speculated == 0 {
+				t.Errorf("no node carries a speculated resolution; the invented callee is indistinguishable from a real dependency")
+			}
+		},
+	}, {
+		// Same shape in Python, where the export binds the call site to
+		// nothing at all rather than to an invented callee.
+		name: "python method reached through a value", src: "src/pyvalue", export: "pyvalue",
+		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
+				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
+			}
+			if c.rel[model.RelCalls] != 0 {
+				t.Errorf("calls = %d; the export binds this call site to no callee at all", c.rel[model.RelCalls])
 			}
 		},
 	}, {
@@ -303,6 +425,41 @@ func TestImportRefusesMalformedExport(t *testing.T) {
 			t.Fatalf("%d nodes published from an export whose paths are not in the snapshot", n)
 		}
 	})
+}
+
+// TestOversizeDescriptiveFieldIsCutNotDropped proves the producer half of the
+// storage-field contract. The model accepts an oversize storage field, so a
+// field over its ceiling that is not cut here reaches the sink whole and a
+// page of hits carries an unbounded response. A descriptive field is therefore
+// cut to its ceiling and counted by name; the declaration is still published,
+// because a clipped signature answers more than a dropped declaration does.
+// Identity fields keep the opposite rule and are proven by the dropped-path
+// case above.
+func TestOversizeDescriptiveFieldIsCutNotDropped(t *testing.T) {
+	const oversize = model.MaxSignatureBytes + 1000
+	dir := copyExport(t, filepath.Join("testdata", "c"), func(name string, data []byte) []byte {
+		if name != "nodes_METHOD_data.csv" {
+			return data
+		}
+		// SIGNATURE is the last column; run's is the only non-empty one.
+		return bytes.Replace(data, []byte(`"void(S*,int*,int)"`),
+			[]byte(strings.Repeat("x", oversize)), 1)
+	})
+	rep, c, _, err := run(t, filepath.Join("testdata", "src", "c"), dir, neo4jcsv.Options{Language: "c"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	got, ok := c.sig["run"]
+	if !ok {
+		t.Fatalf("the declaration with the oversize signature was not published at all; published %v", c.sig)
+	}
+	if len(got) != model.MaxSignatureBytes {
+		t.Fatalf("published signature is %d bytes, want it cut to the %d-byte ceiling",
+			len(got), model.MaxSignatureBytes)
+	}
+	if n := rep.TruncatedFields["signature"]; n != 1 {
+		t.Fatalf("TruncatedFields[signature] = %d, want 1: the cut must be counted, not silent", n)
+	}
 }
 
 // TestImportDelta proves the refresh contract: two imports of one export
@@ -423,8 +580,7 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	files, paths := readSource(t, filepath.Join("testdata", "src", "gofix"))
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
-	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
+	c := newCounts()
 	var part [2]struct{ nodes, aliases int }
 	nodesSoFar := func() int {
 		n := 0
@@ -807,4 +963,179 @@ func (o *carryOut) Seal(ctx context.Context) error {
 		return err
 	}
 	return o.store.SealUnit(ctx, o.UnitWriter)
+}
+
+// TestStagedRowsOverAUserSetBoundImportsAndReports pins the one invariant of
+// providers.dependence.max_staged_rows: crossing it publishes the whole import
+// and says so. The bound used to fail the unit outright, which made a row
+// count — a property of the repository's source — refuse the repository. A
+// regression that restores the refusal, or that stops setting the flag, is the
+// silence the scale posture forbids, and neither shows in any other assertion.
+func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
+	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
+	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if whole.StagedRows == 0 {
+		t.Fatalf("the import staged no rows, so the bound below proves nothing")
+	}
+	if whole.OverStagedRows {
+		t.Fatalf("an import with no max_staged_rows reported crossing one")
+	}
+	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxStagedRows: 1})
+	if err != nil {
+		t.Fatalf("an import over max_staged_rows must not fail the unit: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: crossing a reporting threshold may not fail the unit", state)
+	}
+	if !bounded.OverStagedRows {
+		t.Fatalf("an import of %d rows over max_staged_rows = 1 did not report crossing it", bounded.StagedRows)
+	}
+	if bounded.StagedRows != whole.StagedRows || bounded.Nodes != whole.Nodes || bounded.Relations != whole.Relations {
+		t.Fatalf("the bounded import published less than the unbounded one: rows %d/%d nodes %d/%d relations %d/%d",
+			bounded.StagedRows, whole.StagedRows, bounded.Nodes, whole.Nodes, bounded.Relations, whole.Relations)
+	}
+}
+
+// TestDerivedRowsOverAUserSetBoundImportsAndReports pins the same invariant for
+// providers.dependence.max_derived_rows. The projected occurrence count used to
+// be a hard 4,000,000 that failed the unit outright, and the projection query
+// carried a matching `LIMIT bound+1` that silently truncated it — a refusal and
+// a silent cut on a count that belongs to the analysed source. The equality
+// assertions below are what catch a restored truncation: a surviving LIMIT under
+// a bound of 1 leaves two occurrences and every published relation behind it.
+func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
+	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
+	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if whole.DerivedRows == 0 {
+		t.Fatalf("the import derived no occurrences, so the bound below proves nothing")
+	}
+	if whole.OverDerivedRows {
+		t.Fatalf("an import with no max_derived_rows reported crossing one")
+	}
+	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxDerivedRows: 1})
+	if err != nil {
+		t.Fatalf("an import over max_derived_rows must not fail the unit: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: crossing a reporting threshold may not fail the unit", state)
+	}
+	if !bounded.OverDerivedRows {
+		t.Fatalf("an import of %d occurrences over max_derived_rows = 1 did not report crossing it", bounded.DerivedRows)
+	}
+	if bounded.DerivedRows != whole.DerivedRows || bounded.Relations != whole.Relations {
+		t.Fatalf("the bounded import published less than the unbounded one: derived %d/%d relations %d/%d",
+			bounded.DerivedRows, whole.DerivedRows, bounded.Relations, whole.Relations)
+	}
+}
+
+// TestOneStagingDatabaseIsReusedAcrossImports runs two imports through one
+// scratch directory and looks at what they left behind.
+//
+// Requirement: a run reuses the space it holds and frees nothing in the middle
+// of its work. A staging database created and deleted per import frees
+// hundreds of megabytes per unit; on a host that discards freed blocks into a
+// sparse image, that free stalls every process on the machine for about a
+// minute, minutes later, with nothing able to observe or wait for it. One file
+// per slot, emptied by dropping its tables so the engine writes over its own
+// free list, frees nothing at all and the file never shrinks.
+//
+// It is also what keeps the largest surface the product writes inside the
+// figure the resources block reports: the staging database is a surface of the
+// shared scratch arena, so a pool of its own would be disk the run holds and
+// never discloses.
+//
+// Mutation that fails it: give each import its own staging database again --
+// take a fresh surface per import and remove the file when the import ends.
+func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
+	dir := t.TempDir()
+	pool := filepath.Join(arena.Dir(dir), "0", string(arena.ImportStaging))
+	staged := func() []os.DirEntry {
+		t.Helper()
+		entries, err := os.ReadDir(pool)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			t.Fatalf("scratch: %v", err)
+		}
+		return entries
+	}
+	sizeOf := func(e os.DirEntry) int64 {
+		t.Helper()
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("scratch entry: %v", err)
+		}
+		return info.Size()
+	}
+
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	first := staged()
+	if len(first) != 1 {
+		t.Fatalf("the first import left %d staging databases, want exactly one", len(first))
+	}
+	firstSize := sizeOf(first[0])
+	if firstSize == 0 {
+		t.Fatalf("the first import left an empty staging database: nothing was staged in it")
+	}
+
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	second := staged()
+	if len(second) != 1 {
+		t.Fatalf("the second import left %d staging databases, want the one the first created", len(second))
+	}
+	if second[0].Name() != first[0].Name() {
+		t.Fatalf("the second import staged into %q, not the %q the first created: the file was not reused",
+			second[0].Name(), first[0].Name())
+	}
+	if got := sizeOf(second[0]); got < firstSize {
+		t.Errorf("the staging database shrank from %d to %d bytes: its pages were freed rather than recycled", firstSize, got)
+	}
+}
+
+// TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool protects the pool
+// against the failure that turns it into a trap.
+//
+// The staging database is opened with journalling off, so a crash mid-write
+// leaves an image whose tables cannot be dropped. The surface is taken
+// last-in-first-out, so an import that gave such a surface back would be
+// handed it again by the next import, and the next, for the life of the data
+// directory -- every dependence unit of the workspace failing identically,
+// with no recovery but removing the directory by hand.
+//
+// Mutation: release the surface instead of retiring it (lease.Release in place
+// of lease.Unusable on the failed reset) and the second import fails too.
+func TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool(t *testing.T) {
+	dir := t.TempDir()
+	pool := filepath.Join(arena.Dir(dir), "0", string(arena.ImportStaging))
+	if err := os.MkdirAll(pool, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What a crash mid-write leaves: a file in the pool that is not a readable
+	// database. The import that takes it cannot empty it.
+	poisoned := filepath.Join(pool, "0")
+	if err := os.WriteFile(poisoned, bytes.Repeat([]byte("not a database"), 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src, export := filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c")
+	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err == nil {
+		t.Fatal("the import staged into a file that is not a database and reported success")
+	}
+	if _, err := os.Stat(poisoned); !os.IsNotExist(err) {
+		t.Fatalf("the surface that could not be emptied is still in the pool: %v", err)
+	}
+	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+		t.Fatalf("the next import was handed the same unusable surface: %v", err)
+	}
 }

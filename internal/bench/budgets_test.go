@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -150,6 +151,13 @@ func fixture(tb testing.TB) *budgetFixture {
 	return fixtureValue
 }
 
+// benchStartNodes is the seed width the traversal rows walk from. It is the
+// bench's OWN fixture constant and not a model or configuration bound: the row
+// has to measure the same walk from build to build, so widening the wire
+// ceiling (model.MaxStartNodes) or the operative context.max_start_nodes must
+// not move the baseline the budget is re-pinned against.
+const benchStartNodes = 64
+
 func buildFixture(tb testing.TB) *budgetFixture {
 	tb.Helper()
 	ctx := context.Background()
@@ -190,9 +198,8 @@ func buildFixture(tb testing.TB) *budgetFixture {
 	if err != nil {
 		tb.Fatalf("workspace symbols: %v", err)
 	}
-	// The traversal rows start from the widest seed set a request may carry
-	// (model.MaxStartNodes), led by the high-fanout symbol Section 23.1 asks
-	// for. A walk from one leaf visits two nodes and would measure nothing,
+	// The traversal rows start from benchStartNodes seeds, led by the
+	// high-fanout symbol Section 23.1 asks for. A walk from one leaf visits two nodes and would measure nothing,
 	// and the visited-node row has to state an upper bound the default budget
 	// is re-pinned against, not a best case. The exact-query row wants the
 	// opposite: one ordinary symbol, resolved by name.
@@ -216,7 +223,7 @@ func buildFixture(tb testing.TB) *budgetFixture {
 		}
 	}
 	for _, n := range symbols.Items {
-		if len(f.seeds) >= model.MaxStartNodes {
+		if len(f.seeds) >= benchStartNodes {
 			break
 		}
 		if n.Kind == model.NodeFunction || n.Kind == model.NodeMethod {
@@ -245,7 +252,7 @@ func openWorkspace(tb testing.TB, ctx context.Context, repo, home, extra string)
 	dataDir := filepath.Join(home, "data")
 	writeConfig(tb, home, dataDir, extra)
 	restore := useConfigHome(tb, home)
-	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{})
+	w, err := app.OpenWorkspace(ctx, repo, app.OpenOptions{Operation: "index"})
 	// The environment is restored as soon as the workspace has read it: a
 	// shared fixture outlives the function that built it, and leaving HOME
 	// pointing into the fixture would silently reconfigure every later row.
@@ -399,6 +406,156 @@ func measure(t *testing.T, target time.Duration, n int, op func()) string {
 // process-tree resident set it observed, in bytes. The parent is excluded: the
 // product runs as a descendant of this test binary (see the file comment), so
 // the descendant sum is the product's whole tree.
+// subjectPeak is treePeak for a row whose subject is ONE spawned process: it
+// samples that pid and its descendants and nothing else.
+//
+// treePeak roots the tree at the test process, which is right for a row that
+// measures work this binary does and wrong for a row that measures a child:
+// every other descendant the harness happens to be holding -- the shared
+// fixture's own workspace, a toolchain process, another row's leftovers -- is
+// summed into the subject's figure. The idle-mcp row missed its budget by
+// 60 MiB of parser workers belonging to the fixture, not to the server it
+// names, which is a measurement that charges one process's memory to another.
+func subjectPeak(tb testing.TB, pid int, op func()) uint64 {
+	tb.Helper()
+	var peak uint64
+	sample := func() {
+		if sum, ok := subjectTreeRSSBytes(pid); ok && sum > peak {
+			peak = sum
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		op()
+	}()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			sample()
+			return peak
+		case <-tick.C:
+			sample()
+		}
+	}
+}
+
+// subjectTreeRSSBytes sums the resident set of root and every process below it
+// in one sweep of /proc, so the figures describe one instant. It reports false
+// where /proc is unreadable rather than a smaller number, exactly as the
+// product's own sampler does: a confidently wrong measurement is worse than a
+// missing one.
+func subjectTreeRSSBytes(root int) (uint64, bool) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+	type rec struct {
+		parent int
+		bytes  uint64
+	}
+	page := uint64(os.Getpagesize())
+	all := make(map[int]rec, len(entries))
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// Field 2 is the executable name in parentheses and may itself contain
+		// spaces, so the split starts after the last ')'.
+		cut := strings.LastIndexByte(string(raw), ')')
+		if cut < 0 {
+			continue
+		}
+		fields := strings.Fields(string(raw)[cut+1:])
+		const ppidIndex, rssIndex = 1, 21
+		if len(fields) <= rssIndex {
+			continue
+		}
+		parent, err := strconv.Atoi(fields[ppidIndex])
+		if err != nil {
+			continue
+		}
+		pages, err := strconv.ParseUint(fields[rssIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		all[pid] = rec{parent: parent, bytes: pages * page}
+	}
+	self, ok := all[root]
+	if !ok {
+		return 0, false
+	}
+	total := self.bytes
+	for pid, r := range all {
+		if pid == root {
+			continue
+		}
+		for hops := 0; hops < 16; hops++ {
+			if r.parent == root {
+				total += all[pid].bytes
+				break
+			}
+			next, ok := all[r.parent]
+			if !ok {
+				break
+			}
+			r = next
+		}
+	}
+	return total, true
+}
+
+// workersHeldByThisProcess counts the parser workers this test binary itself
+// has running: a worker is this executable re-executed, so it is a child whose
+// own executable is this one. A budget row that measures a CHILD must open its
+// window with none of these alive, or the harness's own workspace is part of
+// the subject's figure whatever the row does.
+func workersHeldByThisProcess(tb testing.TB) int {
+	tb.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		tb.Fatalf("resolve this executable: %v", err)
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	me := os.Getpid()
+	var n int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 || pid == me {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		cut := strings.LastIndexByte(string(raw), ')')
+		if cut < 0 {
+			continue
+		}
+		fields := strings.Fields(string(raw)[cut+1:])
+		if len(fields) < 2 {
+			continue
+		}
+		if parent, err := strconv.Atoi(fields[1]); err != nil || parent != me {
+			continue
+		}
+		if target, err := os.Readlink("/proc/" + e.Name() + "/exe"); err == nil && target == self {
+			n++
+		}
+	}
+	return n
+}
+
 func treePeak(tb testing.TB, op func()) uint64 {
 	tb.Helper()
 	sampler := diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{})
@@ -481,8 +638,12 @@ func lexicalShape(tb testing.TB, dataDir string) string {
 	}
 	defer db.Close()
 	var units, maxRowID, tokens, bytes int64
+	// The documents keep no stored body (ADR-0003 §2.1), so the source extent
+	// they cover stands in for its bytes: a delete-and-reinsert rewrite moves
+	// the rowids, which is what this shape exists to see, and a reparse that
+	// re-cut the documents would move the extent.
 	row := db.QueryRow(`SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(token_count), 0),
-		coalesce(sum(length(body)), 0) FROM search_units`)
+		coalesce(sum(end_byte - start_byte), 0) FROM search_units`)
 	if err := row.Scan(&units, &maxRowID, &tokens, &bytes); err != nil {
 		tb.Fatalf("read the lexical tables: %v", err)
 	}
@@ -642,7 +803,15 @@ var budgetRows = []budgetRow{
 		}},
 	{name: "idle-mcp-rss", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIdleMCPRSSBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
-			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo)
+			// IDLE means idle. `mcp.watch` is on by default, so a server
+			// started plainly spends its first seconds running the initial
+			// refresh -- parser workers and all -- and a window opened at
+			// process start sampled that STARTUP peak, not the resting
+			// session. The row is the resting one, so the watcher is off for
+			// it (`--watch=false`) and the window opens only after the session
+			// has settled. The refresh peak is row 10's subject, measured
+			// there under `index --full`.
+			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo, "--watch=false")
 			cmd.Env = execEnv(f.execHome)
 			// A server with no stdin producer would see EOF and exit before it
 			// could be sampled, so the pipe is held open and closed to stop it.
@@ -653,10 +822,24 @@ var budgetRows = []budgetRow{
 			if err := cmd.Start(); err != nil {
 				t.Fatalf("start mcp serve: %v", err)
 			}
-			peak := treePeak(t, func() { time.Sleep(2 * time.Second) })
+			// Settle: opening the workspace and standing the server up is
+			// startup, not idle, so it happens outside the sampled window.
+			time.Sleep(idleMCPSettle)
+			// The subject is the server, so the harness must be holding no
+			// parser workers of its own when the window opens: the pool drains
+			// when the parse stage ends, so the shared fixture's workspace has
+			// none left after its index.
+			if held := workersHeldByThisProcess(t); held != 0 {
+				t.Fatalf("the harness holds %d parser worker(s) of its own as the window opens; they would be measured as the server's", held)
+			}
+			peak := subjectPeak(t, cmd.Process.Pid, func() { time.Sleep(idleMCPSample) })
 			_ = stdin.Close()
-			_ = cmd.Wait()
-			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes)
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("mcp serve exited non-zero (%v)", err)
+			}
+			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes) +
+				fmt.Sprintf(" (resting session: watcher off, sampled over %s after a %s settle)",
+					idleMCPSample, idleMCPSettle)
 		}},
 	{name: "interactive-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetInteractivePeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
@@ -715,12 +898,17 @@ var budgetRows = []budgetRow{
 // depth cannot show that.
 func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 	bounds := config.Defaults().Context
+	// The default depth is unlimited now, so the row probes a fixed ladder
+	// instead of the default value: what it measures is how visited and edge
+	// counts GROW per hop, and the ceiling assertion below is what pins the
+	// plan size. scopeWalkProbeDepth is the depth that assertion is made at.
+	const scopeWalkProbeDepth = 3
 	var out []string
 	var atConfigured string
-	for depth := 1; depth <= bounds.MaxGraphDepth+1; depth++ {
+	for depth := 1; depth <= scopeWalkProbeDepth+1; depth++ {
 		res, err := f.svc.Impact(context.Background(), model.ImpactRequest{Start: f.seeds,
 			Direction: model.DirectionBoth, MaxDepth: depth,
-			MaxVisited: bounds.MaxVisitedNodes, MaxEdges: bounds.MaxGraphEdges})
+			MaxVisited: bounds.MaxVisitedNodes.Int(), MaxEdges: bounds.MaxGraphEdges.Int()})
 		if err != nil {
 			t.Fatalf("scope traversal at depth %d: %v", depth, err)
 		}
@@ -728,7 +916,7 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 			depth, res.VisitedCount, res.EdgeCount, len(res.Entries), res.Meta.Truncated,
 			float64(res.EdgeCount)/float64(max(res.VisitedCount, 1)))
 		out = append(out, line)
-		if depth == bounds.MaxGraphDepth {
+		if depth == scopeWalkProbeDepth {
 			atConfigured = line
 			if res.VisitedCount > budgetContextPlanVisitedNodes {
 				t.Errorf("BUDGET MISSED: the scope walk visited %d nodes against a %d-node ceiling",
@@ -736,7 +924,7 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 			}
 		}
 	}
-	return fmt.Sprintf("%d seeds, ceiling %d nodes; at the configured depth %s\n\t%s",
+	return fmt.Sprintf("%d seeds, ceiling %d nodes; at probe depth %s\n\t%s",
 		len(f.seeds), budgetContextPlanVisitedNodes, atConfigured, strings.Join(out, "\n\t"))
 }
 
@@ -835,8 +1023,7 @@ func TestLowMemoryProfile(t *testing.T) {
 	t.Cleanup(closeBaseline)
 	want := capture(t, ctx, baseline)
 
-	const lowMemory = "[index]\nworkers = 1\nmax_parser_workers = 1\n" +
-		"[resources]\nbase_memory_budget_bytes = 2147483648\n"
+	const lowMemory = "[index]\nworkers = 1\n"
 	var peak uint64
 	var constrained *app.Services
 	home := filepath.Join(t.TempDir(), "low")
@@ -846,7 +1033,7 @@ func TestLowMemoryProfile(t *testing.T) {
 	got := capture(t, ctx, constrained)
 
 	if diffs := compareFingerprints(want, got); len(diffs) > 0 {
-		t.Errorf("the one-worker 2 GiB profile produced different results:\n\t%s", strings.Join(diffs, "\n\t"))
+		t.Errorf("the one-worker profile produced different results:\n\t%s", strings.Join(diffs, "\n\t"))
 	}
 	t.Logf("one worker, 2 GiB budget: index tree peak %.1f MiB; fingerprint identical across %d fact families",
 		float64(peak)/(1<<20), len(want.families()))
@@ -923,8 +1110,25 @@ func TestSessionStatusClamp(t *testing.T) {
 	// compiles every later manifest under the CURRENT manifest's budget: a
 	// planBudget-sized ceiling (200 files) would refuse with CTX_MINIMUM_BUDGET
 	// exactly as the session approached the page it exists to exercise.
-	budget := model.Budget{MaxFiles: 500, MaxSlices: 128,
-		MaxBytes: planBudget.MaxBytes, MaxEstimatedTokens: planBudget.MaxEstimatedTokens}
+	//
+	// Re-pinned to the walk this row now measures. The walk's root width is
+	// context.max_start_nodes and unlimited by default, so 24 task seeds resolve
+	// to every distinct entity they name rather than the first 64, and the
+	// required scope is legitimately wider than the constants above were sized
+	// for: MaxSlices 128 refuses it outright with CTX_MINIMUM_BUDGET.
+	//
+	// The byte and token terms are the SLICE-CUT terms, not headroom:
+	// packedSliceCountStream opens a new slice when the next group would take
+	// the running total past MaxBytes or MaxEstimatedTokens, with no per-slice
+	// divisor. planBudget's 4 MiB over a ~193 KB corpus never cuts, so the
+	// packer emits every admitted entry into ONE slice and
+	// model.ContextSlice.Validate refuses its 1508-record entry_ordinals against
+	// the 1000-record page width. 64 KiB / 128k tokens cuts the same required
+	// set into slices no page refuses; MaxSlices 512 is the ceiling that count
+	// has to clear. Widening MaxFiles alone does not help -- it is not the
+	// binding term at either setting.
+	budget := model.Budget{MaxFiles: 500, MaxSlices: 512,
+		MaxBytes: 64 << 10, MaxEstimatedTokens: 128_000}
 	// Batches are disjoint and small: sessionFilesSQL is INSERT OR IGNORE, so a
 	// repeated package adds nothing, and one batch's walk must stay inside the
 	// budget above.

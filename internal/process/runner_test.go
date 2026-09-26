@@ -3,13 +3,13 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -114,72 +114,81 @@ func waitForPID(t *testing.T, path string) int {
 	return 0
 }
 
-// TestOutputLimitTerminates protects the bounded-output invariant: a child that
-// writes without end must be stopped at the configured ceiling and reported as
-// a typed resource limit. Draining it into memory instead would let any
-// analyzer exhaust the serving process.
-func TestOutputLimitTerminates(t *testing.T) {
+// TestOutputOverTheCapCompletesAndIsFlagged protects the invariant that a
+// capture bound bounds memory and nothing else.
+//
+// Requirement: a child that produces three times the bound still runs to
+// completion and still has every record it wrote consumed; only the bytes this
+// package would otherwise have to hold are dropped, and only for a stream it is
+// capturing.
+//
+// Mutation that fails it: terminate the process tree at the capture bound,
+// which turns a large repository into a refusal.
+func TestOutputOverTheCapCompletesAndIsFlagged(t *testing.T) {
 	requireExecutable(t, "/bin/sh")
 	runner, dir := testRunner(t)
 
+	// 3072 bytes of stdout against a 1024-byte capture bound.
+	const (
+		records   = 96
+		recordLen = 32
+		capBytes  = records * recordLen / 3
+	)
+	script := "i=0; while [ $i -lt 96 ]; do printf '%031d\\n' $i; i=$((i+1)); done"
+
 	result, err := runner.Run(context.Background(), Spec{
 		Path:           "/bin/sh",
-		Args:           []string{"-c", "while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done"},
+		Args:           []string{"-c", script},
 		Dir:            dir,
-		MaxStdoutBytes: 4096,
-		MaxStderrBytes: 4096,
-		Timeout:        30 * time.Second,
-		Grace:          200 * time.Millisecond,
-	})
-	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-		t.Fatalf("Run returned %v, want a typed %s", err, model.CodeResourceLimit)
-	}
-	if !result.OutputTruncated {
-		t.Error("Result does not report the truncation that caused the failure")
-	}
-	if int64(len(result.Stdout)) > 4096 {
-		t.Errorf("captured %d bytes of stdout, over the 4096-byte limit", len(result.Stdout))
-	}
-
-	// A child that crosses the limit and then exits successfully is still a
-	// truncated run: reporting success would hand the caller a partial result
-	// it has no way to recognize as partial.
-	//
-	// The slow sink is what makes the child's exit win the race: it writes 4 KiB
-	// into the pipe buffer and exits at once, while the drain is held inside its
-	// first delivery for 100 ms before it can notice the truncation. The margin
-	// is large, not infinite; if it ever proves tight the assertion still holds
-	// on the other ordering, which is the case the first half of this test
-	// covers.
-	slow := &slowWriter{delay: 100 * time.Millisecond}
-	result, err = runner.Run(context.Background(), Spec{
-		Path:           "/bin/sh",
-		Args:           []string{"-c", `printf '%04096d' 0; exit 0`},
-		Dir:            dir,
-		Stdout:         slow,
-		MaxStdoutBytes: 16,
-		MaxStderrBytes: 4096,
-		Timeout:        30 * time.Second,
+		MaxStdoutBytes: capBytes,
+		MaxStderrBytes: capBytes,
 		Grace:          5 * time.Second,
 	})
-	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-		t.Fatalf("Run returned %v for a truncated but successful child, want a typed %s", err, model.CodeResourceLimit)
+	if err != nil {
+		t.Fatalf("a child three times over its capture bound failed the run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("exit code %d, want 0", result.ExitCode)
 	}
 	if !result.OutputTruncated {
-		t.Error("Result does not report the truncation")
+		t.Error("Result does not report that captured bytes were dropped")
+	}
+	if int64(len(result.Stdout)) != capBytes {
+		t.Errorf("captured %d bytes of stdout, want exactly the %d-byte bound", len(result.Stdout), capBytes)
+	}
+
+	// The same child, its stdout handed to a caller's writer: a writer is fed
+	// every byte and paced by its own Write, so all 96 records arrive and
+	// nothing is flagged. A framed protocol could not survive anything less.
+	counter := &recordCounter{}
+	result, err = runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", script},
+		Dir:            dir,
+		Stdout:         counter,
+		MaxStdoutBytes: capBytes,
+		MaxStderrBytes: capBytes,
+		Grace:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("a child writing to a caller's sink failed the run: %v", err)
+	}
+	if counter.lines != records {
+		t.Errorf("the sink consumed %d records, want all %d", counter.lines, records)
+	}
+	if result.OutputTruncated {
+		t.Error("a caller-supplied sink was reported as truncated; its bytes are never dropped")
+	}
+	if result.StdoutBytes != records*recordLen {
+		t.Errorf("StdoutBytes is %d, want %d", result.StdoutBytes, records*recordLen)
 	}
 }
 
-// slowWriter delays its first write, which is how a test pins the ordering
-// between a child exiting and its output being delivered.
-type slowWriter struct {
-	delay time.Duration
-	once  sync.Once
-}
+// recordCounter counts the newline-terminated records a stream delivered.
+type recordCounter struct{ lines int }
 
-func (w *slowWriter) Write(b []byte) (int, error) {
-	w.once.Do(func() { time.Sleep(w.delay) })
+func (c *recordCounter) Write(b []byte) (int, error) {
+	c.lines += bytes.Count(b, []byte{'\n'})
 	return len(b), nil
 }
 
@@ -212,14 +221,19 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 	}
 
 	// The same run proves the other half of the boundary: a Spec that names no
-	// environment gives the child none. An os/exec Cmd with a nil Env inherits
-	// the parent's, which would hand every analyzer this process's tokens,
-	// proxy settings and paths.
+	// environment gives the child none of the parent's. An os/exec Cmd with a
+	// nil Env inherits the parent's, which would hand every analyzer this
+	// process's tokens, proxy settings and paths.
+	//
+	// It also proves what the child does get: the UTF-8 locale. A child with
+	// no locale names files through an ASCII path encoding and cannot open a
+	// source file whose name holds a letter outside ASCII at all -- measured
+	// against the real analysis payload, one such file failed a whole project.
 	requireExecutable(t, "/bin/sh")
 	t.Setenv("CODECTX_TEST_SECRET", "leaked")
 	result, err = runner.Run(context.Background(), Spec{
 		Path:           "/bin/sh",
-		Args:           []string{"-c", `echo "${CODECTX_TEST_SECRET-absent}"`},
+		Args:           []string{"-c", `echo "${CODECTX_TEST_SECRET-absent}" "${LC_ALL-none}" "${LANG-none}"`},
 		Dir:            dir,
 		MaxStdoutBytes: 4096,
 		MaxStderrBytes: 4096,
@@ -229,8 +243,9 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if strings.TrimSpace(string(result.Stdout)) != "absent" {
-		t.Fatalf("child saw %q for an unlisted variable, want it absent", result.Stdout)
+	locale := utf8Locale()
+	if want := "absent " + locale + " " + locale; strings.TrimSpace(string(result.Stdout)) != want {
+		t.Fatalf("child saw %q, want %q: an unlisted variable absent and the UTF-8 locale set", result.Stdout, want)
 	}
 }
 
@@ -313,7 +328,8 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 	// The same must hold when the run ends through one of the stop decisions
 	// rather than by the child exiting: the copy is still in flight there, and
 	// a run that returns without closing the write end leaves it parked on a
-	// pipe forever.
+	// pipe forever. The wall clock is the stop decision used here because an
+	// output bound no longer is one.
 	requireExecutable(t, "/bin/sh")
 	before = openDescriptors(t)
 	for range 16 {
@@ -325,15 +341,15 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 			MaxStdinBytes:  1 << 20,
 			MaxStdoutBytes: 64,
 			MaxStderrBytes: 64,
-			Timeout:        30 * time.Second,
+			Timeout:        200 * time.Millisecond,
 			Grace:          50 * time.Millisecond,
 		})
-		if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-			t.Fatalf("Run returned %v, want a typed %s", err, model.CodeResourceLimit)
+		if !errors.As(err, &typed) || typed.Code != model.CodeProviderTimeout {
+			t.Fatalf("Run returned %v, want a typed %s", err, model.CodeProviderTimeout)
 		}
 	}
 	if after := openDescriptors(t); after > before+4 {
-		t.Fatalf("16 truncated runs left %d open descriptors, up from %d", after, before)
+		t.Fatalf("16 stopped runs left %d open descriptors, up from %d", after, before)
 	}
 }
 
@@ -424,5 +440,233 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 	}
 	if got := runner.LiveSubprocesses(); got != 0 {
 		t.Fatalf("after a non-zero exit the runner reports %d live children, want 0", got)
+	}
+}
+
+// TestAdmissionWaitsForHeadroom protects the class-C rule for the runner's
+// byte budgets.
+//
+// Requirement: a run that does not fit the REMAINING budget waits for headroom
+// and then runs, and only a reservation larger than the whole user-set budget
+// is refused.
+//
+// Mutation that fails it: refuse a reservation that does not fit the remaining
+// budget. A second analysis unit is then refused outright because a first is
+// still holding memory, which turns capacity that exists a second later into a
+// failed unit.
+func TestAdmissionWaitsForHeadroom(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, err := NewRunner(Limits{MaxConcurrent: 4, MemoryBudgetBytes: 1000, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	dir := t.TempDir()
+	// A deadline rather than Background: a regression that reintroduces a
+	// deadlock must fail this test, not hang the package under -race.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := func(seconds string) Spec {
+		return Spec{Path: "/bin/sh", Args: []string{"-c", "sleep " + seconds}, Dir: dir,
+			Grace: time.Second, MemoryReservationBytes: 600}
+	}
+
+	// The first run holds 600 of 1000 bytes; the second needs 600 and cannot
+	// fit beside it.
+	held := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		close(held)
+		_, err := runner.Run(ctx, spec("1"))
+		first <- err
+	}()
+	<-held
+	// Wait until the first run actually holds its reservation, so the second
+	// is admitted through the queue rather than racing ahead of it.
+	for {
+		runner.mu.Lock()
+		used := runner.memoryUsed
+		runner.mu.Unlock()
+		if used == 600 {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("the first run never took its reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	started := time.Now()
+	if _, err := runner.Run(ctx, spec("0")); err != nil {
+		t.Fatalf("a run that did not fit the remaining budget was refused instead of waiting: %v", err)
+	}
+	if waited := time.Since(started); waited < 100*time.Millisecond {
+		t.Fatalf("the second run was admitted after %s; it must have waited for the first to release 600 bytes", waited)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Everything is handed back: no admission leaks past a completed run.
+	runner.mu.Lock()
+	used, running, queued := runner.memoryUsed, runner.running, runner.queue.Len()
+	runner.mu.Unlock()
+	if used != 0 || running != 0 || queued != 0 {
+		t.Fatalf("after both runs: %d bytes reserved, %d running, %d queued; want all zero", used, running, queued)
+	}
+
+	// The one refusal that remains: a request larger than the whole user-set
+	// budget, which no amount of waiting can satisfy. It is reported with
+	// both numbers rather than waiting forever.
+	_, err = runner.Run(ctx, Spec{Path: "/bin/sh", Args: []string{"-c", "true"}, Dir: dir,
+		Grace: time.Second, MemoryReservationBytes: 1001})
+	if err == nil || !strings.Contains(err.Error(), "over the runner budget of 1000") {
+		t.Fatalf("a reservation larger than the whole budget = %v; want it refused and reported", err)
+	}
+}
+
+// TestAdmissionLeavesTheQueueOnCancellation protects the waiter's exit path: a
+// queued run whose context ends must leave the queue, or the queue grows with
+// every abandoned caller and the head-of-line rule blocks on a run nobody is
+// waiting for any more.
+func TestAdmissionLeavesTheQueueOnCancellation(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, err := NewRunner(Limits{MaxConcurrent: 4, MemoryBudgetBytes: 1000, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	dir := t.TempDir()
+	hold, release := context.WithCancel(context.Background())
+	defer release()
+	blocking := make(chan struct{})
+	go func() {
+		defer close(blocking)
+		_, _ = runner.Run(hold, Spec{Path: "/bin/sh", Args: []string{"-c", "sleep 30"}, Dir: dir,
+			Grace: time.Second, MemoryReservationBytes: 900})
+	}()
+	for {
+		runner.mu.Lock()
+		used := runner.memoryUsed
+		runner.mu.Unlock()
+		if used == 900 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = runner.Run(ctx, Spec{Path: "/bin/sh", Args: []string{"-c", "true"}, Dir: dir,
+		Grace: time.Second, MemoryReservationBytes: 900})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a queued run whose context ended returned %v, want the cancellation", err)
+	}
+	release()
+	<-blocking
+	runner.mu.Lock()
+	queued, used := runner.queue.Len(), runner.memoryUsed
+	runner.mu.Unlock()
+	if queued != 0 || used != 0 {
+		t.Fatalf("%d waiters and %d bytes left after a cancelled wait; want none", queued, used)
+	}
+}
+
+// TestChildAccountingReportsWhatTheChildActuallyCost protects the per-child
+// measurement the run accounting is built on: processor time and transferred
+// bytes that this platform CAN observe must arrive as real figures. A run that
+// reported them as unavailable, or as zero, would make every child in the
+// accounting look free, and a reader would have no way to tell an expensive
+// stage from a cheap one.
+func TestChildAccountingReportsWhatTheChildActuallyCost(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, dir := testRunner(t)
+
+	// 1 KiB per line, 1024 lines: exactly a mebibyte written into the child's
+	// own working directory, preceded by an arithmetic loop long enough to
+	// show up in a millisecond figure.
+	const wrote = 1 << 20
+	// The trailing idle is load-bearing, not padding: the byte counters are
+	// read by the tree sampler's periodic sweep, so the tree must still exist
+	// for at least one sweep after the last write or there is no process left
+	// to read them from and the figure would be whatever was true before the
+	// writes.
+	script := `i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done; ` +
+		`line=$(printf '%01023d' 0); j=0; ` +
+		`while [ $j -lt 1024 ]; do echo "$line"; j=$((j+1)); done > out.bin; ` +
+		`sleep 1`
+
+	result, err := runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", script},
+		Dir:            dir,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        90 * time.Second,
+		Grace:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("the child failed the run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code %d, want 0", result.ExitCode)
+	}
+
+	if result.CPUUnsampled {
+		t.Fatal("processor time is reported unavailable for a child this platform reaped")
+	}
+	cpu := result.CPUUserMillis + result.CPUSysMillis
+	if cpu <= 0 {
+		t.Errorf("the child consumed %d ms of processor time (user %d, system %d), want a measurable figure",
+			cpu, result.CPUUserMillis, result.CPUSysMillis)
+	}
+	// One single-threaded child cannot consume more processor time than the
+	// run lasted; a figure above that is a misread unit, not a measurement.
+	if wall := result.Duration.Milliseconds(); cpu > wall {
+		t.Errorf("the child consumed %d ms of processor time in a %d ms run", cpu, wall)
+	}
+
+	if !treeSampled {
+		t.Skip("this platform has no per-process byte counters, so the transferred bytes are absent by construction")
+	}
+	if result.IOUnsampled {
+		t.Fatal("transferred bytes are reported unavailable on a platform that counts them")
+	}
+	if result.WriteBytes < wrote {
+		t.Errorf("the tree is recorded as having written %d bytes; the child alone wrote %d",
+			result.WriteBytes, wrote)
+	}
+}
+
+// TestUnmeasuredChildAccountingIsAbsentNotZero protects Section 22's rule for
+// the same figures: where there is no measurement the Result must say so. A
+// caller cannot tell an observed zero from a missing observation, so a run that
+// never started a child and reported zero cost would be recorded as a stage
+// that genuinely ran for free.
+func TestUnmeasuredChildAccountingIsAbsentNotZero(t *testing.T) {
+	runner, dir := testRunner(t)
+
+	// A path that is not an approved executable: the run is rejected before any
+	// child exists, so nothing was reaped and no sweep ever happened.
+	result, err := runner.Run(context.Background(), Spec{
+		Path:           filepath.Join(dir, "no-such-tool"),
+		Dir:            dir,
+		MaxStdoutBytes: 16,
+		MaxStderrBytes: 16,
+		Timeout:        time.Second,
+		Grace:          time.Second,
+	})
+	if err == nil {
+		t.Fatal("a run of a path that is not an approved executable succeeded")
+	}
+	if !result.CPUUnsampled {
+		t.Errorf("processor time is reported as measured (%d/%d ms) for a child that never ran",
+			result.CPUUserMillis, result.CPUSysMillis)
+	}
+	if !result.IOUnsampled {
+		t.Errorf("transferred bytes are reported as measured (%d read, %d written) for a child that never ran",
+			result.ReadBytes, result.WriteBytes)
+	}
+	if !result.TreeUnsampled {
+		t.Error("the tree peak is reported as measured for a child that never ran")
 	}
 }

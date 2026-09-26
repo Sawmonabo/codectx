@@ -75,7 +75,7 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			// close, the --timeout deadline and the typing of a bare context
 			// failure, so nothing here repeats them.
 			var result model.Page[model.SearchHit]
-			if err := runService(cmd, openForReport(),
+			if err := runService(cmd, openForQuery(),
 				func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 					var err error
 					result, err = svc.Search(ctx, req)
@@ -121,8 +121,13 @@ func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID,
 
 // queryContext applies an operator-supplied deadline to the service call alone.
 // The workspace open is deliberately outside it: a slow open is not a query
-// that ran out of time, and reporting it as one would name the wrong cause. A
-// zero timeout leaves the context alone so resources.query_timeout applies.
+// that ran out of time, and reporting it as one would name the wrong cause.
+//
+// A zero `--timeout` installs NO deadline and leaves the configured
+// resources.query_timeout in charge, which itself defaults to unlimited: the
+// command returns the complete answer unless the operator asked for a bound.
+// context.WithTimeout is never called with zero, which would expire the call
+// immediately -- the opposite of what "no limit" means.
 func queryContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return context.WithCancel(ctx)
@@ -147,8 +152,8 @@ func writeSearchTable(b *strings.Builder, hits []model.SearchHit) {
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			tableCell(string(hit.Tier)), hit.ScoreMicros, hit.OccurrenceCount,
-			tableCell(string(hit.Kind)), rangeLine(hit.Range), tableCell(hit.Path),
-			tableCell(name), reasonCell(hit.Reasons))
+			tableCell(string(hit.Kind)), hitRangeCell(hit), tableCell(hit.Path),
+			tableCell(name), reasonCell(hit))
 	}
 	flushTableInto(tw)
 	fmt.Fprintf(b, "\n%d %s\n", len(hits), plural(len(hits), "hit", "hits"))
@@ -167,7 +172,17 @@ func flushTableInto(tw *tabwriter.Writer) {
 // report ScoreMicros 0 and say why in a reason, so a table without this column
 // would show those hits as scoring nothing with nothing to explain it. Only the
 // first reason fits a column; the rest are counted, and --json carries them all.
-func reasonCell(reasons []string) string {
+// It also carries the per-hit fault the JSON answer reports in
+// `unresolved_fields`: a hit whose range the content store could not supply
+// stays in the answer, so the reason it lost its position must reach an
+// operator reading the table and not only one reading --json.
+func reasonCell(hit model.SearchHit) string {
+	reasons := hit.Reasons
+	if why := hit.UnresolvedFields[model.SearchHitFieldRange]; why != "" {
+		// A fresh slice: the hit's own Reasons must not grow a rendering
+		// artifact that a later --json of the same page would then publish.
+		reasons = append([]string{"range unresolved: " + why}, reasons...)
+	}
 	if len(reasons) == 0 {
 		return "-"
 	}
@@ -176,6 +191,21 @@ func reasonCell(reasons []string) string {
 		cell += fmt.Sprintf(" (+%d more)", extra)
 	}
 	return cell
+}
+
+// hitRangeCell renders a search hit's LINE column. It separates the two ways a
+// hit can reach the table with no position: an entity that simply has no source
+// location renders "-", while a hit whose range the content store could not
+// supply renders "!" and states why in the REASON column. Rendering both as "-"
+// would present a lost location as "this hit has none", which is the silent
+// degradation the per-hit fault flag exists to prevent.
+func hitRangeCell(hit model.SearchHit) string {
+	if hit.Range == nil {
+		if _, unresolved := hit.UnresolvedFields[model.SearchHitFieldRange]; unresolved {
+			return "!"
+		}
+	}
+	return rangeLine(hit.Range)
 }
 
 // rangeLine renders a hit's one-based start line, or "-" for an entity with no

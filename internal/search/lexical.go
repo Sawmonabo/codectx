@@ -5,8 +5,10 @@ package search
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -18,9 +20,73 @@ import (
 type lexicalSource interface {
 	SearchStats(ctx context.Context) (documents, tokens int64, err error)
 	DocumentFrequency(ctx context.Context, terms []string) ([]int64, error)
-	TermOccurrences(ctx context.Context, term string, after int64, limit int) ([]sqlite.TermOccurrence, error)
+	OpenPostings(ctx context.Context) (postingSession, error)
 	Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error)
-	SearchDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
+}
+
+// postingSession is one held-open read transaction over the posting lists of a
+// single query, and occurrenceStream one term's list inside it. They are
+// interfaces so the tier can be driven by a fake that counts the statements it
+// issues: re-opening a stream inside a walk is the regression this seam exists
+// to catch. *sqlite.PostingSession and *sqlite.OccurrenceStream satisfy them
+// through readerPostings below.
+type postingSession interface {
+	// TermOccurrences carries offsets and serves the phrase path, which needs
+	// them to test adjacency. TermCounts serves every other term from the
+	// generation's packed term statistics (ADR-0007 Decision 1), where the
+	// counts the scorer sums are already folded per document and visibility is
+	// already resolved.
+	TermOccurrences(ctx context.Context, term string) (occurrenceStream, error)
+	TermCounts(ctx context.Context, term string) (occurrenceStream, error)
+	// PackedDocuments hydrates a page of candidates from the same packed
+	// segments the term streams are read from (ADR-0007 Decision 2). It
+	// belongs to the session rather than to the reader because the walk's
+	// candidates ascend for the whole query: one part window serves every
+	// page, and no document row is read for a candidate at all.
+	PackedDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
+	Close() error
+}
+
+// occurrenceStream pulls one term's postings in page-sized refills from one
+// statement. Next returns nil, nil once the list is exhausted.
+type occurrenceStream interface {
+	Next(ctx context.Context, limit int) ([]sqlite.TermOccurrence, error)
+	Close() error
+}
+
+// readerPostings adapts *sqlite.PinnedReader to lexicalSource. Storage returns
+// concrete stream types, which Go does not match against the interfaces above,
+// so the posting constructors are re-typed here and nothing else is.
+type readerPostings struct{ *sqlite.PinnedReader }
+
+// OpenPostings begins a posting session as the interface spells it.
+func (r readerPostings) OpenPostings(ctx context.Context) (postingSession, error) {
+	session, err := r.PinnedReader.OpenPostings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return storedPostings{session}, nil
+}
+
+// storedPostings re-types PostingSession's two stream constructors the same way.
+type storedPostings struct{ *sqlite.PostingSession }
+
+// TermOccurrences opens one term's stream as the interface spells it.
+func (p storedPostings) TermOccurrences(ctx context.Context, term string) (occurrenceStream, error) {
+	stream, err := p.PostingSession.TermOccurrences(ctx, term)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+// TermCounts opens one term's packed stream as the interface spells it.
+func (p storedPostings) TermCounts(ctx context.Context, term string) (occurrenceStream, error) {
+	stream, err := p.PostingSession.TermCounts(ctx, term)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
 }
 
 // lexicalTokenizer is *sqlite.Store's Tokenize: the exact unicode61 tokenizer
@@ -44,15 +110,19 @@ func (t lexicalTerm) phrase() bool { return len(t.tokens) > 1 }
 // quoted string, so one spelling serves both.
 func (t lexicalTerm) key() string { return strings.Join(t.tokens, " ") }
 
-// lexicalHit is one scored lexical candidate. It carries only what the ranker
-// needs: name, path and kind arrive later through SearchDocuments, which is
-// what keeps the bounded heap small. Occurrences is the number of matched term
-// instances in this document, folded across query terms and indexed columns —
-// L4 sums it when deduplication folds several documents of one node.
+// lexicalHit is one scored lexical candidate. It carries the document the
+// score was computed from: the tier already hydrates every field of that
+// document to get TokenCount, so handing the same document on costs nothing and
+// spares the consumer a second hydration over the identical rowid page. Doc is carried BY VALUE, not as a pointer into the tier's
+// per-page slice, so an emit that outlives the page cannot alias a reused row.
+// Occurrences is the number of matched term instances in this document, folded
+// across query terms and indexed columns — L4 sums it when deduplication folds
+// several documents of one node.
 type lexicalHit struct {
 	RowID       int64
 	ScoreMicros int64
 	Occurrences int64
+	Doc         sqlite.SearchDocument
 }
 
 // lexicalOutcome reports a lower-bound answer. QueryMeta.Validate rejects a
@@ -68,7 +138,7 @@ type lexicalOutcome struct {
 const truncatedOffsetsReason = "phrase frequencies are a lower bound: a document's term offsets exceeded the per-document offset cap"
 
 // matchPageSize is the candidate window. It is also the hydration batch, so it
-// must not exceed model.MaxPageItems, which SearchDocuments requires.
+// must not exceed model.MaxPageItems, which the packed hydration requires.
 const matchPageSize = model.MaxPageItems
 
 // occurrencePageSize is the posting-list page. It must NOT exceed
@@ -85,15 +155,14 @@ const occurrencePageSize = model.MaxPageItems
 type lexicalTier struct {
 	tok      lexicalTokenizer
 	stats    *statsCache
-	maxTerms int
+	maxTerms config.Limit
 }
 
-// newLexicalTier builds the tier. maxTerms is resources.max_query_terms;
-// cacheBytes is the statistics cache ceiling.
-func newLexicalTier(tok lexicalTokenizer, maxTerms int, cacheBytes int64) *lexicalTier {
-	if maxTerms <= 0 {
-		maxTerms = 1
-	}
+// newLexicalTier builds the tier. maxTerms is resources.max_query_terms, which
+// is a config.Limit: an unlimited (0) value means every term of the query is
+// scored. The former 0 -> 1 coercion here silently turned "no bound" into the
+// tightest bound in the tree, which is the one reading of 0 the wave forbids.
+func newLexicalTier(tok lexicalTokenizer, maxTerms config.Limit, cacheBytes int64) *lexicalTier {
 	return &lexicalTier{tok: tok, stats: newStatsCache(cacheBytes), maxTerms: maxTerms}
 }
 
@@ -120,7 +189,16 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 	}
 	avgdl := float64(tokens) / float64(n)
 
-	dfs, err := l.documentFrequencies(ctx, src, key, terms)
+	// One session for the whole walk: every term stream below is a statement
+	// held open inside it, so the candidate scan reads one snapshot and pays
+	// for each posting list exactly once.
+	session, err := src.OpenPostings(ctx)
+	if err != nil {
+		return out, err
+	}
+	defer session.Close()
+
+	dfs, err := l.documentFrequencies(ctx, src, session, key, terms)
 	if err != nil {
 		return out, err
 	}
@@ -131,7 +209,11 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 
 	streams := make([]*termStream, len(terms))
 	for i, t := range terms {
-		streams[i] = newTermStream(src, t)
+		streams[i], err = newTermStream(ctx, session, t)
+		if err != nil {
+			return out, err
+		}
+		defer streams[i].close()
 	}
 
 	expr := encodeFTS(terms)
@@ -148,23 +230,18 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			return out, nil
 		}
 		after = rowids[len(rowids)-1]
-		docs, err := src.SearchDocuments(ctx, rowids)
+		// One hydration per rowid page, carrying everything both consumers need:
+		// TokenCount for the score here, path/kind/name/identity for the ranker
+		// downstream, read from the packed segments rather than one document row
+		// per candidate. It answers in the requested order and omits rowids the
+		// generation does not make visible, so walking docs is the rowid walk
+		// minus exactly the documents that have no length to score against.
+		docs, err := session.PackedDocuments(ctx, rowids)
 		if err != nil {
 			return out, err
 		}
-		lengths := make(map[int64]int64, len(docs))
 		for _, d := range docs {
-			lengths[d.RowID] = d.TokenCount
-		}
-		for _, rowid := range rowids {
-			dl, ok := lengths[rowid]
-			if !ok {
-				// SearchDocuments omits rowids that are no longer visible;
-				// without dl there is no defined score, so the candidate is
-				// dropped rather than scored against a guessed length.
-				continue
-			}
-			score, occ, lower, err := l.score(ctx, streams, idfs, rowid, dl, avgdl)
+			score, occ, lower, err := l.score(ctx, streams, idfs, d.RowID, d.TokenCount, avgdl)
 			if err != nil {
 				return out, err
 			}
@@ -174,7 +251,7 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			if occ == 0 {
 				continue
 			}
-			if err := emit(lexicalHit{RowID: rowid, ScoreMicros: quantizeScore(score), Occurrences: occ}); err != nil {
+			if err := emit(lexicalHit{RowID: d.RowID, ScoreMicros: quantizeScore(score), Occurrences: occ, Doc: d}); err != nil {
 				return out, err
 			}
 		}
@@ -234,9 +311,11 @@ func (l *lexicalTier) parseQuery(ctx context.Context, text string) ([]lexicalTer
 	// silently dropping terms, matching Tokenize's rejection of
 	// max_query_text_bytes: a query that scores only the first 32 of its terms
 	// would return confidently wrong rankings.
-	if len(terms) > l.maxTerms {
+	if l.maxTerms.Exceeded(int64(len(terms))) {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "query has more terms than resources.max_query_terms allows"}
+			Message: "the query carries " + strconv.Itoa(len(terms)) +
+				" terms, more than the resources.max_query_terms limit of " + l.maxTerms.String(),
+			Remediation: "narrow the query, or raise resources.max_query_terms (0 or \"unlimited\" scores every term)"}
 	}
 	return terms, nil
 }
@@ -294,7 +373,7 @@ func ftsQuote(s string) string {
 // documentFrequencies resolves df for every term, serving the statistics cache
 // first, batching the remaining single tokens into one DocumentFrequency call,
 // and streaming each phrase's own document frequency.
-func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource, key model.AnalysisKey, terms []lexicalTerm) ([]int64, error) {
+func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource, session postingSession, key model.AnalysisKey, terms []lexicalTerm) ([]int64, error) {
 	dfs := make([]int64, len(terms))
 	var pending []string
 	var pendingAt []int
@@ -305,7 +384,7 @@ func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource
 			continue
 		}
 		if t.phrase() {
-			df, err := phraseDocumentFrequency(ctx, src, t)
+			df, err := phraseDocumentFrequency(ctx, session, t)
 			if err != nil {
 				return nil, err
 			}
@@ -339,9 +418,18 @@ func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource
 // The phrase can only occur where its first token occurs, so that token's
 // posting list drives the scan; the cost is O(df of the rarest-bound token),
 // which is why the answer is cached per (AnalysisKey, phrase).
-func phraseDocumentFrequency(ctx context.Context, src lexicalSource, t lexicalTerm) (int64, error) {
-	driver := &occurrenceCursor{src: src, term: t.tokens[0]}
-	stream := newTermStream(src, t)
+func phraseDocumentFrequency(ctx context.Context, session postingSession, t lexicalTerm) (int64, error) {
+	driving, err := session.TermOccurrences(ctx, t.tokens[0])
+	if err != nil {
+		return 0, err
+	}
+	defer driving.Close()
+	driver := &occurrenceCursor{stream: driving}
+	stream, err := newTermStream(ctx, session, t)
+	if err != nil {
+		return 0, err
+	}
+	defer stream.close()
 	var df, last int64
 	first := true
 	for {
@@ -367,17 +455,16 @@ func phraseDocumentFrequency(ctx context.Context, src lexicalSource, t lexicalTe
 }
 
 // occurrenceCursor streams one term's posting rows in ascending
-// (rowid, column), holding at most one page. TermOccurrences keys on rowid
-// while emitting one row per column, so a page that ends inside a document's
-// columns would lose the rest of them; the trailing partial document is
-// therefore dropped and re-read from the next page.
+// (document, column) from ONE statement held open for the whole walk. The
+// former cursor re-issued TermOccurrences per refill, and because fts5vocab
+// cannot seek into a term's instance list, every refill re-scanned the list
+// from its start and re-sorted it: for a corpus-frequent term that is
+// quadratic in the postings and was the dominant cost of a first page.
 type occurrenceCursor struct {
-	src   lexicalSource
-	term  string
-	buf   []sqlite.TermOccurrence
-	i     int
-	after int64
-	done  bool
+	stream occurrenceStream
+	buf    []sqlite.TermOccurrence
+	i      int
+	done   bool
 }
 
 // next yields the next posting row, or ok=false once the stream is exhausted.
@@ -386,32 +473,18 @@ func (c *occurrenceCursor) next(ctx context.Context) (sqlite.TermOccurrence, boo
 		if c.done {
 			return sqlite.TermOccurrence{}, false, nil
 		}
-		rows, err := c.src.TermOccurrences(ctx, c.term, c.after, occurrencePageSize)
+		rows, err := c.stream.Next(ctx, occurrencePageSize)
 		if err != nil {
 			return sqlite.TermOccurrence{}, false, err
 		}
-		if len(rows) < occurrencePageSize {
-			c.done = true
-		} else {
-			// Drop the trailing document, whose columns may continue on the
-			// next page, and rewind the keyset to just before it.
-			tail := rows[len(rows)-1].RowID
-			cut := len(rows)
-			for cut > 0 && rows[cut-1].RowID == tail {
-				cut--
-			}
-			// A single document cannot fill a page (five indexed columns), so
-			// cut > 0 always holds; keeping the page whole if it ever did not
-			// is what prevents an empty page from stalling the scan forever.
-			if cut > 0 {
-				rows = rows[:cut]
-			}
-		}
+		// Exhaustion is the statement running out of rows, never a short
+		// page: a refill ends on a document boundary, so its length says
+		// nothing about whether more documents follow.
 		if len(rows) == 0 {
 			c.done = true
 			return sqlite.TermOccurrence{}, false, nil
 		}
-		c.buf, c.i, c.after = rows, 0, rows[len(rows)-1].RowID
+		c.buf, c.i = rows, 0
 	}
 	row := c.buf[c.i]
 	c.i++
@@ -429,8 +502,9 @@ type termStream struct {
 	live    []bool
 }
 
-// newTermStream opens one posting cursor per token of t.
-func newTermStream(src lexicalSource, t lexicalTerm) *termStream {
+// newTermStream opens one posting cursor per token of t on session. Every
+// stream it opens is closed by close, which the caller must defer.
+func newTermStream(ctx context.Context, session postingSession, t lexicalTerm) (*termStream, error) {
 	s := &termStream{term: t,
 		cursors: make([]*occurrenceCursor, len(t.tokens)),
 		head:    make([]sqlite.TermOccurrence, len(t.tokens)),
@@ -438,10 +512,31 @@ func newTermStream(src lexicalSource, t lexicalTerm) *termStream {
 		live:    make([]bool, len(t.tokens)),
 	}
 	for i, tok := range t.tokens {
-		s.cursors[i] = &occurrenceCursor{src: src, term: tok}
+		// A phrase tests adjacency and needs the offsets only the live path
+		// carries; a single token needs counts, which the packed statistics
+		// already hold per document.
+		open := session.TermCounts
+		if t.phrase() {
+			open = session.TermOccurrences
+		}
+		stream, err := open(ctx, tok)
+		if err != nil {
+			s.close()
+			return nil, err
+		}
+		s.cursors[i] = &occurrenceCursor{stream: stream}
 		s.live[i] = true
 	}
-	return s
+	return s, nil
+}
+
+// close releases every statement the stream holds.
+func (s *termStream) close() {
+	for _, c := range s.cursors {
+		if c != nil && c.stream != nil {
+			c.stream.Close()
+		}
+	}
 }
 
 // at returns the column-weighted frequency, the raw occurrence count and

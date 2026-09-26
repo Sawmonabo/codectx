@@ -58,10 +58,14 @@ type Engine struct {
 type Backend interface {
 	// Engine is the payload this backend resolved, fixed for its lifetime.
 	Engine() Engine
-	// Parse builds the graph for one unit.
+	// Parse builds the graph for one unit. The implementation must name the
+	// step's output to the process runner as its progress file: the engine is
+	// quiet, so its output is the only thing that tells the stall detector the
+	// step is still working.
 	Parse(ctx context.Context, req ParseRequest) (Outcome, error)
 	// Export writes the graph out for import and reports whether the result is
-	// a live graph at all.
+	// a live graph at all. Like Parse, it must name its output directory as the
+	// run's progress file.
 	Export(ctx context.Context, req ExportRequest) (ExportOutcome, error)
 	// NeutralOptions is the frontend's fixed allowlist of semantics-neutral
 	// parse options, used once to confirm a crash reproduces before a unit is
@@ -86,10 +90,12 @@ type ParseRequest struct {
 	// ExtraArgs is the neutral-option allowlist for a crash-confirmation
 	// rerun. It is empty on the first attempt.
 	ExtraArgs []string
-	// ReservationBytes is what the runner admits this child against and
-	// Timeout bounds it.
+	// ReservationBytes is what the runner admits this child against, Timeout
+	// bounds it (zero meaning no wall clock) and StallTimeout terminates it if
+	// it makes no observable progress for that long.
 	ReservationBytes int64
 	Timeout          time.Duration
+	StallTimeout     time.Duration
 }
 
 // ExportRequest is one export step. Export scales with the graph rather than
@@ -100,6 +106,7 @@ type ExportRequest struct {
 	HeapCapBytes     int64
 	ReservationBytes int64
 	Timeout          time.Duration
+	StallTimeout     time.Duration
 }
 
 // Outcome is what the backend observed in neutral terms. Class is empty when
@@ -129,6 +136,31 @@ type Outcome struct {
 	StderrBytes   int64
 	PeakBytes     int64
 	PeakUnsampled bool
+	// CPUUserMS and CPUSysMS are the processor time the step's child consumed,
+	// in milliseconds. CPUUnsampled reports that no processor time was
+	// obtained -- the child never started, or was killed and never reaped --
+	// so the two figures are unavailable rather than zero and a caller that
+	// publishes them must omit them (Section 22).
+	CPUUserMS    int64
+	CPUSysMS     int64
+	CPUUnsampled bool
+	// ReadBytes and WriteBytes are the bytes the step's process group
+	// transferred through the kernel, as the last sweep that still found the
+	// tree running summed them. They count bytes where the process called the
+	// kernel, so they are not disk volume, and they are a sample taken at most
+	// one sampling period before the tree exited rather than an exit-time
+	// total. IOUnsampled reports that no sweep ever read the counters, so the
+	// two figures are unavailable rather than zero.
+	ReadBytes   int64
+	WriteBytes  int64
+	IOUnsampled bool
+	// StderrTail is the last of what the child wrote to its standard error,
+	// bounded to what one error detail carries and cut at a line boundary,
+	// with the private paths of this run reduced to their names. It is the
+	// evidence a failed unit leaves behind: without it the only record of a
+	// crash is its byte count, and a reader has to reproduce the run to learn
+	// what the child said.
+	StderrTail string
 }
 
 // ExportOutcome adds the liveness probe of the produced export. Live reports

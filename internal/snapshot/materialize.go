@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,14 +14,18 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // MaterializeOptions bound one private materialization.
 type MaterializeOptions struct {
 	// Dir is the parent for materializations, normally MaterializeDir(dataDir).
 	Dir string
-	// MaxBytes bounds the total content copied; exceeding it is a typed
-	// resource limit and nothing is left behind.
+	// MaxBytes bounds the total content copied. Zero -- the default -- is
+	// unlimited. Under a user-set budget the files that fit are materialized
+	// and every file left out is named in Skipped; the tree is never refused,
+	// because an analyzer given a smaller tree with a list of what is missing
+	// can still answer, while one given an error cannot.
 	MaxBytes int64
 	// Include, when set, decides membership file by file: only versions it
 	// accepts are copied, and the ones it rejects cost neither a byte of the
@@ -40,6 +45,35 @@ type Materialization struct {
 	owner *os.File
 	once  sync.Once
 	err   error
+	// skippedPaths are the files a user-set MaxBytes budget left out, by path;
+	// skippedCount is complete. The count is retained rather than the whole
+	// list so a budget far below the tree size cannot itself become the
+	// repository-sized allocation the budget exists to prevent.
+	skippedPaths []string
+	skippedCount int
+}
+
+// maxSkippedPaths bounds the exemplar list beside the complete count, matching
+// the capture notes' convention.
+const maxSkippedPaths = 32
+
+func (m *Materialization) skipped(path string) {
+	m.skippedCount++
+	if len(m.skippedPaths) < maxSkippedPaths {
+		m.skippedPaths = append(m.skippedPaths, path)
+	}
+}
+
+// reportSkips puts a user-set budget's exclusions in front of the operator.
+// The tree is handed to an analyzer whose answer is then narrower than the
+// snapshot, so the budget that narrowed it is never silent.
+func (m *Materialization) reportSkips(maxBytes int64) {
+	if m.skippedCount == 0 {
+		return
+	}
+	slog.Default().Warn("materialization budget exceeded; files were not materialized",
+		"component", "snapshot.materialize", "max_bytes", maxBytes,
+		"skipped_files", m.skippedCount, "skipped_examples", m.skippedPaths)
 }
 
 // Root is the absolute directory holding the copied files.
@@ -51,13 +85,13 @@ func (m *Materialization) Close() error {
 		return nil
 	}
 	m.once.Do(func() {
-		if err := os.RemoveAll(m.root); err != nil {
+		if err := paced.RemoveAllFor(paced.Materialization, m.root); err != nil {
 			m.err = ioError("materialization cleanup", err)
 		}
 		if m.owner != nil {
 			fslock.Unlock(m.owner)
 			m.owner.Close()
-			if err := os.Remove(m.owner.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) && m.err == nil {
+			if err := paced.Remove(m.owner.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) && m.err == nil {
 				m.err = ioError("materialization cleanup", err)
 			}
 		}
@@ -75,8 +109,8 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 	if !filepath.IsAbs(opts.Dir) {
 		return nil, invalid("the materialization directory must be an absolute path")
 	}
-	if opts.MaxBytes <= 0 {
-		return nil, resourceLimit("materialization needs a positive byte bound")
+	if opts.MaxBytes < 0 {
+		return nil, resourceLimit("the materialization byte bound is negative; zero means unlimited")
 	}
 	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
 		return nil, ioError("materialization directory", err)
@@ -92,7 +126,7 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 	}
 	if held, err := fslock.TryLock(owner); err != nil || !held {
 		owner.Close()
-		os.Remove(owner.Name())
+		paced.Remove(owner.Name())
 		if err == nil {
 			err = errors.New("fresh lock file is already locked")
 		}
@@ -106,6 +140,7 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 	if err := m.fill(ctx, view, sel, opts); err != nil {
 		return nil, errors.Join(err, m.Close())
 	}
+	m.reportSkips(opts.MaxBytes)
 	return m, nil
 }
 
@@ -126,9 +161,13 @@ func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel
 		if opts.Include != nil && !opts.Include(fv) {
 			return nil
 		}
-		if total += fv.Size; total > opts.MaxBytes {
-			return resourceLimit("materialization exceeds its %d-byte bound", opts.MaxBytes)
+		if opts.MaxBytes > 0 && total+fv.Size > opts.MaxBytes {
+			// A user-set budget admits what fits and reports the rest by path;
+			// it never fails the analyzer tree. Zero is unlimited, the default.
+			m.skipped(fv.Path)
+			return nil
 		}
+		total += fv.Size
 		if strings.HasPrefix(fv.Path, "/") || path.Clean(fv.Path) != fv.Path {
 			return &model.Error{Code: model.CodePathEscape, Message: "manifest path is not a normalized root-relative path"}
 		}
@@ -193,12 +232,12 @@ func sweepMaterializations(dir string) error {
 			}
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := paced.RemoveAllFor(paced.Materialization, filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
 		fslock.Unlock(f)
 		f.Close()
-		if err := os.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
 	}

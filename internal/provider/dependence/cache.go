@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // maxCacheEntries bounds the directory scan retention performs, so a corrupted
@@ -37,8 +39,21 @@ const maxCacheEntries = 4096
 const cacheKeyDomain = "dependence-graph-cache"
 
 // CacheKey is the semantic closure of one unit's parsed graph.
-func CacheKey(ctx context.Context, view model.SnapshotView, u Unit, argv []string, e Engine) (string, error) {
+//
+// providerVersion and analysisConfigHash are the two components the unit's own
+// identity is derived from that nothing else here carries (model.NewUnitID).
+// Without them a provider upgrade or an analysis-configuration edit rebuilds
+// the unit and the rebuild reuses a graph produced under the version and the
+// configuration it replaced -- a different analysis published under the new
+// unit's name. The cost is the other direction of the same rule: a
+// configuration edit that cannot change what the parse produces still reparses.
+// A reuse boundary that disagrees with unit identity is the worse of the two.
+func CacheKey(ctx context.Context, view model.SnapshotView, u Unit, argv []string, e Engine,
+	providerVersion, analysisConfigHash string) (string, error) {
+
 	h := model.NewHasher(cacheKeyDomain)
+	h.AddString(providerVersion)
+	h.AddString(analysisConfigHash)
 	h.AddString(u.ScopeKey)
 	h.AddString(string(u.Family))
 	h.AddString(u.Root)
@@ -135,11 +150,28 @@ func (c *Cache) Put(key, graph string) bool {
 		return false
 	}
 	if err := os.Chmod(dst, 0o600); err != nil {
-		_ = os.Remove(dst)
+		_ = paced.Remove(dst)
 		return false
 	}
 	c.evict(dst)
 	return true
+}
+
+// Drop removes an entry the caller has proved useless -- a graph whose export
+// the engine cannot complete, or one that exports no method at all. Such an
+// entry is not merely stale: Lookup touches what it returns, so it would stay
+// the most recently used graph in the directory and hold its bytes inside the
+// budget for as long as the unit is refreshed, while every refresh skipped the
+// parse and re-paid the dead export. An entry that is not there is not an
+// error, and a removal that fails costs only the space.
+func (c *Cache) Drop(key string) {
+	if c == nil || c.budget == 0 || !model.ValidHexID(key) {
+		return
+	}
+	if err := paced.Remove(c.path(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Error("a dependence graph proved dead was not removed from the cache",
+			"component", component, "error", err)
+	}
 }
 
 // entry is one cached graph's retention record.
@@ -193,7 +225,7 @@ func (c *Cache) evict(keep string) {
 		if e.path == keep {
 			continue
 		}
-		if err := os.Remove(e.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.Remove(e.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		total -= e.size

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -677,7 +678,7 @@ func managedResolver(t *testing.T, overrides map[string]toolchain.Override) *too
 	t.Helper()
 	r, err := toolchain.New(toolchain.Options{
 		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
-		FetchTimeout: time.Second, Overrides: overrides,
+		Overrides: overrides,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -766,4 +767,510 @@ func TestManagedToolIdentity(t *testing.T) {
 			t.Fatalf("the provider version is not a function of the payloads: %q then %q", first, again)
 		}
 	})
+}
+
+// TestOverLimitFieldsAreDroppedAndCounted protects plan row 26: a value over a
+// wire field bound is degradation of that record, never a refusal of the
+// index. One 128-KiB generated symbol name in a monorepo's index used to abort
+// the whole import, so the unit published nothing at all -- the maximal
+// version of the loss it was guarding against.
+//
+// The two halves the split rests on are asserted together: an over-limit
+// IDENTIFYING field (the occurrence's symbol) drops that RECORD, because a
+// symbol-less occurrence is a fact about nothing; an over-limit DECORATIVE
+// field (the symbol's display name) drops only the FIELD and the record is
+// still published. Both are counted per bound on the unit's capability row --
+// silence there is the class-G defect this replaces.
+func TestOverLimitFieldsAreDroppedAndCounted(t *testing.T) {
+	files := fixture(t)
+	longSymbol := "scip-fixture . . " + strings.Repeat("x", model.MaxNativeKeyBytes)
+	longName := strings.Repeat("n", model.MaxNameBytes+1)
+	symbolRecord := appendBytes(appendBytes(nil, 1, []byte(symBar)), 6, []byte(longName))
+	doc := documentRecord("pkg/d.go", "go", 1,
+		occurrenceRecord(longSymbol, 1, 2, 5, 8),
+		occurrenceRecord(symBar, 1, 2, 5, 8))
+	doc = appendBytes(doc, 3, symbolRecord)
+	files["drops.scip"] = string(miniIndex("scip-fixture", "0.1.0", doc))
+	inputs := append([]string{"drops.scip"}, sourcePaths...)
+	got, rep := importDelta(t, providertest.New(t, files), newProvider(t, "drops.scip"),
+		scip.ImportScope("drops.scip"), inputs, nil)
+
+	if rep.Result.State != model.RunSucceeded {
+		t.Fatalf("an index carrying an over-limit symbol failed the unit: state=%s", rep.Result.State)
+	}
+	if len(got.nodes) == 0 {
+		t.Fatal("the in-bound occurrence published nothing; an over-limit sibling must not take the record with it")
+	}
+	if len(rep.Result.Capabilities) == 0 {
+		t.Fatal("the run reported no capability states")
+	}
+	d := rep.Result.Capabilities[0].Details
+	if want := "occurrence symbol=1"; d["decode_dropped_records"] != want {
+		t.Fatalf("decode_dropped_records = %q, want %q: an over-limit identifying field drops the record and says so", d["decode_dropped_records"], want)
+	}
+	if want := "display name=1"; d["decode_dropped_fields"] != want {
+		t.Fatalf("decode_dropped_fields = %q, want %q: an over-limit decorative field drops alone and says so", d["decode_dropped_fields"], want)
+	}
+	if d["decode_drop_reason"] == "" {
+		t.Fatalf("the capability row names no reason for the drops: %v", d)
+	}
+	// The state must be partial; the diagnostic code is whichever reason
+	// degraded the unit FIRST, and an unverified binding outranks a resource
+	// limit by design (`degrade`). Pinning the resource-limit code here would
+	// assert the ordering, not the drop.
+	if c := rep.Result.Capabilities[0]; c.State != model.CapabilityPartial || c.DiagnosticCode == "" {
+		t.Fatalf("a run that dropped records reported %+v; it must be partial under a named reason", c)
+	}
+}
+
+// newBoundedProvider is newProvider with the user-set import bounds under test.
+func newBoundedProvider(t *testing.T, importPath string, limits scip.Limits) *scip.Provider {
+	t.Helper()
+	p, err := scip.New(context.Background(), scip.Options{Import: importPath, WorkDir: t.TempDir(), Limits: limits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestUserSetImportBoundsAreReportedNotRefused protects the row-28 contract
+// for the SCIP provider: the figures a user may now set under providers.scip.*
+// are reporting thresholds, not refusals. Each of the three asserted here used
+// to fail the whole unit the moment it was crossed, with no key to raise, so a
+// repository larger than a built-in constant published nothing at all.
+//
+// The bounds are set to 1 so every one of them is crossed, and the run must
+// still succeed, still publish the facts of BOTH documents, and name each
+// crossed key with the figure seen -- reporting the pass is the only thing
+// that changes when a threshold nothing enforces is exceeded.
+func TestUserSetImportBoundsAreReportedNotRefused(t *testing.T) {
+	files := fixture(t)
+	files["bounds.scip"] = string(miniIndex("scip-fixture", "0.1.0",
+		documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8)),
+		documentRecord("pkg/a.go", "go", 1, occurrenceRecord(symBar, 0, 2, 5, 8))))
+	inputs := append([]string{"bounds.scip"}, sourcePaths...)
+	p := newBoundedProvider(t, "bounds.scip", scip.Limits{MaxIndexBytes: 1, MaxDocuments: 1, MaxSpoolBytes: 1})
+	got, rep := importDelta(t, providertest.New(t, files), p, scip.ImportScope("bounds.scip"), inputs, nil)
+
+	if rep.Result.State != model.RunSucceeded {
+		t.Fatalf("an import over three user-set bounds failed the unit: state=%s", rep.Result.State)
+	}
+	if len(got.nodes) == 0 {
+		t.Fatal("an import over a user-set bound published nothing; a threshold must not cut the facts")
+	}
+	if n := rep.Manifest.Len(); n != 2 {
+		t.Fatalf("the import admitted %d documents, want 2: max_documents must not drop a document", n)
+	}
+	c := rep.Result.Capabilities[0]
+	crossed := c.Details["resource_limits_exceeded"]
+	for _, key := range []string{"max_documents=2/1", "max_index_bytes=", "max_spool_bytes="} {
+		if !strings.Contains(crossed, key) {
+			t.Fatalf("resource_limits_exceeded = %q, want it to name %q: a crossed bound the operator set must be reported", crossed, key)
+		}
+	}
+	if c.State != model.CapabilityPartial || c.DiagnosticCode == "" {
+		t.Fatalf("a run that crossed a user-set bound reported %+v; it must be partial under a named reason", c)
+	}
+}
+
+// TestOverLimitSignatureIsTruncatedNotDropped protects F26: the two producers
+// of a signature must answer the same way. The structural provider truncates a
+// long signature to its ceiling and flags the cut; this one used to discard it
+// whole, so the same symbol carried a usable prefix from one and nothing at
+// all from the other.
+func TestOverLimitSignatureIsTruncatedNotDropped(t *testing.T) {
+	files := fixture(t)
+	long := strings.Repeat("s", model.MaxSignatureBytes+64)
+	sig := appendBytes(nil, 5, []byte(long))
+	symbolRecord := appendBytes(appendBytes(nil, 1, []byte(symBar)), 7, sig)
+	doc := documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8))
+	files["sig.scip"] = string(miniIndex("scip-fixture", "0.1.0", appendBytes(doc, 3, symbolRecord)))
+	inputs := append([]string{"sig.scip"}, sourcePaths...)
+	got, _ := importDelta(t, providertest.New(t, files), newProvider(t, "sig.scip"),
+		scip.ImportScope("sig.scip"), inputs, nil)
+
+	var found bool
+	for _, n := range got.nodes {
+		if n.Node.Signature == "" {
+			continue
+		}
+		found = true
+		if len(n.Node.Signature) > model.MaxSignatureBytes {
+			t.Fatalf("the stored signature is %d bytes, over the %d-byte ceiling", len(n.Node.Signature), model.MaxSignatureBytes)
+		}
+		var meta struct {
+			Truncated map[string]int64 `json:"truncated_fields"`
+		}
+		if err := json.Unmarshal(n.Node.Metadata, &meta); err != nil {
+			t.Fatalf("node metadata: %v", err)
+		}
+		if got := meta.Truncated["signature"]; got != int64(len(long)) {
+			t.Fatalf("truncated_fields[signature] = %d, want %d: a cut signature must say how long it was", got, len(long))
+		}
+	}
+	if !found {
+		t.Fatal("an over-limit signature was dropped whole; it must be truncated to its ceiling and flagged")
+	}
+}
+
+// TestScopesPlanAUnitPerProjectDirectory protects precise indexing on a
+// repository that keeps its projects where its own toolchains expect them.
+//
+// Failure mode: triggers were looked for at the workspace root only, so a
+// monorepo whose every `package.json` and `go.mod` sits in a subdirectory
+// planned ZERO precise units -- `precise_definitions`,
+// `precise_references` and `precise_implementations` unavailable for the whole
+// repository, with six indexers installed and a project for each of them.
+//
+// It also holds the rule a per-directory plan needs: a directory that carries
+// its own manifest is its own project, nested or not. The measured shape is a
+// monorepo whose inner package has a manifest of its own; folding it into the
+// outer project left it planned by nobody's unit but the outer one's, which is
+// what made a nested project's facts depend on where its manifest sat.
+//
+// Mutation proof: in walkTriggers, stop the walk after the workspace root and
+// the assertion fails with no scopes at all.
+func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
+	ctx := context.Background()
+	exe, sum := testBinaryDigest(t)
+	h := providertest.New(t, map[string]string{
+		"go.mod":                       "module m\n",
+		"a.go":                         "package m\n",
+		"tools/build/go.mod":           "module m/tools/build\n",
+		"tools/build/b.go":             "package build\n",
+		"app/package.json":             "{}\n",
+		"app/a.ts":                     "export const a = 1;\n",
+		"app/packages/ui/package.json": "{}\n",
+		"app/packages/ui/u.ts":         "export const u = 1;\n",
+		"legacyPortal/package.json":    "{}\n",
+		"legacyPortal/v.ts":            "export const v = 1;\n",
+	})
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := scip.New(ctx, scip.Options{WorkDir: t.TempDir(), Runner: runner,
+		Resolver: managedResolver(t, map[string]toolchain.Override{
+			"scip-go":         {Executable: exe, Version: "1", Checksum: sum},
+			"scip-typescript": {Executable: exe, Version: "1", Checksum: sum},
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	det, err := p.Detect(ctx, h.Root, h.Policy)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if !det.Available {
+		t.Fatal("Detect reports unavailable for a workspace holding five indexable projects")
+	}
+	got := p.Scopes(det)
+	slices.Sort(got)
+	want := []string{
+		scip.ProfileScope("scip-go", ""),
+		scip.ProfileScope("scip-go", "tools/build"),
+		scip.ProfileScope("scip-typescript", "app"),
+		scip.ProfileScope("scip-typescript", "app/packages/ui"),
+		scip.ProfileScope("scip-typescript", "legacyPortal"),
+	}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("Scopes = %v, want %v", got, want)
+	}
+}
+
+// documentWithText is documentRecord plus the Document.text field. A document
+// that carries the pinned file's own bytes is what makes an import's binding
+// verified. Under either binding a coordinate that misses those bytes costs
+// that occurrence and degrades the unit to partial; what the binding changes
+// is the code the degradation carries, never whether the unit survives.
+func documentWithText(path, language string, encoding uint64, text string, occurrences ...[]byte) []byte {
+	return appendBytes(documentRecord(path, language, encoding, occurrences...), 5, []byte(text))
+}
+
+// TestOccurrenceMustDescribeThePinnedBytes protects the wrong-bytes guarantee
+// at the granularity the guarantee is made and at the granularity it costs:
+// every occurrence is proved, and a refusal costs that occurrence alone.
+//
+// Failure mode, silent and measured on a real project: on a line indented with
+// spaces followed by a tab an indexer can count columns to a different tab stop
+// than the file does, so an occurrence's range is shifted a few columns, stays
+// inside its line, converts to a valid rune-aligned extent and is published at
+// compiler precision over source that is not the symbol. Nothing downstream can
+// detect it — the range is in bounds, the file is the right file, and the fact
+// simply names the wrong bytes.
+//
+// Both publication paths are covered, and every occurrence of both is held to
+// the same proof: the range covers whole tokens, and a range that is one
+// identifier token spells the name its symbol carries. The document leaves its
+// position encoding unspecified, so the per-document encoding probe runs and
+// passes on the first definition, which is correct in every case; the shifted
+// occurrence is the second one.
+//
+// The second failure mode, measured on the same project and equally silent:
+// failing the unit on the first refusal threw away all 93,167 occurrences over
+// 4,714 wrong columns, so a project the indexer mis-columns anywhere publishes
+// nothing anywhere. The unit must survive, publish `partial`, and say how many
+// occurrences it left out and in which document — a silent count would make a
+// thinned unit indistinguishable from a whole one.
+//
+// Mutations that must fail this test: probe once per document (drop the range
+// check from occurrenceRange), which republishes the wrong bytes; drop the
+// end-of-token half of the coverage check, which republishes the keyword case;
+// or drop the refusal count from the capability details, which republishes the
+// silence.
+func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
+	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
+	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	cases := []struct {
+		name    string
+		shifted []byte
+	}{
+		// A declaration on a clean token boundary that is not its own name:
+		// the columns of the parameter, not of the function.
+		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18)},
+		// Five columns to the right of "browser" and still inside the line:
+		// "er + br", which starts in the middle of an identifier.
+		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22)},
+		// Seven columns to the left: "return ", a keyword plus the space
+		// before the identifier. Both ends are wrong -- it covers no whole
+		// token and it does not spell the symbol's name -- and it is the
+		// shift the start-boundary check alone admitted.
+		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10)},
+		// Four columns to the right and four wider: "browser + b", which
+		// begins on a token boundary and stops in the middle of the next
+		// identifier. Only the end of it is wrong, which is the half of the
+		// coverage rule the three rows above do not exercise.
+		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := fixture(t)
+			files["pkg/tabs.go"] = src
+			files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+				documentWithText("pkg/tabs.go", "go", 0, src,
+					// Clean, refused, clean: the last one is spooled AFTER the
+					// refusal, so a refusal that cost the rest of its document
+					// would take it with it.
+					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted,
+					occurrenceRecord(symBrowser, 0, 5, 10, 17))))
+
+			h := providertest.New(t, files)
+			p := newProvider(t, "tabs.scip")
+			got, rep := importDelta(t, h, p, scip.ImportScope("tabs.scip"),
+				append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...), nil)
+			// The clean reference after the refusal still published its
+			// call-site alias, which is what separates "one occurrence
+			// refused" from "the document dropped".
+			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
+				t.Fatalf("%d call-site aliases, want 1: the clean occurrence after the refused one must still publish (%v)", n, aliasKeys(got))
+			}
+			for _, cs := range rep.Result.Capabilities {
+				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+					t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+				}
+				if got := cs.Details["refused_occurrences"]; got != "1" {
+					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, "1")
+				}
+				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, "pkg/tabs.go: ") {
+					t.Fatalf("refused_occurrence_exemplar = %q, want the document named", got)
+				}
+			}
+		})
+	}
+}
+
+// TestFailedEncodingProbeDropsTheDocument protects the one shift that is NOT a
+// per-occurrence refusal. A position encoding assumed from the tool table and
+// contradicted by the bytes shifts every column of that document, so no
+// occurrence of it can be trusted and the document is dropped whole. The
+// failure mode, silent: dropping it without a count leaves an operator reading
+// a unit that describes fewer files than the index held with nothing saying so.
+//
+// The document declares no encoding, so the scip-typescript table entry
+// (UTF-16) is assumed; its one definition sits after a 4-byte rune, where a
+// UTF-16 reading and the truth disagree, and the columns given are the UTF-8
+// ones. Mutation that must fail this test: drop the encodingDropped count (or
+// its detail), which republishes the silence.
+func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
+	// "𝄞" is one UTF-8 4-byte rune and two UTF-16 units. "Start" therefore
+	// begins at UTF-8 column 9 and UTF-16 column 7; the columns below are the
+	// UTF-8 ones, which a UTF-16 reading resolves to bytes that are not it.
+	const src = "// \U0001D11E xx\nfunc Start() {}\n"
+	const symStart = "scip-typescript npm example 1.0.0 src/`a.ts`/Start()."
+
+	files := fixture(t)
+	files["src/a.ts"] = src
+	files["a.scip"] = string(miniIndex("scip-typescript", "0.4.0",
+		documentWithText("src/a.ts", "typescript", 0, src,
+			occurrenceRecord(symStart, 1, 0, 17, 22))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "a.scip")
+	res, _, err := h.Run(t, p, scip.ImportScope("a.scip"), append([]string{"a.scip", "src/a.ts"}, sourcePaths...))
+	if err != nil {
+		t.Fatalf("a document whose encoding probe fails must be dropped, not fail the unit: %v", err)
+	}
+	for _, cs := range res.Capabilities {
+		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+		}
+		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
+			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
+		}
+		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "src/a.ts" {
+			t.Fatalf("documents_dropped_encoding_exemplar = %q, want src/a.ts", got)
+		}
+	}
+	if got := refusedDetail(res); got != "" {
+		t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not a refused occurrence", got)
+	}
+}
+
+// TestAProbeLandingOnAnotherWholeTokenDropsTheDocument protects the name half
+// of the per-document encoding probe: the half that catches an assumed
+// encoding whose columns still convert cleanly.
+//
+// Failure mode, silent: an encoding taken from the per-tool table shifts every
+// column of a document onto other whole tokens of the same lines, so each range
+// converts, is in bounds, cuts no token and covers whole tokens -- and the
+// document publishes a full set of compiler-precision facts over source that is
+// not the symbol, with nothing downstream able to tell. Only the comparison of
+// the selected text against the name the symbol carries separates that reading
+// from the truth.
+//
+// The probe-deciding occurrence here is a declaration of `Start` ranged over
+// `browser`, one whole identifier token further along the same line: it
+// converts, it is not cut, it covers whole tokens, and it is not `Start`. The
+// conversion-error path that TestFailedEncodingProbeDropsTheDocument fires
+// through is therefore never reached, so this is the half that test misses.
+// Because the probe is a claim about the whole document, the assertions are
+// that nothing of it survives -- no call-site alias from the clean reference
+// spooled after it, no row in the fresh manifest -- and that the drop is
+// counted with its exemplar.
+//
+// Mutation that must fail this test, NOT applied and NOT run: let the
+// document-level probe ignore a name mismatch while the per-occurrence path
+// keeps it, i.e. in `encodingHolds` replace
+//
+//	holds = ds.onPinnedBytes(sym, &rng) == ""
+//
+// with
+//
+//	msg := ds.onPinnedBytes(sym, &rng)
+//	holds = msg == "" || msg == "the occurrence does not select the identifier its symbol names"
+//
+// The document is then admitted, the declaration is refused as one occurrence,
+// the reference after it publishes its call-site alias and the manifest gains a
+// row. Deleting the comparison from `onPinnedBytes` outright is a wider
+// mutation that TestOccurrenceMustDescribeThePinnedBytes/definition already
+// catches, so it does not describe this gap.
+//
+// This test was written but has not been compiled and has not been run.
+func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
+	// The same line as the two tests above. On line 4 "Start" sits at columns
+	// [5,10) and "browser" at [11,18); on line 2 "Server" sits at [5,11) and
+	// on line 5 "browser" at [10,17).
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	files := fixture(t)
+	files["pkg/tabs.go"] = src
+	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+		documentWithText("pkg/tabs.go", "go", 0, src,
+			// The document states no encoding, so the per-tool table supplies
+			// one and the probe runs. The first definition whose symbol names
+			// an identifier decides the document, and this is it: the columns
+			// of the parameter under the name of the function.
+			occurrenceRecord(symStart, 1, 4, 11, 18),
+			// Both clean, both spooled after the probe-deciding occurrence, so
+			// a document that was merely thinned rather than dropped would
+			// still resolve this definition and publish this reference's
+			// call-site alias.
+			occurrenceRecord(symServer, 1, 2, 5, 11),
+			occurrenceRecord(symBrowser, 0, 5, 10, 17))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "tabs.scip")
+	got, rep := importDelta(t, h, p, scip.ImportScope("tabs.scip"),
+		append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...), nil)
+	if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 0 {
+		t.Fatalf("%d call-site aliases, want 0: a failed encoding probe drops the whole document, not one occurrence (%v)", n, aliasKeys(got))
+	}
+	if n := rep.Manifest.Len(); n != 0 {
+		t.Fatalf("fresh manifest holds %d documents, want 0: a dropped document must stay out of it, so a later refresh treats it as new", n)
+	}
+	for _, cs := range rep.Result.Capabilities {
+		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+		}
+		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
+			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
+		}
+		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "pkg/tabs.go" {
+			t.Fatalf("documents_dropped_encoding_exemplar = %q, want pkg/tabs.go", got)
+		}
+		if got := cs.Details["refused_occurrences"]; got != "" {
+			t.Fatalf("refused_occurrences = %q: a failed encoding probe is one dropped document, not a refused occurrence", got)
+		}
+	}
+}
+
+// TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse holds the boundary of
+// the wrong-bytes guarantee, which docs/providers-scip.md states beside it: a
+// shift that lands on a whole token spelling the same identifier somewhere
+// else publishes, because the two ranges are byte-for-byte the same claim and
+// this provider never adjusts or guesses a coordinate.
+//
+// Failure mode it guards: the guarantee being read, or later written, as
+// total. A page that claimed every occurrence is proved would tell an operator
+// that a located fact of a `partial` unit cannot name the wrong token, and the
+// counts would carry no warning at all for this class. If a later predicate
+// does refuse this occurrence, the residual on that page is stale and the
+// guarantee can be widened -- which is why this asserts publication rather
+// than leaving the class untested.
+func TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse(t *testing.T) {
+	// The same line as the test above. "browser" sits at columns [10,17) and
+	// again at [20,27); the occurrence below is the first one shifted ten
+	// columns right, onto the second.
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	files := fixture(t)
+	files["pkg/tabs.go"] = src
+	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+		documentWithText("pkg/tabs.go", "go", 0, src,
+			occurrenceRecord(symStart, 1, 4, 5, 10),
+			occurrenceRecord(symBrowser, 0, 5, 20, 27))))
+
+	h := providertest.New(t, files)
+	p := newProvider(t, "tabs.scip")
+	res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := refusedDetail(res); got != "" {
+		t.Fatalf("refused_occurrences = %q: a shift onto a token spelling the same identifier is the measured residual, "+
+			"not something the pinned bytes can refuse -- if it now is, widen the guarantee on docs/providers-scip.md", got)
+	}
+}
+
+func refusedDetail(res model.ProviderResult) string {
+	for _, cs := range res.Capabilities {
+		if v := cs.Details["refused_occurrences"]; v != "" {
+			return v
+		}
+	}
+	return ""
 }

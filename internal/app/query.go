@@ -10,9 +10,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// graphGate is the process-scoped `resources.max_concurrent_graph_queries`
-// semaphore. It is owned here and not by the engine because Workspace.Query
-// builds one Engine per request: a per-Engine semaphore would gate nothing.
+// graphGate is the process-scoped traversal semaphore, sized from the cores
+// this process has (config.GraphSlots). It is owned here and not by the engine
+// because Workspace.Query builds one Engine per request: a per-Engine
+// semaphore would gate nothing.
 //
 // Release returns the slot Acquire took and must be called exactly once per
 // successful Acquire; a Release without one blocks, which is the loud failure
@@ -21,11 +22,9 @@ type graphGate struct {
 	slots chan struct{}
 }
 
-// newGraphGate builds the gate with n concurrent slots. n below one is raised
-// to one: a configuration that admitted no query at all would refuse every
-// graph request with a resource limit nobody can satisfy.
-func newGraphGate(n int) *graphGate {
-	return &graphGate{slots: make(chan struct{}, maxInt(1, n))}
+// newGraphGate builds the gate with one slot per config.GraphSlots.
+func newGraphGate() *graphGate {
+	return &graphGate{slots: make(chan struct{}, config.GraphSlots())}
 }
 
 // Acquire takes a slot, waiting no longer than the request's own deadline.
@@ -45,7 +44,7 @@ func (g *graphGate) Acquire(ctx context.Context) error {
 	case <-ctx.Done():
 		return &model.Error{Code: model.CodeResourceLimit, Retryable: true,
 			Message:     "every graph query slot was busy for the whole request deadline",
-			Remediation: "retry when fewer queries are running, or raise resources.max_concurrent_graph_queries"}
+			Remediation: "retry when fewer traversals are running; how many run at once is derived from this machine's cores and is not a setting"}
 	}
 }
 
@@ -58,11 +57,6 @@ func (g *graphGate) Release() { <-g.slots }
 // N+1 queries against the relation indexes.
 type adjacency struct {
 	reader *sqlite.PinnedReader
-}
-
-func (a adjacency) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	return a.reader.EdgesBatch(ctx, nodes, direction, kinds, after, limit)
 }
 
 // NodesByID drops the storage-only fields of a StoredNode: the engine hydrates
@@ -184,11 +178,11 @@ func (p promoter) Promote(ctx context.Context, providerID, scopeKey string) (gra
 // already refuses.
 func graphLimits(cfg config.Config) graph.Limits {
 	return graph.Limits{
-		MaxDepth:       cfg.Context.MaxGraphDepth,
-		MaxVisited:     cfg.Context.MaxVisitedNodes,
-		MaxEdges:       cfg.Context.MaxGraphEdges,
+		MaxDepth:       cfg.Context.MaxGraphDepth.Int(),
+		MaxVisited:     cfg.Context.MaxVisitedNodes.Int(),
+		MaxEdges:       cfg.Context.MaxGraphEdges.Int(),
 		MaxPageItems:   cfg.Resources.MaxPageItems,
-		MaxReasonPaths: cfg.Context.MaxReasonPathsPerEntry,
+		MaxReasonPaths: cfg.Context.MaxReasonPathsPerEntry.Int(),
 		QueryTimeout:   cfg.Resources.QueryTimeout.Std(),
 		CursorTTL:      cfg.Storage.QueryCursorTTL.Std(),
 		FrontierBytes:  cfg.Resources.QueryMemoryBytes,

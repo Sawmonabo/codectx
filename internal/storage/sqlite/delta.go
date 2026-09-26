@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"iter"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -17,6 +18,17 @@ import (
 // query, every membership check and the single deleteUnit procedure of Section
 // 12.4 would have to learn about unit chains. A copy costs one bounded
 // INSERT..SELECT per fact table and leaves all of that untouched.
+//
+// One thing is shared rather than copied, for the same reason node_ids is: a
+// lexical document's FTS posting. search_fts is contentless (ADR-0003 §2.1),
+// so the indexed text exists ONLY as postings -- no column of this database
+// holds it, and it cannot be re-derived from the source either, because a
+// producer's Body is not the file's bytes over [start_byte, end_byte)
+// (treesitter publishes names, signature and documentation; the filesystem
+// provider publishes none). A carried document therefore keeps the posting it
+// was indexed into, by copying search_units.doc_id along with the rest of the
+// row, and re-indexes nothing. deleteUnit releases a posting only when no
+// surviving unit's row still names it, exactly as it releases a node id.
 //
 // Two retention granularities are supported because the two wave-A importers
 // have two:
@@ -42,10 +54,13 @@ import (
 // only while the node they target is still a fact of the new unit — exactly
 // the condition SealUnit enforces.
 
-// MaxDeltaStateBytes bounds one stored delta-state payload. A provider's
-// manifest or key set is a bounded derivative of the unit it describes; a
-// payload past this is a producer defect, not a large repository.
-const MaxDeltaStateBytes = 64 << 20
+// deltaStatePart is the size of one stored part of a delta-state artifact.
+// An artifact is written and read as a sequence of parts so that a manifest
+// or key set the size of a large unit never sits whole in the process: the
+// producer streams it from the file it was built in, and a refresh streams it
+// back into one. A part is one row's blob, small enough to pass through the
+// engine's bind buffer and the writer's cache without spilling on its own.
+const deltaStatePart = 1 << 20
 
 // Replaced names everything of the previous unit that the current import has
 // already re-emitted or that no longer exists. Everything else is carried.
@@ -62,15 +77,20 @@ const MaxDeltaStateBytes = 64 << 20
 //
 // A producer's stream may read the store — the dependence applier's Files is a
 // merge join against Store.UnitInputs — and it is drained from inside
-// CarryOver's write transaction, on the single writer connection. Such a
-// stream takes a connection from the reader pool (read_connections, default 2)
-// once per page of its own scan, and the write transaction stays open across
-// every one of those round-trips. WAL readers never wait on the writer, so
-// this cannot deadlock; it does mean a saturated reader pool stalls the
-// carry-over, and the open write transaction blocks every other writer in the
-// process for as long as the walk lasts. A producer whose stream reads the
-// store must therefore keep those reads bounded and proportional to the unit
-// it is replacing, and must not discover this nesting by measuring a stall.
+// CarryOver's ingestion call, on the single writer connection. Such a stream
+// sees the store as of the last commit: it takes a connection from the reader
+// pool (read_connections, default 2) once per page of its own scan, and the
+// ingestion group stays open across every one of those round-trips. What a
+// stream reads is the predecessor unit, sealed and committed before this run
+// began, so the last commit is the state it needs; a stream must never call a
+// read that runs on the group's own connection, because the ingestion call
+// draining it holds that connection and the two would wait on each other.
+// WAL readers never wait on the writer, so the pool reads cannot deadlock; a
+// saturated reader pool stalls the carry-over, and the open group blocks
+// every other writer in the process for as long as the walk lasts. A producer
+// whose stream reads the store must therefore keep those reads bounded and
+// proportional to the unit it is replacing, and must not discover this
+// nesting by measuring a stall.
 type Replaced struct {
 	// Files are the per-path evidence buckets the import replaced or dropped.
 	// Each must be a valid FileID.
@@ -106,10 +126,10 @@ type CarryOverStats struct {
 // batches and before SealUnit: every insert it issues yields to a row already
 // present, so the fresh import always wins over its predecessor.
 //
-// The whole body runs in one write transaction on the single writer
-// connection, and draining Replaced's three streams happens inside it: a
-// producer stream that reads the store runs nested in this transaction and on
-// another connection (see Replaced).
+// The whole body is one ingestion call on the single writer connection, and
+// draining Replaced's three streams happens inside it: a producer stream that
+// reads the store runs nested in this call and on the reader pool, seeing the
+// last commit (see Replaced).
 //
 // Carrying a row asserts that its source has not changed, so the whole call is
 // refused unless every file the previous unit located facts in, and that
@@ -128,7 +148,7 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 		return CarryOverStats{}, err
 	}
 	var stats CarryOverStats
-	err = w.s.write(ctx, func(tx *sql.Tx) error {
+	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
 		prevRow, err := w.previousUnitRow(ctx, tx, prev, prevKey)
 		if err != nil {
 			return err
@@ -156,7 +176,7 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 	if err != nil {
 		return CarryOverStats{}, err
 	}
-	w.ftsDocs += stats.SearchUnits
+	w.searchDocs += stats.SearchUnits
 	return stats, nil
 }
 
@@ -370,11 +390,15 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 		return err
 	}
 
-	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key, native_key, node_id)
-		SELECT ?3, na.scope_key, na.native_key, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
-			AND na.scope_key NOT IN (SELECT scope_key FROM cx_carry_scopes)
+	// The replaced scope keys arrive as text and the alias rows carry scope
+	// surrogates (S-3), so the exclusion is resolved through scope_keys. A
+	// replaced scope that was never interned matches no row, which is the same
+	// outcome the text comparison had.
+	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id)
+		SELECT ?3, na.scope_key_id, na.native_key_id, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
+			AND na.scope_key_id NOT IN (SELECT sk.id FROM scope_keys sk JOIN cx_carry_scopes c ON c.scope_key = sk.key)
 			AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = na.node_id)
-		ON CONFLICT(unit_id, scope_key, native_key, node_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
+		ON CONFLICT(unit_id, scope_key_id, native_key_id, node_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
 		return err
 	}
 	stats.Aliases = n
@@ -385,19 +409,26 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	return w.copyEvidence(ctx, tx, prevRow, replaceIndexLevel, stats)
 }
 
-// copySearchUnits copies the lexical documents and then indexes exactly the
-// rows it wrote. search_units.rowid is assigned by the copy, so the external
-// content index must be built against the new rowids; indexing the previous
-// unit's would corrupt the index against content that is not there.
+// copySearchUnits carries the lexical documents forward. doc_id travels with
+// the row, so each carried document keeps the posting its text was indexed
+// into and nothing is re-indexed: the copy is one bounded INSERT..SELECT that
+// reads and writes no text at all, and it chains through repeated deltas
+// because the column it copies is itself a copy. Re-deriving the body instead
+// -- from the content store over [start_byte, end_byte) -- would index source
+// text no producer ever published as a document body, silently changing every
+// carried document's lexical hits, BM25 length and snippets.
+//
+// segment_id travels with doc_id, so a carried document arrives already packed
+// and already naming the segment it lies in. That column is what makes the
+// carried documents part of the new generation's segment set without anything
+// being rewritten, and it is why a compaction re-points every row it absorbs:
+// a carry that copied an absorbed segment forward would name it beside the one
+// that holds the same documents.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
-	var before int64
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(rowid), 0) FROM search_units`).Scan(&before); err != nil {
-		return wrap("search_units", err)
-	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
-		name, qualified_name, signature, start_byte, end_byte, body, token_count)
+		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id, segment_id)
 		SELECT ?3, su.search_key, su.node_id, su.file_id, su.path, su.kind,
-			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.body, su.token_count
+			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id, su.segment_id
 		FROM search_units su WHERE su.unit_id = ?1
 			AND su.file_id NOT IN (SELECT file_id FROM cx_carry_files)
 			AND (su.node_id IS NULL OR EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = su.node_id))
@@ -408,14 +439,6 @@ func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow in
 	n, err := res.RowsAffected()
 	if err != nil {
 		return wrap("search_units", err)
-	}
-	if n == 0 {
-		return nil
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(rowid, name, qualified_name, signature, path, body)
-		SELECT rowid, name, qualified_name, signature, path, body FROM search_units WHERE unit_id = ?1 AND rowid > ?2`,
-		w.rowID, before); err != nil {
-		return wrap("search_fts", err)
 	}
 	stats.SearchUnits = n
 	return nil
@@ -433,7 +456,7 @@ const carryEvidencePage = 2000
 // already proved is this unit's declared hash for that file.
 func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, stats *CarryOverStats) error {
 	ins, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id,
-		start_byte, end_byte, native_key, detail, content_hash_bound)
+		start_byte, end_byte, native_key_id, detail, content_hash_bound)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
 		return wrap("evidence", err)
@@ -465,12 +488,14 @@ func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64
 			}
 			e.ID = model.NewEvidenceID(e)
 			idRaw, _ := model.DecodeID(string(e.ID))
-			nodeRaw, _ := optionalBlob("evidence.node_id", string(e.NodeID))
-			relRaw, _ := optionalBlob("evidence.relation_id", string(e.RelationID))
 			fileRaw, _ := optionalBlob("evidence.file_id", string(e.FileID))
 			start, end := rangeBytes(e.Range)
-			res, err := ins.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw,
-				start, end, e.NativeKey, e.Detail, boolInt(row.bound))
+			// The surrogates are rebound as read: node_ids, relation_ids and
+			// native_keys are database-wide dictionaries, so the predecessor's
+			// refs are already this unit's refs and re-resolving them would
+			// only repeat the lookup the page already did.
+			res, err := ins.ExecContext(ctx, idRaw, w.rowID, nullNode(row.node), nullRelation(row.rel), string(e.Precision), fileRaw,
+				start, end, int64(row.native), e.Detail, boolInt(row.bound))
 			if err != nil {
 				return wrap("evidence", err)
 			}
@@ -490,6 +515,13 @@ type carriedEvidence struct {
 	evidence model.Evidence
 	bound    bool
 	raw      []byte
+	// node, rel and native are the stored surrogates, carried alongside the
+	// canonical values the re-derivation of the evidence id needs: the hash is
+	// a function of the canonical identity (Section 9.3), the row is a function
+	// of the surrogate, and the copy needs both.
+	node   nodeRef
+	rel    relRef
+	native nativeRef
 }
 
 // readEvidencePage reads one keyset page of the previous unit's surviving
@@ -497,9 +529,13 @@ type carriedEvidence struct {
 // A row is surviving when its bucket is inherited and the fact it supports is
 // already a fact of this unit.
 func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, after []byte) ([]carriedEvidence, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.node_id, e.relation_id, e.precision, e.file_id,
-		e.start_byte, e.end_byte, e.native_key, e.detail, e.content_hash_bound
-		FROM evidence e WHERE e.unit_id = ?1 AND e.id > ?4
+	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.node_id, ni.canonical, e.relation_id, ri.canonical, e.precision, e.file_id,
+		e.start_byte, e.end_byte, e.native_key_id, nk.key, e.detail, e.content_hash_bound
+		FROM evidence e
+		LEFT JOIN node_ids ni ON ni.id = e.node_id
+		LEFT JOIN relation_ids ri ON ri.id = e.relation_id
+		JOIN native_keys nk ON nk.id = e.native_key_id
+		WHERE e.unit_id = ?1 AND e.id > ?4
 			AND `+fmt.Sprintf(bucketSurvives, "e")+`
 			AND ((e.node_id IS NOT NULL AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = e.node_id))
 			  OR (e.relation_id IS NOT NULL AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.unit_id = ?3 AND rf.relation_id = e.relation_id)))
@@ -511,15 +547,20 @@ func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow i
 	page := make([]carriedEvidence, 0, carryEvidencePage)
 	for rows.Next() {
 		var id, node, relation, file []byte
+		var nodeRow, relRow sql.NullInt64
 		var start, end sql.NullInt64
+		var native int64
 		var bound int
 		var row carriedEvidence
-		if err := rows.Scan(&id, &node, &relation, &row.evidence.Precision, &file, &start, &end,
-			&row.evidence.NativeKey, &row.evidence.Detail, &bound); err != nil {
+		if err := rows.Scan(&id, &nodeRow, &node, &relRow, &relation, &row.evidence.Precision, &file, &start, &end,
+			&native, &row.evidence.NativeKey, &row.evidence.Detail, &bound); err != nil {
 			return nil, wrap("evidence", err)
 		}
 		row.raw = id
 		row.bound = bound == 1
+		row.node = nodeRef(nodeRow.Int64)
+		row.rel = relRef(relRow.Int64)
+		row.native = nativeRef(native)
 		row.evidence.NodeID = model.NodeID(optionalHex(node))
 		row.evidence.RelationID = model.RelationID(optionalHex(relation))
 		row.evidence.FileID = model.FileID(optionalHex(file))
@@ -572,7 +613,7 @@ func (w *UnitWriter) inputHash(ctx context.Context, tx *sql.Tx, file model.FileI
 func (w *UnitWriter) clipEvidence(ctx context.Context, tx *sql.Tx) error {
 	res, err := tx.ExecContext(ctx, `DELETE FROM evidence WHERE unit_id = ?1 AND id IN (
 		SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY node_id, relation_id ORDER BY id) AS rank
-			FROM evidence WHERE unit_id = ?1) WHERE rank > ?2)`, w.rowID, model.MaxEvidencePerFact)
+			FROM evidence WHERE unit_id = ?1) WHERE rank > ?2)`, w.rowID, w.s.opts.MaxEvidencePerFact)
 	if err != nil {
 		return wrap("evidence", err)
 	}
@@ -587,51 +628,83 @@ func (w *UnitWriter) clipEvidence(ctx context.Context, tx *sql.Tx) error {
 // PutDeltaState stores one provider-owned incremental-refresh artifact with
 // the unit it describes: the SCIP DocumentManifest, the dependence KeySet, or
 // whatever a later provider needs to diff its next run without recomputing the
-// previous one. The payload is opaque to storage. It shares the unit's
-// lifetime exactly, so a retired unit takes its manifest with it and no
-// refresh can diff against state whose facts were collected.
-func (w *UnitWriter) PutDeltaState(ctx context.Context, kind string, payload []byte) error {
+// previous one. The payload is opaque to storage and read from src in parts,
+// so an artifact is never held whole; there is no bound on its size. It
+// shares the unit's lifetime exactly, so a retired unit takes its artifact
+// with it and no refresh can diff against state whose facts were collected.
+// A second call under the same kind replaces the first.
+func (w *UnitWriter) PutDeltaState(ctx context.Context, kind string, src io.Reader) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
 	if kind == "" || len(kind) > model.MaxIdentifierBytes {
 		return invalid("delta state kind is required and bounded to %d bytes", model.MaxIdentifierBytes)
 	}
-	if len(payload) == 0 {
-		return invalid("delta state %q is empty", kind)
-	}
-	if len(payload) > MaxDeltaStateBytes {
-		return &model.Error{Code: model.CodeResourceLimit,
-			Message: fmt.Sprintf("delta state %q is %d bytes, limit %d", kind, len(payload), MaxDeltaStateBytes)}
-	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO unit_delta_state(unit_id, kind, payload) VALUES(?, ?, ?)
-			ON CONFLICT(unit_id, kind) DO UPDATE SET payload = excluded.payload`, w.rowID, kind, payload)
-		return wrap("unit_delta_state", err)
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM unit_delta_state WHERE unit_id = ? AND kind = ?`, w.rowID, kind); err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		buf := make([]byte, deltaStatePart)
+		for part := int64(0); ; part++ {
+			n, err := io.ReadFull(src, buf)
+			if n > 0 {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO unit_delta_state(unit_id, kind, part, payload) VALUES(?, ?, ?, ?)`,
+					w.rowID, kind, part, buf[:n]); err != nil {
+					return wrap("unit_delta_state", err)
+				}
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if part == 0 && n == 0 {
+					return invalid("delta state %q is empty", kind)
+				}
+				return nil
+			}
+			if err != nil {
+				return internal("delta state " + kind + ": " + err.Error())
+			}
+		}
 	})
 }
 
-// DeltaState reads back what a sealed unit stored under kind. A unit that
-// stored none is CTX_ARGUMENT_INVALID with reason not_found, so a refresh can
-// tell "no previous state, import in full" from a failure.
-func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string) ([]byte, error) {
+// DeltaState streams what a sealed unit stored under kind into dst, part by
+// part, in one read transaction so the artifact is the one the unit sealed. A
+// unit that stored none is CTX_ARGUMENT_INVALID with reason not_found, so a
+// refresh can tell "no previous state, import in full" from a failure.
+func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string, dst io.Writer) error {
 	key, err := idBlob("unit_id", string(unit))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var payload []byte
-	err = s.read(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT ds.payload FROM unit_delta_state ds JOIN units u ON u.id = ds.unit_id
-			WHERE u.unit_key = ? AND ds.kind = ?`, key, kind).Scan(&payload)
-		if isNoRows(err) {
+	return s.readOwn(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT ds.part, ds.payload FROM unit_delta_state ds JOIN units u ON u.id = ds.unit_id
+			WHERE u.unit_key = ? AND ds.kind = ? ORDER BY ds.part`, key, kind)
+		if err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		defer rows.Close()
+		var next int64
+		for rows.Next() {
+			var part int64
+			var payload []byte
+			if err := rows.Scan(&part, &payload); err != nil {
+				return wrap("unit_delta_state", err)
+			}
+			if part != next {
+				return corrupt("unit %s delta state %q: part %d follows part %d", unit, kind, part, next-1)
+			}
+			next++
+			if _, err := dst.Write(payload); err != nil {
+				return internal("delta state " + kind + ": " + err.Error())
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		if next == 0 {
 			return notFound("unit %s stored no delta state of kind %q", unit, kind)
 		}
-		return wrap("unit_delta_state", err)
+		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return payload, nil
 }
 
 // unitInputsPage bounds one page of a UnitInputs scan. The iterator reads a
@@ -649,10 +722,13 @@ const unitInputsPage = 1000
 // The first failure ends the sequence: it is yielded with a zero UnitInput and
 // nothing follows it.
 //
-// Each page is one read transaction on the reader pool. The dependence delta
-// applier walks this from inside UnitWriter.CarryOver's write transaction, so
-// those reads are nested inside the writer's and compete for reader
-// connections with the rest of the process; see Replaced.
+// Each page is one read transaction on the reader pool, so the stream sees
+// the last commit and not the ingestion group in progress: the unit it reads
+// is a predecessor, sealed and committed before the run that reads it began.
+// The dependence delta applier walks this from inside UnitWriter.CarryOver's
+// ingestion call, which holds the group's connection, so those reads are
+// nested inside the writer's and compete for reader connections with the
+// rest of the process; see Replaced.
 func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[model.UnitInput, error] {
 	return func(yield func(model.UnitInput, error) bool) {
 		fail := func(err error) { yield(model.UnitInput{}, err) }
@@ -726,7 +802,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 // is CTX_ARGUMENT_INVALID with reason not_found.
 func (s *Store) SelectedUnit(ctx context.Context, gen model.GenerationID, providerID, scopeKey string) (model.UnitID, error) {
 	var raw []byte
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT u.unit_key FROM generation_units gu JOIN units u ON u.id = gu.unit_id
 			WHERE gu.generation_id = ? AND gu.provider_id = ? AND gu.scope_key = ?`, int64(gen), providerID, scopeKey).Scan(&raw)
 		if isNoRows(err) {

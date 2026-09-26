@@ -13,6 +13,7 @@ package filesystem
 
 import (
 	"context"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -22,15 +23,25 @@ import (
 
 // Provider identity and capabilities.
 const (
-	ID      = "filesystem"
-	Version = "1"
+	ID = "filesystem"
+	// Version is part of every unit key, so it is bumped whenever a unit's
+	// emitted facts change. 4: the binary decision is a proportion of the
+	// sniffed head rather than a single NUL byte, so a text file carrying a
+	// stray NUL is indexed (with the NUL substituted) instead of left
+	// without a lexical index; and a chunk boundary is moved off the interior
+	// of a UTF-8 sequence, which changes the byte ranges a file's documents are
+	// keyed by. Units sealed by version 3 must be rebuilt.
+	Version = "4"
 
 	// CapabilityStructure is the repository/directory/file graph.
 	CapabilityStructure = "structure"
 	// CapabilitySearch is the lexical chunk index of a file. It is reported
 	// per file: unavailable for binary or oversize content (an admission
-	// decision that never affects CAS retention) and partial when some
-	// chunks were not UTF-8 text.
+	// decision that never affects CAS retention), and fresh for every other
+	// file, including one whose bytes are not UTF-8 throughout and one
+	// carrying a stray NUL -- those chunks are indexed with the offending
+	// bytes substituted, and the substitution is disclosed in the capability
+	// detail rather than costing the file its content.
 	CapabilitySearch = "search"
 )
 
@@ -39,7 +50,15 @@ const (
 // the analysis configuration hash, so changing them re-keys every unit.
 type Options struct {
 	// MaxSearchFileBytes is the largest file admitted to search indexing.
-	MaxSearchFileBytes int64
+	// Unlimited (0) admits every file; a user-set value excludes the larger
+	// ones and each exclusion is reported on the search capability, naming
+	// the limit that excluded it.
+	MaxSearchFileBytes config.Limit
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 }
 
 // Provider is the filesystem provider.
@@ -49,9 +68,6 @@ type Provider struct {
 
 // New validates the options and returns the provider.
 func New(opts Options) (*Provider, error) {
-	if opts.MaxSearchFileBytes <= 0 {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "filesystem provider needs a positive max_search_file_bytes; zero would mean unlimited"}
-	}
 	return &Provider{opts: opts}, nil
 }
 
@@ -81,12 +97,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if fv.Path != rel {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeInternal, Message: "snapshot returned a different path than the unit scope names"}
 	}
-	e := NewEmitter(req, sink, fv)
+	e := NewEmitter(req, sink, fv, p.opts.MaxEvidencePerFact)
 	cls := Classify(rel)
 
 	// The head is read before any fact is emitted so the binary decision can
 	// travel on the file node; the same window then seeds the chunker.
-	admitted := fv.Size <= p.opts.MaxSearchFileBytes
+	admitted := !p.opts.MaxSearchFileBytes.Exceeded(fv.Size)
 	var ch *chunker
 	binary := false
 	if admitted {
@@ -109,19 +125,26 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	case !admitted:
 		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeResourceLimit)
 	case binary:
-		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeProviderUnavailable)
+		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeBinaryContent)
 	default:
-		skipped, err := ch.each(ctx, func(r model.ByteRange, body []byte) error {
+		lost, err := ch.each(ctx, func(r model.ByteRange, body []byte) error {
 			return e.PutSearch(ctx, chunkDocument(fv, fileNode.ID, r, body))
 		})
 		if err != nil {
 			return model.ProviderResult{}, err
 		}
 		e.AddBytes(ch.consumed)
-		if skipped > 0 {
-			e.Capability(CapabilitySearch, model.CapabilityPartial, model.CodeArgumentInvalid)
-		} else {
-			e.Capability(CapabilitySearch, model.CapabilityFresh, "")
+		// Every byte of the file is indexed, so the capability is fresh. A
+		// file that is not UTF-8 throughout says so in the detail -- the
+		// state must be recorded first, because a detail without its state
+		// is dropped.
+		e.Capability(CapabilitySearch, model.CapabilityFresh, "")
+		if lost.Bytes > 0 {
+			e.CapabilityDetail(CapabilitySearch, "lossy_utf8_chunks", strconv.Itoa(lost.Chunks))
+			e.CapabilityDetail(CapabilitySearch, "lossy_utf8_bytes", strconv.Itoa(lost.Bytes))
+		}
+		if lost.NULs > 0 {
+			e.CapabilityDetail(CapabilitySearch, "nul_bytes", strconv.Itoa(lost.NULs))
 		}
 	}
 	return e.Result(), nil

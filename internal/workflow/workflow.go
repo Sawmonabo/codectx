@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -62,9 +63,18 @@ type Sessions interface {
 	// PutCapsule is write-once: context_capsules.session_id is the primary key,
 	// so it returns the first stored capsule unchanged when a row exists. It
 	// does no canonical-hash comparison -- that determinism check is this
-	// package's (see canonicalCapsuleHash).
-	PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule, error)
+	// package's (see buildCapsule). src streams the capsule's records into
+	// context_capsule_rows inside the same write transaction, so a capsule is
+	// never committed without the rows its identity was derived from; a second
+	// seal returns the stored capsule and writes no rows.
+	PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error)
 	Capsule(ctx context.Context, session model.SessionID, actor string) (model.Capsule, error)
+	// CapsuleRows reads one keyset page of one list of a sealed capsule, after
+	// a cursor that is a row's own key. The capsule blob carries counts only,
+	// so this is the only way to read a capsule's records and the page a
+	// caller sees is never held whole in this process.
+	CapsuleRows(ctx context.Context, session model.SessionID, actor string,
+		list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, error)
 	// Coverage pages one actor's per-file coverage by keyset on file_id. It is
 	// paged only for a user-visible list; counts come from CoverageSummary.
 	Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error)
@@ -75,6 +85,10 @@ type Sessions interface {
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	Manifest(ctx context.Context, id model.ManifestID) (model.ContextManifest, error)
 	ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error)
+	// ManifestScopeNodes pages the DISTINCT node ids a manifest names, in
+	// node-id order. It is the capsule's scope list, deduplicated and ordered
+	// in SQL so the seal never holds a manifest-sized set in Go.
+	ManifestScopeNodes(ctx context.Context, id model.ManifestID, after model.NodeID, limit int) ([]model.NodeID, error)
 	// RangeConfirmed reports whether one interval is already fully confirmed
 	// served to this actor for this file at this content hash. It returns a
 	// bounded boolean, never an interval list: containment is answered in SQL
@@ -86,11 +100,14 @@ type Sessions interface {
 	// naming a file the operator cannot locate is not an answer. NEW -- L6.
 	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
 		ids []model.FileID) (map[model.FileID]string, error)
-	// Waivers reads the session's recorded coverage exceptions in file-id
-	// order. Waive's returned record echoes the request's reason and
+	// WaiversAfter pages the session's recorded coverage exceptions by keyset
+	// on file_id. Waive's returned record echoes the request's reason and
 	// FileCoverage carries only the Waived flag, so this is the only source of
-	// the stored reasons a sealed capsule must carry. NEW -- L6b.
-	Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error)
+	// the stored reasons a sealed capsule must carry. It is a page read, not a
+	// whole-list read: the seal streams it like every other capsule list, so
+	// heap is a function of the page and not of the session's waiver count.
+	WaiversAfter(ctx context.Context, session model.SessionID, actor string,
+		after model.FileID, limit int) ([]model.WaiverRecord, error)
 	// ActiveGeneration is the repository's currently published generation. It
 	// is Task 12's existing read (internal/storage/sqlite/units.go), widened
 	// onto this interface rather than reinvented: supersession is "a newer
@@ -142,14 +159,36 @@ type Limits struct {
 	// MaxPageItems bounds every page this service returns
 	// (resources.max_page_items).
 	MaxPageItems int
-	// MaxObservationReferences bounds the references on one observation
-	// (model.MaxObservationReferences).
-	MaxObservationReferences int
-	// MaxCapsuleBytes bounds the serialized capsule (context.max_capsule_bytes).
-	// The store enforces the same bound; this is the value the service builds
-	// against so an over-budget capsule fails before the write.
-	MaxCapsuleBytes int64
-	// QueryTimeout is the per-request deadline (resources.query_timeout).
+	// MaxObservationReferences is the CALLER's ceiling on the references one
+	// observation carries, and on the references a scope review carries across
+	// all eight of its categories (workflow.max_observation_references). It is
+	// unlimited by default: an attestation over a large scope cites what it
+	// read, and it is never refused for the size of the repository. A caller
+	// that set a ceiling is told the ceiling and the count, never trimmed.
+	MaxObservationReferences config.Limit
+	// MaxCapsuleBytes is the CALLER's budget for the serialized capsule
+	// (context.max_capsule_bytes). It is unlimited by default and a request may
+	// raise it: a capsule is reported as over budget only because the caller
+	// asked for a ceiling, never because the repository is large. The store
+	// enforces its own wire bound; this is the value the service builds against
+	// so an over-budget capsule is reported before the write.
+	MaxCapsuleBytes config.Limit
+	// MaxCapsuleRecordsPerList bounds how many records ONE of the sealing
+	// capsule's lists may hold (context.max_capsule_records_per_list). It is
+	// unlimited by default: a completion is never refused for the number of
+	// observations the session recorded. Only an operator who set a ceiling
+	// sees a refusal, and it names this key and the count the list reached.
+	MaxCapsuleRecordsPerList config.Limit
+	// MaxCapsuleCoverageFiles is the same bound for the capsule's coverage
+	// list alone (context.max_capsule_coverage_files), which grows with the
+	// session's file set rather than with what the actor observed. Also
+	// unlimited by default.
+	MaxCapsuleCoverageFiles config.Limit
+	// QueryTimeout is the DEFAULT per-request deadline (resources.query_timeout),
+	// never a ceiling, and ZERO IS "NO DEADLINE", which is its default. Every
+	// use goes through model.QueryDeadline, which leaves a caller's own
+	// deadline in charge and installs nothing at zero, so a workflow call
+	// nobody bounded runs to a complete answer.
 	QueryTimeout time.Duration
 	// AllowExploratoryWaiverConsolidation permits verify_open ->
 	// consolidate_open with recorded waivers
@@ -157,6 +196,19 @@ type Limits struct {
 	// default false). It never changes StrictGateSatisfied, which stays false
 	// whenever any waiver exists.
 	AllowExploratoryWaiverConsolidation bool
+	// StrictReadGateDisabled is context.strict_read_gate (user-level only,
+	// default TRUE) as this service reads it, inverted by the caller so that
+	// the zero value here is the enforcing one: a Limits built without this
+	// field can never silently relax the gate.
+	//
+	// When it is set, readiness precondition 3 -- every required file fully
+	// served to this actor at the pinned hashes -- does not shut the gate.
+	// The shortfall is not forgiven, it is reported: the gate records that the
+	// read was left unconfirmed, its reason names the configuration, and Strict
+	// -- and therefore the capsule's StrictGateSatisfied, which is taken
+	// straight from it -- stays false. A disabled gate never stamps a strict
+	// claim over a read nothing verified.
+	StrictReadGateDisabled bool
 }
 
 // Service is the Section 17 workflow service. Every field is read-only after
@@ -203,23 +255,21 @@ func New(o Options) (*Service, error) {
 	}, nil
 }
 
-// checkLimits rejects a Limits that cannot bound a request. Zero on a request
-// field means the configured default, so a zero default means "unlimited",
-// which Section 20.2 forbids.
+// checkLimits rejects a Limits that cannot bound a request. MaxPageItems sizes
+// a wire page, a lossless bound whose next cursor carries the rest, so it must
+// be positive. MaxCapsuleBytes and MaxObservationReferences are deliberately
+// absent: each is a config.Limit whose zero is the documented "no caller
+// ceiling", not a missing bound. So is QueryTimeout, whose zero is "no
+// deadline" and is its default; only a negative one is a wiring defect, and it
+// is refused here because model.QueryDeadline would ignore it silently.
 func checkLimits(l Limits) error {
-	for _, b := range []struct {
-		name  string
-		value int64
-	}{
-		{"max_page_items", int64(l.MaxPageItems)},
-		{"max_observation_references", int64(l.MaxObservationReferences)},
-		{"max_capsule_bytes", l.MaxCapsuleBytes},
-		{"query_timeout", int64(l.QueryTimeout)},
-	} {
-		if b.value <= 0 {
-			return typedErrf(model.CodeInternal,
-				"workflow service was built with a non-positive %s bound", b.name)
-		}
+	if l.MaxPageItems <= 0 {
+		return typedErrf(model.CodeInternal,
+			"workflow service was built with a non-positive max_page_items bound")
+	}
+	if l.QueryTimeout < 0 {
+		return typedErrf(model.CodeInternal,
+			"workflow service was built with a negative query_timeout bound")
 	}
 	return nil
 }
@@ -241,6 +291,13 @@ type gate struct {
 	// strict implementation readiness; Strict is the strict gate itself, which
 	// is false whenever any waiver exists.
 	ReadComplete, Ready, Strict, ScopeComplete bool
+	// ReadGateDisabled records that precondition 3 was skipped because
+	// Limits.StrictReadGateDisabled is set AND the read was in fact
+	// incomplete. It is what holds Strict -- and the capsule stamp taken from
+	// it -- false over an unconfirmed read, and it is why the reason names the
+	// configuration rather than telling the operator to read files the
+	// configuration excused.
+	ReadGateDisabled bool
 	// Superseded reports that a newer generation is active than the one this
 	// session pinned. It rides on the gate rather than beside it because Ready
 	// is defined in terms of it and every gate reader must see the same answer.
@@ -256,12 +313,6 @@ type gate struct {
 	// open, carries the point-in-time guarantee limit (ruling Q10).
 	Reason string
 }
-
-// canonicalCapsuleDomain is the hash domain of the Section 17.3 capsule
-// identity preimage. The version suffix is part of the domain, so a change to
-// the preimage's composition yields a disjoint identity space rather than
-// silently reinterpreting stored hashes. Owned by L5.
-const canonicalCapsuleDomain = "codectx.capsule.canonical.v1"
 
 // errNotConsolidating is the sentinel for a capsule asked for outside the one
 // state that produces it. Owned by L5.

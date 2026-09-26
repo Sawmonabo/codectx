@@ -20,19 +20,24 @@
 // generation and leaves the previously published one exactly as it was; a
 // cancellation does the same and releases every reservation it took.
 //
-// The cross-process workspace lock is held by the caller (internal/app) for
-// the whole life of the coordinator and handed in through Options: capture,
-// indexing, publication and retention are all one owner's work, and
-// reacquiring it per stage would let a collector run between two of them.
+// The cross-process workspace lock comes from the caller (internal/app)
+// through Options.Lock and is taken for the whole of one building operation:
+// capture, indexing, publication and retention are all one owner's work, and
+// reacquiring it per stage would let a collector run between two of them. It
+// is given back when that operation ends -- a watch gives it back when the
+// beat that took it ends -- so a process that is idle between operations owns
+// nothing and another process may index.
 package index
 
 import (
 	"context"
 	"errors"
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +45,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -70,11 +76,52 @@ const refNone = "(none)"
 // digest in the product, so one can never be presented as another.
 const domainRepository = "repository-identity-v1"
 
-// maxWorkers bounds the units one generation builds concurrently when the
-// configuration asks for the machine default. Each concurrent unit holds a
-// live sink and an open writer, so the bound is a resource decision and not a
-// throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
-const maxWorkers = 8
+// HoldIntent is how patient the operation taking the workspace is. It is the
+// OPERATION's property and not the composition's, because one process runs
+// both kinds: a watch session's base build is a person waiting at a terminal
+// for the index they just asked for, while every beat of that same session is
+// work the next beat will repeat.
+//
+// It is an intent and not a constructed wait policy because the evidence a
+// waiter judges a holder by -- the run ledger beside the cache -- is the
+// composition root's to open. This package says how patient the operation is;
+// internal/app decides what that means in seconds and where it reads progress.
+type HoldIntent uint8
+
+const (
+	// HoldNow is an operation that must not queue behind another process: it
+	// takes the workspace if it is free and is told CTX_WORKSPACE_BUSY if it
+	// is not. Every watch beat is one, because a beat that blocked would stall
+	// the synchronous delivery of the batches behind it and the next beat
+	// repeats the work anyway; so is an agent's refresh, which is a tool call
+	// with somebody waiting on the answer, and so is every background hold the
+	// deferred sealer takes.
+	HoldNow HoldIntent = iota
+	// HoldPatiently is a build a person asked for and is waiting on. It waits
+	// for as long as whoever holds the workspace keeps getting somewhere,
+	// because refusing a command that would have succeeded in a minute is the
+	// defect; a holder that has stopped making progress is still refused.
+	HoldPatiently
+)
+
+// Locker is where a coordinator gets the cross-process workspace lock of
+// Sections 12.3 and 13.2.
+//
+// Hold takes the lock for the operation that is about to build and returns the
+// release that gives it back; release runs exactly once, on every path,
+// including the one where the operation failed partway. Holds NEST: the
+// composition root hands out one lock for the process and releases it when the
+// last holder has, so a capture inside a refresh, or a refresh inside a watch,
+// takes no second lock and cannot release one another still needs. The intent
+// is read only by the acquisition that actually takes the lock; a nested hold
+// is a counted increment on one this process already has, so it cannot wait
+// and its intent is immaterial.
+//
+// A workspace another process is indexing is reported as the typed, retryable
+// CTX_WORKSPACE_BUSY snapshot.LockWorkspace produces, and nothing is held.
+type Locker interface {
+	Hold(ctx context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error)
+}
 
 // Options are the coordinator's dependencies. Every field except Lock,
 // Watcher, States, Logger and Now is required; the workspace lock is the
@@ -86,19 +133,46 @@ type Options struct {
 	Registry *provider.Registry
 	CAS      *snapshot.CAS
 	Git      *git.Git
-	// Lock may be nil for a report-only coordinator: Status is legal without
-	// it, because Section 12.3 makes the active generation immutable once
-	// published and a report only reads it. Index, Refresh, Watch, Promote
-	// and Drain refuse with a typed CTX_ARGUMENT_INVALID: they capture, build
-	// and publish, and Section 13.2 gives that to exactly one cross-process
-	// owner.
-	Lock *snapshot.WorkspaceLock
+	// Lock is where the cross-process workspace lock comes from. It may be nil
+	// for a report-only coordinator: Status is legal without it, because
+	// Section 12.3 makes the active generation immutable once published and a
+	// report only reads it. Index, Refresh, Watch, Promote and Drain refuse
+	// with a typed CTX_ARGUMENT_INVALID: they capture, build and publish, and
+	// Section 13.2 gives that to exactly one cross-process owner.
+	//
+	// It is a source and not the lock itself because a composition may hold
+	// the lock from its open (an indexing command, whose whole life is the
+	// run) or take it at the first build (the server, which must come up and
+	// answer beside an index another process is already running). The
+	// coordinator asks for it where it is about to build and never closes it:
+	// it is the composition root's.
+	Lock Locker
 	// Collector is the process-level reclaim pass, scheduled from the same
 	// post-activation points as retention-by-ref because that is the one moment
 	// this process holds both locks the pass requires. It may be nil; see the
 	// Collector interface in retention.go.
 	Collector Collector
 	Pool      *provider.Pool
+	// Ledger is the run ledger every stage of a run records into. It may be
+	// nil -- a coordinator composed without one records nothing and indexes
+	// exactly as it would otherwise, because a nil ledger opens a nil run
+	// whose spans do nothing.
+	Ledger *ledger.Ledger
+	// Admission is the process's one memory admission ledger, and it is
+	// required: every heavy unit this coordinator runs is admitted against it,
+	// and a coordinator that observed the machine and built its own would be a
+	// second running total bounded by the same allocation -- two gates, two
+	// totals, one machine, and a process free to reserve twice what the host
+	// has.
+	Admission *admission.Ledger
+	// RunLedgerReader reads back the rows this process's runs recorded: how a
+	// finished run states in its own result what it did, and what this
+	// workspace has already measured its heavy units to cost, which the plan
+	// raises a unit's reservation to. It may be nil, which is a coordinator
+	// whose results carry no run and whose heavy units are sized from the
+	// family estimates alone: a composition that records nothing has nothing
+	// to read back, which is no observation and never a measurement of zero.
+	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
@@ -180,6 +254,10 @@ type Coordinator struct {
 	// watch is what this coordinator's own reconciliation loop knows about
 	// watch coverage; Status projects it.
 	watch watchState
+	// retention is what the last retention sweep did; Status projects it, so a
+	// sweep that never finishes is a reported degradation and not only a log
+	// line (retentionState in retention.go).
+	retention retentionState
 }
 
 // New validates the dependencies and builds the coordinator. It creates the
@@ -196,9 +274,12 @@ func New(o Options) (*Coordinator, error) {
 		return nil, invalid("the workspace is a Git repository but no git executable is available")
 	}
 	limits := provider.Limits{BatchRecords: o.Config.Index.BatchRecords, BatchBytes: o.Config.Index.BatchBytes,
-		MaxRecordBytes: o.Config.Resources.MaxProviderRecordBytes}
+		MaxRecordBytes: o.Config.Resources.MaxProviderRecordBytes.Value()}
 	if err := limits.Validate(); err != nil {
 		return nil, err
+	}
+	if o.Admission == nil {
+		return nil, invalid("the coordinator needs the process memory admission ledger heavy units are admitted against")
 	}
 	workDir := filepath.Join(o.Config.Storage.DataDir, "work", "index")
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -207,8 +288,8 @@ func New(o Options) (*Coordinator, error) {
 	c := &Coordinator{opts: o, repo: model.RepositoryID(model.H(domainRepository, filepath.ToSlash(o.Root.Path))),
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
-		workers: workerCount(o.Config.Index.Workers),
-		sched:   plan.NewScheduler(o.Config.Resources.MaxConcurrentHeavy, dependence.ObserveMachine()),
+		workers: workerCount(o.Config.Index.Workers, config.CPUs()),
+		sched:   plan.NewScheduler(o.Admission),
 	}
 	if c.log == nil {
 		c.log = slog.Default()
@@ -224,6 +305,36 @@ func New(o Options) (*Coordinator, error) {
 	c.late = newLateSealer(c)
 	return c, nil
 }
+
+// newRun opens this process's ledger run of the given kind. A ledger failure
+// never fails the run it was recording: the index is correct whatever the
+// accounting did, so the failure is logged with its diagnostic code and the
+// pass continues with a run that records nothing.
+func (c *Coordinator) newRun(kind ledger.Kind) *ledger.Run {
+	run, err := c.opts.Ledger.NewRun(kind, string(c.repo))
+	if err != nil {
+		logTyped(c.log, "this run is not being recorded in the run ledger", err,
+			"component", component, "repository_id", string(c.repo))
+		return nil
+	}
+	return run
+}
+
+// The stages a run records. They are the coordinator's own phases, named once
+// here so the ledger, the log line and every reader spell them identically.
+const (
+	stageCapture       = "capture"
+	stageWalk          = "walk"
+	stagePlan          = "plan"
+	stageAttachReused  = "attach_reused"
+	stageAttachCarried = "attach_carried"
+	stageBuild         = "build"
+	stageCoverage      = "coverage"
+	stageActivation    = "activation"
+	stageRetention     = "retention"
+	stageCollection    = "collection"
+	stageReclaim       = "reclaim"
+)
 
 // buildAppliers binds the delta appliers of the two providers that can
 // describe what changed since their last run. A provider the registry does not
@@ -252,25 +363,58 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 	return out, nil
 }
 
-// workerCount resolves index.workers. Zero selects from the available CPUs
-// under a fixed ceiling; it is never unlimited (Section 20.1).
-func workerCount(configured int) int {
+// workerCount resolves how many units one generation builds at once: one per
+// core this machine allows the process, under the structural ceiling on live
+// sinks. There is no count beside those two. How much of the machine those
+// units may hold is decided by the reservation ledger every heavy unit is
+// admitted against, so a typed-in ceiling here would be a second gate on the
+// same work -- and one nobody measured, which is what an eight-worker ceiling
+// on a sixteen-core machine was.
+//
+// cpus is a parameter and not a call so the resolution can be exercised for
+// machines this one is not, exactly as config's own counts are.
+func workerCount(configured, cpus int) int {
 	if configured > 0 {
 		return min(configured, provider.MaxLiveSinks)
 	}
-	return max(1, min(runtime.NumCPU(), maxWorkers))
+	return min(cpus, provider.MaxLiveSinks)
 }
 
-// writable refuses an entry point that captures, builds or publishes when the
-// coordinator was opened without the cross-process workspace lock. A
-// report-only coordinator is a legal composition (Section 13.2 gives indexing
-// to one owner, and a report is not indexing), so the refusal belongs at each
-// building method rather than in New, where it would also forbid Status.
-func (c *Coordinator) writable() error {
+// buildable refuses an entry point that captures, builds or publishes when the
+// coordinator was composed without a source for the cross-process workspace
+// lock. A report-only coordinator is a legal composition (Section 13.2 gives
+// indexing to one owner, and a report is not indexing), so the refusal belongs
+// at each building method rather than in New, where it would also forbid
+// Status.
+func (c *Coordinator) buildable() error {
 	if c.opts.Lock == nil {
 		return invalid("this coordinator was opened without the workspace indexing lock")
 	}
 	return nil
+}
+
+// hold is buildable plus the lock itself, for the duration of ONE operation:
+// the caller releases it when that operation ends, so an idle session owns
+// nothing and the person's own `codectx index` is not refused for as long as
+// a server happens to be running. A workspace another process is building in
+// answers the typed, retryable CTX_WORKSPACE_BUSY of snapshot.LockWorkspace.
+//
+// Every entry point that builds calls this, and Watch deliberately does not at
+// its entry: a session that watches must survive a workspace that is busy
+// right now, so its patience is the reconcile interval it already has. The
+// operation a watch holds for is ONE BEAT -- reconcile takes it where it is
+// about to build and gives it back when that beat ends, by whichever path --
+// so a watching session that is between beats owns nothing at all and a beat
+// that cannot have the workspace is skipped rather than ending the session.
+//
+// The intent is each caller's: Index is the one build a person is waiting on,
+// and everything else here is work that is repeated, backgrounded or answered
+// to an agent.
+func (c *Coordinator) hold(ctx context.Context, intent HoldIntent) (*snapshot.WorkspaceLock, func() error, error) {
+	if err := c.buildable(); err != nil {
+		return nil, nil, err
+	}
+	return c.opts.Lock.Hold(ctx, intent)
 }
 
 // Repository is the identity this coordinator derived for the workspace root.
@@ -295,11 +439,24 @@ func (c *Coordinator) Close() error {
 // deleted the store it was handed would be destroying state its caller still
 // owns.
 func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
-	if err := c.writable(); err != nil {
+	// The one build in this package a person is waiting on: `codectx index`,
+	// with or without --watch, and nothing else reaches here. A watch session's
+	// base build therefore waits out a holder that is getting somewhere, while
+	// every beat of that same session below takes the workspace or is skipped.
+	_, release, err := c.hold(ctx, HoldPatiently)
+	if err != nil {
 		return model.IndexResult{}, err
 	}
+	defer release()
 	if err := req.Validate(); err != nil {
 		return model.IndexResult{}, err
+	}
+	// Said once, at the start of the run the operator asked for, and never on
+	// a watch-driven refresh, which would repeat it on every batch: what is
+	// off is a property of the configuration, not of the pass.
+	if disabled := disabledProviders(c.opts.Config); len(disabled) > 0 {
+		c.log.Info("providers disabled by configuration: "+strings.Join(disabled, ", "),
+			"component", component, "repository_id", string(c.repo))
 	}
 	c.run.Lock()
 	defer c.run.Unlock()
@@ -311,9 +468,15 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 // notification that named the wrong file, or named none at all, changes what
 // this run costs and never what it concludes (Section 13.2).
 func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexResult, error) {
-	if err := c.writable(); err != nil {
+	// An agent's refresh tool call, or the nested hold of a beat that already
+	// took the workspace above. Neither waits: the first is answered now with
+	// the retryable refusal, and the second cannot wait because the process
+	// already holds what it is asking for.
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
 		return model.IndexResult{}, err
 	}
+	defer release()
 	// The hint is recorded and deliberately not acted on: narrowing the
 	// capture to it is exactly the mistake Section 13.2 names, because a
 	// notification can miss a timestamp-preserving write and Git status alone
@@ -340,15 +503,33 @@ func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexR
 // which is exactly what makes it the fallback, and its coverage is reported
 // incomplete because periodic reconciliation is not notification coverage.
 func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) error {
-	if err := c.writable(); err != nil {
+	if err := c.buildable(); err != nil {
 		return err
 	}
 	interval := c.opts.Config.Index.ReconcileInterval.Std()
 	if interval <= 0 {
 		return invalid("watch needs a positive reconcile interval")
 	}
-	c.watch.enter(c.opts.Watcher)
+	// The watch's own identity, minted once here: the heartbeat row is keyed by
+	// it, so two watching processes -- a terminal's `codectx watch` and an
+	// editor's server -- each keep their own row instead of overwriting one
+	// another's. It is not the pid, which the operating system reuses.
+	session, err := model.NewRandomID()
+	if err != nil {
+		return err
+	}
+	c.watch.enter(c.opts.Watcher, session)
 	defer c.watch.leave()
+	// The heartbeat row names this repository, and on a workspace nothing has
+	// ever indexed there is no repository row for it to name: every beat would
+	// be refused by the foreign key and logged, and a second process asking
+	// whether a watch covers this workspace would be told nothing does. The
+	// identity is recorded here, before the first beat, by the same call the
+	// build path makes: a watch that has completed no beat must still be
+	// nameable by a process asking whether this workspace is covered.
+	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
+		return err
+	}
 	// Evaluated now and deferred as its result: the beat starts here and the
 	// withdrawal it returns runs when this watch ends.
 	defer c.beatHeartbeat(ctx)()
@@ -441,7 +622,7 @@ func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
 		// would be refused by the very cancellation it is reacting to.
 		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), watchHeartbeatInterval)
 		defer cancel()
-		if err := c.opts.Store.ClearWatchHeartbeat(clearCtx, c.repo); err != nil {
+		if err := c.opts.Store.ClearWatchHeartbeat(clearCtx, c.repo, c.watch.session()); err != nil {
 			logTyped(c.log, "the watch heartbeat could not be withdrawn; another process will report this watch as running until it expires",
 				err, "component", component, "repository_id", string(c.repo))
 		}
@@ -452,13 +633,21 @@ func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
 // the watch: the watch itself is still reconciling this workspace, and the row
 // is how another process reports on it. The row then expires, so a reader is
 // told the coverage is unknown rather than shown a figure that stopped moving.
+//
+// What the row claims is watchState.heartbeat's rule: a watch that has completed
+// no pass -- one still waiting for the workspace another process holds --
+// publishes its presence and no figures, so a reader tells it apart from a watch
+// that is covering this workspace and from one that never ran.
 func (c *Coordinator) publishHeartbeat(ctx context.Context) {
-	lastPass, pending := c.watch.heartbeat()
+	session, lastPass, pending := c.watch.heartbeat()
+	now := c.now()
 	err := c.opts.Store.RecordWatchHeartbeat(ctx, c.repo, sqlite.WatchHeartbeat{
+		SessionID:     session,
 		WriterPID:     os.Getpid(),
+		BeatAt:        now,
 		LastPassAt:    lastPass,
 		PendingEvents: pending,
-		ExpiresAt:     c.now().Add(watchHeartbeatTTL),
+		ExpiresAt:     now.Add(watchHeartbeatTTL),
 	})
 	if err != nil && ctx.Err() == nil {
 		logTyped(c.log, "the watch heartbeat could not be published; another process cannot report on this watch",
@@ -470,6 +659,29 @@ func (c *Coordinator) publishHeartbeat(ctx context.Context) {
 // end of the watch: the prior generation is still published and the next batch
 // or tick tries again.
 func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(model.IndexResult)) (model.IndexResult, bool) {
+	// The workspace is taken for THIS beat and given back when the beat ends,
+	// by whichever path it ends: a watching session that is between beats owns
+	// nothing, so the person's own `codectx index` runs beside it. A workspace
+	// another process is building in is not this beat's failure -- the beat is
+	// skipped, the next one asks again, and the session keeps running.
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
+		c.skipped(ctx, err)
+		return model.IndexResult{}, false
+	}
+	// The workspace was free for this beat, so whatever episode of skipping was
+	// open has ended: the next beat that is refused is a new one and is
+	// reported again.
+	c.watch.tookWorkspace()
+	// Deferred and not a tail call: emit below is the caller's code, and a beat
+	// that panicked through it would otherwise hold the workspace for the rest
+	// of the session.
+	defer func() {
+		if err := release(); err != nil {
+			logTyped(c.log, "the workspace this pass held was not given back cleanly", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+	}()
 	res, err := c.Refresh(ctx, paths)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -488,6 +700,44 @@ func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(m
 		emit(res)
 	}
 	return res, true
+}
+
+// skipped reports a beat that did not run because it could not take the
+// workspace.
+//
+// A workspace another process is building in is the ordinary case and is
+// reported ONCE per episode, at debug, naming the holder the refusal carries:
+// a watch skipping for the length of someone else's index would otherwise
+// write a line per beat, and the person who started that index does not need
+// one. Anything else refused the acquisition itself -- startup recovery, the
+// collection pass -- which every beat repeats and nothing else reports, so it
+// is warned about every time.
+func (c *Coordinator) skipped(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		logTyped(c.log, "this pass could not take the workspace and did not run", err,
+			"component", component, "repository_id", string(c.repo))
+		return
+	}
+	if !c.watch.beginSkipping() {
+		return
+	}
+	args := []any{"component", component, "repository_id", string(c.repo),
+		"diagnostic_code", typed.Code}
+	// Absent rather than empty: a holder that recorded nothing is what
+	// snapshot.LockWorkspace reports, and `holder_pid=""` would read as a
+	// process this beat identified and could not name.
+	if pid := typed.Details[snapshot.DetailHolderPID]; pid != "" {
+		args = append(args, snapshot.DetailHolderPID, pid)
+	}
+	if operation := typed.Details[snapshot.DetailHolderOperation]; operation != "" {
+		args = append(args, snapshot.DetailHolderOperation, operation)
+	}
+	c.log.Debug("this pass was skipped: another process holds the workspace, and the next pass will see whatever it published",
+		args...)
 }
 
 // ref is the ref this generation is built from (ruling Q3): the branch when
@@ -552,6 +802,66 @@ func (c *Coordinator) enablement(providerID string) config.Enablement {
 		}
 	}
 	return config.Enabled
+}
+
+// lspOverlayID is how the configuration and the overlay's own provider ids
+// ("lsp:<profile>") name the snapshot-qualified working-tree overlay. It is
+// not a registry provider -- it answers live queries rather than sealing units
+// -- so it has no descriptor to take the name from, and it is named here
+// because an operator who turned it off must read that on the result like any
+// other provider they turned off.
+const lspOverlayID = "lsp"
+
+// disabledProviders names every provider this configuration turns off, in one
+// stable order. It is the one place the product states that fact: a disabled
+// provider is planned for nothing and reports no capability row, so without
+// this list an agent that finds no call facts cannot tell a configured index
+// from a degraded one. It is derived from the configuration rather than from a
+// selection, because the overlay above never appears in one.
+//
+// The order is the configuration's own declaration order, so two runs of one
+// configuration say the same thing in the same way.
+// It is a function of the configuration alone, not a method, because both
+// capability reports read it: the coordinator that builds a generation and the
+// status reader that answers over a handle of its own. One body, so the two
+// cannot come to different conclusions about the same configuration.
+func disabledProviders(cfg config.Config) []string {
+	p := cfg.Providers
+	var out []string
+	if !p.TreeSitter.Enabled {
+		out = append(out, tslang.ProviderID)
+	}
+	if p.SCIP.Enabled == config.Disabled {
+		out = append(out, scip.ID)
+	}
+	if p.LSP.Enabled == config.Disabled {
+		out = append(out, lspOverlayID)
+	}
+	if p.Dependence.Enabled == config.Disabled {
+		out = append(out, dependence.ProviderID)
+	}
+	return out
+}
+
+// composedStates are Options.States without the rows of a provider the
+// configuration disabled. The composition root records a capability row for a
+// provider it could not construct, and a provider that is off is one it does
+// not even try to construct; that row is the same misreading the selection no
+// longer produces, so it is dropped at the one place both capability reports
+// read those rows from.
+func enabledComposedStates(cfg config.Config, states []model.CapabilityState) []model.CapabilityState {
+	disabled := disabledProviders(cfg)
+	if len(disabled) == 0 {
+		return states
+	}
+	out := make([]model.CapabilityState, 0, len(states))
+	for _, st := range states {
+		if slices.Contains(disabled, st.ProviderID) {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // activeGeneration reads the published generation, answering zero when nothing

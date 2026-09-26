@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -48,21 +49,91 @@ func (s *Store) initSchema(ctx context.Context) error {
 			_, err := tx.ExecContext(ctx, `INSERT INTO schema_meta(singleton, version, fingerprint) VALUES(1, ?, ?)`, schemaVersion, Fingerprint)
 			return wrap("schema_meta", err)
 		}
-		var version int
-		var fingerprint string
-		err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint)
-		if err != nil || version != schemaVersion || fingerprint != Fingerprint {
-			found := fingerprint
-			if err != nil {
-				found = "unreadable"
-			}
-			return &model.Error{Code: model.CodeSchemaMismatch,
-				Message:     "database schema fingerprint " + found + " does not match this binary's schema " + Fingerprint,
-				Details:     map[string]string{"path": s.path},
-				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
-		}
-		return nil
+		return s.checkFingerprint(ctx, tx)
 	})
+}
+
+// verifySchema is initSchema's check for a process that opened the store
+// read-only: the same comparison, run on the reader pool, so a report never
+// begins a write transaction to learn whether it may read. It creates nothing.
+// A cache that holds no tables is one a writing open created and no run has
+// yet published into, and it is reported as the same state Open reports when
+// there is no database to open at all: the workspace that has published
+// nothing. A read-only open creates no database, so it never makes that state
+// itself.
+func (s *Store) verifySchema(ctx context.Context) error {
+	return s.read(ctx, func(tx *sql.Tx) error {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+			return wrap("sqlite_master", err)
+		}
+		if tables == 0 {
+			return notPublishedYet()
+		}
+		return s.checkFingerprint(ctx, tx)
+	})
+}
+
+// notPublishedYet is the answer to a read-only open of a workspace nothing has
+// built: the database is not there at all, or it is there and holds no tables.
+// One answer for both, because they are one state to an operator and one
+// remedy. Reporting it as a fingerprint that failed to match, or as a workspace
+// that was never discovered, would send them to the wrong one.
+func notPublishedYet() error {
+	return &model.Error{Code: model.CodeNoActiveGeneration,
+		Message:     "nothing has been published in this workspace yet",
+		Remediation: "run `codectx index`"}
+}
+
+// adoptSchema is the writer-deferred open's schema check (Options.LazyWriter):
+// the same comparison verifySchema runs, on the reader pool, with one
+// difference -- a cache that holds no tables is CREATED here rather than
+// reported as a workspace that has published nothing.
+//
+// That difference is safe and is the whole reason the check can be a read. A
+// cache with no tables is one no writing open has ever completed against, so
+// no run can be holding a transaction on it; every cache a run IS writing has
+// its schema already, and there this open writes nothing and waits for
+// nothing. The empty case is the one write an empty cache needs, and the
+// alternative -- deferring it too -- would leave the read-only handle opened
+// beside this one with no schema to verify.
+func (s *Store) adoptSchema(ctx context.Context) error {
+	empty := false
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+			return wrap("sqlite_master", err)
+		}
+		if tables == 0 {
+			empty = true
+			return nil
+		}
+		return s.checkFingerprint(ctx, tx)
+	})
+	if err != nil || !empty {
+		return err
+	}
+	return s.initSchema(ctx)
+}
+
+// checkFingerprint compares the stored schema identity with this binary's. It
+// is the one place the comparison lives, so the writing and the read-only opens
+// cannot come to different conclusions about the same database.
+func (s *Store) checkFingerprint(ctx context.Context, tx *sql.Tx) error {
+	var version int
+	var fingerprint string
+	err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint)
+	if err != nil || version != schemaVersion || fingerprint != Fingerprint {
+		found := fingerprint
+		if err != nil {
+			found = "unreadable"
+		}
+		return &model.Error{Code: model.CodeSchemaMismatch,
+			Message:     "database schema fingerprint " + found + " does not match this binary's schema " + Fingerprint,
+			Details:     map[string]string{"path": s.path},
+			Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+	}
+	return nil
 }
 
 // Recover is startup recovery for the indexing owner (Section 12.3). The
@@ -102,10 +173,91 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 }
 
 // Check runs the integrity checks Section 12.1 reserves for initialization,
-// doctor and recovery: quick_check, foreign_key_check and, when deep, the FTS5
-// external-content integrity check. It never runs per query.
+// doctor and recovery.
+//
+// It is two different checks, because the expensive one is O(database bytes)
+// and an ordinary `doctor` may not pay it: on a 1.9 GB index `quick_check`
+// alone costs 30 s cold and ~4.5 s of CPU warm, which made the one command an
+// operator runs on a sick workspace the slowest command in the product.
+//
+//   - shallow (deep == false): the constant-cost header reads -- page size and
+//     page count, the schema fingerprint row, and that the journal is still the
+//     write-ahead log this store requires. These catch a database that is not
+//     this schema, was truncated below its own header, or lost its WAL mode;
+//     they do NOT walk a single page of content, and the caller must report the
+//     content walk as unverified rather than as passed.
+//   - deep (deep == true): everything shallow checks, then `quick_check`, the
+//     foreign key check and the full-text index walk -- the complete pass.
+//
+// Both run on the reader pool (`s.read`), never `s.write`: an integrity walk
+// reads, and taking the writer for it serialised `doctor` against any running
+// indexer for the whole walk. The one exception is the FTS5 `integrity-check`
+// command, which is spelled as an INSERT and is therefore refused by the
+// readers' `query_only=ON`; it takes the writer for that statement alone, and
+// only under deep.
+//
+// search_fts is contentless (ADR-0003 §2.1), so its integrity-check proves the
+// index is internally consistent, not that it agrees with a stored copy of the
+// text -- there is no stored copy, and the text's own authority is the content
+// store, which verifies every block digest on read. Document membership is
+// still checked both ways: a posting is named by search_units.doc_id -- which a
+// delta carry-over shares along a carry chain, so several rows may name one --
+// and the vocabulary scan in checkContent reports any indexed document no row
+// names.
 func (s *Store) Check(ctx context.Context, deep bool) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
+	if err := s.checkHeader(ctx); err != nil {
+		return err
+	}
+	if !deep {
+		return nil
+	}
+	return s.checkContent(ctx)
+}
+
+// checkHeader is the constant-cost half of Check: header pragmas, the schema
+// fingerprint and the journal mode. Nothing here is a function of how much the
+// database holds.
+func (s *Store) checkHeader(ctx context.Context) error {
+	return s.read(ctx, func(tx *sql.Tx) error {
+		var pageSize, pageCount int64
+		if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+			return wrap("page_size", err)
+		}
+		if err := tx.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return wrap("page_count", err)
+		}
+		if pageSize <= 0 || pageCount <= 0 {
+			return corrupt("database header reports %d pages of %d bytes", pageCount, pageSize)
+		}
+		var version int
+		var fingerprint string
+		if err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint); err != nil {
+			return &model.Error{Code: model.CodeSchemaMismatch,
+				Message:     "this database carries no readable schema_meta row",
+				Details:     map[string]string{"path": s.path},
+				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+		}
+		if version != schemaVersion || fingerprint != Fingerprint {
+			return &model.Error{Code: model.CodeSchemaMismatch,
+				Message:     "database schema fingerprint " + fingerprint + " does not match this binary's schema " + Fingerprint,
+				Details:     map[string]string{"path": s.path},
+				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+		}
+		var journal string
+		if err := tx.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err != nil {
+			return wrap("journal_mode", err)
+		}
+		if !strings.EqualFold(journal, "wal") {
+			return corrupt("database journal mode is %s, not the write-ahead log this store requires", journal)
+		}
+		return nil
+	})
+}
+
+// checkContent is the O(database bytes) half: quick_check, the foreign key
+// check and the full-text index walk. Only --deep reaches it.
+func (s *Store) checkContent(ctx context.Context) error {
+	err := s.read(ctx, func(tx *sql.Tx) error {
 		var result string
 		if err := tx.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
 			return wrap("quick_check", err)
@@ -120,22 +272,31 @@ func (s *Store) Check(ctx context.Context, deep bool) error {
 		if violations != 0 {
 			return corrupt("%d foreign key violations", violations)
 		}
-		if deep {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
-				return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index disagrees with its content table: " + err.Error(),
-					Remediation: "rebuild the cache with index --rebuild"}
-			}
-			// integrity-check walks the content table into the index; it does not
-			// report index entries whose content row is gone. The vocabulary table
-			// enumerates every indexed instance, so a stale document shows up here.
-			var stale int64
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.rowid = v.doc)`).Scan(&stale); err != nil {
-				return wrap("search_vocab", err)
-			}
-			if stale != 0 {
-				return &model.Error{Code: model.CodeStorageCorrupt, Message: fmt.Sprintf("search index holds %d term instances for documents that no longer exist", stale),
-					Remediation: "rebuild the cache with index --rebuild"}
-			}
+		// integrity-check inspects only the index's own structures; it cannot
+		// report index entries no search_units row names. The vocabulary table
+		// enumerates every indexed instance, so a stale document shows up here.
+		// idx_search_doc serves the probe.
+		var stale int64
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.doc_id = v.doc)`).Scan(&stale); err != nil {
+			return wrap("search_vocab", err)
+		}
+		if stale != 0 {
+			return &model.Error{Code: model.CodeStorageCorrupt, Message: fmt.Sprintf("search index holds %d term instances for documents that no longer exist", stale),
+				Remediation: "rebuild the cache with index --rebuild"}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// FTS5's integrity-check is spelled as an INSERT into the virtual table, so
+	// the readers' query_only=ON refuses it. It is a read in every other sense
+	// and writes nothing; it is the only statement of this check that needs the
+	// writer, and it holds it only for its own duration.
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
+			return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index failed its internal integrity check: " + err.Error(),
+				Remediation: "rebuild the cache with index --rebuild"}
 		}
 		return nil
 	})
@@ -199,26 +360,21 @@ func fileSize(path string, absentIsZero bool) (int64, error) {
 
 func (s *Store) walBytes() (int64, error) { return fileSize(s.path+"-wal", true) }
 
-// MaintainWAL is the writer-owned passive checkpoint of Section 12.1. It
-// reports the WAL size and whether it still exceeds the configured high-water
-// mark after a passive checkpoint, in which case the caller applies indexing
-// backpressure. It runs between batches, never inside a query.
-func (s *Store) MaintainWAL(ctx context.Context) (walBytes int64, backpressure bool, err error) {
-	if walBytes, err = s.walBytes(); err != nil {
-		return 0, false, err
-	}
-	if walBytes < s.opts.WALHighWaterBytes {
-		return walBytes, false, nil
-	}
-	var busy, logFrames, checkpointed int64
-	if err := s.writer.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
-		return 0, false, wrap("wal_checkpoint", err)
-	}
-	if walBytes, err = s.walBytes(); err != nil {
-		return 0, false, err
-	}
-	return walBytes, walBytes >= s.opts.WALHighWaterBytes || busy != 0, nil
-}
-
 // isNoRows reports a missing row without leaking database/sql to callers.
 func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+// StoreSizes reports the on-disk database and write-ahead-log sizes without
+// running a query. It is what a shallow `doctor` reads instead of Stats, whose
+// row counts are O(rows) per table.
+func (s *Store) StoreSizes(ctx context.Context) (databaseBytes, walBytes int64, err error) {
+	if err = ctx.Err(); err != nil {
+		return 0, 0, wrap("store sizes", err)
+	}
+	if databaseBytes, err = fileSize(s.path, false); err != nil {
+		return 0, 0, err
+	}
+	if walBytes, err = s.walBytes(); err != nil {
+		return 0, 0, err
+	}
+	return databaseBytes, walBytes, nil
+}

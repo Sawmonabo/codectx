@@ -16,6 +16,7 @@
 package process
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // Spec is one child process to run. Every bound is explicit: Section 6 requires
@@ -45,27 +47,69 @@ type Spec struct {
 	Dir string
 	// Env is the complete child environment as KEY=VALUE pairs. It is never
 	// merged with the parent's environment; an empty Env means the child runs
-	// with no environment at all.
+	// with nothing but the UTF-8 locale the runner sets for every child (see
+	// locale.go), which the caller's own pairs come after and may override.
 	Env []string
-	// Stdin is the optional bounded input. At most MaxStdinBytes are copied and
-	// the child's stdin is then closed, so a child cannot stall the parent by
-	// refusing to read. A Stdin that implements io.Closer is closed when the
+	// Stdin is the optional bounded input. At most MaxStdinBytes are copied --
+	// zero means no bound -- and the child's stdin is then closed, so a child
+	// cannot stall the parent by refusing to read. Unlike the output bounds,
+	// a positive stdin bound the input exceeds fails the run: the child would
+	// otherwise compute its answer from a prefix nobody agreed to cut. A Stdin that implements io.Closer is closed when the
 	// run ends -- on every path, not only on a failure -- so the runner takes
 	// ownership of it: hand it a reader whose lifetime is this run, never one
 	// the caller reads again afterwards.
 	Stdin         io.Reader
 	MaxStdinBytes int64
 	// Stdout and Stderr optionally receive the streams. When either is nil the
-	// stream is captured into Result instead. The byte limits apply in both
-	// cases: a caller-supplied writer does not opt out of termination.
+	// stream is captured into Result instead. MaxStdoutBytes and MaxStderrBytes
+	// bound that capture buffer and nothing else: zero means no bound, and a
+	// caller-supplied writer is never truncated, because its own blocking Write
+	// is what paces the child. Crossing the bound drops the excess and sets
+	// Result.OutputTruncated; it never terminates the tree and never fails the
+	// run -- a stream longer than expected is a large repository, not a hang.
 	Stdout         io.Writer
 	Stderr         io.Writer
 	MaxStdoutBytes int64
 	MaxStderrBytes int64
-	// Timeout bounds the whole run. Grace is how long the process tree has to
-	// exit after a graceful stop before it is forced.
+	// Timeout bounds the whole run. Zero means no wall-clock bound: an
+	// analysis unit on a monorepo is large, not wedged, and a clock cannot
+	// tell the two apart. StallTimeout is what catches a wedged tree -- see
+	// below -- and Grace is how long the process tree has to exit after a
+	// graceful stop before it is forced.
 	Timeout time.Duration
 	Grace   time.Duration
+	// StallTimeout is a hang detector, not a size limit: how long the tree may
+	// make no observable progress at all before it is terminated with the stop
+	// reason "stalled". Progress is any byte read from stdout or stderr --
+	// counted before any output limit and whether or not the bytes are kept --
+	// and, where the platform can sample a running tree, any advance of its
+	// consumed CPU time. Zero disables the detector.
+	//
+	// It replaces the wall clock rather than supplementing it: however large
+	// the repository, a wedged process still makes no progress.
+	StallTimeout time.Duration
+	// ProgressFiles are the outputs this run writes, named so the stall
+	// detector can see a tool that writes its answer straight to a file and
+	// says nothing on either pipe. Their sizes are summed into the progress
+	// signal; a path is stated, never opened, and one that does not exist yet
+	// contributes nothing. A named directory is summed one level deep over its
+	// regular entries, which is how a step whose output is a directory of
+	// files grows.
+	//
+	// Naming them is not optional for a quiet tool: without this signal such a
+	// tool's only progress is its CPU time, which no platform but Linux
+	// samples, so a StallTimeout would terminate it mid-work.
+	//
+	// They are also what the runner paces: a run that names its outputs has
+	// them handed to the disk one window at a time while the child writes
+	// them, instead of left dirty until the kernel submits the lot at once.
+	ProgressFiles []string
+	// CPUProgress optionally receives this run's live processor-time signal --
+	// the same figure StallTimeout's detector watches -- for a caller whose own
+	// hang detector watches a protocol this package cannot see inside. The
+	// caller allocates it and reads it while the run is in flight; nil, which
+	// is the ordinary case, publishes nothing.
+	CPUProgress *CPUProgress
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
 	// native child can temporarily exceed a reservation, and only an OS control
@@ -87,18 +131,36 @@ type Result struct {
 	StdoutBytes int64
 	StderrBytes int64
 	Duration    time.Duration
+	// CPUUserMillis and CPUSysMillis are the processor time the child consumed,
+	// in milliseconds, read from its exit status when it was reaped.
+	//
+	// The scope of the figure is the reaped child plus every descendant it
+	// waited for: that is what the kernel accumulates into a parent's usage.
+	// A descendant that outlived the child, or re-parented away from it,
+	// contributes nothing, so this is narrower than the process group the tree
+	// sampler follows and it is not the tree's total.
+	CPUUserMillis int64
+	CPUSysMillis  int64
+	// CPUUnsampled reports that no processor time was obtained -- the child
+	// never started, or it was killed and never reaped, so there is no exit
+	// status to read it from -- and the two figures above are therefore
+	// unavailable rather than zero. A caller that publishes them must omit
+	// them rather than publish an observed zero (Section 22).
+	CPUUnsampled bool
 	// TimedOut and Canceled distinguish the two reasons a tree is terminated;
 	// Section 22 requires cancellation not to be reported as a crash.
 	TimedOut bool
 	Canceled bool
-	// OutputTruncated reports that a stream reached its limit and the tree was
-	// terminated for it.
+	// OutputTruncated reports that captured bytes the child produced were
+	// dropped because a capture bound was reached. What was captured is a
+	// complete prefix; the run itself is unaffected.
 	OutputTruncated bool
 	// Signaled reports that the child was killed by a signal rather than
 	// exiting, which is the normal outcome of a forced termination.
 	Signaled bool
 	// PeakTreeBytes is the highest summed resident set size observed over the
-	// whole process tree while it ran, sampled every treeSampleInterval. It is
+	// whole process tree while it ran, sampled at most treeSampleInterval
+	// apart, and more often where a short StallTimeout polls faster. It is
 	// the tree sum at one instant, never a sum of per-process historical peaks
 	// reached at different instants (Section 22), and it is what the memory
 	// governor reports as the observed figure (Section 11.6).
@@ -107,17 +169,71 @@ type Result struct {
 	// memory, so PeakTreeBytes is unavailable rather than zero. A caller that
 	// publishes the figure must omit it, not publish a zero.
 	TreeUnsampled bool
+	// ReadBytes and WriteBytes are the bytes the whole process group
+	// transferred through the kernel, summed over its members by the last
+	// sweep that still found the tree running.
+	//
+	// Three properties a reader has to know. The figure is a sample and not an
+	// exit-time total: it is the state of the counters at most one sampling
+	// period before the tree exited, and whatever the tree transferred after
+	// that sweep is not in it. It counts bytes where the process called the
+	// kernel, so it includes what a child wrote into its own pipes and what
+	// the page cache absorbed, and it is therefore not disk volume. And the
+	// group sum is not monotonic across sweeps: a worker that exits takes its
+	// counters with it, so a tree whose workers finish before its leader
+	// reports less than it moved.
+	ReadBytes  int64
+	WriteBytes int64
+	// IOUnsampled reports that no sweep ever read the counters -- a platform
+	// with no per-process counters at all, or a group whose members were all
+	// unreadable -- so the two figures are unavailable rather than zero. A
+	// caller that publishes them must omit them rather than publish an
+	// observed zero (Section 22).
+	IOUnsampled bool
+}
+
+// Unmeasured is the starting Result of every run: each figure this package
+// measures is marked absent, so a run that ends before its measurement exists
+// reports nothing observed rather than an observed zero (Section 22). Each
+// flag is cleared only where its figure has actually been read.
+//
+// It is exported because a caller that refuses a run before this package ever
+// sees it -- an argument the caller itself rejects -- must return the same
+// nothing-observed value. A bare Result would say the child ran and used no
+// processor time, no memory and no bytes, which is a measurement nobody made.
+func Unmeasured() Result {
+	return Result{CPUUnsampled: true, TreeUnsampled: true, IOUnsampled: true}
+}
+
+// treeSample is what the sweeps of one run's process group yielded.
+type treeSample struct {
+	// peakBytes is the highest summed resident set size any sweep observed.
+	peakBytes int64
+	// readBytes and writeBytes are the group's transferred byte counters as of
+	// the last sweep that found a member with readable counters; ioSampled
+	// reports that such a sweep happened at all.
+	readBytes  int64
+	writeBytes int64
+	ioSampled  bool
 }
 
 // treeSampleInterval is how often the process tree's resident memory is summed
 // while the child runs. It is the sampling period of the method measured in
 // docs/research/10-round3-empirical.md §1: fine enough to catch an analysis
 // pass's peak, coarse enough that the sweep costs nothing against a run
-// measured in minutes.
+// measured in minutes. It is the upper bound on the period, not the period
+// itself: a run with a stall timeout short enough to poll faster than this
+// samples at the watchdog's poll interval instead, so the CPU signal the
+// watchdog reads is never staler than one of its own polls.
 const treeSampleInterval = 250 * time.Millisecond
 
-// Limits are the runner-wide admission bounds. All three are required: a zero
-// bound would mean unlimited, which Section 20.2 forbids.
+// Limits are the runner-wide admission bounds. Concurrency and memory are
+// required and positive. The disk budget is the one bound that may be zero,
+// because it is the only one that carries a user-set ceiling rather than a
+// derived reservation; what keeps a run from filling the device is not this
+// figure but the process's reservation ledger above, which admits a child's
+// temporary bytes against the free space actually measured under the data
+// directory.
 type Limits struct {
 	MaxConcurrent     int
 	MemoryBudgetBytes int64
@@ -128,11 +244,16 @@ type Limits struct {
 // their reservations. It is safe for concurrent use.
 type Runner struct {
 	limits Limits
-	slots  chan struct{}
 
 	mu         sync.Mutex
 	memoryUsed int64
 	diskUsed   int64
+	// running counts the admissions in flight, against MaxConcurrent.
+	running int
+	// queue holds the runs waiting for headroom, in arrival order. A run that
+	// does not fit the remaining budget waits in it rather than being refused;
+	// see reserve and promote.
+	queue list.List
 	// live counts the children that have been started and whose run has not
 	// returned. It is not the admission count: a run that is admitted and then
 	// fails before exec has no process, and reporting one would describe memory
@@ -141,7 +262,7 @@ type Runner struct {
 	// window in which the run holds an admission slot, so the two accounts
 	// cannot disagree -- including the one case where a child outlives the run
 	// (it could not be killed), which the run reports as an error and which
-	// this counter, like the slot, stops holding.
+	// this counter, like the admission, stops holding.
 	live int64
 }
 
@@ -175,11 +296,31 @@ func (r *Runner) startedChild() func() {
 
 // NewRunner returns a runner bound by limits.
 func NewRunner(limits Limits) (*Runner, error) {
-	if limits.MaxConcurrent <= 0 || limits.MemoryBudgetBytes <= 0 || limits.DiskBudgetBytes <= 0 {
-		return nil, resourceLimit("runner limits are concurrency %d, memory %d and disk %d; every bound must be positive",
-			limits.MaxConcurrent, limits.MemoryBudgetBytes, limits.DiskBudgetBytes)
+	if limits.MaxConcurrent <= 0 || limits.MemoryBudgetBytes <= 0 {
+		return nil, resourceLimit("runner limits are concurrency %d and memory %d; both reservations must be positive",
+			limits.MaxConcurrent, limits.MemoryBudgetBytes)
 	}
-	return &Runner{limits: limits, slots: make(chan struct{}, limits.MaxConcurrent)}, nil
+	// DiskBudgetBytes is a BOUND and not a reservation: it carries
+	// resources.max_temp_bytes, whose default is unlimited, so a non-positive
+	// value admits every run's disk reservation rather than refusing the
+	// runner outright. Concurrency and memory stay reservations -- they size
+	// the machine the children are given, and a zero-sized one is broken
+	// rather than unbounded.
+	//
+	// It is deliberately NOT made a pass-through beneath the reservation
+	// ledger, as the memory budget was. The memory budget bounded the same
+	// bytes the gate above admits, so a narrower one refused precisely what
+	// the gate had just admitted. This budget is a different quantity: the
+	// ledger admits a child's temporary bytes against the host's real free
+	// space less resources.min_free_disk_bytes, while this is the ceiling an
+	// operator put on temporary bytes on purpose. A default install never
+	// refuses here -- the key is unlimited -- and an operator who set it asked
+	// for the refusal, which names the key. Widening it to whatever the gate
+	// admits would delete the only place that key is enforced.
+	if limits.DiskBudgetBytes < 0 {
+		return nil, resourceLimit("runner disk budget is %d; use 0 for unlimited", limits.DiskBudgetBytes)
+	}
+	return &Runner{limits: limits}, nil
 }
 
 // Run executes one child and returns when it and its whole process tree have
@@ -187,11 +328,11 @@ func NewRunner(limits Limits) (*Runner, error) {
 // output stream reaches its limit.
 func (r *Runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err := spec.validate(); err != nil {
-		return Result{}, err
+		return Unmeasured(), err
 	}
 	release, err := r.reserve(ctx, spec)
 	if err != nil {
-		return Result{}, err
+		return Unmeasured(), err
 	}
 	defer release()
 	return r.run(ctx, spec)
@@ -228,14 +369,20 @@ func (s Spec) validate() error {
 			return invalidArgument("env[%d] is not a KEY=VALUE pair", i)
 		}
 	}
-	if s.Timeout <= 0 || s.Grace <= 0 {
-		return resourceLimit("timeout %s and grace %s must both be positive; an unbounded child is never admitted", s.Timeout, s.Grace)
+	if s.Timeout < 0 || s.StallTimeout < 0 {
+		return resourceLimit("timeout %s and stall timeout %s may not be negative; zero means no bound", s.Timeout, s.StallTimeout)
 	}
-	if s.MaxStdoutBytes <= 0 || s.MaxStderrBytes <= 0 {
-		return resourceLimit("output limits are %d and %d; both must be positive", s.MaxStdoutBytes, s.MaxStderrBytes)
+	if s.Grace <= 0 {
+		// Grace is not a bound on the repository but the window a tree gets to
+		// exit once it has been asked to, so it is always finite.
+		return resourceLimit("grace %s must be positive", s.Grace)
 	}
-	if s.Stdin != nil && s.MaxStdinBytes <= 0 {
-		return resourceLimit("stdin is supplied without a positive byte bound")
+	if s.MaxStdoutBytes < 0 || s.MaxStderrBytes < 0 {
+		return resourceLimit("output capture bounds are %d and %d; neither may be negative, and zero means no bound",
+			s.MaxStdoutBytes, s.MaxStderrBytes)
+	}
+	if s.MaxStdinBytes < 0 {
+		return resourceLimit("the stdin byte bound is %d; it may not be negative, and zero means no bound", s.MaxStdinBytes)
 	}
 	if s.MemoryReservationBytes < 0 || s.DiskReservationBytes < 0 {
 		return invalidArgument("reservations are memory %d and disk %d; neither may be negative",
@@ -244,57 +391,124 @@ func (s Spec) validate() error {
 	return nil
 }
 
-// reserve admits one run against the runner's concurrency and byte budgets.
-// A reservation larger than the whole budget is refused immediately rather than
-// waiting for capacity that can never appear.
+// admission is one run's place in the admission queue. ready is closed when
+// the run has been granted its slot and its byte reservations.
+type admission struct {
+	mem, disk int64
+	ready     chan struct{}
+	granted   bool
+	elem      *list.Element
+}
+
+// reserve admits one run against the runner's concurrency and byte budgets. A
+// run that does not fit the remaining headroom WAITS for it -- the budgets are
+// memory admission, which schedules work rather than rejecting it. The only
+// refusal left is the one no amount of waiting can clear: a reservation larger
+// than the whole user-set budget, which is reported with both numbers.
+//
+// Why there is no deadlock. Concurrency and bytes are taken together under one
+// lock, so a run never holds a slot while waiting for memory -- the shape that
+// would let MaxConcurrent waiters block every runner that could free memory.
+// Admission is strictly head-of-line: only the queue's front is considered, so
+// a large reservation cannot starve behind an endless stream of small ones, and
+// nothing behind the head can consume the headroom the head is waiting for.
+// The head is always eventually satisfiable, because its reservations are
+// individually within the whole budget (checked above) and every admitted run
+// releases everything it took when it returns; once the last one does,
+// running, memoryUsed and diskUsed are all zero and the head fits by
+// construction. Nothing inside a run re-enters reserve, so no run waits on a
+// run behind it. A waiter that never reaches the head still leaves on ctx.
+//
+// The trade-off this accepts: head-of-line admission can leave headroom idle
+// while a large reservation waits. That is the cost of never starving one.
 func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 	if spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes {
 		return nil, resourceLimit("the run reserves %d bytes of memory, over the runner budget of %d",
 			spec.MemoryReservationBytes, r.limits.MemoryBudgetBytes)
 	}
-	if spec.DiskReservationBytes > r.limits.DiskBudgetBytes {
-		return nil, resourceLimit("the run reserves %d bytes of disk, over the runner budget of %d",
-			spec.DiskReservationBytes, r.limits.DiskBudgetBytes)
+	// An unlimited disk budget has nothing to exceed, so the reservation is
+	// admitted and only accounted; a user-set one still refuses up front, which
+	// is the only way a run is rejected for disk.
+	if r.limits.DiskBudgetBytes > 0 && spec.DiskReservationBytes > r.limits.DiskBudgetBytes {
+		return nil, (&model.Error{Code: model.CodeResourceLimit,
+			Message: fmt.Sprintf("the run reserves %d bytes of disk, over the runner budget of %d",
+				spec.DiskReservationBytes, r.limits.DiskBudgetBytes),
+			Remediation: "raise resources.max_temp_bytes, or set it to 0 for unlimited",
+		}).WithDetail("limit", "resources.max_temp_bytes")
 	}
-	select {
-	case r.slots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, model.Canceled(ctx.Err())
-	}
+	w := &admission{mem: spec.MemoryReservationBytes, disk: spec.DiskReservationBytes, ready: make(chan struct{})}
 	r.mu.Lock()
-	overMemory := r.memoryUsed+spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes
-	overDisk := r.diskUsed+spec.DiskReservationBytes > r.limits.DiskBudgetBytes
-	if overMemory || overDisk {
-		r.mu.Unlock()
-		<-r.slots
-		return nil, resourceLimit("the run does not fit the remaining runner budget")
-	}
-	r.memoryUsed += spec.MemoryReservationBytes
-	r.diskUsed += spec.DiskReservationBytes
+	w.elem = r.queue.PushBack(w)
+	r.promote()
+	granted := w.granted
 	r.mu.Unlock()
+	if !granted {
+		select {
+		case <-w.ready:
+		case <-ctx.Done():
+			r.mu.Lock()
+			if !w.granted {
+				r.queue.Remove(w.elem)
+				w.elem = nil
+				r.mu.Unlock()
+				return nil, model.Canceled(ctx.Err())
+			}
+			r.mu.Unlock()
+			// Granted in the same moment the context ended: the reservation is
+			// held and must be handed back, or it leaks for the runner's life.
+			r.release(w)
+			return nil, model.Canceled(ctx.Err())
+		}
+	}
+	return func() { r.release(w) }, nil
+}
 
-	return func() {
-		r.mu.Lock()
-		r.memoryUsed -= spec.MemoryReservationBytes
-		r.diskUsed -= spec.DiskReservationBytes
-		r.mu.Unlock()
-		<-r.slots
-	}, nil
+// promote grants queued runs in arrival order. It must be called with r.mu
+// held, and stops at the first waiter that does not fit: see reserve for why
+// nothing behind the head may overtake it.
+func (r *Runner) promote() {
+	for e := r.queue.Front(); e != nil; {
+		w := e.Value.(*admission)
+		if r.running >= r.limits.MaxConcurrent ||
+			r.memoryUsed+w.mem > r.limits.MemoryBudgetBytes ||
+			(r.limits.DiskBudgetBytes > 0 && r.diskUsed+w.disk > r.limits.DiskBudgetBytes) {
+			return
+		}
+		r.running++
+		r.memoryUsed += w.mem
+		r.diskUsed += w.disk
+		w.granted = true
+		next := e.Next()
+		r.queue.Remove(e)
+		w.elem = nil
+		close(w.ready)
+		e = next
+	}
+}
+
+// release hands back one admission and wakes whatever now fits.
+func (r *Runner) release(w *admission) {
+	r.mu.Lock()
+	r.running--
+	r.memoryUsed -= w.mem
+	r.diskUsed -= w.disk
+	r.promote()
+	r.mu.Unlock()
 }
 
 func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	started := time.Now()
-	var result Result
+	result := Unmeasured()
 
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
 	// An os/exec Cmd with a nil Env inherits the parent's environment. The
 	// child must never see it, so an empty allowlist is an empty environment,
-	// not an absent one. Do not "simplify" this to cmd.Env = spec.Env.
-	cmd.Env = spec.Env
-	if cmd.Env == nil {
-		cmd.Env = []string{}
-	}
+	// not an absent one -- and never a nil one, which is why the locale the
+	// product sets for every child is prepended rather than appended: it makes
+	// the slice non-nil whatever the caller passed, and leaves the caller's
+	// own variables last, where a child's runtime reads them.
+	cmd.Env = append(localeEnv(), spec.Env...)
 
 	job, err := newJobControl()
 	if err != nil {
@@ -350,8 +564,22 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// The child is a group leader, so its process ID is the group the sampler
 	// follows and the runner terminates. Sampling starts only once the tree
 	// control holds it, so nothing is sampled that could still escape it.
-	sampler := startTreeSampler(cmd.Process.Pid, treeSampleInterval)
+	// The CPU figure the stall watchdog reads is refreshed by this sampler, so
+	// it must be refreshed at least as often as the watchdog polls: a stall
+	// timeout short enough to poll faster than treeSampleInterval would
+	// otherwise see an unchanged CPU count for a whole window and call a
+	// computing tree wedged.
+	sampleEvery := treeSampleInterval
+	if spec.StallTimeout > 0 {
+		sampleEvery = min(sampleEvery, stallPoll(spec.StallTimeout))
+	}
+	sampler := startTreeSampler(cmd.Process.Pid, sampleEvery)
 	defer sampler.stopSampling()
+	// The same figure, published to a caller watching this child's progress
+	// through a protocol of its own. It is bound after the sampler exists and
+	// never unbound: the last sweep's count stays readable, and a caller that
+	// sees it stop moving is reading a child that has stopped.
+	spec.CPUProgress.bind(sampler)
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.
 	outPipe.closeWriter()
@@ -369,14 +597,43 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	go func() { defer drains.Done(); errPipe.drain() }()
 	go func() { drains.Wait(); close(drained) }()
 
-	timer := time.NewTimer(spec.Timeout)
-	defer timer.Stop()
+	// A zero timeout is no wall clock at all, and a nil channel blocks forever
+	// in a select -- which is exactly the wanted behaviour. A zero-length timer
+	// would instead fire immediately and kill every run.
+	var deadline <-chan time.Time
+	if spec.Timeout > 0 {
+		timer := time.NewTimer(spec.Timeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	// The watchdog is joined before this function returns, like the sampler:
+	// no goroutine this package starts outlives the run that started it.
+	watchdog := startStallWatchdog(spec.StallTimeout, outPipe, errPipe, sampler, spec.ProgressFiles)
+	defer watchdog.stopWatching()
+	// A child writes its answer at memory speed and nothing of it reaches the
+	// disk until the kernel's flusher wakes and submits the lot, which stalls
+	// every other process on the machine. Every run that names its outputs has
+	// them handed to the disk one window at a time while it writes them, and
+	// the pacer's final pass, which runs before this function returns, drains
+	// what the child left.
+	outputs := paced.StartOutputs(spec.ProgressFiles)
+	defer outputs.Stop()
 
 	waiter := newWaiter(cmd)
-	reason, unreaped := waitForExit(ctx, timer.C, job, cmd, spec, outPipe, errPipe, waiter)
+	reason, unreaped := waitForExit(ctx, deadline, job, cmd, spec, watchdog, waiter)
 	var waitErr error
 	if !unreaped {
 		waitErr = waiter.wait()
+		// The exit status carries the child's consumed processor time, and it
+		// exists only once the child has been reaped. The read is here, under
+		// the same condition, because the reaping goroutine is what writes it:
+		// a tree that never exited is still being waited on, and its status
+		// must not be read at all. Its figures stay absent.
+		if state := cmd.ProcessState; state != nil {
+			result.CPUUserMillis = state.UserTime().Milliseconds()
+			result.CPUSysMillis = state.SystemTime().Milliseconds()
+			result.CPUUnsampled = false
+		}
 	}
 
 	// Reaping the direct child says nothing about its descendants: they may
@@ -393,8 +650,12 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 
 	// The tree has exited, so the last sweep has already happened; stopping
 	// joins the sampling goroutine before its peak is read.
-	result.PeakTreeBytes = sampler.stopSampling()
+	sample := sampler.stopSampling()
+	result.PeakTreeBytes = sample.peakBytes
 	result.TreeUnsampled = !treeSampled
+	result.ReadBytes = sample.readBytes
+	result.WriteBytes = sample.writeBytes
+	result.IOUnsampled = !sample.ioSampled
 	result.Duration = time.Since(started)
 	result.Stdout, result.StdoutBytes = outPipe.captured()
 	result.Stderr, result.StderrBytes = errPipe.captured()
@@ -407,7 +668,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// output while being torn down is still a cancelled run: Section 22
 	// requires cancellation not to be reported as a failure, and a Result that
 	// denied it would make the two disagree.
-	result.TimedOut = reason == stopTimeout
+	result.TimedOut = reason == stopTimeout || reason == stopStalled
 	result.Canceled = reason == stopCanceled
 
 	if unreaped {
@@ -424,18 +685,16 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	// An explicit stop decision is why the run ended, so it names the error.
 	switch reason {
-	case stopOutputLimit:
-		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
 	case stopTimeout:
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
+	case stopStalled:
+		// A stall is a timeout in kind -- the tree was terminated for making no
+		// progress -- so it reuses the typed code and is distinguished by the
+		// stop reason, which is what a caller reports.
+		return result, timedOut("%s made no progress for %s and was terminated", filepath.Base(spec.Path), spec.StallTimeout).
+			WithDetail("stop_reason", stopStalled.String())
 	case stopCanceled:
 		return result, model.Canceled(ctx.Err())
-	}
-	// The child exited on its own, but a stream that crossed its limit is still
-	// a refusal: the caller would otherwise receive truncated output reported
-	// as a complete run.
-	if result.OutputTruncated {
-		return result, resourceLimit("%s exceeded its output limit; the output is truncated", filepath.Base(spec.Path))
 	}
 	if err := outPipe.err(); err != nil {
 		return result, err
@@ -475,7 +734,7 @@ const (
 	stopNone stopReason = iota
 	stopCanceled
 	stopTimeout
-	stopOutputLimit
+	stopStalled
 )
 
 func (r stopReason) String() string {
@@ -484,8 +743,8 @@ func (r stopReason) String() string {
 		return "canceled"
 	case stopTimeout:
 		return "timeout"
-	case stopOutputLimit:
-		return "output_limit"
+	case stopStalled:
+		return "stalled"
 	default:
 		return "exited"
 	}
@@ -499,7 +758,7 @@ func (r stopReason) String() string {
 // uninterruptible kernel operation cannot be killed at all, and blocking on it
 // would hang the caller with no diagnosis.
 func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, cmd *exec.Cmd,
-	spec Spec, outPipe, errPipe *streamPipe, w *waiter) (stopReason, bool) {
+	spec Spec, watchdog *stallWatchdog, w *waiter) (stopReason, bool) {
 	var reason stopReason
 	select {
 	case <-w.exited:
@@ -508,10 +767,8 @@ func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, 
 		reason = stopCanceled
 	case <-timeout:
 		reason = stopTimeout
-	case <-outPipe.limitHit:
-		reason = stopOutputLimit
-	case <-errPipe.limitHit:
-		reason = stopOutputLimit
+	case <-watchdog.stalledC():
+		reason = stopStalled
 	}
 
 	// Graceful stop for the whole tree, then a forced one for whatever ignored
@@ -697,8 +954,12 @@ func (p *stdinPump) closeBoth() {
 
 func (p *stdinPump) pump() {
 	defer close(p.done)
-	n, err := io.Copy(p.dst, io.LimitReader(p.src, p.limit))
-	if err == nil && n == p.limit {
+	src := p.src
+	if p.limit > 0 {
+		src = io.LimitReader(p.src, p.limit)
+	}
+	n, err := io.Copy(p.dst, src)
+	if err == nil && p.limit > 0 && n == p.limit {
 		// io.Copy stops at the bound without saying whether anything was left.
 		// Silently truncating a child's input would produce a result computed
 		// from bytes the caller never agreed to drop.

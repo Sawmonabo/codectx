@@ -26,6 +26,7 @@ package scip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,7 +35,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -65,7 +69,7 @@ import (
 // the document hash covers changes, which forces a bump here in turn.
 const (
 	ID      = "scip"
-	Version = "3"
+	Version = "4"
 )
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
@@ -100,58 +104,94 @@ const (
 // path.
 func ImportScope(path string) string { return scopeImport + path }
 
-// ProfileScope is the unit scope key of an approved indexer profile.
-func ProfileScope(name string) string { return scopeProfile + name }
+// ProfileScope is the unit scope key of an approved indexer profile rooted at
+// one project directory. The empty root is the workspace root itself, so a
+// repository whose only project is at the root keeps the shortest key there
+// is for it.
+func ProfileScope(name, root string) string { return scopeProfile + name + ":" + root }
 
-// Limits bound one import. Every field is required to be positive; nothing
-// here means unlimited (Section 6).
+// ProfileRoot is the project directory a profile scope key of kind k names,
+// and whether the key is one of that kind at all. It is how a caller outside
+// this package reads a key without owning its spelling.
+func ProfileRoot(key string, k Kind) (string, bool) {
+	name, root, ok := splitProfileScope(key)
+	if !ok || name != string(k) {
+		return "", false
+	}
+	return root, true
+}
+
+// splitProfileScope takes a profile scope key apart into the indexer name and
+// the project directory it is rooted at. The kind name holds no colon, so the
+// first one separates them and every later one belongs to the directory.
+func splitProfileScope(key string) (name, root string, ok bool) {
+	rest, isProfile := strings.CutPrefix(key, scopeProfile)
+	if !isProfile {
+		return "", "", false
+	}
+	name, root, ok = strings.Cut(rest, ":")
+	return name, root, ok
+}
+
+// Limits bound one import. Every field is a user-set bound
+// (providers.scip.*) whose zero value is unlimited, which is the default:
+// nothing here refuses a repository on the user's behalf (Section 6).
+//
+// Five of the seven cut nothing at all. An index is streamed record by record,
+// documents and occurrences spool to an on-disk database, and a manifest is
+// scanned line by line, so those figures bound neither heap nor the facts the
+// unit emits: a user-set value is a REPORTING threshold, published on the
+// unit's capability rows as `partial` + CTX_RESOURCE_LIMIT and never a refusal.
+// MaxSourceFileBytes and MaxMaterializeBytes are the two that bound heap and
+// disk respectively, so a user-set value there does leave a document or a file
+// out -- and that skip is reported under the same detail.
 type Limits struct {
 	// MaxIndexBytes bounds the whole index file.
-	MaxIndexBytes int64
+	MaxIndexBytes config.Limit
 	// MaxRecordBytes bounds one metadata, occurrence or symbol record. It is
-	// resources.max_provider_record_bytes: the bound a single fact must fit.
+	// the wire reader's pre-allocation ceiling -- the bytes a single record
+	// may cause to be allocated before it is decoded -- not a user-set bound,
+	// so it stays positive and stays out of the configuration (plan class B).
 	MaxRecordBytes int64
 	// MaxDocuments and MaxOccurrencesPerDocument bound the walk.
-	MaxDocuments              int64
-	MaxOccurrencesPerDocument int64
+	MaxDocuments              config.Limit
+	MaxOccurrencesPerDocument config.Limit
 	// MaxSpoolBytes bounds the bytes spooled to the scratch database.
-	MaxSpoolBytes int64
+	MaxSpoolBytes config.Limit
 	// MaxSourceFileBytes bounds one document's source, which is held whole
 	// while its positions are converted, as the parse limit does for
 	// tree-sitter.
-	MaxSourceFileBytes int64
+	MaxSourceFileBytes config.Limit
 	// MaxMaterializeBytes bounds the private materialization a profile runs
 	// against.
-	MaxMaterializeBytes int64
-	// MaxManifestBytes bounds a supplied input-hash manifest.
-	MaxManifestBytes int64
+	MaxMaterializeBytes config.Limit
+	// MaxManifestBytes bounds a supplied input-hash manifest and the
+	// compilation database the C/C++ profile normalizes.
+	MaxManifestBytes config.Limit
 }
 
-// DefaultLimits are the Section 20.1 defaults this provider derives from.
-func DefaultLimits() Limits {
-	return Limits{
-		MaxIndexBytes:             1 << 30,
-		MaxRecordBytes:            4 << 20,
-		MaxDocuments:              1_000_000,
-		MaxOccurrencesPerDocument: 4_000_000,
-		MaxSpoolBytes:             4 << 30,
-		MaxSourceFileBytes:        5 << 20,
-		MaxMaterializeBytes:       4 << 30,
-		MaxManifestBytes:          64 << 20,
-	}
-}
+// defaultRecordBytes is the wire reader's pre-allocation ceiling when the
+// caller names none. It is the only bound this provider still defaults to a
+// finite figure, and it bounds an allocation rather than the work.
+const defaultRecordBytes = 4 << 20
 
-// Validate rejects a non-positive bound.
+// Validate rejects a negative bound. Zero is unlimited at every user-set
+// bound, which is what the defaults are; only MaxRecordBytes, the wire
+// reader's pre-allocation ceiling, must be positive.
 func (l Limits) Validate() error {
 	for _, b := range []struct {
 		name string
-		v    int64
-	}{{"max_index_bytes", l.MaxIndexBytes}, {"max_record_bytes", l.MaxRecordBytes}, {"max_documents", l.MaxDocuments},
+		v    config.Limit
+	}{{"max_index_bytes", l.MaxIndexBytes}, {"max_documents", l.MaxDocuments},
 		{"max_occurrences_per_document", l.MaxOccurrencesPerDocument}, {"max_spool_bytes", l.MaxSpoolBytes},
-		{"max_source_file_bytes", l.MaxSourceFileBytes}, {"max_materialize_bytes", l.MaxMaterializeBytes}, {"max_manifest_bytes", l.MaxManifestBytes}} {
-		if b.v <= 0 {
-			return invalid(fmt.Sprintf("scip limit %s is %d; every bound must be positive", b.name, b.v))
+		{"max_source_file_bytes", l.MaxSourceFileBytes}, {"max_materialize_bytes", l.MaxMaterializeBytes},
+		{"max_manifest_bytes", l.MaxManifestBytes}} {
+		if b.v < 0 {
+			return invalid(fmt.Sprintf("scip limit %s is %d; a bound is a positive value, or 0 for no bound at all", b.name, int64(b.v)))
 		}
+	}
+	if l.MaxRecordBytes <= 0 {
+		return invalid(fmt.Sprintf("scip limit max_record_bytes is %d; the wire reader's pre-allocation ceiling must be positive", l.MaxRecordBytes))
 	}
 	return nil
 }
@@ -168,6 +208,11 @@ type Options struct {
 	// hashes that does not commit to the index is an assertion about some
 	// index, not about this one, and proves nothing.
 	Manifest string
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 	// Resolver hands out the pinned indexer payloads. It is the whole of the
 	// provider's trust in a tool: nothing is looked up on PATH and nothing is
 	// approved in configuration. A nil resolver means this build imports
@@ -175,11 +220,16 @@ type Options struct {
 	Resolver *toolchain.Resolver
 	// Runner is the shared process runner; required when a resolver is given.
 	Runner *process.Runner
-	// Timeout caps every profile run (providers.scip.timeout).
+	// Timeout caps every profile run (providers.scip.timeout). Zero is no
+	// wall-clock cap: an indexer on a monorepo is slow, not wedged.
 	Timeout time.Duration
+	// StallTimeout is the progress-based hang detector that stands in for the
+	// wall clock (providers.scip.stall_timeout). Zero disables it.
+	StallTimeout time.Duration
 	// WorkDir is the absolute private directory for import scratch state.
 	WorkDir string
-	// Limits bound the import; zero selects DefaultLimits.
+	// Limits bound the import. Every field is unlimited by default; a zero
+	// MaxRecordBytes selects the pre-allocation ceiling above.
 	Limits Limits
 	// LookupEnv supplies allowlisted environment values; nil means
 	// os.LookupEnv.
@@ -198,12 +248,19 @@ type Provider struct {
 	version  string
 	// resolver is kept for exactly that deferred fetch. Nothing else in the
 	// provider reaches for a tool after construction.
-	resolver  *toolchain.Resolver
-	runner    *process.Runner
-	timeout   time.Duration
-	workDir   string
-	limits    Limits
-	lookupEnv func(string) (string, bool)
+	resolver *toolchain.Resolver
+	runner   *process.Runner
+	// timeout is the configured wall clock, zero meaning none; stallTimeout is
+	// the progress-based hang detector that stands in its place.
+	timeout      time.Duration
+	stallTimeout time.Duration
+	workDir      string
+	limits       Limits
+	// evidenceClip is the effective per-fact evidence bound this provider
+	// emits under (Options.MaxEvidencePerFact), already resolved to a finite
+	// number by New.
+	evidenceClip int
+	lookupEnv    func(string) (string, bool)
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -232,8 +289,11 @@ var _ provider.Provider = (*Provider)(nil)
 // with the toolchain's own CTX_TOOL_* code and reported as honest absence, so
 // a machine whose platform has no C++ payload still indexes Go.
 func New(ctx context.Context, o Options) (*Provider, error) {
-	if o.Limits == (Limits{}) {
-		o.Limits = DefaultLimits()
+	if o.MaxEvidencePerFact <= 0 {
+		o.MaxEvidencePerFact = model.MaxEvidencePerFact
+	}
+	if o.Limits.MaxRecordBytes == 0 {
+		o.Limits.MaxRecordBytes = defaultRecordBytes
 	}
 	if err := o.Limits.Validate(); err != nil {
 		return nil, err
@@ -270,8 +330,8 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 		version = Version + "/" + toolsFingerprint(identities)
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
-		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout,
-		workDir: o.WorkDir, limits: o.Limits, lookupEnv: o.LookupEnv}, nil
+		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
+		workDir: o.WorkDir, limits: o.Limits, evidenceClip: o.MaxEvidencePerFact, lookupEnv: o.LookupEnv}, nil
 }
 
 // Descriptor declares the provider: optional, workspace-invalidated, on top
@@ -301,17 +361,42 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 	if p.importPath != "" && recognized[p.importPath] {
 		out = append(out, ImportScope(p.importPath))
 	}
+	byKind := triggersByKind(det.InputPaths)
 	for _, k := range p.runnableKinds() {
 		// A kind this machine cannot index precisely at all plans no unit: a
 		// planned unit materializes the whole snapshot before the run and would
 		// then fail on a payload Detect already reported as absent, with its
 		// typed reason. A deferred kind does plan one -- its payload is pinned
 		// for this platform and the unit fetches it.
-		for _, trig := range Triggers(k) {
-			if recognized[trig] {
-				out = append(out, ProfileScope(string(k)))
-				break
+		for _, root := range projectRoots(byKind[k]) {
+			key := ProfileScope(string(k), root)
+			if len(key) > model.MaxScopeKeyBytes {
+				// A key that does not fit is refused as a project, never
+				// truncated: two deep directories with a long common prefix
+				// cut to the same key, and every fact of one would then be
+				// attributed to the other. The project is left to the unit
+				// that encloses it, or to none, and the refusal is counted so
+				// the capability cannot be published fresh.
+				continue
 			}
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// triggersByKind groups the trigger paths detection recognized by the kind
+// each one triggers, ignoring anything that is not a trigger (the supplied
+// index is in the same list).
+func triggersByKind(inputs []string) map[Kind][]string {
+	out := map[Kind][]string{}
+	for _, in := range inputs {
+		base := in
+		if i := strings.LastIndexByte(in, '/'); i >= 0 {
+			base = in[i+1:]
+		}
+		if k, ok := triggerKind[base]; ok {
+			out[k] = append(out[k], in)
 		}
 	}
 	return out
@@ -321,7 +406,7 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 // manifests that trigger an approved profile, through the confined root. It
 // never runs a tool. An absent index and no installed approved indexer is
 // honest absence (CTX_PROVIDER_UNAVAILABLE).
-func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Policy) (provider.Detection, error) {
+func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy workspace.Policy) (provider.Detection, error) {
 	det := provider.Detection{Capabilities: capabilities}
 	if p.importPath != "" {
 		if info, err := root.Lstat(p.importPath); err == nil && info.Mode().IsRegular() {
@@ -329,23 +414,36 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 			det.InputPaths = append(det.InputPaths, p.importPath)
 		}
 	}
+	// The whole workspace is walked, not just its root. A repository keeps its
+	// projects where its own toolchains expect them, which for a monorepo is
+	// never the root: a root-only check planned nothing at all for a
+	// repository with six indexable projects in subdirectories. The walk is
+	// the policy's own -- it descends into nothing the snapshot excludes, so a
+	// dependency directory's manifests are never seen -- and it is bounded by
+	// provider.MaxDetectionInputs like every other detection.
+	triggers, truncated, err := p.walkTriggers(ctx, root, policy)
+	if err != nil {
+		return provider.Detection{}, err
+	}
 	for _, k := range p.runnableKinds() {
-		triggered := false
-		for _, trig := range Triggers(k) {
-			if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
-				triggered = true
-				det.InputPaths = append(det.InputPaths, trig)
-			}
+		if len(triggers[k]) == 0 {
+			continue
 		}
-		if triggered {
-			det.Available = true
-			if slices.Contains(p.deferred, k) {
-				// The kind is recorded as pending rather than as a refusal:
-				// Select publishes a degraded capability row for a CTX_ value and
-				// nothing for this one, which is why the spelling differs.
-				det = det.WithDetail(string(k), markerDeferred)
-			}
+		det.Available = true
+		det.InputPaths = append(det.InputPaths, triggers[k]...)
+		if slices.Contains(p.deferred, k) {
+			// The kind is recorded as pending rather than as a refusal:
+			// Select publishes a degraded capability row for a CTX_ value and
+			// nothing for this one, which is why the spelling differs.
+			det = det.WithDetail(string(k), markerDeferred)
 		}
+	}
+	if truncated {
+		// The bound cut the list, so some project of some kind has no unit.
+		// Nothing is refused silently: this is the one place that knows a
+		// project was dropped, and the detail is what makes the capability
+		// visibly short of the repository rather than quietly so.
+		det = det.WithDetail("unplanned_projects", "the workspace holds more project manifests than one detection carries; the projects past the bound are not indexed precisely")
 	}
 	// A language this workspace triggers whose indexer this machine cannot
 	// supply is named here with the toolchain's own reason, whether or not some
@@ -355,7 +453,7 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 	// unit for the missing kind, so no capability row ever carries the reason
 	// either.
 	for _, u := range p.missing {
-		if triggeredKind(root, u.kind) {
+		if len(triggers[u.kind]) > 0 {
 			det = det.WithDetail(string(u.kind), u.code)
 		}
 	}
@@ -370,10 +468,15 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 	if !det.Available {
 		// The single diagnostic code of an unavailable detection is the first
 		// triggered kind's reason; Details above carries every one of them.
+		// Details do not survive an unavailable detection, so the finding
+		// itself goes on Reason, which does: a bare CTX_PROVIDER_UNAVAILABLE
+		// on a repository full of projects reads as a broken provider.
 		det.DiagnosticCode = model.CodeProviderUnavailable
+		det.Reason = "no project manifest of a language this build indexes precisely is in the workspace"
 		for _, u := range p.missing {
-			if triggeredKind(root, u.kind) {
+			if len(triggers[u.kind]) > 0 {
 				det.DiagnosticCode = u.code
+				det.Reason = "the precise indexer for " + string(u.kind) + " is not usable on this machine"
 				break
 			}
 		}
@@ -395,7 +498,7 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 		// not by which bytes the payload has: codectx invokes the indexer
 		// itself. A deferred payload is therefore not fetched here -- Verify
 		// runs before the unit is opened, and a fetch belongs to the run.
-		if _, err := p.profileKind(scopeKey); err != nil {
+		if _, _, err := p.profileKind(scopeKey); err != nil {
 			return "", err
 		}
 		return model.SourceBindingVerified, nil
@@ -404,7 +507,7 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 	if err != nil {
 		return "", err
 	}
-	sc, err := openScratch(ctx, p.workDir, p.limits.MaxSpoolBytes)
+	sc, err := openScratch(ctx, p.workDir)
 	if err != nil {
 		return "", err
 	}
@@ -449,17 +552,13 @@ type Report struct {
 	// later document with the same path superseded, Skipped a document the
 	// snapshot does not hold or whose encoding or size the import cannot
 	// stand behind.
+	//
+	// Everything else this import left out -- refused occurrences, documents
+	// dropped for an encoding that did not hold, occurrences cut past a
+	// relation's evidence bound, records and fields the decoder discarded --
+	// is published on the capability row's details, which is the channel that
+	// reaches a reader of the generation. It is not repeated here.
 	OutsideRoot, DuplicatePaths, Skipped int64
-	// SkippedOccurrences are coordinates that did not land on the pinned
-	// bytes under an unverified binding; SkippedCallsiteAliases are call-site
-	// aliases whose key would exceed the alias bounds;
-	// TruncatedEdgeOccurrences are occurrences past a relation's evidence
-	// bound.
-	SkippedOccurrences, SkippedCallsiteAliases, TruncatedEdgeOccurrences int64
-	// AssumedPositionEncoding counts documents that left `position_encoding`
-	// unspecified and were converted in the measured encoding of the tool that
-	// wrote the index (see toolPositionEncoding).
-	AssumedPositionEncoding int64
 }
 
 // IndexUnit builds one unit: the supplied index or one profile run. It is the
@@ -489,7 +588,6 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	defer im.close()
 	var open opener
 	var err error
-	workDir := p.workDir
 	if strings.HasPrefix(req.Unit.ScopeKey, scopeProfile) {
 		prof, err := p.profileFor(ctx, req.Unit.ScopeKey)
 		if err != nil {
@@ -507,9 +605,8 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if err != nil {
 			return Report{}, internal("scip run directory: " + err.Error())
 		}
-		defer os.RemoveAll(runDir)
-		workDir = runDir
-		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir)
+		defer paced.RemoveAllFor(paced.Materialization, runDir)
+		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir, &im.seen)
 		if err != nil {
 			return Report{}, err
 		}
@@ -531,15 +628,22 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if ferr != nil {
 			return Report{}, ferr
 		}
+		im.seen.note(limitIndexBytes, fv.Size)
 		im.indexHash, open = fv.ContentHash, p.fileOpener(req.Content, fv)
 	}
-	if im.sc, err = openScratch(ctx, workDir, p.limits.MaxSpoolBytes); err != nil {
+	if im.sc, err = openScratch(ctx, p.workDir); err != nil {
 		return Report{}, im.decorate(err)
 	}
 	defer im.sc.close()
-	if err := im.run(ctx, open); err != nil {
+	// In-process work beside every other unit of the run, so no processor time
+	// is attributed to it: Go has no per-goroutine CPU and a share of the
+	// process counters would be a guess.
+	importCtx, span := ledger.Start(ctx, stageImport, req.Unit.ScopeKey)
+	if err := im.run(importCtx, open); err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return Report{}, im.decorate(err)
 	}
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	rep := im.report()
 	// False readiness. Every one of the six indexers needs the project's own
 	// dependency context (research note 4), and four of them exit 0 having
@@ -582,34 +686,69 @@ func (p *Provider) runnableKinds() []Kind {
 	return out
 }
 
-// triggeredKind reports whether the workspace holds a trigger of one kind. It
-// reads metadata through the confined root and nothing else.
-func triggeredKind(root workspace.Root, k Kind) bool {
-	for _, trig := range kindSpecs[k].triggers {
-		if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
-			return true
+// walkTriggers collects, per kind this build can run, the root-relative
+// project manifests the workspace holds, in the walk's own order. It reads the
+// tree through the confined root under the snapshot's own policy and runs no
+// tool.
+//
+// The bound is provider.MaxDetectionInputs over all kinds together, which is
+// the bound the detection itself carries; the walk stops there and says so,
+// because a list cut in silence is a project nobody indexes and nobody is
+// told about.
+func (p *Provider) walkTriggers(ctx context.Context, root workspace.Root, policy workspace.Policy) (map[Kind][]string, bool, error) {
+	out := make(map[Kind][]string, len(Kinds))
+	found, truncated := 0, false
+	err := workspace.Walk(ctx, root, policy, func(f workspace.File) error {
+		base := f.Path
+		if i := strings.LastIndexByte(f.Path, '/'); i >= 0 {
+			base = f.Path[i+1:]
 		}
+		// Every kind this build knows is collected, not only the ones it can
+		// run: a language whose indexer this machine cannot supply must be
+		// named with its own reason, and only the presence of its manifests
+		// says the repository contains it at all.
+		k, ok := triggerKind[base]
+		if !ok {
+			return nil
+		}
+		if found >= provider.MaxDetectionInputs {
+			truncated = true
+			return errDetectionFull
+		}
+		out[k] = append(out[k], f.Path)
+		found++
+		return nil
+	})
+	if err != nil && !errors.Is(err, errDetectionFull) {
+		return nil, false, err
 	}
-	return false
+	return out, truncated, nil
 }
+
+// errDetectionFull ends a bounded detection walk without making an early stop
+// look like a failure.
+var errDetectionFull = errors.New("detection input bound reached")
 
 // profileKind resolves a profile scope key to the kind it names, without
 // reaching for a payload. A kind this build knows but whose payload did not
 // resolve reports the toolchain's own code, so a unit planned before a payload
 // was lost fails with the reason rather than with "unknown profile".
-func (p *Provider) profileKind(scopeKey string) (Kind, error) {
-	name := strings.TrimPrefix(scopeKey, scopeProfile)
+func (p *Provider) profileKind(scopeKey string) (Kind, string, error) {
+	name, root, ok := splitProfileScope(scopeKey)
+	if !ok {
+		return "", "", invalid("scip unit scope " + scopeKey + " names no indexer profile and no project")
+	}
 	for _, k := range p.runnableKinds() {
 		if string(k) == name {
-			return k, nil
+			return k, root, nil
 		}
 	}
 	for _, u := range p.missing {
 		if string(u.kind) == name {
-			return "", u.err
+			return "", "", u.err
 		}
 	}
-	return "", invalid("scip unit scope names profile " + name + ", which is not a SCIP indexer this build knows")
+	return "", "", invalid("scip unit scope names profile " + name + ", which is not a SCIP indexer this build knows")
 }
 
 // profileFor is profileKind followed by the payload. A kind the store already
@@ -619,12 +758,13 @@ func (p *Provider) profileKind(scopeKey string) (Kind, error) {
 // -- the same failure it would have had at construction, now only for a
 // language this repository actually contains.
 func (p *Provider) profileFor(ctx context.Context, scopeKey string) (Profile, error) {
-	k, err := p.profileKind(scopeKey)
+	k, root, err := p.profileKind(scopeKey)
 	if err != nil {
 		return Profile{}, err
 	}
 	for _, prof := range p.profiles {
 		if prof.Kind == k {
+			prof.Root = root
 			return prof, nil
 		}
 	}
@@ -635,7 +775,7 @@ func (p *Provider) profileFor(ctx context.Context, scopeKey string) (Profile, er
 	if err != nil {
 		return Profile{}, err
 	}
-	return Profile{Kind: k, Tool: t}, nil
+	return Profile{Kind: k, Tool: t, Root: root}, nil
 }
 
 // importFile resolves an import scope key to the pinned snapshot file it
@@ -660,9 +800,6 @@ func (p *Provider) importFile(ctx context.Context, view model.SnapshotView, scop
 	}
 	if !found {
 		return model.FileVersion{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "the snapshot holds no scip index at " + path}
-	}
-	if fv.Size > p.limits.MaxIndexBytes {
-		return model.FileVersion{}, overLimit("index bytes", fv.Size, p.limits.MaxIndexBytes)
 	}
 	return fv, nil
 }

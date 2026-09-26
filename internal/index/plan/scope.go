@@ -135,11 +135,11 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 
 // isProfileScope reports whether a scip scope key names an indexer profile
 // rather than a supplied index, without parsing the key: the scip package owns
-// both spellings, and rebuilding the key from each known kind is the only
-// comparison that cannot drift from it.
+// both spellings, and rebuilding the key from each known kind and the project
+// root the key claims is the only comparison that cannot drift from it.
 func isProfileScope(key string) bool {
 	for _, k := range scip.Kinds {
-		if scip.ProfileScope(string(k)) == key {
+		if root, ok := scip.ProfileRoot(key, k); ok && scip.ProfileScope(string(k), root) == key {
 			return true
 		}
 	}

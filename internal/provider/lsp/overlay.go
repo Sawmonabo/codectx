@@ -33,13 +33,44 @@ type Location struct {
 	Selection   *model.SourceRange `json:"selection,omitempty"`
 }
 
-// Symbol is one document or workspace symbol.
+// Symbol is one document or workspace symbol. Every string it carries is
+// written into a model record, so each is bounded here, at the boundary that
+// reads the server's bytes, and the cut is recorded: the storage ceilings no
+// longer reject an over-long value, so a producer that does not truncate
+// serves the whole thing.
 type Symbol struct {
 	Name      string         `json:"name"`
 	Detail    string         `json:"detail,omitempty"`
 	Container string         `json:"container,omitempty"`
 	Kind      model.NodeKind `json:"kind"`
 	Location  Location       `json:"location"`
+	// TruncatedFields names the fields a storage ceiling cut against their
+	// original lengths, so an answer built from this symbol says which of its
+	// values are prefixes rather than presenting a cut value as the whole.
+	TruncatedFields map[string]int `json:"truncated_fields,omitempty"`
+}
+
+// newSymbol bounds every stored field of one symbol and records what it cut.
+// It is the only constructor: a symbol built field-by-field would be one
+// server response away from writing an unbounded name into a record.
+func newSymbol(name, detail, container string, kind model.NodeKind, loc Location) Symbol {
+	sym := Symbol{Kind: kind, Location: loc}
+	sym.Name = sym.bound("name", name, model.MaxNameBytes)
+	sym.Detail = sym.bound("signature", detail, model.MaxSignatureBytes)
+	sym.Container = sym.bound("container", container, model.MaxNameBytes)
+	return sym
+}
+
+// bound truncates one field and records the original length when it cut.
+func (s *Symbol) bound(field, value string, max int) string {
+	bounded, original := model.TruncateField(value, max)
+	if original > len(bounded) {
+		if s.TruncatedFields == nil {
+			s.TruncatedFields = map[string]int{}
+		}
+		s.TruncatedFields[field] = original
+	}
+	return bounded
 }
 
 // CallItem is a call-hierarchy participant. It is passed back to
@@ -161,12 +192,12 @@ func (o *Overlay) DocumentSymbols(ctx context.Context, file model.FileID, limit 
 	if err != nil {
 		return out, err
 	}
-	doc, notFound, err := o.s.document(ctx, file)
+	doc, missing, err := o.s.document(ctx, file)
 	if err != nil {
 		return out, err
 	}
-	if notFound {
-		return out, invalid("file %s is not in the pinned snapshot", file)
+	if missing != absentNone {
+		return out, invalid("file %s %s", file, missing.reason())
 	}
 	if err := o.s.ensureOpen(doc); err != nil {
 		return out, err
@@ -203,7 +234,7 @@ func (o *Overlay) DocumentSymbols(ctx context.Context, file model.FileID, limit 
 				out.Excluded++
 				continue
 			}
-			out.Items = append(out.Items, Symbol{Name: si.Name, Container: si.ContainerName, Kind: nodeKindOf(si.Kind), Location: loc})
+			out.Items = append(out.Items, newSymbol(si.Name, "", si.ContainerName, nodeKindOf(si.Kind), loc))
 		}
 		return out, nil
 	}
@@ -233,10 +264,8 @@ func (o *Overlay) flatten(doc *document, symbols []documentSymbol, container str
 		if err != nil {
 			return outputInvalid("textDocument/documentSymbol selection range for %q does not describe %s: %v", truncate(ds.Name, 64), doc.version.Path, err)
 		}
-		out.Items = append(out.Items, Symbol{
-			Name: ds.Name, Detail: ds.Detail, Container: container, Kind: nodeKindOf(ds.Kind),
-			Location: Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng, Selection: &sel},
-		})
+		out.Items = append(out.Items, newSymbol(ds.Name, ds.Detail, container, nodeKindOf(ds.Kind),
+			Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng, Selection: &sel}))
 		if err := o.flatten(doc, ds.Children, ds.Name, limit, out); err != nil {
 			return err
 		}
@@ -284,7 +313,7 @@ func (o *Overlay) WorkspaceSymbols(ctx context.Context, query string, limit int)
 			out.Excluded++
 			continue
 		}
-		out.Items = append(out.Items, Symbol{Name: ws.Name, Container: ws.ContainerName, Kind: nodeKindOf(ws.Kind), Location: loc})
+		out.Items = append(out.Items, newSymbol(ws.Name, "", ws.ContainerName, nodeKindOf(ws.Kind), loc))
 	}
 	return out, nil
 }
@@ -384,11 +413,11 @@ func (o *Overlay) calls(ctx context.Context, method string, item CallItem, limit
 		if incoming {
 			siteFile = peer.Location.File
 		}
-		doc, notFound, err := o.s.document(ctx, siteFile)
+		doc, missing, err := o.s.document(ctx, siteFile)
 		if err != nil {
 			return Result[Call]{}, err
 		}
-		if notFound {
+		if missing != absentNone {
 			out.Excluded++
 			continue
 		}
@@ -400,6 +429,12 @@ func (o *Overlay) calls(ctx context.Context, method string, item CallItem, limit
 			}
 			call.Sites = append(call.Sites, Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng})
 			if len(call.Sites) >= model.MaxRecordsPerResult {
+				// The remaining ranges of this call are cut by the per-result
+				// record bound. That is truncation, not exclusion: the sites
+				// are inside the pinned snapshot and the server did name
+				// them, so the answer says it had more to say rather than
+				// counting them as locations outside the snapshot.
+				out.Truncated = true
 				break
 			}
 		}
@@ -419,7 +454,7 @@ func (o *Overlay) callItem(ctx context.Context, raw json.RawMessage) (CallItem, 
 	if err != nil || !ok {
 		return CallItem{}, ok, err
 	}
-	return CallItem{Symbol: Symbol{Name: it.Name, Detail: it.Detail, Kind: nodeKindOf(it.Kind), Location: loc}, raw: raw}, true, nil
+	return CallItem{Symbol: newSymbol(it.Name, it.Detail, "", nodeKindOf(it.Kind), loc), raw: raw}, true, nil
 }
 
 // begin checks the server is serving and the operation is advertised, and
@@ -445,12 +480,12 @@ func (o *Overlay) begin(method string, supported bool, limit int) (int, error) {
 // position loads the queried document, synchronizes it to the server and
 // converts the byte offset to the negotiated encoding.
 func (o *Overlay) position(ctx context.Context, at At) (*document, position, error) {
-	doc, notFound, err := o.s.document(ctx, at.File)
+	doc, missing, err := o.s.document(ctx, at.File)
 	if err != nil {
 		return nil, position{}, err
 	}
-	if notFound {
-		return nil, position{}, invalid("file %s is not in the pinned snapshot", at.File)
+	if missing != absentNone {
+		return nil, position{}, invalid("file %s %s", at.File, missing.reason())
 	}
 	if !isText(doc.data) {
 		return nil, position{}, invalid("file %s is not UTF-8 text; a language server cannot address positions in it", doc.version.Path)
@@ -465,14 +500,19 @@ func (o *Overlay) position(ctx context.Context, at At) (*document, position, err
 	return doc, pos, nil
 }
 
-// call issues one request under the request timeout.
+// call issues one request under its own hang detector. There is no deadline on
+// the answer: a server that is still working -- computing, or answering -- is
+// working, however long the project it is answering about takes to index.
 func (o *Overlay) call(ctx context.Context, method string, params, result any) error {
-	ctx, cancel := context.WithTimeout(ctx, o.s.opts.RequestTimeout)
-	defer cancel()
-	if err := o.s.conn.call(ctx, method, params, result); err != nil {
-		return err
+	ctx, stalled, stop := o.s.conn.watchProgress(ctx, o.s.opts.RequestStallTimeout)
+	defer stop()
+	err := o.s.conn.call(ctx, method, params, result)
+	if err != nil && stalled() {
+		return unavailable("the language server made no progress for %s while answering %s; it is not responding",
+			o.s.opts.RequestStallTimeout, method).
+			WithDetail("method", method).WithDetail("reason", "stalled")
 	}
-	return nil
+	return err
 }
 
 // locate validates one server location: a file URI that maps into the
@@ -485,11 +525,11 @@ func (o *Overlay) locate(ctx context.Context, uri string, rng lspRange, selectio
 	if err != nil || !ok {
 		return Location{}, false, err
 	}
-	doc, notFound, err := o.s.document(ctx, model.NewFileID(o.s.view.Header().RepositoryID, rel))
+	doc, missing, err := o.s.document(ctx, model.NewFileID(o.s.view.Header().RepositoryID, rel))
 	if err != nil {
 		return Location{}, false, err
 	}
-	if notFound {
+	if missing != absentNone {
 		return Location{}, false, nil
 	}
 	r, err := doc.rangeOf(rng, o.s.enc)

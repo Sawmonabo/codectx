@@ -9,47 +9,42 @@ import (
 )
 
 // validate enforces the whole resolved configuration, including the cross-field
-// budget rules of Section 20.1's closing paragraph. No zero or negative setting
-// means unlimited, so every bound is checked for a positive value first.
+// budget rules of Section 20.1's closing paragraph.
+//
+// Two groups, and the difference between them is the whole scale posture. A
+// BOUND (Limit) is what the product refuses to exceed on the user's behalf: 0
+// means unlimited, that is the default for every one of them, and only a
+// negative value is rejected. A RESERVATION (worker counts, batch sizes, queue
+// and memory budgets, connection counts, wire ceilings) is not a limit on the
+// repository at all -- it is how much machine the work is given, it must be
+// positive because a zero-sized batch or a zero-connection reader is a broken
+// reservation rather than an unbounded one, and it never refuses a repository:
+// it serialises and defers the work instead.
 func (c Config) validate() error {
 	if c.Version != SchemaVersion {
 		return configInvalid("version is %d; this build understands configuration version %d", c.Version, SchemaVersion)
 	}
+	// Reservations: positive, never "unlimited".
 	for _, p := range []struct {
 		key string
 		v   int64
 	}{
-		{"workspace.max_files", c.Workspace.MaxFiles},
-		{"workspace.max_parse_file_bytes", c.Workspace.MaxParseFileBytes},
-		{"workspace.max_search_file_bytes", c.Workspace.MaxSearchFileBytes},
-		{"index.max_parser_workers", int64(c.Index.MaxParserWorkers)},
 		{"index.batch_records", int64(c.Index.BatchRecords)},
 		{"index.batch_bytes", c.Index.BatchBytes},
 		{"index.queue_bytes", c.Index.QueueBytes},
 		{"index.watch_pending_paths", int64(c.Index.WatchPendingPaths)},
 		{"index.watch_pending_bytes", c.Index.WatchPendingBytes},
-		{"index.retain_refs", int64(c.Index.RetainRefs)},
-		{"resources.base_memory_budget_bytes", c.Resources.BaseMemoryBudgetBytes},
 		{"resources.query_memory_bytes", c.Resources.QueryMemoryBytes},
 		{"resources.cache_bytes", c.Resources.CacheBytes},
-		{"resources.max_concurrent_queries", int64(c.Resources.MaxConcurrentQueries)},
-		{"resources.max_concurrent_graph_queries", int64(c.Resources.MaxConcurrentGraphQueries)},
-		{"resources.max_concurrent_heavy_analyzers", int64(c.Resources.MaxConcurrentHeavy)},
-		{"resources.max_temp_bytes", c.Resources.MaxTempBytes},
 		{"resources.min_free_disk_bytes", c.Resources.MinFreeDiskBytes},
 		{"resources.max_metadata_response_bytes", c.Resources.MaxMetadataResponseBytes},
 		{"resources.max_source_response_bytes", c.Resources.MaxSourceResponseBytes},
 		{"resources.max_query_text_bytes", int64(c.Resources.MaxQueryTextBytes)},
-		{"resources.max_query_terms", int64(c.Resources.MaxQueryTerms)},
 		{"resources.max_page_items", int64(c.Resources.MaxPageItems)},
-		{"resources.max_provider_record_bytes", c.Resources.MaxProviderRecordBytes},
 		{"storage.read_connections", int64(c.Storage.ReadConnections)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
-		{"storage.wal_high_water_bytes", c.Storage.WALHighWaterBytes},
-		{"providers.lsp.max_servers", int64(c.Providers.LSP.MaxServers)},
 		{"providers.lsp.max_outstanding_requests", int64(c.Providers.LSP.MaxOutstandingRequests)},
-		{"providers.lsp.max_overlay_bytes", c.Providers.LSP.MaxOverlayBytes},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
 		{"providers.dependence.unit_memory_floor_bytes", c.Providers.Dependence.UnitMemoryFloorBytes},
 		{"tools.max_fetch_bytes", c.Tools.MaxFetchBytes},
@@ -57,36 +52,79 @@ func (c Config) validate() error {
 		{"context.default_max_bytes", c.Context.DefaultMaxBytes},
 		{"context.default_max_files", int64(c.Context.DefaultMaxFiles)},
 		{"context.max_slices", int64(c.Context.MaxSlices)},
-		{"context.max_graph_depth", int64(c.Context.MaxGraphDepth)},
-		{"context.max_visited_nodes", int64(c.Context.MaxVisitedNodes)},
-		{"context.max_graph_edges", int64(c.Context.MaxGraphEdges)},
-		{"context.max_reason_paths_per_entry", int64(c.Context.MaxReasonPathsPerEntry)},
-		{"context.max_manifest_bytes", c.Context.MaxManifestBytes},
-		{"context.max_capsule_bytes", c.Context.MaxCapsuleBytes},
 		{"coverage.chunk_bytes", c.Coverage.ChunkBytes},
 		{"coverage.max_chunk_bytes", c.Coverage.MaxChunkBytes},
 		{"coverage.max_receipts_per_confirmation", int64(c.Coverage.MaxReceiptsPerConfirmation)},
-		{"coverage.max_unconfirmed_chunks_per_session", int64(c.Coverage.MaxUnconfirmedChunksPerSession)},
 	} {
 		if p.v <= 0 {
-			return configInvalid("%s is %d; no zero or negative setting means unlimited", p.key, p.v)
+			return configInvalid("%s is %d; a reservation sizes the work and must be positive", p.key, p.v)
 		}
 	}
 	if c.Index.Workers < 0 {
 		return configInvalid("index.workers is %d; use 0 to choose from available CPUs and reservations", c.Index.Workers)
 	}
-	// The two settings whose 0 is a documented policy rather than a limit. A
-	// negative value is still rejected: it is not a third meaning.
+	// Bounds: 0 (or "unlimited") means unlimited and is the default. Only a
+	// negative value is rejected; it is not a third meaning.
 	for _, p := range []struct {
-		key, zeroMeans string
-		v              int64
+		key string
+		v   Limit
 	}{
-		{"index.max_retained_bytes", "retention governed by index.retain_refs alone", c.Index.MaxRetainedBytes},
-		{"providers.dependence.unit_memory_ceiling_bytes", "the machine-derived allocation", c.Providers.Dependence.UnitMemoryCeilingBytes},
+		{"workspace.max_files", c.Workspace.MaxFiles},
+		{"workspace.max_parse_file_bytes", c.Workspace.MaxParseFileBytes},
+		{"workspace.max_search_file_bytes", c.Workspace.MaxSearchFileBytes},
+		{"index.retain_refs", c.Index.RetainRefs},
+		{"index.max_retained_bytes", c.Index.MaxRetainedBytes},
+		{"index.capture_max_retries", c.Index.CaptureMaxRetries},
+		{"resources.max_query_terms", c.Resources.MaxQueryTerms},
+		{"resources.max_provider_record_bytes", c.Resources.MaxProviderRecordBytes},
+		{"providers.lsp.max_overlay_bytes", c.Providers.LSP.MaxOverlayBytes},
+		{"context.max_graph_depth", c.Context.MaxGraphDepth},
+		{"context.max_visited_nodes", c.Context.MaxVisitedNodes},
+		{"context.max_graph_edges", c.Context.MaxGraphEdges},
+		{"context.max_reason_paths_per_entry", c.Context.MaxReasonPathsPerEntry},
+		{"context.max_manifest_bytes", c.Context.MaxManifestBytes},
+		{"context.max_capsule_bytes", c.Context.MaxCapsuleBytes},
+		{"context.max_capsule_records_per_list", c.Context.MaxCapsuleRecordsPerList},
+		{"context.max_capsule_coverage_files", c.Context.MaxCapsuleCoverageFiles},
+		{"context.max_seeds", c.Context.MaxSeeds},
+		{"context.max_start_nodes", c.Context.MaxStartNodes},
+		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
+		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
+		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
+		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
+		{"providers.dependence.max_export_files", c.Providers.Dependence.MaxExportFiles},
+		{"index.watch_max_directories", c.Index.WatchMaxDirectories},
+		{"index.max_evidence_per_fact", c.Index.MaxEvidencePerFact},
+		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
+		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
+		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
+		{"providers.manifest.max_xml_elements", c.Providers.Manifest.MaxXMLElements},
+		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
+		{"providers.tree_sitter.max_records_per_file", c.Providers.TreeSitter.MaxRecordsPerFile},
+		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
+		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
+		{"workspace.max_depth", c.Workspace.MaxDepth},
+		{"workspace.max_ignored_roots", c.Workspace.MaxIgnoredRoots},
+		{"providers.scip.max_index_bytes", c.Providers.SCIP.MaxIndexBytes},
+		{"providers.scip.max_manifest_bytes", c.Providers.SCIP.MaxManifestBytes},
+		{"providers.scip.max_documents", c.Providers.SCIP.MaxDocuments},
+		{"providers.scip.max_occurrences_per_document", c.Providers.SCIP.MaxOccurrencesPerDocument},
+		{"providers.scip.max_spool_bytes", c.Providers.SCIP.MaxSpoolBytes},
+		{"providers.scip.max_source_file_bytes", c.Providers.SCIP.MaxSourceFileBytes},
+		{"providers.scip.max_materialize_bytes", c.Providers.SCIP.MaxMaterializeBytes},
 	} {
 		if p.v < 0 {
-			return configInvalid("%s is %d; use 0 for %s", p.key, p.v, p.zeroMeans)
+			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",
+				p.key, int64(p.v), unlimitedSpelling)
 		}
+	}
+	// index.max_evidence_per_fact is the operator's clip BELOW the record
+	// ceiling: a fact can never carry more occurrences than model tolerates on
+	// the wire, so a value above it would be a setting that does nothing. It is
+	// refused rather than silently reduced.
+	if c.Index.MaxEvidencePerFact.Value() > model.MaxEvidencePerFact {
+		return configInvalid("index.max_evidence_per_fact is %d; a fact record holds at most %d evidence occurrences",
+			c.Index.MaxEvidencePerFact.Value(), model.MaxEvidencePerFact)
 	}
 	for _, d := range []struct {
 		key string
@@ -94,22 +132,47 @@ func (c Config) validate() error {
 	}{
 		{"index.watch_debounce", c.Index.WatchDebounce},
 		{"index.reconcile_interval", c.Index.ReconcileInterval},
-		{"resources.query_timeout", c.Resources.QueryTimeout},
+		{"index.capture_retry_deadline", c.Index.CaptureRetryDeadline},
 		{"storage.busy_timeout", c.Storage.BusyTimeout},
 		{"storage.closed_session_retention", c.Storage.ClosedSessionRetention},
 		{"storage.query_cursor_ttl", c.Storage.QueryCursorTTL},
 		{"retention.blob_grace", c.Retention.BlobGrace},
-		{"providers.tree_sitter.worker_idle_ttl", c.Providers.TreeSitter.WorkerIdleTTL},
-		{"providers.scip.timeout", c.Providers.SCIP.Timeout},
-		{"providers.lsp.request_timeout", c.Providers.LSP.RequestTimeout},
+		{"providers.scip.stall_timeout", c.Providers.SCIP.StallTimeout},
+		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
-		{"providers.dependence.timeout", c.Providers.Dependence.Timeout},
-		{"tools.fetch_timeout", c.Tools.FetchTimeout},
+		{"providers.dependence.stall_timeout", c.Providers.Dependence.StallTimeout},
 		{"coverage.session_ttl", c.Coverage.SessionTTL},
 	} {
 		if d.v <= 0 {
 			return configInvalid("%s is %s; a duration must be positive", d.key, d.v)
 		}
+	}
+	// The query deadline and the two analysis timeouts are the exception: 0
+	// means no wall-clock limit. A query that carries no deadline runs to the
+	// complete answer, and a deadline that fails an analysis unit would refuse a
+	// repository for being large. The stall timeouts above are what catch a
+	// wedged subprocess.
+	for _, d := range []struct {
+		key string
+		v   Duration
+	}{
+		{"resources.query_timeout", c.Resources.QueryTimeout},
+		{"providers.scip.timeout", c.Providers.SCIP.Timeout},
+		{"providers.dependence.timeout", c.Providers.Dependence.Timeout},
+	} {
+		if d.v < 0 {
+			return configInvalid("%s is %s; use 0 for no wall-clock limit", d.key, d.v)
+		}
+	}
+	// storage.synchronous is an enumeration, not a number: it is neither a
+	// reservation nor a bound, so it is checked here rather than in either
+	// loop above. An unrecognized spelling is refused at load time so the
+	// store never has to choose a fallback durability mode of its own.
+	switch c.Storage.Synchronous {
+	case SynchronousNormal, SynchronousFull:
+	default:
+		return configInvalid("storage.synchronous is %q; use %q or %q",
+			c.Storage.Synchronous, SynchronousNormal, SynchronousFull)
 	}
 	if err := c.validateStructuralCeilings(); err != nil {
 		return err
@@ -120,10 +183,14 @@ func (c Config) validate() error {
 	return c.validateTools()
 }
 
-// validateStructuralCeilings rejects a configured limit larger than the
-// contract ceiling internal/model enforces. Configuration may lower an
-// effective limit but never raise one past what a stored column or a bounded
-// response can hold.
+// validateStructuralCeilings rejects a configured value larger than the
+// contract ceiling internal/model enforces. Only the class-A pagination and
+// class-B wire bounds are cross-checked here: those really are what a stored
+// column or a single bounded response can hold, and they are not the bounds the
+// scale posture removes. context.max_reason_paths_per_entry left this list when
+// it became an unlimited-by-default bound -- a per-entry explanation count is a
+// report threshold, not a wire ceiling, so model.MaxReasonPathsPerEntry no
+// longer caps it.
 func (c Config) validateStructuralCeilings() error {
 	for _, p := range []struct {
 		key      string
@@ -131,7 +198,6 @@ func (c Config) validateStructuralCeilings() error {
 	}{
 		{"resources.max_page_items", int64(c.Resources.MaxPageItems), model.MaxPageItems},
 		{"resources.max_query_text_bytes", int64(c.Resources.MaxQueryTextBytes), model.MaxQueryTextBytes},
-		{"context.max_reason_paths_per_entry", int64(c.Context.MaxReasonPathsPerEntry), model.MaxReasonPathsPerEntry},
 		{"coverage.max_chunk_bytes", c.Coverage.MaxChunkBytes, model.MaxRawChunkBytes},
 		{"coverage.max_receipts_per_confirmation", int64(c.Coverage.MaxReceiptsPerConfirmation), model.MaxReceiptsPerConfirmation},
 	} {
@@ -177,9 +243,9 @@ func (c Config) validateBudgets() error {
 		return configInvalid("resources.max_source_response_bytes %d exceeds the %d-byte source wire ceiling",
 			c.Resources.MaxSourceResponseBytes, MaxSourceWireCeilingBytes)
 	}
-	if c.Providers.LSP.MaxOverlayBytes < c.Resources.MaxSourceResponseBytes {
-		return configInvalid("providers.lsp.max_overlay_bytes %d is smaller than resources.max_source_response_bytes %d; one served source response must fit the overlay",
-			c.Providers.LSP.MaxOverlayBytes, c.Resources.MaxSourceResponseBytes)
+	if overlay := c.Providers.LSP.MaxOverlayBytes; !overlay.IsUnlimited() && overlay.Value() < c.Resources.MaxSourceResponseBytes {
+		return configInvalid("providers.lsp.max_overlay_bytes %s is smaller than resources.max_source_response_bytes %d; one served source response must fit the overlay",
+			overlay, c.Resources.MaxSourceResponseBytes)
 	}
 	if c.Resources.MaxMetadataResponseBytes >= c.Resources.MaxSourceResponseBytes {
 		return configInvalid("resources.max_metadata_response_bytes %d is not smaller than the source budget %d; generic tools must stay under the smaller metadata limit",
@@ -189,44 +255,47 @@ func (c Config) validateBudgets() error {
 		return configInvalid("index.batch_bytes %d exceeds index.queue_bytes %d; a batch must fit the queue reservation",
 			c.Index.BatchBytes, c.Index.QueueBytes)
 	}
-	if c.Resources.MaxProviderRecordBytes > c.Index.BatchBytes {
-		return configInvalid("resources.max_provider_record_bytes %d exceeds index.batch_bytes %d; one record must fit one batch",
+	// An unlimited record bound is not a record that must fit one batch: the
+	// batch is a reservation the writer streams through, so the pairing only
+	// binds when the user set a record ceiling.
+	if c.Resources.MaxProviderRecordBytes.Exceeded(c.Index.BatchBytes) {
+		return configInvalid("resources.max_provider_record_bytes %s exceeds index.batch_bytes %d; one record must fit one batch",
 			c.Resources.MaxProviderRecordBytes, c.Index.BatchBytes)
 	}
-	if c.Resources.MaxConcurrentGraphQueries > c.Resources.MaxConcurrentQueries {
-		return configInvalid("resources.max_concurrent_graph_queries %d exceeds resources.max_concurrent_queries %d",
-			c.Resources.MaxConcurrentGraphQueries, c.Resources.MaxConcurrentQueries)
-	}
-	concurrent, err := mulNoOverflow("resources.max_concurrent_queries * resources.query_memory_bytes",
-		int64(c.Resources.MaxConcurrentQueries), c.Resources.QueryMemoryBytes)
-	if err != nil {
+	// This process's base footprint is DERIVED from the machine and these
+	// reservations (BaseFootprint), never checked against a figure: how many
+	// queries run at once comes from the cores, so a larger host simply has a
+	// larger base footprint and leaves its children a smaller allocation. A
+	// comparison here would refuse the shipped defaults for the core count of
+	// the machine they were loaded on, naming no key the operator could lower.
+	// The one thing that can still be wrong is arithmetic that leaves 64-bit
+	// range, and that names the keys that caused it.
+	if _, err := baseFootprintFor(c, QuerySlots()); err != nil {
 		return err
 	}
-	baseline, err := addNoOverflow("baseline memory reservation", concurrent, c.Resources.CacheBytes, c.Index.QueueBytes)
-	if err != nil {
-		return err
+	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
+	// and is the default, a negative value is rejected, and the pairing against
+	// the free-space reserve is one-sided -- an unlimited temporary budget has
+	// nothing to exceed. The free-space reserve itself is unaffected: it is the
+	// host-safety floor and is still enforced against actual free space, so an
+	// unlimited temporary budget never lets the workspace fill the disk.
+	if c.Resources.MaxTempBytes < 0 {
+		return configInvalid("resources.max_temp_bytes is %d; use 0 for unlimited", c.Resources.MaxTempBytes)
 	}
-	if baseline > c.Resources.BaseMemoryBudgetBytes {
-		return configInvalid("query, cache and queue reservations need %d bytes, over resources.base_memory_budget_bytes %d",
-			baseline, c.Resources.BaseMemoryBudgetBytes)
-	}
-	if c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
+	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
 		return configInvalid("resources.max_temp_bytes %d does not exceed the free-space reserve resources.min_free_disk_bytes %d; temporary work would always be refused",
 			c.Resources.MaxTempBytes, c.Resources.MinFreeDiskBytes)
 	}
-	if c.Context.DefaultMaxFiles > int(c.Workspace.MaxFiles) {
-		return configInvalid("context.default_max_files %d exceeds workspace.max_files %d",
+	// Both pairings are one-sided now: a caller budget can only be "more than
+	// the bound" when a bound was set at all. Against an unlimited workspace or
+	// an unlimited manifest there is nothing to exceed.
+	if c.Workspace.MaxFiles.Exceeded(int64(c.Context.DefaultMaxFiles)) {
+		return configInvalid("context.default_max_files %d exceeds workspace.max_files %s",
 			c.Context.DefaultMaxFiles, c.Workspace.MaxFiles)
 	}
-	if c.Context.DefaultMaxBytes > c.Context.MaxManifestBytes {
-		return configInvalid("context.default_max_bytes %d exceeds context.max_manifest_bytes %d",
+	if c.Context.MaxManifestBytes.Exceeded(c.Context.DefaultMaxBytes) {
+		return configInvalid("context.default_max_bytes %d exceeds context.max_manifest_bytes %s",
 			c.Context.DefaultMaxBytes, c.Context.MaxManifestBytes)
-	}
-	// A ceiling under the floor is not a narrow budget, it is a provider that
-	// rejects every unit before it runs while reporting a configured limit.
-	if ceiling := c.Providers.Dependence.UnitMemoryCeilingBytes; ceiling > 0 && ceiling < c.Providers.Dependence.UnitMemoryFloorBytes {
-		return configInvalid("providers.dependence.unit_memory_ceiling_bytes %d is below providers.dependence.unit_memory_floor_bytes %d; every unit would be rejected before it runs",
-			ceiling, c.Providers.Dependence.UnitMemoryFloorBytes)
 	}
 	// The token estimate is derived from bytes, so its arithmetic must not
 	// overflow before the compiler ever runs.

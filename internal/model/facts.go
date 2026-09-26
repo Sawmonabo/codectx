@@ -26,6 +26,7 @@ const (
 	NodeDependency     NodeKind = "dependency"
 	NodeConfiguration  NodeKind = "configuration"
 	NodeDocument       NodeKind = "document"
+	NodeSection        NodeKind = "section"
 	NodeEndpoint       NodeKind = "endpoint"
 	NodeDatabaseEntity NodeKind = "database_entity"
 )
@@ -37,7 +38,7 @@ func (k NodeKind) Valid() bool {
 	case NodeRepository, NodeDirectory, NodeFile, NodePackage, NodeModule, NodeNamespace,
 		NodeFunction, NodeMethod, NodeClass, NodeInterface, NodeStruct, NodeEnum,
 		NodeField, NodeVariable, NodeConstant, NodeTest, NodeBuildTarget, NodeDependency,
-		NodeConfiguration, NodeDocument, NodeEndpoint, NodeDatabaseEntity:
+		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity:
 		return true
 	}
 	return false
@@ -422,9 +423,12 @@ func (r Resolution) Validate() error {
 	if err := requireField("resolution.canonical_key", r.CanonicalKey, MaxNativeKeyBytes); err != nil {
 		return err
 	}
-	if err := boundCount("resolution.ambiguous", len(r.Ambiguous), MaxAmbiguousCandidates); err != nil {
-		return err
-	}
+	// The ambiguous list carries no count bound. A native key aliased to more
+	// equally supported identities than MaxAmbiguousCandidates is a property of
+	// the repository, not an invalid resolution, and refusing it here made the
+	// resolver refuse the provider's whole output instead. The list is bounded
+	// in the only place a bound belongs -- the alias lookup's own page size in
+	// storage -- so nothing unbounded reaches this validator.
 	for i, id := range r.Ambiguous {
 		if err := requireID(indexed("resolution.ambiguous", i), string(id)); err != nil {
 			return err
@@ -451,7 +455,13 @@ func (f NodeFact) Validate() error {
 	if err := f.Node.Validate(); err != nil {
 		return err
 	}
-	if err := requireField("node_fact.canonical_key", f.CanonicalKey, MaxNativeKeyBytes); err != nil {
+	// The canonical key is a 32-byte digest rendered as lowercase hex, not free
+	// text: storage keeps it as canonical_key BLOB(32) and the node identity
+	// derives from the decoded bytes, so a key that is not a digest has no
+	// storable form. Refusing it here names the producer's field; the storage
+	// writer keeps its own assertion because a fact can reach it from a carry
+	// path that never re-ran this method.
+	if err := requireID("node_fact.canonical_key", f.CanonicalKey); err != nil {
 		return err
 	}
 	if len(f.Evidence) == 0 {

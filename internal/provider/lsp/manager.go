@@ -20,13 +20,18 @@ package lsp
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
 
 // Options bound one Manager. Every bound is finite; a zero value takes the
@@ -39,13 +44,27 @@ type Options struct {
 	// DataDir is the data directory; materializations live under
 	// snapshot.MaterializeDir(DataDir).
 	DataDir string
-	// MaxServers caps concurrent language servers (providers.lsp.max_servers).
-	MaxServers int
+	// Admission is the process's one memory admission ledger -- the handle the
+	// composition root built, never a second one: a manager with a running
+	// total of its own would admit servers against an allocation the analysis
+	// engine is already holding, and the process would reserve a multiple of
+	// the machine's memory. Servers are admitted by the sum of the memory
+	// reservations their pinned definitions declare, never by a count: a
+	// monorepo answers as many projects at once as the machine has room for,
+	// and one whose reservation is larger than the whole allocation runs alone
+	// rather than being refused.
+	//
+	// It is not the run ledger below; the two share a word and nothing else.
+	Admission *admission.Ledger
 	// MaxOutstandingRequests caps in-flight requests per server
 	// (providers.lsp.max_outstanding_requests).
 	MaxOutstandingRequests int
-	// RequestTimeout bounds one request (providers.lsp.request_timeout).
-	RequestTimeout time.Duration
+	// RequestStallTimeout is how long a request tolerates the server making no
+	// observable progress before it is declared hung
+	// (providers.lsp.stall_timeout). It is a hang detector, never a deadline on
+	// an answer: a server that is still consuming processor time is working,
+	// and only one that is neither computing nor answering is wedged.
+	RequestStallTimeout time.Duration
 	// IdleTTL is how long a server with no open overlay is kept
 	// (providers.lsp.idle_ttl).
 	IdleTTL time.Duration
@@ -53,20 +72,44 @@ type Options struct {
 	// shutdown exchange and is the runner's grace before a forced stop.
 	StartTimeout time.Duration
 	StopTimeout  time.Duration
-	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
-	// pinned bytes cached for coordinate conversion, and the bytes sent to
-	// and received from a server over its lifetime.
-	MaxOverlayBytes int64
+	// MaxOverlayBytes is the user's overlay bound and is unlimited by default.
+	// When set it bounds, separately, the materialized snapshot (files that do
+	// not fit are named and left out, never refused), one file admitted to the
+	// pinned coordinate cache, and the bytes sent to a server in one rolling
+	// window. It is a config.Limit so that the sentinel can never be used as a
+	// number: arithmetic on it does not compile.
+	MaxOverlayBytes config.Limit
 	// MaxFrameBytes bounds one protocol message.
 	MaxFrameBytes int64
+	// Ledger is the process's run ledger handle -- the one the composition
+	// root composed, never a second one: the ledger file has a single
+	// collector, and a manager that opened its own would be a second writer on
+	// it. It may be nil, and then the manager records nothing, which is what a
+	// composition with no ledger (a report, which never holds the workspace
+	// lock) gets. A handle whose collector is detached -- a server start from a
+	// query, with no hold -- records nothing in exactly the same way, rather
+	// than writing without the workspace lock.
+	//
+	// The manager records into a run of its own rather than a generation's: a
+	// server start is lazy, pooled and shared between generations, so it
+	// belongs to none of them.
+	Ledger *ledger.Ledger
 }
+
+// stageServerStart is the stage a language server's start is recorded under.
+const stageServerStart = "server_start"
 
 // Package defaults for the bounds configuration does not name.
 const (
-	DefaultStartTimeout    = 60 * time.Second
-	DefaultStopTimeout     = 5 * time.Second
-	DefaultMaxOverlayBytes = 512 << 20
-	DefaultMaxFrameBytes   = 8 << 20
+	DefaultStartTimeout = 60 * time.Second
+	DefaultStopTimeout  = 5 * time.Second
+	// DefaultDocCacheBytes is the pinned coordinate cache's ceiling when the
+	// overlay bound is unlimited. The cache is lossless -- eviction costs a
+	// re-read of bytes the snapshot still holds -- so it keeps a finite
+	// ceiling, which is what makes the overlay's peak flat under an unlimited
+	// bound instead of repository-sized.
+	DefaultDocCacheBytes = 512 << 20
+	DefaultMaxFrameBytes = 8 << 20
 )
 
 // Manager starts trusted servers lazily, one per (snapshot, profile), shares
@@ -77,20 +120,47 @@ type Manager struct {
 
 	mu      sync.Mutex
 	servers map[serverKey]*entry
+	// mats holds one materialization per snapshot, shared read-only by every
+	// server of that snapshot. A server only ever READS the tree -- everything
+	// it writes goes to its own private working directory -- so a copy each
+	// would be servers x the whole snapshot on disk for nothing, which on a
+	// large monorepo with several projects is several full copies of the
+	// repository.
+	mats map[model.SnapshotID]*materialization
 	// live holds every server whose process tree has not yet been reaped,
 	// including servers that failed and were forgotten. Close waits on it, so
 	// "Close returns once every process tree is reaped" is true of a failed
 	// server too, not only of the ones still holding a slot.
 	live   map[*server]struct{}
 	closed bool
+	// overlay is this process's overlay run, opened by the FIRST server start
+	// and deleted at Close. It is opened lazily and not at construction
+	// because a run with no span under it is never written until the ledger
+	// stops, and stopping would then write one row per process that never
+	// started a server -- the row this run exists to avoid leaving behind.
+	overlay *ledger.Run
+}
+
+// materialization is one snapshot's shared tree: ready is closed once the fill
+// attempt finished, with either mat or err set, and refs counts the servers
+// rooted inside it. The tree is removed when the last of them has exited.
+type materialization struct {
+	ready chan struct{}
+	mat   *snapshot.Materialization
+	err   error
+	refs  int
 }
 
 // entry is one server slot: ready is closed once the start attempt finished,
-// with either srv or err set.
+// with either srv or err set. release gives the room it holds in the ledger
+// back; the ledger's own release is idempotent, so an entry removed twice -- a
+// failed start that is both forgotten and dropped by Open -- returns its room
+// once.
 type entry struct {
-	ready chan struct{}
-	srv   *server
-	err   error
+	ready   chan struct{}
+	srv     *server
+	err     error
+	release func()
 }
 
 // New validates and defaults the options.
@@ -102,12 +172,14 @@ func New(opts Options) (*Manager, error) {
 		return nil, invalid("the lsp manager needs an absolute data directory")
 	}
 	def := config.Defaults().Providers.LSP
+	if opts.Admission == nil {
+		return nil, invalid("the lsp manager needs the process memory admission ledger servers are admitted against")
+	}
 	for _, b := range []struct {
 		name  string
 		value *int
 		def   int
 	}{
-		{"max_servers", &opts.MaxServers, def.MaxServers},
 		{"max_outstanding_requests", &opts.MaxOutstandingRequests, def.MaxOutstandingRequests},
 	} {
 		if *b.value < 0 {
@@ -122,7 +194,7 @@ func New(opts Options) (*Manager, error) {
 		value *time.Duration
 		def   time.Duration
 	}{
-		{"request_timeout", &opts.RequestTimeout, def.RequestTimeout.Std()},
+		{"stall_timeout", &opts.RequestStallTimeout, def.StallTimeout.Std()},
 		{"idle_ttl", &opts.IdleTTL, def.IdleTTL.Std()},
 		{"start_timeout", &opts.StartTimeout, DefaultStartTimeout},
 		{"stop_timeout", &opts.StopTimeout, DefaultStopTimeout},
@@ -139,7 +211,6 @@ func New(opts Options) (*Manager, error) {
 		value *int64
 		def   int64
 	}{
-		{"max_overlay_bytes", &opts.MaxOverlayBytes, DefaultMaxOverlayBytes},
 		{"max_frame_bytes", &opts.MaxFrameBytes, DefaultMaxFrameBytes},
 	} {
 		if *b.value < 0 {
@@ -149,17 +220,30 @@ func New(opts Options) (*Manager, error) {
 			*b.value = b.def
 		}
 	}
-	if opts.MaxFrameBytes > opts.MaxOverlayBytes {
-		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %d", opts.MaxFrameBytes, opts.MaxOverlayBytes)
+	if opts.MaxOverlayBytes < 0 {
+		return nil, invalid("lsp max_overlay_bytes is %s; a bound must not be negative", opts.MaxOverlayBytes)
 	}
-	return &Manager{opts: opts, servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
+	// Only a bound the user set can be exceeded; an unlimited one is the top of
+	// the lattice and no frame size is over it.
+	if opts.MaxOverlayBytes.Exceeded(opts.MaxFrameBytes) {
+		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
+	}
+	return &Manager{opts: opts,
+		servers: make(map[serverKey]*entry), live: make(map[*server]struct{}),
+		mats: make(map[model.SnapshotID]*materialization)}, nil
 }
 
-// Open returns an overlay over view answered by profile, starting the server
-// lazily on first use and sharing a running one afterwards. The profile must
-// come from Resolve. When every server slot is taken by a server nobody is
-// using, the idle one is stopped to make room; when all are in use, the
-// answer is CTX_RESOURCE_LIMIT rather than a queue.
+// Open returns an overlay over view answered by profile at profile.Root,
+// starting the server lazily on first use and sharing a running one
+// afterwards. Two projects of one repository are two servers: a server
+// resolves a project from the directory it was started in, so one server
+// rooted at a monorepo's workspace root knows none of the projects under it.
+// The profile must come from Resolve. Room for the server is taken from the
+// process's one admission ledger, in turn behind every other heavy child that
+// asked first. When the machine has no room left for this server, an idle one
+// is stopped to make room; when every running server is in use, the open waits
+// for room rather than being refused -- another project's server already
+// running is never an answer of CTX_RESOURCE_LIMIT.
 func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Profile) (*Overlay, error) {
 	if view == nil {
 		return nil, invalid("an overlay needs a snapshot view")
@@ -167,11 +251,14 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	if len(profile.Tool.ArgvPrefix) == 0 || profile.Name == "" {
 		return nil, trustRequired("the profile was not constructed by lsp.Resolve; a server the tool lock did not pin is never started")
 	}
-	key := serverKey{snapshot: view.Header().ID, profile: profile.Name}
+	key := serverKey{snapshot: view.Header().ID, profile: profile.Name, root: profile.Root}
 	// Two attempts: the second covers a shared server that failed or began
 	// stopping between being found and being acquired.
 	for attempt := 0; attempt < 2; attempt++ {
-		e, starter, err := m.slot(key)
+		e, starter, err := m.slot(ctx, key, admission.Reservation{
+			MemoryBytes: profile.MemoryBudgetBytes,
+			DiskBytes:   profile.DiskBudgetBytes,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -186,7 +273,7 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 			// handed to every later Open. The identity check matters: expire
 			// or forget may have replaced this entry already.
 			if e2, ok := m.servers[key]; ok && e2 == e && (err != nil || srv.running() != nil) {
-				delete(m.servers, key)
+				m.dropLocked(key, e2)
 			}
 			m.mu.Unlock()
 			close(e.ready)
@@ -212,45 +299,149 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	return nil, unavailable("the language server could not be acquired")
 }
 
-// slot finds or reserves the entry for key. starter is true when the caller
-// must start the server and complete the entry.
-func (m *Manager) slot(key serverKey) (*entry, bool, error) {
-	for {
-		m.mu.Lock()
-		if m.closed {
-			m.mu.Unlock()
-			return nil, false, unavailable("the lsp manager is closed")
-		}
-		if e, ok := m.servers[key]; ok {
-			m.mu.Unlock()
-			return e, false, nil
-		}
-		if len(m.servers) < m.opts.MaxServers {
-			e := &entry{ready: make(chan struct{})}
-			m.servers[key] = e
-			m.mu.Unlock()
-			return e, true, nil
-		}
-		// Every slot is taken. Stop one idle server, if any, and try again.
-		var idle *server
-		for k, e := range m.servers {
-			select {
-			case <-e.ready:
-			default:
-				continue
-			}
-			if e.srv != nil && e.srv.isIdle() {
-				idle = e.srv
-				delete(m.servers, k)
-				break
-			}
-		}
+// slot finds or reserves the entry for key, admitting bytes against the
+// process's admission ledger. The reservation carries both dimensions: a
+// server holds memory while it runs and disk while it indexes, and the two are
+// granted in one act so no server holds half of what another needs. starter is
+// true when the caller must start the server and complete the entry.
+//
+// The ledger is never asked for room while this manager's mutex is held: the
+// wait can be long, and the ledger calls stopIdle back, which takes that
+// mutex. The entry is therefore published after the room is granted, and the
+// map is re-checked then -- another Open may have started this very server
+// while this one queued, and the room it took is handed straight back.
+func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reservation) (*entry, bool, error) {
+	m.mu.Lock()
+	if m.closed {
 		m.mu.Unlock()
-		if idle == nil {
-			return nil, false, resourceLimit("all %d language server slots are in use", m.opts.MaxServers).
-				WithDetail("limit", "max_servers")
+		return nil, false, unavailable("the lsp manager is closed")
+	}
+	if e, ok := m.servers[key]; ok {
+		m.mu.Unlock()
+		return e, false, nil
+	}
+	m.mu.Unlock()
+
+	// Queued first-in-first-out behind every other heavy child of this process,
+	// so a server can never overtake an engine unit that asked first. What it
+	// may still do, when it reaches the head and does not fit, is stop a server
+	// nobody is using: another project's server already running is never an
+	// answer of CTX_RESOURCE_LIMIT.
+	release, err := m.opts.Admission.ReserveWith(ctx, res, m.stopIdle)
+	if err != nil {
+		return nil, false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		release()
+		return nil, false, unavailable("the lsp manager is closed")
+	}
+	if e, ok := m.servers[key]; ok {
+		release()
+		return e, false, nil
+	}
+	e := &entry{ready: make(chan struct{}), release: release}
+	m.servers[key] = e
+	return e, true, nil
+}
+
+// stopIdle stops one server nobody is using, which gives its room back to the
+// ledger. It is the make-room step the ledger runs for a server open that has
+// reached the head of the queue and does not fit; a manager holding nothing
+// idle frees nothing and the open simply waits its turn.
+func (m *Manager) stopIdle() {
+	m.mu.Lock()
+	var idle *server
+	for k, e := range m.servers {
+		select {
+		case <-e.ready:
+		default:
+			continue
 		}
+		if e.srv != nil && e.srv.isIdle() {
+			idle = e.srv
+			m.dropLocked(k, e)
+			break
+		}
+	}
+	m.mu.Unlock()
+	if idle != nil {
 		idle.stop()
+	}
+}
+
+// materialize returns the snapshot's shared tree, filling it on the first
+// call and taking a reference for the caller. Every reference is given back
+// through releaseMat.
+func (m *Manager) materialize(ctx context.Context, view model.SnapshotView) (*snapshot.Materialization, error) {
+	id := view.Header().ID
+	m.mu.Lock()
+	shared, ok := m.mats[id]
+	if ok {
+		shared.refs++
+		m.mu.Unlock()
+		select {
+		case <-shared.ready:
+		case <-ctx.Done():
+			m.releaseMat(id)
+			return nil, model.Canceled(ctx.Err())
+		}
+		if shared.err != nil {
+			m.releaseMat(id)
+			return nil, shared.err
+		}
+		return shared.mat, nil
+	}
+	shared = &materialization{ready: make(chan struct{}), refs: 1}
+	m.mats[id] = shared
+	m.mu.Unlock()
+	shared.mat, shared.err = snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{
+		Dir: snapshot.MaterializeDir(m.opts.DataDir), MaxBytes: m.opts.MaxOverlayBytes.Value(),
+	})
+	close(shared.ready)
+	if shared.err != nil {
+		// A failed fill must not be handed to the next caller: releasing the
+		// starter's own reference removes it, so the next Open tries again.
+		err := shared.err
+		m.releaseMat(id)
+		return nil, err
+	}
+	return shared.mat, nil
+}
+
+// releaseMat gives one reference back and removes the tree once the last
+// server rooted in it has exited. Removal goes through Materialization.Close,
+// which is the arena's own paced release.
+func (m *Manager) releaseMat(id model.SnapshotID) error {
+	m.mu.Lock()
+	shared, ok := m.mats[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	shared.refs--
+	if shared.refs > 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	delete(m.mats, id)
+	m.mu.Unlock()
+	if shared.mat == nil {
+		return nil
+	}
+	return shared.mat.Close()
+}
+
+// dropLocked removes an entry and gives its room back to the ledger, which
+// admits whatever now fits -- an open of this manager's or an engine unit's,
+// the ledger does not distinguish them. The mutex must be held; the ledger's
+// release is idempotent, so an entry dropped twice returns its room once.
+func (m *Manager) dropLocked(key serverKey, e *entry) {
+	delete(m.servers, key)
+	if e.release != nil {
+		e.release()
 	}
 }
 
@@ -269,7 +460,7 @@ func (m *Manager) expire(s *server) {
 		m.mu.Unlock()
 		return
 	}
-	delete(m.servers, s.key)
+	m.dropLocked(s.key, e)
 	m.mu.Unlock()
 	s.stop()
 }
@@ -280,7 +471,7 @@ func (m *Manager) forget(s *server) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if e, ok := m.servers[s.key]; ok && e.srv == s {
-		delete(m.servers, s.key)
+		m.dropLocked(s.key, e)
 	}
 }
 
@@ -298,6 +489,60 @@ func (m *Manager) untrack(s *server) {
 	m.mu.Unlock()
 }
 
+// overlayContext returns a context whose spans belong to this process's
+// overlay run, opening that run on the first call. repositoryID is the
+// repository the snapshot being served names, which is the only place the
+// manager can learn it without spelling the identity a second time.
+//
+// A ledger failure never fails a server start: the answer the server gives is
+// correct whatever the accounting did, so the failure is logged with its
+// diagnostic code and the start proceeds with a run that records nothing. A
+// start with no hold gets the same nil run, because the handle it is given has
+// no collector attached then.
+//
+// The run is opened once per process and may outlive the hold that recorded
+// it. internal/ledger finalizes such a run when its collector detaches and
+// refuses everything it publishes afterwards, so this cache can never reach
+// into a later hold's accounting.
+func (m *Manager) overlayContext(ctx context.Context, repositoryID string) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.overlay == nil {
+		run, err := m.opts.Ledger.NewRun(ledger.KindOverlay, repositoryID)
+		if err != nil {
+			code := model.CodeInternal
+			var typed *model.Error
+			if errors.As(err, &typed) {
+				code = typed.Code
+			}
+			slog.Warn("language server starts are not being recorded in the run ledger",
+				"component", "lsp", "error_code", code, "error", err.Error())
+			return ctx
+		}
+		if run == nil {
+			return ctx
+		}
+		m.overlay = run
+	}
+	return m.overlay.Context(ctx)
+}
+
+// endOverlay ends this process's overlay run and removes it. An overlay run
+// belongs to no generation, so the retention that deletes a generation's runs
+// would never reach it: a process that exits cleanly takes its own row with it,
+// and the collection pass takes the rows of the processes that did not.
+func (m *Manager) endOverlay() error {
+	m.mu.Lock()
+	run := m.overlay
+	m.overlay = nil
+	m.mu.Unlock()
+	if run == nil {
+		return nil
+	}
+	run.Finish(ledger.OutcomeOK)
+	return m.opts.Ledger.DiscardRun(context.Background(), run)
+}
+
 // Close stops every server and refuses further opens. It returns once every
 // process tree is reaped and every materialization removed, including the
 // trees of servers that failed and were forgotten: those are stopped through
@@ -308,7 +553,7 @@ func (m *Manager) Close() error {
 	entries := make([]*entry, 0, len(m.servers))
 	for k, e := range m.servers {
 		entries = append(entries, e)
-		delete(m.servers, k)
+		m.dropLocked(k, e)
 	}
 	live := make([]*server, 0, len(m.live))
 	for s := range m.live {
@@ -324,7 +569,8 @@ func (m *Manager) Close() error {
 	for _, s := range live {
 		s.stop()
 	}
-	return nil
+	// Last, once no start can still open a span under it.
+	return m.endOverlay()
 }
 
 // Servers reports how many servers are currently running or starting.

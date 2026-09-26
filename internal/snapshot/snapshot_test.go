@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -398,14 +400,18 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 }
 
 // TestUnstableCaptureIsReported protects the Section 10.2 bound: a file that
-// keeps changing under the builder is recaptured at most twice and then the
-// capture fails with CTX_SNAPSHOT_UNSTABLE, rather than publishing a manifest
-// whose bytes were never validated or retrying forever.
+// keeps changing under the builder is recaptured until the user-set retry
+// budget is spent and the capture then fails with CTX_SNAPSHOT_UNSTABLE,
+// rather than publishing a manifest whose bytes were never validated or
+// retrying forever. The budget is now the caller's (zero is unlimited, bounded
+// by RetryDeadline), so the test sets it instead of reading a constant.
 func TestUnstableCaptureIsReported(t *testing.T) {
+	const retries = 4
 	f := newFixture(t, false)
 	f.write("flaky.dat", []byte("v0\n"), 0o644)
 	f.write("stable.dat", []byte("stable\n"), 0o644)
 	b := f.builder()
+	b.MaxRetries = retries
 	captures := 0
 	b.afterCapture = func(rel string) {
 		if rel != "flaky.dat" {
@@ -416,8 +422,8 @@ func TestUnstableCaptureIsReported(t *testing.T) {
 	}
 	_, err := b.Build(f.ctx)
 	wantCode(t, err, model.CodeSnapshotUnstable)
-	if captures != 1+maxRetries {
-		t.Fatalf("flaky.dat was captured %d times, want the initial read plus %d retries", captures, maxRetries)
+	if captures != 1+retries {
+		t.Fatalf("flaky.dat was captured %d times, want the initial read plus %d retries", captures, retries)
 	}
 	if entries, _ := os.ReadDir(StagingDir(f.dataDir)); len(entries) != 0 {
 		t.Fatalf("a failed capture left %d staging files behind", len(entries))
@@ -558,6 +564,129 @@ func TestMaterializeCopiesExactlyTheSelectedFiles(t *testing.T) {
 		}
 		if int64(len(b)) != fv.Size {
 			t.Errorf("%s is %d bytes, want the manifest's %d", rel, len(b), fv.Size)
+		}
+	}
+}
+
+// TestCaptureReportsSkippedAndOverBoundPaths protects the operator-visible half
+// of the scale posture: the walk now skips an unrepresentable path and reports
+// a passed file budget instead of failing, so the capture is only honest if
+// both reach Notes. Without this, the walk's report sink could be unset in the
+// one walk that matters and every skip would be silent again -- the class-G
+// defect this replaces, moved one layer up.
+func TestCaptureReportsSkippedAndOverBoundPaths(t *testing.T) {
+	f := newFixture(t, false)
+	f.write("a.go", []byte("package p\n"), 0o644)
+	f.write("b.go", []byte("package p\n"), 0o644)
+	f.write("c.go", []byte("package p\n"), 0o644)
+	component := strings.Repeat("d", 200)
+	func() {
+		t.Chdir(f.repoDir)
+		for depth := 0; depth*(len(component)+1) <= model.MaxPathBytes; depth++ {
+			if err := os.Mkdir(component, 0o700); err != nil {
+				t.Fatalf("mkdir at depth %d: %v", depth, err)
+			}
+			if err := os.Chdir(component); err != nil {
+				t.Fatalf("chdir at depth %d: %v", depth, err)
+			}
+		}
+		if err := os.WriteFile("buried.go", []byte("package p\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	b := f.builder()
+	b.Policy.MaxFiles = 1
+	snap, _ := f.build(b)
+	if snap.FileCount < 3 {
+		t.Fatalf("the capture recorded %d files under a budget of 1; a budget reports, it never clamps", snap.FileCount)
+	}
+	notes := b.Notes()
+	if notes.LongPathCount != 1 || len(notes.LongPaths) != 1 || len(notes.LongPaths[0]) != model.MaxPathBytes {
+		t.Fatalf("Notes long paths = %d/%d exemplars, want exactly the one skipped path, named and truncated to %d bytes",
+			notes.LongPathCount, len(notes.LongPaths), model.MaxPathBytes)
+	}
+	if !slices.Contains(notes.BoundsExceeded, workspace.SkipFileBudget) {
+		t.Fatalf("Notes.BoundsExceeded = %q, want %s: a passed budget the operator cannot see is a silent limit",
+			notes.BoundsExceeded, workspace.SkipFileBudget)
+	}
+}
+
+// barrierStore wraps the real store and records, at the instant the snapshot
+// is committed, which blobs the CAS batch had already made durable. The
+// manifest is streamed through unchanged, so the two sets are captured from
+// the same commit.
+type barrierStore struct {
+	Store
+	synced *map[string]bool
+	// atCommit is the synced set as it stood when PutSnapshot was entered, and
+	// named is every content hash the committed manifest carries.
+	atCommit map[string]bool
+	named    map[string]bool
+}
+
+func (s *barrierStore) PutSnapshot(ctx context.Context, snap model.Snapshot, files func(yield func(model.FileVersion) error) error) error {
+	s.atCommit = maps.Clone(*s.synced)
+	s.named = map[string]bool{}
+	return s.Store.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
+		return files(func(fv model.FileVersion) error {
+			if fv.ContentHash != "" {
+				s.named[fv.ContentHash] = true
+			}
+			return yield(fv)
+		})
+	})
+}
+
+// TestEveryBlobIsDurableBeforeTheSnapshotNamesIt is the durability barrier of
+// Section 10.3 stated as a test: the capture batches its fsyncs, so the thing
+// that must hold is that the batch has synced and published every blob the
+// committed manifest names, before the commit. Removing the Barrier call in
+// Build fails it: the fixture is smaller than one sync window, so without the
+// barrier nothing is ever flushed.
+func TestEveryBlobIsDurableBeforeTheSnapshotNamesIt(t *testing.T) {
+	f := newFixture(t, true)
+	distinct := 8
+	for i := range distinct {
+		f.write(fmt.Sprintf("pkg/file%d.go", i), []byte(fmt.Sprintf("package p\n\nconst N = %d\n", i)), 0o644)
+	}
+	// A duplicate of the first file: same content, one blob. It proves the
+	// synced set counts blobs and not paths.
+	f.write("pkg/copy.go", []byte("package p\n\nconst N = 0\n"), 0o644)
+	f.gitCmd("add", "-A")
+
+	synced := map[string]bool{}
+	spy := &barrierStore{Store: f.store, synced: &synced}
+	b := f.builder()
+	b.Store = spy
+	b.onBatch = func(batch *Batch) {
+		batch.onSync = func(hash string) { synced[hash] = true }
+	}
+	snap, err := b.Build(f.ctx)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if len(spy.named) != distinct {
+		t.Fatalf("manifest names %d distinct blobs, want %d", len(spy.named), distinct)
+	}
+	if len(spy.atCommit) != distinct {
+		t.Fatalf("%d blobs were durable at the commit, want %d; a vacuous set would pass the check below", len(spy.atCommit), distinct)
+	}
+	for hash := range spy.named {
+		if !spy.atCommit[hash] {
+			t.Errorf("snapshot %s names blob %s, which was not durable when the snapshot was committed", snap.ID, hash)
+		}
+	}
+	// And the bytes are readable afterwards, so publication was real and not
+	// merely recorded.
+	v, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
+	if err != nil {
+		t.Fatalf("OpenView: %v", err)
+	}
+	for _, fv := range f.manifest(v) {
+		if _, err := f.readAll(v, fv.ID); err != nil {
+			t.Fatalf("read %s: %v", fv.Path, err)
 		}
 	}
 }

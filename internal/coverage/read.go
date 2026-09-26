@@ -36,17 +36,24 @@ import (
 // The reported Coverage is the state before this chunk: issuing grants nothing,
 // confirming does. At end of file the zero-length chunk is still issued -- an
 // empty file's coverage can come from nothing else.
-func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.ReadChunkResponse, error) {
+func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model.ReadChunkResponse, err error) {
 	if err := req.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
 
 	// The one endpoint that touches the CAS and the filesystem runs under the
-	// same resources.query_timeout deadline as every other request: the CLI
-	// leaves a zero --timeout alone precisely so this applies, and checkLimits
-	// guarantees the bound is positive.
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	// same resources.query_timeout deadline as every other request -- and
+	// under the same rule: the operator's own --timeout stays in charge if they
+	// set one, and a zero query_timeout (the default) installs no deadline at
+	// all, so an unbounded read serves the whole chunk.
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage read", err) }()
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
@@ -57,15 +64,21 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 			return model.ReadChunkResponse{}, err
 		}
 	}
-	if limit := s.limits.MaxUnconfirmedChunksPerSession; limit > 0 {
+	// coverage.max_unconfirmed_chunks_per_session is a config.Limit and
+	// defaults to unlimited: unconfirmed chunks are rows in the session store,
+	// not heap. A user-set value still refuses the chunk that would exceed it,
+	// naming the limit, because the remedy is to confirm the receipts already
+	// issued rather than to serve more.
+	if s.limits.MaxUnconfirmedChunksPerSession > 0 {
 		outstanding, err := s.sessions.UnconfirmedChunks(ctx, req.SessionID)
 		if err != nil {
 			return model.ReadChunkResponse{}, err
 		}
-		if outstanding >= int64(limit) {
+		if s.limits.unconfirmedCapped(outstanding) {
 			return model.ReadChunkResponse{}, &model.Error{Code: model.CodeResourceLimit, Message: fmt.Sprintf(
-				"session holds %d unconfirmed chunks, at the ceiling of %d; confirm the receipts already issued rather than raising the cap",
-				outstanding, limit)}
+				"session holds %d unconfirmed chunks, at the coverage.max_unconfirmed_chunks_per_session limit of %d; "+
+					"confirm the receipts already issued rather than raising the cap",
+				outstanding, s.limits.MaxUnconfirmedChunksPerSession)}
 		}
 	}
 

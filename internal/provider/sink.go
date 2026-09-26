@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strconv"
 	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -13,8 +12,12 @@ import (
 
 // Limits are the per-batch bounds of Section 11.1: a batch is capped by both
 // records and retained bytes, and flushes at whichever is reached first.
-// MaxRecordBytes is resources.max_provider_record_bytes; a record over it, or
-// over BatchBytes, is CTX_RESOURCE_LIMIT naming the limit it broke.
+// MaxRecordBytes is resources.max_provider_record_bytes, and zero is
+// unlimited: no shipped value refuses a record for being large. A record over
+// a limit the USER set is admitted and REPORTED -- the sink counts it as a
+// degradation the unit's capability rows carry -- because a size key names
+// what the answer should tell the caller about, not what it should refuse.
+// Nothing here is what bounds memory: the batch reservations and the pool are.
 type Limits struct {
 	BatchRecords   int
 	BatchBytes     int64
@@ -26,12 +29,15 @@ type Limits struct {
 // the configured values). A bad bound is a configuration rejection, not
 // resource exhaustion.
 func (l Limits) Validate() error {
-	if l.BatchRecords <= 0 || l.BatchBytes <= 0 || l.MaxRecordBytes <= 0 {
-		return invalid(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; every bound must be positive",
+	// BatchRecords and BatchBytes size the machine rather than the repository:
+	// they are reservations, and a zero reservation is a configuration error.
+	// MaxRecordBytes is a repository bound, so zero means unlimited there.
+	if l.BatchRecords <= 0 || l.BatchBytes <= 0 || l.MaxRecordBytes < 0 {
+		return invalid(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; the batch reservations must be positive and the record bound may not be negative",
 			l.BatchRecords, l.BatchBytes, l.MaxRecordBytes))
 	}
-	if l.MaxRecordBytes > l.BatchBytes {
-		return invalid(fmt.Sprintf("max record bytes %d exceed batch bytes %d; such a record could never be flushed", l.MaxRecordBytes, l.BatchBytes))
+	if l.MaxRecordBytes > 0 && l.MaxRecordBytes > l.BatchBytes {
+		return invalid(fmt.Sprintf("max record bytes %d exceed batch bytes %d; a reporting threshold above the batch reservation could never be reached before the batch flushed", l.MaxRecordBytes, l.BatchBytes))
 	}
 	return nil
 }
@@ -96,6 +102,14 @@ func (p *Pool) release(n int64) {
 // relieves pressure by flushing every live sink's queued batches; if that
 // released anything it retries at once. Nothing is held while blocked.
 func (p *Pool) acquire(ctx context.Context, n int64) error {
+	// With max_provider_record_bytes unlimited, nothing upstream refuses a
+	// record larger than the whole pool, and such a record can never fit
+	// however much every other sink releases. Waiting for it would wedge the
+	// unit with no diagnosis, so it is refused here, naming the reservation
+	// that is too small rather than a repository bound the user did not set.
+	if n > p.capacity {
+		return resourceLimit(fmt.Sprintf("a single record of %d bytes does not fit the %d-byte sink pool (index.queue_bytes)", n, p.capacity))
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			// Checked before relieving: relief may issue one write per live
@@ -231,6 +245,22 @@ type keyed[T any] struct {
 	keys []string
 }
 
+// Degradation is the sink's one degradation surface: a bound a unit's records
+// exceeded, counted, so that exceeding it is reported rather than failing the
+// unit. It is the sink's equivalent of the dropped-and-counted rows the
+// bundled providers already publish, and RunUnit folds it into the unit's
+// capability rows as bounded details the generation stores.
+type Degradation struct {
+	// Limit is the configuration key whose user-set value was exceeded.
+	Limit string
+	// Bound is the value the user set.
+	Bound int64
+	// Count is how many records and reservations exceeded it.
+	Count uint64
+	// Largest is the largest size observed over the bound.
+	Largest int64
+}
+
 // batch is one bounded, typed accumulation awaiting persistence.
 type batch[T any] struct {
 	items []T
@@ -263,6 +293,12 @@ type BatchSink struct {
 	discarded bool
 	records   uint64
 	bytes     uint64
+
+	// overLimit counts the records and reservations admitted over a user-set
+	// MaxRecordBytes, with the largest size seen. They are the sink's whole
+	// degradation surface; see Degradations.
+	overLimit        uint64
+	overLimitLargest int64
 
 	// nodesKeyed and relationsKeyed latch whether this unit's node and
 	// relation facts carry producer keys. The first Put of each kind fixes it
@@ -332,16 +368,48 @@ func NewBatchSink(ctx context.Context, dst Sink, limits Limits, pool *Pool, canc
 func (s *BatchSink) Records() uint64 { s.mu.Lock(); defer s.mu.Unlock(); return s.records }
 func (s *BatchSink) Bytes() uint64   { s.mu.Lock(); defer s.mu.Unlock(); return s.bytes }
 
+// noteOverLimit counts one record or reservation over the user-set record
+// bound. It takes the sink lock and must not be called while it is held.
+func (s *BatchSink) noteOverLimit(size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.overLimit++
+	if size > s.overLimitLargest {
+		s.overLimitLargest = size
+	}
+}
+
+// Degradations reports every bound this unit's records exceeded. It is empty
+// for a unit that stayed within the bounds the user set, which is every unit
+// under the shipped defaults, because no default bounds a record's size.
+func (s *BatchSink) Degradations() []Degradation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.overLimit == 0 {
+		return nil
+	}
+	return []Degradation{{
+		Limit:   "max_provider_record_bytes",
+		Bound:   s.limits.MaxRecordBytes,
+		Count:   s.overLimit,
+		Largest: s.overLimitLargest,
+	}}
+}
+
 // Reserve charges n bytes against the pool before a provider decodes or
 // buffers input of that size, blocking until the reservation fits and
 // returning promptly on cancellation. The returned release must be called
-// exactly once. A reservation over MaxRecordBytes is refused outright.
+// exactly once. A reservation over a user-set MaxRecordBytes is counted as a
+// degradation and then made: the pool is what bounds what the run holds, and
+// refusing here would fail the unit over a bound the user set to be told
+// about. A reservation larger than the whole pool is still refused by
+// Pool.acquire, which names the reservation that is too small.
 func (s *BatchSink) Reserve(ctx context.Context, n int64) (release func(), err error) {
 	if n <= 0 {
 		return nil, invalid("a reservation must be positive")
 	}
-	if n > s.limits.MaxRecordBytes {
-		return nil, s.overLimit(n, "max_provider_record_bytes", s.limits.MaxRecordBytes)
+	if s.limits.MaxRecordBytes > 0 && n > s.limits.MaxRecordBytes {
+		s.noteOverLimit(n)
 	}
 	if err := s.failure(); err != nil {
 		return nil, err
@@ -496,14 +564,22 @@ func (s *BatchSink) PutSearchUnits(ctx context.Context, docs []model.SearchUnit)
 	return nil
 }
 
-// put admits one record: it rejects an oversize record before anything is
-// queued, flushes the batch that would overflow, charges the record's bytes
-// (without holding the sink lock while blocked) and only then appends. The
-// overflow check is repeated after a blocking charge because another worker
-// may have appended meanwhile.
+// put admits one record: it counts a record over the user-set record bound,
+// flushes the batch that would overflow, charges the record's bytes (without
+// holding the sink lock while blocked) and only then appends. The overflow
+// check is repeated after a blocking charge because another worker may have
+// appended meanwhile.
+//
+// An oversize record is admitted, never refused. Every record type here is
+// identity-bearing -- a relation is its endpoints, an alias is its keys, and a
+// node's qualified name is the key generated symbols are told apart by -- so
+// cutting "the largest field" to fit would either collapse two identities into
+// one or, for Node.Metadata, leave a JSON payload storage then rejects. The
+// bound is therefore reported, and the batch reservations and the pool remain
+// what bound the heap.
 func put[T any](s *BatchSink, ctx context.Context, b *batch[T], item T, size int64) error {
-	if size > s.limits.MaxRecordBytes {
-		return s.overLimit(size, "max_provider_record_bytes", s.limits.MaxRecordBytes)
+	if s.limits.MaxRecordBytes > 0 && size > s.limits.MaxRecordBytes {
+		s.noteOverLimit(size)
 	}
 	s.mu.Lock()
 	if err := admit(s, ctx, b, size); err != nil {
@@ -708,11 +784,4 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 func keyless() error {
 	return &model.Error{Code: model.CodeInternal,
 		Message: "the sink destination does not record provider fact keys; a keyed batch cannot be persisted"}
-}
-
-// overLimit is the typed single-record refusal: Details name the limit broken
-// so the diagnosis is not "batch too large" but which bound and by how much.
-func (s *BatchSink) overLimit(size int64, limit string, bound int64) error {
-	return resourceLimit(fmt.Sprintf("a single record of %d bytes exceeds %s (%d); it cannot be admitted in any batch", size, limit, bound)).
-		WithDetail("limit", limit).WithDetail("record_bytes", strconv.FormatInt(size, 10)).WithDetail("limit_bytes", strconv.FormatInt(bound, 10))
 }

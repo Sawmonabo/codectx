@@ -69,9 +69,10 @@ func (h *handlers) contextAdvance(ctx context.Context, _ *mcp.CallToolRequest, i
 }
 
 // contextCapsule answers codectx_context_capsule. The six model.CapsuleView
-// values route to Capsule's bounded page; view="export" routes to Export and is
-// projected to capsuleExport — CANONICAL METADATA ONLY, never the capsule body,
-// whose 8 MiB bound cannot fit the 256 KiB metadata ceiling.
+// values route to Capsule, which reads ONE keyset page of that one list from
+// the capsule's stored rows; view="export" routes to Export and is projected to
+// capsuleExport — identity and counts only, never the capsule body, which is an
+// unbounded record set and could not be served under the metadata ceiling.
 //
 // The export route validates a model.SessionRequest rather than the whole
 // CapsuleRequest, because CapsuleRequest.Validate rejects any view outside the
@@ -113,16 +114,23 @@ func (h *handlers) contextCapsule(ctx context.Context, _ *mcp.CallToolRequest, i
 // exportOf projects a sealed capsule onto its canonical export metadata.
 //
 // It copies identity, binding, both hashes, the scope version, the strict-gate
-// flag and the creation time, and reduces every record list to its length. No
-// capsule record crosses this boundary: a capsule may hold up to
-// context.max_capsule_bytes (8 MiB) of facts, observations, coverage and
-// waivers, which cannot be served under the 256 KiB
-// resources.max_metadata_response_bytes ceiling this tool answers within. A
-// caller that wants the records pages them through the six view spellings.
+// flag and the creation time, and carries the capsule's eight record counts. No
+// capsule record crosses this boundary and none is read to build it: a sealed
+// capsule holds counts, and its records are rows read one keyset page at a time
+// through the six view spellings, so this projection is a fixed, small field
+// set whatever the session recorded.
 //
-// The count keys are the Capsule fields' own JSON tags, so a count and the view
-// that pages it cannot drift apart.
+// The count keys are model.CapsuleList's own spellings, which are the view
+// spellings, so a count and the view that pages it cannot drift apart.
 func exportOf(c model.Capsule) capsuleExport {
+	counts := make(map[string]int64, len(model.CapsuleListOrder)+1)
+	for _, list := range model.CapsuleListOrder {
+		counts[string(list)] = c.Counts.Of(list)
+	}
+	// Completeness is not one of the paged lists -- it is a small, bounded
+	// per-capability status the capsule carries whole -- but an export reader
+	// counts it beside the eight.
+	counts["completeness"] = int64(len(c.Completeness))
 	return capsuleExport{
 		SessionID:           c.SessionID,
 		ActorID:             c.ActorID,
@@ -131,18 +139,8 @@ func exportOf(c model.Capsule) capsuleExport {
 		CanonicalHash:       c.CanonicalHash,
 		ScopeVersion:        c.ScopeVersion,
 		StrictGateSatisfied: c.StrictGateSatisfied,
-		Counts: map[string]int{
-			"scope":            len(c.Scope),
-			"accepted_facts":   len(c.AcceptedFacts),
-			"rejected_facts":   len(c.RejectedFacts),
-			"contradictions":   len(c.Contradictions),
-			"unresolved":       len(c.Unresolved),
-			"scope_review_ids": len(c.ScopeReviewIDs),
-			"coverage":         len(c.Coverage),
-			"waivers":          len(c.Waivers),
-			"completeness":     len(c.Completeness),
-		},
-		CreatedAt: c.CreatedAt,
+		Counts:              counts,
+		CreatedAt:           c.CreatedAt,
 	}
 }
 

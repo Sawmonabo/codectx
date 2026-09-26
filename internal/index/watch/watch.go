@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 	"github.com/fsnotify/fsnotify"
@@ -44,13 +45,6 @@ const (
 	DefaultMaxBytes  = 2 << 20
 )
 
-// maxWatchedDirs bounds the directory watches one watcher holds. It is a
-// product-owned structural bound, not a configuration knob: it exists so the
-// watch set is finite on a pathological tree, and it is deliberately near the
-// order of a stock Linux `fs.inotify.max_user_watches` so the product refuses
-// before the kernel does and can say so in Coverage.
-const maxWatchedDirs = 65536
-
 // Reasons a batch is a full reconciliation. They are operator-facing text on a
 // bounded surface: none of them names a path, because Section 20.1 keeps
 // source paths out of ordinary logs and these strings reach both a log line
@@ -61,9 +55,14 @@ const (
 	ReasonQueueOverflow = "the operating system's notification queue overflowed"
 	ReasonWatchLimit    = "the operating system refused a directory watch"
 	ReasonWatchSetLimit = "the workspace holds more directories than one watcher may watch"
-	ReasonUnavailable   = "filesystem notification is unavailable on this host"
-	ReasonRescanFailed  = "the workspace could not be traversed to place watches"
-	ReasonPeriodic      = "periodic reconciliation"
+	// ReasonPathTooLong is an event about a path longer than
+	// model.MaxPathBytes. The path cannot be carried in a batch, so
+	// notification coverage over it is reported incomplete rather than the
+	// event being dropped in silence.
+	ReasonPathTooLong  = "a changed path is longer than the representable path limit"
+	ReasonUnavailable  = "filesystem notification is unavailable on this host"
+	ReasonRescanFailed = "the workspace could not be traversed to place watches"
+	ReasonPeriodic     = "periodic reconciliation"
 )
 
 // Batch is one debounced set of changes. Paths are root-relative, sorted and
@@ -100,7 +99,15 @@ type Options struct {
 	// what the bound exists to cap.
 	MaxPaths int
 	MaxBytes int64
-	Logger   *slog.Logger
+	// MaxWatchedDirs is index.watch_max_directories: how many directories the
+	// user allows one watcher to watch. Unlimited by default -- a repository's
+	// directory count is a property of the repository, and the kernel's own
+	// per-user watch limit is the real ceiling, which is refused and reported
+	// as ReasonWatchLimit when it is reached. A user-set bound stops the
+	// traversal at that many directories and reports coverage incomplete with
+	// ReasonWatchSetLimit, so what it costs is never silent.
+	MaxWatchedDirs config.Limit
+	Logger         *slog.Logger
 }
 
 // Watcher turns notifications into batches. One Watcher runs one Run at a
@@ -109,6 +116,8 @@ type Options struct {
 type Watcher struct {
 	opts    Options
 	dataDir string
+	// longPathSeen makes the over-long-path warning one-shot per watcher.
+	longPathSeen bool
 
 	mu             sync.Mutex
 	complete       bool
@@ -122,13 +131,18 @@ func New(o Options) (*Watcher, error) {
 	if o.Root.Path == "" {
 		return nil, invalid("the watcher needs an opened workspace root")
 	}
-	// The watch set is directories, so index.max_files never bounds it -- but a
-	// zero-valued Policy is a caller that never built one, and watching a tree
-	// with none of the capture's exclusions applied is what this refuses.
-	// MaxFiles is the field that is never legitimately zero in a real policy,
-	// so it is the one the check reads.
-	if o.Policy.MaxFiles <= 0 {
+	// The watch set is directories, so workspace.max_files never bounds it --
+	// but a zero-valued Policy is a caller that never built one, and watching a
+	// tree with none of the capture's exclusions applied is what this refuses.
+	// DataDir is the field the check reads: Config.TraversalPolicy always fills
+	// it and snapshot.Builder.validate already requires it to be absolute, so
+	// it is present in every real policy. MaxFiles cannot serve as the check:
+	// with unlimited the default, a real policy's MaxFiles is zero.
+	if o.Policy.DataDir == "" {
 		return nil, invalid("the watcher needs the capture's traversal policy, not a zero value")
+	}
+	if o.Policy.MaxFiles < 0 {
+		return nil, invalid("workspace.max_files is negative; zero means unlimited")
 	}
 	for _, b := range []struct {
 		name  string
@@ -145,9 +159,34 @@ func New(o Options) (*Watcher, error) {
 			*b.value = b.def
 		}
 	}
+	if o.MaxWatchedDirs < 0 {
+		return nil, invalid("index.watch_max_directories is negative; zero means unlimited")
+	}
 	if o.MaxPaths < 0 || o.MaxBytes < 0 {
 		return nil, invalid("index.watch_pending_paths and index.watch_pending_bytes must not be negative")
 	}
+	// These two stay reservations with a finite default, and 0 means "use the
+	// default" rather than "unlimited". That is the documented behaviour for a
+	// class-A bound, not an oversight of the "0 = unlimited" rule:
+	//
+	//   - The pending set is a heap-resident structure whose size is the number
+	//     of paths changed between two debounce ticks. On a monorepo a branch
+	//     switch or a generated-code run changes every file at once, so an
+	//     unlimited pending set IS the repository-sized heap allocation the
+	//     scale ruling forbids. "Unlimited" is never "load everything into
+	//     heap"; here the two rules point in opposite directions and the memory
+	//     one wins.
+	//   - Nothing is lost when the reservation is exceeded. Overflow does not
+	//     drop a path: it clears the pending set and forces a FULL
+	//     reconciliation, which is strictly more work over strictly more paths,
+	//     and it is reported three ways (Overflow, the batch Reason, Coverage).
+	//     A bound that can only cost time, never fidelity, has no reason to be
+	//     unlimited.
+	//
+	// So a user who writes 0 is asking for the product's reservation, and the
+	// product must have one; an operator who wants a larger window sets a
+	// larger number. Ruling applied: H-L0 report deviation 2, over the plan's
+	// row-12 sentence.
 	if o.MaxPaths == 0 {
 		o.MaxPaths = DefaultMaxPaths
 	}
@@ -345,9 +384,9 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 				}
 				if overflow {
 					// The collapse frees the accumulated list on purpose: the
-					// batch no longer claims anything about individual paths,
-					// so retaining them would be memory held for a claim that
-					// is no longer made.
+					// collapsed batch claims nothing about individual paths,
+					// so retaining them would be memory held for a claim
+					// nobody makes.
 					pending = make(map[string]struct{})
 					pendingBytes = 0
 					w.setPending(0)
@@ -439,6 +478,20 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // `npm install` under
 // an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
+// Peak RSS: `want` is one entry per ADMITTED DIRECTORY, never one per file,
+// and the loop below stops at a user-set index.watch_max_directories, so the
+// map holds one short relative path per admitted directory -- a 300 000-file
+// monorepo at a realistic 10 files per directory wants ~30 000 entries, a few
+// megabytes. Unlimited is the default: the kernel's own per-user watch limit
+// is the real ceiling, and reaching it is refused and reported rather than
+// pre-empted here. A tree that exceeds a user-set bound stops at it, reports
+// coverage incomplete and keeps working.
+// It is therefore already bounded by watch-set size rather than repository
+// size, and a streamed diff against a spooled directory list would trade a
+// bounded map for a temp file and buy nothing. (Row 12b asks for a diff
+// against a SQLite watched-directory table; no such table exists and
+// schema.sql is frozen this wave -- but on this bound the diff is not the
+// memory fix it would be for a per-file structure.)
 func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map[string]bool) {
 	want := make(map[string]bool, len(watched)+16)
 	// The root is wanted even when the traversal cannot start: a workspace
@@ -450,7 +503,10 @@ func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map
 		if want[dir] {
 			return nil
 		}
-		if len(want) >= maxWatchedDirs {
+		// The question is whether admitting THIS directory would cross the
+		// bound, so the set holds exactly the configured number, root
+		// included -- not one more.
+		if w.opts.MaxWatchedDirs.Exceeded(int64(len(want)) + 1) {
 			overLimit = true
 			return errWatchSetFull
 		}
@@ -553,6 +609,26 @@ func (w *Watcher) relevant(name string, isDir bool) (string, bool) {
 		return "", false
 	}
 	if len(slashed) > model.MaxPathBytes {
+		// Neither this batch nor the capture can name this path, so the honest
+		// answer is that notification coverage is not complete. Dropping it
+		// silently -- what this replaces -- left a file that is never
+		// reindexed and nothing saying so.
+		//
+		// This reports rather than arming a reconciliation, unlike the pending
+		// overflow channel beside it, because a reconciliation would change
+		// nothing: workspace.Walk skips the same path for the same reason, so
+		// the path is unreachable to the indexer by any route. The next rescan
+		// resets coverage to complete; that is a known hole, and the warning
+		// below is what survives it.
+		//
+		// The one-shot flag and the coverage call are both reached only from
+		// the single event-loop goroutine that owns relevant's only call site.
+		if !w.longPathSeen {
+			w.longPathSeen = true
+			w.opts.Logger.Warn("watch event about an unrepresentable path",
+				"component", "index.watch", "reason", ReasonPathTooLong, "path_bytes", len(slashed))
+		}
+		w.setCoverage(false, ReasonPathTooLong)
 		return "", false
 	}
 	if w.opts.Policy.ForceInclude != nil && w.opts.Policy.ForceInclude(slashed) {

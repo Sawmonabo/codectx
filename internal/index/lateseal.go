@@ -3,10 +3,13 @@ package index
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -40,8 +43,28 @@ type deferredUnit struct {
 	previous model.UnitID
 }
 
-// lateSealer owns the background queue. One goroutine drains it, so heavy
-// analyzers are additionally serialized by the scheduler's admission gate.
+// queueState is the generation one queue of deferred units was planned over,
+// and the epoch that queue was published under.
+//
+// The epoch is what a tick runs its units by: it is bumped by every enqueue,
+// so a tick that popped its first unit from one queue never takes a unit a
+// later base activation put there -- which is both the "units of two snapshots
+// must never seal into one work generation" rule the snapshot check used to
+// carry, and what lets the tick write every unit's predecessor into the work
+// plan before its first worker starts rather than beside them.
+type queueState struct {
+	snap  model.SnapshotID
+	sel   provider.Selection
+	ref   string
+	epoch int64
+}
+
+// lateSealer owns the background queue. One goroutine drains it, and the units
+// of one tick overlap exactly as far as the machine's one allocation allows:
+// the tick offers the next unit as soon as the previous one is past
+// plan.Scheduler.Admit, so what runs at once is decided by the summed
+// reservations of ADR-0010 decision 5 and by nothing else -- no count of its
+// own, and no wait for a unit to finish.
 type lateSealer struct {
 	c *Coordinator
 
@@ -60,17 +83,38 @@ type lateSealer struct {
 
 	mu    sync.Mutex
 	queue []deferredUnit
-	// running is the unit the tick is building right now, or nil. It is part
-	// of what is pending: a queue that reports only what has not started yet
-	// answers "nothing is pending" for the whole minutes a unit takes, and a
-	// query reads that as coverage it does not have.
-	running *deferredUnit
-	// snap, sel and ref describe the generation the queued units were planned
-	// over. A later base activation replaces all three together with its own
+	// inflight holds the plan key of every unit a tick is building right now.
+	// Several units of one tick run at once, so it is a set and not one unit:
+	// a queue that reports fewer units than are actually in flight answers for
+	// coverage it does not have, exactly as one that reports only what has not
+	// started yet answers "nothing is pending" for the whole minutes a unit
+	// takes.
+	inflight map[string]bool
+	// state describes the generation the queued units were planned over. A
+	// later base activation replaces the whole of it together with its own
 	// queue: work planned over a superseded snapshot is not worth running.
-	snap model.SnapshotID
-	sel  provider.Selection
-	ref  string
+	state queueState
+	// foreground is the failure aggregate of the generation these units were
+	// planned over. It is replaced with the queue, because failures of a
+	// superseded generation say nothing about the one a later batch extends.
+	foreground map[string]*providerFailures
+	// background is the typed reason, per plan key, that a DEFERRED unit of
+	// THIS queue did not seal, accumulated across every tick the queue is
+	// drained by rather than held for the tick that produced it.
+	//
+	// It has to outlive its tick. A unit that fails is popped off the queue
+	// and never retried, and UnitWriter.Fail deletes its unit row, so nothing
+	// durable is left for a later publication to find: the scope is re-planned
+	// deferred by every later generation and, with only that tick's failures
+	// in hand, published as still running for ever -- an over-claim of work
+	// nothing will finish, which Section 13.3 forbids outright. A tick whose
+	// every unit failed publishes nothing at all, so its reasons would
+	// otherwise be discarded entirely.
+	//
+	// It is bounded by the queue it describes: one entry per queued scope at
+	// worst, and it is replaced with the queue for the same reason foreground
+	// is.
+	background map[string]unitFailure
 	// estimate is the mean duration of the deferred units this process has
 	// completed, and samples how many it is over. Zero samples means the
 	// estimate is unknown and Pending reports no estimate at all.
@@ -124,7 +168,7 @@ const maxBufferedPublications = 32
 func newLateSealer(c *Coordinator) *lateSealer {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &lateSealer{c: c, tick1: make(chan struct{}, 1), wake: make(chan struct{}, 1),
-		ctx: ctx, cancel: cancel, done: make(chan struct{})}
+		inflight: map[string]bool{}, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 }
 
 // acquire takes the tick slot, giving up when ctx is cancelled. release
@@ -172,7 +216,18 @@ func (l *lateSealer) enqueue(g *generation, units []plan.Unit) {
 	for _, u := range units {
 		l.queue = append(l.queue, deferredUnit{unit: u, previous: g.plan.Previous[plan.Key(u.ProviderID, u.ScopeKey)]})
 	}
-	l.snap, l.sel, l.ref = g.snap.ID, g.sel, g.ref()
+	// The epoch is bumped by every enqueue, including the one that queues
+	// nothing: a tick in flight must stop taking units from a queue this call
+	// has replaced whether the replacement holds work or not.
+	l.state = queueState{snap: g.snap.ID, sel: g.sel, ref: g.ref(), epoch: l.state.epoch + 1}
+	// The foreground generation's failures travel with the queue. The
+	// publication below re-plans the same scopes and still holds nothing for
+	// the ones that failed, so a report built without them calls the provider
+	// fresh over a hole the foreground already found.
+	l.foreground = g.failures
+	// The scopes this queue's own background work failed belong to the queue
+	// it was drained from, so they go with it.
+	l.background = map[string]unitFailure{}
 	pending := len(l.queue)
 	if pending > 0 && !l.started {
 		l.started = true
@@ -199,10 +254,7 @@ func (l *lateSealer) enqueue(g *generation, units []plan.Unit) {
 // caller runs them to completion first; Coordinator.Pending is how it decides.
 func (l *lateSealer) close() {
 	l.mu.Lock()
-	started, pending := l.started, len(l.queue)
-	if l.running != nil {
-		pending++
-	}
+	started, pending := l.started, len(l.queue)+len(l.inflight)
 	if l.publishing {
 		// A batch that has sealed its units and is publishing them is about
 		// to be cancelled by l.cancel below, and its units are then members
@@ -234,13 +286,23 @@ func (l *lateSealer) loop() {
 			if l.ctx.Err() != nil {
 				return
 			}
-			n, snap, sel, ref := l.pending()
+			n, state := l.pending()
 			if n == 0 {
 				break
 			}
-			if err := l.tick(l.ctx, snap, sel, ref); err != nil {
+			if err := l.tick(l.ctx, state); err != nil {
 				if l.ctx.Err() != nil {
 					return
+				}
+				var typed *model.Error
+				if errors.As(err, &typed) && typed.Code == model.CodeWorkspaceBusy {
+					// Another process owns the workspace. The queue keeps its
+					// units and stops asking until something wakes it again;
+					// retrying here would be a hot loop against a lock that is
+					// held for as long as that process runs.
+					l.c.log.Info("deferred unit publication is waiting for the workspace another process holds",
+						"component", component, "repository_id", string(l.c.repo), "units", n)
+					break
 				}
 				// Background work that failed leaves the active generation
 				// untouched and the scope answering stale; the next index
@@ -252,47 +314,42 @@ func (l *lateSealer) loop() {
 	}
 }
 
-// next pops the head of the queue and records it as the unit in flight. It
-// answers false when the queue is empty or when a later base activation
-// replaced the queue with work planned over another snapshot: units of two
-// snapshots must never seal into one work generation.
-func (l *lateSealer) next(snap model.SnapshotID) (deferredUnit, bool) {
+// next pops the head of the queue and adds it to the set in flight. It answers
+// false when the queue is empty or when a later base activation replaced the
+// queue: the units of that queue belong to another epoch, and this tick's work
+// generation was opened over the snapshot its own epoch named.
+func (l *lateSealer) next(epoch int64) (deferredUnit, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.queue) == 0 || l.snap != snap {
-		l.running = nil
+	if len(l.queue) == 0 || l.state.epoch != epoch {
 		return deferredUnit{}, false
 	}
 	d := l.queue[0]
 	l.queue[0] = deferredUnit{}
 	l.queue = l.queue[1:]
-	l.running = &d
+	l.inflight[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = true
 	return d, true
 }
 
-// finished clears the unit in flight.
-func (l *lateSealer) finished() {
+// finished takes one unit out of the set in flight.
+func (l *lateSealer) finished(d deferredUnit) {
 	l.mu.Lock()
-	l.running = nil
+	delete(l.inflight, plan.Key(d.unit.ProviderID, d.unit.ScopeKey))
 	l.mu.Unlock()
 }
 
-// pending is what the queue holds now: the unit in flight plus everything
-// behind it, and the snapshot, selection and ref the tick works over.
+// pending is what the queue holds now: the units in flight plus everything
+// behind them, and the state the tick works over.
 //
 // It is the question "is there a tick to run", so the publication window is
 // deliberately not counted: a publication in flight needs no tick, and adding
 // it here would have the background loop open and abort an empty work
 // generation for every batch a Drain publishes. What closing the coordinator
 // would abandon is the other question, and Coordinator.Pending answers it.
-func (l *lateSealer) pending() (int, model.SnapshotID, provider.Selection, string) {
+func (l *lateSealer) pending() (int, queueState) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	n := len(l.queue)
-	if l.running != nil {
-		n++
-	}
-	return n, l.snap, l.sel, l.ref
+	return len(l.queue) + len(l.inflight), l.state
 }
 
 // pendingAt builds the typed answer, attaching the estimate only once this
@@ -311,24 +368,87 @@ type sealedUnit struct {
 	unit                 model.UnitID
 }
 
+// batch is what one tick produced: the units that sealed. What did NOT seal is
+// not here -- it is kept on the sealer, in `background`, because the
+// publication has to tell a scope that failed from a scope still running, and
+// a scope that failed in an EARLIER tick is just as far from running as one
+// that failed in this one.
+type batch struct {
+	sealed []sealedUnit
+	// failed is this tick's own record of what did not seal, for the run row's
+	// totals and the every-unit-failed path; the queue's durable record of every
+	// tick's reasons is the sealer's background map.
+	failed map[string]unitFailure
+}
+
 // tick takes the tick slot and runs one batch, abandoning the attempt if ctx
 // is cancelled before the slot is free.
-func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
-	sel provider.Selection, ref string) error {
+func (l *lateSealer) tick(ctx context.Context, state queueState) error {
+	// The cross-process workspace lock first, then the tick slot: this batch
+	// publishes a generation, and the background loop is the one publisher
+	// that does not run inside a caller's hold. The lock order is
+	// retention/retention.go's -- workspace lock, then this process's indexing
+	// state -- and it is given back the moment the batch is done, so a
+	// deferred unit never keeps the workspace from the person's own index.
+	_, release, err := l.c.hold(ctx, HoldNow)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := l.acquire(ctx); err != nil {
 		return err
 	}
 	defer l.release()
-	return l.tickHeld(ctx, snap, sel, ref)
+	return l.tickHeld(ctx, state)
 }
 
 // tickHeld runs one batch in a work generation and publishes what sealed. The
 // caller holds the tick slot. The publication is recorded for a Drain to
 // deliver, never announced from here: this may be the background loop's
 // goroutine.
-func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
-	sel provider.Selection, ref string) error {
+func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error) {
 	c := l.c
+	snap := state.snap
+	// A deferred publication opens generations of its own, so it is a run in
+	// its own right and not spans of the index run that queued it -- which had
+	// ended long before this tick started. Its spans are keyed by the run id
+	// and belong to no generation, so they outlive the work generation this
+	// tick aborts on every path and the publication generation a later
+	// retention sweeps: the reason a deferred unit failed is still there after
+	// the tick, where a row written against the aborted generation is not.
+	run := c.newRun(ledger.KindDeferred)
+	ctx = run.Context(ctx)
+	// The publication is remembered for a Drain to deliver only once this run
+	// has ended and has read itself back: the result a Drain hands out states
+	// what THIS deferred run did, never the index run's account, and a run
+	// still going is not what a publication that has activated looks like.
+	var res model.IndexResult
+	published := false
+	// What this tick popped and what became of it. They are declared here
+	// because the run row's totals are reported on every exit path, including
+	// the one where nothing sealed: a deferred run whose counts were only ever
+	// reported by the index path rendered `0 planned, 0 succeeded` for a batch
+	// it had plainly run, which is a measurement nobody made.
+	planned := 0
+	b := batch{failed: map[string]unitFailure{}}
+	defer func() {
+		run.Report(ledger.Totals{UnitsPlanned: int64(planned),
+			UnitsSucceeded: int64(len(b.sealed)), UnitsFailed: int64(len(b.failed))})
+		// A batch whose every unit failed is not an ok run. It publishes
+		// nothing and returns no error -- one background unit's failure never
+		// stops the others, and the next index plans them again -- so the run
+		// row is the only place that says the batch got nowhere.
+		outcome := endOutcome(err)
+		if err == nil && len(b.sealed) == 0 && len(b.failed) > 0 {
+			outcome = ledger.OutcomeFailed
+		}
+		run.Finish(outcome)
+		if err != nil || !published {
+			return
+		}
+		c.attachRunLedger(ctx, &res, run, err)
+		l.record(res)
+	}()
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
 		return err
@@ -340,7 +460,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 	if err != nil {
 		return err
 	}
-	workGen, err := c.opts.Store.BeginGeneration(ctx, c.repo, snap, c.cfgHash, ref)
+	workGen, err := c.opts.Store.BeginGeneration(ctx, c.repo, snap, c.cfgHash, state.ref)
 	if err != nil {
 		return err
 	}
@@ -355,40 +475,96 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 	work := &generation{c: c, view: view, gen: workGen, prev: active, caps: c.newCapabilityReport(),
 		snap: model.Snapshot{ID: snap, RepositoryID: c.repo},
 		plan: plan.Plan{Previous: map[string]model.UnitID{}}}
-	var sealed []sealedUnit
+	// The predecessor of every unit this tick may run is written into the work
+	// plan here, before the first worker starts: generation.run reads that map
+	// from each worker's own goroutine, and writing it beside those reads would
+	// be two goroutines on one map.
+	l.carryPrevious(work, state.epoch)
+	// bmu guards what the workers accumulate. The batch is this tick's own
+	// record of what sealed and what did not, which is neither of the
+	// accumulators generation.mu guards.
+	var (
+		bmu sync.Mutex
+		wg  sync.WaitGroup
+	)
 	// One unit is popped at a time, so Promote can still see everything that
-	// has not sealed yet; every unit that seals before the queue empties
+	// has not started yet; every unit that seals before the queue empties
 	// publishes through the one generation below, which is the coalescing
 	// Section 11.6 requires.
 	for {
-		d, ok := l.next(snap)
+		d, ok := l.next(state.epoch)
 		if !ok {
 			break
 		}
 		if ctx.Err() != nil {
-			l.finished()
-			abort()
-			return model.Canceled(ctx.Err())
+			l.finished(d)
+			break
 		}
-		work.plan.Previous[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = d.previous
-		unit, err := l.runOne(ctx, work, d)
-		l.finished()
-		if err != nil {
-			// One background unit's failure does not stop the others, and it
-			// does not touch what is published: the scope keeps answering
-			// stale from its carried predecessor.
-			logTyped(c.log, "a deferred unit failed", err, "component", component,
-				"provider_id", d.unit.ProviderID, "scope_key", d.unit.ScopeKey)
-			continue
-		}
-		sealed = append(sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
+		planned++
+		ready := make(chan struct{})
+		admitted := sync.OnceFunc(func() { close(ready) })
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer l.finished(d)
+			unit, out, runErr := l.runOne(ctx, work, d, admitted)
+			key := plan.Key(d.unit.ProviderID, d.unit.ScopeKey)
+			if runErr != nil {
+				if ctx.Err() != nil && errors.Is(runErr, ctx.Err()) {
+					// The tick was cancelled, so this unit has no failure of
+					// its own: recording one would write a run-failure row and
+					// warn the operator about work only they stopped. The
+					// batch is thrown away below in any case.
+					return
+				}
+				// One background unit's failure does not stop the others, and
+				// it does not touch what is published: the scope keeps
+				// answering stale from its carried predecessor. The reason is
+				// kept on the run row and logged by the same path the
+				// foreground uses, so a deferred failure is as diagnosable as
+				// a foreground one. The row is written before the lock is
+				// taken: the mutex guards this tick's batch and nothing else.
+				failure := work.recordFailure(ctx, d.unit, out, runErr)
+				l.recordBackgroundFailure(key, failure)
+				bmu.Lock()
+				defer bmu.Unlock()
+				b.failed[key] = failure
+				return
+			}
+			bmu.Lock()
+			defer bmu.Unlock()
+			b.sealed = append(b.sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
+		}()
+		// The next unit is offered as soon as this one is past the admission
+		// gate, and the tick waits for nothing else: what runs at once is the
+		// summed reservations of ADR-0010 decision 5 and never a count of this
+		// loop's own. An empty queue therefore ends the popping and not the
+		// tick -- the publication below is after every worker has finished.
+		<-ready
 	}
-	if len(sealed) == 0 {
+	wg.Wait()
+	if ctx.Err() != nil {
 		abort()
+		return model.Canceled(ctx.Err())
+	}
+	if len(b.sealed) == 0 {
+		abort()
+		if len(b.failed) > 0 {
+			// Nothing published, so no capability row states it and the work
+			// generation that held the provider-run failure rows is gone with
+			// the abort. What survives is this run: its unit spans carry each
+			// scope's typed reason, its row says the batch failed, and this
+			// line is what an operator watching the log sees at the moment it
+			// happens. Every scope keeps answering from its carried
+			// predecessor and the next index plans them again.
+			c.log.Warn("every deferred unit of this batch failed; nothing was published",
+				"component", component, "repository_id", string(c.repo),
+				"units", len(b.failed), "run_id", run.ID())
+		}
 		return nil
 	}
 	l.setPublishing(true)
-	res, published, err := l.publish(ctx, snap, sel, ref, sealed)
+	res, published, err = l.publish(ctx, snap, state.sel, state.ref, b)
 	l.setPublishing(false)
 	abort()
 	if err != nil {
@@ -397,13 +573,25 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		// engine work is lost. Saying how much is lost is the difference
 		// between a diagnosable failure and minutes of analysis vanishing.
 		c.log.Warn("a deferred publication failed and its sealed units are abandoned",
-			"component", component, "repository_id", string(c.repo), "units", len(sealed))
+			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return err
 	}
-	if published {
-		l.record(res)
-	}
 	return nil
+}
+
+// carryPrevious writes the predecessor every queued unit imports its delta
+// from into the work generation's plan. It is called once, before the tick
+// starts its first worker, and covers exactly the queue of this tick's epoch:
+// a queue a later activation replaced is another tick's, and next stops at it.
+func (l *lateSealer) carryPrevious(work *generation, epoch int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state.epoch != epoch {
+		return
+	}
+	for _, d := range l.queue {
+		work.plan.Previous[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = d.previous
+	}
 }
 
 // setPublishing marks the publication window, which is pending work that is
@@ -416,33 +604,58 @@ func (l *lateSealer) setPublishing(on bool) {
 
 // runOne builds one deferred unit in the work generation, under the heavy
 // analyzer admission gate.
-func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, error) {
+// The provider result is answered on both paths: a failure's result carries
+// the run the provider actually opened, which is where the reason is kept.
+//
+// admitted is called once this unit is past the admission gate, and on every
+// path that never reaches it: it is how the tick knows it may offer the next
+// unit, so a unit that returns before the gate must not hold the queue behind
+// it.
+func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit,
+	admitted func()) (id model.UnitID, res outcome, err error) {
+
+	defer admitted()
 	started := l.c.now()
+	// The row exists before the unit is admitted, and the deferred close below
+	// gives it a terminal state on every path this call can take; run closes
+	// it first for a unit that reached its provider.
+	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
+	defer func() { span.End(unitEnding(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
-		return "", err
+		return "", outcome{}, err
 	}
 	state, exists, err := l.c.opts.Store.UnitState(ctx, spec.ID)
 	if err != nil {
-		return "", err
+		return "", outcome{}, err
 	}
 	if exists && state == model.UnitSealed {
 		// An earlier tick sealed it and could not publish; the unit is
 		// immutable, so it is published now rather than rebuilt.
-		return spec.ID, nil
+		return spec.ID, outcome{}, nil
 	}
 	if d.unit.Heavy {
-		release, err := l.c.sched.Admit(ctx, d.unit.Reservation)
-		if err != nil {
-			return "", err
+		release, admitErr := l.c.sched.Admit(ctx, d.unit.Reservation)
+		if admitErr != nil {
+			// The gate refused or was cancelled, so the unit never reached its
+			// work: unavailable with that reason, not a failure of a provider
+			// that was never asked. Ending the span here wins over the deferred
+			// close, which takes the first terminal state a span is given.
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return "", outcome{}, admitErr
 		}
 		defer release()
 	}
-	if _, err := work.run(ctx, d.unit, spec); err != nil {
-		return "", err
+	// Past the gate: this reservation is part of the sum the next unit is
+	// admitted against, so the tick may offer that one now.
+	admitted()
+	out, err := work.run(ctx, d.unit, spec, span)
+	if err != nil {
+		return "", out, err
 	}
 	l.observe(l.c.now().Sub(started))
-	return spec.ID, nil
+	return spec.ID, out, nil
 }
 
 // observe folds one completed unit's duration into the running mean Pending
@@ -483,9 +696,9 @@ func (l *lateSealer) observe(d time.Duration) {
 // the indexing path stops there: a caller that loses twice is contending with
 // a writer that is winning.
 func (l *lateSealer) publish(ctx context.Context, snap model.SnapshotID, sel provider.Selection,
-	ref string, sealed []sealedUnit) (model.IndexResult, bool, error) {
+	ref string, b batch) (model.IndexResult, bool, error) {
 	for attempt := 0; ; attempt++ {
-		res, published, err := l.publishOnce(ctx, snap, sel, ref, sealed)
+		res, published, err := l.publishOnce(ctx, snap, sel, ref, b)
 		if err == nil {
 			return res, published, nil
 		}
@@ -505,7 +718,7 @@ func (l *lateSealer) publish(ctx context.Context, snap model.SnapshotID, sel pro
 // generation the tick saw and has retention delete it, so pinning that id
 // would fail and discard the whole batch.
 func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel provider.Selection,
-	ref string, sealed []sealedUnit) (model.IndexResult, bool, error) {
+	ref string, b batch) (model.IndexResult, bool, error) {
 	c := l.c
 	started := c.now()
 	active, err := c.activeGeneration(ctx)
@@ -523,7 +736,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	pinned.Close()
 	if current != snap {
 		c.log.Warn("deferred units were sealed over a superseded snapshot; they are not published and the next index rebuilds them",
-			"component", component, "repository_id", string(c.repo), "units", len(sealed))
+			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return model.IndexResult{}, false, nil
 	}
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
@@ -538,33 +751,37 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	in := plan.Inputs{View: view, Selection: sel, Store: c.opts.Store, PrevGen: active,
-		CarriedPage: c.carriedPage(active), Config: c.opts.Config}
+		CarriedPage: c.carriedPage(active), Config: c.opts.Config, TempDir: c.workDir}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return model.IndexResult{}, false, err
 	}
-	replacing := make(map[string]model.UnitID, len(sealed))
-	for _, s := range sealed {
+	defer func() { _ = p.Close() }()
+	replacing := make(map[string]model.UnitID, len(b.sealed))
+	for _, s := range b.sealed {
 		replacing[plan.Key(s.providerID, s.scopeKey)] = s.unit
 	}
 	// Every sealed unit must be the unit this plan derives for its scope. If
 	// it is not, the snapshot or the configuration moved under the background
 	// work and the unit is not this generation's answer; nothing is published.
-	for _, u := range p.Units {
+	if err := p.Units(func(u plan.Unit) error {
 		key := plan.Key(u.ProviderID, u.ScopeKey)
 		want, ok := replacing[key]
 		if !ok {
-			continue
+			return nil
 		}
 		spec, err := u.Spec(c.cfgHash)
 		if err != nil {
-			return model.IndexResult{}, false, err
+			return err
 		}
 		if spec.ID != want {
 			c.log.Info("a deferred unit no longer matches the plan for its scope; it is not published",
 				"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey)
 			delete(replacing, key)
 		}
+		return nil
+	}); err != nil {
+		return model.IndexResult{}, false, err
 	}
 	if len(replacing) == 0 {
 		return model.IndexResult{}, false, nil
@@ -574,8 +791,16 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	if err != nil {
 		return model.IndexResult{}, false, err
 	}
+	// The run is linked to the generation it publishes INTO, never to the work
+	// generation, which is aborted on every path: the column states which
+	// generation this run produced, and the work generation is one no reader
+	// will ever find. A tick that publishes nothing leaves it null, which is
+	// the truthful answer and costs the run nothing -- the ledger's own bound
+	// keeps a run's account whether or not it reached a generation.
+	ledger.RunFromContext(ctx).AttachGeneration(int64(pubGen))
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
-		snap: captured, started: started, caps: c.newCapabilityReport()}
+		snap: captured, started: started, caps: c.newCapabilityReport(),
+		failedScopes: l.backgroundFailures(), failures: l.foregroundFailures()}
 	for _, s := range p.States {
 		g.caps.add(s)
 	}
@@ -584,8 +809,10 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	var health model.GenerationHealth
 	err = l.attach(ctx, g, replacing)
 	if err == nil {
-		g.coverage()
-		states, _ = g.caps.finish(c.log)
+		err = g.coverage(ctx)
+	}
+	if err == nil {
+		states = g.caps.finish(c.log)
 		health = healthOf(states)
 		// The publication generation is a new row, so it carries none of the
 		// working generation's supplied-index record: it is re-recorded here
@@ -612,10 +839,54 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	c.retain(ctx)
 	c.collect(ctx)
 	c.run.Unlock()
+	// The run list is the same wire-sized page the foreground publish serves,
+	// with the same count of what did not fit: a late-sealed generation with
+	// more runs than one response carries must say so rather than serve a
+	// short list as the whole of it.
+	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, StartedAt: started, CompletedAt: c.now()}, true, nil
+		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(c.opts.Config),
+		StartedAt: started, CompletedAt: c.now()}, true, nil
+}
+
+// recordBackgroundFailure keeps one deferred unit's typed reason for as long
+// as the queue it came from does. The unit is popped and never retried and its
+// unit row is deleted with it, so this is the only record left that the scope
+// is a failure and not work still in flight.
+func (l *lateSealer) recordBackgroundFailure(key string, f unitFailure) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.background == nil {
+		l.background = map[string]unitFailure{}
+	}
+	l.background[key] = f
+}
+
+// backgroundFailures is a copy of every reason this queue's ticks have
+// recorded, so the publication generation can fold them in without sharing
+// state with the sealer. It is nil before the first failure, which is the same
+// empty answer the indexing path gives.
+func (l *lateSealer) backgroundFailures() map[string]unitFailure {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return maps.Clone(l.background)
+}
+
+// foregroundFailures is a copy of the failure aggregate the queued units were
+// planned over, so the publication generation can fold it in without sharing
+// state with the sealer.
+func (l *lateSealer) foregroundFailures() map[string]*providerFailures {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]*providerFailures, len(l.foreground))
+	for id, agg := range l.foreground {
+		clone := *agg
+		clone.named = slices.Clone(agg.named)
+		out[id] = &clone
+	}
+	return out
 }
 
 // attach fills the publication generation: the reused members, the sealed
@@ -625,12 +896,14 @@ func (l *lateSealer) attach(ctx context.Context, g *generation, replacing map[st
 	if err := g.attachReused(ctx); err != nil {
 		return err
 	}
-	g.sealed = make(map[string]bool, len(replacing))
-	for key, unit := range replacing {
+	// The attached rows are themselves what the coverage pass reads back to
+	// decide which deferred scopes this generation still has outstanding, so
+	// nothing mirrors them in memory: they must be attached before coverage
+	// runs, which is the order publishOnce calls the two in.
+	for _, unit := range replacing {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
 			return err
 		}
-		g.sealed[key] = true
 		g.built++
 	}
 	for _, carried := range g.plan.Carry {
@@ -670,10 +943,7 @@ func (c *Coordinator) Pending() Pending {
 	l := c.late
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	units := len(l.queue)
-	if l.running != nil {
-		units++
-	}
+	units := len(l.queue) + len(l.inflight)
 	if l.publishing {
 		units++
 	}
@@ -712,9 +982,11 @@ func (c *Coordinator) Pending() Pending {
 // unit and its publication, and a caller that closed the coordinator there
 // would cancel a completed batch away.
 func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult)) error {
-	if err := c.writable(); err != nil {
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
 		return err
 	}
+	defer release()
 	l := c.late
 	l.mu.Lock()
 	if l.draining {
@@ -740,13 +1012,13 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 			deliver()
 			return err
 		}
-		units, snap, sel, ref := l.pending()
+		units, state := l.pending()
 		if units == 0 {
 			l.release()
 			deliver()
 			return nil
 		}
-		err := l.tickHeld(ctx, snap, sel, ref)
+		err := l.tickHeld(ctx, state)
 		l.release()
 		deliver()
 		if err != nil {
@@ -760,9 +1032,11 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 // not queued answers zero units: it is not pending, and the active generation
 // already holds whatever it has.
 func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) (Pending, error) {
-	if err := c.writable(); err != nil {
+	_, release, err := c.hold(ctx, HoldNow)
+	if err != nil {
 		return Pending{}, err
 	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return Pending{}, model.Canceled(err)
 	}
@@ -772,15 +1046,12 @@ func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) 
 	l := c.late
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	pending := len(l.queue)
-	if l.running != nil {
-		pending++
-		// The unit is already building: it cannot be promoted any further, and
-		// reporting it as absent would let the caller read "nothing pending" for
-		// the whole time it runs.
-		if l.running.unit.ProviderID == providerID && l.running.unit.ScopeKey == scopeKey {
-			return l.pendingAt(pending, 1), nil
-		}
+	pending := len(l.queue) + len(l.inflight)
+	// A unit already building cannot be promoted any further, and reporting it
+	// as absent would let the caller read "nothing pending" for the whole time
+	// it runs.
+	if l.inflight[plan.Key(providerID, scopeKey)] {
+		return l.pendingAt(pending, 1), nil
 	}
 	at := -1
 	for i, d := range l.queue {
@@ -795,12 +1066,9 @@ func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) 
 	promoted := l.queue[at]
 	copy(l.queue[1:at+1], l.queue[:at])
 	l.queue[0] = promoted
-	// A unit in flight holds position 1, so a promoted unit is next after it.
-	position := 1
-	if l.running != nil {
-		position = 2
-	}
-	return l.pendingAt(pending, position), nil
+	// The units in flight hold the positions in front, so a promoted unit is
+	// next after them.
+	return l.pendingAt(pending, len(l.inflight)+1), nil
 }
 
 // ref is the ref of the generation this pass built, which the deferred work

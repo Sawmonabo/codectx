@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -93,10 +96,126 @@ type importer struct {
 	records    uint64
 	indexBytes uint64
 
-	skippedDocs, skippedOccurrences, truncatedEdges int64
-	outsideRoot, duplicatePaths, skippedAliases     int64
-	assumedEncoding                                 int64
-	partialCode                                     string
+	skippedDocs, truncatedEdges int64
+	outsideRoot, duplicatePaths int64
+	// refusedOccurrences counts occurrences whose range the pinned bytes
+	// contradict; refusedExemplar is the first one's document, the coordinate
+	// that occurrence claimed and the reason, kept as the example an operator
+	// starts from. The coordinate is what makes the example usable: without it
+	// the operator has a file and must re-run the indexer to find the line
+	// inside it that disagrees. One exemplar, not a set: a set grows with the
+	// repository and the report is a bounded diagnostic surface.
+	refusedOccurrences int64
+	refusedExemplar    string
+	// encodingDropped counts documents whose assumed position encoding the
+	// pinned bytes contradict; encodingDroppedPath is the first of them. A
+	// failed probe is a whole-document shift, so the document is dropped
+	// rather than any one of its occurrences.
+	encodingDropped     int64
+	encodingDroppedPath string
+	partialCode         string
+	// drops is the one account of everything the wire decoder discarded for
+	// exceeding a field bound, across every pass of this import.
+	drops decodeDrops
+	// seen is the one account of the largest figure this import observed at
+	// each user-settable bound, across every pass. It is compared with the
+	// configured bounds once, in result.
+	seen limitSeen
+}
+
+// pathPrefix is the project directory this unit's index is written against,
+// or empty when it is the workspace itself. A supplied index is never
+// prefixed: it was produced outside this product and its paths are the
+// repository's already.
+func (im *importer) pathPrefix() string {
+	if im.profile == nil {
+		return ""
+	}
+	return im.profile.Root
+}
+
+// Bound names the seven providers.scip.* bounds are reported under. They are
+// the configuration keys themselves, so an operator reading a capability row
+// reads the name of the key to raise.
+const (
+	limitIndexBytes             = "max_index_bytes"
+	limitManifestBytes          = "max_manifest_bytes"
+	limitDocuments              = "max_documents"
+	limitOccurrencesPerDocument = "max_occurrences_per_document"
+	limitSpoolBytes             = "max_spool_bytes"
+	limitSourceFileBytes        = "max_source_file_bytes"
+)
+
+// detailLimitsExceeded is the capability-row detail the crossed bounds are
+// published under, as one sorted `key=seen/bound` list so the value is
+// reproducible across runs of the same index and costs one detail slot
+// whatever crossed.
+const detailLimitsExceeded = "resource_limits_exceeded"
+
+// The capability-row details of what the pinned bytes contradicted. Counts are
+// published separately from their exemplar so a reader can compare runs on the
+// number and still be handed one place to look.
+const (
+	// detailRefusedOccurrences counts occurrences left out because their range
+	// does not describe the bytes it claims.
+	detailRefusedOccurrences = "refused_occurrences"
+	// detailRefusedExemplar is the first of them, as
+	// `<document>:<line>:<column>: <reason>`. The coordinate is the one the
+	// occurrence claimed, spelled exactly as the index spelled it: zero-based,
+	// and the column counted in the position encoding the document declared --
+	// the encoding this refusal is a disagreement about. It is not converted,
+	// because a converted coordinate is one the product computed and the
+	// operator cannot look it up in the index that produced the disagreement.
+	detailRefusedExemplar = "refused_occurrence_exemplar"
+	// detailEncodingDropped counts documents dropped whole because the
+	// position encoding assumed for them did not hold against their bytes,
+	// and names the first.
+	detailEncodingDropped  = "documents_dropped_encoding"
+	detailEncodingExemplar = "documents_dropped_encoding_exemplar"
+)
+
+// limitSeen records the largest figure observed at each bound. It is a
+// measurement, not a gate: nothing consults it until the run is over, which
+// is what makes an unset bound cost nothing and a set one report rather than
+// refuse.
+type limitSeen struct{ m map[string]int64 }
+
+func (l *limitSeen) note(bound string, v int64) {
+	if l == nil {
+		return
+	}
+	if l.m == nil {
+		l.m = map[string]int64{}
+	}
+	if v > l.m[bound] {
+		l.m[bound] = v
+	}
+}
+
+// exceeded renders the bounds a user set and this run crossed, sorted, or "".
+func (l *limitSeen) exceeded(lim Limits) string {
+	bounds := []struct {
+		name string
+		v    config.Limit
+	}{{limitIndexBytes, lim.MaxIndexBytes}, {limitManifestBytes, lim.MaxManifestBytes},
+		{limitDocuments, lim.MaxDocuments}, {limitOccurrencesPerDocument, lim.MaxOccurrencesPerDocument},
+		{limitSpoolBytes, lim.MaxSpoolBytes}, {limitSourceFileBytes, lim.MaxSourceFileBytes}}
+	sort.Slice(bounds, func(i, j int) bool { return bounds[i].name < bounds[j].name })
+	var b strings.Builder
+	for _, bd := range bounds {
+		seen := int64(0)
+		if l != nil && l.m != nil {
+			seen = l.m[bd.name]
+		}
+		if !bd.v.Exceeded(seen) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s=%d/%d", bd.name, seen, int64(bd.v))
+	}
+	return b.String()
 }
 
 // location is a pinned file plus a byte range on it: where evidence points.
@@ -111,6 +230,12 @@ type docSource struct {
 	data []byte
 	cur  *source.Cursor
 	enc  source.ColumnEncoding
+	// spellings are the identifiers this document spells for a symbol that
+	// are not the name the symbol carries, per bindSpellings. It is what lets
+	// the name check hold every occurrence to its symbol's name without
+	// refusing the correct references an aliased import creates. It is bounded
+	// by this document's occurrences and discarded with it.
+	spellings map[string]map[string]struct{}
 }
 
 // docRow is the scratch record of one document bound to a snapshot file.
@@ -183,7 +308,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceBinding, metadata, error) {
 	var meta metadata
 	var verified, unverified int64
-	w := &walker{limits: im.p.limits, onGrow: im.reserve,
+	w := &walker{limits: im.p.limits, pathPrefix: im.pathPrefix(), onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onMetadata: func(m metadata) error { meta = m; return nil },
 		onDocument: func(d document) error {
 			admitted, err := im.seeDocument(ctx, d)
@@ -229,9 +354,7 @@ func (im *importer) walk(ctx context.Context, open opener, w *walker) error {
 		return err
 	}
 	defer rc.Close()
-	if size > im.p.limits.MaxIndexBytes {
-		return overLimit("index bytes", size, im.p.limits.MaxIndexBytes)
-	}
+	im.seen.note(limitIndexBytes, size)
 	consumed, err := w.walk(ctx, bufio.NewReaderSize(rc, 64<<10), size)
 	im.indexBytes += uint64(consumed)
 	return err
@@ -316,9 +439,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	if fv.Size > im.p.limits.MaxManifestBytes {
-		return overLimit("manifest bytes", fv.Size, im.p.limits.MaxManifestBytes)
-	}
+	im.seen.note(limitManifestBytes, fv.Size)
 	rc, _, err := im.req.Content.Open(ctx, fv.ID)
 	if err != nil {
 		return err
@@ -379,7 +500,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 // passDefinitions is pass 1: spool occurrences and symbols, bind each
 // document to its snapshot file when it ends, and publish its definitions.
 func (im *importer) passDefinitions(ctx context.Context, open opener) error {
-	w := &walker{limits: im.p.limits, onGrow: im.reserve,
+	w := &walker{limits: im.p.limits, pathPrefix: im.pathPrefix(), onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onOccurrence: func(doc, seq int64, o occurrence, n int64) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
@@ -450,10 +571,15 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 	if name == "" {
 		name = sym.lastName
 	}
-	if err := im.sc.exec(ctx, `INSERT INTO sym(key, symbol, kind, name, sig) VALUES(?, ?, ?, ?, ?)
+	// sigcut follows sig through the same arm: the stored signature and the
+	// original length it was cut from are one fact, and a twice-seen symbol
+	// keeping one from each row would publish a flag about a value it does
+	// not hold.
+	if err := im.sc.exec(ctx, `INSERT INTO sym(key, symbol, kind, name, sig, sigcut) VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET kind = CASE WHEN sym.kind = 0 THEN excluded.kind ELSE sym.kind END,
 		name = CASE WHEN sym.name = '' THEN excluded.name ELSE sym.name END,
-		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature); err != nil {
+		sigcut = CASE WHEN sym.sig = '' THEN excluded.sigcut ELSE sym.sigcut END,
+		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature, s.signatureCut); err != nil {
 		return err
 	}
 	for _, rel := range s.relationships {
@@ -500,7 +626,12 @@ func (im *importer) endDocument(d document) error {
 		im.skippedDocs++
 		im.degrade(model.CodeProviderOutputInvalid)
 		return im.dropSpool(ctx, d.index)
-	case fv.Size > im.p.limits.MaxSourceFileBytes:
+	case im.p.limits.MaxSourceFileBytes.Exceeded(fv.Size):
+		// The one bound that still leaves something out, because it is the
+		// one that bounds heap: the source is held whole while positions are
+		// converted. Unlimited by default, so this arm is unreachable until
+		// an operator asks for it, and the skip is reported under the key.
+		im.seen.note(limitSourceFileBytes, fv.Size)
 		im.skippedDocs++
 		im.degrade(model.CodeResourceLimit)
 		return im.dropSpool(ctx, d.index)
@@ -523,11 +654,18 @@ func (im *importer) endDocument(d document) error {
 			return err
 		}
 		if !holds {
+			// A failed probe is a claim about the whole document -- its
+			// columns are read in an encoding its bytes contradict -- so the
+			// document is dropped whole and counted, which is the one shift
+			// that is not a per-occurrence refusal.
 			im.skippedDocs++
+			im.encodingDropped++
+			if im.encodingDroppedPath == "" {
+				im.encodingDroppedPath = d.path
+			}
 			im.degrade(model.CodeProviderOutputInvalid)
 			return im.dropSpool(ctx, d.index)
 		}
-		im.assumedEncoding++
 	}
 	hash, err := im.documentHash(ctx, row)
 	if err != nil {
@@ -539,6 +677,11 @@ func (im *importer) endDocument(d document) error {
 	}
 	if err := im.sc.exec(ctx, `INSERT INTO docs(idx, path, lang, enc, file_id, content_hash, size) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		row.idx, row.path, row.language, row.encoding, string(fv.ID), fv.ContentHash, fv.Size); err != nil {
+		return err
+	}
+	// After the encoding is settled, because a spelling is read out of the
+	// bytes the columns resolve to.
+	if err := im.bindSpellings(ctx, ds); err != nil {
 		return err
 	}
 	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
@@ -716,8 +859,7 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 			if err != nil {
 				return err
 			}
-			name, ok := sym.probeName()
-			if !ok {
+			if _, ok := sym.probeName(); !ok {
 				return nil
 			}
 			// This occurrence decides the document: a symbol that names an
@@ -728,10 +870,13 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 				return nil
 			}
 			rng, cerr := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
-			if cerr != nil || rng.End.Byte > uint64(len(ds.data)) || rng.Start.Byte > rng.End.Byte {
+			if cerr != nil {
 				return nil
 			}
-			holds = string(ds.data[rng.Start.Byte:rng.End.Byte]) == name
+			// The same predicate every occurrence of the document will be held
+			// to, so an encoding cannot be proved by one rule and its
+			// occurrences refused by another.
+			holds = ds.onPinnedBytes(sym, &rng) == ""
 			return nil
 		})
 	return holds, err
@@ -755,31 +900,299 @@ func (im *importer) loadSource(ctx context.Context, d docRow) (*docSource, error
 	return &docSource{doc: d, data: data, cur: source.NewCursor(data), enc: columnEncoding(d.encoding)}, nil
 }
 
-// rangeOf converts a SCIP range against the document's bytes. A coordinate
-// that does not land on these bytes is a wrong-source error under a verified
-// binding and a skipped occurrence under an unverified one; it is never
-// adjusted.
-func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, error) {
+// rangeOf converts a SCIP range against the document's bytes. It reports the
+// converted range, or nil and the reason the coordinate does not land on these
+// bytes; nothing is ever adjusted. The reason is returned rather than counted
+// here because the same conversion serves an occurrence, which is refused and
+// counted, and a definition's enclosing containment span, which is not an
+// occurrence and costs nothing when it cannot be converted.
+func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, string) {
 	if r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 {
-		return nil, im.badRange(ds, "occurrence range has a negative coordinate")
+		return nil, "occurrence range has a negative coordinate"
 	}
 	rng, err := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
 	if err != nil {
-		return nil, im.badRange(ds, err.Error())
+		return nil, err.Error()
 	}
-	return &rng, nil
+	return &rng, ""
 }
 
-// badRange is the typed outcome of a coordinate that misses the pinned
-// bytes: nil under an unverified binding (the caller skips and counts),
-// otherwise CTX_PROVIDER_OUTPUT_INVALID that fails the unit.
-func (im *importer) badRange(ds *docSource, msg string) error {
-	if im.unverify {
-		im.skippedOccurrences++
+// occurrenceRange converts one occurrence's range and proves it against the
+// pinned bytes it claims to describe. A range that converts cleanly is not yet
+// a fact: a column shifted by a tab the indexer measured to a different stop
+// than the file does still lands inside the line, selects a valid rune-aligned
+// extent, and is published at compiler precision over source that is not the
+// symbol — the wrong-bytes class nothing downstream can detect (measured: 4,714
+// of 93,167 occurrences of one Java project, in 91 of its 223 documents, every
+// one of them that shift).
+//
+// So every occurrence is checked, not one per document; see onPinnedBytes.
+//
+// A refused occurrence yields nil and is counted (refuse): one coordinate the
+// index got wrong costs that coordinate and nothing else. Failing the unit on
+// it would throw away every other fact of a project over shifted columns --
+// measured, 4,714 wrong of 93,167 cost all 93,167 -- and the count plus the
+// first refused coordinate, named with its document, say exactly what was left
+// out and where to look at it.
+func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) *model.SourceRange {
+	rng, why := im.rangeOf(ds, r)
+	if rng == nil {
+		im.refuse(ds, r, why)
 		return nil
 	}
-	return (&model.Error{Code: model.CodeProviderOutputInvalid, Message: "scip occurrence does not describe the pinned source bytes: " + msg}).
-		WithDetail("path", ds.doc.path)
+	if msg := ds.onPinnedBytes(sym, rng); msg != "" {
+		im.refuse(ds, r, msg)
+		return nil
+	}
+	return rng
+}
+
+// onPinnedBytes reports why an occurrence's range does not describe the bytes
+// it claims, or "" when it does. Every occurrence, declaration or reference, is
+// held to both checks:
+//
+//   - whole-token coverage: the range begins at the first byte of a token and
+//     ends at the last byte of one. A range that starts or ends in the middle
+//     of an identifier, or on whitespace, describes a cut of the source no
+//     grammar produced. A shifted column is exactly that, at one end or both:
+//     `browser` moved five columns right is `er + br`, moved seven left is
+//     `return ` with the space the token does not have;
+//   - the name check: a range that is exactly one identifier token, and whose
+//     symbol's last descriptor is a name the grammar spells literally
+//     (symbol.probeName), selects that name or an identifier this document
+//     spells for that symbol (bindSpellings).
+//
+// A range that is not one identifier token is not held to the name check,
+// because measured, such ranges are correct without spelling the name: an
+// aliased import can put the occurrence on the whole alias clause
+// (`OrderedDict as OD`), and an operator is a reference to the method it
+// desugars to (`+` to `add`), which is not an identifier token at all.
+//
+// What survives both checks is a shift that lands on a whole token spelling
+// the same identifier somewhere else on the line. Comparing bytes cannot
+// separate those two ranges, and this provider never adjusts or guesses a
+// coordinate, so that residual is stated in docs/providers-scip.md rather than
+// covered by a rule that would refuse correct references to close it.
+func (ds *docSource) onPinnedBytes(sym symbol, rng *model.SourceRange) string {
+	if rng.Start.Byte > rng.End.Byte || rng.End.Byte > uint64(len(ds.data)) {
+		return "the range ends past the pinned bytes"
+	}
+	text := ds.data[rng.Start.Byte:rng.End.Byte]
+	if len(text) == 0 {
+		// A zero-width range selects no bytes, so there are none for the
+		// pinned bytes to contradict. Measured, every one of them is a
+		// document-level symbol an indexer anchors at the start of the file
+		// (a module's `__init__`, a file namespace).
+		return ""
+	}
+	if why := cutsAToken(ds.data, rng, text); why != "" {
+		return why
+	}
+	if why := coversWholeTokens(text); why != "" {
+		return why
+	}
+	name, named := sym.probeName()
+	if !named || !wholeIdentifier(text) {
+		return ""
+	}
+	if string(text) == name {
+		return ""
+	}
+	if _, spelled := ds.spellings[sym.raw][string(text)]; spelled {
+		return ""
+	}
+	return "the occurrence does not select the identifier its symbol names"
+}
+
+// cutsAToken reports whether either end of the range splits an identifier
+// token: an identifier byte inside the range with another immediately outside
+// it. It holds for every range, whatever the range is meant to describe, since
+// no grammar produces half an identifier.
+func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
+	if identifierByte(text[0]) && rng.Start.Byte > 0 && identifierByte(data[rng.Start.Byte-1]) {
+		return "the range starts inside an identifier token"
+	}
+	last := text[len(text)-1]
+	if identifierByte(last) && rng.End.Byte < uint64(len(data)) && identifierByte(data[rng.End.Byte]) {
+		return "the range ends inside an identifier token"
+	}
+	return ""
+}
+
+// coversWholeTokens reports whether a range that names an identifier on one
+// line begins and ends on the tokens it covers rather than on the whitespace
+// between them. A shifted column produces exactly that: `browser` moved seven
+// columns left is `return ` -- an identifier plus the gap before the next
+// token, which is not how the source spells anything.
+//
+// Two shapes of range do not name an identifier on a line and keep cutsAToken
+// alone. A range spanning lines is a block span -- measured, a crate's whole
+// file -- and its edges are the file's, not a token's. A range holding no
+// identifier byte at all is punctuation the grammar spells without one:
+// measured, rust-analyzer ranges the reference from `+` to the `add` method it
+// desugars to over the space beside the operator.
+func coversWholeTokens(text []byte) string {
+	named := false
+	for _, b := range text {
+		if b == '\n' {
+			return ""
+		}
+		named = named || identifierByte(b)
+	}
+	if !named {
+		return ""
+	}
+	if spaceByte(text[0]) {
+		return "the range begins on whitespace rather than on a token"
+	}
+	if spaceByte(text[len(text)-1]) {
+		return "the range ends on whitespace rather than on a token"
+	}
+	return ""
+}
+
+// wholeIdentifier reports whether text is one identifier token and nothing
+// else, which is the shape the name check compares. Held with cutsAToken and
+// coversWholeTokens it means the range is that token exactly.
+func wholeIdentifier(text []byte) bool {
+	for _, b := range text {
+		if !identifierByte(b) {
+			return false
+		}
+	}
+	return len(text) > 0
+}
+
+// spaceByte reports whether b is source whitespace. Every byte of a multi-byte
+// rune is >= 0x80, so no rune is ever mistaken for one.
+func spaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	}
+	return false
+}
+
+// identifierByte reports whether b can sit inside an identifier token of the
+// languages this provider imports. Every byte of a multi-byte rune is one:
+// identifiers are non-ASCII in several of them, and the question here is only
+// where a token stops, never what the rune is.
+func identifierByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '_', b == '$':
+		return true
+	}
+	return b >= 0x80
+}
+
+// refuse records one occurrence the pinned bytes contradict. The occurrence is
+// left out, counted, and the unit continues; nothing is adjusted and nothing is
+// published for it. The occurrence is the unit of the refusal, never the
+// document and never the unit.
+//
+// The binding is carried by the diagnostic code rather than by a second
+// counter. Under a verified binding the index claims to describe exactly these
+// bytes and does not, which is CTX_PROVIDER_OUTPUT_INVALID; under an unverified
+// one the index describes bytes it never saw, and degrade keeps the
+// CTX_SOURCE_BINDING_UNVERIFIED the run already set, because an unverified
+// binding outranks every later reason. Either way the count and the exemplar
+// reach the operator on the capability row, which is the only channel that
+// reaches one.
+func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
+	im.refusedOccurrences++
+	if im.refusedExemplar == "" {
+		// The path is bounded before the coordinate is appended, so the
+		// coordinate survives the detail's own ceiling: a path may be four
+		// times MaxDetailBytes, and an exemplar cut back to a path alone is
+		// the very thing the coordinate is here to answer.
+		doc, _ := model.TruncateField(ds.doc.path, model.MaxIdentifierBytes)
+		im.refusedExemplar = doc + ":" + strconv.FormatInt(int64(r[0]), 10) +
+			":" + strconv.FormatInt(int64(r[1]), 10) + ": " + msg
+	}
+	im.degrade(model.CodeProviderOutputInvalid)
+}
+
+// bindSpellings records the identifiers this document spells for a symbol
+// that are not the name the symbol carries, so the name check can hold every
+// occurrence to its symbol's name without refusing them. A document that
+// aliases an import spells the symbol under a name of its own -- `use HashSet
+// as Set` makes every later `Set` of that file a correct reference to HashSet
+// -- and the occurrence carries nothing that says so: measured over the six
+// pinned indexers, the one that produces this shape sets no occurrence role at
+// all, so the import role cannot seed it.
+//
+// A spelling is bound only when the document holds at least two occurrences
+// that spell it identically, which is the structural minimum of the construct
+// the exemption exists for: an alias that is used produces the occurrence in
+// the alias clause and the occurrence at the use site. An alias declared and
+// never used produces one occurrence -- and no second one for the rule to
+// refuse either, so nothing is lost. A shifted column that lands on a whole
+// token spelling something else produces that spelling once, so it stays
+// refused; a shift landing twice on the same text within one document is the
+// residual stated in docs/providers-scip.md.
+//
+// The tally holds one document's spellings and is discarded with its
+// docSource; it is bounded by that document's occurrences, which
+// MaxOccurrencesPerDocument bounds. A coordinate that does not convert, and a
+// symbol that does not parse, are passed over here and refused by the pass
+// that publishes them, which is where a refusal is counted.
+func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
+	spelled := make(map[string]map[string]int)
+	if err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ?`, []any{ds.doc.idx},
+		func(scan func(...any) error) error {
+			var symbolText string
+			var r [4]int32
+			if err := scan(&symbolText, &r[0], &r[1], &r[2], &r[3]); err != nil {
+				return internal("scip scratch read: " + err.Error())
+			}
+			if symbolText == "" {
+				return nil
+			}
+			sym, err := parseSymbol(symbolText)
+			if err != nil {
+				return nil
+			}
+			name, ok := sym.probeName()
+			if !ok {
+				return nil
+			}
+			rng, _ := im.rangeOf(ds, r)
+			if rng == nil {
+				return nil
+			}
+			text := ds.data[rng.Start.Byte:rng.End.Byte]
+			if !wholeIdentifier(text) || string(text) == name {
+				return nil
+			}
+			counts := spelled[sym.raw]
+			if counts == nil {
+				counts = make(map[string]int)
+				spelled[sym.raw] = counts
+			}
+			counts[string(text)]++
+			return nil
+		}); err != nil {
+		return err
+	}
+	for raw, counts := range spelled {
+		for text, n := range counts {
+			if n < 2 {
+				continue
+			}
+			if ds.spellings == nil {
+				ds.spellings = make(map[string]map[string]struct{})
+			}
+			bound := ds.spellings[raw]
+			if bound == nil {
+				bound = make(map[string]struct{})
+				ds.spellings[raw] = bound
+			}
+			bound[text] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // defineSymbol resolves one definition occurrence and records its identity,
@@ -793,23 +1206,27 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
-	rng, err := im.rangeOf(ds, r)
-	if err != nil || rng == nil {
-		return err
+	rng := im.occurrenceRange(ds, sym, r)
+	if rng == nil {
+		// Refused and counted: this declaration is left out, the rest of the
+		// document is not.
+		return nil
 	}
 	extent := rng
 	if enclosing != nil {
-		if extent, err = im.rangeOf(ds, *enclosing); err != nil {
-			return err
-		}
-		if extent == nil || extent.Start.Byte > rng.Start.Byte || extent.End.Byte < rng.End.Byte {
-			extent = rng
+		// A containment span is not an occurrence: it is never published as a
+		// located identity, so a span the bytes cannot carry costs the span,
+		// not a refusal, and the declaration's own range stands in for it.
+		if ext, why := im.rangeOf(ds, *enclosing); why == "" && ext != nil &&
+			ext.Start.Byte <= rng.Start.Byte && ext.End.Byte >= rng.End.Byte {
+			extent = ext
 		}
 	}
 	key := symKey(ds.doc.idx, sym)
 	var kind int32
 	var name, sig, existing string
-	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &existing); err != nil {
+	var sigCut int64
+	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node, sigcut FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &existing, &sigCut); err != nil {
 		return err
 	}
 	if name == "" {
@@ -828,7 +1245,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	}
 	loc := location{file: ds.doc.file, rng: rng}
 	if publish {
-		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false); err != nil {
+		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
 			return err
 		}
 		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
@@ -867,7 +1284,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 // belong to one path's rows, and a refresh that changed a different document
 // would then publish a second evidence row for the same node on every pass
 // until the bound of Section 11.1 was reached.
-func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey, detail string, loc location, external bool) error {
+func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey, detail string, loc location, external bool, sigCut int64) error {
 	node := res.Node
 	meta := map[string]any{}
 	if im.unverify {
@@ -876,6 +1293,13 @@ func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey
 	if external {
 		meta["scip_external"] = true
 		loc = location{}
+	}
+	if sigCut > 0 {
+		// Index-time field truncation, on the fact itself and under the same
+		// attribute the structural provider publishes, so an answer built
+		// from either says which stored value was cut and how long it was.
+		// Never merged with a result page's transient truncation flag.
+		meta["truncated_fields"] = map[string]int64{"signature": sigCut}
 	}
 	if len(meta) > 0 {
 		raw, err := json.Marshal(meta)
@@ -956,6 +1380,9 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 	if err != nil {
 		return err
 	}
+	if err := im.bindSpellings(ctx, ds); err != nil {
+		return err
+	}
 	return im.sc.each(ctx, `SELECT symbol, roles, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) = 0 ORDER BY seq`,
 		[]any{d.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
@@ -971,9 +1398,11 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
-			rng, err := im.rangeOf(ds, r)
-			if err != nil || rng == nil {
-				return err
+			rng := im.occurrenceRange(ds, sym, r)
+			if rng == nil {
+				// Refused and counted: this reference is left out, the rest of
+				// the document is not.
+				return nil
 			}
 			loc := location{file: d.file, rng: rng}
 			to, err := im.targetNode(ctx, symKey(d.idx, sym), sym, loc)
@@ -1012,7 +1441,6 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.SourceRange, to model.NodeID) error {
 	scopeKey, nativeKey, ok := callsiteAlias(p, rng)
 	if !ok {
-		im.skippedAliases++
 		return nil
 	}
 	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scopeKey, NativeKey: nativeKey, NodeID: to}}); err != nil {
@@ -1030,7 +1458,8 @@ func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.S
 func (im *importer) targetNode(ctx context.Context, key string, sym symbol, loc location) (model.NodeID, error) {
 	var kind int32
 	var name, sig, node string
-	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &node); err != nil {
+	var sigCut int64
+	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node, sigcut FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &node, &sigCut); err != nil {
 		return "", err
 	}
 	if node != "" {
@@ -1049,7 +1478,7 @@ func (im *importer) targetNode(ctx context.Context, key string, sym symbol, loc 
 	if err != nil {
 		return "", err
 	}
-	if err := im.putNode(ctx, res, sym.raw, "reference", loc, true); err != nil {
+	if err := im.putNode(ctx, res, sym.raw, "reference", loc, true, sigCut); err != nil {
 		return "", err
 	}
 	for _, other := range res.Ambiguous {
@@ -1099,7 +1528,7 @@ func (im *importer) enclosingNode(ctx context.Context, ds *docSource, rng *model
 	if err != nil {
 		return "", err
 	}
-	if err := im.putNode(ctx, res, cand.NativeKey, "document", location{file: ds.doc.file, rng: whole}, false); err != nil {
+	if err := im.putNode(ctx, res, cand.NativeKey, "document", location{file: ds.doc.file, rng: whole}, false, 0); err != nil {
 		return "", err
 	}
 	return res.Node.ID, im.sc.exec(ctx, `UPDATE docs SET file_node = ? WHERE idx = ?`, string(res.Node.ID), ds.doc.idx)
@@ -1242,7 +1671,7 @@ func (im *importer) emitEdges(ctx context.Context) error {
 				current = &model.RelationFact{Relation: rel}
 			}
 			loc := location{file: model.FileVersion{ID: model.FileID(fileID), ContentHash: hash}, rng: &rng}
-			if len(current.Evidence) >= model.MaxEvidencePerFact {
+			if len(current.Evidence) >= im.p.evidenceClip {
 				overflow++
 				return nil
 			}
@@ -1266,6 +1695,16 @@ func (im *importer) emitEdges(ctx context.Context) error {
 // each capability partial under the first degradation reason (an unverified
 // binding, an unprocessable document, or truncated occurrence evidence).
 func (im *importer) result() model.ProviderResult {
+	if im.drops.any() {
+		im.degrade(model.CodeResourceLimit)
+	}
+	if im.sc != nil {
+		im.seen.note(limitSpoolBytes, im.sc.bytes)
+	}
+	crossed := im.seen.exceeded(im.p.limits)
+	if crossed != "" {
+		im.degrade(model.CodeResourceLimit)
+	}
 	state := model.CapabilityFresh
 	if im.partialCode != "" {
 		state = model.CapabilityPartial
@@ -1278,7 +1717,48 @@ func (im *importer) result() model.ProviderResult {
 	// through the capability states below, which is the channel that exists.
 	r := model.ProviderResult{RunID: im.req.Run, State: model.RunSucceeded, RecordsEmitted: im.records, BytesProcessed: im.indexBytes}
 	for _, c := range capabilities {
-		r.Capabilities = append(r.Capabilities, model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode})
+		cs := model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode}
+		// What the wire decoder discarded for exceeding a field bound, named
+		// per bound and split by what the bound cost: a whole record whose
+		// identity was unreadable, or one decorative field of a record that is
+		// still published. Silence here was the class-G defect (plan row 26).
+		if v := summarizeDrops(im.drops.records); v != "" {
+			cs = cs.WithDetail(detailDroppedRecords, v)
+		}
+		if v := summarizeDrops(im.drops.fields); v != "" {
+			cs = cs.WithDetail(detailDroppedFields, v)
+		}
+		if im.drops.any() {
+			cs = cs.WithDetail(detailDropReason, dropReason)
+		}
+		// Every providers.scip.* bound the operator set that this run crossed,
+		// as `key=seen/bound`. Nothing was refused and, apart from
+		// max_source_file_bytes and max_materialize_bytes, nothing was left
+		// out: the row says the figure was passed, which is what a threshold
+		// the product does not enforce on the user's behalf can honestly say.
+		if crossed != "" {
+			cs = cs.WithDetail(detailLimitsExceeded, crossed)
+		}
+		// Occurrences cut past a relation's evidence bound. The degradation
+		// alone says only that something was cut; the shared clip key names
+		// the bound and the count, so an operator reads one spelling of this
+		// cut across every provider that can make it.
+		if im.truncatedEdges > 0 {
+			cs = cs.WithDetail(model.DetailEvidenceClipped, strconv.FormatInt(im.truncatedEdges, 10))
+		}
+		// What the pinned bytes contradicted, at the two granularities the
+		// contradiction has. Without these the operator of a partial unit
+		// reads only the diagnostic family and cannot tell one wrong
+		// coordinate from a project the indexer mis-columned throughout.
+		if im.refusedOccurrences > 0 {
+			cs = cs.WithDetail(detailRefusedOccurrences, strconv.FormatInt(im.refusedOccurrences, 10)).
+				WithDetail(detailRefusedExemplar, im.refusedExemplar)
+		}
+		if im.encodingDropped > 0 {
+			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped, 10)).
+				WithDetail(detailEncodingExemplar, im.encodingDroppedPath)
+		}
+		r.Capabilities = append(r.Capabilities, cs)
 	}
 	return r
 }
@@ -1291,7 +1771,5 @@ func (im *importer) report() Report {
 	return Report{
 		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
 		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
-		SkippedOccurrences: im.skippedOccurrences, SkippedCallsiteAliases: im.skippedAliases,
-		TruncatedEdgeOccurrences: im.truncatedEdges, AssumedPositionEncoding: im.assumedEncoding,
 	}
 }

@@ -6,12 +6,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
 
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
+	"github.com/Sawmonabo/codectx/internal/diskfree"
+	"github.com/Sawmonabo/codectx/internal/index"
+	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -63,6 +69,12 @@ func (r storeReader) Stats(ctx context.Context) (diagnostics.StoreStats, error) 
 // it on the reader it was handed.
 var _ diagnostics.StoreReader = storeReader{}
 
+// StoreSizes is forwarded by the embedded *sqlite.Store. The assertion is what
+// keeps a shallow doctor's accounting row a real measurement: without it a
+// signature drift would leave the optional interface unsatisfied and the check
+// permanently `unavailable`, with nothing failing to compile.
+var _ diagnostics.StoreSizer = storeReader{}
+
 // SuppliedIndexes restates (*sqlite.Store).SuppliedIndexes in the doctor's own
 // vocabulary, for the same reason Stats does: internal/diagnostics must not
 // import a storage package, so the two structurally identical types meet here.
@@ -88,31 +100,140 @@ func (r storeReader) SuppliedIndexes(ctx context.Context, gen model.GenerationID
 // build failure, not a doctor check that quietly reports unavailable forever.
 var _ diagnostics.SuppliedIndexReader = storeReader{}
 
-// WatchHeartbeat restates (*sqlite.Store).WatchHeartbeat in the doctor's own
+// WatchHeartbeats restates (*sqlite.Store).WatchHeartbeats in the doctor's own
 // vocabulary. It is written rather than embedded for the same reason
 // SuppliedIndexes is: the result type differs, and an embedded forward with the
 // wrong signature would satisfy nothing, fail no build, and leave both the
 // `watch_heartbeat` check and the resource block's pending-event count
 // permanently absent with nothing to show for it.
 //
-// The `found` bit is carried through unchanged: absent and expired are the two
-// answers the check renders differently, and collapsing them here would lose
-// the distinction before it reaches the renderer.
-func (r storeReader) WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (diagnostics.WatchHeartbeat, bool, error) {
-	hb, found, err := r.Store.WatchHeartbeat(ctx, repo)
-	if err != nil || !found {
-		return diagnostics.WatchHeartbeat{}, false, err
+// Every row is carried through, expired ones included and in the order the
+// store read them: absent, live and expired are three answers the check renders
+// differently, and judging any of them here would lose the distinction before it
+// reaches the renderer.
+func (r storeReader) WatchHeartbeats(ctx context.Context, repo model.RepositoryID) ([]diagnostics.WatchHeartbeat, error) {
+	rows, err := r.Store.WatchHeartbeats(ctx, repo)
+	if err != nil {
+		return nil, err
 	}
-	return diagnostics.WatchHeartbeat{
-		WriterPID:     hb.WriterPID,
-		LastPassAt:    hb.LastPassAt,
-		PendingEvents: hb.PendingEvents,
-		ExpiresAt:     hb.ExpiresAt,
-	}, true, nil
+	out := make([]diagnostics.WatchHeartbeat, 0, len(rows))
+	for _, hb := range rows {
+		out = append(out, diagnostics.WatchHeartbeat{
+			WriterPID:     hb.WriterPID,
+			LastPassAt:    hb.LastPassAt,
+			PendingEvents: hb.PendingEvents,
+			ExpiresAt:     hb.ExpiresAt,
+		})
+	}
+	return out, nil
 }
 
 // The same compile-time assertion, for the same reason.
 var _ diagnostics.WatchHeartbeatReader = storeReader{}
+
+// runLedger adapts the run ledger beside the index store to
+// diagnostics.RunLedger, and is the one place a recorded run becomes the rows
+// the model carries.
+//
+// It opens the ledger for each call rather than holding a connection open,
+// because the report is a one-shot answer and the open is read-only: a status
+// surface must be able to read a run that another process is writing and must
+// never become a second writer of the file. A workspace that has recorded no
+// run reports no rows and no failure, which is the reader's own answer.
+type runLedger struct{ dir string }
+
+func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
+	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, nil, 0, err
+	}
+	defer reader.Close()
+	view, found, err := reader.LatestRun(ctx, string(repo), int64(generation))
+	if err != nil || !found {
+		return nil, nil, 0, err
+	}
+	return runRecord(view)
+}
+
+// Run is the run with this identifier, which is how a run that has just ended
+// reports on itself: it knows its own id, and the latest run of the repository
+// may be another live run of this same process.
+func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, nil, 0, err
+	}
+	defer reader.Close()
+	view, found, err := reader.Run(ctx, runID)
+	if err != nil || !found {
+		return nil, nil, 0, err
+	}
+	return runRecord(view)
+}
+
+// RecordedPeaks is what this workspace has already measured its heavy units to
+// cost, which the planner raises a unit's reservation to where the constants
+// derive less. It is advisory and must never refuse a plan, so a ledger that
+// is absent or cannot be read answers no rows at all -- not a peak of zero,
+// which would be read as work that costs nothing. A read that fails is logged
+// rather than returned, because the plan it would otherwise fail is the whole
+// index.
+func (l runLedger) RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		if err != nil {
+			slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
+				"component", "workspace", "error", err)
+		}
+		return nil, nil
+	}
+	defer reader.Close()
+	rows, err := reader.RecordedPeaks(ctx, limit)
+	if err != nil {
+		slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
+			"component", "workspace", "error", err)
+		return nil, nil
+	}
+	out := make([]plan.RecordedPeak, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, plan.RecordedPeak{ScopeKey: r.ScopeKey, PeakBytes: r.PeakBytes})
+	}
+	return out, nil
+}
+
+// runRecord is the one place a read run becomes the rows the model carries,
+// whichever question selected it.
+func runRecord(view ledger.RunView) (*model.RunRecord, []model.StageRecord, int64, error) {
+	run := model.RunRecord{
+		RunID:               view.Run.RunID,
+		Kind:                string(view.Run.Kind),
+		RepositoryID:        view.Run.RepositoryID,
+		GenerationID:        view.Run.GenerationID,
+		StartedAt:           view.Run.StartedAt,
+		FinishedAt:          view.Run.FinishedAt,
+		WallMS:              view.Run.WallMS,
+		Outcome:             string(view.Run.Outcome),
+		FileCount:           view.Run.FileCount,
+		SourceBytes:         view.Run.SourceBytes,
+		UnitsPlanned:        view.Run.UnitsPlanned,
+		UnitsSucceeded:      view.Run.UnitsSucceeded,
+		UnitsFailed:         view.Run.UnitsFailed,
+		UnitsSubdivided:     view.Run.UnitsSubdivided,
+		EventsDropped:       view.Run.EventsDropped,
+		ProcessPeakRSSBytes: view.Run.ProcessPeakRSSBytes,
+	}
+	stages := make([]model.StageRecord, 0, len(view.Spans))
+	for _, span := range view.Spans {
+		stages = append(stages, stageRecord(span))
+	}
+	return &run, stages, view.SpansOmitted, nil
+}
+
+var _ diagnostics.RunLedger = runLedger{}
+
+// And the reader a run reports on itself through.
+var _ index.RunLedgerReader = runLedger{}
 
 // toolchainReporter adapts *toolchain.Resolver to diagnostics.ToolchainReporter.
 // Resolver.Status returns its rows directly and reports no error; the interface
@@ -123,6 +244,17 @@ type toolchainReporter struct{ r *toolchain.Resolver }
 
 func (t toolchainReporter) Statuses(ctx context.Context) ([]toolchain.Status, error) {
 	return t.r.Status(ctx), nil
+}
+
+// Selected forwards to SelectedTools, the one implementation of the repository
+// -> lock entry mapping. `codectx tools prefetch --for-repo` reaches it through
+// internal/cli; the doctor reaches it here, because internal/diagnostics must
+// not import a command package. Neither side owns a second copy.
+func (t toolchainReporter) Selected(ctx context.Context, root string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, model.Canceled(err)
+	}
+	return SelectedTools(root)
 }
 
 // workspaceProber answers the two filesystem questions neither the store nor
@@ -164,7 +296,7 @@ func (workspaceProber) Writable(ctx context.Context, dir string) error {
 	}
 	name := f.Name()
 	closeErr := f.Close()
-	rmErr := os.Remove(name)
+	rmErr := paced.Remove(name)
 	if closeErr != nil {
 		// Close reports the write-back failure on the filesystems that defer
 		// it, so it is answered before the removal's own error.
@@ -244,7 +376,11 @@ func (workspaceProber) FreeDiskBytes(ctx context.Context, dir string) (*uint64, 
 	if dir == "" {
 		return nil, nil
 	}
-	return freeDiskBytes(dir)
+	free, ok := diskfree.Available(dir)
+	if !ok {
+		return nil, nil
+	}
+	return &free, nil
 }
 
 // snapshotSweeper adapts the package-level snapshot.Sweep to the collector's

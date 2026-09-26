@@ -1,0 +1,4 @@
+167503724544,TYPE_DECL,,<empty>,<empty>,<empty>,1,N/A,ANY,<empty>,,false,1,ANY,1,1,0
+167503724545,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.helper,<empty>,ANY,false,1,helper,0,33,2
+167503724546,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.run,<empty>,ANY,false,4,run,33,76,4
+167503724547,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>,<empty>,ANY,false,1,<module>,0,76,2

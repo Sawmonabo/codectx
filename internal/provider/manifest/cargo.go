@@ -75,7 +75,13 @@ func (u *unit) cargo(ctx context.Context) error {
 		u.malformed()
 		return nil
 	}
-	layout := layoutTOML(u.data)
+	layout, cutLines := layoutTOML(u.data, u.tomlLines)
+	if cutLines > 0 {
+		// The scan stopped at the configured line bound. Facts declared past
+		// that line are published without a range; every fact before it keeps
+		// its exact range. The line count that crossed the bound is reported.
+		u.overBound(BoundTOMLLines, u.tomlLines, cutLines)
+	}
 	rel := u.e.File().Path
 	var owner model.Node
 	switch {
@@ -122,8 +128,7 @@ func (u *unit) cargo(ctx context.Context) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			d := decodeCargoDep(deps[n])
@@ -170,9 +175,7 @@ func (u *unit) cargo(ctx context.Context) error {
 		}
 	}
 	if doc.Workspace != nil {
-		if len(doc.Workspace.Members) > MaxEntries {
-			u.overBound()
-		}
+		u.cut(BoundEntries, u.entries, int64(len(doc.Workspace.Members)))
 		// The workspace catalog declares versions members inherit; it is a
 		// dependency declaration of the workspace itself.
 		if err := emit("workspace.dependencies", doc.Workspace.Dependencies, KindRuntime, "declared", "workspace"); err != nil {

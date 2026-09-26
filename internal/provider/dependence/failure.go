@@ -60,6 +60,12 @@ const (
 	FailureEngine FailureClass = "engine"
 	// FailureTimeout is a step that exceeded the unit's deadline.
 	FailureTimeout FailureClass = "timeout"
+	// FailureEmptyExport is an export that carries no method for a unit that
+	// has source. Both steps exited cleanly; what the export holds is the
+	// only signal, and it is not a crash: a frontend that skips every file it
+	// was given -- because its own default excludes the directories the
+	// project keeps its sources in, say -- leaves exactly this.
+	FailureEmptyExport FailureClass = "empty_export"
 )
 
 // code maps a class to its Section 22 error code.
@@ -87,6 +93,11 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 		msg += "the analysis ran out of memory"
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
+	case FailureEmptyExport:
+		// emptyExport below names the two causes that remain. This wording is
+		// what the product knows without them: which steps ran, and that
+		// nothing came of them.
+		msg += "both analysis steps exited cleanly and produced no method for a unit that has source"
 	default:
 		msg += "the analysis backend crashed"
 	}
@@ -100,6 +111,12 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	if o.Exception != "" {
 		err = err.WithDetail("exception", truncate(o.Exception, model.MaxIdentifierBytes))
+	}
+	// The child's own last words. A failure that reports only how many bytes
+	// its child wrote to standard error has discarded the one record of what
+	// went wrong, which is what a 7.5 KB crash on a real repository did.
+	if o.StderrTail != "" {
+		err = err.WithDetail(model.DetailStderrTail, truncate(o.StderrTail, model.MaxDetailBytes))
 	}
 	// The observed peak is the tree's, sampled while it ran: what the failed
 	// unit actually used, against what it was admitted for. It is reported for
@@ -124,6 +141,103 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	return err
 }
+
+// unreadRemediation is what an operator can do about source the frontend read
+// and drew nothing from. Two causes remain there and the product cannot tell
+// them apart -- source with no definition the frontend parses, and a frontend
+// that failed without saying so -- so it names both rather than asserting the
+// first, which a helper that died behind a zero exit would make false.
+const unreadRemediation = "check that this unit's source files hold method definitions this language family's " +
+	"frontend can parse; if they do, the frontend failed without reporting it"
+
+// emptyExport is the typed failure for a unit whose analysis exported no
+// method at all. "the export carries no method" is the symptom, never the
+// reason, so the error names the two causes that remain once the frontend has
+// been given every file of the unit -- source it finds no definition in, and a
+// frontend that failed without reporting it -- and publishes how much source
+// it was handed.
+//
+// files is counted over the one pass that decided what the frontend was
+// given, so a zero there is "nothing reached the frontend" and not a guess.
+func emptyExport(unit Unit, o Outcome, r Reservation, files int64) *model.Error {
+	return failure(FailureEmptyExport, unit.ScopeKey, o, r).
+		WithDetail("family", string(unit.Family)).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithRemediation(unreadRemediation)
+}
+
+// emptyPart is the typed reason one part of a subdivided unit produced no
+// method: both its steps exited cleanly and its export carries none. It is the
+// part's own outcome and not the unit's -- the unit fails only when no part
+// produced anything (subdivisionEmpty) -- so the part's span row says so in
+// those words rather than in the unit's.
+func emptyPart(scopeKey string, o Outcome, r Reservation) *model.Error {
+	err := failure(FailureEmptyExport, scopeKey, o, r).WithRemediation(unreadRemediation)
+	err.Message = "this part of a subdivided dependence unit produced no method: " +
+		"both its analysis steps exited cleanly and its export carries none"
+	return err
+}
+
+// partTally is what a subdivided unit's parts did, counted as the loop ran
+// them. It is three integers, never the parts themselves: a unit is split into
+// as many parts as it has child projects, and a list of them would grow with
+// the repository.
+type partTally struct {
+	// Parts is how many parts the unit was split into, Failed how many failed
+	// in the analysis itself, and Empty how many were analysed cleanly and
+	// carried no method.
+	Parts  int
+	Failed int
+	Empty  int
+}
+
+// subdivisionEmpty is the typed failure for a subdivided unit no part of which
+// produced a method. A unit with no part at all never reaches it: childProjects
+// refuses the split before the parts run. "no part produced an honest result" is the same
+// restatement emptyExport removes, so this names the tally instead.
+func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {
+	err := failure(FailureEngine, unit.ScopeKey, crash, r).
+		WithDetail("source_files", strconv.FormatInt(files, 10)).
+		WithDetail("parts", strconv.Itoa(t.Parts)).
+		WithDetail("parts_failed", strconv.Itoa(t.Failed)).
+		WithDetail("parts_without_method", strconv.Itoa(t.Empty))
+	err.Message = "the dependence unit failed: no part of the subdivided unit produced a method -- " +
+		strconv.Itoa(t.Failed) + " of " + strconv.Itoa(t.Parts) + " failed in the analysis and " +
+		strconv.Itoa(t.Empty) + " were analysed cleanly and produced none"
+	if t.Empty > 0 {
+		return err.WithRemediation(unreadRemediation)
+	}
+	// Nothing was analysed cleanly: the failing pass and exception this error
+	// already carries are what a maintainer has to act on.
+	return err.WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream; no part of this unit was analysed cleanly")
+}
+
+// crashDecision is how the provider established that an engine crash
+// reproduces. A subdivided unit publishes it beside the failing pass, so an
+// operator reading the report knows why one crash cost a second parse of the
+// whole unit and another did not, instead of inferring it from a duration.
+type crashDecision string
+
+const (
+	// crashNamed is a crash whose own diagnostics identify the defect: the
+	// failing pass and the exception class are both on the child's standard
+	// error, which is a deterministic analysis fault and reproduces.
+	crashNamed crashDecision = "named pass and exception, taken on first sight"
+	// crashConfirmed is a crash that named neither -- a signal death, a step
+	// that left no graph, an exit with nothing said about a pass -- and was
+	// therefore observed a second time before anything was split.
+	crashConfirmed crashDecision = "failure class observed twice"
+)
+
+// reproducibleOnSight reports whether a crashed step said enough about itself
+// to be believed the first time. A named failing pass with a named exception
+// class is a deterministic fault in that pass: re-running the same argv over
+// the same source only re-proves it, at the cost of a second full parse of the
+// unit -- which is what a real run spent three minutes and twenty-two seconds
+// doing. Anything less -- a signal death, heap exhaustion, an exit that named
+// no pass -- may be the machine rather than the source, and keeps the one
+// confirmation the plan allows.
+func reproducibleOnSight(o Outcome) bool { return o.Pass != "" && o.Exception != "" }
 
 // publication is everything a succeeded unit publishes about how complete it
 // is. A unit that ran whole and skipped nothing publishes five fresh rows and
@@ -151,6 +265,41 @@ type publication struct {
 	// analysis ran at a coarser project boundary than the source owns — which
 	// degrades every capability of the family alike, not one pass.
 	UnplannedProjects int
+	// Family is the unit's language family, carried so the two user-set
+	// threshold reports below can name it: a capability row carries a scope
+	// key, and the project count they report is the family's, not the scope's.
+	Family Family
+	// OverUnitsPerFamily is the project count that crossed a user-set
+	// providers.dependence.max_units_per_family (0 when it did not, or when
+	// the user set no threshold), and UnitsPerFamilyBound that threshold.
+	// Nothing was refused or dropped: every project has its unit and every
+	// part of a subdivided unit was analysed. The row says so because the user
+	// asked to be told, which is the only reason these two keys exist.
+	OverUnitsPerFamily  int
+	UnitsPerFamilyBound int64
+	// StagedRows is the import's staged row count and StagedRowsBound the
+	// user-set providers.dependence.max_staged_rows it crossed; both are zero
+	// unless it crossed. The import staged and published every row regardless.
+	StagedRows      int64
+	StagedRowsBound int64
+	// DerivedRows is the count of relation occurrences the import projected
+	// and DerivedRowsBound the user-set providers.dependence.max_derived_rows
+	// it crossed; both are zero unless it crossed. The projection was neither
+	// truncated nor refused.
+	DerivedRows      int64
+	DerivedRowsBound int64
+	// TruncatedFields counts, by field name, the descriptive storage values
+	// the import cut to their model ceiling before writing them. The facts
+	// were published whole apart from those values; the map is what keeps the
+	// clipping from being silent, and it is bounded by the fixed set of
+	// descriptive field names, never by the repository.
+	TruncatedFields map[string]int
+	// ClippedEvidence counts the evidence occurrences the import removed from
+	// facts it published, under the user's own index.max_evidence_per_fact.
+	// The key's contract (internal/config/config.go) is that "the cut is
+	// reported on the unit's capability detail, never silent", so this is what
+	// carries it to the generation.
+	ClippedEvidence int
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -189,6 +338,41 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
 			row = row.WithDetail("unplanned_projects", strconv.Itoa(p.UnplannedProjects))
 		}
+		// Neither threshold below lost anything: they are the user's own
+		// reporting bounds on a count that belongs to the repository. The row
+		// is marked partial with CodeResourceLimit all the same, because a
+		// fresh row's Details are nil'd on the way into the generation
+		// (internal/index/status.go) and a report nobody can read is the
+		// silence the posture forbids as squarely as a refusal.
+		if p.OverUnitsPerFamily > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("family", string(p.Family)).
+				WithDetail("units_per_family", strconv.Itoa(p.OverUnitsPerFamily)).
+				WithDetail("max_units_per_family", strconv.FormatInt(p.UnitsPerFamilyBound, 10))
+		}
+		if p.StagedRows > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("staged_rows", strconv.FormatInt(p.StagedRows, 10)).
+				WithDetail("max_staged_rows", strconv.FormatInt(p.StagedRowsBound, 10))
+		}
+		if p.DerivedRows > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("derived_rows", strconv.FormatInt(p.DerivedRows, 10)).
+				WithDetail("max_derived_rows", strconv.FormatInt(p.DerivedRowsBound, 10))
+		}
+		// A clipped stored value degrades every capability alike: any pass can
+		// be the one that published the fact whose name or signature was cut.
+		if names := p.truncatedFields(); names != "" {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("truncated_fields", names)
+		}
+		// Evidence removed from a published fact degrades every capability
+		// alike: any pass can be the one whose fact lost occurrences, and a
+		// consumer counting occurrences reads a number the clip decided.
+		if p.ClippedEvidence > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(p.ClippedEvidence))
+		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
 			row = row.WithDetail("subdivided", truncate(p.Subdivided, model.MaxDetailBytes))
@@ -202,6 +386,37 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 		out = append(out, p.unsupportedLabels(scopeKey))
 	}
 	return out
+}
+
+// truncatedFields renders the cut storage fields as one detail value,
+// "field=count" in field order, empty when nothing was cut. The field names
+// are a fixed set, so the value is bounded by this code; the ceiling is
+// honoured all the same, on a separator boundary, because a value clipped
+// mid-pair would report a count nobody measured.
+func (p publication) truncatedFields() string {
+	fields := make([]string, 0, len(p.TruncatedFields))
+	for f, n := range p.TruncatedFields {
+		if n > 0 {
+			fields = append(fields, f)
+		}
+	}
+	slices.Sort(fields)
+	var b strings.Builder
+	for _, f := range fields {
+		pair := f + "=" + strconv.Itoa(p.TruncatedFields[f])
+		sep := 0
+		if b.Len() > 0 {
+			sep = 1
+		}
+		if b.Len()+sep+len(pair) > model.MaxDetailBytes {
+			break
+		}
+		if sep > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(pair)
+	}
+	return b.String()
 }
 
 // skippedNames is the sorted, deduplicated sample of skipped method names as
@@ -294,4 +509,15 @@ func peakForLog(o Outcome) any {
 		return "unsampled"
 	}
 	return o.PeakBytes
+}
+
+// allocationForLog renders the machine-derived allocation a reservation was
+// bounded by. Zero there means the machine's available memory could not be
+// observed at all (Reservation.AllocationBytes), so a log that printed 0 would
+// claim the host offered the unit nothing.
+func allocationForLog(r Reservation) any {
+	if r.AllocationBytes <= 0 {
+		return "unobserved"
+	}
+	return r.AllocationBytes
 }

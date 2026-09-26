@@ -5,7 +5,11 @@ package model
 // importing the other, and without any package importing a provider's native
 // handles (Sections 7.1, 11.1).
 
-import "maps"
+import (
+	"maps"
+	"slices"
+	"strconv"
+)
 
 // InvalidationScope is the unit granularity a provider reprocesses. A file-local
 // provider reprocesses only changed files; a package or workspace provider
@@ -259,6 +263,91 @@ func (s UnitSpec) Validate() error {
 // the size of the repository.
 const MaxCapabilityDetails = MaxErrorDetails
 
+// The reserved capability detail keys are the report fold's own bookkeeping:
+// they are assertions about the FOLD (how many scopes a row stands for, how
+// many units failed behind it, which merged values were cut, how many provider
+// details did not fit), not particulars a provider published. They are never
+// evicted to make room for a provider detail, because dropping one silently
+// falsifies the report -- a lost `scopes` under-counts the scopes a row speaks
+// for, and a lost `details_truncated` or `details_omitted` publishes a clipped
+// or incomplete detail map as if it were whole.
+const (
+	// DetailScopes counts the scopes one folded row stands for.
+	DetailScopes = "scopes"
+	// DetailUnitsFailed counts the units that failed behind one row.
+	DetailUnitsFailed = "units_failed"
+	// DetailDetailsTruncated names the detail values that were cut to fit
+	// MaxDetailBytes.
+	DetailDetailsTruncated = "details_truncated"
+	// DetailDetailsOmitted counts the provider details WithDetail dropped
+	// because the map was full.
+	DetailDetailsOmitted = "details_omitted"
+	// DetailUnitsPlanned counts the units the plan gave the provider behind
+	// one row, which is what makes DetailUnitsFailed readable: "two failed"
+	// is a different report of the same capability depending on whether two
+	// or two hundred were attempted.
+	DetailUnitsPlanned = "units_planned"
+	// DetailFailedScopes names the scopes that failed behind one row. It is a
+	// multi-valued detail and is deliberately NOT a scope-naming key: the
+	// exemplar `scope_key` names the one scope whose diagnostic code the row
+	// publishes, while this one is the set, and a merge of two rows must
+	// union the sets rather than keep the receiving row's.
+	DetailFailedScopes = "failed_scopes"
+	// DetailFailureMessage carries the safe message of the typed error the
+	// exemplar scope failed with, so a reader learns what happened and not
+	// only which family it belongs to.
+	DetailFailureMessage = "failure_message"
+)
+
+// DetailScopeKey carries the one exemplar scope a folded row names, the scope
+// whose DiagnosticCode, Remediation and DetailFailureMessage the row
+// publishes. It is NOT a reserved fold key -- it is charged to the provider
+// budget like any other particular -- and it is spelled here because the fold
+// that writes it and the surfaces that render it are in different packages,
+// where two spellings of one key would silently stop matching.
+const DetailScopeKey = "scope_key"
+
+// DetailStderrTail is the detail key under which a provider discloses the tail
+// of a failed tool's standard error. It is NOT a reserved fold key and it is
+// never published on a capability row or a log line: it is raw analyzer
+// output, which Section 6 keeps out of both. It is spelled here because the
+// producer and the fold that must exclude it are in different packages.
+const DetailStderrTail = "stderr_tail"
+
+// reservedCapabilityDetails is the set the constants above name. It is an
+// array so its length is a compile-time constant: the provider budget below is
+// derived from it, and every reserved key added must move that budget in the
+// same edit that adds the key.
+var reservedCapabilityDetails = [...]string{
+	DetailScopes,
+	DetailUnitsFailed,
+	DetailDetailsTruncated,
+	DetailDetailsOmitted,
+	DetailUnitsPlanned,
+	DetailFailedScopes,
+	DetailFailureMessage,
+}
+
+// DetailEvidenceClipped is the capability detail key under which a provider
+// discloses occurrences cut by the per-fact evidence bound. It is NOT a
+// reserved fold key -- it is a particular the provider publishes -- but it is
+// spelled once here because more than one provider applies the same bound, and
+// two spellings of it would read as two different bounds to an operator.
+const DetailEvidenceClipped = "evidence_clipped"
+
+// ReservedCapabilityDetail reports whether key is one the report fold owns.
+// A provider that writes one of these keys is writing the fold's bookkeeping,
+// not its own particulars; the fold's own writes go through the same door and
+// are the reason the key is guaranteed room.
+func ReservedCapabilityDetail(key string) bool {
+	return slices.Contains(reservedCapabilityDetails[:], key)
+}
+
+// MaxProviderCapabilityDetails is how many details a PROVIDER may contribute.
+// The reserved keys hold back the remainder of MaxCapabilityDetails so the
+// fold can always write them, whatever a provider filled the map with.
+const MaxProviderCapabilityDetails = MaxCapabilityDetails - len(reservedCapabilityDetails)
+
 // CapabilityState reports one provider capability at one scope. The machine
 // reason code is kept separate from user-readable remediation (Section 13.3).
 // Details carries the machine-readable particulars of a state that is not
@@ -271,14 +360,41 @@ type CapabilityState struct {
 	Scope          string               `json:"scope"`
 	State          CapabilityStateValue `json:"state"`
 	DiagnosticCode string               `json:"diagnostic_code,omitempty"`
-	Details        map[string]string    `json:"details,omitempty"`
+	// Remediation is what an operator can DO about this row, in prose, and
+	// it is a field rather than a detail key on purpose: the detail map has a
+	// fixed budget a provider fills with its own particulars, so a reserved
+	// key for it would be taken out of that budget and could be the entry a
+	// busy row drops. It belongs to the same scope as DiagnosticCode and the
+	// exemplar `scope_key` -- a fold that keeps one row's code keeps that
+	// row's remediation with it and never joins two.
+	Remediation string `json:"remediation,omitempty"`
+	// UnitsRunning is how many scopes of this capability were still being
+	// built in the background when this row was published. It is an assertion
+	// about the generation, written into the generation's own row, which is
+	// what lets a SECOND process read it: the in-process deferred queue
+	// answers only for the process that is doing the work, so a `codectx
+	// status` in another terminal would otherwise report a capability as
+	// simply degraded while the work that completes it is still running.
+	//
+	// Every row of one provider capability carries the same figure, so a fold
+	// of two of them takes the greater and never the sum: adding them would
+	// count one running unit once per row it appears on.
+	UnitsRunning int               `json:"units_running,omitempty"`
+	Details      map[string]string `json:"details,omitempty"`
 }
 
 // WithDetail returns the state with one bounded diagnostic pair added, so a
 // publisher can build a row in one expression. Values are truncated to
 // MaxDetailBytes and the map is capped at MaxCapabilityDetails entries; an
-// empty key and an overflowing new key are both dropped, so a detail map never
-// grows without bound and never carries a keyless value.
+// empty key is dropped, so a detail map never grows without bound and never
+// carries a keyless value.
+//
+// A provider detail that does not fit the MaxProviderCapabilityDetails budget
+// is dropped AND counted in DetailDetailsOmitted, so a reader is never handed a
+// silently short detail map. A reserved key (ReservedCapabilityDetail) is
+// always admitted: the budget holds room back for exactly those keys, so the
+// fold's own bookkeeping -- including this omission count and the truncation
+// flag -- can never be the thing that is evicted.
 //
 // The map is copied rather than written through. CapabilityState is a value
 // type that lives in slices and is copied freely, and Details is a reference:
@@ -290,14 +406,32 @@ func (c CapabilityState) WithDetail(key, value string) CapabilityState {
 	if key == "" {
 		return c
 	}
-	if _, replacing := c.Details[key]; !replacing && len(c.Details) >= MaxCapabilityDetails {
-		return c
+	if _, replacing := c.Details[key]; !replacing && !ReservedCapabilityDetail(key) &&
+		c.providerDetails() >= MaxProviderCapabilityDetails {
+		// The dropped key is counted, not swallowed. This recurses exactly
+		// once: DetailDetailsOmitted is reserved, so the branch above cannot
+		// be taken for it.
+		omitted, _ := strconv.Atoi(c.Details[DetailDetailsOmitted])
+		return c.WithDetail(DetailDetailsOmitted, strconv.Itoa(omitted+1))
 	}
 	details := make(map[string]string, len(c.Details)+1)
 	maps.Copy(details, c.Details)
 	details[key] = TruncateDetail(value)
 	c.Details = details
 	return c
+}
+
+// providerDetails counts the details a provider contributed, which is what the
+// MaxProviderCapabilityDetails budget bounds; the reserved keys are held back
+// from that budget rather than charged to it.
+func (c CapabilityState) providerDetails() int {
+	n := 0
+	for k := range c.Details {
+		if !ReservedCapabilityDetail(k) {
+			n++
+		}
+	}
+	return n
 }
 
 // Validate enforces the generation_capabilities constraints.
@@ -317,6 +451,12 @@ func (c CapabilityState) Validate() error {
 	if err := boundField("capability_state.diagnostic_code", c.DiagnosticCode, MaxIdentifierBytes); err != nil {
 		return err
 	}
+	if err := boundField("capability_state.remediation", c.Remediation, MaxDetailBytes); err != nil {
+		return err
+	}
+	if c.UnitsRunning < 0 {
+		return invalid("capability_state.units_running is %d", c.UnitsRunning)
+	}
 	if err := boundCount("capability_state.details", len(c.Details), MaxCapabilityDetails); err != nil {
 		return err
 	}
@@ -333,10 +473,11 @@ func (c CapabilityState) Validate() error {
 
 // validateCapabilityStates bounds and checks a completeness list; every public
 // result carries one.
+// The list itself is NOT length-bounded: a completeness report names every
+// capability the answer actually rests on, and failing the answer because the
+// repository has more capabilities than a constant anticipated withholds the
+// very report the caller needs. Each row is still bounded in every field.
 func validateCapabilityStates(field string, states []CapabilityState) error {
-	if err := boundCount(field, len(states), MaxCapabilityStates); err != nil {
-		return err
-	}
 	for _, s := range states {
 		if err := s.Validate(); err != nil {
 			return err
@@ -372,6 +513,71 @@ func (r ProviderResult) Validate() error {
 	}
 	if err := boundSigned64("provider_result.bytes_processed", r.BytesProcessed); err != nil {
 		return err
+	}
+	return nil
+}
+
+// RunFailure is the typed reason one provider run did not produce its unit,
+// kept on the run row so an operator can ask why a scope has no facts long
+// after the log line scrolled away. It holds what the capability row cannot:
+// the scope key the run was about (a run row is keyed by provider, not by
+// scope) and the raw tool output, which the fold and the log both exclude.
+type RunFailure struct {
+	// ProviderID names the provider whose run this was. It is on the wire
+	// because the failed runs of one generation are reported as a list: a row
+	// that says a scope failed without saying which provider was analysing it
+	// names no work an operator can act on.
+	ProviderID string `json:"provider_id"`
+	ScopeKey   string `json:"scope_key"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	// Remediation is what an operator can do about this failure, as the
+	// provider stated it. Without it a provider's own advice is lost between
+	// the error it raised and every surface that reports the failure.
+	Remediation string `json:"remediation,omitempty"`
+	// UnitsRunning is how many scopes of this capability were still being
+	// built in the background when this row was published. It is an assertion
+	// about the generation, written into the generation's own row, which is
+	// what lets a SECOND process read it: the in-process deferred queue
+	// answers only for the process that is doing the work, so a `codectx
+	// status` in another terminal would otherwise report a capability as
+	// simply degraded while the work that completes it is still running.
+	//
+	// Every row of one provider capability carries the same figure, so a fold
+	// of two of them takes the greater and never the sum: adding them would
+	// count one running unit once per row it appears on.
+	UnitsRunning int               `json:"units_running,omitempty"`
+	Details      map[string]string `json:"details,omitempty"`
+}
+
+// Validate bounds every field a run failure persists, so a provider's own text
+// can never grow the row with the size of its output.
+func (f RunFailure) Validate() error {
+	if err := requireField("run_failure.code", f.Code, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.scope_key", f.ScopeKey, MaxScopeKeyBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.provider_id", f.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.message", f.Message, MaxDetailBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.remediation", f.Remediation, MaxDetailBytes); err != nil {
+		return err
+	}
+	if len(f.Details) > MaxErrorDetails {
+		return invalid("run_failure.details holds more than %d entries", MaxErrorDetails)
+	}
+	for k, v := range f.Details {
+		if err := requireField("run_failure.details key", k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := boundField("run_failure.details["+k+"]", v, MaxDetailBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }

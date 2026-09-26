@@ -17,17 +17,21 @@ package joern
 //   - Definition-cap skips: an induced `--max-num-def 1` on a Python fixture
 //     produced paired WARN lines, `<method> has more than <n> definitions`
 //     and `Skipping.`, 13 of each, from `ReachingDefPass`.
-//   - Pass crash: `io.shiftleft.passes.CpgPassBase` logs
-//     `Pass %s failed in %.0f ms` with the throwable attached, at WARN. The
-//     format string and the log level were read out of the pinned payload's
-//     bytecode; the two reproductions are recorded in
-//     docs/research/10-round3-empirical.md Section 6.
+//   - Pass crash: the pass runner logs `Pass %s failed in %.0f ms` with the
+//     throwable attached, at WARN, and a pass that throws before it is timed
+//     is logged as `Pass %s failed` at ERROR instead. The format string and
+//     the log level were read out of the pinned payload's bytecode; the two
+//     reproductions are recorded in docs/research/10-round3-empirical.md
+//     Section 6, and the untimed form is recorded verbatim in
+//     testdata/linker-pass-crash.stderr.
 //   - Zero-exit helper crash: the orchestrator prints `Process exited with
 //     code <n>.` and still exits 0, having written a near-empty graph.
 
 import (
 	"bufio"
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -39,7 +43,8 @@ import (
 const (
 	markerOutOfMemory  = "OutOfMemoryError"
 	markerPassFailed   = "Pass"
-	markerFailedIn     = " failed in "
+	markerFailed       = " failed"
+	markerFailedIn     = markerFailed + " in "
 	markerHelperExited = "Process exited with code"
 	markerSkipping     = "Skipping."
 	markerOverDefs     = " has more than "
@@ -58,9 +63,16 @@ const maxScanTokenBytes = 1 << 20
 // classify turns one child's outcome into the neutral vocabulary the provider
 // acts on. A timeout wins over everything, because a terminated tree's stderr
 // says whatever it happened to have flushed.
-func classify(res process.Result) dependence.Outcome {
+//
+// private are the directories this run made for the child. They are reduced to
+// their names in the tail the outcome carries: a diagnostic an operator reads
+// must not publish where a private materialization or a work directory lives.
+func classify(res process.Result, private []string) dependence.Outcome {
 	out := dependence.Outcome{ExitCode: res.ExitCode, Duration: res.Duration, StderrBytes: res.StderrBytes,
-		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled}
+		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled,
+		CPUUserMS: res.CPUUserMillis, CPUSysMS: res.CPUSysMillis, CPUUnsampled: res.CPUUnsampled,
+		ReadBytes: res.ReadBytes, WriteBytes: res.WriteBytes, IOUnsampled: res.IOUnsampled,
+		StderrTail: stderrTail(res.Stderr, private)}
 	if res.TimedOut {
 		out.Class = dependence.FailureTimeout
 		return out
@@ -113,16 +125,115 @@ func classify(res process.Result) dependence.Outcome {
 	return out
 }
 
-// failedPass extracts the analysis pass name from the engine's own
-// `Pass %s failed in %.0f ms` warning. The name is matched from the right,
-// because the log's own logger column is usually the same pass name and a
-// left-to-right search finds that instead.
+// stderrTail is the last of a child's standard error: at most one error
+// detail's worth, cut forward to a line boundary so a stack frame is never
+// served half-written, and with every absolute path in it reduced to a name.
+//
+// The reduction is deliberately blunt. What a reader needs from an engine
+// stack trace is the exception, the pass and the file it choked on, and every
+// one of those survives a base name; what nobody outside this process may be
+// told is where the run materialized the repository, nor where the repository
+// itself lives. A rooted path is a path whatever produced it, so the rule
+// needs no knowledge of which tool wrote the line -- and the private
+// directories are replaced first, by name, so a path under one of them cannot
+// survive as an unrelated-looking suffix.
+func stderrTail(b []byte, private []string) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) > model.MaxDetailBytes {
+		b = b[len(b)-model.MaxDetailBytes:]
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			b = b[i+1:]
+		}
+	}
+	s := string(b)
+	for _, dir := range private {
+		if dir != "" {
+			s = strings.ReplaceAll(s, dir, privatePathName)
+		}
+	}
+	fields := strings.Fields(s)
+	for i, f := range fields {
+		fields[i] = reducePaths(f)
+	}
+	tail := strings.Join(fields, " ")
+	if len(tail) > model.MaxDetailBytes {
+		tail = tail[len(tail)-model.MaxDetailBytes:]
+	}
+	return tail
+}
+
+// privatePathName is what a directory this run made is called in a
+// diagnostic. It ends in a closing bracket, which is not a path opener below,
+// so what is left of a path under it -- the part inside the run's own
+// directory, which is the part that says which step wrote the file --
+// survives the reduction.
+const privatePathName = "(private)"
+
+// pathOpeners are the characters after which a path separator starts a rooted
+// path rather than continuing one. The engine does not print bare paths: it
+// prints them inside punctuation -- a backticked command line, an argument
+// list, a quoted value -- so a rule that only reduced a field beginning with a
+// separator left the whole directory chain, and with it the home and
+// repository directories, in a durable failure row.
+//
+// The closing brackets are deliberately absent: privatePathName ends in one,
+// and what follows a private directory's name is the remainder of a path, not
+// a new root.
+const pathOpeners = "([{<\"'`=,;:"
+
+// pathTerminators end a rooted path inside a larger token. A path separator is
+// never one of them, which is what lets the scan below resume at the end of a
+// reduced path without re-examining it.
+const pathTerminators = ")]}>\"'`,;"
+
+// reducePaths replaces every rooted path anywhere in one whitespace-delimited
+// field with its base name, leaving the punctuation around it in place: an
+// operator still has to be able to read the line, so `cmd: "/a/b/tool"` is
+// reduced to `cmd: "tool"` rather than to a bare name with its quoting gone.
+//
+// Relative paths are left alone. They name something inside a directory the
+// reader is not being told, so they publish nothing on their own, and they
+// carry the step a file belongs to.
+func reducePaths(field string) string {
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if field[i] != os.PathSeparator || (i > 0 && strings.IndexByte(pathOpeners, field[i-1]) < 0) {
+			b.WriteByte(field[i])
+			continue
+		}
+		end := len(field)
+		if j := strings.IndexAny(field[i:], pathTerminators); j >= 0 {
+			end = i + j
+		}
+		b.WriteString(filepath.Base(field[i:end]))
+		i = end - 1
+	}
+	return b.String()
+}
+
+// failedPass extracts the analysis pass name from either of the two lines the
+// engine logs when a pass dies: `Pass <name> failed in <n> ms`, timed, and
+// `Pass <name> failed`, untimed, which is the one a pass that threw before it
+// could be timed leaves. Both are matched from the right of whatever precedes
+// `failed`, because the log's own logger column is usually the same pass name
+// and a left-to-right search finds that instead.
+//
+// Recognising only the timed form recorded an empty pass name for a real
+// crash, and an unnamed pass is the difference between a crash the product
+// knows reproduces and one it has to re-run to find out.
 func failedPass(line string) (string, bool) {
-	j := strings.Index(line, markerFailedIn)
-	if j < 0 {
+	head := strings.TrimRight(line, " \t\r")
+	switch j := strings.Index(head, markerFailedIn); {
+	case j >= 0:
+		head = head[:j]
+	case strings.HasSuffix(head, markerFailed):
+		head = head[:len(head)-len(markerFailed)]
+	default:
 		return "", false
 	}
-	fields := strings.Fields(line[:j])
+	fields := strings.Fields(head)
 	if len(fields) < 2 || fields[len(fields)-2] != markerPassFailed {
 		return "", false
 	}

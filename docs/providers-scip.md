@@ -7,7 +7,7 @@ decoder.
 | Input | Unit scope key | Source binding |
 |---|---|---|
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
-| One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
+| One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>:<project directory>` (`scip.ProfileScope`), one unit per triggering directory | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
 The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
@@ -26,7 +26,15 @@ coordinator exists.
 - `Detect` inspects declared inputs only through the confined root: the
   import path, and the trigger manifests of each profile (`go.mod`;
   `package.json`/`tsconfig.json`; `pom.xml`/`build.gradle`/`build.gradle.kts`)
-  together with the profile payload's state. It never runs a tool.
+  together with the profile payload's state. It never runs a tool. It walks
+  the **whole** workspace for those manifests, not just its root, under the
+  snapshot's own exclusion policy, so a dependency directory's manifests are
+  never seen and a repository that keeps its projects in subdirectories is
+  detected at all. A root-only check reported a monorepo with six indexable
+  projects as having none. The walk is bounded like every other detection;
+  when the bound cuts the list, the detection says so under
+  `unplanned_projects`, because a project dropped in silence is one nobody
+  indexes and nobody is told about.
   Nothing usable is `CTX_PROVIDER_UNAVAILABLE`. When at least one language is
   indexable the detection is available, and `Detection.Details` still names
   every other triggered language and why it is not: the toolchain's own
@@ -38,7 +46,29 @@ coordinator exists.
   repository with `go.mod` and `Cargo.toml` on a machine with no usable
   `rust-analyzer` would be reported available, plan `scip-go` only, and say
   nothing anywhere about Rust.
-- `Scopes(detection)` lists the unit scope keys to plan. A profile this
+- `Scopes(detection)` lists the unit scope keys to plan: `import:<path>` for a
+  supplied index, and `profile:<indexer>:<project directory>` for one project
+  of one indexer, the empty directory being the workspace root. **One unit per
+  triggering directory**, whatever the language and whatever encloses the
+  directory. A manifest is the toolchain's own declaration of a boundary, so a
+  nested one is a second program and not a subdirectory of the first: a `go.mod`
+  inside another module's tree, an `app/package.json` under a root
+  `package.json`, and a `tsconfig` inside another project's tree are each their
+  own project with their own unit. A workspace root that triggers is a project
+  like any other, planned beside the projects below it. What is never done is
+  splitting a project at a directory that declares nothing — that split loses
+  more than half of the calls that resolve to the project's own methods
+  (`docs/research/10-round3-empirical.md` §8), so a Python package, a Cargo
+  workspace and a compilation database are whole up to the next directory that
+  declares itself and no further. A trigger inside a dependency directory
+  (`node_modules`, `vendor`, `third_party`, `bower_components`, `Godeps`) is not
+  a project and never reaches the rule while `workspace.index_vendor` is false,
+  which is the default, because those directories are then excluded from the
+  snapshot; with it enabled the operator has asked for them to be indexed and
+  their manifests are projects like any other. A project whose scope key
+  does not fit the identity bound is refused rather than truncated, because two
+  deep directories with a long common prefix cut to the same key and one
+  project's facts would be attributed to the other. A profile this
   machine cannot supply at all — no payload for this platform, a corrupt store
   entry, an invalid override — plans no unit, so a missing tool never costs a
   snapshot materialization or a failed unit. A profile whose payload the lock
@@ -106,8 +136,8 @@ real bindings, so the decoder is verified against library-encoded bytes.
 The import is three streaming passes over the index:
 
 1. **Binding pre-pass**: document paths and text hashes decide the binding
-   before any fact exists (the binding decides whether a bad coordinate
-   fails the unit or is skipped).
+   before any fact exists (the binding decides which diagnostic code a
+   refused coordinate carries).
 2. **Definitions**: occurrences and symbols are spooled to a private scratch
    SQLite file under the work directory (bounded by `MaxSpoolBytes`, 4 MiB
    page cache) as they stream; when a document ends its position encoding is
@@ -118,7 +148,10 @@ The import is three streaming passes over the index:
    minted. Edges are grouped on disk by relation identity and published with
    one evidence row per distinct occurrence range.
 
-The scratch directory is removed on every path.
+The spool is a surface of the shared scratch pool
+([storage](storage.md#the-scratch-pool)), so a second import of the same shape
+writes over the first one's bytes and frees nothing; the scratch directory
+around it is removed on every path.
 
 ## Delta import
 
@@ -142,9 +175,10 @@ codectx-scip-documents v1
 
 sorted by path with strictly increasing paths. `Provider.Version` moves with
 the hash domain, so a manifest written under an earlier mapping is never
-reachable: the old unit has a different `UnitID` and is not reused. `LoadDocumentManifest` validates
-all of that and refuses a malformed file rather than treating it as an empty
-previous state, because an empty previous state silently imports everything.
+reachable: the old unit has a different `UnitID` and is not reused.
+`LoadDocumentManifest` validates all of that and refuses a malformed file
+rather than treating it as an empty previous state, because an empty previous
+state silently imports everything.
 `Save` writes through a temporary file and one rename; `Close` removes the
 private temporary an import produced. `Diff(prev, fn)` is a merge join over the
 two sorted files: it returns the `Delta` counts and streams each path to `fn`
@@ -262,6 +296,99 @@ converts to the same bytes, so there is nothing to catch. A document whose
 guess does not hold is skipped and the capabilities are `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID`.
 
+The probe is not the guarantee, only its precondition. **Every** occurrence's
+range is then proved against the bytes it claims to describe — every one to the
+same two checks, whatever it is, and with what those checks cannot catch stated
+below rather than left implied. A wrong column does not need a wrong encoding: on a line carrying a tab after other
+characters an indexer can count columns to a different tab stop than the file
+does, so the range is shifted a few columns, stays inside its line, converts to
+a valid rune-aligned extent, and names source that is not the symbol. Measured
+on one Java project: 4,714 of 93,167 occurrences, in 91 of its 223 documents —
+3,531 refused for starting inside an identifier token and 1,183 for a column
+past the end of its line, 4,408 of them on lines indented with spaces followed
+by a tab and the remaining 306 on other lines, sampled and found to be the same
+shift. None of them is a false positive of the predicate: an identifier holding
+a `$` and one holding a non-ASCII letter are both admitted, by construction.
+
+The per-occurrence proof holds **every** occurrence, declaration and reference
+alike, to two checks over the pinned bytes.
+
+**Whole-token coverage.** No range may cut an identifier token: an identifier
+byte inside the range with another immediately outside it is half a token, and
+no grammar produces one. A range that names an identifier on a single line must
+in addition begin and end on the tokens it covers rather than on the whitespace
+between them — `browser` shifted seven columns left is `return `, an identifier
+plus the gap before the next token, which is not how the source spells
+anything. Two shapes of range do not name an identifier on a line and keep the
+cut check alone: a range spanning lines is a block span, measured, a crate's
+whole file; and a range holding no identifier byte at all is punctuation the
+grammar spells without one, measured, the reference from `+` to the `add`
+method it desugars to, which one indexer ranges over the space beside the
+operator. A zero-width range selects no bytes, so there are none to contradict;
+measured, every one is a document-level symbol anchored at the start of a file.
+
+**The name check.** A range that is exactly one identifier token, whose symbol's
+last descriptor is a name the grammar spells literally, must select that name or
+an identifier the document itself spells for that symbol. A document that
+aliases an import spells the symbol under a name of its own — `use HashSet as
+Set` makes every later `Set` of that file a correct reference to `HashSet` — and
+the occurrence carries nothing saying so: the indexer that produces this shape
+sets no occurrence role at all, so the import role cannot mark it. A spelling is
+therefore bound by corroboration: the document must hold at least two
+occurrences of that symbol spelling it identically. That is not a threshold
+chosen to fit a measurement, it is the structural minimum of the construct — an
+alias that is *used* produces the occurrence in the alias clause and the
+occurrence at the use site. An alias declared and never used produces one
+occurrence, and no second one for the rule to refuse either, so nothing is lost.
+A range that is not one identifier token is not name-checked at all: an aliased
+import can put the occurrence on the whole alias clause (`OrderedDict as OD`),
+and an operator reference is punctuation.
+
+Measured over the indexes the six pinned indexers produce from the fixtures of
+the per-platform matrix — 308 occurrences, all nine languages — the proof
+refuses **none** of them. The corroboration rule is what admits 2 of those 308
+(`Set` for `HashSet`); no other spelling in the corpus is corroborated.
+
+**What the proof does not catch.** It compares bytes, and it never adjusts or
+guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
+the truth publishes. Measured by shifting every one of the 308 occurrences by
+the two column distances observed in the field: of 214 occurrences a +5 shift
+converts at all, 32 still pass, and of 126 a +12 shift converts, 19 still pass —
+against 63 and 45 under the start-boundary rule this replaces. Those survivors,
+by kind: **24** whose symbol carries no name the grammar spells literally (a
+`local` symbol, a namespace, a meta descriptor, a backtick-escaped name), so
+there is nothing to compare the token against; **17** whose range is punctuation
+rather than one identifier token; and **10** zero-width ranges, which name a
+position and no bytes. A shift landing on another token spelling the **same**
+identifier is the remaining kind — two byte-identical ranges are the same claim,
+and nothing in the bytes separates them; it occurs **0** times in this corpus
+under those two shifts, and `internal/provider/scip` holds a fixture case for it
+so the boundary stays stated rather than assumed.
+
+The two proofs deliberately have different outcomes, because the two failures
+have different reach. A failed **encoding probe** is a claim about the whole
+document — every column of it is read in an encoding its bytes contradict — so
+the document is dropped whole, counted under `documents_dropped_encoding` and
+named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
+proof** reaches exactly one coordinate, so exactly one occurrence is left out:
+it is counted under `refused_occurrences`, the first is named with its reason by
+`refused_occurrence_exemplar` as `<document>:<line>:<column>: <reason>` — the
+coordinate the occurrence claimed, spelled as the index spelled it, zero-based
+and with the column counted in the position encoding the document declared,
+which is the encoding the refusal is a disagreement about, so that an operator
+opens the disagreeing line instead of re-running the indexer to find it — and
+the unit publishes `partial` with
+`CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
+the index describes bytes it never saw, so the same coordinate is a plain skip
+and is counted with the other unverified skips.
+
+A unit is never failed over one occurrence. Failing closed on the first refusal
+threw away all 93,167 occurrences of the project above over 4,714 wrong columns:
+every fact the indexer got right was lost with the ones it got wrong, and an
+operator was told the unit was unavailable rather than thinner. The counts are
+what makes the thinner unit honest — a partial capability that does not say how
+much it left out is indistinguishable from a whole one.
+
 `Metadata.text_document_encoding` is deliberately never consulted. All six
 indexers set it to `UTF8`, including the three whose columns are UTF-16,
 because `scip.proto` defines it as the encoding of the source files on disk and
@@ -270,13 +397,7 @@ every UTF-16 column as a byte offset.
 
 A document of any other tool build that does not declare an encoding is
 skipped and the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`:
-Section 9.3 forbids guessing one. `Report.AssumedPositionEncoding` counts the
-documents that were converted through the per-tool-build table **and** proved
-against their pinned bytes. A
-coordinate that does not land on the bytes is `CTX_PROVIDER_OUTPUT_INVALID`
-and fails the unit under a verified binding (the index claims to describe
-these bytes and does not); under an unverified binding it is skipped and
-counted.
+Section 9.3 forbids guessing one.
 
 A document proves its bytes by embedded `text` whose SHA-256 equals the
 pinned content hash, or by a matching row of a **qualifying** input-hash
@@ -324,8 +445,13 @@ Every node goes through `req.Resolver`; the provider copies
 | the file node a file-level occurrence points out of | `workspace`, native key `file:<path>` | exactly the filesystem provider's file candidate: kind `file`, name `path.Base`, qualified name = path, no defining file, no range, no language. Resolving it against the declared `filesystem` dependency adopts that provider's identity instead of minting a second file node for one path; SCIP's own evidence row (`[0, size)` of the pinned file) stays on it |
 
 Name is `display_name`, else the last descriptor's name. Signature is
-`signature_documentation.text` when it fits the signature ceiling.
-Ambiguous resolutions become `may_refer_to` edges.
+`signature_documentation.text`, truncated to the signature ceiling when it is
+longer and flagged on the node as `"truncated_fields":{"signature":<original
+byte length>}` — the same index-time truncation attribute the structural
+provider publishes, never merged with a result page's transient truncation
+flag. Only the ceiling is ever read off the wire, so a signature of any size
+costs the ceiling and not itself. Ambiguous resolutions become `may_refer_to`
+edges.
 
 Node kind is `SymbolInformation.Kind` mapped to Section 9.2: Class, Object,
 SingletonClass, Mixin, Concept and the bare type kinds (Type, TypeAlias,
@@ -354,7 +480,7 @@ namespace, `#` class, `().` method under a type else function, `.` variable,
 Every evidence row is `compiler` precision with the SCIP symbol as
 `native_key` and the role word as `detail`. The same edge at two ranges is
 one relation with two evidence rows; the same edge at the same range is one
-row. One relation carries at most `model.MaxEvidencePerFact` (64) evidence
+row. One relation carries at most `model.MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) evidence
 rows; further occurrences are counted and the capabilities are `partial`
 with `CTX_RESOURCE_LIMIT`. The first definition of a symbol is the one
 references bind to; a later definition keeps its own located identity.
@@ -398,21 +524,44 @@ wrong range.
 
 ## Bounds
 
-`scip.Limits` (defaults in `DefaultLimits`): whole index 1 GiB; one record
-`resources.max_provider_record_bytes` (4 MiB); 1,000,000 documents; 4,000,000
-occurrences per document; 4 GiB spooled; one source file 5 MiB (a larger file
-is skipped, `partial` with `CTX_RESOURCE_LIMIT`); materialization 4 GiB;
-manifest 64 MiB.
+`scip.Limits` is seven `providers.scip.*` keys, **all unlimited by default**,
+and one constant. Nothing here refuses a repository for its size unless an
+operator asked for it: `max_index_bytes`, `max_manifest_bytes`,
+`max_documents`, `max_occurrences_per_document` and `max_spool_bytes` cut
+nothing at all, because the index streams record by record, documents and
+occurrences spool to an on-disk database and a manifest is scanned line by
+line. A value an operator sets and this run crossed is published on every
+capability row of the unit as `partial` with `CTX_RESOURCE_LIMIT`, under the
+detail `resource_limits_exceeded`, as a sorted `key=seen/bound` list — the run
+reports that the figure was passed and admits every fact regardless.
+
+Three of the seven do leave something out: `max_source_file_bytes` (a document
+whose source would be held whole is skipped, reported under the same detail),
+`max_materialize_bytes` (files left out of an indexer's private copy, named in
+the materializer's own operator report with a complete count) and, for C and
+C++ only, `max_manifest_bytes` (a compilation database over it is left
+un-normalized, which costs that unit its whole run — reported, never silent).
+Those three are therefore part of the index fingerprint; the four pure
+reporting thresholds deliberately are not, so adjusting one never invalidates
+an index.
+
+`MaxRecordBytes` (4 MiB) is the one bound that stays product code. It is the
+wire reader's pre-allocation ceiling — the bytes one record may cause to be
+allocated before it is decoded — not a figure about the repository, and it
+must stay positive.
 
 The record buffer — the only buffer sized by untrusted index bytes — is
 charged against the sink's byte pool through `Reserve` when the sink offers
 it. One document's source bytes are **not** charged: `BatchSink.Reserve`
 refuses a reservation above `resources.max_provider_record_bytes` (4 MiB),
-while a source file is bounded by `MaxSourceFileBytes` (5 MiB), so the charge
-is impossible for exactly the largest case. At most one document's source is
-held at a time, so a unit retains up to `MaxSourceFileBytes` (5 MiB) outside
-the pool's accounting, on top of the pool's own budget. That buffer is sized
-by the pinned snapshot file, whose size is checked before the read.
+while a source file is bounded only by what the operator set in
+`max_source_file_bytes`, so the charge is impossible for exactly the largest
+case. At most one document's source is held at a time, so a unit retains one
+document's source outside the pool's accounting, on top of the pool's own
+budget — the one place an unset bound leaves peak memory a function of the
+largest file the index describes, which is why this bound exists to be set.
+That buffer is sized by the pinned snapshot file, whose size is checked before
+the read.
 
 ## Payload resolution
 
@@ -453,13 +602,14 @@ table, no approved path and no PATH lookup (Section 20.2 — trust is the lock).
 Every one of the six was resolved through the real lock and store and run end
 to end on `linux/amd64` — materialize, index, import, seal — against a fixture
 of its own language; the exact argv, the environment allowlist and the sealed
-result of each run are in the lane B1 report. The six profiles and the argument
-arrays this build pins, after the payload's own launcher prefix:
+result of each run were recorded when the matrix was verified. The six
+profiles and the argument arrays this build pins, after the payload's own
+launcher prefix:
 
 | Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture | Host toolchain it needs |
 |---|---|---|---|---|---|
 | `scip-go` | `go.mod`, `go.work` | `index --output <output>` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | allowed | `go` |
-| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar` | `HOME` | denied | none (managed Node) |
+| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar --infer-tsconfig` | `HOME` | denied | none (managed Node) |
 | `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied | `python3`, `pip3` |
 | `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --scip-config <input>/scip-java.json --targetroot <work>/scip-java-targetroot --output <output>` | `PATH HOME` | denied | none (managed JDK) |
 | `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo` |
@@ -472,25 +622,44 @@ project's installed distributions through the interpreter and pip, and
 `rust-analyzer` loads `cargo metadata`. Where the toolchain is absent, that
 language has no precise index — the profile exits non-zero and the unit fails
 with `CTX_PROVIDER_UNAVAILABLE` — and the structural and dependence providers
-still cover it. `scip-java` used to belong to that list, through Maven or
-Gradle; it no longer does (see below).
+still cover it. `scip-java` is not in that list: it compiles the snapshot with
+the managed JDK's own `javac` and needs no host build tool (see below).
 
-`<input>` is the private materialization root, which is also the child's
-working directory; `<output>` and `<work>` are under the run directory, outside
-the materialization.
+`<input>` is the unit's project directory inside the private materialization,
+which is also the child's working directory; `<output>` and `<work>` are under
+the run directory, outside the materialization.
 
-**A profile's private copy is the whole workspace, deliberately.** The
-materialization is not narrowed to the files a unit "owns": a precise indexer
-resolves symbols through the project's own dependency context — the module
-graph, the package manifests, the installed distributions, the headers — and
-the unit's scope is the workspace, so a narrower copy would produce an index
-that describes less than the unit claims. The call site says so explicitly
-rather than leaving it to an omitted selection. The launcher prefix comes from the lock: a self-contained
-binary runs as itself, a Node-hosted indexer runs as `<managed node> <entry>`,
-and `scip-java`'s launcher runs with `JAVA_HOME` pointing at the managed JDK.
-The child's environment is exactly the allowlisted variables the parent has
-plus the variables the payload needs; the payload's come last, so a host
-`JAVA_HOME` can never shadow the pinned runtime.
+**A profile's private copy is the whole workspace, deliberately — and the
+indexer is run over one project inside it.** The two are different decisions.
+The materialization is not narrowed to the files a unit "owns": a precise
+indexer resolves symbols through the project's own dependency context — the
+module graph, the package manifests, the installed distributions, the headers,
+a `tsconfig` above it — so a narrower copy would produce an index that
+describes less than the unit claims. What the indexer is *run over* is the
+unit's project, which is what makes the unit a project rather than a
+repository. The call site says so explicitly rather than leaving it to an
+omitted selection.
+
+What the copy cannot supply is a dependency directory: those are excluded from
+the snapshot, so an indexer that resolves installed packages by reading them
+out of the tree it is given resolves them to nothing. That is a limit on what a
+unit publishes — the project's own definitions and the references among them —
+not a reason for the unit to fail.
+
+**Document paths are prefixed back to the workspace.** An indexer writes
+document paths relative to what it was run over: `scip-go` run in `sub/`
+writes `a.go`, not `sub/a.go` (measured against the pinned payload). The
+import prepends the unit's project directory to every document path once, as
+the document is decoded, so every path the import resolves, stores and
+publishes is workspace-relative whatever project the unit is. Without it every
+document would fail to resolve against the snapshot and the unit would trip
+the false-readiness refusal below. The launcher prefix comes from
+the lock: a self-contained binary runs as itself, a Node-hosted indexer runs
+as `<managed node> <entry>`, and `scip-java`'s launcher runs with `JAVA_HOME`
+pointing at the managed JDK. The child's environment is exactly the
+allowlisted variables the parent has plus the variables the payload needs; the
+payload's come last, so a host `JAVA_HOME` can never shadow the pinned
+runtime.
 
 Everything is executed through the shared `internal/process` runner with an
 argv array only (ruling R9-3: no shell anywhere). The run is bounded by the
@@ -514,17 +683,39 @@ unit seals with all three capabilities fresh. A repository's own
 configuration surface. `--targetroot` keeps the indexer's own intermediate
 output inside the run directory rather than in the materialization.
 
-A materialization that holds **no** `.java` file is refused before the indexer
-starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a remediation naming the
-source-free case. This is the aggregator POM of a multi-module repository —
+A materialization that holds **no** source file the indexer can describe is
+refused before that indexer starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a
+remediation naming the source-free case. Two profiles apply it, through one
+helper. For Java it is the aggregator POM of a multi-module repository —
 `pom.xml` triggers the profile, the root carries no source of its own — and
 without the check `javac` refuses, the indexer exits 1, and the run fails as
-`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured):
-a process failure with no stderr and no remediation. The refusal is the same
-typed one the other profiles produce for an index that describes no admitted
-document, raised before a JVM is started rather than after.
+`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured).
+For TypeScript it is a package directory holding only a manifest, a lock file
+and documentation, with no `.ts`/`.js` beside them: measured on a real
+repository, the run failed as `CTX_PROVIDER_UNAVAILABLE: node exited with
+status 1`. Both are a process failure with no stderr and no remediation, for a
+condition this provider can name precisely. `node_modules` is excluded from the
+TypeScript walk: a dependency's own sources are not the project's, and counting
+them would restore that opaque failure with an extra step. The refusal is the
+same typed one the other profiles produce for an index that describes no
+admitted document, raised before a tool is started rather than after.
 
-**Two pinned arguments exist because of a measured failure, not a preference.**
+**Three pinned arguments exist because of a measured failure, not a
+preference.** `scip-typescript` is given `--infer-tsconfig` because two of its
+three triggers — `jsconfig.json` and `package.json` — name a project that has
+no `tsconfig.json`. Without the flag the indexer prints `(missing
+tsconfig.json)`, indexes nothing and exits 1, so every such project fails its
+unit with `CTX_PROVIDER_UNAVAILABLE` and zero records: nine projects of one
+monorepo failed exactly that way, and every one of them indexes with the flag.
+With it the indexer infers the configuration it needs and writes it into the
+private materialization — never into the repository, which this provider never
+writes to — and indexes the project. A project that already carries a
+`tsconfig.json` is unaffected: the flag is consulted only when the file is
+absent, so a configured project is still indexed under its own configuration.
+The symbols such a unit can resolve are bounded by the paragraph above: a
+snapshot holds no dependency directories, so a name owned by an installed
+package has no definition in the index, and what the unit publishes is the
+project's own definitions and the references among them.
 `scip-python` is given `--project-version` because, left to itself, it asks git
 for the current revision; the private materialization is never a repository, so
 the lookup fails, the version stays undefined and the indexer dies inside its
@@ -599,4 +790,11 @@ the run was declared under.
 
 Materializations, manifests and outputs live under the provider's own work
 directory (`<work_dir>/profiles/<profile>/`) in a per-run directory that is
-removed on success, failure and cancellation.
+removed on success, failure and cancellation. Those removals return at once --
+the tree is renamed into the process's to-free set -- and the space is given
+back off the run's path, a window at a time
+([storage](storage.md#what-a-run-still-frees)). An indexer's tree is copies
+rather than links to the content store because the profile writes into the tree
+it was given: `scip-clang` normalizes its compile database there and
+`scip-java` writes its project configuration there, and a link would put those
+writes through to the published blob.

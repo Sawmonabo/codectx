@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -67,6 +68,9 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 		if err == nil {
 			err = sink.Flush(runCtx)
 		}
+		// Folded before checkResult so the added details are validated with
+		// the rest of the result rather than smuggled past validation.
+		result.Capabilities = reportDegradations(result.Capabilities, sink.Degradations(), p.Descriptor(), req.Unit)
 		// From here on the writer belongs to this function alone.
 		sink.Discard()
 	}
@@ -104,6 +108,48 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 		err = errors.Join(err, failErr)
 	}
 	return failedResult(req.Run, stateOf(err), sink), err
+}
+
+// reportDegradations folds the sink's counted degradations into the unit's
+// capability rows, which is where a generation stores what a run had to give
+// up.
+//
+// A degradation the sink counts is a truncate-and-flag outcome, never a
+// partial one: both paths that count a record over the user-set record bound
+// (BatchSink.Reserve and put) admit the record and then report the bound, so
+// nothing was dropped and nothing failed. The row therefore keeps the state it
+// has -- a fresh row stays fresh -- and carries the counts as details. The
+// generation's capability fold collapses fresh rows to one workspace-scoped
+// row but merges their details, so a count carried on a fresh row does reach
+// the reader; only the diagnostic code and the details that NAME the one scope
+// a row was reported at are dropped there. Keep these detail keys out of that
+// scope-naming set, or the fold will discard them. A row that is already
+// partial, failed or unavailable likewise keeps the state and code it has:
+// those describe an outcome the sink's counters do not.
+//
+// A provider that published no capability row has no other place to carry
+// this, so one row per declared capability is synthesized; the descriptor's
+// list is the provider's own static declaration, so it is small and does not
+// grow with the repository.
+func reportDegradations(states []model.CapabilityState, degraded []Degradation, desc model.ProviderDescriptor, unit model.UnitSpec) []model.CapabilityState {
+	if len(degraded) == 0 {
+		return states
+	}
+	if len(states) == 0 {
+		for _, c := range desc.Capabilities {
+			states = append(states, model.CapabilityState{
+				ProviderID: unit.ProviderID, Capability: c, Scope: unit.ScopeKey, State: model.CapabilityFresh})
+		}
+	}
+	for i, st := range states {
+		for _, d := range degraded {
+			st = st.WithDetail("over_"+d.Limit, strconv.FormatUint(d.Count, 10)).
+				WithDetail(d.Limit, strconv.FormatInt(d.Bound, 10)).
+				WithDetail("largest_record_bytes", strconv.FormatInt(d.Largest, 10))
+		}
+		states[i] = st
+	}
+	return states
 }
 
 // checkResult rejects a result that does not describe this run.

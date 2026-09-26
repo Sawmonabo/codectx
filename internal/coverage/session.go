@@ -68,10 +68,14 @@ func New(o Options) (*Service, error) {
 		log:      log,
 	}
 	if s.leases == nil {
-		// Both consequences are real and neither is recoverable per request, so
-		// the operator hears about it once at composition instead of never.
-		log.Warn("coverage sessions will not retain their generation and status pages will not continue",
-			"component", "coverage", "reason", "no retention leases were supplied")
+		// A service without leases cannot retain the generation a session is
+		// bound to and cannot issue a status continuation, so every coverage
+		// answer past the first page is silently unreachable and the blobs the
+		// session hands out may be collected under it. Neither is recoverable
+		// per request and neither is visible to the actor, so composition
+		// refuses rather than warning once and degrading forever.
+		return nil, typedErrf(model.CodeConfigInvalid,
+			"coverage requires a retention lease store: without one, sessions do not pin their generation and status pages cannot continue")
 	}
 	return s, nil
 }
@@ -89,10 +93,8 @@ func checkLimits(l Limits) error {
 		{"max_source_response_bytes", l.MaxSourceResponseBytes},
 		{"max_metadata_response_bytes", l.MaxMetadataResponseBytes},
 		{"max_receipts_per_confirmation", int64(l.MaxReceiptsPerConfirmation)},
-		{"max_unconfirmed_chunks_per_session", int64(l.MaxUnconfirmedChunksPerSession)},
 		{"max_page_items", int64(l.MaxPageItems)},
 		{"session_ttl", int64(l.SessionTTL)},
-		{"query_timeout", int64(l.QueryTimeout)},
 		{"receipt_ttl", int64(l.ReceiptTTL)},
 	} {
 		if b.value <= 0 {
@@ -100,6 +102,22 @@ func checkLimits(l Limits) error {
 				"coverage limit %s is %d; every bound must be resolved to a positive value before the service is built",
 				b.name, b.value)
 		}
+	}
+	// query_timeout is exempt from the positive check above: zero is its
+	// default and means no deadline (Limits). A negative one is a wiring
+	// defect, and model.QueryDeadline would silently ignore it, so it is
+	// refused here where it can still be attributed.
+	if l.QueryTimeout < 0 {
+		return typedErrf(model.CodeInternal,
+			"coverage limit query_timeout is %d; a bound cannot be negative", l.QueryTimeout)
+	}
+	// max_unconfirmed_chunks_per_session is exempt from the positive check
+	// above and only refuses a negative: zero is its default and means
+	// unlimited (Limits).
+	if l.MaxUnconfirmedChunksPerSession < 0 {
+		return typedErrf(model.CodeInternal,
+			"coverage limit max_unconfirmed_chunks_per_session is %d; a bound cannot be negative",
+			l.MaxUnconfirmedChunksPerSession)
 	}
 	if l.MaxReceiptsPerConfirmation > model.MaxReceiptsPerConfirmation {
 		return typedErrf(model.CodeInternal,
@@ -130,7 +148,7 @@ func checkLimits(l Limits) error {
 // CTX_VERSION_CONFLICT. The phase gate, the manifest's generation and snapshot
 // and the session's file scope are the store's too, so none of it is repeated
 // here.
-func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (model.SessionID, error) {
+func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (_ model.SessionID, err error) {
 	if err := req.Validate(); err != nil {
 		return "", err
 	}
@@ -143,8 +161,14 @@ func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manife
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage session open", err) }()
 
 	session, err := s.sessions.OpenSession(ctx, model.SessionOpen{
 		ID:              model.SessionID(id),
@@ -206,9 +230,6 @@ func openRequestHash(req model.PlanRequest, manifest model.ManifestID) string {
 // refusal is this session already holding exactly what retain is asking for, so
 // it is the success case and not an error to report.
 func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
-	if s.leases == nil {
-		return nil
-	}
 	_, err := s.leases.AcquireFor(ctx, rec.Binding.GenerationID, rec.Binding.SnapshotID,
 		model.LeaseSession, string(rec.ID))
 	if sqlite.OwnerLeaseConflict(err) {
@@ -224,7 +245,7 @@ func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
 // session-level counts are NOT reported here: workflow.Service.Status is the one
 // producer of a model.SessionStatus (ruling VF1), and the facade pairs this page
 // with it.
-func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], error) {
+func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (_ model.Page[model.FileCoverage], err error) {
 	var emptyPage model.Page[model.FileCoverage]
 	if err := req.Validate(); err != nil {
 		return emptyPage, err
@@ -233,8 +254,18 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 		return emptyPage, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage status", err) }()
+	// statusLimit already keeps the request one record below the wire ceiling,
+	// so a clamp here would be a caller asking for more than the ceiling. It is
+	// reported rather than applied silently.
+	ctx, clamps := sqlite.WithPageClamps(ctx)
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil && !(expiredSession(err) && rec.ID != "") {
@@ -256,7 +287,7 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 		items = items[:limit]
 	}
 
-	meta := model.QueryMeta{Binding: rec.Binding}
+	meta := model.QueryMeta{Binding: rec.Binding, Notices: clamps.Notices()}
 	if more {
 		token, why, err := s.statusCursor(ctx, rec, items[len(items)-1].FileID)
 		if err != nil {
@@ -336,9 +367,6 @@ func (s *Service) resumeStatus(token string, rec sqlite.SessionRecord) (model.Fi
 func (s *Service) statusCursor(ctx context.Context, rec sqlite.SessionRecord, last model.FileID) (token, why string, err error) {
 	if last == "" {
 		return "", "", typedErrf(model.CodeInternal, "a status page ended without a keyset position")
-	}
-	if s.leases == nil {
-		return "", "this workspace does not retain coverage continuations", nil
 	}
 	if !model.ValidHexID(string(rec.Binding.AnalysisKey)) {
 		// The generation is still staging, so there is no analysis key to pin

@@ -69,12 +69,12 @@ the two the bytes come from.
 | `scip-typescript` | 0.4.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-typescript |
 | `scip-python` | 0.6.6 | MIT (the package vendors pyright) | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-python |
 | `scip-java` | 0.13.1 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-java |
-| `rust-analyzer` | 2026-08-17.4 | MIT OR Apache-2.0 | upstream | https://github.com/rust-lang/rust-analyzer |
+| `rust-analyzer` | 2026-09-14 | MIT OR Apache-2.0 | upstream | https://github.com/rust-lang/rust-analyzer |
 | `scip-clang` | 0.4.0 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-clang |
 | `gopls` | 0.23.0 | BSD-3-Clause (the Go project) | redistributed | https://pkg.go.dev/golang.org/x/tools/gopls |
 | `typescript-language-server` | 6.0.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/typescript-language-server |
 | `typescript` (shipped inside the `typescript-language-server` payload) | 5.9.3 | Apache-2.0 | redistributed | https://www.npmjs.com/package/typescript |
-| `pyright` | 1.1.414 | MIT | redistributed | https://www.npmjs.com/package/pyright |
+| `ty` | 0.0.81 | MIT | upstream | https://github.com/astral-sh/ty |
 | `clangd` | 22.1.6 | Apache-2.0 WITH LLVM-exception | upstream | https://github.com/clangd/clangd |
 | `jdtls` (Eclipse JDT Language Server) | 1.61.0 | EPL-2.0 | upstream | https://download.eclipse.org/jdtls/milestones/1.61.0/ |
 | `joern` (backend of the `dependence` provider) | 4.0.627 | Apache-2.0 | upstream | https://github.com/joernio/joern |

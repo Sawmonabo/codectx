@@ -1,0 +1,698 @@
+// Package scratch is the pool of working files a store writes for its own
+// later reading: sort runs, staging databases, content-store temporaries,
+// materialized trees, cursor and traversal state.
+//
+// Freeing disk space is the expensive act. On a filesystem that discards
+// freed blocks under a sparse virtual disk, releasing gigabytes stalls every
+// other writer on the machine for about a minute, a minute after the free,
+// and nothing inside the machine can observe or wait for that work. A run
+// that creates its working files and removes them when it is done pays that
+// cost once per surface; a run that takes the same files again pays it never.
+//
+// So a scratch file is taken from the arena and given back to it. Take hands
+// out an existing file of the asked-for purpose opened for overwrite at
+// offset zero, with no truncation, or creates one; Release returns it for the
+// next taker. A file keeps whatever length its largest tenant gave it for as
+// long as the arena exists, and the arena is emptied only when an operator
+// asks for it.
+//
+// Because nothing truncates, the file's length is not the data's length: a
+// tenant that wrote a megabyte into a file whose previous tenant wrote ten
+// will read nine megabytes of the previous tenant's bytes after its own if
+// it reads to end of file. Every tenant therefore carries its own logical
+// length — a header, a record count, a byte count it recorded when it wrote —
+// and never learns it from os.Stat, from Seek to the end, or from reading
+// until EOF. A tenant that cannot do that must not use the arena.
+//
+// # Two processes, one data directory
+//
+// A pool is per process, because a lease is an object in one process's heap
+// and means nothing to another. Some purposes are written from paths several
+// processes can run at once. SortRun and PathSearch are both taken on the
+// query path, where any number of readers may serve pages from one data
+// directory at the same time, and SortRun is taken on the index path too,
+// where the workspace's single writer takes it. ContentTemp and LexicalStage
+// are the index path's alone, which one writer holds at a time. Two processes
+// sharing a pool would each take slot zero and each read the other's bytes as
+// its own, so the claim below applies to every purpose rather than to the two
+// that need it.
+//
+// So the pool lives under a numbered INSTANCE directory that the process
+// claims with an exclusive lock held for as long as it runs, and no two live
+// processes ever share one. A process that exits or dies leaves its instance
+// unlocked, and the next process to start claims that same instance and takes
+// over its files: an abandoned pool is inherited, never accumulated and never
+// swept.
+package scratch
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+
+	"github.com/Sawmonabo/codectx/internal/fslock"
+	"github.com/Sawmonabo/codectx/internal/paced"
+)
+
+// A Purpose names a family of interchangeable scratch surfaces. Files of one
+// purpose are pooled together, so a purpose groups tenants whose sizes and
+// lifetimes are alike: every sort run is one purpose, every staging database
+// another. The name becomes a directory under the arena's instance, so it is
+// a plain lowercase identifier.
+type Purpose string
+
+// The purposes the product takes from an arena. They live here rather than
+// beside their tenants so the set of surfaces a store can hold is readable
+// in one place.
+const (
+	// SortRun is one run file of an external sort, and its merged output.
+	SortRun Purpose = "sort-run"
+	// LexicalStage is a lexical seal's staging database, one per seal slot.
+	LexicalStage Purpose = "lexical-stage"
+	// ImportSpool is one index import's native-symbol map and occurrence
+	// spool, in a database.
+	ImportSpool Purpose = "import-spool"
+	// PathSearch is one shortest-path search's external-memory state: the
+	// settled set, the parent edges and the cost buckets, in a database.
+	PathSearch Purpose = "path-search"
+	// ContentTemp is the file a content-addressed store streams one blob
+	// into while it hashes it, before it knows whether the store already
+	// holds that content.
+	ContentTemp Purpose = "content-temp"
+	// ImportStaging is one dependence import's staging database: the rows of
+	// an export, loaded so the derivations can be run as ordered passes. It
+	// is the largest surface the product writes.
+	ImportStaging Purpose = "import-staging"
+	// EngineTemp is a temporary the database engine asked its file system
+	// for: a sort's spilled runs, a statement's pre-image. The engine never
+	// names these files and would create and unlink one per use.
+	EngineTemp Purpose = "engine-temp"
+)
+
+// dirName is the arena's own directory under the directory it serves.
+const dirName = "scratch"
+
+// Dir is where the arena of the given directory keeps its surfaces. Anything
+// that enumerates a served directory -- a sweep, a budget, a test counting
+// what a run left behind -- uses it to tell the pool apart from the state it
+// is looking for: the pool is not a leftover, and emptying it is an
+// operator's decision.
+func Dir(served string) string { return filepath.Join(served, dirName) }
+
+// lockName is the file inside an instance directory whose exclusive lock is
+// the claim on that instance.
+const lockName = "owner.lock"
+
+// An Arena is the pool of scratch surfaces under one directory. One exists
+// per directory: every part of the store that writes a working file under
+// that directory takes it from there, so the pool is shared by everything
+// rooted at it without a handle threaded through every constructor.
+//
+// An Arena is safe for concurrent use. Take never hands the same surface to
+// two callers within the process, and the instance claim keeps two processes
+// out of one pool.
+type Arena struct {
+	root string
+	// served is the directory this arena pools for: removals under it are
+	// renamed into the arena's to-free set instead of being freed in place.
+	served string
+
+	// claimMu guards the instance claim, and only that. It is separate from
+	// mu because the arena's to-free set is resolved by the removal path,
+	// which can be reached from a caller already holding mu; a claim that
+	// waited on mu would deadlock there.
+	claimMu  sync.Mutex
+	instance string   // the claimed instance directory, once claimed
+	lock     *os.File // the open, locked claim file, held for the process's life
+
+	mu    sync.Mutex
+	free  map[Purpose][]string // paths available to take, per purpose
+	held  map[string]bool      // paths currently leased
+	next  map[Purpose]int      // the next ordinal to create, per purpose
+	swept map[Purpose]bool     // purposes whose directory has been read
+}
+
+// arenas is the process's arena per served directory.
+var (
+	arenasMu sync.Mutex
+	arenas   = map[string]*Arena{}
+)
+
+// All is every arena this process has opened, in no particular order. A
+// store's surfaces are pooled under more than one directory -- the data
+// directory, the continuation store's, a provider's work directory -- so the
+// disk a run is holding rather than freeing is the sum over all of them, and
+// disclosing one of them would understate it.
+func All() []*Arena {
+	arenasMu.Lock()
+	defer arenasMu.Unlock()
+	out := make([]*Arena, 0, len(arenas))
+	for _, a := range arenas {
+		out = append(out, a)
+	}
+	return out
+}
+
+// For returns the arena of the given directory, creating it on first use.
+// Callers that already hold the directory a surface belongs under — every
+// producer of scratch in the product already takes one — reach the pool
+// through it with no new plumbing. Nothing touches the disk until the first
+// Take, so For cannot fail.
+func For(dir string) *Arena {
+	root := Dir(dir)
+	arenasMu.Lock()
+	defer arenasMu.Unlock()
+	if a := arenas[root]; a != nil {
+		return a
+	}
+	a := &Arena{
+		root:   root,
+		served: filepath.Clean(dir),
+		free:   map[Purpose][]string{},
+		held:   map[string]bool{},
+		next:   map[Purpose]int{},
+		swept:  map[Purpose]bool{},
+	}
+	arenas[root] = a
+	// Every removal under the directory this arena serves is renamed into the
+	// arena's own to-free set and given back at the pace, off the run's path.
+	// The set lives inside the claimed instance, so it is exclusive to this
+	// process while it runs and inherited, with whatever it still holds, by
+	// the next process to claim that instance after a crash.
+	paced.RegisterToFree(dir, a.toFreeSet)
+	return a
+}
+
+// toFreeSet is the directory removals under this arena's served directory are
+// renamed into. Claiming the instance is what makes the set this process's
+// alone, so it happens here, on the first removal, rather than when the arena
+// is first reached for.
+func (a *Arena) toFreeSet() (string, error) {
+	instance, err := a.claim()
+	if err != nil {
+		return "", err
+	}
+	set := paced.ToFreeDir(instance)
+	if err := os.MkdirAll(set, 0o700); err != nil {
+		return "", err
+	}
+	return set, nil
+}
+
+// Root is the arena's directory: the parent of every instance.
+func (a *Arena) Root() string { return a.root }
+
+// A Lease is one scratch surface taken from an arena. It goes back to the
+// pool with Release, which never removes it from the disk, or leaves the pool
+// with Discard when the tenant has moved the file somewhere else.
+type Lease struct {
+	arena   *Arena
+	path    string
+	purpose Purpose
+
+	mu   sync.Mutex
+	file *os.File
+}
+
+// Path is the leased file's path. The file exists when the lease is handed
+// out.
+func (l *Lease) Path() string { return l.path }
+
+// File is the leased file opened for reading and writing, positioned at
+// offset zero, with nothing truncated. The same *os.File is returned on
+// every call for the life of the lease; Release and Discard close it.
+//
+// The file's length is the previous tenant's high-water mark, not this
+// tenant's data length. See the package comment.
+func (l *Lease) File() (*os.File, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		if _, err := l.file.Seek(0, 0); err != nil {
+			return nil, err
+		}
+		return l.file, nil
+	}
+	f, err := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	l.file = f
+	return f, nil
+}
+
+// close shuts the open file, if any, and answers the arena the lease was
+// taken from, or nil when the lease has already ended.
+func (l *Lease) close() *Arena {
+	l.mu.Lock()
+	f := l.file
+	l.file = nil
+	l.mu.Unlock()
+	if f != nil {
+		_ = f.Close()
+	}
+	a := l.arena
+	l.arena = nil
+	return a
+}
+
+// Release gives the surface back to the arena for the next taker. The file
+// stays on the disk at its high-water length: releasing frees nothing, which
+// is the whole point of the arena. Releasing twice is a no-op.
+func (l *Lease) Release() {
+	a := l.close()
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.held[l.path] {
+		return
+	}
+	delete(a.held, l.path)
+	a.free[l.purpose] = append(a.free[l.purpose], l.path)
+}
+
+// Discard ends the lease of a surface that has LEFT the pool: the tenant
+// renamed the file somewhere else, so there is nothing at this slot to hand
+// the next taker and the arena forgets it. It is the hand-off a sort makes
+// when it moves its runs into a continuation's state directory.
+//
+// It is not a way to delete a surface. A tenant that is finished with its
+// bytes releases; only a tenant that moved the file discards.
+func (l *Lease) Discard() {
+	a := l.close()
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.held, l.path)
+}
+
+// Unusable ends the lease of a surface the tenant found it cannot use: a
+// database whose rollback did not finish, a slot whose schema could not be
+// emptied. The surface leaves the pool AND the disk, because what makes it
+// unusable is its contents and handing it to the next taker would fail the
+// same way -- every time, for the life of the data directory, and again after
+// a restart once the sweep re-found it.
+//
+// It is not Release with a removal bolted on: releasing is what a tenant that
+// is merely finished does, and the difference between the two is the
+// difference between a pool and a trap.
+func (l *Lease) Unusable() {
+	path := l.path
+	a := l.close()
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	delete(a.held, path)
+	a.mu.Unlock()
+	_ = paced.Remove(path)
+}
+
+// Take hands out a surface of the given purpose: one the arena already holds
+// and nobody is using, or a new one when the pool is empty. The surface is an
+// existing file, never truncated, whose bytes past this tenant's writes are
+// the previous tenant's.
+//
+// The surface is OPENED here, and a surface that cannot be opened never
+// leaves the pool: it is removed from the disk and the next one is tried. A
+// pool is a last-in-first-out stack, so one surface that had become
+// unopenable -- left at a mode the process cannot write, on a filesystem that
+// went read-only -- would otherwise be handed to every taker of its purpose
+// for the life of the data directory, and re-found by the sweep after a
+// restart, with no way back but removing the directory by hand. Removing it
+// here is what makes that impossible: there is no name left for the sweep to
+// re-pool.
+func (a *Arena) Take(p Purpose) (*Lease, error) {
+	instance, err := a.claim()
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.sweepLocked(instance, p); err != nil {
+		return nil, err
+	}
+	for n := len(a.free[p]); n > 0; n = len(a.free[p]) {
+		path := a.free[p][n-1]
+		a.free[p] = a.free[p][:n-1]
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			_ = paced.Remove(path)
+			continue
+		}
+		a.held[path] = true
+		return &Lease{arena: a, path: path, purpose: p, file: f}, nil
+	}
+	path, f, err := a.createLocked(instance, p)
+	if err != nil {
+		return nil, err
+	}
+	a.held[path] = true
+	return &Lease{arena: a, path: path, purpose: p, file: f}, nil
+}
+
+// TakeFile is Take followed by File: the common case of a byte file taken to
+// be overwritten from offset zero. On an error opening the file the lease is
+// released, so a failed take holds nothing.
+func (a *Arena) TakeFile(p Purpose) (*Lease, *os.File, error) {
+	l, err := a.Take(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := l.File()
+	if err != nil {
+		l.Release()
+		return nil, nil, err
+	}
+	return l, f, nil
+}
+
+// claim claims this process's instance directory, the first time the arena is
+// used, and answers it. It takes the lowest-numbered instance whose lock is
+// free, which is how a process started after a crash inherits the crashed
+// process's files -- and whatever its to-free set still holds -- instead of
+// leaving them for an operator to notice.
+func (a *Arena) claim() (string, error) {
+	a.claimMu.Lock()
+	defer a.claimMu.Unlock()
+	if a.instance != "" {
+		return a.instance, nil
+	}
+	for n := 0; ; n++ {
+		dir := filepath.Join(a.root, strconv.Itoa(n))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+		f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return "", err
+		}
+		held, err := fslock.TryLock(f)
+		if err != nil {
+			f.Close()
+			return "", err
+		}
+		if !held {
+			// A live process owns this instance and its files are its own.
+			f.Close()
+			continue
+		}
+		a.instance, a.lock = dir, f
+		// The claim is exclusive, so the to-free set inside it is this
+		// process's alone -- including whatever a process that died holding
+		// this instance left queued in it. Announcing it here is the startup
+		// collection pass: the reclaimer resumes freeing it at the pace.
+		if set := paced.ToFreeDir(dir); os.MkdirAll(set, 0o700) == nil {
+			paced.AdoptSet(a.served, set)
+		}
+		return dir, nil
+	}
+}
+
+// sweepLocked reads a purpose's directory once, so surfaces left in this
+// instance by the process that held it before — an earlier run of the store,
+// or one that crashed — are taken again instead of created beside them.
+// Without it the instance would grow a second pool every time it was claimed.
+func (a *Arena) sweepLocked(instance string, p Purpose) error {
+	if a.swept[p] {
+		return nil
+	}
+	a.swept[p] = true
+	entries, err := os.ReadDir(filepath.Join(instance, string(p)))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var names []string
+	for _, e := range entries {
+		n, err := strconv.Atoi(e.Name())
+		if err != nil || n < 0 || e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+		if n >= a.next[p] {
+			a.next[p] = n + 1
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		a.free[p] = append(a.free[p], filepath.Join(instance, string(p), n))
+	}
+	return nil
+}
+
+// createLocked makes one new surface of a purpose and hands back the open
+// file, so that a taker holds an open surface whether it was pooled or new.
+func (a *Arena) createLocked(instance string, p Purpose) (string, *os.File, error) {
+	dir := filepath.Join(instance, string(p))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+	for {
+		n := a.next[p]
+		a.next[p] = n + 1
+		path := filepath.Join(dir, strconv.Itoa(n))
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return "", nil, err
+		}
+		return path, f, nil
+	}
+}
+
+// Bytes is the disk this arena's instances hold: every surface, taken or
+// free, at its current length, including the instances of processes that are
+// no longer running. It is what the resources block discloses as the space a
+// run keeps instead of freeing.
+//
+// It excludes the to-free sets. Space that has been removed and is waiting
+// for the reclaimer is not space the pool is holding, and the resources block
+// reports it separately; counting it here would count it twice and would say
+// the pool grows every time the run removes something.
+func (a *Arena) Bytes() (int64, error) { return dirBytes(a.root) }
+
+// BytesByPurpose splits Bytes over the purposes the surfaces were taken for,
+// across every instance this arena's directory holds -- this process's and
+// those of processes that are no longer running. It is what an operator is
+// shown before being asked to give the space back: "12 GB of scratch" is a
+// number to be alarmed by, and "11 GB of it is sort runs one query spilled" is
+// a number to decide on.
+//
+// The purposes are read from the disk rather than from the constant list, so a
+// directory left by a build that pooled something this one does not is
+// reported under its own name instead of vanishing from a total that still
+// counts it.
+func (a *Arena) BytesByPurpose() (map[Purpose]int64, error) {
+	out := map[Purpose]int64{}
+	instances, err := os.ReadDir(a.root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return out, nil
+		}
+		return nil, err
+	}
+	for _, in := range instances {
+		if !in.IsDir() {
+			continue
+		}
+		purposes, err := os.ReadDir(filepath.Join(a.root, in.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, pe := range purposes {
+			if !pe.IsDir() || paced.IsToFreeDir(pe.Name()) {
+				continue
+			}
+			n, err := dirBytes(filepath.Join(a.root, in.Name(), pe.Name()))
+			if err != nil {
+				return nil, err
+			}
+			out[Purpose(pe.Name())] += n
+		}
+	}
+	return out, nil
+}
+
+// ErrInUse refuses to empty an arena while something holds a surface of it.
+var ErrInUse = errors.New("scratch arena in use")
+
+// Empty removes every surface this process's instance holds and every
+// instance no live process has claimed, one window at a time, and forgets
+// them. It is the only place the arena's disk is given back, and it runs only
+// when an operator asks for it: no timer, no threshold, no setting. It
+// returns the bytes it freed.
+//
+// It refuses while any lease of this arena is outstanding, because removing a
+// A Collection is what one request to empty an arena did: the bytes it gave
+// back, and every queued removal the reclaimer could not make. A removal that
+// cannot be made still holds its space, so a collection that reports only its
+// freed bytes would leave the difference unexplained.
+type Collection struct {
+	FreedBytes int64
+	Stuck      []paced.Stuck
+	// LeftAlone names the instances this collection did not touch because a
+	// live process holds their claim, and what each of them is holding. An
+	// instance is a whole pool, so a collection that reported only its freed
+	// bytes would read as having emptied everything it counted.
+	LeftAlone []Untouched
+}
+
+// An Untouched is one instance a collection left exactly as it was.
+type Untouched struct {
+	// Instance is the instance directory's own name inside the pool.
+	Instance string
+	// HeldBytes is the disk that instance is holding.
+	HeldBytes int64
+	// Reason is why it was left.
+	Reason string
+}
+
+// surface a tenant is writing would corrupt that tenant's work, and it leaves
+// alone the instance of any other process that is still running.
+func (a *Arena) Empty() (Collection, error) {
+	// The claim, and with it the to-free set, is resolved before the arena is
+	// locked: the removals below reach it through the reclaimer.
+	instance, err := a.claim()
+	if err != nil {
+		return Collection{}, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n := len(a.held); n > 0 {
+		return Collection{}, fmt.Errorf("%w: %d surfaces are leased", ErrInUse, n)
+	}
+	entries, err := os.ReadDir(a.root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return Collection{}, nil
+		}
+		return Collection{}, err
+	}
+	var out Collection
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(a.root, e.Name())
+		if dir != instance {
+			free, idle, err := a.emptyIdleLocked(dir)
+			if err != nil {
+				return out, err
+			}
+			if !idle {
+				held, err := dirBytes(dir)
+				if err != nil {
+					return out, err
+				}
+				out.LeftAlone = append(out.LeftAlone, Untouched{Instance: e.Name(), HeldBytes: held,
+					Reason: "a running process holds this instance and its surfaces are that run's working files"})
+				continue
+			}
+			out.FreedBytes += free
+			continue
+		}
+		n, err := dirBytes(dir)
+		if err != nil {
+			return out, err
+		}
+		// This instance's claim stays held: the process still owns it and
+		// will take surfaces again. Only its pooled files go, and they are
+		// found by reading the instance rather than by naming the purposes,
+		// so a purpose added later is emptied by the same code that counted
+		// its bytes instead of being silently left behind and over-reported.
+		purposes, err := os.ReadDir(dir)
+		if err != nil {
+			return out, err
+		}
+		for _, pe := range purposes {
+			if !pe.IsDir() || paced.IsToFreeDir(pe.Name()) {
+				continue
+			}
+			if err := paced.RemoveAllFor(paced.ScratchCollection, filepath.Join(dir, pe.Name())); err != nil {
+				return out, err
+			}
+		}
+		out.FreedBytes += n
+		a.free, a.next, a.swept = map[Purpose][]string{}, map[Purpose]int{}, map[Purpose]bool{}
+	}
+	// The removals above renamed the pools into the to-free set and returned;
+	// the space is given back by the one reclaimer, at the one pace, and this
+	// is the only caller in the product that waits for it, because it is the
+	// only one an operator asked for. It returns what it could not free
+	// rather than waiting on it, so a removal the filesystem refuses is
+	// reported to the operator instead of holding the request open.
+	out.Stuck = paced.Drain()
+	return out, nil
+}
+
+// emptyIdleLocked removes one instance directory if no live process holds its
+// claim, and reports the bytes it freed and whether it was idle. An instance
+// a running process owns is left exactly as it is, and reported as left:
+// emptying it would take the working files out from under that run.
+func (a *Arena) emptyIdleLocked(dir string) (int64, bool, error) {
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return 0, false, err
+	}
+	defer f.Close()
+	held, err := fslock.TryLock(f)
+	if err != nil {
+		return 0, false, err
+	}
+	if !held {
+		return 0, false, nil
+	}
+	defer fslock.Unlock(f)
+	n, err := dirBytes(dir)
+	if err != nil {
+		return 0, true, err
+	}
+	if err := paced.RemoveAllFor(paced.ScratchCollection, dir); err != nil {
+		return 0, true, err
+	}
+	return n, true, nil
+}
+
+// dirBytes is the length of every regular file under dir except the claims
+// and the space awaiting freeing.
+func dirBytes(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() && path != dir && paced.IsToFreeDir(d.Name()) {
+			return filepath.SkipDir
+		}
+		if !d.Type().IsRegular() || d.Name() == lockName {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
+}

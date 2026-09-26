@@ -91,7 +91,7 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				// Names are resolved against the same generation the answer
 				// will pin, so a name and an id name the same node in one
 				// invocation. An argument that is already an id passes through.
@@ -174,10 +174,17 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 		Use:   name + " <node-id> [node-id...]",
 		Short: short,
 		Long: detail + "\n\nThe walk is bounded: --depth caps the hop count from the nearest seed, " +
-			"--visited and --edges cap the distinct nodes and relations it may admit, and each of " +
-			"those budgets is cumulative across the pages of one traversal rather than refilled " +
-			"per page. Exhausting any of them, or --timeout, reports the answer as truncated with " +
-			"the reason rather than presenting it as exhaustive.\n\n" +
+			"--visited and --edges cap the distinct nodes and relations it may admit, and those two " +
+			"are per-page work budgets that refill on each page rather than ceilings on the whole " +
+			"traversal. A page that spends one ends there, and --timeout ends a page the same way, " +
+			"so a page-end reason is never a claim that the answer is all there is.\n\n" +
+			"Every page that has more to give comes with a continuation: a walk whose whole " +
+			"position fits the token carries it there, and one that has to keep a frontier keeps " +
+			"it on disk beside the workspace, which this command writes even while another " +
+			"process is indexing. Pass the printed cursor back with --cursor to take the next " +
+			"page. Continuation state is reclaimed on its own deadline, so a cursor left unused " +
+			"for longer than the configured cursor lifetime is refused and the walk is re-run " +
+			"from the first page.\n\n" +
 			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
 			"that asking for the overlay is refused explicitly rather than answered from canonical " +
 			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
@@ -200,7 +207,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				return err
 			}
 			var result model.GraphResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -246,8 +253,18 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"An exhausted --depth, --visited or --timeout is reported as truncation together with " +
 			"whatever routes were found; it is never reported as \"no path exists\". A target that " +
 			"is genuinely unreachable returns no routes and is not marked truncated.\n\n" +
-			"This command takes no --limit, --cursor or --edges: a route set is bounded by the " +
-			"reason-path cap, not paged.\n\n" + nameArgumentHelp,
+			"A page ends on --timeout or on the --visited budget and carries a continuation: the " +
+			"half-explored frontier is kept beside the workspace and the printed cursor resumes " +
+			"the same search where it stopped. The routes found so far are returned, marked " +
+			"truncated with the reason; pass the cursor back with --cursor, or raise --visited " +
+			"or --timeout to let one page reach the target.\n\n" +
+			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
+			"cap, not paged.\n\n" +
+			"--direction chooses which way edges are followed. The default, outgoing, answers " +
+			"\"what does the first node depend on, on the way to the second\". A node that is only " +
+			"ever CALLED has no outgoing route to its callers, so a search for one reports no path " +
+			"at all; --direction incoming follows edges backwards and --direction both ignores " +
+			"their orientation, which gives the cheapest undirected route.\n\n" + nameArgumentHelp,
 		Args:          cobra.ExactArgs(2),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -267,8 +284,16 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			page, err := pageRequest(cmd)
+			if err != nil {
+				return err
+			}
+			direction, err := pathDirectionFlag(cmd)
+			if err != nil {
+				return err
+			}
 			var result model.PathResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -277,8 +302,10 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 					GenerationID: gen,
 					From:         nodes[0],
 					To:           nodes[1],
+					Direction:    direction,
 					MaxDepth:     depth,
 					MaxVisited:   visited,
+					Page:         page,
 				})
 				return err
 			}); err != nil {
@@ -291,8 +318,15 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd, false)
+	// cursored: `path` declares --cursor below, so its --generation help must
+	// carry the same "not combinable with --cursor" refusal every other
+	// cursored command states and docs/queries.md documents unconditionally.
+	addQueryFlags(cmd, true)
 	addTraversalFlags(cmd, false, false)
+	addPathDirectionFlag(cmd)
+	// A path search IS resumable now: a page that spends its deadline or its
+	// visited budget keeps its state and prints the token that continues it.
+	addCursorFlag(cmd)
 	return cmd
 }
 
@@ -326,7 +360,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -473,11 +507,15 @@ func emitQuery[T any](cmd *cobra.Command, build model.BuildInfo, args []string, 
 }
 
 // queryWarnings is the bounded set of notes about work the answer does not
-// cover: the truncation the engine reported, and every capability it could not
-// read. Both reach the operator on both output paths -- an answer that is not
-// exhaustive and does not say so is the failure Section 13.3 names.
+// cover: the truncation the engine reported, every capability it could not
+// read, and every notice about a request the engine resolved differently from
+// what was asked (a page bound clamped to the wire ceiling, say). All three
+// reach the operator on both output paths -- an answer that is not exhaustive,
+// or not the answer that was asked for, and does not say so is the failure
+// Section 13.3 names.
 func queryWarnings(meta model.QueryMeta) []string {
 	var warnings []string
+	warnings = append(warnings, meta.Notices...)
 	if meta.Truncated {
 		reason := meta.TruncationReason
 		if reason == "" {
@@ -497,8 +535,13 @@ func queryWarnings(meta model.QueryMeta) []string {
 		if reason := state.Details["reason"]; reason != "" {
 			note += " (" + reason + ")"
 		}
-		if units := state.Details["units"]; units != "" {
-			note += fmt.Sprintf(", %s %s still building", units, plural(atoiOrZero(units), "unit", "units"))
+		// The row's own field, not a detail key: the count is published as a
+		// field of the capability row precisely so it survives the detail
+		// budget, and a warning read from a key nothing writes was silent on
+		// every generation that had work in flight.
+		if state.UnitsRunning > 0 {
+			note += fmt.Sprintf(", %d %s still building", state.UnitsRunning,
+				plural(state.UnitsRunning, "unit is", "units are"))
 		}
 		warnings = append(warnings, note)
 	}
@@ -674,21 +717,53 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 
 // addTraversalFlags declares the walk budgets. The two switches are separate
 // because the commands differ on both axes: `path` carries no edge budget at
-// all and issues no continuation, while `impact` carries one and pages its
-// ranked list. A flag with no field behind it would describe a request the
-// command cannot build, and "cumulative across pages" on a command that issues
-// no continuation would describe a workflow it cannot perform.
+// all and refills nothing, while `impact` carries one and bounds its whole
+// answer. A flag with no field behind it would describe a request the command
+// cannot build, and "per page" on a command that answers in one page would
+// describe a workflow it cannot perform.
 func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
-	cumulative := ""
+	// The two paging endpoints refill these budgets per page; impact expands its
+	// walk in one request, so there the same flag is a ceiling on the whole
+	// answer. Spending a per-page budget is exactly what mints a continuation,
+	// so the flag says only that the budget is per page and the command's own
+	// help states the continuation rule once.
+	cumulative := " for the whole walk"
 	if acrossPages {
-		cumulative = ", cumulative across pages"
+		cumulative = " per page"
 	}
 	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+cumulative+zeroBoundHelp)
 	if edges {
 		cmd.Flags().Int(queryEdgesFlag, 0,
 			"maximum distinct relations the walk may admit"+cumulative+zeroBoundHelp)
 	}
+}
+
+// addPathDirectionFlag declares `path --direction`. It is not part of
+// addTraversalFlags: the other traversal commands PIN their direction (a
+// `callers` query that could be asked outgoing would not be a callers query),
+// and `path` is the one search where the orientation is the caller's question
+// rather than the command's.
+func addPathDirectionFlag(cmd *cobra.Command) {
+	cmd.Flags().String(queryDirectionFlag, string(model.DirectionOutgoing),
+		"follow edges `outgoing` (what the first node depends on), `incoming` (what depends on it) or `both` (either way, the cheapest undirected route)")
+}
+
+// pathDirectionFlag reads and validates it here rather than leaving it to the
+// request validator, so a misspelling is reported as the command-line mistake
+// it is, naming the three spellings, instead of surfacing from the engine.
+func pathDirectionFlag(cmd *cobra.Command) (model.Direction, error) {
+	v, err := stringFlag(cmd, queryDirectionFlag)
+	if err != nil {
+		return "", err
+	}
+	d := model.Direction(v)
+	if !d.Valid() {
+		return "", &model.Error{Code: model.CodeArgumentInvalid,
+			Message:     "--direction " + v + " is not a known direction",
+			Remediation: "use outgoing, incoming or both"}
+	}
+	return d, nil
 }
 
 // clip bounds one display cell. It never shortens an identifier a caller has to

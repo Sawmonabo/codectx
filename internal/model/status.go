@@ -39,13 +39,40 @@ type IndexResult struct {
 	// UnitsCarried counts sealed units of a refreshing semantic scope carried
 	// into this generation as stale with provenance distance (Section 13.3);
 	// UnitsInvalidated counts previously reusable units this run had to rebuild.
-	UnitsCarried     int64            `json:"units_carried"`
-	UnitsInvalidated int64            `json:"units_invalidated"`
-	FilesParsed      int64            `json:"files_parsed"`
-	FilesCaptured    int64            `json:"files_captured"`
-	Runs             []ProviderResult `json:"runs"`
-	StartedAt        time.Time        `json:"started_at"`
-	CompletedAt      time.Time        `json:"completed_at"`
+	UnitsCarried     int64 `json:"units_carried"`
+	UnitsInvalidated int64 `json:"units_invalidated"`
+	FilesParsed      int64 `json:"files_parsed"`
+	FilesCaptured    int64 `json:"files_captured"`
+	// ProvidersDisabled names the providers this configuration turns off, in
+	// one stable order, and is absent when none is. A disabled provider is
+	// planned for nothing and therefore publishes no capability row at all:
+	// this is where a reader learns why there are none, once, instead of
+	// inferring it from a row per capability saying the work was not done.
+	// `unavailable` keeps its own meaning -- a provider that IS enabled and
+	// reached no output, with the reason it did not.
+	ProvidersDisabled []string         `json:"providers_disabled,omitempty"`
+	Runs              []ProviderResult `json:"runs"`
+	// RunsOmitted is how many runs this generation produced beyond the
+	// per-result ceiling Runs carries. Runs is a wire-sized page, not the
+	// total: a generation with more runs than one response may carry says so
+	// here instead of truncating in silence.
+	RunsOmitted int64     `json:"runs_omitted"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
+	// Run is this indexing run as the run ledger recorded it, and Stages is
+	// one page of its span tree in the order the stages were opened. Both are
+	// absent where the run recorded nothing. They carry the same rows status
+	// reports, so a surface renders the run's accounting and the result's own
+	// counts above from one set of numbers rather than two.
+	Run    *RunRecord    `json:"run,omitempty"`
+	Stages []StageRecord `json:"stages,omitempty"`
+	// StagesOmitted is how many of the run's stages this generation recorded
+	// beyond the per-result ceiling Stages carries, exactly as RunsOmitted
+	// reports it for runs. Stages is a wire-sized page, not the whole of the
+	// run's accounting, and a short list that did not say how much it dropped
+	// would read as the complete cost of the run -- the one thing a bounded
+	// response must never do.
+	StagesOmitted int64 `json:"stages_omitted"`
 }
 
 // Validate enforces the result shape.
@@ -70,18 +97,26 @@ func (r IndexResult) Validate() error {
 		{"index_result.units_built", r.UnitsBuilt},
 		{"index_result.files_parsed", r.FilesParsed},
 		{"index_result.files_captured", r.FilesCaptured},
+		{"index_result.runs_omitted", r.RunsOmitted},
 	} {
 		if err := requireNonNegative(count.field, count.value); err != nil {
 			return err
 		}
 	}
-	if err := boundCount("index_result.runs", len(r.Runs), MaxRecordsPerResult); err != nil {
+	if err := boundPage("index_result.runs", len(r.Runs)); err != nil {
 		return err
 	}
 	for _, run := range r.Runs {
 		if err := run.Validate(); err != nil {
 			return err
 		}
+	}
+	if err := validateRunLedger("index_result", r.Run, r.Stages, r.StagesOmitted); err != nil {
+		return err
+	}
+	if err := boundStrings("index_result.providers_disabled", r.ProvidersDisabled,
+		MaxCapabilityStates, MaxIdentifierBytes); err != nil {
+		return err
 	}
 	return nil
 }
@@ -119,17 +154,81 @@ type IndexStatus struct {
 	Coherence          Coherence          `json:"coherence"`
 	CaptureConsistency CaptureConsistency `json:"capture_consistency"`
 	Completeness       []CapabilityState  `json:"completeness"`
-	FileCount          uint64             `json:"file_count"`
-	SourceBytes        uint64             `json:"source_bytes"`
-	WatchActive        bool               `json:"watch_active"`
-	WatchComplete      bool               `json:"watch_complete"`
-	PendingPaths       int64              `json:"pending_paths"`
-	LastReconciledAt   *time.Time         `json:"last_reconciled_at,omitempty"`
-	ActivatedAt        *time.Time         `json:"activated_at,omitempty"`
-	Warnings           []string           `json:"warnings,omitempty"`
+	// FailedUnits is one page of the reasons the runs of the active
+	// generation failed, read from the run rows and so answerable by any
+	// process, and FailedUnitsOmitted is how many did not fit that page. The
+	// capability rows above carry ONE exemplar scope per provider capability;
+	// this is every failed scope with its own reason, which is what an
+	// operator asking "why does this scope have no facts" is asking for.
+	FailedUnits []RunFailure `json:"failed_units,omitempty"`
+	// A short list served as the whole of it is the one thing a bounded
+	// failure report must never be, so what did not fit is counted here.
+	FailedUnitsOmitted int64  `json:"failed_units_omitted"`
+	FileCount          uint64 `json:"file_count"`
+	SourceBytes        uint64 `json:"source_bytes"`
+	// Watchers is every watching process whose heartbeat is live for this
+	// workspace, freshest deadline first, read from the store and so visible
+	// to a process that is not watching. WatchActive and the three fields
+	// under it are this process's own watch and stay that way: a reporting
+	// process cannot see another one's notification coverage, only what that
+	// one published.
+	Watchers         []WatchProcess `json:"watchers,omitempty"`
+	WatchActive      bool           `json:"watch_active"`
+	WatchComplete    bool           `json:"watch_complete"`
+	PendingPaths     int64          `json:"pending_paths"`
+	LastReconciledAt *time.Time     `json:"last_reconciled_at,omitempty"`
+	ActivatedAt      *time.Time     `json:"activated_at,omitempty"`
+	Warnings         []string       `json:"warnings,omitempty"`
 	// Resources is the Section 23 accounting block. It is nil on an ordinary
 	// status so a cheap call stays cheap; Task 20 populates it.
 	Resources *ResourceReport `json:"resources,omitempty"`
+	// ProvidersDisabled is what IndexResult.ProvidersDisabled is, reported by
+	// the same configuration on the same terms: the providers that are off,
+	// once, and absent when none is.
+	ProvidersDisabled []string `json:"providers_disabled,omitempty"`
+}
+
+// WatchProcess is one watching process, as it published itself. Section 13.2's
+// watch coverage is reported per watcher because a workspace can be watched by
+// more than one process at a time -- a `codectx watch` in a terminal and an
+// editor's server -- and one figure for all of them would name a state no
+// process is in.
+//
+// SessionID is the watch's identity and PID the process running it. The pid
+// alone does not identify a watch: an operating system reuses a pid, and one
+// process can hold two watches.
+//
+// LastBeatAt is when that watcher last published itself. LastPassAt and
+// PendingEvents are absent when nothing measured them, which is what keeps the
+// three answers apart for each watcher separately: no entry at all is a watch
+// that is not running, an entry with no pass time is a watch that is running
+// and covering nothing -- waiting for whichever process holds the workspace --
+// and an entry with one is a watch that is covering this workspace.
+type WatchProcess struct {
+	SessionID     string     `json:"session_id"`
+	PID           int        `json:"pid"`
+	LastBeatAt    time.Time  `json:"last_beat_at"`
+	LastPassAt    *time.Time `json:"last_pass_at,omitempty"`
+	PendingEvents *int64     `json:"pending_events,omitempty"`
+}
+
+// Validate checks one watcher entry.
+func (w WatchProcess) Validate() error {
+	if err := requireID("watch_process.session_id", w.SessionID); err != nil {
+		return err
+	}
+	if w.PID <= 0 {
+		return invalid("watch_process.pid %d is not a process id", w.PID)
+	}
+	if w.LastBeatAt.IsZero() {
+		return invalid("watch_process.last_beat_at is required")
+	}
+	if w.PendingEvents != nil {
+		if err := requireNonNegative("watch_process.pending_events", *w.PendingEvents); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ResourceReport is the resource accounting Section 23 requires status to
@@ -147,14 +246,154 @@ type ResourceReport struct {
 	QueryReservationBytes *uint64 `json:"query_reservation_bytes,omitempty"`
 	CacheReservationBytes *uint64 `json:"cache_reservation_bytes,omitempty"`
 	QueueReservationBytes *uint64 `json:"queue_reservation_bytes,omitempty"`
-	LiveSubprocesses      *int64  `json:"live_subprocesses,omitempty"`
-	PendingEvents         *int64  `json:"pending_events,omitempty"`
-	DatabaseBytes         *uint64 `json:"database_bytes,omitempty"`
-	WALBytes              *uint64 `json:"wal_bytes,omitempty"`
-	TempBytes             *uint64 `json:"temp_bytes,omitempty"`
-	CASBytes              *uint64 `json:"cas_bytes,omitempty"`
-	UnitsReused           *int64  `json:"units_reused,omitempty"`
-	UnitsParsed           *int64  `json:"units_parsed,omitempty"`
+	// AdmissionAllocationBytes is the one machine-derived allocation every
+	// heavy child of this process is admitted against, and
+	// AdmissionReservedBytes the sum currently reserved against it by the
+	// children running now. They are the whole of this process's heavy-memory
+	// accounting: one allocation, one total, whatever the child is. Both are
+	// absent where this process composed no admission ledger.
+	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
+	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
+	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same
+	// pair for the ledger's second dimension: the free space under the data
+	// directory less the host-safety floor, and the sum the children running
+	// now have reserved of it. A child can wait on either dimension, so an
+	// operator who cannot read this one cannot tell a run waiting for disk from
+	// a run waiting for memory. Absent where this process composed no ledger,
+	// and absent -- never zero -- where the platform published no free-space
+	// figure, in which case the ledger admits against a stand-in it warned
+	// about at composition.
+	AdmissionDiskAllocationBytes *uint64 `json:"admission_disk_allocation_bytes,omitempty"`
+	AdmissionDiskReservedBytes   *uint64 `json:"admission_disk_reserved_bytes,omitempty"`
+	LiveSubprocesses             *int64  `json:"live_subprocesses,omitempty"`
+	PendingEvents                *int64  `json:"pending_events,omitempty"`
+	DatabaseBytes                *uint64 `json:"database_bytes,omitempty"`
+	WALBytes                     *uint64 `json:"wal_bytes,omitempty"`
+	TempBytes                    *uint64 `json:"temp_bytes,omitempty"`
+	CASBytes                     *uint64 `json:"cas_bytes,omitempty"`
+	// FreedBytes is the disk space this process has given back to the
+	// filesystem since it started, one window at a time. A run reuses the
+	// space it holds and frees only the leftovers of a dead run at its start,
+	// because on a host that discards freed blocks into a sparse image a
+	// multi-gigabyte free stalls every process on the machine, minutes later,
+	// with nothing able to observe or wait for it. This is what makes that
+	// claim checkable from outside. It is byte-exact and counted as each
+	// truncation and each unlink releases the space: a file smaller than the
+	// window frees its length without a windowed step and is counted here
+	// like any other.
+	FreedBytes *uint64 `json:"freed_bytes,omitempty"`
+	// ScratchBytes is the disk the store's scratch pools hold: every working
+	// file this process writes for its own later reading -- sort runs,
+	// staging databases, blob staging surfaces, a search's state -- at its
+	// current length, taken or free.
+	//
+	// It is the other half of FreedBytes and the reason that figure is small.
+	// The product does not remove these files when it finishes with them; it
+	// hands them back to the pool and writes over them next time, so what
+	// would have been freed and re-created over and over is disclosed here
+	// instead as space the store is holding. It shrinks only when an operator
+	// asks for the pools to be emptied, which is what `codectx gc` does.
+	ScratchBytes *uint64 `json:"scratch_bytes,omitempty"`
+	// FreedByPurpose says what the freeing this process did was for, in bytes
+	// released, keyed by internal/paced.Purpose. A well-behaved run frees the
+	// outputs of foreign writers it cannot write over, the source trees it
+	// built for them, and the leftovers of runs whose caller never came back
+	// -- and nothing else. It is the labelled part of FreedBytes, counted by
+	// the same additions, so it never exceeds it; the difference is the
+	// removals no call site names, such as the engine shortening a file it
+	// owns.
+	FreedByPurpose map[string]uint64 `json:"freed_by_purpose,omitempty"`
+	// PendingFreeBytes is disk this process has finished with and not yet
+	// given back: every file and tree a removal renamed aside, waiting for the
+	// reclaimer to release it a window at a time.
+	//
+	// It is not part of ScratchBytes, which is space the pools are holding to
+	// write over again, and it is not yet part of FreedByPurpose, which counts
+	// space as it is actually released. A run's removals return to their
+	// callers at once and land here; a run that exits with this above zero
+	// leaves the rest for the next run to release at the same pace.
+	PendingFreeBytes *uint64 `json:"pending_free_bytes,omitempty"`
+	// StuckFrees names the removals the reclaimer has tried and could not
+	// make, each with the reason. It is the neighbour PendingFreeBytes needs:
+	// that figure rising and never falling is either a run removing faster
+	// than the pace gives back, which resolves itself, or a removal nothing
+	// can make, which does not, and only this tells the two apart.
+	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// AnalyzerUnits is what each heavy analysis unit this process ran was
+	// given and what it used: the reservation it was admitted against, the
+	// heap caps its two steps ran under, the machine-derived allocation those
+	// caps were bounded by, and the peak resident memory its process tree
+	// reached. It is the only place the three appear together, and the only
+	// way an operator can see that a unit was handed far more than it needed
+	// -- or serialized behind a reservation it never came close to using.
+	//
+	// It is process accounting and not a capability detail on purpose: an
+	// observed peak differs on every run, and a capability row's details fold
+	// into the analysis key, where two identical runs must key identically.
+	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
+	// AnalyzerOverrunUnits is how many of those units peaked ABOVE the
+	// reservation they were admitted against. It is the one direction of the
+	// memory accounting that can freeze the host the product is running on --
+	// every reservation in flight is sized so the machine holds them all, and
+	// a unit that exceeds its own takes memory nobody accounted for -- so it
+	// is a count in its own right and not something an operator has to derive
+	// by reading every unit row. The rows name which ones.
+	//
+	// It counts the units this process RECORDED, which the record's own bound
+	// limits, and it counts none of the units whose process tree this platform
+	// cannot sample: an unsampled peak is not a peak below the reservation, so
+	// it is neither an overrun nor evidence against one. It is absent where
+	// this process ran no heavy unit at all, and zero where it ran them and
+	// none overran.
+	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
+	UnitsReused          *int64 `json:"units_reused,omitempty"`
+	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
+	// Run is the latest recorded run for this repository -- the live one if a
+	// run is going, otherwise the one that produced the active generation --
+	// and Stages is one page of its stages. Run is carried beside Stages
+	// because a stage's share of the run is unreadable without the run it is
+	// a share of.
+	Run    *RunRecord    `json:"run,omitempty"`
+	Stages []StageRecord `json:"stages,omitempty"`
+	// StagesOmitted is how many of the run's stages this page does not carry,
+	// with the same meaning it has on IndexResult.
+	StagesOmitted int64 `json:"stages_omitted"`
+	// Warnings names the parts of this block that could not be read and why.
+	// A figure this report leaves absent is indistinguishable from a figure
+	// nothing ever recorded -- an unreadable run ledger looks exactly like a
+	// workspace that has never indexed -- and an operator reading a resource
+	// block to diagnose a problem is the last person who should have to guess
+	// which of the two they are looking at. Each carries the remediation of
+	// the typed error it came from.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
+// ObservedPeakBytes are absent rather than zero where the host does not expose
+// available memory and where the platform cannot sample a process tree: a zero
+// there would claim a measurement nobody made (Section 23).
+type AnalyzerUnit struct {
+	ScopeKey           string  `json:"scope_key"`
+	Family             string  `json:"family"`
+	ReservationBytes   uint64  `json:"reservation_bytes"`
+	HeapCapBytes       uint64  `json:"heap_cap_bytes"`
+	ExportHeapCapBytes uint64  `json:"export_heap_cap_bytes"`
+	AllocationBytes    *uint64 `json:"allocation_bytes,omitempty"`
+	ObservedPeakBytes  *uint64 `json:"observed_peak_bytes,omitempty"`
+}
+
+// OverranReservation reports that this unit's process tree peaked above the
+// reservation it was admitted against, which is the one direction of the
+// memory accounting that can take memory the machine had promised to another
+// unit. It is the ONE place that comparison is spelled, so the count on the
+// report and the row an operator reads cannot disagree about which units it
+// covers.
+//
+// A unit whose tree this platform never sampled carries no peak and answers
+// false: nothing was measured, which is not a measurement below the
+// reservation and must never be counted as one either way.
+func (u AnalyzerUnit) OverranReservation() bool {
+	return u.ObservedPeakBytes != nil && *u.ObservedPeakBytes > u.ReservationBytes
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -172,10 +411,17 @@ func (r ResourceReport) Validate() error {
 		{"resources.query_reservation_bytes", r.QueryReservationBytes},
 		{"resources.cache_reservation_bytes", r.CacheReservationBytes},
 		{"resources.queue_reservation_bytes", r.QueueReservationBytes},
+		{"resources.admission_allocation_bytes", r.AdmissionAllocationBytes},
+		{"resources.admission_reserved_bytes", r.AdmissionReservedBytes},
+		{"resources.admission_disk_allocation_bytes", r.AdmissionDiskAllocationBytes},
+		{"resources.admission_disk_reserved_bytes", r.AdmissionDiskReservedBytes},
 		{"resources.database_bytes", r.DatabaseBytes},
 		{"resources.wal_bytes", r.WALBytes},
 		{"resources.temp_bytes", r.TempBytes},
 		{"resources.cas_bytes", r.CASBytes},
+		{"resources.freed_bytes", r.FreedBytes},
+		{"resources.scratch_bytes", r.ScratchBytes},
+		{"resources.pending_free_bytes", r.PendingFreeBytes},
 	} {
 		if f.value == nil {
 			continue
@@ -190,6 +436,7 @@ func (r ResourceReport) Validate() error {
 	}{
 		{"resources.live_subprocesses", r.LiveSubprocesses},
 		{"resources.pending_events", r.PendingEvents},
+		{"resources.analyzer_overrun_units", r.AnalyzerOverrunUnits},
 		{"resources.units_reused", r.UnitsReused},
 		{"resources.units_parsed", r.UnitsParsed},
 	} {
@@ -199,6 +446,40 @@ func (r ResourceReport) Validate() error {
 		if err := requireNonNegative(f.field, *f.value); err != nil {
 			return err
 		}
+	}
+	if err := boundStrings("resources.warnings", r.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
+		return invalid("resources.analyzer_units holds %d rows, more than the %d a bounded response carries",
+			len(r.AnalyzerUnits), MaxRecordsPerResult)
+	}
+	for _, u := range r.AnalyzerUnits {
+		for _, f := range []struct {
+			field string
+			value uint64
+		}{
+			{"resources.analyzer_units.reservation_bytes", u.ReservationBytes},
+			{"resources.analyzer_units.heap_cap_bytes", u.HeapCapBytes},
+			{"resources.analyzer_units.export_heap_cap_bytes", u.ExportHeapCapBytes},
+		} {
+			if err := boundSigned64(f.field, f.value); err != nil {
+				return err
+			}
+		}
+		if u.AllocationBytes != nil {
+			if err := boundSigned64("resources.analyzer_units.allocation_bytes", *u.AllocationBytes); err != nil {
+				return err
+			}
+		}
+		if u.ObservedPeakBytes != nil {
+			if err := boundSigned64("resources.analyzer_units.observed_peak_bytes", *u.ObservedPeakBytes); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateRunLedger("resources", r.Run, r.Stages, r.StagesOmitted); err != nil {
+		return err
 	}
 	return nil
 }
@@ -230,7 +511,34 @@ func (s IndexStatus) Validate() error {
 	if err := requireNonNegative("index_status.pending_paths", s.PendingPaths); err != nil {
 		return err
 	}
+	if err := boundPage("index_status.failed_units", len(s.FailedUnits)); err != nil {
+		return err
+	}
+	for _, f := range s.FailedUnits {
+		if err := f.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := requireNonNegative("index_status.failed_units_omitted", s.FailedUnitsOmitted); err != nil {
+		return err
+	}
+	// A response bound, which Section 6 requires of every list: the store's own
+	// read is bounded at the same page width, so a workspace with more live
+	// watchers than one page holds is a producer defect and not a refusal of a
+	// legitimately busy workspace.
+	if err := boundPage("index_status.watchers", len(s.Watchers)); err != nil {
+		return err
+	}
+	for _, w := range s.Watchers {
+		if err := w.Validate(); err != nil {
+			return err
+		}
+	}
 	if err := boundStrings("index_status.warnings", s.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := boundStrings("index_status.providers_disabled", s.ProvidersDisabled,
+		MaxCapabilityStates, MaxIdentifierBytes); err != nil {
 		return err
 	}
 	if s.Resources != nil {
@@ -280,12 +588,20 @@ const (
 	// Section 22 requires an unavailable metric be reported as unavailable,
 	// never as zero.
 	CheckUnavailable CheckState = "unavailable"
+	// CheckUnverified records a check this run deliberately did not perform
+	// because performing it walks the whole database. It is not `unavailable`:
+	// the check is available on this host and on this build, it was skipped by
+	// the mode the operator chose, and its detail names the flag that runs it.
+	// Collapsing the two would tell an operator a verifiable fact is
+	// unmeasurable. Like `unavailable` it does not degrade the report state --
+	// a skipped check is not a defect.
+	CheckUnverified CheckState = "unverified"
 )
 
 // Valid reports whether s is a known wire spelling.
 func (s CheckState) Valid() bool {
 	switch s {
-	case CheckPass, CheckWarn, CheckFail, CheckUnavailable:
+	case CheckPass, CheckWarn, CheckFail, CheckUnavailable, CheckUnverified:
 		return true
 	}
 	return false
@@ -341,12 +657,273 @@ func (r DoctorReport) Validate() error {
 	if !r.State.Valid() {
 		return invalid("doctor_report.state %q is not a known check state", truncateForMessage(string(r.State)))
 	}
-	if err := boundCount("doctor_report.checks", len(r.Checks), MaxCapabilityStates); err != nil {
-		return err
-	}
+	// The check list is not length-bounded. Doctor is the one command that must
+	// produce a report on a broken workspace, so a report that fails validation
+	// for being too long is the one outcome it may never have; the checks are
+	// enumerated by the code itself, not by repository size.
 	for _, c := range r.Checks {
 		if err := c.Validate(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// ScratchCollection is what one operator request to give the pooled scratch
+// space back did: what each pool held, by what its surfaces were taken for,
+// and what was actually released.
+//
+// Held and freed are reported separately and are not the same number. Held is
+// what the pools were carrying when the request arrived; freed is what the
+// filesystem was actually given back, which excludes an instance another live
+// process still owns.
+type ScratchCollection struct {
+	Pools      []ScratchPool `json:"pools"`
+	HeldBytes  uint64        `json:"held_bytes"`
+	FreedBytes uint64        `json:"freed_bytes"`
+	// StuckFrees names the removals this request could not make, each with the
+	// reason the filesystem gave. They are why freed can fall short of held
+	// without the request having failed, and an operator reading the two
+	// figures needs them to tell "the space is gone" from "the space is
+	// stuck".
+	//
+	// It belongs to the REQUEST and not to a pool: one reclaimer serves the
+	// whole process, so what it could not free is the same list whichever pool
+	// was being emptied when the request waited on it. Reported per pool, the
+	// same entries appeared under each of them and every one of those
+	// attributions but at most one was wrong.
+	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+}
+
+// ScratchPool is one pool of ScratchCollection: the directory it serves, what
+// it held by purpose, and what went.
+type ScratchPool struct {
+	Directory     string            `json:"directory"`
+	HeldBytes     uint64            `json:"held_bytes"`
+	HeldByPurpose map[string]uint64 `json:"held_by_purpose,omitempty"`
+	FreedBytes    uint64            `json:"freed_bytes"`
+	// LeftAlone names the instances of this pool the collection did not
+	// touch, and why. An instance is a whole pool of surfaces, so held minus
+	// freed is mostly these; without them the report reads as a collection
+	// that quietly did less than it counted.
+	LeftAlone []UntouchedInstance `json:"left_alone,omitempty"`
+}
+
+// A StuckFree is one removal the space reclaimer tried to make and could not.
+type StuckFree struct {
+	Entry  string `json:"entry"`
+	Reason string `json:"reason"`
+}
+
+// An UntouchedInstance is one pool instance a collection left as it was.
+type UntouchedInstance struct {
+	Instance  string `json:"instance"`
+	HeldBytes uint64 `json:"held_bytes"`
+	Reason    string `json:"reason"`
+}
+
+// A RunRecord is one recorded run of the coordinator as the run ledger holds
+// it: what the run was, which generation it produced, what it cost and what it
+// got through. It is the row every surface reports first, because a stage's
+// share of the run means nothing without it.
+//
+// The measured fields are pointers and the counters are not, and that split is
+// deliberate: a counter the run keeps itself is always available and zero is a
+// real answer, while ProcessPeakRSSBytes is a platform measurement that a host
+// may not expose, where absent must not read as a process using no memory.
+type RunRecord struct {
+	// RunID is the run's 32-byte identifier, hex-encoded. It exists from the
+	// coordinator's first stage, which is earlier than any generation, so it
+	// and not the generation is what names a run.
+	RunID string `json:"run_id"`
+	// Kind is `index`, `deferred` or `overlay`: an ordinary indexing run, a
+	// deferred publication, or the per-process run that carries work with no
+	// generation of its own.
+	Kind string `json:"kind"`
+	// RepositoryID is the repository the run indexed, hex-encoded.
+	RepositoryID string `json:"repository_id"`
+	// GenerationID is the generation this run produced, absent until the run
+	// reaches one and for ever on a run that failed before it. A run without
+	// a generation is still a run, and this is how it says so.
+	GenerationID *int64    `json:"generation_id,omitempty"`
+	StartedAt    time.Time `json:"started_at"`
+	// FinishedAt is absent while the run is still going.
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// WallMS is the run's elapsed time: its measured wall once FinishedAt is
+	// set, and its elapsed time so far while it is live.
+	WallMS int64 `json:"wall_ms"`
+	// Outcome is one of `running`, `ok`, `failed`, `subdivided`, `reused`,
+	// `skipped` or `interrupted`; `interrupted` is a run whose process ended
+	// without finishing it.
+	Outcome         string `json:"outcome"`
+	FileCount       int64  `json:"file_count"`
+	SourceBytes     int64  `json:"source_bytes"`
+	UnitsPlanned    int64  `json:"units_planned"`
+	UnitsSucceeded  int64  `json:"units_succeeded"`
+	UnitsFailed     int64  `json:"units_failed"`
+	UnitsSubdivided int64  `json:"units_subdivided"`
+	// EventsDropped counts the accounting events the bounded bus refused
+	// because the collector was behind. A run never waits on its own
+	// accounting, so the loss is counted rather than prevented: above zero,
+	// the stage rows are known to be incomplete and a reader must say so.
+	EventsDropped int64 `json:"events_dropped"`
+	// ProcessPeakRSSBytes is the peak resident size of this process, absent
+	// where the platform does not expose it. The stage rows carry null here
+	// because a resident-size delta across overlapping work measures the
+	// process and not the stage.
+	//
+	// It is the process's peak and not the run's: the kernel's mark covers the
+	// whole life of the process, so a process that has served earlier runs may
+	// report a peak one of those set. A one-shot command's run and process are
+	// the same life and the distinction does not arise there.
+	ProcessPeakRSSBytes *uint64 `json:"process_peak_rss_bytes,omitempty"`
+}
+
+// A StageRecord is one span of a run: a stage, a unit, a provider step or a
+// worker, with the part of the run's cost that is attributable to it. Per-file
+// work is never a stage; a worker's row aggregates its files.
+//
+// Every field the platform measures is a pointer, so an unavailable figure is
+// absent and never zero (Section 23). The counters ItemsIn and ItemsOut are
+// not, because they are the stage's own tally.
+type StageRecord struct {
+	// RunID is the run this stage belongs to, hex-encoded as RunRecord.RunID
+	// is. It is carried on every row because one process records more than one
+	// run at a time -- an indexing run and the per-process overlay a language
+	// server's start hangs under -- and a subscriber that cannot tell them
+	// apart would count another run's stages as its own.
+	RunID string `json:"run_id"`
+	// Seq is the run's own ordinal for this stage, in the order the stages
+	// were opened, counting from zero; ParentSeq is the ordinal of the stage
+	// this one nests under, absent at the run's top level. Absent and not
+	// zero, because zero is the first stage's own ordinal. The tree is
+	// carried as ordinals because that is what both the recording and the
+	// reading side know.
+	Seq       int64     `json:"seq"`
+	ParentSeq *int64    `json:"parent_seq,omitempty"`
+	Stage     string    `json:"stage"`
+	ScopeKey  string    `json:"scope_key,omitempty"`
+	Provider  string    `json:"provider,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	// FinishedAt is absent while the stage is running and on a stage that was
+	// still open when its run ended.
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// WallMS is the stage's measured wall once it has finished, and its
+	// elapsed time so far while Running is true. Running is carried beside it
+	// precisely so that a live stage's partial time is never presented as a
+	// final measurement.
+	WallMS  int64 `json:"wall_ms"`
+	Running bool  `json:"running,omitempty"`
+	// CPUUserMS and CPUSysMS are absent where no processor time can be
+	// attributed to this stage, and CPUUnattributed then names why:
+	// `overlapped` for in-process work that ran beside other goroutines,
+	// where the process-wide counters measure the process rather than the
+	// stage, and `unsampled` for a platform that does not expose them.
+	CPUUserMS       *int64  `json:"cpu_user_ms,omitempty"`
+	CPUSysMS        *int64  `json:"cpu_sys_ms,omitempty"`
+	CPUUnattributed string  `json:"cpu_unattributed,omitempty"`
+	PeakRSSBytes    *uint64 `json:"peak_rss_bytes,omitempty"`
+	ReadBytes       *uint64 `json:"read_bytes,omitempty"`
+	WriteBytes      *uint64 `json:"write_bytes,omitempty"`
+	ItemsIn         int64   `json:"items_in"`
+	ItemsOut        int64   `json:"items_out"`
+	// Outcome takes the same spellings as RunRecord.Outcome.
+	Outcome        string `json:"outcome"`
+	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+	// Failure is the retained detail of a failed stage: the typed error's
+	// message and details as the ledger stored them.
+	Failure string `json:"failure,omitempty"`
+	// ShareOfWall is this stage's wall as a fraction of its run's, as the
+	// ledger computes it when the row is read. It is zero on a row that
+	// reached a surface before its run's own wall was known.
+	ShareOfWall float64 `json:"share_of_wall,omitempty"`
+}
+
+// validateRunLedger enforces the shape of a run row and its page of stage
+// rows. Both surfaces that carry them -- the completed run an index reports
+// and the latest run status reports -- have the same bound and the same
+// non-negativity rules, so they share one check rather than drifting apart.
+func validateRunLedger(field string, run *RunRecord, stages []StageRecord, omitted int64) *Error {
+	if err := requireNonNegative(field+".stages_omitted", omitted); err != nil {
+		return err
+	}
+	// Rows can only have been dropped from a page that is actually full, of a
+	// run whose rows it is a page of: a count reported over a short list names
+	// stages nothing could have omitted.
+	if omitted > 0 && (run == nil || len(stages) < MaxRecordsPerResult) {
+		return invalid("%s.stages_omitted is %d on a page of %d stages that dropped none", field, omitted, len(stages))
+	}
+	if run != nil {
+		for _, c := range []struct {
+			name  string
+			value int64
+		}{
+			{field + ".run.wall_ms", run.WallMS},
+			{field + ".run.file_count", run.FileCount},
+			{field + ".run.source_bytes", run.SourceBytes},
+			{field + ".run.units_planned", run.UnitsPlanned},
+			{field + ".run.units_succeeded", run.UnitsSucceeded},
+			{field + ".run.units_failed", run.UnitsFailed},
+			{field + ".run.units_subdivided", run.UnitsSubdivided},
+			{field + ".run.events_dropped", run.EventsDropped},
+		} {
+			if err := requireNonNegative(c.name, c.value); err != nil {
+				return err
+			}
+		}
+		if run.ProcessPeakRSSBytes != nil {
+			if err := boundSigned64(field+".run.process_peak_rss_bytes", *run.ProcessPeakRSSBytes); err != nil {
+				return err
+			}
+		}
+	}
+	if err := boundPage(field+".stages", len(stages)); err != nil {
+		return err
+	}
+	for i, s := range stages {
+		at := indexed(field+".stages", i)
+		for _, c := range []struct {
+			name  string
+			value int64
+		}{
+			{at + ".seq", s.Seq},
+			{at + ".wall_ms", s.WallMS},
+			{at + ".items_in", s.ItemsIn},
+			{at + ".items_out", s.ItemsOut},
+		} {
+			if err := requireNonNegative(c.name, c.value); err != nil {
+				return err
+			}
+		}
+		for _, c := range []struct {
+			name  string
+			value *int64
+		}{
+			{at + ".parent_seq", s.ParentSeq},
+			{at + ".cpu_user_ms", s.CPUUserMS},
+			{at + ".cpu_sys_ms", s.CPUSysMS},
+		} {
+			if c.value == nil {
+				continue
+			}
+			if err := requireNonNegative(c.name, *c.value); err != nil {
+				return err
+			}
+		}
+		for _, c := range []struct {
+			name  string
+			value *uint64
+		}{
+			{at + ".peak_rss_bytes", s.PeakRSSBytes},
+			{at + ".read_bytes", s.ReadBytes},
+			{at + ".write_bytes", s.WriteBytes},
+		} {
+			if c.value == nil {
+				continue
+			}
+			if err := boundSigned64(c.name, *c.value); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

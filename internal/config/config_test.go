@@ -4,6 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -93,8 +96,21 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeTrustRequired,
 		},
 		{
+			// Against the unlimited default this file would be NARROWING, which
+			// a project may do; the escalation is only against a ceiling the
+			// user actually set, so the case has to set one.
 			name:     "project raises a ceiling it may only lower",
+			user:     "[workspace]\nmax_files = 1000\n",
 			project:  "[workspace]\nmax_files = 500000\n",
+			wantCode: model.CodeTrustRequired,
+		},
+		{
+			// Unlimited is the TOP of the lattice: proposing it over a finite
+			// user ceiling removes the ceiling, which is an escalation even
+			// though the proposed number is the smaller one.
+			name:     "project proposes unlimited over a finite user ceiling",
+			user:     "[workspace]\nmax_files = 1000\n",
+			project:  "[workspace]\nmax_files = \"unlimited\"\n",
 			wantCode: model.CodeTrustRequired,
 		},
 		{
@@ -111,7 +127,7 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 		},
 		{
 			name:     "zero is not unlimited",
-			user:     "[resources]\nmax_concurrent_queries = 0\n",
+			user:     "[storage]\nread_connections = 0\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
@@ -129,17 +145,27 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// Retention is by ref: 0 retained refs would prune the results the
-			// active ref is being served from.
-			name:     "retain_refs 0 is rejected",
-			user:     "[index]\nretain_refs = 0\n",
+			// Retention is by ref, and 0 is "keep every ref" now, matching
+			// index.max_retained_bytes. Only a negative value is refused: it is
+			// not a third meaning.
+			name:     "a negative bound is rejected",
+			user:     "[index]\nretain_refs = -1\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// 0 means the machine-derived allocation; a negative value is not a
-			// third meaning, and admitting one would size every unit from it.
-			name:     "a negative dependence memory ceiling is rejected",
-			user:     "[providers.dependence]\nunit_memory_ceiling_bytes = -1\n",
+			// A reservation is not a bound. 0 records per batch is a broken
+			// reservation, not an unbounded one, so it stays refused -- this is
+			// what keeps the `< 0` rule for bounds from leaking into sizing.
+			name:     "a zero reservation is rejected",
+			user:     "[index]\nbatch_records = 0\n",
+			wantCode: model.CodeConfigInvalid,
+		},
+		{
+			// How much runs at once is derived from the machine, so the keys
+			// that used to set it are unknown keys now and there is no
+			// extension namespace to absorb them.
+			name:     "a retired concurrency key is an unknown key",
+			user:     "[resources]\nmax_concurrent_heavy_analyzers = 4\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 	} {
@@ -203,9 +229,226 @@ func TestFingerprintsCoverEligibilityInputs(t *testing.T) {
 		quoteBool(cfg.Workspace.IncludeUntracked),
 		quoteBool(cfg.Workspace.IndexGenerated),
 		quoteBool(cfg.Workspace.IndexVendor),
-		quoteInt(cfg.Workspace.MaxFiles),
+		quoteInt(cfg.Workspace.MaxFiles.Value()),
 	)
 	if cfg.SourcePolicyHash() == bare {
 		t.Error("SourcePolicyHash covers only the configured toggles; the built-in exclusion lists are not an input")
+	}
+}
+
+// TestTraversalPolicyCarriesEveryTraversalBound protects the "every key is
+// read" invariant for the four workspace bounds the traversal owns. Three of
+// them were dead fields: configured, validated, documented and never carried
+// into the policy, so the walk's own SkipDirEntries and SkipDepth reports were
+// unreachable and an operator had no escape hatch over a pathological tree.
+func TestTraversalPolicyCarriesEveryTraversalBound(t *testing.T) {
+	c := Defaults()
+	c.Workspace.MaxFiles = 11
+	c.Workspace.MaxDirEntries = 22
+	c.Workspace.MaxDepth = 33
+	c.Workspace.MaxIgnoredRoots = 44
+	p := c.TraversalPolicy()
+	for _, tc := range []struct {
+		key  string
+		got  int64
+		want int64
+	}{
+		{"workspace.max_files", p.MaxFiles, 11},
+		{"workspace.max_dir_entries", p.MaxDirEntries, 22},
+		{"workspace.max_depth", p.MaxDepth, 33},
+		{"workspace.max_ignored_roots", p.MaxIgnoredRoots, 44},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("TraversalPolicy carried %s as %d, want %d: the key is configured and documented but unread",
+				tc.key, tc.got, tc.want)
+		}
+	}
+	// Unlimited is the default and must travel as 0, which the traversal reads
+	// as no bound at all rather than as a bound of zero.
+	if d := Defaults().TraversalPolicy(); d.MaxFiles != 0 || d.MaxDirEntries != 0 || d.MaxDepth != 0 || d.MaxIgnoredRoots != 0 {
+		t.Errorf("the default traversal policy carries bounds %+v, want every one unlimited (0)", d)
+	}
+}
+
+// storage.synchronous decides whether every store commit fsyncs the
+// write-ahead log, so the default it resolves to is a durability promise and an
+// unrecognized spelling must be refused at load time rather than silently
+// mapped onto one of the two modes (docs/adr/ADR-0004-wal-synchronous-mode.md).
+func TestStorageSynchronous(t *testing.T) {
+	cfg, err := loadFixture(t, "", "")
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	if cfg.Storage.Synchronous != SynchronousNormal {
+		t.Fatalf("default storage.synchronous = %q, want %q", cfg.Storage.Synchronous, SynchronousNormal)
+	}
+	if cfg, err = loadFixture(t, "[storage]\nsynchronous = \"full\"\n", ""); err != nil {
+		t.Fatalf("load full: %v", err)
+	}
+	if cfg.Storage.Synchronous != SynchronousFull {
+		t.Fatalf("storage.synchronous = %q, want %q", cfg.Storage.Synchronous, SynchronousFull)
+	}
+	_, err = loadFixture(t, "[storage]\nsynchronous = \"off\"\n", "")
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeConfigInvalid {
+		t.Fatalf("synchronous = off: got %v, want CTX_CONFIG_INVALID", err)
+	}
+	if want := `storage.synchronous is "off"; use "normal" or "full"`; typed.Message != want {
+		t.Fatalf("message = %q, want %q", typed.Message, want)
+	}
+}
+
+// TestEvidenceClipIsUserSetAndRekeysUnits protects index.max_evidence_per_fact,
+// the only setting that removes evidence occurrences from a sealed fact. Three
+// silent failures: a default that clips (a fact would lose occurrences nobody
+// asked to lose), a clip left out of the analysis key (units sealed under a
+// clip would be reused for a run that asked for every occurrence), and a value
+// above the record ceiling accepted as if it did something.
+func TestEvidenceClipIsUserSetAndRekeysUnits(t *testing.T) {
+	absent, err := loadFixture(t, "", "")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !absent.Index.MaxEvidencePerFact.IsUnlimited() {
+		t.Errorf("default index.max_evidence_per_fact is %s, want unlimited", absent.Index.MaxEvidencePerFact)
+	}
+	// A repository's own file may narrow what this tool retains for it.
+	project, err := loadFixture(t, "", "version = 1\n[index]\nmax_evidence_per_fact = 3\n")
+	if err != nil {
+		t.Fatalf("Load with project clip: %v", err)
+	}
+	if project.Index.MaxEvidencePerFact != 3 {
+		t.Errorf("project index.max_evidence_per_fact is %d, want 3", project.Index.MaxEvidencePerFact)
+	}
+	if project.AnalysisConfigHash() == absent.AnalysisConfigHash() {
+		t.Error("a user-set evidence clip left AnalysisConfigHash unchanged; units sealed with fewer occurrences stay cached")
+	}
+	_, err = loadFixture(t, "[index]\nmax_evidence_per_fact = 65537\n", "")
+	var ctxErr *model.Error
+	if !errors.As(err, &ctxErr) || ctxErr.Code != model.CodeConfigInvalid {
+		t.Fatalf("a clip above the record ceiling was accepted: err = %v", err)
+	}
+	if !strings.Contains(ctxErr.Message, "index.max_evidence_per_fact") {
+		t.Errorf("rejection does not name the key: %s", ctxErr.Message)
+	}
+}
+
+// TestToolStoreIsSharedByEveryWorkspace protects the product's "works off the
+// bat" posture: the managed toolchain is gigabytes of payloads that are
+// byte-identical for every checkout, so the store they land in must be one
+// machine-wide directory. A per-workspace default made every new repository
+// start with nothing installed and re-download the whole toolchain, which is
+// what this asserts can no longer happen.
+//
+// It also pins the path itself to the one the installer's bundle path writes,
+// because a bundle that populated a directory the product does not read would
+// be an offline install that still tries to dial out.
+func TestToolStoreIsSharedByEveryWorkspace(t *testing.T) {
+	base := t.TempDir()
+	data := filepath.Join(base, "data")
+	userDir := filepath.Join(base, "config")
+	mustMkdir(t, filepath.Join(userDir, appDirName))
+	userConfigDir = func() (string, error) { return userDir, nil }
+	userCacheDir = func() (string, error) { return filepath.Join(base, "cache"), nil }
+	userDataDir = func() (string, error) { return data, nil }
+	t.Cleanup(func() {
+		userConfigDir = os.UserConfigDir
+		userCacheDir = os.UserCacheDir
+		userDataDir = osUserDataDir
+	})
+
+	want := filepath.Join(data, appDirName, "tools")
+	first := filepath.Join(base, "repo-one")
+	second := filepath.Join(base, "repo-two")
+	mustMkdir(t, first)
+	mustMkdir(t, second)
+
+	one, err := Load(first)
+	if err != nil {
+		t.Fatalf("Load(repo-one): %v", err)
+	}
+	two, err := Load(second)
+	if err != nil {
+		t.Fatalf("Load(repo-two): %v", err)
+	}
+	if one.Tools.CacheDir != want || two.Tools.CacheDir != want {
+		t.Fatalf("tool store per workspace: repo-one %q, repo-two %q, want both %q",
+			one.Tools.CacheDir, two.Tools.CacheDir, want)
+	}
+	// The data directories must still differ, or the shared store would have
+	// been bought by making two checkouts share one index.
+	if one.Storage.DataDir == two.Storage.DataDir {
+		t.Fatalf("both workspaces resolved data directory %q; the store is shared, the index is not", one.Storage.DataDir)
+	}
+	// Nothing is created by resolution: a read-only command must not leave a
+	// store behind on a host that has never installed a payload.
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Fatalf("Load created the tool store: stat = %v, want not-exist", err)
+	}
+}
+
+// TestCPUBoundWorkIsSizedFromTheMachine protects the rule that no typed-in
+// number decides how much CPU-bound work runs at once. Failure mode: a fixed
+// worker or slot count leaves a sixteen-core machine running two parsers while
+// a two-core laptop is oversubscribed, and neither figure is anything a user
+// or an agent can be asked to tune.
+//
+// Mutation: return a constant from parserWorkersFor -- `func
+// parserWorkersFor(cpus int) int { return 2 }` -> "16 CPUs give 2 parser
+// workers, want 16: the count is not coming from the machine".
+func TestCPUBoundWorkIsSizedFromTheMachine(t *testing.T) {
+	for _, cpus := range []int{16, 2, 1} {
+		if got := parserWorkersFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d parser workers, want %d: the count is not coming from the machine", cpus, got, cpus)
+		}
+		if got := querySlotsFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d query slots, want %d", cpus, got, cpus)
+		}
+		// A traversal holds a query slot as well, so half the cores answer them
+		// and the rest stay free for the cheap calls interleaved with them --
+		// but never fewer than one, or a single-core machine answers no
+		// traversal at all.
+		want := cpus / 2
+		if want < 1 {
+			want = 1
+		}
+		if got := graphSlotsFor(cpus); got != want {
+			t.Errorf("%d CPUs give %d traversal slots, want %d", cpus, got, want)
+		}
+	}
+}
+
+// TestBaseFootprintIsDerivedFromTheMachine protects the rule that this
+// process's base footprint follows the machine instead of being compared to a
+// figure. Failure mode: the shipped defaults, unchanged, are refused at load
+// time on a machine with enough cores -- 31 query slots of 32 MiB plus the
+// cache and the queue exceed a 1 GiB constant -- and the refusal names no key
+// the operator could lower, so the product simply does not start on a large
+// host. The core count is pinned because this host has few enough that the
+// defect is invisible on it.
+//
+// Mutation: restore the comparison in validate.go --
+// `if baseline > BaseFootprintBytes { ... }` -> "Load on a 31-core machine
+// returned CTX_CONFIG_INVALID".
+func TestBaseFootprintIsDerivedFromTheMachine(t *testing.T) {
+	for _, cpus := range []int{31, 64, 128} {
+		t.Run(strconv.Itoa(cpus), func(t *testing.T) {
+			cpuCount = func() int { return cpus }
+			t.Cleanup(func() { cpuCount = runtime.NumCPU })
+			cfg, err := loadFixture(t, "", "")
+			if err != nil {
+				t.Fatalf("Load on a %d-core machine returned %v, want the shipped defaults to resolve", cpus, err)
+			}
+			// The footprint is the idle overhead plus the three reservations
+			// this process makes up front, one query slot per core. A footprint
+			// that did not grow with the cores would under-state what the
+			// parent holds and admit children against memory already spoken for.
+			want := IdleFootprintBytes +
+				int64(cpus)*cfg.Resources.QueryMemoryBytes +
+				cfg.Resources.CacheBytes + cfg.Index.QueueBytes
+			if got := BaseFootprint(cfg); got != want {
+				t.Errorf("BaseFootprint on a %d-core machine is %d, want %d", cpus, got, want)
+			}
+		})
 	}
 }

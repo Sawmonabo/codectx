@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
@@ -39,8 +41,9 @@ const (
 var errWorkerGone = errors.New("treesitter: parser worker exited")
 
 // pool is the bounded lazy set of parser workers (Section 11.3, 23.4): at
-// most max live at once, started on demand, kept idle for idleTTL, recycled
-// when a lifetime bound approaches and torn down on cancellation.
+// most max live at once, started on demand, reused while there is parse work
+// in flight, drained when there is none, recycled when a lifetime bound
+// approaches and torn down on cancellation.
 //
 // max bounds live processes, not concurrent parses. A worker occupies its
 // place in live from before it is started until the runner has reaped it, so
@@ -54,7 +57,6 @@ type pool struct {
 	cmd      WorkerCommand
 	dir      string
 	max      int
-	idleTTL  time.Duration
 	parseTTL time.Duration
 	memory   int64
 
@@ -66,6 +68,12 @@ type pool struct {
 	live   map[*worker]bool
 	closed bool
 	wg     sync.WaitGroup
+	// totals is the open structural-parse total of every run parsing through
+	// this pool, which is what a worker's span hangs off. It is keyed by the
+	// run and not held as one span because a deferred publication's tick runs
+	// units of its own, and its workers belong to its run rather than to
+	// whatever index run happens to be live.
+	totals map[*ledger.Run]*stageTotal
 
 	started, exited, parses, retries uint64
 }
@@ -85,6 +93,10 @@ type worker struct {
 	// result and runErr are written by the run goroutine before done closes.
 	result process.Result
 	runErr error
+	// span is this worker's place in the run ledger. It is opened where the
+	// process is started and ended in the run goroutine, which is where the
+	// child's measured cost first exists.
+	span *ledger.Span
 
 	// pid and rss are written by the goroutine driving the worker and read by
 	// stats from any goroutine, so both are atomic rather than guarded by the
@@ -97,14 +109,101 @@ type worker struct {
 	bytesIn  int64
 	bytesOut int64
 	started  time.Time
-	timer    *time.Timer
 }
 
-func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, idleTTL, parseTTL time.Duration, memory int64) *pool {
-	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, idleTTL: idleTTL, parseTTL: parseTTL, memory: memory,
-		live: map[*worker]bool{}}
+// pprofDirEnv is the one variable a parser worker inherits, and only when the
+// operator set it on the parent. A worker otherwise runs with an empty
+// environment by construction, which is what keeps a parse from depending on
+// anything but the bytes it is sent; the exception exists because a profile of
+// the parse itself cannot be collected any other way -- a worker takes no
+// arguments of its own -- and it is inert unless the variable is set.
+const pprofDirEnv = "CODECTX_PPROF_DIR"
+
+// workerEnv is the child environment: empty, or the profiling directory alone.
+func workerEnv() []string {
+	if dir := os.Getenv(pprofDirEnv); dir != "" {
+		return []string{pprofDirEnv + "=" + dir}
+	}
+	return nil
+}
+
+func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, parseTTL time.Duration, memory int64) *pool {
+	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, parseTTL: parseTTL, memory: memory,
+		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{}}
 	p.cond = sync.NewCond(&p.mu)
 	return p
+}
+
+// enterStage opens the run's structural-parse total on the first unit that
+// parses under it, and counts this one in. The total is opened from the run
+// alone rather than from the caller's context: the workers under it outlive
+// the unit that started them.
+func (p *pool) enterStage(ctx context.Context) {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.totals[run]
+	if t == nil {
+		spanCtx, span := ledger.Start(run.Context(context.Background()), stageStructuralParse, "")
+		t = &stageTotal{ctx: spanCtx, span: span}
+		p.totals[run] = t
+	}
+	t.refs++
+}
+
+// leaveStage counts one unit out and ends the run's total when the last one
+// leaves. The caller drains the pool first, so the workers' own spans -- and
+// with them the child measurements the total's children carry -- are recorded
+// before the parent ends. A worker still busy for another run keeps its own
+// span and ends it where it exits.
+func (p *pool) leaveStage(ctx context.Context) {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	if t == nil {
+		p.mu.Unlock()
+		return
+	}
+	t.refs--
+	last := t.refs == 0
+	if last {
+		delete(p.totals, run)
+	}
+	p.mu.Unlock()
+	if last {
+		// The stage's own goroutines run beside everything else in the
+		// process, so the parent carries no processor time of its own: the
+		// measured cost of this stage is on its children, one per worker
+		// process.
+		t.span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	}
+}
+
+// count records one parsed file on the worker that parsed it and on its run's
+// total. This is why no file is a span: a worker's files are two atomic adds
+// on a span that already exists, and the total is the sum of its workers.
+func (p *pool) count(ctx context.Context, w *worker, ex *extraction) {
+	records := int64(len(ex.decls) + len(ex.imports) + len(ex.refs))
+	w.span.AddIn(1)
+	w.span.AddOut(records)
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	p.mu.Unlock()
+	if t == nil {
+		return
+	}
+	t.span.AddIn(1)
+	t.span.AddOut(records)
 }
 
 // newWorker builds one worker's plumbing. Nothing here can fail and nothing
@@ -131,7 +230,6 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 		if n := len(p.idle); n > 0 {
 			w := p.idle[n-1]
 			p.idle = p.idle[:n-1]
-			w.timer.Stop()
 			p.mu.Unlock()
 			return w, nil
 		}
@@ -178,9 +276,10 @@ func (p *pool) wait(ctx context.Context) error {
 }
 
 // release returns a worker after a parse. A worker that is unhealthy or has
-// consumed its share of a lifetime bound is stopped; otherwise it goes idle
-// under a TTL timer. Its place in live is given up only when the process has
-// exited, which is what keeps live processes bounded.
+// consumed its share of a lifetime bound is stopped; otherwise it goes idle,
+// reusable by the next parse of this stage and stopped by the drain that
+// follows the last one. Its place in live is given up only when the process
+// has exited, which is what keeps live processes bounded.
 func (p *pool) release(w *worker, healthy bool) {
 	if !healthy || w.exhausted() {
 		w.stop(!healthy)
@@ -207,27 +306,41 @@ func (p *pool) release(w *worker, healthy bool) {
 		return
 	}
 	p.idle = append(p.idle, w)
-	w.timer = time.AfterFunc(p.idleTTL, func() { p.expire(w) })
 	p.cond.Broadcast()
 	p.mu.Unlock()
 }
 
-// expire retires an idle worker whose TTL elapsed, unless it was reacquired.
-func (p *pool) expire(w *worker) {
+// drain stops every worker nobody is using and returns once each has been
+// reaped. It is what ends the stage: a worker is warm for exactly as long as
+// there is parse work in flight, and no longer.
+//
+// There is no timer here and no setting. A timer would mean a resting machine
+// holds one process per core -- on a sixteen-core host about 320 MB -- for
+// however long the timer says, to save the milliseconds a re-execution of this
+// binary costs when the next refresh comes. That trade is the wrong way round
+// for a product whose whole posture is coexisting with the editor, the browser
+// and the agents the person is using at the time.
+//
+// Busy workers are untouched: they belong to a caller that is parsing, and the
+// caller returns them through release, which is what makes the drain that
+// follows the last one complete.
+func (p *pool) drain() {
 	p.mu.Lock()
-	i := -1
-	for j, x := range p.idle {
-		if x == w {
-			i = j
-		}
-	}
-	if i >= 0 {
-		p.idle = append(p.idle[:i], p.idle[i+1:]...)
-	}
+	idle := p.idle
+	p.idle = nil
 	p.mu.Unlock()
-	if i >= 0 {
-		w.stop(false)
+	// Stopped concurrently rather than one grace after another: an idle worker
+	// exits on the end of its stdin, and serialising sixteen of those would
+	// make the drain take sixteen graces in the worst case.
+	var stopping sync.WaitGroup
+	for _, w := range idle {
+		stopping.Add(1)
+		go func() {
+			defer stopping.Done()
+			w.stop(false)
+		}()
 	}
+	stopping.Wait()
 }
 
 // close stops every worker and waits for the runner to reap each one. An idle
@@ -253,7 +366,6 @@ func (p *pool) close() {
 	p.mu.Unlock()
 	var stopping sync.WaitGroup
 	for _, w := range idle {
-		w.timer.Stop()
 		stopping.Add(1)
 		go func() {
 			defer stopping.Done()
@@ -273,14 +385,25 @@ func (p *pool) close() {
 // whatever happens here.
 func (p *pool) start(ctx context.Context, w *worker) error {
 	spec := process.Spec{
-		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir,
+		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir, Env: workerEnv(),
 		Stdin: w.childIn, MaxStdinBytes: workerStdinBudget,
 		Stdout: w.childOut, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
 		Timeout: workerLifetime, Grace: workerGrace, MemoryReservationBytes: p.memory,
 	}
+	w.span = p.openWorkerSpan(ctx)
 	go func() {
 		defer p.wg.Done()
 		w.result, w.runErr = p.runner.Run(w.ctx, spec)
+		// The worker's cost is known here and nowhere earlier: the run has
+		// returned, so the child has been reaped and its processor time, tree
+		// peak and transferred bytes are on the result. The span is ended
+		// before done closes, so a drain that waits for the reap cannot return
+		// before this worker's cost has been recorded.
+		outcome := ledger.OutcomeOK
+		if w.runErr != nil {
+			outcome = ledger.OutcomeFailed
+		}
+		w.span.End(outcome, measured(w.result), w.runErr)
 		// Unblock any parent write or read: the worker cannot answer any more.
 		w.childIn.CloseWithError(errWorkerGone)
 		w.childOut.CloseWithError(errWorkerGone)
@@ -290,8 +413,7 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		// an external kill — and an exited worker is not reusable, so it leaves
 		// the idle list with the live map. Otherwise idle could outnumber live
 		// and the next caller would be handed a dead worker, spending on a
-		// certain errWorkerGone the one retry a real parse failure needs. Its
-		// TTL timer may still fire; expire finds nothing and does nothing.
+		// certain errWorkerGone the one retry a real parse failure needs.
 		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
 		p.exited++
 		p.cond.Broadcast()
@@ -335,6 +457,27 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	}
 	w.pid.Store(int64(hello.PID))
 	return nil
+}
+
+// openWorkerSpan opens one worker's span under the total of the run that is
+// starting it, or, where that run is parsing outside a stage, under the run
+// itself. It is never opened under the caller's context: a pooled worker
+// serves the units that follow this one and is reaped long after this unit's
+// span has ended.
+func (p *pool) openWorkerSpan(ctx context.Context) *ledger.Span {
+	run := ledger.RunFromContext(ctx)
+	if run == nil {
+		return nil
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	p.mu.Unlock()
+	parent := run.Context(context.Background())
+	if t != nil {
+		parent = t.ctx
+	}
+	_, span := ledger.Start(parent, stageStructuralParse, "")
+	return span
 }
 
 // watch cancels the worker when ctx ends or the deadline passes before the
@@ -416,6 +559,12 @@ type extraction struct {
 	imports []wire.Import
 	refs    []wire.Ref
 	done    wire.Done
+	// overflow records that the parent stopped buffering a record set at the
+	// request's bound. It is folded into done.Truncated, which provider.go
+	// turns into a partial structure capability: a child that sends past the
+	// bound is not a reason to fail the file, and failing it would turn a
+	// user-set bound into a refusal.
+	overflow bool
 }
 
 // perFileError is a worker error frame: the file failed, the worker did not.
@@ -457,6 +606,19 @@ func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byt
 	return nil, err
 }
 
+// atRequestBound is the parent's half of the per-file record bound, read off
+// the SAME request field the worker reads. The check exists to stop a
+// misbehaving child from making the parent buffer more than a healthy one would
+// send, so it must never be stricter than what the worker was told: a parent
+// holding its own constant would kill a healthy worker's output the moment the
+// operator raised the limit. A zero bound is unlimited and the check is a
+// no-op, which is the shipped default. Reaching it drops the frame and flags
+// the file truncated rather than failing the unit: the bound is the operator's
+// and crossing it is a short answer, not a protocol fault.
+func atRequestBound(req wire.Request, have int) bool {
+	return req.MaxRecordsPerFile != 0 && uint64(have) >= req.MaxRecordsPerFile
+}
+
 func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, error) {
 	if err := wire.WriteJSON(w.in, wire.KindRequest, req, wire.MaxFactFrameBytes); err != nil {
 		return nil, err
@@ -478,8 +640,9 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &d); err != nil {
 				return nil, err
 			}
-			if len(ex.decls) >= wire.MaxDeclsPerFile {
-				return nil, errors.New("worker exceeded the declaration bound")
+			if atRequestBound(req, len(ex.decls)) {
+				ex.overflow = true
+				continue
 			}
 			ex.decls = append(ex.decls, d)
 		case wire.KindImport:
@@ -487,8 +650,9 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &i); err != nil {
 				return nil, err
 			}
-			if len(ex.imports) >= wire.MaxImportsPerFile {
-				return nil, errors.New("worker exceeded the import bound")
+			if atRequestBound(req, len(ex.imports)) {
+				ex.overflow = true
+				continue
 			}
 			ex.imports = append(ex.imports, i)
 		case wire.KindRef:
@@ -496,14 +660,16 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &r); err != nil {
 				return nil, err
 			}
-			if len(ex.refs) >= wire.MaxRefsPerFile {
-				return nil, errors.New("worker exceeded the reference bound")
+			if atRequestBound(req, len(ex.refs)) {
+				ex.overflow = true
+				continue
 			}
 			ex.refs = append(ex.refs, r)
 		case wire.KindDone:
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
+			ex.done.Truncated = ex.done.Truncated || ex.overflow
 			w.rss.Store(ex.done.RSSBytes)
 			return ex, nil
 		case wire.KindError:
@@ -526,7 +692,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 // value that cannot be measured is -1, never zero.
 type Stats struct {
 	// Processes is every worker process the runner has not yet reaped: busy,
-	// idle and shutting down alike. It never exceeds index.max_parser_workers.
+	// idle and shutting down alike. It never exceeds Options.MaxWorkers.
 	Processes int `json:"processes"`
 	// IdleWorkers is the reusable subset of Processes, and BusyWorkers the
 	// rest: parsing for a caller, or on their way out. The two are reported

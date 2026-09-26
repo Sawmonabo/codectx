@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -80,8 +81,9 @@ type SuppliedIndexReader interface {
 	SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error)
 }
 
-// WatchHeartbeat is what a running watch published about itself, read from the
-// store by a process that is not the one watching.
+// WatchHeartbeat is what one running watch published about itself, read from
+// the store by a process that is not the one watching. A workspace can be
+// watched by more than one process, and each publishes its own.
 //
 // ExpiresAt is the writer's own deadline and the only liveness signal this
 // package consults. A watching process refreshes it while it lives, so an
@@ -89,7 +91,9 @@ type SuppliedIndexReader interface {
 // death that needs no pid probe and works on every platform. LastPassAt and
 // PendingEvents are absent when nothing measured them: a watch driven only by
 // periodic reconciliation counts no notification queue, and a watch that has
-// completed no pass has no pass time.
+// completed no pass has neither a pass time nor any figure at all -- it is
+// running and covering nothing, which is a third answer beside coverage and no
+// watch at all.
 type WatchHeartbeat struct {
 	WriterPID     int
 	LastPassAt    *time.Time
@@ -97,20 +101,34 @@ type WatchHeartbeat struct {
 	ExpiresAt     time.Time
 }
 
-// WatchHeartbeatReader reports the repository's watch heartbeat, and whether
-// one exists at all -- absent and expired are different answers. Like
+// Live is this package's one statement of whether the process that published a
+// row is still refreshing it: the writer's own unelapsed deadline against the
+// reader's clock, which is the rule the store and the run ledger both judge a
+// writer's liveness by. No pid is probed.
+func (hb WatchHeartbeat) Live(now time.Time) bool { return hb.ExpiresAt.After(now) }
+
+// WatchHeartbeatReader reports every watch heartbeat the repository holds,
+// expired rows included -- absent and expired are different answers. Like
 // SuppliedIndexReader it is optional, exported, and converts rather than
 // forwards, so the composition root asserts it at compile time instead of
 // leaving a signature drift to show up as a check that is unavailable forever.
 type WatchHeartbeatReader interface {
-	WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (WatchHeartbeat, bool, error)
+	WatchHeartbeats(ctx context.Context, repo model.RepositoryID) ([]WatchHeartbeat, error)
 }
 
-// liveWatch reports the heartbeat of a watch that is running now: the row
-// exists and the writer's own deadline has not passed. An expired row is a
-// watch that stopped, and is reported as no watch at all rather than as
-// coverage -- a figure from a dead process would read as "the watch is caught
-// up" for as long as nobody rebooted it.
+// liveWatch chooses the one heartbeat this package reports on, and says whether
+// it is live. A row that has expired is a watch that stopped, and is never
+// reported as coverage -- a figure from a dead process would read as "the watch
+// is caught up" for as long as nobody rebooted it.
+//
+// The choice over several watching processes is what keeps the three answers
+// apart at this surface. A live watch that has completed a pass is preferred
+// over a live one that has not: with an editor's server waiting behind a
+// terminal's watch, reporting the waiting one would say nothing covers this
+// workspace while something does. The row chosen is one watcher's own coherent
+// pair of figures, never a total synthesized across processes, which would name
+// a pending count no process ever published. With no live row at all the
+// freshest row is returned so an expired one can be warned about.
 //
 // The second result separates "no heartbeat is live" from "this build cannot
 // tell", which the two callers render differently.
@@ -119,14 +137,33 @@ func (s *Service) liveWatch(ctx context.Context) (hb WatchHeartbeat, live bool, 
 	if !isReader {
 		return WatchHeartbeat{}, false, false
 	}
-	hb, found, err := reader.WatchHeartbeat(ctx, s.opts.Repo)
+	rows, err := reader.WatchHeartbeats(ctx, s.opts.Repo)
 	if err != nil {
 		return WatchHeartbeat{}, false, false
 	}
-	if !found {
-		return WatchHeartbeat{}, false, true
+	now := s.opts.Now()
+	waiting := -1
+	for i, row := range rows {
+		if !row.Live(now) {
+			continue
+		}
+		if row.LastPassAt != nil {
+			return row, true, true
+		}
+		if waiting < 0 {
+			waiting = i
+		}
 	}
-	return hb, hb.ExpiresAt.After(s.opts.Now()), true
+	switch {
+	case waiting >= 0:
+		return rows[waiting], true, true
+	case len(rows) == 0:
+		return WatchHeartbeat{}, false, true
+	default:
+		// The rows are freshest-deadline first, so this is the watch that
+		// stopped refreshing most recently.
+		return rows[0], false, true
+	}
 }
 
 // captureReader reports when the capture behind a generation was taken -- the
@@ -159,14 +196,24 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 	// report can disagree with each other, and the accounting figures an
 	// operator is shown must be the same ones the retention sample reasoned
 	// about.
-	stats, statsErr := s.opts.Store.Stats(ctx)
+	//
+	// It is read only under --deep. Stats is eleven `count(*)` scans, one per
+	// table, and node_facts, relation_facts and evidence are the largest tables
+	// this product writes: on a large repository that is a second whole-database
+	// walk beside the integrity one, on a command Section 22 forbids scanning.
+	// Shallow reports the sizes it can stat and marks the counts unverified.
+	var stats StoreStats
+	var statsErr error
+	if req.Deep {
+		stats, statsErr = s.opts.Store.Stats(ctx)
+	}
 	checks := make([]model.DoctorCheck, 0, 24)
 	checks = append(checks,
 		s.checkBuild(),
 		s.checkDataDirectory(ctx),
 		s.checkFreeDisk(ctx),
 		s.checkStorage(ctx, req.Deep),
-		s.checkAccounting(stats, statsErr),
+		s.checkAccounting(ctx, req.Deep, stats, statsErr),
 	)
 	active, generationCheck := s.checkActive(ctx)
 	checks = append(checks,
@@ -183,9 +230,10 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 	// The state is reduced BEFORE the list is bounded: a failing check that
 	// fell off the end of an over-long list must still fail the report.
 	state := aggregate(checks)
-	if len(checks) > model.MaxCapabilityStates {
-		checks = checks[:model.MaxCapabilityStates]
-	}
+	// No clamp. The check list is enumerated above -- it is a function of the
+	// code, not of the repository -- and a silent `checks[:256]` dropped the
+	// toolchain checks appended last with no omitted count and no warning,
+	// which is exactly the shape a diagnostic report may not have.
 	report := model.DoctorReport{
 		Build: s.opts.Build,
 		Deep:  req.Deep,
@@ -295,26 +343,90 @@ func (s *Service) checkFreeDisk(ctx context.Context) model.DoctorCheck {
 	return model.DoctorCheck{Name: checkFreeDisk, State: model.CheckPass, Detail: bytesPhrase(int64(*free)) + " free under the data directory"}
 }
 
-// checkStorage runs the integrity checks. deep is passed straight through: the
-// store's own contract is that an ordinary pass is quick_check plus the foreign
-// key check, and the full-text index walk happens only when deep is set.
+// checkStorage runs the integrity checks. deep is passed straight through, and
+// it decides which check this row reports: shallow reads the database header,
+// the schema fingerprint and the journal mode -- all constant cost -- while
+// quick_check, the foreign key check and the full-text index walk are O(database
+// bytes) and belong to --deep alone.
+//
+// A shallow pass is therefore reported `unverified`, never `pass`. The row is
+// still emitted with the flag that verifies it: nothing is dropped from the
+// report, and an operator is never told the database passed a check this run did
+// not run. A shallow FAILURE is a real failure -- a fingerprint mismatch or a
+// truncated header is decided without reading a page of content.
 func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck {
 	if err := s.opts.Store.Check(ctx, deep); err != nil {
 		return failure(checkStorageIntegrity, err)
 	}
-	detail := "the index database passed its quick integrity and referential checks"
-	if deep {
-		detail = "the index database passed its full integrity checks, including the search index"
+	if !deep {
+		return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckUnverified,
+			Detail: "the index database header, page count, schema fingerprint and write-ahead-log mode read back" +
+				s.synchronousPhrase(ctx) + "; the integrity and referential checks walk the whole database and were " +
+				shallowUnverified,
+			Remediation: shallowRemediation}
 	}
-	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass, Detail: detail}
+	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass,
+		Detail: "the index database passed its full integrity checks, including the search index" +
+			s.synchronousPhrase(ctx)}
 }
+
+// synchronousReader reads the durability mode the storage layer is actually
+// running in. Like blobSampler and captureReader it is an optional interface
+// beside the frozen StoreReader, so a reader that cannot answer makes the
+// storage row say what it knows -- the configured mode, named as configured --
+// instead of claiming a read-back it did not do. The composition root's adapter
+// forwards (*sqlite.Store).SynchronousMode.
+type synchronousReader interface {
+	SynchronousMode(ctx context.Context) (string, error)
+}
+
+// synchronousPhrase names the durability mode the storage layer is running in,
+// for both readings of the storage check. ADR-0004 Decision 1a states that a
+// receipt acknowledged under `normal` can be lost to a machine-level crash and
+// that `full` closes that window, so which mode is live is an operational fact
+// an operator has to be able to read back -- the same reason checkTemporary
+// echoes its configured ceiling.
+//
+// It READS the mode, from `PRAGMA synchronous` on the connection whose mode is
+// a choice, rather than echoing the configured value: echoing verifies nothing,
+// and "read back" is what the row claims. When the reader cannot answer -- an
+// adapter that does not forward it, or a pragma read that failed -- the phrase
+// falls back to the configured mode and says so in those words, because a row
+// that quietly reports configuration as measurement is the misreport this
+// closes.
+func (s *Service) synchronousPhrase(ctx context.Context) string {
+	configured := s.opts.Config.Storage.Synchronous
+	if configured == "" {
+		configured = config.SynchronousNormal
+	}
+	r, ok := s.opts.Store.(synchronousReader)
+	if !ok {
+		return " (storage.synchronous = " + configured + " as configured; this store cannot read the live mode back)"
+	}
+	live, err := r.SynchronousMode(ctx)
+	if err != nil || live == "" {
+		return " (storage.synchronous = " + configured + " as configured; the live mode could not be read back)"
+	}
+	return " (storage.synchronous reads back " + live + ")"
+}
+
+// shallowUnverified is the one phrase every check skipped by shallow mode ends
+// with, and shallowRemediation the one remediation beside it. They are declared
+// once so an operator and a script see the same wording whichever check skipped.
+const (
+	shallowUnverified  = "not verified in shallow mode; run doctor --deep"
+	shallowRemediation = "run codectx doctor --deep to verify this check"
+)
 
 // checkAccounting reports the bounded row counts and file sizes, and warns when
 // the write-ahead log has grown past its high-water mark: a WAL that never
 // checkpoints is how a workspace runs a disk out of space while every
 // individual operation still succeeds. The lease and session counts are the
 // retention figures Section 22 asks for -- they are counts, never identities.
-func (s *Service) checkAccounting(stats StoreStats, err error) model.DoctorCheck {
+func (s *Service) checkAccounting(ctx context.Context, deep bool, stats StoreStats, err error) model.DoctorCheck {
+	if !deep {
+		return s.checkAccountingShallow(ctx)
+	}
 	if err != nil {
 		return failure(checkStorageAccount, err)
 	}
@@ -324,13 +436,51 @@ func (s *Service) checkAccounting(stats StoreStats, err error) model.DoctorCheck
 		strconv.FormatInt(stats.Leases, 10) + " live leases, " +
 		strconv.FormatInt(stats.Sessions, 10) + " read sessions; database " +
 		bytesPhrase(stats.DatabaseBytes) + ", write-ahead log " + bytesPhrase(stats.WALBytes)
-	if high := s.opts.Config.Storage.WALHighWaterBytes; high > 0 && stats.WALBytes > high {
+	if sizer, ok := s.opts.Store.(StoreSizer); ok && stats.WALBytes > sizer.WALBoundBytes() {
 		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckWarn,
 			Detail:      detail,
 			Code:        model.CodeResourceLimit,
-			Remediation: "the write-ahead log is past its high-water mark; run an index or refresh to checkpoint it"}
+			Remediation: walRemediation}
 	}
 	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckPass, Detail: detail}
+}
+
+// walRemediation is what a write-ahead log larger than the store's ingestion
+// group bound means: either nothing has folded it since the last run, which
+// the next index or refresh does, or a reader once held its frames open across
+// several groups and the file keeps that high-water length. The log is rewound
+// in place and reused rather than freed, so folding its frames does not shrink
+// the file.
+const walRemediation = "the write-ahead log is larger than the store's ingestion group bound: run an index or refresh to fold any frames it still holds. The file keeps the length its largest log reached and is written over rather than freed, so it does not shrink"
+
+// checkAccountingShallow reports what accounting costs nothing: the two file
+// sizes, and the write-ahead-log bound warning that is the one actionable
+// fact in this check. The row counts are O(rows) and are reported unverified.
+//
+// The WAL warning is deliberately NOT suppressed by shallow mode. A WAL that
+// never checkpoints fills a disk while every operation still succeeds, and it is
+// decided by a file stat; withholding it until --deep would hide the cheapest
+// real finding this command has behind the most expensive flag.
+func (s *Service) checkAccountingShallow(ctx context.Context) model.DoctorCheck {
+	sizer, ok := s.opts.Store.(StoreSizer)
+	if !ok {
+		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckUnavailable,
+			Detail: "this build's store reader reports no on-disk sizes without a full row count, so no accounting figure could be read"}
+	}
+	dbBytes, walBytes, err := sizer.StoreSizes(ctx)
+	if err != nil {
+		return failure(checkStorageAccount, err)
+	}
+	detail := "database " + bytesPhrase(dbBytes) + ", write-ahead log " + bytesPhrase(walBytes) +
+		"; the generation, unit, blob, lease and session counts are " + shallowUnverified
+	if walBytes > sizer.WALBoundBytes() {
+		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckWarn,
+			Detail:      detail,
+			Code:        model.CodeResourceLimit,
+			Remediation: walRemediation}
+	}
+	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckUnverified,
+		Detail: detail, Remediation: shallowRemediation}
 }
 
 // checkActive resolves the active generation pointer and returns it, so the
@@ -375,13 +525,22 @@ func (s *Service) checkCAS(ctx context.Context, deep bool, stats StoreStats, sta
 		// all quarantined or in trash returns nothing here, and reporting
 		// that as "nothing to verify" would read as a healthy empty
 		// workspace, so the accounting count decides which it is.
-		if statsErr == nil && stats.Blobs > 0 {
-			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
-				Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
-				Code:        model.CodeSourceIntegrity,
-				Remediation: "rebuild the cache with codectx index --rebuild"}
+		if deep {
+			if statsErr == nil && stats.Blobs > 0 {
+				return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
+					Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
+					Code:        model.CodeSourceIntegrity,
+					Remediation: "rebuild the cache with codectx index --rebuild"}
+			}
+			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckPass, Detail: "no source is retained yet, so there was nothing to verify"}
 		}
-		return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckPass, Detail: "no source is retained yet, so there was nothing to verify"}
+		// Telling the two apart needs the retained-object count, which is one
+		// of the O(rows) figures shallow mode does not read. "Nothing to
+		// verify" and "every retained object is unreadable" look identical
+		// from here, and reporting the reassuring one would be a guess.
+		return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckUnverified,
+			Detail:      "no retained object was listed in a readable state; whether that is an empty workspace or an unreadable one is " + shallowUnverified,
+			Remediation: shallowRemediation}
 	}
 	for _, h := range hashes {
 		if _, err := s.opts.Store.Blob(ctx, h); err != nil {
@@ -452,20 +611,54 @@ func (s *Service) checkTemporary(ctx context.Context) model.DoctorCheck {
 			Code:        model.CodeResourceLimit,
 			Remediation: "run codectx index or refresh to reclaim abandoned staging state, or raise resources.max_temp_bytes"}
 	}
+	ceiling := "unlimited"
+	if want > 0 {
+		ceiling = bytesPhrase(want)
+	}
 	return model.DoctorCheck{Name: checkTemporaryState, State: model.CheckPass,
-		Detail: bytesPhrase(int64(*report.TempBytes)) + " of temporary state"}
+		Detail: bytesPhrase(int64(*report.TempBytes)) + " of temporary state, against a configured ceiling of " + ceiling}
 }
 
-// checkToolchain reports one check per lock entry, named by the entry. A tool
-// the lock names for another platform is unavailable, not a failure: that is
-// the honest answer on a host the payload was never published for.
+// checkToolchain reports the lock entries this repository actually needs and
+// cannot use. Two filters decide the rows, and both exist so the operator sees
+// only work they must do:
+//
+//   - an entry the repository does not select is skipped entirely -- a Go and
+//     Python repository is not told to install a C++ indexer it will never run;
+//   - a selected entry that is installed (or replaced by a user override) is
+//     skipped too, because there is nothing to act on.
+//
+// A selected entry that is NOT usable always produces a row: `available` warns
+// with the install remediation, `corrupt` fails, and a tool the lock names for
+// another platform is unavailable rather than a failure -- that is the honest
+// answer on a host the payload was never published for. Corrupt is deliberately
+// not swallowed by the installed filter: a damaged payload is installed, and
+// doctor is the only place it is reported.
+//
+// A selection that cannot be computed (an unreadable repository root) is one
+// failing check of its own, never silence: dropping every row on that path
+// would report a healthy toolchain for a workspace nobody can read.
 func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 	statuses, err := s.opts.Toolchain.Statuses(ctx)
 	if err != nil {
 		return []model.DoctorCheck{failure(checkToolchainPrefix+"status", err)}
 	}
+	names, err := s.opts.Toolchain.Selected(ctx, s.opts.Root)
+	if err != nil {
+		return []model.DoctorCheck{failure(checkToolchainPrefix+"selection", err)}
+	}
+	selected := make(map[string]bool, len(names))
+	for _, name := range names {
+		selected[name] = true
+	}
 	out := make([]model.DoctorCheck, 0, len(statuses))
 	for _, st := range statuses {
+		if !selected[st.Name] {
+			continue
+		}
+		if st.State == toolchain.StateInstalled || st.State == toolchain.StateOverride {
+			continue
+		}
 		c := model.DoctorCheck{Name: checkToolchainPrefix + st.Name, State: model.CheckPass,
 			Detail: st.Name + " " + st.Version + " is " + string(st.State)}
 		switch st.State {
@@ -477,14 +670,14 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 			// remediation beside it tells the operator to do.
 			c.Detail = st.Name + " " + st.Version + " is pinned by the lock but not installed"
 			c.Code = model.CodeProviderUnavailable
-			c.Remediation = "run codectx tools install to fetch the payloads this lock names"
+			c.Remediation = "run codectx tools prefetch --for-repo . to install what this repository needs"
 		case toolchain.StateUnsupportedPlatform:
 			c.State = model.CheckUnavailable
 			c.Detail = st.Name + " publishes no payload for this platform"
 		case toolchain.StateCorrupt:
 			c.State = model.CheckFail
 			c.Code = model.CodeToolCorrupt
-			c.Remediation = "run codectx tools gc and then codectx tools install to reinstall this payload"
+			c.Remediation = "run codectx tools gc and then codectx tools prefetch --for-repo . to reinstall this payload"
 		}
 		out = append(out, c)
 	}
@@ -593,27 +786,36 @@ func (s *Service) checkAnalyzerRestriction() model.DoctorCheck {
 // checkWatchHeartbeat reports whether a watch is running for this workspace,
 // from the row a watching process publishes and refreshes (Section 13.2).
 //
-// The three states are three different facts and never collapse. `pass` is a
-// live row: some process is watching, and it says which one, so an operator who
-// wants it stopped knows what to stop. `warn` is an expired row: a watch ran and
-// is no longer refreshing, so every change since is unseen while the workspace
-// still looks watched -- the one state an operator must act on. `unavailable` is
-// no row at all, which is the ordinary state of a workspace nobody is watching
-// and not a defect; it is also what a build with no heartbeat reader reports.
+// The states are different facts and never collapse. A live row is `pass`, and
+// its detail separates a watch that is covering this workspace from one that is
+// running but has completed no pass -- a watch waiting for whichever process
+// holds the workspace covers nothing yet, and reporting it as coverage is how an
+// operator comes to trust an index that is not being kept fresh. `warn` is an
+// expired row: a watch ran and is no longer refreshing, so every change since is
+// unseen while the workspace still looks watched -- the one state an operator
+// must act on. `unavailable` is no row at all, which is the ordinary state of a
+// workspace nobody is watching and not a defect; it is also what a build with no
+// heartbeat reader reports.
 func (s *Service) checkWatchHeartbeat(ctx context.Context) model.DoctorCheck {
 	hb, live, ok := s.liveWatch(ctx)
 	switch {
 	case !ok:
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,
 			Detail: "this build publishes no watch heartbeat, so whether a watch is running for this workspace cannot be told from another process"}
+	case live && hb.LastPassAt == nil:
+		// A watch process is here and refreshing its row, but it has completed
+		// no pass -- it is waiting for a workspace another process holds. It is
+		// neither coverage nor an absent watch, and saying either would send an
+		// operator looking for the wrong thing.
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckPass,
+			Detail: "a watch is running in process " + strconv.Itoa(hb.WriterPID) +
+				" but has completed no pass yet, so nothing in this workspace is covered by it; it is waiting for whichever process holds the workspace"}
 	case live:
 		detail := "a watch is running in process " + strconv.Itoa(hb.WriterPID)
 		if hb.PendingEvents != nil {
 			detail += ", with " + strconv.FormatInt(*hb.PendingEvents, 10) + " pending event/events"
 		}
-		if hb.LastPassAt != nil {
-			detail += "; its last pass completed " + hb.LastPassAt.UTC().Format(time.RFC3339)
-		}
+		detail += "; its last pass completed " + hb.LastPassAt.UTC().Format(time.RFC3339)
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckPass, Detail: detail}
 	case hb.ExpiresAt.IsZero():
 		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,

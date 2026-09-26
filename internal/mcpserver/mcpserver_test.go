@@ -5,8 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -214,6 +220,15 @@ func (f *fakeServices) Capsule(ctx context.Context, r model.CapsuleRequest) (mod
 	return f.capsuleFn(ctx, r)
 }
 
+// CapsuleRows is on app.ContextService for the CLI's whole-capsule export. No
+// tool reaches it -- codectx_context_capsule pages through Capsule and projects
+// Export -- so the fake refuses it rather than answering a page a tool would
+// then be believed to serve.
+func (f *fakeServices) CapsuleRows(_ context.Context, _ model.SessionRequest, _ model.CapsuleList,
+	_ string, _ int) ([]model.CapsuleRow, string, error) {
+	return nil, "", unset("CapsuleRows")
+}
+
 func (f *fakeServices) Export(ctx context.Context, r model.SessionRequest) (model.Capsule, error) {
 	if f.exportFn == nil {
 		return model.Capsule{}, unset("Export")
@@ -293,6 +308,18 @@ func connect(t *testing.T, s *mcp.Server) *mcp.ClientSession {
 // invariant is asserted on every other session instead.
 func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSession {
 	t.Helper()
+	return connectWith(t, s, mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, nil), wantClean)
+}
+
+// connectClient is connect over a client the caller configured, which is how a
+// row that must observe SERVER-SENT notifications gets its handlers installed.
+func connectClient(t *testing.T, s *mcp.Server, c *mcp.Client) *mcp.ClientSession {
+	t.Helper()
+	return connectWith(t, s, c, true)
+}
+
+func connectWith(t *testing.T, s *mcp.Server, c *mcp.Client, wantClean bool) *mcp.ClientSession {
+	t.Helper()
 	ctx := t.Context()
 	clientT, serverT := mcp.NewInMemoryTransports()
 	// The server session outlives t.Context(), which is canceled just BEFORE
@@ -302,7 +329,6 @@ func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSess
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, nil)
 	cs, err := c.Connect(ctx, clientT, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
@@ -347,7 +373,7 @@ var toolSchemas = map[string][]string{
 	"codectx_references":          {"node_id", "operation", "semantic_source", "page"},
 	"codectx_callers":             {"start", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_callees":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited"},
+	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited", "page"},
 	"codectx_impact":              {"start", "direction", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_context_plan":        {"context", "actor_id"},
 	"codectx_context_status":      {"session_id", "actor_id", "page"},
@@ -441,6 +467,13 @@ func TestToolSchemaSnapshot(t *testing.T) {
 		if _, expected := toolSchemas[name]; !expected {
 			t.Errorf("tool %q is registered but not in the snapshot", name)
 		}
+	}
+	// The continuation argument of ruling C9 is OPTIONAL, so it never enters
+	// the required list above and the table alone would not notice it
+	// disappearing. Its presence is what makes a deadline-truncated plan
+	// resumable over MCP, so it is pinned by name.
+	if seen["codectx_context_plan"].Properties["cursor"] == nil {
+		t.Error("codectx_context_plan exposes no \"cursor\" argument; a truncated plan would be unresumable over MCP")
 	}
 	for name, fields := range toolEnums {
 		for path, want := range fields {
@@ -577,6 +610,71 @@ var scenarios = []scenario{
 	},
 
 	// L2 rows.
+	{
+		// Failure mode: the MCP surface grows a second shape for the run
+		// ledger. codectx_index_status has no special case for resources: it
+		// hands model.StatusRequest to the same IndexStatus the CLI calls and
+		// returns the answer whole, so the run and stage rows a client reads
+		// are the ones the service produced. A handler that built its own row
+		// list -- or projected, reordered or trimmed the service's -- would let
+		// the two surfaces disagree about what a run cost, and neither would be
+		// wrong on its face. The row also pins the JSON PATH: the MCP envelope
+		// puts model.IndexStatus directly in data, one level shallower than the
+		// CLI's, so the rows live at data.resources.stages and a consumer that
+		// assumed the CLI's path would read nothing.
+		name: "index_status carries the service's own ledger rows at data.resources.stages",
+		facade: func(f *fakeServices) {
+			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
+				if !r.Resources {
+					return model.IndexStatus{}, unset("IndexStatus: resources was not forwarded")
+				}
+				return model.IndexStatus{Resources: ledgerReport()}, nil
+			}
+		},
+		tool: "codectx_index_status",
+		args: model.StatusRequest{Resources: true},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("index_status reported a tool error: %s", firstText(res))
+			}
+			var got result[model.IndexStatus]
+			decode(t, res, &got)
+			want := ledgerReport()
+			if got.Data.Resources == nil {
+				t.Fatalf("data.resources is absent; the service reported %+v", want)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Run, want.Run) {
+				t.Errorf("data.resources.run = %+v, want the service's row %+v", got.Data.Resources.Run, want.Run)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Stages, want.Stages) {
+				t.Errorf("data.resources.stages = %+v, want the service's rows %+v", got.Data.Resources.Stages, want.Stages)
+			}
+			// The path itself, read from the wire rather than from the typed
+			// envelope, so a renamed or re-nested field is caught here and not
+			// only by a client in the field.
+			var wire struct {
+				Data struct {
+					Resources struct {
+						Stages []struct {
+							Stage   string `json:"stage"`
+							WallMS  int64  `json:"wall_ms"`
+							ItemsIn int64  `json:"items_in"`
+						} `json:"stages"`
+					} `json:"resources"`
+				} `json:"data"`
+			}
+			decode(t, res, &wire)
+			if len(wire.Data.Resources.Stages) != len(want.Stages) {
+				t.Fatalf("data.resources.stages carried %d rows, want %d", len(wire.Data.Resources.Stages), len(want.Stages))
+			}
+			for i, s := range wire.Data.Resources.Stages {
+				if s.Stage != want.Stages[i].Stage || s.WallMS != want.Stages[i].WallMS || s.ItemsIn != want.Stages[i].ItemsIn {
+					t.Errorf("data.resources.stages[%d] = %+v, want %+v", i, s, want.Stages[i])
+				}
+			}
+		},
+	},
+
 	{
 		// Failure mode: an LSP overlay answer reaches the model looking like a
 		// sealed canonical fact. Two ways that happens, both guarded here: the
@@ -968,33 +1066,18 @@ var scenarios = []scenario{
 		},
 	},
 	func() scenario {
-		// Failure mode: view="export" ships the capsule body. A capsule is
-		// bounded by context.max_capsule_bytes at 8 MiB while this tool
-		// answers under resources.max_metadata_response_bytes at 256 KiB, so
-		// returning model.Capsule whole would blow the response bound and
-		// spill stored facts, observations and coverage the six paged views
-		// exist to serve. The row proves both halves at once: the body the
-		// facade returns does NOT fit the ceiling, and the projection does,
-		// carrying counts instead of records.
+		// Failure mode: view="export" answers with capsule RECORDS. A sealed
+		// capsule now carries only identity and its eight per-list counts --
+		// the records are rows read one keyset page at a time -- so the failure
+		// this row still guards is the projection: an export that omits a
+		// list's count, or that also returns a page, makes a caller believe it
+		// has been told how much the capsule holds when it has not.
 		//
 		// The row is a closure so the fixture capsule is shared by facade and
 		// check without a package-level helper another lane would collide on.
-		const sentinel = "sentinel-content-hash-no-capsule-record-may-ship"
 		sessionID := model.SessionID(strings.Repeat("a", 64))
 		manifestHash := strings.Repeat("d", 64)
 		canonicalHash := strings.Repeat("e", 64)
-		coverage := make([]model.FileCoverage, 2000)
-		for i := range coverage {
-			coverage[i] = model.FileCoverage{
-				FileID:         "file-with-a-realistically-long-identifier",
-				ContentHash:    strings.Repeat("c", 64),
-				Size:           4096,
-				ConfirmedBytes: 4096,
-				Requirement:    model.RequirementFull,
-				State:          model.CoverageFullServed,
-			}
-		}
-		coverage[0].ContentHash = sentinel
 		capsule := model.Capsule{
 			SessionID: sessionID,
 			ActorID:   "actor-1",
@@ -1006,17 +1089,14 @@ var scenarios = []scenario{
 			ManifestHash:  manifestHash,
 			CanonicalHash: canonicalHash,
 			ScopeVersion:  3,
-			Scope:         []model.NodeID{model.NodeID(strings.Repeat("3", 64)), model.NodeID(strings.Repeat("4", 64))},
-			Coverage:      coverage,
-			Waivers: []model.WaiverRecord{{
-				SessionID: sessionID, ActorID: "actor-1",
-				FileID: model.FileID(strings.Repeat("b", 64)), Reason: "vendored",
-			}},
+			Counts: model.CapsuleCounts{
+				Scope: 2, AcceptedFacts: 7, RejectedFacts: 1, Contradictions: 3,
+				Unresolved: 4, ScopeReviewIDs: 5, Coverage: 2000, Waivers: 1,
+			},
 			StrictGateSatisfied: false,
 		}
-		ceiling := config.Defaults().Resources.MaxMetadataResponseBytes
 		return scenario{
-			name: "gate: capsule export returns canonical metadata under the response ceiling",
+			name: "gate: capsule export returns identity and per-list counts, never records",
 			facade: func(f *fakeServices) {
 				f.exportFn = func(_ context.Context, _ model.SessionRequest) (model.Capsule, error) {
 					return capsule, nil
@@ -1029,26 +1109,8 @@ var scenarios = []scenario{
 				Page: model.PageRequest{Limit: 50},
 			},
 			check: func(t *testing.T, res *mcp.CallToolResult) {
-				body, err := json.Marshal(capsule)
-				if err != nil {
-					t.Fatalf("marshal the fixture capsule: %v", err)
-				}
-				if int64(len(body)) <= ceiling {
-					t.Fatalf("fixture capsule is %d bytes, which already fits the %d-byte ceiling; the row proves nothing",
-						len(body), ceiling)
-				}
 				if res.IsError {
 					t.Fatalf("context_capsule export reported a tool error: %s", firstText(res))
-				}
-				raw, err := json.Marshal(res.StructuredContent)
-				if err != nil {
-					t.Fatalf("marshal the structured answer: %v", err)
-				}
-				if int64(len(raw)) > ceiling {
-					t.Errorf("export answer is %d bytes, over the %d-byte metadata ceiling", len(raw), ceiling)
-				}
-				if strings.Contains(string(raw), sentinel) {
-					t.Errorf("export answer carries a capsule record; it must carry metadata only")
 				}
 				var got result[capsuleOutput]
 				decode(t, res, &got)
@@ -1063,8 +1125,12 @@ var scenarios = []scenario{
 					e.ScopeVersion != 3 || e.Binding.GenerationID != 42 || e.StrictGateSatisfied {
 					t.Errorf("export = %+v, want the capsule's canonical metadata", *e)
 				}
-				if e.Counts["coverage"] != len(coverage) || e.Counts["waivers"] != 1 || e.Counts["scope"] != 2 {
-					t.Errorf("counts = %v, want the capsule's per-section lengths", e.Counts)
+				// Every one of the eight lists a caller may page must be
+				// counted here, at the count the capsule sealed.
+				for _, list := range model.CapsuleListOrder {
+					if e.Counts[string(list)] != capsule.Counts.Of(list) {
+						t.Errorf("counts[%s] = %d, want %d", list, e.Counts[string(list)], capsule.Counts.Of(list))
+					}
 				}
 			},
 		}
@@ -1124,6 +1190,34 @@ func decode(t *testing.T, res *mcp.CallToolResult, v any) {
 	}
 }
 
+// ledgerReport is the run ledger one fake IndexStatus reports, built the same
+// way on both sides of the assertion so the row compares the wire against the
+// service's own rows rather than against a second hand-written shape.
+func ledgerReport() *model.ResourceReport {
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finished := started.Add(2 * time.Second)
+	generation := int64(9)
+	return &model.ResourceReport{
+		Run: &model.RunRecord{
+			RunID:          "5f2b",
+			Kind:           "index",
+			RepositoryID:   "a1b2",
+			GenerationID:   &generation,
+			StartedAt:      started,
+			FinishedAt:     &finished,
+			WallMS:         2000,
+			Outcome:        "ok",
+			FileCount:      12,
+			UnitsPlanned:   2,
+			UnitsSucceeded: 2,
+		},
+		Stages: []model.StageRecord{
+			{Seq: 0, Stage: "walk", StartedAt: started, WallMS: 500, Outcome: "ok", ItemsIn: 12, ItemsOut: 12, ShareOfWall: 0.25},
+			{Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", StartedAt: started, WallMS: 1500, Outcome: "ok", ItemsIn: 12, ItemsOut: 340, ShareOfWall: 0.75},
+		},
+	}
+}
+
 // firstText returns the first text content block, which is where the SDK puts a
 // tool error's message.
 func firstText(res *mcp.CallToolResult) string {
@@ -1179,5 +1273,358 @@ func oversizedArgumentsRow() scenario {
 				t.Errorf("the facade was entered for a frame the bound refuses")
 			}
 		},
+	}
+}
+
+// TestCapsuleCursorWalkReachesEveryRecord protects the capsule tool's
+// continuation across CALLS, which the single-call scenario table above cannot
+// reach.
+//
+// A sealed capsule's records are rows read one keyset page at a time, so a
+// client only ever sees the whole list by following meta.next_cursor. Two
+// failure modes are silent at the tool boundary and both lose records for good:
+// a continuation that is dropped on the last page it should have been offered
+// truncates the list, and one that is offered on the last page hands the client
+// a cursor onto an empty page. Walking a multi-page list to exhaustion and
+// comparing the records to the sealed list catches both.
+// ---------------------------------------------------------------------------
+// The live view of a run.
+// ---------------------------------------------------------------------------
+
+// TestRefreshReportsStagesLive drives one codectx_refresh_index call while the
+// run publishes finished stages, over a real client session, and asserts the
+// rule a client driving a progress bar depends on.
+//
+// Failure mode: the bar goes backwards, repeats a value, floods, or keeps
+// moving after the run is over -- any of which makes the figure unusable
+// without the client knowing it. The rate limit must cost a NOTIFICATION and
+// never a count, so a value a client sees is always the true number of
+// finished top-level stages; and a client that passed no progress token must
+// be sent nothing at all, so following progress stays something a client asks
+// for rather than something it is charged.
+func TestRefreshReportsStagesLive(t *testing.T) {
+	// settle is how long a row is given to cross the in-memory transport and
+	// be recorded by the client. It is a test's own pause, not a product
+	// timeout: the rule under test is about ORDER and VALUES, and a row that
+	// took longer than this would fail the row's counts rather than pass it.
+	const settle = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name         string
+		token        any
+		wantProgress bool
+	}{
+		{name: "a progress token is followed", token: "run-1", wantProgress: true},
+		{name: "no progress token means no progress notifications", token: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu       sync.Mutex
+				progress []mcp.ProgressNotificationParams
+				logs     []mcp.LoggingMessageParams
+			)
+			// The rows the run publishes. Only the top-level ones move the
+			// bar; the nested one is a stage of the same run and must not.
+			nested := int64(0)
+			rows := []model.StageRecord{
+				{RunID: indexRunID, Seq: 0, Stage: "walk", WallMS: 10, Outcome: "ok", ItemsIn: 12, ItemsOut: 12},
+				{RunID: indexRunID, Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", WallMS: 20, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 2, ParentSeq: &nested, Stage: "parse", WallMS: 5, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 3, Stage: "seal", WallMS: 30, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 4, Stage: "activation", WallMS: 1, Outcome: "ok"},
+			}
+			var publish func(model.StageRecord)
+			f := &fakeServices{}
+			f.refreshFn = func(_ context.Context, _ model.IndexRequest) (model.IndexResult, error) {
+				// One row, then a pause long enough for the notification it
+				// causes to cross the in-memory transport. The first one is
+				// not rate limited.
+				publish(rows[0])
+				time.Sleep(settle)
+				// These three fall inside the same interval as the first, so
+				// they are reported by the NEXT notification's value and not
+				// by three more notifications.
+				publish(rows[1])
+				publish(rows[2])
+				publish(rows[3])
+				time.Sleep(progressInterval)
+				publish(rows[4])
+				time.Sleep(settle)
+				return model.IndexResult{FilesParsed: 12}, nil
+			}
+			s, hook := newSpanTestServer(f, func() (string, bool) { return indexRunID, true })
+			publish = hook
+			c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, &mcp.ClientOptions{
+				ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+					mu.Lock()
+					progress = append(progress, *req.Params)
+					mu.Unlock()
+				},
+				LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
+					mu.Lock()
+					logs = append(logs, *req.Params)
+					mu.Unlock()
+				},
+			})
+			cs := connectClient(t, s, c)
+			params := &mcp.CallToolParams{Name: "codectx_refresh_index", Arguments: emptyInput{}}
+			// The level a client wants travels on the request itself, beside
+			// the progress token: under the protocol this session negotiates,
+			// a call's own _meta level is what decides whether the server's
+			// log messages are sent, and a session-wide logging/setLevel is
+			// replaced by it on every request. Asking here is therefore how a
+			// client asks at all.
+			params.SetMeta(map[string]any{mcp.MetaKeyLogLevel: "info"})
+			if tc.token != nil {
+				params.SetProgressToken(tc.token)
+			}
+			res, err := cs.CallTool(t.Context(), params)
+			if err != nil {
+				t.Fatalf("tools/call codectx_refresh_index raised a protocol error: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("refresh_index reported a tool error: %s", firstText(res))
+			}
+			// A stage published after the run answered must reach nobody.
+			publish(model.StageRecord{RunID: indexRunID, Seq: 5, Stage: "retention", WallMS: 2, Outcome: "ok"})
+			time.Sleep(settle)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if !tc.wantProgress {
+				if len(progress) != 0 {
+					t.Fatalf("a call that passed no progress token was sent %d progress notifications", len(progress))
+				}
+				if len(logs) != 5 {
+					t.Errorf("log messages = %d, want the 5 stages published during the call", len(logs))
+				}
+				return
+			}
+			if len(progress) != 2 {
+				t.Fatalf("progress notifications = %d, want 2: one per interval, and none after the run answered", len(progress))
+			}
+			last := 0.0
+			for i, p := range progress {
+				if p.ProgressToken != tc.token {
+					t.Errorf("progress[%d] token = %v, want the token the client passed %v", i, p.ProgressToken, tc.token)
+				}
+				if p.Progress <= last {
+					t.Fatalf("progress[%d] = %v, which does not increase on %v: a bar that goes backwards or stands still",
+						i, p.Progress, last)
+				}
+				if p.Total != 0 {
+					t.Errorf("progress[%d] carried total %v; the number of stages a run will open is not known to a finished stage",
+						i, p.Total)
+				}
+				if p.Message == "" {
+					t.Errorf("progress[%d] carried no message; a client shows the stage that finished", i)
+				}
+				last = p.Progress
+			}
+			// The rate limit cost a notification, not a count: three more
+			// top-level stages finished inside the first interval, and the
+			// next value accounts for all of them.
+			if progress[0].Progress != 1 || progress[1].Progress != 4 {
+				t.Errorf("progress values = %v then %v, want 1 then 4: every finished top-level stage counted, the nested one not",
+					progress[0].Progress, progress[1].Progress)
+			}
+			if len(logs) != 5 {
+				t.Fatalf("log messages = %d, want one per stage published during the call and none after", len(logs))
+			}
+			if logs[0].Level != "info" {
+				t.Errorf("log level = %q, want info", logs[0].Level)
+			}
+			var row model.StageRecord
+			raw, err := json.Marshal(logs[0].Data)
+			if err != nil {
+				t.Fatalf("re-marshal the log message data: %v", err)
+			}
+			if err := json.Unmarshal(raw, &row); err != nil {
+				t.Fatalf("a log message did not carry a stage row as structured data: %v", err)
+			}
+			if row.Stage != rows[0].Stage || row.WallMS != rows[0].WallMS || row.ItemsIn != rows[0].ItemsIn {
+				t.Errorf("logged row = %+v, want the published row %+v", row, rows[0])
+			}
+		})
+	}
+}
+
+// indexRunID and overlayRunID are the two runs one process records at the same
+// time: the indexing run a client's call is following, and the per-process
+// overlay run a language server's start hangs under.
+const (
+	indexRunID   = "1111111111111111111111111111111111111111111111111111111111111111"
+	overlayRunID = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
+// TestAnotherRunsStageDoesNotAdvanceThisRunsProgress guards the truthfulness
+// of the progress a client drives its bar with.
+//
+// Failure mode: under `mcp serve` one process records BOTH runs, and a
+// language server that starts while an index is going publishes a top-level
+// stage of its own. Counted, it advances the bar of a run it has nothing to do
+// with -- the client is told that work it asked about got further than it did,
+// and the protocol's increasing-progress contract cannot tell the two apart.
+// The overlay stage here finishes BEFORE the indexing run is even open, which
+// is what a reporter that simply followed the first row it saw would latch on.
+func TestAnotherRunsStageDoesNotAdvanceThisRunsProgress(t *testing.T) {
+	const settle = 300 * time.Millisecond
+	var (
+		mu       sync.Mutex
+		progress []mcp.ProgressNotificationParams
+	)
+	// The client's call, and its progress token, arrive before the coordinator
+	// opens the run: until it does, the process is recording no indexing run.
+	var opened atomic.Bool
+	var publish func(model.StageRecord)
+	index := func(seq int64, stage string) model.StageRecord {
+		return model.StageRecord{RunID: indexRunID, Seq: seq, Stage: stage, WallMS: 5, Outcome: "ok"}
+	}
+	overlay := func(seq int64) model.StageRecord {
+		return model.StageRecord{RunID: overlayRunID, Seq: seq, Stage: "server_start", WallMS: 5, Outcome: "ok"}
+	}
+	f := &fakeServices{}
+	f.refreshFn = func(_ context.Context, _ model.IndexRequest) (model.IndexResult, error) {
+		publish(overlay(0))
+		opened.Store(true)
+		publish(index(0, "capture"))
+		time.Sleep(settle)
+		publish(overlay(1))
+		publish(index(1, "walk"))
+		time.Sleep(progressInterval)
+		publish(index(2, "activation"))
+		time.Sleep(settle)
+		return model.IndexResult{}, nil
+	}
+	s, hook := newSpanTestServer(f, func() (string, bool) {
+		if !opened.Load() {
+			return "", false
+		}
+		return indexRunID, true
+	})
+	publish = hook
+	c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			progress = append(progress, *req.Params)
+			mu.Unlock()
+		},
+	})
+	cs := connectClient(t, s, c)
+	params := &mcp.CallToolParams{Name: "codectx_refresh_index", Arguments: emptyInput{}}
+	params.SetProgressToken("run-1")
+	res, err := cs.CallTool(t.Context(), params)
+	if err != nil {
+		t.Fatalf("tools/call codectx_refresh_index raised a protocol error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("refresh_index reported a tool error: %s", firstText(res))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(progress) != 2 {
+		t.Fatalf("progress notifications = %d, want 2: one per interval over the indexing run's three stages", len(progress))
+	}
+	// Three indexing stages finished and two overlay ones did. The figures the
+	// client saw count the first and none of the second.
+	if progress[0].Progress != 1 || progress[1].Progress != 3 {
+		t.Errorf("progress values = %v then %v, want 1 then 3: a stage of another run of this process advanced the bar of the run the client asked about",
+			progress[0].Progress, progress[1].Progress)
+	}
+}
+
+// newSpanTestServer builds a server whose span source is the returned
+// function, which is what an indexing run's collector calls as each stage
+// finishes.
+func newSpanTestServer(f *fakeServices, indexRun func() (string, bool)) (*mcp.Server, func(model.StageRecord)) {
+	h := newTestHandlers(f)
+	var publish func(model.StageRecord)
+	s, err := New(Options{
+		Index:    h.index,
+		Explore:  h.explore,
+		Context:  h.context,
+		Config:   h.cfg,
+		Build:    h.build,
+		Logger:   h.log,
+		Spans:    func(fn func(model.StageRecord)) { publish = fn },
+		IndexRun: indexRun,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return s.mcp, func(row model.StageRecord) { publish(row) }
+}
+
+func TestCapsuleCursorWalkReachesEveryRecord(t *testing.T) {
+	sessionID := model.SessionID(strings.Repeat("a", 64))
+	sealed := make([]model.FactReference, 5)
+	for i := range sealed {
+		sealed[i] = model.FactReference{
+			RelationID:    model.RelationID(strings.Repeat(strconv.Itoa(i), 64)),
+			ObservationID: model.ObservationID(strings.Repeat("b", 63) + strconv.Itoa(i)),
+		}
+	}
+	const pageSize = 2
+	f := &fakeServices{capsuleFn: func(_ context.Context, r model.CapsuleRequest) (model.CapsulePage, error) {
+		start := 0
+		if r.Page.Cursor != "" {
+			for i, fact := range sealed {
+				if string(fact.ObservationID) == r.Page.Cursor {
+					start = i + 1
+					break
+				}
+			}
+		}
+		end := min(start+pageSize, len(sealed))
+		page := model.CapsulePage{
+			SessionID: sessionID, View: r.View,
+			ManifestHash:  strings.Repeat("d", 64),
+			CanonicalHash: strings.Repeat("e", 64),
+			AcceptedFacts: sealed[start:end],
+		}
+		if end < len(sealed) {
+			page.Meta.NextCursor = string(sealed[end-1].ObservationID)
+		}
+		return page, nil
+	}}
+	cs := connectSession(t, newTestServer(f), true)
+
+	var walked []model.FactReference
+	cursor := ""
+	for calls := 0; ; calls++ {
+		if calls > len(sealed) {
+			t.Fatalf("the capsule walk made %d calls for %d records; the continuation does not terminate", calls, len(sealed))
+		}
+		res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{
+			Name: "codectx_context_capsule",
+			Arguments: model.CapsuleRequest{
+				SessionID: sessionID, ActorID: "actor-1",
+				View: model.CapsuleViewAcceptedFacts,
+				Page: model.PageRequest{Limit: pageSize, Cursor: cursor},
+			},
+		})
+		if err != nil {
+			t.Fatalf("tools/call codectx_context_capsule after %q: %v", cursor, err)
+		}
+		if res.IsError {
+			t.Fatalf("codectx_context_capsule after %q reported a tool error: %s", cursor, firstText(res))
+		}
+		var got result[capsuleOutput]
+		decode(t, res, &got)
+		if got.Data.Page == nil {
+			t.Fatalf("a capsule view answered with no page after %q", cursor)
+		}
+		if len(got.Data.Page.AcceptedFacts) == 0 {
+			t.Fatalf("the continuation %q fetched an empty page; a cursor is offered only when records remain", cursor)
+		}
+		walked = append(walked, got.Data.Page.AcceptedFacts...)
+		if got.Data.Page.Meta.NextCursor == "" {
+			break
+		}
+		cursor = got.Data.Page.Meta.NextCursor
+	}
+	if !slices.EqualFunc(walked, sealed, func(a, b model.FactReference) bool {
+		return a.RelationID == b.RelationID && a.ObservationID == b.ObservationID
+	}) {
+		t.Fatalf("the walk read %d records, the capsule sealed %d: %+v", len(walked), len(sealed), walked)
 	}
 }

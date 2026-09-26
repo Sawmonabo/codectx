@@ -17,6 +17,12 @@ const (
 	domainWorkspaceKey   = "workspace-key-v1"
 )
 
+// The domains keep their v1 suffix through the unlimited-defaults change: the
+// SET of components each fingerprint covers is unchanged, only the value of
+// some of them and the spelling an absent bound renders to. That is a
+// configuration change like any other, which is exactly what these hashes exist
+// to detect; a new domain would instead declare the old hashes uninterpretable.
+
 // SourcePolicyHash is the source eligibility and byte policy that feeds
 // SnapshotID: exactly the settings that decide which files are captured. An
 // analysis admission limit is deliberately absent, because raising it must not
@@ -27,7 +33,17 @@ func (c Config) SourcePolicyHash() string {
 		quoteBool(c.Workspace.IncludeUntracked),
 		quoteBool(c.Workspace.IndexGenerated),
 		quoteBool(c.Workspace.IndexVendor),
-		quoteInt(c.Workspace.MaxFiles),
+		quoteLimit(c.Workspace.MaxFiles),
+		// The three traversal bounds are MaxFiles' siblings: each decides which
+		// files the walk reaches. A user-set MaxDirEntries leaves the entries of
+		// a wide directory out of the capture, MaxDepth leaves a deep subtree
+		// out, and an exceeded MaxIgnoredRoots degrades the policy to the base
+		// one, which walks trees the ignore set would have excluded. All three
+		// change the captured file set from the same bytes, so they belong to
+		// the snapshot's identity rather than to the analysis key.
+		quoteLimit(c.Workspace.MaxDirEntries),
+		quoteLimit(c.Workspace.MaxDepth),
+		quoteLimit(c.Workspace.MaxIgnoredRoots),
 		// The toggles above select built-in classification lists, so the lists
 		// themselves are policy: a build shipping a different one captures a
 		// different set of files from the same bytes.
@@ -45,8 +61,8 @@ func (c Config) SourcePolicyHash() string {
 // excluded: they change how the work is scheduled, never what it concludes.
 func (c Config) AnalysisConfigHash() string {
 	h := model.NewHasher(domainAnalysisConfig)
-	h.AddString(quoteInt(c.Workspace.MaxParseFileBytes))
-	h.AddString(quoteInt(c.Workspace.MaxSearchFileBytes))
+	h.AddString(quoteLimit(c.Workspace.MaxParseFileBytes))
+	h.AddString(quoteLimit(c.Workspace.MaxSearchFileBytes))
 	h.AddString(quoteBool(c.Providers.TreeSitter.Enabled))
 	// The language list is a set: two files differing only in its order select
 	// the same grammars and must not invalidate every unit.
@@ -57,8 +73,43 @@ func (c Config) AnalysisConfigHash() string {
 		h.AddString(lang)
 	}
 	h.AddString(c.Providers.SCIP.Enabled.String())
+	// The three SCIP bounds that change which facts are emitted, exactly as
+	// workspace.max_parse_file_bytes above does: a user-set value leaves a
+	// document's source unread, leaves a file out of the private
+	// materialization, or leaves a C/C++ compilation database un-normalized,
+	// which costs that unit its whole run. The other four providers.scip
+	// bounds are reporting thresholds that cut nothing, so they are
+	// deliberately absent: adjusting one must not invalidate an index.
+	h.AddString(quoteLimit(c.Providers.SCIP.MaxSourceFileBytes))
+	h.AddString(quoteLimit(c.Providers.SCIP.MaxMaterializeBytes))
+	h.AddString(quoteLimit(c.Providers.SCIP.MaxManifestBytes))
+	// The manifest list bounds and the tree-sitter callee bound cut FACTS: a
+	// unit sealed under a user-set value published a shorter dependency list, a
+	// shorter entry list or fewer callee nodes than the same bytes yield under a
+	// higher one, so raising the bound must invalidate it. The two manifest parse
+	// bounds are here for the same reason: past either one the manifest provider
+	// truncates and flags the unit's facts, so a unit cached under a lower bound
+	// holds fewer dependencies than the same manifest yields under a higher one.
+	// The remaining keys added with them are deliberately absent.
+	// providers.dependence.max_export_files REFUSES an import rather than cutting
+	// it, and a failed unit is never reused as a complete one;
+	// index.capture_max_retries, index.capture_retry_deadline and
+	// index.watch_max_directories are scheduling and coverage policy, which
+	// changes how the work is driven and never what it concludes.
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxDependencies))
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxEntries))
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxTOMLLines))
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxXMLElements))
+	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxCalleeReferences))
+	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxRecordsPerFile))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
+	// index.max_evidence_per_fact cuts evidence rows out of the sealed facts:
+	// a unit sealed under a user-set clip carries fewer occurrences of the same
+	// fact than the same bytes yield under a higher one, so raising it must
+	// invalidate the unit. The rest of the index section is scheduling policy
+	// and stays out.
+	h.AddString(quoteLimit(c.Index.MaxEvidencePerFact))
 	return h.Sum()
 }
 
@@ -72,13 +123,17 @@ func (c Config) ContextPolicyHash() string {
 		quoteInt(c.Context.DefaultMaxBytes),
 		quoteInt(int64(c.Context.DefaultMaxFiles)),
 		quoteInt(int64(c.Context.MaxSlices)),
-		quoteInt(int64(c.Context.MaxGraphDepth)),
-		quoteInt(int64(c.Context.MaxVisitedNodes)),
-		quoteInt(int64(c.Context.MaxGraphEdges)),
-		quoteInt(int64(c.Context.MaxReasonPathsPerEntry)),
-		quoteInt(c.Context.MaxManifestBytes),
-		quoteInt(c.Context.MaxCapsuleBytes),
+		quoteLimit(c.Context.MaxGraphDepth),
+		quoteLimit(c.Context.MaxVisitedNodes),
+		quoteLimit(c.Context.MaxGraphEdges),
+		quoteLimit(c.Context.MaxReasonPathsPerEntry),
+		quoteLimit(c.Context.MaxManifestBytes),
+		quoteLimit(c.Context.MaxCapsuleBytes),
+		quoteLimit(c.Context.MaxCapsuleRecordsPerList),
+		quoteLimit(c.Context.MaxCapsuleCoverageFiles),
 		quoteBool(c.Context.StrictReadGate),
 		quoteBool(c.Context.AllowExploratoryWaiverConsolidation),
+		quoteLimit(c.Context.MaxSeeds),
+		quoteLimit(c.Context.MaxStartNodes),
 	)
 }

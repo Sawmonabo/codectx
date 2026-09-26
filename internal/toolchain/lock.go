@@ -412,7 +412,7 @@ var toolLanguages = map[string][]string{
 	"rust-analyzer":              {"rust"},
 	"gopls":                      {"go"},
 	"typescript-language-server": {"javascript", "tsx", "typescript"},
-	"pyright":                    {"python"},
+	"ty":                         {"python"},
 	"clangd":                     {"c", "cpp"},
 	"jdtls":                      {"java"},
 	"joern":                      {"c", "cpp", "go", "java", "javascript", "python", "rust", "tsx", "typescript"},

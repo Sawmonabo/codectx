@@ -29,7 +29,7 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 		return model.Snapshot{}, err
 	}
 	var snap model.Snapshot
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		var repo []byte
 		var count, bytes int64
 		var created string
@@ -64,7 +64,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 		return model.FileVersion{}, err
 	}
 	var fv model.FileVersion
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND sf.file_id = ?2 LIMIT 1`, snapRaw, fileRaw)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -88,7 +88,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 // walk emits and the manifest hash folds, so a page boundary never reorders or
 // repeats a row. limit is capped at model.MaxPageItems.
 func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPath string, limit int) ([]model.FileVersion, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	snapRaw, err := idBlob("snapshot.id", string(id))
 	if err != nil {
 		return nil, err
@@ -97,7 +97,7 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 		return nil, invalid("after_path is %d bytes, limit %d", len(afterPath), model.MaxPathBytes)
 	}
 	var out []model.FileVersion
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND f.path > ?2 ORDER BY f.path LIMIT ?3`, snapRaw, afterPath, limit)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -120,12 +120,24 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 // blob that is absent, quarantined or in trash is CTX_SOURCE_INTEGRITY: no
 // caller may serve bytes it cannot verify against stored digests.
 func (s *Store) Blob(ctx context.Context, hash string) (model.BlobRecord, error) {
+	var rec model.BlobRecord
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		var err error
+		rec, err = blobRecord(ctx, tx, hash)
+		return err
+	})
+	return rec, err
+}
+
+// blobRecord is Blob's body against an open transaction, so a write path can
+// resolve a blob's integrity metadata without opening a second connection.
+func blobRecord(ctx context.Context, tx *sql.Tx, hash string) (model.BlobRecord, error) {
 	raw, err := idBlob("blob.hash", hash)
 	if err != nil {
 		return model.BlobRecord{}, err
 	}
 	rec := model.BlobRecord{Hash: hash}
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = func() error {
 		var state model.BlobState
 		err := tx.QueryRowContext(ctx, `SELECT size_bytes, state FROM blobs WHERE hash = ?`, raw).Scan(&rec.Size, &state)
 		if isNoRows(err) {
@@ -167,7 +179,7 @@ func (s *Store) Blob(ctx context.Context, hash string) (model.BlobRecord, error)
 			rec.LineCheckpoints = append(rec.LineCheckpoints, model.LineCheckpoint{ByteOffset: uint64(offset), LineNumber: uint32(line), LineStartByte: uint64(start)})
 		}
 		return wrap("line_checkpoints", lines.Err())
-	})
+	}()
 	if err != nil {
 		return model.BlobRecord{}, err
 	}

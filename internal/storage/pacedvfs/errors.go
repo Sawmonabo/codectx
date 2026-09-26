@@ -1,0 +1,50 @@
+package pacedvfs
+
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+)
+
+var (
+	errNoDefault = errors.New("paced: the engine has no default file system to wrap")
+	errNoMemory  = errors.New("paced: out of memory registering the file system")
+)
+
+func registrationError(rc int32) error {
+	return fmt.Errorf("paced: the engine refused the file system (result code %d)", rc)
+}
+
+// windows counts the waits issued so far and logBytes the bytes written to a
+// write-ahead log through this file system. The space this file system frees
+// is not counted here: it goes to internal/paced, where every byte the
+// process gives back is counted once whatever released it.
+var (
+	windows  atomic.Int64
+	logBytes atomic.Int64
+	// truncations counts the windowed steps a shortening took. Nothing
+	// discloses it -- what an operator reads is bytes, paced.FreedBytes --
+	// but whether a shortening stepped at all is the difference between
+	// freeing a window at a time and freeing in a burst, which the bytes
+	// alone cannot show.
+	truncations atomic.Int64
+)
+
+// Windows reports how many window waits this file system has issued since the
+// process started: one per window of bytes written to a file through it. It is
+// what says the shim is between the engine and the disk -- a database opened
+// before the registration writes through the engine's own file system and
+// moves nothing here -- so a package that opens its own database asserts on it
+// rather than on the order its packages happened to initialize in.
+func Windows() int64 { return windows.Load() }
+
+// LogBytes reports the bytes written to a write-ahead log through this file
+// system since the process started. It is the store's spill signal: nothing
+// reaches the log while a group's dirty pages fit the writer's page cache, so
+// a group that has moved this figure is one the cache has begun spilling. The
+// log's own size cannot say that any more, because the log is rewound in
+// place and keeps its high-water length, so a spill that fits inside it
+// changes neither its size nor its header. The count is the process's, not
+// one database's: a second store's log moves it too, which can only make a
+// group commit earlier than it had to, never later than it must.
+func LogBytes() int64 { return logBytes.Load() }

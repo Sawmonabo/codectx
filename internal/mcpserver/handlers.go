@@ -31,12 +31,22 @@ type handlers struct {
 	context app.ContextService
 
 	// cfg carries the Section 20 bounds. L1's limitMiddleware reads
-	// resources.max_metadata_response_bytes, max_concurrent_queries,
-	// max_concurrent_graph_queries and query_timeout from it; L4's readSource
+	// resources.max_metadata_response_bytes and query_timeout from it, and the
+	// two gate sizes from the machine's cores; L4's readSource
 	// reads max_source_response_bytes.
 	cfg   config.Config
 	build model.BuildInfo
 	log   *slog.Logger
+
+	// spans fans the finished stages of an indexing run out to the calls
+	// that are listening (progress.go). Nil is a server built without a span
+	// source, and watchSpans answers with a no-op rather than a guard at
+	// every call site.
+	spans *spanHub
+	// indexRun names the indexing run this process is recording, so a call
+	// following one counts its stages and not the stages of the per-process
+	// overlay run recorded beside it. It is set exactly when spans is.
+	indexRun func() (string, bool)
 }
 
 // The frozen per-tool method set. Every name below is registered by
@@ -101,9 +111,15 @@ type graphInput struct {
 
 // planOutput shows the manifest and the opened session's status together, so
 // `context_plan` needs no second round trip — the facade returns both.
+//
+// Status is a POINTER because a truncated plan (ruling C9) opened no session:
+// the compile stopped at a pass boundary and answered a continuation cursor
+// instead. A zero SessionStatus on the wire there would show a client a blank
+// session id, an empty phase and a "not ready" gate as though a real session
+// had been opened and found wanting, so the field is absent instead.
 type planOutput struct {
-	Plan   model.PlanResult    `json:"plan"`
-	Status model.SessionStatus `json:"status"`
+	Plan   model.PlanResult     `json:"plan"`
+	Status *model.SessionStatus `json:"status,omitempty"`
 }
 
 // statusInput pages coverage for one session. Session and actor are TOOL
@@ -141,31 +157,32 @@ type advanceOutput struct {
 }
 
 // capsuleOutput is exactly one of its two fields. The six model.CapsuleView
-// values return the bounded page; view="export" returns the metadata
-// projection.
+// values return one keyset page of that one list, whose next cursor travels in
+// the page's meta; view="export" returns the identity-and-counts projection.
 type capsuleOutput struct {
 	Page   *model.CapsulePage `json:"page,omitempty"`
 	Export *capsuleExport     `json:"export,omitempty"`
 }
 
 // capsuleExport is the canonical export METADATA projection and NEVER the
-// capsule body. A capsule is bounded by context.max_capsule_bytes at 8 MiB
-// against a resources.max_metadata_response_bytes ceiling of 256 KiB, so
-// returning model.Capsule whole over this tool could not honour the response
-// bound. Section 19.2's "bounded capsule page or canonical export metadata" is
-// this field set: identity, binding, both hashes, the scope version, the
-// strict-gate flag, per-section counts and the creation time — everything
-// needed to verify or fetch an export, and no capsule content.
+// capsule body. A sealed capsule's records are rows of their own and there is
+// no bound on how many a session may record, so returning them whole over this
+// tool could never honour the resources.max_metadata_response_bytes ceiling.
+// Section 19.2's "bounded capsule page or canonical export metadata" is this
+// field set: identity, binding, both hashes, the scope version, the strict-gate
+// flag, per-list counts and the creation time — everything needed to verify or
+// fetch an export, and no capsule content. The records are read a page at a
+// time through the tool's six view spellings and their cursors.
 type capsuleExport struct {
-	SessionID           model.SessionID `json:"session_id"`
-	ActorID             string          `json:"actor_id"`
-	Binding             model.Binding   `json:"binding"`
-	ManifestHash        string          `json:"manifest_hash"`
-	CanonicalHash       string          `json:"canonical_hash"`
-	ScopeVersion        int             `json:"scope_version"`
-	StrictGateSatisfied bool            `json:"strict_gate_satisfied"`
-	Counts              map[string]int  `json:"counts"`
-	CreatedAt           time.Time       `json:"created_at"`
+	SessionID           model.SessionID  `json:"session_id"`
+	ActorID             string           `json:"actor_id"`
+	Binding             model.Binding    `json:"binding"`
+	ManifestHash        string           `json:"manifest_hash"`
+	CanonicalHash       string           `json:"canonical_hash"`
+	ScopeVersion        int              `json:"scope_version"`
+	StrictGateSatisfied bool             `json:"strict_gate_satisfied"`
+	Counts              map[string]int64 `json:"counts"`
+	CreatedAt           time.Time        `json:"created_at"`
 }
 
 // closeInput carries the optimistic-concurrency version the facade's

@@ -1,0 +1,140 @@
+package diagnostics
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
+)
+
+// TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor is what makes the
+// reuse design checkable from outside the process.
+//
+// A run that reuses its working files instead of freeing them reports a small
+// freed_bytes. On its own that reads as a run that did little work. The disk
+// those files hold has to be disclosed beside it, or the figure that matters
+// is invisible: scratch_bytes is the space the store is keeping precisely so
+// it never has to free it.
+//
+// It has to be the sum over EVERY pool. A store's surfaces are pooled under
+// more than one directory -- the data directory, the continuation store's, a
+// provider's work directory -- so a block that reported one of them would
+// understate what the run is holding, which is the one direction this figure
+// must never err in.
+//
+// And freed_by_purpose is what keeps the small freed_bytes honest: it says the
+// freeing that did happen was an analyzer's output or a copied source tree,
+// never a working file the run will need again.
+//
+// The two freeing figures must be the same counter read two ways. Counted in
+// whole windows, freed_bytes reported nothing at all for a removal of files
+// smaller than the window -- the shape a materialized tree of source files has
+// -- while freed_by_purpose reported their exact lengths beside it, so the
+// block contradicted itself about the one thing it exists to disclose.
+//
+// Mutation: sum one arena instead of scratch.All(), drop the per-purpose map,
+// or round freed_bytes down to whole windows, and this fails.
+func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
+	const each = 128 << 10
+	var held int64
+	// Two directories, and the import staging surface among them: it is the
+	// largest single file the product writes, and while it was pooled outside
+	// the arena the figure whose own comment says a partial sum "is the one
+	// thing this figure exists to rule out" did not count it at all.
+	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.ImportStaging} {
+		lease, f, err := scratch.For(t.TempDir()).TakeFile(p)
+		if err != nil {
+			t.Fatalf("take %s: %v", p, err)
+		}
+		if _, err := f.Write(make([]byte, each)); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		lease.Release()
+		held += each
+	}
+
+	// A foreign writer's output, which is removed rather than pooled.
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "index"), make([]byte, 64<<10), 0o600); err != nil {
+		t.Fatalf("write output: %v", err)
+	}
+	if err := paced.RemoveAllFor(paced.AnalyzerOutput, out); err != nil {
+		t.Fatalf("remove output: %v", err)
+	}
+
+	res, err := newTestService(t, Options{}).Resources(context.Background())
+	if err != nil {
+		t.Fatalf("Resources: %v", err)
+	}
+	if res.ScratchBytes == nil {
+		t.Fatal("the resources block reports no scratch_bytes; the disk the run is holding instead of freeing is undisclosed")
+	}
+	if got := int64(*res.ScratchBytes); got < held {
+		t.Fatalf("scratch_bytes is %d with %d bytes pooled under two directories: the block is summing one pool and understating what the run holds", got, held)
+	}
+	n, ok := res.FreedByPurpose[string(paced.AnalyzerOutput)]
+	if !ok {
+		t.Fatalf("freed_by_purpose does not account %s; a small freed_bytes with no breakdown cannot be told from a run that froze", paced.AnalyzerOutput)
+	}
+	if n < 64<<10 {
+		t.Fatalf("freed_by_purpose accounts %d bytes of %s, want at least the %d removed", n, paced.AnalyzerOutput, 64<<10)
+	}
+	if res.FreedBytes == nil {
+		t.Fatal("the resources block reports no freed_bytes beside a breakdown of what was freed")
+	}
+	if got := uint64(*res.FreedBytes); got < n {
+		t.Fatalf("freed_bytes is %d while freed_by_purpose accounts %d for %s alone: the whole and its labelled part are not the same counter, so one of them is wrong",
+			got, n, paced.AnalyzerOutput)
+	}
+}
+
+// refusingLedger answers every read with the typed refusal a schema-mismatched
+// or corrupt run ledger produces, remediation and all.
+type refusingLedger struct{}
+
+func (refusingLedger) LatestRun(context.Context, model.RepositoryID, model.GenerationID) (
+	*model.RunRecord, []model.StageRecord, int64, error) {
+	return nil, nil, 0, &model.Error{Code: model.CodeSchemaMismatch,
+		Message:     "the run ledger was written by a different schema",
+		Remediation: "remove the ledger beside the store; the next run writes a new one"}
+}
+
+// The requirement: a resource block that could not read something says so.
+//
+// A schema-mismatched or corrupt run ledger produces a typed error with its own
+// remediation, and the block dropped it: no run rows, no warning, no log line,
+// exit 0. That is byte for byte the block a workspace that has never indexed
+// produces, so an operator diagnosing a problem could not tell "nothing ever
+// recorded a run here" from "your accounting file is unreadable, and here is
+// what to do about it".
+//
+// The figures themselves still stand -- the host readings the sampler produced
+// are true whatever the ledger says -- so this is a warning beside them and not
+// a failure of the call.
+//
+// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
+//
+// Mutation: restore `if err != nil || run == nil { return }` in runLedger and
+// the block comes back with no warnings at all.
+func TestAnUnreadableRunLedgerIsDisclosedRatherThanDropped(t *testing.T) {
+	res, err := newTestService(t, Options{Ledger: refusingLedger{}}).Resources(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable run ledger failed the whole resource block: %v", err)
+	}
+	if res.Run != nil {
+		t.Fatalf("an unreadable ledger produced a run row: %+v", res.Run)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("the block carries %d warnings; want exactly the unreadable ledger", len(res.Warnings))
+	}
+	for _, want := range []string{model.CodeSchemaMismatch, "remove the ledger"} {
+		if !strings.Contains(res.Warnings[0], want) {
+			t.Fatalf("the warning %q does not carry %q: an operator cannot act on it", res.Warnings[0], want)
+		}
+	}
+}

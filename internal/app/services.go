@@ -10,6 +10,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workflow"
 )
@@ -48,11 +49,39 @@ import (
 // request is reading.
 type Services struct {
 	w *Workspace
+	// read routes the question-answering half of this facade through the
+	// composition's reader handle. See Workspace.ReadServices.
+	read bool
 }
 
 // Services is the one accessor Tasks 18 and 19 call. It is cheap: the services
 // it routes to were composed when the workspace opened.
 func (w *Workspace) Services() *Services { return &Services{w: w} }
+
+// ReadServices is the same facade with its ExploreService half bound to the
+// composition's READER handle. It exists for the one process that indexes and
+// answers questions at the same time: the MCP server, whose codectx_refresh_index
+// holds an ingestion group open while an agent calls codectx_search beside it.
+// Through Services that search pinned a generation on the writing handle, and a
+// pin writes a retention lease -- so the tool call force-committed the refresh's
+// group and then queued behind the writer. Through ReadServices it reaches no
+// write transaction at all.
+//
+// In every composition but the server's the reader handle IS the writing one,
+// so this returns the same behaviour as Services: nothing else needs to know
+// which process it is in.
+//
+// Only the read half is affected. Index, Refresh and the whole ContextService
+// record rows and stay on the writer, which is what they are for.
+func (w *Workspace) ReadServices() *Services { return &Services{w: w, read: true} }
+
+// searchService is the search half of whichever handle this facade is bound to.
+func (s *Services) searchService() *search.Service {
+	if s.read {
+		return s.w.s.querySearch
+	}
+	return s.w.s.search
+}
 
 // The four interfaces are asserted against *Services here rather than at each
 // consumer, so a signature that drifts fails in this package instead of in the
@@ -105,6 +134,8 @@ type ContextService interface {
 	Advance(ctx context.Context, req model.AdvanceRequest) (model.WorkflowStatus, model.SessionStatus, error)
 	Capsule(ctx context.Context, req model.CapsuleRequest) (model.CapsulePage, error)
 	Export(ctx context.Context, req model.SessionRequest) (model.Capsule, error)
+	CapsuleRows(ctx context.Context, req model.SessionRequest, list model.CapsuleList,
+		after string, limit int) ([]model.CapsuleRow, string, error)
 	CloseSession(ctx context.Context, req model.SessionRequest, expectedVersion int) (model.SessionStatus, error)
 }
 
@@ -166,11 +197,19 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 // caller asked for resources, so answering without them would report a
 // measurement as absent when it was refused. Absence inside the block still
 // means "not measurable on this host", which is the sampler's own contract.
+//
+// It answers through the composition's query handle, which is a SECOND,
+// read-only handle only where the composition has one -- the serving process,
+// which both answers and builds. In every other composition that handle is the
+// composition's own store, so what this guarantees is not a separate
+// connection but that the MCP status tool, registered against the writing
+// facade beside refresh, does not pin on the writer and commit that refresh's
+// ingestion group early.
 func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.IndexStatus{}, err
 	}
-	st, err := s.w.coord.Status(ctx)
+	st, err := s.w.status.Status(ctx)
 	if err != nil {
 		return model.IndexStatus{}, s.fail("index status", err)
 	}
@@ -221,7 +260,7 @@ func (s *Services) Search(ctx context.Context, req model.SearchRequest) (model.P
 	if err := req.Validate(); err != nil {
 		return model.Page[model.SearchHit]{}, err
 	}
-	page, err := s.w.s.search.Search(ctx, req)
+	page, err := s.searchService().Search(ctx, req)
 	if err != nil {
 		return model.Page[model.SearchHit]{}, s.fail("search", err)
 	}
@@ -241,7 +280,7 @@ func (s *Services) Symbol(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	switch req.SemanticSource {
 	case model.SemanticCanonical:
-		page, err := s.w.s.search.Resolve(ctx, req)
+		page, err := s.searchService().Resolve(ctx, req)
 		if err != nil {
 			return model.Page[model.Node]{}, s.fail("symbol", err)
 		}
@@ -327,7 +366,7 @@ func (s *Services) Path(ctx context.Context, req model.PathRequest) (model.PathR
 //
 // It returns the engine's whole model.ImpactResult rather than a page of its
 // entries. L0 froze this method as model.Page[model.ImpactEntry]; INT changed
-// it (wave-e ruling "Rulings on L7 FACADE deviations", D3) because the result
+// it (the ruling "Rulings on L7 FACADE deviations", D3) because the result
 // also carries the per-package rollup and the visited/edge accounting that
 // `codectx impact` already prints, and model.Page has no home for either. A
 // facade that silently dropped them would make the facade path a downgrade from
@@ -358,14 +397,34 @@ func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.I
 // publishes the manifest on its own and OpenSession is idempotent per actor and
 // idempotency key, so a session that fails to open leaves a reusable manifest
 // rather than a half-written one.
+//
+// The compile is CONTINUABLE (rulings C7 and C9): when it runs out of query
+// deadline it ends the pass it is in and answers a truncated PlanResult
+// carrying the token the caller presents back as PlanRequest.Cursor. No session
+// is opened on that path -- see the truncation branch below.
 func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanResult, model.SessionStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, err
 	}
-	manifest, err := s.w.Compile(ctx, req.Context)
+	res, err := s.w.CompilePage(ctx, req.Context, req.Cursor)
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
+	// Ruling C9: a compile that ended at a pass boundary is returned BEFORE any
+	// session is opened. There is no manifest for a session to bind to -- a
+	// partial plan is never persisted -- so opening one here would leave a
+	// session row pointing at a manifest that does not exist, and the actor
+	// would have to close it before continuing. The status is the zero one on
+	// purpose: there is no session to describe yet.
+	if res.Truncated {
+		return model.PlanResult{
+			ActorID:          req.ActorID,
+			Truncated:        true,
+			TruncationReason: res.TruncationReason,
+			NextCursor:       res.NextCursor,
+		}, model.SessionStatus{}, nil
+	}
+	manifest := res.Manifest
 	id, err := s.w.s.coverage.OpenSession(ctx, req, manifest.ID)
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
@@ -555,6 +614,29 @@ func (s *Services) Export(ctx context.Context, req model.SessionRequest) (model.
 	return capsule, nil
 }
 
+// CapsuleRows reads one keyset page of one sealed capsule list and the cursor
+// that continues it.
+//
+// Export answers a capsule's identity and per-list counts; its records are
+// rows. A caller that must render the capsule whole -- `codectx context export`
+// is the only one -- walks each list through this call, so the records held in
+// this process are one page's worth however large the session was.
+func (s *Services) CapsuleRows(ctx context.Context, req model.SessionRequest, list model.CapsuleList,
+	after string, limit int) ([]model.CapsuleRow, string, error) {
+	if err := req.Validate(); err != nil {
+		return nil, "", err
+	}
+	wf, err := s.workflow()
+	if err != nil {
+		return nil, "", err
+	}
+	rows, next, err := wf.CapsuleRows(ctx, req, list, after, limit)
+	if err != nil {
+		return nil, "", s.fail("context export", err)
+	}
+	return rows, next, nil
+}
+
 // CloseSession closes the session under the caller's expected version.
 //
 // It spends two calls on purpose. The transition is the workflow service's,
@@ -642,18 +724,24 @@ func (s *Services) workflow() (*workflow.Service, error) {
 }
 
 // withEngine builds the graph engine for the pinned generation, runs one query
-// against it and releases the reader's lease on every path. A release failure
-// is reported only when the query itself succeeded: the query's own failure is
-// the one the caller needs.
+// against it and releases the reader's lease on every path.
+//
+// A release failure NEVER becomes the answer. The page is already computed and
+// correct by the time the lease is dropped, so promoting the release error
+// turned a good answer -- entries, cursor and all -- into a failed query and
+// left the caller nothing to page from; and when the query had failed too, the
+// release error was dropped silently. It is reported on the operator channel
+// instead, the same way a continuation lease that cannot be released is.
 func (s *Services) withEngine(ctx context.Context, gen model.GenerationID,
-	query func(*graph.Engine) error) (err error) {
-	engine, release, err := s.w.Query(ctx, gen)
+	query func(*graph.Engine) error) error {
+	engine, release, err := s.w.query(ctx, gen, s.read)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := release(); cerr != nil && err == nil {
-			err = cerr
+		if cerr := release(); cerr != nil {
+			s.w.s.logger.Warn("a pinned query lease could not be released",
+				"component", "app", "error", cerr.Error())
 		}
 	}()
 	return query(engine)

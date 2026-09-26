@@ -89,125 +89,10 @@ func batchBlobs(field string, ids []string) ([]any, error) {
 	return out, nil
 }
 
-// kindMarks binds the relation kind filter, rejecting an unknown kind rather
-// than silently matching nothing.
-func kindMarks(b *binder, kinds []model.RelationKind) (string, error) {
-	if len(kinds) == 0 {
-		return "", nil
-	}
-	if len(kinds) > model.MaxFilterValues {
-		return "", invalid("relation filter has %d kinds, limit %d", len(kinds), model.MaxFilterValues)
-	}
-	values := make([]any, len(kinds))
-	for i, k := range kinds {
-		if !k.Valid() {
-			return "", invalid("relation kind %q is not a known relation kind", k)
-		}
-		values[i] = string(k)
-	}
-	return " AND ri.kind IN " + b.markList(values), nil
-}
-
-// EdgesBatch pages the visible edges touching any node in nodes, keyset-ordered
-// by relation id, in one round trip. It is the batched form of Relations: the
-// traversal calls it once per frontier, never once per node.
-//
-// The two semantics graph.Adjacency.Edges freezes hold here: an empty kinds
-// slice is "no kind filter", not "no rows", and a non-positive limit is a
-// typed argument error rather than an unbounded read. limit above
-// model.MaxPageItems is clamped to it.
-func (r *PinnedReader) EdgesBatch(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	query, args, err := r.edgesBatchQuery(nodes, direction, kinds, after, limit)
-	if err != nil {
-		return nil, err
-	}
-	var out []model.Relation
-	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return wrap("relation_facts", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, from, to []byte
-			var rel model.Relation
-			if err := rows.Scan(&id, &from, &rel.Kind, &to); err != nil {
-				return wrap("relation_facts", err)
-			}
-			rel.ID, rel.From, rel.To = model.RelationID(idHex(id)), model.NodeID(idHex(from)), model.NodeID(idHex(to))
-			out = append(out, rel)
-		}
-		return wrap("relation_facts", rows.Err())
-	})
-	return out, err
-}
-
-// edgesBatchQuery builds the statement EdgesBatch runs. It is separate so the
-// query plan can be asserted against exactly the SQL that ships.
-func (r *PinnedReader) edgesBatchQuery(nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) (string, []any, error) {
-	if limit <= 0 {
-		return "", nil, invalid("edge batch limit must be positive")
-	}
-	limit = pageLimit(limit)
-	if !direction.Valid() {
-		return "", nil, invalid("direction %q is not a known direction", direction)
-	}
-	raw := make([]string, len(nodes))
-	for i, n := range nodes {
-		raw[i] = string(n)
-	}
-	values, err := batchBlobs("node_id", raw)
-	if err != nil {
-		return "", nil, err
-	}
-	afterRaw, err := optionalBlob("after", string(after))
-	if err != nil {
-		return "", nil, err
-	}
-	b := newBinder(r.gen)
-	nodeList := b.markList(values)
-	kindClause, err := kindMarks(b, kinds)
-	if err != nil {
-		return "", nil, err
-	}
-	keyset := ""
-	if afterRaw != nil {
-		keyset = " AND ri.id > " + b.mark(afterRaw)
-	}
-	limitMark := b.mark(limit)
-
-	// One indexed scan per direction column; an OR across the two columns would
-	// use neither index. The EXISTS applies the same membership rule visible()
-	// applies, as a semi-join so the scan stays on the relation index.
-	branch := func(column string) string {
-		return `SELECT ri.id AS id, ri.from_node_id AS from_node_id, ri.kind AS kind, ri.to_node_id AS to_node_id
-			FROM relation_ids ri WHERE ri.` + column + ` IN ` + nodeList + kindClause + keyset + `
-			AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.relation_id = ri.id` + memberOf("rf") + `)
-			ORDER BY ri.id LIMIT ` + limitMark
-	}
-	var query string
-	switch direction {
-	case model.DirectionOutgoing:
-		query = branch("from_node_id")
-	case model.DirectionIncoming:
-		query = branch("to_node_id")
-	default:
-		// Each branch is already keyset-bounded, so the union of their first
-		// `limit` rows contains the union's first `limit` rows; the outer sort
-		// merges them back into relation-id order.
-		query = `SELECT id, from_node_id, kind, to_node_id FROM (
-			SELECT * FROM (` + branch("from_node_id") + `) UNION SELECT * FROM (` + branch("to_node_id") + `)
-		) ORDER BY id LIMIT ` + limitMark
-	}
-	return query, b.args, nil
-}
-
 // nodeBatchColumns is nodeColumns with explicit result names so the grouped
 // subquery can be projected by name. It must stay column-for-column identical
 // to nodeColumns, which is what scanNode reads.
-const nodeBatchColumns = `nf.node_id AS node_id, ni.kind AS kind, nf.language AS language, nf.name AS name,
+const nodeBatchColumns = `ni.canonical AS node_id, ni.kind AS kind, nf.language AS language, nf.name AS name,
 	nf.qualified_name AS qualified_name, nf.signature AS signature, nf.file_id AS file_id,
 	ui.content_hash AS content_hash, nf.start_byte AS start_byte, nf.end_byte AS end_byte,
 	nf.metadata_json AS metadata_json, u.unit_key AS unit_key, u.source_binding AS source_binding`
@@ -270,18 +155,23 @@ func (r *PinnedReader) nodesByIDQuery(ids []model.NodeID) (string, []any, error)
 		JOIN units u ON u.id = nf.unit_id
 		JOIN node_ids ni ON ni.id = nf.node_id
 		LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-		WHERE nf.node_id IN ` + nodeList + memberOf("nf") + ` GROUP BY nf.node_id
+		WHERE ni.canonical IN ` + nodeList + memberOf("nf") + ` GROUP BY nf.node_id
 	) ORDER BY node_id LIMIT ` + limitMark
 	return query, b.args, nil
 }
 
 // evidenceBatchColumns names every column StoredEvidence needs, aliased so the
 // windowed subquery can be projected by name.
+// node_id is projected as a literal NULL, not joined: this batch filters on
+// e.relation_id, and the evidence CHECK admits exactly one of node_id /
+// relation_id, so every row here has a NULL node_id. A LEFT JOIN node_ids would
+// be a join that can never bind. The column stays so the list remains
+// column-for-column the one scanBatchedEvidence and Evidence share.
 const evidenceBatchColumns = `e.id AS id, u.unit_key AS unit_key, u.provider_id AS provider_id,
-	u.provider_version AS provider_version, u.origin_run_id AS origin_run_id, e.node_id AS node_id,
-	e.relation_id AS relation_id, e.precision AS precision, e.file_id AS file_id,
+	u.provider_version AS provider_version, u.origin_run_id AS origin_run_id, NULL AS node_id,
+	rl.canonical AS relation_id, e.precision AS precision, e.file_id AS file_id,
 	ui.content_hash AS content_hash, e.start_byte AS start_byte, e.end_byte AS end_byte,
-	e.native_key AS native_key, e.detail AS detail`
+	nk.key AS native_key, e.detail AS detail`
 
 const evidenceBatchOuterColumns = `id, unit_key, provider_id, provider_version, origin_run_id, node_id,
 	relation_id, precision, file_id, content_hash, start_byte, end_byte, native_key, detail`
@@ -293,7 +183,7 @@ const evidenceBatchOuterColumns = `id, unit_key, provider_id, provider_version, 
 // internal hydration cap rather than a frozen request field, so zero takes the
 // model.MaxPageItems default the rest of the reader uses.
 func (r *PinnedReader) EvidenceBatch(ctx context.Context, relations []model.RelationID, perRelation int) (map[model.RelationID][]StoredEvidence, error) {
-	query, args, err := r.evidenceBatchQuery(relations, perRelation)
+	query, args, err := r.evidenceBatchQuery(ctx, relations, perRelation)
 	if err != nil {
 		return nil, err
 	}
@@ -321,8 +211,8 @@ func (r *PinnedReader) EvidenceBatch(ctx context.Context, relations []model.Rela
 
 // evidenceBatchQuery builds the statement EvidenceBatch runs, separately so the
 // query plan can be asserted against exactly the SQL that ships.
-func (r *PinnedReader) evidenceBatchQuery(relations []model.RelationID, perRelation int) (string, []any, error) {
-	perRelation = pageLimit(perRelation)
+func (r *PinnedReader) evidenceBatchQuery(ctx context.Context, relations []model.RelationID, perRelation int) (string, []any, error) {
+	perRelation = pageLimit(ctx, perRelation)
 	raw := make([]string, len(relations))
 	for i, id := range relations {
 		raw[i] = string(id)
@@ -338,8 +228,10 @@ func (r *PinnedReader) evidenceBatchQuery(relations []model.RelationID, perRelat
 		SELECT ` + evidenceBatchColumns + `, row_number() OVER (PARTITION BY e.relation_id ORDER BY e.id) AS rn
 		FROM evidence e
 		JOIN units u ON u.id = e.unit_id
+		JOIN relation_ids rl ON rl.id = e.relation_id
+		JOIN native_keys nk ON nk.id = e.native_key_id
 		LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id
-		WHERE e.relation_id IN ` + relList + memberOf("e") + `
+		WHERE rl.canonical IN ` + relList + memberOf("e") + `
 	) WHERE rn <= ` + perMark + ` ORDER BY relation_id, id`
 	return query, b.args, nil
 }

@@ -12,10 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -29,7 +33,7 @@ const (
 	// classification or pinned argument arrays change. The descriptor version
 	// is this plus the engine payload digest, so a unit built by one engine
 	// release is never reused for another.
-	adapterVersion = "3"
+	adapterVersion = "5"
 	// ScopeWorkspace is the scope of the C/C++ unit, the one unit that is the
 	// whole repository.
 	ScopeWorkspace = provider.ScopeWorkspace
@@ -42,15 +46,16 @@ const (
 // reconciled against.
 var dependsOn = []string{"filesystem", "treesitter"}
 
-// Product-owned bounds on what one unit may leave on disk. Neither is a
-// configuration knob: they are the shapes Section 6 requires a finite bound
-// for, sized from the largest repositories measured in
-// docs/research/10-round3-empirical.md (a 1.8M-line C repository is about 54 MB
-// of source and 2 GB of export; a 1.05M-line Python tree exports 4.95 GB).
-const (
-	maxMaterializationBytes int64 = 4 * giB
-	maxExportBytes          int64 = 16 * giB
-)
+// maxMaterializationBytes is the product-owned bound on what one unit may
+// materialize on disk before it is analysed. It is not a configuration knob:
+// it is the shape Section 6 requires a finite bound for, sized from the
+// largest repositories measured in docs/research/10-round3-empirical.md (a
+// 1.8M-line C repository is about 54 MB of source).
+//
+// The export has no such bound. An export the disk cannot hold is a disk that
+// is full, which the store reports as one; refusing a unit whose export is
+// large would refuse a repository the host can index.
+const maxMaterializationBytes int64 = 4 * giB
 
 // minStepTimeout is the least time an analysis step is started with. A unit
 // whose deadline has all but expired fails as a timeout rather than starting a
@@ -74,17 +79,61 @@ type Options struct {
 	// run directories live under.
 	DataDir string
 	// Timeout bounds one whole unit: materialize, parse, export and import.
+	// Zero is no wall-clock bound; StallTimeout catches a wedged unit instead.
 	Timeout time.Duration
+	// StallTimeout is the progress-based hang detector applied to every child
+	// this provider starts (providers.dependence.stall_timeout). Zero disables
+	// it.
+	StallTimeout time.Duration
 	// CacheBytes is the parsed-graph cache budget; 0 disables the cache.
 	CacheBytes int64
-	// UnitMemoryFloorBytes is the smallest heap cap a unit is given, and
-	// UnitMemoryCeilingBytes the explicit user limit that may reject a unit
-	// before it runs; 0 means the allocation is derived from the machine and
-	// nothing is rejected up front.
-	UnitMemoryFloorBytes   int64
-	UnitMemoryCeilingBytes int64
+	// UnitMemoryFloorBytes is the smallest heap cap a unit is given. Nothing
+	// rejects a unit for the memory it asks for; the cap only sizes it.
+	UnitMemoryFloorBytes int64
+	// BaseFootprintBytes is what this process holds for itself on this
+	// machine, derived by the composition from the machine and the
+	// configuration (config.BaseFootprint). The governor subtracts it from
+	// available memory, so it must be the same figure the admission allocation
+	// was derived from or a unit is sized against one allocation and admitted
+	// against another.
+	BaseFootprintBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
+	// MaxUnitsPerFamily, MaxStagedRows and MaxDerivedRows are the three
+	// user-set reporting thresholds of `[providers.dependence]`, 0 (the
+	// default) meaning no threshold at all. None refuses anything: a
+	// repository's project count, an export's row count and the occurrences
+	// that project from it are properties of the source, so exceeding one is
+	// published on the unit's capability rows -- never a plan refusal, never a
+	// silently truncated list, never a failed unit.
+	//
+	// They are config.Limit values rather than plain integers: the type is
+	// what carries "0 and unlimited are the same absent bound" and the strict
+	// Exceeded comparison, and a copy re-declared as an int64 here would be a
+	// second place those semantics could drift.
+	MaxUnitsPerFamily config.Limit
+	MaxStagedRows     config.Limit
+	MaxDerivedRows    config.Limit
+	// MaxExportFiles is the user's bound on the entries of one export
+	// directory, unlimited by default. Unlike the three thresholds above it
+	// refuses the import when a user set it and the export crosses it, which
+	// is the only thing an entry count can honestly do: the files are the
+	// import's input, not its output.
+	MaxExportFiles config.Limit
+	// StagingCacheKiB is the user's `providers.dependence.staging_cache_kib`,
+	// the page cache of one import's staging database; 0 selects the
+	// importer's default.
+	StagingCacheKiB int
+	// AnalysisConfigHash is config.Config.AnalysisConfigHash, the digest of
+	// the analyzer, grammar and admission policy every unit identity is
+	// derived from. The graph cache folds it into its key, so a graph is never
+	// reused across the configuration change that rebuilt the unit.
+	AnalysisConfigHash string
 }
 
 // Provider is the dependence provider.Provider. One instance serves a process
@@ -116,8 +165,11 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	if backend == nil || importer == nil {
 		return nil, invalid("the dependence provider needs an engine backend and an export importer")
 	}
-	if opts.Timeout <= 0 {
-		return nil, invalid("the dependence provider needs a positive unit timeout")
+	if opts.Timeout < 0 || opts.StallTimeout < 0 {
+		return nil, invalid("the dependence provider's unit timeout and stall timeout may not be negative")
+	}
+	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 || opts.MaxDerivedRows < 0 {
+		return nil, invalid("the dependence provider's max_units_per_family, max_staged_rows and max_derived_rows may not be negative; 0 is no threshold")
 	}
 	if err := opts.Limits.Validate(); err != nil {
 		return nil, err
@@ -139,7 +191,7 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	}
 	sweepPrivate(opts.DataDir)
 	return &Provider{backend: backend, importer: importer, opts: opts,
-		gov: NewGovernor(opts.UnitMemoryFloorBytes, opts.UnitMemoryCeilingBytes), cache: cache, engine: e}, nil
+		gov: NewGovernor(opts.UnitMemoryFloorBytes, opts.BaseFootprintBytes), cache: cache, engine: e}, nil
 }
 
 // Descriptor is the static contract. Version is the adapter version plus the
@@ -266,7 +318,16 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink provider.Sink,
 	opts ImportOptions) (Report, error) {
 
-	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
+	// A zero timeout is no wall clock: a monorepo unit is large, not wedged,
+	// and the stall detector on every child is what catches a wedged one. The
+	// cancel is still installed so the unit's children are torn down when the
+	// caller gives up.
+	var cancel context.CancelFunc
+	if p.opts.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, p.opts.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 
 	unit, plan, err := p.unitFor(ctx, req)
@@ -274,9 +335,6 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, err
 	}
 	res := p.gov.Reserve(unit.Family, unit.Bytes, ObserveMachine())
-	if err := p.gov.Reject(res, unit.ScopeKey); err != nil {
-		return Report{}, err
-	}
 
 	run, err := p.openRun(req)
 	if err != nil {
@@ -289,12 +347,42 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
+	// Storage fields the import had to cut to their model ceiling. Nothing was
+	// refused: the fact carries the clipped value, and the row says which
+	// fields were clipped and how many values each cut covered.
+	pub.TruncatedFields = report.TruncatedFields
+	// Evidence occurrences the import removed under the user's own
+	// index.max_evidence_per_fact. The facts were published; what the clip
+	// took off them is disclosed on the capability, not only in the line
+	// logged below.
+	pub.ClippedEvidence = int(report.ClippedEvidence)
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
 	// while that is true is false readiness, and the unit that ran is the only
 	// place with a capability row to say so.
 	pub.UnplannedProjects = plan.Unplanned[unit.Family]
+	pub.Family = unit.Family
+	// The plan holds every project of the family, whatever the count: a
+	// monorepo is not refused. A user who set the threshold is told which
+	// family crossed it and by how much, on the rows of the unit that ran.
+	// pub.OverUnitsPerFamily may already carry a subdivided unit's part count
+	// against the same threshold; the plan's count is the larger claim about
+	// the family and takes it.
+	if n := plan.Projects[unit.Family]; p.opts.MaxUnitsPerFamily.Exceeded(int64(n)) && n > pub.OverUnitsPerFamily {
+		pub.OverUnitsPerFamily, pub.UnitsPerFamilyBound = n, p.opts.MaxUnitsPerFamily.Value()
+	}
+	// The unit's staged rows are the sum over its parts when it was subdivided,
+	// so the threshold is compared here rather than read off the flag: a unit
+	// can cross it in total without any one part crossing it alone.
+	if p.opts.MaxStagedRows.Exceeded(report.StagedRows) {
+		pub.StagedRows, pub.StagedRowsBound = report.StagedRows, p.opts.MaxStagedRows.Value()
+	}
+	// The projected occurrences are summed over a subdivided unit's parts for
+	// the same reason, and compared here for the same one.
+	if p.opts.MaxDerivedRows.Exceeded(report.DerivedRows) {
+		pub.DerivedRows, pub.DerivedRowsBound = report.DerivedRows, p.opts.MaxDerivedRows.Value()
+	}
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
 	// source bytes are a different figure and are logged as source_bytes
@@ -303,18 +391,31 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		RecordsEmitted: uint64(report.Nodes + report.Relations + report.Aliases),
 		BytesProcessed: report.BytesRead,
 		Capabilities:   pub.capabilities(unit.ScopeKey)}
-	slog.Info("dependence unit imported", "component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
+	fields := []any{"component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
 		"scope", unit.ScopeKey, "family", string(unit.Family), "source_files", unit.Files, "source_bytes", unit.Bytes,
 		"nodes", report.Nodes, "relations", report.Relations, "aliases", report.Aliases,
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
+		"truncated_fields", len(report.TruncatedFields),
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"unplanned_projects", pub.UnplannedProjects,
-		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
+		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
+		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
+		"derived_rows", report.DerivedRows, "over_max_derived_rows", report.OverDerivedRows,
+		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", allocationForLog(res),
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
-		"keys_removed", report.Removed)
+		"keys_removed", report.Removed}
+	// The allocation is an observation of the machine, and a host that
+	// publishes no available-memory figure leaves it zero. Logging that zero
+	// would tell an operator this unit was admitted against no memory at all;
+	// an unavailable measurement is absent from the line instead, as it is
+	// from the resources block and from a memory failure's details.
+	if res.AllocationBytes > 0 {
+		fields = append(fields, "allocation_bytes", res.AllocationBytes)
+	}
+	slog.Info("dependence unit imported", fields...)
 	return Report{Result: result, Keys: report.Keys,
 		Delta: neo4jcsv.Delta{Changed: report.Changed, Unchanged: report.Unchanged, Removed: report.Removed}}, nil
 }
@@ -363,11 +464,6 @@ func (p *Provider) openRun(req provider.UnitRequest) (*runDir, error) {
 func runsRoot(dataDir string) string    { return filepath.Join(dataDir, "dependence", "runs") }
 func scratchRoot(dataDir string) string { return filepath.Join(dataDir, "dependence", "scratch") }
 
-// maxSweptEntries bounds the startup sweep's directory scan, so a corrupted or
-// hand-filled private root can never turn provider construction into an
-// unbounded walk (Section 6: an explicit finite bound on every traversal).
-const maxSweptEntries = 4096
-
 // sweepPrivate removes everything left under the provider's private working
 // roots. defer covers every return and every panic but not SIGKILL or power
 // loss, and a killed unit leaves a materialization, a graph, an export and a
@@ -389,16 +485,34 @@ func sweepPrivate(dataDir string) {
 		if err != nil {
 			continue
 		}
-		if len(entries) > maxSweptEntries {
-			entries = entries[:maxSweptEntries]
-		}
+		// Every entry is swept, however many there are. Stopping at a fixed
+		// count would leave the rest of a large private root on disk without
+		// saying so, and would save nothing: the directory is read in full to
+		// find them either way. What the sweep did is disclosed as a count per
+		// root, so leftover disk is visible even when per-entry logging is not
+		// read.
+		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())
-			if err := os.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if path == scratch.Dir(root) {
+				// The pool of staging surfaces, which is not a leftover. Its
+				// instances are claimed with a lock, so the one a killed run
+				// held is taken over by the next run rather than left: the
+				// sweep would free exactly the space the pool exists to keep,
+				// and it is what `codectx gc` empties on request.
+				continue
+			}
+			if err := paced.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				failed++
 				slog.Error("a stale dependence working directory was not removed", "component", component, "error", err)
 				continue
 			}
+			swept++
 			slog.Info("a stale dependence working directory was swept", "component", component, "name", e.Name())
+		}
+		if swept > 0 || failed > 0 {
+			slog.Info("the dependence provider swept a private working root", "component", component,
+				"entries", len(entries), "swept", swept, "not_removed", failed)
 		}
 	}
 }
@@ -406,7 +520,7 @@ func sweepPrivate(dataDir string) {
 func (r *runDir) path(name string) string { return filepath.Join(r.root, name) }
 
 func (r *runDir) close(req provider.UnitRequest) {
-	if err := os.RemoveAll(r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.RemoveAllFor(paced.Materialization, r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence run directory was not removed", "component", component,
 			"run", string(req.Run), "error", err)
 	}
@@ -421,9 +535,24 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// the nested projects afterwards spent the time and the disk of every
 	// sibling project, and left another unit's source inside this unit's
 	// private tree for as long as the pruning took.
+	//
+	// The same pass counts this unit's own source files, so a unit that
+	// exports nothing publishes how much source the frontend was actually
+	// handed. It is one counter, never a list. It is taken here rather than
+	// from the planner's Unit.Files, which foldSizes arbitrates across the
+	// whole plan: only this pass knows what reached the frontend.
+	var files int64
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
-			Include: func(fv model.FileVersion) bool { return unit.Contains(fv.Path) }})
+			Include: func(fv model.FileVersion) bool {
+				if !unit.Contains(fv.Path) {
+					return false
+				}
+				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family {
+					files++
+				}
+				return true
+			}})
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -433,50 +562,133 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		return publication{}, ImportReport{}, err
 	}
 
-	graph, outcome, err := p.graphFor(ctx, req, unit, res, run, source)
+	g, err := p.graphFor(ctx, req, unit, res, run, source)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
-	if outcome.Class == FailureEngine {
+	if g.outcome.Class == FailureEngine {
 		// A reproducible crash is the only thing subdivision is for. Every
-		// capability of the result then says so.
-		report, err := p.subdivide(ctx, req, unit, res, run, source, sink, outcome)
-		if err != nil {
-			return publication{}, ImportReport{}, err
-		}
-		return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(outcome)}, report, nil
+		// capability of the result then says so, and says how the crash was
+		// established to reproduce.
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, g.outcome, g.decision, files)
 	}
 
-	exp, err := p.export(ctx, req, unit, res, run, graph)
+	exp, crash, err := p.export(ctx, req, unit, res, run, g.path, files)
+	if crash.Class == FailureEngine || crash.Class == FailureEmptyExport {
+		// The export proved this graph produces nothing, and would produce
+		// nothing again: the engine died writing it out twice on its own
+		// exception, or both steps exited cleanly over a unit with source and
+		// the export carried no method. A cached entry would hand the next
+		// refresh the same dead graph, skip the parse and re-pay the dead
+		// export, every generation.
+		p.cache.Drop(g.key)
+	}
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
+	if crash.Class == FailureEngine {
+		// The parse produced a graph and the engine then died writing it out,
+		// twice, on its own exception. That is the same condition subdivision
+		// recovers from on the parse side and it has the same recovery: the
+		// whole unit's export is dead while its children's are not, measured
+		// on a 4,984-file project whose export died at every heap cap while
+		// every subdivided part of it exported. Reporting it as a failed unit
+		// threw away facts the engine could still produce.
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash, crashConfirmed, files)
+	}
+	// The export is the proof that this graph produces a live result, so it is
+	// the first point at which the graph is worth keeping. Caching it before
+	// the export ran stored a graph nothing had read yet, under exactly the key
+	// a clean run produces.
+	p.keep(req, unit, g)
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
-	return publication{Skipped: outcome.SkippedMethods, SkippedCount: outcome.SkippedCount + exp.SkippedCount}, report, nil
+	return publication{Skipped: g.outcome.SkippedMethods, SkippedCount: g.outcome.SkippedCount + exp.SkippedCount}, report, nil
+}
+
+// keep stores a parsed graph whose export has proved it alive.
+//
+// A reused graph is already in the cache. A graph whose parse skipped methods
+// is deliberately never cached: what was skipped is only on that parse's
+// stderr, and a cache hit replays the graph without it -- so a reused entry
+// would publish data_flows_to as fresh for a unit whose data dependence is
+// missing whole method bodies. Not caching it costs a reparse for units that
+// skip at all, which the pinned definition cap makes rare (docs/research/
+// 10-round3-empirical.md Section 9a); caching it would cost the truth.
+//
+// Failing to store is never an error the unit fails on -- the graph was
+// produced and the export read it -- so the only consequence is the reparse
+// the next refresh pays, which is what the line says. A user who disabled the
+// cache is not told about it every unit.
+func (p *Provider) keep(req provider.UnitRequest, unit Unit, g parsedGraph) {
+	if g.reused || g.outcome.SkippedCount > 0 {
+		return
+	}
+	if !p.cache.Put(g.key, g.path) && p.opts.CacheBytes > 0 {
+		slog.Info("a dependence graph was not cached; the next refresh of this unit reparses it",
+			"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey)
+	}
+}
+
+// recoverBySubdivision splits the unit after a reproducible engine crash --
+// in the parse or in the export -- and renders what the caller publishes: a
+// partial result naming the subdivided scope and the failing pass and
+// exception, never a failed unit.
+func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (publication, ImportReport, error) {
+
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash, decision, files)
+	if err != nil {
+		return publication{}, ImportReport{}, err
+	}
+	return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(crash, decision),
+		OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily.Value()}, report, nil
+}
+
+// parsedGraph is one unit's graph and what the caller needs to decide its fate
+// once the export has judged it.
+type parsedGraph struct {
+	// path is the graph file: a fresh parse in the run directory, or the cache
+	// entry a reused graph was found at.
+	path string
+	// key is the semantic closure this graph is cached under -- what keep
+	// stores it as once the export proves it alive, and what Drop removes when
+	// the export proves it dead. It is filled whether or not the graph is in
+	// the cache, because a reused graph is exactly the one a dead export must
+	// be able to remove.
+	key string
+	// reused reports that path is a cache entry rather than a fresh parse.
+	reused bool
+	// outcome is the parse's own outcome, and decision how a reproducible
+	// crash in it was established.
+	outcome  Outcome
+	decision crashDecision
 }
 
 // graphFor reuses a cached graph whose semantic closure matches, or parses a
-// new one. The returned outcome is FailureEngine when the unit crashed
-// reproducibly and the caller must subdivide; every other failure class is
-// already an error by then.
+// new one. Nothing is stored here: a graph is cached by the caller, after the
+// export has proved it produces a live result (build, keep). The returned
+// outcome is FailureEngine when the unit crashed reproducibly and the caller
+// must subdivide, and the crashDecision says how that was established; every
+// other failure class is already an error by then.
 func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string) (string, Outcome, error) {
+	run *runDir, source string) (parsedGraph, error) {
 
-	key, err := CacheKey(ctx, req.Content, unit, p.backend.Argv(unit.Family), p.engine)
+	key, err := CacheKey(ctx, req.Content, unit, p.backend.Argv(unit.Family), p.engine,
+		req.Unit.ProviderVersion, p.opts.AnalysisConfigHash)
 	if err != nil {
-		return "", Outcome{}, err
+		return parsedGraph{}, err
 	}
 	if cached, ok := p.cache.Lookup(key); ok {
 		slog.Info("dependence graph reused", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey)
-		return cached, Outcome{}, nil
+		return parsedGraph{path: cached, key: key, reused: true}, nil
 	}
 	graph := run.path("graph")
 	outcome, err := p.parse(ctx, req, unit, res, source, graph, nil)
 	if err != nil {
-		return "", Outcome{}, err
+		return parsedGraph{}, err
 	}
 	switch outcome.Class {
 	case FailureMemory:
@@ -486,74 +698,80 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 			// the tree it ran in peaked at what the machine can allocate. A
 			// retry with no more memory behind it cannot succeed and costs a
 			// full parse.
-			return "", Outcome{}, failure(FailureMemory, unit.ScopeKey, outcome, res)
+			return parsedGraph{}, failure(FailureMemory, unit.ScopeKey, outcome, res)
 		}
 		retried := res
 		retried.HeapCapBytes = retry
 		if outcome, err = p.parse(ctx, req, unit, retried, source, graph, nil); err != nil {
-			return "", Outcome{}, err
+			return parsedGraph{}, err
 		}
 		if outcome.Class == FailureMemory {
-			return "", Outcome{}, failure(FailureMemory, unit.ScopeKey, outcome, retried)
+			return parsedGraph{}, failure(FailureMemory, unit.ScopeKey, outcome, retried)
 		}
 		res = retried
 	case FailureTimeout:
-		return "", Outcome{}, failure(FailureTimeout, unit.ScopeKey, outcome, res)
+		return parsedGraph{}, failure(FailureTimeout, unit.ScopeKey, outcome, res)
 	}
 	if outcome.Class == FailureEngine {
-		// Confirm the crash before anything is split. The neutral option
-		// allowlist is empty for every frontend today, so the confirmation
-		// runs the same argv over the same source; the engine is not
-		// run-to-run deterministic, so what it yields is a second observation
-		// of the same failure class, which raises the odds that the crash is
-		// deterministic without proving it. That is what subdivision is
-		// allowed to rest on: a class seen twice, against the cost of
-		// splitting a project, which loses more than half of its resolved
-		// calls. A crash seen once is never split on.
+		if reproducibleOnSight(outcome) {
+			// The child named the pass that died and the exception it died
+			// on. That is a deterministic fault in that pass, so the unit is
+			// split on the first sight of it: the confirmation below would
+			// run the same argv over the same source and re-prove what the
+			// stderr already says, at the price of a second full parse of a
+			// unit large enough to be worth splitting.
+			slog.Info("a dependence crash named its failing pass and is not re-parsed to confirm it",
+				"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
+				"pass", outcome.Pass, "exception", outcome.Exception)
+			return parsedGraph{path: graph, key: key, outcome: outcome, decision: crashNamed}, nil
+		}
+		// A crash that named no pass -- a signal death, a step that left no
+		// graph, an exit with nothing said about a pass -- may be the machine
+		// rather than the source, so it is confirmed before anything is split.
+		// The neutral option allowlist is empty for every frontend today, so
+		// the confirmation runs the same argv over the same source; the engine
+		// is not run-to-run deterministic, so what it yields is a second
+		// observation of the same failure class, which raises the odds that
+		// the crash is deterministic without proving it. That is what
+		// subdivision is allowed to rest on, against the cost of splitting a
+		// project, which loses more than half of its resolved calls.
 		confirm, err := p.parse(ctx, req, unit, res, source, graph, p.backend.NeutralOptions(unit.Family))
 		if err != nil {
-			return "", Outcome{}, err
+			return parsedGraph{}, err
 		}
 		if confirm.Class == FailureEngine {
-			return "", confirm, nil
+			return parsedGraph{path: graph, key: key, outcome: confirm, decision: crashConfirmed}, nil
 		}
 		if confirm.Class != FailureNone {
-			return "", Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm, res)
+			return parsedGraph{}, failure(confirm.Class, unit.ScopeKey, confirm, res)
 		}
 		outcome = confirm
 	}
-	if outcome.SkippedCount == 0 && p.cache.Put(key, graph) {
-		// A graph whose parse skipped methods is deliberately not cached. What
-		// was skipped is only on the parse's stderr, and a cache hit replays
-		// the graph without it — so a reused entry would publish data_flows_to
-		// as fresh for a unit whose data dependence is missing whole method
-		// bodies. Not caching it costs a reparse for units that skip at all,
-		// which the pinned definition cap makes rare (docs/research/
-		// 10-round3-empirical.md Section 9a); caching it would cost the truth.
-		return p.cache.path(key), outcome, nil
-	}
-	return graph, outcome, nil
+	return parsedGraph{path: graph, key: key, outcome: outcome}, nil
 }
 
 // parse runs one parse step and validates that it left a graph behind.
 func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	source, graph string, extra []string) (Outcome, error) {
 
-	_ = os.Remove(graph)
+	_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	timeout, err := remaining(ctx)
 	if err != nil {
 		return Outcome{}, err
 	}
+	_, span := ledger.Start(ctx, stageParse, unit.ScopeKey)
 	out, err := p.backend.Parse(ctx, ParseRequest{SourceDir: source, OutputPath: graph, Family: unit.Family,
-		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout})
+		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, unmeasured(), err)
 		return Outcome{}, err
 	}
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"family", string(unit.Family), "exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"family", string(unit.Family), "exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
 		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
 		"tree_peak_bytes", peakForLog(out))
+	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	if out.Class == FailureNone {
 		if info, err := os.Stat(graph); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 			// A zero exit with no graph is the helper crash the orchestrator
@@ -562,6 +780,12 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 			out.Class = FailureEngine
 		}
 	}
+	// Ended after the graph-presence check, so the span's outcome is the
+	// verdict on the step and not the child's exit code: a zero exit that left
+	// no graph is a failed parse, and its span must say so.
+	m := measured(out)
+	overran(&m, unit.ScopeKey, res.Bytes())
+	span.End(spanOutcome(out), m, spanFailure(out, unit.ScopeKey, res))
 	return out, nil
 }
 
@@ -569,37 +793,86 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // with source files whose export carries no methods is the zero-exit helper
 // crash of research Section 6: the exit code is a lie there, and the only
 // honest signal is the empty result.
+//
+// The second return is the verdict on the graph itself: a reproducible engine
+// crash the caller must subdivide on, exactly as graphFor returns one for the
+// parse, or the empty export below. Both say the graph produces nothing, which
+// is what makes them the two the caller must not keep a cache entry for. An export that dies on
+// the engine's own exception is not a property of the unit's memory or of its
+// deadline -- those keep their own failure paths here -- and it is not a
+// verdict on the unit's source either: the children of a project whose whole
+// export dies export cleanly. Confirming it costs one more export of a graph
+// already on disk; the engine exposes no neutral option for this step, so the
+// confirmation is the same argv a second time and what it yields is a second
+// observation of the same class, which is what subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
+	run *runDir, graph string, files int64) (ExportOutcome, Outcome, error) {
+
+	out, err := p.runExport(ctx, req, unit, res, run, graph)
+	if err != nil {
+		return ExportOutcome{}, Outcome{}, err
+	}
+	if out.Class == FailureEngine && out.Exception != "" {
+		confirm, err := p.runExport(ctx, req, unit, res, run, graph)
+		if err != nil {
+			return ExportOutcome{}, Outcome{}, err
+		}
+		switch {
+		case confirm.Class == FailureEngine && confirm.Exception != "":
+			// Nothing of this export is usable; the children write their own
+			// directories and the failed one would otherwise sit on the disk
+			// for the rest of the run.
+			if err := paced.RemoveAllFor(paced.AnalyzerOutput, run.path("export")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				slog.Error("a failed dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
+			}
+			return ExportOutcome{}, confirm.Outcome, nil
+		case confirm.Class != FailureNone:
+			return ExportOutcome{}, Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm.Outcome, res)
+		}
+		out = confirm
+	}
+	if out.Class != FailureNone {
+		return ExportOutcome{}, Outcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
+	}
+	if unit.Files > 0 && !out.Live {
+		// Both steps exited cleanly and the export holds no method. That is
+		// not a crash and must not be worded as one, and it must not be
+		// worded as itself either: the failure names the two causes that
+		// remain and how much source the frontend was handed.
+		out.Outcome.Class = FailureEmptyExport
+		return ExportOutcome{}, out.Outcome, emptyExport(unit, out.Outcome, res, files)
+	}
+	return out, Outcome{}, nil
+}
+
+// runExport is one export step: the engine run, its log line and its observed
+// peak. It classifies nothing -- export above decides what each class means.
+func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	run *runDir, graph string) (ExportOutcome, error) {
 
-	dir := run.path("export")
 	timeout, err := remaining(ctx)
 	if err != nil {
 		return ExportOutcome{}, err
 	}
-	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
-		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout})
+	_, span := ledger.Start(ctx, stageExport, unit.ScopeKey)
+	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: run.path("export"),
+		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, unmeasured(), err)
 		return ExportOutcome{}, err
 	}
+	// The span is the child's, so it carries the child's verdict. An export
+	// that exited cleanly over a unit with source and carries no method is
+	// judged FailureEmptyExport by the caller afterwards; that verdict belongs
+	// to the unit, whose own span records it.
+	m := measured(out.Outcome)
+	overran(&m, unit.ScopeKey, res.Bytes())
+	span.End(spanOutcome(out.Outcome), m, spanFailure(out.Outcome, unit.ScopeKey, res))
 	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
-		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes)
-	if out.Bytes > maxExportBytes {
-		return ExportOutcome{}, resourceLimit("the dependence export exceeds the bound one unit may write").
-			WithDetail("scope_key", truncate(unit.ScopeKey, model.MaxIdentifierBytes)).
-			WithDetail("export_bytes", itoa(out.Bytes)).WithDetail("limit", "max_export_bytes").
-			WithDetail("bound", itoa(maxExportBytes))
-	}
-	if out.Class != FailureNone {
-		return ExportOutcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
-	}
-	if unit.Files > 0 && !out.Live {
-		out.Outcome.Class = FailureEngine
-		return ExportOutcome{}, failure(FailureEngine, unit.ScopeKey, out.Outcome, res).
-			WithDetail("reason", "the analysis produced no methods for a unit that has source")
-	}
+		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes, "pass", out.Pass, "exception", out.Exception)
+	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	return out, nil
 }
 
@@ -616,9 +889,9 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 // module, or one part of a subdivided unit — needs its own root prefixed back
 // on, or every fact it publishes binds to a path the snapshot does not have
 // and the unit seals with nothing in it. ScratchDir keeps the staging database,
-// which holds source-derived graph content and was measured at 649 MB for a
-// 64 MB export, inside the provider's private data directory instead of the
-// system temp directory.
+// which holds source-derived graph content a few times the export's size,
+// inside the provider's private data directory instead of the system temp
+// directory.
 //
 // Language is the source language recorded on the export's fileless nodes
 // only; a located node takes its language from the snapshot file. The family
@@ -637,15 +910,32 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	if err := os.MkdirAll(scratch, 0o700); err != nil {
 		return ImportReport{}, internalErr("the dependence import scratch directory could not be created: " + err.Error())
 	}
+	// Each phase is logged with the time it took, so a slow import names
+	// the phase that was slow.
+	phaseStart := time.Now()
+	onPhase := func(phase string) {
+		now := time.Now()
+		slog.Info("dependence import phase finished", "component", component, "run", string(req.Run),
+			"unit", string(req.Unit.ID), "phase", phase, "elapsed", now.Sub(phaseStart).Round(time.Millisecond))
+		phaseStart = now
+	}
+	// In-process work beside every other unit of the run, so no processor time
+	// is attributed to it: Go has no per-goroutine CPU and a share of the
+	// process counters would be a guess.
+	ctx, span := ledger.Start(ctx, stageImport, unit.ScopeKey)
 	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
-		Content: req.Content, ScratchDir: scratch,
-		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
+		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
+		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles, StagingCacheKiB: p.opts.StagingCacheKiB,
+		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
+		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return ImportReport{}, err
 	}
-	if err := os.RemoveAll(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	if err := paced.RemoveAllFor(paced.AnalyzerOutput, dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
 	}
 	return report, nil
@@ -658,15 +948,26 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome) (ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
-		return ImportReport{}, err
+		return ImportReport{}, 0, err
+	}
+	// The parts are all parsed and imported whatever the count. A user-set
+	// providers.dependence.max_units_per_family says how many parts of one
+	// unit the caller wanted to hear about, so crossing it is reported on
+	// every capability row this subdivided unit publishes.
+	overParts := 0
+	if p.opts.MaxUnitsPerFamily.Exceeded(int64(len(children))) {
+		overParts = len(children)
+		slog.Warn("a subdivided dependence unit has more parts than providers.dependence.max_units_per_family; every part is analysed",
+			"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
+			"parts", len(children), "max_units_per_family", p.opts.MaxUnitsPerFamily)
 	}
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
-		"children", len(children))
+		"decision", string(decision), "children", len(children))
 	// Every part imports into the one sink storage opened for the unit. Two
 	// parts legitimately describe the same entity — above all the external
 	// stub of a callee both parts reference — and storage now admits a
@@ -677,26 +978,52 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
+	// What the parts did, so a unit no part of which produced a method can say
+	// which of the two things happened to them rather than restating that
+	// nothing came out.
+	tally := partTally{Parts: len(children)}
 	for i, child := range children {
+		// One span per part, under the unit's: every step below nests inside
+		// it, so a subdivided unit's cost reads as the sum of its parts rather
+		// than as one unattributed total.
+		partCtx, part := ledger.Start(ctx, stagePart, child)
 		graph := run.path("graph-" + itoa(int64(i)))
-		out, err := p.parse(ctx, req, unit, res, filepath.Join(source, child), graph, nil)
+		out, err := p.parse(partCtx, req, unit, res, filepath.Join(source, child), graph, nil)
 		if err != nil {
-			return ImportReport{}, err
+			part.End(ledger.OutcomeFailed, bracketed(), err)
+			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
+			tally.Failed++
+			part.End(ledger.OutcomeFailed, bracketed(), spanFailure(out, child, res))
 			continue
 		}
 		dir := run.path("export-" + itoa(int64(i)))
-		timeout, err := remaining(ctx)
+		timeout, err := remaining(partCtx)
 		if err != nil {
-			return ImportReport{}, err
+			part.End(ledger.OutcomeFailed, bracketed(), err)
+			return ImportReport{}, 0, err
 		}
-		exp, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
-			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout})
+		exportCtx, exportSpan := ledger.Start(partCtx, stageExport, child)
+		exp, err := p.backend.Export(exportCtx, ExportRequest{GraphPath: graph, OutputDir: dir,
+			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
-			return ImportReport{}, err
+			exportSpan.End(ledger.OutcomeFailed, unmeasured(), err)
+			part.End(ledger.OutcomeFailed, bracketed(), err)
+			return ImportReport{}, 0, err
 		}
-		if exp.Class != FailureNone || !exp.Live {
+		exportSpan.End(spanOutcome(exp.Outcome), measured(exp.Outcome), spanFailure(exp.Outcome, child, res))
+		if exp.Class != FailureNone {
+			tally.Failed++
+			part.End(ledger.OutcomeFailed, bracketed(), spanFailure(exp.Outcome, child, res))
+			continue
+		}
+		if !exp.Live {
+			// The part was analysed from end to end and carries no method.
+			// That is the empty export of a part, and it is counted apart from
+			// a failure so the unit's reason can tell the two apart.
+			tally.Empty++
+			part.End(ledger.OutcomeFailed, bracketed(), emptyPart(child, exp.Outcome, res))
 			continue
 		}
 		// No delta options: a part's key set is a subset of the unit's, so
@@ -704,25 +1031,32 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		// every other part's keys removed and carry nothing. Every part
 		// imports in full and merge reports the absent set, which makes the
 		// next refresh of a subdivided unit a full import.
-		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
+		report, err := p.importExport(partCtx, req, unit, filepath.Join(source, child),
 			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
-			return ImportReport{}, err
+			part.End(ledger.OutcomeFailed, bracketed(), err)
+			return ImportReport{}, 0, err
 		}
 		total = merge(total, report)
 		admitted++
-		_ = os.Remove(graph)
+		part.End(ledger.OutcomeOK, bracketed(), nil)
+		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
-		return ImportReport{}, failure(FailureEngine, unit.ScopeKey, crash, res).
-			WithDetail("reason", "no subdivided part of the unit produced an honest result")
+		return ImportReport{}, 0, subdivisionEmpty(unit, crash, res, tally, files)
 	}
-	return total, nil
+	return total, overParts, nil
 }
 
 // childProjects lists the immediate subdirectories of a unit's root that hold
 // source, in a stable order. That is the next frontend-native boundary below a
 // project: the project's own top-level packages or source directories.
+//
+// Every one of them is returned. A truncated list would drop whole parts of a
+// crashed unit's source from the only run that can still analyse it, and would
+// do it without a word: the unit would seal, partial for the subdivision, with
+// no sign that the tail of its source was never parsed. The caller reports the
+// count against the user's threshold instead.
 func childProjects(source string, unit Unit) ([]string, error) {
 	entries, err := os.ReadDir(source)
 	if err != nil {
@@ -736,12 +1070,10 @@ func childProjects(source string, unit Unit) ([]string, error) {
 		out = append(out, e.Name())
 	}
 	slices.Sort(out)
-	if len(out) > MaxUnitsPerFamily {
-		out = out[:MaxUnitsPerFamily]
-	}
 	if len(out) == 0 {
 		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
-			WithDetail("reason", "the unit has no boundary below it to split along")
+			WithDetail("reason", "the unit has no boundary below it to split along").
+			WithRemediation("the failing pass and exception on the crash that forced this split are what identifies the defect upstream")
 	}
 	return out, nil
 }
@@ -771,6 +1103,15 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
+	// Each part stages into its own scratch and compares its own rows against
+	// the threshold, so three parts of ten rows each cross a bound of fifteen
+	// that none of them crossed alone. The unit's count is the sum, and the
+	// caller compares that; the per-part flag is carried too, so a part that
+	// crossed on its own is never lost behind a sum.
+	a.StagedRows += b.StagedRows
+	a.OverStagedRows = a.OverStagedRows || b.OverStagedRows
+	a.DerivedRows += b.DerivedRows
+	a.OverDerivedRows = a.OverDerivedRows || b.OverDerivedRows
 	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
@@ -778,6 +1119,17 @@ func merge(a, b ImportReport) ImportReport {
 		}
 		for l, n := range b.UnknownLabels {
 			a.UnknownLabels[l] += n
+		}
+	}
+	// Each part cuts its own oversize descriptive fields, so the unit's count
+	// per field is the sum over its parts. Dropping this sum would lose the
+	// report for exactly the largest units, which are the ones subdivided.
+	if b.TruncatedFields != nil {
+		if a.TruncatedFields == nil {
+			a.TruncatedFields = map[string]int{}
+		}
+		for f, n := range b.TruncatedFields {
+			a.TruncatedFields[f] += n
 		}
 	}
 	return a
@@ -803,25 +1155,37 @@ func unitSource(root string, unit Unit) (string, error) {
 
 // backendFailure renders the crash a subdivided unit publishes: the failing
 // pass and its exception class, which is what a maintainer needs to report the
-// crash upstream.
-func backendFailure(o Outcome) string {
+// crash upstream, followed by how the provider established that it reproduces.
+//
+// The decision travels inside this value rather than under a detail key of its
+// own because a subdivided capability row already fills most of the bounded
+// detail map a provider may contribute, and a key that is dropped exactly when
+// the row is busiest would tell an operator nothing at all.
+func backendFailure(o Outcome, d crashDecision) string {
+	var named string
 	switch {
 	case o.Pass != "" && o.Exception != "":
-		return o.Pass + "/" + o.Exception
+		named = o.Pass + "/" + o.Exception
 	case o.Pass != "":
-		return o.Pass
+		named = o.Pass
 	default:
-		return o.Exception
+		named = o.Exception
 	}
+	if named == "" {
+		return string(d)
+	}
+	return named + " (" + string(d) + ")"
 }
 
 // remaining is the time left on the unit's deadline, or a typed timeout when
 // too little is left to start a step. Starting an analyzer with a second to live
-// wastes the second and reports a timeout anyway.
+// wastes the second and reports a timeout anyway. A unit with no deadline is
+// the configured unlimited case: every step is started with no wall clock and
+// bounded by its stall detector instead.
 func remaining(ctx context.Context) (time.Duration, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return 0, internalErr("the dependence unit ran without a deadline")
+		return 0, nil
 	}
 	left := time.Until(deadline)
 	if left < minStepTimeout {

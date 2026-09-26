@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
-	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -38,10 +39,11 @@ type Capabilities struct {
 	CallHierarchy    bool `json:"call_hierarchy"`
 }
 
-// server is one running language server bound to one snapshot: its private
-// materialization, its process, its connection and the documents it has been
-// told about. It is shared by every Overlay opened for the same snapshot and
-// profile and stopped when the last one closes and the idle TTL passes.
+// server is one running language server bound to one snapshot: the tree it
+// shares with every other server of that snapshot, its process, its connection
+// and the documents it has been told about. It is shared by every Overlay
+// opened for the same snapshot and profile and stopped when the last one
+// closes and the idle TTL passes.
 type server struct {
 	key     serverKey
 	profile Profile
@@ -49,7 +51,6 @@ type server struct {
 	opts    Options
 	manager *Manager
 
-	mat  *snapshot.Materialization
 	uris materializationURI
 	conn *conn
 	enc  source.ColumnEncoding
@@ -77,6 +78,10 @@ type server struct {
 	docs     map[model.FileID]*document
 	docOrder []model.FileID
 	docBytes int64
+	// docCacheBytes is the pinned cache's ceiling: the overlay bound when the
+	// user set one, DefaultDocCacheBytes when it is unlimited. It is never the
+	// sentinel, so the eviction loop can compare against it.
+	docCacheBytes int64
 	// opened maps each document the server has been told about to its path.
 	opened    map[model.FileID]string
 	openOrder []model.FileID
@@ -85,6 +90,11 @@ type server struct {
 type serverKey struct {
 	snapshot model.SnapshotID
 	profile  string
+	// root is the root-relative project directory the server was started at.
+	// It is part of the key because a server rooted at one project of a
+	// monorepo cannot answer about another: sharing one server across projects
+	// is what made a workspace-root server answer about none of them.
+	root string
 }
 
 // pipeStream joins the server's stdout (read side) and stdin (write side)
@@ -100,7 +110,8 @@ func (p pipeStream) Write(b []byte) (int, error) { return p.w.Write(b) }
 // errServerGone is the write-side error after the process has exited.
 var errServerGone = errors.New("the language server process has exited")
 
-// startServer materializes the snapshot, starts the pinned payload through the
+// startServer takes a reference to the snapshot's shared tree, starts the
+// pinned payload through the
 // shared runner, performs the initialize/initialized handshake and negotiates
 // the position encoding. Any failure releases the process, the pipes and the
 // materialization before returning.
@@ -109,18 +120,39 @@ var errServerGone = errors.New("the language server process has exited")
 // resolution and Profile.Tool carries that digest, so a second read of the same
 // file would prove nothing the fingerprint in the overlay binding does not
 // already commit to.
-func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (*server, error) {
+func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (srv *server, err error) {
 	snap := view.Header()
-	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{
-		Dir: snapshot.MaterializeDir(m.opts.DataDir), MaxBytes: m.opts.MaxOverlayBytes,
-	})
+	// A start is lazy, pooled and shared between generations, so it hangs off
+	// the process's overlay run and never off a generation's. It spans the
+	// whole start -- filling the shared tree, launching the payload and the
+	// handshake -- because that is what a caller waits for. No processor time
+	// is attributed to it: the child is still running when the start returns,
+	// so its resource usage does not exist yet, and the in-process half runs
+	// beside every other goroutine.
+	ctx, span := ledger.StartProvider(m.overlayContext(ctx, string(snap.RepositoryID)),
+		stageServerStart, p.Root, p.Name)
+	defer func() {
+		// End is idempotent, so the success path below ends the span itself
+		// and this closes only the paths that returned an error -- of which
+		// there are five, and a missed one would leave a span the stopping
+		// ledger writes as interrupted.
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
+	}()
+	// One tree per snapshot, shared read-only by every server of it: this
+	// server is rooted at its own project directory INSIDE that tree, and
+	// everything it writes goes to workDir below.
+	mat, err := m.materialize(ctx, view)
 	if err != nil {
 		return nil, err
 	}
 	s := &server{
-		key:     serverKey{snapshot: snap.ID, profile: p.Name},
-		profile: p, view: view, opts: m.opts, manager: m,
-		mat:    mat,
+		// The pinned cache is lossless, so it keeps a finite ceiling of its
+		// own when the overlay bound is unlimited: evicting costs a re-read,
+		// while an unbounded cache would make the overlay's peak a function of
+		// the repository.
+		docCacheBytes: m.opts.MaxOverlayBytes.ValueOr(DefaultDocCacheBytes),
+		key:           serverKey{snapshot: snap.ID, profile: p.Name, root: p.Root},
+		profile:       p, view: view, opts: m.opts, manager: m,
 		uris:   materializationURI{root: mat.Root()},
 		exited: make(chan struct{}),
 		docs:   make(map[model.FileID]*document),
@@ -128,12 +160,16 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	}
 	s.stdinR, s.stdinW = io.Pipe()
 	s.stdoutR, s.stdoutW = io.Pipe()
-	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes,
-		m.opts.MaxOutstandingRequests, s.handleServerRequest)
+	// The child's live processor time, sampled by the runner and read by the
+	// connection's per-request hang detector: a server computing an answer in
+	// silence is working, and nothing on the wire says so.
+	cpu := &process.CPUProgress{}
+	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes.Value(),
+		m.opts.MaxOutstandingRequests, cpu, s.handleServerRequest)
 
 	workDir := p.workDir(m.opts.DataDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		mat.Close()
+		_ = m.releaseMat(snap.ID)
 		return nil, unavailable("language server %q work directory cannot be created: %v", p.Name, err)
 	}
 	if p.Name == serverJDTLS && p.Tool.Source == toolchain.SourceManaged {
@@ -142,7 +178,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		// store payload to seed from -- it replaces the binary and owns its own
 		// launch -- so the copy is the managed payload's alone.
 		if err := seedPlatformConfig(p.Tool.Root, workDir); err != nil {
-			mat.Close()
+			_ = m.releaseMat(snap.ID)
 			return nil, err
 		}
 	}
@@ -157,16 +193,26 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		// The client writes requests into stdinR's other end for the life of
 		// the server; the runner copies them to the child and closes the
 		// child's stdin when the write end is closed at shutdown.
+		// The client writes into this reader for the whole life of the server,
+		// so there is no lifetime byte total to bound: the request stream is
+		// paced by the server reading it, and the rolling window in conn.write
+		// is what bounds a client that floods one. A bound here would end a
+		// long healthy session mid-request.
 		Stdin:         s.stdinR,
-		MaxStdinBytes: m.opts.MaxOverlayBytes + 1,
+		MaxStdinBytes: 0,
 		// Responses stream into stdoutW, which the connection reads. Stderr
 		// is a server's log and is not retained (Section 22: raw child
 		// output stays out of ordinary logs); its bound still terminates a
 		// server that floods it.
-		Stdout:                 s.stdoutW,
-		Stderr:                 io.Discard,
-		MaxStdoutBytes:         m.opts.MaxOverlayBytes,
-		MaxStderrBytes:         m.opts.MaxOverlayBytes,
+		Stdout: s.stdoutW,
+		Stderr: io.Discard,
+		// Both are unbounded: stdout is a framed protocol the connection reads
+		// and pacing it is that reader's job -- dropping bytes from it would
+		// desynchronize every later frame -- and stderr is discarded, so its
+		// bytes cost nothing to let through.
+		MaxStdoutBytes:         0,
+		MaxStderrBytes:         0,
+		CPUProgress:            cpu,
 		Timeout:                p.Timeout,
 		Grace:                  m.opts.StopTimeout,
 		MemoryReservationBytes: p.MemoryBudgetBytes,
@@ -197,7 +243,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		s.fail(err)
 	}()
 
-	if err := s.initialize(ctx, snap); err != nil {
+	if err = s.initialize(ctx, snap); err != nil {
 		// A start that failed after the process exists must not leave it: the
 		// same path a running server takes on failure.
 		s.fail(err)
@@ -212,6 +258,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		}
 		return nil, err
 	}
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	return s, nil
 }
 
@@ -221,8 +268,8 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	defer cancel()
 	params := initializeParams{
 		ClientInfo:       clientInfo{Name: "codectx", Version: model.CurrentBuildInfo().Version},
-		RootURI:          s.uris.rootURI(),
-		WorkspaceFolders: []workspaceFolder{{URI: s.uris.rootURI(), Name: "snapshot"}},
+		RootURI:          s.uris.uri(s.profile.Root),
+		WorkspaceFolders: []workspaceFolder{{URI: s.uris.uri(s.profile.Root), Name: "project"}},
 		Capabilities: clientCapabilities{
 			General: generalCapabilities{PositionEncodings: offeredEncodings},
 			TextDocument: textDocumentCapabilities{
@@ -248,11 +295,12 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	}
 	s.enc = enc
 	// A server that declines to name itself is still identified by the payload
-	// the lock pinned: pyright and typescript-language-server both answer
-	// initialize with no serverInfo at all (measured), and an empty
-	// ProviderVersion fails OverlayBinding.Validate, which made the overlay
-	// permanently unavailable for python, typescript, tsx and javascript with
-	// an error in the argument class. The *reported* string keeps feeding
+	// the lock pinned: typescript-language-server answers initialize with no
+	// serverInfo at all (measured), and since the python server became a native
+	// binary that reports one (ADR-0006) it is the only pinned server that
+	// does. An empty ProviderVersion fails OverlayBinding.Validate, which made
+	// the overlay permanently unavailable for typescript, tsx and javascript
+	// with an error in the argument class. The *reported* string keeps feeding
 	// inputDigest unchanged, so a payload that starts reporting a version later
 	// is still a different question.
 	version := ""
@@ -308,12 +356,14 @@ func (s *server) handleServerRequest(method string, params json.RawMessage) (any
 
 // onExit runs once the runner has reaped the process tree. It ends the
 // stream on both sides so the reader sees end of file and any writer fails
-// instead of blocking on a pipe nobody drains, removes the materialization,
-// and reports the exit as a failure unless this was a requested stop.
+// instead of blocking on a pipe nobody drains, gives back this server's
+// reference to the shared materialization -- which is removed once the last
+// server of the snapshot has exited -- and reports the exit as a failure
+// unless this was a requested stop.
 func (s *server) onExit(runErr error) {
 	s.stdoutW.Close()
 	s.stdinR.CloseWithError(errServerGone)
-	matErr := s.mat.Close()
+	matErr := s.manager.releaseMat(s.key.snapshot)
 	s.mu.Lock()
 	closing := s.state == serverClosing
 	s.mu.Unlock()
@@ -434,38 +484,62 @@ func (s *server) running() error {
 	return nil
 }
 
+// absence says why an overlay has no document for a file. It is a reason
+// rather than a bool because the two reasons are reported differently: a file
+// the snapshot does not hold is a caller mistake, while a file a user-set
+// overlay bound left out is an admission the operator asked for.
+type absence int
+
+const (
+	absentNone absence = iota
+	absentFromSnapshot
+	absentOverBound
+)
+
+// reason is the phrase a caller puts in front of an operator.
+func (a absence) reason() string {
+	if a == absentOverBound {
+		return "is over the overlay bound providers.lsp.max_overlay_bytes and was not admitted"
+	}
+	return "is not in the pinned snapshot"
+}
+
 // document returns the pinned bytes of one snapshot file, reading them from
 // the verified view (never the materialization the server may have written
-// to, never the live checkout) and caching them under the overlay byte bound
-// with least-recently-used eviction. notFound is true when the snapshot has
-// no such file.
-func (s *server) document(ctx context.Context, id model.FileID) (doc *document, notFound bool, err error) {
+// to, never the live checkout) and caching them under the cache ceiling with
+// least-recently-used eviction. The absence says why there is no document.
+func (s *server) document(ctx context.Context, id model.FileID) (doc *document, missing absence, err error) {
 	s.docMu.Lock()
 	defer s.docMu.Unlock()
 	if d, ok := s.docs[id]; ok {
 		s.touch(id)
-		return d, false, nil
+		return d, absentNone, nil
 	}
 	rc, fv, err := s.view.Open(ctx, id)
 	if err != nil {
 		if isNotFound(err) {
-			return nil, true, nil
+			return nil, absentFromSnapshot, nil
 		}
-		return nil, false, err
+		return nil, absentNone, err
 	}
 	defer rc.Close()
-	if fv.Size > s.opts.MaxOverlayBytes {
-		return nil, false, resourceLimit("file %s is %d bytes, over the %d-byte overlay bound", fv.Path, fv.Size, s.opts.MaxOverlayBytes).
-			WithDetail("limit", "max_overlay_bytes")
+	if s.opts.MaxOverlayBytes.Exceeded(fv.Size) {
+		// A user-set bound admits what fits and names what it left out; the
+		// overlay then answers about the rest of the snapshot instead of
+		// refusing the whole query over one large file.
+		slog.Default().Warn("file not admitted to the language server overlay; it is over the overlay bound",
+			"component", "provider.lsp", "profile", s.profile.Name, "path", fv.Path,
+			"file_bytes", fv.Size, "max_overlay_bytes", s.opts.MaxOverlayBytes.String())
+		return nil, absentOverBound, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(rc, fv.Size+1))
 	if err != nil {
-		return nil, false, err
+		return nil, absentNone, err
 	}
 	if int64(len(data)) != fv.Size {
-		return nil, false, &model.Error{Code: model.CodeSourceIntegrity, Message: "retained bytes differ in length from the manifest"}
+		return nil, absentNone, &model.Error{Code: model.CodeSourceIntegrity, Message: "retained bytes differ in length from the manifest"}
 	}
-	for s.docBytes+fv.Size > s.opts.MaxOverlayBytes && len(s.docOrder) > 0 {
+	for s.docBytes+fv.Size > s.docCacheBytes && len(s.docOrder) > 0 {
 		oldest := s.docOrder[0]
 		s.docOrder = s.docOrder[1:]
 		s.docBytes -= int64(len(s.docs[oldest].data))
@@ -475,7 +549,7 @@ func (s *server) document(ctx context.Context, id model.FileID) (doc *document, 
 	s.docs[id] = d
 	s.docOrder = append(s.docOrder, id)
 	s.docBytes += fv.Size
-	return d, false, nil
+	return d, absentNone, nil
 }
 
 func (s *server) touch(id model.FileID) {

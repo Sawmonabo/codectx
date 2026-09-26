@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -36,10 +37,12 @@ type Sampler interface {
 // does not import internal/storage/sqlite (see doc.go); the composition root
 // adapts it.
 type StoreReader interface {
-	// Check runs the Section 12.1 integrity checks. deep adds the expensive
-	// FTS5 external-content check, and an ordinary doctor call must pass
-	// false: Section 22's last line forbids a full database scan on an
-	// ordinary command.
+	// Check runs the Section 12.1 integrity checks. With deep false it reads
+	// the database header, the schema fingerprint and the journal mode and
+	// nothing else; deep adds quick_check, the foreign key check and the FTS5
+	// external-content check, each of which walks the whole database. An
+	// ordinary doctor call must pass false: Section 22's last line forbids a
+	// full database scan on an ordinary command.
 	Check(ctx context.Context, deep bool) error
 	// Stats reports row counts and the on-disk database and WAL sizes.
 	Stats(ctx context.Context) (StoreStats, error)
@@ -68,12 +71,31 @@ type StoreStats struct {
 	WALBytes      int64
 }
 
+// StoreSizer reports only the on-disk sizes -- two file stats, no query -- and
+// the write-ahead log size the store itself treats as the largest a run leaves
+// behind. It is an optional interface beside StoreReader because StoreReader is
+// frozen, and it exists so a shallow doctor can still report database and
+// write-ahead-log bytes (and warn on a log past the store's bound) without
+// paying for Stats, whose eleven `count(*)` scans are O(rows). A store that
+// does not implement it reports the accounting sizes as unavailable rather
+// than as zero.
+type StoreSizer interface {
+	StoreSizes(ctx context.Context) (databaseBytes, walBytes int64, err error)
+	WALBoundBytes() int64
+}
+
 // ToolchainReporter reports one status per lock entry. The lock entry name is
 // what a check prints for a managed tool; the dependence backend is reported in
 // the `engine <version> <digest>` form the provider already uses, never by the
 // backend's product name.
 type ToolchainReporter interface {
 	Statuses(ctx context.Context) ([]toolchain.Status, error)
+	// Selected names the lock entries the repository at root selects -- the
+	// same answer `codectx tools prefetch --for-repo` installs. An empty list
+	// is an answer (a root that selects no pinned tool), not a failure. The
+	// doctor reports only these entries, so an operator is never told to
+	// install a payload their repository will not run.
+	Selected(ctx context.Context, root string) ([]string, error)
 }
 
 // WorkspaceProber answers the questions about the filesystem that neither the
@@ -93,8 +115,24 @@ type WorkspaceProber interface {
 	FreeDiskBytes(ctx context.Context, dir string) (*uint64, error)
 }
 
+// RunLedger is the read surface the resource block needs from the run ledger:
+// the latest run recorded for this repository, one page of its stages as the
+// model carries them, and whether the run holds more stages than that page --
+// a page that dropped rows must say so, or a partial account of a run reads as
+// the whole of it.
+//
+// It is stated here as a narrow interface for the same reason StoreReader is:
+// this package must not import the ledger any more than it imports the store,
+// and the composition root adapts the one to the other. A nil run is the honest
+// answer for a workspace that has recorded no run, which is what a reader of a
+// cache built before anything was instrumented sees.
+type RunLedger interface {
+	LatestRun(ctx context.Context, repo model.RepositoryID, generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error)
+}
+
 // Options are the dependencies of a Service. Every field is required except
-// Now, which defaults to time.Now.
+// Now, which defaults to time.Now, and Ledger, whose absence is reported as a
+// resource block with no run rows rather than as a failure.
 type Options struct {
 	Config config.Config
 	Build  model.BuildInfo
@@ -106,9 +144,18 @@ type Options struct {
 	// READability only -- Section 6 forbids this product writing anything into
 	// the repository, so the write probe the data directory gets must never be
 	// aimed at the workspace.
-	Root      string
-	Sampler   Sampler
-	Store     StoreReader
+	Root    string
+	Sampler Sampler
+	Store   StoreReader
+	// Ledger reads the run ledger beside the index store. It is optional
+	// because a workspace that has recorded no run must still report its
+	// resources; a nil one leaves the run and stage rows out of the block.
+	Ledger RunLedger
+	// Admission is the process's one memory admission ledger, whose allocation
+	// and current total the resource block discloses. It is optional: a
+	// composition without one -- a diagnostics service that starts no heavy
+	// child -- leaves both figures absent rather than reporting them as zero.
+	Admission *admission.Ledger
 	Toolchain ToolchainReporter
 	Workspace WorkspaceProber
 	// Now is the clock every check and the report's CheckedAt read (L1). A

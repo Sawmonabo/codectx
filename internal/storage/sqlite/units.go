@@ -10,8 +10,28 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
+
+// The stages of an activation that are recorded on their own. Each runs inside
+// the activation, not as a phase the coordinator can bracket, so its span is
+// opened here, under the activation span the caller already holds.
+const (
+	stageLexicalCompaction = "lexical_compaction"
+	stageAdjacency         = "adjacency"
+	stageLexicalBuild      = "lexical_build"
+	stageSeal              = "seal"
+)
+
+// spanOutcome is how an activation stage reports itself: a span that returned
+// an error failed, and every other return is a success.
+func spanOutcome(err error) ledger.Outcome {
+	if err != nil {
+		return ledger.OutcomeFailed
+	}
+	return ledger.OutcomeOK
+}
 
 // Hash domains for the aggregate digests folded into AnalysisKey (Section 9.1).
 const (
@@ -46,7 +66,7 @@ func (s *Store) BeginGeneration(ctx context.Context, repo model.RepositoryID, sn
 		return 0, invalid("generation ref is required and bounded to %d bytes", model.MaxPathBytes)
 	}
 	var id int64
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO generations(repository_id, snapshot_id, ref, analysis_key, semantic_config_hash, status, health, created_at)
 			VALUES(?, ?, ?, NULL, ?, ?, ?, ?)`, repoRaw, snapRaw, ref, semanticConfigHash, string(model.GenerationStaging), string(model.HealthFresh), formatTime(time.Now()))
 		if err != nil {
@@ -69,7 +89,7 @@ func (s *Store) BeginProviderRun(ctx context.Context, gen model.GenerationID, pr
 		return "", err
 	}
 	raw, _ := model.DecodeID(id)
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		if _, err := s.generationRow(ctx, tx, gen, model.GenerationStaging); err != nil {
 			return err
 		}
@@ -108,11 +128,104 @@ func (s *Store) CompleteProviderRun(ctx context.Context, result model.ProviderRe
 	if err != nil {
 		return internal("counters: " + err.Error())
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		return exec1(ctx, tx, conflict("provider run %s is not running", result.RunID),
 			`UPDATE provider_runs SET status = ?, counters_json = ?, diagnostic_code = ?, completed_at = ? WHERE id = ? AND status = 'running'`,
 			string(result.State), string(counters), diagnosticCode, formatTime(time.Now()), raw)
 	})
+}
+
+// RecordRunFailure keeps the typed reason a run produced no unit on the run
+// row. It is the only durable home for a failed unit's message and details: a
+// unit that never sealed has no row of its own, and the capability row the
+// fold publishes carries one exemplar scope per provider capability and
+// excludes the raw tool output entirely.
+//
+// It is written after CompleteProviderRun and therefore does not require the
+// run to still be running; a run recorded as succeeded has no failure to
+// write, which is why the empty reason is refused rather than stored.
+func (s *Store) RecordRunFailure(ctx context.Context, id model.ProviderRunID, failure model.RunFailure) error {
+	if err := failure.Validate(); err != nil {
+		return err
+	}
+	raw, err := idBlob("run_id", string(id))
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(failure)
+	if err != nil {
+		return internal("run failure: " + err.Error())
+	}
+	return s.ingest(ctx, func(tx *sql.Tx) error {
+		return exec1(ctx, tx, invalid("provider run %s does not exist", id),
+			`UPDATE provider_runs SET failure_json = ? WHERE id = ?`, string(encoded), raw)
+	})
+}
+
+// FailedRuns is one page of the typed reasons the runs of one generation
+// failed, oldest first, with the number of reasons that did not fit the page.
+//
+// It is keyed by GENERATION and not by run id, which is what makes it
+// answerable at all: the reasons are on the run rows, a status report holds no
+// run ids, and a reader keyed by one could only be called by something that
+// already knew which run to ask about. Every surface that reports a failure
+// asks the same question -- why does this generation have no facts for these
+// scopes -- and this is the one answer to it.
+//
+// A generation that has been collected takes its runs with it, so an empty
+// page is "no reason is kept for this generation" and not an error: the
+// question was why a scope has no facts, and "the generation that failed is no
+// longer retained" is an answer.
+//
+// The page is bounded like every other result list, and what did not fit is
+// counted rather than dropped in silence: the one surface whose job is to
+// report failures must never lose one without saying so.
+func (s *Store) FailedRuns(ctx context.Context, gen model.GenerationID) ([]model.RunFailure, int64, error) {
+	var out []model.RunFailure
+	var total int64
+	// readOwn and not read: in the process that is indexing, `codectx status`
+	// is answered while an ingestion group is open, and a reason written into
+	// that group but read from the reader pool is a failure the run that just
+	// recorded it cannot see.
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		out, total = nil, 0
+		rows, err := tx.QueryContext(ctx, `SELECT provider_id, failure_json FROM provider_runs
+			WHERE generation_id = ? AND failure_json != '' ORDER BY provider_id, started_at, id`, int64(gen))
+		if err != nil {
+			return wrap("provider_runs", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			total++
+			var providerID, encoded string
+			if err := rows.Scan(&providerID, &encoded); err != nil {
+				return wrap("provider_runs", err)
+			}
+			if len(out) >= model.MaxRecordsPerResult {
+				continue
+			}
+			var failure model.RunFailure
+			if err := json.Unmarshal([]byte(encoded), &failure); err != nil {
+				return corrupt("the recorded provider run failure is not readable")
+			}
+			// The row's own column is the authority on which provider ran:
+			// the blob is the reason, and a reason that disagreed with the run
+			// it sits on would name the wrong provider on every surface.
+			failure.ProviderID = providerID
+			// The write path bounds every reason, but the read path must not
+			// trust the row: a blob written by a foreign binary would
+			// otherwise hand a caller an unbounded message.
+			if err := failure.Validate(); err != nil {
+				return corrupt("a recorded provider run failure is not a valid reason: %v", err)
+			}
+			out = append(out, failure)
+		}
+		return wrap("provider_runs", rows.Err())
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return out, total - int64(len(out)), nil
 }
 
 // ProviderRun reads one run's provenance. GenerationID is zero once the
@@ -123,7 +236,7 @@ func (s *Store) ProviderRun(ctx context.Context, id model.ProviderRunID) (model.
 		return model.ProviderRun{}, err
 	}
 	var run model.ProviderRun
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		var gen sql.NullInt64
 		var counters, started string
 		var completed sql.NullString
@@ -187,15 +300,40 @@ func (s *Store) generationRow(ctx context.Context, tx *sql.Tx, gen model.Generat
 // building. Only the store hands one out; providers reach it through the Task
 // 6 sink and never see SQL.
 type UnitWriter struct {
-	s       *Store
-	rowID   int64
-	build   model.UnitBuild
-	unitKey []byte
-	repo    model.RepositoryID
-	repoRaw []byte
-	gen     model.GenerationID
-	ftsDocs int64
-	done    bool
+	s          *Store
+	rowID      int64
+	build      model.UnitBuild
+	unitKey    []byte
+	repo       model.RepositoryID
+	gen        model.GenerationID
+	searchDocs int64
+	done       bool
+
+	// ids resolves a canonical identity or an interned string to the
+	// storage-internal surrogate every reference column now carries (ids.go),
+	// and nodes caches the lookup-only direction: a node that must ALREADY be
+	// registered -- a relation endpoint, an alias target, a search document's
+	// symbol -- is never minted here, so it is resolved by canonical lookup and
+	// an absent row is malformed provider output, exactly as the foreign key to
+	// node_ids reports it.
+	//
+	// Both are bounded LRUs sized from the configured batch, and endBatch drops
+	// them at every batch boundary, so the writer's live set is a function of
+	// one batch and never of the repository.
+	ids   interner
+	nodes *refCache
+
+	// lex is the unit's lexical staging database, opened by the first
+	// PutSearchUnits batch and folded into the unit's segment at seal. It is
+	// deleted at seal, at Abandon and at Fail, so no staging outlives the
+	// building unit that owns it.
+	lex *lexicalStage
+
+	// stmts holds the prepared statements of the write transaction currently
+	// running, so the dozen SQL texts the per-row helpers issue are parsed
+	// once per transaction instead of once per row (stmtcache.go). It is
+	// installed by inTx for the life of one transaction and nil outside one.
+	stmts *stmtCache
 
 	// evidenceClipped records what SealUnit dropped to hold the evidence
 	// bound, so a caller can report the truncation instead of it being silent.
@@ -226,14 +364,15 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 	}
 	unitKey, _ := model.DecodeID(string(build.Spec.ID))
 	runRaw, _ := model.DecodeID(string(build.OriginRunID))
-	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen}
+	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen,
+		ids: newInterner(s.opts), nodes: newRefCache(max(s.opts.BatchRecords, internCacheFloor))}
 	var snapshot []byte
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
 		}
-		snapshot, w.repoRaw = g.snapshot, g.repo
+		snapshot = g.snapshot
 		w.repo = model.RepositoryID(idHex(g.repo))
 		var runGen sql.NullInt64
 		var runProvider, runVersion string
@@ -309,7 +448,7 @@ func (w *UnitWriter) streamInputs(ctx context.Context, snapshot []byte, inputs f
 		if len(batch) == 0 {
 			return nil
 		}
-		err := w.s.write(ctx, func(tx *sql.Tx) error {
+		err := w.s.ingest(ctx, func(tx *sql.Tx) error {
 			check, err := tx.PrepareContext(ctx, `SELECT 1 FROM snapshot_files WHERE snapshot_id = ? AND file_id = ? AND content_hash = ? AND executable = ? AND status <> 'deleted'`)
 			if err != nil {
 				return wrap("snapshot_files", err)
@@ -445,6 +584,17 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 			return &model.Error{Code: model.CodeProviderOutputInvalid,
 				Message: "node id does not derive from its repository, kind and canonical key", Details: map[string]string{"node_id": string(f.Node.ID)}}
 		}
+		// node_ids.canonical_key is BLOB(32) (S-4): the key is stored as the
+		// digest it is, not as its 64-character hex rendering. Every minted key
+		// comes from model.CanonicalNodeKey, so a key that is not a digest is
+		// a producer that bypassed the resolver, refused here rather than by a
+		// CHECK constraint that could name no fact.
+		if _, err := model.DecodeID(f.CanonicalKey); err != nil {
+			return &model.Error{Code: model.CodeProviderOutputInvalid,
+				Message:     "node canonical key is not a 64-character lowercase hex digest",
+				Details:     map[string]string{"node_id": string(f.Node.ID)},
+				Remediation: "derive the canonical key through the resolver (model.CanonicalNodeKey)"}
+		}
 		if err := w.checkEvidence(f.Evidence); err != nil {
 			return err
 		}
@@ -455,13 +605,9 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
-			ids, err := tx.PrepareContext(ctx, `INSERT INTO node_ids(id, repository_id, kind, canonical_key) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
-			if err != nil {
-				return err
-			}
-			defer ids.Close()
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
+		return w.providerWrite(tx, func() error {
+			defer w.endBatch()
 			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
 			if err != nil {
 				return err
@@ -480,12 +626,19 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 			defer putKey.Close()
 			for i, f := range facts {
 				n := f.Node
-				nodeRaw, _ := model.DecodeID(string(n.ID))
-				if _, err := ids.ExecContext(ctx, nodeRaw, w.repoRaw, string(n.Kind), f.CanonicalKey); err != nil {
+				keyRaw, _ := model.DecodeID(f.CanonicalKey)
+				ref, err := w.ids.node(ctx, tx, n.ID, string(n.Kind), keyRaw)
+				if err != nil {
 					return err
 				}
+				w.nodes.put(string(n.ID), int64(ref))
+				// The kind registered under this identity is re-read rather
+				// than trusted from the cache: node_ids.canonical is unique and
+				// the identity derives from (repository, kind, canonical key),
+				// so a divergence here is the one thing that derivation cannot
+				// rule out, and it is a rowid point lookup.
 				var kind model.NodeKind
-				if err := kindOf.QueryRowContext(ctx, nodeRaw).Scan(&kind); err != nil {
+				if err := kindOf.QueryRowContext(ctx, int64(ref)).Scan(&kind); err != nil {
 					return err
 				}
 				if kind != n.Kind {
@@ -504,18 +657,18 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 					}
 					metadata = string(n.Metadata)
 				}
-				res, err := ins.ExecContext(ctx, w.rowID, nodeRaw, n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
+				res, err := ins.ExecContext(ctx, w.rowID, int64(ref), n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
 				if err != nil {
 					return err
 				}
-				if err := w.checkRepeatedNode(ctx, tx, res, n, nodeRaw,
+				if err := w.checkRepeatedNode(ctx, tx, res, n, ref,
 					[]string{n.Language, n.Name, n.QualifiedName, n.Signature, blobText(fileRaw), intText(start), intText(end), metadata}); err != nil {
 					return err
 				}
-				if err := w.storeFactKeys(ctx, putKey, nodeRaw, nil, keysAt(keys, i)); err != nil {
+				if err := w.storeFactKeys(ctx, putKey, nullNode(ref), nil, keysAt(keys, i)); err != nil {
 					return err
 				}
-				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
+				if err := w.insertEvidence(ctx, tx, f.Evidence, ref, noRef); err != nil {
 					return err
 				}
 			}
@@ -561,13 +714,9 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
-			ids, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO relation_ids(id, repository_id, from_node_id, kind, to_node_id) VALUES(?, ?, ?, ?, ?)`)
-			if err != nil {
-				return err
-			}
-			defer ids.Close()
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
+		return w.providerWrite(tx, func() error {
+			defer w.endBatch()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
 			if err != nil {
 				return err
@@ -580,19 +729,25 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 			defer putKey.Close()
 			for i, f := range facts {
 				r := f.Relation
-				relRaw, _ := model.DecodeID(string(r.ID))
-				fromRaw, _ := model.DecodeID(string(r.From))
-				toRaw, _ := model.DecodeID(string(r.To))
-				if _, err := ids.ExecContext(ctx, relRaw, w.repoRaw, fromRaw, string(r.Kind), toRaw); err != nil {
+				from, err := w.nodeRef(ctx, tx, r.From)
+				if err != nil {
 					return err
 				}
-				if _, err := ins.ExecContext(ctx, w.rowID, relRaw); err != nil {
+				to, err := w.nodeRef(ctx, tx, r.To)
+				if err != nil {
 					return err
 				}
-				if err := w.storeFactKeys(ctx, putKey, nil, relRaw, keysAt(keys, i)); err != nil {
+				ref, err := w.ids.relation(ctx, tx, r.ID, from, string(r.Kind), to)
+				if err != nil {
 					return err
 				}
-				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
+				if _, err := ins.ExecContext(ctx, w.rowID, int64(ref)); err != nil {
+					return err
+				}
+				if err := w.storeFactKeys(ctx, putKey, nil, nullRelation(ref), keysAt(keys, i)); err != nil {
+					return err
+				}
+				if err := w.insertEvidence(ctx, tx, f.Evidence, noRef, ref); err != nil {
 					return err
 				}
 			}
@@ -617,16 +772,28 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 	if err := w.s.checkBatch(len(aliases), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
-			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key, native_key, node_id) VALUES(?, ?, ?, ?)`)
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
+		return w.providerWrite(tx, func() error {
+			defer w.endBatch()
+			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id) VALUES(?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer stmt.Close()
 			for _, a := range aliases {
-				nodeRaw, _ := model.DecodeID(string(a.NodeID))
-				if _, err := stmt.ExecContext(ctx, w.rowID, a.ScopeKey, a.NativeKey, nodeRaw); err != nil {
+				node, err := w.nodeRef(ctx, tx, a.NodeID)
+				if err != nil {
+					return err
+				}
+				scope, err := w.ids.scopeKey(ctx, tx, a.ScopeKey)
+				if err != nil {
+					return err
+				}
+				native, err := w.ids.nativeKey(ctx, tx, a.NativeKey)
+				if err != nil {
+					return err
+				}
+				if _, err := stmt.ExecContext(ctx, w.rowID, int64(scope), int64(native), int64(node)); err != nil {
 					return err
 				}
 			}
@@ -636,8 +803,12 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 }
 
 // PutSearchUnits stores lexical documents and their FTS index rows in the same
-// transaction. The FTS insert is explicit: the external-content table is never
-// maintained by cascade or by row counts (Section 12.2).
+// transaction. The FTS insert is explicit: search_fts is contentless
+// (ADR-0003 §2.1), so nothing maintains it by cascade or by row counts and the
+// body text reaches the index from this document and nowhere else -- the
+// database keeps no second copy of it (Section 12.2). Each posting's rowid is
+// recorded as the row's doc_id, which is what every read resolves a document
+// by and what a delta carry-over inherits instead of re-indexing.
 //
 // token_count is computed here with the index's own unicode61 tokenizer over
 // exactly the columns search_fts indexes, so the Section 12.4 length
@@ -657,40 +828,68 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err := w.s.checkBatch(len(docs), bytes); err != nil {
 		return err
 	}
-	tokenCounts, err := w.s.countTokens(ctx, docs)
+	if w.lex == nil {
+		stage, err := w.s.openLexicalStage(ctx)
+		if err != nil {
+			return err
+		}
+		w.lex = stage
+	}
+	batch := w.lex.nextBatch()
+	// One tokenizer pass serves both the token counts and the unit's lexical
+	// staging. The staged rows carry the batch-local document number; the
+	// ingestion below resolves it to the document rowid it assigns.
+	tokenCounts, err := w.s.countTokens(ctx, docs, func(doc int64, term, col string, n int64) error {
+		return w.lex.putTerm(ctx, batch, doc, term, col, n)
+	})
 	if err != nil {
 		return err
 	}
+	docIDs := make([]int64, len(docs))
 	var inserted int64
-	err = w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
-			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count)
+	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
+		return w.providerWrite(tx, func() error {
+			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer content.Close()
-			index, err := tx.PrepareContext(ctx, `INSERT INTO search_fts(rowid, name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?, ?)`)
+			index, err := tx.PrepareContext(ctx, `INSERT INTO search_fts(name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer index.Close()
+			defer w.endBatch()
 			for i, d := range docs {
 				keyRaw, _ := model.DecodeID(d.ID)
 				fileRaw, _ := model.DecodeID(string(d.FileID))
-				nodeRaw, _ := optionalBlob("search_unit.node_id", string(d.NodeID))
-				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nodeRaw, fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
-					int64(d.Bytes.Start), int64(d.Bytes.End), d.Body, tokenCounts[i])
+				var node nodeRef
+				if d.NodeID != "" {
+					if node, err = w.nodeRef(ctx, tx, d.NodeID); err != nil {
+						return err
+					}
+				}
+				// The posting is written FIRST so its rowid can be stored as
+				// the document's doc_id in the same insert: search_fts assigns
+				// it, search_units records it, and the carry-over copies it
+				// forward. The alternative -- insert the row, then update it
+				// with its own rowid -- costs a second b-tree write per
+				// document on the indexing hot path. A failure below rolls the
+				// whole transaction back, so an orphan posting cannot survive.
+				posting, err := index.ExecContext(ctx, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body)
 				if err != nil {
 					return err
 				}
-				rowid, err := res.LastInsertId()
+				docID, err := posting.LastInsertId()
 				if err != nil {
 					return err
 				}
-				if _, err := index.ExecContext(ctx, rowid, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body); err != nil {
+				if _, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
+					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i], docID); err != nil {
 					return err
 				}
+				docIDs[i] = docID
 				inserted++
 			}
 			return nil
@@ -699,7 +898,16 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err != nil {
 		return err
 	}
-	w.ftsDocs += inserted
+	// The document rowids are staged only now, after the ingestion returned:
+	// a batch whose transaction failed leaves no mapping, and the seal's join
+	// drops its staged terms rather than folding a document that does not
+	// exist.
+	for i := range docs {
+		if err := w.lex.putDoc(ctx, batch, int64(i+1), docIDs[i]); err != nil {
+			return err
+		}
+	}
+	w.searchDocs += inserted
 	return nil
 }
 
@@ -707,7 +915,27 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 // CTX_PROVIDER_OUTPUT_INVALID: an unregistered endpoint, an input file the
 // unit did not declare or a duplicated fact is malformed provider output, not
 // a caller argument error.
-func (w *UnitWriter) providerWrite(fn func() error) error {
+// providerWrite runs one provider batch inside tx and translates what the
+// batch reports.
+//
+// It also installs the transaction's statement cache for the duration of the
+// batch and finalises every statement that cache prepared on the way out, so
+// the dozen SQL texts the per-row helpers issue are parsed once per batch
+// rather than once per row. Every per-row helper reaches the cache through
+// w.stmts; outside a batch it is nil and those helpers prepare on the
+// transaction they are handed, which is what every non-writer caller of the
+// same code does.
+func (w *UnitWriter) providerWrite(tx *sql.Tx, fn func() error) error {
+	cache := newStmtCache(tx)
+	w.stmts = cache
+	if in, ok := w.ids.(*dbInterner); ok {
+		in.stmts = cache
+		defer func() { in.stmts = nil }()
+	}
+	defer func() {
+		w.stmts = nil
+		cache.close()
+	}()
 	err := fn()
 	if err == nil {
 		return nil
@@ -728,7 +956,7 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 	}
 	fileRaw, _ := model.DecodeID(string(file))
 	var stored []byte
-	err := tx.QueryRowContext(ctx, `SELECT content_hash FROM unit_inputs WHERE unit_id = ? AND file_id = ?`, w.rowID, fileRaw).Scan(&stored)
+	err := w.stmts.queryRow(ctx, tx, `SELECT content_hash FROM unit_inputs WHERE unit_id = ? AND file_id = ?`, w.rowID, fileRaw).Scan(&stored)
 	if isNoRows(err) {
 		return nil, &model.Error{Code: model.CodeProviderOutputInvalid,
 			Message: "fact names a file the unit did not declare as an input", Details: map[string]string{"file_id": string(file)}}
@@ -743,28 +971,90 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 	return fileRaw, nil
 }
 
-func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence) error {
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key, detail, content_hash_bound)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
+// insertEvidence writes the occurrences of ONE fact, whose surrogate the
+// caller has already resolved: NodeFact.Validate and RelationFact.Validate
+// both refuse evidence that names another fact than the one being published,
+// so node and rel are exactly the refs every row in list must carry and
+// resolving them again per row would buy nothing. Exactly one of them is
+// valid, which is what the evidence CHECK constraint requires.
+//
+// evidence.id stays the canonical 32-byte digest (S-6 dropped): the id is a
+// pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
+// what makes a republished occurrence idempotent.
+func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
+	const insert = `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, content_hash_bound)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`
+	stmt, cached, err := w.stmts.prepare(ctx, tx, insert)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	if !cached {
+		// No cache owns the handle (this writer is outside a provider batch),
+		// so this call prepares and finalises its own.
+		if stmt, err = tx.PrepareContext(ctx, insert); err != nil {
+			return err
+		}
+		defer stmt.Close()
+	}
 	for _, e := range list {
 		idRaw, _ := model.DecodeID(string(e.ID))
-		nodeRaw, _ := optionalBlob("evidence.node_id", string(e.NodeID))
-		relRaw, _ := optionalBlob("evidence.relation_id", string(e.RelationID))
 		fileRaw, err := w.inputFile(ctx, tx, e.FileID, e.ContentHash)
 		if err != nil {
 			return err
 		}
+		native, err := w.ids.nativeKey(ctx, tx, e.NativeKey)
+		if err != nil {
+			return err
+		}
 		start, end := rangeBytes(e.Range)
-		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw, start, end, e.NativeKey, e.Detail,
-			boolInt(e.ContentHash != "")); err != nil {
+		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nullNode(node), nullRelation(rel), string(e.Precision), fileRaw, start, end,
+			int64(native), e.Detail, boolInt(e.ContentHash != "")); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// nodeRef resolves a canonical node identity that must ALREADY be registered
+// -- a relation endpoint, an alias target, a search document's symbol. The
+// node_ids row is never created here: publishing a fact under a new identity
+// goes through PutKeyedNodes, which alone carries the kind and canonical key
+// that identity derives from. An unregistered identity is malformed provider
+// output, which is precisely what the foreign key to node_ids reported before
+// the reference columns became surrogates.
+//
+// Hits are served from the writer's bounded LRU; a miss is one lookup on
+// node_ids.canonical (UNIQUE). Both are dropped at the batch boundary.
+func (w *UnitWriter) nodeRef(ctx context.Context, tx *sql.Tx, id model.NodeID) (nodeRef, error) {
+	raw, err := idBlob("node_id", string(id))
+	if err != nil {
+		return noRef, err
+	}
+	if ref, ok := w.nodes.get(string(id)); ok {
+		return nodeRef(ref), nil
+	}
+	var ref int64
+	err = w.stmts.queryRow(ctx, tx, `SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&ref)
+	if isNoRows(err) {
+		return noRef, &model.Error{Code: model.CodeProviderOutputInvalid,
+			Message:     "fact names a node identity that is not registered",
+			Details:     map[string]string{"node_id": string(id)},
+			Remediation: "publish the node fact through PutNodes before the facts that reference it"}
+	}
+	if err != nil {
+		return noRef, wrap("node_ids", err)
+	}
+	w.nodes.put(string(id), ref)
+	return nodeRef(ref), nil
+}
+
+// endBatch drops every cached surrogate. It runs at the end of each provider
+// batch, so the writer's live set is a function of the configured batch size
+// and never of how many distinct identities or interned strings a repository
+// holds.
+func (w *UnitWriter) endBatch() {
+	w.ids.reset()
+	w.nodes.reset()
 }
 
 // canonicalDetails renders a capability's diagnostic pairs as the stored JSON
@@ -863,7 +1153,7 @@ var nodeFactColumns = []string{"language", "name", "qualified_name", "signature"
 // over the same source would then hold different rows, which is the one thing
 // Section 11.4 requires a delta not to do. An identical repeat costs one
 // comparison and is free.
-func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.Result, n model.Node, raw []byte, incoming []string) error {
+func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.Result, n model.Node, ref nodeRef, incoming []string) error {
 	affected, err := res.RowsAffected()
 	if err != nil || affected != 0 {
 		return err
@@ -871,8 +1161,8 @@ func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.
 	var language, name, qualified, signature, metadata string
 	var file []byte
 	var start, end sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
-		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, raw).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
+	if err := w.stmts.queryRow(ctx, tx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
+		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, int64(ref)).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
 		return err
 	}
 	stored := []string{language, name, qualified, signature, optionalHex(file), nullIntText(start), nullIntText(end), metadata}
@@ -947,7 +1237,10 @@ func (w *UnitWriter) Abandon(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	if err := w.closeStage(); err != nil {
+		return err
+	}
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
 			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
 		return wrap("units", err)
@@ -961,7 +1254,10 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	if err := w.closeStage(); err != nil {
+		return err
+	}
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		var state model.UnitState
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE id = ?`, w.rowID).Scan(&state)
 		if isNoRows(err) {
@@ -977,6 +1273,18 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 	})
 }
 
+// closeStage gives the unit's lexical staging slot back to the store's scratch
+// pool. Every path that ends a building unit -- seal, Abandon, Fail -- calls
+// it, so a slot is never held past the unit that took it.
+func (w *UnitWriter) closeStage() error {
+	if w.lex == nil {
+		return nil
+	}
+	stage := w.lex
+	w.lex = nil
+	return stage.close()
+}
+
 // closureCTE selects the unit row and every transitive dependency.
 const closureCTE = `WITH RECURSIVE closure(id) AS (
 	SELECT ?1 UNION SELECT ud.dependency_id FROM unit_dependencies ud JOIN closure c ON ud.unit_id = c.id)`
@@ -990,7 +1298,15 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	// The seal is a stage of its own: it is the validation of a whole unit,
+	// eight closure queries over everything the unit emitted, and it is the
+	// cost a provider's own spans do not carry. No processor time is
+	// attributed to it -- units seal while the other units of the run are
+	// still building, so the process-wide counters measure the run and not
+	// this -- and its scope is the unit's, so the row lines up with the unit
+	// span a reader sees it under.
+	ctx, span := ledger.Start(ctx, stageSeal, w.build.Spec.ScopeKey)
+	err := s.ingest(ctx, func(tx *sql.Tx) error {
 		if err := w.clipEvidence(ctx, tx); err != nil {
 			return err
 		}
@@ -1031,24 +1347,40 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_units WHERE unit_id = ?`, w.rowID).Scan(&docs); err != nil {
 			return wrap("search_units", err)
 		}
-		if docs != w.ftsDocs {
-			return corrupt("unit %s has %d search documents but emitted %d index rows", w.build.Spec.ID, docs, w.ftsDocs)
+		if docs != w.searchDocs {
+			return corrupt("unit %s has %d search document rows but the writer accounted for %d", w.build.Spec.ID, docs, w.searchDocs)
 		}
 		if err := exec1(ctx, tx, conflict("unit %s is no longer building", w.build.Spec.ID),
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
+		// The unit's lexical segment is folded in the seal's own transaction,
+		// so a unit becomes sealed and gains the segment its documents live in
+		// together or neither. A unit that published no document folds none.
+		if w.lex != nil {
+			if _, err := foldUnitSegment(ctx, tx, w.rowID, w.lex); err != nil {
+				return err
+			}
+		}
 		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey, false, Carry{})
 	})
+	if err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
+	} else {
+		span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	}
 	if err == nil {
 		w.done = true
+		if closeErr := w.closeStage(); closeErr != nil {
+			return closeErr
+		}
 		if w.evidenceClipped != 0 {
 			// One bounded line per sealed unit, and only when the bound
 			// actually truncated something: the clip is legitimate but it
 			// silently drops occurrences a caller may be counting on, so the
 			// unit and the count are on the record. No source, no native keys.
 			slog.Warn("evidence occurrences were dropped to hold the per-fact bound",
-				"unit_id", string(w.build.Spec.ID), "dropped", w.evidenceClipped, "limit", model.MaxEvidencePerFact)
+				"unit_id", string(w.build.Spec.ID), "dropped", w.evidenceClipped, "limit", w.s.opts.MaxEvidencePerFact)
 		}
 	}
 	return err
@@ -1082,7 +1414,7 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -1130,31 +1462,64 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 	if normalizationVersion == "" || len(normalizationVersion) > model.MaxIdentifierBytes {
 		return model.Binding{}, invalid("normalization version is required and bounded to %d bytes", model.MaxIdentifierBytes)
 	}
-	if len(capabilities) > model.MaxCapabilityStates {
-		return model.Binding{}, invalid("capability report has %d entries, limit %d", len(capabilities), model.MaxCapabilityStates)
-	}
+	// Activate validates the SHAPE of the capability report, never its length.
+	// A repository large enough to publish more rows than any one constant
+	// anticipated is still a repository whose generation must publish: refusing
+	// here made the index unpublishable at scale, which is the failure the
+	// unlimited-by-default posture exists to remove. The rows are inserted in
+	// batches below, so the count bounds disk, not heap.
 	for _, c := range capabilities {
 		if err := c.Validate(); err != nil {
 			return model.Binding{}, err
 		}
 	}
-	var binding model.Binding
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	// The two conditions an activation loses a race on are read FIRST, before
+	// any work: the pointer the caller believes is published, and the frozen
+	// membership being non-empty. Each is one row, and the cascade below is
+	// thousands of committed merges -- so a coordinator that has ALREADY been
+	// overtaken pays a read rather than a rebuild of the segment set.
+	//
+	// That is the whole of what it spares, and it is worth saying exactly:
+	// this reaches only a caller whose pointer had already moved when it got
+	// here. Two activations that start together both pass this read and both
+	// pay the cascade; the one that loses fails on the re-check inside the
+	// activation transaction below, having merged. Sparing that one too would
+	// need the two to be serialized against each other, which is a lock held
+	// across a rebuild of the segment set, and a lock that long is a worse
+	// bargain than the merges it saves. Correctness does not depend on any of
+	// it: both conditions are checked again inside the transaction, which is
+	// where they decide anything, so a pointer that moves between this read
+	// and that transaction is caught there exactly as before.
+	// readOwn, not read: the generation this is about may still be in the
+	// store's open ingestion group, which the reader pool cannot see.
+	if err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
 		}
-		var current int64
-		if err := activeGeneration(ctx, tx, g.repo, &current); err != nil {
-			var typed *model.Error
-			if !errors.As(err, &typed) || typed.Code != model.CodeNoActiveGeneration {
-				return err
-			}
+		if err := checkExpectedActive(ctx, tx, g.repo, expectedActive); err != nil {
+			return err
 		}
-		if current != int64(expectedActive) {
-			return &model.Error{Code: model.CodeVersionConflict,
-				Message:     fmt.Sprintf("active generation is %d, not the expected %d; another activation intervened", current, expectedActive),
-				Remediation: "re-read the active generation and decide again whether to publish"}
+		return checkMembership(ctx, tx, g.id, gen)
+	}); err != nil {
+		return model.Binding{}, err
+	}
+	// Whatever compaction the generation's segment set is due runs next, each
+	// merge its own ingestion call, so the group can commit between merges and
+	// the cascade is bounded by WALBoundBytes like any other ingestion. The
+	// activation below then names the set the merges left. See
+	// compactGeneration for why a merge committed before the swap is safe.
+	if err := s.compactBeforeActivation(ctx, gen); err != nil {
+		return model.Binding{}, err
+	}
+	var binding model.Binding
+	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
+		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
+		if err != nil {
+			return err
+		}
+		if err := checkExpectedActive(ctx, tx, g.repo, expectedActive); err != nil {
+			return err
 		}
 		checks := []struct {
 			what  string
@@ -1200,12 +1565,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 					Message: fmt.Sprintf("generation %d cannot activate: %d %s", gen, n, c.what)}
 			}
 		}
-		var members int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, g.id).Scan(&members); err != nil {
-			return wrap("generation_units", err)
-		}
-		if members == 0 {
-			return conflict("generation %d has no units; nothing to publish", gen)
+		if err := checkMembership(ctx, tx, g.id, gen); err != nil {
+			return err
 		}
 		var violations int64
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check('generation_units')`).Scan(&violations); err != nil {
@@ -1218,8 +1579,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, details_json)
-			VALUES(?, ?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, units_running, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -1229,7 +1590,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			if err != nil {
 				return err
 			}
-			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State), c.DiagnosticCode, details); err != nil {
+			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State),
+				c.DiagnosticCode, c.Remediation, c.UnitsRunning, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
@@ -1244,12 +1606,36 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ? ORDER BY u.unit_key`, g.id); err != nil {
 			return err
 		}
+		// The capability digest folds what the rows SAY and nothing about when
+		// they were written. remediation is in it because it is a function of
+		// the typed failure, exactly as diagnostic_code and the message inside
+		// details_json are: two identical runs produce the same string.
+		// units_running is deliberately NOT, and must not be added: it records
+		// how many scopes happened to still be in flight at the moment the
+		// generation was published, which is scheduling and not content, so
+		// two rebuilds of one workspace under one configuration can
+		// legitimately differ on it and folding it in would make the digest
+		// nondeterministic (Section 20.2).
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
-			|| char(0) || details_json
+			|| char(0) || remediation || char(0) || details_json
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}
+		// The packed adjacency is built HERE, before the active pointer flips
+		// and inside the same transaction, so a generation is never published
+		// without the structure every traversal reads (ADR-0005 Decision 1) and
+		// a failed build fails the activation instead of leaving a half-graph.
+		if err := buildGraph(ctx, tx, g.id); err != nil {
+			return err
+		}
+		// The packed term statistics follow the adjacency, under the same rule
+		// and in the same transaction (ADR-0007 Decision 1): a generation is
+		// never published without the structure every lexical query reads.
+		if err := buildLexical(ctx, tx, g.id); err != nil {
+			return err
+		}
+
 		snapshotID := model.SnapshotID(idHex(g.snapshot))
 		key := model.NewAnalysisKey(snapshotID, Fingerprint, membership.Sum(), capsHash.Sum(), normalizationVersion, g.semantic)
 		keyRaw, _ := model.DecodeID(string(key))
@@ -1314,17 +1700,20 @@ func (s *Store) refreshStatistics(ctx context.Context) {
 	// chosen: on the 66,307-node proof store the plan flips to idx_nodes_qname
 	// at 10,000 and not at 1,000, so it is set an order of magnitude above the
 	// point where it starts working.
-	if _, err := s.writer.ExecContext(ctx, `PRAGMA analysis_limit=10000`); err != nil {
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `PRAGMA analysis_limit=10000`); err != nil {
+			return wrap("analysis_limit", err)
+		}
+		for _, table := range analyzedTables {
+			if _, err := tx.ExecContext(ctx, `ANALYZE `+table); err != nil {
+				return wrap("analyze "+table, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
 			"component", "storage", "error", err.Error())
-		return
-	}
-	for _, table := range analyzedTables {
-		if _, err := s.writer.ExecContext(ctx, `ANALYZE `+table); err != nil {
-			slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
-				"component", "storage", "table", table, "error", err.Error())
-			return
-		}
 	}
 }
 
@@ -1350,7 +1739,7 @@ func foldColumn(ctx context.Context, tx *sql.Tx, h *model.Hasher, query string, 
 // runs were building are deleted. Sealed units stay reusable and the active
 // pointer is untouched.
 func (s *Store) Abort(ctx context.Context, gen model.GenerationID) error {
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
 		if err := exec1(ctx, tx, conflict("generation %d is not staging", gen),
 			`UPDATE generations SET status = 'failed', health = 'failed' WHERE id = ? AND status = 'staging'`, int64(gen)); err != nil {
 			return err
@@ -1379,6 +1768,42 @@ func (s *Store) ActiveGeneration(ctx context.Context, repo model.RepositoryID) (
 	return model.GenerationID(gen), err
 }
 
+// checkExpectedActive compares the repository's published pointer with the one
+// the caller believes it saw. A repository with no active generation compares
+// as zero, which is what a first publication passes. It is the single
+// definition of the version conflict: the activation transaction applies it at
+// the moment that decides, and Activate's preflight applies it before the
+// compaction cascade so a loser pays a row read instead of the cascade.
+func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected model.GenerationID) error {
+	var current int64
+	if err := activeGeneration(ctx, tx, repo, &current); err != nil {
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeNoActiveGeneration {
+			return err
+		}
+	}
+	if current != int64(expected) {
+		return &model.Error{Code: model.CodeVersionConflict,
+			Message:     fmt.Sprintf("active generation is %d, not the expected %d; another activation intervened", current, expected),
+			Remediation: "re-read the active generation and decide again whether to publish"}
+	}
+	return nil
+}
+
+// checkMembership refuses a generation with no frozen members. Like the
+// pointer comparison it is one row read, applied both in the activation
+// transaction and in the preflight before the cascade.
+func checkMembership(ctx context.Context, tx *sql.Tx, row int64, gen model.GenerationID) error {
+	var members int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, row).Scan(&members); err != nil {
+		return wrap("generation_units", err)
+	}
+	if members == 0 {
+		return conflict("generation %d has no units; nothing to publish", gen)
+	}
+	return nil
+}
+
 func activeGeneration(ctx context.Context, tx *sql.Tx, repo []byte, gen *int64) error {
 	err := tx.QueryRowContext(ctx, `SELECT generation_id FROM active_generations WHERE repository_id = ?`, repo).Scan(gen)
 	if isNoRows(err) {
@@ -1391,7 +1816,7 @@ func activeGeneration(ctx context.Context, tx *sql.Tx, repo []byte, gen *int64) 
 // GenerationStatus reads one generation's lifecycle status.
 func (s *Store) GenerationStatus(ctx context.Context, gen model.GenerationID) (model.GenerationStatus, error) {
 	var status model.GenerationStatus
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT status FROM generations WHERE id = ?`, int64(gen)).Scan(&status)
 		if isNoRows(err) {
 			return invalid("generation %d does not exist", gen)
@@ -1408,7 +1833,7 @@ func (s *Store) GenerationStatus(ctx context.Context, gen model.GenerationID) (m
 // workspace is serving".
 func (s *Store) GenerationCapturedAt(ctx context.Context, gen model.GenerationID) (time.Time, error) {
 	var captured time.Time
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		var created string
 		err := tx.QueryRowContext(ctx, `SELECT s.created_at FROM generations g JOIN snapshots s ON s.id = g.snapshot_id
 			WHERE g.id = ?`, int64(gen)).Scan(&created)
@@ -1432,7 +1857,7 @@ func (s *Store) UnitOrigin(ctx context.Context, unit model.UnitID) (model.Provid
 		return "", err
 	}
 	var origin []byte
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT origin_run_id FROM units WHERE unit_key = ?`, key).Scan(&origin)
 		if isNoRows(err) {
 			return invalid("unit %s does not exist", unit)

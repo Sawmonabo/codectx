@@ -62,6 +62,15 @@ type Detection struct {
 	// affected input -- `details["rust-analyzer"] = "CTX_TOOL_OFFLINE"` --
 	// keeps that typed rather than silent.
 	Details map[string]string `json:"details,omitempty"`
+	// Reason is the one bounded phrase that says, in the product's own words,
+	// why a detection is unavailable. A diagnostic code alone names the
+	// category and not the finding -- CTX_PROVIDER_UNAVAILABLE on a
+	// repository whose projects simply sit in subdirectories reads as "this
+	// provider is broken or absent" -- and Details deliberately do not
+	// survive an unavailable detection, so this is where the finding goes.
+	// It is empty for an available detection, which has its rows to speak
+	// with.
+	Reason string `json:"reason,omitempty"`
 }
 
 // WithDetail returns the detection with one bounded diagnostic pair added, so
@@ -162,8 +171,10 @@ type Resolver interface {
 // Sink receives a unit's facts. Ownership of a handed-off slice transfers to
 // the sink: the provider must not retain or mutate it afterwards. A call
 // blocks while the sink's retained-byte reservation is exhausted and returns
-// promptly on cancellation; a single record over the configured limit is a
-// CTX_RESOURCE_LIMIT failure, not a bypass.
+// promptly on cancellation. A single record over a user-set
+// resources.max_provider_record_bytes is admitted and counted as a degradation
+// the unit's capability rows report; it never fails the unit. What bounds the
+// heap is the batch reservation and the shared pool, not that key.
 //
 // Hand a node fact to the sink before any relation, alias or search document
 // that references its identity. Batch flush timing is not under the

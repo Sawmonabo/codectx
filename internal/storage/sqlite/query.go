@@ -4,24 +4,38 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// PinnedReader reads exactly one generation. It was pinned together with its
-// retention lease in one short write transaction, so the generation cannot be
-// collected while the reader is open. Every read joins visible membership
-// through generation_units; staging, failed and non-member units are never
-// returned. Close releases the lease.
+// PinnedReader reads exactly one generation. A writer-bearing process pins it
+// together with its retention lease in one short write transaction, so the
+// generation cannot be collected while the reader is open; a process that
+// opened the store read-only holds it by snapshot instead, one deferred read
+// transaction per call. Every read joins visible membership through
+// generation_units; staging, failed and non-member units are never returned.
+// Close releases the lease, if there is one.
 type PinnedReader struct {
 	s       *Store
 	binding model.Binding
 	repo    []byte
 	gen     int64
 	lease   string
+
+	// The generation's lexical shape -- its segment set, its document
+	// statistics and its visible-document bitmap -- resolved once for the
+	// whole reader. It costs a scan of the generation's documents, and a
+	// single request opens the structure for its statistics, its frequencies
+	// and its postings, so resolving it per call would pay that scan three
+	// times. The mutex is because a reader is pinned once and may be used from
+	// more than one goroutine of the request it serves.
+	lexMu   sync.Mutex
+	lexMeta *lexicalMeta
 }
 
 // PinGeneration resolves gen (zero selects the active generation) and acquires
@@ -43,7 +57,18 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		return nil, err
 	}
 	r := &PinnedReader{s: s, repo: repoRaw, lease: leaseID}
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	// A read-only process cannot take the lease, so it resolves the generation
+	// on the reader pool instead: no write transaction, nothing for the writer
+	// of another process to be waited on for.
+	//
+	// Such a pin is a SNAPSHOT, not a lease, and that is enough. Every read it
+	// serves runs in one deferred read transaction of its own (Store.read), so
+	// within a call the log snapshot is fixed and a collection running
+	// concurrently in another process cannot take rows out from under it.
+	// Across calls the generation can indeed be collected, and the caller that
+	// named it -- a continuation naming the generation its token pins -- is
+	// told so by the typed refusal below rather than served a short answer.
+	resolve := func(tx *sql.Tx) error {
 		id := int64(gen)
 		if id == 0 {
 			if err := activeGeneration(ctx, tx, repoRaw, &id); err != nil {
@@ -55,7 +80,7 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		err := tx.QueryRowContext(ctx, `SELECT snapshot_id, analysis_key, status FROM generations WHERE id = ? AND repository_id = ?`, id, repoRaw).
 			Scan(&snapshot, &key, &status)
 		if isNoRows(err) {
-			return invalid("generation %d does not exist for this repository", id)
+			return generationMissing(id)
 		}
 		if err != nil {
 			return wrap("generations", err)
@@ -63,6 +88,13 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		if status != model.GenerationActive && status != model.GenerationSuperseded {
 			return &model.Error{Code: model.CodeNoActiveGeneration,
 				Message: "generation " + string(status) + " has never been published and cannot be pinned"}
+		}
+		if s.opts.ReadOnly {
+			r.lease = ""
+			r.gen = id
+			r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
+				GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
+			return nil
 		}
 		// Through insertLease, never a statement of its own: a query lease is
 		// a retention_leases row like any other, and a second write path here
@@ -80,23 +112,53 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
 			GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
 		return nil
-	})
+	}
+	if s.opts.ReadOnly {
+		err = s.read(ctx, resolve)
+	} else {
+		err = s.write(ctx, resolve)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
+// generationStateDetail marks the refusal a pin gets when the generation it
+// names has no row at all: it was collected. The refusal itself stays
+// CTX_ARGUMENT_INVALID, which is what an operator who named the generation by
+// hand asked for; a caller resuming from a token it was handed did not name it
+// by hand, and IsGenerationCollected is how that caller recognises the case and
+// answers in the cursor's own family instead.
+const generationStateDetail = "generation_state"
+
+func generationMissing(id int64) *model.Error {
+	return invalid("generation %d does not exist for this repository", id).
+		WithDetail(generationStateDetail, "collected")
+}
+
+// IsGenerationCollected reports whether err is a pin refused because the
+// generation it named has been collected.
+func IsGenerationCollected(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Details[generationStateDetail] == "collected"
+}
+
 // Binding is the generation every result from this reader is qualified by.
 func (r *PinnedReader) Binding() model.Binding { return r.binding }
 
-// LeaseID is the retention lease this reader holds; cursors carry it.
-func (r *PinnedReader) LeaseID() string { return r.lease }
+// Continuable reports whether a query served through this reader may record a
+// retention LEASE. A process that opened the store read-only cannot: it still
+// hands back a continuation -- the spool is a filesystem write and the token is
+// signed, not stored -- but that continuation names no lease and the state it
+// names is reclaimed by the expiry its header carries instead.
+func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
 
-// Renew extends the reader's lease for a further ttl.
-func (r *PinnedReader) Renew(ctx context.Context, ttl time.Duration) error {
-	return r.s.RenewLease(ctx, r.lease, time.Now().Add(ttl))
-}
+// RetainsLeases is Continuable for a caller that holds the lease store rather
+// than a pinned reader -- the graph engine, whose continuations are minted far
+// from the reader that pinned them. It satisfies pagination.LeaseRetainer, so
+// pagination.Leases answers it for the whole process.
+func (s *Store) RetainsLeases() bool { return !s.opts.ReadOnly }
 
 // Close releases the lease. It is safe to call more than once.
 func (r *PinnedReader) Close() error {
@@ -125,12 +187,24 @@ type StoredEvidence struct {
 	Bytes    *model.ByteRange
 }
 
+// nodeRefByCanonical and relationRefByCanonical resolve a public 32-byte
+// canonical id to its storage-internal surrogate inside the statement itself.
+// A reader never holds a surrogate: it hands SQLite the canonical id it was
+// given and lets the dictionary's UNIQUE(canonical) autoindex turn it into the
+// rowid the fact tables are keyed by, so the outer predicate stays an indexed
+// probe on node_ids.id / relation_ids.from_node_id and friends. The aliases are
+// deliberately nx/rx so the subquery can never shadow an outer ni/ri.
+const (
+	nodeRefByCanonical     = `(SELECT nx.id FROM node_ids nx WHERE nx.canonical = ?)`
+	relationRefByCanonical = `(SELECT rx.id FROM relation_ids rx WHERE rx.canonical = ?)`
+)
+
 // visible restricts a fact table alias to units selected by this generation.
 func (r *PinnedReader) visible(alias string) string {
 	return ` JOIN generation_units gu ON gu.unit_id = ` + alias + `.unit_id AND gu.generation_id = ?1 JOIN units u ON u.id = gu.unit_id `
 }
 
-const nodeColumns = `nf.node_id, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
+const nodeColumns = `ni.canonical, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
 	nf.start_byte, nf.end_byte, nf.metadata_json, u.unit_key, u.source_binding`
 
 // nodeOrder is the Section 9.4 attribute precedence as far as storage can
@@ -178,7 +252,7 @@ func (r *PinnedReader) Node(ctx context.Context, id model.NodeID) (StoredNode, e
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM node_facts nf`+r.visible("nf")+
 			`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-			WHERE nf.node_id = ?2`+nodeOrder+` LIMIT 1`, r.gen, raw)
+			WHERE ni.canonical = ?2`+nodeOrder+` LIMIT 1`, r.gen, raw)
 		var err error
 		n, err = scanNode(row)
 		if isNoRows(err) {
@@ -202,7 +276,7 @@ type NodeFilter struct {
 // node: when several units publish the same node the precedence order picks
 // one. limit is capped at model.MaxPageItems.
 func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.NodeID, limit int) ([]StoredNode, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	predicates := 0
 	for _, p := range []string{f.Name, f.QualifiedName, f.QualifiedPrefix} {
 		if p != "" {
@@ -244,13 +318,13 @@ func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.Node
 		where = append(where, "ni.kind IN ("+strings.Join(marks, ",")+")")
 	}
 	if afterRaw != nil {
-		where = append(where, "nf.node_id > ?")
+		where = append(where, "ni.canonical > ?")
 		args = append(args, afterRaw)
 	}
 	args = append(args, limit)
 	query := `SELECT ` + nodeColumns + ` FROM node_facts nf` + r.visible("nf") +
 		`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY nf.node_id, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
+		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY ni.canonical, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
 	var out []StoredNode
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, query, args...)
@@ -286,13 +360,6 @@ func prefixUpperBound(prefix string) string {
 		}
 	}
 	return prefix + "\xff"
-}
-
-func pageLimit(limit int) int {
-	if limit <= 0 || limit > model.MaxPageItems {
-		return model.MaxPageItems
-	}
-	return limit
 }
 
 // Containers pages the visible CONTAINER nodes of the pinned generation by
@@ -332,9 +399,9 @@ func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
 	}
 	where := "ni.kind IN (" + strings.Join(marks, ",") + ")"
 	if afterRaw != nil {
-		where += " AND nf.node_id > " + b.mark(afterRaw)
+		where += " AND ni.canonical > " + b.mark(afterRaw)
 	}
-	limitMark := b.mark(pageLimit(limit))
+	limitMark := b.mark(pageLimit(ctx, limit))
 	query := `SELECT ` + nodeBatchOuterColumns + ` FROM (
 		SELECT ` + nodeBatchColumns + `, ` + nodePrecedence + ` FROM node_facts nf
 		JOIN units u ON u.id = nf.unit_id
@@ -365,7 +432,7 @@ func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
 // relation_id. Reverse traversal uses the indexed target column.
 func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, direction model.Direction, kinds []model.RelationKind,
 	after model.RelationID, limit int) ([]model.Relation, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	nodeRaw, err := idBlob("node_id", string(node))
 	if err != nil {
 		return nil, err
@@ -384,13 +451,13 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 	var where []string
 	switch direction {
 	case model.DirectionOutgoing:
-		where = append(where, "ri.from_node_id = ?")
+		where = append(where, "ri.from_node_id = "+nodeRefByCanonical)
 		args = append(args, nodeRaw)
 	case model.DirectionIncoming:
-		where = append(where, "ri.to_node_id = ?")
+		where = append(where, "ri.to_node_id = "+nodeRefByCanonical)
 		args = append(args, nodeRaw)
 	default:
-		where = append(where, "(ri.from_node_id = ? OR ri.to_node_id = ?)")
+		where = append(where, "(ri.from_node_id = "+nodeRefByCanonical+" OR ri.to_node_id = "+nodeRefByCanonical+")")
 		args = append(args, nodeRaw, nodeRaw)
 	}
 	if len(kinds) > 0 {
@@ -405,14 +472,20 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 		where = append(where, "ri.kind IN ("+strings.Join(marks, ",")+")")
 	}
 	if afterRaw != nil {
-		where = append(where, "ri.id > ?")
+		// The keyset carries the canonical RelationID, never relation_ids.id:
+		// a surrogate is meaningful only inside one store and one rebuild, so a
+		// cursor that carried it would decode to a different edge after a
+		// reindex (scale-posture-plan.md 3d).
+		where = append(where, "ri.canonical > ?")
 		args = append(args, afterRaw)
 	}
 	args = append(args, limit)
 	var out []model.Relation
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ri.id, ri.from_node_id, ri.kind, ri.to_node_id FROM relation_facts rf`+r.visible("rf")+
-			`JOIN relation_ids ri ON ri.id = rf.relation_id WHERE `+strings.Join(where, " AND ")+` ORDER BY ri.id LIMIT ?`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ri.canonical, fn.canonical, ri.kind, tn.canonical FROM relation_facts rf`+r.visible("rf")+
+			`JOIN relation_ids ri ON ri.id = rf.relation_id
+			JOIN node_ids fn ON fn.id = ri.from_node_id JOIN node_ids tn ON tn.id = ri.to_node_id
+			WHERE `+strings.Join(where, " AND ")+` ORDER BY ri.canonical LIMIT ?`, args...)
 		if err != nil {
 			return wrap("relation_facts", err)
 		}
@@ -434,7 +507,7 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 // Evidence pages the visible evidence for one node or one relation, keyset on
 // evidence id. Exactly one subject must be given.
 func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation model.RelationID, after model.EvidenceID, limit int) ([]StoredEvidence, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if (node == "") == (relation == "") {
 		return nil, invalid("evidence lookup needs exactly one of node_id or relation_id")
 	}
@@ -449,13 +522,13 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 		if err != nil {
 			return nil, err
 		}
-		subject, args = "e.node_id = ?", append(args, raw)
+		subject, args = "e.node_id = "+nodeRefByCanonical, append(args, raw)
 	} else {
 		raw, err := idBlob("relation_id", string(relation))
 		if err != nil {
 			return nil, err
 		}
-		subject, args = "e.relation_id = ?", append(args, raw)
+		subject, args = "e.relation_id = "+relationRefByCanonical, append(args, raw)
 	}
 	if afterRaw != nil {
 		subject += " AND e.id > ?"
@@ -464,9 +537,11 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 	args = append(args, limit)
 	var out []StoredEvidence
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT e.id, u.unit_key, u.provider_id, u.provider_version, u.origin_run_id, e.node_id, e.relation_id, e.precision,
-			e.file_id, ui.content_hash, e.start_byte, e.end_byte, e.native_key, e.detail FROM evidence e`+r.visible("e")+
-			`LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id WHERE `+subject+` ORDER BY e.id LIMIT ?`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT e.id, u.unit_key, u.provider_id, u.provider_version, u.origin_run_id, en.canonical, er.canonical, e.precision,
+			e.file_id, ui.content_hash, e.start_byte, e.end_byte, nk.key, e.detail FROM evidence e`+r.visible("e")+
+			`JOIN native_keys nk ON nk.id = e.native_key_id
+			LEFT JOIN node_ids en ON en.id = e.node_id LEFT JOIN relation_ids er ON er.id = e.relation_id
+			LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id WHERE `+subject+` ORDER BY e.id LIMIT ?`, args...)
 		if err != nil {
 			return wrap("evidence", err)
 		}
@@ -524,7 +599,7 @@ func (r *PinnedReader) File(ctx context.Context, id model.FileID) (model.FileVer
 // Files pages the pinned manifest by keyset on file_id. This is the one
 // paginated source of truth for public file listings (Section 10.1).
 func (r *PinnedReader) Files(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -569,7 +644,7 @@ func (r *PinnedReader) ChangedFiles(ctx context.Context, after model.FileID,
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -618,12 +693,24 @@ func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 	return fv, nil
 }
 
-// Capabilities returns the generation's stored capability report.
+// Capabilities returns the generation's stored capability report -- every row
+// of it. The bare `LIMIT 256` this once carried silently dropped rows off the
+// tail of a large generation's report, and QueryMeta.Completeness is derived
+// from what this returns on every answer, so the drop made every answer
+// over-claim. The scan streams in one read transaction under the primary key's
+// order, but the ANSWER is the whole report and so is the peak: every row is
+// decoded into the returned slice and there is no page API here. That is
+// deliberate rather than an omission -- the report is written pre-folded. The
+// index publishes it through capabilityReport.finish, which collapses the rows
+// to one per (provider, capability, scope) in foldCollapsed and bounds what
+// survives in boundStates (internal/index/status.go), so a generation's stored
+// report is bounded by the provider/capability/scope product and not by the
+// repository. A page API would page a set whose size the writer already fixed.
 func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	var out []model.CapabilityState
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, details_json FROM generation_capabilities
-			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key LIMIT ?`, r.gen, model.MaxCapabilityStates)
+		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, remediation, units_running, details_json FROM generation_capabilities
+			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, r.gen)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -631,7 +718,8 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 		for rows.Next() {
 			var c model.CapabilityState
 			var details string
-			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode, &details); err != nil {
+			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode,
+				&c.Remediation, &c.UnitsRunning, &details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 			if details != "" && details != "{}" {
@@ -656,21 +744,14 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 // store exposes membership-restricted rowids and aggregates; ranking is not
 // implemented here.
 
-// SearchStats returns the visible document count and total token length, the
-// corpus statistics a generation-local BM25 needs.
-func (r *PinnedReader) SearchStats(ctx context.Context) (documents, tokens int64, err error) {
-	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		return wrap("search_units", tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(su.token_count), 0) FROM search_units su`+r.visible("su"), r.gen).Scan(&documents, &tokens))
-	})
-	return documents, tokens, err
-}
-
-// SearchUnitRowIDs pages the visible search document rowids by keyset.
+// SearchUnitRowIDs pages the visible search document ids by keyset. The id is
+// search_units.doc_id -- the search_fts rowid the document's text lives at --
+// which is what Match returns and what the vocabulary joins on.
 func (r *PinnedReader) SearchUnitRowIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []int64
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT su.rowid FROM search_units su`+r.visible("su")+` WHERE su.rowid > ?2 ORDER BY su.rowid LIMIT ?3`, r.gen, after, limit)
+		rows, err := tx.QueryContext(ctx, `SELECT su.doc_id FROM search_units su`+r.visible("su")+` WHERE su.doc_id > ?2 ORDER BY su.doc_id LIMIT ?3`, r.gen, after, limit)
 		if err != nil {
 			return wrap("search_units", err)
 		}
@@ -691,14 +772,14 @@ func (r *PinnedReader) SearchUnitRowIDs(ctx context.Context, after int64, limit 
 // keyset by rowid. The caller owns query encoding: pass an expression built by
 // the literal-text encoder, never raw user text (Section 14.2).
 func (r *PinnedReader) Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if strings.TrimSpace(expression) == "" || len(expression) > model.MaxQueryTextBytes*2 {
 		return nil, invalid("fts expression is empty or exceeds its bound")
 	}
 	var out []int64
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT f.rowid FROM search_fts f WHERE f.search_fts MATCH ?2 AND f.rowid > ?3
-			AND EXISTS (SELECT 1 FROM search_units su JOIN generation_units gu ON gu.unit_id = su.unit_id WHERE su.rowid = f.rowid AND gu.generation_id = ?1)
+			AND EXISTS (SELECT 1 FROM search_units su JOIN generation_units gu ON gu.unit_id = su.unit_id WHERE su.doc_id = f.rowid AND gu.generation_id = ?1)
 			ORDER BY f.rowid LIMIT ?4`, r.gen, expression, after, limit)
 		if err != nil {
 			return wrap("search_fts", err)
@@ -716,15 +797,22 @@ func (r *PinnedReader) Match(ctx context.Context, expression string, after int64
 	return out, err
 }
 
-// SearchUnit reads one visible document by rowid, including its bounded body.
+// SearchUnit reads one visible document by doc id. A posting is shared along a
+// carry chain, but generation_units admits one unit per (provider, scope) and
+// CarryOver refuses a predecessor from another, so at most one row of a chain
+// is visible here and the doc id names one document. Body is always empty: the
+// database stores no source body (ADR-0003 §2.1), and a caller that needs the
+// text reads it from the content store over the returned file identity and
+// byte range.
 func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.SearchUnit, error) {
 	var d model.SearchUnit
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		var key, node, file []byte
 		var start, end int64
-		err := tx.QueryRowContext(ctx, `SELECT su.search_key, su.node_id, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
-			su.start_byte, su.end_byte, su.body, su.token_count FROM search_units su`+r.visible("su")+` WHERE su.rowid = ?2`, r.gen, rowid).
-			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.Body, &d.TokenCount)
+		err := tx.QueryRowContext(ctx, `SELECT su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
+			su.start_byte, su.end_byte, su.token_count FROM search_units su`+r.visible("su")+
+			`LEFT JOIN node_ids ni ON ni.id = su.node_id WHERE su.doc_id = ?2`, r.gen, rowid).
+			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.TokenCount)
 		if isNoRows(err) {
 			return invalid("search document %d is not visible in generation %d", rowid, r.gen)
 		}
@@ -743,8 +831,9 @@ func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.Searc
 
 // maxQueryTokens is the ceiling on tokens one query can yield. Query text is
 // bounded to MaxQueryTextBytes and every token occupies at least one byte, so
-// this LIMIT can never truncate; Section 20.1's resources.max_query_terms (32)
-// is enforced by the search service on top.
+// this LIMIT can never truncate. The bound on how many terms a query may carry
+// is the operator's resources.max_query_terms, which the search service
+// enforces on top and which is unlimited by default.
 const maxQueryTokens = model.MaxQueryTextBytes
 
 // tokenizerDDL declares a throwaway FTS5 table with exactly search_fts's
@@ -808,9 +897,17 @@ func (s *Store) Tokenize(ctx context.Context, text string) ([]string, error) {
 }
 
 // countTokens returns, for each document, the number of token instances the
-// index tokenizer produces across every indexed column. It is the one source
-// of search_units.token_count.
-func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit) ([]int64, error) {
+// index tokenizer produces across every indexed column, and stages those
+// instances for the unit's lexical segment. It is the one source of
+// search_units.token_count and the ONE tokenizer pass a document ever gets:
+// the packed lexical structure is folded from these same rows at seal, never
+// from a second tokenization.
+//
+// stage is called once per (term, column, document) group of the batch, with
+// the document's batch-local number; the caller resolves that number to the
+// document rowid its ingestion transaction assigns.
+func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit,
+	stage func(doc int64, term, col string, n int64) error) ([]int64, error) {
 	counts := make([]int64, len(docs))
 	if len(docs) == 0 {
 		return counts, nil
@@ -826,20 +923,27 @@ func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit) ([]int
 				return wrap("tokenizer", err)
 			}
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT doc, count(*) FROM tok_vocab GROUP BY doc`)
+		// The grouped instance vocabulary answers both questions at once: a
+		// document's token count is the sum of its groups, and each group is
+		// one staged row. Reading it twice would tokenize the batch twice.
+		rows, err := tx.QueryContext(ctx, `SELECT term, doc, col, count(*) FROM tok_vocab GROUP BY term, doc, col`)
 		if err != nil {
 			return wrap("tokenizer", err)
 		}
 		defer rows.Close()
 		for rows.Next() {
+			var term, col string
 			var doc, n int64
-			if err := rows.Scan(&doc, &n); err != nil {
+			if err := rows.Scan(&term, &doc, &col, &n); err != nil {
 				return wrap("tokenizer", err)
 			}
 			if doc < 1 || doc > int64(len(docs)) {
 				return corrupt("tokenizer reported document %d outside the batch", doc)
 			}
-			counts[doc-1] = n
+			counts[doc-1] += n
+			if err := stage(doc, term, col, n); err != nil {
+				return err
+			}
 		}
 		return wrap("tokenizer", rows.Err())
 	})

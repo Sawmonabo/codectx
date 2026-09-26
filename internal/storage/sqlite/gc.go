@@ -12,6 +12,24 @@ import (
 // gcBatchUnits bounds one collection transaction.
 const gcBatchUnits = 200
 
+// gcNativeRowsExamined bounds the child-table rows one retention run may spend
+// proving native keys unreferenced. It is a work budget that DEFERS the
+// remainder to the next run, never a cap that skips or truncates anything. With
+// idx_alias_native and idx_evidence_native in place each proof is two index
+// lookups over rows that are not there (see nativeKeyRowsPerDelete), so 200
+// million rows is 100 million deletable keys per run -- orders of magnitude
+// above any dictionary a real store holds, which is what makes it a safety
+// bound rather than a policy.
+const gcNativeRowsExamined = 200_000_000
+
+// nativeKeyRowsPerDelete is the child-table rows one deletion examines. A key
+// the collector deletes is by construction named by no alias and no evidence
+// row, so each of the two foreign-key checks descends its child index and finds
+// nothing: two rows examined, independent of how large the child tables are.
+// That constant is what the two indexes buy; without them the same two checks
+// are a full scan of each child table per deleted row.
+const nativeKeyRowsPerDelete = 2
+
 // DeleteGeneration removes a failed or superseded generation's membership and
 // metadata, then collects units no retained generation or dependent unit
 // reaches, in reverse dependency order through the FTS-aware deletion
@@ -54,8 +72,12 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("retention_leases", err)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id)
-		return wrap("generations", err)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id); err != nil {
+			return wrap("generations", err)
+		}
+		// The generation's generation_segments rows have just cascaded away, so
+		// the segments only it named are collectable in this same transaction.
+		return collectUnreferencedSegments(ctx, tx)
 	})
 	if err != nil {
 		return err
@@ -75,7 +97,16 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 	if err := s.collectUnreachableUnits(ctx); err != nil {
 		return err
 	}
+	if err := s.collectUnreferencedScopeKeys(ctx); err != nil {
+		return err
+	}
+	if err := s.collectUnreferencedNativeKeys(ctx); err != nil {
+		return err
+	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := collectUnreferencedSegments(ctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
 			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
 			return wrap("provider_runs", err)
@@ -128,9 +159,140 @@ func (s *Store) collectUnreachableUnits(ctx context.Context) error {
 		AND NOT EXISTS (SELECT 1 FROM unit_dependencies ud WHERE ud.dependency_id = u.id) LIMIT ?2`, 0)
 }
 
+// collectUnreferencedScopeKeys deletes the S-3 scope-key dictionary rows that
+// no alias names any more. A dictionary row outlives every unit that referred
+// to it -- deleteUnit removes the alias rows, never the interned string -- so
+// without this pass a store that is rebuilt repeatedly accumulates scope keys
+// that nothing can reach.
+//
+// The pass is a keyset over scope_keys.id in gcBatchUnits-sized transactions:
+// the heap holds one cursor, never the dictionary, and a pass that cannot
+// finish drains over the next collection. Each candidate's reachability is one
+// indexed probe -- idx_alias_lookup leads with scope_key_id -- which is also
+// the index SQLite uses to enforce native_aliases' foreign key onto this row,
+// so the delete costs the same lookup twice rather than a scan.
+//
+// The cursor advances past the whole batch whether or not its rows were
+// deleted, so a dictionary of live keys is walked once per pass instead of
+// re-examining the same surviving prefix forever.
+//
+// collectUnreferencedNativeKeys below is the same pass over the other
+// dictionary; it carries a delete budget as well, because its candidates have
+// two child tables to clear rather than one.
+func (s *Store) collectUnreferencedScopeKeys(ctx context.Context) error {
+	var after int64
+	for {
+		var last int64
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM
+				(SELECT id FROM scope_keys WHERE id > ?1 ORDER BY id LIMIT ?2)`,
+				after, gcBatchUnits).Scan(&last); err != nil {
+				return wrap("scope_keys", err)
+			}
+			if last == 0 {
+				return nil
+			}
+			_, err := tx.ExecContext(ctx, `DELETE FROM scope_keys WHERE id > ?1 AND id <= ?2
+				AND NOT EXISTS (SELECT 1 FROM native_aliases na WHERE na.scope_key_id = scope_keys.id)`,
+				after, last)
+			return wrap("scope_keys", err)
+		})
+		if err != nil || last == 0 {
+			return err
+		}
+		after = last
+	}
+}
+
+// nativeKeyDeleteBudget is the number of native keys one run may delete: the
+// rows-examined budget divided by the rows a single deletion examines. It is a
+// function rather than a constant expression only so the two numbers it
+// combines are named where they are used, and it never returns zero, so every
+// run makes progress.
+func nativeKeyDeleteBudget() int64 {
+	return max(gcNativeRowsExamined/nativeKeyRowsPerDelete, 1)
+}
+
+// collectUnreferencedNativeKeys deletes the native-key dictionary rows that no
+// alias and no evidence row names any more. Like scope keys, a native key
+// outlives every unit that referred to it -- deleteUnit removes the alias and
+// evidence rows, never the interned string -- so a store rebuilt repeatedly
+// accumulates them forever. The retained cost is real: measured on a control
+// fixture store, native_keys plus its UNIQUE autoindex holds ~182 B per
+// distinct key, so a full-vocabulary churn of 402 568 keys strands ~73 MB per
+// re-index, monotonically and with no bound.
+//
+// The shape is collectUnreferencedScopeKeys': a keyset over native_keys.id in
+// gcBatchUnits-sized transactions, each candidate proved unreferenced by two
+// correlated NOT EXISTS probes, each an index lookup (idx_alias_native,
+// idx_evidence_native). The heap holds one cursor, never the dictionary, and
+// liveness is evaluated inside the transaction that deletes, so a key another
+// writer interns between two batches is simply seen as live.
+//
+// Those two indexes are also what SQLite uses to enforce the two foreign keys
+// onto the deleted row. That check is the real cost of this sweep and it is
+// invisible to EXPLAIN QUERY PLAN, which reports only the probes above: with
+// the child columns unindexed it was a full scan of native_aliases and of
+// evidence per DELETED row -- measured at ~2.7 ms per deletion against child
+// tables of 27 481 / 47 739 rows and ~27 ms against ten times that, i.e. linear
+// in the size of the child tables and ~90 minutes for a full-vocabulary churn.
+// Indexed, it is two lookups that find nothing, flat in child-table size.
+//
+// The budget bounds the DELETIONS a run performs, not the run: a batch that
+// deletes nothing still costs its rowid-range scan and two probes per
+// candidate, and the walk is deliberately not bounded. Capping the walk would
+// need a cursor persisted between retention runs; without one, a cap would
+// re-examine the same prefix every run and leave dead keys past it permanently
+// unreachable -- a correctness regression traded for a sub-second saving.
+// Nothing the budget defers is lost either: a key this run does not reach is
+// still unreferenced next run, and the ones it deleted are gone, so every run
+// advances.
+func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
+	budget := nativeKeyDeleteBudget()
+	var after, deleted int64
+	for deleted < budget {
+		var last, n int64
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM
+				(SELECT id FROM native_keys WHERE id > ?1 ORDER BY id LIMIT ?2)`,
+				after, gcBatchUnits).Scan(&last); err != nil {
+				return wrap("native_keys", err)
+			}
+			if last == 0 {
+				return nil
+			}
+			res, err := tx.ExecContext(ctx, `DELETE FROM native_keys WHERE id > ?1 AND id <= ?2
+				AND NOT EXISTS (SELECT 1 FROM native_aliases na WHERE na.native_key_id = native_keys.id)
+				AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.native_key_id = native_keys.id)`,
+				after, last)
+			if err != nil {
+				return wrap("native_keys", err)
+			}
+			n, err = res.RowsAffected()
+			return wrap("native_keys", err)
+		})
+		if err != nil || last == 0 {
+			return err
+		}
+		deleted += n
+		// The cursor advances past the whole batch whether or not its rows were
+		// deleted, so a dictionary of live keys is walked once per pass.
+		after = last
+	}
+	return nil
+}
+
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
 // transaction per batch, until the query returns nothing.
+//
+// It touches no staging database. A lexical staging is a SLOT of the store's
+// scratch pool, not a file of the unit that staged into it: a crashed build's
+// slot is taken by the next unit that stages and emptied, and the pool itself
+// is inherited whole by the next process. There is no per-unit staging file to
+// collect, which is also what keeps collection away from the slot a live build
+// is writing -- several processes may share one data directory, and a live
+// build's staging would look exactly like a dead one's.
 func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
 	for {
 		var deleted int
@@ -158,16 +320,43 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 				}
 			}
 			deleted = len(ids)
-			return nil
+			// The deleted units' search_units rows cascaded away with them, so
+			// the segments no row points at and no generation names go in the
+			// same transaction.
+			return collectUnreferencedSegments(ctx, tx)
 		})
-		if err != nil || deleted == 0 {
+		if err != nil {
 			return err
+		}
+		if deleted == 0 {
+			return nil
 		}
 	}
 }
 
-// deleteUnit is the one unit deletion procedure (Section 12.4). It issues the
-// FTS delete with each document's indexed values before the content rows go,
+// collectUnreferencedSegments deletes every lexical segment that no retained
+// generation names and that no document still points at. A segment survives
+// its generation only while some document lies in it -- the unit holding that
+// document may be attached to a new generation at any time, and it must find
+// its postings where its rows point -- and it survives its last document only
+// while a retained generation still reads it. The two tests together are what
+// makes a segment collectable, and they are what collects a segment a
+// compaction emptied: the merge re-points every row of its inputs, so an
+// absorbed segment is left named only by the generations that were published
+// before it, and it goes when the last of them does. Its parts cascade with it.
+//
+// It runs in the caller's transaction: a generation or a unit that goes away
+// and the segments that go away with it are one atomic change, so no reader
+// can pin a generation whose segments have already been reclaimed.
+func collectUnreferencedSegments(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM lexical_segments
+		WHERE NOT EXISTS (SELECT 1 FROM generation_segments gs WHERE gs.segment_id = lexical_segments.id)
+		AND NOT EXISTS (SELECT 1 FROM search_units su WHERE su.segment_id = lexical_segments.id)`)
+	return wrap("lexical_segments", err)
+}
+
+// deleteUnit is the one unit deletion procedure (Section 12.4). It deletes the
+// unit's FTS documents by rowid before the search_units rows go,
 // removes facts, then the identities only this unit referenced, then the unit.
 // Callers never `DELETE FROM units` directly. Membership rows are deliberately
 // not touched: every caller has already established the unit is unreachable,
@@ -175,13 +364,26 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 // transaction rather than silently shrinking a retained generation.
 func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error {
 	steps := []string{
-		`CREATE TEMP TABLE IF NOT EXISTS gc_nodes(id BLOB PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS gc_relations(id BLOB PRIMARY KEY) WITHOUT ROWID`,
+		// The candidate sets hold node_ids.id / relation_ids.id surrogates, so
+		// an INTEGER PRIMARY KEY is the temp table's own rowid: the set costs
+		// one varint per candidate instead of a 32-byte BLOB key, and the
+		// `id IN (SELECT id FROM gc_nodes)` probe below resolves through the
+		// rowid rather than a WITHOUT ROWID b-tree lookup.
+		`CREATE TEMP TABLE IF NOT EXISTS gc_nodes(id INTEGER PRIMARY KEY)`,
+		`CREATE TEMP TABLE IF NOT EXISTS gc_relations(id INTEGER PRIMARY KEY)`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM node_facts WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM native_aliases WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,
-		`INSERT INTO search_fts(search_fts, rowid, name, qualified_name, signature, path, body)
-			SELECT 'delete', rowid, name, qualified_name, signature, path, body FROM search_units WHERE unit_id = ?1`,
+		// search_fts is contentless with contentless_delete=1 (ADR-0003 §2.1),
+		// so a plain DELETE by rowid removes the document: no column values are
+		// read back and no body is stored to read. A posting is named by
+		// doc_id, and a delta carry-over shares one along a carry chain, so it
+		// is released only when no surviving unit still names it -- the same
+		// reference test node_ids and relation_ids get below. This runs before
+		// the search_units delete, so the survivor probe must exclude this
+		// unit's own rows explicitly. idx_search_doc serves both halves.
+		`DELETE FROM search_fts WHERE rowid IN (SELECT su.doc_id FROM search_units su WHERE su.unit_id = ?1
+			AND NOT EXISTS (SELECT 1 FROM search_units s2 WHERE s2.doc_id = su.doc_id AND s2.unit_id <> ?1))`,
 		`DELETE FROM search_units WHERE unit_id = ?1`,
 		`DELETE FROM evidence WHERE unit_id = ?1`,
 		`DELETE FROM fact_keys WHERE unit_id = ?1`,
@@ -363,4 +565,70 @@ func (s *Store) CollectBlobs(ctx context.Context, deadline time.Time, limit int)
 		return nil, 0, err
 	}
 	return deleted, restored, nil
+}
+
+// knownBlobsChunk bounds one IN(...) list so the statement stays inside
+// SQLite's host-parameter ceiling whatever batch the caller walks in. It is a
+// statement shape, not a bound on the work: KnownBlobs answers for every hash
+// it is given, one chunk at a time.
+const knownBlobsChunk = 500
+
+// KnownBlobs reports which of hashes the index still holds a blobs row for, as
+// a set: a hash present in the result is named by the store, and absence means
+// no row exists. It is the oracle (*snapshot.CAS).SweepOrphans asks before
+// removing a published object, so the direction of an error matters -- a
+// partial answer must never reach the sweep, and this returns nothing but a
+// complete set or an error.
+//
+// The chunking is a statement-shape bound only: every chunk is read inside ONE
+// read transaction, so the answer is a single consistent snapshot of blobs
+// rather than one stitched from as many snapshots as it took chunks. A set
+// assembled across snapshots could omit a hash a concurrent writer inserted
+// after an earlier chunk and report the object an orphan.
+//
+// No state filter: 'quarantined' and 'trash' rows are blobs mid-grace-protocol,
+// whose objects that protocol deletes after its own reachability recheck. Only
+// a file with no row at all is an orphan.
+func (s *Store) KnownBlobs(ctx context.Context, hashes []string) (map[string]struct{}, error) {
+	known := make(map[string]struct{}, len(hashes))
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		for start := 0; start < len(hashes); start += knownBlobsChunk {
+			chunk := hashes[start:min(start+knownBlobsChunk, len(hashes))]
+			args := make([]any, 0, len(chunk))
+			placeholders := make([]byte, 0, len(chunk)*2)
+			for _, h := range chunk {
+				raw, err := idBlob("content_hash", h)
+				if err != nil {
+					return err
+				}
+				args = append(args, raw)
+				if len(placeholders) > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+			}
+			rows, err := tx.QueryContext(ctx, `SELECT hash FROM blobs WHERE hash IN (`+string(placeholders)+`)`, args...)
+			if err != nil {
+				return wrap("blobs", err)
+			}
+			if err := func() error {
+				defer rows.Close()
+				for rows.Next() {
+					var raw []byte
+					if err := rows.Scan(&raw); err != nil {
+						return wrap("blobs", err)
+					}
+					known[idHex(raw)] = struct{}{}
+				}
+				return wrap("blobs", rows.Err())
+			}(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return known, nil
 }

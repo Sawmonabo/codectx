@@ -132,16 +132,17 @@ serving. The `search` capability is reported per file:
 | Condition | State | Diagnostic |
 |---|---|---|
 | size over `workspace.max_search_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
-| NUL byte in the first 8000 bytes | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` |
+| over 30% of the first 8000 bytes is not text, or they carry a run of 4 NULs | `unavailable` | `CTX_BINARY_CONTENT` |
 | some chunks were not UTF-8 text (skipped; source reads serve them as base64) | `partial` | `CTX_ARGUMENT_INVALID` |
 | otherwise | `fresh` | |
 
 The `structure` capability is always `fresh` for a unit that seals.
 
-`CTX_PROVIDER_UNAVAILABLE` for binary content is a reuse of an existing
-Section 22 family, because `internal/model` is frozen: the honest code would
-be a dedicated `CTX_BINARY_CONTENT`. It is ledgered as a shared-helper change,
-not worked around here.
+`CTX_BINARY_CONTENT` is its own Section 22 family rather than a reuse of
+`CTX_PROVIDER_UNAVAILABLE`: the provider ran and answered, and the answer is
+that the file is not text, so a lexical index has nothing to say about it.
+Reporting it as an unavailable provider would send an operator looking for a
+broken installation that does not exist.
 
 ## What `manifest` emits per file
 
@@ -163,7 +164,15 @@ never of the kinds.
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
 | `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
-| Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact) | ATX headings → name-only search documents of the document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+| Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+
+A heading is its own entity, not a label on the file. Each one gets a
+`section` node, so a query that matches thirty headings of one document answers
+with thirty hits at thirty ranges instead of folding them onto the document.
+Identity is the heading trail rather than a byte offset, so inserting a
+paragraph does not re-key the sections below it; a heading repeated verbatim
+under the same parent takes an ordinal suffix (`…#Guide > Usage~2`) so the
+repeat stays a second section rather than converging on the first.
 
 A Maven child both **inherits its identity from** `<parent>` (a missing
 `groupId` or `version` is taken from it and the field is listed in the node's
@@ -180,10 +189,12 @@ statement about a transitive graph this provider does not resolve, and
 emitting its coordinates as a dependency would be a wrong fact, not a missing
 one.
 
-TOML evidence ranges come from a bounded line scan (`maxTOMLLines`, 200000).
-A manifest with more lines than that gets an empty layout and every fact of
-it carries evidence without a range: the documented degradation is evidence
-without a range, never a guessed one.
+TOML evidence ranges come from a line scan bounded by
+`providers.manifest.max_toml_lines`, which is unlimited by default. When an
+operator sets it, the scan stops at that line: facts declared before it keep
+their exact byte ranges and only the facts past it carry evidence without a
+range. The documented degradation is evidence without a range, never a
+guessed one.
 
 Every fact carries evidence at precision `syntax` with the exact byte range
 of the declaring line, element or token when the parser exposes one;
@@ -198,7 +209,7 @@ scope:
 | Outcome | State | Diagnostic |
 |---|---|---|
 | parsed | `fresh` | |
-| a list was cut at `MaxDependencies` (4096) or `MaxEntries` (1024) | `partial` | `CTX_RESOURCE_LIMIT` |
+| a list was cut at a user-set `providers.manifest.max_dependencies` or `providers.manifest.max_entries`, or the parse at a user-set `providers.manifest.max_toml_lines` or `providers.manifest.max_xml_elements` (all four unlimited by default, so this outcome cannot arise from the shipped configuration); the capability names the key and the count that crossed it | `partial` | `CTX_RESOURCE_LIMIT` |
 | one entry was unusable (a dependency without a name, a path outside the workspace) | `partial` | `CTX_ARGUMENT_INVALID` |
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |

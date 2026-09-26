@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -44,7 +45,12 @@ var (
 	actorA   = "actor-a"
 	actorB   = "actor-b"
 
-	fixtureBinding = model.Binding{RepositoryID: repoID, SnapshotID: snapshotID, GenerationID: 1}
+	// The analysis key is part of the binding a real session carries, and a
+	// status continuation cannot be minted without one (session.go statusCursor
+	// answers "not yet analysed" instead). A fixture without it silently turns
+	// every paged Status assertion into a single-page one.
+	fixtureBinding = model.Binding{RepositoryID: repoID, SnapshotID: snapshotID, GenerationID: 1,
+		AnalysisKey: model.AnalysisKey(hexID(0x77))}
 )
 
 // --- fixture files ----------------------------------------------------------
@@ -205,6 +211,13 @@ type fakeStore struct {
 	sessions map[model.SessionID]*fakeSession
 	chunks   map[string]*fakeChunk
 	nextID   int
+
+	// leases is the pagination.LeaseStore side of the fixture. The service now
+	// requires a lease store at composition (a coverage session that pins
+	// nothing cannot continue its status pages), so the fixture has to hold
+	// real leases rather than a nil one.
+	leases map[string]model.Lease
+	owners map[string]string
 
 	// confirmCalls counts ConfirmChunks calls. Storage refuses a foreign
 	// chunk too, so a row that only checks the returned code cannot tell the
@@ -609,6 +622,20 @@ func (b blockingSessions) Session(ctx context.Context, id model.SessionID, actor
 	}
 }
 
+// deadlineSessions records whether the context the service handed down carried
+// a deadline, and answers immediately so the row costs no wall clock. It embeds
+// the fake for the same reason blockingSessions does.
+type deadlineSessions struct {
+	*fakeStore
+	deadline *bool
+}
+
+func (d deadlineSessions) Session(ctx context.Context, id model.SessionID, actor string) (sqlite.SessionRecord, error) {
+	_, ok := ctx.Deadline()
+	*d.deadline = ok
+	return d.fakeStore.Session(ctx, id, actor)
+}
+
 // --- the fake source --------------------------------------------------------
 
 // fakeSource reproduces snapshot.View.Read: it rejects a range past the file
@@ -734,7 +761,8 @@ func newHarness(t *testing.T) *harness {
 			return src, nil
 		},
 		Signer: signer, Limits: fixtureLimits(),
-		Now: func() time.Time { return h.now },
+		Leases: pagination.NewLeases(store, time.Hour),
+		Now:    func() time.Time { return h.now },
 	})
 	if err != nil {
 		t.Fatalf("build coverage service: %v", err)
@@ -1282,6 +1310,56 @@ var scenarios = []scenario{
 		}
 	}},
 
+	// resources.query_timeout is unlimited by DEFAULT and is a default, never a
+	// ceiling. Both halves were broken here: every endpoint wrapped its request
+	// in context.WithTimeout unconditionally, so the shipped zero minted
+	// `now + 0` -- an instant already past, which refuses every request instead
+	// of running it unbounded -- and a caller who set a longer deadline of their
+	// own had it silently cut back to the configured default. The row asserts
+	// at the seam where it is decidable, the context the service hands the
+	// store, so it needs no wall clock at all.
+	//
+	// Mutation: restore context.WithTimeout(ctx, s.limits.QueryTimeout) in
+	// Read, Next, OpenSession or Status in place of model.QueryDeadline and the
+	// zero-timeout leg fails with a deadline the request never asked for.
+	{"read/an unbounded read carries no deadline and a caller's own is kept", func(t *testing.T, h *harness) {
+		read := func(l Limits, ctx context.Context) bool {
+			installed := false
+			svc := &Service{
+				sessions: deadlineSessions{h.store, &installed},
+				open:     func(context.Context, model.SnapshotID) (Source, error) { return h.src, nil },
+				signer:   h.sign, limits: l,
+				now: func() time.Time { return h.now },
+			}
+			if _, err := svc.Read(ctx, model.ReadChunkRequest{
+				SessionID: sessionA, ActorID: actorA, FileID: model.FileID(hexID(0x21)),
+			}); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			return installed
+		}
+		limits := fixtureLimits()
+		limits.QueryTimeout = 0
+		if read(limits, context.Background()) {
+			t.Fatal("query_timeout 0 means NO deadline, yet the read ran under one: " +
+				"`now + 0` is an instant already past and would refuse every request")
+		}
+
+		// A caller's own deadline is the request's, and a positive configured
+		// value must not narrow it. A minute is far beyond anything this
+		// package would install, so the two are distinguishable.
+		limits = fixtureLimits()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		before, _ := ctx.Deadline()
+		if !read(limits, ctx) {
+			t.Fatal("the caller's deadline was dropped")
+		}
+		if after, _ := ctx.Deadline(); !after.Equal(before) {
+			t.Fatalf("the caller's deadline moved from %s to %s: query_timeout is a ceiling", before, after)
+		}
+	}},
+
 	// F2 puts context.WithTimeout(ctx, QueryTimeout) atop
 	// Read, as OpenSession and Status already do. Read is the one endpoint
 	// that touches the CAS and the filesystem, and `--timeout` defaults to
@@ -1334,9 +1412,145 @@ var scenarios = []scenario{
 				item.FileID, item.Path, want.path)
 		}
 	}},
+
+	// F18: the status continuation itself. Every other row asks for one page,
+	// so nothing here ever presented a cursor back -- resumeStatus had no
+	// coverage at all in a wave whose binding ruling is cursor pagination.
+	// This walks the session's whole required scope at the narrowest and the
+	// widest page and asserts the two properties a continuation must have: a
+	// page that leaves records unserved says so (a cursor, or a truncation
+	// with its reason -- never a silent stop), and the records the walk yields
+	// are the unpaginated set exactly, in the same order, with no repeat and
+	// no drop.
+	{"status/pages to exhaustion and never stops silently", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		req := model.SessionRequest{SessionID: sessionA, ActorID: actorA}
+
+		// The reference set: the endpoint's own default page, followed to
+		// exhaustion. The first page is not the whole answer even at the
+		// default limit -- the store pages under it -- which is exactly why a
+		// walk that stops at the first page proves nothing.
+		var want []model.FileID
+		for cursor := ""; ; {
+			p, err := h.svc.Status(ctx, req, model.PageRequest{Cursor: cursor})
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			for _, it := range p.Items {
+				want = append(want, it.FileID)
+			}
+			if p.Meta.NextCursor == "" {
+				break
+			}
+			cursor = p.Meta.NextCursor
+		}
+		total := len(want)
+		if total < 2 {
+			t.Fatalf("the fixture session carries %d coverage records; a continuation cannot be exercised "+
+				"with fewer than two", total)
+		}
+
+		for _, limit := range []int{1, total} {
+			var got []model.FileID
+			seen := map[model.FileID]bool{}
+			cursor := ""
+			for page := 1; ; page++ {
+				p, err := h.svc.Status(ctx, req, model.PageRequest{Limit: limit, Cursor: cursor})
+				if err != nil {
+					t.Fatalf("status at limit %d, page %d: %v", limit, page, err)
+				}
+				for _, it := range p.Items {
+					if seen[it.FileID] {
+						t.Fatalf("status at limit %d re-served %s on page %d", limit, it.FileID, page)
+					}
+					seen[it.FileID] = true
+					got = append(got, it.FileID)
+				}
+				if len(got) < total && p.Meta.NextCursor == "" &&
+					!(p.Meta.Truncated && p.Meta.TruncationReason != "") {
+					t.Fatalf("status at limit %d stopped after %d of %d records with no cursor and no "+
+						"truncation reason: the remaining coverage is unreachable and the answer does not say so",
+						limit, len(got), total)
+				}
+				if p.Meta.NextCursor == "" {
+					break
+				}
+				cursor = p.Meta.NextCursor
+				if page > total+2 {
+					t.Fatalf("status at limit %d issued a cursor on page %d after serving %d of %d records",
+						limit, page, len(got), total)
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("status paged at limit %d yielded %v; the unpaginated answer is %v", limit, got, want)
+			}
+		}
+	}},
+}
+
+// AcquireLease, RenewLease, ReleaseLease and LeaseExpiry make the fixture a
+// pagination.LeaseStore: one live lease per owner, refusing a second.
+func (f *fakeStore) AcquireLease(_ context.Context, lease model.Lease, ownerRef string) error {
+	if f.leases == nil {
+		f.leases, f.owners = map[string]model.Lease{}, map[string]string{}
+	}
+	if ownerRef != "" {
+		if id, ok := f.owners[ownerRef]; ok {
+			if _, live := f.leases[id]; live {
+				return (&model.Error{Code: model.CodeVersionConflict,
+					Message: "owner already holds a lease"}).WithDetail("conflict", "owner_lease")
+			}
+		}
+		f.owners[ownerRef] = lease.ID
+	}
+	f.leases[lease.ID] = lease
+	return nil
+}
+
+func (f *fakeStore) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
+	l, ok := f.leases[id]
+	if !ok {
+		return typed(model.CodeCursorInvalid, "lease is not live")
+	}
+	l.ExpiresAt = expiresAt
+	f.leases[id] = l
+	return nil
+}
+
+func (f *fakeStore) ReleaseLease(_ context.Context, id string) error {
+	delete(f.leases, id)
+	return nil
+}
+
+func (f *fakeStore) LeaseExpiry(_ context.Context, id string) (time.Time, error) {
+	l, ok := f.leases[id]
+	if !ok {
+		return time.Time{}, typed(model.CodeCursorInvalid, "lease is not live")
+	}
+	return l.ExpiresAt, nil
 }
 
 func TestCoverage(t *testing.T) {
+	// The unconfirmed-chunk bound is the one Limits accessor no scenario
+	// reaches -- a session would have to hold four unissued receipts at once
+	// -- so its two arms are asserted directly. Both are load bearing: the
+	// zero arm is the documented "unlimited" spelling of
+	// coverage.max_unconfirmed_chunks_per_session, and a session AT the bound
+	// has no allowance left, so the comparison is >= on what it already
+	// holds. Mutating unconfirmedCapped to `return false` (or to `>`) fails
+	// here and nowhere else in this package.
+	t.Run("the unconfirmed-chunk bound is unlimited at zero and refuses at the bound", func(t *testing.T) {
+		if (Limits{MaxUnconfirmedChunksPerSession: 0}).unconfirmedCapped(1 << 20) {
+			t.Error("a zero bound capped a session holding a million unconfirmed chunks; zero is the unlimited spelling")
+		}
+		l := Limits{MaxUnconfirmedChunksPerSession: 4}
+		if l.unconfirmedCapped(3) {
+			t.Error("a session holding 3 of 4 unconfirmed chunks was refused its next one")
+		}
+		if !l.unconfirmedCapped(4) {
+			t.Error("a session already holding its 4-chunk allowance was served another; the bound is >= on what it holds")
+		}
+	})
 	for _, tc := range scenarios {
 		t.Run(tc.name, func(t *testing.T) { tc.run(t, newHarness(t)) })
 	}

@@ -53,7 +53,13 @@ func (u *unit) pyproject(ctx context.Context) error {
 		u.malformed()
 		return nil
 	}
-	layout := layoutTOML(u.data)
+	layout, cutLines := layoutTOML(u.data, u.tomlLines)
+	if cutLines > 0 {
+		// The scan stopped at the configured line bound. Facts declared past
+		// that line are published without a range; every fact before it keeps
+		// its exact range. The line count that crossed the bound is reported.
+		u.overBound(BoundTOMLLines, u.tomlLines, cutLines)
+	}
 	poetry := doc.Tool.Poetry
 	var name, version string
 	meta := map[string]any{}
@@ -73,7 +79,13 @@ func (u *unit) pyproject(ctx context.Context) error {
 		name, version = poetry.Name, poetry.Version
 		nameKey, nameFound = layout.key(u.data, "tool.poetry", "name")
 	default:
-		u.malformed()
+		// The file parsed cleanly and declares no package: a pyproject.toml
+		// that carries only [tool.*] linter and formatter configuration, or
+		// only [build-system], is a valid and common file. There is nothing
+		// for this provider to define and nothing is missing, so the
+		// capability is fresh with no facts. Calling it malformed said the
+		// file did not parse as its format, which is a false statement about
+		// it and left a failed capability row on a healthy repository.
 		return nil
 	}
 	if version != "" {
@@ -92,8 +104,7 @@ func (u *unit) pyproject(ctx context.Context) error {
 	requirements := func(table, key string, list []string, kind string, extra ...string) error {
 		arr, found := layout.keyValue(u.data, table, key)
 		for _, req := range list {
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			depName, spec := splitPEP508(req)
@@ -143,8 +154,7 @@ func (u *unit) pyproject(ctx context.Context) error {
 			if n == "python" {
 				continue
 			}
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			spec := asString(deps[n])

@@ -4,10 +4,12 @@ import (
 	"context"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -29,6 +31,72 @@ func TestDiagnostics(t *testing.T) {
 }
 
 var scenarios = []scenario{
+	{
+		// Failure mode: the doctor lists a toolchain row for every entry the
+		// lock carries, so an operator on a Go and Python repository is told
+		// to install a C++ indexer and a Java indexer their repository will
+		// never run, beside a dozen rows for payloads that are already there.
+		// The one actionable line -- install what THIS repository needs and
+		// does not have -- is then indistinguishable from the noise, and the
+		// remediation beside it downloads gigabytes nothing will execute.
+		// A corrupt payload must survive both filters: it is installed, and
+		// doctor is the only place a damaged store is reported.
+		name: "doctor names only the tools this repository selects and lacks",
+		run: func(t *testing.T) {
+			tc := &fakeToolchain{
+				selected: []string{"gopls", "node", "scip-go", "scip-python"},
+				statuses: []toolchain.Status{
+					{Name: "clangd", Version: "22.1.6", State: toolchain.StateAvailable},
+					{Name: "gopls", Version: "0.23.0", State: toolchain.StateAvailable},
+					{Name: "node", Version: "22.23.2", State: toolchain.StateInstalled},
+					{Name: "scip-go", Version: "0.2.7", State: toolchain.StateCorrupt},
+					{Name: "scip-java", Version: "0.13.1", State: toolchain.StateInstalled},
+					{Name: "scip-python", Version: "0.6.6", State: toolchain.StateAvailable},
+				},
+			}
+			rep, err := newTestService(t, Options{Toolchain: tc}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			var got []string
+			for _, c := range rep.Checks {
+				if name, ok := strings.CutPrefix(c.Name, checkToolchainPrefix); ok {
+					got = append(got, name+"="+string(c.State))
+				}
+			}
+			// gopls and scip-python are selected and missing; scip-go is
+			// selected and damaged. node is selected but installed, clangd is
+			// missing but unselected, scip-java is both installed and
+			// unselected: none of the three is the operator's business.
+			want := []string{"gopls=" + string(model.CheckWarn), "scip-go=" + string(model.CheckFail),
+				"scip-python=" + string(model.CheckWarn)}
+			if !slices.Equal(got, want) {
+				t.Fatalf("toolchain rows %v, want %v", got, want)
+			}
+			if c := checkNamed(t, rep, checkToolchainPrefix+"gopls"); !strings.Contains(c.Remediation, "tools prefetch --for-repo") {
+				t.Fatalf("the missing-tool remediation must name a command that installs it: %q", c.Remediation)
+			}
+		},
+	},
+	{
+		// Failure mode: the repository root cannot be read, the selection
+		// fails, and the doctor answers with no toolchain row at all -- a
+		// clean bill of health for a workspace nobody can list.
+		name: "a selection that cannot be computed is a failing check, not silence",
+		run: func(t *testing.T) {
+			tc := &fakeToolchain{
+				selErr:   &model.Error{Code: model.CodeArgumentInvalid, Message: "the repository root cannot be listed"},
+				statuses: []toolchain.Status{{Name: "gopls", Version: "0.23.0", State: toolchain.StateAvailable}},
+			}
+			rep, err := newTestService(t, Options{Toolchain: tc}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			if c := checkNamed(t, rep, checkToolchainPrefix+"selection"); c.State != model.CheckFail {
+				t.Fatalf("selection check is %q, want %q", c.State, model.CheckFail)
+			}
+		},
+	},
 	// L0 rows
 	{
 		// Failure mode: a metric this host cannot read is defaulted to zero,
@@ -90,6 +158,72 @@ var scenarios = []scenario{
 			}
 			if rep.State != model.CheckPass {
 				t.Fatalf("report state is %q; an unavailable measurement is an answer, not a defect", rep.State)
+			}
+		},
+	},
+	{
+		// Failure mode: an ordinary doctor skips the whole-database work but
+		// reports the rows it skipped as `pass`, so an operator reads "the
+		// index database passed its integrity checks" off a run that read no
+		// page of it. Ruling QP-A: nothing is dropped from the report and
+		// nothing skipped is claimed as verified -- each such row is
+		// `unverified` and names the flag that verifies it.
+		name: "an ordinary doctor reports the whole-database checks unverified, never passed",
+		run: func(t *testing.T) {
+			ordinary := &fakeStore{}
+			rep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: ordinary}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("ordinary Doctor: %v", err)
+			}
+			if ordinary.statCalls != 0 {
+				t.Fatalf("an ordinary doctor made %d Stats calls; the row counts are O(rows) and belong to --deep", ordinary.statCalls)
+			}
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount} {
+				got := checkNamed(t, rep, name)
+				if got.State != model.CheckUnverified {
+					t.Fatalf("%s state is %q, want %q", name, got.State, model.CheckUnverified)
+				}
+				if !strings.Contains(got.Detail, shallowUnverified) {
+					t.Fatalf("%s detail %q does not say it was %q", name, got.Detail, shallowUnverified)
+				}
+			}
+			if rep.State != model.CheckPass {
+				t.Fatalf("report state is %q; a deliberately skipped check is not a defect", rep.State)
+			}
+
+			deep := &fakeStore{}
+			deepRep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: deep}).Doctor(context.Background(), model.DoctorRequest{Deep: true})
+			if err != nil {
+				t.Fatalf("deep Doctor: %v", err)
+			}
+			if deep.statCalls != 1 {
+				t.Fatalf("a deep doctor made %d Stats calls, want exactly 1", deep.statCalls)
+			}
+
+			// The retained-object check is a bounded sample either way, so it
+			// reports what it sampled and is `unverified` in exactly one case:
+			// an empty sample, which without the retained-object count cannot
+			// be told from a store whose every object is unreadable. Documenting
+			// it as a deep-only walk would be wrong, and only a populated
+			// fixture catches that -- the empty one above passes either way.
+			if got := checkNamed(t, rep, checkSourceRetention); got.State != model.CheckUnverified {
+				t.Fatalf("source_retention on an empty sample is %q, want %q", got.State, model.CheckUnverified)
+			}
+			populated := &fakeStore{hashes: []string{"a", "b"}}
+			popRep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: populated}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("ordinary Doctor on a populated store: %v", err)
+			}
+			if got := checkNamed(t, popRep, checkSourceRetention); got.State != model.CheckPass {
+				t.Fatalf("source_retention state is %q on a store whose sample verified, want %q", got.State, model.CheckPass)
+			}
+			if populated.statCalls != 0 {
+				t.Fatalf("the populated ordinary doctor made %d Stats calls, want 0", populated.statCalls)
+			}
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount} {
+				if got := checkNamed(t, deepRep, name); got.State != model.CheckPass {
+					t.Fatalf("deep %s state is %q, want %q", name, got.State, model.CheckPass)
+				}
 			}
 		},
 	},
@@ -263,19 +397,21 @@ var scenarios = []scenario{
 		// The writer's own expiry is the only death signal, so a row past it
 		// must report no figure at all and must warn, while a live one
 		// reports the figure and a never-watched workspace says so without
-		// warning.
+		// warning. The second failure mode, with a watch per process: a
+		// waiting watcher's row is preferred over a covering one's and the
+		// workspace is reported as covered by nothing while a watch covers it.
 		name: "an expired watch heartbeat is never reported as live coverage",
 		run: func(t *testing.T) {
 			now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 			pending := int64(7)
 			pass := now.Add(-time.Second)
-			at := func(d time.Duration) *WatchHeartbeat {
-				return &WatchHeartbeat{WriterPID: 4321, LastPassAt: &pass,
-					PendingEvents: &pending, ExpiresAt: now.Add(d)}
+			at := func(d time.Duration) []WatchHeartbeat {
+				return []WatchHeartbeat{{WriterPID: 4321, LastPassAt: &pass,
+					PendingEvents: &pending, ExpiresAt: now.Add(d)}}
 			}
-			run := func(t *testing.T, hb *WatchHeartbeat) (model.ResourceReport, model.DoctorCheck) {
+			run := func(t *testing.T, hb []WatchHeartbeat) (model.ResourceReport, model.DoctorCheck) {
 				t.Helper()
-				svc := newTestService(t, Options{Store: &fakeStore{heartbeat: hb}})
+				svc := newTestService(t, Options{Store: &fakeStore{heartbeats: hb}})
 				res, err := svc.Resources(context.Background())
 				if err != nil {
 					t.Fatalf("Resources: %v", err)
@@ -310,6 +446,24 @@ var scenarios = []scenario{
 			if noneCheck.State != model.CheckUnavailable {
 				t.Fatalf("a workspace nobody watches is unavailable, not a defect: %+v", noneCheck)
 			}
+			// Two processes watch this workspace: one waiting for whichever
+			// process holds it, one covering it. The waiting row carries the
+			// later deadline, so a reader that judged the freshest row alone
+			// would report that nothing here is covered while something is,
+			// and would drop the covering watcher's pending count with it.
+			both := []WatchHeartbeat{
+				{WriterPID: 99, ExpiresAt: now.Add(2 * time.Minute)},
+				{WriterPID: 4321, LastPassAt: &pass, PendingEvents: &pending, ExpiresAt: now.Add(time.Minute)},
+			}
+			bothRes, bothCheck := run(t, both)
+			if bothRes.PendingEvents == nil || *bothRes.PendingEvents != pending {
+				t.Fatalf("a covering watch beside a waiting one must report its pending count, got %v", bothRes.PendingEvents)
+			}
+			if bothCheck.State != model.CheckPass || !strings.Contains(bothCheck.Detail, "4321") ||
+				strings.Contains(bothCheck.Detail, "covered by it") {
+				t.Fatalf("a covering watch beside a waiting one must be reported as coverage: %+v", bothCheck)
+			}
+
 			// A composition root that forgets to forward the probe must say
 			// so rather than report a workspace as unwatched.
 			svc := newTestService(t, Options{Store: bareStore{}})
@@ -319,6 +473,50 @@ var scenarios = []scenario{
 			}
 			if bare := checkNamed(t, rep, checkWatchHeartbeat); bare.State != model.CheckUnavailable {
 				t.Fatalf("a store with no heartbeat probe reports %q, want %q", bare.State, model.CheckUnavailable)
+			}
+		},
+	},
+	// rows added with the capability-state fix
+	{
+		// Failure mode: ADR-0004 Decision 1a tells an operator that a receipt
+		// acknowledged under `normal` can be lost to a machine-level crash and
+		// that `full` closes that window, while no doctor row said which mode
+		// the workspace is running in -- so the one fact the decision asks an
+		// operator to check was unreadable from the product. The mode is
+		// reported by BOTH readings of the storage check, because an ordinary
+		// doctor is the call an operator actually makes.
+		// The durability-mode residual: the row reported the CONFIGURED mode,
+		// which verifies nothing -- it re-prints an input. The fixture is
+		// therefore MISMATCHED on purpose: configured `normal`, live `full`.
+		// A phrase that echoes configuration prints normal and fails here.
+		name: "the storage check reads the live durability mode back",
+		run: func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.Storage.Synchronous = config.SynchronousNormal
+			svc := newTestService(t, Options{Config: cfg,
+				Store: &fakeStore{synchronous: config.SynchronousFull}})
+			for _, req := range []model.DoctorRequest{{}, {Deep: true}} {
+				rep, err := svc.Doctor(context.Background(), req)
+				if err != nil {
+					t.Fatalf("Doctor(deep=%v): %v", req.Deep, err)
+				}
+				got := checkNamed(t, rep, checkStorageIntegrity)
+				if !strings.Contains(got.Detail, "storage.synchronous reads back full") {
+					t.Fatalf("storage_integrity (deep=%v) detail %q does not report the mode the store "+
+						"read back (full); the configured mode is normal", req.Deep, got.Detail)
+				}
+			}
+			// The honesty half: a store that cannot answer must drop the
+			// read-back claim rather than print configuration as measurement.
+			bare := newTestService(t, Options{Config: cfg, Store: bareStore{}})
+			rep, err := bare.Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor with a bare store: %v", err)
+			}
+			got := checkNamed(t, rep, checkStorageIntegrity)
+			if strings.Contains(got.Detail, "reads back") || !strings.Contains(got.Detail, "as configured") {
+				t.Fatalf("a store that cannot read the mode back reports %q; it must name the configured "+
+					"mode as configured", got.Detail)
 			}
 		},
 	},
@@ -350,17 +548,31 @@ type fakeStore struct {
 	active model.GenerationID
 	blob   model.BlobRecord
 	err    error
+	// walBound is what WALBoundBytes reports; zero means the store's log is
+	// always past it, so a test that wants no warning sets it.
+	walBound int64
 	// deepChecks and checks record what a doctor call actually asked the
 	// store for, which is how a row proves an ordinary call runs no scan.
 	checks     int
 	deepChecks int
+	// statCalls records Stats calls. Stats is eleven count(*) scans, so an
+	// ordinary doctor must make none of them.
+	statCalls int
 	// L1: the two optional probes doctor.go asserts for. supplied is what
 	// SuppliedIndexes reports; sampleLimit records the sample size the caller
 	// asked for, so a row can prove --deep widens it.
 	supplied    []SuppliedIndex
 	sampleLimit int
-	// heartbeat is the watch heartbeat the store holds, absent when nil.
-	heartbeat *WatchHeartbeat
+	// synchronous is the LIVE durability mode this store reads back, which a
+	// row sets to something the configuration does not say so that a phrase
+	// echoing the configuration cannot pass. Empty means the read failed.
+	synchronous string
+	// hashes is what SampleBlobs reports. Nil is the ordinary fixture (an
+	// empty store); a row that needs a populated one sets it.
+	hashes []string
+	// heartbeats are the watch heartbeat rows the store holds, freshest
+	// deadline first as the store reads them.
+	heartbeats []WatchHeartbeat
 }
 
 // SampleBlobs is the optional hash source for the content-addressed-storage
@@ -368,7 +580,10 @@ type fakeStore struct {
 // legitimate state, and the rows that care assert on sampleLimit.
 func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) {
 	f.sampleLimit = limit
-	return nil, f.err
+	if len(f.hashes) > limit {
+		return f.hashes[:limit], f.err
+	}
+	return f.hashes, f.err
 }
 
 // SuppliedIndexes is the optional supplied-index probe (L1).
@@ -376,14 +591,17 @@ func (f *fakeStore) SuppliedIndexes(context.Context, model.GenerationID) ([]Supp
 	return f.supplied, f.err
 }
 
-// WatchHeartbeat is the optional watch-liveness probe. A nil heartbeat is a
-// workspace no watch ever ran in, which is a different answer from an expired
-// one.
-func (f *fakeStore) WatchHeartbeat(context.Context, model.RepositoryID) (WatchHeartbeat, bool, error) {
-	if f.heartbeat == nil {
-		return WatchHeartbeat{}, false, f.err
+// WatchHeartbeats is the optional watch-liveness probe. No rows is a workspace
+// no watch ever ran in, which is a different answer from an expired row.
+func (f *fakeStore) WatchHeartbeats(context.Context, model.RepositoryID) ([]WatchHeartbeat, error) {
+	return f.heartbeats, f.err
+}
+
+func (f *fakeStore) SynchronousMode(context.Context) (string, error) {
+	if f.synchronous == "" {
+		return "", f.err
 	}
-	return *f.heartbeat, true, f.err
+	return f.synchronous, f.err
 }
 
 // bareStore is a StoreReader implementing the frozen four methods and none of
@@ -425,7 +643,20 @@ func (f *fakeStore) Check(_ context.Context, deep bool) error {
 	return f.err
 }
 
-func (f *fakeStore) Stats(context.Context) (StoreStats, error) { return f.stats, f.err }
+func (f *fakeStore) Stats(context.Context) (StoreStats, error) {
+	f.statCalls++
+	return f.stats, f.err
+}
+
+// StoreSizes is the optional cheap-size probe a shallow accounting check reads
+// instead of Stats. It is two file stats in the real store and counts nothing.
+func (f *fakeStore) StoreSizes(context.Context) (int64, int64, error) {
+	return f.stats.DatabaseBytes, f.stats.WALBytes, f.err
+}
+
+// WALBoundBytes is the fake's ingestion group bound, the size past which a
+// write-ahead log is one nothing has folded.
+func (f *fakeStore) WALBoundBytes() int64 { return f.walBound }
 
 func (f *fakeStore) ActiveGeneration(context.Context, model.RepositoryID) (model.GenerationID, error) {
 	return f.active, f.err
@@ -437,11 +668,17 @@ func (f *fakeStore) Blob(context.Context, string) (model.BlobRecord, error) {
 
 type fakeToolchain struct {
 	statuses []toolchain.Status
+	selected []string
 	err      error
+	selErr   error
 }
 
 func (f *fakeToolchain) Statuses(context.Context) ([]toolchain.Status, error) {
 	return f.statuses, f.err
+}
+
+func (f *fakeToolchain) Selected(context.Context, string) ([]string, error) {
+	return f.selected, f.selErr
 }
 
 type fakeWorkspace struct {

@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Phase is the context-compilation phase. Only sweep and verify can open a new
 // session; consolidate is compiled by the workflow service for an existing
@@ -75,6 +78,18 @@ type Budget struct {
 	MaxBytes           int64 `json:"max_bytes"`
 	MaxFiles           int   `json:"max_files"`
 	MaxSlices          int   `json:"max_slices"`
+	// MaxManifestBytes is the stored-manifest byte budget for THIS request. It
+	// is a caller budget, not a deployment ceiling: a request that knows it can
+	// hold a larger manifest may raise the configured value, and zero takes the
+	// configured one. Refusing to compile because a deployment default was
+	// smaller than the caller's real window is a scale refusal.
+	//
+	// BudgetUnlimited (-1) is the caller's explicit "no manifest ceiling". It
+	// is spelled apart from zero because zero already means "take the
+	// configured value", so a caller under a finite deployment default has no
+	// other way to raise the budget all the way -- and a caller budget a
+	// request cannot raise to unlimited is still a scale refusal.
+	MaxManifestBytes int64 `json:"max_manifest_bytes,omitempty"`
 }
 
 // Validate rejects a negative budget field. Zero is accepted and means "use the
@@ -95,8 +110,17 @@ func (b Budget) Validate() error {
 			return err
 		}
 	}
+	// max_manifest_bytes is the one budget field that admits BudgetUnlimited;
+	// anything below it is still a negative bound.
+	if b.MaxManifestBytes < BudgetUnlimited {
+		return requireNonNegative("budget.max_manifest_bytes", b.MaxManifestBytes)
+	}
 	return nil
 }
+
+// BudgetUnlimited is the request-side spelling of "no ceiling" for a budget
+// field whose zero already means "take the configured value".
+const BudgetUnlimited int64 = -1
 
 // ContextRequest is the semantic input to compilation. Its normalized form is
 // part of manifest identity, so it carries no operational field.
@@ -136,6 +160,13 @@ type PlanRequest struct {
 	Context        ContextRequest `json:"context"`
 	ActorID        string         `json:"actor_id"`
 	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+
+	// Cursor continues a compile that ended on its query deadline at a pass
+	// boundary (ruling C9). It is the token the previous PlanResult printed as
+	// NextCursor, and it is presented beside the SAME request: the token is
+	// bound to the compile's request identity, so a cursor offered with any
+	// other request is refused rather than answered.
+	Cursor string `json:"cursor,omitempty"`
 }
 
 // Validate enforces the plan shape, including the Section 17.1 rule that direct
@@ -155,6 +186,12 @@ func (r PlanRequest) Validate() error {
 		if err := requireTrimmed("plan.idempotency_key", r.IdempotencyKey, MaxIdentifierBytes); err != nil {
 			return err
 		}
+	}
+	// A wire-class bound, not a limit: the token is signed and self-describing,
+	// so anything past MaxTokenBytes is a forged or corrupted argument rather
+	// than a large legitimate request. It is the same bound page.cursor carries.
+	if err := boundField("plan.cursor", r.Cursor, MaxTokenBytes); err != nil {
+		return err
 	}
 	return nil
 }
@@ -209,9 +246,12 @@ func (e ContextEntry) Validate() error {
 	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
-	if err := boundCount("context_entry.evidence_paths", len(e.EvidencePaths), MaxReasonPathsPerEntry); err != nil {
-		return err
-	}
+	// No count bound on evidence_paths. MaxReasonPathsPerEntry is superseded by
+	// the configured context.max_reason_paths_per_entry limit, which the ranking
+	// lane honours as written -- including unlimited. Refusing an entry here for
+	// carrying more routes than the old model constant would fail a persist for
+	// obeying the operator's own setting, and what an entry cannot enumerate is
+	// already disclosed by its MorePaths reason rather than dropped.
 	for i, path := range e.EvidencePaths {
 		field := indexed("context_entry.evidence_paths", i)
 		if err := boundCount(field, len(path), MaxRelationsPerPath); err != nil {
@@ -244,7 +284,10 @@ func (s ContextSlice) Validate() error {
 	if len(s.EntryOrdinals) == 0 {
 		return invalid("context_slice %d has no entries", s.Index)
 	}
-	if err := boundCount("context_slice.entry_ordinals", len(s.EntryOrdinals), MaxRecordsPerResult); err != nil {
+	// A page width, not a ceiling on a slice: a slice wider than one page is
+	// served as a page plus a cursor, so this reports a producer that returned
+	// an oversized page rather than refusing a legitimate plan.
+	if err := boundPage("context_slice.entry_ordinals", len(s.EntryOrdinals)); err != nil {
 		return err
 	}
 	for i, o := range s.EntryOrdinals {
@@ -329,6 +372,20 @@ type ContextManifest struct {
 	ScopeComplete  bool              `json:"scope_complete"`
 	EstimateMethod string            `json:"estimate_method"`
 	CreatedAt      time.Time         `json:"created_at"`
+	// Notices are the compile's non-fatal disclosures, the same contract
+	// QueryMeta.Notices carries on the query surfaces: a request that asked for
+	// a bound the configuration resolves differently reports "requested N,
+	// effective M" here rather than being silently clamped, and a field the
+	// compile had to truncate names the count it truncated here rather than
+	// shortening an explanation without saying so.
+	//
+	// They are NOT part of CanonicalHash and are not persisted: the hash
+	// identifies the PLAN, and two compiles of one generation that differ only
+	// in the bounds the operator configured are the same plan. A manifest
+	// re-read from storage therefore carries no notices, and Compile re-emits
+	// the configuration-derived ones on the reuse path so the caller that
+	// asked is still told.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Validate enforces the context_manifests constraints.
@@ -366,26 +423,86 @@ func (m ContextManifest) Validate() error {
 	if err := requireField("manifest.estimate_method", m.EstimateMethod, MaxIdentifierBytes); err != nil {
 		return err
 	}
+	// Bounded per notice, not in total -- the QueryMeta.Notices rule: the count
+	// is a function of how many bounds the request met, and an aggregate cap
+	// would be the silent disclosure drop these notices exist to prevent. The
+	// producers pass every notice through TruncateField, so this bound reports
+	// a producer defect rather than refusing a legitimate compile.
+	for i, note := range m.Notices {
+		if strings.TrimSpace(note) == "" {
+			return invalid("manifest.notices[%d] is empty", i)
+		}
+		if err := boundField("manifest.notices", note, MaxReasonBytes); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// PlanResult is the answer to a plan request: the immutable manifest plus the
-// operational session binding the actor uses from here on.
+// PlanResult is the answer to a plan request. It is ONE type with two shapes
+// (ruling C9): either the finished plan -- the immutable manifest plus the
+// operational session binding the actor uses from here on -- or the report that
+// this call ended on its query deadline at a pass boundary, carrying the token
+// the next call resumes from and nothing else.
+//
+// It is widened rather than split because a continuation is the same answer to
+// the same question, not a different endpoint: a client decodes one type and
+// branches on Truncated. A truncated result carries the ZERO manifest and no
+// session id, because a partial plan is never persisted and no session may bind
+// to one -- which is exactly what the exactly-one-of rule in Validate enforces.
 type PlanResult struct {
-	Manifest  ContextManifest `json:"manifest"`
-	SessionID SessionID       `json:"session_id"`
+	// omitzero / omitempty: on the truncated shape these two are absent from
+	// the wire rather than encoded as an all-zero manifest object and a blank
+	// session id, which a client would read as a plan that selected nothing
+	// inside a session it may now use. They are always present on the finished
+	// shape, where Validate requires both.
+	Manifest  ContextManifest `json:"manifest,omitzero"`
+	SessionID SessionID       `json:"session_id,omitempty"`
 	ActorID   string          `json:"actor_id"`
+
+	// Truncated says this call stopped at a pass boundary and compiled no
+	// manifest. TruncationReason names why ("deadline" is the only reason a
+	// compile ends this way) and NextCursor is the token that continues it.
+	Truncated        bool   `json:"truncated,omitempty"`
+	TruncationReason string `json:"truncation_reason,omitempty"`
+	NextCursor       string `json:"next_cursor,omitempty"`
 }
 
-// Validate enforces the result shape.
+// Validate enforces the result shape: exactly one of (Manifest + SessionID) or
+// (NextCursor + Truncated). A result carrying both would let a reader treat a
+// continuation as an answer; a result carrying neither is an empty answer no
+// caller can act on. ActorID is required on both shapes -- it is who asked, and
+// a continuation is resumed by the same actor.
 func (r PlanResult) Validate() error {
+	if err := requireTrimmed("plan_result.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	continuation := r.Truncated || r.NextCursor != "" || r.TruncationReason != ""
+	if continuation {
+		if r.SessionID != "" || r.Manifest.ID != "" {
+			return invalid("plan_result names both a compiled plan and a continuation cursor; a truncated compile persists no manifest and opens no session")
+		}
+		if !r.Truncated {
+			return invalid("plan_result carries a continuation cursor without truncated")
+		}
+		// MaxReasonBytes, the same bound meta.truncation_reason carries: the
+		// vocabulary is the same one QueryMeta reports truncation with, and one
+		// wire type should not spell the same reason two lengths.
+		if err := requireField("plan_result.truncation_reason", r.TruncationReason, MaxReasonBytes); err != nil {
+			return err
+		}
+		if err := requireField("plan_result.next_cursor", r.NextCursor, MaxTokenBytes); err != nil {
+			return err
+		}
+		return nil
+	}
+	if r.Manifest.ID == "" && r.SessionID == "" {
+		return invalid("plan_result names neither a compiled plan nor a continuation cursor")
+	}
 	if err := r.Manifest.Validate(); err != nil {
 		return err
 	}
 	if err := requireID("plan_result.session_id", string(r.SessionID)); err != nil {
-		return err
-	}
-	if err := requireTrimmed("plan_result.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
 		return err
 	}
 	return nil

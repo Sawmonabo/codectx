@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -220,21 +222,60 @@ func data[T any](t *testing.T, env envelope, code int) T {
 // session. Nothing else in a row may take that lock while this is open.
 func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSession {
 	t.Helper()
-	var stderr bytes.Buffer
-	cmd := exec.Command(binary, "mcp", "serve", "--repo", s.Repo)
+	session, _, closeSession := s.mcpServer(t, ctx)
+	t.Cleanup(closeSession)
+	return session
+}
+
+// serverLog is the running server's stderr, readable while it is still being
+// written. The buffer is guarded because the process writes it from the
+// exec.Cmd's own goroutine while a row polls it for the records the session
+// emits -- a watch's refreshes are reported there and nowhere else.
+type serverLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *serverLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *serverLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// mcpServer is mcpSession with the extra `mcp serve` arguments a row needs and
+// the close in the caller's hands. A row that starts a second server must be
+// able to end the first one where it says so rather than at the end of the
+// test: a session that is still connected is still a process on this
+// workspace, and two of them is a different scenario from one.
+//
+// The close is idempotent, so a caller may end the session early and still let
+// the cleanup it registered run. The server's stderr is returned with it: what
+// a watching session does between tool calls is reported there.
+func (s *sandbox) mcpServer(t *testing.T, ctx context.Context, extra ...string) (*mcp.ClientSession, *serverLog, func()) {
+	t.Helper()
+	stderr := &serverLog{}
+	cmd := exec.Command(binary, append([]string{"mcp", "serve", "--repo", s.Repo}, extra...)...)
 	cmd.Env = s.Environ
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	client := mcp.NewClient(&mcp.Implementation{Name: "codectx-e2e", Version: "0.0.0-test"}, nil)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {
 		t.Fatalf("connect to `codectx mcp serve` over stdio: %v\nserver stderr:\n%s", err, stderr.String())
 	}
-	t.Cleanup(func() {
-		if err := session.Close(); err != nil {
-			t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
-		}
-	})
-	return session
+	var once sync.Once
+	return session, stderr, func() {
+		once.Do(func() {
+			if err := session.Close(); err != nil {
+				t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
+			}
+		})
+	}
 }
 
 // callTool calls one tool and decodes the Section 19 answer envelope out of the
@@ -365,9 +406,11 @@ func TestE2ESearchParity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 
-	// The index is built first and the process exits, releasing the workspace
-	// lock. `mcp serve` below takes that same lock for its whole session, so
-	// the order is not stylistic: an overlapping index would be refused busy.
+	// The index is built first and the process exits: this row compares the
+	// CLI's answer with the server's over one published generation, so both
+	// must read the same one. `mcp serve` no longer needs the order -- it
+	// starts and answers beside a running index -- but an overlapping index
+	// would leave the two halves comparing different generations.
 	indexEnv, indexCode := s.run(t, "index")
 	if !indexEnv.OK || indexCode != 0 {
 		t.Fatalf("index failed (exit %d): %+v", indexCode, indexEnv.Error)
@@ -784,7 +827,7 @@ func scopeReviewOf(session model.SessionID, actor string, scope int, manifestHas
 // repoState is every file in the repository with its bytes, as one comparable
 // value. It is what "the MCP leg writes nothing to the repository" is asserted
 // against: Section 6 forbids codectx writing into the tree it indexes, and the
-// MCP server is the one boundary that holds the workspace for a whole session.
+// MCP server is the one boundary that serves a workspace for a whole session.
 func repoState(t *testing.T, dir string) string {
 	t.Helper()
 	var state bytes.Buffer
@@ -1136,8 +1179,9 @@ func TestE2EProductBoundary(t *testing.T) {
 		t.Fatalf("search resolved no node for %q in the generated repository: %+v", tinySeedSymbol, hitKeys(hits.Items))
 	}
 	impactEnv, impactCode := s.run(t, "impact", string(node))
+	whole := data[model.ImpactResult](t, impactEnv, impactCode)
 	var relation model.RelationID
-	for _, entry := range data[model.ImpactResult](t, impactEnv, impactCode).Entries {
+	for _, entry := range whole.Entries {
 		for _, path := range entry.Paths {
 			if len(path.Relations) > 0 {
 				relation = path.Relations[0]
@@ -1147,6 +1191,71 @@ func TestE2EProductBoundary(t *testing.T) {
 	if relation == "" {
 		t.Fatalf("impact on %s produced no evidence-backed relation to cite", node)
 	}
+	// The `r` continuation, end to end through the CLI: one page of one, then
+	// the token that page printed. Impact runs its whole walk on the first
+	// request and serves the globally ranked remainder from a spool, so this is
+	// the only boundary at which the ranked cursor's round trip -- signed,
+	// bound to this query, and read back as a ranked spool rather than a walk
+	// -- is exercised against the built binary.
+	if len(whole.Entries) > 1 || len(whole.Packages) > 1 {
+		firstEnv, firstCode := s.run(t, "impact", string(node), "--limit", "1")
+		first := data[model.ImpactResult](t, firstEnv, firstCode)
+		if first.Meta.NextCursor == "" {
+			t.Fatalf("impact on %s holds %d entr(ies) and %d pair(s) but offered no continuation at a page of one",
+				node, len(whole.Entries), len(whole.Packages))
+		}
+		nextEnv, nextCode := s.run(t, "impact", string(node), "--limit", "1",
+			"--cursor", first.Meta.NextCursor)
+		next := data[model.ImpactResult](t, nextEnv, nextCode)
+		if len(next.Entries)+len(next.Packages) == 0 {
+			t.Fatalf("the ranked continuation served nothing: %+v", next.Meta)
+		}
+	} else if _, code := s.run(t, "impact", string(node), "--cursor",
+		"not-a-token"); code == 0 {
+		// The generated repository's blast radius fits one page, so the token
+		// this build would have to accept cannot be produced here. What is
+		// still provable at this boundary is that --cursor REACHES the request:
+		// a malformed one must be refused rather than ignored.
+		t.Fatal("`impact --cursor` accepted a malformed token: the flag is not reaching the request")
+	}
+	// `codectx path`, end to end. This is the ONLY CLI-level coverage the
+	// command has: nothing else in the tree runs it, and it spent a release
+	// dying on every invocation with "flag accessed but not defined: limit"
+	// (pageRequest read a --limit `path` deliberately does not declare) while
+	// `go test ./...` stayed green. The assertion is deliberately weak on the
+	// ROUTES -- the generated repository need not connect any two nodes -- and
+	// strong on the invocation: it must reach the workspace and answer.
+	//
+	// The loop below is the only place it runs, so "the body never executed"
+	// has to be a failure rather than a green test: an impact answer whose
+	// only entry is the seed would otherwise invoke `path` zero times and
+	// re-admit exactly the blind spot this leg exists to close.
+	ranPath := false
+	for _, entry := range whole.Entries {
+		if entry.NodeID == node {
+			continue
+		}
+		ranPath = true
+		pathEnv, pathCode := s.run(t, "path", string(node), string(entry.NodeID))
+		if !pathEnv.OK || pathCode != 0 {
+			t.Fatalf("`codectx path %s %s` failed (exit %d): %+v", node, entry.NodeID, pathCode, pathEnv.Error)
+		}
+		_ = data[model.PathResult](t, pathEnv, pathCode)
+		// --cursor reaches the request: `path` is resumable, and a page that
+		// spends its deadline or its visited budget prints a token. A search
+		// this small finishes in one page, so what is provable here is that the
+		// flag is wired -- a malformed token must be refused, not ignored.
+		if _, code := s.run(t, "path", string(node), string(entry.NodeID),
+			"--cursor", "not-a-token"); code == 0 {
+			t.Fatal("`path --cursor` accepted a malformed token: the flag is not reaching the request")
+		}
+		break
+	}
+	if !ranPath {
+		t.Fatalf("`codectx path` never ran: the impact answer for %s holds %d entr(ies) and none of them "+
+			"is a second node, so the command's only end-to-end coverage silently did not execute", node, len(whole.Entries))
+	}
+
 	start := seed{Node: node, Relation: relation}
 
 	var cli, viaMCP walk
@@ -1154,7 +1263,7 @@ func TestE2EProductBoundary(t *testing.T) {
 		cli = runScenario(t, cliAdapter{s: s}, cliActor, start)
 
 		// The repository is captured before the server starts and compared
-		// after it stops. `codectx mcp serve` holds the workspace for its whole
+		// after it stops. `codectx mcp serve` serves the workspace for its whole
 		// session, and it is the one boundary a client drives without a process
 		// boundary between each step, so "codectx writes no file into the tree
 		// it indexes" is asserted where it is hardest to keep.
@@ -1183,6 +1292,37 @@ func TestE2EProductBoundary(t *testing.T) {
 
 		refreshEnv, refreshCode := s.run(t, "refresh")
 		result := data[model.IndexResult](t, refreshEnv, refreshCode)
+		// The run states what it did. A run that has just returned is
+		// finished, and its accounting has to say so: the collector holds a
+		// finished run in memory until its next write, so without the barrier
+		// the coordinator waits on, this reads as a run still going and its
+		// last stages are missing. `running` here is the failure mode --
+		// a completed index reported as live, with an incomplete stage list
+		// presented as the whole of it.
+		if result.Run == nil {
+			t.Fatalf("the refresh reported no run; the result carries no account of what it did")
+		}
+		if result.Run.Outcome == "running" || result.Run.FinishedAt == nil {
+			t.Errorf("the run the refresh reported is %q with finished_at %v: a run that has returned is over",
+				result.Run.Outcome, result.Run.FinishedAt)
+		}
+		// Activation is one of the last stages a run opens, so a result that
+		// carries it carries the stages that ended after the collector's last
+		// periodic write, and every row belongs to the run reported above and
+		// not to another run of the same process.
+		activated := false
+		for _, stage := range result.Stages {
+			if stage.RunID != result.Run.RunID {
+				t.Fatalf("a stage of run %s was reported under run %s", stage.RunID, result.Run.RunID)
+			}
+			if stage.Stage == "activation" {
+				activated = true
+			}
+		}
+		if !activated {
+			t.Errorf("the run reported %d stages and none of them is the activation it just performed",
+				len(result.Stages))
+		}
 		if result.Binding.GenerationID <= pinned.Binding.GenerationID {
 			t.Fatalf("the refresh published generation %d; the session is pinned to %d and a change was made",
 				result.Binding.GenerationID, pinned.Binding.GenerationID)
@@ -1407,5 +1547,80 @@ func mutateStore(t *testing.T, repo string) {
 	}
 	if err := os.WriteFile(path, append(after, mutationBody...), 0o600); err != nil {
 		t.Fatalf("mutate %s: %v", mutatedFile, err)
+	}
+}
+
+// TestE2EResourcesReportsAStoreWithNoLedger drives the most common state this
+// code will ever be in and the one nothing exercised: a store whose run ledger
+// is not there. A workspace indexed before the ledger existed, a first run
+// after an upgrade and a store whose ledger a sweep removed all reach it, and
+// every surface above ledger.OpenReader has an absent-ledger branch that no
+// test ran.
+//
+// Two failures are guarded, and both are silent. The report must still be
+// produced -- the resources block is the host's own measurements and does not
+// depend on any run having been recorded, so an absent ledger must not fail the
+// command. And it must render no run at all rather than a run of zeros: a row
+// reading `0s`, `0` files and `0` units is a run that never happened, and an
+// operator reading it cannot tell it from a run that did nothing.
+//
+// It is an end-to-end row rather than a unit one because the absent branch is
+// in the composition -- the workspace's ledger adapter -- and only a real store
+// with its ledger file removed puts it there.
+//
+// Mutation: in the workspace's run-ledger adapter, answer an unrecorded ledger
+// with an empty model.RunRecord instead of none.
+func TestE2EResourcesReportsAStoreWithNoLedger(t *testing.T) {
+	s := newSandbox(t)
+	indexEnv, indexCode := s.run(t, "index")
+	if !indexEnv.OK || indexCode != 0 {
+		t.Fatalf("index failed (exit %d): %+v", indexCode, indexEnv.Error)
+	}
+
+	// The ledger is removed the way a sweep or an older store leaves it: the
+	// file is simply not there. Its sidecars go with it, since a stale
+	// write-ahead log would describe a database that no longer exists.
+	var removed int
+	root := filepath.Join(s.Home, "data")
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasPrefix(d.Name(), "ledger.db") {
+			return nil
+		}
+		removed++
+		return os.Remove(path)
+	}); err != nil {
+		t.Fatalf("removing the run ledger: %v", err)
+	}
+	if removed == 0 {
+		t.Fatalf("the index recorded no ledger under %s, so this row proves nothing about its absence", root)
+	}
+
+	// runText fails the test on any non-zero exit, which is the first
+	// assertion: a store with no ledger still reports.
+	report := s.runText(t, "status", "--resources")
+	if !strings.Contains(report, "parent rss") {
+		t.Fatalf("the resources block is missing from a report over a store with no ledger:\n%s", report)
+	}
+	if strings.Contains(report, "\nrun\n") {
+		t.Fatalf("a store with no recorded run rendered a run table, which is a run that never happened:\n%s", report)
+	}
+
+	env, code := s.run(t, "status", "--resources")
+	// The command's payload wraps the status under "index", beside the tool
+	// report; only the status is asserted here.
+	status := data[struct {
+		Index model.IndexStatus `json:"index"`
+	}](t, env, code).Index
+	if status.Resources == nil {
+		t.Fatal("the report carries no resources block, though the block measures the host and not any run")
+	}
+	if status.Resources.Run != nil {
+		t.Fatalf("a store with no ledger answered with a run record: %+v", status.Resources.Run)
+	}
+	if len(status.Resources.Stages) != 0 {
+		t.Fatalf("a store with no ledger answered with %d stages", len(status.Resources.Stages))
 	}
 }

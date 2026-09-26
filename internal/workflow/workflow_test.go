@@ -15,12 +15,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -38,6 +41,65 @@ func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
 		// L1 rows
+		// resources.query_timeout is unlimited by DEFAULT and is a default,
+		// never a ceiling. Both halves were broken here: checkLimits refused a
+		// non-positive value, so the shipped configuration could not compose a
+		// workflow service at all, and Advance, Status and Include each wrapped
+		// their request in context.WithTimeout unconditionally -- so a zero
+		// minted `now + 0`, an instant already past that refuses every request,
+		// and a caller's longer deadline was silently cut back to the
+		// configured default. The row asserts at the seam where it is
+		// decidable, the context the service hands the store, so it costs no
+		// wall clock.
+		//
+		// Mutation: restore context.WithTimeout(ctx, s.limits.QueryTimeout) in
+		// advance.go, ready.go or include.go in place of model.QueryDeadline
+		// and the zero-timeout leg fails with a deadline nobody asked for.
+		{name: "an unbounded call carries no deadline and a caller's own is kept", run: func(t *testing.T, h *harness) {
+			status := func(timeout time.Duration, ctx context.Context) bool {
+				saw := false
+				svc, err := New(Options{
+					Sessions: deadlineStore{h.store, &saw},
+					Compile:  h.store,
+					Validate: h.store,
+					Limits: Limits{
+						MaxPageItems:             model.MaxPageItems,
+						MaxObservationReferences: config.Unlimited,
+						MaxCapsuleBytes:          8 << 20,
+						QueryTimeout:             timeout,
+					},
+					Now:    func() time.Time { return fixtureNow },
+					Logger: slog.New(slog.DiscardHandler),
+				})
+				if err != nil {
+					t.Fatalf("build a workflow service with query_timeout %s: %v", timeout, err)
+				}
+				if _, err := svc.Status(ctx, model.SessionRequest{
+					SessionID: fixtureSession, ActorID: fixtureActor,
+				}); err != nil {
+					t.Fatalf("Status under query_timeout %s: %v", timeout, err)
+				}
+				return saw
+			}
+			if status(0, context.Background()) {
+				t.Fatal("query_timeout 0 means NO deadline, yet the call ran under one: " +
+					"`now + 0` is an instant already past and would refuse every request")
+			}
+
+			// A caller's own deadline is the request's, and a positive
+			// configured value must not narrow it. A minute is far beyond
+			// anything this package would install of its own.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			before, _ := ctx.Deadline()
+			if !status(10*time.Second, ctx) {
+				t.Fatal("the caller's deadline was dropped")
+			}
+			if after, _ := ctx.Deadline(); !after.Equal(before) {
+				t.Fatalf("the caller's deadline moved from %s to %s: query_timeout is a ceiling", before, after)
+			}
+		}},
+
 		// Failure mode: a service that picked its own version from a
 		// pre-read record, retried the store's compare-and-swap or
 		// swallowed its conflict would let two clients both believe they
@@ -439,6 +501,62 @@ func TestWorkflowScenarios(t *testing.T) {
 					st.StrictGateSatisfied, st.ReadyForImplementation)
 			}
 		}},
+		// Failure mode: context.strict_read_gate is documented as the switch
+		// for confirmed source coverage, and a key nothing reads is a promise
+		// the product does not keep. The row asserts both halves of what the
+		// switch may do: with it off the coverage shortfall no longer shuts the
+		// gate (precondition 3 is skipped, and the reason stops naming files
+		// the configuration excused), and it still never buys a strict claim --
+		// StrictGateSatisfied is what the capsule seals, and sealing it over a
+		// read nothing confirmed is the false attestation the gate exists to
+		// refuse. The marker is the only way a reader can tell the two apart.
+		{name: "readiness/a disabled strict read gate skips precondition 3 and never claims a strict gate", run: func(t *testing.T, h *harness) {
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+			h.store.mu.Lock()
+			// No waiver and a current-scope review, so precondition 3 is the
+			// only one left unsatisfied: filePartial stays partly served.
+			fs := h.store.sessions[fixtureSession]
+			fs.files[fileWaived].waived = false
+			fs.waivers = nil
+			fs.obs = append(fs.obs, fixtureScopeReview(fixtureSession, fixtureActor, 1))
+			h.store.mu.Unlock()
+
+			req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+			enforced, err := h.svc.Status(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Status with the gate enforced: %v (code %q)", err, code(err))
+			}
+			if enforced.ReadCompleteForSnapshot || enforced.WaivedFiles != 0 || enforced.Superseded {
+				t.Fatalf("the fixture does not isolate precondition 3: read_complete=%v waived=%d superseded=%v",
+					enforced.ReadCompleteForSnapshot, enforced.WaivedFiles, enforced.Superseded)
+			}
+			if !strings.Contains(enforced.GuaranteeLimit, "required files are not all fully served") {
+				t.Fatalf("the enforced gate must shut on the coverage shortfall, reason %q", enforced.GuaranteeLimit)
+			}
+
+			relaxed, err := h.serviceWithReadGateDisabled(t).Status(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Status with the gate disabled: %v (code %q)", err, code(err))
+			}
+			if strings.Contains(relaxed.GuaranteeLimit, "required files are not all fully served") {
+				t.Fatalf("precondition 3 still shut the gate although context.strict_read_gate is false: reason %q",
+					relaxed.GuaranteeLimit)
+			}
+			if !strings.Contains(relaxed.GuaranteeLimit, "strict_read_gate=disabled") {
+				t.Fatalf("a disabled read gate must say so in its reason, got %q", relaxed.GuaranteeLimit)
+			}
+			if relaxed.StrictGateSatisfied || relaxed.ReadyForImplementation {
+				t.Fatalf("a disabled read gate claimed strict readiness over an unconfirmed read: strict=%v ready=%v",
+					relaxed.StrictGateSatisfied, relaxed.ReadyForImplementation)
+			}
+			// The reported facts are untouched by the switch: it decides what
+			// shuts the gate, never what the counts say.
+			if relaxed.ReadCompleteForSnapshot || relaxed.RequiredFiles != enforced.RequiredFiles ||
+				relaxed.FullyServedFiles != enforced.FullyServedFiles {
+				t.Fatalf("the switch changed the reported coverage: read_complete=%v required=%d served=%d",
+					relaxed.ReadCompleteForSnapshot, relaxed.RequiredFiles, relaxed.FullyServedFiles)
+			}
+		}},
 		// Failure mode: expiry is lazy, so a lapsed session is still recorded
 		// as verify_open and the store hands back the record beside
 		// CTX_SESSION_EXPIRED -- which status deliberately swallows to stay
@@ -588,6 +706,9 @@ type fakeSession struct {
 	obs     []model.Observation
 	waivers []model.WaiverRecord
 	capsule *model.Capsule
+	// rows is what PutCapsule streamed out of the sealing source, per list, in
+	// the order it streamed them -- the fake's context_capsule_rows.
+	rows map[model.CapsuleList][]model.CapsuleRow
 }
 
 // fakeStore is the in-package Sessions, Compiler and Validator. It reproduces
@@ -614,6 +735,23 @@ type fakeStore struct {
 	// compileErr and validateErr let a lane drive the failure paths without a
 	// second fake.
 	compileErr, validateErr error
+	// walks counts, per capsule list, how many times the SESSION STORE was
+	// walked for that list. The seal makes exactly three bounded passes over
+	// the source (count, hash, write) and retains no list between them, so a
+	// source that memoised a pass would drop this to one.
+	walks map[model.CapsuleList]int
+	// waiverPages records one entry per WaiversAfter call -- the cursor it was
+	// given, the page bound it was given and how many records it answered. It
+	// is how a row proves the waiver list is read a page at a time: a
+	// whole-list read is one call answering every record regardless of limit.
+	waiverPages []waiverPage
+}
+
+// waiverPage is one recorded WaiversAfter call.
+type waiverPage struct {
+	after model.FileID
+	limit int
+	got   int
 }
 
 var (
@@ -653,7 +791,7 @@ func newHarness(t *testing.T) *harness {
 		Validate: store,
 		Limits: Limits{
 			MaxPageItems:             model.MaxPageItems,
-			MaxObservationReferences: model.MaxObservationReferences,
+			MaxObservationReferences: config.Unlimited,
 			MaxCapsuleBytes:          8 << 20,
 			QueryTimeout:             10 * time.Second,
 		},
@@ -678,7 +816,7 @@ func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 		Validate: h.store,
 		Limits: Limits{
 			MaxPageItems:                        model.MaxPageItems,
-			MaxObservationReferences:            model.MaxObservationReferences,
+			MaxObservationReferences:            config.Unlimited,
 			MaxCapsuleBytes:                     8 << 20,
 			QueryTimeout:                        10 * time.Second,
 			AllowExploratoryWaiverConsolidation: true,
@@ -688,6 +826,33 @@ func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 	})
 	if err != nil {
 		t.Fatalf("build the workflow service with the waiver flag: %v", err)
+	}
+	return svc
+}
+
+// serviceWithReadGateDisabled is the same fake store behind a service whose
+// user-level context.strict_read_gate is off. Like the waiver flag it is a
+// Limits field read during the one readiness evaluation, so exercising both
+// sides of the switch against one fixture needs a second service over the same
+// store.
+func (h *harness) serviceWithReadGateDisabled(t *testing.T) *Service {
+	t.Helper()
+	svc, err := New(Options{
+		Sessions: h.store,
+		Compile:  h.store,
+		Validate: h.store,
+		Limits: Limits{
+			MaxPageItems:             model.MaxPageItems,
+			MaxObservationReferences: config.Unlimited,
+			MaxCapsuleBytes:          8 << 20,
+			QueryTimeout:             10 * time.Second,
+			StrictReadGateDisabled:   true,
+		},
+		Now:    func() time.Time { return fixtureNow },
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("build the workflow service with the read gate disabled: %v", err)
 	}
 	return svc
 }
@@ -732,6 +897,32 @@ func code(err error) string {
 	return ""
 }
 
+// capsuleListOfKind is which capsule list an observation kind feeds, so a walk
+// of the session's observations can be attributed to the list the seal was
+// streaming. Coverage and waivers have no kind and are counted at their own
+// reads.
+var capsuleListOfKind = map[model.ObservationKind]model.CapsuleList{
+	model.ObservationAcceptFact:    model.CapsuleListAcceptedFacts,
+	model.ObservationRejectFact:    model.CapsuleListRejectedFacts,
+	model.ObservationContradiction: model.CapsuleListContradictions,
+	model.ObservationUnresolved:    model.CapsuleListUnresolved,
+	model.ObservationScopeReview:   model.CapsuleListScopeReviewIDs,
+}
+
+// deadlineStore records whether the context the service handed down carried a
+// deadline. It embeds the fake rather than reimplementing it, so it keeps
+// satisfying Sessions however that interface is widened.
+type deadlineStore struct {
+	*fakeStore
+	sawDeadline *bool
+}
+
+func (d deadlineStore) Session(ctx context.Context, id model.SessionID, actor string) (sqlite.SessionRecord, error) {
+	_, ok := ctx.Deadline()
+	*d.sawDeadline = ok
+	return d.fakeStore.Session(ctx, id, actor)
+}
+
 func newFakeStore() *fakeStore {
 	binding := model.Binding{
 		RepositoryID: model.RepositoryID(fixtureID("repo")),
@@ -764,6 +955,7 @@ func newFakeStore() *fakeStore {
 			served: []model.ByteRange{{Start: 0, End: 0}}},
 	}
 	s := &fakeStore{
+		walks:     map[model.CapsuleList]int{},
 		sessions:  map[model.SessionID]*fakeSession{},
 		manifests: map[model.ManifestID]model.ContextManifest{fixtureManifest: manifest},
 		entries:   map[model.ManifestID][]model.ContextEntry{},
@@ -986,6 +1178,11 @@ func (s *fakeStore) Observations(_ context.Context, session model.SessionID, act
 	kind model.ObservationKind, scopeVersion int, after model.ObservationID, limit int) ([]model.Observation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if after == "" {
+		if list, ok := capsuleListOfKind[kind]; ok {
+			s.walks[list]++
+		}
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
@@ -1014,32 +1211,99 @@ func (s *fakeStore) Observations(_ context.Context, session model.SessionID, act
 	return out, err
 }
 
-func (s *fakeStore) PutCapsule(_ context.Context, c model.Capsule) (model.Capsule, error) {
+func (s *fakeStore) PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	fs, err := s.lookup(c.SessionID, c.ActorID)
 	if err != nil {
 		return model.Capsule{}, err
 	}
 	if fs.capsule != nil {
-		// session_id is the primary key: the first capsule is the capsule, and
-		// it comes back unchanged with its original timestamp.
-		return *fs.capsule, nil
+		// session_id is the primary key: the first capsule is the capsule, it
+		// comes back unchanged with its original timestamp, and no row is
+		// written a second time.
+		stored := *fs.capsule
+		s.mu.Unlock()
+		return stored, nil
 	}
 	if fs.rec.State != model.StateConsolidateOpen {
+		s.mu.Unlock()
 		return model.Capsule{}, &model.Error{Code: model.CodeVersionConflict,
 			Message: "a capsule is sealed only while consolidate is open"}
 	}
 	if c.Binding != fs.rec.Binding {
+		s.mu.Unlock()
 		return model.Capsule{}, &model.Error{Code: model.CodeSessionSuperseded,
 			Message: "the capsule is bound to another generation"}
 	}
 	if err := c.Validate(); err != nil {
+		s.mu.Unlock()
 		return model.Capsule{}, err
 	}
+	s.mu.Unlock()
+	// The rows are streamed OUTSIDE the lock: the source reads this same store
+	// back, exactly as the real seal's third pass re-walks the session.
+	rows := make(map[model.CapsuleList][]model.CapsuleRow, len(model.CapsuleListOrder))
+	for _, list := range model.CapsuleListOrder {
+		if err := src.Rows(ctx, list, func(row model.CapsuleRow) error {
+			if err := row.Validate(); err != nil {
+				return err
+			}
+			rows[list] = append(rows[list], row)
+			return nil
+		}); err != nil {
+			return model.Capsule{}, err
+		}
+		if int64(len(rows[list])) != c.Counts.Of(list) {
+			return model.Capsule{}, &model.Error{Code: model.CodeInternal,
+				Message: "the sealed " + string(list) + " count does not match the rows written"}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stored := c
 	fs.capsule = &stored
+	fs.rows = rows
 	return stored, nil
+}
+
+// CapsuleRows pages one sealed list by keyset on the row key, refusing a cursor
+// that names no row rather than silently restarting the list.
+func (s *fakeStore) CapsuleRows(_ context.Context, session model.SessionID, actor string,
+	list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fs, err := s.lookup(session, actor)
+	if fs == nil {
+		return nil, err
+	}
+	if fs.capsule == nil {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "this session has sealed no capsule"}
+	}
+	all := fs.rows[list]
+	start := 0
+	if after != "" {
+		start = -1
+		for i, row := range all {
+			if row.Key == after {
+				start = i + 1
+				break
+			}
+		}
+		if start < 0 {
+			return nil, (&model.Error{Code: model.CodeCursorInvalid,
+				Message: "cursor names no record in this capsule projection"}).
+				WithDetail("endpoint", "context_capsule")
+		}
+	}
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	end := start + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return append([]model.CapsuleRow(nil), all[start:end]...), err
 }
 
 func (s *fakeStore) Capsule(_ context.Context, session model.SessionID, actor string) (model.Capsule, error) {
@@ -1060,6 +1324,9 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	after model.FileID, limit int) ([]model.FileCoverage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if after == "" {
+		s.walks[model.CapsuleListCoverage]++
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
@@ -1086,18 +1353,38 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	return out, err
 }
 
-// Waivers answers in file-id order, not insertion order: the store pages its
-// primary key and the capsule's identity is order-sensitive, so an
+// WaiversAfter answers in file-id order, not insertion order: the store pages
+// its primary key and the capsule's identity is order-sensitive, so an
 // append-ordered answer here would assert a determinism the store never gives.
-func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+// It records every page call in waiverPages so a row can assert the seal reads
+// the list a page at a time rather than whole.
+func (s *fakeStore) WaiversAfter(_ context.Context, session model.SessionID, actor string,
+	after model.FileID, limit int) ([]model.WaiverRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if after == "" {
+		s.walks[model.CapsuleListWaivers]++
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
 	}
-	out := append([]model.WaiverRecord(nil), fs.waivers...)
-	sort.Slice(out, func(i, j int) bool { return out[i].FileID < out[j].FileID })
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	sorted := append([]model.WaiverRecord(nil), fs.waivers...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FileID < sorted[j].FileID })
+	out := make([]model.WaiverRecord, 0, limit)
+	for _, w := range sorted {
+		if after != "" && w.FileID <= after {
+			continue
+		}
+		out = append(out, w)
+		if len(out) == limit {
+			break
+		}
+	}
+	s.waiverPages = append(s.waiverPages, waiverPage{after: after, limit: limit, got: len(out)})
 	return out, err
 }
 
@@ -1164,6 +1451,43 @@ func (s *fakeStore) ManifestEntries(_ context.Context, id model.ManifestID, afte
 			continue
 		}
 		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ManifestScopeNodes answers the DISTINCT node ids in node-id order, which is
+// what the real store derives in SQL. The fake deduplicates and sorts here so a
+// service that expected the seal to do it in Go would fail on a manifest whose
+// entries repeat a node or arrive out of order.
+func (s *fakeStore) ManifestScopeNodes(_ context.Context, id model.ManifestID,
+	after model.NodeID, limit int) ([]model.NodeID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if after == "" {
+		s.walks[model.CapsuleListScope]++
+	}
+	seen := make(map[model.NodeID]bool)
+	var ids []model.NodeID
+	for _, e := range s.entries[id] {
+		if e.NodeID == "" || seen[e.NodeID] {
+			continue
+		}
+		seen[e.NodeID] = true
+		ids = append(ids, e.NodeID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	out := make([]model.NodeID, 0, limit)
+	for _, n := range ids {
+		if n <= after {
+			continue
+		}
+		out = append(out, n)
 		if len(out) == limit {
 			break
 		}
@@ -1298,7 +1622,11 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	later := fixtureNow.Add(72 * time.Hour)
 	restamped := first
 	restamped.CreatedAt = later
-	if got := canonicalCapsuleHash(restamped); got != first.CanonicalHash {
+	got, err := model.CapsuleCanonicalHash(ctx, restamped, &capsuleSource{svc: h.svc, rec: rec})
+	if err != nil {
+		t.Fatalf("re-derive the capsule identity: %v", err)
+	}
+	if got != first.CanonicalHash {
 		t.Fatalf("the canonical hash moved with CreatedAt: %s before, %s after", first.CanonicalHash, got)
 	}
 
@@ -1320,6 +1648,75 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}
 	if !second.CreatedAt.Equal(first.CreatedAt) {
 		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
+
+	// A FRESH STORE, sealed independently. The two seals above share one store,
+	// so they cannot tell a reproducible identity from a memoised one: the
+	// second returns the stored capsule by design. The capsule is the durable
+	// artifact a later session replays, so the identity must be a function of
+	// what the session recorded and nothing else -- not of insertion order, not
+	// of any per-store counter -- and the ROW KEYS must match too, because they
+	// are the cursors a reader of the exported capsule follows.
+	other := newHarness(t)
+	if _, err := other.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the second store: %v", err)
+	}
+	other.file(fixtureSession, fileWaived).waived = false
+	other.store.sessions[fixtureSession].waivers = nil
+	elsewhere, err := other.svc.buildCapsule(ctx, other.session(fixtureSession), g)
+	if err != nil {
+		t.Fatalf("seal the same session on a second store: %v", err)
+	}
+	if elsewhere.CanonicalHash != first.CanonicalHash {
+		t.Fatalf("the same session sealed %s on one store and %s on another; a capsule identity is not reproducible",
+			first.CanonicalHash, elsewhere.CanonicalHash)
+	}
+	if elsewhere.Counts != first.Counts {
+		t.Fatalf("the two seals counted %+v and %+v", first.Counts, elsewhere.Counts)
+	}
+	for _, list := range model.CapsuleListOrder {
+		want := capsuleRowKeys(t, h.svc, list)
+		got := capsuleRowKeys(t, other.svc, list)
+		if !slices.Equal(want, got) {
+			t.Fatalf("the %s list sealed row keys %v on one store and %v on another", list, want, got)
+		}
+	}
+}
+
+// capsuleRowKeys reads one sealed list's keys by following the service's own
+// continuations to exhaustion, which is exactly what `codectx context export`
+// does to render a capsule whole. It walks Service.CapsuleRows rather than the
+// store so the continuation rule -- a cursor is offered only while the sealed
+// count says records remain -- is exercised by the seal's own determinism row
+// instead of being asserted nowhere: a rule that is off by one either truncates
+// the export or never terminates it.
+func capsuleRowKeys(t *testing.T, svc *Service, list model.CapsuleList) []string {
+	t.Helper()
+	req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+	var keys []string
+	var cursor string
+	for calls := 0; ; calls++ {
+		rows, next, err := svc.CapsuleRows(context.Background(), req, list, cursor, 2)
+		if err != nil {
+			t.Fatalf("page the sealed %s list after %q: %v", list, cursor, err)
+		}
+		if len(rows) == 0 && cursor != "" {
+			t.Fatalf("the %s continuation %q fetched an empty page", list, cursor)
+		}
+		for _, row := range rows {
+			keys = append(keys, row.Key)
+		}
+		if next == "" {
+			return keys
+		}
+		if calls > len(keys) {
+			t.Fatalf("the %s walk made %d calls for %d keys; the continuation does not terminate",
+				list, calls, len(keys))
+		}
+		cursor = next
 	}
 }
 
@@ -1363,12 +1760,26 @@ func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
 	if err != nil {
 		t.Fatalf("seal a capsule for a waived session: %v", err)
 	}
-	if len(c.Waivers) != 1 {
-		t.Fatalf("the sealed capsule carries %d waivers; the session recorded 1", len(c.Waivers))
+	if c.Counts.Waivers != 1 {
+		t.Fatalf("the sealed capsule counts %d waivers; the session recorded 1", c.Counts.Waivers)
 	}
-	if got := c.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
+	// The reason lives in the sealed ROW, not in the capsule blob, so the
+	// assertion has to read the projection an operator would.
+	page, err := h.svc.Capsule(ctx, model.CapsuleRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor, View: model.CapsuleViewWaivers,
+	})
+	if err != nil {
+		t.Fatalf("page the sealed capsule's waivers: %v", err)
+	}
+	if len(page.Waivers) != 1 {
+		t.Fatalf("the waivers projection returned %d records; the capsule counts 1", len(page.Waivers))
+	}
+	if got := page.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
 		t.Fatalf("the capsule carries waiver %s/%q, not the stored %s/%q",
 			got.FileID, got.Reason, fileWaived, "vendored generated code")
+	}
+	if page.Meta.NextCursor != "" {
+		t.Fatalf("a one-record projection offered a continuation %q, so a reader would fetch an empty page", page.Meta.NextCursor)
 	}
 }
 

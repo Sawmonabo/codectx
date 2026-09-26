@@ -8,7 +8,7 @@
 // distribution. There is no product-owned analysis script, no interpreter
 // server and no second export:
 //
-//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph>
+//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph> --frontend-args --no-default-exclude
 //	joern-export <graph> --repr=all --format=neo4jcsv --out <export>
 //
 // Both were run against Joern 4.0.627 on all six frontends before they were
@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
@@ -57,10 +58,13 @@ var frontend = map[dependence.Family]string{
 // second parse at a higher limit.
 const maxNumDef = "40000"
 
-// Output bounds. The child's stdout is the engine's banner and is discarded;
-// its stderr is the classifier's only input and is bounded before it is read.
+// Output bounds. The child's stdout is the banner and is discarded, so it is
+// unbounded: bytes nobody keeps cost no memory, and bounding them once made a
+// talkative run a refusal. Its stderr is the classifier's only input and is
+// bounded before it is read -- what the bound drops is reported through
+// process.Result.OutputTruncated, never by failing the unit.
 const (
-	maxStdoutBytes int64 = 1 << 20
+	maxStdoutBytes int64 = 0
 	maxStderrBytes int64 = 8 << 20
 	grace                = 10 * time.Second
 )
@@ -167,18 +171,43 @@ func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
 	return b.resolved, nil
 }
 
+// clearDefaultExclusions empties the frontend's own default set of excluded
+// path patterns for this parse. The Java frontend of the pinned payload is the
+// only one that carries a non-empty default, and `test` is one of its nine
+// folder names, so without this the frontend silently reads no file whose path
+// holds a `test` component -- a whole package tree, not only a source root.
+//
+// The delimiter hands everything after it to the frontend rather than to the
+// parse tool, so it is appended last, after the paths the parse tool reads
+// itself; anything placed after the delimiter would never reach the parse
+// tool. The frontend's own file-selection default is the product's to decide,
+// not the frontend's: the frontend is pointed at a private materialization
+// that already holds exactly the files this unit owns.
+var clearDefaultExclusions = []string{"--frontend-args", "--no-default-exclude"}
+
+// pinnedArgs is the pinned parse argument array for a family, without the
+// paths and without the frontend arguments that must trail them. Argv and
+// Parse both build on it so the cache key and the command line cannot drift.
+func pinnedArgs(f dependence.Family) []string {
+	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
+}
+
 // Argv is the pinned parse argument array for a family, without the paths. It
 // is what the cache key folds in, so changing a pinned argument invalidates
 // every cached graph instead of silently reusing one built differently.
 func (b *Backend) Argv(f dependence.Family) []string {
-	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
+	return append(pinnedArgs(f), clearDefaultExclusions...)
 }
 
 // NeutralOptions is the frontend's fixed allowlist of semantics-neutral parse
 // options. It is empty for every frontend: every option this release offers
 // changes results (the Rust helper's --no-sysroot drops type resolution, the
 // overlay switches drop whole fact families), so there is nothing that could
-// be added to confirm a crash without changing what a success would mean.
+// be added to confirm a crash without changing what a success would mean. The
+// option that empties the default exclusions is no exception -- it changes
+// which files are read, which is the whole point of it -- and it is not a
+// retry lever in any case: every parse passes it, so a confirmation rerun
+// carries it already.
 func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 
 // Parse builds the graph for one unit. The heap cap reaches the frontend
@@ -187,8 +216,7 @@ func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 // release by inducing an out-of-memory failure with a cap the unit could not
 // fit in.
 func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
-	fe, ok := frontend[req.Family]
-	if !ok {
+	if _, ok := frontend[req.Family]; !ok {
 		return dependence.Outcome{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the analysis engine has no frontend for this language family"}
 	}
@@ -196,12 +224,14 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 	if err != nil {
 		return dependence.Outcome{}, err
 	}
-	args := append([]string{}, e.ParseArgv[1:]...)
-	args = append(args, "--language", fe, "--max-num-def", maxNumDef)
-	args = append(args, req.ExtraArgs...)
-	args = append(args, req.SourceDir, "--output", req.OutputPath)
-	return stepOutcome(b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
+	args := parseArgs(e.ParseArgv[1:], req)
+	// The graph file is this step's only observable progress: the payload runs
+	// quiet, its stdout is discarded, and on a platform with no tree sampling
+	// there is no CPU signal either, so without naming the output a parse of a
+	// large project would be terminated as stalled mid-work.
+	res, err := b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputPath})
+	return stepOutcome(res, err, []string{filepath.Dir(req.OutputPath), req.SourceDir})
 }
 
 // Export writes the graph out as the single Neo4j CSV export the importer
@@ -212,14 +242,18 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 		return dependence.ExportOutcome{}, err
 	}
 	// The engine refuses an output directory that already exists.
-	if err := os.RemoveAll(req.OutputDir); err != nil {
+	if err := paced.RemoveAllFor(paced.AnalyzerOutput, req.OutputDir); err != nil {
 		return dependence.ExportOutcome{}, &model.Error{Code: model.CodeInternal,
 			Message: "the previous analysis export could not be removed: " + err.Error()}
 	}
 	args := append([]string{}, e.ExportArgv[1:]...)
 	args = append(args, req.GraphPath, "--repr=all", "--format=neo4jcsv", "--out", req.OutputDir)
-	outcome, err := stepOutcome(b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
+	// The export directory fills with the CSV files the importer reads; their
+	// growth is this step's progress, for the same reason the parse names its
+	// graph.
+	res, err := b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputDir})
+	outcome, err := stepOutcome(res, err, []string{filepath.Dir(req.OutputDir), filepath.Dir(req.GraphPath)})
 	if err != nil {
 		return dependence.ExportOutcome{}, err
 	}
@@ -228,22 +262,35 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 	return out, nil
 }
 
+// parseArgs assembles one parse command line. The order is the contract: the
+// delimiter that hands the rest of the line to the frontend stands last, so
+// the source directory and the output path still reach the parse tool itself.
+// Anything appended after it would be read by the frontend instead, and the
+// parse tool would run with no input path at all.
+func parseArgs(base []string, req dependence.ParseRequest) []string {
+	args := append([]string{}, base...)
+	args = append(args, pinnedArgs(req.Family)...)
+	args = append(args, req.ExtraArgs...)
+	args = append(args, req.SourceDir, "--output", req.OutputPath)
+	return append(args, clearDefaultExclusions...)
+}
+
 // stepOutcome turns the runner's result and error into the neutral outcome, or
 // into a real error. A child that exited non-zero or was stopped on its
 // deadline is not a runner failure: it is the engine reporting something the
 // classifier has to read, and discarding it would turn every classified
 // failure class into one untyped "the tool failed". A child that never
 // started, a denied executable or a broken output stream stays an error.
-func stepOutcome(res process.Result, err error) (dependence.Outcome, error) {
+func stepOutcome(res process.Result, err error, private []string) (dependence.Outcome, error) {
 	if err == nil {
-		return classify(res), nil
+		return classify(res, private), nil
 	}
 	var typed *model.Error
 	if errors.As(err, &typed) && (typed.Code == model.CodeProviderUnavailable || typed.Code == model.CodeProviderTimeout) {
 		// Distinguish "ran and failed" from "never started": the latter leaves
 		// a zero result, which would classify as an unremarkable success.
 		if res.ExitCode != 0 || res.StderrBytes > 0 || res.TimedOut {
-			return classify(res), nil
+			return classify(res, private), nil
 		}
 	}
 	return dependence.Outcome{}, err
@@ -256,13 +303,14 @@ func stepOutcome(res process.Result, err error) (dependence.Outcome, error) {
 // engine emits at WARN, and a host environment that raised the level would
 // silence a definition-cap skip into a silent loss of data dependence.
 func (b *Backend) run(ctx context.Context, e dependence.Engine, path string, args []string, dir string,
-	heapCap, reservation int64, timeout time.Duration) (process.Result, error) {
+	heapCap, reservation int64, timeout, stallTimeout time.Duration, progress []string) (process.Result, error) {
 
 	env := append([]string{}, e.Env...)
 	env = append(env, "JAVA_OPTS=-Xmx"+strconv.FormatInt(max(heapCap, 1<<20)/(1<<20), 10)+"m", "SL_LOGGING_LEVEL=WARN")
 	return b.runner.Run(ctx, process.Spec{Path: path, Args: args, Dir: dir, Env: env,
 		Stdout: io.Discard, MaxStdoutBytes: maxStdoutBytes, MaxStderrBytes: maxStderrBytes,
-		Timeout: timeout, Grace: grace, MemoryReservationBytes: reservation})
+		Timeout: timeout, StallTimeout: stallTimeout, Grace: grace, ProgressFiles: progress,
+		MemoryReservationBytes: reservation})
 }
 
 // probe reports whether the export carries any method rows at all, and its

@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -108,6 +107,8 @@ type Options struct {
 	// StoreDir, when set, is the tool store itself, used verbatim. Otherwise the
 	// store is StoreDir(DataDir), i.e. <data_dir>/tools. tools.cache_dir names a
 	// store, not a parent of one, so the configuration key and the option agree.
+	// The product always sets this: tools.cache_dir defaults to one shared
+	// machine-wide store rather than to a per-workspace one.
 	StoreDir string
 	// Offline turns every fetch into a typed refusal without opening a socket.
 	Offline bool
@@ -117,10 +118,6 @@ type Options struct {
 	Mirror string
 	// MaxFetchBytes caps one payload.
 	MaxFetchBytes int64
-	// FetchTimeout bounds one payload fetch, including every retry, and is also
-	// how long a resolution waits for another process's install of the same
-	// tool.
-	FetchTimeout time.Duration
 	// Overrides are the user's [tools.override.<name>] entries.
 	Overrides map[string]Override
 	// Log receives one record per completed fetch and nothing else.
@@ -136,6 +133,11 @@ const (
 	StateUnsupportedPlatform State = "unsupported_platform"
 	StateOverride            State = "override"
 	StateCorrupt             State = "corrupt"
+	// StateUnlisted is a payload directory the store holds that no lock entry
+	// names. It is not a lock entry, so it carries no version and no digest;
+	// `tools verify` reports one row per such directory and `tools prefetch`
+	// removes them.
+	StateUnlisted State = "unlisted"
 )
 
 // Status is one line of the toolchain report. Detail is a short safe phrase; it
@@ -145,6 +147,14 @@ type Status struct {
 	State         State
 	Languages     []string
 	Detail        string
+	// EntrySHA256 is the digest the lock pins for this platform's entry
+	// executable, and InstalledSHA256 the digest the store's own bytes hash to.
+	// Only Verify fills the second one -- Status does not rehash -- and it is
+	// empty for an entry that is not installed. They are reported separately,
+	// never collapsed into one "digest" field: a report that prints the pinned
+	// digest twice tells an operator a store was checked when nothing was read.
+	EntrySHA256     string
+	InstalledSHA256 string
 }
 
 // Resolver hands out runnable tools. It is safe for concurrent use: it holds no
@@ -156,7 +166,6 @@ type Resolver struct {
 	fetch     *fetcher
 	platform  Platform
 	offline   bool
-	wait      time.Duration
 	overrides map[string]Override
 }
 
@@ -191,9 +200,6 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	if opts.MaxFetchBytes <= 0 {
 		return nil, invalid("tools.max_fetch_bytes must be positive")
 	}
-	if opts.FetchTimeout <= 0 {
-		return nil, invalid("tools.fetch_timeout must be positive")
-	}
 	var mirror *url.URL
 	if opts.Mirror != "" {
 		u, err := url.Parse(opts.Mirror)
@@ -219,10 +225,9 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	return &Resolver{
 		lock:      lock,
 		store:     &store{dir: storeDir},
-		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, opts.FetchTimeout, log),
+		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, log),
 		platform:  Current(),
 		offline:   opts.Offline,
-		wait:      opts.FetchTimeout,
 		overrides: overrides,
 	}, nil
 }
@@ -380,7 +385,7 @@ func (r *Resolver) ensure(ctx context.Context, name string, e Entry, p Payload) 
 	if r.offline {
 		return "", "", offline(name)
 	}
-	held, err := r.store.acquire(ctx, name, r.wait)
+	held, err := r.store.acquire(ctx, name, installWait)
 	if err != nil {
 		return "", "", err
 	}
@@ -560,15 +565,39 @@ func (r *Resolver) Status(ctx context.Context) []Status {
 	return out
 }
 
-// Verify rehashes each installed entry executable against the lock, so a store
-// a user has edited or a disk has damaged is reported as corrupt rather than
-// discovered at the next run.
+// Verify rehashes each installed entry executable against the lock and then
+// reports what the store holds beyond the lock. Both halves answer the same
+// operator question -- is this store what this binary pins -- and a report that
+// only walked the lock would call a store clean while it held payloads nothing
+// vouches for.
 func (r *Resolver) Verify(ctx context.Context) ([]Status, error) {
 	out, err := r.report(ctx, true)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return out, model.Canceled(ctxErr)
 	}
-	return out, err
+	unlisted, uErr := r.unlistedStatus()
+	return append(out, unlisted...), errors.Join(err, uErr)
+}
+
+// unlistedStatus is one row per store directory the lock does not name. The
+// directory name is operator-visible output, so a name outside the lock's
+// alphabet -- which nothing in this package writes -- is reported as such
+// rather than rendered into a terminal.
+func (r *Resolver) unlistedStatus() ([]Status, error) {
+	entries, err := r.store.unlisted(r.lock)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Status, 0, len(entries))
+	for _, e := range entries {
+		s := Status{Name: e.Name(), State: StateUnlisted,
+			Detail: "the store holds this payload; no lock entry names it, and `codectx tools prefetch` removes it"}
+		if validToolName(s.Name) != nil {
+			s.Name = "(a name outside the lock's alphabet)"
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // report builds the status list. A store that cannot be inspected at all is
@@ -594,8 +623,12 @@ func (r *Resolver) report(ctx context.Context, rehash bool) ([]Status, error) {
 				s.Detail = "the lock carries no payload for " + r.platform.Key()
 				break
 			}
-			_, state, detail, err := r.inspect(name, e, p, rehash)
-			s.State, s.Detail = state, detail
+			// The pinned digest is known for every supported platform; the
+			// installed one is whatever the bytes on disk hash to, and
+			// inspect reports it only when it rehashed them.
+			s.EntrySHA256 = e.entryDigest(p)
+			hash, state, detail, err := r.inspect(name, e, p, rehash)
+			s.State, s.Detail, s.InstalledSHA256 = state, detail, hash
 			if err != nil {
 				s.State, s.Detail = StateCorrupt, "the store could not be inspected"
 				errs = append(errs, err)
@@ -629,6 +662,13 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 		if err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// Prefetch's post-condition is a store that holds what the lock names, so
+	// it also removes what the lock does not: payload directories left by a
+	// superseded entry are bytes no digest in this binary vouches for, and the
+	// operator who ran prefetch is the one asking for the store to be right.
+	if _, err := r.store.pruneUnlisted(ctx, r.lock); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

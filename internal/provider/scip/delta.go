@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // Delta-import state of one run (Section 11.4, "Delta import"). Everything
@@ -253,7 +254,7 @@ func (im *importer) writeManifest(ctx context.Context) (*DocumentManifest, error
 	w := bufio.NewWriter(f)
 	fail := func(err error) (*DocumentManifest, error) {
 		f.Close()
-		os.Remove(m.name)
+		paced.Remove(m.name)
 		return nil, err
 	}
 	if _, err := w.WriteString(manifestDocumentHeader + "\n"); err != nil {
@@ -278,7 +279,7 @@ func (im *importer) writeManifest(ctx context.Context) (*DocumentManifest, error
 		return fail(internal("scip document manifest: " + err.Error()))
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(m.name)
+		paced.Remove(m.name)
 		return nil, internal("scip document manifest: " + err.Error())
 	}
 	return m, nil

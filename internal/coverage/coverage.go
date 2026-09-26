@@ -100,8 +100,8 @@ type Sessions interface {
 // it. Read verifies exactly the CAS blocks it touches, walking back to the
 // nearest stored line checkpoint for the line and column context, and returns
 // exactly the requested bytes, rejecting a boundary inside a UTF-8 sequence and
-// a range past the file. The walk back is the view's own cost and no longer
-// bounds the chunk: it reads that prefix in spans of its own.
+// a range past the file. The walk back is the view's own cost and does not
+// bound the chunk: it reads that prefix in spans of its own.
 //
 // Range.Bytes aliases the buffer the view read, so a caller that retains the
 // slice must copy it first.
@@ -120,11 +120,12 @@ var _ Sessions = (*sqlite.Store)(nil)
 // *sqlite.Store, *snapshot.CAS and config.Config out of this package.
 type SourceOpener func(ctx context.Context, snap model.SnapshotID) (Source, error)
 
-// Options composes the service. Sessions, OpenSource, Signer and every Limits
-// bound are required: the composition root builds this eagerly when a workspace
-// opens, so a missing one is a wiring defect that must fail there rather than
-// per request. Leases and Logger are the two exceptions New tolerates -- see
-// New for what a nil one costs.
+// Options composes the service. Sessions, OpenSource, Signer, Leases and every
+// Limits bound are required: the composition root builds this eagerly when a
+// workspace opens, so a missing one is a wiring defect that must fail there
+// rather than per request. Logger is the one exception New tolerates; a nil
+// Leases is refused, because without it a session pins nothing and no status
+// page past the first is reachable.
 type Options struct {
 	Sessions   Sessions
 	OpenSource SourceOpener
@@ -149,13 +150,38 @@ type Limits struct {
 	MaxSourceResponseBytes   int64
 	MaxMetadataResponseBytes int64
 
-	MaxReceiptsPerConfirmation     int
+	MaxReceiptsPerConfirmation int
+	// MaxUnconfirmedChunksPerSession carries coverage.max_unconfirmed_chunks_per_session
+	// with its configured meaning intact: ZERO IS UNLIMITED, which is its
+	// default, because unconfirmed chunks are rows in the session store and not
+	// heap. It is therefore the one Limits field the positive-value check in
+	// newService exempts. (This package imports no config, by design, so the
+	// convention travels as an int rather than as config.Limit.)
 	MaxUnconfirmedChunksPerSession int
 	MaxPageItems                   int
 
 	// SessionTTL is coverage.session_ttl and also the retention lease duration.
 	// ReceiptTTL bounds how long an issued receipt may be echoed back.
-	SessionTTL, QueryTimeout, ReceiptTTL time.Duration
+	SessionTTL, ReceiptTTL time.Duration
+	// QueryTimeout carries resources.query_timeout: the DEFAULT per-request
+	// deadline, never a ceiling, and ZERO IS "NO DEADLINE", which is its
+	// default -- so it is the second Limits field the positive-value check in
+	// newService exempts. Every use goes through model.QueryDeadline, which
+	// leaves a caller's own deadline in charge and installs nothing at zero, so
+	// a request nobody bounded returns the complete answer.
+	QueryTimeout time.Duration
+}
+
+// unconfirmedCapped is the one place this package spells the
+// zero-means-unlimited comparison for MaxUnconfirmedChunksPerSession. It
+// mirrors config.Limit's own accessors exactly -- unlimited at zero, and a
+// session AT the bound has no allowance left, so the test is `>=` on what the
+// session already holds rather than `>` on what it would hold. The bound
+// travels as an int rather than as a config.Limit because this package imports
+// no configuration by design (see the package comment), so the semantics
+// travel as this method instead of as a hand-rolled `> 0` at each site.
+func (l Limits) unconfirmedCapped(outstanding int64) bool {
+	return l.MaxUnconfirmedChunksPerSession > 0 && outstanding >= int64(l.MaxUnconfirmedChunksPerSession)
 }
 
 // Service answers the six Section 16 operations. It is safe for concurrent use:
