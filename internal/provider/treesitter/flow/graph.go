@@ -22,6 +22,13 @@ const (
 	// Jump transfers control away from the fall-through: return, break,
 	// continue, goto, throw, panic, fallthrough.
 	Jump
+	// Handler is the landing of exceptional edges, created by the Builder at
+	// a catch or finally (Builder.EnterHandler, Builder.EnterFinally). Every
+	// edge into it is exceptional: its predecessor threw before any
+	// definition it makes, so data flow into a Handler takes each
+	// predecessor's ENTRY values, never its Def or MayDefs. It defines and
+	// uses nothing.
+	Handler
 )
 
 // Fixed node ids every Graph carries.
@@ -42,19 +49,20 @@ type node struct {
 // per-node def/use record. It is produced by Builder.Finish and is valid
 // until the next Arena.Begin.
 //
-// Layout: nodes, useOff/uses and vars live in construction scratch; the two
-// CSRs (succOff/succ, predOff/pred) live in the slabs Arena.Bytes counts.
-// For node n, its uses are uses[useOff[n]:useOff[n+1]], its successors
+// Layout: nodes, useOff/uses and mayOff/mayDefs live in construction
+// scratch; the two CSRs (succOff/succ, predOff/pred) live in the slabs
+// Arena.Bytes counts. For node n, its uses are uses[useOff[n]:useOff[n+1]],
+// its may-definitions mayDefs[mayOff[n]:mayOff[n+1]], its successors
 // succ[succOff[n]:succOff[n+1]] and its predecessors
 // pred[predOff[n]:predOff[n+1]]; each list is sorted ascending with no
 // duplicates.
 type Graph struct {
-	nodes            []node
-	useOff, uses     []int32
-	succOff, succ    []int32
-	predOff, pred    []int32
-	vars             []Span
-	defs, unresolved int
+	nodes                  []node
+	useOff, uses           []int32
+	mayOff, mayDefs        []int32
+	succOff, succ          []int32
+	predOff, pred          []int32
+	vars, defs, unresolved int
 }
 
 // Len is the node count N, Entry and Exit included.
@@ -72,8 +80,14 @@ func (g *Graph) Span(n int32) Span { return g.nodes[n].span }
 func (g *Graph) Def(n int32) int32 { return g.nodes[n].def }
 
 // Uses are the distinct variables node n reads, ascending. Every use is read
-// BEFORE n's own definition is written, so `x = x + 1` uses the previous x.
+// BEFORE n's own definitions (its Def and its MayDefs) are written, so
+// `x = x + 1` uses the previous x.
 func (g *Graph) Uses(n int32) []int32 { return window(g.uses, g.useOff, n) }
+
+// MayDefs are the distinct variables node n may define without killing the
+// definitions that reach it, ascending; see Builder.MayDef. It never holds
+// Def(n).
+func (g *Graph) MayDefs(n int32) []int32 { return window(g.mayDefs, g.mayOff, n) }
 
 // Succ are node n's successors, ascending, without duplicates; a self-loop
 // is allowed. It is the graph as lowered: no exit augmentation.
@@ -84,13 +98,10 @@ func (g *Graph) Succ(n int32) []int32 { return window(g.succ, g.succOff, n) }
 func (g *Graph) Pred(n int32) []int32 { return window(g.pred, g.predOff, n) }
 
 // Vars is the variable count; variable ids are dense in [0, Vars()).
-func (g *Graph) Vars() int { return len(g.vars) }
-
-// VarSpan is the declaring identifier's range of variable v.
-func (g *Graph) VarSpan(v int32) Span { return g.vars[v] }
+func (g *Graph) Vars() int { return g.vars }
 
 // Defs is the definition count D, the number of nodes whose Def is not -1.
-// D ≤ N structurally.
+// D ≤ N structurally. May-definitions are not counted.
 func (g *Graph) Defs() int { return g.defs }
 
 // Unresolved counts jumps whose target was not found (a break, continue or
@@ -122,3 +133,6 @@ func (e Edges) At(i int) (from, to int32) {
 
 // pack encodes one pair in the Edges order.
 func pack(from, to int32) uint64 { return uint64(uint32(from))<<32 | uint64(uint32(to)) }
+
+// unpack decodes a pair encoded by pack.
+func unpack(p uint64) (hi, lo int32) { return int32(uint32(p >> 32)), int32(uint32(p)) }
