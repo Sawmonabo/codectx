@@ -36,11 +36,11 @@ const rsTryLabel = " try"
 //     inside it; a let declaration spans the declaration. An assignment or
 //     compound assignment is its own defining node, spanning it; return,
 //     break and continue are Jump nodes spanning the expression. A macro
-//     invocation is one Stmt node spanning it whose Uses are the identifiers
-//     of its token tree that resolve to a variable; its expansion is not
-//     lowered, so a panicking macro (panic!, unreachable!, todo!, assert!) is
-//     a plain node that falls through, as a call does. A string literal's
-//     implicit format captures (`"{x}"`) are text and not Uses.
+//     invocation is one node spanning it, read as Macro invocations states:
+//     a Stmt node, or a Branch when a jump in its token tree can leave it.
+//     Its expansion is not lowered, so a panicking macro (panic!,
+//     unreachable!, todo!, assert!) is a plain node that falls through, as a
+//     call does.
 //   - An expression lowered for its value ends in the node that consumes it
 //     (a let, an assignment, a jump, a statement) and takes no second node
 //     when the last node its own lowering made already spans it, as a `?`, a
@@ -140,9 +140,10 @@ const rsTryLabel = " try"
 //
 // Only an identifier or `self` resolving to a variable declared in this
 // function is a Use; a path (`a::b`), a field name, a type and a label never
-// are. A node that defines v also Uses v when its statement read v before
-// it, since the value the statement consumes was read before the definition
-// overwrote it (the seed's rule).
+// are, in a macro's token tree too (see Macro invocations). A node that
+// defines v also Uses v when its statement read v before it, since the value
+// the statement consumes was read before the definition overwrote it (the
+// seed's rule).
 //
 // # Exceptions
 //
@@ -158,6 +159,40 @@ const rsTryLabel = " try"
 // capture locals: it creates no node in the enclosing function and its name
 // shadows as a non-variable. Every identifier in a pattern binds, except the
 // path of a tuple-struct or struct pattern.
+//
+// # Macro invocations
+//
+// A macro's expansion is not known here, so its token tree (The Rust
+// Reference, Macros › Macro invocation) is read as the Rust tokens it holds,
+// nested trees included:
+//
+//   - An identifier or `self` resolving to a variable is a Use, except a name
+//     after `.`, `::` or a label's `'`, or before `::`, `!`, `:` or a single
+//     `=`: a field or method name, a path segment, a label, a macro's name, a
+//     field or binding name, and a named argument or assignment target.
+//   - `&` or `&&` then `mut` borrows the base variable of the name after it
+//     (`&mut x`, `&mut x.f`, `&mut *x`), by the address-taking rule of
+//     Lowering: a may-definition on the node that evaluates the invocation.
+//   - Every string literal that is not a byte or C string is read as a format
+//     string, by the std::fmt library documentation (Named parameters, Width,
+//     Precision): `{x}`, `{x:…}` and a `name$` width or precision capture the
+//     variable they name, unless the same tree level passes a named argument
+//     of that name; `{{` is a literal brace and a numbered argument captures
+//     nothing. Which macros format is not known, so a literal a macro does not
+//     format is read too.
+//   - A `?` after an operand (The question mark operator), a return, and a
+//     break or continue can leave the invocation. The invocation is then a
+//     Branch node, Using the tree's reads, whose successors are its
+//     fall-through and each such jump's target, as a `?` is lowered. A jump
+//     stays inside the tree when the tree itself holds its target: nothing
+//     leaves a closure (a `|…|` or `||` after a non-operand, running to the
+//     next `,` or `;` of its level), the `{…}` tree after `fn`, or an async or
+//     gen block; an unlabelled break or continue does not leave the `{…}` tree
+//     after `loop`, `while` or `for`, a labelled one does not leave the tree
+//     that declares its label, and a `?` does not leave a try block.
+//   - A name the tree binds (a closure parameter, a `let` or other pattern in
+//     it) is not scoped: a later token of that name still resolves to the
+//     enclosing variable, which over-approximates the tree's reads.
 func lowerRust(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	cur := s.cursor(fn)
 	r := rsLower{l: l, b: b, src: src, k: rsSyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1}
@@ -219,13 +254,20 @@ type rsLower struct {
 // kids pushes n's named, non-extra children (comments are extras) onto buf
 // and returns the stack mark and the list; done(mark) pops them. A list stays
 // valid across nested kids calls: later pushes never overwrite it.
-func (r *rsLower) kids(n *ts.Node) (int, []ts.Node) {
+func (r *rsLower) kids(n *ts.Node) (int, []ts.Node) { return r.children(n, true) }
+
+// toks is kids for every child, named or not: the tokens of a token tree.
+func (r *rsLower) toks(n *ts.Node) (int, []ts.Node) { return r.children(n, false) }
+
+// children pushes n's non-extra children onto buf, only the named ones when
+// named is set, and returns the stack mark and the list.
+func (r *rsLower) children(n *ts.Node, named bool) (int, []ts.Node) {
 	start := len(r.buf)
 	c := r.cur
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); x.IsNamed() && !x.IsExtra() {
+			if x := c.Node(); (x.IsNamed() || !named) && !x.IsExtra() {
 				r.buf = append(r.buf, *x)
 			}
 			if !c.GotoNextSibling() {
@@ -553,9 +595,9 @@ func (r *rsLower) expr(e *ts.Node) {
 	case k.returnExpression, k.breakExpression, k.continueExpression:
 		r.jump(u)
 	case k.macroInvocation:
-		m := len(r.reads)
-		r.tokens(u)
-		r.node(flow.Stmt, spanOf(u), m, len(r.reads))
+		if m := len(r.reads); !r.macro(u) {
+			r.node(flow.Stmt, spanOf(u), m, len(r.reads))
+		}
 	default:
 		r.valueNode(e)
 	}
@@ -627,7 +669,7 @@ func (r *rsLower) value(n *ts.Node) {
 		r.value(left)
 		r.value(right)
 	case k.macroInvocation:
-		r.tokens(n)
+		r.macro(n)
 	case k.typeCastExpression:
 		r.value(n.ChildByFieldId(k.fValue))
 	case k.genericFunction:
@@ -652,24 +694,313 @@ func (r *rsLower) value(n *ts.Node) {
 	}
 }
 
-// tokens records, as reads, every identifier of macro invocation or token
-// tree n's token trees that resolves to a variable; the macro's name is not
-// one.
-func (r *rsLower) tokens(n *ts.Node) {
+// The jumps a token-tree region lets leave the macro invocation it is in.
+const (
+	rsEscTry    = 1 << iota // a `?`
+	rsEscReturn             // a return
+	rsEscLoop               // an unlabelled break or continue
+	rsEscLabel              // a labelled break or continue
+	rsEscAll    = rsEscTry | rsEscReturn | rsEscLoop | rsEscLabel
+)
+
+// macro lowers macro invocation n's token tree: its reads and mutable
+// borrows are recorded for the consuming node. When a jump in it can leave
+// the invocation, macro creates the Branch node spanning n that Uses the
+// tree's reads, issues every such jump from it, leaves the fringe on its
+// fall-through, and reports true; otherwise it creates no node. Inside a
+// nested callable being walked for its captures nothing jumps: the jumps are
+// the callable's own.
+func (r *rsLower) macro(n *ts.Node) bool {
+	t := r.token(n, r.k.tokenTree)
+	if t == nil {
+		return false
+	}
+	esc := rsEscAll
+	if r.shadow > 0 {
+		esc = 0
+	}
+	m := len(r.reads)
+	if !r.tokens(t, esc, false, 0) {
+		return false
+	}
+	r.node(flow.Branch, spanOf(n), m, len(r.reads))
+	from := r.b.Push()
+	r.tokens(t, esc, true, from)
+	r.b.Restore(from)
+	r.b.Pop(from)
+	return true
+}
+
+// tokens walks token tree t, whose tokens may make the jumps in esc leave the
+// invocation, and reports whether one of them does. Without emit it records
+// the tree's reads, mutable borrows and format captures; with emit it records
+// nothing and issues each jump that leaves from the saved fringe from.
+func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool {
 	k := r.k
-	tree := n.KindId() == k.tokenTree
-	start, list := r.kids(n)
+	jumps, lits := false, false
+	// own is what this level's tokens may make leave: esc, or nothing within
+	// a closure. next is what the next `{…}` tree's tokens may: a loop, fn,
+	// async, gen or try head before it narrows own.
+	own, next := esc, esc
+	// label is a label `'a:` declares, for the loop or block after it.
+	var label []byte
+	params, closure := false, false
+	start, list := r.toks(t)
 	for i := range list {
-		switch c := &list[i]; c.KindId() {
-		case k.tokenTree:
-			r.tokens(c)
-		case k.identifier, k.self:
-			if tree {
+		c := &list[i]
+		id := c.KindId()
+		var prev, after *ts.Node
+		if i > 0 {
+			prev = &list[i-1]
+		}
+		if i+1 < len(list) {
+			after = &list[i+1]
+		}
+		switch {
+		case params:
+			// A closure's parameters bind; none is a read.
+			params = id != k.pipe
+		case id == k.tokenTree:
+			sub := own
+			if r.src[c.StartByte()] == '{' {
+				sub = own & next
+				switch {
+				case prev != nil && (prev.KindId() == k.asyncKw || prev.KindId() == k.genKw):
+					sub = 0
+				case prev != nil && prev.KindId() == k.identifier && r.word(prev, "move") && i > 1 &&
+					(list[i-2].KindId() == k.asyncKw || list[i-2].KindId() == k.genKw):
+					sub = 0
+				case prev != nil && prev.KindId() == k.identifier && r.word(prev, "try"):
+					sub &^= rsEscTry
+				}
+				next = own
+			}
+			m := r.binds.mark()
+			if label != nil && r.src[c.StartByte()] == '{' {
+				r.binds.push(label, -1)
+				label = nil
+			}
+			if r.tokens(c, sub, emit, from) {
+				jumps = true
+			}
+			r.binds.truncate(m)
+		case id == k.pipe || id == k.or:
+			if prev == nil || !r.operand(prev) {
+				closure, params, own, next = true, id == k.pipe, 0, 0
+			}
+		case id == k.comma || id == k.semi:
+			if closure {
+				closure, own = false, esc
+			}
+			next, label = own, nil
+		case id == k.loopKw || id == k.whileKw || id == k.forKw:
+			next = own &^ rsEscLoop
+		case id == k.fnKw:
+			next = 0
+		case id == k.quote:
+			if after != nil && after.KindId() == k.identifier && i+2 < len(list) && list[i+2].KindId() == k.colon {
+				label = r.src[c.StartByte():after.EndByte()]
+			}
+		case id == k.question || id == k.returnKw || id == k.breakKw || id == k.continueKw:
+			lab, ok := r.leaves(list, i, own)
+			if !ok {
+				break
+			}
+			jumps = true
+			if !emit {
+				break
+			}
+			r.b.Restore(from)
+			switch id {
+			case k.question:
+				if r.tries > 0 {
+					r.b.Break(rsTryLabel)
+				} else {
+					r.b.Return()
+				}
+			case k.returnKw:
+				r.b.Return()
+			case k.breakKw:
+				r.b.Break(view(lab))
+			default:
+				r.b.Continue(view(lab))
+			}
+		case emit:
+		case id == k.identifier || id == k.self:
+			if !r.named(prev, after) {
 				r.read(r.lookup(c))
 			}
+		case id == k.mutableSpecifier:
+			if prev != nil && (prev.KindId() == k.amp || prev.KindId() == k.and) {
+				r.tokenBorrow(list[i+1:], prev)
+			}
+		case id == k.stringLiteral || id == k.rawStringLiteral:
+			lits = true
 		}
 	}
+	if lits {
+		r.formats(list)
+	}
 	r.done(start)
+	return jumps
+}
+
+// leaves reports whether jump token list[i] (`?`, return, break or continue)
+// leaves the invocation, given own, the jumps its region lets leave, and
+// returns the label a break or continue names, or nil. A `?` is the operator
+// only after an operand (a bound `?Sized` follows `:` or `+`); a labelled
+// jump stays in the tree when the tree declares its label.
+func (r *rsLower) leaves(list []ts.Node, i int, own int) ([]byte, bool) {
+	k := r.k
+	switch list[i].KindId() {
+	case k.question:
+		return nil, own&rsEscTry != 0 && i > 0 && r.operand(&list[i-1])
+	case k.returnKw:
+		return nil, own&rsEscReturn != 0
+	}
+	if i+2 < len(list) && list[i+1].KindId() == k.quote && list[i+2].KindId() == k.identifier {
+		lab := r.src[list[i+1].StartByte():list[i+2].EndByte()]
+		return lab, own&rsEscLabel != 0 && r.binds.innermost(lab) < 0
+	}
+	return nil, own&rsEscLoop != 0
+}
+
+// operand reports whether token c ends an operand, so that a `?` after it is
+// the question mark operator and a `|` or `||` after it is binary.
+func (r *rsLower) operand(c *ts.Node) bool {
+	k := r.k
+	switch id := c.KindId(); {
+	case id == k.question || id == k.awaitKw:
+		return true
+	case !c.IsNamed() || id == k.mutableSpecifier:
+		return false
+	case id == k.identifier:
+		return !r.word(c, "move")
+	}
+	return true
+}
+
+// word reports whether token c's text is w.
+func (r *rsLower) word(c *ts.Node, w string) bool { return string(r.text(c)) == w }
+
+// named reports whether the name between tokens prev and after is a name
+// rather than a read: a field or method name after `.`, a path segment after
+// or before `::`, a label after `'`, a macro's name before `!`, a field or
+// binding name before `:`, or a named argument or assignment target before a
+// single `=`.
+func (r *rsLower) named(prev, after *ts.Node) bool {
+	k := r.k
+	if prev != nil {
+		if id := prev.KindId(); id == k.dot || id == k.pathSep || id == k.quote {
+			return true
+		}
+	}
+	if after != nil {
+		if id := after.KindId(); id == k.pathSep || id == k.bang || id == k.colon || id == k.eq {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenBorrow records the mutable borrow `&mut` (amp is its `&` or `&&`)
+// makes of the base variable of the tokens rest after it (x in `&mut x`,
+// `&mut x.f`, `&mut *x`): a pending may-definition at amp's position, or,
+// inside a nested callable, one of its writes.
+func (r *rsLower) tokenBorrow(rest []ts.Node, amp *ts.Node) {
+	k := r.k
+	j := 0
+	for j < len(rest) && rest[j].KindId() == k.star {
+		j++
+	}
+	if j == len(rest) || rest[j].KindId() != k.identifier && rest[j].KindId() != k.self ||
+		j+1 < len(rest) && rest[j+1].KindId() == k.pathSep {
+		return
+	}
+	v := r.lookup(&rest[j])
+	switch {
+	case v < 0:
+	case r.shadow > 0:
+		r.writes = append(r.writes, v)
+	default:
+		r.borrows = append(r.borrows, rsBorrow{v: v, at: uint32(amp.StartByte())})
+	}
+}
+
+// formats reads the variables the format strings of one token-tree level
+// capture: every string literal that is not a byte or C string. A name the
+// level passes as a named argument (`x = …`) is that argument, not a capture.
+func (r *rsLower) formats(list []ts.Node) {
+	k := r.k
+	m := r.binds.mark()
+	for i := range list {
+		if list[i].KindId() == k.identifier && i+1 < len(list) && list[i+1].KindId() == k.eq {
+			r.binds.push(r.text(&list[i]), -1)
+		}
+	}
+	for i := range list {
+		lit := &list[i]
+		if id := lit.KindId(); id != k.stringLiteral && id != k.rawStringLiteral {
+			continue
+		}
+		if b := r.src[lit.StartByte()]; b == 'b' || b == 'c' {
+			continue
+		}
+		start, parts := r.kids(lit)
+		for j := range parts {
+			if parts[j].KindId() == k.stringContent {
+				r.captures(r.text(&parts[j]))
+			}
+		}
+		r.done(start)
+	}
+	r.binds.truncate(m)
+}
+
+// captures reads the variables format string text s captures: the argument
+// of `{x}` or `{x:…}`, and every `name$` width or precision in a format
+// spec. `{{` is a literal brace; a numbered argument captures nothing.
+func (r *rsLower) captures(s []byte) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '{' {
+			i++
+			continue
+		}
+		e := rsNameEnd(s, i+1)
+		if e > i+1 && (e == len(s) || s[e] == '}' || s[e] == ':') && string(s[i+1:e]) != "self" {
+			r.read(r.binds.lookup(s[i+1 : e]))
+		}
+		for i = e; i < len(s) && s[i] != '}'; {
+			n := rsNameEnd(s, i)
+			if n == i {
+				i++
+				continue
+			}
+			if n < len(s) && s[n] == '$' {
+				r.read(r.binds.lookup(s[i:n]))
+			}
+			i = n
+		}
+	}
+}
+
+// rsNameEnd is the end of the identifier starting at s[i], or i when none
+// does: a letter, `_` or a non-ASCII byte, then those or digits.
+func rsNameEnd(s []byte, i int) int {
+	if i >= len(s) || !rsNameByte(s[i]) {
+		return i
+	}
+	for i++; i < len(s) && (rsNameByte(s[i]) || '0' <= s[i] && s[i] <= '9'); i++ {
+	}
+	return i
+}
+
+// rsNameByte reports whether b may start an identifier.
+func rsNameByte(b byte) bool {
+	return b == '_' || 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' || b >= 0x80
 }
 
 // closure creates the node spanning n, a nested callable: it Uses n's
@@ -1069,7 +1400,7 @@ func (r *rsLower) cap(n *ts.Node) {
 	case k.identifier, k.self:
 		r.read(r.lookup(n))
 	case k.macroInvocation:
-		r.tokens(n)
+		r.macro(n)
 	case k.assignmentExpression:
 		r.capWrite(n.ChildByFieldId(k.fLeft), false)
 		r.cap(n.ChildByFieldId(k.fRight))
@@ -1196,6 +1527,10 @@ type rsSyntax struct {
 
 	and, or, loopKw, forKw uint16
 
+	// The tokens a macro's token tree is read by.
+	question, returnKw, breakKw, continueKw, whileKw, fnKw, asyncKw, genKw, awaitKw, dot, pathSep, eq, colon, bang,
+	quote, amp, star, pipe, comma, semi, stringLiteral, rawStringLiteral, stringContent uint16
+
 	fAlternative, fBody, fCondition, fConsequence, fFunction, fLeft, fName, fOperator, fParameters, fPattern,
 	fRight, fType, fValue uint16
 
@@ -1244,6 +1579,11 @@ func rsSyntaxOf() *rsSyntax {
 		s.fConsequence, s.fFunction, s.fLeft, s.fName = field("consequence"), field("function"), field("left"), field("name")
 		s.fOperator, s.fParameters, s.fPattern = field("operator"), field("parameters"), field("pattern")
 		s.fRight, s.fType, s.fValue = field("right"), field("type"), field("value")
+		s.question, s.returnKw, s.breakKw, s.continueKw = tok("?"), tok("return"), tok("break"), tok("continue")
+		s.whileKw, s.fnKw, s.asyncKw, s.genKw, s.awaitKw = tok("while"), tok("fn"), tok("async"), tok("gen"), tok("await")
+		s.dot, s.pathSep, s.eq, s.colon, s.bang = tok("."), tok("::"), tok("="), tok(":"), tok("!")
+		s.quote, s.amp, s.star, s.pipe, s.comma, s.semi = tok("'"), tok("&"), tok("*"), tok("|"), tok(","), tok(";")
+		s.stringLiteral, s.rawStringLiteral, s.stringContent = kind("string_literal"), kind("raw_string_literal"), kind("string_content")
 		s.item = make([]bool, tl.NodeKindCount())
 		for _, name := range [...]string{"associated_type", "attribute_item", "const_item", "empty_statement", "enum_item",
 			"extern_crate_declaration", "foreign_mod_item", "function_item", "function_signature_item", "impl_item",

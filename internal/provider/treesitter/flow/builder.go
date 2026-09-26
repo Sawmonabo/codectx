@@ -628,6 +628,24 @@ func (b *Builder) EnterFinally(f Frame, at Span) (normal bool) {
 	return normal
 }
 
+// Thrown reports whether an exception reached finally frame f, entered and
+// not yet closed: an intercepted Throw from a reachable point, or a MayThrow
+// source. A lowering whose finally can end the exception (a Python with
+// statement whose exit may suppress it) passes normal || Thrown(f) to
+// CloseFinally, since execution may then continue after the statement.
+func (b *Builder) Thrown(f Frame) bool {
+	fr, _ := b.innermost(f)
+	if fr.kind != finallyFrame || !fr.entered {
+		panic("flow: Builder.Thrown on a frame that is not an entered finally")
+	}
+	for r := fr.recs; r != -1; r = b.recs[r].next {
+		if b.recs[r].kind == throwJump {
+			return true
+		}
+	}
+	return false
+}
+
 // CloseFinally pops finally frame f and re-issues, from the finally body's
 // exit fringe, every intercepted break, continue, return, throw and leaving
 // goto, and every intercepted MayThrow source as a throw, toward its original
