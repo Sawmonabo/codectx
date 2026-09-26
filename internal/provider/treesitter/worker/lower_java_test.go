@@ -518,5 +518,36 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"r = 0@24 -> h(r)@81", "r = g()@37 -> h(r)@81", "r = 1@62 -> h(r)@81",
 				"r = 0@24 -> return r;@89", "r = g()@37 -> return r;@89", "r = 1@62 -> return r;@89"},
 		},
+		{
+			// §15.25, §15.26.1. Nodes: x@20, x > 0@29 (the condition, a
+			// Branch using x), 1@37 and 2@41 (the arms, each defining the
+			// conditional's owned result), x = x > 0 ? 1 : 2@25 (Uses the
+			// result, defines x), return x;@44. Succ: x > 0→{1, 2}; 1,
+			// 2→the assignment→return. IPDom: x > 0, 1, 2 → the assignment
+			// → return. Frontier walk: x > 0 over 1 and 2. The condition's
+			// read of x is its own node's, so the assignment, which defines
+			// x, does not Use x.
+			name:     "a conditional hands its arms' values to its consumer, and its condition's reads stay on the condition",
+			protects: "the node consuming a conditional depends on the arms through the result variable and not on the condition's variables, even when it defines the variable the condition read",
+			mutation: "give the arms no definition of the result (loses 1@37 and 2@41 -> x = x > 0 ? 1 : 2@25), leave the condition's reads to the consumer (gains x@20 -> x = x > 0 ? 1 : 2@25), or let a defining node Use a variable its statement read on a nested node (gains x@20 -> x = x > 0 ? 1 : 2@25)",
+			src:      "class A { int f(int x) { x = x > 0 ? 1 : 2; return x; } }",
+			fn:       1,
+			cd:       []string{"x > 0@29 -> 1@37", "x > 0@29 -> 2@41"},
+			du: []string{"x@20 -> x > 0@29", "1@37 -> x = x > 0 ? 1 : 2@25", "2@41 -> x = x > 0 ? 1 : 2@25",
+				"x = x > 0 ? 1 : 2@25 -> return x;@44"},
+		},
+		{
+			// §15.26.1, §15.12.4.2. Nodes: o@19, a@26, o.f = a@33 (the
+			// embedded assignment: Uses o and a, may-defines o, defines the
+			// owned result), g(o.f = a)@31 (Uses the result). Succ: a
+			// straight line. No local carries the assigned value to the
+			// call, so only the result variable does.
+			name:     "an embedded assignment to a field hands its value to its consumer through a result variable",
+			protects: "a call whose argument assigns a field depends on the assignment node, and does not re-read the assignment's operands",
+			mutation: "give an embedded assignment no result (loses o.f = a@33 -> g(o.f = a)@31), or leave its reads to the consumer (o@19 and a@26 -> g(o.f = a)@31 replace o.f = a@33 -> g(o.f = a)@31)",
+			src:      "class A { void f(P o, int a) { g(o.f = a); } }",
+			fn:       1,
+			du:       []string{"o@19 -> o.f = a@33", "a@26 -> o.f = a@33", "o.f = a@33 -> g(o.f = a)@31"},
+		},
 	})
 }
