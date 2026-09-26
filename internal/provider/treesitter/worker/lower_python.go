@@ -188,17 +188,16 @@ var pythonLowering = Lowering{
 //     nothing), a chained comparison (the first comparison's Branch, each
 //     later comparison's Branch, and the last operand's node, which makes
 //     the last comparison; each operand between is held in a variable of
-//     its own, so it is read once), and a lambda or comprehension (the
-//     creating node). A condition over one of them (`if a and b:`) is a
-//     Branch that Uses the result variable.
-//   - A yielding node that already defines a named variable holding the
-//     value hands it on through that variable, with no result variable: `x
-//     := e`, whose node defines x, the consumer then reading x, and a def or
-//     class statement, whose node defines its name. `x := e` as an operand
-//     or arm of a construct above also may-defines that construct's result
-//     variable: a node defines one variable, and a may-definition of a
-//     variable only the construct's yielding nodes define gives the same
-//     pairs. A `:=` to a global defines the result variable instead.
+//     its own, so it is read once), `x := e` (its node defines x and
+//     may-defines the result, since a node defines one variable; the
+//     consumer Uses the result, never x, so `(x := 1) + (x := 2)` depends
+//     on both; a `:=` to a global defines the result), and a lambda or
+//     comprehension (the creating node). A condition over one of them (`if
+//     a and b:`) is a Branch that Uses the result variable. `x := e` as an
+//     operand or arm of another construct may-defines that construct's
+//     result the same way.
+//   - A def or class statement's node defines its name, the variable the
+//     created value travels through.
 //   - A node that defines v also Uses v when its statement read v before
 //     it and no node carries that read yet: in `y = x + (x := 1)` the
 //     assignment expression's node Uses the x read before it. A read a node
@@ -2086,16 +2085,8 @@ func (j *pyLower) value(n *ts.Node) {
 		j.throws++
 	case k.keywordArgument:
 		j.value(n.ChildByFieldId(k.fValue))
-	case k.booleanOperator, k.conditionalExpression:
+	case k.booleanOperator, k.conditionalExpression, k.namedExpression:
 		j.result(n)
-	case k.namedExpression:
-		// The value travels through the name the node defines.
-		if v := j.lookup(n.ChildByFieldId(k.fName)); v >= 0 {
-			j.walrus(n, -1)
-			j.read(v)
-		} else {
-			j.result(n)
-		}
 	case k.comparisonOperator:
 		if j.chained(n) {
 			j.result(n)
@@ -2144,9 +2135,9 @@ func (j *pyLower) conditional(n *ts.Node, dst int32) {
 
 // walrus lowers `x := e` (§6.12) into dst: one node spanning it Uses e's
 // reads and defines x. A node defines one variable, so when x is a
-// variable it only may-defines dst, which the construct's other yielding
-// nodes define: the pairs are the same. When x is no variable of this
-// function (a global), the node defines dst.
+// variable the node may-defines dst (see Lowering, one definition per
+// node); when x is no variable of this function (a global), the node
+// defines dst.
 func (j *pyLower) walrus(n *ts.Node, dst int32) {
 	m := len(j.reads)
 	j.value(n.ChildByFieldId(j.k.fValue))

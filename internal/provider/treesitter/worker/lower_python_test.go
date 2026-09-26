@@ -602,15 +602,30 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §6.12: the assignment expression's value is the value it
 			// assigns. Lines at 0, 10, 28. Nodes: a@6, x := a@16 (Uses a,
-			// defines x), y = (x := a) * 2@11 (Uses x, defines y), return x
-			// + y@29.
-			name:     "an assignment expression's value travels through the name it assigns",
-			protects: "the node consuming `x := a` reads x, defined by the assignment expression's node, and does not re-read the value's names",
+			// defines x, may-defines the result variable), y = (x := a) *
+			// 2@11 (Uses the result variable, defines y), return x + y@29
+			// (Uses x and y).
+			name:     "an assignment expression's value travels through its result variable",
+			protects: "the node consuming `x := a` reads the result variable the assignment expression's node may-defines, and does not re-read the value's names",
 			mutation: "let the consumer re-read the assigned value's reads (a@6 -> y = (x := a) * 2@11 appears)",
 			src:      "def f(a):\n y = (x := a) * 2\n return x + y\n",
 			fn:       1,
 			du: []string{"a@6 -> x := a@16", "x := a@16 -> y = (x := a) * 2@11", "x := a@16 -> return x + y@29",
 				"y = (x := a) * 2@11 -> return x + y@29"},
+		},
+		{
+			// §6.12: each assignment expression's value is the value it
+			// assigns when it is evaluated. Lines at 0, 9, 34. Nodes: x :=
+			// 1@15 and x := 2@26 (each defines x and may-defines its own
+			// result variable), y = (x := 1) + (x := 2)@10 (Uses the two
+			// result variables, defines y), return y@35.
+			name:     "two assignment expressions to one name each reach their consumer",
+			protects: "the consumer of `(x := 1) + (x := 2)` reads each assignment expression's result variable, so it depends on the first assignment although the second rebinds x before it",
+			mutation: "let the consumer read the assigned name instead of the result variable (x := 1@15 -> y = (x := 1) + (x := 2)@10 disappears)",
+			src:      "def f():\n y = (x := 1) + (x := 2)\n return y\n",
+			fn:       1,
+			du: []string{"x := 1@15 -> y = (x := 1) + (x := 2)@10", "x := 2@26 -> y = (x := 1) + (x := 2)@10",
+				"y = (x := 1) + (x := 2)@10 -> return y@35"},
 		},
 		{
 			// §6.14, §7.2. Lines at 0, 10, 25. Nodes: k@6, lambda: k@15 (the
