@@ -78,7 +78,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 	)
 
 	b.index = func(ctx context.Context, ureq provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-		opts := dependence.ImportOptions{KeysPath: keysPath}
+		opts := dependence.ImportOptions{Reservation: req.Reservation, Readmit: req.Readmit, KeysPath: keysPath}
 		if prev != nil {
 			// THE INVARIANT: a filtered emit may only be requested when no
 			// file the predecessor declared changed or went away, because

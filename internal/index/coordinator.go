@@ -67,8 +67,8 @@ const NormalizationVersion = "identity-normalization-v1"
 // component is the slog component of every entry this package emits.
 const component = "index"
 
-// refNone is the generation ref of a workspace that is not a Git repository
-// (ruling Q3). Storage refuses an empty ref rather than grouping every such
+// refNone is the generation ref of a workspace that is not a Git repository.
+// Storage refuses an empty ref rather than grouping every such
 // generation under one nameless retention bucket, so the sentinel is explicit.
 const refNone = "(none)"
 
@@ -165,6 +165,12 @@ type Options struct {
 	// totals, one machine, and a process free to reserve twice what the host
 	// has.
 	Admission *admission.Ledger
+	// Machine is the composition root's one observation of the host: the
+	// reading Admission's allocation was derived from, handed over so the
+	// planner sizes every heavy unit's reservation and heap caps against the
+	// same reading. The coordinator never observes the machine itself. The
+	// zero value is a host that exposes no available memory.
+	Machine dependence.Machine
 	// RunLedgerReader reads back the rows this process's runs recorded: how a
 	// finished run states in its own result what it did, and what this
 	// workspace has already measured its heavy units to cost, which the plan
@@ -212,10 +218,12 @@ type SuppliedIndex struct {
 
 // Pending is the typed answer a query gets for a capability whose dependence
 // units have not sealed yet (Section 11.6): how many units it waits on, where
-// the promoted scope now sits in the background queue, and how long the
-// remaining units are expected to take. Estimate is zero while no deferred
-// unit of this process has completed: an unmeasured duration is reported as
-// unmeasured, never as an invented number.
+// the promoted scope now sits in the background queue, and how long one unit
+// is expected to take to build. Estimate is the mean build time of the
+// deferred units this process has completed, measured from each one's
+// admission, so the time a unit spent queued or waiting for admission is not
+// in it. It is zero while no deferred unit of this process has completed: an
+// unmeasured duration is reported as unmeasured, never as an invented number.
 type Pending struct {
 	Units    int
 	Position int
@@ -368,8 +376,7 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 // sinks. There is no count beside those two. How much of the machine those
 // units may hold is decided by the reservation ledger every heavy unit is
 // admitted against, so a typed-in ceiling here would be a second gate on the
-// same work -- and one nobody measured, which is what an eight-worker ceiling
-// on a sixteen-core machine was.
+// same work, and one nobody measured.
 //
 // cpus is a parameter and not a call so the resolution can be exercised for
 // machines this one is not, exactly as config's own counts are.
@@ -740,7 +747,7 @@ func (c *Coordinator) skipped(ctx context.Context, err error) {
 		args...)
 }
 
-// ref is the ref this generation is built from (ruling Q3): the branch when
+// ref is the ref this generation is built from: the branch when
 // HEAD is symbolic, the HEAD object id when it is detached, and the fixed
 // sentinel when the workspace is not a Git repository. Retention groups by it,
 // so two detached commits are two refs.

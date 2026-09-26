@@ -52,7 +52,7 @@ const statusFollowInterval = time.Second
 
 // statusReport is the data payload of `status`: the coordinator's own index
 // status, and the managed-toolchain rows the same report renders, which is
-// what Task 22 Step 3 owes `status` beside `doctor`. They travel in one
+// what `status` reports beside `doctor`. They travel in one
 // envelope because they answer one question -- what does this workspace hold
 // and what can it run -- and a consumer that had to make two calls could see
 // two different moments.
@@ -250,7 +250,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Ruling Q1 makes the resource block a request field rather than a
+			// The resource block is a request field rather than a
 			// second call: one report, one moment. The request is built and
 			// screened here, where the command line is.
 			req := model.StatusRequest{Resources: resources}
@@ -443,7 +443,7 @@ func runWatch(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, ar
 // drainIndex publishes the generation a one-shot command has just produced and
 // then runs the deferred queue to empty, which is what makes
 // providers.dependence.enabled = "auto" its documented self in a one-shot run
-// (Section 11.6, ruling Q9). Both one-shot building commands end here --
+// (Section 11.6). Both one-shot building commands end here --
 // `codectx index` with the generation its Index call activated and `codectx
 // refresh` with the one its Refresh call activated -- because the lifetime that
 // makes the abandonment possible is the same in both: the process exits as soon
@@ -982,8 +982,10 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	// three together is the whole point -- a peak far under the cap says the
 	// unit was serialized behind memory it never used.
 	for _, u := range r.AnalyzerUnits {
-		// The count above says how many overran; this names which, on the row
-		// that already carries both figures it is a comparison of.
+		// The count above is the report's own and covers every unit this
+		// process recorded, including runs the rows had no room for; it is
+		// never re-derived from these rows. This marks which of the rows shown
+		// overran, on the row that carries both figures it compares.
 		overran := ""
 		if u.OverranReservation() {
 			overran = ", OVER RESERVATION"

@@ -20,19 +20,23 @@ agent driving the product over MCP cannot, and neither can a script, and neither
 itself when asked why a run is taking a long time *while it is still taking it*.
 
 What the product had instead, when this was decided, was scattered. Six stages each logged a
-duration, every one in its own shape and none of them aggregated:
-`internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
-`internal/storage/sqlite/lexicalmerge.go:135`, `internal/snapshot/builder.go:289` and
-`internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
-needs were already being taken and thrown away: the child process tree's peak resident memory was
-sampled every 250 ms by `internal/process/treesample_linux.go:55` and reached only the dependence
-provider's memory governor; the reaped child's `rusage` was reachable at
-`internal/process/runner.go:607` and was read by nothing at all; the tree's summed CPU ticks were
-kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
+duration, every one in its own shape and none of them aggregated: the lexical build, the adjacency
+build, lexical compaction, the snapshot capture, and the dependence provider's parse and export.
+Three of the measurements the ledger needs were already being taken and thrown away: the child
+process tree's peak resident memory was sampled every 250 ms and reached only the dependence
+provider's memory governor; the reaped child's `rusage` was reachable and read by nothing at all;
+the tree's summed CPU ticks were kept by the same sampler and consumed only as a liveness signal by
+the stall watchdog.
 
-The decision below replaced all of it. Those six duration lines are gone, and each of those three
-measurements now has a reader, so this paragraph describes the state that motivated the decision and
-not the state of the tree.
+The decision below replaced all of it, so this paragraph describes the state that motivated the
+decision and not the state of the tree. Each of the six stages is now a span, opened at
+`internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:288` and
+`internal/provider/dependence/provider.go:828` and `:924`, and its duration line is gone. Each of
+the three measurements has a reader: the sampler keeps the tree's peak at
+`internal/process/treesample_linux.go:65` and its CPU ticks at `:77`, and the runner reads the reaped
+child's user and system time into its result at `internal/process/runner.go:632-634`; the span a
+child ran under records all three.
 
 ## Decision
 
@@ -119,8 +123,40 @@ invalidates every existing cache. A diagnostic table is not worth that, and neve
 
 So the ledger is its own file beside the store, with its own schema and fingerprint, its own
 write-ahead log, one writer (the collector) and any number of read-only readers at any moment. It
-is found where the store is found, lives under the same directory lock, and its rows follow the
-generation they describe out of existence when retention deletes it.
+is found where the store is found and lives under the same directory lock. Its rows do not follow
+generations: the generation a run published is deleted by retention as soon as a later generation
+of the same ref exists, which a deferred publication makes true within the same command, so the
+collection pass keeps each repository's most recent runs, the run that produced the active
+generation, and every live run, and deletes the rest.
+
+A run whose writer died is read, never rewritten, as the collector would have closed it: the run
+and every span it left running read as interrupted with no wall, and every unit it left planned
+reads as unavailable with the not-admitted reason, the same three columns the collector writes when
+a run it is still attached to ends.
+
+### 3a. A scope's learned peak is a row of its own, bounded by the scopes that exist
+
+The planner raises a heavy unit's reservation to the largest process-tree peak this repository has
+measured for that scope, and for a scope never run here to the largest measured for any scope of the
+same language family ([ADR-0010](ADR-0010-engine-memory.md)). That measurement cannot live only in
+the spans of retained runs: the run history is kept by count, and a scope that the kept runs did not
+touch -- a watch session editing elsewhere for longer than the history lasts -- would lose its
+measurement and be admitted against the family estimate again, which is the direction that
+overruns a host.
+
+So every span that ends with a measured peak above zero raises its scope's row in a high-water
+table keyed by repository and scope key, in the same transaction as the span's end. A span with no
+measured peak writes nothing, so a scope nothing sampled has no row and answers "no observation",
+never a peak of zero. The planner asks about exactly the heavy scopes it plans: the scope's own row
+by its key, and only where that row is absent, the largest row in the family's key range -- two
+reads off the primary key, whose cost follows the heavy units of the plan rather than the size of
+the history.
+
+The table is bounded by what the repository holds, not by a count. Sweeping runs never touches it.
+Each plan that derived the complete heavy scope set -- the provider that plans heavy units was
+active -- retires every row whose key it does not name: a removed project, a renamed root, a
+subdivision part, a key no plan asks about. A plan without that provider names nothing and retires
+nothing, because retiring against it would forget every measurement the next plan with it needs.
 
 ### 4. The same rows answer on four surfaces
 
@@ -176,8 +212,8 @@ figure is reproduced by `go test -run TestLedgerCost ./internal/bench`.
 A deferred tick whose every unit fails publishes no generation. Its reason therefore has exactly one
 durable home: this ledger — the run row, which says the batch failed and how many units it planned
 and lost, and the unit spans, each naming its scope and its typed diagnostic code. Both survive the
-tick's abort, and the sweep keeps them because a run's rows are no longer swept with the generation
-that wrote them.
+tick's abort, because the collection pass keeps a repository's recent runs whatever became of the
+generations they wrote.
 
 The store is deliberately not a second home for it. `provider_runs.failure_json` belongs to the work
 generation the abort removes, and a `generation_capabilities` row would have to be written against
@@ -215,8 +251,10 @@ reconstruction-from-timestamps that produced the reference breakdown becomes a q
 failure on a span row is the one place a failed stage's reason survives the run, which is what a
 later diagnosis reads.
 
-The accepted trade-offs: a second database file exists in the workspace directory and must be
-retained and collected with the generations it describes; a run that produces more events than the
+The accepted trade-offs: a second database file exists in the workspace directory and is collected
+by its own rules -- the run history by recency, the learned peaks by the scopes a plan still names;
+a learned peak only ever rises while its scope exists, so a scope that shrinks keeps the reservation
+its largest measurement set; a run that produces more events than the
 channel bound drops some and says so rather than slowing down; a stage whose CPU cannot be
 attributed reports none, so the CPU column has holes exactly where concurrency is; and the span
 tree is a public shape that the CLI, the MCP tool and the log all depend on, so changing it changes

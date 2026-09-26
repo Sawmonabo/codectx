@@ -198,7 +198,7 @@ func readSource(t *testing.T, dir string) (map[string]string, []string) {
 	return files, paths
 }
 
-// TestImport is the import half of Task 11 Step 1. Every fixture under
+// TestImport drives the import over the recorded exports. Every fixture under
 // testdata is a real `--repr=all --format=neo4jcsv` export of the matching
 // source tree, produced by the pinned engine; the cases below protect the
 // behaviors whose silent breakage would publish facts about the wrong bytes,
@@ -323,7 +323,7 @@ func TestImport(t *testing.T) {
 			// is the only external method this export publishes, so no node
 			// here may carry an import resolution.
 			//
-			// NOT RUN in this round. Mutation that fails it: in project
+			// Mutation that fails it: in project
 			// (scratch.go), drop the second arm of the invented table's
 			// INSERT, leaving only the speculated-namespace test; `f` is then
 			// published with a resolution of import.
@@ -832,8 +832,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	}
 	// A refresh is a new generation: one generation selects one unit per
 	// provider and scope, so the successor cannot be sealed beside the unit it
-	// carries over from. (L1 widens BeginGeneration with a ref parameter; this
-	// call site is listed in the lane report.)
+	// carries over from.
 	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"), "refs/heads/providertest")
 	if err != nil {
 		t.Fatalf("BeginGeneration: %v", err)
@@ -967,10 +966,10 @@ func (o *carryOut) Seal(ctx context.Context) error {
 
 // TestStagedRowsOverAUserSetBoundImportsAndReports pins the one invariant of
 // providers.dependence.max_staged_rows: crossing it publishes the whole import
-// and says so. The bound used to fail the unit outright, which made a row
-// count — a property of the repository's source — refuse the repository. A
-// regression that restores the refusal, or that stops setting the flag, is the
-// silence the scale posture forbids, and neither shows in any other assertion.
+// and says so. A bound that failed the unit would make a row count — a
+// property of the repository's source — refuse the repository. A regression
+// that refuses, or that stops setting the flag, is the silence the scale
+// posture forbids, and neither shows in any other assertion.
 func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
 	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
@@ -1000,12 +999,11 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 }
 
 // TestDerivedRowsOverAUserSetBoundImportsAndReports pins the same invariant for
-// providers.dependence.max_derived_rows. The projected occurrence count used to
-// be a hard 4,000,000 that failed the unit outright, and the projection query
-// carried a matching `LIMIT bound+1` that silently truncated it — a refusal and
-// a silent cut on a count that belongs to the analysed source. The equality
-// assertions below are what catch a restored truncation: a surviving LIMIT under
-// a bound of 1 leaves two occurrences and every published relation behind it.
+// providers.dependence.max_derived_rows. A fixed count that failed the unit,
+// or a projection query carrying a `LIMIT bound+1` that truncated it, would be
+// a refusal or a silent cut on a count that belongs to the analysed source. The
+// equality assertions below are what catch a truncation: a LIMIT under a bound
+// of 1 leaves two occurrences and every published relation behind it.
 func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
 	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
@@ -1137,5 +1135,38 @@ func TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool(t *testing.T) {
 	}
 	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("the next import was handed the same unusable surface: %v", err)
+	}
+}
+
+// TestAFileTheExportDidNotReadIsCounted protects the one record of source a
+// frontend dropped by a rule of its own. The failure mode: a unit's file the
+// engine was handed has no file node in the export, the import publishes the
+// rest, and the unit seals fresh with no fact for that file and nothing that
+// says so. Mutation that fails it: drop the anti-join (or stage no file node,
+// or ignore Options.Expected) so the count stays zero.
+func TestAFileTheExportDidNotReadIsCounted(t *testing.T) {
+	dir := t.TempDir()
+	files, _ := readSource(t, filepath.Join("testdata", "src", "javasrc"))
+	files["test/T.java"] = "class T {}\n"
+	for p, body := range files {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	java := func(fv model.FileVersion) bool { return strings.HasSuffix(fv.Path, ".java") }
+	rep, _, state, err := run(t, dir, filepath.Join("testdata", "javasrc"), neo4jcsv.Options{Language: "java", Expected: java})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: a dropped file is disclosed, not a failure", state)
+	}
+	if rep.UnanalysedFiles != 1 || rep.UnanalysedFirst != "test/T.java" {
+		t.Fatalf("unanalysed = %d first %q, want 1 first %q: the export has a file node for W.java only",
+			rep.UnanalysedFiles, rep.UnanalysedFirst, "test/T.java")
 	}
 }

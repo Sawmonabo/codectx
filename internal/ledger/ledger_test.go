@@ -599,67 +599,75 @@ func runByID(t *testing.T, dir, id string) ledger.RunView {
 	return view
 }
 
-// TestRecordedPeaksAnswerOnlyMeasurementsThatWereTaken protects the one
-// invariant whose silent breakage would collapse every reservation in the
-// product: the planner raises a heavy unit's reservation to the largest peak
-// this workspace has recorded for its scope, so a scope whose spans carry NO
-// peak -- a platform that samples no process tree, an in-process stage that
-// owns none, a run that was cut off before its child exited -- must answer
-// with no row at all. A NULL peak read back as the zero database/sql would
-// hand over is an observation of "this work costs nothing", and a reservation
-// derived from it would be a reservation of nothing.
+// TestALearnedPeakSurvivesRunRetention protects the reservation a heavy scope
+// is admitted against. A scope's measured process-tree peak is what the next
+// plan raises its reservation to, and the run history is swept by count: a
+// scope that more than ledger.RetainedRuns runs leave untouched -- a watch
+// session editing elsewhere -- would otherwise be sized from the family
+// constants again and overrun the host. The other half is the absence rule: a
+// scope whose span carried no peak answers no observation, never a peak of
+// zero, which would read as work that costs nothing.
 //
-// It also holds the ordering the bound rests on: the page is answered largest
-// first, so a repository with more recorded scopes than one page keeps the
-// measurements an under-reservation would be built on.
-func TestRecordedPeaksAnswerOnlyMeasurementsThatWereTaken(t *testing.T) {
+// Mutation: answer the lookup from the spans table (or delete scope_peaks rows
+// in SweepRuns) and the heavy scope's peak is gone once its run is swept; skip
+// the familyPrefix fallback and the unmeasured sibling answers no
+// observation; write a row for an absent peak and the unsampled scope answers
+// observed.
+func TestALearnedPeakSurvivesRunRetention(t *testing.T) {
+	ctx := context.Background()
 	l, dir := openLedger(t)
-	run, ctx := newRun(t, l)
-
-	peaked := func(stage, scope string, bytes uint64) {
-		_, span := ledger.Start(ctx, stage, scope)
+	defer func() {
+		if err := l.Stop(); err != nil {
+			t.Errorf("stop the ledger: %v", err)
+		}
+	}()
+	const heavy, unsampled = "pkg:javascript:app", "pkg:python:tool"
+	run, runCtx := newRun(t, l)
+	for _, bytes := range []uint64{4 << 30, 9 << 30} {
+		_, span := ledger.Start(runCtx, "parse", heavy)
 		span.End(ledger.OutcomeOK, ledger.Measured{PeakRSSBytes: &bytes}, nil)
 	}
-	// Two measurements of one scope: the largest is what that scope cost.
-	peaked("parse", "pkg:javascript:app", 4<<30)
-	peaked("export", "pkg:javascript:app", 9<<30)
-	peaked("parse", "pkg:go:service", 1<<30)
-	// Never sampled: no peak was measured for this scope at all.
-	_, unsampled := ledger.Start(ctx, "parse", "pkg:python:tool")
-	unsampled.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	// Measured, and measured at nothing. It cannot raise anything a caller
-	// derived, and it must not spend a row of the bound claiming it could.
-	peaked("parse", "pkg:rust:crate", 0)
+	_, span := ledger.Start(runCtx, "parse", unsampled)
+	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	run.Finish(ledger.OutcomeOK)
-	if err := l.Stop(); err != nil {
-		t.Fatalf("stop the ledger: %v", err)
+	// More runs than the history keeps, none of them touching either scope,
+	// so the run that measured them is swept.
+	for range ledger.RetainedRuns + 1 {
+		later, laterCtx := newRun(t, l)
+		_, span := ledger.Start(laterCtx, "capture", "")
+		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+		later.Finish(ledger.OutcomeOK)
 	}
-
-	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := l.SweepRuns(ctx, repositoryID, 0); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
+	}
+	reader, open, err := ledger.OpenReader(ctx, dir)
 	if err != nil || !open {
 		t.Fatalf("open the reader: %v (open %v)", err, open)
 	}
 	defer reader.Close()
-	peaks, err := reader.RecordedPeaks(context.Background(), model.MaxRecordsPerResult)
-	if err != nil {
-		t.Fatalf("recorded peaks: %v", err)
+	if _, found, err := reader.Run(ctx, run.ID()); err != nil || found {
+		t.Fatalf("the measuring run reads back found=%v (%v); the test must sweep it to mean anything", found, err)
 	}
-	want := []ledger.RecordedPeak{
-		{ScopeKey: "pkg:javascript:app", PeakBytes: 9 << 30},
-		{ScopeKey: "pkg:go:service", PeakBytes: 1 << 30},
-	}
-	if len(peaks) != len(want) {
-		t.Fatalf("read back %d recorded peaks, want %d: %v", len(peaks), len(want), peaks)
-	}
-	for i, w := range want {
-		if peaks[i] != w {
-			t.Fatalf("recorded peak %d is %v, want %v", i, peaks[i], w)
+	for _, tc := range []struct {
+		scope, prefix string
+		want          int64
+		observed      bool
+	}{
+		{scope: heavy, want: 9 << 30, observed: true},
+		{scope: "pkg:javascript:lib", prefix: "pkg:javascript:", want: 9 << 30, observed: true},
+		{scope: unsampled, prefix: "pkg:python:", observed: false},
+	} {
+		peak, observed, err := reader.RecordedPeak(ctx, repositoryID, tc.scope, tc.prefix)
+		if err != nil {
+			t.Fatalf("recorded peak of %s: %v", tc.scope, err)
 		}
-	}
-	for _, p := range peaks {
-		if p.PeakBytes <= 0 {
-			t.Fatalf("scope %q answers a peak of %d: a figure nobody measured was read as zero",
-				p.ScopeKey, p.PeakBytes)
+		if observed != tc.observed || (observed && peak != tc.want) {
+			t.Fatalf("scope %s answers peak %d observed=%v, want %d observed=%v",
+				tc.scope, peak, observed, tc.want, tc.observed)
 		}
 	}
 }

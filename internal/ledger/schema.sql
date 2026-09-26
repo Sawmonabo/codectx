@@ -102,6 +102,19 @@ CREATE TABLE spans (
     diagnostic_code TEXT NOT NULL,
     failure_json TEXT NOT NULL
 );
+-- The largest process-tree peak any span ever measured for one scope of one
+-- repository: what the planner raises a heavy unit's reservation to. It is its
+-- own table and not an aggregate over spans because runs are swept by count
+-- and a scope a run did not touch would otherwise lose its measurement with
+-- the runs that took it. A row exists only for a measurement above zero; a
+-- scope nothing sampled has no row, never a row of zero. Rows leave only when
+-- a plan that derived this repository's heavy scopes no longer names the key.
+CREATE TABLE scope_peaks (
+    repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
+    scope_key TEXT NOT NULL CHECK(length(scope_key) > 0),
+    peak_rss_bytes INTEGER NOT NULL CHECK(peak_rss_bytes > 0),
+    PRIMARY KEY (repository_id, scope_key)
+) WITHOUT ROWID;
 -- Unique so that a span's end, and a child's parent lookup, name exactly one
 -- row by (run_id, seq); it is also the order a reader pages the run in.
 CREATE UNIQUE INDEX idx_spans_run_seq ON spans(run_id, seq);

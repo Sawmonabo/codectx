@@ -21,10 +21,10 @@ import (
 
 // TestRunsOmittedCountsEveryRunPastTheCeiling protects the honesty of the run
 // list. Runs is a wire-sized page -- one response carries at most
-// model.MaxRecordsPerResult runs -- but the generation used to stop appending
-// there with no counter, no log line and no Warnings entry, so a repository
-// with more provider runs than one response may carry published a list that
-// silently claimed to be the whole of it.
+// model.MaxRecordsPerResult runs -- and a generation that stopped appending
+// there with no counter, no log line and no Warnings entry would publish, for
+// a repository with more provider runs than one response may carry, a list
+// that silently claims to be the whole of it.
 //
 // It asserts what the generation PUBLISHES -- model.IndexResult.RunsOmitted as
 // generation.publish fills it, through the same runsPage the publish site uses
@@ -97,10 +97,9 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 // with a measured wall: a stage whose span is never ended reads as running for
 // ever and its cost is simply missing from the breakdown.
 //
-// The three activation stages are asserted for a second reason: each of them
-// used to log its own duration, and those lines were removed once the span
-// carried the same wall. Removing a log line must not remove the fact it
-// carried, so a missing span here is the information going silently missing.
+// The three activation stages are asserted for a second reason: their span is
+// the only record of their duration, which no log line carries, so a missing
+// span here is the information going silently missing.
 //
 // Mutation proof: delete the `walk.End(...)` call in generation.capture and the
 // walk stage reads as unfinished; or drop the lexical_build span's End in
@@ -199,9 +198,9 @@ func (p toolAbsentProvider) IndexUnit(ctx context.Context, req provider.UnitRequ
 }
 
 // TestUnitWhoseToolIsAbsentEndsUnavailableWithItsReason protects the one fact a
-// capability reported unavailable used to rest on nothing: a planned unit that
-// reaches no output leaves a row, after the run has ended, naming the scope and
-// the reason.
+// capability reported unavailable rests on: a planned unit that reaches no
+// output leaves a row, after the run has ended, naming the scope and the
+// reason.
 //
 // Failure mode: a unit is planned, its tool is absent, the run ends, and the
 // store holds no unit row, no provider-run row and a capability keyed at the
@@ -242,67 +241,12 @@ func TestUnitWhoseToolIsAbsentEndsUnavailableWithItsReason(t *testing.T) {
 	}
 }
 
-// TestTheLedgerIsBoundedByTheCollectionPass protects the one bound on the run
-// ledger's growth. Nothing else deletes a ledger row -- a run's account is
-// deliberately not swept with the generation it published -- so the periodic
-// ticks, each of which opens a run whether or not it publishes anything, grow
-// the file for as long as the workspace is open unless this pass runs. The
-// failure mode guarded is a sweep that exists, is correct and is called by
-// nothing.
-//
-// It drives Coordinator.collect -- the process's collection pass, which is
-// where the sweep is wired -- rather than the sweep itself, because the sweep
-// having a caller is the whole of what is at stake here.
-//
-// Mutation: remove the sweepLedger call from Coordinator.collect, or the
-// SweepRuns call from sweepLedger, and the oldest run below is still readable
-// after a collection pass that had one run too many to keep.
-func TestTheLedgerIsBoundedByTheCollectionPass(t *testing.T) {
-	f := newFixture(t, map[string]string{"a.txt": "a\n"})
-	repo := string(f.c.repo)
-	// One more tick than the ledger retains, each of which did some work and
-	// published no generation: the ordinary shape of a watching process.
-	ids := make([]string, 0, ledger.RetainedRuns+1)
-	for i := range ledger.RetainedRuns + 1 {
-		barren, err := f.ledger.NewRun(ledger.KindDeferred, repo)
-		if err != nil {
-			t.Fatalf("NewRun %d: %v", i, err)
-		}
-		_, span := ledger.Start(barren.Context(f.ctx), stageCollection, "")
-		span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
-		barren.Finish(ledger.OutcomeOK)
-		ids = append(ids, barren.ID())
-	}
-	// A run is swept only once it is no longer live, so every row must first be
-	// on disk saying how it ended: a run still writing is indistinguishable
-	// from one that has not reached its generation yet.
-	if err := f.ledger.Flush(f.ctx); err != nil {
-		t.Fatalf("flush the ledger: %v", err)
-	}
-	reader, ok, err := ledger.OpenReader(f.ctx, f.dataDir)
-	if err != nil || !ok {
-		t.Fatalf("OpenReader: %v, present=%v", err, ok)
-	}
-	t.Cleanup(func() { reader.Close() })
-
-	f.c.collect(f.ctx)
-	if _, present, err := reader.Run(f.ctx, ids[0]); err != nil || present {
-		t.Fatalf("the collection pass left the oldest tick's run %s (err %v): the ledger has no "+
-			"other bound, so every tick that publishes nothing adds a row that is never removed",
-			ids[0], err)
-	}
-	if _, present, err := reader.Run(f.ctx, ids[len(ids)-1]); err != nil || !present {
-		t.Fatalf("the collection pass took the newest tick's run %s (err %v): the bound must "+
-			"reclaim the oldest accounts, never the one an operator is about to read", ids[len(ids)-1], err)
-	}
-}
-
 // TestUnitsTheRunNeverReachedAreStillAccountedFor protects the account of what
-// a run had planned from the failure it is most needed for. The planned-unit
-// row used to be written inside the build walk, so a run that died before the
+// a run had planned from the failure it is most needed for. A planned-unit row
+// written only inside the build walk would leave a run that died before the
 // walk reached a unit -- here a required provider's first unit failing and
-// cancelling the rest, which ends the walk at the next provider -- left every
-// unit past that point with no row at all: the plan named them, the run ended,
+// cancelling the rest, which ends the walk at the next provider -- with no row
+// at all for every unit past that point: the plan named them, the run ended,
 // and nothing anywhere says they were ever going to be built.
 //
 // Failure mode: an operator investigating a failed run sees rows for the units

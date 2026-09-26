@@ -28,7 +28,7 @@ const (
 // may have changed (Section 20.1).
 const zeroBoundHelp = " (0 uses the configured default)"
 
-// nameArgumentHelp describes the `<name-or-id>` argument. Ruling Q9: a name is
+// nameArgumentHelp describes the `<name-or-id>` argument. A name is
 // resolved through Workspace.ResolveNodes, which reads PinnedReader.Nodes --
 // storage rather than search, so this path does not make the graph depend on
 // search. A name several nodes carry is rejected with the candidates rather
@@ -512,7 +512,9 @@ func emitQuery[T any](cmd *cobra.Command, build model.BuildInfo, args []string, 
 // what was asked (a page bound clamped to the wire ceiling, say). All three
 // reach the operator on both output paths -- an answer that is not exhaustive,
 // or not the answer that was asked for, and does not say so is the failure
-// Section 13.3 names.
+// Section 13.3 names. A capability's count of units still building is not
+// repeated in its note: the text path prints it on the row's own line
+// (writeCapabilities) and the JSON path carries it as the row's units_running.
 func queryWarnings(meta model.QueryMeta) []string {
 	var warnings []string
 	warnings = append(warnings, meta.Notices...)
@@ -534,14 +536,6 @@ func queryWarnings(meta model.QueryMeta) []string {
 		note := fmt.Sprintf("%s/%s is %s", state.ProviderID, state.Capability, state.State)
 		if reason := state.Details["reason"]; reason != "" {
 			note += " (" + reason + ")"
-		}
-		// The row's own field, not a detail key: the count is published as a
-		// field of the capability row precisely so it survives the detail
-		// budget, and a warning read from a key nothing writes was silent on
-		// every generation that had work in flight.
-		if state.UnitsRunning > 0 {
-			note += fmt.Sprintf(", %d %s still building", state.UnitsRunning,
-				plural(state.UnitsRunning, "unit is", "units are"))
 		}
 		warnings = append(warnings, note)
 	}
