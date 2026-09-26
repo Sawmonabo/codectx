@@ -56,10 +56,9 @@ func measured(o Outcome) ledger.Measured {
 //
 // A step whose tree was never sampled records nothing: nothing was measured,
 // which is not a peak below the reservation and must never be read as one.
-// reservedBytes is the reservation the UNIT was admitted against -- Bytes, not
-// the individual step's figure -- so this row and the count on the resources
-// block (model.AnalyzerUnit.OverranReservation) ask exactly the same question
-// and cannot disagree about which units overran.
+// reservedBytes is the reservation the UNIT holds -- Bytes of the admitted
+// reservation, not the individual step's figure -- which is the same figure
+// the unit's row on the resources block is compared against.
 func overran(m *ledger.Measured, scopeKey string, reservedBytes int64) {
 	if m.PeakRSSBytes == nil || reservedBytes <= 0 || int64(*m.PeakRSSBytes) <= reservedBytes {
 		return
@@ -73,6 +72,20 @@ func overran(m *ledger.Measured, scopeKey string, reservedBytes int64) {
 	}
 	slog.Warn("a dependence step peaked above its reservation", "component", component,
 		"scope", scopeKey, "reservation_bytes", reservedBytes, "tree_peak_bytes", int64(*m.PeakRSSBytes))
+}
+
+// measured is what the span of one step run under this admission records: the
+// child's own figures, and the over-reservation marker when the step succeeded
+// and its tree peaked above the reservation the unit holds. A step that failed
+// keeps its own class: a crash or a timeout above the reservation is that
+// crash or that timeout, and the overrun must not take its code and reason.
+// scope names the step's work in the marker's reason.
+func (a *admitted) measured(o Outcome, scope string) ledger.Measured {
+	m := measured(o)
+	if o.Class == FailureNone {
+		overran(&m, scope, a.res.Bytes())
+	}
+	return m
 }
 
 // unmeasured is what a span records when nothing of the step it brackets was

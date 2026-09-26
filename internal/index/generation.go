@@ -18,6 +18,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -345,7 +346,7 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 		prev = 0
 	}
 	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev,
-		Config: c.opts.Config, TempDir: c.workDir}
+		Config: c.opts.Config, TempDir: c.workDir, Machine: c.opts.Machine}
 	if prev != 0 {
 		in.CarriedPage = c.carriedPage(prev)
 	}
@@ -829,9 +830,10 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	if err != nil {
 		return err
 	}
+	var grant *unitGrant
 	if u.Heavy {
-		release, admitErr := g.c.sched.Admit(ctx, u.Reservation)
-		if admitErr != nil {
+		var admitErr error
+		if grant, admitErr = admitUnit(ctx, g.c.sched, u.Reservation); admitErr != nil {
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
 			// a provider that was never asked.
@@ -839,7 +841,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
 			return admitErr
 		}
-		defer release()
+		defer grant.release()
 	}
 	// A unit whose key is already sealed is the same bytes under the same
 	// configuration by construction, so it is attached rather than rebuilt.
@@ -860,7 +862,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 		g.mu.Unlock()
 		return nil
 	}
-	out, runErr := g.run(ctx, u, spec, span)
+	out, runErr := g.run(ctx, u, spec, span, grant)
 	if runErr == nil {
 		g.record(u, out)
 		return nil
@@ -885,9 +887,55 @@ type outcome struct {
 	span *ledger.Span
 }
 
+// unitGrant is one heavy unit's admission while the unit runs: the grant it
+// holds now, and the scheduler it was taken from. It is owned by the one
+// goroutine that runs the unit and is not safe for concurrent use.
+type unitGrant struct {
+	sched *plan.Scheduler
+	// held returns the grant the unit holds now; it is a no-op once that
+	// grant has been returned and no other taken.
+	held func()
+}
+
+// admitUnit admits a heavy unit at its planned reservation.
+func admitUnit(ctx context.Context, s *plan.Scheduler, r dependence.Reservation) (*unitGrant, error) {
+	release, err := s.Admit(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return &unitGrant{sched: s, held: release}, nil
+}
+
+// readmit exchanges the unit's grant for one at r: the current grant is
+// returned first and then the whole of r is admitted through the same
+// scheduler. Holding the first grant while asking for the difference would
+// deadlock: the ledger admits a reservation larger than the allocation only
+// when it holds nothing, and an out-of-memory retry's reservation -- its cap
+// is the allocation, plus the family's resident memory -- is always larger.
+// The price is the unit's place: it re-enters the queue behind every waiter
+// that arrived while it ran, which strict first-in-first-out admission
+// requires of any reservation it has not yet granted. A cancelled or refused
+// re-admission leaves the unit holding nothing and returns the ledger's error.
+func (g *unitGrant) readmit(ctx context.Context, r dependence.Reservation) error {
+	g.held()
+	g.held = func() {}
+	release, err := g.sched.Admit(ctx, r)
+	if err != nil {
+		return err
+	}
+	g.held = release
+	return nil
+}
+
+// release returns whichever grant the unit holds now.
+func (g *unitGrant) release() { g.held() }
+
 // run executes one unit through its delta applier when the provider has one,
-// and through the provider runtime otherwise.
-func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span) (res outcome, err error) {
+// and through the provider runtime otherwise. grant is the heavy unit's
+// admission, nil for a unit that is not heavy; its reservation and its
+// re-admission travel to the applier with the request.
+func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span,
+	grant *unitGrant) (res outcome, err error) {
 	c := g.c
 	// The unit's span was opened when the plan named it and begins here: the
 	// providers' own inner spans find it in the context they are handed and
@@ -933,6 +981,9 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		previous := g.plan.Previous[plan.Key(u.ProviderID, u.ScopeKey)]
 		req := delta.Request{Generation: g.gen, Previous: previous,
 			Build: build, Inputs: u.Inputs, Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
+		if grant != nil {
+			req.Reservation, req.Readmit = u.Reservation, grant.readmit
+		}
 		// The applier calls CompleteProviderRun itself, on both paths and
 		// under a context that survives cancellation; calling it again here
 		// would fail as "run is not running".

@@ -3,7 +3,7 @@
 // run, names everything of the predecessor that did not survive, and lets
 // storage carry the rest into the new unit.
 //
-// The two wave-A importers produce deltas at two granularities — one SCIP
+// The two delta-aware importers produce deltas at two granularities — one SCIP
 // document, one dependence fact — and Applier is the one interface behind
 // both. What each applier does is the same sequence, and only the middle of it
 // differs:
@@ -37,6 +37,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -71,6 +72,12 @@ type Request struct {
 	Inputs  func(yield func(model.UnitInput) error) error
 	Unit    provider.UnitRequest
 	WorkDir string
+	// Reservation is the heavy unit's one reservation as the planner sized it
+	// and the coordinator admitted it, and Readmit exchanges that admission
+	// for a larger one (see dependence.ImportOptions, which both are handed
+	// to). An applier whose provider runs no heavy child reads neither.
+	Reservation dependence.Reservation
+	Readmit     func(context.Context, dependence.Reservation) error
 }
 
 func (r Request) validate() error {

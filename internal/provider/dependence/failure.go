@@ -510,14 +510,3 @@ func peakForLog(o Outcome) any {
 	}
 	return o.PeakBytes
 }
-
-// allocationForLog renders the machine-derived allocation a reservation was
-// bounded by. Zero there means the machine's available memory could not be
-// observed at all (Reservation.AllocationBytes), so a log that printed 0 would
-// claim the host offered the unit nothing.
-func allocationForLog(r Reservation) any {
-	if r.AllocationBytes <= 0 {
-		return "unobserved"
-	}
-	return r.AllocationBytes
-}
