@@ -84,14 +84,21 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     test is evaluated only when the previous failed), that Uses the
 //     discriminant's reads with its own, since it compares the two; a case
 //     body's end
-//     flows into the next body when it does not break. A for…in/for…of loop
-//     is a Stmt node for the iterated expression, evaluated once, then a
-//     Branch head spanning the head clause from the left side to the end of
-//     the iterated expression (whether another element is assigned), which
-//     defines nothing: each name the left side binds is defined on the body
-//     path, after the head, by the destructuring rule below (a bare
-//     identifier is one defining node spanning it), so the exit edge carries
-//     the definitions from before the loop.
+//     flows into the next body when it does not break. A for…in, for…of or
+//     for await…of loop follows the iteration model (see Iteration in
+//     Lowering; ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation): a Stmt node
+//     spanning the iterated expression Uses its reads and defines the
+//     iteration variable, then a Branch head spanning the head clause from
+//     the left side to the end of the iterated expression (whether another
+//     element is assigned) Uses only that variable and defines nothing. On
+//     the body path, after the head, the left side is assigned
+//     (§14.7.5.7 ForIn/OfBodyEvaluation): each name it binds is defined by
+//     the destructuring rule below (a bare identifier is one defining node
+//     spanning it), and a property target `o.p` is evaluated anew on every
+//     iteration, one Stmt node spanning it that Uses o and defines nothing;
+//     each of these nodes Uses the iteration variable, never the iterated
+//     expression's names. The exit edge carries the definitions from before
+//     the loop.
 //   - `&&`, `||`, `??` and the conditional operator: the deciding operand is
 //     a Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -158,9 +165,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // also Uses v when its statement read v before it: the enclosing expression
 // consumes that earlier value only after the definition has overwritten it,
 // so the defining node carries it, read before its write (`f(x, x = 1)`),
-// the rule a destructuring swap follows. A destructuring or for…in/for…of
-// defining node also Uses the variables of the value it destructures, and a
-// destructuring element those of its computed key and property target. A
+// the rule a destructuring swap follows. A destructuring defining node also
+// Uses the variables of the value it destructures (for a for…in/for…of left
+// side, the iteration variable), and a destructuring element those of its
+// computed key and property target. A
 // property write (`o.p = v`, `a[i] = v`) is a Stmt node spanning the
 // assignment that Uses o, a, i and v and defines nothing; a compound one
 // (`o.p += v`) is first a Stmt node spanning the target, the property read,
@@ -1216,28 +1224,32 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 			j.def(d, j.lookup(left))
 		}
 	}
+	// ForIn/OfHeadEvaluation (ECMA-262 §14.7.5.6) evaluates the iterated
+	// expression once; its node defines the iteration variable it, which the
+	// head and every per-iteration node Use in its place.
 	j.reset()
 	right := n.ChildByFieldId(k.fRight)
 	j.value(right, false)
 	if of {
 		j.throws++
 	}
-	j.node(flow.Stmt, right, 0, len(j.reads))
-	rEnd := len(j.reads)
+	it := j.b.Var()
+	j.b.Def(j.node(flow.Stmt, right, 0, len(j.reads)), it)
 	f := j.b.OpenLoop(labels...)
+	j.reset()
+	j.read(it)
 	if of {
 		j.throws++
-	}
-	property := left.KindId() == k.memberExpression || left.KindId() == k.subscriptExpression
-	if property {
-		j.target(left)
 	}
 	head := flow.Span{Start: uint32(n.ChildByFieldId(k.fLeft).StartByte()), End: uint32(right.EndByte())}
 	h := j.nodeAt(flow.Branch, head, 0, len(j.reads))
 	exit := j.b.Push()
-	if !property {
-		j.bind(left, 0, rEnd)
-	}
+	// ForIn/OfBodyEvaluation (§14.7.5.7) assigns the next value once one
+	// exists, evaluating a property target anew on every iteration: bind
+	// makes that target's node, which Uses it and the target's reads.
+	j.reset()
+	j.read(it)
+	j.bind(left, 0, len(j.reads))
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)

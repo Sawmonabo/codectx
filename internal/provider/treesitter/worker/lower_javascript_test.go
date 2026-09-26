@@ -181,15 +181,52 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x = g()@27 -> y = (x = g()) + 1@22", "y = (x = g()) + 1@22 -> return y;@41"},
 		},
 		{
+			// ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation evaluates arr once;
+			// §14.7.5.7 ForIn/OfBodyEvaluation assigns last only once next
+			// yields a value. Nodes: arr@11, last = null@22, arr@48 (Uses arr,
+			// defines the iteration variable), the head last of arr@40
+			// (Uses the iteration variable), last@40 on the body path (Uses
+			// it, defines last), return last;@56 on the exit edge. The empty
+			// body returns to the head, which controls last@40 and itself.
 			name:     "a for…of over a bare identifier defines it only on the body path",
 			protects: "the loop's exit edge carries the definition from before the loop, since an empty iterable assigns nothing, and the head is its own node, distinct from the definition",
-			mutation: "define the identifier on the loop head (return last loses last = null@22), or span the head by the left side alone (it renders as last@40, like the definition)",
+			mutation: "define the identifier on the loop head (return last loses last = null@22), span the head by the left side alone (it renders as last@40, like the definition), or give the head and the binding the iterated expression's reads (arr@11 -> last of arr@40 and arr@11 -> last@40 appear)",
 			src:      "function f(arr) { let last = null; for (last of arr) {} return last; }",
 			fn:       1,
 			cd:       []string{"last of arr@40 -> last of arr@40", "last of arr@40 -> last@40"},
 			du: []string{
-				"arr@11 -> arr@48", "arr@11 -> last of arr@40", "arr@11 -> last@40",
+				"arr@11 -> arr@48", "arr@48 -> last of arr@40", "arr@48 -> last@40",
 				"last = null@22 -> return last;@56", "last@40 -> return last;@56",
+			},
+		},
+		{
+			// ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation: the iterated
+			// expression is evaluated once, before the first iteration, so a
+			// body that writes the iterated name does not change what is
+			// iterated. Nodes: d@11, xs@14; d@36 (Uses d, defines the first
+			// iteration variable), the head k in d@31 (Uses it), k@31 (Uses
+			// it, defines k), d[k] = g(k)@39 (a property write: Uses d and
+			// k, defines nothing); xs@68 (Uses xs, defines the second
+			// iteration variable), the head x of xs@63 (Uses it), x@63 (Uses
+			// it, defines x), xs = h(x)@72 (Uses x, defines xs); return
+			// xs;@83, reached by xs@14 on the path where the second loop
+			// never runs its body and by xs = h(x)@72. Each head controls
+			// its binding, its body and itself.
+			name:     "a body that writes the iterated name does not reach the loop head",
+			protects: "the head and the binding read the iteration variable the iterated expression defined once, so a write to the iterated name in the body pairs only with later reads of that name",
+			mutation: "give the head and the binding the iterated expression's reads (xs = h(x)@72 -> x of xs@63 and xs = h(x)@72 -> x@63 appear, with d@11 and xs@14 pairing with both heads and bindings)",
+			src:      "function f(d, xs) { for (const k in d) d[k] = g(k); for (const x of xs) xs = h(x); return xs; }",
+			fn:       1,
+			cd: []string{
+				"k in d@31 -> k in d@31", "k in d@31 -> k@31", "k in d@31 -> d[k] = g(k)@39",
+				"x of xs@63 -> x of xs@63", "x of xs@63 -> x@63", "x of xs@63 -> xs = h(x)@72",
+			},
+			du: []string{
+				"d@11 -> d@36", "d@11 -> d[k] = g(k)@39",
+				"d@36 -> k in d@31", "d@36 -> k@31", "k@31 -> d[k] = g(k)@39",
+				"xs@14 -> xs@68", "xs@14 -> return xs;@83",
+				"xs@68 -> x of xs@63", "xs@68 -> x@63", "x@63 -> xs = h(x)@72",
+				"xs = h(x)@72 -> return xs;@83",
 			},
 		},
 		{
