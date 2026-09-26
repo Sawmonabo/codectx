@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -51,20 +50,17 @@ type Definition struct {
 	// repository is this server's kind. Detection reads their metadata through
 	// the confined root and nothing else.
 	RootMarkers []string
-	// MemoryBudgetBytes and DiskBudgetBytes are the runner reservations;
-	// Timeout bounds the server's whole lifetime. The manager's idle TTL
-	// usually stops it long before.
+	// MemoryBudgetBytes and DiskBudgetBytes are the room the server holds in
+	// the admission ledger while it runs. There is no lifetime bound: a server
+	// ends when it has been idle for the manager's idle TTL, when it is
+	// stopped, or when a request finds it making no progress.
 	MemoryBudgetBytes int64
 	DiskBudgetBytes   int64
-	Timeout           time.Duration
 }
 
-// Standard bounds for a language server. A server is an interactive process
-// held open across many requests, so the timeout is a lifetime ceiling rather
-// than a per-request bound (Options.RequestStallTimeout is that one), and the
-// reservations are what the runner accounts before the child starts.
+// Standard reservations for a language server, accounted before the child
+// starts.
 const (
-	serverLifetime     = time.Hour
 	serverMemoryBudget = 4 << 30
 	serverDiskBudget   = 2 << 30
 	serverMemoryLarge  = 8 << 30
@@ -88,13 +84,13 @@ var definitions = map[string]Definition{
 		Args:              []string{"serve"},
 		EnvAllowlist:      []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
 		RootMarkers:       []string{"go.mod", "go.work"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"rust-analyzer": {
 		Name: "rust-analyzer", Languages: []string{"rust"},
 		EnvAllowlist:      []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
 		RootMarkers:       []string{"Cargo.toml"},
-		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge,
 	},
 	// The python server is a native static binary started with its server
 	// subcommand, so it runs as itself like gopls, clangd and rust-analyzer
@@ -104,20 +100,20 @@ var definitions = map[string]Definition{
 		Args:              []string{"server"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"pyproject.toml", "ty.toml", "setup.py", "requirements.txt"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"typescript-language-server": {
 		Name: "typescript-language-server", Languages: []string{"typescript", "tsx", "javascript"},
 		Args:              []string{"--stdio"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"tsconfig.json", "jsconfig.json", "package.json"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"clangd": {
 		Name: "clangd", Languages: []string{"c", "cpp"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	serverJDTLS: {
 		Name: serverJDTLS, Languages: []string{"java"},
@@ -151,7 +147,7 @@ var definitions = map[string]Definition{
 		// the runtime the lock pinned.
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"pom.xml", "build.gradle", "build.gradle.kts"},
-		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge,
 	},
 }
 

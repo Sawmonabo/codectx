@@ -68,10 +68,11 @@ type Options struct {
 	// IdleTTL is how long a server with no open overlay is kept
 	// (providers.lsp.idle_ttl).
 	IdleTTL time.Duration
-	// StartTimeout bounds the initialize handshake; StopTimeout bounds the
-	// shutdown exchange and is the runner's grace before a forced stop.
-	StartTimeout time.Duration
-	StopTimeout  time.Duration
+	// StopTimeout is the grace a server is given to leave once it has been
+	// told to stop: the shutdown answer and the exit share it, and it is the
+	// runner's grace between asking the tree to end and forcing it. It bounds
+	// nothing else; the initialize handshake runs under RequestStallTimeout.
+	StopTimeout time.Duration
 	// MaxOverlayBytes is the user's overlay bound and is unlimited by default.
 	// When set it bounds, separately, the materialized snapshot (files that do
 	// not fit are named and left out, never refused), one file admitted to the
@@ -101,8 +102,7 @@ const stageServerStart = "server_start"
 
 // Package defaults for the bounds configuration does not name.
 const (
-	DefaultStartTimeout = 60 * time.Second
-	DefaultStopTimeout  = 5 * time.Second
+	DefaultStopTimeout = 5 * time.Second
 	// DefaultDocCacheBytes is the pinned coordinate cache's ceiling when the
 	// overlay bound is unlimited. The cache is lossless -- eviction costs a
 	// re-read of bytes the snapshot still holds -- so it keeps a finite
@@ -196,7 +196,6 @@ func New(opts Options) (*Manager, error) {
 	}{
 		{"stall_timeout", &opts.RequestStallTimeout, def.StallTimeout.Std()},
 		{"idle_ttl", &opts.IdleTTL, def.IdleTTL.Std()},
-		{"start_timeout", &opts.StartTimeout, DefaultStartTimeout},
 		{"stop_timeout", &opts.StopTimeout, DefaultStopTimeout},
 	} {
 		if *b.value < 0 {

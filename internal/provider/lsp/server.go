@@ -213,7 +213,6 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		MaxStdoutBytes:         0,
 		MaxStderrBytes:         0,
 		CPUProgress:            cpu,
-		Timeout:                p.Timeout,
 		Grace:                  m.opts.StopTimeout,
 		MemoryReservationBytes: p.MemoryBudgetBytes,
 		DiskReservationBytes:   p.DiskBudgetBytes,
@@ -262,10 +261,11 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	return s, nil
 }
 
-// initialize performs the handshake and checks what the server claimed.
+// initialize performs the handshake and checks what the server claimed. The
+// initialize request runs under the same hang detector as every other request
+// and under no deadline: a server loading a large project before it answers is
+// working, and only one that is neither computing nor answering is wedged.
 func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
-	ctx, cancel := context.WithTimeout(ctx, s.opts.StartTimeout)
-	defer cancel()
 	params := initializeParams{
 		ClientInfo:       clientInfo{Name: "codectx", Version: model.CurrentBuildInfo().Version},
 		RootURI:          s.uris.uri(s.profile.Root),
@@ -282,7 +282,7 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		},
 	}
 	var result initializeResult
-	if err := s.conn.call(ctx, "initialize", params, &result); err != nil {
+	if err := s.call(ctx, "initialize", params, &result); err != nil {
 		return err
 	}
 	wire := result.Capabilities.PositionEncoding
@@ -327,6 +327,21 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		return err
 	}
 	return s.conn.notify("initialized", struct{}{})
+}
+
+// call issues one request under its own hang detector. There is no deadline on
+// the answer: a server that is still working -- computing, or answering -- is
+// working, however long the project it is answering about takes to index.
+func (s *server) call(ctx context.Context, method string, params, result any) error {
+	ctx, stalled, stop := s.conn.watchProgress(ctx, s.opts.RequestStallTimeout)
+	defer stop()
+	err := s.conn.call(ctx, method, params, result)
+	if err != nil && stalled() {
+		return unavailable("the language server made no progress for %s while answering %s; it is not responding",
+			s.opts.RequestStallTimeout, method).
+			WithDetail("method", method).WithDetail("reason", "stalled")
+	}
+	return err
 }
 
 // handleServerRequest is the explicit policy for server-initiated requests:
@@ -424,17 +439,20 @@ func (s *server) stop() {
 	}
 	s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.StopTimeout)
-	defer cancel()
+	// The stop is already decided, so the whole orderly exit -- the shutdown
+	// answer and the process leaving -- shares one grace period: it bounds how
+	// long a server is given to leave on its own, never how long it may work.
 	// Errors here are not actionable: whatever the server answers, it is told
 	// to exit and its stdin is closed, and the runner terminates what remains.
-	_ = s.conn.call(ctx, "shutdown", nil, nil)
+	grace, cancel := context.WithTimeout(context.Background(), s.opts.StopTimeout)
+	defer cancel()
+	_ = s.conn.call(grace, "shutdown", nil, nil)
 	_ = s.conn.notify("exit", nil)
 	s.conn.fail(unavailable("the language server was stopped"))
 	s.stdinW.Close()
 	select {
 	case <-s.exited:
-	case <-time.After(s.opts.StopTimeout):
+	case <-grace.Done():
 		s.runCancel()
 		<-s.exited
 	}
