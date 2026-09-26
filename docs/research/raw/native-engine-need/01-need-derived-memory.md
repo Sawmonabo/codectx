@@ -4,7 +4,7 @@ Date 2026-09-26. Question: replace every fixed memory figure on the structural-p
 path with need learned from observation, for any repository and any host. Every `path:line` is at the head of this
 branch. "The benchmark rows" means the finished parse/file rows of the public TypeScript compiler checkout at commit
 `cf8cf4f6c17ada5e920949ad984791ceb9ce06df` (31,400 parse rows, 18,250 file rows; the only corpus finished when this
-was written). It is **one repository**: every quantile quoted from it is evidence for the *shape* of a design, never a
+was written; §0 adds the all-corpora aggregate that finished later). It is **one repository**: every quantile quoted from it is evidence for the *shape* of a design, never a
 constant in one. Mechanism probes are cited from `00-mechanism-probes.md` (P1–P4) and were not re-run.
 
 ## 0. What the code does today (the figures to replace, and two gaps the ADRs describe as closed)
@@ -33,9 +33,17 @@ from the kernel's available-memory figure between files" is not implemented.
 
 **Observed need is far below the constant.** Benchmark rows: the largest single-file native peak is 52.2 MB (a
 3,151,774-byte TypeScript file); the per-source-byte native peak is p50 24.2 / p99 61.7 / max 109.2 (JavaScript),
-27.1 / 67.8 / 278.1 (TypeScript), 19.3 / 35.7 / 54.7 (Go), 21.9 / 42.6 / 48.6 (TSX). Files ≥ 64 KiB have *lower*
-ratios (p50 17.7–21.0, max 31.2–76.4) than files < 4 KiB (p50 19.0–27.3, max up to 278.1): the need is affine (an
-intercept plus a slope), not a bare ratio. The same bytes vary by content by three orders of magnitude: a 4,029,319-byte
+27.1 / 67.8 / 278.1 (TypeScript), 19.3 / 35.7 / 54.7 (Go), 21.9 / 42.6 / 48.6 (TSX). For JavaScript and TypeScript,
+files ≥ 64 KiB have *lower* ratios (p50 17.7 / 17.9) than files < 4 KiB (p50 24.1 / 27.3, max up to 278.1); Go is flat
+(p50 21.0 vs 19.0). The need is affine where it is not flat (an intercept plus a slope), not a bare ratio. **All seven public corpora** (the corpus benchmark finished over llvm-project, kubernetes, elasticsearch,
+home-assistant core, vscode, the TypeScript checkout and rust-lang/rust, all at the commits of the corpus matrix, binary
+`b6dd3f6`; figures from its per-corpus aggregate, files ≥ 4 KiB): native bytes per source byte p50 9.6 (C,
+llvm-project) to ≈ 17–26 for every other language; p99 up to 45.0 (C++, llvm-project) and 72.6 (Rust, rust-lang/rust);
+max 300.8 (C++, llvm-project). The largest single-file native need is 303.9 MiB for a 15.4 MiB C file (llvm-project) —
+**above** the 256 MiB constant — then 135.1 MiB for an 8.0 MiB TypeScript file (vscode) and 131.9 MiB for a 2.6 MiB
+Rust file (rust-lang/rust), while the median file needs well under 1 MiB. The constant is therefore wrong in both
+directions at once: hundreds of times too large for the median file and too small for the largest. Scanner bytes are
+uncounted for Python, C++ and Rust in every corpus. The same bytes vary by content by three orders of magnitude: a 4,029,319-byte
 Go file peaked at 0.92 MB and a 1,144,573-byte one at 17 KB (data literals), against 39.2 MB for a 1,501,771-byte one.
 Transient above the final tree is small: (peak − tree) / source p50 0.004, max 6.4 B/B on files ≥ 64 KiB; the input
 copies the binding makes are 1.00–2.00× the source (p50 1.23).
@@ -65,7 +73,9 @@ So there are two quantities, and each has its own right instrument:
 **Recommendation.** Adopt, with the release step that makes it a measurement of need rather than of marginal growth:
 after each file the worker closes the tree, returns freed C pages to the OS (glibc `malloc_trim(0)`), reads its base
 from `/proc/self/status` (`VmRSS`, `RssAnon`, `RssFile`), writes `5` to `/proc/self/clear_refs`, and after the next
-file reads `VmHWM`. `need(f) = VmHWM − base`; `Done` carries `need`, `base` and the post-file `RssAnon`. Cost: one
+file reads `VmHWM`. `need(f) = (VmHWM − base) − ΔRssFile`, where `ΔRssFile` (from the same `status` read, before and after) removes
+the file-backed grammar tables and query rodata a worker faults on its first parse of a language — shared, untouched by
+the trim, and otherwise one inflated observation per worker per language; `Done` carries `need`, `base` and the post-file `RssAnon`. Cost: one
 status read is 6.9 µs (P2); the reset branch does no mapping walk (kernel `fs/proc/task_mmu.c`, the
 `CLEAR_REFS_MM_HIWATER_RSS` branch calls `reset_mm_hiwater_rss(mm)` and jumps to unlock —
 https://raw.githubusercontent.com/torvalds/linux/master/fs/proc/task_mmu.c, lines 1895-1901 at fetch time); the write's
@@ -102,7 +112,7 @@ returns the parser library's pages on each platform is unavailable (not verified
 make "lifetime" equal "per file" everywhere, but pays a process spawn and a grammar/query rebuild per file across
 10⁴–10⁶ files — rejected.
 
-**Measurement.** Per repository class (one large repository per language family plus a mixed monorepo): for every file,
+**The measurement the benchmark task must take to confirm it.** Per repository class (one large repository per language family plus a mixed monorepo): for every file,
 `need` from the trimmed worker vs the counting allocator's native peak + input copies on the same file; pass when
 `need ≥ native_peak + input_copy` on ≥ 99% of files and the parse wall with trim is within the benchmark's stated
 noise of the wall without; report the trim's added wall per class.
@@ -115,9 +125,11 @@ never takes a sample *during* a file; it sees worker drift. Its cost scales with
 `/proc` entry (`internal/process/treesample_linux.go:141-169`), one sampler per running child (`runner.go:577`), so 16
 workers are 16 full `/proc` scans every 250 ms. It is Linux-only (`treesample_other.go:17` returns nil).
 
-**Strongest alternative.** Shorten the interval until it sees files. **Why rejected:** a 1 ms interval would be 250× the
-`/proc` scans and still miss sub-millisecond parses, which are most files; the worker observes itself for free.
-**Trade-off.** The parent no longer independently verifies per-file figures; it verifies the envelope. **Measurement:**
+**Strongest alternative, steel-manned.** Shorten the interval until it sees files: one mechanism, in the parent, that
+trusts nothing the child reports. **Why the recommendation wins:** a 1 ms interval would be 250× the `/proc` scans and
+still miss sub-millisecond parses, which are most files; the worker observes itself for free. **Trade-off accepted:**
+the parent no longer independently verifies per-file figures; it verifies the envelope. **The measurement the
+benchmark task must take to confirm it:**
 per class, the sampler's worker peak vs `max(base + need)` reported through `Done`; pass when the sampler never exceeds
 the worker-reported maximum by more than one file's need.
 
@@ -127,9 +139,10 @@ the worker-reported maximum by more than one file's need.
 text. Use `status` fields for the envelope: charge each worker its `RssAnon` and charge the file-backed text
 (`RssFile`, shared by all workers of one binary) once. `smaps_rollup`'s `Pss` is the exact apportionment and earns its
 cost only once, at worker start, if the benchmark shows `RssFile` differs materially from the text's `Pss`.
-**Alternative:** `Pss` for every reading, the only exact per-process share. **Why rejected:** 183 µs per file across
-10⁶ files is minutes of CPU for a correction the `RssAnon`/`RssFile` split makes at 6.9 µs. **Trade-off:** shared anon
-(none expected in a worker) would be double-counted. **Measurement:** per class, Σ workers' `RssAnon` + one `RssFile`
+**Strongest alternative, steel-manned:** `Pss` for every reading, the only exact per-process share of shared pages.
+**Why the recommendation wins:** 183 µs per file across 10⁶ files is minutes of CPU for a correction the
+`RssAnon`/`RssFile` split makes at 6.9 µs. **Trade-off accepted:** shared anonymous memory (none expected in a worker)
+would be double-counted. **The measurement the benchmark task must take to confirm it:** per class, Σ workers' `RssAnon` + one `RssFile`
 vs Σ `Pss` at worker start; pass within 5%.
 
 ### (d) cgroup v2 `memory.peak`
@@ -140,9 +153,13 @@ here sits in root-owned `init.scope` and cannot create a child (P3); macOS, Wind
 no delegated user manager. Buck2, the one build system found that uses cgroups for actions, states the precondition in
 its source: the daemon must be started "with something like systemd-run" and hold `Delegate=yes`
 (https://raw.githubusercontent.com/facebook/buck2/main/app/buck2_resource_control/src/buck_cgroup_tree.rs, the
-start-up doc comment). **Alternative:** use it where delegated, fall back elsewhere — it also counts charged page cache.
-**Why rejected:** two code paths for the same quantity, one reachable only on a configured Linux host. **Trade-off:**
-no kernel-enforced per-worker limit (none is wanted: ADR-0010 forbids refusing for size). **Measurement:** none.
+start-up doc comment). **Strongest alternative, steel-manned:** use it where delegated and fall back elsewhere — it is
+kernel-attributed, covers the whole worker tree and counts charged page cache. **Why the recommendation wins:** two code
+paths for the same quantity, one reachable only on a configured Linux host. **Trade-off accepted:** no kernel-enforced
+per-worker limit (none is wanted: ADR-0010 forbids refusing for size) and no page-cache attribution. **The measurement
+the benchmark task must take to confirm it:** none is needed to keep it rejected; what would revive it is a survey of
+the fraction of target hosts (developer machines, CI runners, containers) on which the product's process can obtain a
+delegated memory subtree unprivileged — if that were near all of them, re-open.
 
 ### (e) The counting tree allocator as a live signal
 
@@ -153,11 +170,11 @@ over 31,400 files, 1.22 on files ≥ 64 KiB), and the paused run still takes the
 external scanners of cpp, rust and python (`allocator.go:38-50`; their rows carry `scanner_bytes: null`), the binding's
 input copies (`allocator.go:51-61`), the Go heap, or the dependence arena. A cheaper header-prefix counter is unsafe:
 the binding frees libc-allocated C strings through the hook (`allocator.go:51-58`), and a header read on a foreign
-pointer is a crash. **Alternative, steel-manned:** it is portable to every platform and the only signal that sees the
+pointer is a crash. **Strongest alternative, steel-manned:** it is portable to every platform and the only signal that sees the
 20 MB need behind a zero resident-set change. **Why the recommendation wins:** the trimmed worker (a) sees the same
 need on Linux without the 18%+, and it also sees what the counter cannot (scanners, copies, Go heap, arena — the file
-rows show arena peaks up to 9.85 B/B on files ≥ 64 KiB). **Trade-off:** macOS and Windows per-file need is the
-coarser `Done`-time footprint. **Measurement:** as (a): `need − (native_peak + input_copy)` per file per class is the
+rows show arena peaks up to 9.85 B/B on files ≥ 64 KiB). **Trade-off accepted:** macOS and Windows per-file need is the
+coarser `Done`-time footprint. **The measurement the benchmark task must take to confirm it:** as (a): `need − (native_peak + input_copy)` per file per class is the
 invisible remainder; report its quantiles per grammar.
 
 ### (f) A per-language need model learned online
@@ -180,10 +197,13 @@ https://raw.githubusercontent.com/kubernetes/autoscaler/master/vertical-pod-auto
 - **Persistence:** a ledger table beside `scope_peaks`, keyed (repository, language, grammar fingerprint, size class),
   bucket weights as its payload, written at the end of each generation. Bounded by construction: 9 grammars × at most
   one class per power of two up to `wire.MaxSourceOffset` × about 190 buckets (5% steps over four decades of B/B).
-- **Unseen class:** borrow the ratio of the nearest populated class. Ratios fall with size in the rows, so borrowing
-  from a smaller class over-estimates a larger file (safe) and borrowing from a larger class under-estimates a smaller
-  one by about the p50 gap (24 vs 18 B/B) — small absolute bytes, and immediately corrected because small files are
-  numerous.
+- **Unseen class:** borrow the ratio of the nearest populated class. Where ratios fall with size (JavaScript and
+  TypeScript in the rows), borrowing from a smaller class over-estimates a larger file (safe) and borrowing from a
+  larger class under-estimates a smaller one by about the p50 gap (24 vs 18 B/B) — small absolute bytes, corrected at
+  once because small files are numerous; where ratios are flat (Go), borrowing either way is close. No direction is
+  assumed in the design: an under-estimate is an overrun, which runs and is observed.
+- **Weights:** "sample maximum below 100 observations" is stated in total weight: under decay a faded extreme drops
+  out of the p99 tail, which is the intended forgetting.
 - **File larger than any seen:** the largest populated class's ratio × its bytes. It is observed exactly when it runs
   and enters the model before the next admission; no bump constant is needed because, unlike VPA's OOM-truncated
   observation (VPA bumps by `max(+100 MB, ×1.2)`, `aggregations_config.go` `DefaultOOMBumpUpRatio`/`DefaultOOMMinBumpUp`),
@@ -195,7 +215,7 @@ has no quantile constant, and is one row. **Why the recommendation wins:** max-o
 file poisons a language on that repository forever (SQL Server's lesson: feedback that follows one extreme execution
 oscillates and "disables itself"; the percentile over history is its fix, same URL); and a max has no per-size
 structure, so a 3 MB file's peak would be reserved for every 1 KB file. **Trade-off accepted:** ~1% of files overrun
-their reservation by design, disclosed; one design constant (p99) and one derived half-life. **Measurement:** per class,
+their reservation by design, disclosed; one design constant (p99) and one derived half-life. **The measurement the benchmark task must take to confirm it:** per class,
 the fraction of files whose `need` exceeds the reservation after the first generation (pass: ≤ 2%) and the summed
 reservation vs summed need (report the over-reservation ratio); across two consecutive generations of the same
 snapshot, the model's p99 per language changes by less than the bucket width.
@@ -219,20 +239,24 @@ reserved at a **structural prior**, with no constant fitted to a repository:
   assumption about glibc); so `s_node ≈ 104`. The benchmark must assert both sizes through cgo.
 - `c_copy = 2` (the binding's input copies, observed 1.00–2.00×), `c_src = 1` (the worker's Go-side source buffer).
 
-Verdict on the hint: **confirmed as a prior, refuted as a bound.** 107 B/B exceeds every observed ratio on files
-≥ 64 KiB (max 76.4) and the GLR transient (max 6.4 B/B) fits inside it. But "≤ one heap node per source byte" is an
+Verdict on the hint: **confirmed as a prior, refuted as a bound.** Across all seven corpora, **none of 3,827 files
+≥ 64 KiB** has a native need above 104 B/B (the TypeScript checkout's maximum is 76.4), and the GLR transient (max
+6.4 B/B) fits inside it; but **9 of 74,059 files ≥ 4 KiB** exceed it (worst 301 B/B, a 10,479-byte C++ file in
+llvm-project; then 260 C, 150 JavaScript with a syntax error, four Rust files 106–148) — counts computed per file over
+every finished parse row, not from the aggregate. But "≤ one heap node per source byte" is an
 assumption, not a theorem: unary chains (`expression → identifier`) and zero-width tokens (missing nodes, scanner
 indent/dedent) can exceed it, and files < 4 KiB reach 278 B/B (the per-parse intercept; absolute bytes are tiny). The
 design does not need a bound — an overrun runs — so a prior is sufficient. With longest-first dispatch the prior is
-paid on each language's *largest* file: on the benchmark's 3,151,774-byte file it reserves ≈ 337 MB against an
-observed 52 MB for 239 ms, costing concurrency, never a failure; a file whose prior exceeds the allocation runs alone
+paid on each language's *largest* file — exactly the size range where it held on every corpus: on the TypeScript
+checkout's 3,151,774-byte file it reserves ≈ 337 MB against an observed 52 MB for 239 ms, and on llvm-project's
+15.4 MiB C file ≈ 1.7 GB against 303.9 MiB, costing concurrency for one file, never a failure; a file whose prior exceeds the allocation runs alone
 (`admission.go:113-116,226`).
 
 **How it converges.** After one file the class has a sample maximum; after 100, a p99; the prior is never used again for
 that (repository, language, grammar). Each generation's observations enter the persisted histogram, so the second run
 of a repository starts converged.
 
-**A file whose observed peak exceeds its reservation.** It has already run and is never refused (ADR-0010 decision 2;
+**A file whose observed peak exceeds its reservation.** It has already run and is never refused (ADR-0010 decisions 2 and 5;
 `admission.go:113-116`). The worker's `Done` reports it; the pool raises the worker's ledger holding to the observed
 figure at once (a ledger *adjust* that records, without waiting, memory already taken — the ledger needs this one
 operation, since today a reservation is fixed from grant to release, `admission.go:147-188,270-279`), the observation
@@ -245,6 +269,16 @@ reservations behind it; with longest-first dispatch that is the intended order. 
 refuse what the ledger admitted (`runner.go:426-427` refuses a spawn reservation above its budget): its budget becomes
 `max(allocation, largest base_w prior)` in place of `max(childMemory, 256 MiB)` at `compose.go:780`; per-file
 increments are ledger-only and never reach the runner.
+
+**Forward progress (required, or the shape deadlocks).** The ledger's runs-alone rule fires only when nothing is
+admitted (`admission.go:226`). With W workers admitted holding their bases and no parse in flight, a head increment that
+does not fit would wait for a release nothing will produce; the same happens when a re-derived allocation falls below
+Σ bases while every worker is idle. `stopIdle` (the make-room step passed at `pool.go:289`) frees *other* idle workers'
+bases, never the requester's. The rule the design states: **a per-file increment is granted whenever no parse is in
+flight** — the runs-alone rule restated for the increment class, since held bases are memory already taken, not work
+that will release. This is Buck2's guarantee that the first running scene is never suspended: "Without this kind of a
+guarantee, we risk creating a deadlock where no scene ever finishes before it's killed and retried" (`scheduler.rs`,
+the `running_scenes` comment).
 
 **"Half of available."** It is a coexistence share, not a need, and **no derivation from need exists**: need says how
 much the product would use, never how much the person's editor, browser and agents will want in the next minute. Keep
@@ -259,7 +293,9 @@ editor stalls first, which is the failure ADR-0010 was written to prevent; (2) i
 (d); (3) PSI (`/proc/pressure/memory`, readable unprivileged on this host) is Linux-only, so the share is still needed
 everywhere else. PSI is worth recording as a later Linux-only brake (stop admitting new increments while memory stall is
 rising), not as the allocation. What must change is Gap 2: re-derive the allocation between files as
-`min(A − base − margin, A / 2)` with `A = MemAvailable(t) + own(t)`, where `own(t)` is the product's own observed
+`min(A − base − margin, A / 2)` with `A = ObserveMachine(t) + own(t)` — `ObserveMachine` already takes the smaller of
+`MemAvailable` and the control-group headroom (`internal/provider/dependence/machine_linux.go:31-43`), which is what
+binds in a container — where `own(t)` is the product's own observed
 resident set (Σ workers' `RssAnon` from their last `Done` plus the parent's), so the product's own growth is not read as
 a competitor and does not throttle itself.
 
@@ -305,7 +341,7 @@ count is already the core count, so it leaves this path.
   (https://spark.apache.org/docs/latest/configuration.html); its "adaptive" memory is execution/storage borrowing inside
   one heap, not a learned reservation.
 
-Only VPA and SQL Server learn a reservation from observation; both converge by a high percentile over decaying,
+Only VPA and SQL Server learn a per-unit reservation from observation (Buck2 learns a whole-daemon cap); both converge by a high percentile over decaying,
 persisted history. Neither has the product's advantage: the worker reports its exact per-file peak, so no bump for a
 censored reading is needed except after a kernel kill.
 
@@ -327,8 +363,18 @@ censored reading is needed except after a kernel kill.
    `collector.go:500` stays correct for scope-less spans); `scope_peaks` for heavy units moves from max-only to the same
    decaying quantile.
 6. **Disclosure.** Per generation and per language: reservation, observed need quantiles, overrun count and drift.
+7. **Forward progress.** A per-file increment is granted whenever no parse is in flight (§3).
 
-**Measurement the benchmark must take to confirm the whole** (per repository class: one large repository per language
+**Strongest alternative, steel-manned.** Keep the constants and make them honest: a per-worker reservation sized by
+`workspace.max_parse_file_bytes` × a structural slope, max-only learning in `scope_peaks`, and a cgroup where one is
+delegated. Nothing is predicted, nothing can under-reserve for a size already seen, and the ledger needs no adjust
+operation. **Why the recommendation wins:** a per-worker constant must cover the largest admissible file on every worker
+at once — the corpora's largest need is 303.9 MiB against a median well under 1 MiB — so it reserves orders of magnitude
+more than a run uses, and it is a figure the policy forbids; max-only never forgets; the cgroup is unavailable on most
+hosts (d). **Trade-off accepted:** a ledger adjust operation, a trimmed worker, one persisted table, one design constant
+(p99), and about 1% of files running over their reservation by design, disclosed.
+
+**The measurement the benchmark task must take to confirm it (the whole design)** (per repository class: one large repository per language
 family plus a mixed monorepo): Σ reserved vs Σ observed need and peak whole-tree residency against the current 256 MiB
 design at the same worker count; overrun fraction ≤ 2% after the first generation; the trimmed worker's wall within
 noise of the untrimmed; the structural prior ≥ observed need on the first (largest) file of every language in every
@@ -341,6 +387,6 @@ class. A class where the prior is below observed need refutes the struct-size pr
 - The per-file cost of `malloc_trim(0)` and the refaults it causes; the cost of the `clear_refs` write (P2 timed reads).
 - Whether each platform's release call returns the parser library's pages on macOS and Windows; the macOS and Windows
   available-memory calls were named, not fetched.
-- Per-grammar ratios for c, cpp, java, python and rust: the only finished corpus parses JavaScript, TypeScript, TSX and
-  Go; the per-grammar research owns them.
+- Scanner allocations for Python, C++ and Rust (uncounted in every corpus); they are inside the trimmed worker's
+  `VmHWM` reading and outside every benchmark figure quoted here.
 - `sizeof(SubtreeHeapData)` measured rather than hand-computed (needs a cgo build, which this research may not run).
