@@ -52,12 +52,15 @@ const yieldLabel = " yield"
 //     parentheses: if, while, do, for. A loop whose condition is the literal
 //     `true`, or a for without one, has no exit edge: its head is a Stmt node
 //     spanning `true` or the `for` keyword (JLS §14.21).
-//   - An enhanced for (JLS §14.14.2) is a Stmt node spanning the iterated
-//     expression, evaluated once, which defines an iteration variable of the
-//     lowering's own; a Branch head spanning the header from its first
-//     modifier or type to the end of the iterated expression, which uses
-//     that variable; then, on the body path, one node spanning the loop
-//     variable's name that defines it and uses the iteration variable.
+//   - An enhanced for (JLS §14.14.2) follows the iteration model (see
+//     Iteration in Lowering): a Stmt node spanning the iterated expression,
+//     evaluated once, which Uses its reads and defines an iteration variable
+//     of the lowering's own; a Branch head spanning the header from its
+//     first modifier or type to the end of the iterated expression, which
+//     Uses only that variable; then, on the body path, one node spanning the
+//     loop variable's name that defines it and Uses only the iteration
+//     variable. The back edge re-enters the head, never the iterated
+//     expression.
 //   - A switch (JLS §14.11 statement, §15.28 expression) is a Stmt node for
 //     its selector, then one Branch node per `case` label in source order,
 //     spanning the label, each tested only when the previous failed; a
