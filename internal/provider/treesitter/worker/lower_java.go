@@ -77,17 +77,20 @@ const yieldLabel = " yield"
 //     variable, spanning the variable's identifier and using the selector's
 //     variable, then, for a guard, a Branch node spanning the
 //     guard expression whose false edge joins the next label's test.
-//     Several labels of one group all enter its body. `default` is taken
-//     when no label matched; the grammar has no `case null, default` label,
-//     so that source parses with an error node
-//     and is lowered as the labels the recovered tree holds. In the colon
+//     Several labels of one group all enter its body. `default` makes no
+//     node: the last label's false edge, the path on which no label
+//     matched, enters the group holding it, together with a colon-form
+//     fall-through into that group. The grammar has no `case null,
+//     default` label, so that source parses with an error node and is
+//     lowered as the labels the recovered tree holds. In the colon
 //     form a body's end falls through into the next body; in the arrow form
 //     it leaves the switch. A switch expression without `default` is
 //     exhaustive, and its no-match path throws (JLS §15.28.2); so does that
 //     of a switch statement without `default` whose labels include a pattern
 //     or `null`, an enhanced switch statement, which is exhaustive too (JLS
-//     §14.11.2, §14.11.3: MatchException). Any other switch statement
-//     without `default` is left when no label matches, and so is every
+//     §14.11.2, §14.11.3: MatchException); each such throw is a Throw from the
+//     last label's false edge, with no node of its own. Any other switch
+//     statement without `default` is left when no label matches, and so is every
 //     switch whose tree holds an error node, whose recovery may have dropped
 //     its `default`. An arrow arm's expression is a Stmt node spanning it, and
 //     the yield of its value; `yield e;` is a Jump node spanning the
@@ -106,11 +109,18 @@ const yieldLabel = " yield"
 //     define each pattern variable on one node spanning its identifier,
 //     using that variable, before the node that decides on the test, into
 //     which the test itself is folded. An instanceof without a pattern is
-//     folded whole.
+//     folded whole. The deciding node is the one consuming the test: a
+//     condition's Branch through any `!` or parentheses (`!` swaps the
+//     pattern variable sets and makes no node), an `&&` or `||` deciding
+//     operand's Branch, or the node of the statement holding the test.
 //   - try (JLS §14.20): each catch clause's type test is a Branch node
 //     spanning its catch type (a multi-catch `A | B` is one test), in order;
 //     its match path defines the parameter on a node spanning its name; the
-//     path matching no clause is rethrown. A clause catching `Throwable`
+//     path matching no clause, the last test's false edge, is rethrown by a
+//     Throw with no node of its own. EnterHandler has popped the catch
+//     frame, so the Throw goes to an enclosing catch or to Exit, and the
+//     statement's own finally, open around its catch clauses, intercepts it
+//     as a Throw source. A clause catching `Throwable`
 //     catches everything: its test is a Stmt node and ends the chain. The
 //     builder's Handler spans the first `catch` keyword, or `finally`.
 //   - try-with-resources (JLS §14.20.3.1, the basic form; the extended
@@ -123,14 +133,22 @@ const yieldLabel = " yield"
 //     its variable (see Uses) and may throw; the resources close in reverse
 //     order, and the statement's catch clauses and finally enclose all of
 //     them. A resource's Handler spans the `;` or `)` that ends the
-//     resource. The null test before close is not modelled.
+//     resource. A close runs inside its own finally body, which intercepts
+//     nothing, so the close's own MayThrow edges into the Handler of the
+//     resource acquired before it, while every throw its finally re-issues
+//     from the close (CloseFinally re-issues each intercepted MayThrow as a
+//     throw) is a Throw source that outer finally intercepts: an edge from
+//     the close into the outer finally body, which coincides with normal
+//     completion, never a second edge into its Handler. The null test
+//     before close is not modelled.
 //   - `synchronized (e) { … }` (JLS §14.19) is a Stmt node spanning e, which
 //     may throw, then the block; the monitor exit is not a node.
 //   - `assert c : m;` (JLS §14.10) is a Branch node spanning the `assert`
 //     keyword, whether assertions are enabled, whose false edge skips the
 //     statement: a disabled assertion evaluates neither operand. Its true
 //     edge reaches a Branch node spanning c whose false path is a Stmt node
-//     spanning m, when present, then a throw.
+//     spanning m, when present, then a Throw with no node of its own, from
+//     m's node or, without m, from c's false edge.
 //   - A type body unit lowers, in source order, each field or constant
 //     declarator with an initializer (its value's nodes, then a Stmt node
 //     spanning the declarator), each enum constant (a Stmt node spanning it)
@@ -212,8 +230,10 @@ const yieldLabel = " yield"
 // declarator keeps its read of x, which sees the parameter when the arm is
 // skipped and the assignment when it runs. A write through a
 // field or array element of a local (`o.f = v`, `a[i] += v`, `a[i]++`) is a
-// Stmt node spanning the assignment that uses its operands and may-defines
-// (MayDef, non-killing) the local at the base of the target.
+// Stmt node spanning the assignment that Uses its operands, the local at the
+// base of the target included, since the object or array reference is
+// evaluated first (JLS §15.26.1), and may-defines (MayDef, non-killing) that
+// local.
 //
 // A lambda (its own function) is one Stmt node spanning it in the enclosing
 // function; an anonymous class's body is its own unit, and the object
@@ -228,8 +248,11 @@ const yieldLabel = " yield"
 // §15.27.2, §8.1.3), so no nested code assigns it; a write through its
 // field or array element inside (`arr[0] = 1`, `box.v = 2`) is the
 // through-a-target rule: a MayDef of the local on the creating node, since
-// when the nested code runs is unknown. A local class declaration's node is
-// its creating node.
+// when the nested code runs is unknown, and a Use of it there too, since the
+// write reads the local to reach its field or element. A local class
+// declaration's node is its creating node: it Uses the captures and
+// may-defines the locals written through them, but defines no result, since
+// a declaration has no value.
 //
 // A name that resolves to no variable (see Names that resolve to no
 // variable in Lowering) is -1 from lookup: a field or inherited member named
@@ -253,8 +276,9 @@ const yieldLabel = " yield"
 // through a receiver other than `this` or `super`, a cast, an enhanced-for
 // iterator step (the head) or a resource close; a monitor expression may
 // throw. Division, unboxing and string conversion are not counted. A throw
-// statement's node, a failed assertion and an unmatched catch chain are a
-// Throw. The Builder applies MayThrow only inside an open catch or finally
+// statement's node is a Throw; a failed assertion, an unmatched catch chain
+// and an exhaustive switch's no-match path are a Throw with no node of its
+// own. The Builder applies MayThrow only inside an open catch or finally
 // frame.
 //
 // # Scoping
