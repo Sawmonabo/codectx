@@ -294,6 +294,40 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 		},
 	)
+	shared = append(shared,
+		goldenCase{
+			// The compiler's emit: a `declare` declaration emits no code, so
+			// `declare let g` binds no variable and g names the global the
+			// program assumes (ECMA-262 §9.4.2 ResolveBinding), never a
+			// variable of f; h is free too. The wrappers are erased, so each
+			// target is g read through them; `delete g` is left out, the
+			// compiler rejecting a delete of anything but a property
+			// reference. Nodes: x@31; g! = x@41 and (g as
+			// any) += x@49 (each Uses x, defines nothing), g++@66 (Uses
+			// nothing); the embedded g! = x@73 (Uses x, defines its result) and
+			// h(g! = x)@71 (Uses the result); (g as any).p = x@82 (Uses x,
+			// may-defines no base); the right side x@107 (Uses x, defines the
+			// incoming value) and the element g@101 (Uses it); the iterated
+			// x@120 (Uses x, defines the iteration variable), the head g of
+			// x@115 and the binding g@115 (each Uses it), h(g)@123 (Uses
+			// nothing); the arrow () => g! += x@139 (Uses its capture x,
+			// may-defines nothing, defines its result), the declarator c = ()
+			// => g! += x@135 (Uses the result, defines c); return c;@154.
+			name:     "a name only a declare form introduces is read and written as nothing through the wrappers",
+			protects: "an ambient name reached through a transparent wrapper as an assignment, compound, update, embedded, property-base, destructuring, iteration or capture target defines and reads nothing, while its node keeps its other reads",
+			mutation: "drop the v < 0 return in def (flow.Builder.Def panics on g's -1 at g! = x@41), in read (seen[-1] panics at (g as any) += x@49), in mayDefBase (MayDef(-1) at (g as any).p = x@82) or in capTarget (MayDef(-1) on the arrow's node)",
+			src:      "declare let g: any; function f(x: any) { g! = x; (g as any) += x; g++; h(g! = x); (g as any).p = x; [g!] = x; for (g of x) h(g); const c = () => g! += x; return c; }",
+			fn:       1,
+			cd:       []string{"g of x@115 -> g of x@115", "g of x@115 -> g@115", "g of x@115 -> h(g)@123"},
+			du: []string{
+				"x@31 -> g! = x@41", "x@31 -> (g as any) += x@49", "x@31 -> g! = x@73", "g! = x@73 -> h(g! = x)@71",
+				"x@31 -> (g as any).p = x@82", "x@31 -> x@107", "x@107 -> g@101",
+				"x@31 -> x@120", "x@120 -> g of x@115", "x@120 -> g@115",
+				"x@31 -> () => g! += x@139", "() => g! += x@139 -> c = () => g! += x@135",
+				"c = () => g! += x@135 -> return c;@154",
+			},
+		},
+	)
 	runGolden(t, "typescript", shared)
 	runGolden(t, "tsx", append(shared, goldenCase{
 		// The compiler's JSX emit: an element is a call whose first
