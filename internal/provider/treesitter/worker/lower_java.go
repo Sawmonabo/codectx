@@ -204,14 +204,14 @@ const yieldLabel = " yield"
 //   - An assignment or update embedded in a larger expression (`(x = a) *
 //     2`, `f(o.f = a)`, `g(i++)`) is its own node, which hands its value to
 //     its consumer through an owned result, never through its target: one
-//     of a local defines the local and may-defines the result, one of a
-//     field or element target may-defines its base and defines the result.
-//     So `(x = 1) + (x = 2)` depends on both. At statement level it is the
+//     of a local defines both the local and the result, one of a field or
+//     element target may-defines its base and defines the result. So `(x =
+//     1) + (x = 2)` depends on both. At statement level it is the
 //     statement's node and hands on nothing.
-//   - A node defines at most one variable. A yielding node that already
-//     defines one (an embedded assignment to a local, an arm's result node
-//     that is itself one or a creation) may-defines the construct's result
-//     instead (see Lowering).
+//   - A node may make several killing definitions. A yielding node that
+//     defines a variable of its own (an embedded assignment to a local, an
+//     arm's result node that is itself one or a creation) defines the
+//     construct's result too (see Lowering).
 //   - The node deciding on `x instanceof P` with a pattern Uses the tested
 //     value's owned variable, as each pattern variable's defining node does:
 //     the tested expression is evaluated once, at its own node (JLS
@@ -222,7 +222,7 @@ const yieldLabel = " yield"
 //
 // An assignment or update of a local carries the reads of the local that
 // its statement made before it and no node carries (see Lowering): in `y =
-// x + (x = 2)` the node `x = 2` Uses x's earlier value and may-defines an
+// x + (x = 2)` the node `x = 2` Uses x's earlier value and defines an
 // owned variable holding it, which the declarator Uses in place of x, since
 // Java evaluates the left operand first (JLS §15.7.1). The hand-off is made
 // only when the assignment runs whenever the read's consumer does: in `y = x
@@ -232,8 +232,8 @@ const yieldLabel = " yield"
 // field or array element of a local (`o.f = v`, `a[i] += v`, `a[i]++`) is a
 // Stmt node spanning the assignment that Uses its operands, the local at the
 // base of the target included, since the object or array reference is
-// evaluated first (JLS §15.26.1), and may-defines (MayDef, non-killing) that
-// local.
+// evaluated first (JLS §15.26.1), and may-defines that local (see
+// May-definitions in Lowering).
 //
 // A lambda (its own function) is one Stmt node spanning it in the enclosing
 // function; an anonymous class's body is its own unit, and the object
@@ -398,8 +398,6 @@ type javaLower struct {
 	// being lowered, innermost last: its arm result nodes and its yields
 	// define it.
 	results []int32
-	// defined[n] marks node n as defining a variable already (see define).
-	defined []bool
 	// throws counts throwing constructs evaluated by the current statement;
 	// those past thrown are not yet attached to a node.
 	throws, thrown int
@@ -451,7 +449,6 @@ func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.Tree
 	j.buf, j.labels, j.caseBinds, j.pats = j.buf[:0], j.labels[:0], j.caseBinds[:0], j.pats[:0]
 	j.reads, j.stack, j.writes, j.hide, j.results = j.reads[:0], j.stack[:0], j.writes[:0], j.hide[:0], j.results[:0]
 	j.conds = j.conds[:0]
-	j.defined = j.defined[:0]
 	j.arms, j.groupAt, j.frames = j.arms[:0], j.groupAt[:0], j.frames[:0]
 }
 
@@ -559,7 +556,7 @@ func (j *javaLower) holds(v int32) bool {
 // earlier makes node id, which defines the local v and whose own reads
 // begin at m, carry the reads of v the statement made before it and no node
 // carries (`y = x + (x = 1)`, `f(x, x = 1)`): id Uses v's earlier value and
-// may-defines an owned variable holding it, which replaces those reads, so
+// defines an owned variable holding it, which replaces those reads, so
 // the node folding them pairs with the definition that reached them (see
 // Uses in Lowering). Only the reads made since the innermost conditionally
 // evaluated operand began are handed off: their consumer runs only when id
@@ -581,7 +578,7 @@ func (j *javaLower) earlier(id, v int32, m int) {
 		if t < 0 {
 			j.b.Use(id, v)
 			t = j.b.Var()
-			j.define(id, t)
+			j.b.Def(id, t)
 			if int(t) >= len(j.at) {
 				j.at = append(j.at, make([]int32, int(t)+1-len(j.at))...)
 			}
@@ -621,24 +618,8 @@ func (j *javaLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 // def records that node n defines v, unless v is -1.
 func (j *javaLower) def(n, v int32) {
 	if v >= 0 {
-		j.define(n, v)
+		j.b.Def(n, v)
 	}
-}
-
-// define makes node n define v. A node defines at most one variable, so a
-// node that already defines one, an arm's result node that is also an
-// assignment or a creation, may-defines v instead: v is a result variable
-// only the construct's own yielding nodes define, so the pairs are the same.
-func (j *javaLower) define(n, v int32) {
-	if int(n) >= len(j.defined) {
-		j.defined = append(j.defined, make([]bool, int(n)+1-len(j.defined))...)
-	}
-	if j.defined[n] {
-		j.b.MayDef(n, v)
-		return
-	}
-	j.b.Def(n, v)
-	j.defined[n] = true
 }
 
 // valueNode lowers n for its value and ends it with a Stmt node spanning n,
@@ -681,7 +662,7 @@ func (j *javaLower) arm(n *ts.Node) int32 {
 func (j *javaLower) hand(id int32, r int) {
 	j.reads = j.reads[:r]
 	res := j.b.Var()
-	j.define(id, res)
+	j.b.Def(id, res)
 	j.read(res)
 }
 
@@ -1063,7 +1044,7 @@ func (j *javaLower) stmt(n *ts.Node) {
 			// A yield hands its operand's value to the innermost switch
 			// expression.
 			if r := len(j.results); r > 0 {
-				j.define(id, j.results[r-1])
+				j.b.Def(id, j.results[r-1])
 			}
 			j.b.Break(yieldLabel)
 		}
@@ -1315,7 +1296,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	// The selector is evaluated once, at its node, which defines an owned
 	// variable every label and pattern variable node Uses.
 	sv := j.b.Var()
-	j.define(j.node(flow.Stmt, sel, m, len(j.reads)), sv)
+	j.b.Def(j.node(flow.Stmt, sel, m, len(j.reads)), sv)
 	j.reads = j.reads[:m]
 	var f flow.Frame
 	if expr {
@@ -1389,7 +1370,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			case c.KindId() == k.switchLabel:
 			case arrow && expr && c.KindId() == k.expressionStmt:
 				j.reset()
-				j.define(j.valueNode(firstNamed(c)), j.results[len(j.results)-1])
+				j.b.Def(j.valueNode(firstNamed(c)), j.results[len(j.results)-1])
 				j.b.Break(yieldLabel)
 			case arrow:
 				j.stmt(c)
@@ -1772,7 +1753,7 @@ func (j *javaLower) expr(n *ts.Node) int {
 			// where it decides the value.
 			r, res := len(j.reads), j.b.Var()
 			lo := j.keep(m, j.expr(left), and)
-			j.define(j.node(flow.Branch, left, r, len(j.reads)), res)
+			j.b.Def(j.node(flow.Branch, left, r, len(j.reads)), res)
 			j.reads = j.reads[:r]
 			mark := j.binds.mark()
 			j.scopePats(m, lo)
@@ -1780,7 +1761,7 @@ func (j *javaLower) expr(n *ts.Node) int {
 			j.conds = append(j.conds, len(j.reads))
 			id, mid := j.exprNode(right)
 			j.conds = j.conds[:len(j.conds)-1]
-			j.define(id, res)
+			j.b.Def(id, res)
 			end := j.keep(lo, mid, and)
 			j.b.Merge(p)
 			j.b.Pop(p)
@@ -1807,12 +1788,12 @@ func (j *javaLower) expr(n *ts.Node) int {
 		mark := j.binds.mark()
 		p := j.b.Push()
 		j.scopePats(m, mid)
-		j.define(j.arm(n.ChildByFieldId(k.fConsequence)), res)
+		j.b.Def(j.arm(n.ChildByFieldId(k.fConsequence)), res)
 		j.binds.truncate(mark)
 		t := j.b.Push()
 		j.b.Restore(p)
 		j.scopePats(mid, len(j.pats))
-		j.define(j.arm(n.ChildByFieldId(k.fAlternative)), res)
+		j.b.Def(j.arm(n.ChildByFieldId(k.fAlternative)), res)
 		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(p)
@@ -1884,7 +1865,7 @@ func (j *javaLower) expr(n *ts.Node) int {
 		// The tested value is evaluated once, at its node, which defines an
 		// owned variable the pattern variable nodes and the test Use.
 		tv := j.b.Var()
-		j.define(j.valueNode(left), tv)
+		j.b.Def(j.valueNode(left), tv)
 		r := len(j.reads)
 		j.read(tv)
 		j.bindPattern(p, r, len(j.reads))
