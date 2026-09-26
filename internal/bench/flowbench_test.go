@@ -189,14 +189,9 @@ func (ps parsers) get(t *testing.T, l lang.Language) *ts.Parser {
 	if p, ok := ps[l.Name]; ok {
 		return p
 	}
-	g, ok := worker.Grammar(l.Name)
-	if !ok {
-		t.Fatalf("language %s has no linked grammar", l.Name)
-	}
-	p := ts.NewParser()
-	if err := p.SetLanguage(g); err != nil {
-		p.Close()
-		t.Fatalf("set language %s: %v", l.Name, err)
+	p, err := worker.NewParser(l.Name)
+	if err != nil {
+		t.Fatal(err)
 	}
 	ps[l.Name] = p
 	return p
@@ -208,20 +203,13 @@ func (ps parsers) close() {
 	}
 }
 
-// parse parses src the way the worker does, in worker.ParseChunkBytes slices, and
-// returns the tree (nil when the parser produced none) and the bytes of the
-// C strings the binding copied the slices into: each slice plus its
-// terminator, the empty end-of-input slice included.
+// parse parses src through worker.Parse and returns the tree (nil when the
+// parser produced none) and the bytes of the C strings the binding copied
+// the slices into: each slice plus its terminator, the empty end-of-input
+// slice included.
 func parse(p *ts.Parser, src []byte) (*ts.Tree, int64) {
 	var copies int64
-	tree := p.ParseWithOptions(func(offset int, _ ts.Point) []byte {
-		var chunk []byte
-		if offset < len(src) {
-			chunk = src[offset:min(offset+worker.ParseChunkBytes, len(src))]
-		}
-		copies += int64(len(chunk)) + 1
-		return chunk
-	}, nil, nil)
+	tree := worker.Parse(p, src, func(chunk []byte) { copies += int64(len(chunk)) + 1 })
 	return tree, copies
 }
 

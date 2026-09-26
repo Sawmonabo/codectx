@@ -6,8 +6,8 @@
 // framed, language-neutral facts. It is started only through the shared
 // process runner, so its lifetime, environment and output are bounded there.
 //
-// Native lifecycle (go-tree-sitter v0.25.0, files read in full: parser.go,
-// tree.go, query.go, node.go, tree_cursor.go, language.go, allocator.go):
+// Native lifecycle (go-tree-sitter v0.25.0: parser.go, tree.go, query.go,
+// node.go, tree_cursor.go, language.go, allocator.go):
 // Parser.Close, Tree.Close, Query.Close and QueryCursor.Close free the C
 // objects; nothing is finalized by the garbage collector. Parsing uses
 // Parser.ParseWithOptions with a chunked read callback and nil options: the
@@ -44,7 +44,7 @@ const (
 )
 
 // Main runs the worker loop until stdin ends or ctx is done. It is the entry
-// the hidden `codectx __ts-worker` subcommand calls (ruling R8-1).
+// the hidden `codectx __ts-worker` subcommand calls.
 func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	w := &state{parsers: map[string]*ts.Parser{}, queries: map[string]*ts.Query{}}
 	defer w.close()
@@ -118,7 +118,7 @@ func (w *state) verify() error {
 		if !ok {
 			return fmt.Errorf("language %q is pinned but not linked", l.Name)
 		}
-		tl := ts.NewLanguage(g.language())
+		tl := g.tsLanguage()
 		if abi := tl.AbiVersion(); abi != l.ABI {
 			return fmt.Errorf("grammar %s has ABI %d, pinned %d", l.Name, abi, l.ABI)
 		}
@@ -146,12 +146,7 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	if err != nil {
 		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}, wire.MaxFactFrameBytes)
 	}
-	tree := parser.ParseWithOptions(func(offset int, _ ts.Point) []byte {
-		if offset >= len(src) {
-			return nil
-		}
-		return src[offset:min(offset+ParseChunkBytes, len(src))]
-	}, nil, nil)
+	tree := Parse(parser, src, nil)
 	if tree == nil {
 		parser.Reset()
 		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}, wire.MaxFactFrameBytes)
@@ -172,12 +167,10 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 
 // tools returns the language's parser and compiled query, creating them once.
 func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error) {
-	tl := ts.NewLanguage(g.language())
 	p, ok := w.parsers[l.Name]
 	if !ok {
-		p = ts.NewParser()
-		if err := p.SetLanguage(tl); err != nil {
-			p.Close()
+		var err error
+		if p, err = NewParser(l.Name); err != nil {
 			return nil, nil, err
 		}
 		w.parsers[l.Name] = p
@@ -185,13 +178,50 @@ func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error
 	q, ok := w.queries[l.Name]
 	if !ok {
 		var qerr *ts.QueryError
-		q, qerr = ts.NewQuery(tl, l.Query)
+		q, qerr = ts.NewQuery(g.tsLanguage(), l.Query)
 		if qerr != nil {
 			return nil, nil, fmt.Errorf("query pack %s: %s", l.Name, qerr.Error())
 		}
 		w.queries[l.Name] = q
 	}
 	return p, q, nil
+}
+
+// tsLanguage is g's parse-tree language, the one construction every parser,
+// query and lowering of g uses.
+func (g *grammar) tsLanguage() *ts.Language { return ts.NewLanguage(g.language()) }
+
+// NewParser returns a parser set to the pinned grammar of language; the
+// caller closes it.
+func NewParser(language string) (*ts.Parser, error) {
+	tl, ok := Grammar(language)
+	if !ok {
+		return nil, fmt.Errorf("language %q has no linked grammar", language)
+	}
+	p := ts.NewParser()
+	if err := p.SetLanguage(tl); err != nil {
+		p.Close()
+		return nil, fmt.Errorf("set language %s: %w", language, err)
+	}
+	return p, nil
+}
+
+// Parse parses src with p the way the worker does: through the read
+// callback in ParseChunkBytes slices, with nil options (see the package
+// comment). observe, when non-nil, sees every slice handed to the parser,
+// the empty end-of-input slice included. It returns nil when the parser
+// produced no tree.
+func Parse(p *ts.Parser, src []byte, observe func(chunk []byte)) *ts.Tree {
+	return p.ParseWithOptions(func(offset int, _ ts.Point) []byte {
+		var chunk []byte
+		if offset < len(src) {
+			chunk = src[offset:min(offset+ParseChunkBytes, len(src))]
+		}
+		if observe != nil {
+			observe(chunk)
+		}
+		return chunk
+	}, nil, nil)
 }
 
 // emitter writes fact frames, dropping a record whose encoding would exceed
