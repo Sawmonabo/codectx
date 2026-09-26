@@ -374,7 +374,8 @@ function of the file's bytes.
 - `MaxWorkers` bounds live worker *processes*, not concurrent parses: a worker
   occupies its place in the pool from before it is started until the runner has
   reaped it, so an idle worker and one still shutting down both still count. A
-  unit reuses an idle worker, starts one when the pool is under its bound, or
+  unit reuses an idle worker while no reserver waits on the admission ledger
+  (see Launch), starts one when the pool is under its bound, or
   waits (promptly returning on cancellation) until a worker goes idle or a
   process exits; it then reads the hello under the hang detector below. A worker stays warm
   only while there is parse work in flight: the last unit to finish drains the
