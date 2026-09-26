@@ -89,7 +89,7 @@ and the product must turn that into facts without holding it in heap. A native e
 the staging database, its 256 MiB cache, its pool, its lock, its retirement rule and the paced
 reclamation of its freed gigabytes all have no native equivalent.
 
-Accounting: `internal/provider/dependence/neo4jcsv` is 3,446 non-test Go lines + 1,428 test lines
+Accounting: `internal/provider/dependence/graphcsv` is 3,446 non-test Go lines + 1,428 test lines
 = 4,874 lines of package source (plus 99 lines of Go fixture source under its `testdata/` tree). A
 native engine **deletes** it, except for the 339-line fact-key comparator, which relocates because it
 is what the differential oracle is built on. The honest credit is therefore **4,535 lines**, and it

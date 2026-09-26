@@ -151,7 +151,7 @@ var indexChecks = []check{
 }
 
 // engineFrontends are the engine's own spellings for the parser of each
-// language family, matching internal/provider/dependence/joern. The engine
+// language family, matching internal/provider/dependence/graphengine. The engine
 // covers all nine languages through six frontends.
 var engineFrontends = []struct {
 	frontend  string

@@ -1,4 +1,4 @@
-package joern
+package graphengine
 
 import (
 	"os"

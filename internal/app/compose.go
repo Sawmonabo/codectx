@@ -28,7 +28,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/joern"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphengine"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
@@ -1029,10 +1029,10 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 	// force-offline resolver, which would report a merely-uninstalled payload
 	// as CTX_TOOL_OFFLINE and tell an operator to turn off an offline mode
 	// they never enabled.
-	locator, err := joern.NewLocator(s.resolver)
+	locator, err := graphengine.NewLocator(s.resolver)
 	if err == nil {
-		var backend *joern.Backend
-		if backend, err = joern.New(ctx, locator, runner); err == nil {
+		var backend *graphengine.Backend
+		if backend, err = graphengine.New(ctx, locator, runner); err == nil {
 			var p *dependence.Provider
 			p, err = dependence.New(backend, dependence.Options{
 				DataDir:              s.dataDir,

@@ -18,7 +18,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -330,7 +330,7 @@ type ImportOptions struct {
 	// PreviousKeys is the fact key set the sealed unit this run refreshes
 	// published. The zero value is the absent set and means a full import:
 	// every relation is published and nothing of a predecessor is carried.
-	PreviousKeys neo4jcsv.KeySet
+	PreviousKeys graphcsv.KeySet
 	// KeysPath is the absolute path this run's fresh key set is written to,
 	// so the caller can store it with the unit it describes. Empty writes it
 	// beside the import's staging database, which is deleted with it — which
@@ -347,8 +347,8 @@ type ImportOptions struct {
 // of such a unit is a full import.
 type Report struct {
 	Result model.ProviderResult
-	Keys   neo4jcsv.KeySet
-	Delta  neo4jcsv.Delta
+	Keys   graphcsv.KeySet
+	Delta  graphcsv.Delta
 }
 
 // IndexUnit is the full-import form of Import, which is what the
@@ -509,7 +509,7 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 	}
 	slog.Info("dependence unit imported", fields...)
 	return Report{Result: result, Keys: report.Keys,
-		Delta: neo4jcsv.Delta{Changed: report.Changed, Unchanged: report.Unchanged, Removed: report.Removed}}, nil
+		Delta: graphcsv.Delta{Changed: report.Changed, Unchanged: report.Unchanged, Removed: report.Removed}}, nil
 }
 
 // unitFor re-derives the plan from the pinned snapshot and returns the unit
@@ -1027,7 +1027,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	// is attributed to it: Go has no per-goroutine CPU and a share of the
 	// process counters would be a guess.
 	ctx, span := ledger.Start(ctx, stageImport, unit.ScopeKey)
-	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
+	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, graphcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
@@ -1260,7 +1260,7 @@ func merge(a, b ImportReport) ImportReport {
 	a.OverStagedRows = a.OverStagedRows || b.OverStagedRows
 	a.DerivedRows += b.DerivedRows
 	a.OverDerivedRows = a.OverDerivedRows || b.OverDerivedRows
-	a.Keys = neo4jcsv.KeySet{}
+	a.Keys = graphcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
 			a.UnknownLabels = map[string]int{}

@@ -1,4 +1,4 @@
-package joern
+package graphengine
 
 // Diagnostic classification. Every pattern below was taken from Joern 4.0.627
 // itself — from runs against real fixtures, or from the release's own payload

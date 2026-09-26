@@ -1,4 +1,4 @@
-// Package joern is the Joern backend of the dependence provider: the one
+// Package graphengine is the dependence provider's engine backend: the one
 // place in the product that knows which code-property-graph engine produces
 // the facts, what its command line looks like, how its heap cap is placed and
 // what its diagnostics mean. Everything outside this package, the tool lock
@@ -18,7 +18,7 @@
 // exports, not that two runs of one are equal. `--repr=pdg|cdg|ddg` is not
 // implemented for CSV or GraphML in this release, and the single `all` export
 // already carries every edge family the provider imports.
-package joern
+package graphengine
 
 import (
 	"bytes"

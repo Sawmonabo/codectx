@@ -1,4 +1,4 @@
-package neo4jcsv_test
+package graphcsv_test
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	arena "github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -138,12 +138,12 @@ func (r recorder) PutAliases(ctx context.Context, a []model.NativeAlias) error {
 	return r.Sink.PutAliases(ctx, a)
 }
 
-func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Report, counts, model.UnitState, error) {
+func run(t *testing.T, src, export string, opts graphcsv.Options) (graphcsv.Report, counts, model.UnitState, error) {
 	t.Helper()
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
 	c := newCounts()
-	var rep neo4jcsv.Report
+	var rep graphcsv.Report
 	var importErr error
 	p := providertest.Func{
 		Desc: descriptor(),
@@ -155,7 +155,7 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 			if o.ScratchDir == "" {
 				o.ScratchDir = t.TempDir()
 			}
-			rep, importErr = neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o)
+			rep, importErr = graphcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o)
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
 			}
@@ -209,13 +209,13 @@ func TestImport(t *testing.T) {
 		name   string
 		src    string
 		export string
-		check  func(t *testing.T, rep neo4jcsv.Report, c counts)
+		check  func(t *testing.T, rep graphcsv.Report, c counts)
 	}{{
 		// Failure mode: a frontend's write lowering is not understood and the
 		// unit publishes no reads/writes at all, silently losing the only
 		// honest source of write facts (no SCIP indexer sets a write role).
 		name: "c reads and writes", src: "src/c", export: "c",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
 			// `s->f = 3` writes the member the base type declares, and the
 			// `<global> g` closure binding makes the flow a capture.
@@ -237,17 +237,17 @@ func TestImport(t *testing.T) {
 		},
 	}, {
 		name: "go reads and writes", src: "src/golang", export: "golang",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
 		},
 	}, {
 		name: "java reads and writes", src: "src/javasrc", export: "javasrc",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
 		},
 	}, {
 		name: "javascript reads and writes", src: "src/jssrc", export: "jssrc",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo, model.RelMayReferTo)
 			// Failure mode: a destructuring or computed target is published as
 			// a precise write against a guessed declaration.
@@ -271,7 +271,7 @@ func TestImport(t *testing.T) {
 		},
 	}, {
 		name: "python reads and writes", src: "src/pythonsrc", export: "pythonsrc",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo, model.RelMayReferTo)
 		},
 	}, {
@@ -279,7 +279,7 @@ func TestImport(t *testing.T) {
 		// a fact instead of being counted. The Rust export's CONFIG_FILE row
 		// (its Cargo.toml) is the real unmapped label.
 		name: "rust reads and writes, unknown label counted", src: "src/rust", export: "rust",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
 			if rep.UnknownLabels["CONFIG_FILE"] != 1 {
 				t.Errorf("unknown labels = %v; the export's CONFIG_FILE row must be counted, not emitted", rep.UnknownLabels)
@@ -294,7 +294,7 @@ func TestImport(t *testing.T) {
 		// edges_* file sorts before every nodes_* file, so every relation here
 		// was staged before its endpoints' rows were read.
 		name: "calls and control dependence", src: "src/gofix", export: "gofix",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			wantRelations(t, c, model.RelCalls, model.RelControlDependsOn, model.RelDataFlowsTo,
 				model.RelReads, model.RelWrites)
 			if c.detail["cdg"] == 0 || c.detail["call"] == 0 {
@@ -309,7 +309,7 @@ func TestImport(t *testing.T) {
 		// `f`, never to `helper`, so the dependence on `helper` exists only as
 		// the flow of the method value into the name that is called.
 		name: "javascript method reached through a value", src: "src/jsvalue", export: "jsvalue",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
 				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
 			}
@@ -344,7 +344,7 @@ func TestImport(t *testing.T) {
 		// Same shape in Python, where the export binds the call site to
 		// nothing at all rather than to an invented callee.
 		name: "python method reached through a value", src: "src/pyvalue", export: "pyvalue",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
 				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
 			}
@@ -358,19 +358,19 @@ func TestImport(t *testing.T) {
 		// name. The export is the same module parsed without its second
 		// package, so helper.Scale is a real IS_EXTERNAL stub.
 		name: "external declaration kept and aliased", src: "src/goapp", export: "goapp",
-		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			if rep.ExternalMethods != 1 {
 				t.Errorf("external methods = %d, want 1", rep.ExternalMethods)
 			}
 			wantRelations(t, c, model.RelCalls)
-			if _, ok := c.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]; !ok {
+			if _, ok := c.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]; !ok {
 				t.Errorf("the external declaration was not aliased by full name; aliases = %v", keysOf(c.alias))
 			}
 		},
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rep, c, state, err := run(t, filepath.Join("testdata", tc.src), filepath.Join("testdata", tc.export), neo4jcsv.Options{Language: "go"})
+			rep, c, state, err := run(t, filepath.Join("testdata", tc.src), filepath.Join("testdata", tc.export), graphcsv.Options{Language: "go"})
 			if err != nil {
 				t.Fatalf("Import: %v", err)
 			}
@@ -401,7 +401,7 @@ func TestImportRefusesMalformedExport(t *testing.T) {
 			// here rather than committed so the fixture stays small.
 			return append(data, []byte("\n1,CALL,-1,,,\""+strings.Repeat("x", 4*int(providertest.Limits.MaxRecordBytes))+"\",1,STATIC_DISPATCH,,1,<operator>.assignment,a,,,1,,,,ANY\n")...)
 		})
-		_, _, state, err := run(t, filepath.Join("testdata", "src", "c"), dir, neo4jcsv.Options{Language: "c"})
+		_, _, state, err := run(t, filepath.Join("testdata", "src", "c"), dir, graphcsv.Options{Language: "c"})
 		var typed *model.Error
 		if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
 			t.Fatalf("err = %v, want %s", err, model.CodeResourceLimit)
@@ -445,7 +445,7 @@ func TestOversizeDescriptiveFieldIsCutNotDropped(t *testing.T) {
 		return bytes.Replace(data, []byte(`"void(S*,int*,int)"`),
 			[]byte(strings.Repeat("x", oversize)), 1)
 	})
-	rep, c, _, err := run(t, filepath.Join("testdata", "src", "c"), dir, neo4jcsv.Options{Language: "c"})
+	rep, c, _, err := run(t, filepath.Join("testdata", "src", "c"), dir, graphcsv.Options{Language: "c"})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -472,12 +472,12 @@ func TestImportDelta(t *testing.T) {
 	base := filepath.Join(dir, "base")
 	again := filepath.Join(dir, "again")
 	rep1, _, _, err := run(t, filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix"),
-		neo4jcsv.Options{Language: "go", KeysPath: base})
+		graphcsv.Options{Language: "go", KeysPath: base})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
 	rep2, _, _, err := run(t, filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix"),
-		neo4jcsv.Options{Language: "go", KeysPath: again})
+		graphcsv.Options{Language: "go", KeysPath: again})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -485,12 +485,12 @@ func TestImportDelta(t *testing.T) {
 		t.Fatalf("two imports of one export produced different key sets (%d and %d keys)", rep1.Keys.Count(), rep2.Keys.Count())
 	}
 
-	prev, err := neo4jcsv.LoadKeySet(base)
+	prev, err := graphcsv.LoadKeySet(base)
 	if err != nil {
 		t.Fatalf("LoadKeySet: %v", err)
 	}
 	rep3, c, state, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
-		neo4jcsv.Options{Language: "go", PreviousKeys: prev, KeysPath: filepath.Join(dir, "edit")})
+		graphcsv.Options{Language: "go", PreviousKeys: prev, KeysPath: filepath.Join(dir, "edit")})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -513,7 +513,7 @@ func TestImportDelta(t *testing.T) {
 		t.Fatalf("the fixture edit removed no key; it no longer covers the unfiltered case")
 	}
 	_, full, _, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
-		neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "full")})
+		graphcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "full")})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestImportDelta(t *testing.T) {
 // descriptor is the provider identity the import is driven under. The
 // capabilities are the relation kinds this package publishes.
 func descriptor() model.ProviderDescriptor {
-	return model.ProviderDescriptor{ID: neo4jcsv.ProviderID, Version: "test-1",
+	return model.ProviderDescriptor{ID: graphcsv.ProviderID, Version: "test-1",
 		Capabilities:      []string{"control_depends_on", "data_flows_to", "reads", "writes", "calls"},
 		InvalidationScope: model.InvalidationPackage}
 }
@@ -553,10 +553,10 @@ func TestImportConformsUnderPerPutFlush(t *testing.T) {
 	p := providertest.Func{
 		Desc: descriptor(),
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-			o := neo4jcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
+			o := graphcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
 				Limits: providertest.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit,
 				Run: req.Run, Content: req.Content, ScratchDir: t.TempDir()}
-			rep, err := neo4jcsv.Import(ctx, export, req.Resolver, sink, o)
+			rep, err := graphcsv.Import(ctx, export, req.Resolver, sink, o)
 			if err != nil {
 				return model.ProviderResult{}, err
 			}
@@ -594,10 +594,10 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 			for i := range part {
 				nodes, aliases := nodesSoFar(), c.aliasN
-				o := neo4jcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
+				o := graphcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
 					Limits: providertest.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit,
 					Run: req.Run, Content: req.Content, ScratchDir: t.TempDir()}
-				if _, err := neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o); err != nil {
+				if _, err := graphcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o); err != nil {
 					return model.ProviderResult{}, err
 				}
 				part[i].nodes, part[i].aliases = nodesSoFar()-nodes, c.aliasN-aliases
@@ -620,7 +620,7 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	}
 }
 
-func runFiles(t *testing.T, files map[string]string, export string) (neo4jcsv.Report, counts, model.UnitState, error) {
+func runFiles(t *testing.T, files map[string]string, export string) (graphcsv.Report, counts, model.UnitState, error) {
 	t.Helper()
 	dir := t.TempDir()
 	for p, body := range files {
@@ -628,7 +628,7 @@ func runFiles(t *testing.T, files map[string]string, export string) (neo4jcsv.Re
 			t.Fatal(err)
 		}
 	}
-	return run(t, dir, export, neo4jcsv.Options{Language: "c"})
+	return run(t, dir, export, graphcsv.Options{Language: "c"})
 }
 
 // copyExport copies an export directory, letting rewrite alter one file.
@@ -705,7 +705,7 @@ func TestRelationKeyTracksItsEndpoints(t *testing.T) {
 	src := filepath.Join("testdata", "src", "gofix")
 	basePath := filepath.Join(dir, "base")
 	_, base, _, err := run(t, src, filepath.Join("testdata", "gofix"),
-		neo4jcsv.Options{Language: "go", KeysPath: basePath})
+		graphcsv.Options{Language: "go", KeysPath: basePath})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -724,7 +724,7 @@ func TestRelationKeyTracksItsEndpoints(t *testing.T) {
 	if moved != 1 {
 		t.Fatalf("the callee declaration row was rewritten %d times, want exactly 1; the fixture's columns moved", moved)
 	}
-	mutRep, mut, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "moved")})
+	mutRep, mut, state, err := run(t, src, export, graphcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "moved")})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -734,10 +734,10 @@ func TestRelationKeyTracksItsEndpoints(t *testing.T) {
 
 	// Precondition: moving the declaration moves the callee's published
 	// identity, and nothing else. The workspace alias is the cross-run handle.
-	scaleBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
-	scaleMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
-	runBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
-	runMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
+	scaleBase := base.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	scaleMut := mut.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	runBase := base.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/app.Run"]
+	runMut := mut.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/app.Run"]
 	if scaleBase == "" || scaleMut == "" || runBase == "" || runMut == "" {
 		t.Fatalf("the fixture did not publish both declarations: Scale %q/%q, Run %q/%q", scaleBase, scaleMut, runBase, runMut)
 	}
@@ -765,7 +765,7 @@ func TestRelationKeyTracksItsEndpoints(t *testing.T) {
 	}
 
 	// The leg storage consumes: the refresh must report those keys changed.
-	prev, err := neo4jcsv.LoadKeySet(basePath)
+	prev, err := graphcsv.LoadKeySet(basePath)
 	if err != nil {
 		t.Fatalf("LoadKeySet: %v", err)
 	}
@@ -816,7 +816,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	h := providertest.New(t, files)
 
 	baseKeys := filepath.Join(dir, "carry-base")
-	base, baseRep := imports(t, baseExport, neo4jcsv.Options{Language: "go", KeysPath: baseKeys})
+	base, baseRep := imports(t, baseExport, graphcsv.Options{Language: "go", KeysPath: baseKeys})
 	baseUnit := h.Plan(t, base, "pkg:fixture", paths)
 	res, err := provider.RunUnit(ctx, base, baseUnit.Request, h.Begin(t, baseUnit, paths), providertest.Limits, h.Pool)
 	if err != nil {
@@ -826,7 +826,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 		t.Fatalf("CompleteProviderRun: %v", err)
 	}
 
-	prev, err := neo4jcsv.LoadKeySet(baseKeys)
+	prev, err := graphcsv.LoadKeySet(baseKeys)
 	if err != nil {
 		t.Fatalf("LoadKeySet: %v", err)
 	}
@@ -839,7 +839,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	}
 	h.Gen = gen
 
-	refresh, refreshRep := imports(t, mutExport, neo4jcsv.Options{Language: "go",
+	refresh, refreshRep := imports(t, mutExport, graphcsv.Options{Language: "go",
 		KeysPath: filepath.Join(dir, "carry-refresh"), PreviousKeys: prev})
 	refreshPaths := append(slices.Clone(paths), marker)
 	refreshUnit := h.Plan(t, refresh, "pkg:fixture", refreshPaths)
@@ -849,7 +849,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	}
 
 	var stats sqlite.CarryOverStats
-	var delta neo4jcsv.Delta
+	var delta graphcsv.Delta
 	var diffErr error
 	out := &carryOut{UnitWriter: w, store: h.Store, carry: func(ctx context.Context, w *sqlite.UnitWriter) error {
 		fresh := refreshRep.Keys
@@ -902,13 +902,13 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	}
 }
 
-// imports is one provider whose whole index is a neo4jcsv import of export,
+// imports is one provider whose whole index is a graphcsv import of export,
 // plus the report it produced. The report is read after RunUnit returns, or
 // inside the seal the caller wraps around it.
-func imports(t *testing.T, export string, opts neo4jcsv.Options) (provider.Provider, *neo4jcsv.Report) {
+func imports(t *testing.T, export string, opts graphcsv.Options) (provider.Provider, *graphcsv.Report) {
 	t.Helper()
 	projectRoot := t.TempDir()
-	rep := new(neo4jcsv.Report)
+	rep := new(graphcsv.Report)
 	p := providertest.Func{
 		Desc: descriptor(),
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
@@ -916,7 +916,7 @@ func imports(t *testing.T, export string, opts neo4jcsv.Options) (provider.Provi
 			o.UnitScopeKey, o.ProjectRoot = req.Unit.ScopeKey, projectRoot
 			o.Limits = providertest.Limits
 			o.Repository, o.Unit, o.Run, o.Content = req.Binding.RepositoryID, req.Unit, req.Run, req.Content
-			r, err := neo4jcsv.Import(ctx, export, req.Resolver, sink, o)
+			r, err := graphcsv.Import(ctx, export, req.Resolver, sink, o)
 			if err != nil {
 				return model.ProviderResult{}, err
 			}
@@ -972,7 +972,7 @@ func (o *carryOut) Seal(ctx context.Context) error {
 // posture forbids, and neither shows in any other assertion.
 func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
-	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	whole, _, _, err := run(t, src, export, graphcsv.Options{Language: "go"})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -982,7 +982,7 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	if whole.OverStagedRows {
 		t.Fatalf("an import with no max_staged_rows reported crossing one")
 	}
-	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxStagedRows: 1})
+	bounded, _, state, err := run(t, src, export, graphcsv.Options{Language: "go", MaxStagedRows: 1})
 	if err != nil {
 		t.Fatalf("an import over max_staged_rows must not fail the unit: %v", err)
 	}
@@ -1006,7 +1006,7 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 // of 1 leaves two occurrences and every published relation behind it.
 func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
-	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	whole, _, _, err := run(t, src, export, graphcsv.Options{Language: "go"})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -1016,7 +1016,7 @@ func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	if whole.OverDerivedRows {
 		t.Fatalf("an import with no max_derived_rows reported crossing one")
 	}
-	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxDerivedRows: 1})
+	bounded, _, state, err := run(t, src, export, graphcsv.Options{Language: "go", MaxDerivedRows: 1})
 	if err != nil {
 		t.Fatalf("an import over max_derived_rows must not fail the unit: %v", err)
 	}
@@ -1073,7 +1073,7 @@ func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
 		return info.Size()
 	}
 
-	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), graphcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("first import: %v", err)
 	}
 	first := staged()
@@ -1085,7 +1085,7 @@ func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
 		t.Fatalf("the first import left an empty staging database: nothing was staged in it")
 	}
 
-	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), graphcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("second import: %v", err)
 	}
 	second := staged()
@@ -1127,13 +1127,13 @@ func TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool(t *testing.T) {
 	}
 
 	src, export := filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c")
-	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err == nil {
+	if _, _, _, err := run(t, src, export, graphcsv.Options{Language: "c", ScratchDir: dir}); err == nil {
 		t.Fatal("the import staged into a file that is not a database and reported success")
 	}
 	if _, err := os.Stat(poisoned); !os.IsNotExist(err) {
 		t.Fatalf("the surface that could not be emptied is still in the pool: %v", err)
 	}
-	if _, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
+	if _, _, _, err := run(t, src, export, graphcsv.Options{Language: "c", ScratchDir: dir}); err != nil {
 		t.Fatalf("the next import was handed the same unusable surface: %v", err)
 	}
 }
@@ -1158,7 +1158,7 @@ func TestAFileTheExportDidNotReadIsCounted(t *testing.T) {
 		}
 	}
 	java := func(fv model.FileVersion) bool { return strings.HasSuffix(fv.Path, ".java") }
-	rep, _, state, err := run(t, dir, filepath.Join("testdata", "javasrc"), neo4jcsv.Options{Language: "java", Expected: java})
+	rep, _, state, err := run(t, dir, filepath.Join("testdata", "javasrc"), graphcsv.Options{Language: "java", Expected: java})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}

@@ -1,7 +1,7 @@
-// Package neo4jcsv imports one dependence-engine graph export into provider
+// Package graphcsv imports one dependence-engine graph export into provider
 // facts.
 //
-// The engine writes a whole-unit export as a directory of Neo4j bulk-import
+// The engine writes a whole-unit export as a directory of graph bulk-import
 // CSV: one `nodes_<LABEL>_header.csv` / `nodes_<LABEL>_data.csv` pair per node
 // label and one `edges_<TYPE>_header.csv` / `edges_<TYPE>_data.csv` pair per
 // edge type, beside `*_cypher.csv` load scripts that are not data. Node ids
@@ -30,7 +30,7 @@
 //
 // The engine's name appears nowhere in this package: not in an identifier, a
 // native key, an evidence detail or an error message.
-package neo4jcsv
+package graphcsv
 
 import (
 	"context"

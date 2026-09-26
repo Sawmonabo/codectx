@@ -2409,7 +2409,7 @@ internal/provider/treesitter/languages/  pinned grammar and query packs
 internal/provider/scip/            wire import, aliases, source binding, profiles
 internal/provider/lsp/             bounded client, manager, snapshot-qualified overlay
 internal/provider/dependence/      frontend-native units, graph cache, streaming CSV import and normalization
-internal/provider/dependence/joern/  pinned engine argv, stderr parsing, label map
+internal/provider/dependence/graphengine/  pinned engine argv, stderr parsing, label map
 internal/toolchain/                embedded tool lock, verified fetch, atomic store, resolver, runtime launchers
 internal/tools/toollock/           release-time lock and payload generator
 internal/reconcile/                deterministic canonical resolution and lineage
@@ -2782,7 +2782,7 @@ git diff --check
 
 **Deliverable:** A real version-pinned parse/export/import path providing evidence-supported control-dependence, data-dependence and fallback call facts per frontend-native unit, extraction-lazy and cached, with independent resource/failure and partial-analysis reporting, and no engine name on any product surface.
 
-**Files and ownership:** `internal/provider/dependence/` (provider, units, cache, CSV import, emit) with the engine adapter in `internal/provider/dependence/joern/`, small Neo4j CSV fixtures, `docs/providers-dependence.md`.
+**Files and ownership:** `internal/provider/dependence/` (provider, units, cache, CSV import, emit) with the engine adapter in `internal/provider/dependence/graphengine/`, small Neo4j CSV fixtures, `docs/providers-dependence.md`.
 
 **Dependencies / consumes:** Task 6 runner/resolver; Task 4 private materialization; completed structural runtime dependencies from Tasks 7–8; Task 22 `toolchain.Resolver` for the engine and its JDK.
 
@@ -3088,9 +3088,9 @@ because each row builds a real workspace and spawns real parser workers.
 
 **Deliverable:** Every SCIP, LSP, and dependence profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
 
-**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/dependence/joern/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
+**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/dependence/graphengine/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
 
-**Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`, `dependence/joern` tool resolution); `model.Error` codes; `lang.Of`.
+**Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`, `dependence/graphengine` tool resolution); `model.Error` codes; `lang.Of`.
 
 **Produces / contract:**
 
@@ -3162,7 +3162,7 @@ type ToolOverride struct {
 }
 ```
 
-Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Tool}` with `profileKinds` extended to `scip-python` (triggers `pyproject.toml`, `setup.py`, `requirements.txt`, `setup.cfg`), `rust-analyzer` (trigger `Cargo.toml`, argv `scip ${input_dir} --output ${output_file}`), and `scip-clang` (trigger `compile_commands.json`, argv `--compdb-path ${input_dir}/compile_commands.json --index-output-path ${output_file}`); each profile carries its fixed argv, env allowlist, budgets, timeout, and network posture as Go values, verified against the real tool in this task. `lsp.Trusted(cfg, name)` becomes `lsp.Resolve(ctx, resolver, cfg, name)`; `dependence/joern` resolves its `Parse`/`Export` tools through `resolver.Resolve(ctx, "joern")` with `Parse`/`Export` tools from the `joern` entry under the `jdk` runtime. `provider.Detection.DiagnosticCode` carries the `CTX_TOOL_*` reason when a tool cannot be resolved, so `status`/`doctor` name the exact cause.
+Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Tool}` with `profileKinds` extended to `scip-python` (triggers `pyproject.toml`, `setup.py`, `requirements.txt`, `setup.cfg`), `rust-analyzer` (trigger `Cargo.toml`, argv `scip ${input_dir} --output ${output_file}`), and `scip-clang` (trigger `compile_commands.json`, argv `--compdb-path ${input_dir}/compile_commands.json --index-output-path ${output_file}`); each profile carries its fixed argv, env allowlist, budgets, timeout, and network posture as Go values, verified against the real tool in this task. `lsp.Trusted(cfg, name)` becomes `lsp.Resolve(ctx, resolver, cfg, name)`; `dependence/graphengine` resolves its `Parse`/`Export` tools through `resolver.Resolve(ctx, "joern")` with `Parse`/`Export` tools from the `joern` entry under the `jdk` runtime. `provider.Detection.DiagnosticCode` carries the `CTX_TOOL_*` reason when a tool cannot be resolved, so `status`/`doctor` name the exact cause.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Read all three profile files, their run/open paths, `config.Analyzer` and every consumer, `process.Runner`, the confined opener, and `snapshot` materialization in full. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum test set.** Four critical invariants, one table test each: a payload whose SHA-256 or size disagrees with the lock is neither extracted nor executed and leaves no store directory; an archive containing an absolute path, `..`, a symlink escaping the payload, a hard link, or more files/bytes than declared is rejected before any byte lands outside staging; `Offline: true` resolves a missing tool to `CTX_TOOL_OFFLINE` without a dial (use an `http.Transport` whose `DialContext` fails the test); a store directory without `.complete`, or whose `entry` hash disagrees with `entry_sha256`, is invisible and repaired by a fresh install. Serve fixtures from `httptest` with a two-file tarball built in the test; no real download in unit tests.

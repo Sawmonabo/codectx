@@ -1,6 +1,6 @@
 //go:build linux
 
-package neo4jcsv_test
+package graphcsv_test
 
 import (
 	"context"
@@ -17,7 +17,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 )
 
@@ -350,16 +350,16 @@ func TestImportWritesAreProportionalToTheExport(t *testing.T) {
 		}
 		samples = append(samples, sample{phase, procIO(t, "wchar"), procIO(t, "write_bytes"), stage, time.Now()})
 	}
-	var rep neo4jcsv.Report
+	var rep graphcsv.Report
 	var importErr error
 	p := providertest.Func{
 		Desc: descriptor(),
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, _ provider.Sink) (model.ProviderResult, error) {
-			o := neo4jcsv.Options{UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(), Limits: providertest.Limits,
+			o := graphcsv.Options{UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(), Limits: providertest.Limits,
 				Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run, Content: req.Content,
 				ScratchDir: scratch, OnPhase: mark, StagingCacheKiB: envInt(t, "CODECTX_DEPENDENCE_CACHE_KIB", 2048)}
 			mark("start")
-			rep, importErr = neo4jcsv.Import(ctx, export, req.Resolver, sink, o)
+			rep, importErr = graphcsv.Import(ctx, export, req.Resolver, sink, o)
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
 			}

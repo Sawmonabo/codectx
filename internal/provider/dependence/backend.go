@@ -4,7 +4,7 @@
 // code-property-graph engine that runs one frontend-native project at a time.
 //
 // The engine is a backend, not a product surface. Nothing outside the
-// dependence/joern subpackage, docs/providers-dependence.md and the tool lock
+// dependence/graphengine subpackage, docs/providers-dependence.md and the tool lock
 // names it: the provider id is `dependence`, the configuration table is
 // `[providers.dependence]`, the capabilities are control_depends_on,
 // data_flows_to, reads, writes and calls, and the evidence details are cdg,
@@ -25,7 +25,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 )
 
 // Engine identifies the resolved analysis payload. Version and Digest are the
@@ -208,25 +208,25 @@ var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyP
 // from it could satisfy the reader's own validation. ImportReport is an alias, so
 // there is exactly one definition of an import's results and Importer is
 // satisfiable by the reader as written; Importer's own options parameter
-// names neo4jcsv.Options for the same reason.
+// names graphcsv.Options for the same reason.
 //
 // The export format is not the engine. The engine's dialect lives behind
-// Backend; neo4jcsv reads the bulk-import CSV the export step writes and
+// Backend; graphcsv reads the bulk-import CSV the export step writes and
 // names nothing of the engine, which is why this package may depend on it.
 //
 // The fact key set has no alias of its own: the delta API this package
-// exposes (ImportOptions.PreviousKeys, Report.Keys) names neo4jcsv.KeySet
+// exposes (ImportOptions.PreviousKeys, Report.Keys) names graphcsv.KeySet
 // directly, and a second spelling one function away from it is the drift this
 // comment warns about.
 
 // ImportReport is what one import published and what it refused.
-type ImportReport = neo4jcsv.Report
+type ImportReport = graphcsv.Report
 
 // Importer streams one export into the sink. It is an interface so a test can
 // drive the provider's failure paths without an engine; the production
 // binding is defaultImporter, which New uses.
 type Importer interface {
-	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error)
+	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts graphcsv.Options) (ImportReport, error)
 }
 
 // defaultImporter is the production importer: the export reader itself. The
@@ -238,8 +238,8 @@ type Importer interface {
 type defaultImporter struct{}
 
 func (defaultImporter) Import(ctx context.Context, exportDir string, res provider.Resolver,
-	sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error) {
-	return neo4jcsv.Import(ctx, exportDir, res, sink, opts)
+	sink provider.Sink, opts graphcsv.Options) (ImportReport, error) {
+	return graphcsv.Import(ctx, exportDir, res, sink, opts)
 }
 
 func invalid(msg string) *model.Error {

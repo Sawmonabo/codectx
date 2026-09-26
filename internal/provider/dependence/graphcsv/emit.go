@@ -1,4 +1,4 @@
-package neo4jcsv
+package graphcsv
 
 import (
 	"bytes"

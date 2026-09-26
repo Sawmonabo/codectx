@@ -116,7 +116,7 @@ grammar registrations (from eight pinned grammar modules) are already pinned.
 
 ## What it deletes
 
-`internal/provider/dependence/neo4jcsv` — 4,874 lines of package source (3,446 non-test + 1,428 test),
+`internal/provider/dependence/graphcsv` — 4,874 lines of package source (3,446 non-test + 1,428 test),
 of which **339 relocate rather than die** (the fact-key comparator the oracle is built on), for a net
 credit of **4,535** (`15-requirements-audit.md`) — plus the staging database, its 256 MiB cache, its scratch pool, its
 exclusive lock, its retirement rule, the paced reclamation of its freed gigabytes, the six engine

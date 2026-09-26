@@ -55,7 +55,7 @@ respectively and no subdirectories, so the enumeration is exhaustive, not a samp
 ## 2. The row every Base and TypeRelations pass gets
 
 `Scala main lines at the tag` is `wc -l` on the file, measured for this document. `staged by the
-product?` is read from the label sets in `internal/provider/dependence/neo4jcsv/scratch.go:44-82`.
+product?` is read from the label sets in `internal/provider/dependence/graphcsv/scratch.go:44-82`.
 `Go estimate` is for a native implementation over a tree-sitter CST, which gets none of the graph the
 Scala pass rides on.
 
@@ -528,4 +528,4 @@ filename itself carries a vendor token, the right-hand column names the role ins
 | the export driver, `--repr`/`--format` dispatch | "the export driver, at the tag" |
 
 Product citations carry no vendor token and are used as written: `scratch.go`, `rw.go`, `csv.go`,
-`neo4jcsv.go`, all under `internal/provider/dependence/neo4jcsv/`.
+`neo4jcsv.go`, all under `internal/provider/dependence/graphcsv/`.

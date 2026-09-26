@@ -10,7 +10,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -136,7 +136,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			}
 			b.res.Delta = Stats{Changed: int64(d.Changed), Unchanged: int64(d.Unchanged), Removed: int64(d.Removed)}
 
-			// filtered mirrors neo4jcsv.deltaFilter over what this build
+			// filtered mirrors graphcsv.deltaFilter over what this build
 			// actually passed: only then did the import leave the unchanged
 			// relations, and the facts that name no file, unpublished.
 			b.res.Filtered = supplied && d.Removed == 0
@@ -244,7 +244,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 // would turn a recoverable state into a failed capability. The returned reason
 // says which it was, so a coordinator can tell an invalidated predecessor from
 // one that never existed.
-func (a *dependenceApplier) previous(ctx context.Context, req Request, dir string) (*neo4jcsv.KeySet, string, error) {
+func (a *dependenceApplier) previous(ctx context.Context, req Request, dir string) (*graphcsv.KeySet, string, error) {
 	if req.Previous == "" {
 		return nil, FullNoPredecessor, nil
 	}
@@ -255,7 +255,7 @@ func (a *dependenceApplier) previous(ctx context.Context, req Request, dir strin
 	if keysFile == "" {
 		return nil, FullNoState, nil
 	}
-	keys, err := neo4jcsv.LoadKeySet(keysFile)
+	keys, err := graphcsv.LoadKeySet(keysFile)
 	if err != nil {
 		slog.Warn("a stored dependence fact key set could not be read; the unit is built in full",
 			"component", component, "unit", string(req.Previous), "kind", KindDependenceKeys, "error", err)

@@ -11,8 +11,8 @@ $ find internal/provider/<pkg> -name "*_test.go"            -exec cat {} + | wc 
 | package | non-test Go lines | test Go lines |
 |---|---|---|
 | `internal/provider/dependence` (this dir only) | 2754 | 793 |
-| `internal/provider/dependence/neo4jcsv` (this dir only) | 3446 | 1428 |
-| `internal/provider/dependence/joern` (this dir only) | 737 | 131 |
+| `internal/provider/dependence/graphcsv` (this dir only) | 3446 | 1428 |
+| `internal/provider/dependence/graphengine` (this dir only) | 737 | 131 |
 | `internal/provider/treesitter` (this dir only) | 1936 | 502 |
 | `internal/provider/treesitter/worker` (this dir only) | 990 | 0 |
 | `internal/provider/scip` (this dir only) | 5686 | 1066 |
