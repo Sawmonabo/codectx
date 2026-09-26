@@ -24,12 +24,20 @@ type PostDom struct {
 
 // PostDominators computes the post-dominator tree by the same iterative pass
 // as Dominators, run on the reversed exit-augmented CFG rooted at Exit. Its
-// arrays are arena-backed (Arena.Bytes).
+// arrays are arena-backed (Arena.Bytes). Two depth-first searches run, the
+// forward reverse post-order exit augmentation ranks headers by and the
+// reverse one the tree is built over, both in ONE 16·N scratch, which the
+// strongly-connected-component pass between them also reuses.
+//
+// Arena, with E edges and A augmented edges: the 16·N search scratch, 8·N
+// for the component pass's index and lowlink, two bitsets of ⌈N/64⌉ words,
+// the augmented relation and its reverse 8·(N+1) + 8·(E+A), and the 4·N tree.
 func PostDominators(g *Graph, a *Arena) PostDom {
-	toExit, augmented := exitAugmentation(g, a)
+	search := newDFS(g.Len(), a)
+	toExit, augmented := exitAugmentation(g, &search, a)
 	succ, pred := augment(g, toExit, augmented, a)
 	return PostDom{
-		ipdom:     dominatorTree(pred, succ, ExitNode, a),
+		ipdom:     dominatorTree(pred, succ, ExitNode, &search, a),
 		succ:      succ,
 		augmented: augmented,
 	}
@@ -57,12 +65,14 @@ func (p PostDom) Augmented() int { return p.augmented }
 // Entry; members Entry does not reach order after every reachable node, by
 // node id.
 //
-// Arena: forward order 16·N, Tarjan's index, lowlink, component stack, call
-// stack and edge cursor 20·N, and two bitsets of ⌈N/64⌉ words.
-func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
+// The forward order is computed in search. Tarjan's component stack, call
+// stack and edge cursor then reuse search's order, stack and cursor arrays,
+// which the ranking no longer reads (it reads only num); its index and
+// lowlink are 8·N in the arena, with two bitsets of ⌈N/64⌉ words.
+func exitAugmentation(g *Graph, search *dfs, a *Arena) (toExit []uint64, count int) {
 	n := g.Len()
 	fwd := g.successors()
-	_, rpo := reversePostOrder(fwd, EntryNode, a)
+	_, rpo := search.reversePostOrder(fwd, EntryNode)
 	rank := func(v int32) int {
 		if rpo[v] >= 0 {
 			return int(rpo[v])
@@ -77,9 +87,7 @@ func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
 	// is open; -(c+1) once v was emitted in component c.
 	index := a.Int32s(n)
 	low := a.Int32s(n)
-	members := a.Int32s(n)
-	calls := a.Int32s(n)
-	cursor := a.Int32s(n)
+	members, calls, cursor := search.order, search.stack, search.cursor
 	next, comp := int32(0), int32(0)
 	top := 0
 	for root := range int32(n) {
