@@ -441,5 +441,37 @@ func TestCLoweringGolden(t *testing.T) {
 			cd:       []string{"A@24 -> x = 1@32"},
 			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x@10 -> return x;@66", "x = 2@56 -> return x;@66"},
 		},
+		{
+			// C17 §6.7.6.3 (a block-scope `int g(int);` declares a function,
+			// not an object), §6.10.1. The #ifdef group binds g to no
+			// variable; the #else group's declaration is still a variable of
+			// its own, and after the directive g is that variable. Nodes:
+			// x@10, A@24 (Branch), #else@40 (Branch), g = x@52 (Uses x,
+			// defines g), return g;@68 (Uses g). Succ: A→{#else, return g}
+			// (the #ifdef group makes no node); #else→g = x→return g. IPDom:
+			// A → return g.
+			name:     "a prototype in one arm leaves a sibling arm's declaration a variable",
+			protects: "a name one arm declares as a function is no variable in that arm only, and a sibling arm's object declaration of the same name gets a variable whose definition reaches the code after the directive",
+			mutation: "let a sibling arm's declaration reuse the parked binding even when it names no variable (g = x@52 defines nothing: loses g = x@52 -> return g;@68)",
+			src:      "int f(int x) { {\n#ifdef A\n  int g(int);\n#else\n  int g = x;\n#endif\n  return g; } }",
+			cd:       []string{"A@24 -> #else@40", "A@24 -> g = x@52"},
+			du:       []string{"x@10 -> g = x@52", "g = x@52 -> return g;@68"},
+		},
+		{
+			// C17 §6.3.2.1p3 (an array evaluated as a call argument decays to
+			// its address), §6.10.1p6. x is an array in the build without A
+			// and an int in the build with it, so h(x) passes the array's
+			// address in one build. Nodes: A@33 (Branch), x = 1@41, h(x)@57
+			// (Uses both variables, may-defines both: the name is an array in
+			// some build), return x[0];@65 (after the block, the array; a
+			// subscript's operand does not decay). `int x[2];` makes no node.
+			// Succ: A→{x = 1, h(x)}; x = 1→h(x)→return. IPDom: A → h(x).
+			name:     "a name that is an array in some build decays to its address after the directive",
+			protects: "a call after a conditional that passes a name which is an array in one build may-defines that array, so a later read of the array depends on the call",
+			mutation: "test only the arms' variable for an array shape (h(x)@57 no longer may-defines the enclosing array: loses h(x)@57 -> return x[0];@65)",
+			src:      "int f(void) { int x[2]; {\n#ifdef A\n  int x = 1;\n#endif\n  h(x); } return x[0]; }",
+			cd:       []string{"A@33 -> x = 1@41"},
+			du:       []string{"x = 1@41 -> h(x)@57", "h(x)@57 -> return x[0];@65"},
+		},
 	})
 }
