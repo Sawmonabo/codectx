@@ -35,6 +35,11 @@ const CapabilityUnsupportedLabels = "unsupported_labels"
 // bounded detail map. It is a count of labels, not one of them.
 const detailUntrackedLabels = "untracked_labels"
 
+// detailUnanalysedFiles is the capability detail under which a unit reports
+// the source files it handed the engine that the export carries no file node
+// for: the count, a space, and the first such path in path order.
+const detailUnanalysedFiles = "unanalysed_files"
+
 // MaxReportedSkips bounds the skipped-method names a result names one by one.
 // The count is always exact; the names are a sample when a unit skips more
 // than this, because a result list is bounded (Section 6) and a thousand
@@ -300,6 +305,11 @@ type publication struct {
 	// reported on the unit's capability detail, never silent", so this is what
 	// carries it to the generation.
 	ClippedEvidence int
+	// UnanalysedFiles counts the unit's own source files the engine was handed
+	// and the export carries no file node for, and UnanalysedFirst names the
+	// first of them in path order. No fact of this unit comes from them.
+	UnanalysedFiles int64
+	UnanalysedFirst string
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -330,6 +340,18 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			if names := p.skippedNames(); names != "" {
 				row = row.WithDetail("skipped_method_names", names)
 			}
+		}
+		// A file the engine was handed and did not read degrades every
+		// capability alike: no pass has a fact from it. The count and the
+		// first path travel in one value, "<count> <path>", because this row
+		// may already carry most of the provider's detail budget and a count
+		// without a path, or a path without its count, would not say what was
+		// missed. The key is written before the threshold reports so it is
+		// never the one the budget drops.
+		if p.UnanalysedFiles > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
+			row = row.WithDetail(detailUnanalysedFiles,
+				truncate(strconv.FormatInt(p.UnanalysedFiles, 10)+" "+p.UnanalysedFirst, model.MaxDetailBytes))
 		}
 		// Source analysed under a project boundary that is not its own
 		// degrades every capability of the family alike: a resolution that

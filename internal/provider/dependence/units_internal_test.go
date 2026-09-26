@@ -43,15 +43,24 @@ func TestChildProjectsKeepsEveryPart(t *testing.T) {
 // many call sites reach a sink — reads a number the clip decided, and with
 // every capability left fresh there is nothing on the generation that says so.
 // A log line is not that disclosure: it reaches no reader of the index.
+//
+// The unanalysed row protects the same posture for a source file the engine
+// was handed and did not read: every capability lacks its facts, so every row
+// must say so. Mutation that fails it: leave the rows fresh when
+// UnanalysedFiles is set.
 func TestAClippedFactIsDisclosedOnEveryCapability(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		pub     publication
 		want    model.CapabilityStateValue
+		key     string
 		wantDet string
 	}{
-		{name: "clipped", pub: publication{ClippedEvidence: 7}, want: model.CapabilityPartial, wantDet: "7"},
-		{name: "not clipped", pub: publication{}, want: model.CapabilityFresh},
+		{name: "clipped", pub: publication{ClippedEvidence: 7}, want: model.CapabilityPartial,
+			key: model.DetailEvidenceClipped, wantDet: "7"},
+		{name: "not clipped", pub: publication{}, want: model.CapabilityFresh, key: model.DetailEvidenceClipped},
+		{name: "unanalysed", pub: publication{UnanalysedFiles: 3, UnanalysedFirst: "test/a.js"},
+			want: model.CapabilityPartial, key: detailUnanalysedFiles, wantDet: "3 test/a.js"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			rows := c.pub.capabilities("scope")
@@ -62,9 +71,8 @@ func TestAClippedFactIsDisclosedOnEveryCapability(t *testing.T) {
 				if row.State != c.want {
 					t.Errorf("%s = %q, want %q", row.Capability, row.State, c.want)
 				}
-				if got := row.Details[model.DetailEvidenceClipped]; got != c.wantDet {
-					t.Errorf("%s detail %s = %q, want %q", row.Capability,
-						model.DetailEvidenceClipped, got, c.wantDet)
+				if got := row.Details[c.key]; got != c.wantDet {
+					t.Errorf("%s detail %s = %q, want %q", row.Capability, c.key, got, c.wantDet)
 				}
 			}
 		})

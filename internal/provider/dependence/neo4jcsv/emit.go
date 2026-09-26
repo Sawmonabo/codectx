@@ -57,14 +57,17 @@ func (e *emitter) cut(field, value string, max int) string {
 }
 
 // stageFiles records the pinned snapshot manifest so an engine FILENAME can be
-// matched to the exact file version its facts must be bound to. The manifest
-// is streamed into the scratch, never held in the heap.
+// matched to the exact file version its facts must be bound to, marking the
+// files the caller handed the engine (Options.Expected) so the ones the export
+// has no file node for can be counted. The manifest is streamed into the
+// scratch, never held in the heap.
 func (e *emitter) stageFiles(ctx context.Context) error {
 	return e.opts.Content.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
-		return e.sc.putFile(ctx, fv.Path, string(fv.ID), fv.ContentHash, fv.Size, fv.Language)
+		expected := e.opts.Expected != nil && e.opts.Expected(fv)
+		return e.sc.putFile(ctx, fv.Path, string(fv.ID), fv.ContentHash, fv.Size, fv.Language, expected)
 	})
 }
 

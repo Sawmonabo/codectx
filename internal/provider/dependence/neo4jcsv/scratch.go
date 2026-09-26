@@ -31,6 +31,10 @@ const (
 	labelMember    = "MEMBER"
 	labelParamIn   = "METHOD_PARAMETER_IN"
 	labelTypeDecl  = "TYPE_DECL"
+	// labelFile is the export's record of one source file the frontend read.
+	// Its NAME is the only thing staged from it: the set of file nodes is what
+	// the unit's own files are compared against (scratch.unanalysed).
+	labelFile = "FILE"
 
 	// speculatedParent is the namespace the export parks an ORPHAN invented
 	// callee under: a method it emitted with no definition anywhere in the
@@ -66,7 +70,7 @@ var stagedNodeLabels = map[string]bool{
 // stage: they carry declarations of shape, modifiers, types or documentation,
 // never a control- or data-dependence endpoint.
 var knownNodeLabels = map[string]bool{
-	labelMetaData: true, "NAMESPACE": true, "NAMESPACE_BLOCK": true, "MODIFIER": true, "FILE": true,
+	labelMetaData: true, "NAMESPACE": true, "NAMESPACE_BLOCK": true, "MODIFIER": true, labelFile: true,
 	"BINDING": true, "TYPE": true, "IMPORT": true, "DEPENDENCY": true, "COMMENT": true,
 	"ANNOTATION": true, "ANNOTATION_LITERAL": true, "ANNOTATION_PARAMETER": true,
 	"ANNOTATION_PARAMETER_ASSIGN": true, "TAG": true, "TAG_NODE_PAIR": true,
@@ -154,6 +158,12 @@ type scratch struct {
 	unknown      map[string]uint64
 	unknownN     uint64
 	ignoredFiles int
+	// filePath turns a file node's NAME into the snapshot path it names, or ""
+	// for a name that is not one (a placeholder the frontend invents for a
+	// package or an include set). The import sets it from its own roots,
+	// because the export's names are relative to the directory the engine
+	// parsed.
+	filePath func(name string) string
 
 	// Staging runs inside an explicit transaction committed every
 	// commitEvery rows, with every insert a reused prepared statement.
@@ -170,7 +180,7 @@ type scratch struct {
 // complete, so that each is written in one ordered pass.
 const scratchSchema = `
 CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL, file_id TEXT NOT NULL, content_hash TEXT NOT NULL,
-	size INTEGER NOT NULL, language TEXT NOT NULL);
+	size INTEGER NOT NULL, language TEXT NOT NULL, expected INTEGER NOT NULL);
 CREATE UNIQUE INDEX files_by_path ON files(path);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE node_in(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, label TEXT NOT NULL, name TEXT NOT NULL,
@@ -180,6 +190,7 @@ CREATE TABLE node_in(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, label TEXT NO
 	ast_parent TEXT NOT NULL);
 CREATE TABLE code(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, code TEXT NOT NULL);
 CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER NOT NULL, dst INTEGER NOT NULL);
+CREATE TABLE file_nodes(path TEXT NOT NULL);
 `
 
 // defaultCacheKiB is the staging database's page cache when the caller sets
@@ -397,6 +408,9 @@ func (s *scratch) countUnknown(label string) {
 }
 
 func (s *scratch) putNode(ctx context.Context, n graphNode) error {
+	if n.label == labelFile {
+		return s.putFileNode(ctx, n.name)
+	}
 	if !stagedNodeLabels[n.label] {
 		if !knownNodeLabels[n.label] {
 			s.countUnknown(n.label)
@@ -437,12 +451,54 @@ func (s *scratch) putMeta(ctx context.Context, key, value string) error {
 	return s.exec(ctx, `INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)`, key, value)
 }
 
+// putFileNode records the snapshot path one file node of the export names.
+// A name that is not a path in the unit's tree is not recorded: it can match
+// no file of the snapshot either way.
+func (s *scratch) putFileNode(ctx context.Context, name string) error {
+	if s.filePath == nil {
+		return nil
+	}
+	p := s.filePath(name)
+	if p == "" {
+		return nil
+	}
+	if err := s.exec(ctx, `INSERT INTO file_nodes(path) VALUES(?)`, p); err != nil {
+		return err
+	}
+	return s.staged(ctx)
+}
+
 // putFile records one manifest entry; a path the manifest repeats keeps its
 // last version. The manifest is small beside the export and arrives in path
-// order, so its path index is appended to.
-func (s *scratch) putFile(ctx context.Context, path, fileID, hash string, size int64, language string) error {
-	return s.exec(ctx, `INSERT OR REPLACE INTO files(path, file_id, content_hash, size, language) VALUES(?,?,?,?,?)`,
-		path, fileID, hash, size, language)
+// order, so its path index is appended to. expected marks a file the caller
+// handed the engine to analyse (Options.Expected).
+func (s *scratch) putFile(ctx context.Context, path, fileID, hash string, size int64, language string, expected bool) error {
+	return s.exec(ctx, `INSERT OR REPLACE INTO files(path, file_id, content_hash, size, language, expected) VALUES(?,?,?,?,?,?)`,
+		path, fileID, hash, size, language, boolInt(expected))
+}
+
+// unanalysed counts the files the caller handed the engine for which the
+// export carries no file node, and names the first of them in path order. It
+// is one anti-join over two on-disk tables -- the staged manifest and the
+// staged file nodes, the latter indexed once after it is complete -- so no
+// list of either is ever held in memory, whatever the unit's size.
+//
+// The rule is the export's own record and not any frontend's: a file the
+// frontend skipped by a fixed rule of its own, one it failed on without
+// saying so, and one a future frontend drops for a reason nobody has met yet
+// all leave the same mark, a file of the unit with no file node.
+func (s *scratch) unanalysed(ctx context.Context) (int64, string, error) {
+	if err := s.run(ctx, "file nodes", `CREATE INDEX file_nodes_by_path ON file_nodes(path)`); err != nil {
+		return 0, "", err
+	}
+	var n int64
+	var first string
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(f.path), '') FROM files f
+		WHERE f.expected = 1 AND NOT EXISTS (SELECT 1 FROM file_nodes n WHERE n.path = f.path)`).Scan(&n, &first)
+	if err != nil {
+		return 0, "", internalErr("import file nodes: %v", err)
+	}
+	return n, first, nil
 }
 
 // order turns the appended export into the structures the projection reads:

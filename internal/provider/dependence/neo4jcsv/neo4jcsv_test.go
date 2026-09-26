@@ -1139,3 +1139,36 @@ func TestAStagingSurfaceThatCannotBeEmptiedLeavesThePool(t *testing.T) {
 		t.Fatalf("the next import was handed the same unusable surface: %v", err)
 	}
 }
+
+// TestAFileTheExportDidNotReadIsCounted protects the one record of source a
+// frontend dropped by a rule of its own. The failure mode: a unit's file the
+// engine was handed has no file node in the export, the import publishes the
+// rest, and the unit seals fresh with no fact for that file and nothing that
+// says so. Mutation that fails it: drop the anti-join (or stage no file node,
+// or ignore Options.Expected) so the count stays zero.
+func TestAFileTheExportDidNotReadIsCounted(t *testing.T) {
+	dir := t.TempDir()
+	files, _ := readSource(t, filepath.Join("testdata", "src", "javasrc"))
+	files["test/T.java"] = "class T {}\n"
+	for p, body := range files {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	java := func(fv model.FileVersion) bool { return strings.HasSuffix(fv.Path, ".java") }
+	rep, _, state, err := run(t, dir, filepath.Join("testdata", "javasrc"), neo4jcsv.Options{Language: "java", Expected: java})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: a dropped file is disclosed, not a failure", state)
+	}
+	if rep.UnanalysedFiles != 1 || rep.UnanalysedFirst != "test/T.java" {
+		t.Fatalf("unanalysed = %d first %q, want 1 first %q: the export has a file node for W.java only",
+			rep.UnanalysedFiles, rep.UnanalysedFirst, "test/T.java")
+	}
+}

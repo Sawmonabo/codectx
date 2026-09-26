@@ -325,6 +325,18 @@ func (u Unit) Contains(p string) bool {
 	return true
 }
 
+// handed is the predicate for the files the engine is handed when it parses
+// the directory root of this unit -- the unit's root, or one part's directory
+// when the unit is subdivided: a live source file of the unit's own family
+// that the unit owns and that lies under root. It is the same membership the
+// materialization counts as the unit's source files.
+func (u Unit) handed(root string) func(model.FileVersion) bool {
+	return func(fv model.FileVersion) bool {
+		return fv.Status != model.FileDeleted && within(fv.Path, root) && u.Contains(fv.Path) &&
+			FamilyOf(lang.Of(fv.Path)) == u.Family
+	}
+}
+
 // OwnsInput reports whether path is part of this unit's semantic closure
 // (Section 11.6): a source file of its own family that it owns, or a manifest
 // or lock file it owns. It is the manifest half of the cache key (CacheKey)

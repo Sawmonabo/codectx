@@ -415,6 +415,10 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 	// took off them is disclosed on the capability, not only in the line
 	// logged below.
 	pub.ClippedEvidence = int(report.ClippedEvidence)
+	// Source files of this unit the engine was handed and that the export has
+	// no file node for. Nothing of them reached a fact, so a unit that
+	// published the rest fresh would claim facts for files it never read.
+	pub.UnanalysedFiles, pub.UnanalysedFirst = report.UnanalysedFiles, report.UnanalysedFirst
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
@@ -456,6 +460,7 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
+		"unanalysed_files", report.UnanalysedFiles,
 		"truncated_fields", len(report.TruncatedFields),
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
@@ -601,13 +606,14 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// from the planner's Unit.Files, which foldSizes arbitrates across the
 	// whole plan: only this pass knows what reached the frontend.
 	var files int64
+	handed := unit.handed(unit.Root)
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
 			Include: func(fv model.FileVersion) bool {
 				if !unit.Contains(fv.Path) {
 					return false
 				}
-				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family {
+				if handed(fv) {
 					files++
 				}
 				return true
@@ -964,6 +970,11 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 // TSX nodes javascript), which is accurate for every located fact and
 // approximate for the fileless remainder.
 //
+// Expected is the set of files the engine was handed for this export: the
+// unit's own source files under unitRoot. Every one of them the export has no
+// file node for is counted by the import and published on the unit's rows, so
+// a file a frontend dropped by a rule of its own is never silently missing.
+//
 // PreviousKeys and KeysPath come from the coordinator's delta applier
 // (docs/providers-dependence.md §Refresh and delta). A run handed the previous
 // unit's key set publishes only the relations whose key changed; a run handed
@@ -993,8 +1004,8 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
 		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles, StagingCacheKiB: p.opts.StagingCacheKiB,
-		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
-		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
+		MaxEvidencePerFact: p.opts.MaxEvidencePerFact, Expected: unit.handed(unitRoot),
+		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return ImportReport{}, err
@@ -1043,6 +1054,9 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
+	// The parts whose export was imported, by directory name. It is bounded by
+	// the entries of one directory, which childProjects already holds.
+	imported := make(map[string]bool, len(children))
 	// What the parts did, so a unit no part of which produced a method can say
 	// which of the two things happened to them rather than restating that
 	// nothing came out.
@@ -1098,13 +1112,52 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		}
 		total = merge(total, report)
 		admitted++
+		imported[child] = true
 		part.End(ledger.OutcomeOK, bracketed(), nil)
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
 		return ImportReport{}, 0, subdivisionEmpty(unit, crash, adm.res, tally, files)
 	}
+	// Each imported part counted its own files the export did not read. The
+	// unit's files that no imported part covers -- those directly in the unit's
+	// root, in a directory the split does not descend into, or in a part that
+	// failed or exported nothing -- reached no fact either, and are counted
+	// here, so the unit's figure is over the union of its parts: every file the
+	// unit owns and published no fact for.
+	outside, first, err := outsideParts(ctx, req.Content, unit, imported)
+	if err != nil {
+		return ImportReport{}, 0, err
+	}
+	total = merge(total, ImportReport{UnanalysedFiles: outside, UnanalysedFirst: first})
 	return total, overParts, nil
+}
+
+// outsideParts counts the unit's own source files that lie under no imported
+// part of a subdivided unit, and names the first in path order. It streams the
+// pinned manifest and holds only the count and that one path.
+func outsideParts(ctx context.Context, view model.SnapshotView, unit Unit, imported map[string]bool) (int64, string, error) {
+	handed := unit.handed(unit.Root)
+	var n int64
+	var first string
+	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+		if fv.Status == model.FileDeleted || !handed(fv) {
+			return nil
+		}
+		rel := fv.Path
+		if unit.Root != "" {
+			rel = strings.TrimPrefix(rel, unit.Root+"/")
+		}
+		if part, _, nested := strings.Cut(rel, "/"); nested && imported[part] {
+			return nil
+		}
+		n++
+		if first == "" || fv.Path < first {
+			first = fv.Path
+		}
+		return nil
+	})
+	return n, first, err
 }
 
 // childProjects lists the immediate subdirectories of a unit's root that hold
@@ -1162,6 +1215,10 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
+	a.UnanalysedFiles += b.UnanalysedFiles
+	if b.UnanalysedFirst != "" && (a.UnanalysedFirst == "" || b.UnanalysedFirst < a.UnanalysedFirst) {
+		a.UnanalysedFirst = b.UnanalysedFirst
+	}
 	// Each part stages into its own scratch and compares its own rows against
 	// the threshold, so three parts of ten rows each cross a bound of fifteen
 	// that none of them crossed alone. The unit's count is the sum, and the
