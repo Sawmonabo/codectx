@@ -77,8 +77,9 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// may-defines d, its base variable, §7.2), return d@38. Succ:
 			// d@20→head→{k@15, return d}; k@15→d[k] = g(k)→head. IPDom:
 			// k@15 → d[k] = g(k) → head → return d. The subscript write's
-			// may-definition kills nothing, so d@6 and it both reach it
-			// around the loop and reach return d.
+			// may-definition is a χ, so around the loop it pairs with d@6
+			// and with itself, the nearest may-definition, and return d
+			// pairs with both.
 			name:     "a body that writes through the iterated name does not reach the loop head",
 			protects: "the head reads the iterator made once from d, so a subscript write to d in the body, a may-definition of d, pairs with the later reads of d and never with the head",
 			mutation: "make the head Use the iterable's reads (d@6 -> k in d@15 and d[k] = g(k)@25 -> k in d@15 appear)",
@@ -151,7 +152,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §8.5. Lines at 0, 13, 27, 35, 47, 57. Nodes: m@6, c@9, m as
-			// r@19 (enter, defines r and may-defines the manager), c@32,
+			// r@19 (enter, defines r and the manager), c@32,
 			// return r@38, raise E@49, with m as r@14 (the exit, reading the
 			// manager), return 0@58. Both jumps are intercepted by the with's
 			// finally and re-issued from the exit to EXIT; the raise reached
@@ -181,7 +182,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// IPDom: b() as y, y's exit, with@11 → x's exit → EXIT; c@41,
 			// return x → y's exit. The Handler carries the values on entry
 			// to b() as y (no y) and to y's exit (y from b() as y). Each
-			// exit reads the manager its enter node may-defines.
+			// exit reads the manager its enter node defines.
 			name:     "two with items close in reverse on the return path and the normal path",
 			protects: "the second item's exit runs before the first's whether the body returns or completes, and a failure entering the second item runs only the first item's exit",
 			mutation: "close the items in source order (x's exit then precedes y's, b() as y@26 -> with a() as x, b() as y@11 is lost and x's exit controls y's), or open one finally for both items (b() as y no longer controls with@11)",
@@ -301,14 +302,15 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// §6.12. Lines at 0, 11, 18, 40. Nodes: xs@6, y = 0@12, the
 			// comprehension node@19 (reads xs, its first iterable, and
 			// may-defines y: the assignment expression writes y and never
-			// reads it), return y@41. The expression statement is the
-			// comprehension's node.
+			// reads it, and the χ pairs the node with y = 0@12, the version
+			// it may leave in place), return y@41. The expression statement
+			// is the comprehension's node.
 			name:     "an assignment expression in a comprehension binds in the enclosing function",
-			protects: "`:=` inside a comprehension writes the enclosing function's variable, a may-definition at the comprehension's creation that reads nothing of it",
-			mutation: "bind a `:=` target as the comprehension's own local (the comprehension node loses its may-definition, and y = 0@12 alone reaches return y@41), or record the target as a read (y = 0@12 -> [y := x for x in xs]@19 appears)",
+			protects: "`:=` inside a comprehension writes the enclosing function's variable, a may-definition at the comprehension's creation, so the earlier definition reaches both that node and the later use",
+			mutation: "bind a `:=` target as the comprehension's own local (the comprehension node loses its may-definition: y = 0@12 -> [y := x for x in xs]@19 and [y := x for x in xs]@19 -> return y@41 disappear), or make the write a killing definition (y = 0@12 -> return y@41 disappears)",
 			src:      "def f(xs):\n y = 0\n [y := x for x in xs]\n return y\n",
 			fn:       1,
-			du: []string{"xs@6 -> [y := x for x in xs]@19",
+			du: []string{"xs@6 -> [y := x for x in xs]@19", "y = 0@12 -> [y := x for x in xs]@19",
 				"y = 0@12 -> return y@41", "[y := x for x in xs]@19 -> return y@41"},
 		},
 		{
@@ -371,7 +373,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// §6.10: b is evaluated once, and c only when a < b holds. Lines
 			// at 0, 16. Nodes: a@6, b@9, c@12, a < b@24 (Branch: Uses a and
 			// b, defines the result variable, the value when it fails, and
-			// may-defines a variable holding b), c@32 (evaluated only when a
+			// a variable holding b), c@32 (evaluated only when a
 			// < b holds: Uses c and the held b, makes b < c and defines the
 			// result variable), return a < b < c@17 (Uses the result
 			// variable). Succ: a < b→{c, return}; c→return. IPDom: a < b, c
@@ -477,21 +479,23 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §7.13, §7.2. Lines at 0, 9, 16, 26, 39, 47, 52. Nodes: n = 0@10,
-			// def g(): …@17 (defines g, may-defines n through the nonlocal,
-			// reads nothing: `n = 1` only writes n), g()@48, return n@53.
-			name:     "a nested callable's plain assignment writes an enclosing variable without reading it",
-			protects: "the node creating a callable that assigns an enclosing variable may-defines it and does not use it",
-			mutation: "collect an assignment target in a nested callable as a read (n = 0@10 -> def g(): nonlocal n n = 1@17 appears)",
+			// def g(): …@17 (defines g, may-defines n through the nonlocal:
+			// `n = 1` only writes n, and the χ pairs the node with n = 0@10,
+			// the version it may leave in place), g()@48, return n@53.
+			name:     "a nested callable's plain assignment is a may-definition of the enclosing variable",
+			protects: "the node creating a callable that assigns an enclosing variable may-defines it, so the definition before it reaches both that node and the later use",
+			mutation: "record no write for a nested callable's plain assignment to a nonlocal name (def g(): nonlocal n n = 1@17 loses its pairs with n = 0@10 and return n@53), or make it a killing definition (n = 0@10 -> return n@53 disappears)",
 			src:      "def f():\n n = 0\n def g():\n  nonlocal n\n  n = 1\n g()\n return n\n",
 			fn:       1,
-			du: []string{"n = 0@10 -> return n@53", "def g(): nonlocal n n = 1@17 -> return n@53",
+			du: []string{"n = 0@10 -> def g(): nonlocal n n = 1@17",
+				"n = 0@10 -> return n@53", "def g(): nonlocal n n = 1@17 -> return n@53",
 				"def g(): nonlocal n n = 1@17 -> g()@48"},
 		},
 		{
 			// §8.5: a failing assignment to the target runs __exit__. Lines
 			// at 0, 13, 29, 36. Nodes: m@6, o@9, m as o.p@19 (enter, reads
-			// m, defines the entered value's variable and may-defines the
-			// manager's), o.p@24 (the target's write: Uses the entered value
+			// m, defines the entered value's variable and the manager's),
+			// o.p@24 (the target's write: Uses the entered value
 			// and o, may-defines o, may throw into the item's finally),
 			// with@14 (that finally's Handler), with m as o.p@14 (the exit),
 			// return o@37. Succ: o.p→{with@14, exit}; with@14→exit;
@@ -533,7 +537,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §8.5: the exit calls the manager the enter produced. Lines at
-			// 0, 10, 19, 27. Nodes: m@6, m@16 (enter, may-defines the
+			// 0, 10, 19, 27. Nodes: m@6, m@16 (enter, defines the
 			// manager), m = 0@21, with m@11 (the exit, reading the manager),
 			// return m@28.
 			name:     "a with exit reads the manager entered, not the context variable at exit time",
@@ -597,11 +601,11 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §6.12: the assignment expression's value is the value it
 			// assigns. Lines at 0, 10, 28. Nodes: a@6, x := a@16 (Uses a,
-			// defines x, may-defines the result variable), y = (x := a) *
+			// defines x and the result variable), y = (x := a) *
 			// 2@11 (Uses the result variable, defines y), return x + y@29
 			// (Uses x and y).
 			name:     "an assignment expression's value travels through its result variable",
-			protects: "the node consuming `x := a` reads the result variable the assignment expression's node may-defines, and does not re-read the value's names",
+			protects: "the node consuming `x := a` reads the result variable the assignment expression's node defines, and does not re-read the value's names",
 			mutation: "let the consumer re-read the assigned value's reads (a@6 -> y = (x := a) * 2@11 appears)",
 			src:      "def f(a):\n y = (x := a) * 2\n return x + y\n",
 			fn:       1,
@@ -611,8 +615,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §6.12: each assignment expression's value is the value it
 			// assigns when it is evaluated. Lines at 0, 9, 34. Nodes: x :=
-			// 1@15 and x := 2@26 (each defines x and may-defines its own
-			// result variable), y = (x := 1) + (x := 2)@10 (Uses the two
+			// 1@15 and x := 2@26 (each defines x and its own result
+			// variable), y = (x := 1) + (x := 2)@10 (Uses the two
 			// result variables, defines y), return y@35.
 			name:     "two assignment expressions to one name each reach their consumer",
 			protects: "the consumer of `(x := 1) + (x := 2)` reads each assignment expression's result variable, so it depends on the first assignment although the second rebinds x before it",
@@ -626,9 +630,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// §6.12, §6.16: operands are evaluated left to right, so the
 			// first x is read before either assignment expression. Lines at
 			// 0, 10, 39. Nodes: x@6, x := 1@20 (Uses the earlier x, defines
-			// x, may-defines a variable carrying the earlier value and its
-			// own result variable), x := 2@31 (defines x, may-defines its
-			// result variable; the held read of x is no longer the name),
+			// x, a variable carrying the earlier value and its own result
+			// variable), x := 2@31 (defines x and its result variable; the held read of x is no longer the name),
 			// y = x + (x := 1) + (x := 2)@11 (Uses the carried value and
 			// the two result variables), return y@40.
 			name:     "a read made before an assignment expression reaches its consumer through the assignment's node",
@@ -643,7 +646,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// §6.11, §6.12: the operand after `and`'s deciding one runs only
 			// when c is true. Lines at 0, 13, 39. Nodes: x@6, c@9, c@23
 			// (Branch: Uses c, defines the result variable), x := 1@30
-			// (defines x, may-defines the result variable; it does not run
+			// (defines x and the result variable; it does not run
 			// whenever the consumer does, so the earlier read of x stays on
 			// the consumer), y = x + (c and (x := 1))@14 (Uses x and the
 			// result variable), return y@40. Succ: c@23→{x := 1, y = …};
@@ -718,8 +721,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// 2@55 (embedded: defines the result variable), y = (g := 2)@50,
 			// lambda: g@68 (captures nothing), h = lambda: g@64, del g@79
 			// (deleted), xs@95 (the iterable), g in xs@90 (head), g@90
-			// (iterated target), m as g@112 (with target: defines nothing,
-			// may-defines the manager), with m as g@107 (the exit), h()@135
+			// (iterated target), m as g@112 (with target: defines nothing
+			// but the manager), with m as g@107 (the exit), h()@135
 			// (may throw), except@140 (Handler), E@147 (a free name: Uses
 			// nothing), g@152 (the except target), except E as g: pass@140
 			// (the deletion of g, still made), def k(): global g g = 3@163

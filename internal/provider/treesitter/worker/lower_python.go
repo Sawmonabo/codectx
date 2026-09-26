@@ -104,7 +104,7 @@ var pythonLowering = Lowering{
 //     when it is a name, a variable of the lowering's own holding the
 //     entered value when the target is a pattern or reference, and nothing
 //     when the item has no `as` target (the entered value is discarded), and
-//     in every case may-defines another variable holding the manager. The
+//     in every case defines another variable holding the manager. The
 //     rest of the statement is a finally: its Handler spans the token
 //     introducing the item (the `with` keyword for the first, the preceding
 //     comma for each later one), a pattern or reference target is bound
@@ -145,10 +145,12 @@ var pythonLowering = Lowering{
 //     of the parts evaluated there (decorators, defaults, bases, a
 //     comprehension's first iterable), which Uses the reads of those parts
 //     and every enclosing variable read inside it (its captures), defines
-//     the created value, and may-defines (MayDef, a non-killing definition)
-//     every enclosing variable it assigns — through nonlocal, through global
-//     when the enclosing function is the module, or through `:=` in a
-//     comprehension (§6.12). A def or class statement's node defines its
+//     the created value, and may-defines (MayDef) every enclosing variable
+//     it assigns — through nonlocal, through global when the enclosing
+//     function is the module, or through `:=` in a comprehension (§6.12).
+//     Each is a χ (see May-definitions in Lowering): the node pairs with the
+//     variable's definitions reaching it even when the callable only writes
+//     it, and records no read of it. A def or class statement's node defines its
 //     name; a lambda's or comprehension's defines a result variable (see
 //     Uses).
 //   - A comprehension's graph is its clauses as nested loops: each `for`
@@ -200,24 +202,21 @@ var pythonLowering = Lowering{
 //     later comparison's Branch, and the last operand's node, which makes
 //     the last comparison; each operand between is held in a variable of
 //     its own, so it is read once: the first comparison's Branch defines
-//     the result, its one killing definition, and may-defines the variable
-//     holding the middle operand, which no other node defines, so the
-//     may-definition loses no pair; each later middle operand's node
-//     defines its held variable and its comparison's Branch the result),
-//     `x := e` (its node defines x and may-defines the result, since a
-//     node defines one variable; the
-//     consumer Uses the result, never x, so `(x := 1) + (x := 2)` depends
-//     on both; a `:=` to a global defines the result), and a lambda or
-//     comprehension (the creating node). A condition over one of them (`if
-//     a and b:`) is a Branch that Uses the result variable. `x := e` as an
-//     operand or arm of another construct may-defines that construct's
-//     result the same way.
+//     the result and the variable holding the middle operand; each later
+//     middle operand's node defines its held variable and its comparison's
+//     Branch the result), `x := e` (its node defines x and the result, each
+//     a killing definition; the consumer Uses the result, never x, so `(x
+//     := 1) + (x := 2)` depends on both; a `:=` to a global defines the
+//     result alone), and a lambda or comprehension (the creating node). A
+//     condition over one of them (`if a and b:`) is a Branch that Uses the
+//     result variable. `x := e` as an operand or arm of another construct
+//     defines that construct's result the same way.
 //   - A def or class statement's node defines its name, the variable the
 //     created value travels through.
 //   - A read the consumer folds that its statement makes before a node
 //     defining the same variable (`y = x + (x := 1)`) is carried by that
 //     node (see Lowering): it Uses the earlier value and hands it on through
-//     a variable of the lowering's own that it may-defines, which replaces
+//     a variable of the lowering's own that it defines, which replaces
 //     the held read, so the consumer pairs with that node and a later
 //     definition of x in the statement (`(x := 2)`) neither re-reads nor
 //     receives it. The hand-off is made only when that node runs whenever
@@ -302,7 +301,7 @@ var pythonLowering = Lowering{
 // nested callable's writes are recorded (site, scan) only for variables of
 // this function, so its creating node may-defines no -1. Every construct
 // still makes its nodes: `x := e` with x unresolved defines the result
-// variable instead, and `except E as n` with n global keeps its finally and
+// variable alone, and `except E as n` with n global keeps its finally and
 // its deleting node, which defines nothing. So reads, seen and the Builder
 // never see -1.
 func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
@@ -1030,7 +1029,7 @@ func (j *pyLower) def(n, v int32) {
 	// read pairs with n rather than with v's later definitions.
 	j.b.Use(n, v)
 	t := j.b.Var()
-	j.b.MayDef(n, t)
+	j.b.Def(n, t)
 	at := int(j.seen[v].at)
 	for i := at; i < len(j.reads); i++ {
 		if j.reads[i] == v {
@@ -1725,10 +1724,8 @@ func (j *pyLower) withStmt(n *ts.Node) {
 		j.value(mgr)
 		j.throws++ // __enter__
 		a := j.node(flow.Stmt, &items[i], 0, len(j.reads))
-		// The manager is defined only here, so a may-definition loses
-		// nothing; a is the node's one killing definition, the target's.
 		m := j.b.Var()
-		j.b.MayDef(a, m)
+		j.b.Def(a, m)
 		j.mgrs = append(j.mgrs, m)
 		var t *ts.Node
 		if target != nil {
@@ -2230,23 +2227,15 @@ func (j *pyLower) conditional(n *ts.Node, dst int32) {
 }
 
 // walrus lowers `x := e` (§6.12) into dst: one node spanning it Uses e's
-// reads and defines x. A node defines one variable, so when x is a
-// variable the node may-defines dst (see Lowering, one definition per
-// node); when x is no variable of this function (a global), the node
-// defines dst.
+// reads and defines x, when x is a variable of this function, and dst, each
+// a killing definition (see Uses in Lowering).
 func (j *pyLower) walrus(n *ts.Node, dst int32) {
 	m := len(j.reads)
 	j.value(n.ChildByFieldId(j.k.fValue))
 	id := j.node(flow.Stmt, n, m, len(j.reads))
 	j.reads = j.reads[:m]
-	if v := j.lookup(n.ChildByFieldId(j.k.fName)); v >= 0 {
-		j.def(id, v)
-		if dst >= 0 {
-			j.b.MayDef(id, dst)
-		}
-	} else {
-		j.def(id, dst)
-	}
+	j.def(id, j.lookup(n.ChildByFieldId(j.k.fName)))
+	j.def(id, dst)
 }
 
 // chained reports whether comparison n is a chain of more than one
@@ -2261,8 +2250,7 @@ func (j *pyLower) chained(n *ts.Node) bool {
 // each operand is evaluated once and a later comparison is evaluated only
 // when the ones before it held. The first comparison is a Branch node
 // spanning o0 and o1 that Uses their reads, defines dst (the value when it
-// fails; its killing definition) and may-defines a variable of the
-// lowering's own holding o1 (a node defines one variable). Every later
+// fails) and a variable of the lowering's own holding o1. Every later
 // operand is a Stmt node spanning it: the last one also makes the last
 // comparison, Using the held operand before it, and defines dst; any other
 // one defines a held variable of its own, and the comparison it ends is a
@@ -2280,7 +2268,7 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 	j.reads = j.reads[:m]
 	j.def(id, dst)
 	held := j.b.Var()
-	j.b.MayDef(id, held)
+	j.b.Def(id, held)
 	base := len(j.hold)
 	mark := j.b.Push()
 	j.hold = append(j.hold, mark)
