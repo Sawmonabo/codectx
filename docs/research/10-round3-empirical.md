@@ -1,4 +1,4 @@
-# Engine empirical results (2026-09-13, linux/amd64, 16 cores, 47 GiB, Joern 4.0.627, JDK 21)
+# Round 3 empirical results (2026-09-13, linux/amd64, 16 cores, 47 GiB, Joern 4.0.627, JDK 21)
 
 Raw logs, scripts and fixtures: `raw/`. Every number is from a real run on this machine.
 Memory is reported two ways: `largest` = peak RSS of the biggest single process (`/usr/bin/time %M`),

@@ -1,6 +1,6 @@
 # Native-engine research, raw evidence — can SCIP + LSP replace the engine's call graph? The measured answer on the reference repository itself
 
-Source: `docs/research/19-language-server-and-indexer-matrix.md` §2 **[MEASURED]**,
+Source: `docs/research/19-language-server-and-indexer-matrix.md` §2 **[MEASURED]**, lane TOOLS-R,
 2026-09-15, linux/amd64. Method: JSON-RPC driver, `initialize` → `initialized` → `didOpen` → one
 `textDocument/references` (`includeDeclaration: true`) → `shutdown` → `exit`, `/usr/bin/time -v`
 wrapping the server process.
@@ -63,5 +63,5 @@ locations cold and still 2 after 15, 40 and 60 s — so the cold gap is **wider*
 
 So the engine's `calls` is **not** simply replaceable on the reference repository today. That is an argument for keeping
 the engine's call graph, not against a native dependence engine — the two fact groups separate
-cleanly, and it is exactly the separation the subdivision parity table already shows (`10-engine-empirical` §8:
+cleanly, and it is exactly the separation the subdivision parity table already shows (`10-round3` §8:
 CDG 99.7% / REACHING_DEF 99.9% survive a split, resolved calls 46% do not).

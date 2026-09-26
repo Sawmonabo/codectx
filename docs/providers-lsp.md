@@ -83,8 +83,8 @@ constructor:
 `enabled = "auto"` therefore means "start the pinned payload for this
 language"; nothing found on `PATH` is ever started and there is no
 `[analyzers.<name>]` approval to write (Section 20.2 — trust is the lock). The
-argument array, the environment allowlist and the budgets are constants of
-this build, and a server has no lifetime bound; `${input_dir}` is the materialization root and
+argument array, the environment allowlist, the budgets and the lifetime are
+constants of this build; `${input_dir}` is the materialization root and
 `${work_dir}` the server's private working directory
 `<data_dir>/lsp/<server>/<payload identity>/`, which the overlay creates before
 the server starts. The last component is the digest half of the resolved
@@ -232,17 +232,18 @@ Bounds, all finite:
 | Bound | Source | Effect when hit |
 |---|---|---|
 | concurrent servers | the machine-derived allocation, summed over the definitions' memory reservations | an idle server is stopped to make room; otherwise the open waits for room |
-| in-flight requests per server | `providers.lsp.max_outstanding_requests` (default unlimited: every caller already waits on its own gate) | with a value set, callers wait for a slot under their context |
-| a request making no progress, the `initialize` handshake included | `providers.lsp.stall_timeout` (default 5m, the server consuming no processor time) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer: a server computing one is working however long it takes, and where a platform cannot observe a running process tree the connection's byte count stands in. |
+| in-flight requests per server | `providers.lsp.max_outstanding_requests` | callers wait for a slot under their context |
+| a request making no progress | `providers.lsp.stall_timeout` (default 5m, the server consuming no processor time) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer: a server computing one is working however long it takes, and where a platform cannot observe a running process tree the connection's byte count stands in. |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
+| server lifetime | the definition's own `Timeout` (1 h) | the runner terminates the tree |
 | materialized bytes, one admitted file, bytes sent per rolling minute | `Options.MaxOverlayBytes` (default unlimited) | files that do not fit are named in the log and left out; a file over the bound is not admitted and the query answers about the rest; a sustained flood over the send budget fails the server |
 | cached pinned bytes | `Options.MaxOverlayBytes` when set, otherwise `DefaultDocCacheBytes` (512 MiB) | cache evicts least-recently-used; eviction costs a re-read, never an answer |
 | one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
-| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable and the request reports it to its caller; an answer to a server-initiated request that cannot fit fails the connection instead, because a server waiting on an answer it can never receive would wait forever |
+| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable — a request reports it to its caller, an answer to a server-initiated request is dropped and the writer goroutine continues |
 | header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels — the line bound is applied to the chunk the reader holds before it is accumulated | protocol error, connection failed |
-| queued answers to server-initiated requests | one frame's worth of bytes (`Options.MaxFrameBytes`), unwritten | no answer is ever dropped: a server holding more than that unread is not reading its input, and the connection is failed with `CTX_UNAVAILABLE` (`reason=not_draining`) |
+| queued answers to server-initiated requests | 4 | the reply is dropped; the reader never blocks on a write |
 | documents held open on the server | 16 | `didClose` of the least recently opened |
-| shutdown | `Options.StopTimeout` (5 s), the grace after a stop has been requested; it bounds nothing else | the runner forces the stop |
+| handshake, shutdown | `Options.StartTimeout` (60 s), `Options.StopTimeout` (5 s) | start fails; the runner forces the stop |
 
 Stderr is a server's log and is discarded, not retained or logged (Section
 22); its bound still terminates a server that floods it.
@@ -258,10 +259,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 - **Cancellation.** When a call's context ends the client sends
   `$/cancelRequest`, forgets the id and returns `CTX_CANCELED` (or
   `CTX_PROVIDER_TIMEOUT` for a deadline). The connection stays usable.
-  A write parked behind a frame the server has not consumed is reached by no
-  context, so when `providers.lsp.stall_timeout` ends a call while a send is
-  parked, the server is failed as `stalled` and its process stopped, which
-  ends the pipe the write waits on.
+  `conn.write` itself is not context-aware, so a call can wait on the writer
+  lock behind a frame the server has not yet consumed; that wait is bounded by
+  the server's own progress and ultimately by the approval's `timeout`
+  terminating the tree, not by `providers.lsp.stall_timeout`.
 - **Server-initiated requests** are handled by explicit policy:
   `workspace/configuration` is answered with `null` per item (at most 64
   items) — codectx supplies no settings; **everything else** is answered with
@@ -271,17 +272,13 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   server's behalf. Notifications (`window/logMessage`,
   `textDocument/publishDiagnostics`, `$/progress`) are read and dropped, as
   is a response the server could not attribute to a request (`"id": null`).
-  The answer is **queued** for one dedicated writer goroutine: the goroutine
-  that reads the server's output never writes, because a write parks on the
-  server's stdin while the server is parked writing stdout that only the
-  reader drains. No answer is dropped. The queue is bounded by bytes, at one
-  frame's worth: answers are written as fast as the server reads its input, so
-  a server holding more than that unread is asking while it has stopped
-  reading, and the connection is failed with `CTX_UNAVAILABLE`
-  (`reason=not_draining`) rather than left to wait forever on answers it can
-  never receive. A request whose id leaves no room for an answer within the
-  frame bound fails the connection the same way, as `CTX_RESOURCE_LIMIT`. The
-  writer exits only once the connection is failed.
+  The answer is **queued** (at most four) for one dedicated writer goroutine:
+  the goroutine that reads the server's output never writes, because a write
+  parks on the server's stdin while the server is parked writing stdout that
+  only the reader drains. A full queue drops the reply rather than blocking,
+  and so does a reply the frame bound refuses — its id and method name come
+  from the server, so one long-named server request must not be able to stop
+  every later answer. The writer exits only once the connection is failed.
 - **Position encoding.** The client offers `utf-8`, `utf-32`, `utf-16` in
   that order; the server's `positionEncoding` (default `utf-16`) is used for
   every coordinate in both directions. A choice the client did not offer is
@@ -358,8 +355,8 @@ Null), TypeParameter and anything unknown→variable.
 
 ## Failure
 
-Any transport error, protocol violation, frame over its bound, reply queue a
-server does not drain, or process exit **fails the server**: every pending call is released with the
+Any transport error, protocol violation, frame over its bound, process exit
+or lifetime cap **fails the server**: every pending call is released with the
 typed reason, the process tree is terminated through the runner, the
 materialization is removed once the tree is reaped, and the manager forgets
 the server so the next `Open` starts a fresh one. Overlays still holding the
@@ -383,10 +380,11 @@ dies and `Run` returns after twice the grace (`Options.StopTimeout`).
 These are deliberate and bounded, not defects; each is named here so a reader
 does not have to rediscover it.
 
-- **A server has no lifetime bound.** It ends when it has been idle for
-  `providers.lsp.idle_ttl`, when it is stopped, when a request finds it making
-  no progress, or when it fails; a long interactive session is never ended for
-  its length.
+- **A server's lifetime is the approval's `timeout`.** There is no separate
+  lifetime setting: the value that bounds one analyzer run bounds a whole
+  language server here, and when it elapses the runner terminates the tree and
+  the next `Open` starts a fresh server. An operator approving a server for
+  interactive use approves a `timeout` of that length.
 - **`Options.MaxOverlayBytes` is set from `providers.lsp.max_overlay_bytes`**
   (default unlimited; a value you set is validated to be at least
   `resources.max_source_response_bytes`). When set it bounds, separately, the

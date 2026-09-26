@@ -37,7 +37,7 @@ matters because — confirmed below — they will not.
 ## 1. The two scenarios, stated concretely
 
 Both are priced against codectx's own measurements
-([09](09-scaling-governance-empirical.md), [10](10-engine-empirical.md)), so the
+([09](09-scaling-governance-empirical.md), [10](10-round3-empirical.md)), so the
 recommendations have real numbers attached rather than adjectives.
 
 | | Scenario (a): one local edit | Scenario (b): commit or branch switch |
@@ -45,7 +45,7 @@ recommendations have real numbers attached rather than adjectives.
 | **The change** | One function body edited in one `.go` file inside a 239k-line Go module (1,283 files) | `git switch` rewrites 5,000 files; the target branch was indexed an hour ago |
 | **Tree-sitter tier** | 1 file re-parsed. Negligible. | ~5,000 files re-parsed at tier-2 throughput (~10⁵–10⁶ LOC/s, [03 §10](03-industrial-precise-indexers.md)) — seconds |
 | **SCIP tier today** | Whole unit re-runs: `scip-go` on x/tools = **7.3 s / 0.4 GB / 21 MB index** ([09](09-scaling-governance-empirical.md)) | Same, for every affected project root |
-| **Dependence tier today** | Whole unit re-runs: parse **23.2 s** @500 MB cap + export **4.5 s** = **~28 s / ~1.0 GB tree** ([10 §1](10-engine-empirical.md)) | Same, for every affected unit |
+| **Dependence tier today** | Whole unit re-runs: parse **23.2 s** @500 MB cap + export **4.5 s** = **~28 s / ~1.0 GB tree** ([10 §1](10-round3-empirical.md)) | Same, for every affected unit |
 | **Worst realistic case** | Python 506k-line unit: parse 37 s (2 GB cap) + export 27.5 s, 1.27 GB CSV ([09](09-scaling-governance-empirical.md)) | Several such units at once, serialized by `max_concurrent_heavy_analyzers = 1` |
 
 The asymmetry is the whole problem: in scenario (a) **one changed byte costs the same as a
@@ -593,7 +593,7 @@ but the *import, normalization, alias generation and FTS write* for 1,282 unchan
 collapse to a hash comparison.
 
 **One gap that must be named, or it will be found the expensive way.** The callsite-join
-reconciliation ([00-synthesis §3](00-synthesis.md), [10 §2](10-engine-empirical.md)) matches a
+reconciliation ([00-synthesis §3](00-synthesis.md), [10 §2](10-round3-empirical.md)) matches a
 SCIP occurrence range against a *tree-sitter* call-site range **in the same file version**;
 the two range sets are only comparable when both sides are bound to the same blob. So a
 `Document` payload deduped purely by `payload_hash` is not safe to inherit its join from if
