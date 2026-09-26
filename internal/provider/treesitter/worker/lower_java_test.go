@@ -50,7 +50,7 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// y = 1 are killed on every path.
 			name:     "a colon-form case body falls through into the next body",
 			protects: "a colon-form body without break continues into the next group's body, and each label is tested only when the previous failed",
-			mutation: "end every colon-form body with a break (y = 1@57 reaches return y;@104 and case 1@57 loses y = 2@72 and break;@79)",
+			mutation: "end every colon-form body with a break (y = 1@57 reaches return y;@104 and case 1@49 loses y = 2@72 and break;@79)",
 			src:      "class A { int f(int x) { int y = 0; switch (x) { case 1: y = 1; case 2: y = 2; break; default: y = 3; } return y; } }",
 			fn:       1,
 			cd: []string{"case 1@49 -> y = 1@57", "case 1@49 -> y = 2@72", "case 1@49 -> break;@79",
