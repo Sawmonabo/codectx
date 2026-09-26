@@ -227,7 +227,14 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // A read the consumer folds that the statement makes before a node
 // redefines its variable (`f(x, x = 1)`) is carried by that node, as Uses in
 // Lowering states: the node Uses v and may-defines an owned variable that
-// replaces the held reads of v. JavaScript evaluates operands left to right
+// replaces the held reads of v. The hand-off is made only for reads the
+// node runs after whenever their consumer does: a node inside an operand
+// evaluated on some paths only (a short-circuit operand after the deciding
+// one, a conditional's arm, an optional chain's tail after a `?.`, a
+// logical assignment's right side and write, a default) takes over only the
+// reads made inside that operand, and a read before it stays on the
+// consumer, where `y = x + (c && (x = 1))` pairs y with the x before it
+// and, through the operator's result, with the assignment. JavaScript evaluates operands left to right
 // (ECMA-262 §13.3.8.1 ArgumentListEvaluation, §13.15.4), so source order is
 // the language's. A read another node carried (a condition's, a capture) is
 // no longer held.
@@ -447,6 +454,9 @@ type jsLower struct {
 	optR int32
 	// defd is the node the last Def went to, or -1.
 	defd int32
+	// condFrom is where in reads the innermost conditionally evaluated
+	// operand of the statement began, or 0.
+	condFrom int
 	// decorated counts the decorators collected that are evaluated where the
 	// class being collected is created: a class whose collection counted one
 	// may throw there. A nested callable's parameters and body and a field's
@@ -517,7 +527,7 @@ type jsSeen struct {
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (j *jsLower) reset() {
-	j.reads, j.throws, j.thrown = j.reads[:0], 0, 0
+	j.reads, j.throws, j.thrown, j.condFrom = j.reads[:0], 0, 0, 0
 	j.stmtNo++
 }
 
@@ -595,9 +605,9 @@ func (j *jsLower) uses(id int32, from, to int) {
 }
 
 // def records that node n defines v. When the statement still holds a read
-// of v from before n, n reads that earlier value before overwriting it and
-// hands it on through an owned variable, which replaces those reads (see Uses
-// in lowerJavaScript).
+// of v from before n, made where n runs whenever its consumer does, n reads
+// that earlier value before overwriting it and hands it on through an owned
+// variable, which replaces those reads (see Uses in lowerJavaScript).
 func (j *jsLower) def(n, v int32) {
 	if v < 0 {
 		return
@@ -606,17 +616,38 @@ func (j *jsLower) def(n, v int32) {
 	if int(v) >= len(j.seen) || j.seen[v].stmt != j.stmtNo {
 		return
 	}
+	// Only the reads made since the innermost conditionally evaluated
+	// operand began are handed off: n runs whenever their consumer does.
+	at := max(j.seen[v].at, j.condFrom)
+	for at < len(j.reads) && j.reads[at] != v {
+		at++
+	}
+	if at == len(j.reads) {
+		return
+	}
 	j.b.Use(n, v)
 	t := j.b.Var()
 	j.define(n, t)
-	at := j.seen[v].at
 	for i := at; i < len(j.reads); i++ {
 		if j.reads[i] == v {
 			j.reads[i] = t
 		}
 	}
-	j.seen[v].stmt = 0
+	if j.seen[v].at >= j.condFrom {
+		j.seen[v].stmt = 0
+	}
 	j.mark(t, at)
+}
+
+// enter begins an operand evaluated only on some paths through the
+// expression (a short-circuit operand after the deciding one, a
+// conditional's arm, an optional chain's tail, a logical assignment's right
+// side, a default): a definition inside it takes over no read made before
+// it. It returns the enclosing start, which the caller restores.
+func (j *jsLower) enter() int {
+	saved := j.condFrom
+	j.condFrom = len(j.reads)
+	return saved
 }
 
 // mark records that v is one of the statement's reads, first at reads[at].
@@ -1567,7 +1598,9 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 			j.value(left, false)
 			j.yieldTo(j.node(flow.Branch, left, m, len(j.reads)), m, r)
 			p := j.b.Push()
+			saved := j.enter()
 			id, a := j.valueNode(j.l.unparen(right))
+			j.condFrom = saved
 			j.yieldTo(id, a, r)
 			j.b.Merge(p)
 			j.b.Pop(p)
@@ -1585,11 +1618,15 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 		j.node(flow.Branch, cond, m, len(j.reads))
 		j.drop(m)
 		p := j.b.Push()
+		saved := j.enter()
 		id, a := j.valueNode(j.l.unparen(n.ChildByFieldId(k.fConsequence)))
+		j.condFrom = saved
 		j.yieldTo(id, a, r)
 		t := j.b.Push()
 		j.b.Restore(p)
+		saved = j.enter()
 		id, a = j.valueNode(j.l.unparen(n.ChildByFieldId(k.fAlternative)))
+		j.condFrom = saved
 		j.yieldTo(id, a, r)
 		j.b.Merge(t)
 		j.b.Pop(p)
@@ -1636,7 +1673,7 @@ func (j *jsLower) children(n *ts.Node, lower bool) {
 // nullish exits.
 func (j *jsLower) chain(n *ts.Node, inChain bool) {
 	k := j.k
-	base, outer := len(j.opt), j.optR
+	base, outer, outerFrom := len(j.opt), j.optR, j.condFrom
 	if !inChain {
 		j.optR = -1
 	}
@@ -1658,6 +1695,8 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 		j.yieldTo(j.node(flow.Branch, j.l.unparen(recv), m, len(j.reads)), m, j.optR)
 		j.read(j.optR)
 		j.opt = append(j.opt, j.b.Push())
+		// What follows the `?.` runs only on the non-nullish path.
+		j.condFrom = len(j.reads)
 	}
 	switch id {
 	case k.subscriptExpression:
@@ -1670,7 +1709,7 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 		return
 	}
 	if len(j.opt) == base {
-		j.optR = outer
+		j.optR, j.condFrom = outer, outerFrom
 		return
 	}
 	j.yieldTo(j.node(flow.Stmt, n, m, len(j.reads)), m, j.optR)
@@ -1680,7 +1719,7 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 	}
 	j.b.Pop(j.opt[base])
 	j.opt = j.opt[:base]
-	j.optR = outer
+	j.optR, j.condFrom = outer, outerFrom
 }
 
 // reference evaluates a property reference's object and index and reports
@@ -1806,6 +1845,7 @@ func (j *jsLower) augment(n *ts.Node) {
 	r := j.b.Var()
 	j.yieldTo(j.node(flow.Branch, left, m, len(j.reads)), m, r)
 	p := j.b.Push()
+	saved := j.enter()
 	if !named {
 		// The write stores through the reference the Branch evaluated.
 		j.read(r)
@@ -1820,6 +1860,7 @@ func (j *jsLower) augment(n *ts.Node) {
 	} else {
 		j.mayDefBase(id, left)
 	}
+	j.condFrom = saved
 	j.yieldTo(id, m, r)
 	j.b.Merge(p)
 	j.b.Pop(p)
@@ -1937,7 +1978,9 @@ func (j *jsLower) defaulted(left, dflt, whole *ts.Node, from, to int) {
 	br := j.node(flow.Branch, whole, from, to)
 	j.def(br, u)
 	p := j.b.Push()
+	saved := j.enter()
 	id, m := j.valueNode(j.l.unparen(dflt))
+	j.condFrom = saved
 	j.def(id, u)
 	j.drop(m)
 	j.b.Merge(p)

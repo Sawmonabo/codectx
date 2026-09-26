@@ -603,5 +603,25 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			fn:       1,
 			du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
 		},
+		{
+			// ECMA-262 §13.13 Binary Logical Operators (the right operand is
+			// evaluated only when c is truthy) and §13.15.4
+			// EvaluateStringOrNumericBinaryExpression (x is read before the right
+			// operand). Nodes: c@11, x@14; the Branch c@34 (Uses c) defines the
+			// operator's result; x = 1@40, on the true path only, defines x and
+			// the result; the declarator y = x + (c && (x = 1))@25 Uses x, still
+			// reached by x@14 on the false path, and the result; return y;@49. x =
+			// 1 depends on c@34.
+			name:     "an assignment in a short-circuit operand leaves an earlier read on its consumer",
+			protects: "a definition inside a conditionally evaluated operand takes over no read made before the operand, so the consumer keeps the earlier definition on the path that skips the assignment",
+			mutation: "hand the earlier read off to the assignment unconditionally (x@14 -> y = x + (c && (x = 1))@25 vanishes and x@14 -> x = 1@40 appears)",
+			src:      "function f(c, x) { const y = x + (c && (x = 1)); return y; }",
+			fn:       1,
+			cd:       []string{"c@34 -> x = 1@40"},
+			du: []string{
+				"c@11 -> c@34", "x@14 -> y = x + (c && (x = 1))@25", "x = 1@40 -> y = x + (c && (x = 1))@25",
+				"c@34 -> y = x + (c && (x = 1))@25", "y = x + (c && (x = 1))@25 -> return y;@49",
+			},
+		},
 	})
 }
