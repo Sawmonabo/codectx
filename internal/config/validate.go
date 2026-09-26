@@ -270,7 +270,7 @@ func (c Config) validateBudgets() error {
 	// the machine they were loaded on, naming no key the operator could lower.
 	// The one thing that can still be wrong is arithmetic that leaves 64-bit
 	// range, and that names the keys that caused it.
-	if _, err := baseFootprintFor(c, QuerySlots()); err != nil {
+	if _, err := baseFootprintFor(c); err != nil {
 		return err
 	}
 	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
