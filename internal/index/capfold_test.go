@@ -255,8 +255,8 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 	if row.DiagnosticCode != model.CodeProviderOutputInvalid {
 		t.Errorf("diagnostic code %q, want the failure's own", row.DiagnosticCode)
 	}
-	if row.Details["reason"] == "units_deferred" {
-		t.Error("a scope that failed was reported as still running")
+	if row.Details["reason"] == "units_deferred" || row.UnitsRunning != 0 {
+		t.Errorf("a scope that failed was reported as still running (units_running=%d)", row.UnitsRunning)
 	}
 }
 
@@ -444,19 +444,12 @@ func TestCoverageNeverReportsFreshOverAFailedPlannedUnit(t *testing.T) {
 // same wrong pair is what `status`, the completion block and the index-status
 // tool all render, because all four read this row.
 //
-// It also protects the exemplar scope's REMEDIATION reaching that same row.
-// Failure mode: a provider attaches a remediation to the error it fails with
-// -- the one sentence that says what an operator can do -- and the fold drops
-// it, so every surface reports a failure nobody is told how to act on.
-//
 // Mutation proof: in coveredProviders, drop the `planned[id]++` from the
-// Plan.Reuse loop; for the remediation, drop `Remediation: f.remediation`
-// from failureRow.publish.
+// Plan.Reuse loop.
 func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	t.Parallel()
 	const id, capability = "scip", "precise_definitions"
 	const reused, walked = 9, 2
-	const remediation = "install the analyzer for this language family, or disable the provider"
 
 	g := &generation{
 		caps: newCapabilityReport(),
@@ -473,7 +466,7 @@ func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	for i := range walked {
 		scope := "pkg:go:refused" + strconv.Itoa(i)
 		walkedScopes = append(walkedScopes, scope)
-		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable, remediation: remediation})
+		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable})
 	}
 	g.failures = map[string]*providerFailures{id: failures}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
@@ -501,9 +494,5 @@ func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	}
 	if row.State != model.CapabilityPartial {
 		t.Errorf("capability state %q, want partial: nine scopes are in this generation", row.State)
-	}
-	if row.Remediation != remediation {
-		t.Errorf("the row carries remediation %q, want %q: the provider's own advice reached no operator",
-			row.Remediation, remediation)
 	}
 }

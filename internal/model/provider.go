@@ -521,7 +521,8 @@ func (r ProviderResult) Validate() error {
 // kept on the run row so an operator can ask why a scope has no facts long
 // after the log line scrolled away. It holds what the capability row cannot:
 // the scope key the run was about (a run row is keyed by provider, not by
-// scope) and the raw tool output, which the fold and the log both exclude.
+// scope) and the raw tool output, which stays on the run row: the capability
+// fold, the status answer and the log all exclude it.
 type RunFailure struct {
 	// ProviderID names the provider whose run this was. It is on the wire
 	// because the failed runs of one generation are reported as a list: a row
@@ -534,20 +535,8 @@ type RunFailure struct {
 	// Remediation is what an operator can do about this failure, as the
 	// provider stated it. Without it a provider's own advice is lost between
 	// the error it raised and every surface that reports the failure.
-	Remediation string `json:"remediation,omitempty"`
-	// UnitsRunning is how many scopes of this capability were still being
-	// built in the background when this row was published. It is an assertion
-	// about the generation, written into the generation's own row, which is
-	// what lets a SECOND process read it: the in-process deferred queue
-	// answers only for the process that is doing the work, so a `codectx
-	// status` in another terminal would otherwise report a capability as
-	// simply degraded while the work that completes it is still running.
-	//
-	// Every row of one provider capability carries the same figure, so a fold
-	// of two of them takes the greater and never the sum: adding them would
-	// count one running unit once per row it appears on.
-	UnitsRunning int               `json:"units_running,omitempty"`
-	Details      map[string]string `json:"details,omitempty"`
+	Remediation string            `json:"remediation,omitempty"`
+	Details     map[string]string `json:"details,omitempty"`
 }
 
 // Validate bounds every field a run failure persists, so a provider's own text

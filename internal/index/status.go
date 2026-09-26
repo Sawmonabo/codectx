@@ -175,6 +175,12 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
+	// The run row keeps the analyzer's standard-error tail; this answer is
+	// handed to any client of `status --json` and the index-status tool, so it
+	// never carries it.
+	for i := range failed {
+		failed[i].Details = withoutRawOutput(failed[i].Details)
+	}
 	st.FailedUnits, st.FailedUnitsOmitted = failed, omitted
 	if r.watch != nil {
 		r.watch.project(&st)
@@ -871,12 +877,31 @@ func (f *failureRow) publish() model.CapabilityState {
 	if f.message != "" {
 		row = row.WithDetail(failureMessageDetail, f.message)
 	}
-	for _, k := range slices.Sorted(maps.Keys(f.details)) {
-		if k != model.DetailStderrTail {
-			row = row.WithDetail(k, f.details[k])
-		}
+	details := withoutRawOutput(f.details)
+	for _, k := range slices.Sorted(maps.Keys(details)) {
+		row = row.WithDetail(k, details[k])
 	}
 	return row
+}
+
+// withoutRawOutput is a provider's failure details less the standard-error
+// tail. The tail is raw analyzer output: it is kept on the run row and leaves
+// through no capability row, status answer or log line. The input is never
+// modified; a map that holds no tail is answered as it is.
+func withoutRawOutput(details map[string]string) map[string]string {
+	if _, ok := details[model.DetailStderrTail]; !ok {
+		return details
+	}
+	out := make(map[string]string, len(details)-1)
+	for k, v := range details {
+		if k != model.DetailStderrTail {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // finish publishes the bounded list and how many rows the bound omitted. The

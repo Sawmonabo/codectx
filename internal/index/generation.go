@@ -1258,10 +1258,9 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	if f.remediation != "" {
 		args = append(args, "remediation", f.remediation)
 	}
-	for _, k := range slices.Sorted(maps.Keys(f.details)) {
-		if k != model.DetailStderrTail {
-			args = append(args, k, f.details[k])
-		}
+	details := withoutRawOutput(f.details)
+	for _, k := range slices.Sorted(maps.Keys(details)) {
+		args = append(args, k, details[k])
 	}
 	g.c.log.Warn("an optional provider unit failed; its capability is published failed", args...)
 	return f
