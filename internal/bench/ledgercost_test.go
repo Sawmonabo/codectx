@@ -210,8 +210,7 @@ func TestLedgerCost(t *testing.T) {
 // doing at that moment, and the drift that dominates the unpaired ranges
 // cancels. Comparing a difference of medians against the wider arm's range
 // instead would let one slow repetition in either arm widen the range enough
-// to absorb a real and repeatable difference -- which is exactly what was
-// observed here before this rule replaced it.
+// to absorb a real and repeatable difference.
 //
 // The verdict is WITHIN NOISE when the per-repetition differences straddle
 // zero: the sign of the difference is then not stable from repetition to

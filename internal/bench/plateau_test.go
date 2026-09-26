@@ -37,18 +37,17 @@ import (
 // live at once -- `go test ./...` beside a targeted rerun of this package, a
 // CI stage beside a developer's shell -- and over a fixed path whichever
 // started second would clear the corpus out from under the first's remaining
-// rows. That is exactly the failure a full-suite race run was seen to hit:
-// rows late in the Section 23.2 table refused with CTX_PATH_ESCAPE because the
-// repository they were measuring had been removed mid-run.
+// rows: rows late in the Section 23.2 table would refuse with CTX_PATH_ESCAPE
+// because the repository they were measuring had been removed mid-run.
 //
 // Its lifetime is TestMain's rather than any row's: the fixture deliberately
 // outlives the test or benchmark that happens to build it (see fixture), so no
 // t.Cleanup may own it. It is cleared on entry -- a pid can be reused after a
 // crashed run -- and released after the last row returns.
-var benchRoot = filepath.Join(os.TempDir(), fmt.Sprintf("codectx-bench-l2-%d", os.Getpid()))
+var benchRoot = filepath.Join(os.TempDir(), fmt.Sprintf("codectx-bench-%d", os.Getpid()))
 
 // TestMain makes this test binary the parser worker, as the codectx binary
-// is in production (ruling R8-1), and owns benchRoot's lifetime.
+// is in production, and owns benchRoot's lifetime.
 func TestMain(m *testing.M) {
 	// A parser worker returns here: it runs no row, so it must never create or
 	// release the root its parent is measuring against.
@@ -62,8 +61,9 @@ func TestMain(m *testing.M) {
 	}
 	// Only the process that runs rows counts native allocations, and it
 	// installs the counter before any row can create a parser: nothing in
-	// this binary creates one in-process outside the native-core rows (every
-	// other row parses in a worker child, which returned above).
+	// this binary creates one in-process outside the dependence-core
+	// measurements (every other row parses in a worker child, which returned
+	// above).
 	installNativeCounter()
 	if err := openRows(); err != nil {
 		fmt.Fprintf(os.Stderr, "open the benchmark row file: %v\n", err)
@@ -337,9 +337,9 @@ func TestIncrementalReuse(t *testing.T) {
 	if refreshed.UnitsReused != cold.UnitsBuilt {
 		t.Fatalf("the refresh reused %d of the %d units the cold index built", refreshed.UnitsReused, cold.UnitsBuilt)
 	}
-	// The cost, not the count, is what this test exists for. A generous margin
-	// keeps it from failing on a loaded machine, where the measured ratio was
-	// 13x.
+	// The cost, not the count, is what this test exists for. The margin is
+	// generous so that a loaded machine, which slows both runs, does not fail
+	// it.
 	if refreshFor*4 > coldFor {
 		t.Fatalf("the no-op refresh took %s against a %s cold index; reuse is not paying for itself", refreshFor, coldFor)
 	}
