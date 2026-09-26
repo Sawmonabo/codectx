@@ -12,11 +12,11 @@ import (
 // javascriptLowering lowers JavaScript callables: function declarations and
 // expressions, arrow functions, methods, generator functions (async is a
 // modifier of these kinds), class static blocks, and the program itself,
-// whose top-level code is one function as the hosted engine's per-file
-// program method is.
+// whose top-level code is one function.
 var javascriptLowering = Lowering{
-	callable: set("program", "function_declaration", "function_expression", "arrow_function", "method_definition",
-		"generator_function", "generator_function_declaration", "class_static_block"),
+	language: "javascript",
+	callables: []string{"program", "function_declaration", "function_expression", "arrow_function",
+		"method_definition", "generator_function", "generator_function_declaration", "class_static_block"},
 	lower: lowerJavaScript,
 }
 
@@ -97,7 +97,7 @@ var javascriptLowering = Lowering{
 func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	cur := fn.Walk()
 	defer cur.Close()
-	j := jsLower{b: b, src: src, k: jsSyntaxOf(l), cur: cur, first: -1}
+	j := jsLower{l: l, b: b, src: src, k: jsSyntaxOf(), cur: cur, first: -1}
 	k := j.k
 	switch fn.KindId() {
 	case k.program:
@@ -141,16 +141,9 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	}
 }
 
-// jsBind is one name in scope: src[start:end] names variable v, or v is -1
-// for a name declared inside a nested callable, which shadows without being
-// a variable of the function being lowered.
-type jsBind struct {
-	start, end uint32
-	v          int32
-}
-
 // jsLower is the state of lowering one JavaScript callable.
 type jsLower struct {
+	l   *Lowering
 	b   *flow.Builder
 	src []byte
 	k   *jsSyntax
@@ -159,7 +152,7 @@ type jsLower struct {
 	buf []ts.Node
 	// binds is the scope chain, innermost last; fnMark is where the
 	// innermost function scope begins, the target of var hoisting.
-	binds  []jsBind
+	binds  scope
 	fnMark int
 	// shadow is non-zero while walking a nested callable or class for its
 	// captures: declarations then bind -1 and no node is created.
@@ -202,31 +195,10 @@ func (j *jsLower) kids(n *ts.Node) (int, []ts.Node) {
 
 func (j *jsLower) done(mark int) { j.buf = j.buf[:mark] }
 
-// firstKid is n's first named, non-extra child, or nil.
-func (j *jsLower) firstKid(n *ts.Node) *ts.Node {
-	start, list := j.kids(n)
-	defer j.done(start)
-	if len(list) == 0 {
-		return nil
-	}
-	x := list[0]
-	return &x
-}
+// jsSpan is the span a declared name's variable records.
+func jsSpan(n *ts.Node) flow.Span { return spanOf(n) }
 
-// inner strips parentheses.
-func (j *jsLower) inner(n *ts.Node) *ts.Node {
-	for n != nil && n.KindId() == j.k.parenthesizedExpression {
-		n = j.firstKid(n)
-	}
-	return n
-}
-
-// jsSpan is n's byte range.
-func jsSpan(n *ts.Node) flow.Span {
-	return flow.Span{Start: uint32(n.StartByte()), End: uint32(n.EndByte())}
-}
-
-func (j *jsLower) text(n *ts.Node) []byte { return j.src[n.StartByte():n.EndByte()] }
+func (j *jsLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
 
 // declare binds name in the innermost scope: a new variable, or -1 inside a
 // nested callable.
@@ -235,31 +207,17 @@ func (j *jsLower) declare(name *ts.Node) int32 {
 	if j.shadow == 0 {
 		v = j.b.Var(jsSpan(name))
 	}
-	j.binds = append(j.binds, jsBind{uint32(name.StartByte()), uint32(name.EndByte()), v})
+	j.binds = append(j.binds, binding{name: j.text(name), v: v})
 	return v
 }
 
 // lookup resolves name through the scope chain: its variable, or -1 when it
 // is declared inside a nested callable or not in this function at all.
-func (j *jsLower) lookup(name *ts.Node) int32 {
-	t := j.text(name)
-	for i := len(j.binds) - 1; i >= 0; i-- {
-		if bb := j.binds[i]; bytes.Equal(j.src[bb.start:bb.end], t) {
-			return bb.v
-		}
-	}
-	return -1
-}
+func (j *jsLower) lookup(name *ts.Node) int32 { return j.binds.lookup(j.text(name)) }
 
 // boundSince reports whether name is bound in binds[from:].
 func (j *jsLower) boundSince(from int, name *ts.Node) bool {
-	t := j.text(name)
-	for _, bb := range j.binds[from:] {
-		if bytes.Equal(j.src[bb.start:bb.end], t) {
-			return true
-		}
-	}
-	return false
+	return j.binds.find(j.text(name), from) >= 0
 }
 
 // ref records a read of name when it resolves to a variable of this function.
@@ -277,7 +235,7 @@ func (j *jsLower) reset() {
 // node creates a node spanning n that Uses reads[from:to] and every pending
 // read, and MayThrow when a throwing construct is pending.
 func (j *jsLower) node(kind flow.Kind, n *ts.Node, from, to int) int32 {
-	id := j.b.Node(kind, jsSpan(n))
+	id := j.b.Node(kind, spanOf(n))
 	if j.first < 0 {
 		j.first = id
 	}
@@ -446,7 +404,7 @@ func (j *jsLower) imports(n *ts.Node) {
 			case k.identifier:
 				j.importName(part)
 			case k.namespaceImport:
-				if id := j.firstKid(part); id != nil {
+				if id := firstNamed(part); id != nil {
 					j.importName(id)
 				}
 			case k.namedImports:
@@ -481,7 +439,7 @@ func (j *jsLower) stmt(n *ts.Node) {
 	j.reset()
 	switch n.KindId() {
 	case k.expressionStatement:
-		if e := j.firstKid(n); e != nil {
+		if e := firstNamed(n); e != nil {
 			j.exprStmt(e)
 		}
 	case k.lexicalDeclaration, k.usingDeclaration:
@@ -512,13 +470,13 @@ func (j *jsLower) stmt(n *ts.Node) {
 	case k.labeledStatement:
 		j.labeled(n, labels)
 	case k.returnStatement:
-		if e := j.firstKid(n); e != nil {
+		if e := firstNamed(n); e != nil {
 			j.value(e, false)
 		}
 		j.node(flow.Jump, n, 0, len(j.reads))
 		j.b.Return()
 	case k.throwStatement:
-		if e := j.firstKid(n); e != nil {
+		if e := firstNamed(n); e != nil {
 			j.value(e, false)
 		}
 		j.node(flow.Jump, n, 0, len(j.reads))
@@ -530,7 +488,7 @@ func (j *jsLower) stmt(n *ts.Node) {
 		j.node(flow.Jump, n, 0, 0)
 		j.b.Continue(j.label(n))
 	case k.withStatement:
-		obj := j.inner(n.ChildByFieldId(k.fObject))
+		obj := j.l.unparen(n.ChildByFieldId(k.fObject))
 		j.value(obj, false)
 		j.node(flow.Stmt, obj, 0, len(j.reads))
 		j.stmt(n.ChildByFieldId(k.fBody))
@@ -604,7 +562,7 @@ func (j *jsLower) declaration(n *ts.Node, isVar bool) {
 
 func (j *jsLower) ifStmt(n *ts.Node) {
 	k := j.k
-	cond := j.inner(n.ChildByFieldId(k.fCondition))
+	cond := j.l.unparen(n.ChildByFieldId(k.fCondition))
 	j.value(cond, false)
 	j.node(flow.Branch, cond, 0, len(j.reads))
 	p := j.b.Push()
@@ -612,7 +570,7 @@ func (j *jsLower) ifStmt(n *ts.Node) {
 	t := j.b.Push()
 	j.b.Restore(p)
 	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
-		if s := j.firstKid(alt); s != nil {
+		if s := firstNamed(alt); s != nil {
 			j.stmt(s)
 		}
 	}
@@ -621,7 +579,7 @@ func (j *jsLower) ifStmt(n *ts.Node) {
 }
 
 // isTrue reports whether a loop condition is the literal true.
-func (j *jsLower) isTrue(cond *ts.Node) bool { return j.inner(cond).KindId() == j.k.trueLit }
+func (j *jsLower) isTrue(cond *ts.Node) bool { return j.l.unparen(cond).KindId() == j.k.trueLit }
 
 // head lowers a loop condition as the loop's decision node, or as a Stmt
 // node without an exit edge when it is the literal true. It reports whether
@@ -654,7 +612,7 @@ func (j *jsLower) whileStmt(n *ts.Node, labels []string) {
 	k := j.k
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
-	exits := j.head(j.inner(n.ChildByFieldId(k.fCondition)))
+	exits := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
 	h := j.close(saved)
 	var exit flow.Fringe
 	if exits {
@@ -671,7 +629,7 @@ func (j *jsLower) doStmt(n *ts.Node, labels []string) {
 	saved := j.open()
 	j.stmt(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
-	exits := j.head(j.inner(n.ChildByFieldId(k.fCondition)))
+	exits := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
 	h := j.close(saved)
 	var exit flow.Fringe
 	if exits {
@@ -722,7 +680,7 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	k := j.k
 	mark := len(j.binds)
-	left := j.inner(n.ChildByFieldId(k.fLeft))
+	left := j.l.unparen(n.ChildByFieldId(k.fLeft))
 	kw := n.ChildByFieldId(k.fKind)
 	if kw != nil && kw.KindId() != k.varKw {
 		j.declarePattern(left, false)
@@ -773,7 +731,7 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 
 func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	k := j.k
-	disc := j.inner(n.ChildByFieldId(k.fValue))
+	disc := j.l.unparen(n.ChildByFieldId(k.fValue))
 	j.value(disc, false)
 	j.node(flow.Stmt, disc, 0, len(j.reads))
 	mark := len(j.binds)
@@ -905,7 +863,7 @@ func (j *jsLower) labeled(n *ts.Node, labels []string) {
 func (j *jsLower) value(n *ts.Node, inChain bool) {
 	k := j.k
 	id := n.KindId()
-	if k.isCallable(id) {
+	if j.l.isCallable(n) {
 		m := len(j.reads)
 		j.capFunction(n)
 		j.node(flow.Stmt, n, m, len(j.reads))
@@ -946,7 +904,7 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 	case k.augmentedAssignmentExpression:
 		j.augment(n)
 	case k.updateExpression:
-		arg := j.inner(n.ChildByFieldId(k.fArgument))
+		arg := j.l.unparen(n.ChildByFieldId(k.fArgument))
 		if arg.KindId() == k.identifier {
 			m := len(j.reads)
 			j.ref(arg)
@@ -1040,7 +998,7 @@ func (j *jsLower) target(t *ts.Node) {
 
 func (j *jsLower) assign(n *ts.Node) {
 	k := j.k
-	left, right := j.inner(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
+	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(j.reads)
 	switch left.KindId() {
 	case k.identifier:
@@ -1059,7 +1017,7 @@ func (j *jsLower) assign(n *ts.Node) {
 
 func (j *jsLower) augment(n *ts.Node) {
 	k := j.k
-	left, right := j.inner(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
+	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	op := n.ChildByFieldId(k.fOperator).KindId()
 	logical := op == k.andAssign || op == k.orAssign || op == k.nullishAssign
 	m := len(j.reads)
@@ -1100,11 +1058,11 @@ func (j *jsLower) bind(p *ts.Node, from, to int) {
 		j.target(p)
 		j.node(flow.Stmt, p, from, to)
 	case k.parenthesizedExpression:
-		j.bind(j.inner(p), from, to)
+		j.bind(j.l.unparen(p), from, to)
 	case k.assignmentPattern:
 		j.defaulted(p.ChildByFieldId(k.fLeft), p.ChildByFieldId(k.fRight), p, from, to)
 	case k.restPattern:
-		if c := j.firstKid(p); c != nil {
+		if c := firstNamed(p); c != nil {
 			j.bind(c, from, to)
 		}
 	case k.objectPattern, k.arrayPattern:
@@ -1249,7 +1207,7 @@ func (j *jsLower) patternExprs(p *ts.Node) {
 func (j *jsLower) cap(n *ts.Node) {
 	k := j.k
 	id := n.KindId()
-	if k.isCallable(id) {
+	if j.l.isCallable(n) {
 		j.capFunction(n)
 		return
 	}
@@ -1293,7 +1251,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.binds = j.binds[:mark]
 	case k.forInStatement:
 		mark := len(j.binds)
-		left := j.inner(n.ChildByFieldId(k.fLeft))
+		left := j.l.unparen(n.ChildByFieldId(k.fLeft))
 		if kw := n.ChildByFieldId(k.fKind); kw == nil {
 			j.cap(left)
 		} else {
@@ -1360,9 +1318,6 @@ func (j *jsLower) jsxElement(n *ts.Node, lower bool) {
 // resolved once by name against the pinned grammar so the walk compares
 // integers rather than converting every node's kind to a string.
 type jsSyntax struct {
-	// callable is indexed by kind id: the Lowering's callable set.
-	callable []bool
-
 	program, statementBlock, expressionStatement, lexicalDeclaration, variableDeclaration, usingDeclaration,
 	variableDeclarator, functionDeclaration, generatorFunctionDeclaration, classDeclaration, class, classHeritage,
 	ifStatement, elseClause, forStatement, forInStatement, whileStatement, doStatement, switchStatement,
@@ -1384,10 +1339,6 @@ type jsSyntax struct {
 	fOperator, fOptionalChain, fParameter, fParameters, fRight, fValue uint16
 }
 
-// isCallable reports whether kind id begins a function. An error node's id
-// lies outside the grammar's kind count.
-func (s *jsSyntax) isCallable(id uint16) bool { return int(id) < len(s.callable) && s.callable[id] }
-
 var (
 	jsSyntaxOnce  sync.Once
 	jsSyntaxTable *jsSyntax
@@ -1396,32 +1347,14 @@ var (
 // jsSyntaxOf resolves the table once. A name the grammar does not define is
 // a lowering defect and panics, so a misspelt kind can never silently match
 // nothing.
-func jsSyntaxOf(l *Lowering) *jsSyntax {
+func jsSyntaxOf() *jsSyntax {
 	jsSyntaxOnce.Do(func() {
-		tl, ok := Grammar("javascript")
-		if !ok {
-			panic("worker: the javascript grammar is not linked")
-		}
-		id := func(name string, named bool) uint16 {
-			v := tl.IdForNodeKind(name, named)
-			if v == 0 {
-				panic("worker: the javascript grammar has no kind " + name)
-			}
-			return v
-		}
-		kind := func(name string) uint16 { return id(name, true) }
-		tok := func(name string) uint16 { return id(name, false) }
-		field := func(name string) uint16 {
-			v := tl.FieldIdForName(name)
-			if v == 0 {
-				panic("worker: the javascript grammar has no field " + name)
-			}
-			return v
-		}
-		s := &jsSyntax{callable: make([]bool, tl.NodeKindCount())}
-		for name := range l.callable {
-			s.callable[kind(name)] = true
-		}
+		const language = "javascript"
+		tl := mustGrammar(language)
+		kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
+		tok := func(name string) uint16 { return mustKind(tl, language, name, false) }
+		field := func(name string) uint16 { return mustField(tl, language, name) }
+		s := &jsSyntax{}
 		s.program, s.statementBlock, s.expressionStatement = kind("program"), kind("statement_block"), kind("expression_statement")
 		s.lexicalDeclaration, s.variableDeclaration, s.usingDeclaration = kind("lexical_declaration"), kind("variable_declaration"), kind("using_declaration")
 		s.variableDeclarator, s.functionDeclaration = kind("variable_declarator"), kind("function_declaration")

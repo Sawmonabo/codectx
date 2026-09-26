@@ -1,8 +1,6 @@
 package worker
 
 import (
-	"bytes"
-
 	ts "github.com/tree-sitter/go-tree-sitter"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -10,8 +8,9 @@ import (
 
 // goLowering lowers Go functions, methods and function literals.
 var goLowering = Lowering{
-	callable: set("function_declaration", "method_declaration", "func_literal"),
-	lower:    lowerGo,
+	language:  "go",
+	callables: []string{"function_declaration", "method_declaration", "func_literal"},
+	lower:     lowerGo,
 }
 
 // lowerGo lowers one Go callable's parameters and body into b.
@@ -100,14 +99,6 @@ func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	g.close()
 }
 
-// goBinding maps a name to a variable id, or to -1 for a name that is not a
-// variable of the function being lowered (a constant, a type, or a function
-// literal's own declaration while its captures are resolved).
-type goBinding struct {
-	name []byte
-	v    int32
-}
-
 // goTarget is one variable target of a statement while its nodes are
 // ordered: its identifier, its index among the statement's targets, its
 // variable, and its uses in goLower.buf[lo:hi].
@@ -125,8 +116,8 @@ type goLower struct {
 	l   *Lowering
 	b   *flow.Builder
 	src []byte
-	// binds is the scope stack, innermost last; marks are block starts.
-	binds []goBinding
+	// binds is the scope chain; marks are block starts.
+	binds scope
 	marks []int
 	// results are the named result variables a bare return uses.
 	results []int32
@@ -142,11 +133,9 @@ type goLower struct {
 	first   int32
 }
 
-func (g *goLower) span(n *ts.Node) flow.Span {
-	return flow.Span{Start: uint32(n.StartByte()), End: uint32(n.EndByte())}
-}
+func (g *goLower) span(n *ts.Node) flow.Span { return spanOf(n) }
 
-func (g *goLower) text(n *ts.Node) []byte { return g.src[n.StartByte():n.EndByte()] }
+func (g *goLower) text(n *ts.Node) []byte { return textOf(g.src, n) }
 
 func (g *goLower) blank(name []byte) bool { return len(name) == 1 && name[0] == '_' }
 
@@ -161,16 +150,6 @@ func (g *goLower) nodeSpan(k flow.Kind, s flow.Span) int32 {
 	return id
 }
 
-// named0 is n's first named child that is not a comment, or nil.
-func (g *goLower) named0(n *ts.Node) *ts.Node {
-	for i := range n.NamedChildCount() {
-		if c := n.NamedChild(i); c.Kind() != "comment" {
-			return c
-		}
-	}
-	return nil
-}
-
 // token is n's anonymous child spelled kind, or nil.
 func (g *goLower) token(n *ts.Node, kind string) *ts.Node {
 	for i := range n.ChildCount() {
@@ -179,13 +158,6 @@ func (g *goLower) token(n *ts.Node, kind string) *ts.Node {
 		}
 	}
 	return nil
-}
-
-func (g *goLower) unparen(n *ts.Node) *ts.Node {
-	for n != nil && n.Kind() == "parenthesized_expression" {
-		n = g.named0(n)
-	}
-	return n
 }
 
 func (g *goLower) open() { g.marks = append(g.marks, len(g.binds)) }
@@ -199,7 +171,7 @@ func (g *goLower) close() {
 // bind makes name resolve to v in the innermost block; _ binds nothing.
 func (g *goLower) bind(name []byte, v int32) {
 	if !g.blank(name) {
-		g.binds = append(g.binds, goBinding{name: name, v: v})
+		g.binds = append(g.binds, binding{name: name, v: v})
 	}
 }
 
@@ -224,32 +196,12 @@ func (g *goLower) bindNames(n *ts.Node) {
 	}
 }
 
-// resolve returns the index of the binding name resolves to, or -1.
-func (g *goLower) resolve(name []byte) int {
-	for i := len(g.binds) - 1; i >= 0; i-- {
-		if bytes.Equal(g.binds[i].name, name) {
-			return i
-		}
-	}
-	return -1
-}
-
 // variable is the variable identifier id resolves to, or -1.
-func (g *goLower) variable(id *ts.Node) int32 {
-	if i := g.resolve(g.text(id)); i >= 0 {
-		return g.binds[i].v
-	}
-	return -1
-}
+func (g *goLower) variable(id *ts.Node) int32 { return g.binds.lookup(g.text(id)) }
 
 // declaredHere reports whether name is declared in the innermost block.
 func (g *goLower) declaredHere(name []byte) bool {
-	for i := len(g.binds) - 1; i >= g.marks[len(g.marks)-1]; i-- {
-		if bytes.Equal(g.binds[i].name, name) {
-			return true
-		}
-	}
-	return false
+	return g.binds.find(name, g.marks[len(g.marks)-1]) >= 0
 }
 
 // params declares every named parameter of list, each as a defining node.
@@ -335,7 +287,7 @@ func (g *goLower) hoist(n *ts.Node) {
 // where n is true, f where it is false, and first, the earliest handle it
 // pushed, which releases them all.
 func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
-	n = g.unparen(n)
+	n = g.l.unparen(n)
 	if !g.isShort(n) {
 		g.hoist(n)
 		g.uses(g.node(flow.Branch, n), n)
@@ -411,7 +363,7 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 	case "block":
 		g.block(s)
 	case "expression_statement":
-		e := g.named0(s)
+		e := firstNamed(s)
 		g.hoist(e)
 		if g.isPanic(e) {
 			g.uses(g.node(flow.Jump, s), e)
@@ -423,11 +375,11 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		g.hoist(s)
 		g.uses(g.node(flow.Stmt, s), s)
 	case "inc_statement", "dec_statement":
-		e := g.named0(s)
+		e := firstNamed(s)
 		g.hoist(e)
 		id := g.node(flow.Stmt, s)
 		g.uses(id, e)
-		if x := g.unparen(e); x.Kind() == "identifier" {
+		if x := g.l.unparen(e); x.Kind() == "identifier" {
 			if v := g.variable(x); v >= 0 {
 				b.Def(id, v)
 			}
@@ -461,7 +413,7 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		g.hoist(s)
 		id := g.node(flow.Jump, s)
 		g.uses(id, s)
-		if g.named0(s) == nil {
+		if firstNamed(s) == nil {
 			for _, v := range g.results {
 				b.Use(id, v)
 			}
@@ -500,12 +452,12 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 
 // isPanic reports whether e calls the predeclared panic.
 func (g *goLower) isPanic(e *ts.Node) bool {
-	e = g.unparen(e)
+	e = g.l.unparen(e)
 	if e == nil || e.Kind() != "call_expression" {
 		return false
 	}
 	f := e.ChildByFieldName("function")
-	return f != nil && f.Kind() == "identifier" && string(g.text(f)) == "panic" && g.resolve(g.text(f)) < 0
+	return f != nil && f.Kind() == "identifier" && string(g.text(f)) == "panic" && g.binds.find(g.text(f), 0) < 0
 }
 
 // labeled lowers a labelled statement. Go's break and continue name only an
@@ -614,7 +566,7 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 		define := g.token(rc, ":=") != nil
 		for i := range left.NamedChildCount() {
 			t := left.NamedChild(i)
-			x := g.unparen(t)
+			x := g.l.unparen(t)
 			if t.Kind() == "comment" || (x.Kind() == "identifier" && g.blank(g.text(x))) {
 				continue
 			}
@@ -736,7 +688,7 @@ func (g *goLower) typeSwitchHead(s, value *ts.Node) {
 	if alias == nil {
 		return
 	}
-	if id := g.named0(alias); id != nil && id.Kind() == "identifier" {
+	if id := firstNamed(alias); id != nil && id.Kind() == "identifier" {
 		if v := g.declare(id); v >= 0 {
 			g.b.Def(head, v)
 		}
@@ -845,7 +797,7 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	// first node carries them.
 	g.targets = g.targets[:0]
 	for i, n := range g.lefts {
-		x := g.unparen(n)
+		x := g.l.unparen(n)
 		t := goTarget{id: x, left: i, v: -1}
 		if x.Kind() == "identifier" {
 			switch name := g.text(x); {
@@ -1023,7 +975,7 @@ func (g *goLower) scan(n *ts.Node, base int) {
 	}
 	switch n.Kind() {
 	case "identifier":
-		if i := g.resolve(g.text(n)); i >= 0 && i < base && g.binds[i].v >= 0 {
+		if i := g.binds.find(g.text(n), 0); i >= 0 && i < base && g.binds[i].v >= 0 {
 			g.buf = append(g.buf, g.binds[i].v)
 		}
 		return
