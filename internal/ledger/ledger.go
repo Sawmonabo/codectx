@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -720,22 +721,25 @@ func (l *Ledger) DiscardRun(ctx context.Context, run *Run) error {
 // the record of a process another surface has just called live.
 const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
 
-// RetainedRuns is how many of a repository's runs the ledger keeps. It is
-// structural and not a setting, for the reason busDepth is: the file exists so
-// an operator can read what the last few runs of this workspace cost, and the
-// answer to "how many is a few" is not a number anybody tunes.
+// RetainedRuns is how many of a repository's runs the ledger keeps. It bounds
+// the run history and nothing else: the file exists so an operator can read
+// what the last few runs of this workspace cost, and no decision the product
+// makes reads a run that is older than that. A learned peak is not such a run
+// -- it lives in its scope's high-water row, which this sweep never touches --
+// so how many runs are kept changes what `status --resources` can show about
+// the past and never what a unit is reserved against.
 //
-// It is what bounds the file. A run's rows are not a generation's rows and
-// never go with one: the generation of a run that published is deleted by
-// retention as soon as a later generation of the same ref exists -- which a
-// deferred publication makes true within the same command -- and a ledger kept
-// to a generation's lifetime therefore loses the account of the run that built
-// the store minutes after it built it. The ledger outlives generations, which
-// is also what lets a rebuild reserve from the peaks the last run measured.
+// It is a count because what it bounds is a history of runs rather than a
+// quantity of work: a run's rows are not a generation's rows and cannot follow
+// one, because the generation of a run that published is deleted by retention
+// as soon as a later generation of the same ref exists -- which a deferred
+// publication makes true within the same command -- and a ledger kept to a
+// generation's lifetime would lose the account of the run that built the store
+// minutes after it built it.
 const RetainedRuns = 16
 
 // SweepRuns keeps this repository's last RetainedRuns runs and deletes the
-// rest, which is the whole of the ledger's own collection: a run that
+// rest, which is the whole of the run history's collection: a run that
 // published, a tick that published nothing, and a run whose process died
 // before it reached a generation all leave the file the same way.
 //
@@ -777,6 +781,74 @@ func (l *Ledger) SweepRuns(ctx context.Context, repositoryID string, activeGener
 			repo, RetainedRuns, model.MaxRecordsPerResult)
 		return wrap("sweep the runs", err)
 	})
+}
+
+// RetirePeaks deletes this repository's high-water rows whose scope keys are
+// not in keep, which is what bounds that table by what the repository holds
+// instead of by a count: keep is every heavy scope a plan just derived for the
+// repository, in ascending order, so a scope that no longer exists -- a
+// removed project, a renamed root, a subdivision part or any other key a span
+// measured that no plan asks about -- leaves the table at the next plan, and
+// every scope that still exists keeps its measurement however many runs have
+// passed since one last touched it.
+//
+// The caller calls it only with a plan that derived the complete heavy scope
+// set; a plan that did not -- the provider that plans heavy units was not
+// active -- names nothing, and retiring against it would forget every
+// measurement a later plan will need. The table is read in pages of
+// model.MaxRecordsPerResult, one write transaction per page, so no statement
+// carries a repository-sized parameter list and the writer is never held for
+// longer than one page.
+func (l *Ledger) RetirePeaks(ctx context.Context, repositoryID string, keep []string) error {
+	c := l.current()
+	if c == nil {
+		return nil
+	}
+	repo, err := model.DecodeID(repositoryID)
+	if err != nil {
+		return err
+	}
+	after := ""
+	for {
+		var n int
+		err := c.writeTx(ctx, func(tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, `SELECT scope_key FROM scope_peaks
+				WHERE repository_id = ? AND scope_key > ? ORDER BY scope_key LIMIT ?`,
+				repo, after, model.MaxRecordsPerResult)
+			if err != nil {
+				return wrap("read the scope peaks", err)
+			}
+			var gone []string
+			for rows.Next() {
+				var key string
+				if err := rows.Scan(&key); err != nil {
+					rows.Close()
+					return wrap("read the scope peaks", err)
+				}
+				n++
+				after = key
+				if _, found := slices.BinarySearch(keep, key); !found {
+					gone = append(gone, key)
+				}
+			}
+			// Closed before the deletes: the transaction runs one statement
+			// at a time, so the page is read out before a write on its rows.
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return wrap("read the scope peaks", err)
+			}
+			for _, key := range gone {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM scope_peaks WHERE repository_id = ? AND scope_key = ?`,
+					repo, key); err != nil {
+					return wrap("retire a scope peak", err)
+				}
+			}
+			return nil
+		})
+		if err != nil || n < model.MaxRecordsPerResult {
+			return err
+		}
+	}
 }
 
 // OverlayRuns lists the overlay runs whose writer is gone: an overlay run that

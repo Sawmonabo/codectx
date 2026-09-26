@@ -355,14 +355,32 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 		// It is wired whatever the previous generation is -- unlike the carry
 		// pages, which are about one generation's rows -- because the ledger
 		// outlives generations: a rebuild starts from no previous generation
-		// and must still not under-reserve what the last run measured.
-		in.RecordedPeaks = c.opts.RunLedgerReader.RecordedPeaks
+		// and must still not under-reserve what the last run measured. The
+		// lookup is opened once for the plan and closed when it is built.
+		peaks, err := c.opts.RunLedgerReader.OpenPeaks(ctx)
+		if err != nil {
+			return err
+		}
+		if peaks != nil {
+			defer peaks.Close()
+			in.RecordedPeak = c.recordedPeak(peaks)
+		}
 	}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return err
 	}
 	g.plan = p
+	if p.HeavyDerived {
+		// The plan named every heavy scope this repository now holds, so a
+		// learned peak for any other key is about a scope that is gone. Like
+		// the other ledger sweeps it never fails the run: the rows stay and
+		// the next plan retires them.
+		if err := c.opts.Ledger.RetirePeaks(ctx, string(c.repo), p.HeavyScopes); err != nil {
+			logTyped(c.log, "the learned peaks of scopes this repository no longer holds were not retired", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+	}
 	g.planned = int64(len(p.Reuse) + len(p.Carry))
 	span.AddOut(g.planned)
 	for _, s := range p.States {
@@ -422,15 +440,46 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 // from a recorded span to a stage row stays where every other surface's
 // conversion is and this package never grows a second.
 //
-// RecordedPeaks is the second thing this process asks of its own recorded
-// history, and the reason the interface is not named after one run: the
-// largest process-tree peak this workspace has measured for each scope key,
+// OpenPeaks is the second thing this process asks of its own recorded
+// history, and the reason the interface is not named after one run: a lookup
+// of the largest process-tree peak this workspace has measured for a scope,
 // which is what stops the second index of a repository reserving less for a
-// unit than the first one watched it use. It is advisory and never a refusal,
-// so an implementation that cannot read its ledger answers no rows.
+// unit than the first one watched it use. It is advisory and never a refusal:
+// an implementation with no ledger, or one that cannot open it, reports that
+// itself and answers a nil lookup, which the plan reads as no observation for
+// every scope. An error that does arrive is a broken supplier and fails the
+// plan.
 type RunLedgerReader interface {
 	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
-	RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error)
+	OpenPeaks(ctx context.Context) (PeakLookup, error)
+}
+
+// PeakLookup is one open reading of the learned peaks, held for the length of
+// one plan. *ledger.Reader is one.
+type PeakLookup interface {
+	RecordedPeak(ctx context.Context, repositoryID, scopeKey, familyPrefix string) (int64, bool, error)
+	Close() error
+}
+
+// recordedPeak binds a lookup to this coordinator's repository as the plan's
+// Inputs.RecordedPeak. A lookup that fails answers no observation and is not
+// asked again for the rest of the plan: the history is advisory, and the first
+// failure is logged once rather than once per heavy unit.
+func (c *Coordinator) recordedPeak(peaks PeakLookup) func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
+	failed := false
+	return func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
+		if failed {
+			return 0, false
+		}
+		peak, observed, err := peaks.RecordedPeak(ctx, string(c.repo), scopeKey, familyPrefix)
+		if err != nil {
+			failed = true
+			logTyped(c.log, "the learned peaks could not be read; heavy units are sized from the family estimates alone", err,
+				"component", component, "repository_id", string(c.repo))
+			return 0, false
+		}
+		return peak, observed
+	}
 }
 
 // attachRunLedger states on a result what the run that produced it just did:
