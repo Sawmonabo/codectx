@@ -111,17 +111,36 @@ type lateSealer struct {
 	// over-claim of work nothing will finish, which Section 13.3 forbids
 	// outright.
 	//
-	// It holds only failures a publication activated. That publication copied
-	// the failures' run rows onto the generation it made active, and every
-	// later publication copies the active generation's rows on, so each scope
-	// counted failed from here is also listed with its reason. A tick that
-	// does not publish keeps its failures to itself (batch.failures): their
-	// run rows die with the work generation it aborts.
+	// It holds only failures a publication activated. A unit's own failure
+	// has a run row, which that publication copied onto the generation it
+	// made active and every later publication copies on, so such a scope is
+	// also listed with its reason. A scope moved here from abandoned has no
+	// run row at all: its row states the reason itself, as publication_failed
+	// with the deferred run's id. A tick that does not publish keeps its own
+	// failures to itself (batch.failures): their run rows die with the work
+	// generation it aborts.
 	//
 	// It is bounded by the queue it describes: one entry per queued scope at
 	// worst, and it is replaced with the queue for the same reason foreground
 	// is.
 	background map[string]unitFailure
+	// abandoned is every unit of THIS queue a failed publication lost, per
+	// plan key: each unit that tick popped, sealed or failed alike, because
+	// the sealed ones are members of nothing but the work generation it
+	// aborted and the failed ones' run rows died with it. Nothing requeues
+	// them, so without this record their scopes would read as still running
+	// for as long as the active generation stands. Each carries the
+	// publication error's code, reason publication_failed and the deferred
+	// run's id.
+	//
+	// No generation holds it until a later publication of this queue folds it
+	// into failedScopes (backgroundFailures) and activates, which moves it
+	// into background (keepFailures). Until then status projects it over the
+	// active generation's rows (projectAbandoned). It is this process's
+	// record: a failed publication wrote nothing durable, so another process
+	// reads the active generation as it was published. It is bounded and
+	// replaced exactly as background is.
+	abandoned map[string]abandonedUnit
 	// estimate is the mean duration of the deferred units this process has
 	// completed, and samples how many it is over. Zero samples means the
 	// estimate is unknown and Pending reports no estimate at all.
@@ -235,6 +254,7 @@ func (l *lateSealer) enqueue(g *generation, units []plan.Unit) {
 	// The scopes this queue's own background work failed belong to the queue
 	// it was drained from, so they go with it.
 	l.background = map[string]unitFailure{}
+	l.abandoned = map[string]abandonedUnit{}
 	pending := len(l.queue)
 	if pending > 0 && !l.started {
 		l.started = true
@@ -609,17 +629,121 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	if err != nil {
 		// The sealed units are members of nothing but the work generation this
 		// tick just aborted, so the next retention pass collects them and the
-		// engine work is lost. The failed units' reasons die with it too, so
-		// no generation counts or lists them: their scopes read as still
-		// running until the next index plans them again. Saying how much is
-		// lost is the difference between a diagnosable failure and minutes of
-		// analysis vanishing.
+		// engine work is lost. The failed units' run rows die with it too.
+		// Nothing requeues either, so every popped scope is recorded failed
+		// with the publication's own error (abandon): status reads it as
+		// failed with reason publication_failed and this run's id, never as
+		// still running. Saying how much is lost is the difference between a
+		// diagnosable failure and minutes of analysis vanishing.
+		l.abandon(state.epoch, popped, err, run.ID())
 		c.log.Warn("a deferred publication failed and its units are abandoned",
 			"component", component, "repository_id", string(c.repo),
-			"sealed_units", len(b.sealed), "failed_units", len(b.failures))
+			"sealed_units", len(b.sealed), "failed_units", len(b.failures), "run_id", run.ID())
 		return err
 	}
 	return nil
+}
+
+// abandonedUnit is one scope a failed publication lost, with the reason its
+// capability row states.
+type abandonedUnit struct {
+	providerID, scopeKey string
+	failure              unitFailure
+}
+
+// reasonPublicationFailed is the reason detail of a scope a failed
+// publication lost; detailRunID names the deferred run whose publication it
+// was, which is where its ledger account is kept.
+const (
+	reasonPublicationFailed = "publication_failed"
+	detailRunID             = "run_id"
+)
+
+// abandon records every unit a failed publication popped as failed with that
+// publication's error. It is dropped when a later base activation replaced the
+// queue, as keepFailures drops a replaced queue's reasons.
+func (l *lateSealer) abandon(epoch int64, popped []deferredUnit, cause error, runID string) {
+	failure := typedFailure(cause)
+	details := make(map[string]string, len(failure.details)+2)
+	maps.Copy(details, withoutRawOutput(failure.details))
+	details["reason"] = reasonPublicationFailed
+	details[detailRunID] = runID
+	failure.details = details
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(popped) == 0 || l.state.epoch != epoch {
+		return
+	}
+	if l.abandoned == nil {
+		l.abandoned = map[string]abandonedUnit{}
+	}
+	for _, d := range popped {
+		l.abandoned[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = abandonedUnit{providerID: d.unit.ProviderID,
+			scopeKey: d.unit.ScopeKey, failure: failure}
+	}
+}
+
+// projectAbandoned is a status answer's rows over snapshot snap with this
+// queue's abandoned units folded in. A row that reports a provider's deferred
+// units still running loses the abandoned ones from that count and becomes the
+// failure row coverage would have published for them: failed, or partial when
+// another row of the provider shows facts it holds, with the publication's
+// code, reason and run id. Rows over any other snapshot are answered as they
+// are: the abandoned units were planned over this queue's snapshot alone.
+func (l *lateSealer) projectAbandoned(snap model.SnapshotID, states []model.CapabilityState) []model.CapabilityState {
+	l.mu.Lock()
+	if len(l.abandoned) == 0 || l.state.snap != snap {
+		l.mu.Unlock()
+		return states
+	}
+	failed := map[string]*providerFailures{}
+	for _, a := range l.abandoned {
+		agg, ok := failed[a.providerID]
+		if !ok {
+			agg = &providerFailures{}
+			failed[a.providerID] = agg
+		}
+		agg.add(a.scopeKey, a.failure)
+	}
+	l.mu.Unlock()
+	holdsFacts := map[string]bool{}
+	for _, s := range states {
+		switch s.State {
+		case model.CapabilityFresh, model.CapabilityPartial, model.CapabilityStale:
+			holdsFacts[s.ProviderID] = true
+		}
+	}
+	out := slices.Clone(states)
+	for i, s := range out {
+		agg, ok := failed[s.ProviderID]
+		if !ok || s.Details["reason"] != reasonUnitsDeferred {
+			continue
+		}
+		exemplar := agg.named[0]
+		scopes := make([]string, 0, len(agg.named))
+		for _, n := range agg.named {
+			scopes = append(scopes, n.scopeKey)
+		}
+		row := (&failureRow{providerID: s.ProviderID, capability: s.Capability, scope: exemplar.scopeKey,
+			code: exemplar.failure.code, message: exemplar.failure.message,
+			remediation: exemplar.failure.remediation, details: exemplar.failure.details, scopes: scopes,
+			units: agg.units, running: max(0, s.UnitsRunning-agg.units), covered: holdsFacts[s.ProviderID]}).publish()
+		row.Scope = s.Scope
+		out[i] = row
+	}
+	return out
+}
+
+// SettleAbandoned is a result this coordinator published, answered with the
+// deferred units a failed publication has since lost read as failed rather
+// than running (projectAbandoned), and its health re-derived from those rows.
+// A command that reports a publication after its deferred queue stopped on a
+// failed one calls it, so the account it hands over names no work in flight
+// that nothing will finish.
+func (c *Coordinator) SettleAbandoned(res model.IndexResult) model.IndexResult {
+	res.Completeness = c.late.projectAbandoned(res.Binding.SnapshotID, res.Completeness)
+	res.Health = healthOf(res.Completeness)
+	return res
 }
 
 // carryPrevious writes the predecessor every queued unit imports its delta
@@ -872,10 +996,14 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	// the active generation's -- the foreground pass's and every earlier
 	// batch that published, each carried forward by the publication before --
 	// and this batch's own, from the work generation that is aborted next.
-	// Those are exactly the failures failedScopes counts: `background` holds
-	// only published ones, and a batch that published nothing added none. A
-	// scope this generation seals takes no reason with it: its fresh unit is
-	// the answer.
+	// The rows count those failures in two places: the foreground pass's in
+	// the failures aggregate this generation was seeded with, the deferred
+	// ones in failedScopes. Every run row copied here belongs to one of the
+	// two, since `background` holds only published failures and a batch that
+	// published nothing added none. The one scope failedScopes counts with no
+	// run row is an abandoned one, whose row states its reason and run id
+	// itself. A scope this generation seals takes no reason with it: its fresh
+	// unit is the answer.
 	sealed := make([]sqlite.RunScope, 0, len(replacing))
 	for _, s := range b.sealed {
 		if _, ok := replacing[plan.Key(s.providerID, s.scopeKey)]; ok {
@@ -932,7 +1060,9 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 // keepFailures keeps a published tick's typed reasons for as long as the queue
 // they came from does. Their units are never retried and their unit rows are
 // deleted with them, so this is the only record left that the scopes are
-// failures and not work still in flight.
+// failures and not work still in flight. The abandoned units move here too:
+// the publication folded them into its failedScopes, so its rows now state
+// them and projecting them again would subtract them twice.
 //
 // Reasons from a queue a later base activation replaced are dropped, as next
 // drops that queue's units: the replacing queue may hold the same scope again,
@@ -941,28 +1071,36 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 func (l *lateSealer) keepFailures(epoch int64, failures map[string]unitFailure) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(failures) == 0 || l.state.epoch != epoch {
+	if l.state.epoch != epoch || len(failures)+len(l.abandoned) == 0 {
 		return
 	}
 	if l.background == nil {
 		l.background = map[string]unitFailure{}
 	}
+	for key, a := range l.abandoned {
+		l.background[key] = a.failure
+	}
+	clear(l.abandoned)
 	maps.Copy(l.background, failures)
 }
 
 // backgroundFailures is every reason this queue's published ticks have kept,
-// plus this tick's own, copied so the publication generation can fold them in
-// without sharing state with the sealer. It is nil when neither holds one,
-// which is the same empty answer the indexing path gives.
+// every unit a failed publication of it abandoned, and this tick's own
+// reasons, copied so the publication generation can fold them in without
+// sharing state with the sealer. It is nil when none holds one, which is the
+// same empty answer the indexing path gives.
 func (l *lateSealer) backgroundFailures(tick map[string]unitFailure) map[string]unitFailure {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := maps.Clone(l.background)
-	if len(tick) == 0 {
+	if len(tick)+len(l.abandoned) == 0 {
 		return out
 	}
 	if out == nil {
-		out = make(map[string]unitFailure, len(tick))
+		out = make(map[string]unitFailure, len(tick)+len(l.abandoned))
+	}
+	for key, a := range l.abandoned {
+		out[key] = a.failure
 	}
 	maps.Copy(out, tick)
 	return out

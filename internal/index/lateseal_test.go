@@ -293,3 +293,46 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 		t.Fatalf("status still lists %+v as failed after a later batch sealed it", st.FailedUnits)
 	}
 }
+
+// TestAnAbandonedDeferredUnitReadsFailedNotRunning protects the status of the
+// deferred units a failed publication lost. Nothing requeues them, so a row
+// that still counts them running reports work in flight that nothing will
+// finish, the over-claim Section 13.3 forbids: the row must read failed, with
+// reason publication_failed, the publication error's code and the deferred
+// run's id. Once a later publication has folded them into its own rows they
+// must not be subtracted from its count a second time.
+//
+// Mutation: return states unchanged from projectAbandoned, and the row still
+// reports two units running; drop the clear from keepFailures, and the
+// published generation's row is rewritten again.
+func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
+	l := newLateSealer(nil)
+	l.state = queueState{snap: "snap", epoch: 1}
+	units := deferredScopes("lost", 2)
+	l.abandon(1, units, &model.Error{Code: model.CodeDiskFull, Message: "the store is full"}, "run-1")
+	rows := []model.CapabilityState{{ProviderID: heavyProviderID, Capability: "dependence",
+		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
+		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: 2,
+		Details: map[string]string{"reason": reasonUnitsDeferred}}}
+	row := l.projectAbandoned("snap", rows)[0]
+	if row.State != model.CapabilityFailed || row.UnitsRunning != 0 || row.DiagnosticCode != model.CodeDiskFull ||
+		row.Details["reason"] != reasonPublicationFailed || row.Details[detailRunID] != "run-1" ||
+		row.Details[model.DetailUnitsFailed] != "2" {
+		t.Fatalf("the abandoned units read %+v, want failed, none running, %s, %s and run-1",
+			row, model.CodeDiskFull, reasonPublicationFailed)
+	}
+	if err := row.Validate(); err != nil {
+		t.Fatalf("the projected row does not validate: %v", err)
+	}
+	if other := l.projectAbandoned("another-snap", rows)[0]; other.State != model.CapabilityUnavailable {
+		t.Fatalf("a row over another snapshot was rewritten to %+v", other)
+	}
+	if kept := l.backgroundFailures(nil); len(kept) != 2 ||
+		kept[plan.Key(heavyProviderID, units[0].unit.ScopeKey)].code != model.CodeDiskFull {
+		t.Fatalf("the next publication's failed scopes are %+v, want both abandoned units", kept)
+	}
+	l.keepFailures(1, nil)
+	if again := l.projectAbandoned("snap", rows)[0]; again.State != model.CapabilityUnavailable {
+		t.Fatalf("units a publication already stated were projected again: %+v", again)
+	}
+}
