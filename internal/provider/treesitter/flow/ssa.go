@@ -85,8 +85,11 @@ func DefUse(g *Graph, a *Arena) Edges {
 			i++
 		}
 	}
+	// A pair is stamped once per use, so two uses at one node whose
+	// variables reach the same definition node, a definition's own
+	// variable and the result it hands on, push the same pair twice.
 	slices.Sort(r.pairs.s)
-	return Edges{pairs: r.pairs.s}
+	return Edges{pairs: slices.Compact(r.pairs.s)}
 }
 
 // Value ids during construction: a definition is its node id in [0, n); φ k
