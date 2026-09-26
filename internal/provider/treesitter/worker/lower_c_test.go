@@ -276,17 +276,20 @@ func TestCLoweringGolden(t *testing.T) {
 			// C17 §6.5.13p4 (&& evaluates its right operand only when the left
 			// is nonzero), §6.5.15p4 (only the selected operand of ?: is
 			// evaluated), §6.5.17p2 (the comma operator's left operand is
-			// evaluated first). Nodes: a@10, b@17, a@30 (Branch), g(b)@35,
-			// r = a && g(b)@26, r@45 (Branch), a@49, b@53, r = r ? a :
-			// b@41, a = 1@56, b = 2@63, return a + b + r;@70.
+			// evaluated first). Nodes: a@10, b@17, a@30 (Branch, Uses a),
+			// g(b)@35 (Uses b), r = a && g(b)@26 (Uses a and b, both &&
+			// operands being consumed), r@45 (Branch, Uses r), a@49, b@53,
+			// r = r ? a : b@41 (Uses the arms' a and b, not the condition's
+			// r, which its own node consumed), a = 1@56, b = 2@63, return
+			// a + b + r;@70.
 			name:     "&&, ?: and the comma operator in C",
-			protects: "a conditionally evaluated operand depends on the operand that decides it, and each comma operand is its own defining statement",
-			mutation: "lower && as a plain binary (a@30 and its control of g(b)@35 vanish), evaluate both ?: operands unconditionally (r@45 loses control of a@49 and b@53), or lower a comma statement as one node (a = 1@56 and b = 2@63 are replaced by one node spanning both)",
+			protects: "a conditionally evaluated operand depends on the operand that decides it, a node consuming ?: takes its arms' reads and not its condition's, and each comma operand is its own defining statement",
+			mutation: "lower && as a plain binary (a@30 and its control of g(b)@35 vanish), evaluate both ?: operands unconditionally (r@45 loses control of a@49 and b@53), leave the ?: condition's reads to the assignment consuming it (adds r = a && g(b)@26 -> r = r ? a : b@41), or lower a comma statement as one node (a = 1@56 and b = 2@63 are replaced by one node spanning both)",
 			src:      "int f(int a, int b) { int r = a && g(b); r = r ? a : b; a = 1, b = 2; return a + b + r; }",
 			cd:       []string{"a@30 -> g(b)@35", "r@45 -> a@49", "r@45 -> b@53"},
 			du: []string{"a@10 -> a@30", "b@17 -> g(b)@35", "a@10 -> r = a && g(b)@26", "b@17 -> r = a && g(b)@26",
 				"r = a && g(b)@26 -> r@45", "a@10 -> a@49", "b@17 -> b@53", "a@10 -> r = r ? a : b@41",
-				"b@17 -> r = r ? a : b@41", "r = a && g(b)@26 -> r = r ? a : b@41", "a = 1@56 -> return a + b + r;@70",
+				"b@17 -> r = r ? a : b@41", "a = 1@56 -> return a + b + r;@70",
 				"b = 2@63 -> return a + b + r;@70", "r = r ? a : b@41 -> return a + b + r;@70"},
 		},
 		{

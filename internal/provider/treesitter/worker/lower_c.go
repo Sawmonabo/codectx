@@ -153,11 +153,23 @@ const (
 // an array type name are evaluated), and the controlling expression of a
 // generic selection (C17 §6.5.1.1p3) are not; the association a generic
 // selection picks depends on types, so every association's expression is
-// read. A node Uses every variable read inside its own span; an
-// assignment, compound assignment or update of an identifier embedded in a
-// larger expression is its own defining node, and the variable it defined
-// is a read of the node that evaluates the enclosing expression. A node
-// that defines v also Uses v when its statement read v before it. A write
+// read. A node Uses what the consumption rule (see Lowering) gives it. In C
+// and C++ the consumed constructs are: both operands of `&&` and `||`, so the
+// node evaluating `a && g(b)` Uses a and b while the deciding operand's own
+// Branch node Uses a; the arms of `c ? a : b`, not its condition, and in
+// `a ?: b` also a, whose value is the result when it is nonzero; and a
+// statement expression's last statement (see Statement expressions). The
+// operand of a lambda or nested function is not: its creating node Uses the
+// captures (see Captures), and the declarator, assignment, call or return
+// consuming the created value does not repeat them. An assignment, compound
+// assignment or update of an identifier embedded in a larger expression is
+// its own defining node, and the variable it defined is a read of the node
+// that evaluates the enclosing expression. A node that defines v also Uses
+// v while a read of v its statement made is still pending, one its own
+// operands made or one an enclosing expression made whose node comes after
+// it, since that read sees the value reaching the defining node. A read an
+// earlier node consumed is not pending: `r = r ? a : b` Uses a and b, and
+// its condition's node alone Uses r. A write
 // through `*p`, `p->f`, `a[i]` or `s.f` (and an assembly output operand)
 // Uses its operands and is a non-killing may-definition of the base
 // variable on the node that evaluates the enclosing expression. By the
@@ -180,16 +192,25 @@ const (
 //
 // # Statement expressions
 //
-// No standard defines them; the anchor is the statement-expression
-// extension's documented semantics. `({ … })` is lowered as its block in
-// place; the node of the enclosing expression Uses its last statement's
-// reads. The extension permits jumping out of a statement expression: a
-// `break` or `continue` in one binds to the innermost loop or switch open
-// where it stands, so one in a for loop's update clause or a do loop's
-// condition binds to that loop. Its break ends the loop. Its continue goes
-// where every continue of that loop goes, to the end of the loop body (C17
-// §6.8.6.2), after which the update or the condition runs again: it lands
-// on the first node of the update or the condition.
+// No standard defines them; the anchor is the GNU C extension's documented
+// semantics (Statements and Declarations in Expressions). `({ … })` is
+// lowered as its block in place, and its value is its last statement's: the
+// node of the enclosing expression Uses the reads of the last statement,
+// lowered for its value when it is an expression statement (an assignment's
+// or update's variable read back, a comma expression's right operand), and
+// no read when it is not, since the construct then has no value. Every other
+// statement is a node of its own, evaluated separately, whose reads the
+// enclosing node does not take. An expression statement whose expression is
+// a statement expression, such as a for loop's update `({ …; j++; })`, ends
+// with a Stmt node spanning it unless the last node its lowering made
+// already spans it, so that node Uses the last statement's reads. The
+// extension permits jumping out of a statement expression: a `break` or
+// `continue` in one binds to the innermost loop or switch open where it
+// stands, so one in a for loop's update clause or a do loop's condition
+// binds to that loop. Its break ends the loop. Its continue goes where every
+// continue of that loop goes, to the end of the loop body (C17 §6.8.6.2),
+// after which the update or the condition runs again: it lands on the first
+// node of the update or the condition.
 //
 // # Exceptions
 //
@@ -234,7 +255,12 @@ const (
 // A lambda's creating node ([expr.prim.lambda.capture]) Uses every
 // enclosing variable its capture list names, its init-captures read and its
 // body references, resolved with the lambda's own scopes so a name it
-// declares shadows. A variable captured by reference (named `&x`, or
+// declares shadows. A variable the body only writes is referenced too: a
+// by-copy capture copies its value when the lambda is created, and a
+// by-reference capture binds a reference to it, which Uses it by the
+// address-taking rule of Lowering. The node consuming the created value (an
+// initialized declarator `auto g = [&a] { … }`, a node of its own after the
+// creating node) does not Use the captures. A variable captured by reference (named `&x`, or
 // implicitly under a `&` default) that the body writes, takes the address
 // of, binds a reference to, or evaluates as a decaying array is a
 // may-definition on the creating node; a by-copy capture never is. A
@@ -308,15 +334,14 @@ type cLower struct {
 	// shadow is non-zero while walking a nested callable for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
-	// reads are the variables read by the current statement from base on;
-	// seen[v] == stmtNo marks v as one of them. base is non-zero inside a
-	// statement expression, whose statements keep the enclosing reads.
-	// stmtNo only ever increases, across functions too, so a mark left in
-	// seen by an earlier statement or function never matches.
-	reads  []int32
-	seen   []int
-	stmtNo int
-	base   int
+	// reads are the variables read and not yet consumed by a node that
+	// ends them, pending for the current statement's nodes from base on;
+	// live[v] counts v's entries in reads. base is where the reads of the
+	// innermost open statement expression begin (0 outside one): its
+	// statements keep the enclosing expression's reads below base.
+	reads []int32
+	live  []int32
+	base  int
 	// may are the pending may-definitions, each with the position in reads
 	// where the operand that makes it began: a node takes the ones from its
 	// own first read on (see nodeAt).
@@ -366,9 +391,8 @@ func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k 
 	c.buf = c.buf[:0]
 	c.blockMark, c.pp, c.ppArm, c.shadow, c.base = 0, -1, -1, 0, 0
 	c.parked.truncate(0)
-	c.reads, c.seen, c.may, c.shape, c.writes, c.names, c.hs =
-		c.reads[:0], c.seen[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
-	c.stmtNo++
+	c.reads, c.live, c.may, c.shape, c.writes, c.names, c.hs =
+		c.reads[:0], c.live[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
 	c.throws, c.thrown, c.seh = 0, 0, 0
 	c.first, c.last, c.lastSpan = -1, -1, flow.Span{}
 }
@@ -457,19 +481,28 @@ func (c *cLower) read(v int32) {
 		return
 	}
 	c.reads = append(c.reads, v)
-	if int(v) >= len(c.seen) {
-		c.seen = append(c.seen, make([]int, int(v)+1-len(c.seen))...)
+	if int(v) >= len(c.live) {
+		c.live = append(c.live, make([]int32, int(v)+1-len(c.live))...)
 	}
-	c.seen[v] = c.stmtNo
+	c.live[v]++
+}
+
+// drop removes reads[m:]: a node that consumed them ended them, or the
+// statement that made them is over.
+func (c *cLower) drop(m int) {
+	for _, v := range c.reads[m:] {
+		c.live[v]--
+	}
+	c.reads = c.reads[:m]
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (c *cLower) reset() {
-	c.reads, c.throws, c.thrown = c.reads[:c.base], 0, 0
+	c.drop(c.base)
+	c.throws, c.thrown = 0, 0
 	if c.base == 0 {
 		c.may = c.may[:0]
 	}
-	c.stmtNo++
 }
 
 // node creates a node spanning n that Uses reads[from:to], carries the
@@ -530,14 +563,16 @@ func (c *cLower) mayDef(at int, v int32) {
 	}
 }
 
-// def records that node n defines v and, when the statement read v before
-// n, that n Uses v.
+// def records that node n defines v and, when a read of v is still pending
+// (made by n's own operands, or by an enclosing expression whose node comes
+// after n), that n Uses v: the value that read sees is the one reaching n,
+// which n's definition would otherwise hide from it.
 func (c *cLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
 	c.b.Def(n, v)
-	if int(v) < len(c.seen) && c.seen[v] == c.stmtNo {
+	if int(v) < len(c.live) && c.live[v] > 0 {
 		c.b.Use(n, v)
 	}
 }
@@ -1377,7 +1412,7 @@ func (c *cLower) switchStmt(n *ts.Node) {
 	}
 	if cond.KindId() == k.declaration {
 		c.condDecl(cond, flow.Stmt)
-		c.reads = c.reads[:m]
+		c.drop(m)
 		if id := c.variable(cond.ChildByFieldId(k.fDeclarator)); id != nil {
 			c.ref(id)
 		}
@@ -1719,12 +1754,18 @@ func (c *cLower) value(n *ts.Node) {
 		c.value(left)
 		c.value(right)
 	case k.conditionalExpression:
-		cond := n.ChildByFieldId(k.fCondition)
+		// The condition is a node of its own; the value is an arm's, so only
+		// the arms' reads stay for the consumer, except in `a ?: b`, whose
+		// value when a is nonzero is a itself.
+		cond, cons := n.ChildByFieldId(k.fCondition), n.ChildByFieldId(k.fConsequence)
 		m := len(c.reads)
 		c.value(cond)
 		c.node(flow.Branch, cond, m, len(c.reads))
+		if cons != nil {
+			c.drop(m)
+		}
 		p := c.b.Push()
-		if cons := n.ChildByFieldId(k.fConsequence); cons != nil {
+		if cons != nil {
 			c.valueNode(cons)
 		}
 		t := c.b.Push()
@@ -1873,13 +1914,50 @@ func (c *cLower) children(n *ts.Node) {
 	c.done(start)
 }
 
-// stmtExpr lowers a statement expression's block in place; the enclosing
-// expression's node reads its last statement's reads.
+// stmtExpr lowers a statement expression's block in place (see Statement
+// expressions in lowerC): every statement but the last is lowered as a
+// statement, and the reads its value leaves for the enclosing expression's
+// node are those of its last statement, lowered for its value when it is an
+// expression statement, and none when it is not.
 func (c *cLower) stmtExpr(n *ts.Node) {
 	base, throws, thrown := c.base, c.throws, c.thrown
 	c.base = len(c.reads)
-	c.block(n)
+	s := c.open()
+	start, list := c.kids(n)
+	for i := range list {
+		if i < len(list)-1 || list[i].KindId() != c.k.expressionStatement {
+			c.stmt(&list[i])
+			continue
+		}
+		c.reset()
+		if e := firstNamed(&list[i]); e != nil {
+			c.tail(e)
+		}
+	}
+	if len(list) == 0 || list[len(list)-1].KindId() != c.k.expressionStatement {
+		c.reset()
+	}
+	c.done(start)
+	c.close(s)
 	c.base, c.throws, c.thrown = base, throws, thrown
+}
+
+// tail lowers e, the expression of a statement expression's last statement,
+// for its value: a comma expression's left operand is a statement of its own
+// and its right operand the value, and an assembly statement has no value.
+func (c *cLower) tail(e *ts.Node) {
+	k := c.k
+	switch u := c.l.unparen(e); u.KindId() {
+	case k.commaExpression:
+		c.exprStmt(u.ChildByFieldId(k.fLeft))
+		c.reset()
+		c.tail(u.ChildByFieldId(k.fRight))
+	case k.asmExpression:
+		c.asm(u)
+		c.reset()
+	default:
+		c.valueNode(e)
+	}
 }
 
 // assign lowers `left = right` and `left op= right`. made reports that it
@@ -1959,11 +2037,15 @@ func (c *cLower) baseIdent(n *ts.Node) *ts.Node {
 }
 
 // closure creates the node spanning n, a lambda or nested function: it Uses
-// n's captures and may-defines every variable n writes by reference.
+// n's captures and may-defines every variable n writes by reference. The
+// captures are the creating node's alone, so they are dropped from the
+// statement's reads and a node consuming the created value does not repeat
+// them.
 func (c *cLower) closure(n *ts.Node) int32 {
 	m, w := len(c.reads), len(c.writes)
 	c.capture(n)
 	id := c.node(flow.Stmt, n, m, len(c.reads))
+	c.drop(m)
 	for _, v := range c.writes[w:] {
 		c.b.MayDef(id, v)
 	}
