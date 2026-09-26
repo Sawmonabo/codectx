@@ -167,7 +167,7 @@ func (r *PinnedReader) nodesInFile(ctx context.Context, file model.FileID, after
 	}
 	// Duplicate node ids at one offset are collapsed by the Section 9.4
 	// precedence order -- verified source binding, then provider id, then unit
-	// key -- which is the read-time mechanism ruling Q8 names; it is not
+	// key -- which is the read-time mechanism; it is not
 	// reimplemented here. The grouping key is the keyset key itself, so the
 	// survivor of a group never straddles a page boundary. The same node at
 	// two different offsets is two units disagreeing about the declaration:

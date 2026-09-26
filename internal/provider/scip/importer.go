@@ -1606,7 +1606,7 @@ func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) 
 			// mapped: `reads` and `writes` are the dependence provider's
 			// facts (Section 11.6), derived from the graph's assignment
 			// operators, and two providers publishing one relation kind from
-			// different precisions is the parallel implementation policy.md
+			// different precisions is the parallel implementation Section 5.1
 			// forbids. Every non-definition, non-import occurrence is a
 			// `references` edge here.
 			kind, detail := model.RelReferences, "reference"

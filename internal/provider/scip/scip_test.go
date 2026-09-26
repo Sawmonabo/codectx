@@ -28,7 +28,7 @@ import (
 
 // The canonical fixture was encoded with the real scip Go bindings
 // (github.com/scip-code/scip/bindings/go/scip v0.10.0) by a throwaway
-// generator; only the bytes are committed (ruling R9-2). It holds a Go
+// generator; only the bytes are committed. It holds a Go
 // document (UTF-8, a multi-byte rune before the definitions), a TypeScript
 // document (UTF-16, a surrogate pair before every definition), a Python
 // document (UTF-32, a non-BMP rune before the definition), a forward

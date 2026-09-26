@@ -12,7 +12,7 @@ from the pinned snapshot view.
 
 ## Units
 
-A unit is one file for both providers (ruling R7-1). The coordinator plans:
+A unit is one file for both providers. The coordinator plans:
 
 | Provider | One unit per | Scope key | Inputs | Dependencies |
 |---|---|---|---|---|
@@ -45,7 +45,7 @@ canonical key. The candidate shapes decide the Section 9.4 basis:
 | dependency | qualified name = ecosystem-qualified name, no file | structural key | `dependency:`+qualified name |
 
 Path-identified nodes carry no `FileID` in their candidate: identity is a
-pure function of the path (ruling R7-2), so every unit that mentions a path
+pure function of the path, so every unit that mentions a path
 mints the same node and storage deduplicates the identity. That is what lets
 a file unit publish its ancestor directories as idempotent facts, a go.work
 unit name the directories it uses, and a Markdown unit link to another

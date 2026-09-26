@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// L0 harness
+// Harness
 // ---------------------------------------------------------------------------
 
 // binary is the codectx under test, built once for the whole test binary. Every
@@ -392,7 +392,7 @@ func hitKeys(hits []model.SearchHit) []hitKey {
 	return keys
 }
 
-// TestE2ESearchParity is L0's vertical slice: build the index through the CLI,
+// TestE2ESearchParity is the vertical slice: build the index through the CLI,
 // then ask the SAME question of the SAME workspace through the CLI and through
 // `codectx mcp serve` over real stdio, and require the same domain answer.
 //
@@ -447,7 +447,7 @@ func TestE2ESearchParity(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L1 rows
+// Product-boundary rows
 //
 // The one Section 25.1 product-boundary scenario is filled in here as four rows
 // of one table over ONE pass of the harness above -- not four walkthroughs. The

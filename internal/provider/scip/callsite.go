@@ -52,5 +52,5 @@ func callsiteAlias(p string, rng *model.SourceRange) (scopeKey, nativeKey string
 	return scopeKey, nativeKey, true
 }
 
-// fileScope is the file-local alias scope of Section 11.3 and ruling R9-1.
+// fileScope is the file-local alias scope of Section 11.3.
 func fileScope(p string) string { return "file:" + p }

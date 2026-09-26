@@ -489,7 +489,7 @@ carries `source_binding=unverified`, every node's metadata says
 `CTX_SOURCE_BINDING_UNVERIFIED`. Project root, matching paths, timestamps and
 tool versions prove nothing.
 
-## Identity and alias scopes (ruling R9-1)
+## Identity and alias scopes
 
 Every node goes through `req.Resolver`; the provider copies
 `Resolution.CanonicalKey` verbatim.
@@ -720,7 +720,7 @@ payload's come last, so a host `JAVA_HOME` can never shadow the pinned
 runtime.
 
 Everything is executed through the shared `internal/process` runner with an
-argv array only (ruling R9-3: no shell anywhere). The run is bounded by the
+argv array only: no shell anywhere. The run is bounded by the
 smaller of the profile's own timeout and `providers.scip.timeout`, by the
 profile's memory and disk reservations, and by 1 MiB of captured output per
 stream.

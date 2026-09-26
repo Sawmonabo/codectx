@@ -278,7 +278,7 @@ defer ts.Close()
 ### Protocol (`wire`)
 
 Every frame is a 4-byte big-endian payload length, a 1-byte kind and a JSON
-payload (ruling R8-3). Both sides refuse to allocate for a length over the
+payload. Both sides refuse to allocate for a length over the
 cap they expect: the parent caps every frame from the child at
 `wire.MaxFactFrameBytes` = 64 KiB; the worker caps a request at the same and a source
 frame at the `SourceBytes` the request declared, itself at most
@@ -374,7 +374,7 @@ truncation, never sent oversize.
   measure RSS with the same `wire.ResidentBytes` helper over
   `/proc/self/statm`. A value that cannot be measured is -1, never 0.
 
-### Native lifecycle in the worker (ruling R8-2)
+### Native lifecycle in the worker
 
 Files read in full from `github.com/tree-sitter/go-tree-sitter@v0.25.0` before
 choosing APIs: `parser.go`, `tree.go`, `query.go`, `node.go`,
@@ -461,8 +461,7 @@ All MIT:
   Brunsfeld, Ayman Nadeem, Maxim Sokolov and tree-sitter contributors.
 - `github.com/mattn/go-pointer` (binding dependency), Yasuhiro Matsumoto.
 
-`THIRD_PARTY_LICENSES.md` at the repository root is a shared file and should
-carry this inventory; it is reported as a shared change in the Task 8 report.
+`THIRD_PARTY_LICENSES.md` at the repository root carries this inventory.
 
 ## Tests
 
