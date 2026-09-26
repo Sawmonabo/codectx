@@ -447,8 +447,11 @@ which is the encoding the refusal is a disagreement about, so that an operator
 opens the disagreeing line instead of re-running the indexer to find it — and
 the unit publishes `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
-the index describes bytes it never saw, so the same coordinate is a plain skip
-and is counted with the other unverified skips.
+the index describes bytes it never saw, and the same coordinate is refused the
+same way: it is counted under `refused_occurrences` and can be the
+`refused_occurrence_exemplar`, and the unit keeps the
+`CTX_SOURCE_BINDING_UNVERIFIED` it already carries, because an unverified
+binding outranks every later reason.
 
 A unit is never failed over one occurrence. Failing closed on the first refusal
 threw away all 93,167 occurrences of the project above over 4,714 wrong columns:
