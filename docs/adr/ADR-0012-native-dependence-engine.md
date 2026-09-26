@@ -9,8 +9,16 @@ retirement conditions stand.
 A benchmark over a public corpus matrix revised decisions 1, 2, 5 and 6 and added decisions 9 and 10. The matrix is one
 large pinned repository per language family, plus a compiler checkout. Every decision names the measurement that
 confirms it. If a confirmation fails, that decision is reopened, not the whole record. The per-language control-flow
-lowerings of phase 0 exist for all nine advertised languages, each with an authored golden table. They are not yet
-wired into the worker, the wire protocol or a provider.
+lowerings of phase 0 exist for all nine advertised languages, each with a golden table. They are not yet wired into
+the worker, the wire protocol or a provider. Phase 0 is not yet claimable under its own golden rule (decision 6). A
+review on 2026-09-26 found these gaps:
+- most Go and JavaScript cases cite no reference anchor;
+- some C cases cite none, and the TypeScript cases cite a handbook, which is not a language reference;
+- Rust has no `?`-on-`Result` case;
+- several handled constructs have no case;
+- no table has had its blind second derivation.
+
+Each gap is closed before phase 0 is claimed.
 
 ## Context
 
@@ -24,7 +32,7 @@ byte ranges. Those facts are what `codectx_callers`, `codectx_callees`, `codectx
 `codectx_impact` walk; `codectx_symbol_info` and `codectx_references` report their precision.
 
 The engine is reached through one backend package and consumed through a graph CSV export staged in a
-private SQLite database ([ADR-0009](ADR-0009-import-staging.md)). It has no incremental mode: one
+private staging database ([ADR-0009](ADR-0009-import-staging.md)). It has no incremental mode: one
 edited file re-runs a whole unit.
 
 ### The requirements this decision is judged against
@@ -43,7 +51,7 @@ contains. Editorial substitution in square brackets; everything else is the owne
 > be taken as truth and done when self-verified and results hold. This app should be simple so an AI
 > simply uses the MCP to get what it needs immediately without wasting time on figuring out how to tune
 > timeouts etc. It must work on extremely large open-source / large enterprise monorepo codebases
-> (3–10× the size of [the reference repository], a Microsoft-scale enterprise codebase) and prove
+> (3–10× the size of [the reference repository], [a very large] enterprise codebase) and prove
 > blazing fast speed and memory handling (leveraging advanced algorithms), support out of the box no
 > caps, time limits, max visited nodes, etc., and leverage all tools ([the engine], LSP, SCIP,
 > dependencies, providers) and provide the complete full repo mapping, repo map graph, call stack,
@@ -105,7 +113,7 @@ anywhere in the tree, so no profile is planned for it. On a second corpus whose 
 carry one, and where the pinned indexer ran over the whole repository, the same call-site join covers
 **112,554 of 135,714 call sites (82.9%)** and **91.5%** of that language's own; on a nine-language
 fixture, every project configured, it covers **41 of 45** and **23 of the 23** whose callee is defined
-in the fixture. The tree-sitter tier resolves 13.6% — corrected to about 12.4% below — and leaves
+in the fixture. The syntax tier resolves 13.6% — corrected to about 12.4% below — and leaves
 **82.8% as calls through a value**; on the second corpus **82.6% of that same unresolved population
 does carry a compiler-precision occurrence at the callee identifier**, so what a precise index cannot
 supply is the call *site*, never the callee identity. Measured on the reference repository's largest
@@ -163,7 +171,12 @@ Four findings follow, and each one changes a decision below.
 2. **The lowering walk dominates the per-function cost, not the algorithms.**
    - In the Go corpus, 228,765 functions took 11.6 s to lower. Post-dominators, control dependence and def-use together
      took 0.54 s.
-   - The cause is crossings into the parse-tree library: every access by field name allocated and freed a C string.
+   - The cause is crossings into the parse-tree library, measured by a CPU profile of the Go corpus's function rows.
+     Of 66 s of samples, the parse itself is 19.4 s (29%) and lowering 22.5 s (34%). The walk that finds callables
+     costs about 15 s more. Inside both, the dominant cost is one native call per node access: node kind, named child,
+     named flag and cursor steps.
+   - Resolving field names to ids, which removed a C-string allocation per field lookup, cut the Go corpus's lowering
+     only from 11.6 s to 10.5 s.
 3. **The structural stage's wall time goes to unit work outside the parse, and that work is serialized through the
    store's lock.**
    - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time is a
@@ -177,8 +190,10 @@ Four findings follow, and each one changes a decision below.
    - `.h` belongs to the C grammar (`internal/provider/treesitter/lang/lang.go:79`).
    - In the compiler-infrastructure corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files.
 
-The per-function design figure of decision 5 has a heavy tail but a small absolute size. `bound_ratio` reaches p99
-about 2.4–5.9 and a maximum of about 25, while the largest arena measured is 1.7 MiB.
+The per-function design figure of decision 5 has a heavy tail but a small absolute size. The population is the
+function rows of all nine lowerings over the matrix; two corpora's runs stopped early on the lowering panics fixed in
+the same round. On every population of at least 1,000 functions, `bound_ratio` reaches p99 about 1.4–6.2. The maximum
+is about 85, on a Rust function, and the largest arena measured is 26.8 MiB, on a TypeScript function.
 
 ### Why the previous plan was not enough
 
@@ -228,12 +243,12 @@ from the other four. That asymmetry is real and is why `calls` is ported last, b
 | Post-dominators | the **same** pass over a **reversed, exit-augmented** CFG | one code path to validate instead of two. A generic implementation reversed this way was verified sound from source — both entry points consult only the successor relation — so this is a choice, not a necessity. The augmentation is mandatory: a unique synthetic exit, plus an edge from every strongly-connected component that cannot reach it, or an infinite loop's nodes silently have no post-dominator. **Given up:** the native set will differ from the engine's *by design* on functions with unreachable-from-exit regions (29 of the Go corpus's 228,765 functions); the differential band must expect that surplus as a named cause |
 | Control dependence | **Ferrante-Ottenstein-Warren** via post-dominance frontiers on the exit-augmented CFG, **without** the entry-to-exit edge | it is the textbook set. The engine computes a strict under-approximation in two provable places: the method node's single successor fails the ≥2-predecessor filter, so nothing is control-dependent on entry, and the frontier walk truncates on a missing post-immediate-dominator. **Why it matters more than it sounds:** the product's `control_depends_on` is a single-hop anchored join with no walk, unlike the depth-8 `data_flows_to` walk, so a missing edge is an unrecoverable missing fact rather than a longer path |
 | Reaching definitions / def-use | **replace, do not port**: sparse SSA-based def-use, not the dense bit-vector worklist | the dense `in`/`out` is Θ(N²/64) words — **2.34 GiB on one function at N = 10⁵** — which a design with no caps cannot carry. The engine survives it only by having the cap this record forbids. The SSA construction chosen needs no dominance computation for def-use, so the port keeps one dominator computation per function, for control dependence. **Given up:** exact oracle parity. The two formulations differ in named places, so the `data_flows_to` band becomes signed and per-cause rather than one absolute difference, and the port owns φ-operand resolution |
-| Address-taking | taking the address of, or mutably borrowing, a local is a **may-definition** of it at that node, killing nothing, in every language that has it | a write through the pointer is invisible without points-to analysis, which decision 2 rules out below. A may-definition keeps every earlier definition reaching later uses and adds the address-taking node as one more. **Given up:** the later write's own position; the edge anchors at the address-taking node |
+| Address-taking | a local gets a **may-definition**, killing nothing, at the node that evaluates the operation, when its address is taken, when it is mutably borrowed (including `ref mut` pattern bindings), when a C++ reference is bound to it, and, in C and C++, when an array-declared local is evaluated other than as the operand of `sizeof`, `&` or a subscript | a write through the pointer is invisible without points-to analysis, which this table rules out below. A may-definition keeps every earlier definition reaching later uses and adds the address-taking node as one more. **Given up:** a later write through a pointer or reference (`*p = 2`), whose target is unknown without points-to: making it a may-definition of every address-taken local would connect every indirect write to every such local. The implicit receiver borrow of a method call, which depends on the method's signature. A shared borrow of an interior-mutable type, which depends on the type. A `move` closure writes its own copy, so its writes are not definitions of the outer variable |
 | Interprocedural framework | **none** — no IFDS, no IDE | realizable-path precision is unobservable at a surface that publishes unlabelled depth-8 reachability, and the exploded supergraph reinstates exactly the whole-program resident structure decision 5 forbids |
 | Incrementality | **no incremental dataflow algorithm**; a changed function is recomputed from scratch, and the invalidation boundary is the file's content hash | a function's CFG is tens to hundreds of nodes; the bookkeeping costs more than the recomputation. This is also the model the structural tier already runs |
 | In-flight adjacency | plain `int32` compressed sparse row, forward and reverse, no varint | it is built and discarded inside one worker — a different object from the published per-generation adjacency of [ADR-0005](ADR-0005-graph-traversal-layout.md), which is unchanged |
-| Tree access | every field and node kind the lowering reads is **resolved to an id once per process**; no lookup by name per call, and a walk uses the tree cursor | the lowering walk is about 95% of per-function time, and a lookup by field name allocates and frees a C string on every call. **Given up:** nothing but the convenience of names in the lowering source |
-| Allocation | one **reset slab arena per worker**, pointer-free typed backing arrays, reused across a file's functions and **released at the file boundary** | the multiplier is on the order of 10⁶ functions, and what the arena saves is the collector's scan set. The earlier 1 MiB release threshold was a figure fitted to nothing: it fired for 3 of about 351,000 functions while the arena kept 0.4–1.25 MB between them. **Given up:** manual lifetime discipline inside the worker |
+| Tree access | each file's tree is **flattened once, in one native call**, into a Go-side node array (kind, field, flags, byte range, parent, first child, next sibling), after the structural queries have run on the native tree; the native tree is then closed, and the lowering and the callable walk read the array with **no native call per node**. Every kind and field is resolved to an id once per process | per-node native calls are the measured dominant cost inside lowering and the callable walk (the context section's profile). **Alternatives:** per-call accessors, which is the measured cost; resolving ids alone, measured at under 10%; reading the library's node structures directly through unsafe pointers, which breaks on any change of the library's layout. **Given up:** the flat array's own bytes beside the tree while flattening, and whether it is smaller than the tree after is unknown (the tree stores leaves inline in 8 bytes). **Confirming measurement:** lowering time per function on the Go corpus, and flat bytes per source byte beside tree bytes, per language |
+| Allocation | one **reset slab arena per worker**, pointer-free typed backing arrays, reused across a file's functions and **released at the file boundary** | the multiplier is on the order of 10⁶ functions, and what the arena saves is the collector's scan set. Today the arena releases at a 1 MiB threshold (`flow/arena.go`), a figure fitted to nothing and corrected here: it fired for 3 of about 351,000 functions while the arena kept 0.4–1.25 MB between them. **Given up:** manual lifetime discipline inside the worker |
 | The file boundary | after each file the worker closes the tree, drops the arena's backing, returns freed C heap pages to the kernel and resets its own peak reading; the parse loop runs on one OS thread with one C heap arena | a per-file need can only be observed if the memory of the previous file is returned (decision 5). Without the return, the C allocator reuses what it already holds and the reading is censored: the resident set does not move on about 95% of files. **Given up:** the refault cost of the next file, and the arena setting is specific to one C library; both are measured before the decision is closed |
 | `GOGC` / `GOMEMLIMIT` | **set neither** | the parse tree's C allocation can be counted, because the binding routes it through Go. But the memory a limit would govern in the worker is small, and the coordinator's retained records are already bounded by the sink pool. A limit would add only the thrashing risk the garbage collector's own guide describes |
 | Call graph — Java and other hierarchy-typed languages | **class-hierarchy analysis** | decided on **streamability**: its inputs are two tables an ordered merge join consumes, while rapid type analysis needs a reachability fixed point and variable-type analysis a global propagation graph — both whole-program resident state decision 5 forbids. **Given up:** precision on megamorphic sites, which land in the existing ambiguous-candidate family the product already publishes with a candidate count |
@@ -286,8 +301,9 @@ O(N + E), and the reaching-definitions pass also grows with:
 - the (block, variable) pairs its lookups visit;
 - the pairs it emits.
 
-So the arena is not linear in N alone, and nothing guarantees or enforces the figure. Measured over the matrix,
-`bound_ratio` reaches p99 about 2.4–5.9 and a maximum of about 25, and the largest arena is 1.7 MiB. The benchmark
+So the arena is not linear in N alone, and nothing guarantees or enforces the figure. Measured over the matrix for all
+nine lowerings, `bound_ratio` reaches p99 about 1.4–6.2 on every population of at least 1,000 functions, and a maximum
+of about 85. The largest arena is 26.8 MiB. The benchmark
 reports each function's arena bytes against the figure as `bound_ratio`, taken after the three dependence-core passes:
 post-dominators, control dependence and reaching definitions. The forward dominator pass, which the dependence core
 does not run, is excluded from that ratio and reported on its own.
@@ -309,9 +325,10 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
   its size.
 - **First file.** The first file of a language never seen in this repository is reserved at a **structural prior**:
   `worker base + source bytes × 107`.
-  - The 107 is derived from the parse-tree runtime's own node layout, not measured on any repository: about 88 bytes
-    per heap node, the binding's two input copies and the worker's buffer.
-  - It holds on all 3,827 matrix files of 64 KiB or more. It is exceeded by 9 of 74,059 files of 4 KiB or more.
+  - The 107 is derived from the parse-tree runtime's own node layout, not measured on any repository. Per source byte
+    it adds 80 + 8 bytes for a heap node, 16 for the C allocator's per-allocation overhead, 2 for the binding's two
+    input copies and 1 for the worker's buffer.
+  - How many matrix files exceed it, per size class, is counted in the research note of 2026-09-26, section 1.
   - An exceeded prior is an overrun that runs and is disclosed, never a refusal. If the prior falls below observed need
     on some class, the first file of a language runs alone.
 
@@ -319,7 +336,8 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 
 > `R_run = B_process + Σ over workers in flight (base_w + predicted_need(file_w)) + A_link`
 
-- `B_process` is `config.BaseFootprint`, with its idle term read from the parent's own resident set at composition.
+- `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set at composition;
+  today it is the constant `IdleFootprintBytes`, corrected here.
 - `predicted_need` is the learned p99 above, or the prior for a first file.
 - `A_link` is the package-scoped linker's working set (decision 9).
 - No term is a constant fitted to a repository.
@@ -331,6 +349,11 @@ before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/ad
 - **Forward progress.** A per-file increment is granted whenever no parse is in flight. This is the runs-alone rule
   restated per file, so a file larger than the whole allocation still runs, whole.
 - **One budget.** The parser runner's budget never refuses what the ledger admitted.
+
+**The overrun target** is at most 2% of files after the first generation, per class. Reserving the p99 expects 1% of
+files to overrun once the model is warm, and the second 1% is the decaying histogram's lag behind a repository that
+changes. A class that misses the target reopens the percentile, never the refusal rule: a file that overruns still
+runs.
 
 A file whose need exceeds its prediction does not fail; the overrun is counted and disclosed with its reservation, its
 observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed in code: parser
@@ -346,17 +369,29 @@ collector skips them (`internal/ledger/collector.go:500`).
   returns. Available memory falling **is** the signal that the user's editor, browser or the agent driving the product
   is competing.
 - **What is absent.** There is no count of children, no per-family count, no setting, and nothing is refused.
-- **Two constants, with their reason.** "Half of available" and the margin stay as coexistence constants, because no
-  derivation from need exists for them. Need says what the product would use, never what the person's other processes
-  will want next, and requirement 11 makes a frozen machine a product defect.
+- **Two coexistence constants, with their reason.** "Half of available" and the margin stay as coexistence constants,
+  because no derivation from need exists for them. Need says what the product would use, never what the person's other
+  processes will want next, and requirement 11 makes a frozen machine a product defect.
+- **The model's design constants, with their reason.** None of them is fitted to a repository.
+  - The p99 percentile trades overruns against held-back concurrency, and the overrun target above is stated from it.
+  - The 5% bucket width bounds the prediction's rounding to one bucket.
+  - The cutover from sample maximum to percentile at 100 observations is where a p99 first rests on more than one
+    sample.
+  - The half-life, counted in the repository's own files of the language, makes the model forget at the speed the
+    repository in front of it produces evidence.
+
+  Each is re-examined when its confirming measurement misses.
 - **The alternative, steel-manned.** A cap learned from memory pressure: raise concurrency until the kernel reports
   pressure, then back off. It loses on three counts. It learns the limit by causing the pressure requirement 11
   forbids. It needs a control group per action, which an unprivileged user session on this host class cannot create.
   And the pressure signal exists on one operating system only.
 
 **Scheduling** dispatches files largest-first by source bytes, from one shared queue:
-- Parse time ranks with source bytes at Spearman ρ 0.82–0.86 per language.
-- A replay of the matrix rows reaches the makespan lower bound at 16 workers, where path order (today's) is 10% over it.
+- On one corpus's rows, the compiler checkout's, parse time ranks with source bytes at Spearman ρ 0.82–0.86 per
+  language.
+- A replay of those rows reaches the makespan lower bound at 16 workers, where path order, today's, is 10% over it.
+- The same rank and replay over every matrix corpus is a measurement of the benchmark task, and largest-first is
+  confirmed per class on it.
 - Work stealing is dropped: it solves contention between per-worker queues, which one central queue does not have.
 - The worker count is the smaller of the processor count and the allocation divided by observed need.
 - The classic longest-processing-time bound is 4/3 − 1/(3m) of optimal.
@@ -425,7 +460,7 @@ A second public instance of each is pinned before its gate is claimed.
 
 Rust goldens are authored from the Rust Reference, with `?` on both `Result` and `Option` mandatory. Java goldens are
 authored from the Java Language Specification, chapters 14 and 15. The golden tables that exist now were each derived
-once, by the lane that wrote the lowering. So phase 0's equality gate is not claimed until a second, blind derivation of
+once, by the lowering's author. So phase 0's equality gate is not claimed until a second, blind derivation of
 every case agrees. That derivation is made from the source text and the reference alone, without the lowering, its
 output or the first table.
 
@@ -433,9 +468,9 @@ output or the first table.
 |---|---|---|---|
 | **0 — shared core and every lowering** | CFG, post-dominators, control dependence, def-use; the lowering of all nine languages with their authored goldens; the one-pass worker walk and the per-file memory of decisions 1, 2 and 5 | all four families for every language (nothing is published yet) | each authored golden table reproduces **100%** of its cases and emits nothing outside them. Equality is right here and only here, because the corpus is authored rather than observed. Mandatory golden cases: the try operator must yield a control dependence, which the engine does not emit. The benchmark shows the need-derived reservation holding its overrun target over the matrix |
 | **1 — Go and Rust publish, the calibration gate** | `control_depends_on` and `data_flows_to` for Go and Rust, published by the structural provider (decision 9) | the same two families for the other seven languages; `reads`/`writes` and `calls` everywhere | per family, the symmetric difference against the engine is **≤ the band measured first from two engine runs on the same units**, per class. Rust's gate is its authored goldens, because the engine has no Rust test corpus and emits no try-operator control dependence. Second required output: **differential-test cost per language**, the number nobody has, from which every later phase is priced |
-| **2 — ECMAScript family, and the shared write algebra** | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class, **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
+| **2 — ECMAScript family, and the shared write algebra** | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class (Rust's by its authored goldens, since no engine band exists for it), **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
 | **3 — Python, Java, C/C++ dependence** | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language and class; Java control and data dependence are diffed against the engine like any other language, and only Java `calls` is authored. **And** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation, which is what licenses deleting the import path |
-| **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
+| **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
 | **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
 
@@ -443,8 +478,9 @@ output or the first table.
 
 1. **Parity.** For each of the nine advertised languages and each of the five published families, the native key set
    is within the per-family band measured from two engine runs on that language's pinned units, on every instance of
-   every claimed class. For `calls`, the comparison is the in-repo-resolved subset.
-2. **No capability depends on it.** On one instance of every claimed class, a fresh index with the dependence provider
+   every claimed class. For `calls`, the comparison is the in-repo-resolved subset. Two exemptions, where no engine
+   band exists: Rust's families and Java's `calls` pass by their authored goldens instead.
+2. **No capability depends on it.** On every instance of every claimed class, a fresh index with the dependence provider
    absent publishes every capability at the same state as one with it present.
 3. **No resolution regression, stated per repository class against the honest denominator.**
    - **The denominator** is call sites whose callee is **defined in a tracked file**, measured by the sample method of
@@ -456,11 +492,15 @@ output or the first table.
      for.
    - **A typed repository without configuration, or a dynamic-language repository:** it resolves **≥ 85%** by the
      language-general inference of decision 2.
+   - **Both targets are provisional.** The ≥ 95% was measured on one configured corpus, and the ≥ 85% on one
+     unconfigured private instance. Each is re-derived, by the same sample method, as the lowest measured ceiling
+     across at least two instances of its class. A class is claimed only when every instance meets the re-derived
+     target.
    - Each class is judged on its instances, and the reference repository is one instance of the second class, never the
      definition of the target.
    - Additionally, the syntax-tier ambiguity population has not grown.
-4. **Coexistence.** The whole index completes with a tree-summed peak below the standing admission allocation, **no
-   single reservation larger than its file's observed need plus the disclosed drift**, and the dependence phase's share
+4. **Coexistence.** The whole index completes with a tree-summed peak below the standing admission allocation, **Σ reserved ÷ Σ observed
+   need per class no higher than phase 0 measured on the same class, with the overrun target of decision 5 met**, and the dependence phase's share
    of the index wall below the engine's measured **74%** on the same instance.
 5. **No consumer remains.** The tool lock entry, the provider's backend and its capability mapping are the only
    references left, and all are deleted in the same change: no dead consumer, no unreachable path, and no configuration
@@ -529,6 +569,9 @@ what it is, and the retirement gate's parity condition is what proves the label 
 - **Who publishes.** The structural provider publishes `control_depends_on`, `data_flows_to`, `reads` and `writes` as
   per-file capabilities, from the worker walk of decision 1.
 - **Failure scope.** A failure of the pass on a file degrades that file's four capabilities and never fails the unit.
+  A lowering or analysis defect that panics is recovered per function in the worker and counts as that failure. It is
+  disclosed with the function's byte range, so no construct in a user's code can take down a worker or lose the
+  file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
   (`internal/index/generation.go:1257-1260`).
 - **`calls`.** A new package-scoped linking provider publishes `calls`. It is keyed on per-file digests of each file's
@@ -570,8 +613,8 @@ makes a file-local decision depend on a project-wide pass that runs before any h
 - a second parse of each header whose first parse has errors;
 - two neighbouring headers can differ in language.
 
-**Measurement:** the `.h` error share in the compiler-infrastructure corpus falls to within a few points of its `.cpp`
-share, and no C-only repository changes.
+**Measurement, per class:** on every C/C++ instance, the `.h` parse-error share is no greater than the larger of that
+instance's `.c` and `.cpp` shares. No C-only instance changes.
 
 ## Measurements
 
@@ -616,7 +659,7 @@ Call resolution on the same store, at the active generation:
 
 | | sites | edges |
 |---|---|---|
-| tree-sitter `calls`, `syntax` | 555,588 | 363,750 |
+| syntax-tier `calls`, `syntax` | 555,588 | 363,750 |
 | …resolved, in-file or via import | 75,751 (13.6%) | 51,012 |
 | …ambiguous (≈8.96 candidates each) | 20,046 (3.6%) | 10,419 |
 | …**unresolved — call through a value** | **459,791 (82.8%)** | 302,319 |
@@ -630,9 +673,9 @@ every call site, including calls whose target is a library, the platform or the 
 in-repo definition is the correct answer. The honest denominator — call sites whose callee is
 **defined in a file the repository tracks** — was measured rather than argued.
 
-*The method, inlined so this record stands alone.* Two evidence stores, read with `sqlite3 -readonly`
-only, the product never run against either repository. From each, a **seeded** sample of tree-sitter
-call sites at the active generation, rows sorted by `(path, start, end)` inside each stratum so the
+*The method, inlined so this record stands alone.* Two evidence stores, read only through the store's
+command-line shell in read-only mode, the product never run against either repository. From each, a **seeded**
+sample of syntax-tier call sites at the active generation, rows sorted by `(path, start, end)` inside each stratum so the
 draw reproduces: **460 rows** from the reference repository stratified by language (javascript 300 of
 526,393 · java 90 of 26,416 · python 45 of 2,291 · typescript 25 of 488, seed 20260916) and **204
 rows** from a second corpus stratified by join status and language (seed 20260917). Allocation is
@@ -694,8 +737,8 @@ Under subdivision of one project: control dependence 99.7%, reaching definitions
 Memory: per function the design figure **M_sparse(N) ≈ 96·N + 64 bytes** (0.92 MiB at N = 10⁴; 9.16 MiB
 at N = 10⁵), against the dense formulation's 2.34 GiB at N = 10⁵. It is a design figure, not a bound
 (§5); `bound_ratio` compares the arena after the three dependence-core passes against it and excludes
-the forward dominator pass. Over the public matrix it reaches p99 about 2.4–5.9 and a maximum of about
-25, with the largest arena 1.7 MiB. The per-run figure is the observed form of decision 5: it depends on the files in
+the forward dominator pass. Over the public matrix, all nine lowerings, it reaches p99 about 1.4–6.2 on every
+population of at least 1,000 functions, and a maximum of about 85. The largest arena is 26.8 MiB. The per-run figure is the observed form of decision 5: it depends on the files in
 flight, not on the repository's file count. The per-language parse-memory distribution it is learned from is the table
 in the context section. Function sizes measured on this host: this repository 3,272 functions, p50 13 / p99 122
 / max 387 body lines; a large Go library 4,153 functions, p50 9 / p99 187 / max 669; a generated driver
