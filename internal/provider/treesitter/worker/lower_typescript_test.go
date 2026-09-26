@@ -142,6 +142,35 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			cd:       []string{"c@22 -> 1@26", "c@22 -> 2@30"},
 		},
 	}
+	// The JavaScript switch and compound-write rules hold on both grammars;
+	// the sources carry no type syntax, so the offsets are JavaScript's.
+	shared = append(shared,
+		goldenCase{
+			// ECMAScript §14.12.4 CaseClauseIsSelected; derivation as in the
+			// JavaScript case of the same name.
+			name:     "every case test reads the discriminant",
+			protects: "a case test's decision depends on the discriminant's variables, so their definitions reach every test",
+			mutation: "reset the discriminant's reads before each case test (x@11 -> 1@34 and x@11 -> 2@54 vanish)",
+			src:      "function f(x) { switch (x) { case 1: g(); break; case 2: h(); } }",
+			fn:       1,
+			cd:       []string{"1@34 -> g()@37", "1@34 -> break;@42", "1@34 -> 2@54", "2@54 -> h()@57"},
+			du:       []string{"x@11 -> x@24", "x@11 -> 1@34", "x@11 -> 2@54"},
+		},
+		goldenCase{
+			// ECMAScript §13.15.2; derivation as in the JavaScript case of
+			// the same name.
+			name:     "a compound property write's throw is on the write's node",
+			protects: "the throw of a compound property assignment is not attached to the first node its right side makes",
+			mutation: "count the target's throw before the right side (c@32 gains control of catch@44, e@51 and h()@56)",
+			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
+			fn:       1,
+			cd: []string{
+				"c@32 -> 1@36", "c@32 -> 2@40",
+				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
+			},
+			du: []string{"c@14 -> c@32", "o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25"},
+		},
+	)
 	runGolden(t, "typescript", shared)
 	runGolden(t, "tsx", append(shared, goldenCase{
 		// JSX (the JSX specification's JSXElement): a capitalized tag name

@@ -165,8 +165,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 // `await`, `yield`, a spread, a property read or write, a destructuring
 // element, a for…of iterator step (including for await), or a class
 // declaration's heritage; a throw statement's node is also a Throw. A plain
-// property write throws when the value is stored, so its throw is counted
-// after its right side, on the write's node. The Builder applies MayThrow
+// or compound property write throws when the value is stored, so its throw
+// is counted after its right side, on the write's node. The Builder applies MayThrow
 // only inside an open catch or finally frame, where the throwing node's own
 // definitions do not reach the handler.
 //
@@ -1568,15 +1568,25 @@ func (j *jsLower) augment(n *ts.Node) (made bool, v int32) {
 	logical := op == k.andAssign || op == k.orAssign || op == k.nullishAssign
 	m := len(j.reads)
 	v = -1
-	if left.KindId() == k.identifier {
+	property := false
+	switch {
+	case left.KindId() == k.identifier:
 		v = j.lookup(left)
 		j.ref(left)
-	} else {
+	case logical:
 		j.target(left)
+	default:
+		property = j.reference(left)
 	}
 	if !logical {
+		// As for a plain property write, the throw of the read and the store
+		// is counted after the right side, on the node spanning n that the
+		// enclosing expression makes, not on a node the right side makes.
 		j.value(right, false)
 		if left.KindId() != k.identifier {
+			if property {
+				j.throws++
+			}
 			return false, -1
 		}
 		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)

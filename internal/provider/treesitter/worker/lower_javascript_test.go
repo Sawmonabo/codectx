@@ -285,5 +285,22 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			cd:       []string{"1@34 -> g()@37", "1@34 -> break;@42", "1@34 -> 2@54", "2@54 -> h()@57"},
 			du:       []string{"x@11 -> x@24", "x@11 -> 1@34", "x@11 -> 2@54"},
 		},
+		{
+			// ECMAScript §13.15.2: a compound assignment evaluates the
+			// reference, then the right side, then PutValue. The write's node
+			// o.p += c ? 1 : 2@25 carries the throw, after the right side's
+			// Branch c@32 and its arms 1@36 and 2@40, so c controls only its
+			// arms and the write controls the catch's Handler@44, e@51, h()@56.
+			name:     "a compound property write's throw is on the write's node",
+			protects: "the throw of a compound property assignment is not attached to the first node its right side makes",
+			mutation: "count the target's throw before the right side (c@32 gains control of catch@44, e@51 and h()@56)",
+			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
+			fn:       1,
+			cd: []string{
+				"c@32 -> 1@36", "c@32 -> 2@40",
+				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
+			},
+			du: []string{"c@14 -> c@32", "o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25"},
+		},
 	})
 }
