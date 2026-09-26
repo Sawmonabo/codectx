@@ -105,7 +105,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// 2@25, g(x)@34; x = 2 kills x = 1.
 			name:     "a namespace body runs inline where it stands",
 			protects: "a namespace's statements are ordinary definitions of the enclosing function, not a closure's may-definitions",
-			mutation: "lower a namespace body as a nested callable (g(x) also pairs with x = 1@4, a may-definition)",
+			mutation: "lower a namespace body as a nested callable (its creating node may-defines x, so g(x) pairs with it and, through it, with x = 1@4)",
 			src:      "let x = 1; namespace N { x = 2; } g(x);",
 			fn:       0,
 			du:       []string{"x = 2@25 -> g(x)@34"},
@@ -266,7 +266,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// the same name.
 			name:     "a compound property assignment reads the property before its right side",
 			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node, the store reading the old value through the read's result",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (o@11 -> o.p += c ? 1 : 2@25 and c@14 -> o.p += c ? 1 : 2@25 appear)",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -277,7 +277,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"o@11 -> o.p@25", "c@14 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25",
-				"1@36 -> o.p += c ? 1 : 2@25", "2@40 -> o.p += c ? 1 : 2@25",
+				"1@36 -> o.p += c ? 1 : 2@25", "2@40 -> o.p += c ? 1 : 2@25", "o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		goldenCase{

@@ -304,7 +304,10 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			// ECMA-262 §10.2.11 FunctionDeclarationInstantiation (a function
 			// declaration is instantiated before the body runs) and §15.2 Function
-			// Definitions.
+			// Definitions. Nodes: a@11, the hoisted g@38 (defines g), b = a@22,
+			// the declaration function g() { return b }@29 (Uses its capture b,
+			// may-defines g, so it pairs with g@38), return g;@55, reached by the
+			// declaration's may-definition and, through it, by g@38.
 			name:     "a hoisted function declaration captures at its own position",
 			protects: "the hoisted name is defined at the block's start, and the declaration's captures are read where it stands, so a definition before it flows into later uses of the name",
 			mutation: "read the captures on the hoisted node at the block's start (b = a@22 flows nowhere)",
@@ -312,7 +315,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			fn:       1,
 			du: []string{
 				"a@11 -> b = a@22", "b = a@22 -> function g() { return b }@29",
-				"g@38 -> return g;@55", "function g() { return b }@29 -> return g;@55",
+				"g@38 -> function g() { return b }@29", "g@38 -> return g;@55",
+				"function g() { return b }@29 -> return g;@55",
 			},
 		},
 		{
@@ -321,8 +325,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// then writes). Nodes: xs@11, n = 0@21, the arrow x => { n += x }@39
 			// (Uses its capture n, may-defines n, defines its result), the call
 			// xs.forEach(x => { n += x })@28 (Uses xs and the result), return
-			// n;@57, reached by n = 0 and by the arrow's non-killing
-			// may-definition.
+			// n;@57, reached by the arrow's may-definition and, through it, by
+			// n = 0.
 			name:     "a closure's write to an enclosing variable is a may-definition where it is created",
 			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation, the closure node reads only its captures, and the call reads the closure through the creating node's result",
 			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pair to return n), as a killing definition (return n loses n = 0@21), attach a read no node evaluated to the next node made (xs@11 -> x => { n += x }@39 appears), or give the call the arrow's captures instead of its result (n = 0@21 -> xs.forEach(x => { n += x })@28 appears)",
@@ -388,14 +392,19 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			// ECMA-262 Annex B.3.3 FunctionDeclarations in IfStatement Statement
 			// Clauses: the declaration behaves as if it were in a block of its own.
+			// Nodes: c@11, g = 0@20, the Branch c@31, the hoisted g@43 (defines
+			// the inner g), the declaration function g() { return c }@34 (Uses
+			// its capture c, may-defines the inner g, so it pairs with g@43),
+			// return g;@60, which reads the outer g.
 			name:     "a function declaration as an if body is scoped to that body",
 			protects: "the declaration binds and defines its own name in an implicit block, so it never may-defines an enclosing variable of the same name",
-			mutation: "lower an if body with stmt alone (the hoisted g@43 vanishes and function g() { return c }@34 may-defines the outer g, pairing with return g;@60)",
+			mutation: "lower an if body with stmt alone (the hoisted g@43 vanishes with g@43 -> function g() { return c }@34, and function g() { return c }@34 may-defines the outer g: g = 0@20 -> function g() { return c }@34 and function g() { return c }@34 -> return g;@60 appear)",
 			src:      "function f(c) { let g = 0; if (c) function g() { return c } return g; }",
 			fn:       1,
 			cd:       []string{"c@31 -> g@43", "c@31 -> function g() { return c }@34"},
 			du: []string{
-				"c@11 -> c@31", "c@11 -> function g() { return c }@34", "g = 0@20 -> return g;@60",
+				"c@11 -> c@31", "c@11 -> function g() { return c }@34", "g@43 -> function g() { return c }@34",
+				"g = 0@20 -> return g;@60",
 			},
 		},
 		{
@@ -420,15 +429,15 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// stores after it. Nodes: the property read o.p@25 (Uses o, may throw,
 			// defines the reference's value), the right side's Branch c@32 and its
 			// arms 1@36 and 2@40, each defining the conditional's result, then the
-			// write o.p += c ? 1 : 2@25 (Uses both values, may-defines o, may
-			// throw). Both throwing nodes reach the catch's Handler catch@44, then
+			// write o.p += c ? 1 : 2@25 (Uses both values, may-defines o, so it
+			// pairs with o@11, may throw). Both throwing nodes reach the catch's Handler catch@44, then
 			// e@51 and h()@56. The read's successors are c@32 and the Handler;
 			// c@32 is post-dominated by the write, the Handler by e and h(), so
 			// the read controls those five; the write controls the Handler's
 			// three; c controls its arms.
 			name:     "a compound property assignment reads the property before its right side",
 			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node, the store reading the old value through the read's result",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (o@11 -> o.p += c ? 1 : 2@25 and c@14 -> o.p += c ? 1 : 2@25 appear)",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -438,7 +447,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"o@11 -> o.p@25", "c@14 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25", "1@36 -> o.p += c ? 1 : 2@25",
-				"2@40 -> o.p += c ? 1 : 2@25",
+				"2@40 -> o.p += c ? 1 : 2@25", "o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		{
@@ -457,19 +466,19 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			// ECMA-262 §13.15.2: a plain assignment evaluates its right side and
 			// stores it (PutValue); it never reads the target's value. Nodes:
-			// x@11, the arrow () => { x = 1; }@26 (may-defines x, Uses nothing,
-			// defines its result), the declarator g = () => { x = 1; }@22 (Uses
-			// the result, defines g), return x;@44, reached by x@11 and the
-			// arrow's non-killing may-definition. Straight line, no control
-			// dependence.
+			// x@11, the arrow () => { x = 1; }@26 (Uses nothing, may-defines x,
+			// so it pairs with x@11, defines its result), the declarator g = ()
+			// => { x = 1; }@22 (Uses the result, defines g), return x;@44,
+			// reached by the arrow's may-definition and, through it, by x@11.
+			// Straight line, no control dependence.
 			name:     "a closure's plain assignment writes an enclosing variable without reading it",
-			protects: "the creating node of a closure that only assigns an enclosing variable does not Use it, so no earlier definition flows into the closure",
-			mutation: "collect a plain assignment's target as a read in cap (x@11 -> () => { x = 1; }@26 appears)",
+			protects: "a closure's plain assignment to an enclosing variable is a may-definition on the creating node, which pairs with the definition reaching it, and a later use pairs with both",
+			mutation: "record the closure's write as a killing definition (x@11 -> () => { x = 1; }@26 and x@11 -> return x;@44 vanish), or drop a plain assignment's target from capTarget (x@11 -> () => { x = 1; }@26 and () => { x = 1; }@26 -> return x;@44 vanish)",
 			src:      "function f(x) { const g = () => { x = 1; }; return x; }",
 			fn:       1,
 			du: []string{
 				"x@11 -> return x;@44", "() => { x = 1; }@26 -> return x;@44",
-				"() => { x = 1; }@26 -> g = () => { x = 1; }@22",
+				"() => { x = 1; }@26 -> g = () => { x = 1; }@22", "x@11 -> () => { x = 1; }@26",
 			},
 		},
 		{
@@ -561,7 +570,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// stores (PutValue) and its value is the value assigned. Nodes: o@11,
 			// x@14, the write o.p = x@21 (Uses o and x, may-defines o, defines its
 			// result), the call g(o.p = x)@19 (Uses the result), return o;@31,
-			// reached by o@11 and by the write's non-killing may-definition.
+			// reached by the write's may-definition and, through it, by o@11.
 			name:     "an embedded property write is its own node and may-defines its base",
 			protects: "a property write inside a larger expression is a node of its own that may-defines its base variable and hands its value to the consumer through a result",
 			mutation: "fold an embedded property write into its consumer (o.p = x@21 vanishes; o@11 and x@14 pair with g(o.p = x)@19), or drop the base may-definition (o.p = x@21 -> return o;@31 vanishes)",

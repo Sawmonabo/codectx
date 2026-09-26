@@ -140,7 +140,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     c ? 1 : 2`: the write Uses o, the condition's Branch only c). A compound
 //     property assignment is first a Stmt node spanning the target, the
 //     property read, whose result carries the reference and the old value to
-//     the write node.
+//     the write node; the write node reads o only as its may-definition's
+//     prior version, so it pairs with o by the May-definitions rule.
 //   - Destructuring is one defining node per bound name, spanning the name,
 //     so D ≤ N. The value destructured is evaluated once, at its own node:
 //     a declarator's initializer or an assignment's right side is a Stmt node
@@ -166,15 +167,16 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     function its creating expression is one Stmt node spanning it, which
 //     Uses every enclosing variable read inside it (its own evaluation),
 //     resolved with its own scopes so a name it declares shadows, and
-//     may-defines (MayDef, a non-killing definition) every enclosing
-//     variable assigned inside it and the base variable of every property
-//     it writes; a plain assignment or binding target is written and not
+//     may-defines every enclosing variable assigned inside it and the base
+//     variable of every property it writes (a χ, see May-definitions in
+//     Lowering); a plain assignment or binding target is written and not
 //     read, while a compound assignment or an update also reads its
 //     variable: when the closure runs is unknown, so a use after its
-//     creation sees both the closure's write and every definition reaching
-//     the creation. A class's field initializers and static blocks, static
-//     and instance alike, are its class body's unit, lowered in source
-//     order: each initializer is the nodes of its value then one Stmt node
+//     creation pairs with the creation and, through it, with the killing
+//     definitions reaching the creation, and the creating node pairs with
+//     those definitions too. A class's field initializers and static
+//     blocks, static and instance alike, are its class body's unit, lowered
+//     in source order: each initializer is the nodes of its value then one Stmt node
 //     spanning the field definition, which ends before its `;` (the grammar
 //     makes the `;` a sibling in the class body) and Uses the value's reads
 //     but defines no variable (it writes a property of the instance or the
@@ -216,7 +218,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // it defines nothing while the node is still made with its other reads;
 // mayDefBase drops it as a property write's base, and capTarget as a
 // nested callable's write, so the creating node may-defines nothing for
-// it. define takes only an owned variable or one def admitted.
+// it. Every other flow.Builder.Def takes an owned variable or one def
+// admitted.
 //
 // Values travel through variables (see Uses in Lowering): a node Uses what
 // its own evaluation reads, the reads no node of their own carries, and the
@@ -239,9 +242,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     result of x = 1's node);
 //   - a logical assignment: its Branch and its write node, as for `??`;
 //   - an assignment, compound assignment or update: its node defines the
-//     result, the value assigned (for an identifier target, whose variable
-//     it Defs, the result is a MayDef: a node Defs one variable), so two
-//     assignments to one variable in one expression hand on two values;
+//     result, the value assigned, a killing definition beside the
+//     identifier target's own, so two assignments to one variable in one
+//     expression hand on two values;
 //   - a destructuring assignment: the right side's node, whose result is
 //     the assignment's value; it is one variable, the incoming value every
 //     element Uses;
@@ -250,10 +253,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     the consumer never repeats them.
 //
 // Where a construct's yielding node is one its own lowering already made
-// and that node already Defs a variable (an assignment, a creation standing
-// for a conditional's arm), it MayDefs the result instead; since only the
-// construct's own yielding nodes define that variable, the pairs are the
-// same.
+// and that node already defines a variable (an assignment, a creation
+// standing for a conditional's arm), the node Defs the result too: a node
+// may make several killing definitions, and only the construct's own
+// yielding nodes define its result.
 //
 // Folded into the node that evaluates them, their reads being its own
 // evaluation: identifiers, literals and templates, plain unary and binary
@@ -264,7 +267,7 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //
 // A read the consumer folds that the statement makes before a node
 // redefines its variable (`f(x, x = 1)`) is carried by that node, as Uses in
-// Lowering states: the node Uses v and may-defines an owned variable that
+// Lowering states: the node Uses v and defines an owned variable that
 // replaces the held reads of v. The hand-off is made only for reads the
 // node runs after whenever their consumer does: a node inside an operand
 // evaluated on some paths only (a short-circuit operand after the deciding
@@ -386,7 +389,7 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *S
 	clear(j.lab[:cap(j.lab)])
 	*j = jsLower{l: l, b: b, src: src, k: k, cur: s.cursor(fn), buf: j.buf[:0], binds: &s.scope,
 		reads: j.reads[:0], seen: j.seen[:0], stmtNo: 1, writes: j.writes[:0], first: -1, last: -1,
-		opt: j.opt[:0], lab: j.lab[:0], match: j.match[:0], optR: -1, defd: -1}
+		opt: j.opt[:0], lab: j.lab[:0], match: j.match[:0], optR: -1}
 	switch fn.KindId() {
 	case k.program:
 		j.hoistVars(fn)
@@ -497,8 +500,6 @@ type jsLower struct {
 	// optR is the result variable of the optional chain being lowered, or -1
 	// before its first `?.`.
 	optR int32
-	// defd is the node the last Def went to, or -1.
-	defd int32
 	// condFrom is where in reads the innermost conditionally evaluated
 	// operand of the statement began, or 0.
 	condFrom int
@@ -593,23 +594,8 @@ func (j *jsLower) drop(m int) {
 // its reads are dropped. The consumer reads r once every yielding node is
 // made.
 func (j *jsLower) yieldTo(id int32, m int, r int32) {
-	j.define(id, r)
+	j.b.Def(id, r)
 	j.drop(m)
-}
-
-// define records that node n defines v: a Def, or a MayDef when n already
-// Defs a variable (a node defines at most one). That happens only where n
-// yields a value into a variable that only the construct's own yielding
-// nodes define, or into a pattern name the Branch before n defined, so the
-// definitions a MayDef leaves live are ones that already pair with every use
-// it reaches, and the pairs are the same.
-func (j *jsLower) define(n, v int32) {
-	if n == j.defd {
-		j.b.MayDef(n, v)
-		return
-	}
-	j.b.Def(n, v)
-	j.defd = n
 }
 
 // give is yieldTo into a new result variable, which the consumer reads in
@@ -657,7 +643,7 @@ func (j *jsLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
-	j.define(n, v)
+	j.b.Def(n, v)
 	if int(v) >= len(j.seen) || j.seen[v].stmt != j.stmtNo {
 		return
 	}
@@ -672,7 +658,7 @@ func (j *jsLower) def(n, v int32) {
 	}
 	j.b.Use(n, v)
 	t := j.b.Var()
-	j.define(n, t)
+	j.b.Def(n, t)
 	for i := at; i < len(j.reads); i++ {
 		if j.reads[i] == v {
 			j.reads[i] = t
@@ -1445,7 +1431,7 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 		j.throws++
 	}
 	it := j.b.Var()
-	j.define(j.node(flow.Stmt, right, 0, len(j.reads)), it)
+	j.b.Def(j.node(flow.Stmt, right, 0, len(j.reads)), it)
 	f := j.b.OpenLoop(labels...)
 	j.reset()
 	j.read(it)
@@ -1475,7 +1461,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	// dv; each case test compares dv's value with its own, so its Branch
 	// Uses dv.
 	dv := j.b.Var()
-	j.define(j.node(flow.Stmt, disc, 0, len(j.reads)), dv)
+	j.b.Def(j.node(flow.Stmt, disc, 0, len(j.reads)), dv)
 	mark := j.binds.mark()
 	start, cases := j.kids(n.ChildByFieldId(k.fBody))
 	// A case's statements are its named children after the test value.
@@ -1913,8 +1899,8 @@ func (j *jsLower) augment(n *ts.Node) {
 }
 
 // carry makes node id, which carries reads[m:], define the variable the
-// identifier x names and yield its value into an owned result (a MayDef,
-// since id Defs x), which the consumer reads in place of reads[m:]: never x
+// identifier x names and yield its value into an owned result, both killing
+// definitions, which the consumer reads in place of reads[m:]: never x
 // itself, which a later assignment in the same expression may overwrite.
 func (j *jsLower) carry(id int32, m int, x *ts.Node) {
 	j.def(id, j.lookup(x))
