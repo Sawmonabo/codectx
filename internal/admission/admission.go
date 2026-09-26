@@ -58,12 +58,6 @@ type Ledger struct {
 	// is a real reading -- a host already at or below its floor -- and
 	// serializes every child that wants disk at all.
 	diskAllocation int64
-	// memoryObserved and diskObserved say whether each allocation was derived
-	// from a reading of this host or is the stand-in the composition root
-	// admits against where the platform published none. They are fixed at
-	// construction, so they need no lock.
-	memoryObserved bool
-	diskObserved   bool
 	admitted       int
 	used           int64
 	diskUsed       int64
@@ -85,16 +79,6 @@ type waiter struct {
 	release sync.Once
 }
 
-// Allocation is one dimension's figure and whether it was derived from a
-// reading of this host. Observed is false for the stand-in the composition
-// root admits against where the platform published no figure: the ledger
-// admits against it all the same, because a gate with no bound is not a gate,
-// but nothing may publish it as a measurement.
-type Allocation struct {
-	Bytes    int64
-	Observed bool
-}
-
 // NewLedger builds the ledger over the one memory allocation and the one disk
 // allocation. A non-positive memory allocation is refused rather than treated
 // as unlimited: an admission gate with no bound is not a gate, and every
@@ -106,19 +90,20 @@ type Allocation struct {
 // keep has nothing to give a child, and every child that wants disk then runs
 // alone rather than being refused. An unobservable free-space figure is NOT
 // zero and must not be passed as one; the composition root stands a
-// conservative figure in for it, exactly as it does for memory, and passes it
-// with Observed false.
-func NewLedger(memory, disk Allocation) (*Ledger, error) {
-	if memory.Bytes <= 0 {
+// conservative figure in for it, exactly as it does for memory. Whether a
+// figure was observed is not the ledger's concern: it gates against the
+// figure either way, and the composition root tells the surfaces that
+// disclose it.
+func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
+	if allocationBytes <= 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the reservation ledger needs a positive memory allocation"}
 	}
-	if disk.Bytes < 0 {
+	if diskAllocationBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the reservation ledger needs a disk allocation that is not negative"}
 	}
-	return &Ledger{allocation: memory.Bytes, diskAllocation: disk.Bytes,
-		memoryObserved: memory.Observed, diskObserved: disk.Observed}, nil
+	return &Ledger{allocation: allocationBytes, diskAllocation: diskAllocationBytes}, nil
 }
 
 // Reserve blocks until these bytes of MEMORY may be held: the summed
@@ -222,14 +207,6 @@ func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.diskAllocation, l.diskUsed
-}
-
-// Observed reports, per dimension, whether the allocation was derived from a
-// reading of this host rather than stood in for one. A surface that discloses
-// the allocations leaves an unobserved one absent and still reports what is
-// reserved against it.
-func (l *Ledger) Observed() (memory, disk bool) {
-	return l.memoryObserved, l.diskObserved
 }
 
 // pump grants the head of the queue for as long as the head fits. The mutex

@@ -19,7 +19,7 @@ import (
 //     after the first child leaves, although a memory-only child is still
 //     running, so the runs-alone rule cannot mask the leak.
 func TestDiskIsAdmittedOnTheSameQueueAsMemory(t *testing.T) {
-	l, err := NewLedger(Allocation{Bytes: 8 << 30, Observed: true}, Allocation{Bytes: 10 << 30, Observed: true})
+	l, err := NewLedger(8<<30, 10<<30)
 	if err != nil {
 		t.Fatalf("the ledger was refused: %v", err)
 	}

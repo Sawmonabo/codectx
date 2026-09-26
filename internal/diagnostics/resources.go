@@ -247,9 +247,10 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 // one moment rather than two, and is absent altogether when this composition
 // has no ledger: an unavailable figure is never published as zero, and a zero
 // allocation would read as a process that may run nothing. An allocation the
-// ledger holds as a stand-in -- the platform published no memory or no
-// free-space figure -- is absent too, because it is not a measurement; what is
-// reserved against it is still a real sum and is reported.
+// composition marked unobserved -- the platform published no memory or no
+// free-space figure, and the ledger admits against a stand-in -- is absent
+// too, because it is not a measurement; what is reserved against it is still
+// a real sum and is reported.
 //
 // The three are the reservations config.BaseFootprint adds to this build's idle
 // overhead from the resources and index blocks; it adds the store's page
@@ -268,16 +269,15 @@ func (s *Service) reservations(report *model.ResourceReport) {
 	report.CacheReservationBytes = nonNegativeBytes(res.CacheBytes)
 	report.QueueReservationBytes = nonNegativeBytes(s.opts.Config.Index.QueueBytes)
 	if s.opts.Admission != nil {
-		memoryObserved, diskObserved := s.opts.Admission.Observed()
 		allocation, reserved := s.opts.Admission.Snapshot()
-		if memoryObserved {
+		if s.opts.AdmissionMemoryObserved {
 			report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
 		}
 		report.AdmissionReservedBytes = nonNegativeBytes(reserved)
 		// The ledger gates on two dimensions and a child can wait on either,
 		// so both are disclosed or the report explains only half of a wait.
 		diskAllocation, diskReserved := s.opts.Admission.DiskSnapshot()
-		if diskObserved {
+		if s.opts.AdmissionDiskObserved {
 			report.AdmissionDiskAllocationBytes = nonNegativeBytes(diskAllocation)
 		}
 		report.AdmissionDiskReservedBytes = nonNegativeBytes(diskReserved)

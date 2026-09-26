@@ -157,8 +157,15 @@ type Options struct {
 	// starts no heavy child -- leaves every figure absent rather than
 	// reporting them as zero.
 	Admission *admission.Ledger
-	Toolchain ToolchainReporter
-	Workspace WorkspaceProber
+	// AdmissionMemoryObserved and AdmissionDiskObserved say whether each of
+	// Admission's allocations was derived from a reading of this host. One
+	// that is false is the stand-in the composition admits against where the
+	// platform published no figure; the block leaves it absent and still
+	// reports what is reserved against it.
+	AdmissionMemoryObserved bool
+	AdmissionDiskObserved   bool
+	Toolchain               ToolchainReporter
+	Workspace               WorkspaceProber
 	// Now is the clock every check and the report's CheckedAt read. A test
 	// supplies a fixed one so a doctor report is deterministic.
 	Now func() time.Time

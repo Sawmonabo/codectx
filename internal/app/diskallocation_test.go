@@ -16,26 +16,30 @@ import (
 //     every writer on the device;
 //   - the floor not being subtracted: the children would be admitted to fill
 //     the space the host is promised to keep.
+//   - the stand-in returned as observed: the resource block would publish a
+//     figure nobody measured as the host's free space.
 func TestFreeDiskAllocationRecordsWhatWasMeasured(t *testing.T) {
 	dir := t.TempDir()
 
-	full := freeDiskAllocation(dir, 0)
-	if full <= 0 {
-		t.Fatalf("a readable directory yielded no allocation: %d", full)
+	full, observed := freeDiskAllocation(dir, 0)
+	if !observed || full < 0 {
+		t.Fatalf("a readable directory yielded %d, observed %v; want a measured figure", full, observed)
 	}
-	if withFloor := freeDiskAllocation(dir, 1<<30); withFloor > full-(1<<30) {
+	// Below 1 GiB free the floor leaves nothing, which is zero and not negative.
+	if withFloor, _ := freeDiskAllocation(dir, 1<<30); withFloor > max(full-(1<<30), 0) {
 		t.Fatalf("the floor was not kept back: %d free of %d with a 1 GiB floor", withFloor, full)
 	}
 	// A floor larger than the device is a real reading of a host with nothing
 	// to give, which is zero and is not the stand-in.
-	if atFloor := freeDiskAllocation(dir, full+(1<<40)); atFloor != 0 {
-		t.Fatalf("a host below its floor yielded %d, want 0", atFloor)
+	if atFloor, observed := freeDiskAllocation(dir, full+(1<<40)); atFloor != 0 || !observed {
+		t.Fatalf("a host below its floor yielded %d, observed %v; want 0, observed", atFloor, observed)
 	}
 	// No figure at all: the stand-in, which is neither zero nor unlimited. A
 	// missing leaf under a directory that exists is what the platform call
 	// actually fails on, which is the unmeasurable reading this asserts.
-	unmeasured := freeDiskAllocation(filepath.Join(dir, "no-such-directory"), 0)
-	if unmeasured != unobservedFreeDiskBytes {
-		t.Fatalf("an unmeasurable directory yielded %d, want the stand-in %d", unmeasured, unobservedFreeDiskBytes)
+	unmeasured, observed := freeDiskAllocation(filepath.Join(dir, "no-such-directory"), 0)
+	if unmeasured != unobservedFreeDiskBytes || observed {
+		t.Fatalf("an unmeasurable directory yielded %d, observed %v; want the stand-in %d, unobserved",
+			unmeasured, observed, unobservedFreeDiskBytes)
 	}
 }

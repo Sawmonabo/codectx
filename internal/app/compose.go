@@ -400,14 +400,21 @@ type stack struct {
 	// resource sampler can count their live children. Nothing else reads them:
 	// each component keeps its own runner.
 	runners []diagnostics.ProcessCounter
-	// admission is the ONE memory admission ledger of this process, built here
-	// from the one observation of the machine and handed to every reserver:
+	// admission is the one reservation ledger, for memory and disk, of this
+	// process, built here from the one observation of the machine and the one
+	// of the data directory's free space, and handed to every reserver:
 	// the heavy-unit scheduler inside the coordinator, the language-server
 	// manager, and the resource block that discloses it. There is no second
 	// one -- a reserver with a running total of its own is bounded by the same
 	// allocation as this one and nothing sums the two, which is a process free
 	// to reserve a multiple of the machine's memory.
 	admission *admission.Ledger
+	// admissionMemoryObserved and admissionDiskObserved say whether each of
+	// the ledger's allocations came from a reading of this host rather than a
+	// stand-in, so the resource block never publishes a stand-in as a
+	// measurement.
+	admissionMemoryObserved bool
+	admissionDiskObserved   bool
 	// diagnose produces the Section 22 check list and the Section 23 resource
 	// block; collector is the process-level reclaim pass and the Section 10.4
 	// blob grace protocol. Both are set by openDiagnostics, which needs the
@@ -699,17 +706,17 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	machine := dependence.ObserveMachine()
 	baseFootprint := config.BaseFootprint(cfg)
 	childMemory := machine.SchedulingAllocation(baseFootprint)
-	memoryObserved := machine.Allocation(baseFootprint, dependence.DefaultSafetyMarginBytes) > 0
+	s.admissionMemoryObserved = machine.Observed &&
+		machine.Allocation(baseFootprint, dependence.DefaultSafetyMarginBytes) > 0
 	// Disk is the ledger's second dimension and is observed the same way: the
 	// free space under the data directory, less the floor the host keeps, is
 	// what the children may stage between them. It is observed here, once, for
 	// the reason the memory allocation is -- the ledger observes nothing and
 	// derives nothing -- and a child that does not fit it waits rather than
 	// filling the device.
-	childDisk, diskObserved := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
-	if s.admission, err = admission.NewLedger(
-		admission.Allocation{Bytes: childMemory, Observed: memoryObserved},
-		admission.Allocation{Bytes: childDisk, Observed: diskObserved}); err != nil {
+	var childDisk int64
+	childDisk, s.admissionDiskObserved = freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
+	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its
@@ -1162,8 +1169,7 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 //
 // Both are built in BOTH compositions. `codectx doctor` and `codectx status
 // --resources` open the workspace for a report, so building the reporter only
-// for an indexing run would leave every diagnostic command with no producer --
-// the exact failure Task 20 exists to remove.
+// for an indexing run would leave every diagnostic command with no producer.
 //
 // Every dependency crosses as a narrow interface: neither package sees
 // *sqlite.Store, *toolchain.Resolver, *snapshot.CAS or config.Config's whole
@@ -1176,16 +1182,18 @@ func (s *stack) openDiagnostics() error {
 		// The binary's own identity, read from the same source `codectx
 		// version` reads. Threading it down from the command line would be a
 		// second spelling of a fact this process can always answer for itself.
-		Build:     model.CurrentBuildInfo(),
-		Repo:      s.repo,
-		Root:      s.root.Path,
-		Admission: s.admission,
-		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
-		Store:     storeReader{Store: s.store},
-		Ledger:    runLedger{dir: dataDir},
-		Toolchain: toolchainReporter{r: s.resolver},
-		Workspace: workspaceProber{},
-		Now:       time.Now,
+		Build:                   model.CurrentBuildInfo(),
+		Repo:                    s.repo,
+		Root:                    s.root.Path,
+		Admission:               s.admission,
+		AdmissionMemoryObserved: s.admissionMemoryObserved,
+		AdmissionDiskObserved:   s.admissionDiskObserved,
+		Sampler:                 diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
+		Store:                   storeReader{Store: s.store},
+		Ledger:                  runLedger{dir: dataDir},
+		Toolchain:               toolchainReporter{r: s.resolver},
+		Workspace:               workspaceProber{},
+		Now:                     time.Now,
 	})
 	if err != nil {
 		return err
