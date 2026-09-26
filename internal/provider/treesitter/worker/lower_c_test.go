@@ -371,6 +371,20 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"x = g()@20 -> return x;@30"},
 		},
 		{
+			// C17 §6.2.1p4: g, declared outside any block, has file scope, so
+			// it is no variable of f. Nodes: y@18, g = y@23 (Uses y, defines
+			// nothing), g += y@30 (Uses y only), g++@38 (Uses nothing), g =
+			// y@45 (the embedded assignment: Uses y, defines the owned result),
+			// h(g = y)@43 (Uses that result), h(&g)@53 (Uses and may-defines
+			// nothing), return g;@60 (Uses nothing). Succ: a straight line to
+			// EXIT.
+			name:     "a name with file scope is no variable in any position",
+			protects: "an assignment, compound assignment, update, embedded assignment, address-taking and read of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
+			mutation: "drop read's filter (Builder.Use panics on g's -1 at g += y@30), def's (Builder.Def panics at g = y@23), or mayDef's (Builder.MayDef panics at h(&g)@53), or fold the embedded assignment into its consumer (loses g = y@45 -> h(g = y)@43)",
+			src:      "int g; void f(int y) { g = y; g += y; g++; h(g = y); h(&g); return g; }",
+			du:       []string{"y@18 -> g = y@23", "y@18 -> g += y@30", "y@18 -> g = y@45", "g = y@45 -> h(g = y)@43"},
+		},
+		{
 			// C17 §6.10.1p6: a conditional without #else keeps no group when
 			// A is undefined, so after the directive x is the #ifdef group's
 			// variable in one build and the parameter in the other. Nodes:

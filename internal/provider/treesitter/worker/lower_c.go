@@ -139,7 +139,17 @@ const (
 //     An assembly statement is one node spanning the assembly expression,
 //     without the statement's semicolon: with goto labels a Branch node with
 //     an edge to each label and one to the next statement, otherwise a Stmt
-//     node.
+//     node. The node Uses what its input operands' expressions read, and an
+//     output operand is a write through its expression (see Uses).
+//   - A loop's back edge lands on the first node its head makes: a while or
+//     for loop's on the condition's first node (the node of an assignment
+//     embedded in it, `while ((c = g()) != 0)`, comes before its Branch; C17
+//     §6.8.5p4 evaluates the whole controlling expression before each
+//     iteration), or on the head's Stmt node when the loop has no exit edge;
+//     a do loop's on its body's first node. A continue lands where the
+//     continue path starts: the first node of a for loop's update, else the
+//     first node of the condition (a do loop's included), or the head's
+//     Stmt node of a loop with no exit edge.
 //   - A preprocessor conditional inside a function body (`#if`, `#ifdef`,
 //     `#ifndef`, `#elif`, `#elifdef`, `#elifndef`, `#else`) keeps every
 //     branch as reachable code, since the lowering cannot know which one
@@ -194,6 +204,19 @@ const (
 // read. A node Uses what its own evaluation reads, and a value computed at
 // another node reaches it through a variable, as Lowering's Uses rule
 // states.
+//
+// A name that resolves to no variable (Lowering, Names that resolve to no
+// variable: here a file-scope or namespace name, a member named without its
+// object, a name no declaration binds, or a function prototype) is -1 from
+// lookup, and the filter sits where a variable enters the lowering's state
+// or the builder: read (a read, a compound assignment's or update's own
+// read, a captured name's read), def (an assignment's, update's or
+// declaration's target), mayDef and mayDefs (taking its address, a decaying
+// array, a write through it, a range for's range base; capWrite for a
+// callable's write), and the shape table (arrayed, shaped). The node the
+// construct makes is still made, and an embedded assignment to such a name
+// defines the owned result its consumer Uses. C has no deletion or
+// iteration of a name, and C++ `delete p` only reads p.
 //
 // Lowered to nodes of their own, each handing its value to the consumer
 // through an owned result variable the consumer Uses:
@@ -257,7 +280,9 @@ const (
 // Uses its operands and is a non-killing may-definition of the base
 // variable on the node that evaluates the enclosing expression. By the
 // address-taking rule of Lowering, so is each of these, which also Uses its
-// operands: taking an address, `&x` (`&s.f`, `&a[i]`); evaluating a local
+// operands (`&x` Uses x though it reads no value of x: that is the rule's
+// Use, which pairs the address with the definitions reaching it): taking an
+// address, `&x` (`&s.f`, `&a[i]`); evaluating a local
 // declared as an array anywhere but as the operand of sizeof, `&` or a
 // subscript, where it decays to its address (C17 §6.3.2.1p3), as in
 // `fill(buf)`; and binding a C++ reference to a non-const type to an
@@ -270,7 +295,8 @@ const (
 // may-definition is recorded with the position of its operand's reads, as
 // reads are, and a node takes only those its own reads cover. A write
 // through the pointer or reference (`*p = 2`, `r = 2`) is given up, as
-// Lowering states. Destructors, setjmp/longjmp and signal handlers are not
+// Lowering states: `r = 2`, whose target is the local r, is r's defining
+// node, a Def of r, and the object r refers to is not written. Destructors, setjmp/longjmp and signal handlers are not
 // modelled.
 //
 // # Statement expressions
@@ -298,7 +324,13 @@ const (
 // C++ ([except]): inside a try block MayThrow is given to every node whose
 // own evaluation contains a call, a `new`, a `delete` (the destructor and
 // the deallocation function, [expr.delete]), a direct initialization, a
-// default-initialized object of class type or a range for's iterator step; a throw statement's node is also a Throw. A
+// default-initialized object of class type or a range for's iterator step.
+// A throw statement's node is a Throw, and MayThrow only when its operand's
+// own evaluation holds one of those: `throw 1;` goes straight to the first
+// clause's test, and a try whose body has no MayThrow node has no Handler
+// node. A member initializer `a(g(x))` initializes a member, no variable
+// of the function: its one Stmt node Uses its arguments' reads, defines
+// nothing and may throw. A
 // try statement's handlers are tested in order after the Handler node
 // spanning the first `catch` keyword: each typed clause is a Branch node
 // spanning its parameter list that defines the caught name, true into its
@@ -316,7 +348,10 @@ const (
 // `__except` keyword, and its filter is a Branch node spanning the filter
 // expression without its parentheses, true into the handler, false
 // rethrowing; resumption at the fault is not modelled. `__leave` breaks to
-// the end of the `__try` body. A `__finally` runs on every way out of its
+// the end of the `__try` body: its block frame is opened inside the
+// finally or catch frame, so the jump stays inside the try and reaches a
+// `__finally` as the body's normal completion, not as an intercepted jump
+// re-issued after it. A `__finally` runs on every way out of its
 // `__try` body, a goto to a label outside it included: the builder routes
 // such a goto through the `__finally` (flow.Builder, Goto). The builder
 // applies MayThrow only inside an open catch or finally frame, so outside

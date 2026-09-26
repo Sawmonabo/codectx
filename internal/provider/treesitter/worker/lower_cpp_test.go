@@ -239,5 +239,29 @@ func TestCppLoweringGolden(t *testing.T) {
 			du: []string{"c@17 -> c@34", "x@10 -> return g(x, c && (x = 1));@22", "x = 1@40 -> return g(x, c && (x = 1));@22",
 				"c@34 -> return g(x, c && (x = 1));@22"},
 		},
+		{
+			// [class.mfct.non.static]/2: a member named without `this->` in a
+			// member function is `(*this).m`, a member, no variable of f.
+			// Nodes: y@42, m = y@47 (Uses y, defines nothing), m += y@54
+			// (Uses y only), m++@62 (Uses nothing), m = y@72 (the embedded
+			// assignment: Uses y, defines the owned result), g(0, m = y)@67
+			// (Uses that result), g(0, &m)@80 (Uses and may-defines nothing),
+			// the lambda [&] { m = 1; }@99 (captures nothing, defines its
+			// owned result), l = …@95 (Uses it, defines l), v@130 (the range,
+			// defining the iteration variable), &e : v@125 (the head, Using
+			// it, the range base may-defining nothing), e@126 (Uses it), g(0,
+			// e)@133, delete p@142 (Uses nothing). The calls take a first
+			// argument so no statement reads as a declaration ([stmt.ambig]).
+			// Succ: a straight line to the head; head→{e, delete p};
+			// e→g(0, e)→head. IPDom: head → delete p; e → g(0, e) → head.
+			name:     "a member named without its object is no variable in any position",
+			protects: "an assignment, compound assignment, update, embedded assignment, address-taking, by-reference capture, iterated range and deletion of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
+			mutation: "drop read's filter (m += y@54 indexes the held reads with -1 and panics), def's (Builder.Def panics at m = y@47), mayDef's (Builder.MayDef panics at g(0, &m)@80), or mayDefs' (the range base v reaches Builder.MayDef at e@126 and panics; with capWrite's filter dropped too, so does the lambda's by-reference write of m at [&] { m = 1; }@99)",
+			src:      "struct S { int m; int *p; V v; void f(int y) { m = y; m += y; m++; g(0, m = y); g(0, &m); auto l = [&] { m = 1; }; for (auto &e : v) g(0, e); delete p; } };",
+			cd:       []string{"&e : v@125 -> e@126", "&e : v@125 -> g(0, e)@133", "&e : v@125 -> &e : v@125"},
+			du: []string{"y@42 -> m = y@47", "y@42 -> m += y@54", "y@42 -> m = y@72", "m = y@72 -> g(0, m = y)@67",
+				"[&] { m = 1; }@99 -> l = [&] { m = 1; }@95", "v@130 -> &e : v@125", "v@130 -> e@126",
+				"e@126 -> g(0, e)@133"},
+		},
 	})
 }
