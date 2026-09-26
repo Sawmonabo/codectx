@@ -217,17 +217,17 @@ const (
 	// modeServe composes for the one process that is BOTH: the MCP server
 	// indexes on request and answers questions for the same client, in the
 	// same process, at the same time. It opens a SECOND, read-only handle on
-	// the same database for the read path. Without it every tool call pinned a
+	// the same database for the read path. Without it every tool call would pin a
 	// generation through the writer, and pinning writes a retention lease:
 	// that write force-commits whatever ingestion group the session's own
 	// refresh has open and then waits behind the writer, so one agent query
-	// both cut the run's group short and blocked on it. The reader handle has
+	// would both cut the run's group short and block on it. The reader handle has
 	// no writer connection at all, so a tool call cannot reach either.
 	//
 	// What it does NOT do at startup is take the workspace lock or write. An
 	// agent's server must come up and answer beside an index the person
-	// started in a terminal, and a server that took the lock at its open was
-	// refused outright for the whole of that run -- every exploration tool
+	// started in a terminal, and a server that took the lock at its open would
+	// be refused outright for the whole of that run -- every exploration tool
 	// with it, none of which needs the lock or the writer. So the read-only
 	// handle opens first, the store is opened LazyWriter, and the lock, the
 	// startup recovery and the collection pass are taken at the first
@@ -240,8 +240,8 @@ const (
 	//
 	// The reason is the same one and so is the mechanism. A watch is idle
 	// between its beats, and a session that owned the workspace while it was
-	// idle refused the person's own `codectx index` in the next terminal for
-	// as long as the watch happened to be running -- for nothing, because a
+	// idle would refuse the person's own `codectx index` in the next terminal
+	// for as long as the watch happened to be running -- for nothing, because a
 	// watch between beats is building nothing. So the store opens LazyWriter,
 	// and the lock, the startup recovery and the collection pass are taken by
 	// the beat that builds (Coordinator.reconcile) and given back when that
@@ -397,7 +397,7 @@ type stack struct {
 	queryStore  *sqlite.Store
 	querySearch *search.Service
 	// workflow is the Section 17 guard, review and capsule service the facade
-	// routes every session mutation through. INT wires it.
+	// routes every session mutation through. openWorkflow builds it.
 	workflow *workflow.Service
 
 	// runners are every process runner this stack owns, held only so the
@@ -538,8 +538,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 
 	// Section 13.2's single cross-process owner governs indexing. A report
-	// publishes nothing, so it takes no lock: the writer lock on this path made
-	// `codectx status` permanently refused while a `watch` session ran, with a
+	// publishes nothing, so it takes no lock: a writer lock on this path would
+	// refuse `codectx status` for as long as a `watch` session runs, with a
 	// remediation ("wait for the running process to finish") that a watch never
 	// satisfies. internal/index refuses its building entry points when Lock is
 	// nil, so the absence is enforced there rather than trusted here. The
@@ -739,8 +739,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// unit can present is larger than the allocation; an external indexer's
 	// is its profile's fixed figure, which a small host's allocation can be
 	// below. A runner budgeted at the allocation would refuse precisely those
-	// children, with the resource-limit error the whole memory ruling exists
-	// to avoid. This is the same rule the language-server runner below
+	// children, with the resource-limit error memory admission exists to
+	// avoid. This is the same rule the language-server runner below
 	// states: the budget is wide enough for the largest child the gate above
 	// it can admit.
 	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
@@ -960,8 +960,8 @@ const maxRebuildAttempts = 64
 //
 // It is os.Mkdir and not os.MkdirAll because the difference is the whole
 // contract: MkdirAll accepts a directory that already exists, so two
-// `index --rebuild` runs inside the same second silently shared one cache while
-// the second run told the operator a new one had been created. An existing
+// `index --rebuild` runs inside the same second would silently share one cache
+// while the second run told the operator a new one had been created. An existing
 // directory is therefore visible here, and the name gains a `-2`, `-3`, ...
 // suffix until one is free -- the timestamp still names the run, the suffix
 // only distinguishes runs the timestamp cannot.
@@ -1008,12 +1008,12 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
 		return nil
 	}
-	// Nothing here installs anything any more: the locator reports the pinned
-	// identity of a payload the store does not hold and the first unit that
-	// needs the engine resolves it. The report path therefore needs no second,
-	// force-offline resolver -- which was itself a defect, because it reported
-	// a merely-uninstalled payload as CTX_TOOL_OFFLINE and told an operator to
-	// turn off an offline mode they had never enabled.
+	// Nothing here installs anything: the locator reports the pinned identity
+	// of a payload the store does not hold and the first unit that needs the
+	// engine resolves it. The report path therefore needs no second,
+	// force-offline resolver, which would report a merely-uninstalled payload
+	// as CTX_TOOL_OFFLINE and tell an operator to turn off an offline mode
+	// they never enabled.
 	locator, err := joern.NewLocator(s.resolver)
 	if err == nil {
 		var backend *joern.Backend
@@ -1277,8 +1277,8 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 
 // collect runs the one startup collection pass of a composition that has just
 // become the workspace's owner. It is the caller pagination.Spools.Sweep,
-// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC were
-// documented to expect and never had.
+// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC are
+// documented to expect.
 //
 // Like retention after an activation it never fails what triggered it: the
 // state it reclaims is by definition state nothing references, and the only
@@ -1724,10 +1724,9 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Logger: s.logger,
 		// The compile's external-sort runs live beside the query spools, under
 		// the same resources.max_temp_bytes area the workspace already sweeps
-		// and reports (ruling C5'), and SortDir is derived from the same store
-		// rather than named twice. The spool store also holds the leased state
-		// directory a deadline-interrupted compile continues from (ruling C7),
-		// which is why the signer and the lease store come with it.
+		// and reports, and SortDir is derived from the same store rather than
+		// named twice. The spool store also holds the leased state directory a
+		// deadline-interrupted compile continues from, which is why the signer and the lease store come with it.
 		Spools: s.spools,
 		Signer: s.signer,
 		Leases: s.leases,

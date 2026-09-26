@@ -14,9 +14,9 @@ import (
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
-// This is the package's ONE scenario table. Every lane adds its rows under its
-// own marker and nowhere else; a per-lane test file is a finding, and so is a
-// row that re-asserts Validate(), a getter, an enum spelling or forwarding.
+// This is the package's ONE scenario table. Every row goes here and nowhere
+// else; a second test file of scenarios is a finding, and so is a row that
+// re-asserts Validate(), a getter, an enum spelling or forwarding.
 // Each row names, in its comment, the failure mode it protects against.
 
 type scenario struct {
@@ -97,7 +97,6 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// L0 rows
 	{
 		// Failure mode: a metric this host cannot read is defaulted to zero,
 		// so a missing resident-set reading renders as a process using no
@@ -133,7 +132,6 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// L1 rows
 	{
 		// Failure mode: a figure this host cannot read is reported as a
 		// passing check with a zero value, so an operator reads "0 bytes
@@ -334,7 +332,6 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// L2 rows
 	{
 		// Failure mode: a host that cannot observe a running process tree
 		// reports the worker and analyzer figures as zero instead of as
@@ -520,18 +517,12 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// L3a rows
-	// L3b rows
-	// L4 rows
-	// L5 rows
-	// L6 rows
-	// L7 rows (none: docs carry no test rows)
 }
 
 // --- deterministic fakes for the four frozen interfaces ---------------------
 //
 // They are values, not mocks: a row sets the fields it cares about and reads
-// calls back off the recorder. A lane that needs another field adds it here
+// calls back off the recorder. A row that needs another field adds it here
 // rather than declaring a second fake.
 
 type fakeSampler struct {
@@ -558,7 +549,7 @@ type fakeStore struct {
 	// statCalls records Stats calls. Stats is eleven count(*) scans, so an
 	// ordinary doctor must make none of them.
 	statCalls int
-	// L1: the two optional probes doctor.go asserts for. supplied is what
+	// The two optional probes doctor.go asserts for. supplied is what
 	// SuppliedIndexes reports; sampleLimit records the sample size the caller
 	// asked for, so a row can prove --deep widens it.
 	supplied    []SuppliedIndex
@@ -576,7 +567,7 @@ type fakeStore struct {
 }
 
 // SampleBlobs is the optional hash source for the content-addressed-storage
-// check (L1). It reports no hashes: a store with nothing retained is a
+// check. It reports no hashes: a store with nothing retained is a
 // legitimate state, and the rows that care assert on sampleLimit.
 func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) {
 	f.sampleLimit = limit
@@ -586,7 +577,7 @@ func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) 
 	return f.hashes, f.err
 }
 
-// SuppliedIndexes is the optional supplied-index probe (L1).
+// SuppliedIndexes is the optional supplied-index probe.
 func (f *fakeStore) SuppliedIndexes(context.Context, model.GenerationID) ([]SuppliedIndex, error) {
 	return f.supplied, f.err
 }
@@ -606,7 +597,7 @@ func (f *fakeStore) SynchronousMode(context.Context) (string, error) {
 
 // bareStore is a StoreReader implementing the frozen four methods and none of
 // the optional probes, which is what the composition root hands diagnostics if
-// its adapter forgets to forward them (L1). It exists to prove that case
+// its adapter forgets to forward them. It exists to prove that case
 // reports unavailable with a reason rather than passing silently.
 type bareStore struct{}
 
