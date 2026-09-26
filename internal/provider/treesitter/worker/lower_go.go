@@ -210,7 +210,7 @@ func (g *goLower) declare(id *ts.Node) int32 {
 	if g.blank(name) {
 		return -1
 	}
-	v := g.b.Var(g.span(id))
+	v := g.b.Var()
 	g.bind(name, v)
 	return v
 }
@@ -510,11 +510,12 @@ func (g *goLower) isPanic(e *ts.Node) bool {
 
 // labeled lowers a labelled statement. Go's break and continue name only an
 // enclosing for, switch or select, so the labels reach those frames; every
-// label also names the next node for goto.
+// label is also its own node, the target of goto.
 func (g *goLower) labeled(s *ts.Node, labels []string) {
-	name := string(g.text(s.ChildByFieldName("label")))
+	id := s.ChildByFieldName("label")
+	name := string(g.text(id))
 	labels = append(labels, name)
-	g.b.Label(name)
+	g.b.Label(name, g.span(id))
 	var inner *ts.Node
 	for i := range s.NamedChildCount() {
 		if c := s.NamedChild(i); c.Kind() != "label_name" && c.Kind() != "comment" {
@@ -522,11 +523,9 @@ func (g *goLower) labeled(s *ts.Node, labels []string) {
 			break
 		}
 	}
-	if inner == nil || inner.Kind() == "empty_statement" {
-		g.node(flow.Stmt, s)
-		return
+	if inner != nil && inner.Kind() != "empty_statement" {
+		g.stmt(inner, labels)
 	}
-	g.stmt(inner, labels)
 }
 
 func (g *goLower) ifStmt(s *ts.Node) {

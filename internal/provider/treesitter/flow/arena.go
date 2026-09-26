@@ -67,29 +67,37 @@ func (a *Arena) Uint64s(n int) []uint64 { return a.u64.take(n) }
 // every array it outgrew, since each stays allocated until the next Begin.
 func (a *Arena) Bytes() int { return 4*a.i32.handed() + 8*a.u64.handed() }
 
-// ScratchBytes is the construction scratch used since Begin: node records,
-// raw edges, uses, variable spans, fringe and frame stacks, labels and
-// pending gotos. The Graph's node metadata and uses are read from it. It is
-// outside the 96·N + 64 bound and reported separately.
-func (a *Arena) ScratchBytes() int { return a.b.scratchBytes() }
+// ScratchBytes is the construction scratch high-water since Begin, in
+// bytes: the most the builder's lists held at once (node records, raw edges,
+// uses and may-definitions, saved fringes, the current fringe, frames, jump
+// lists, intercepted jumps, labels and gotos, and the per-node use and
+// may-definition CSRs Finish builds), whether it is read during construction
+// or after Finish. The Graph's node metadata, uses and may-definitions are
+// read from that scratch. It is outside the 96·N + 64 bound and reported
+// separately.
+func (a *Arena) ScratchBytes() int { return a.b.scratchHigh() }
 
-// Retained is the backing capacity, in bytes, the arena currently holds
-// across slabs and scratch, whether or not it is in use.
+// Retained is the backing capacity, in bytes, the arena itself holds for
+// reuse: each slab's current array and every scratch list's capacity. An
+// array a slab outgrew since Begin is excluded; the arena no longer
+// references it (only views handed out from it do, until the next Begin),
+// and Bytes already counts what was handed from it.
 func (a *Arena) Retained() int {
-	return 4*a.i32.capacity() + 8*a.u64.capacity() + a.b.scratchRetained()
+	return 4*len(a.i32.buf) + 8*len(a.u64.buf) + a.b.scratchRetained()
 }
 
 // slab is one element type's backing: a current array handed out front to
-// back, plus the count of arrays it replaced since Begin. A replaced array
-// is no longer referenced by the arena, but the views handed out from it keep
-// it allocated until the next Begin, so its size stays in the accounting.
+// back, plus the count of elements handed out from the arrays it replaced
+// since Begin. A replaced array is no longer referenced by the arena, but
+// the views handed out from it keep it allocated until the next Begin, so
+// what was handed from it stays in Bytes.
 type slab[T int32 | uint64] struct {
 	buf []T
 	// used is the elements of buf handed out since Begin.
 	used int
-	// spilled and spilledCap are the elements handed out from, and the
-	// capacity of, the arrays buf replaced since Begin.
-	spilled, spilledCap int
+	// spilled is the elements handed out from the arrays buf replaced since
+	// Begin.
+	spilled int
 }
 
 // take hands out n zeroed elements. buf is zeroed up to its hand-out point
@@ -98,7 +106,6 @@ type slab[T int32 | uint64] struct {
 func (s *slab[T]) take(n int) []T {
 	if n > len(s.buf)-s.used {
 		s.spilled += s.used
-		s.spilledCap += len(s.buf)
 		s.buf = make([]T, max(n, 2*len(s.buf)))
 		s.used = 0
 	}
@@ -108,24 +115,21 @@ func (s *slab[T]) take(n int) []T {
 }
 
 // recycle reclaims everything handed out, keeping the backing. A function
-// that spilled gets one array of everything it was handed, so the same
-// function next time is served from one slab without spilling; otherwise the
-// handed-out prefix is zeroed for reuse.
+// that was handed elements from a replaced array gets one array of
+// everything it was handed, so the same function next time is served from
+// one slab without spilling; otherwise the handed-out prefix is zeroed for
+// reuse.
 func (s *slab[T]) recycle() {
-	if s.spilledCap > 0 {
+	if s.spilled > 0 {
 		s.buf = make([]T, s.spilled+s.used)
 	} else {
 		clear(s.buf[:s.used])
 	}
-	s.used, s.spilled, s.spilledCap = 0, 0, 0
+	s.used, s.spilled = 0, 0
 }
 
 // handed is the element count handed out since Begin.
 func (s *slab[T]) handed() int { return s.spilled + s.used }
-
-// capacity is the element capacity allocated for the current function: the
-// current array plus the arrays it replaced.
-func (s *slab[T]) capacity() int { return len(s.buf) + s.spilledCap }
 
 // list32 is an arena-backed int32 list grown by need: when full it moves to
 // an arena array of twice its capacity (at least one element). The outgrown

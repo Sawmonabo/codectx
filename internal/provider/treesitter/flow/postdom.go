@@ -8,11 +8,12 @@ package flow
 // with no successor, and, for every non-trivial strongly connected component
 // from which Exit is not reachable, one edge to Exit from its member with the
 // smallest reverse-post-order number. After it every node reaches Exit, so the
-// relation is a tree rooted at Exit and IPDom is total. Without it an
-// infinite loop's nodes would have no post-dominator and their control
-// dependences would be silently lost.
+// relation is a tree rooted at Exit and every node has an immediate
+// post-dominator. Without it an infinite loop's nodes would have no
+// post-dominator and their control dependences would be silently lost.
 type PostDom struct {
-	// ipdom is the immediate post-dominator of every node.
+	// ipdom is the immediate post-dominator of every node, Exit's being Exit;
+	// never -1, reachable from Entry or not. ControlDependence walks it.
 	ipdom []int32
 	// succ is the exit-augmented successor relation the tree was built on;
 	// ControlDependence walks its frontier over it.
@@ -33,10 +34,6 @@ func PostDominators(g *Graph, a *Arena) PostDom {
 		augmented: augmented,
 	}
 }
-
-// IPDom is node n's immediate post-dominator; Exit's is Exit. It is never -1
-// for a node of the Graph, reachable from Entry or not.
-func (p PostDom) IPDom(n int32) int32 { return p.ipdom[n] }
 
 // Augmented is the number of edges exit augmentation added: one per
 // successor-less node plus one per non-trivial strongly connected component
@@ -145,7 +142,7 @@ func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
 					switch {
 					case w == m:
 						cyclic = true
-					case w == ExitNode, index[w] != done && bit(reaches, w):
+					case index[w] != done && bit(reaches, w):
 						reached = true
 					}
 				}

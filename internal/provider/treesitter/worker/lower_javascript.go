@@ -233,7 +233,7 @@ func (j *jsLower) text(n *ts.Node) []byte { return j.src[n.StartByte():n.EndByte
 func (j *jsLower) declare(name *ts.Node) int32 {
 	v := int32(-1)
 	if j.shadow == 0 {
-		v = j.b.Var(jsSpan(name))
+		v = j.b.Var()
 	}
 	j.binds = append(j.binds, jsBind{uint32(name.StartByte()), uint32(name.EndByte()), v})
 	return v
@@ -860,7 +860,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 	j.block(n.ChildByFieldId(k.fBody))
 	if handler != nil {
 		t := j.b.Push()
-		j.b.EnterHandler(cf)
+		j.b.EnterHandler(cf, jsSpan(handler.Child(0)))
 		mark := len(j.binds)
 		if p := handler.ChildByFieldId(k.fParameter); p != nil {
 			j.reset()
@@ -873,7 +873,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 		j.b.Pop(t)
 	}
 	if fin != nil {
-		normal := j.b.EnterFinally(ff)
+		normal := j.b.EnterFinally(ff, jsSpan(fin.Child(0)))
 		j.block(fin.ChildByFieldId(k.fBody))
 		j.b.CloseFinally(ff, normal)
 	}

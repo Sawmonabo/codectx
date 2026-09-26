@@ -8,8 +8,10 @@
 //	lower     a language's lowering drives a Builder obtained from Arena.Begin
 //	          and calls Builder.Finish, yielding a Graph: dense int32 node ids,
 //	          node 0 the Entry, node 1 the synthetic Exit, successor and
-//	          predecessor adjacency, and per node at most one defined variable
-//	          and the distinct variables it reads
+//	          predecessor adjacency, and per node at most one killing
+//	          definition, the variables it may define without killing
+//	          (Builder.MayDef) and the distinct variables it reads; the
+//	          exceptional edges of a try land on a builder-made Handler node
 //	CFG → post-dominators
 //	          PostDominators runs the iterative dominator pass over reverse
 //	          post-order on the REVERSED graph after exit augmentation: an edge
@@ -44,7 +46,8 @@
 // Nothing here limits a function: there is no node, edge, definition,
 // variable, iteration or time limit, and no preallocation constant. The
 // definition count D is bounded structurally — a definition is a node, and a
-// node defines at most one variable — so D ≤ N. Every fixed point runs to
+// node makes at most one killing definition — so D ≤ N; may-definitions are
+// bounded by the lowering's records, like uses. Every fixed point runs to
 // convergence. The per-function bound on the analysis structures,
 // 96·N + 64 bytes, is a claim the benchmarks measure through Arena.Bytes, not
 // one the code assumes or enforces.
