@@ -36,15 +36,22 @@ var javascriptLowering = Lowering{
 //     An expression statement that is an assignment or update of an
 //     identifier is its defining node, not a second node. `var x;` is a
 //     hoisted declaration and no node; `let x;` defines x.
-//   - A function declaration is one defining node at the start of its block
-//     (it is hoisted), spanning the declaration.
+//   - A function declaration is hoisted: one node at the start of its block,
+//     spanning its name, defines the name. At the declaration's own position
+//     a Stmt node spanning the declaration creates the function (see nested
+//     callables below) and may-defines the name, so a use after the
+//     declaration sees the captures read there.
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do…while, for. A switch is a Stmt node for the
 //     discriminant then one Branch node per case test, in source order (each
 //     test is evaluated only when the previous failed); a case body's end
 //     flows into the next body when it does not break. A for…in/for…of loop
 //     is a Stmt node for the iterated expression, evaluated once, then a
-//     Branch head spanning the loop's left side.
+//     Branch head spanning the loop's left side, which defines nothing: each
+//     name the left side binds is defined on the body path, after the head,
+//     by the destructuring rule below (a bare identifier is one defining node
+//     spanning it), so the exit edge carries the definitions from before the
+//     loop.
 //   - `&&`, `||`, `??` and the conditional operator: the deciding operand is
 //     a Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -64,13 +71,17 @@ var javascriptLowering = Lowering{
 //     were before any element of the statement was written — directly, or,
 //     for a variable an earlier element wrote (`[x, y] = [y, x]`), through
 //     that element's node, which read the old value before writing it: the
-//     Go lowering's rule for a cyclic multi-assignment, a sound
+//     rule both lowerings apply to a cyclic multi-assignment, a sound
 //     over-approximation.
 //   - A nested callable or class is its own function; in the enclosing
 //     function its creating expression is one Stmt node spanning it, which
 //     Uses every enclosing variable referenced inside it, resolved with its
-//     own scopes so a name it declares shadows. Class field initializers are
-//     part of that class node's captures, not lowered as control flow.
+//     own scopes so a name it declares shadows, and may-defines (MayDef, a
+//     non-killing definition) every enclosing variable assigned inside it:
+//     when the closure runs is unknown, so a use after its creation sees both
+//     the closure's write and every definition reaching the creation. Class
+//     field initializers are part of that class node's captures, not lowered
+//     as control flow.
 //   - A loop whose condition is the literal `true`, or a for loop without a
 //     condition, has no exit edge: only a break leaves it. Its head is a Stmt
 //     node spanning `true`, or the `for` keyword.
@@ -82,9 +93,13 @@ var javascriptLowering = Lowering{
 // computes derives from them, since the lowering introduces no
 // temporaries), plus every read evaluated since the previous node and not
 // yet attached, so a read before an embedded assignment is attributed to the
-// node that runs after it. A destructuring or for…in/for…of defining node
-// also Uses the variables of the value it destructures. A property write
-// (`o.p = v`, `a[i] = v`) Uses o, a, i and v and defines nothing.
+// node that runs after it. An assignment, compound assignment or update of an
+// identifier embedded in a larger expression is its own defining node, and
+// the variable it defined is a read of the node that evaluates the enclosing
+// expression, since the expression's value is the value assigned. A
+// destructuring or for…in/for…of defining node also Uses the variables of the
+// value it destructures. A property write (`o.p = v`, `a[i] = v`) is a Stmt
+// node spanning the assignment that Uses o, a, i and v and defines nothing.
 //
 // # Exceptions
 //
@@ -92,8 +107,11 @@ var javascriptLowering = Lowering{
 // source evaluated since the previous node — contains a call, `new`,
 // `await`, `yield`, a spread, a property read or write, a destructuring
 // element, a for…of iterator step (including for await), or a class
-// declaration's heritage; a throw statement's node is also a Throw. The
-// Builder applies it only inside an open catch or finally frame.
+// declaration's heritage; a throw statement's node is also a Throw. A plain
+// property write throws when the value is stored, so its throw is counted
+// after its right side, on the write's node. The Builder applies MayThrow
+// only inside an open catch or finally frame, where the throwing node's own
+// definitions do not reach the handler.
 //
 // # Scoping
 //
@@ -170,6 +188,10 @@ type jsLower struct {
 	// order; reads[flushed:] are not yet attached to a node.
 	reads   []int32
 	flushed int
+	// writes are the enclosing variables assigned inside the nested callable
+	// or class whose captures are being collected; closure may-defines them
+	// on its creating node.
+	writes []int32
 	// throws counts throwing constructs evaluated by the current statement;
 	// those past thrown are not yet attached to a node.
 	throws, thrown int
@@ -203,9 +225,6 @@ func (j *jsLower) kids(n *ts.Node) (int, []ts.Node) {
 }
 
 func (j *jsLower) done(mark int) { j.buf = j.buf[:mark] }
-
-// jsSpan is the span a declared name's variable records.
-func jsSpan(n *ts.Node) flow.Span { return spanOf(n) }
 
 func (j *jsLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
 
@@ -272,6 +291,32 @@ func (j *jsLower) def(n, v int32) {
 	}
 }
 
+// readBack records v, the variable an embedded assignment just defined, as a
+// read of the node evaluating the enclosing expression.
+func (j *jsLower) readBack(v int32) {
+	if v >= 0 {
+		j.reads = append(j.reads, v)
+	}
+}
+
+// closure creates the node spanning n, a nested callable or class: it Uses
+// n's captures and every pending read, and may-defines every enclosing
+// variable n assigns.
+func (j *jsLower) closure(n *ts.Node) int32 {
+	m, w := len(j.reads), len(j.writes)
+	if j.l.isCallable(n) {
+		j.capFunction(n)
+	} else {
+		j.capClass(n)
+	}
+	id := j.node(flow.Stmt, n, m, len(j.reads))
+	for _, v := range j.writes[w:] {
+		j.b.MayDef(id, v)
+	}
+	j.writes = j.writes[:w]
+	return id
+}
+
 // open starts tracking the first node created; close returns it (-1 if none)
 // and restores the enclosing tracking.
 func (j *jsLower) open() int32 {
@@ -332,8 +377,8 @@ func (j *jsLower) predeclare(n *ts.Node) {
 	}
 }
 
-// hoistFunction emits the defining node of a function declaration at the
-// start of its block.
+// hoistFunction emits a function declaration's hoisted defining node, spanning
+// its name, at the start of its block.
 func (j *jsLower) hoistFunction(n *ts.Node) {
 	k := j.k
 	if n.KindId() == k.exportStatement {
@@ -345,8 +390,8 @@ func (j *jsLower) hoistFunction(n *ts.Node) {
 		return
 	}
 	j.reset()
-	j.capFunction(n)
-	j.def(j.node(flow.Stmt, n, 0, len(j.reads)), j.lookup(n.ChildByFieldId(k.fName)))
+	name := n.ChildByFieldId(k.fName)
+	j.def(j.node(flow.Stmt, name, 0, 0), j.lookup(name))
 }
 
 // declarePattern binds every name a binding pattern declares. With merge (var
@@ -455,11 +500,14 @@ func (j *jsLower) stmt(n *ts.Node) {
 		j.declaration(n, false)
 	case k.variableDeclaration:
 		j.declaration(n, true)
-	case k.functionDeclaration, k.generatorFunctionDeclaration, k.emptyStatement, k.debuggerStatement,
-		k.importStatement, k.hashBangLine:
+	case k.emptyStatement, k.debuggerStatement, k.importStatement, k.hashBangLine:
+	case k.functionDeclaration, k.generatorFunctionDeclaration:
+		id := j.closure(n)
+		if v := j.lookup(n.ChildByFieldId(k.fName)); v >= 0 {
+			j.b.MayDef(id, v)
+		}
 	case k.classDeclaration:
-		j.capClass(n)
-		j.def(j.node(flow.Stmt, n, 0, len(j.reads)), j.lookup(n.ChildByFieldId(k.fName)))
+		j.def(j.closure(n), j.lookup(n.ChildByFieldId(k.fName)))
 	case k.statementBlock:
 		j.block(n)
 	case k.ifStatement:
@@ -534,14 +582,21 @@ func (j *jsLower) exprStmt(e *ts.Node) {
 		return
 	}
 	m := len(j.reads)
-	saved := j.open()
-	j.value(e, false)
-	made := j.close(saved) >= 0
-	switch e.KindId() {
-	case k.assignmentExpression, k.augmentedAssignmentExpression, k.updateExpression:
-		if made && j.flushed == len(j.reads) && j.thrown == j.throws {
-			return
-		}
+	// made reports that the assignment made the statement's own node; the
+	// variable it defined is not read back, since nothing encloses it.
+	made := false
+	switch u := j.l.unparen(e); u.KindId() {
+	case k.assignmentExpression:
+		made, _ = j.assign(u)
+	case k.augmentedAssignmentExpression:
+		made, _ = j.augment(u)
+	case k.updateExpression:
+		made, _ = j.update(u)
+	default:
+		j.value(e, false)
+	}
+	if made && j.flushed == len(j.reads) && j.thrown == j.throws {
+		return
 	}
 	j.node(flow.Stmt, e, m, len(j.reads))
 }
@@ -715,21 +770,13 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	if of {
 		j.throws++
 	}
-	var h int32
-	pattern := false
-	switch left.KindId() {
-	case k.identifier:
-		h = j.node(flow.Branch, left, 0, rEnd)
-		j.def(h, j.lookup(left))
-	case k.memberExpression, k.subscriptExpression:
+	property := left.KindId() == k.memberExpression || left.KindId() == k.subscriptExpression
+	if property {
 		j.target(left)
-		h = j.node(flow.Branch, left, 0, rEnd)
-	default:
-		h = j.node(flow.Branch, left, 0, rEnd)
-		pattern = true
 	}
+	h := j.node(flow.Branch, left, 0, rEnd)
 	exit := j.b.Push()
-	if pattern {
+	if !property {
 		j.bind(left, 0, rEnd)
 	}
 	j.stmt(n.ChildByFieldId(k.fBody))
@@ -827,7 +874,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 	j.block(n.ChildByFieldId(k.fBody))
 	if handler != nil {
 		t := j.b.Push()
-		j.b.EnterHandler(cf, jsSpan(handler.Child(0)))
+		j.b.EnterHandler(cf, spanOf(handler.Child(0)))
 		mark := len(j.binds)
 		if p := handler.ChildByFieldId(k.fParameter); p != nil {
 			j.reset()
@@ -840,7 +887,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 		j.b.Pop(t)
 	}
 	if fin != nil {
-		normal := j.b.EnterFinally(ff, jsSpan(fin.Child(0)))
+		normal := j.b.EnterFinally(ff, spanOf(fin.Child(0)))
 		j.block(fin.ChildByFieldId(k.fBody))
 		j.b.CloseFinally(ff, normal)
 	}
@@ -873,9 +920,7 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 	k := j.k
 	id := n.KindId()
 	if j.l.isCallable(n) {
-		m := len(j.reads)
-		j.capFunction(n)
-		j.node(flow.Stmt, n, m, len(j.reads))
+		j.closure(n)
 		return
 	}
 	switch id {
@@ -909,27 +954,21 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 		j.b.Merge(t)
 		j.b.Pop(p)
 	case k.assignmentExpression:
-		j.assign(n)
+		_, v := j.assign(n)
+		j.readBack(v)
 	case k.augmentedAssignmentExpression:
-		j.augment(n)
+		_, v := j.augment(n)
+		j.readBack(v)
 	case k.updateExpression:
-		arg := j.l.unparen(n.ChildByFieldId(k.fArgument))
-		if arg.KindId() == k.identifier {
-			m := len(j.reads)
-			j.ref(arg)
-			j.def(j.node(flow.Stmt, n, m, len(j.reads)), j.lookup(arg))
-			return
-		}
-		j.target(arg)
+		_, v := j.update(n)
+		j.readBack(v)
 	case k.memberExpression, k.subscriptExpression, k.callExpression:
 		j.chain(n, inChain)
 	case k.newExpression, k.awaitExpression, k.yieldExpression, k.spreadElement:
 		j.children(n, true)
 		j.throws++
 	case k.class:
-		m := len(j.reads)
-		j.capClass(n)
-		j.node(flow.Stmt, n, m, len(j.reads))
+		j.closure(n)
 	case k.jsxOpeningElement, k.jsxSelfClosingElement:
 		j.jsxElement(n, true)
 	case k.jsxClosingElement:
@@ -988,9 +1027,9 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 	j.opt = j.opt[:base]
 }
 
-// target evaluates a property write's reference: the object and index are
-// read, and the write may throw.
-func (j *jsLower) target(t *ts.Node) {
+// reference evaluates a property reference's object and index and reports
+// whether t is one; any other target is evaluated as a value.
+func (j *jsLower) reference(t *ts.Node) bool {
 	k := j.k
 	switch t.KindId() {
 	case k.memberExpression:
@@ -1000,37 +1039,75 @@ func (j *jsLower) target(t *ts.Node) {
 		j.value(t.ChildByFieldId(k.fIndex), false)
 	default:
 		j.value(t, false)
-		return
+		return false
 	}
-	j.throws++
+	return true
 }
 
-func (j *jsLower) assign(n *ts.Node) {
+// target evaluates the reference of a property access that reads or writes
+// before anything else is evaluated (an update, a compound assignment's read,
+// a for…in/for…of or destructuring target): it may throw there.
+func (j *jsLower) target(t *ts.Node) {
+	if j.reference(t) {
+		j.throws++
+	}
+}
+
+// assign lowers `left = right`. made reports that it created the node
+// spanning n or, for a destructuring, the element nodes that stand for it; v
+// is the variable an identifier target defines, else -1.
+func (j *jsLower) assign(n *ts.Node) (made bool, v int32) {
 	k := j.k
 	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(j.reads)
 	switch left.KindId() {
 	case k.identifier:
 		j.value(right, false)
-		j.def(j.node(flow.Stmt, n, m, len(j.reads)), j.lookup(left))
+		v = j.lookup(left)
+		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
+		return true, v
 	case k.objectPattern, k.arrayPattern:
 		j.value(right, false)
+		saved := j.open()
 		j.bind(left, m, len(j.reads))
-	case k.memberExpression, k.subscriptExpression:
-		j.target(left)
-		j.value(right, false)
+		return j.close(saved) >= 0, -1
 	default:
+		// The store happens after the right side is evaluated, so its throw
+		// belongs to the write's node, not to a node the right side makes.
+		property := j.reference(left)
 		j.value(right, false)
+		if property {
+			j.throws++
+		}
+		return false, -1
 	}
 }
 
-func (j *jsLower) augment(n *ts.Node) {
+// update lowers `x++`, `--x` and their property forms; made and v are as for
+// assign.
+func (j *jsLower) update(n *ts.Node) (made bool, v int32) {
+	k := j.k
+	arg := j.l.unparen(n.ChildByFieldId(k.fArgument))
+	if arg.KindId() != k.identifier {
+		j.target(arg)
+		return false, -1
+	}
+	m := len(j.reads)
+	j.ref(arg)
+	v = j.lookup(arg)
+	j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
+	return true, v
+}
+
+// augment lowers a compound or logical assignment; made and v are as for
+// assign. A logical one always makes its conditional node spanning n.
+func (j *jsLower) augment(n *ts.Node) (made bool, v int32) {
 	k := j.k
 	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	op := n.ChildByFieldId(k.fOperator).KindId()
 	logical := op == k.andAssign || op == k.orAssign || op == k.nullishAssign
 	m := len(j.reads)
-	v := int32(-1)
+	v = -1
 	if left.KindId() == k.identifier {
 		v = j.lookup(left)
 		j.ref(left)
@@ -1039,10 +1116,11 @@ func (j *jsLower) augment(n *ts.Node) {
 	}
 	if !logical {
 		j.value(right, false)
-		if left.KindId() == k.identifier {
-			j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
+		if left.KindId() != k.identifier {
+			return false, -1
 		}
-		return
+		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
+		return true, v
 	}
 	j.node(flow.Branch, left, m, len(j.reads))
 	p := j.b.Push()
@@ -1054,6 +1132,7 @@ func (j *jsLower) augment(n *ts.Node) {
 	j.def(j.node(flow.Stmt, n, m2, len(j.reads)), v)
 	j.b.Merge(p)
 	j.b.Pop(p)
+	return true, v
 }
 
 // bind lowers a binding or assignment pattern whose incoming value read
@@ -1224,6 +1303,12 @@ func (j *jsLower) cap(n *ts.Node) {
 	switch id {
 	case k.identifier, k.shorthandPropertyIdentifier, k.shorthandPropertyIdentifierPattern:
 		j.ref(n)
+	case k.assignmentExpression, k.augmentedAssignmentExpression:
+		j.capWrite(n.ChildByFieldId(k.fLeft))
+		j.children(n, false)
+	case k.updateExpression:
+		j.capWrite(n.ChildByFieldId(k.fArgument))
+		j.children(n, false)
 	case k.classDeclaration, k.class:
 		j.capClass(n)
 	case k.statementBlock:
@@ -1263,6 +1348,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		mark := len(j.binds)
 		left := j.l.unparen(n.ChildByFieldId(k.fLeft))
 		if kw := n.ChildByFieldId(k.fKind); kw == nil {
+			j.capWrite(left)
 			j.cap(left)
 		} else {
 			if kw.KindId() != k.varKw {
@@ -1294,6 +1380,29 @@ func (j *jsLower) cap(n *ts.Node) {
 	case k.jsxClosingElement:
 	default:
 		j.children(n, false)
+	}
+}
+
+// capWrite records, as writes, the enclosing variables an assignment target
+// inside a nested callable or class binds: an identifier, or every name of a
+// destructuring target. A property target writes no variable.
+func (j *jsLower) capWrite(t *ts.Node) {
+	k := j.k
+	switch t = j.l.unparen(t); t.KindId() {
+	case k.identifier, k.shorthandPropertyIdentifierPattern:
+		if v := j.lookup(t); v >= 0 {
+			j.writes = append(j.writes, v)
+		}
+	case k.assignmentPattern, k.objectAssignmentPattern:
+		j.capWrite(t.ChildByFieldId(k.fLeft))
+	case k.pairPattern:
+		j.capWrite(t.ChildByFieldId(k.fValue))
+	case k.objectPattern, k.arrayPattern, k.restPattern:
+		start, list := j.kids(t)
+		for i := range list {
+			j.capWrite(&list[i])
+		}
+		j.done(start)
 	}
 }
 

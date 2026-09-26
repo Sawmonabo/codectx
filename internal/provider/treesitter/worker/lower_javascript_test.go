@@ -34,8 +34,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			name:     "labelled break and continue out of nested loops",
-			protects: "a labelled continue targets the labelled loop's head and a labelled break leaves the labelled loop",
-			mutation: "resolve a labelled jump against the innermost loop instead of the one its label names",
+			protects: "a label on a loop names the loop's own frame, so a labelled continue targets that loop's condition and a labelled break leaves that loop",
+			mutation: "open a block frame for every labelled statement instead of handing a loop its labels (continue outer then names no loop: unresolved becomes 1)",
 			src:      "function f(a, b) { outer: while (a) { while (b) { if (g()) continue outer; if (h()) break outer; } k(); } }",
 			fn:       1,
 			cd: []string{
@@ -67,12 +67,12 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 		{
 			name:     "a throw from the first of several try statements reaches the handler",
 			protects: "an explicit throw inside a try reaches its handler, and every throwing node, not only the last, has an exceptional edge to it",
-			mutation: "send the throw to Exit and wire only the try body's last statement to the handler, as the hosted engine does (the handler is no longer control dependent on c)",
+			mutation: "send the throw statement to Exit instead of the catch (e and r = e lose their control dependence on c), or skip MayThrow on a call statement (h() loses its three control dependences)",
 			src:      "function f(c) { let r = 0; try { if (c) throw c; r = 1; h(); } catch (e) { r = e; } return r; }",
 			fn:       1,
 			cd: []string{
 				"c@37 -> throw c;@40", "c@37 -> e@70", "c@37 -> r = e@75", "c@37 -> r = 1@49", "c@37 -> h()@56",
-				"h()@56 -> e@70", "h()@56 -> r = e@75",
+				"h()@56 -> catch@63", "h()@56 -> e@70", "h()@56 -> r = e@75",
 			},
 			du: []string{
 				"c@11 -> c@37", "c@11 -> throw c;@40",
@@ -94,9 +94,9 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
-			name:     "φ through a loop and through if/else",
-			protects: "definitions merged at the loop head and after if/else reach every use, self-pairs included",
-			mutation: "emit the φ instead of resolving it to the definitions it merges",
+			name:     "while re-enters its condition and if/else merges both arms",
+			protects: "a while loop's back edge re-enters its condition node and both if/else arms flow on, so both arms' definitions reach the loop, each other and the return, self-pairs included",
+			mutation: "drop the Merge of the then arm's end in ifStmt (s = s + i@67 keeps no successor and every pair from it is lost), or drop the loop's back edge (i < n@45 loses its self-dependence and i++@100 its pair to i < n@45)",
 			src:      "function f(n) { let s = 0; let i = 0; while (i < n) { if (i > 2) { s = s + i; } else { s = s - 1; } i++; } return s; }",
 			fn:       1,
 			cd: []string{
@@ -135,6 +135,100 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du: []string{
 				"x@11 -> x@20", "y@14 -> x@20", "y@14 -> y@23", "x@20 -> y@23",
 				"x@20 -> return x + y;@36", "y@23 -> return x + y;@36",
+			},
+		},
+		{
+			name:     "a throwing assignment in a try leaves the old value to the catch",
+			protects: "an assignment whose right side throws lands on the catch's Handler, which sees the value from before the assignment, not the assignment's",
+			mutation: "carry a node's own definition along its exceptional edge (return x pairs with x = g() only, not with x = 1)",
+			src:      "function f() { let x = 1; try { x = g(); } catch (e) { return x; } }",
+			fn:       1,
+			cd:       []string{"x = g()@32 -> catch@43", "x = g()@32 -> e@50", "x = g()@32 -> return x;@55"},
+			du:       []string{"x = 1@19 -> return x;@55"},
+		},
+		{
+			name:     "a finally sees both a throwing assignment's old value and its new one",
+			protects: "a finally is entered normally with the assignment's value and exceptionally, through its Handler, with the value from before it",
+			mutation: "carry a node's own definition along its exceptional edge (h(x) loses x = 1), or land a MayThrow source on the finally's first node directly (there is no Handler, x = g() controls nothing and h(x) loses x = 1)",
+			src:      "function f() { let x = 1; try { x = g(); } finally { h(x); } }",
+			fn:       1,
+			cd:       []string{"x = g()@32 -> finally@43"},
+			du:       []string{"x = 1@19 -> h(x)@53", "x = g()@32 -> h(x)@53"},
+		},
+		{
+			name:     "an assignment embedded in a loop condition flows into the condition",
+			protects: "the node evaluating an expression that embeds `m = e` reads the m it defined, and the loop's back edge re-enters that assignment",
+			mutation: "drop the read-back of the variable an embedded assignment defined (the condition loses m = re.exec(s)@35)",
+			src:      "function f(re, s) { let m; while ((m = re.exec(s)) !== null) g(m); }",
+			fn:       1,
+			cd: []string{
+				"(m = re.exec(s)) !== null@34 -> (m = re.exec(s)) !== null@34",
+				"(m = re.exec(s)) !== null@34 -> m = re.exec(s)@35",
+				"(m = re.exec(s)) !== null@34 -> g(m)@61",
+			},
+			du: []string{
+				"re@11 -> m = re.exec(s)@35", "s@15 -> m = re.exec(s)@35",
+				"re@11 -> (m = re.exec(s)) !== null@34", "s@15 -> (m = re.exec(s)) !== null@34",
+				"m = re.exec(s)@35 -> (m = re.exec(s)) !== null@34", "m = re.exec(s)@35 -> g(m)@61",
+			},
+		},
+		{
+			name:     "an assignment embedded in an initializer flows into the declared name",
+			protects: "a declaration whose initializer embeds `x = e` uses the x it defined",
+			mutation: "drop the read-back of the variable an embedded assignment defined (y's definition uses nothing)",
+			src:      "function f(x) { const y = (x = g()) + 1; return y; }",
+			fn:       1,
+			du:       []string{"x = g()@27 -> y = (x = g()) + 1@22", "y = (x = g()) + 1@22 -> return y;@41"},
+		},
+		{
+			name:     "a for…of over a bare identifier defines it only on the body path",
+			protects: "the loop's exit edge carries the definition from before the loop, since an empty iterable assigns nothing",
+			mutation: "define the identifier on the loop head (return last loses last = null@22)",
+			src:      "function f(arr) { let last = null; for (last of arr) {} return last; }",
+			fn:       1,
+			cd:       []string{"last@40 -> last@40", "last@40 -> last@40"},
+			du: []string{
+				"arr@11 -> arr@48", "arr@11 -> last@40", "arr@11 -> last@40",
+				"last = null@22 -> return last;@56", "last@40 -> return last;@56",
+			},
+		},
+		{
+			name:     "a property write whose right side branches is its own throwing node",
+			protects: "a property write is one node after its right side, and only it throws for the store, so the right side's decision does not control the catch",
+			mutation: "count the store's throw before the right side (c@31 gains control of catch@43, e@50 and h()@55), or skip the write node when the right side made a node (the write node and its pairs vanish)",
+			src:      "function f(o, c) { try { o.p = c ? 1 : 2 } catch (e) { h() } }",
+			fn:       1,
+			cd: []string{
+				"c@31 -> 1@35", "c@31 -> 2@39",
+				"o.p = c ? 1 : 2@25 -> catch@43", "o.p = c ? 1 : 2@25 -> e@50", "o.p = c ? 1 : 2@25 -> h()@55",
+			},
+			du: []string{
+				"o@11 -> c@31", "c@14 -> c@31",
+				"o@11 -> o.p = c ? 1 : 2@25", "c@14 -> o.p = c ? 1 : 2@25",
+			},
+		},
+		{
+			name:     "a hoisted function declaration captures at its own position",
+			protects: "the hoisted name is defined at the block's start, and the declaration's captures are read where it stands, so a definition before it flows into later uses of the name",
+			mutation: "read the captures on the hoisted node at the block's start (b = a@22 flows nowhere)",
+			src:      "function f(a) { const b = a; function g() { return b } return g; }",
+			fn:       1,
+			du: []string{
+				"a@11 -> b = a@22", "b = a@22 -> function g() { return b }@29",
+				"g@38 -> return g;@55", "function g() { return b }@29 -> return g;@55",
+			},
+		},
+		{
+			name:     "a closure's write to an enclosing variable is a may-definition where it is created",
+			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation",
+			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pairs to the call and to return n), or as a killing definition (return n loses n = 0@21)",
+			src:      "function f(xs) { let n = 0; xs.forEach(x => { n += x }); return n; }",
+			fn:       1,
+			du: []string{
+				"xs@11 -> x => { n += x }@39", "xs@11 -> xs.forEach(x => { n += x })@28",
+				"n = 0@21 -> x => { n += x }@39", "n = 0@21 -> xs.forEach(x => { n += x })@28",
+				"x => { n += x }@39 -> xs.forEach(x => { n += x })@28",
+				"n = 0@21 -> return n;@57", "x => { n += x }@39 -> return n;@57",
 			},
 		},
 	})
