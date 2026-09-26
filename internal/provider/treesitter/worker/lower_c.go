@@ -2218,9 +2218,16 @@ func (c *cLower) handOn(n int32) int32 {
 	return r
 }
 
-// arrayed reports whether variable v was declared with shape bit s.
+// arrayed reports whether variable v, or a variable v's name also stands
+// for (joined), was declared with shape bit s: in some build the name is
+// such an array.
 func (c *cLower) arrayed(v int32, s uint8) bool {
-	return v >= 0 && int(v) < len(c.shape) && c.shape[v]&s != 0
+	for ; v >= 0; v = c.joined(v) {
+		if int(v) < len(c.shape) && c.shape[v]&s != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // shaped records that variable v was declared with shape bits s.
