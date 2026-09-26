@@ -23,7 +23,11 @@ func decodeForTest(t *testing.T, id string) []byte {
 }
 
 // internFixture opens a real store and hands the test a write transaction, the
-// only context in which the interner contract (ids.go) permits a call.
+// only context in which the interner contract (ids.go) permits a call. The
+// transaction is on a connection of the test's own over the store's file: the
+// store's writer connection belongs to its writer goroutine, and a test body
+// run as a job there could not fail through t.Fatal without ending that
+// goroutine.
 func internFixture(t *testing.T) (context.Context, *Store, *sql.Tx) {
 	t.Helper()
 	ctx := context.Background()
@@ -32,7 +36,12 @@ func internFixture(t *testing.T) (context.Context, *Store, *sql.Tx) {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	tx, err := s.writer.BeginTx(ctx, nil)
+	db, err := openPool(s.path, []pragma{{"foreign_keys", "ON", "1"}}, "immediate", 1, false, false)
+	if err != nil {
+		t.Fatalf("open a connection of the test's own: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}

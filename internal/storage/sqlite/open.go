@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -192,29 +191,27 @@ type Store struct {
 	postings  *sql.DB
 	tokenizer *sql.DB
 
-	// The ingestion group: one write transaction that every ingestion call
-	// joins, so a run commits when the writer's page cache would spill, when
-	// another writer needs the database, at activation, and at close -- never
-	// per batch. groupMu guards group and every statement issued on it.
-	// writerMu is held by whichever holds the single writer connection: an
-	// open group, or an exclusive write for its duration. Lock order is
-	// groupMu then writerMu, and neither is held across a call that takes the
-	// other in the opposite order. writerWanted counts exclusive writers
-	// waiting for the connection; an ingestion call that ends with one waiting
-	// commits the group before returning.
-	groupMu      sync.Mutex
-	group        *sql.Tx
-	writerMu     sync.Mutex
-	writerWanted atomic.Int32
+	// The writer: one goroutine (runWriter) owns the writer connection, and
+	// every use of it -- an ingestion call, an exclusive write, a read of the
+	// group's own writes, a flush, the final commit at close -- is a job handed
+	// to it over jobs. writerDone is closed when the goroutine has exited, so a
+	// caller of a closed store is answered instead of blocked. Both are nil on
+	// a read-only store, which has no writer.
+	jobs       chan writerJob
+	writerDone chan struct{}
+	// group is the ingestion group: one write transaction that every
+	// ingestion call joins, so a run commits when the writer's page cache
+	// would spill, when an exclusive writer needs the connection, at
+	// activation or abort, at a flush and at close -- never per batch. Only
+	// the writer goroutine reads or writes it.
+	group *writeGroup
 	// commits counts the ingestion groups this store has committed. It is a
 	// disclosure of how a long cascade was broken up, read by the test that
 	// holds the activation's compaction to the group bound.
 	commits atomic.Int64
-	// groupLog is the count of bytes written to a write-ahead log through the
-	// process's file system when the open group began. Nothing reaches the log
-	// while a group's dirty pages fit the writer's page cache, so a count that
-	// has moved since is one the cache has started spilling into.
-	groupLog int64
+	// writerBusy is the nanoseconds the writer goroutine has spent running
+	// jobs, commits and checkpoints included (WriterBusy).
+	writerBusy atomic.Int64
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -337,6 +334,8 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		if s.writer, err = openPool(abs, writerPragmas, "immediate", 1, false, false); err != nil {
 			return nil, err
 		}
+		// The writer goroutine runs before the schema step, which writes.
+		s.startWriter()
 	}
 	s.readers, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
 	if err != nil {
@@ -385,10 +384,12 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	return s, nil
 }
 
-// closeOpened closes whichever pools Open has opened so far. Open builds them
-// in order and a read-only store never has a writer, so every failure path
-// releases exactly what exists rather than naming a fixed set.
+// closeOpened stops the writer goroutine, if Open started one, and closes
+// whichever pools Open has opened so far. Open builds them in order and a
+// read-only store never has a writer, so every failure path releases exactly
+// what exists rather than naming a fixed set.
 func (s *Store) closeOpened() {
+	_ = s.stopWriter()
 	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
 		if db != nil {
 			db.Close()
@@ -607,15 +608,10 @@ func (s *Store) checkEngine(ctx context.Context) error {
 	return nil
 }
 
-// Close commits any open ingestion group and releases every pool. It is safe
-// to call once.
+// Close commits any open ingestion group, stops the writer goroutine and
+// releases every pool. It is safe to call once.
 func (s *Store) Close() error {
-	var first error
-	s.groupMu.Lock()
-	if err := s.commitGroupLocked(); err != nil {
-		first = err
-	}
-	s.groupMu.Unlock()
+	first := s.stopWriter()
 	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
 		if db == nil {
 			continue
@@ -644,82 +640,209 @@ func (s *Store) Close() error {
 // budget, and the run returns it at activation.
 const defaultWriterCacheKiB = 1 << 20
 
+// writerJob is one use of the writer connection, run by the writer goroutine.
+// run executes there and nowhere else, which is what lets it touch s.writer
+// and s.group without a lock. A run must never hand another job to the
+// writer -- through ingest, write, readOwn, writerQueryRow or Flush -- because
+// the goroutine that would serve it is the one running it. stop ends the
+// goroutine once run returns.
+type writerJob struct {
+	run  func() error
+	done chan writerResult
+	stop bool
+}
+
+// writerResult is what the writer goroutine hands back to the caller of one
+// job: its error, or the value it panicked with.
+type writerResult struct {
+	err      error
+	panicked bool
+	panicVal any
+}
+
+// writeGroup is the open ingestion group: its transaction, the statement
+// cache that lives exactly as long as it (stmtcache.go), and the count of
+// bytes written to a write-ahead log through the process's file system when
+// it began. Nothing reaches the log while a group's dirty pages fit the
+// writer's page cache, so a count that has moved since is one the cache has
+// started spilling into.
+type writeGroup struct {
+	tx    *sql.Tx
+	stmts *stmtCache
+	log   int64
+}
+
+// startWriter starts the goroutine that owns the writer connection.
+func (s *Store) startWriter() {
+	s.jobs = make(chan writerJob)
+	s.writerDone = make(chan struct{})
+	go s.runWriter()
+}
+
+// runWriter serves jobs one at a time until a stop job has run. The hand-off
+// channel is unbuffered, so the queue is the callers blocked on it -- bounded
+// by their number, served in the order they arrived -- and an exclusive write
+// that arrives behind ingestion calls commits the group they built before it
+// runs, which is the ordering an exclusive writer needs.
+func (s *Store) runWriter() {
+	defer close(s.writerDone)
+	for job := range s.jobs {
+		start := time.Now()
+		res := s.runJob(job.run)
+		s.writerBusy.Add(int64(time.Since(start)))
+		job.done <- res
+		if job.stop {
+			return
+		}
+	}
+}
+
+// runJob runs one job. A panic inside it must not end the goroutine, which
+// would leave every later caller waiting on a writer that is gone: the open
+// group is abandoned, since a panic mid-batch leaves it in no state the run
+// can build on, and the value goes back to the caller, who panics with it in
+// its own goroutine. An exclusive write's own transaction has already been
+// rolled back by the time the panic reaches here (see write).
+func (s *Store) runJob(run func() error) (res writerResult) {
+	defer func() {
+		if v := recover(); v != nil {
+			s.abandonGroup()
+			res = writerResult{panicked: true, panicVal: v}
+		}
+	}()
+	return writerResult{err: run()}
+}
+
+// onWriter hands run to the writer goroutine and waits for its result. The
+// hand-off gives up when the caller's context ends or the store is closed;
+// once the goroutine has taken the job, the caller waits for it to finish,
+// because run writes into the caller's own variables. The goroutine runs it
+// under the caller's context, so a caller whose context ends loses its own
+// statements promptly. A goroutine that exits without answering -- a job that
+// ended it through runtime.Goexit -- is reported as a closed store rather than
+// waited on forever.
+func (s *Store) onWriter(ctx context.Context, run func() error, stop bool) error {
+	if s.jobs == nil {
+		return readOnlyRefusal()
+	}
+	job := writerJob{run: run, done: make(chan writerResult, 1), stop: stop}
+	select {
+	case s.jobs <- job:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.writerDone:
+		return storeClosed()
+	}
+	var res writerResult
+	select {
+	case res = <-job.done:
+	case <-s.writerDone:
+		// A stop job answers and then exits, so both can be ready at once;
+		// its answer is the one that counts.
+		select {
+		case res = <-job.done:
+		default:
+			return storeClosed()
+		}
+	}
+	if res.panicked {
+		panic(res.panicVal)
+	}
+	return res.err
+}
+
+// stopWriter commits the open group and ends the writer goroutine. It is what
+// Close and every failure path of Open call; on a store without a writer, or
+// one whose writer has already stopped, it does nothing.
+func (s *Store) stopWriter() error {
+	if s.jobs == nil {
+		return nil
+	}
+	select {
+	case <-s.writerDone:
+		return nil
+	default:
+	}
+	return s.onWriter(context.Background(), s.commitGroup, true)
+}
+
+// storeClosed is the answer to a caller of a store whose writer has stopped.
+// It is CTX_INTERNAL: only a composition that uses a store after closing it
+// can reach it.
+func storeClosed() *model.Error { return internal("the store is closed") }
+
+// WriterBusy is the writer's busy time: how long the goroutine that owns the
+// writer connection has spent running jobs, commits and checkpoints included,
+// since the store opened. The index build reports it against a stage's wall
+// (ADR-0012 decision 5): the share of the wall the one writer the log admits
+// was busy says whether writing is what bounds the stage. A read-only store has
+// no writer and reports zero.
+func (s *Store) WriterBusy() time.Duration { return time.Duration(s.writerBusy.Load()) }
+
 // write runs fn in one immediate write transaction of its own on the single
 // writer connection, committed before it returns. It is the path for state
 // that must be visible to every connection the moment the call returns --
 // sessions, leases, heartbeats, retention, the query planner's statistics --
-// and it ends any open ingestion group first, since the group holds the
-// connection. Any error rolls back; the caller sees the first typed failure.
+// and it commits any open ingestion group first, since the group holds the
+// connection. The transaction keeps no statement cache. Any error rolls back;
+// the caller sees the first typed failure.
 func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	if s.opts.ReadOnly {
-		return readOnlyRefusal()
-	}
-	s.writerWanted.Add(1)
-	defer s.writerWanted.Add(-1)
-	s.groupMu.Lock()
-	err := s.commitGroupLocked()
-	s.groupMu.Unlock()
-	if err != nil {
-		return err
-	}
-	s.writerMu.Lock()
-	defer s.writerMu.Unlock()
-	tx, err := s.writer.BeginTx(ctx, nil)
-	if err != nil {
-		return wrap("begin", err)
-	}
-	if err := fn(tx); err != nil {
-		tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return wrap("commit", err)
-	}
-	return nil
+	return s.onWriter(ctx, func() error {
+		if err := s.commitGroup(); err != nil {
+			return err
+		}
+		tx, err := s.writer.BeginTx(ctx, nil)
+		if err != nil {
+			return wrap("begin", err)
+		}
+		// Rolled back on every path that does not commit, a panic in fn
+		// included, so the connection is never left inside a transaction.
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return wrap("commit", err)
+		}
+		return nil
+	}, false)
 }
 
 // ingest runs fn inside the ingestion group, opening the group when none is
 // open. fn is atomic on its own -- it runs inside a savepoint, so a refused
 // batch rolls back alone and the units already in the group are kept -- and
-// the group commits when the writer's page cache would spill or an exclusive
-// writer is waiting. The group's transaction is begun under a context that
-// outlives any one caller: a caller whose context ends loses its own
-// statement, never the run.
+// the group commits when the writer's page cache would spill. The group's
+// transaction is begun under a context that outlives any one caller: a caller
+// whose context ends loses its own statement, never the run.
 func (s *Store) ingest(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	return s.attribute(s.ingestGroup(ctx, false, fn))
+	return s.attribute(s.onWriter(ctx, func() error { return s.ingestGroup(ctx, false, fn) }, false))
 }
 
 // ingestAndCommit is ingest followed by the group's commit, whether fn
 // succeeded or was rolled back, for the calls whose outcome must be durable
 // when they return: a generation's activation or abort.
 func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	err := s.attribute(s.ingestGroup(ctx, true, fn))
-	// The run is over: the writer's page cache, which the run filled with
-	// its groups, goes back to the process so a long-lived server does not
-	// keep a run's working set resident.
-	s.writerMu.Lock()
-	_, _ = s.writer.ExecContext(context.WithoutCancel(ctx), `PRAGMA shrink_memory`)
-	s.writerMu.Unlock()
-	return err
+	return s.attribute(s.onWriter(ctx, func() error {
+		err := s.ingestGroup(ctx, true, fn)
+		// The run is over: the writer's page cache, which the run filled with
+		// its groups, goes back to the process so a long-lived server does not
+		// keep a run's working set resident.
+		_, _ = s.writer.ExecContext(context.WithoutCancel(ctx), `PRAGMA shrink_memory`)
+		return err
+	}, false))
 }
 
+// ingestGroup is the body of an ingestion job. It runs on the writer
+// goroutine.
 func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) error {
-	if s.opts.ReadOnly {
-		return readOnlyRefusal()
-	}
-	s.groupMu.Lock()
-	defer s.groupMu.Unlock()
 	if s.group == nil {
-		s.writerMu.Lock()
 		tx, err := s.writer.BeginTx(context.WithoutCancel(ctx), nil)
 		if err != nil {
-			s.writerMu.Unlock()
 			return wrap("begin", err)
 		}
-		s.group = tx
-		s.groupLog = pacedvfs.LogBytes()
+		s.group = &writeGroup{tx: tx, stmts: newStmtCache(tx), log: pacedvfs.LogBytes()}
 	}
-	tx := s.group
+	tx := s.group.tx
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
 		return wrap("savepoint", err)
 	}
@@ -727,72 +850,80 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		if _, rbErr := tx.ExecContext(context.WithoutCancel(ctx), `ROLLBACK TO ingest`); rbErr != nil {
 			// The savepoint could not be unwound: the group is no longer a
 			// state the run can build on, so it ends here.
-			s.abandonGroupLocked()
+			s.abandonGroup()
 			return errors.Join(err, wrap("rollback to savepoint", rbErr))
 		}
 		if _, relErr := tx.ExecContext(context.WithoutCancel(ctx), `RELEASE ingest`); relErr != nil {
-			s.abandonGroupLocked()
+			s.abandonGroup()
 			return errors.Join(err, wrap("release savepoint", relErr))
 		}
-		if commitErr := s.commitGroupIfDueLocked(commit); commitErr != nil {
+		if commitErr := s.commitGroupIfDue(commit); commitErr != nil {
 			return errors.Join(err, commitErr)
 		}
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `RELEASE ingest`); err != nil {
-		s.abandonGroupLocked()
+		s.abandonGroup()
 		return wrap("release savepoint", err)
 	}
-	return s.commitGroupIfDueLocked(commit)
+	return s.commitGroupIfDue(commit)
 }
 
-// commitGroupIfDueLocked commits the open group when the caller asks for it,
-// when an exclusive writer is waiting, or when the writer's page cache has
-// begun spilling to the log. groupMu is held.
-func (s *Store) commitGroupIfDueLocked(force bool) error {
+// commitGroupIfDue commits the open group when the caller asks for it or when
+// the writer's page cache has begun spilling to the log. It runs on the
+// writer goroutine.
+func (s *Store) commitGroupIfDue(force bool) error {
 	if s.group == nil {
 		return nil
 	}
-	if !force && s.writerWanted.Load() == 0 && pacedvfs.LogBytes() == s.groupLog {
+	if !force && pacedvfs.LogBytes() == s.group.log {
 		return nil
 	}
-	return s.commitGroupLocked()
+	return s.commitGroup()
 }
 
-// commitGroupLocked commits the open group, if any, folds its log into the
-// database, and releases the writer connection. groupMu is held.
-func (s *Store) commitGroupLocked() error {
-	if s.group == nil {
+// commitGroup commits the open group, if any, closing its statement cache
+// first, and folds its log into the database. It runs on the writer
+// goroutine.
+func (s *Store) commitGroup() error {
+	g := s.group
+	if g == nil {
 		return nil
 	}
-	tx := s.group
 	s.group = nil
-	err := tx.Commit()
-	if err == nil {
-		s.commits.Add(1)
-		// The engine checkpoints on its own once the log holds a thousand
-		// frames; a group smaller than that would otherwise leave its frames
-		// for the next group to stack on. A checkpoint that finds a reader on
-		// the log folds what it can and is not a failure of the commit.
-		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
-	}
-	s.writerMu.Unlock()
-	if err != nil {
+	g.stmts.close()
+	if err := g.tx.Commit(); err != nil {
 		return s.attribute(wrap("commit", err))
 	}
+	s.commits.Add(1)
+	// The engine checkpoints on its own once the log holds a thousand
+	// frames; a group smaller than that would otherwise leave its frames for
+	// the next group to stack on. A checkpoint that finds a reader on the log
+	// folds what it can and is not a failure of the commit.
+	_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
 	return nil
 }
 
-// abandonGroupLocked rolls the open group back and releases the writer
-// connection. groupMu is held.
-func (s *Store) abandonGroupLocked() {
-	if s.group == nil {
+// abandonGroup rolls the open group back, closing its statement cache first.
+// It runs on the writer goroutine.
+func (s *Store) abandonGroup() {
+	g := s.group
+	if g == nil {
 		return
 	}
-	tx := s.group
 	s.group = nil
-	tx.Rollback()
-	s.writerMu.Unlock()
+	g.stmts.close()
+	g.tx.Rollback()
+}
+
+// groupStmts is the open group's statement cache, or nil when no group is
+// open. Only a job reads it, and one goroutine runs every job, so a caller
+// inside an ingestion call holds the cache alone for its length.
+func (s *Store) groupStmts() *stmtCache {
+	if s.group == nil {
+		return nil
+	}
+	return s.group.stmts
 }
 
 // WALBoundBytes is the largest write-ahead log an ingestion group leaves
@@ -803,18 +934,20 @@ func (s *Store) abandonGroupLocked() {
 // several groups, or the log was never checkpointed.
 func (s *Store) WALBoundBytes() int64 { return 2 * int64(s.opts.WriterCacheKiB) << 10 }
 
-// Flush commits the open ingestion group, if any. Nothing in the indexing path
-// calls it: a run's work reaches the disk with its publication, and Close
-// commits whatever a process leaves open. It exists for a caller that opens a
-// connection of its own -- a test or a tool reading the database file beside
-// the store -- and must see what the store has written so far.
+// Flush commits the open ingestion group, if any. The index build calls it at
+// each provider boundary, so the next provider's reads on the reader pool see
+// the units the previous one sealed; a caller that opens a connection of its
+// own -- a test or a tool reading the database file beside the store -- calls
+// it to see what the store has written so far. Close commits whatever a
+// process leaves open.
 func (s *Store) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return wrap("flush", err)
 	}
-	s.groupMu.Lock()
-	defer s.groupMu.Unlock()
-	return s.commitGroupLocked()
+	if s.opts.ReadOnly {
+		return nil
+	}
+	return s.onWriter(ctx, s.commitGroup, false)
 }
 
 // readOwn runs fn where it sees the ingestion group's own writes: on the
@@ -822,30 +955,38 @@ func (s *Store) Flush(ctx context.Context) error {
 // It is the read path of the ingestion side -- unit states, aliases of
 // dependency units, the snapshot and blobs a capture just recorded -- whose
 // callers reason about what this run has already stored. Query paths read
-// through read and never see a group in progress. It holds the group for the
-// length of fn, so it is never called from inside an ingestion call: a
-// producer stream an ingestion call drains reads through the pool instead
-// (UnitInputs), and sees the last commit.
+// through read and never see a group in progress. Only the group branch is a
+// job: with no group open, the read runs on the reader pool in the caller's
+// goroutine and never delays the writer. It is never called from inside a
+// job: a producer stream an ingestion call drains reads through the pool
+// instead (UnitInputs), and sees the last commit.
 func (s *Store) readOwn(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	s.groupMu.Lock()
-	if s.group != nil {
-		defer s.groupMu.Unlock()
-		return s.attribute(fn(s.group))
+	if s.opts.ReadOnly {
+		return s.read(ctx, fn)
 	}
-	s.groupMu.Unlock()
+	onGroup := false
+	err := s.onWriter(ctx, func() error {
+		if s.group == nil {
+			return nil
+		}
+		onGroup = true
+		return fn(s.group.tx)
+	}, false)
+	if onGroup || err != nil {
+		return s.attribute(err)
+	}
 	return s.read(ctx, fn)
 }
 
 // writerQueryRow issues one row query on the writer connection, through the
 // open group when there is one so the probe never waits on the run.
 func (s *Store) writerQueryRow(ctx context.Context, query string, dest ...any) error {
-	s.groupMu.Lock()
-	if s.group != nil {
-		defer s.groupMu.Unlock()
-		return s.group.QueryRowContext(ctx, query).Scan(dest...)
-	}
-	s.groupMu.Unlock()
-	return s.writer.QueryRowContext(ctx, query).Scan(dest...)
+	return s.onWriter(ctx, func() error {
+		if s.group != nil {
+			return s.group.tx.QueryRowContext(ctx, query).Scan(dest...)
+		}
+		return s.writer.QueryRowContext(ctx, query).Scan(dest...)
+	}, false)
 }
 
 // read runs fn in one short deferred read transaction on the reader pool, so
