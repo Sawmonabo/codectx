@@ -283,7 +283,7 @@ under-approximation of the textbook FOW set in two named places.**
 ### What the product's published `control_depends_on` loses or gains under this choice
 
 The projection is a **single-hop join requiring BOTH endpoints anchored**, with no walk:
-`internal/provider/dependence/graphcsv/scratch.go:578-581` joins `anchors` to both ends of each CDG
+`internal/provider/dependence/neo4jcsv/scratch.go:578-581` joins `anchors` to both ends of each CDG
 edge and emits `('control_depends_on', ad.target, ac.target, e.dst, '', 'cdg', '')`. Anchors are the
 entity itself, a **non-operator** call site (`scratch.go:550-553`, `method_full_name NOT LIKE
 '<operator>.%'`) and an identifier/`FIELD_IDENTIFIER`/`METHOD_REF` with a `REF` edge. Contrast

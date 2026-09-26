@@ -121,7 +121,6 @@ row counts per stratum equal the allocation.
 | second corpus | Python, unjoined-in-an-indexed-file | 5 | 2 | 0 | 6 | 25 | 0 |
 | second corpus | Python, unjoined-file-not-indexed | 9 | 3 | 0 | 0 | 0 | 0 |
 | second corpus | Python, joined-defined | 12 | 0 | 0 | 0 | 0 | 0 |
-| second corpus | Python, joined-external | 0 | 0 | 0 | 0 | 0 | 0 |
 | second corpus | TSX/TypeScript | 4 | 4 | 0 | 0 | 1 | 0 |
 | second corpus | Go/Java/JavaScript/C/Rust | 1 | 2 | 0 | 0 | 1 | 0 |
 | **all** | | **90** | **22** | **47** | **51** | **74** | **2** |

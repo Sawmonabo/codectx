@@ -42,7 +42,7 @@ Three facts, each read at the tag, compose into the conclusion:
    generic builder `staticCallNode` (`astcreation/AstNodeBuilder.scala:158-172`), whose **only** caller
    is `createBuiltinStaticCall` (`AstForExpressionsCreator.scala:17-25`). Operator sites are precisely
    the nodes the product's projection excludes with `method_full_name NOT LIKE '<operator>.%'`
-   (`internal/provider/dependence/graphcsv/scratch.go:577`).
+   (`internal/provider/dependence/neo4jcsv/scratch.go:577`).
    `StaticCallLinker` only acts on `STATIC_DISPATCH | INLINED`
    (`.../passes/callgraph/StaticCallLinker.scala:24-27`), so for JavaScript its **entire** reachable
    input is the builtin arm, whose `methodFullName` is the builtin's source text (`Math.max`,
@@ -261,8 +261,8 @@ arguments after the frontend-args delimiter (`JoernParse.scala:71` splits, `:140
 `frontendArgs.toList` into `cpgGeneratorForLanguage`, which does `config.withArgs(args)` at
 `console/.../cpgcreation/package.scala:22`). The product's pinned parse argv is
 `--language <frontend> --max-num-def 40000 <source> --output <graph>`
-(`internal/provider/dependence/graphengine/graphengine.go:11,178,204`) with `req.ExtraArgs` supplied by
-`NeutralOptions`, which **returns nil for every frontend** (`internal/provider/dependence/graphengine/graphengine.go:186`). There is no delimiter and
+(`internal/provider/dependence/joern/joern.go:11,178,204`) with `req.ExtraArgs` supplied by
+`NeutralOptions`, which **returns nil for every frontend** (`internal/provider/dependence/joern/joern.go:186`). There is no delimiter and
 no frontend argument, so `cmdLineArgs` is empty, `enableTypeRecovery` is false, and
 `super.applyPostProcessingPasses` is the base no-op at `console/.../cpgcreation/CpgGenerator.scala:56-58`.
 
@@ -439,8 +439,8 @@ Where the file name itself carries a vendor token the twin names the role.
 | `console/src/main/scala/io/joern/console/cpgcreation/{JsSrc,PythonSrc,C,Go,Rust}CpgGenerator.scala` | **the per-language generator** for JavaScript (lines 36-39), Python (lines 26-29), C/C++, Go and Rust (no override at the tag) |
 | `console/src/main/scala/io/joern/console/cpgcreation/package.scala:22` | **the generator factory**, line 22 — `config.withArgs(args)`, the only place a frontend argument reaches a generator |
 | `joern-cli/frontends/javasrc2cpg/src/main/scala/io/joern/javasrc2cpg/Main.scala:133-135` | `javasrc2cpg/.../Main.scala:133-135` — where the type-recovery flag is declared |
-| `internal/provider/dependence/graphengine/graphengine.go:11,178,186,204` | **the product's engine backend**, `internal/provider/dependence/<engine>/`, lines 11, 178, 186 and 204 — the documented argv, `Argv`, `NeutralOptions` and `Parse` |
+| `internal/provider/dependence/joern/joern.go:11,178,186,204` | **the product's engine backend**, `internal/provider/dependence/<engine>/`, lines 11, 178, 186 and 204 — the documented argv, `Argv`, `NeutralOptions` and `Parse` |
 
 Every other path cited in this file (`x2cpg/...`, `dataflowengineoss/...`, `semanticcpg/...`,
-`internal/provider/dependence/graphcsv/...`) carries no vendor token and is quoted identically in both
+`internal/provider/dependence/neo4jcsv/...`) carries no vendor token and is quoted identically in both
 forms.

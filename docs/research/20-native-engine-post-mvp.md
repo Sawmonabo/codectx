@@ -332,7 +332,7 @@ an operator call whose argument 1 is the written operand — identifier with `RE
 and chained assignment. The product walks that shape in `rw.go` (374 lines) and resolves the innermost
 identifier to a declaration, falling back to `may_refer_to` with a syntactic name.
 
-Four gaps are already measured (`10-engine-empirical.md` §3): Go `a, b = b, a` lowers only the first
+Four gaps are already measured (`10-round3-empirical.md` §3): Go `a, b = b, a` lowers only the first
 target; Rust `(a, b) = (b, a)` keeps a `tupleLiteral` target; Java static fields and Go package globals
 appear as `fieldAccess` on a type or package base rather than a `REF`'d identifier; Rust `static mut`
 is unresolved.

@@ -20,7 +20,7 @@ All answered by experiment on this machine; details in `09-scaling-governance-em
 | Long-term backend | The engine remains viable once capped: 239k Go lines in 12 s / 1 GB, 506k Python in 37 s / 3.9 GB. One real engine bug (its JS/TS frontend crashing on a code shape) was hit on a 1.0M-line JavaScript application and on one 324k-line subtree of it; per-unit runs contain it. No alternative covers nine languages with control and data dependence: Infer is compositional but C/Java/ObjC and emits no dependence graph; CodeQL is heavier; Fraunhofer cpg has the same JVM profile. Revisit only if the engine bug rate in the CI matrix stays high. |
 
 ## 0a. Third-round verification (reviewer's twelve points)
-All by experiment; details and raw logs in `10-engine-empirical.md`.
+All by experiment; details and raw logs in `10-round3-empirical.md`.
 
 | Point | Result |
 |---|---|
@@ -128,7 +128,7 @@ either completely or not at all, never partially, and the `pending` capability a
 real answer exactly at activation.
 
 ## 7. Round-3 evidence
-See `10-engine-empirical.md` for the tree-summed memory tables (parse and export), per-language
+See `10-round3-empirical.md` for the tree-summed memory tables (parse and export), per-language
 caps on C, Rust, TypeScript, Java and large Python, the Kubernetes go.work finding, the six-language
 call-site join, the reads/writes lowering algebra, subdivision parity and the definition-cap retry.
 

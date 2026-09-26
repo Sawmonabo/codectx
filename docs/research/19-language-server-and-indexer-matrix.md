@@ -1,6 +1,6 @@
 # Language servers and SCIP indexers: was the pinned set researched, and is it still right?
 
-Research, 2026-09-15, linux/amd64. Measurements use the tools already in
+Research lane TOOLS-R, 2026-09-15, linux/amd64. Measurements use the tools already in
 `~/.local/share/codectx/tools/` plus three candidates installed into a scratch prefix and
 deleted afterwards; nothing was written into the tool store.
 

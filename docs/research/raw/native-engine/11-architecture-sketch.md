@@ -71,7 +71,7 @@ What remains:
 1. The corpus — pinned by commit in Task 21, which `00-synthesis.md` §8 already names as "the
    differential oracle for any future native engine".
 2. **The band.** Two engine runs over the same unmodified tree differ by ~0.01%
-   (`10-engine-empirical` §9b), and `providers-dependence.md` makes a claim of equality between two engine runs
+   (`10-round3` §9b), and `providers-dependence.md` makes a claim of equality between two engine runs
    a defect. So the oracle establishes the band from two engine runs *first*, then judges the native
    run against the band. A native-vs-engine diff inside the band is not a finding.
 3. Per-family thresholds, because the families diverge for different reasons: CDG divergence is a
@@ -116,7 +116,7 @@ grammar registrations (from eight pinned grammar modules) are already pinned.
 
 ## What it deletes
 
-`internal/provider/dependence/graphcsv` — 4,874 lines of package source (3,446 non-test + 1,428 test),
+`internal/provider/dependence/neo4jcsv` — 4,874 lines of package source (3,446 non-test + 1,428 test),
 of which **339 relocate rather than die** (the fact-key comparator the oracle is built on), for a net
 credit of **4,535** (`15-requirements-audit.md`) — plus the staging database, its 256 MiB cache, its scratch pool, its
 exclusive lock, its retirement rule, the paced reclamation of its freed gigabytes, the six engine
