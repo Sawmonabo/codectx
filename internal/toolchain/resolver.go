@@ -385,7 +385,9 @@ func (r *Resolver) ensure(ctx context.Context, name string, e Entry, p Payload) 
 	if r.offline {
 		return "", "", offline(name)
 	}
-	held, err := r.store.acquire(ctx, name, installWait)
+	// Another process installing the same tool is waited for under ctx alone:
+	// see acquire for why a progressing peer is never reported busy.
+	held, err := r.store.acquire(ctx, name, true)
 	if err != nil {
 		return "", "", err
 	}
