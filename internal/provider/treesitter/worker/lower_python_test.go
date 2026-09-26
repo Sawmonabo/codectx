@@ -148,6 +148,29 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"m as r@19 -> return r@38"},
 		},
 		{
+			// §8.5: the items nest, so y's exit runs before x's on every
+			// path. Lines at 0, 10, 36, 44, 56. Nodes: c@6, a() as x@16
+			// (enter x), b() as y@26 (enter y; its call may throw, into x's
+			// finally), c@41, return x@47, y's exit (from `with` to the end
+			// of item 2)@11, x's finally Handler with@11 (from b() as y and
+			// y's exit, which may throw), x's exit with a() as x@11, return
+			// y@57. The return is intercepted by y's finally, re-issued
+			// into x's, then to EXIT. Succ: b() as y→{c@41, with@11};
+			// c@41→{return x, y's exit}; return x→y's exit; y's exit→{x's
+			// exit, with@11}; with@11→x's exit; x's exit→{EXIT, return y}.
+			// IPDom: b() as y, y's exit, with@11 → x's exit → EXIT; c@41,
+			// return x → y's exit. The Handler carries the values on entry
+			// to b() as y (no y) and to y's exit (y from b() as y).
+			name:     "two with items close in reverse on the return path and the normal path",
+			protects: "the second item's exit runs before the first's whether the body returns or completes, and a failure entering the second item runs only the first item's exit",
+			mutation: "close the items in source order (x's exit then precedes y's, b() as y@26 -> with a() as x, b() as y@11 is lost and x's exit controls y's), or open one finally for both items (b() as y no longer controls with@11)",
+			src:      "def f(c):\n with a() as x, b() as y:\n  if c:\n   return x\n return y\n",
+			fn:       1,
+			cd: []string{"b() as y@26 -> c@41", "b() as y@26 -> with a() as x, b() as y@11", "b() as y@26 -> with@11",
+				"c@41 -> return x@47", "with a() as x, b() as y@11 -> with@11", "with a() as x@11 -> return y@57"},
+			du: []string{"c@6 -> c@41", "a() as x@16 -> return x@47", "b() as y@26 -> return y@57"},
+		},
+		{
 			// §8.6. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
 			// (subject), (x, y)@27 (a Branch using the subject), x@28 and
 			// y@31 (captures), x@37 (guard), r = y@43, _@56 (irrefutable: a
