@@ -16,7 +16,8 @@ import "testing"
 // augmented graph with no entry-to-exit edge; a def-use pair is (defining
 // node, using node) with every φ resolved; a may-definition kills nothing; a
 // Handler node carries the values on entry to each node that threw to it.
-// Section numbers are those of The Python Language Reference.
+// Every case opens with the section it turns on; section numbers are those
+// of The Python Language Reference, version 3.13.
 func TestPythonLoweringGolden(t *testing.T) {
 	runGolden(t, "python", []goldenCase{
 		{
@@ -108,7 +109,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			cd:       []string{"g()@27 -> True@16", "g()@27 -> g()@27"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 23, 34, 42, 53, 61. Nodes: a@6,
+			// §8.4.1. Lines at 0, 10, 16, 23, 34, 42, 53, 61. Nodes: a@6,
 			// g(a)@18 (may throw), except@24 (Handler), E@31, a = 1@36,
 			// F@50, a = 2@55, return a@62. Succ: g(a)→{return a, except};
 			// except→E→{a = 1, F}; F→{a = 2, EXIT (the re-raise)}; both
@@ -124,7 +125,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du: []string{"a@6 -> g(a)@18", "a@6 -> return a@62", "a = 1@36 -> return a@62", "a = 2@55 -> return a@62"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 22, 33, 41, 50, 58. Nodes: a@6,
+			// §8.4.1. Lines at 0, 10, 16, 22, 33, 41, 50, 58. Nodes: a@6,
 			// g()@18, except@23 (Handler), E@30, a = 1@35, a = 2@52 (the
 			// bare clause, no test), return a@59. E→{a = 1, a = 2}; every
 			// path reaches return a, the IPDom of g() and E.
@@ -137,7 +138,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@6 -> return a@59", "a = 1@35 -> return a@59", "a = 2@52 -> return a@59"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 26, 37, 48, 55, 67, 77, 84. Nodes:
+			// §8.4.3, §8.4.4. Lines at 0, 10, 16, 26, 37, 48, 55, 67, 77, 84. Nodes:
 			// a@6, a = g()@18 (may throw), except@27 (Handler), E@34,
 			// return 0@39, a = a + 1@57 (else), h(a)@79 (finally; no
 			// finally Handler: nothing throws to it part-way), return a@85.
@@ -199,7 +200,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"a() as x@16 -> with a() as x@11", "b() as y@26 -> with a() as x, b() as y@11"},
 		},
 		{
-			// §8.6. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
+			// §8.6.2, §8.6.3. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
 			// (subject), (x, y)@27 (a Branch using the subject), x@28 and
 			// y@31 (captures), x@37 (guard), r = y@43, _@56 (irrefutable: a
 			// Stmt, no false edge), r = 0@62, return r@69. Succ: (x, y)→
@@ -339,7 +340,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@6 -> a > 0@18", "a@6 -> m(a)@25", "a@6 -> return a@31"},
 		},
 		{
-			// §8.4. Lines at 0, 9, 16, 22, 28, 44, 51. Nodes: e = 0@10,
+			// §8.4.1. Lines at 0, 9, 16, 22, 28, 44, 51. Nodes: e = 0@10,
 			// g()@24 (may throw), except@29 (Handler), E@36, e@41 (the
 			// binding), h(e)@46 (may throw, into the clause's finally),
 			// as@38 (that finally's Handler), the deletion of e (a Stmt
