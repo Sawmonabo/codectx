@@ -1186,13 +1186,15 @@ func (c *cLower) preproc(n *ts.Node) {
 func (c *cLower) arms(n *ts.Node) {
 	k := c.k
 	var at flow.Span
+	last := false
 	switch n.KindId() {
 	case k.preprocIf, k.preprocElif:
 		at = spanOf(n.ChildByFieldId(k.fCondition))
 	case k.preprocIfdef, k.preprocElifdef:
 		at = spanOf(n.ChildByFieldId(k.fName))
 	default:
-		at = spanOf(n.Child(0))
+		// `#else`: its arm is the only path on; nothing skips it.
+		at, last = spanOf(n.Child(0)), true
 	}
 	c.reset()
 	c.nodeAt(flow.Branch, at, c.base, c.base)
@@ -1207,7 +1209,7 @@ func (c *cLower) arms(n *ts.Node) {
 		c.b.Restore(p)
 		c.arms(alt)
 		c.b.Merge(t)
-	} else {
+	} else if !last {
 		c.b.Merge(p)
 	}
 	c.b.Pop(p)
