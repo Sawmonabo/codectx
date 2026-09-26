@@ -820,7 +820,7 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 // reachable by a second round trip.
 type contextPlan struct {
 	Plan model.PlanResult `json:"plan"`
-	// omitzero, not a bare tag: a truncated plan (ruling C9) opened no session,
+	// omitzero, not a bare tag: a truncated plan opened no session,
 	// and a zero SessionStatus encoded as a real `session` object would show a
 	// machine consumer a blank session id and a "not ready" gate as though a
 	// session had been opened and found wanting. The field is absent on that
@@ -1852,7 +1852,7 @@ func contextVersionValue(cmd *cobra.Command, flag, kind, session string) (int, e
 // canonical hashes are shortened because nothing asks the operator to retype
 // them.
 func writePlanResult(b *strings.Builder, result model.PlanResult) {
-	// The truncated shape (ruling C9) carries no manifest at all, so the header
+	// The truncated shape carries no manifest at all, so the header
 	// lines below would print zeros that read like a plan that selected
 	// nothing. What the operator needs instead is why it stopped and how to
 	// continue, which is exactly what is printed here.

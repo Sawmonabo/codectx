@@ -134,7 +134,7 @@ type Ledger struct {
 
 // A collector is one attachment: the writer connection, the bus, and the
 // goroutine that drains it. Its quit/done/stopOnce machinery is per
-// attachment, because detaching finalizes exactly as stopping used to --
+// attachment, because detaching finalizes exactly as stopping does --
 // drain, flush, write every still-open span as interrupted and every run's
 // finish, then close the pool.
 type collector struct {

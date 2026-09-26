@@ -7,8 +7,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// TestATruncatedPlanEnvelopeCarriesNoSession pins the wire shape ruling C9
-// promises and docs/context-sessions.md documents: a compile that stopped at a
+// TestATruncatedPlanEnvelopeCarriesNoSession pins the wire shape
+// docs/context-sessions.md documents: a compile that stopped at a
 // pass boundary opened no session, so the envelope carries the continuation and
 // NO `session` object.
 //
