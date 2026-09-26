@@ -105,9 +105,12 @@ const rsTryLabel = " try"
 //     it breaks to the block's end. unsafe and const blocks are inline blocks.
 //   - A write through a field, index or dereference target (`x.f = e`,
 //     `a[i] += e`, `*p = e`) Uses the target's operands and is a non-killing
-//     may-definition of its base variable. A method call or a `&mut x`
-//     argument is not a definition of the receiver or of x, as a call is not
-//     one in either seed lowering.
+//     may-definition of its base variable. So is a mutable borrow `&mut x`
+//     (`&mut x.f`, `&mut a[i]`): whatever receives it may write x, so the
+//     first node created after it whose span holds it (the node evaluating
+//     it) Uses and may-defines x's base variable. A method call's implicit
+//     borrow of its receiver (`v.push(1)`) is not a definition of v, since
+//     telling it apart needs the receiver's type.
 //
 // # Statement and expression kinds
 //
@@ -120,8 +123,9 @@ const rsTryLabel = " try"
 // binary_expression (`&&`, `||`), closure_expression, async_block, gen_block.
 // Plain (reads recorded, falls through): await_expression, yield_expression,
 // call_expression, field_expression, index_expression, unary_expression,
-// reference_expression, range_expression, tuple_expression, array_expression,
-// struct_expression, type_cast_expression, generic_function,
+// reference_expression (a `&mut` one also may-defines its base),
+// range_expression, tuple_expression, array_expression, struct_expression,
+// type_cast_expression, generic_function,
 // parenthesized_expression, identifier, self, scoped_identifier and
 // metavariable (never a read), literals, unit_expression, and any kind not
 // named here, an error node included. No node, only shadowing:
@@ -203,6 +207,9 @@ type rsLower struct {
 	last     int32
 	lastSpan flow.Span
 	lastDef  bool
+	// borrows are the base variables of the `&mut` expressions evaluated
+	// and not yet attached to a node, each with the start of its span.
+	borrows []rsBorrow
 	// hs holds the saved false edges of the conditions and match arms being
 	// lowered; ends holds the saved ends of the open matches' arms.
 	hs, ends []flow.Fringe
@@ -255,7 +262,15 @@ func (r *rsLower) read(v int32) {
 	}
 }
 
-// node creates a node spanning s that Uses reads[from:to].
+// rsBorrow is one pending mutable borrow: the variable it may write and
+// where its expression starts.
+type rsBorrow struct {
+	v  int32
+	at uint32
+}
+
+// node creates a node spanning s that Uses reads[from:to] and may-defines
+// every pending mutable borrow inside s.
 func (r *rsLower) node(kind flow.Kind, s flow.Span, from, to int) int32 {
 	id := r.b.Node(kind, s)
 	if r.first < 0 {
@@ -264,6 +279,15 @@ func (r *rsLower) node(kind flow.Kind, s flow.Span, from, to int) int32 {
 	for _, v := range r.reads[from:to] {
 		r.b.Use(id, v)
 	}
+	kept := r.borrows[:0]
+	for _, w := range r.borrows {
+		if w.at >= s.Start && w.at < s.End {
+			r.b.MayDef(id, w.v)
+		} else {
+			kept = append(kept, w)
+		}
+	}
+	r.borrows = kept
 	r.last, r.lastSpan, r.lastDef = id, s, false
 	return id
 }
@@ -611,6 +635,14 @@ func (r *rsLower) value(n *ts.Node) {
 		r.value(n.ChildByFieldId(k.fFunction))
 	case k.structExpression:
 		r.value(n.ChildByFieldId(k.fBody))
+	case k.referenceExpression:
+		v := n.ChildByFieldId(k.fValue)
+		r.value(v)
+		if r.token(n, k.mutableSpecifier) != nil {
+			if b := r.baseVar(v); b >= 0 {
+				r.borrows = append(r.borrows, rsBorrow{v: b, at: uint32(n.StartByte())})
+			}
+		}
 	case k.scopedIdentifier, k.label:
 	default:
 		start, list := r.kids(n)
@@ -1103,6 +1135,14 @@ func (r *rsLower) cap(n *ts.Node) {
 		r.cap(n.ChildByFieldId(k.fFunction))
 	case k.structExpression:
 		r.cap(n.ChildByFieldId(k.fBody))
+	case k.referenceExpression:
+		v := n.ChildByFieldId(k.fValue)
+		r.cap(v)
+		if r.token(n, k.mutableSpecifier) != nil {
+			if b := r.baseVar(v); b >= 0 {
+				r.writes = append(r.writes, b)
+			}
+		}
 	case k.scopedIdentifier, k.label:
 	default:
 		start, list := r.kids(n)
@@ -1153,7 +1193,7 @@ type rsSyntax struct {
 	unaryExpression, macroInvocation, tokenTree, tupleExpression, arrayExpression, typeCastExpression,
 	genericFunction, structExpression, scopedIdentifier, constItem, staticItem, structItem,
 	shorthandFieldIdentifier, fieldPattern, orPattern, tupleStructPattern, structPattern, capturedPattern,
-	mutPattern, refPattern, referencePattern, tuplePattern, slicePattern uint16
+	mutPattern, refPattern, referencePattern, tuplePattern, slicePattern, referenceExpression, mutableSpecifier uint16
 
 	and, or, loopKw, forKw uint16
 
@@ -1199,6 +1239,7 @@ func rsSyntaxOf() *rsSyntax {
 		s.tupleStructPattern, s.structPattern, s.capturedPattern = kind("tuple_struct_pattern"), kind("struct_pattern"), kind("captured_pattern")
 		s.mutPattern, s.refPattern, s.referencePattern = kind("mut_pattern"), kind("ref_pattern"), kind("reference_pattern")
 		s.tuplePattern, s.slicePattern = kind("tuple_pattern"), kind("slice_pattern")
+		s.referenceExpression, s.mutableSpecifier = kind("reference_expression"), kind("mutable_specifier")
 		s.and, s.or, s.loopKw, s.forKw = tok("&&"), tok("||"), tok("loop"), tok("for")
 		s.fAlternative, s.fBody, s.fCondition = field("alternative"), field("body"), field("condition")
 		s.fConsequence, s.fFunction, s.fLeft, s.fName = field("consequence"), field("function"), field("left"), field("name")

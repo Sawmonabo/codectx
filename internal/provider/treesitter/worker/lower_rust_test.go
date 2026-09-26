@@ -181,6 +181,19 @@ func TestRustLoweringGolden(t *testing.T) {
 				"self@19 -> self.a@54"},
 		},
 		{
+			// Expressions › Borrow operators: `&mut v` lends v mutably, so
+			// the call receiving it may write v. Nodes: let mut v =
+			// Vec::new();@18 (defines v; a path is no read), fill(&mut v)@42
+			// (Uses v, may-defines v), v.len()@56. The may-definition kills
+			// nothing, so both the let and the call reach v.len().
+			name:     "a mutable borrow passed to a call is a may-definition of the borrowed variable",
+			protects: "a mutable borrow passed to a call reaches later uses as a may-definition",
+			mutation: "drop the MayDef on &mut (loses fill(&mut v)@42 -> v.len()@56)",
+			src:      "fn f() -> usize { let mut v = Vec::new(); fill(&mut v); v.len() }",
+			du: []string{"let mut v = Vec::new();@18 -> fill(&mut v)@42", "let mut v = Vec::new();@18 -> v.len()@56",
+				"fill(&mut v)@42 -> v.len()@56"},
+		},
+		{
 			// Statements › Declaration statements › Item declarations: a
 			// nested function item cannot access the enclosing function's
 			// locals (the compiler rejects the capture below), so it creates
