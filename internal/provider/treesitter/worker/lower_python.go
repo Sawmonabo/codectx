@@ -87,7 +87,10 @@ var pythonLowering = Lowering{
 //     clauses (§8.4.2): every clause matching a part of the group runs, so
 //     each test is reached from the previous test's false edge and from the
 //     previous body's end, and after the last clause the statement both
-//     completes and re-raises what no clause matched. `except E as n`
+//     completes and re-raises what no clause matched: every member of the
+//     fringe there (the last test's false edge and the last body's end)
+//     has an edge to the re-raise (Throw) and falls through to the
+//     statement after the try. `except E as n`
 //     defines n on a node spanning n, and n is deleted however the clause
 //     ends (§8.4.1): the body runs in a finally whose body is a killing
 //     definition of n on a Stmt node spanning the whole clause, and whose
@@ -98,8 +101,10 @@ var pythonLowering = Lowering{
 //   - with (§8.5), per item in order: the context expression's nodes, then
 //     one acquiring Stmt node spanning the item (entering the manager), which
 //     Uses the context expression's reads alone, defines the `as` target
-//     when it is a name, or else a variable of the lowering's own holding
-//     the entered value, and may-defines another holding the manager. The
+//     when it is a name, a variable of the lowering's own holding the
+//     entered value when the target is a pattern or reference, and nothing
+//     when the item has no `as` target (the entered value is discarded), and
+//     in every case may-defines another variable holding the manager. The
 //     rest of the statement is a finally: its Handler spans the token
 //     introducing the item (the `with` keyword for the first, the preceding
 //     comma for each later one), a pattern or reference target is bound
@@ -118,7 +123,10 @@ var pythonLowering = Lowering{
 //     exit and never falls through. Items close in reverse.
 //   - match (§8.6): the subjects are evaluated once, at one Stmt node
 //     spanning them that defines a variable of the lowering's own holding
-//     the subject value. Each case is one node spanning its patterns, in
+//     the subject value. Each case is one node spanning its patterns as
+//     written, parentheses included (a parenthesized sequence pattern `(x,
+//     y)` spans its parentheses: they are the pattern's own syntax, §8.6.4,
+//     and the Spans rule strips them from expressions only), in
 //     source order, that Uses that variable and every value its patterns
 //     read (a dotted name, a class): a Branch whose false edge reaches the
 //     next case, or a Stmt with no false edge when the pattern is
@@ -191,8 +199,13 @@ var pythonLowering = Lowering{
 //     nothing), a chained comparison (the first comparison's Branch, each
 //     later comparison's Branch, and the last operand's node, which makes
 //     the last comparison; each operand between is held in a variable of
-//     its own, so it is read once), `x := e` (its node defines x and
-//     may-defines the result, since a node defines one variable; the
+//     its own, so it is read once: the first comparison's Branch defines
+//     the result, its one killing definition, and may-defines the variable
+//     holding the middle operand, which no other node defines, so the
+//     may-definition loses no pair; each later middle operand's node
+//     defines its held variable and its comparison's Branch the result),
+//     `x := e` (its node defines x and may-defines the result, since a
+//     node defines one variable; the
 //     consumer Uses the result, never x, so `(x := 1) + (x := 2)` depends
 //     on both; a `:=` to a global defines the result), and a lambda or
 //     comprehension (the creating node). A condition over one of them (`if
@@ -243,7 +256,12 @@ var pythonLowering = Lowering{
 // an unpacking assignment, an import, a for loop's iterator creation or step,
 // a context manager's enter or exit, a class creation, a comprehension's
 // creation, or a class, mapping, sequence or dotted-value pattern; a raise
-// statement's node is also a Throw. The Builder applies MayThrow only inside
+// statement's node is also a Throw. A raise counts toward MayThrow only
+// through its operand's own evaluation: `raise E` instantiates the class E
+// (§7.8), but its source holds no call, so its node is a Throw alone, which
+// joins the enclosing catch's or finally's fringe as a Throw source and
+// makes no Handler node (`raise E()` makes a call, so its node is MayThrow
+// as well). The Builder applies MayThrow only inside
 // an open catch or finally frame. An arithmetic operator does not count,
 // although its special method may raise, and a comparison counts exactly as
 // an arithmetic operator does: a rich comparison, and each comparison of a
@@ -268,6 +286,25 @@ var pythonLowering = Lowering{
 // name a plain assignment, `:=`, or a for, with, except, del or case
 // capture target binds, which only writes it; an augmented assignment
 // reads and writes it.
+//
+// # Names that resolve to no variable
+//
+// The shared contract (see Lowering) holds here as follows. lookup returns
+// -1 for a name no frame binds (a free or builtin name), a name the callable
+// being lowered declares global or nonlocal (a global is a variable only of
+// the module being lowered), a name local to a nested callable, and a class
+// body's name seen from a method. Two filters take it at its source: read
+// records no read of it (a read, a capture, an augmented assignment's
+// target), and def defines nothing through it (an assignment, augmented
+// assignment, `:=`, for, with, except or match capture target, a deleted
+// name, an import, a def or class name, a type alias). mayDefBase skips the
+// base of an attribute or subscript write when it is unresolved, and a
+// nested callable's writes are recorded (site, scan) only for variables of
+// this function, so its creating node may-defines no -1. Every construct
+// still makes its nodes: `x := e` with x unresolved defines the result
+// variable instead, and `except E as n` with n global keeps its finally and
+// its deleting node, which defines nothing. So reads, seen and the Builder
+// never see -1.
 func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	j := &s.py
 	j.start(l, b, fn, src, s)
@@ -1628,20 +1665,18 @@ func (j *pyLower) except(c *ts.Node, star bool) bool {
 	}
 	j.nodeAt(flow.Branch, flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}, 0, len(j.reads))
 	miss := j.b.Push()
-	v := int32(-1)
 	if alias != nil {
 		j.reset()
-		if alias.KindId() == k.identifier {
-			v = j.lookup(alias)
-		}
 		j.bind(alias, nil, 0, 0)
 	}
-	if v >= 0 {
+	// The name is deleted whether or not it is a variable of this function
+	// (a global is deleted too); def filters an unresolved one.
+	if alias != nil && alias.KindId() == k.identifier {
 		f := j.b.OpenFinally()
 		j.block(body)
 		normal := j.b.EnterFinally(f, as)
 		j.reset()
-		j.b.Def(j.node(flow.Stmt, c, 0, 0), v)
+		j.def(j.node(flow.Stmt, c, 0, 0), j.lookup(alias))
 		j.b.CloseFinally(f, normal)
 	} else {
 		j.block(body)
@@ -2226,7 +2261,8 @@ func (j *pyLower) chained(n *ts.Node) bool {
 // each operand is evaluated once and a later comparison is evaluated only
 // when the ones before it held. The first comparison is a Branch node
 // spanning o0 and o1 that Uses their reads, defines dst (the value when it
-// fails) and holds o1 in a variable of the lowering's own. Every later
+// fails; its killing definition) and may-defines a variable of the
+// lowering's own holding o1 (a node defines one variable). Every later
 // operand is a Stmt node spanning it: the last one also makes the last
 // comparison, Using the held operand before it, and defines dst; any other
 // one defines a held variable of its own, and the comparison it ends is a
