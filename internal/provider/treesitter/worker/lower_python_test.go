@@ -43,7 +43,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// g(i) over break, i += 1 and head.
 			name:     "a while loop's else runs from the head's false edge and a break skips it",
 			protects: "the else body is on the head's false path only, so the value defined before a break reaches the code after the loop",
-			mutation: "lower the else body after CloseFrame, from the breaks too (break@45 then flows into i = -1@69, killing i = 0@11 and i += 1@53 at return i@77)",
+			mutation: "lower the else body from the breaks too (break@45 then flows into i = -1@69, killing i = 0@11 and i += 1@53 at return i@77)",
 			src:      "def f(n):\n i = 0\n while i < n:\n  if g(i):\n   break\n  i += 1\n else:\n  i = -1\n return i\n",
 			fn:       1,
 			cd: []string{"i < n@24 -> g(i)@36", "i < n@24 -> i = -1@69",
@@ -132,19 +132,20 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §8.5. Lines at 0, 13, 27, 35, 47, 57. Nodes: m@6, c@9, m as
-			// r@19 (enter, defines r), c@32, return r@38, raise E@49, with
-			// m as r@14 (the exit, reading m), return 0@58. Both jumps are
-			// intercepted by the with's finally and re-issued from the exit
-			// to EXIT; the exit also flows on, since __exit__ may suppress.
+			// r@19 (enter, defines r and may-defines the manager), c@32,
+			// return r@38, raise E@49, with m as r@14 (the exit, reading the
+			// manager), return 0@58. Both jumps are intercepted by the with's
+			// finally and re-issued from the exit to EXIT; the raise reached
+			// it, so the exit also flows on, since __exit__ may suppress.
 			// Succ: c@32→{return r, raise E}; both → exit; exit→{EXIT,
 			// return 0}. IPDom: c@32 → exit → EXIT.
 			name:     "a with statement's exit runs on return and on raise, and may suppress",
 			protects: "a return and a raise inside a with body both reach the exit node, and the code after the with stays reachable from the exit",
-			mutation: "close the with's finally as abnormal when only jumps reached it (return 0@58 becomes unreachable and the exit controls nothing), or skip the exit for a return (return r@38 goes straight to EXIT)",
+			mutation: "close the with's finally as abnormal when only a raise reached it (return 0@58 becomes unreachable and the exit controls nothing), or skip the exit for a return (return r@38 goes straight to EXIT)",
 			src:      "def f(m, c):\n with m as r:\n  if c:\n   return r\n  raise E\n return 0\n",
 			fn:       1,
 			cd:       []string{"c@32 -> return r@38", "c@32 -> raise E@49", "with m as r@14 -> return 0@58"},
-			du: []string{"m@6 -> m as r@19", "m@6 -> with m as r@14", "c@9 -> c@32",
+			du: []string{"m@6 -> m as r@19", "m as r@19 -> with m as r@14", "c@9 -> c@32",
 				"m as r@19 -> return r@38"},
 		},
 		{
@@ -160,7 +161,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// exit, with@11}; with@11→x's exit; x's exit→{EXIT, return y}.
 			// IPDom: b() as y, y's exit, with@11 → x's exit → EXIT; c@41,
 			// return x → y's exit. The Handler carries the values on entry
-			// to b() as y (no y) and to y's exit (y from b() as y).
+			// to b() as y (no y) and to y's exit (y from b() as y). Each
+			// exit reads the manager its enter node may-defines.
 			name:     "two with items close in reverse on the return path and the normal path",
 			protects: "the second item's exit runs before the first's whether the body returns or completes, and a failure entering the second item runs only the first item's exit",
 			mutation: "close the items in source order (x's exit then precedes y's, b() as y@26 -> with a() as x, b() as y@11 is lost and x's exit controls y's), or open one finally for both items (b() as y no longer controls with@11)",
@@ -168,7 +170,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			fn:       1,
 			cd: []string{"b() as y@26 -> c@41", "b() as y@26 -> with a() as x, b() as y@11", "b() as y@26 -> with@11",
 				"c@41 -> return x@47", "with a() as x, b() as y@11 -> with@11", "with a() as x@11 -> return y@57"},
-			du: []string{"c@6 -> c@41", "a() as x@16 -> return x@47", "b() as y@26 -> return y@57"},
+			du: []string{"c@6 -> c@41", "a() as x@16 -> return x@47", "b() as y@26 -> return y@57",
+				"a() as x@16 -> with a() as x@11", "b() as y@26 -> with a() as x, b() as y@11"},
 		},
 		{
 			// §8.6. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
@@ -270,14 +273,16 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §6.12. Lines at 0, 11, 18, 40. Nodes: xs@6, y = 0@12, the
-			// comprehension node@19 (reads xs and y, may-defines y), return
-			// y@41. The expression statement is the comprehension's node.
+			// comprehension node@19 (reads xs, its first iterable, and
+			// may-defines y: the assignment expression writes y and never
+			// reads it), return y@41. The expression statement is the
+			// comprehension's node.
 			name:     "an assignment expression in a comprehension binds in the enclosing function",
-			protects: "`:=` inside a comprehension writes the enclosing function's variable, a may-definition at the comprehension's creation",
-			mutation: "bind a `:=` target as the comprehension's own local (the comprehension node loses its read of y and its may-definition, and y = 0@12 alone reaches return y@41)",
+			protects: "`:=` inside a comprehension writes the enclosing function's variable, a may-definition at the comprehension's creation that reads nothing of it",
+			mutation: "bind a `:=` target as the comprehension's own local (the comprehension node loses its may-definition, and y = 0@12 alone reaches return y@41), or record the target as a read (y = 0@12 -> [y := x for x in xs]@19 appears)",
 			src:      "def f(xs):\n y = 0\n [y := x for x in xs]\n return y\n",
 			fn:       1,
-			du: []string{"xs@6 -> [y := x for x in xs]@19", "y = 0@12 -> [y := x for x in xs]@19",
+			du: []string{"xs@6 -> [y := x for x in xs]@19",
 				"y = 0@12 -> return y@41", "[y := x for x in xs]@19 -> return y@41"},
 		},
 		{
@@ -306,17 +311,21 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §8.4. Lines at 0, 9, 16, 22, 28, 44, 51. Nodes: e = 0@10,
 			// g()@24 (may throw), except@29 (Handler), E@36, e@41 (the
-			// binding), h(e)@46, the clause's end deleting e (a Stmt
-			// spanning the clause)@29, return e@52. Succ: g()→{return e,
-			// except}; except→E→{e@41, EXIT}; e@41→h(e)→clause end→return
-			// e. IPDom: g(), E → EXIT; e@41 → h(e) → clause end → return e.
-			name:     "an except clause's name is deleted at the clause's end",
-			protects: "the exception bound by `as e` does not outlive its clause, so the code after the try sees the clause's deletion, not the exception",
-			mutation: "drop the deletion at the clause's end (e@41 -> return e@52 replaces except E as e: h(e)@29 -> return e@52)",
+			// binding), h(e)@46 (may throw, into the clause's finally),
+			// as@38 (that finally's Handler), the deletion of e (a Stmt
+			// spanning the clause)@29, the finally's body, return e@52.
+			// Succ: g()→{return e, except}; except→E→{e@41, EXIT};
+			// e@41→h(e)→{as, deletion}; as→deletion; deletion→{return e,
+			// EXIT (h(e)'s exception, re-raised)}. IPDom: g(), E, deletion →
+			// EXIT; e@41 → h(e) → deletion; as → deletion.
+			name:     "an except clause's name is deleted however the clause ends",
+			protects: "the exception bound by `as e` does not outlive its clause, on the normal end and on an exception leaving the body, so the code after the try sees the deletion, not the exception",
+			mutation: "delete the name only at the clause's normal end (as@38 disappears, h(e)@46 controls nothing and the deletion no longer controls return e@52), or drop the deletion (e@41 -> return e@52 replaces except E as e: h(e)@29 -> return e@52)",
 			src:      "def f():\n e = 0\n try:\n  g()\n except E as e:\n  h(e)\n return e\n",
 			fn:       1,
 			cd: []string{"g()@24 -> return e@52", "g()@24 -> except@29", "g()@24 -> E@36",
-				"E@36 -> e@41", "E@36 -> h(e)@46", "E@36 -> except E as e: h(e)@29", "E@36 -> return e@52"},
+				"E@36 -> e@41", "E@36 -> h(e)@46", "E@36 -> except E as e: h(e)@29",
+				"h(e)@46 -> as@38", "except E as e: h(e)@29 -> return e@52"},
 			du: []string{"e@41 -> h(e)@46", "except E as e: h(e)@29 -> return e@52", "e = 0@10 -> return e@52"},
 		},
 		{
@@ -354,6 +363,149 @@ func TestPythonLoweringGolden(t *testing.T) {
 			src:      "def f(o, v):\n o.p = v\n return o\n",
 			fn:       1,
 			du:       []string{"v@9 -> o.p = v@14", "o@6 -> o.p = v@14", "o.p = v@14 -> return o@23", "o@6 -> return o@23"},
+		},
+		{
+			// §8.7: the decorator expressions are evaluated when the
+			// definition runs. Lines at 0, 10, 14, 24, 31. Nodes: d@6, the
+			// decorated definition@11 (reads d, defines g), return g@32.
+			name:     "a decorated definition's node uses its decorators' reads",
+			protects: "a decorator is evaluated where the function is defined, so the variables it reads reach the definition's node",
+			mutation: "take the definition's read mark after the decorators are evaluated (d@6 -> @d def g(): pass@11 disappears)",
+			src:      "def f(d):\n @d\n def g():\n  pass\n return g\n",
+			fn:       1,
+			du:       []string{"d@6 -> @d def g(): pass@11", "@d def g(): pass@11 -> return g@32"},
+		},
+		{
+			// §7.5. Lines at 0, 16, 24, 38. Nodes: del(a)@17 (the one
+			// target, parenthesized: spans the statement, kills a), b@30
+			// (an element of the list target, spanning itself, kills b),
+			// (c)@34 (one of two targets, spanning itself, kills c), return
+			// a, b, c@39. The parameters' definitions are all killed.
+			name:     "parenthesized and list del targets kill the names they hold",
+			protects: "`del(x)`, `del [x]` and `del (a), b` delete names like `del x`, rather than failing to lower the function",
+			mutation: "recurse into a parenthesized target with no statement span (the lowering panics spanning nil), or treat a list target as a plain value (b@9 -> return a, b, c@39 replaces b@30 -> return a, b, c@39)",
+			src:      "def f(a, b, c):\n del(a)\n del [b], (c)\n return a, b, c\n",
+			fn:       1,
+			du:       []string{"del(a)@17 -> return a, b, c@39", "b@30 -> return a, b, c@39", "(c)@34 -> return a, b, c@39"},
+		},
+		{
+			// §8.3, §8.2. Lines at 0, 10, 20, 34, 43, 51, 63, 71. Nodes:
+			// a@6, a@17 (while head), a@31 (the iterable), y in a@26 (for
+			// head), y@26 (target), break@37, continue@54 (the for's else),
+			// a = 0@65, return a@72. The for's frame is closed when its else
+			// runs, so the continue targets the while. Succ: a@17→{a@31,
+			// return a}; a@31→y in a→{y@26, continue}; y@26→break→a = 0→
+			// a@17; continue→a@17. IPDom: a@17 → return a; a@31 → y in a →
+			// a@17; y@26 → break → a = 0 → a@17; continue → a@17.
+			name:     "a continue in a for loop's else continues the enclosing loop",
+			protects: "a loop's else body runs after its frame closes, so a continue there reaches the enclosing loop's head instead of failing to lower the function",
+			mutation: "lower the else body before closing the loop's frame (the continue binds to the for loop, is still pending at CloseFrame, and the lowering panics)",
+			src:      "def f(a):\n while a:\n  for y in a:\n   break\n  else:\n   continue\n  a = 0\n return a\n",
+			fn:       1,
+			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> a@17",
+				"y in a@26 -> y@26", "y in a@26 -> break@37", "y in a@26 -> a = 0@65", "y in a@26 -> continue@54"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@72",
+				"a = 0@65 -> a@17", "a = 0@65 -> a@31", "a = 0@65 -> y in a@26", "a = 0@65 -> y@26", "a = 0@65 -> return a@72"},
+		},
+		{
+			// §8.3, §8.2. Lines at 0, 10, 20, 34, 42, 50, 59. Nodes: a@6,
+			// a@17 (while head), a@31, y in a@26 (for head), y@26, break@53
+			// (the for's else), return a@60. Succ: a@17→{a@31, return a};
+			// a@31→y in a→{y@26, break}; y@26→y in a; break→return a.
+			// IPDom: a@17 → return a; a@31 → y in a → break → return a;
+			// y@26 → y in a.
+			name:     "a break in a for loop's else leaves the enclosing loop",
+			protects: "a break in a loop's else body targets the enclosing loop, so it reaches the code after that loop, not the enclosing loop's head",
+			mutation: "lower the else body inside the for loop's frame (break@53 then flows back to a@17, and a@17 -> a@17 appears)",
+			src:      "def f(a):\n while a:\n  for y in a:\n   pass\n  else:\n   break\n return a\n",
+			fn:       1,
+			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> break@53",
+				"y in a@26 -> y@26", "y in a@26 -> y in a@26"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@60"},
+		},
+		{
+			// §8.4.2. Lines at 0, 9, 16, 22, 28, 40, 48, 60, 67. Nodes:
+			// x = 0@10, g()@24 (may throw), except@29 (Handler), E@37,
+			// x = 1@42, F@57 (reached from E's false edge and from x = 1),
+			// h(x)@62, return x@68. After the last clause, both F's false
+			// edge and h(x) re-raise what no clause matched (EXIT) and
+			// complete (return x). IPDom: g(), F, h(x) → EXIT; E, x = 1 → F;
+			// except → E.
+			name:     "every matching except* clause runs, and what none matched is re-raised",
+			protects: "an except* clause's body continues to the next clause's test, so a definition in one clause reaches the next, and the statement both completes and re-raises after the last",
+			mutation: "lower except* as except, first match wins (x = 1@42 -> h(x)@62 disappears and x = 1@42 reaches return x@68 past F@57), or drop the final re-raise (h(x)@62 -> return x@68 disappears)",
+			src:      "def f():\n x = 0\n try:\n  g()\n except* E:\n  x = 1\n except* F:\n  h(x)\n return x\n",
+			fn:       1,
+			cd: []string{"g()@24 -> except@29", "g()@24 -> E@37", "g()@24 -> F@57", "g()@24 -> return x@68",
+				"E@37 -> x = 1@42", "F@57 -> h(x)@62", "F@57 -> return x@68", "h(x)@62 -> return x@68"},
+			du: []string{"x = 0@10 -> h(x)@62", "x = 1@42 -> h(x)@62", "x = 0@10 -> return x@68", "x = 1@42 -> return x@68"},
+		},
+		{
+			// §7.13, §7.2. Lines at 0, 9, 16, 26, 39, 47, 52. Nodes: n = 0@10,
+			// def g(): …@17 (defines g, may-defines n through the nonlocal,
+			// reads nothing: `n = 1` only writes n), g()@48, return n@53.
+			name:     "a nested callable's plain assignment writes an enclosing variable without reading it",
+			protects: "the node creating a callable that assigns an enclosing variable may-defines it and does not use it",
+			mutation: "collect an assignment target in a nested callable as a read (n = 0@10 -> def g(): nonlocal n n = 1@17 appears)",
+			src:      "def f():\n n = 0\n def g():\n  nonlocal n\n  n = 1\n g()\n return n\n",
+			fn:       1,
+			du: []string{"n = 0@10 -> return n@53", "def g(): nonlocal n n = 1@17 -> return n@53",
+				"def g(): nonlocal n n = 1@17 -> g()@48"},
+		},
+		{
+			// §8.5: a failing assignment to the target runs __exit__. Lines
+			// at 0, 13, 29, 36. Nodes: m@6, o@9, m as o.p@19 (enter, reads
+			// m, may-defines the manager), o.p@24 (the target's write: reads
+			// m and o, may-defines o, may throw into the item's finally),
+			// with@14 (that finally's Handler), with m as o.p@14 (the exit),
+			// return o@37. Succ: o.p→{with@14, exit}; with@14→exit;
+			// exit→{EXIT (the re-raise), return o}. IPDom: o.p, with@14 →
+			// exit → EXIT.
+			name:     "a with item's reference target is bound inside the item's finally",
+			protects: "an exception assigning a with item's target reaches the manager's exit, as one in the body does",
+			mutation: "bind a reference target before opening the item's finally (with@14 disappears and the exit controls nothing)",
+			src:      "def f(m, o):\n with m as o.p:\n  pass\n return o\n",
+			fn:       1,
+			cd:       []string{"o.p@24 -> with@14", "with m as o.p@14 -> return o@37"},
+			du: []string{"m@6 -> m as o.p@19", "m@6 -> o.p@24", "o@9 -> o.p@24", "m as o.p@19 -> with m as o.p@14",
+				"o@9 -> return o@37", "o.p@24 -> return o@37"},
+		},
+		{
+			// §7.12, the module (callable 0). Lines at 0, 12, 24, 33, 40.
+			// cfg is bound only by init's global declaration, so it is a
+			// module variable. Nodes: def init(): …@0 (defines init,
+			// may-defines cfg), init()@33, use(cfg)@40.
+			name:     "a global assigned only in a nested function is a module variable",
+			protects: "a module variable written only through a function's global declaration reaches the module code that reads it",
+			mutation: "bind only the module's own binding sites (cfg is no variable and def init(): … -> use(cfg)@40 disappears)",
+			src:      "def init():\n global cfg\n cfg = 1\ninit()\nuse(cfg)\n",
+			du: []string{"def init(): global cfg cfg = 1@0 -> init()@33",
+				"def init(): global cfg cfg = 1@0 -> use(cfg)@40"},
+		},
+		{
+			// §8.5. Lines at 0, 10, 19, 30. Nodes: m@6, m@16 (enter),
+			// return 1@21 (intercepted by the with's finally), with m@11
+			// (the exit, re-issuing the return to EXIT), g()@31, which only
+			// normal completion or a suppressed exception would reach: it
+			// has no predecessor.
+			name:     "a return inside with does not fall through past the with",
+			protects: "the statement after a with is reached from the exit only when the body completed or an exception reached the exit, never by a return alone",
+			mutation: "close the with's finally as normal whatever reached it (the exit gains an edge to g()@31 and controls it)",
+			src:      "def f(m):\n with m:\n  return 1\n g()\n",
+			fn:       1,
+			du:       []string{"m@6 -> m@16", "m@16 -> with m@11"},
+		},
+		{
+			// §8.5: the exit calls the manager the enter produced. Lines at
+			// 0, 10, 19, 27. Nodes: m@6, m@16 (enter, may-defines the
+			// manager), m = 0@21, with m@11 (the exit, reading the manager),
+			// return m@28.
+			name:     "a with exit reads the manager entered, not the context variable at exit time",
+			protects: "rebinding the context expression's variable in the body does not change which value the exit uses",
+			mutation: "make the exit read the context expression's variables again (m = 0@21 -> with m@11 replaces m@16 -> with m@11)",
+			src:      "def f(m):\n with m:\n  m = 0\n return m\n",
+			fn:       1,
+			du:       []string{"m@6 -> m@16", "m@16 -> with m@11", "m = 0@21 -> return m@28"},
 		},
 	})
 }

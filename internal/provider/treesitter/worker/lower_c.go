@@ -64,10 +64,15 @@ const (
 //     node. A declarator without an initializer makes no node (the object's
 //     value is indeterminate, C17 §6.7.9p10), unless a variable-length array
 //     size is evaluated there: then one Stmt node spans the declarator and
-//     reads the size. A structured binding is one defining node per name,
-//     spanning the name, each reading the initializer. A `static` local is a
-//     variable whose initializer is a defining node at its position; the
-//     value it keeps across calls is not modelled.
+//     reads the size. In C++ a declarator without an initializer whose
+//     declaration type is not a fundamental or enumeration type specifier,
+//     outside an `extern` declaration, declares an object of class type,
+//     which its default constructor initializes ([dcl.init]/7): one Stmt
+//     node spans the declarator, defines the name and may throw; a type name
+//     that aliases a scalar is counted too, an over-approximation. A structured binding is one defining node
+//     per name, spanning the name, each reading the initializer. A `static`
+//     local is a variable whose initializer is a defining node at its
+//     position; the value it keeps across calls is not modelled.
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do…while, for; a C++ condition that declares
 //     a variable is a Branch node spanning the declaration that defines it.
@@ -76,7 +81,8 @@ const (
 //     nonzero integer literal (`while (1)`), and a for without a condition,
 //     has no exit edge: its head is a Stmt node spanning the literal, or the
 //     `for` keyword.
-//   - `&&`, `||` and the conditional operator: the deciding operand is a
+//   - `&&`, `||` (in C++ also their alternative tokens `and` and `or`,
+//     [lex.digraph]) and the conditional operator: the deciding operand is a
 //     Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node
 //     spanning it (C17 §6.5.13–§6.5.15). The two-operand conditional
@@ -93,13 +99,17 @@ const (
 //     through the builder's Label and Goto: its Branch node jumps to a
 //     label node spanning the `case` or `default` keyword, named by
 //     cCasePrefix and the label's start byte, a name built only for such
-//     nested labels (two small allocations per nested label). Statements
+//     nested labels, in a buffer the function's lowering reuses. Statements
 //     before the first case label are reachable only by a jump into them.
 //   - A C++ range for ([stmt.ranged]) is a Stmt node for the range
 //     expression, evaluated once, which defines an iteration variable of the
 //     lowering's own; a Branch head spanning from the declarator to the end
 //     of the range expression, which Uses it; then one defining node per
-//     bound name spanning the name, which Uses it too.
+//     bound name spanning the name, which Uses it too; a name bound by a
+//     reference to a non-const type (`auto &e : v`) is bound to an element
+//     of the range, so its node may-defines the range's base variable, as
+//     `&v[i]` does; a reference to a const type (`const auto &e : v`) only
+//     reads it.
 //   - Every label is its own Stmt node spanning the label identifier, before
 //     the statement it labels, so a goto always lands on it (C17 §6.8.6.1).
 //     An assembly statement with goto labels is a Branch node spanning the
@@ -110,11 +120,13 @@ const (
 //     the build selects: a Branch node spans the directive's condition (the
 //     macro name of an `#ifdef` form, the `#else` keyword for `#else`), each
 //     arm is a path from it and the arms are merged after the directive, so
-//     no arm sees another arm's definitions. A declaration in one arm and a
-//     redeclaration of the same name in a sibling arm at the same block
-//     level are one variable, so a use after the directive sees both. The
-//     condition reads no variable. Every other preprocessor line inside a
-//     body produces no node.
+//     no arm sees another arm's definitions, nor its declarations: each arm
+//     resolves names against the bindings made before the directive, and the
+//     code after it sees every arm's declarations. A declaration in one arm
+//     and a redeclaration of the same name in a sibling arm at the same
+//     block level are one variable, so a use after the directive sees both.
+//     The condition reads no variable. Every other preprocessor line inside
+//     a body produces no node.
 //   - A lambda or a nested function definition is its own function; in the
 //     enclosing function its creating expression is one Stmt node spanning
 //     it (see Captures).
@@ -134,28 +146,56 @@ const (
 // # Uses
 //
 // Only an identifier resolving to a variable declared in this function is
-// a Use; a qualified name, a field name, `this` and the operand of sizeof,
-// alignof and offsetof (unevaluated, C17 §6.5.3.4p2) are not. A node Uses
-// every variable read inside its own span; an assignment, compound
-// assignment or update of an identifier embedded in a larger expression is
-// its own defining node, and the variable it defined is a read of the node
-// that evaluates the enclosing expression. A node that defines v also Uses
-// v when its statement read v before it. A write through `*p`, `p->f`,
-// `a[i]` or `s.f` (and an assembly output operand) Uses its operands and is
-// a non-killing may-definition of the base variable on the node that
-// consumes it. So is taking an address, `&x` (`&s.f`, `&a[i]`), by the
-// address-taking rule of Lowering: it Uses its operands and may-defines its
-// base variable. A C++ reference binding and pointer aliasing are not
-// modelled. Destructors,
-// setjmp/longjmp and signal handlers are not modelled. A GNU statement
-// expression `({ … })` is lowered as its block in place; the node of the
-// enclosing expression Uses its last statement's reads.
+// a Use; a qualified name, a field name, `this`, the operand of alignof and
+// offsetof, the operand of sizeof unless its type is a variable-length
+// array (C17 §6.5.3.4p2: a VLA local named there is read, and the sizes of
+// an array type name are evaluated), and the controlling expression of a
+// generic selection (C17 §6.5.1.1p3) are not; the association a generic
+// selection picks depends on types, so every association's expression is
+// read. A node Uses every variable read inside its own span; an
+// assignment, compound assignment or update of an identifier embedded in a
+// larger expression is its own defining node, and the variable it defined
+// is a read of the node that evaluates the enclosing expression. A node
+// that defines v also Uses v when its statement read v before it. A write
+// through `*p`, `p->f`, `a[i]` or `s.f` (and an assembly output operand)
+// Uses its operands and is a non-killing may-definition of the base
+// variable on the node that evaluates the enclosing expression. By the
+// address-taking rule of Lowering, so is each of these, which also Uses its
+// operands: taking an address, `&x` (`&s.f`, `&a[i]`); evaluating a local
+// declared as an array anywhere but as the operand of sizeof, `&` or a
+// subscript, where it decays to its address (C17 §6.3.2.1p3), as in
+// `fill(buf)`; and binding a C++ reference to a non-const type to an
+// object, `T &r = x` (also `T &r{x}`, `T &r(x)`, `T &&r = …` and
+// `auto &[a, b] = s`), which may-defines its base variable at the
+// declarator's node ([dcl.init.ref]). A reference to a const type
+// (`const T &r = x`, [dcl.ref]/1) is a read-only view: its binding only
+// reads the object, as Lowering states. The may-definition
+// lands on that node even when a later operand makes a node first: the
+// may-definition is recorded with the position of its operand's reads, as
+// reads are, and a node takes only those its own reads cover. A write
+// through the pointer or reference (`*p = 2`, `r = 2`) is given up, as
+// Lowering states. Destructors, setjmp/longjmp and signal handlers are not
+// modelled.
+//
+// # Statement expressions
+//
+// No standard defines them; the anchor is the statement-expression
+// extension's documented semantics. `({ … })` is lowered as its block in
+// place; the node of the enclosing expression Uses its last statement's
+// reads. The extension permits jumping out of a statement expression: a
+// `break` or `continue` in one binds to the innermost loop or switch open
+// where it stands, so one in a for loop's update clause or a do loop's
+// condition binds to that loop. Its break ends the loop. Its continue goes
+// where every continue of that loop goes, to the end of the loop body (C17
+// §6.8.6.2), after which the update or the condition runs again: it lands
+// on the first node of the update or the condition.
 //
 // # Exceptions
 //
 // C++ ([except]): inside a try block MayThrow is given to every node whose
-// own evaluation contains a call, a `new`, a direct initialization or a
-// range for's iterator step; a throw statement's node is also a Throw. A
+// own evaluation contains a call, a `new`, a `delete` (the destructor and
+// the deallocation function, [expr.delete]), a direct initialization, a
+// default-initialized object of class type or a range for's iterator step; a throw statement's node is also a Throw. A
 // try statement's handlers are tested in order after the Handler node
 // spanning the first `catch` keyword: each typed clause is a Branch node
 // spanning its parameter list that defines the caught name, true into its
@@ -164,15 +204,19 @@ const (
 // member initializers and the body; for a constructor or destructor the end
 // of a handler rethrows ([except.handle]/15), otherwise it returns.
 //
-// Structured exceptions (both grammars): inside a `__try` body every call
-// and every dereference (`*p`, `->`, `[]`) may raise. `__try/__finally` is
+// Structured exceptions (both grammars; the anchor is the structured
+// exception handling extension's documented semantics of its try-finally
+// and try-except statements): inside a `__try` body every call and every
+// dereference (`*p`, `->`, `[]`) may raise. `__try/__finally` is
 // a finally; `__try/__except (filter)` is a catch whose filter is a Branch
 // node spanning the filter expression, true into the handler, false
 // rethrowing; resumption at the fault is not modelled. `__leave` breaks to
-// the end of the `__try` body. The builder applies MayThrow only inside an
-// open catch or finally frame, so outside every try a call throws nowhere;
-// a dereference inside a C++ try nested in a `__try` is also given
-// MayThrow, an over-approximation.
+// the end of the `__try` body. A `__finally` runs on every way out of its
+// `__try` body, a goto to a label outside it included: the builder routes
+// such a goto through the `__finally` (flow.Builder, Goto). The builder
+// applies MayThrow only inside an open catch or finally frame, so outside
+// every try a call throws nowhere; a dereference inside a C++ try nested in
+// a `__try` is also given MayThrow, an over-approximation.
 //
 // # Scoping
 //
@@ -190,16 +234,17 @@ const (
 // enclosing variable its capture list names, its init-captures read and its
 // body references, resolved with the lambda's own scopes so a name it
 // declares shadows. A variable captured by reference (named `&x`, or
-// implicitly under a `&` default) that the body writes, or whose address it
-// takes, is a may-definition
-// on the creating node; a by-copy capture never is. A nested function
-// definition (a GNU extension) accesses every enclosing variable by
+// implicitly under a `&` default) that the body writes, takes the address
+// of, binds a reference to, or evaluates as a decaying array is a
+// may-definition on the creating node; a by-copy capture never is. A
+// by-reference init-capture `&r = x` binds a reference to x, a
+// may-definition of x on the creating node. A nested function definition
+// (a compiler extension to C) accesses every enclosing variable by
 // reference.
-func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	k := cSyntaxOf(l.language)
-	cur := fn.Walk()
-	defer cur.Close()
-	c := cLower{l: l, b: b, src: src, k: k, cur: cur, pp: -1, first: -1, last: -1, stmtNo: 1}
+	c := &s.c
+	c.reuse(l, b, fn, src, k, s)
 	if fn.KindId() == k.lambdaExpression {
 		if d := fn.ChildByFieldId(k.fDeclarator); d != nil {
 			c.params(d.ChildByFieldId(k.fParameters))
@@ -209,14 +254,26 @@ func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	}
 	c.params(c.parameters(fn.ChildByFieldId(k.fDeclarator)))
 	body := fn.ChildByFieldId(k.fBody)
+	start, list := c.kids(fn)
 	if body == nil {
+		// The grammar gives a constructor's or destructor's
+		// function-try-block no body field: it is a try statement child.
+		for i := range list {
+			if list[i].KindId() == k.tryStatement {
+				body = &list[i]
+				break
+			}
+		}
+	}
+	if body == nil {
+		c.done(start)
 		return
 	}
 	if body.KindId() == k.tryStatement {
 		c.tryStmt(body, c.structor(fn))
+		c.done(start)
 		return
 	}
-	start, list := c.kids(fn)
 	for i := range list {
 		if list[i].KindId() == k.fieldInitializerList {
 			c.initializers(&list[i])
@@ -226,7 +283,8 @@ func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	c.block(body)
 }
 
-// cLower is the state of lowering one C or C++ callable.
+// cLower is the state of lowering one C or C++ callable. It lives in the
+// worker's Scratch and is reset in place for every function by reuse.
 type cLower struct {
 	l   *Lowering
 	b   *flow.Builder
@@ -236,26 +294,42 @@ type cLower struct {
 	// buf is a stack of child lists; kids pushes one and done pops it.
 	buf []ts.Node
 	// binds is the scope chain; blockMark is where the innermost block's
-	// bindings begin, and pp where the innermost preprocessor conditional at
-	// that block level began, or -1.
-	binds     scope
+	// bindings begin, and pp where the outermost preprocessor conditional at
+	// that block level began, or -1, with ppArm its mark in parked.
+	binds     *scope
 	blockMark int
 	pp        int
+	ppArm     int
+	// parked holds the bindings the finished arms of the open preprocessor
+	// conditionals declared, hidden from their sibling arms and bound again
+	// after the directive (see preproc).
+	parked scope
 	// shadow is non-zero while walking a nested callable for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
 	// reads are the variables read by the current statement from base on;
 	// seen[v] == stmtNo marks v as one of them. base is non-zero inside a
 	// statement expression, whose statements keep the enclosing reads.
+	// stmtNo only ever increases, across functions too, so a mark left in
+	// seen by an earlier statement or function never matches.
 	reads  []int32
 	seen   []int
 	stmtNo int
 	base   int
-	// may are the may-definitions the next node created carries.
-	may []int32
+	// may are the pending may-definitions, each with the position in reads
+	// where the operand that makes it began: a node takes the ones from its
+	// own first read on (see nodeAt).
+	may []cMay
+	// shape[v] records how variable v was declared: as an array (cArray),
+	// whose evaluation decays to its address, and with a size evaluated at
+	// run time (cVLA).
+	shape []uint8
 	// writes are the enclosing variables written inside the nested callable
 	// whose captures are being collected.
 	writes []int32
+	// names holds the goto labels built for nested case labels; each label
+	// is a view of it, which only grows while a function is lowered.
+	names []byte
 	// throws counts throwing constructs evaluated by the current statement;
 	// those past thrown are not yet attached to a node. seh is the depth of
 	// open `__try` bodies, where a dereference may raise.
@@ -268,6 +342,34 @@ type cLower struct {
 	lastSpan flow.Span
 	// hs holds the case-label fringes of the open switches.
 	hs []flow.Fringe
+}
+
+// cMay is a pending may-definition of v made by an operand whose reads begin
+// at reads[at].
+type cMay struct {
+	at int
+	v  int32
+}
+
+// Declaration shapes recorded in cLower.shape.
+const (
+	cArray uint8 = 1 << iota
+	cVLA
+)
+
+// reuse resets c in place for lowering fn: every scalar set anew, every list
+// truncated with its capacity kept.
+func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k *cSyntax, s *Scratch) {
+	c.l, c.b, c.src, c.k, c.cur, c.binds = l, b, src, k, s.cursor(fn), &s.scope
+	clear(c.buf[:cap(c.buf)])
+	c.buf = c.buf[:0]
+	c.blockMark, c.pp, c.ppArm, c.shadow, c.base = 0, -1, -1, 0, 0
+	c.parked.truncate(0)
+	c.reads, c.seen, c.may, c.shape, c.writes, c.names, c.hs =
+		c.reads[:0], c.seen[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
+	c.stmtNo++
+	c.throws, c.thrown, c.seh = 0, 0, 0
+	c.first, c.last, c.lastSpan = -1, -1, flow.Span{}
 }
 
 // kids pushes n's named, non-extra children onto buf and returns the stack
@@ -310,12 +412,15 @@ func (c *cLower) text(n *ts.Node) []byte { return textOf(c.src, n) }
 type cScope struct{ mark, block int }
 
 func (c *cLower) open() cScope {
-	s := cScope{mark: len(c.binds), block: c.blockMark}
-	c.blockMark = len(c.binds)
+	s := cScope{mark: c.binds.mark(), block: c.blockMark}
+	c.blockMark = c.binds.mark()
 	return s
 }
 
-func (c *cLower) close(s cScope) { c.binds, c.blockMark = c.binds[:s.mark], s.block }
+func (c *cLower) close(s cScope) {
+	c.binds.truncate(s.mark)
+	c.blockMark = s.block
+}
 
 // declare binds name in the innermost scope: a new variable, the variable a
 // sibling arm of the enclosing preprocessor conditional declared under the
@@ -326,20 +431,20 @@ func (c *cLower) declare(name *ts.Node) int32 {
 	switch {
 	case c.shadow > 0:
 	case c.pp >= 0 && c.pp >= c.blockMark:
-		if i := c.binds.find(t, c.pp); i >= 0 {
-			v = c.binds[i].v
+		if i := c.parked.find(t, c.ppArm); i >= 0 {
+			v = c.parked.at(i).v
 			break
 		}
 		v = c.b.Var()
 	default:
 		v = c.b.Var()
 	}
-	c.binds = append(c.binds, binding{name: t, v: v})
+	c.binds.push(t, v)
 	return v
 }
 
 // hide binds name to no variable.
-func (c *cLower) hide(name *ts.Node) { c.binds = append(c.binds, binding{name: c.text(name), v: -1}) }
+func (c *cLower) hide(name *ts.Node) { c.binds.push(c.text(name), -1) }
 
 func (c *cLower) lookup(name *ts.Node) int32 { return c.binds.lookup(c.text(name)) }
 
@@ -367,12 +472,18 @@ func (c *cLower) reset() {
 }
 
 // node creates a node spanning n that Uses reads[from:to], carries the
-// pending may-definitions, and MayThrow when a throwing construct was
-// evaluated since the previous node.
+// pending may-definitions its own operands made, and MayThrow when a
+// throwing construct was evaluated since the previous node.
 func (c *cLower) node(kind flow.Kind, n *ts.Node, from, to int) int32 {
 	return c.nodeAt(kind, spanOf(n), from, to)
 }
 
+// nodeAt is node over span s. A pending may-definition belongs to the node
+// whose reads include its operand's, the node of the expression evaluating
+// it, so the node takes those made at reads[from] or later and leaves the
+// earlier ones, made by an operand of an enclosing expression, pending for
+// that expression's node: in `g(&x, i++)` the node of i++ is created first
+// and x's may-definition still lands on the call's.
 func (c *cLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	id := c.b.Node(kind, s)
 	if c.first < 0 {
@@ -381,16 +492,41 @@ func (c *cLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	for _, v := range c.reads[from:to] {
 		c.b.Use(id, v)
 	}
-	for _, v := range c.may {
-		c.b.MayDef(id, v)
+	kept := 0
+	for _, m := range c.may {
+		if m.at >= from {
+			c.b.MayDef(id, m.v)
+			continue
+		}
+		c.may[kept] = m
+		kept++
 	}
-	c.may = c.may[:0]
+	c.may = c.may[:kept]
 	if c.throws > c.thrown {
 		c.b.MayThrow(id)
 	}
 	c.thrown = c.throws
 	c.last, c.lastSpan = id, s
 	return id
+}
+
+// pending reports whether a may-definition made at reads[from] or later
+// waits for a node.
+func (c *cLower) pending(from int) bool {
+	for _, m := range c.may {
+		if m.at >= from {
+			return true
+		}
+	}
+	return false
+}
+
+// mayDef records a pending may-definition of v by an operand whose reads
+// begin at reads[at], unless v is -1.
+func (c *cLower) mayDef(at int, v int32) {
+	if v >= 0 {
+		c.may = append(c.may, cMay{at: at, v: v})
+	}
 }
 
 // def records that node n defines v and, when the statement read v before
@@ -482,7 +618,7 @@ func (c *cLower) inner(d *ts.Node) *ts.Node {
 	start, list := c.kids(d)
 	defer c.done(start)
 	for i := range list {
-		if id := list[i].KindId(); id != k.attributeDeclaration && id != k.msCallModifier {
+		if id := list[i].KindId(); id != k.attributeDeclaration && id != k.callModifier {
 			x := list[i]
 			return &x
 		}
@@ -491,39 +627,39 @@ func (c *cLower) inner(d *ts.Node) *ts.Node {
 }
 
 // name is the identifier declarator d declares, or nil for a qualified,
-// field or operator name, which is no local; fn reports that it declares a
-// function (a block-scope prototype) rather than an object: the type
-// constructor nearest the identifier is a function declarator, so
-// `int (*fp)(int)` declares an object and `int g(int)` a function.
-func (c *cLower) name(d *ts.Node) (id *ts.Node, fn bool) {
+// field or operator name, which is no local, and ctor the kind of the type
+// constructor nearest the identifier (a function, pointer, array or
+// reference declarator), or 0 for none. A function declarator nearest it
+// declares a function (a block-scope prototype) rather than an object, so
+// `int (*fp)(int)` declares an object and `int g(int)` a function; an array
+// declarator nearest it declares an array, so `char *a[4]` is an array and
+// `char (*a)[4]` a pointer.
+func (c *cLower) name(d *ts.Node) (id *ts.Node, ctor uint16) {
 	k := c.k
 	for d != nil {
 		switch d.KindId() {
 		case k.identifier:
-			return d, fn
-		case k.functionDeclarator:
-			fn = true
-			d = d.ChildByFieldId(k.fDeclarator)
-		case k.pointerDeclarator, k.arrayDeclarator:
-			fn = false
+			return d, ctor
+		case k.functionDeclarator, k.pointerDeclarator, k.arrayDeclarator:
+			ctor = d.KindId()
 			d = d.ChildByFieldId(k.fDeclarator)
 		case k.initDeclarator:
 			d = d.ChildByFieldId(k.fDeclarator)
 		case k.referenceDeclarator:
-			fn = false
+			ctor = k.referenceDeclarator
 			d = c.inner(d)
 		case k.parenthesizedDeclarator, k.attributedDeclarator, k.variadicDeclarator:
 			d = c.inner(d)
 		default:
-			return nil, false
+			return nil, 0
 		}
 	}
-	return nil, false
+	return nil, 0
 }
 
 // variable is the identifier declarator d declares as a variable, or nil.
 func (c *cLower) variable(d *ts.Node) *ts.Node {
-	if id, fn := c.name(d); !fn {
+	if id, ctor := c.name(d); ctor != c.k.functionDeclarator {
 		return id
 	}
 	return nil
@@ -632,7 +768,7 @@ func (c *cLower) stmt(n *ts.Node) {
 		c.caseBody(n)
 	case k.labeledStatement:
 		name := n.ChildByFieldId(k.fLabel)
-		c.b.Label(string(c.text(name)), spanOf(name))
+		c.b.Label(view(c.text(name)), spanOf(name))
 		start, list := c.body(n, k.fLabel, 0, 0)
 		for i := range list {
 			c.stmt(&list[i])
@@ -648,7 +784,7 @@ func (c *cLower) stmt(n *ts.Node) {
 		c.done(start)
 	case k.gotoStatement:
 		c.node(flow.Jump, n, c.base, c.base)
-		c.b.Goto(string(c.text(n.ChildByFieldId(k.fLabel))))
+		c.b.Goto(view(c.text(n.ChildByFieldId(k.fLabel))))
 	case k.breakStatement:
 		c.node(flow.Jump, n, c.base, c.base)
 		c.b.Break("")
@@ -696,14 +832,14 @@ func (c *cLower) exprStmt(e *ts.Node) {
 		made, _ = c.assign(u)
 	case k.updateExpression:
 		made, _ = c.update(u)
-	case k.gnuAsmExpression:
+	case k.asmExpression:
 		c.asm(u)
 		return
 	default:
 		c.valueNode(e)
 		return
 	}
-	if made && c.thrown == c.throws && len(c.may) == 0 {
+	if made && c.thrown == c.throws && !c.pending(m) {
 		return
 	}
 	c.node(flow.Stmt, e, m, len(c.reads))
@@ -724,7 +860,7 @@ func (c *cLower) asm(e *ts.Node) {
 	start, list := c.kids(labels)
 	for i := range list {
 		p := c.b.Push()
-		c.b.Goto(string(c.text(&list[i])))
+		c.b.Goto(view(c.text(&list[i])))
 		c.b.Restore(p)
 		c.b.Pop(p)
 	}
@@ -737,7 +873,7 @@ func (c *cLower) asm(e *ts.Node) {
 func (c *cLower) valueNode(n *ts.Node) {
 	m, last := len(c.reads), c.last
 	c.value(n)
-	if c.last != last && c.lastSpan == spanOf(c.l.unparen(n)) && c.thrown == c.throws && len(c.may) == 0 {
+	if c.last != last && c.lastSpan == spanOf(c.l.unparen(n)) && c.thrown == c.throws && !c.pending(m) {
 		return
 	}
 	c.node(flow.Stmt, n, m, len(c.reads))
@@ -765,8 +901,8 @@ func (c *cLower) declaration(n *ts.Node) {
 		d := &list[i]
 		m := len(c.reads)
 		if d.KindId() != k.initDeclarator {
-			id, fn := c.name(d)
-			if fn {
+			id, ctor := c.name(d)
+			if ctor == k.functionDeclarator {
 				c.hide(id)
 				continue
 			}
@@ -774,20 +910,40 @@ func (c *cLower) declaration(n *ts.Node) {
 			if id != nil {
 				v = c.declare(id)
 			}
-			c.sizes(d)
+			c.arraySizes(d, v, ctor)
 			// A declaration-level initializer (a C++ condition declaration)
 			// initializes the declarator.
 			if val := n.ChildByFieldId(k.fValue); val != nil {
-				c.value(val)
+				if ctor == k.referenceDeclarator {
+					c.bindRef(val, c.constRef(n, d))
+				} else {
+					c.value(val)
+				}
 				c.def(c.node(flow.Stmt, n, m, len(c.reads)), v)
-			} else if len(c.reads) > m {
-				c.node(flow.Stmt, d, m, len(c.reads))
+				continue
+			}
+			// A C++ object of class type without an initializer is
+			// default-initialized by its constructor ([dcl.init]/7).
+			ctorCall := k.cpp && id != nil && (ctor == 0 || ctor == k.arrayDeclarator) && c.classType(n)
+			if ctorCall {
+				c.throws++
+			}
+			if ctorCall || len(c.reads) > m {
+				x := c.node(flow.Stmt, d, m, len(c.reads))
+				if ctorCall {
+					c.def(x, v)
+				}
 			}
 			continue
 		}
 		inner, val := d.ChildByFieldId(k.fDeclarator), d.ChildByFieldId(k.fValue)
 		if sb := c.binding(inner); sb != nil {
-			c.value(val)
+			// `auto &[a, b] = s` binds a reference to s ([dcl.struct.bind]/1).
+			if inner.KindId() == k.referenceDeclarator {
+				c.bindRef(val, c.constRef(n, inner))
+			} else {
+				c.value(val)
+			}
 			to := len(c.reads)
 			s2, names := c.kids(sb)
 			for j := range names {
@@ -797,18 +953,136 @@ func (c *cLower) declaration(n *ts.Node) {
 			c.done(s2)
 			continue
 		}
+		id, ctor := c.name(inner)
 		v := int32(-1)
-		if id := c.variable(inner); id != nil {
+		if id != nil && ctor != k.functionDeclarator {
 			v = c.declare(id)
 		}
-		c.sizes(inner)
-		c.value(val)
-		if val.KindId() == k.argumentList || val.KindId() == k.initializerList && k.cpp {
-			c.throws++
+		c.arraySizes(inner, v, ctor)
+		if ctor == k.referenceDeclarator {
+			c.bindRef(val, c.constRef(n, inner))
+		} else {
+			c.value(val)
+			if val.KindId() == k.argumentList || val.KindId() == k.initializerList && k.cpp {
+				c.throws++
+			}
 		}
 		c.def(c.node(flow.Stmt, d, m, len(c.reads)), v)
 	}
 	c.done(start)
+}
+
+// arraySizes reads the array sizes along declarator d of variable v, whose
+// nearest type constructor is ctor, and records v's shape: an array, and a
+// variable-length one when a size read a variable or called a function.
+func (c *cLower) arraySizes(d *ts.Node, v int32, ctor uint16) {
+	m, t := len(c.reads), c.throws
+	c.sizes(d)
+	if ctor != c.k.arrayDeclarator {
+		return
+	}
+	s := cArray
+	if len(c.reads) > m || c.throws > t {
+		s |= cVLA
+	}
+	c.shaped(v, s)
+}
+
+// classType reports whether declaration n defines an object whose type may
+// be a class type: its type is not a fundamental or enumeration type
+// specifier, and it is not `extern`, which declares without constructing. A
+// type name that aliases a scalar is counted, an over-approximation.
+func (c *cLower) classType(n *ts.Node) bool {
+	k := c.k
+	t := n.ChildByFieldId(k.fType)
+	if t == nil {
+		return false
+	}
+	switch t.KindId() {
+	case k.primitiveType, k.sizedTypeSpecifier, k.enumSpecifier:
+		return false
+	}
+	start, list := c.kids(n)
+	defer c.done(start)
+	for i := range list {
+		if list[i].KindId() == k.storageClassSpecifier && string(c.text(&list[i])) == "extern" {
+			return false
+		}
+	}
+	return true
+}
+
+// bindRef lowers the initializer of a C++ reference, which binds the
+// reference to it ([dcl.init.ref]). For a reference to a non-const type the
+// object's base variable is may-defined, by the address-taking rule of
+// Lowering; the initializer of a reference to a const type (constRef) is
+// only read, since the reference is a read-only view of it. A braced or
+// parenthesized initializer binds each operand the same way.
+func (c *cLower) bindRef(val *ts.Node, readOnly bool) {
+	k := c.k
+	bind := c.target
+	if readOnly {
+		bind = c.value
+	}
+	if val.KindId() != k.argumentList && val.KindId() != k.initializerList {
+		bind(val)
+		return
+	}
+	start, list := c.kids(val)
+	for i := range list {
+		bind(&list[i])
+	}
+	c.done(start)
+}
+
+// constRef reports whether the reference that declarator d, of declaration
+// or range for n, declares refers to a const-qualified type ([dcl.ref]/1):
+// the qualifiers of the nearest pointer declarator outside the reference
+// (`const T *&r` refers to a non-const pointer), or, with none, the
+// specifiers of n itself (`const T &r`, `T const &&r`, `const auto &[a, b]`);
+// an array of const elements is const, and a reference to a function refers
+// to nothing writable. A const type named through an alias (`using CR =
+// const T &`) is not seen, and that binding stays a may-definition.
+func (c *cLower) constRef(n, d *ts.Node) bool {
+	k := c.k
+	var near *ts.Node
+	for d != nil {
+		switch d.KindId() {
+		case k.referenceDeclarator:
+			switch {
+			case near == nil:
+				return c.constQualified(n)
+			case near.KindId() == k.functionDeclarator:
+				return true
+			default:
+				return c.constQualified(near)
+			}
+		case k.pointerDeclarator, k.functionDeclarator:
+			near = d
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.arrayDeclarator, k.initDeclarator:
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.parenthesizedDeclarator, k.attributedDeclarator:
+			d = c.inner(d)
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// constQualified reports whether n, a declaration, range for or pointer
+// declarator, carries a `const` type qualifier of its own.
+func (c *cLower) constQualified(n *ts.Node) bool {
+	k := c.k
+	start, list := c.kids(n)
+	defer c.done(start)
+	for i := range list {
+		if list[i].KindId() == k.typeQualifier && string(c.text(&list[i])) == "const" {
+			return true
+		}
+	}
+	return false
 }
 
 // cond lowers a condition as one Branch node (after an init-statement, for
@@ -915,9 +1189,18 @@ func (c *cLower) head(cond *ts.Node) bool {
 	return true
 }
 
-// loopEnd closes a loop whose back edge targets h.
-func (c *cLower) loopEnd(f flow.Frame, h int32, exits bool, exit flow.Fringe) {
+// loopEnd closes a loop whose back edge targets h. again is the first node
+// of the code on the loop's continue path lowered after ContinueHere (a for
+// loop's update, a do loop's condition), or -1: a continue that code issues
+// through a statement expression is pending after ContinueHere, and lands on
+// again, since the continue path runs that code anew (see Statement
+// expressions in lowerC).
+func (c *cLower) loopEnd(f flow.Frame, h, again int32, exits bool, exit flow.Fringe) {
 	c.b.Close(h)
+	if again >= 0 {
+		c.b.ContinueHere(f)
+		c.b.Close(again)
+	}
 	if exits {
 		c.b.Restore(exit)
 	}
@@ -940,7 +1223,7 @@ func (c *cLower) whileStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, exits, exit)
+	c.loopEnd(f, h, -1, exits, exit)
 	c.close(s)
 }
 
@@ -950,13 +1233,15 @@ func (c *cLower) doStmt(n *ts.Node) {
 	saved := c.mark()
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
+	cm := c.mark()
 	exits := c.head(n.ChildByFieldId(k.fCondition))
+	again := c.unmark(cm)
 	h := c.unmark(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = c.b.Push()
 	}
-	c.loopEnd(f, h, exits, exit)
+	c.loopEnd(f, h, again, exits, exit)
 }
 
 func (c *cLower) forStmt(n *ts.Node) {
@@ -986,11 +1271,14 @@ func (c *cLower) forStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
+	again := int32(-1)
 	if upd := n.ChildByFieldId(k.fUpdate); upd != nil {
+		um := c.mark()
 		c.reset()
 		c.exprStmt(upd)
+		again = c.unmark(um)
 	}
-	c.loopEnd(f, h, exits, exit)
+	c.loopEnd(f, h, again, exits, exit)
 	c.close(s)
 }
 
@@ -1008,10 +1296,19 @@ func (c *cLower) forRange(n *ts.Node) {
 	rn := c.node(flow.Stmt, right, c.base, len(c.reads))
 	iter := c.b.Var()
 	c.b.Def(rn, iter)
+	// A reference declarator binds each name to an element of the range
+	// ([dcl.init.ref]), which may-defines the range's base variable by the
+	// address-taking rule, as `&v[i]` does.
+	elem := int32(-1)
+	decl := n.ChildByFieldId(k.fDeclarator)
+	if decl.KindId() == k.referenceDeclarator && !c.constRef(n, decl) {
+		if id := c.baseIdent(right); id != nil {
+			elem = c.lookup(id)
+		}
+	}
 	f := c.b.OpenLoop()
 	c.reset()
 	c.throws++
-	decl := n.ChildByFieldId(k.fDeclarator)
 	h := c.nodeAt(flow.Branch, flow.Span{Start: uint32(decl.StartByte()), End: uint32(right.EndByte())}, c.base, c.base)
 	c.b.Use(h, iter)
 	exit := c.b.Push()
@@ -1019,27 +1316,38 @@ func (c *cLower) forRange(n *ts.Node) {
 	if sb := c.binding(decl); sb != nil {
 		start, names := c.kids(sb)
 		for i := range names {
-			v := c.declare(&names[i])
-			id := c.node(flow.Stmt, &names[i], c.base, c.base)
-			c.def(id, v)
-			c.b.Use(id, iter)
+			c.element(&names[i], iter, elem)
 		}
 		c.done(start)
 	} else if name := c.variable(decl); name != nil {
-		v := c.declare(name)
-		id := c.node(flow.Stmt, name, c.base, c.base)
-		c.def(id, v)
-		c.b.Use(id, iter)
+		c.element(name, iter, elem)
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, true, exit)
+	c.loopEnd(f, h, -1, true, exit)
 	c.close(s)
 }
 
-// caseName is the goto label of a nested case or default label.
+// element declares a range for's bound name as a node that defines it from
+// the iteration variable iter and may-defines elem, the range's base
+// variable when the name is a reference, unless elem is -1.
+func (c *cLower) element(name *ts.Node, iter, elem int32) {
+	v := c.declare(name)
+	id := c.node(flow.Stmt, name, c.base, c.base)
+	c.def(id, v)
+	c.b.Use(id, iter)
+	if elem >= 0 {
+		c.b.MayDef(id, elem)
+	}
+}
+
+// caseName is the goto label of a nested case or default label: cCasePrefix
+// and the label's start byte, built in names, whose bytes stay in place
+// until the next function (a label is a view of them).
 func (c *cLower) caseName(n *ts.Node) string {
-	return cCasePrefix + strconv.FormatUint(uint64(n.StartByte()), 10)
+	at := len(c.names)
+	c.names = strconv.AppendUint(append(c.names, cCasePrefix...), uint64(n.StartByte()), 10)
+	return view(c.names[at:])
 }
 
 // caseBody lowers the statements a case or default label heads.
@@ -1176,17 +1484,36 @@ func (c *cLower) nestedCases(n *ts.Node, tag [2]int, dflt *ts.Node) *ts.Node {
 }
 
 // preproc lowers a preprocessor conditional inside a body: every arm is a
-// path (see Node granularity).
+// path (see Node granularity). Each arm sees only the bindings made before
+// the directive: when an arm ends, the bindings it made are parked and
+// truncated away, and after the last arm every parked binding is bound
+// again, so the code after the directive sees the union.
 func (c *cLower) preproc(n *ts.Node) {
-	saved := c.pp
+	saved, savedArm := c.pp, c.ppArm
+	cond, arm := c.binds.mark(), c.parked.mark()
 	if c.pp < c.blockMark {
-		c.pp = len(c.binds)
+		c.pp, c.ppArm = cond, arm
 	}
-	c.arms(n)
-	c.pp = saved
+	c.arms(n, cond)
+	c.park(cond)
+	for i := arm; i < c.parked.mark(); i++ {
+		b := c.parked.at(i)
+		c.binds.bind(b.name, b.v)
+	}
+	c.parked.truncate(arm)
+	c.pp, c.ppArm = saved, savedArm
 }
 
-func (c *cLower) arms(n *ts.Node) {
+// park moves the bindings an arm made, binds[cond:], into parked.
+func (c *cLower) park(cond int) {
+	for i := cond; i < c.binds.mark(); i++ {
+		b := c.binds.at(i)
+		c.parked.bind(b.name, b.v)
+	}
+	c.binds.truncate(cond)
+}
+
+func (c *cLower) arms(n *ts.Node, cond int) {
 	k := c.k
 	var at flow.Span
 	last := false
@@ -1208,9 +1535,10 @@ func (c *cLower) arms(n *ts.Node) {
 	}
 	c.done(start)
 	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
+		c.park(cond)
 		t := c.b.Push()
 		c.b.Restore(p)
-		c.arms(alt)
+		c.arms(alt, cond)
 		c.b.Merge(t)
 	} else if !last {
 		c.b.Merge(p)
@@ -1360,7 +1688,14 @@ func (c *cLower) value(n *ts.Node) {
 	}
 	switch n.KindId() {
 	case k.identifier:
-		c.ref(n)
+		// An array decays to its address here (C17 §6.3.2.1p3), which the
+		// receiver may write through: the address-taking rule of Lowering.
+		at := len(c.reads)
+		v := c.lookup(n)
+		c.read(v)
+		if c.arrayed(v, cArray) {
+			c.mayDef(at, v)
+		}
 	case k.assignmentExpression:
 		_, v := c.assign(n)
 		c.read(v)
@@ -1369,7 +1704,7 @@ func (c *cLower) value(n *ts.Node) {
 		c.read(v)
 	case k.binaryExpression:
 		left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
-		if op := n.ChildByFieldId(k.fOperator).KindId(); op == k.and || op == k.or {
+		if op := n.ChildByFieldId(k.fOperator).KindId(); op == k.and || op == k.or || op == k.altAnd || op == k.altOr {
 			m := len(c.reads)
 			c.value(left)
 			c.node(flow.Branch, left, m, len(c.reads))
@@ -1395,7 +1730,9 @@ func (c *cLower) value(n *ts.Node) {
 		c.valueNode(n.ChildByFieldId(k.fAlternative))
 		c.b.Merge(t)
 		c.b.Pop(p)
-	case k.callExpression, k.newExpression:
+	case k.callExpression, k.newExpression, k.deleteExpression:
+		// A delete expression calls the destructor and the deallocation
+		// function ([expr.delete]), either of which may throw.
 		c.children(n)
 		c.throws++
 	case k.pointerExpression:
@@ -1414,21 +1751,115 @@ func (c *cLower) value(n *ts.Node) {
 			c.throws++
 		}
 	case k.subscriptExpression:
-		c.children(n)
+		// The operands of a subscript are read without the decay: the
+		// element read or written is the subscript's own access.
+		start, list := c.kids(n)
+		for i := range list {
+			if list[i].KindId() == k.identifier {
+				c.ref(&list[i])
+			} else {
+				c.value(&list[i])
+			}
+		}
+		c.done(start)
 		if c.seh > 0 {
 			c.throws++
 		}
 	case k.initializerPair:
 		c.value(n.ChildByFieldId(k.fValue))
-	case k.gnuAsmOutputOperand:
+	case k.asmOutputOperand:
 		c.target(n.ChildByFieldId(k.fValue))
 	case k.compoundStatement:
 		c.stmtExpr(n)
-	case k.sizeofExpression, k.alignofExpression, k.offsetofExpression, k.gnuAsmGotoList, k.qualifiedIdentifier,
-		k.fieldIdentifier, k.this:
+	case k.sizeofExpression:
+		c.sizeofOperand(n, false)
+	case k.genericExpression:
+		c.generic(n, false)
+	case k.alignofExpression, k.offsetofExpression, k.asmGotoList, k.qualifiedIdentifier, k.fieldIdentifier, k.this:
 	default:
 		c.children(n)
 	}
+}
+
+// arrayed reports whether variable v was declared with shape bit s.
+func (c *cLower) arrayed(v int32, s uint8) bool {
+	return v >= 0 && int(v) < len(c.shape) && c.shape[v]&s != 0
+}
+
+// shaped records that variable v was declared with shape bits s.
+func (c *cLower) shaped(v int32, s uint8) {
+	if v < 0 || s == 0 {
+		return
+	}
+	if int(v) >= len(c.shape) {
+		c.shape = append(c.shape, make([]uint8, int(v)+1-len(c.shape))...)
+	}
+	c.shape[v] |= s
+}
+
+// eval lowers n for its value, or collects its captures when capture is set.
+func (c *cLower) eval(n *ts.Node, capture bool) {
+	if capture {
+		c.cap(n)
+	} else {
+		c.value(n)
+	}
+}
+
+// sizeofOperand lowers the operand of sizeof n, which is evaluated only
+// when its type is a variable-length array (C17 §6.5.3.4p2): a VLA local
+// named as the operand is read, and the array sizes of a type name are
+// evaluated.
+func (c *cLower) sizeofOperand(n *ts.Node, capture bool) {
+	k := c.k
+	var id *ts.Node
+	if v := n.ChildByFieldId(k.fValue); v != nil {
+		id = c.l.unparen(v)
+	} else if t := n.ChildByFieldId(k.fType); t != nil {
+		// `sizeof(a)` parses as a type name when a could name a type.
+		if d := t.ChildByFieldId(k.fDeclarator); d != nil {
+			c.typeSizes(d, capture)
+		} else {
+			id = t.ChildByFieldId(k.fType)
+		}
+	}
+	if id != nil && (id.KindId() == k.identifier || id.KindId() == k.typeIdentifier) && c.arrayed(c.lookup(id), cVLA) {
+		c.ref(id)
+	}
+}
+
+// typeSizes evaluates every array size along abstract declarator d, the
+// declarator of a type name.
+func (c *cLower) typeSizes(d *ts.Node, capture bool) {
+	k := c.k
+	for d != nil {
+		switch d.KindId() {
+		case k.abstractArrayDeclarator:
+			if s := d.ChildByFieldId(k.fSize); s != nil && s.IsNamed() {
+				c.eval(s, capture)
+			}
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.abstractPointerDeclarator:
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.abstractParenthesizedDeclarator:
+			d = c.inner(d)
+		default:
+			return
+		}
+	}
+}
+
+// generic lowers a generic selection: its controlling expression is not
+// evaluated (C17 §6.5.1.1p3), and the association selected is decided by
+// type, so every association's expression is lowered.
+func (c *cLower) generic(n *ts.Node, capture bool) {
+	start, list := c.kids(n)
+	for i := 1; i < len(list); i++ {
+		if list[i].KindId() != c.k.typeDescriptor {
+			c.eval(&list[i], capture)
+		}
+	}
+	c.done(start)
 }
 
 // children lowers n's named children for their values.
@@ -1489,11 +1920,15 @@ func (c *cLower) update(n *ts.Node) (made bool, v int32) {
 // operand of an address-taking: its operands are read and its base variable
 // may-defined by the node that consumes it.
 func (c *cLower) target(t *ts.Node) {
-	c.value(t)
+	at := len(c.reads)
+	if u := c.l.unparen(t); u.KindId() == c.k.identifier {
+		// The operand of `&`, or a written array: no decay.
+		c.ref(u)
+	} else {
+		c.value(t)
+	}
 	if id := c.baseIdent(t); id != nil {
-		if v := c.lookup(id); v >= 0 {
-			c.may = append(c.may, v)
-		}
+		c.mayDef(at, c.lookup(id))
 	}
 }
 
@@ -1581,6 +2016,18 @@ func (c *cLower) capture(n *ts.Node) {
 		}
 	}
 	c.writes = c.writes[:kept]
+	if cs == nil {
+		return
+	}
+	// A by-reference init-capture `&r = x` binds a reference to x
+	// ([expr.prim.lambda.capture]/6), a may-definition of x by the rule.
+	start, list := c.kids(cs)
+	for i := range list {
+		if x := &list[i]; x.KindId() == k.lambdaCaptureInitializer && x.Child(0).KindId() == k.amp {
+			c.capWrite(x.ChildByFieldId(k.fRight))
+		}
+	}
+	c.done(start)
 }
 
 // captureList records the reads of a lambda's explicit captures and
@@ -1656,14 +2103,34 @@ func (c *cLower) cap(n *ts.Node) {
 	}
 	switch n.KindId() {
 	case k.identifier:
-		c.ref(n)
+		// An enclosing array evaluated here decays to its address, which
+		// the callable may write through (the address-taking rule).
+		v := c.lookup(n)
+		c.read(v)
+		if c.arrayed(v, cArray) {
+			c.writes = append(c.writes, v)
+		}
+	case k.subscriptExpression:
+		start, list := c.kids(n)
+		for i := range list {
+			if list[i].KindId() == k.identifier {
+				c.ref(&list[i])
+			} else {
+				c.cap(&list[i])
+			}
+		}
+		c.done(start)
+	case k.sizeofExpression:
+		c.sizeofOperand(n, true)
+	case k.genericExpression:
+		c.generic(n, true)
 	case k.assignmentExpression:
 		c.capWrite(n.ChildByFieldId(k.fLeft))
 		c.capKids(n)
 	case k.updateExpression:
 		c.capWrite(n.ChildByFieldId(k.fArgument))
 		c.capKids(n)
-	case k.gnuAsmOutputOperand:
+	case k.asmOutputOperand:
 		c.capWrite(n.ChildByFieldId(k.fValue))
 		c.capKids(n)
 	case k.pointerExpression:
@@ -1681,6 +2148,10 @@ func (c *cLower) cap(n *ts.Node) {
 			c.cap(init)
 		}
 		c.cap(n.ChildByFieldId(k.fRight))
+		// An element reference to a non-const type may write the range.
+		if decl := n.ChildByFieldId(k.fDeclarator); decl.KindId() == k.referenceDeclarator && !c.constRef(n, decl) {
+			c.capWrite(n.ChildByFieldId(k.fRight))
+		}
 		c.capNames(n.ChildByFieldId(k.fDeclarator))
 		c.cap(n.ChildByFieldId(k.fBody))
 		c.close(s)
@@ -1710,15 +2181,20 @@ func (c *cLower) cap(n *ts.Node) {
 			d := &list[i]
 			switch {
 			case d.KindId() == k.initDeclarator:
-				c.capNames(d.ChildByFieldId(k.fDeclarator))
+				inner := d.ChildByFieldId(k.fDeclarator)
+				c.capNames(inner)
 				c.cap(d.ChildByFieldId(k.fValue))
+				// A reference to a non-const type bound to an enclosing object
+				// may write it.
+				if _, ctor := c.name(inner); (ctor == k.referenceDeclarator || inner.KindId() == k.referenceDeclarator) && !c.constRef(n, inner) {
+					c.capWrite(d.ChildByFieldId(k.fValue))
+				}
 			default:
 				c.capNames(d)
 			}
 		}
 		c.done(start)
-	case k.sizeofExpression, k.alignofExpression, k.offsetofExpression, k.gnuAsmGotoList, k.qualifiedIdentifier,
-		k.fieldIdentifier, k.this:
+	case k.alignofExpression, k.offsetofExpression, k.asmGotoList, k.qualifiedIdentifier, k.fieldIdentifier, k.this:
 	case k.fieldExpression:
 		c.cap(n.ChildByFieldId(k.fArgument))
 	case k.initializerPair:
@@ -1797,20 +2273,24 @@ type cSyntax struct {
 	doStatement, forStatement, switchStatement, caseStatement, labeledStatement, attributedStatement,
 	gotoStatement, breakStatement, continueStatement, returnStatement, sehTryStatement, sehExceptClause,
 	sehFinallyClause, sehLeaveStatement, preprocIf, preprocIfdef, preprocElif, preprocElifdef,
-	attributeDeclaration, msCallModifier, identifier, fieldIdentifier, functionDeclarator, pointerDeclarator,
+	attributeDeclaration, callModifier, identifier, fieldIdentifier, functionDeclarator, pointerDeclarator,
 	arrayDeclarator, parenthesizedDeclarator, attributedDeclarator, commaExpression, assignmentExpression,
 	updateExpression, binaryExpression, conditionalExpression, callExpression, pointerExpression,
 	fieldExpression, subscriptExpression, castExpression, sizeofExpression, alignofExpression,
-	offsetofExpression, initializerList, initializerPair, gnuAsmExpression, gnuAsmOutputOperand,
-	gnuAsmGotoList, trueLit, numberLiteral uint16
+	offsetofExpression, initializerList, initializerPair, asmExpression, asmOutputOperand,
+	asmGotoList, trueLit, numberLiteral, genericExpression, typeDescriptor, typeIdentifier,
+	abstractArrayDeclarator, abstractPointerDeclarator, abstractParenthesizedDeclarator, primitiveType,
+	sizedTypeSpecifier, enumSpecifier, storageClassSpecifier, typeQualifier uint16
 
 	// C++ only.
 	lambdaExpression, lambdaCaptureInitializer, lambdaDefaultCapture, tryStatement, catchClause,
 	throwStatement, coReturnStatement, forRangeLoop, conditionClause, fieldInitializerList, newExpression,
 	referenceDeclarator, variadicDeclarator, structuredBindingDeclarator, qualifiedIdentifier, operatorCast,
-	argumentList, this uint16
+	argumentList, this, deleteExpression uint16
 
 	and, or, assign, star, arrow, amp, ellipsis uint16
+	// C++ only: the alternative tokens `and` and `or` ([lex.digraph]).
+	altAnd, altOr uint16
 
 	fAlternative, fArgument, fBody, fCondition, fConsequence, fDeclarator, fFilter, fGotoLabels,
 	fInitializer, fLabel, fLeft, fName, fOperator, fParameters, fRight, fSize, fType, fUpdate, fValue uint16
@@ -1852,7 +2332,7 @@ func resolveCSyntax(language string) *cSyntax {
 	s.returnStatement, s.sehTryStatement, s.sehExceptClause = kind("return_statement"), kind("seh_try_statement"), kind("seh_except_clause")
 	s.sehFinallyClause, s.sehLeaveStatement = kind("seh_finally_clause"), kind("seh_leave_statement")
 	s.preprocIf, s.preprocIfdef, s.preprocElif, s.preprocElifdef = kind("preproc_if"), kind("preproc_ifdef"), kind("preproc_elif"), kind("preproc_elifdef")
-	s.attributeDeclaration, s.msCallModifier = kind("attribute_declaration"), kind("ms_call_modifier")
+	s.attributeDeclaration, s.callModifier = kind("attribute_declaration"), kind("ms_call_modifier")
 	s.identifier, s.fieldIdentifier, s.functionDeclarator = kind("identifier"), kind("field_identifier"), kind("function_declarator")
 	s.pointerDeclarator, s.arrayDeclarator = kind("pointer_declarator"), kind("array_declarator")
 	s.parenthesizedDeclarator, s.attributedDeclarator = kind("parenthesized_declarator"), kind("attributed_declarator")
@@ -1861,8 +2341,13 @@ func resolveCSyntax(language string) *cSyntax {
 	s.pointerExpression, s.fieldExpression, s.subscriptExpression = kind("pointer_expression"), kind("field_expression"), kind("subscript_expression")
 	s.castExpression, s.sizeofExpression, s.alignofExpression = kind("cast_expression"), kind("sizeof_expression"), kind("alignof_expression")
 	s.offsetofExpression, s.initializerList, s.initializerPair = kind("offsetof_expression"), kind("initializer_list"), kind("initializer_pair")
-	s.gnuAsmExpression, s.gnuAsmOutputOperand, s.gnuAsmGotoList = kind("gnu_asm_expression"), kind("gnu_asm_output_operand"), kind("gnu_asm_goto_list")
-	s.trueLit, s.numberLiteral = kind("true"), kind("number_literal")
+	s.asmExpression, s.asmOutputOperand, s.asmGotoList = kind("gnu_asm_expression"), kind("gnu_asm_output_operand"), kind("gnu_asm_goto_list")
+	s.trueLit, s.numberLiteral, s.genericExpression = kind("true"), kind("number_literal"), kind("generic_expression")
+	s.typeDescriptor, s.typeIdentifier = kind("type_descriptor"), kind("type_identifier")
+	s.abstractArrayDeclarator, s.abstractPointerDeclarator = kind("abstract_array_declarator"), kind("abstract_pointer_declarator")
+	s.abstractParenthesizedDeclarator, s.primitiveType = kind("abstract_parenthesized_declarator"), kind("primitive_type")
+	s.sizedTypeSpecifier, s.enumSpecifier = kind("sized_type_specifier"), kind("enum_specifier")
+	s.storageClassSpecifier, s.typeQualifier = kind("storage_class_specifier"), kind("type_qualifier")
 	s.and, s.or, s.assign, s.star, s.arrow, s.amp = tok("&&"), tok("||"), tok("="), tok("*"), tok("->"), tok("&")
 	s.fAlternative, s.fArgument, s.fBody, s.fCondition = field("alternative"), field("argument"), field("body"), field("condition")
 	s.fConsequence, s.fDeclarator, s.fFilter, s.fGotoLabels = field("consequence"), field("declarator"), field("filter"), field("goto_labels")
@@ -1877,6 +2362,8 @@ func resolveCSyntax(language string) *cSyntax {
 		s.referenceDeclarator, s.variadicDeclarator = kind("reference_declarator"), kind("variadic_declarator")
 		s.structuredBindingDeclarator, s.qualifiedIdentifier = kind("structured_binding_declarator"), kind("qualified_identifier")
 		s.operatorCast, s.argumentList, s.this = kind("operator_cast"), kind("argument_list"), kind("this")
+		s.deleteExpression = kind("delete_expression")
+		s.altAnd, s.altOr = tok("and"), tok("or")
 		s.ellipsis = tok("...")
 		s.fCaptures = field("captures")
 		noNode = append(noNode, "class_specifier", "using_declaration", "alias_declaration", "namespace_definition",

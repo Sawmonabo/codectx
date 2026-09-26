@@ -39,6 +39,10 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 	if !ok {
 		t.Fatalf("no lowering for %q", language)
 	}
+	// One Scratch serves every case, as one serves every function a worker
+	// lowers, so a list a case leaves behind reaches the next one's lowering.
+	var s Scratch
+	defer s.Close()
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			src := []byte(c.src)
@@ -67,7 +71,7 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				t.Fatalf("callable %d not found (%d callables)", c.fn, i)
 			}
 			var a flow.Arena
-			g := low.Lower(fn, src, &a)
+			g := low.Lower(fn, src, &a, &s)
 			pd := flow.PostDominators(g, &a)
 			render := func(e flow.Edges) []string {
 				out := make([]string, 0, e.Len())

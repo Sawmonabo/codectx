@@ -286,21 +286,32 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x@11 -> x@24", "x@11 -> 1@34", "x@11 -> 2@54"},
 		},
 		{
-			// ECMAScript §13.15.2: a compound assignment evaluates the
-			// reference, then the right side, then PutValue. The write's node
-			// o.p += c ? 1 : 2@25 carries the throw, after the right side's
-			// Branch c@32 and its arms 1@36 and 2@40, so c controls only its
-			// arms and the write controls the catch's Handler@44, e@51, h()@56.
-			name:     "a compound property write's throw is on the write's node",
-			protects: "the throw of a compound property assignment is not attached to the first node its right side makes",
-			mutation: "count the target's throw before the right side (c@32 gains control of catch@44, e@51 and h()@56)",
+			// ECMA-262 §13.15.2 (AssignmentExpression: LeftHandSideExpression
+			// AssignmentOperator AssignmentExpression): the reference is
+			// evaluated and its value read (GetValue) before the right side,
+			// and PutValue stores after it. Nodes: the property read o.p@25
+			// (Uses o, may throw), the right side's Branch c@32 and its arms
+			// 1@36 and 2@40, then the write o.p += c ? 1 : 2@25 (Uses o and
+			// c, may throw). Both throwing nodes reach the catch's Handler
+			// catch@44, then e@51 and h()@56. The read's successors are c@32
+			// and the Handler; c@32 is post-dominated by the write, the
+			// Handler by e and h(), so the read controls those five; the
+			// write controls the Handler's three; c controls its arms.
+			name:     "a compound property assignment reads the property before its right side",
+			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
+				"o.p@25 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25",
+				"o.p@25 -> catch@44", "o.p@25 -> e@51", "o.p@25 -> h()@56",
 				"c@32 -> 1@36", "c@32 -> 2@40",
 				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
 			},
-			du: []string{"c@14 -> c@32", "o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25"},
+			du: []string{
+				"o@11 -> o.p@25", "c@14 -> c@32",
+				"o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25",
+			},
 		},
 		{
 			// ECMAScript §16.2.2 ImportDeclaration: each ImportSpecifier binds
@@ -310,10 +321,41 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			// dependence.
 			name:     "a comment between import specifiers binds nothing",
 			protects: "the lowering walks an import clause as the extraction does and never takes a comment for a specifier (a comment has no name field, so reading one dereferences a nil node)",
-			mutation: "drop the import_specifier kind check in importClauseBindings (the comment is read as a specifier: a nil dereference, or b@20 loses its binding)",
+			mutation: "end the named-imports walk in importClauseBindings at the first extra (break when the cursor's node IsExtra): b is never bound, so b@20 -> g(a, b)@34 vanishes",
 			src:      "import { a, /* c */ b } from \"m\"; g(a, b);",
 			fn:       0,
 			du:       []string{"a@9 -> g(a, b)@34", "b@20 -> g(a, b)@34"},
+		},
+		{
+			// ECMA-262 §13.15.2: a plain assignment evaluates its right side
+			// and stores it (PutValue); it never reads the target's value.
+			// Nodes: x@11, the arrow () => { x = 1; }@26 (may-defines x, Uses
+			// nothing), the declarator g = () => { x = 1; }@22 (defines g,
+			// Uses nothing), return x;@44, reached by x@11 and the arrow's
+			// non-killing may-definition. Straight line, no control
+			// dependence.
+			name:     "a closure's plain assignment writes an enclosing variable without reading it",
+			protects: "the creating node of a closure that only assigns an enclosing variable does not Use it, so no earlier definition flows into the closure",
+			mutation: "collect a plain assignment's target as a read in cap (x@11 -> () => { x = 1; }@26 and x@11 -> g = () => { x = 1; }@22 appear)",
+			src:      "function f(x) { const g = () => { x = 1; }; return x; }",
+			fn:       1,
+			du:       []string{"x@11 -> return x;@44", "() => { x = 1; }@26 -> return x;@44"},
+		},
+		{
+			// ECMA-262 §15.7.14 ClassDefinitionEvaluation: a static field's
+			// initializer runs while the class is created, so the class
+			// declaration's node class A { static x = g(); }@21 may throw and
+			// is the catch's only way in: it controls the Handler catch@51,
+			// e@58 and h()@63. No variable is read.
+			name:     "a class whose static initializer runs at its creation may throw there",
+			protects: "a static field initializer, a static block or a computed key is a throw point of the class's creation",
+			mutation: "count only a heritage and a decorator as a class-level throw (the class node controls nothing and the catch is unreachable)",
+			src:      "function f() { try { class A { static x = g(); } } catch (e) { h(); } }",
+			fn:       1,
+			cd: []string{
+				"class A { static x = g(); }@21 -> catch@51", "class A { static x = g(); }@21 -> e@58",
+				"class A { static x = g(); }@21 -> h()@63",
+			},
 		},
 	})
 }

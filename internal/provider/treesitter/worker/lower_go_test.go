@@ -265,5 +265,51 @@ func TestGoLoweringGolden(t *testing.T) {
 			src:      "package p\nfunc f() int { x := 1; g(&x); return x }",
 			du:       []string{"x := 1@25 -> g(&x)@33", "x := 1@25 -> return x@40", "g(&x)@33 -> return x@40"},
 		},
+		{
+			// Go spec, Short variable declarations and Assignment statements:
+			// every operand is evaluated, then the targets are assigned, so
+			// x's final value is g's result whatever g wrote through &x.
+			// Nodes: x := 0@25, the target nodes x@33 (Uses x through &x,
+			// defines x; the may-definition &x makes is on it, the node that
+			// evaluates g(&x), and is overwritten by its own assignment) and
+			// y@36 (defines y), return x@51, reached only by x@33.
+			name:     "a multi-assignment's address-taking lands on the node that evaluates it",
+			protects: "the may-definition of an address taken in a paired value is attached by position, never to the statement's last node",
+			mutation: "attach the statement's may-definitions to its last node (y@36 -> return x@51 appears)",
+			src:      "package p\nfunc f() int { x := 0; x, y := g(&x), 2; return x }",
+			du:       []string{"x := 0@25 -> x@33", "x@33 -> return x@51"},
+		},
+		{
+			// Go spec, Select statements: the channel operand and the sent
+			// value `&x` are evaluated once, on entering the select, so the
+			// head select@45 Uses ch and x and may-defines x; the clause node
+			// ch <- &x@59 Uses them again and writes nothing. The head has one
+			// successor, so there is no control dependence. return x@72 is
+			// reached by x := 0@37 and the head's non-killing may-definition.
+			name:     "a select clause's address-taking is may-defined once, at the head",
+			protects: "an address taken in a select's channel operand or sent value is a may-definition of the head that evaluates it, not of the clause",
+			mutation: "collect a send clause's operands with their may-definitions on its node (ch <- &x@59 -> return x@72 appears)",
+			src:      "package p\nfunc f(ch chan *int) int { x := 0; select { case ch <- &x: }; return x }",
+			du: []string{"ch@17 -> select@45", "x := 0@37 -> select@45", "ch@17 -> ch <- &x@59",
+				"x := 0@37 -> ch <- &x@59", "select@45 -> ch <- &x@59",
+				"x := 0@37 -> return x@72", "select@45 -> return x@72"},
+		},
+		{
+			// Go spec, Logical operators and Address operators: g(&x) is
+			// evaluated only when a is true, by its own hoisted Branch
+			// g(&x)@47, which Uses x and may-defines it; the condition
+			// a && g(&x)@42 reads a and x and writes nothing. Nodes: a@17,
+			// x := 0@31, the operand Branch a@42, g(&x)@47, the condition,
+			// return x@58. a@42 reaches the condition directly when false,
+			// so it controls g(&x)@47 only.
+			name:     "a short-circuit operand's address-taking is on the operand's node",
+			protects: "an address taken inside a hoisted && operand is a may-definition of the operand's node, not also of the node owning the expression",
+			mutation: "keep the may-definitions of short-circuit operands when collecting the owning node (a && g(&x)@42 -> return x@58 appears)",
+			src:      "package p\nfunc f(a bool) int { x := 0; if a && g(&x) { }; return x }",
+			cd:       []string{"a@42 -> g(&x)@47"},
+			du: []string{"a@17 -> a@42", "a@17 -> a && g(&x)@42", "x := 0@31 -> g(&x)@47",
+				"x := 0@31 -> a && g(&x)@42", "g(&x)@47 -> a && g(&x)@42",
+				"x := 0@31 -> return x@58", "g(&x)@47 -> return x@58"},
+		},
 	})
 }

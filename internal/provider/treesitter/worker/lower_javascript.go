@@ -52,9 +52,9 @@ type jsGrammar struct {
 }
 
 // lower is the Lowering.lower of the grammar: lowerJavaScript over its table.
-func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
+func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
 	g.once.Do(func() { g.s = resolveJSSyntax(g.language) })
-	lowerJavaScript(l, b, fn, src, g.s)
+	lowerJavaScript(l, b, fn, src, s, g.s)
 }
 
 // lowerJavaScript lowers one JavaScript callable's parameters and body into b.
@@ -115,9 +115,11 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 //     over-approximation.
 //   - A nested callable or class is its own function; in the enclosing
 //     function its creating expression is one Stmt node spanning it, which
-//     Uses every enclosing variable referenced inside it, resolved with its
-//     own scopes so a name it declares shadows, and may-defines (MayDef, a
-//     non-killing definition) every enclosing variable assigned inside it:
+//     Uses every enclosing variable read inside it, resolved with its own
+//     scopes so a name it declares shadows, and may-defines (MayDef, a
+//     non-killing definition) every enclosing variable assigned inside it;
+//     a plain assignment or binding target is written and not read, while a
+//     compound assignment or an update also reads its variable:
 //     when the closure runs is unknown, so a use after its creation sees both
 //     the closure's write and every definition reaching the creation. A
 //     class's field initializers and static blocks, static and instance
@@ -160,40 +162,49 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 // defining node also Uses the variables of the value it destructures, and a
 // destructuring element those of its computed key and property target. A
 // property write (`o.p = v`, `a[i] = v`) is a Stmt node spanning the
-// assignment that Uses o, a, i and v and defines nothing.
+// assignment that Uses o, a, i and v and defines nothing; a compound one
+// (`o.p += v`) is first a Stmt node spanning the target, the property read,
+// that Uses o (and a and i), then that write node.
 //
 // # Exceptions
 //
 // MayThrow is given to every node whose own evaluation — the part of the
 // source evaluated since the previous node — contains a call, `new`,
 // `await`, `yield`, a spread, a property read or write, a destructuring
-// element, a for…of iterator step (including for await), or a class
-// declaration's heritage; a throw statement's node is also a Throw. A plain
-// or compound property write throws when the value is stored, so its throw
-// is counted after its right side, on the write's node. The Builder applies MayThrow
-// only inside an open catch or finally frame, where the throwing node's own
-// definitions do not reach the handler.
+// element, a for…of iterator step (including for await), or the creation of
+// a class that evaluates an `extends` expression, a computed key, a static
+// field initializer, a static block or a decorator (ECMA-262 §15.7.14); a
+// throw statement's node is also a Throw. A property write throws when the
+// value is stored, after its right side, so its throw is on the write's
+// node. A compound property assignment reads the property before its right
+// side is evaluated (§13.15.2), so that read throws on its own node before
+// the right side's nodes, and the store throws on the write's node after
+// them. The Builder applies MayThrow only inside an open catch or finally
+// frame, where the throwing node's own definitions do not reach the handler.
 //
 // # Scoping
 //
 // `var` and a function's parameters are function-scoped and hoisted, as are
-// import bindings in the program; `let`, `const`, `using`, `class` and a
-// function declaration in a block are block-scoped and bound from the block's
+// import bindings in the program; `let`, `const`, `using`, `class`, a
+// TypeScript enum or namespace, and a function declaration in a block are
+// block-scoped and bound from the block's
 // start (the strict-mode rule, which modules and classes impose); a catch
 // parameter is scoped to its clause and a `for (let …)` binding to its loop;
 // a switch body is one block. Parameter defaults see the parameters only.
 //
 // # TypeScript
 //
-// Syntax the compiler erases produces no node and binds no variable (the
-// handbook's "Erased Types"): type annotations, type parameters and
-// arguments, interfaces, type aliases, `declare` declarations, overload and
-// method signatures without a body, abstract members, index signatures,
+// Syntax the compiler erases, emitting no code for it, produces no node and
+// binds no variable: type annotations, type parameters and arguments,
+// interfaces, type aliases, `declare` declarations, overload and method
+// signatures without a body, abstract members, index signatures,
 // `implements` clauses, `import type`, a `type` import specifier, and a
-// `const enum` (removed at compilation, the handbook's "const enums"); an
-// erased subtree is skipped wherever it stands, so a `typeof x` inside a
-// type reads nothing. `e!`, `e as T`, `e satisfies T`, `<T>e` and `f<T>`
-// evaluate to their operand and lower as it: a node the enclosing construct
+// `const enum` (its uses are replaced by the members' values); an erased
+// subtree is skipped wherever it stands, so a `typeof x` inside a type reads
+// nothing. `e!`, `e as T`, `e satisfies T`, `<T>e` and `f<T>` evaluate to
+// their operand and lower as it (the capture collection of a nested
+// callable or class, too, walks only the operand, never the type): a node
+// the enclosing construct
 // makes for the whole expression (a condition's Branch, a statement's node)
 // spans the expression as written, wrapper included, and a node the
 // operand's own lowering made (an optional chain, a nested callable, an
@@ -209,16 +220,23 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 // carry a decorator may throw, and an exported class's decorators are read
 // by its node. (This holds for JavaScript decorators too.) `public_field_definition`
 // is the field initializer of the class body's unit. An abstract class is a
-// class. The compiler emits an enum, a namespace and `import x = …` as a
-// `var` with an assignment where the declaration stands, so their names are
-// function-scoped and hoisted like var, and a second declaration of the
-// same name merges into the same variable:
+// class. The compiler emits an enum and a namespace as a variable declared
+// where the declaration stands, a `var` at a file's top level and a `let`
+// everywhere else, then an assignment to it, so the name is block-scoped
+// and bound from its block's start (at a file's top level the program's
+// block is its function scope, so the two agree); a later enum or namespace
+// of a name its block already binds (an enum or namespace before it, or the
+// class or function a namespace merges with) declares no second variable and
+// assigns the same one. `import x = …` is emitted as a `var`, so its name is
+// function-scoped and hoisted like var:
 //
 //   - An enum is one Stmt node spanning its name that Uses and defines the
 //     name (the emitted `E || (E = {})`), then one Stmt node per member
 //     initializer, spanning the member, in order; every member's bare name
 //     is bound to no variable throughout the body, since inside an
-//     initializer it names the member (the handbook's "Enums").
+//     initializer it names the member (the emitted body assigns each member
+//     as a property of the enum object and reads a member name as that
+//     property).
 //   - A namespace with a body runs its body once, immediately, where it
 //     stands (the emitted immediately invoked function), so it is lowered
 //     inline, not as a callable: one Stmt node spanning the leftmost name
@@ -228,10 +246,18 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 //     and may throw; `import x = A.B` is one spanning x that Uses A and
 //     defines x, and may throw when it reads a property.
 //   - `export = e` evaluates e like a default export.
-func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k *jsSyntax) {
-	cur := fn.Walk()
-	defer cur.Close()
-	j := jsLower{l: l, b: b, src: src, k: k, cur: cur, first: -1, last: -1, stmtNo: 1}
+func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch, k *jsSyntax) {
+	// The state is s.js, reset in place: every list keeps its capacity, and
+	// the lists holding nodes or views of the previous function's source are
+	// cleared first, so nothing of it outlives its function. seen is
+	// truncated too, so the markers the previous function left are zeroed
+	// as it grows again and stmtNo can start over.
+	j := &s.js
+	clear(j.buf[:cap(j.buf)])
+	clear(j.lab[:cap(j.lab)])
+	*j = jsLower{l: l, b: b, src: src, k: k, cur: s.cursor(fn), buf: j.buf[:0], binds: &s.scope,
+		reads: j.reads[:0], seen: j.seen[:0], stmtNo: 1, writes: j.writes[:0], first: -1, last: -1,
+		opt: j.opt[:0], lab: j.lab[:0], held: j.held[:0], match: j.match[:0]}
 	switch fn.KindId() {
 	case k.program:
 		j.hoistVars(fn)
@@ -285,12 +311,12 @@ func (j *jsLower) classBody(n *ts.Node) {
 				j.node(flow.Stmt, m, 0, len(j.reads))
 			}
 		case k.classStaticBlock:
-			mark := len(j.binds)
+			mark := j.binds.mark()
 			j.fnMark = mark
 			body := m.ChildByFieldId(k.fBody)
 			j.hoistVars(body)
 			j.block(body)
-			j.binds = j.binds[:mark]
+			j.binds.truncate(mark)
 		}
 	}
 	j.done(start)
@@ -307,7 +333,7 @@ type jsLower struct {
 	buf []ts.Node
 	// binds is the scope chain, innermost last; fnMark is where the
 	// innermost function scope begins, the target of var hoisting.
-	binds  scope
+	binds  *scope
 	fnMark int
 	// shadow is non-zero while walking a nested callable or class for its
 	// captures: declarations then bind -1 and no node is created.
@@ -333,14 +359,17 @@ type jsLower struct {
 	// opt holds the fringes saved at each `?.` of the optional chains being
 	// lowered, innermost chain last.
 	opt []flow.Fringe
-	// labels are the statement labels the next statement takes.
-	labels []string
+	// labels are the statement labels the next statement takes, the top of
+	// lab, the stack of the labels of the labelled statements being lowered.
+	labels, lab []string
 	// held keeps the reads of the discriminants of the switches whose case
 	// tests are being lowered; match holds their case tests' fringes.
 	held  []int32
 	match []flow.Fringe
-	// decorated counts the decorators collected: a class whose collection
-	// counted one may throw where it is created.
+	// decorated counts the decorators collected that are evaluated where the
+	// class being collected is created: a class whose collection counted one
+	// may throw there. A nested callable's parameters and body and a field's
+	// initializer run later, so collecting them leaves it unchanged.
 	decorated int
 }
 
@@ -375,7 +404,7 @@ func (j *jsLower) declare(name *ts.Node) int32 {
 	if j.shadow == 0 {
 		v = j.b.Var()
 	}
-	j.binds = append(j.binds, binding{name: j.text(name), v: v})
+	j.binds.push(j.text(name), v)
 	return v
 }
 
@@ -582,14 +611,14 @@ func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
 	if body == nil {
 		return
 	}
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(body)
 	for i := range list {
 		member := &list[i]
 		if member.KindId() == k.enumAssignment {
 			member = member.ChildByFieldId(k.fName)
 		}
-		j.binds = append(j.binds, binding{name: j.text(member), v: -1})
+		j.binds.push(j.text(member), -1)
 	}
 	for i := range list {
 		m := &list[i]
@@ -606,7 +635,7 @@ func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
 		}
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // namespace lowers a namespace with a body inline (see TypeScript in
@@ -620,11 +649,12 @@ func (j *jsLower) namespace(n *ts.Node) {
 	v := j.lookup(name)
 	j.read(v)
 	j.def(j.node(flow.Stmt, name, 0, 0), v)
-	mark, savedFn := len(j.binds), j.fnMark
+	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	j.hoistVars(body)
 	j.block(body)
-	j.binds, j.fnMark = j.binds[:mark], savedFn
+	j.binds.truncate(mark)
+	j.fnMark = savedFn
 }
 
 // importEquals lowers `import x = require(m)` and `import x = A.B`.
@@ -726,10 +756,10 @@ func (j *jsLower) close(saved int32) int32 {
 // block lowers a statement list in its own lexical scope: its lexical names
 // are bound from the start and its function declarations defined there.
 func (j *jsLower) block(n *ts.Node) {
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
-		j.predeclare(&list[i])
+		j.predeclare(&list[i], mark)
 	}
 	for i := range list {
 		j.hoistFunction(&list[i])
@@ -738,11 +768,14 @@ func (j *jsLower) block(n *ts.Node) {
 		j.stmt(&list[i])
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
-// predeclare binds the block-scoped names statement n declares.
-func (j *jsLower) predeclare(n *ts.Node) {
+// predeclare binds the block-scoped names statement n declares, in the block
+// whose bindings start at mark. An enum or a namespace whose name the block
+// already binds (an enum or namespace before it, or the class or function a
+// namespace merges with) merges into that variable.
+func (j *jsLower) predeclare(n *ts.Node, mark int) {
 	k := j.k
 	switch n.KindId() {
 	case k.lexicalDeclaration, k.usingDeclaration:
@@ -755,7 +788,22 @@ func (j *jsLower) predeclare(n *ts.Node) {
 		j.declare(n.ChildByFieldId(k.fName))
 	case k.exportStatement:
 		if d := n.ChildByFieldId(k.fDeclaration); d != nil {
-			j.predeclare(d)
+			j.predeclare(d, mark)
+		}
+	case k.enumDeclaration:
+		if name := n.ChildByFieldId(k.fName); !j.erased(n) && !j.boundSince(mark, name) {
+			j.declare(name)
+		}
+	case k.internalModule, k.module, k.expressionStatement:
+		// Only a TypeScript grammar has namespaces; the guard keeps an
+		// expression statement of the other grammars from being inspected.
+		if k.internalModule == 0 {
+			return
+		}
+		if ns := j.namespaceOf(n); ns != nil && ns.ChildByFieldId(k.fBody) != nil {
+			if name := j.root(ns.ChildByFieldId(k.fName)); name != nil && name.KindId() == k.identifier && !j.boundSince(mark, name) {
+				j.declare(name)
+			}
 		}
 	}
 }
@@ -817,17 +865,6 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 			j.declarePattern(n.ChildByFieldId(k.fLeft), true)
 		}
 		j.hoistVars(n.ChildByFieldId(k.fBody))
-	case k.enumDeclaration:
-		if !j.erased(n) {
-			j.declarePattern(n.ChildByFieldId(k.fName), true)
-		}
-	case k.internalModule, k.module, k.expressionStatement:
-		// A namespace's own var names stay in its body's scope.
-		if ns := j.namespaceOf(n); ns != nil && ns.ChildByFieldId(k.fBody) != nil {
-			if name := j.root(ns.ChildByFieldId(k.fName)); name != nil && name.KindId() == k.identifier {
-				j.declarePattern(name, true)
-			}
-		}
 	case k.importStatement, k.importAlias:
 		if !j.erased(n) {
 			j.hoistEquals(n)
@@ -971,17 +1008,17 @@ func (j *jsLower) stmt(n *ts.Node) {
 // with or label, in an implicit block of its own: a declaration there binds
 // its names in that block, and a function declaration is hoisted within it.
 func (j *jsLower) sub(n *ts.Node) {
-	mark := len(j.binds)
-	j.predeclare(n)
+	mark := j.binds.mark()
+	j.predeclare(n, mark)
 	j.hoistFunction(n)
 	j.stmt(n)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // label is a break or continue statement's label, or "".
 func (j *jsLower) label(n *ts.Node) string {
 	if l := n.ChildByFieldId(j.k.fLabel); l != nil {
-		return string(j.text(l))
+		return view(j.text(l))
 	}
 	return ""
 }
@@ -1125,10 +1162,10 @@ func (j *jsLower) doStmt(n *ts.Node, labels []string) {
 
 func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	switch init := n.ChildByFieldId(k.fInitializer); init.KindId() {
 	case k.lexicalDeclaration:
-		j.predeclare(init)
+		j.predeclare(init, mark)
 		j.stmt(init)
 	case k.variableDeclaration:
 		j.stmt(init)
@@ -1158,13 +1195,13 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 		j.exprStmt(inc)
 	}
 	j.loopEnd(f, h, exits, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 // forIn lowers for…in, for…of and for await…of.
 func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	k := j.k
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	left := j.strip(n.ChildByFieldId(k.fLeft))
 	kw := n.ChildByFieldId(k.fKind)
 	if kw != nil && kw.KindId() != k.varKw {
@@ -1204,7 +1241,7 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
@@ -1218,7 +1255,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	hb := len(j.held)
 	j.held = append(j.held, j.reads...)
 	he := len(j.held)
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	start, cases := j.kids(n.ChildByFieldId(k.fBody))
 	// A case's statements are its named children after the test value.
 	body := func(c *ts.Node) (int, []ts.Node) {
@@ -1231,7 +1268,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	for c := range cases {
 		s, list := body(&cases[c])
 		for i := range list {
-			j.predeclare(&list[i])
+			j.predeclare(&list[i], mark)
 		}
 		j.done(s)
 	}
@@ -1294,7 +1331,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	j.b.Pop(firstPush)
 	j.match = j.match[:fb]
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 }
 
 func (j *jsLower) tryStmt(n *ts.Node) {
@@ -1311,14 +1348,14 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 	if handler != nil {
 		t := j.b.Push()
 		j.b.EnterHandler(cf, spanOf(handler.Child(0)))
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if p := handler.ChildByFieldId(k.fParameter); p != nil {
 			j.reset()
 			j.declarePattern(p, false)
 			j.bind(p, 0, 0)
 		}
 		j.block(handler.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(t)
 	}
@@ -1334,7 +1371,13 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 // targets.
 func (j *jsLower) labeled(n *ts.Node, labels []string) {
 	k := j.k
-	labels = append(labels, string(j.text(n.ChildByFieldId(k.fLabel))))
+	// labels, the labels of the labelled statements this one is the body of,
+	// is the top of lab; this label is pushed after them. The frame a loop,
+	// a switch or the block below opens copies the names, so they are popped
+	// once n is lowered.
+	start := len(j.lab) - len(labels)
+	j.lab = append(j.lab, view(j.text(n.ChildByFieldId(k.fLabel))))
+	labels = j.lab[start:]
 	body := n.ChildByFieldId(k.fBody)
 	switch body.KindId() {
 	case k.forStatement, k.forInStatement, k.whileStatement, k.doStatement, k.switchStatement, k.labeledStatement:
@@ -1345,6 +1388,7 @@ func (j *jsLower) labeled(n *ts.Node, labels []string) {
 		j.sub(body)
 		j.b.CloseFrame(f)
 	}
+	j.lab = j.lab[:start]
 }
 
 // value lowers an expression evaluated for its value: reads are recorded,
@@ -1448,7 +1492,9 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 		recv = n.ChildByFieldId(k.fFunction)
 	}
 	j.value(recv, true)
-	if n.ChildByFieldId(k.fOptionalChain) != nil {
+	// A TypeScript optional call `f?.(…)` carries its `?.` as an anonymous
+	// token, not in the optional_chain field.
+	if n.ChildByFieldId(k.fOptionalChain) != nil || id == k.callExpression && j.hasTok(n, k.optTok) {
 		j.node(flow.Branch, recv, m, len(j.reads))
 		j.opt = append(j.opt, j.b.Push())
 	}
@@ -1562,9 +1608,17 @@ func (j *jsLower) augment(n *ts.Node) (made bool, v int32) {
 		property = j.reference(left)
 	}
 	if !logical {
-		// As for a plain property write, the throw of the read and the store
-		// is counted after the right side, on the node spanning n that the
-		// enclosing expression makes, not on a node the right side makes.
+		if property {
+			// ECMA-262 §13.15.2: the reference's value is read (GetValue)
+			// before the right side is evaluated, so the property read throws
+			// on a node of its own, spanning the target, before any node the
+			// right side makes.
+			j.throws++
+			j.node(flow.Stmt, left, m, len(j.reads))
+		}
+		// The store (PutValue) follows the right side: as for a plain
+		// property write, its throw is on the node spanning n that the
+		// enclosing expression makes.
 		j.value(right, false)
 		if left.KindId() != k.identifier {
 			if property {
@@ -1590,9 +1644,11 @@ func (j *jsLower) augment(n *ts.Node) (made bool, v int32) {
 
 // bind lowers a binding or assignment pattern whose incoming value read
 // reads[from:to]: one defining node per bound name, in source order, each
-// using all of reads[from:to] (see Destructuring in lowerJavaScript).
+// using all of reads[from:to] (see Destructuring in lowerJavaScript). An
+// element is read through the transparent wrappers, so `[y!] = a` defines y.
 func (j *jsLower) bind(p *ts.Node, from, to int) {
 	k := j.k
+	p = j.strip(p)
 	switch p.KindId() {
 	case k.identifier, k.shorthandPropertyIdentifierPattern:
 		j.def(j.node(flow.Stmt, p, from, to), j.lookup(p))
@@ -1644,6 +1700,7 @@ func (j *jsLower) bind(p *ts.Node, from, to int) {
 // the incoming value is undefined, the default is evaluated only then.
 func (j *jsLower) defaulted(left, dflt, whole *ts.Node, from, to int) {
 	k := j.k
+	left = j.strip(left)
 	named := left.KindId() == k.identifier || left.KindId() == k.shorthandPropertyIdentifierPattern
 	v := int32(-1)
 	if named {
@@ -1687,8 +1744,12 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 		}
 		j.done(start)
 	}
+	// The parameters' defaults and the body run when the callable is
+	// called, not where an enclosing class is created, so a decorator in
+	// them is not counted for that class.
+	dec := j.decorated
 	j.shadow++
-	mark, savedFn := len(j.binds), j.fnMark
+	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	if id == k.functionExpression || id == k.generatorFunction {
 		if nm := fn.ChildByFieldId(k.fName); nm != nil {
@@ -1712,27 +1773,38 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 		j.hoistVars(body)
 	}
 	j.cap(body)
-	j.binds, j.fnMark = j.binds[:mark], savedFn
+	j.binds.truncate(mark)
+	j.fnMark = savedFn
 	j.shadow--
+	j.decorated = dec
 }
 
 // capClass collects a class's captures: its heritage, computed member names,
 // field initializers and members. The class's own name is bound inside it.
-// A heritage expression is evaluated, and may throw, where the class is
-// created.
+// Where the class is created (ECMA-262 §15.7.14 ClassDefinitionEvaluation)
+// its `extends` expression, its computed keys, its static field initializers
+// and its static blocks are evaluated, and each may throw; a TypeScript
+// `implements` clause is erased and evaluates nothing.
 func (j *jsLower) capClass(n *ts.Node) {
 	k := j.k
 	start, list := j.kids(n)
 	if j.shadow == 0 {
 		for i := range list {
-			if list[i].KindId() == k.classHeritage {
-				j.throws++
+			switch c := &list[i]; c.KindId() {
+			case k.classHeritage:
+				if k.extendsClause == 0 || j.childOfKind(c, k.extendsClause) {
+					j.throws++
+				}
+			case k.classBody:
+				if j.createThrows(c) {
+					j.throws++
+				}
 			}
 		}
 	}
 	dec := j.decorated
 	j.shadow++
-	mark := len(j.binds)
+	mark := j.binds.mark()
 	if nm := n.ChildByFieldId(k.fName); nm != nil {
 		j.declare(nm)
 	}
@@ -1746,11 +1818,49 @@ func (j *jsLower) capClass(n *ts.Node) {
 		}
 	}
 	j.done(start)
-	j.binds = j.binds[:mark]
+	j.binds.truncate(mark)
 	j.shadow--
 	if j.shadow == 0 && j.decorated > dec {
 		j.throws++
 	}
+}
+
+// childOfKind reports whether one of n's named children is of kind id.
+func (j *jsLower) childOfKind(n *ts.Node, id uint16) bool {
+	start, list := j.kids(n)
+	defer j.done(start)
+	for i := range list {
+		if list[i].KindId() == id {
+			return true
+		}
+	}
+	return false
+}
+
+// createThrows reports whether class body n evaluates, where its class is
+// created, a computed key, a static field initializer or a static block.
+func (j *jsLower) createThrows(n *ts.Node) bool {
+	k := j.k
+	start, list := j.kids(n)
+	defer j.done(start)
+	for i := range list {
+		switch m := &list[i]; m.KindId() {
+		case k.classStaticBlock:
+			return true
+		case k.methodDefinition, k.fieldDefinition, k.publicFieldDefinition:
+			name := m.ChildByFieldId(k.fName)
+			if name == nil {
+				name = m.ChildByFieldId(k.fProperty)
+			}
+			if name != nil && name.KindId() == k.computedPropertyName {
+				return true
+			}
+			if m.KindId() != k.methodDefinition && m.ChildByFieldId(k.fValue) != nil && j.hasTok(m, k.staticKw) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // patternExprs collects the captures of a binding pattern's defaults and
@@ -1802,61 +1912,92 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.enumMembers(n, false)
 	case k.internalModule, k.module:
 		if body := n.ChildByFieldId(k.fBody); body != nil {
-			mark, savedFn := len(j.binds), j.fnMark
+			mark, savedFn := j.binds.mark(), j.fnMark
 			j.fnMark = mark
 			j.hoistVars(body)
 			j.cap(body)
-			j.binds, j.fnMark = j.binds[:mark], savedFn
+			j.binds.truncate(mark)
+			j.fnMark = savedFn
 		}
-	case k.assignmentExpression, k.augmentedAssignmentExpression:
-		j.capWrite(n.ChildByFieldId(k.fLeft))
-		j.children(n, false)
-	case k.updateExpression:
-		j.capWrite(n.ChildByFieldId(k.fArgument))
-		j.children(n, false)
+	case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
+		// The wrapper evaluates its operand; its type is no code.
+		if o := j.operand(n); o != nil {
+			j.cap(o)
+		}
+	case k.assignmentExpression:
+		j.capTarget(n.ChildByFieldId(k.fLeft))
+		j.cap(n.ChildByFieldId(k.fRight))
+	case k.augmentedAssignmentExpression, k.updateExpression:
+		// A compound or logical assignment and an update read the variable
+		// they write.
+		t := n.ChildByFieldId(k.fLeft)
+		if t == nil {
+			t = n.ChildByFieldId(k.fArgument)
+		}
+		j.capTarget(t)
+		if u := j.strip(t); u.KindId() == k.identifier {
+			j.ref(u)
+		}
+		if r := n.ChildByFieldId(k.fRight); r != nil {
+			j.cap(r)
+		}
+	case k.fieldDefinition, k.publicFieldDefinition:
+		// A field's initializer runs where the class is created (a static
+		// one, a class-level throw of its own: see capClass) or constructed,
+		// never as one of the class's decorator applications, so a
+		// decorator inside it is not counted for the class.
+		v := n.ChildByFieldId(k.fValue)
+		start, list := j.kids(n)
+		for i := range list {
+			dec := j.decorated
+			j.cap(&list[i])
+			if v != nil && list[i].StartByte() == v.StartByte() {
+				j.decorated = dec
+			}
+		}
+		j.done(start)
 	case k.classDeclaration, k.abstractClassDeclaration, k.class:
 		j.capClass(n)
 	case k.classStaticBlock:
 		j.capFunction(n)
 	case k.statementBlock:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		start, list := j.kids(n)
 		for i := range list {
-			j.predeclare(&list[i])
+			j.predeclare(&list[i], mark)
 		}
 		for i := range list {
 			j.cap(&list[i])
 		}
 		j.done(start)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.switchStatement:
 		j.cap(n.ChildByFieldId(k.fValue))
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		body := n.ChildByFieldId(k.fBody)
 		start, cases := j.kids(body)
 		for c := range cases {
 			s, list := j.kids(&cases[c])
 			for i := range list {
-				j.predeclare(&list[i])
+				j.predeclare(&list[i], mark)
 			}
 			j.done(s)
 		}
 		j.done(start)
 		j.cap(body)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.forStatement:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if init := n.ChildByFieldId(k.fInitializer); init.KindId() == k.lexicalDeclaration {
-			j.predeclare(init)
+			j.predeclare(init, mark)
 		}
 		j.children(n, false)
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.forInStatement:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		left := j.strip(n.ChildByFieldId(k.fLeft))
 		if kw := n.ChildByFieldId(k.fKind); kw == nil {
-			j.capWrite(left)
-			j.cap(left)
+			j.capTarget(left)
 		} else {
 			if kw.KindId() != k.varKw {
 				j.declarePattern(left, false)
@@ -1868,15 +2009,15 @@ func (j *jsLower) cap(n *ts.Node) {
 		}
 		j.cap(n.ChildByFieldId(k.fRight))
 		j.cap(n.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.catchClause:
-		mark := len(j.binds)
+		mark := j.binds.mark()
 		if p := n.ChildByFieldId(k.fParameter); p != nil {
 			j.declarePattern(p, false)
 			j.patternExprs(p)
 		}
 		j.cap(n.ChildByFieldId(k.fBody))
-		j.binds = j.binds[:mark]
+		j.binds.truncate(mark)
 	case k.variableDeclarator:
 		j.patternExprs(n.ChildByFieldId(k.fName))
 		if v := n.ChildByFieldId(k.fValue); v != nil {
@@ -1890,10 +2031,13 @@ func (j *jsLower) cap(n *ts.Node) {
 	}
 }
 
-// capWrite records, as writes, the enclosing variables an assignment target
-// inside a nested callable or class binds: an identifier, or every name of a
-// destructuring target. A property target writes no variable.
-func (j *jsLower) capWrite(t *ts.Node) {
+// capTarget collects an assignment target inside a nested callable or class:
+// the enclosing variables it binds (an identifier, or every name of a
+// destructuring target) are writes and not reads, since a plain assignment
+// or a binding only writes them; a default, a computed key and the object and
+// index of a property target are evaluated, so their references are reads. A
+// property target writes no variable.
+func (j *jsLower) capTarget(t *ts.Node) {
 	k := j.k
 	switch t = j.strip(t); t.KindId() {
 	case k.identifier, k.shorthandPropertyIdentifierPattern:
@@ -1901,15 +2045,21 @@ func (j *jsLower) capWrite(t *ts.Node) {
 			j.writes = append(j.writes, v)
 		}
 	case k.assignmentPattern, k.objectAssignmentPattern:
-		j.capWrite(t.ChildByFieldId(k.fLeft))
+		j.capTarget(t.ChildByFieldId(k.fLeft))
+		j.cap(t.ChildByFieldId(k.fRight))
 	case k.pairPattern:
-		j.capWrite(t.ChildByFieldId(k.fValue))
+		if key := t.ChildByFieldId(k.fKey); key.KindId() == k.computedPropertyName {
+			j.cap(key)
+		}
+		j.capTarget(t.ChildByFieldId(k.fValue))
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(t)
 		for i := range list {
-			j.capWrite(&list[i])
+			j.capTarget(&list[i])
 		}
 		j.done(start)
+	default:
+		j.cap(t)
 	}
 }
 
@@ -1965,17 +2115,21 @@ type jsSyntax struct {
 	// The TypeScript kinds, optional.
 	requiredParameter, optionalParameter, publicFieldDefinition, abstractClassDeclaration, enumDeclaration,
 	enumAssignment, internalModule, module, nestedIdentifier, importRequireClause, importAlias, nonNullExpression,
-	asExpression, satisfiesExpression, typeAssertion, instantiationExpression, typeArguments, decorator uint16
+	asExpression, satisfiesExpression, typeAssertion, instantiationExpression, typeArguments, decorator,
+	extendsClause uint16
 	// erased is indexed by kind id: the kinds the TypeScript compiler erases.
 	erased []bool
 	// imports is the import-clause table the extraction shares.
 	imports importSyntax
 
-	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, typeKw uint16
+	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, staticKw uint16
+	// typeKw and optTok (the anonymous `?.` of a TypeScript optional call)
+	// are optional.
+	typeKw, optTok uint16
 
 	fAlternative, fArgument, fArguments, fBody, fCondition, fConsequence, fDeclaration, fFinalizer,
 	fFunction, fHandler, fIncrement, fIndex, fInitializer, fKey, fKind, fLabel, fLeft, fName, fObject,
-	fOperator, fOptionalChain, fParameter, fParameters, fPattern, fRight, fValue uint16
+	fOperator, fOptionalChain, fParameter, fParameters, fPattern, fProperty, fRight, fValue uint16
 }
 
 // jsErased are the kinds the TypeScript compiler erases (see TypeScript in
@@ -2039,7 +2193,9 @@ func resolveJSSyntax(language string) *jsSyntax {
 			s.erased[id] = true
 		}
 	}
-	s.constKw, s.eqTok, s.typeKw = tok("const"), tok("="), tl.IdForNodeKind("type", false)
+	s.constKw, s.eqTok, s.staticKw = tok("const"), tok("="), tok("static")
+	s.typeKw, s.optTok = tl.IdForNodeKind("type", false), tl.IdForNodeKind("?.", false)
+	s.extendsClause = opt("extends_clause")
 	s.fPattern = tl.FieldIdForName("pattern")
 	s.fAlternative, s.fArgument, s.fArguments = field("alternative"), field("argument"), field("arguments")
 	s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
@@ -2047,6 +2203,6 @@ func resolveJSSyntax(language string) *jsSyntax {
 	s.fIndex, s.fInitializer, s.fKey, s.fKind, s.fLabel = field("index"), field("initializer"), field("key"), field("kind"), field("label")
 	s.fLeft, s.fName, s.fObject, s.fOperator = field("left"), field("name"), field("object"), field("operator")
 	s.fOptionalChain, s.fParameter, s.fParameters = field("optional_chain"), field("parameter"), field("parameters")
-	s.fRight, s.fValue = field("right"), field("value")
+	s.fProperty, s.fRight, s.fValue = field("property"), field("right"), field("value")
 	return s
 }
