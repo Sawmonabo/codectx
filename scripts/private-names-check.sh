@@ -15,9 +15,12 @@
 #   * each part is also split at camelCase boundaries (`FooBar` yields `foo`
 #     and `bar`);
 #   * everything is lowercased before hashing.
-# A binary file's printable runs of four or more characters are checked the
-# same way. A hit is reported as file and line (or commit and message line)
-# with the hash prefix only, so the report names nothing either.
+# The content checked is what the index records, read from its blobs: a
+# tracked symlink is checked by its link text, and a file is checked as it is
+# staged, not as the working tree holds it. A file holding a NUL byte is
+# checked through its printable runs of four or more characters, the same way.
+# A hit is reported as file and line (or commit and message line) with the
+# hash prefix only, so the report names nothing either.
 #
 # To add a token: printf '%s' '<lowercase token>' | sha256sum, and append the
 # hash here. Never commit the token itself.
@@ -25,10 +28,11 @@
 # Usage:
 #   sh scripts/private-names-check.sh                      tracked paths and content
 #   sh scripts/private-names-check.sh --messages <range>   commit messages in <range>
-# Exit 1 lists every hit. The check fails closed: when git cannot list the
-# tracked files or the commits, when it lists no tracked file, when a tracked
-# file cannot be read, or when the scanner cannot run, it exits 2 with the
-# reason and never reports clean.
+# Exit 1 lists every hit. The check fails closed: when the hash list is empty
+# or malformed, when an argument is not one of the two forms above, when git
+# cannot list the tracked files or the commits, when it lists no tracked file,
+# when a tracked entry cannot be read (a submodule included), or when the
+# scanner cannot run, it exits 2 with the reason and never reports clean.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -67,18 +71,26 @@ e49d63b2a8a78f048bafc4b4590029603a5a4165ee8bf98af15d62f24cd83479
 fcea588a704287278eb5c63a328ad401d647f09b4cf328192dab65fbe583c33c
 '
 
-# The scanner runs the git command it is given (every argument after the hash
-# list) and reads its NUL-separated records: in files mode each record is a
-# tracked path whose name and content are checked; in messages mode each record
-# is a commit id, a newline, and that commit's message. It exits 0 when clean,
-# 1 when it found a hit, and 2 when it could not check everything: git failed
-# or listed no tracked file, or a tracked file could not be read.
+# The scanner checks the hash list first: an empty list, or an entry that is
+# not a lowercase SHA-256, would match nothing and print clean, so either one
+# stops the check with exit 2. In files mode it reads every index entry's path
+# and committed content through scripts/tracked-blobs.pl, so a tracked
+# symlink is checked by its link text and never by what it points at; in
+# messages mode it runs the git command it is given (every argument after the
+# hash list) and reads its NUL-separated records, each a commit id, a newline,
+# and that commit's message. It exits 0 when clean, 1 when it found a hit, and
+# 2 when it could not check everything.
 scan='
 use strict; use warnings; use Digest::SHA qw(sha256_hex);
 my ($mode, $list, @git) = @ARGV;
 my $failed = 0;
 sub failure { print STDERR "private-names-check: $_[0]\n"; $failed++; }
-my %bad = map { $_ => 1 } grep { length } split /\s+/, $list;
+my @list = grep { length } split /\s+/, $list;
+if (!@list || grep { !/\A[0-9a-f]{64}\z/ } @list) {
+  failure("the hash list is empty or holds an entry that is not a lowercase SHA-256");
+  exit 2;
+}
+my %bad = map { $_ => 1 } @list;
 my %seen; my $hits = 0;
 sub hit {
   my ($t) = @_; my $l = lc $t;
@@ -99,33 +111,32 @@ sub check {
     if (@found) { $hits++; print "$where: private token (sha256 $found[0])\n"; return; }
   }
 }
-open(my $in, q(-|), @git) or do { failure("cannot run @git: $!"); exit 2; };
-local $/ = "\0";
-my $records = 0;
-while (my $rec = <$in>) {
-  chomp $rec;
-  $records++;
-  if ($mode eq q(messages)) {
+if ($mode eq q(messages)) {
+  open(my $in, q(-|), @git) or do { failure("cannot run @git: $!"); exit 2; };
+  local $/ = "\0";
+  while (my $rec = <$in>) {
+    chomp $rec;
     my ($id, $body) = split /\n/, $rec, 2;
     my $n = 0;
     for my $line (split /\n/, $body // q()) { $n++; check("commit $id message line $n", $line); }
-    next;
   }
-  check("$rec (file name)", $rec);
-  my $fh;
-  unless (open($fh, q(<:raw), $rec)) { failure("$rec: cannot open: $!"); next; }
-  my $data = do { local $/; <$fh> };
-  unless (defined $data) { failure("$rec: cannot read: $!"); close $fh; next; }
-  close $fh;
-  if (index(substr($data, 0, 8000), "\0") >= 0) {
-    while ($data =~ /([\x20-\x7e]{4,})/g) { check("$rec (binary, byte " . ($-[1]) . ")", $1); }
-    next;
+  close($in) or failure("@git failed" . ($! ? ": $!" : " with exit status " . ($? >> 8)));
+  exit($failed ? 2 : $hits ? 1 : 0);
+}
+eval { require "./scripts/tracked-blobs.pl"; 1 } or do { failure("cannot load scripts/tracked-blobs.pl: $@"); exit 2; };
+my $entries = tracked_blobs(sub {
+  my ($path, $kind, $data) = @_;
+  check("$path (file name)", $path);
+  return unless defined $data;
+  my $what = $kind eq q(120000) ? q( (symlink target)) : q();
+  if (index($data, "\0") >= 0) {
+    while ($data =~ /([\x20-\x7e]{4,})/g) { check("$path$what (binary, byte " . ($-[1]) . ")", $1); }
+    return;
   }
   my $n = 0;
-  for my $line (split /\n/, $data) { $n++; check("$rec:$n", $line); }
-}
-close($in) or failure("@git failed" . ($! ? ": $!" : " with exit status " . ($? >> 8)));
-failure("@git listed no tracked file") if $mode eq q(files) && !$records;
+  for my $line (split /\n/, $data) { $n++; check("$path$what:$n", $line); }
+}, \&failure);
+failure("git ls-files listed no tracked file") unless $entries;
 exit($failed ? 2 : $hits ? 1 : 0);
 '
 
@@ -142,13 +153,22 @@ verdict() {
   esac
 }
 
-status=0
-if [ "${1:-}" = "--messages" ]; then
-  range="${2:?usage: private-names-check.sh --messages <rev-range>}"
-  perl -e "$scan" messages "$hashes" git log -z --format='%H%n%B' "$range" || status=$?
-  verdict "$status" "commit messages in $range"
-  exit 0
-fi
+usage() {
+  echo "usage: private-names-check.sh [--messages <rev-range>]" >&2
+  exit 2
+}
 
-perl -e "$scan" files "$hashes" git ls-files -z || status=$?
+status=0
+case "$#:${1:-}" in
+0:) ;;
+2:--messages)
+  [ -n "$2" ] || usage
+  perl -e "$scan" messages "$hashes" git log -z --format='%H%n%B' --end-of-options "$2" || status=$?
+  verdict "$status" "commit messages in $2"
+  exit 0
+  ;;
+*) usage ;;
+esac
+
+perl -e "$scan" files "$hashes" || status=$?
 verdict "$status" ""
