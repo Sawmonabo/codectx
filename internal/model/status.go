@@ -254,11 +254,11 @@ type ResourceReport struct {
 	// absent where this process composed no admission ledger. The allocation
 	// is also absent -- never zero -- where it is not an observation of this
 	// host: where the platform published no available-memory figure, the
-	// ledger admits against a stand-in it warned about at composition, and
-	// the reserved total is still reported against it. A host that was read
-	// and has no memory to spare beyond this process's own footprint reports
-	// an allocation of zero, which is an observation: its children are then
-	// admitted one at a time.
+	// ledger admits against a stand-in the process warned about once at
+	// composition, and the reserved total is still reported against it. A
+	// host that was read and has no memory to spare beyond this process's own
+	// footprint reports an allocation of zero, which is an observation: its
+	// children are then admitted one at a time.
 	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
 	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
 	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same

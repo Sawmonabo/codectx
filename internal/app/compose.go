@@ -712,11 +712,16 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// allocation is that reading, and where nothing is left over the
 	// footprint it is zero: an observation under which the ledger runs heavy
 	// children one at a time. Only a host that exposes no figure gets the
-	// stand-in, and the ledger's surfaces are told it is not an observation.
+	// stand-in; composition warns about it once, as it does about an observed
+	// zero, and the ledger's surfaces are told it is not an observation.
 	s.machine = dependence.ObserveMachine()
 	var childMemory int64
 	childMemory, s.admissionMemoryObserved = s.machine.SchedulingAllocation(config.BaseFootprint(cfg))
-	if s.admissionMemoryObserved && childMemory == 0 {
+	switch {
+	case !s.admissionMemoryObserved:
+		slog.Warn("this host publishes no available-memory figure, so heavy children are admitted against a stand-in allocation that is not an observation",
+			"component", "app", "stand_in_allocation_bytes", childMemory)
+	case childMemory == 0:
 		slog.Warn("this host has no available memory beyond this process's own footprint, so heavy children run one at a time",
 			"component", "app", "available_bytes", s.machine.AvailableBytes)
 	}

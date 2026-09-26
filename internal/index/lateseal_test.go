@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
-	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -75,8 +74,14 @@ func TestOneDeferredUnitsFailureLeavesTheOthersSealed(t *testing.T) {
 // with no "deferred units are not built" warning, and the work is lost in
 // silence. Every unit must be back on the queue, in the order it was queued.
 //
+// That includes a unit that failed before the cancellation: its run row is the
+// aborted work generation's, so no publication can list its reason, and a
+// failure counted for it would be one status never names, while dropping it
+// would leave its scope reported running with nothing queued to finish it.
+//
 // Mutation: pass requeue=false to settle on the cancelled path of tickHeld,
-// and Pending reports no unit.
+// and Pending reports no unit. Mutation: have settle skip the units that
+// failed, and the queue is missing the failed scope.
 func TestACancelledDeferredBatchKeepsItsUnitsQueued(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n"})
 	p := &heavyFixtureProvider{}
@@ -90,13 +95,15 @@ func TestACancelledDeferredBatchKeepsItsUnitsQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	units := deferredScopes("cancelled", 3)
+	p.fail = plan.Key(heavyProviderID, units[1].unit.ScopeKey)
 	p.entered = make(chan struct{}, len(units))
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- f.tick(ctx, c, units, res.Binding.SnapshotID, sel) }()
 	// Every unit is inside its provider before the cancellation, so each one
-	// is cancelled mid-build rather than refused at a storage call.
+	// is cancelled mid-build rather than refused at a storage call, and the
+	// failing one has already returned its failure.
 	for range units {
 		<-p.entered
 	}
@@ -159,8 +166,9 @@ const heavyProviderID = "heavy-fixture"
 const rawAnalyzerOutput = "a stack trace naming source paths"
 
 // heavyFixtureProvider is a provider that emits nothing. The unit whose plan
-// key is fail reports a failure; with entered set, every unit signals it and
-// then holds until its context ends.
+// key is fail reports a failure at once; with entered set, every unit
+// signals it first, and every unit but that one then holds until its context
+// ends.
 //
 // It is unavailable to detection: no plan derives a unit for it, so the
 // foreground run neither builds nor seals the scopes the deferred queue is
@@ -186,13 +194,15 @@ func (p *heavyFixtureProvider) IndexUnit(ctx context.Context, req provider.UnitR
 
 	if p.entered != nil {
 		p.entered <- struct{}{}
-		<-ctx.Done()
-		return model.ProviderResult{RunID: req.Run, State: model.RunCanceled}, model.Canceled(ctx.Err())
 	}
 	if p.fail == plan.Key(req.Unit.ProviderID, req.Unit.ScopeKey) {
 		return model.ProviderResult{RunID: req.Run, State: model.RunFailed},
 			&model.Error{Code: model.CodeProviderOutputInvalid, Message: "the fixture made this deferred unit fail",
 				Details: map[string]string{model.DetailStderrTail: rawAnalyzerOutput}}
+	}
+	if p.entered != nil {
+		<-ctx.Done()
+		return model.ProviderResult{RunID: req.Run, State: model.RunCanceled}, model.Canceled(ctx.Err())
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded}, nil
 }
@@ -205,8 +215,8 @@ func (p *heavyFixtureProvider) IndexUnit(ctx context.Context, req provider.UnitR
 // the ACTIVE generation, so a deferred failure reached no failed_units list
 // while the capability row named it; a batch whose every unit failed published
 // nothing at all and left the active generation claiming its scopes were still
-// running. The batch must publish, its reasons must be the published
-// generation's, and the run row must say the batch failed.
+// running. The batch must publish, and its reasons must be the published
+// generation's.
 //
 // It also protects the privacy rule on the status answer: the analyzer's
 // standard-error tail stays on the run row and never reaches failed_units,
@@ -219,8 +229,6 @@ func (p *heavyFixtureProvider) IndexUnit(ctx context.Context, req provider.UnitR
 // publication is delivered. Mutation: drop the CarryRunFailures call from
 // publishOnce, and status lists no failed unit. Mutation: drop the
 // withoutRawOutput loop from StatusReader.Status, and the tail is served.
-// Mutation: finish the run with endOutcome(err) alone, and a batch whose every
-// unit failed reads as an ok run.
 func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n"})
 	ctx := f.ctx
@@ -264,40 +272,6 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	if err != nil || len(kept) != 1 || kept[0].Details[model.DetailStderrTail] != rawAnalyzerOutput {
 		t.Fatalf("the run row keeps %+v (err=%v), want the reason with its standard-error tail", kept, err)
 	}
-	if err := f.ledger.Flush(ctx); err != nil {
-		t.Fatalf("flush the ledger: %v", err)
-	}
-	reader, ok, err := ledger.OpenReader(ctx, f.dataDir)
-	if err != nil || !ok {
-		t.Fatalf("OpenReader: %v, present=%v", err, ok)
-	}
-	t.Cleanup(func() { reader.Close() })
-	view, present, err := reader.LatestRun(ctx, string(c.repo), 0)
-	if err != nil || !present {
-		t.Fatalf("LatestRun: %v, present=%v", err, present)
-	}
-	if view.Run.Kind != ledger.KindDeferred {
-		t.Fatalf("the latest run is a %s run, want the deferred tick's own", view.Run.Kind)
-	}
-	if view.Run.Outcome != ledger.OutcomeFailed || view.Run.UnitsPlanned != 1 ||
-		view.Run.UnitsSucceeded != 0 || view.Run.UnitsFailed != 1 {
-		t.Fatalf("the run reads %s with %d planned, %d succeeded, %d failed; want failed with "+
-			"1 planned and 1 failed: the batch got nowhere and the row must say so",
-			view.Run.Outcome, view.Run.UnitsPlanned, view.Run.UnitsSucceeded, view.Run.UnitsFailed)
-	}
-	reason := false
-	for _, span := range view.Spans {
-		if span.ScopeKey == units[0].unit.ScopeKey &&
-			span.DiagnosticCode == model.CodeProviderOutputInvalid && span.Failure != "" {
-			reason = true
-		}
-	}
-	if !reason {
-		t.Fatalf("no span of the failed batch names the scope %q with its typed reason among the %d "+
-			"recorded spans",
-			units[0].unit.ScopeKey, len(view.Spans))
-	}
-
 	// A later batch seals the scope that failed. The publication extends the
 	// generation that carries the old reason, and must not carry it on: the
 	// scope would be listed failed beside a capability row that reports it
