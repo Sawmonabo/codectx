@@ -74,8 +74,14 @@ func TestOneDeferredUnitsFailureLeavesTheOthersSealed(t *testing.T) {
 // with no "deferred units are not built" warning, and the work is lost in
 // silence. Every unit must be back on the queue, in the order it was queued.
 //
+// That includes a unit that failed before the cancellation: its run row is the
+// aborted work generation's, so no publication can list its reason, and a
+// failure counted for it would be one status never names, while dropping it
+// would leave its scope reported running with nothing queued to finish it.
+//
 // Mutation: pass requeue=false to settle on the cancelled path of tickHeld,
-// and Pending reports no unit.
+// and Pending reports no unit. Mutation: have settle skip the units that
+// failed, and the queue is missing the failed scope.
 func TestACancelledDeferredBatchKeepsItsUnitsQueued(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n"})
 	p := &heavyFixtureProvider{}
@@ -89,13 +95,15 @@ func TestACancelledDeferredBatchKeepsItsUnitsQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	units := deferredScopes("cancelled", 3)
+	p.fail = plan.Key(heavyProviderID, units[1].unit.ScopeKey)
 	p.entered = make(chan struct{}, len(units))
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- f.tick(ctx, c, units, res.Binding.SnapshotID, sel) }()
 	// Every unit is inside its provider before the cancellation, so each one
-	// is cancelled mid-build rather than refused at a storage call.
+	// is cancelled mid-build rather than refused at a storage call, and the
+	// failing one has already returned its failure.
 	for range units {
 		<-p.entered
 	}
@@ -158,8 +166,9 @@ const heavyProviderID = "heavy-fixture"
 const rawAnalyzerOutput = "a stack trace naming source paths"
 
 // heavyFixtureProvider is a provider that emits nothing. The unit whose plan
-// key is fail reports a failure; with entered set, every unit signals it and
-// then holds until its context ends.
+// key is fail reports a failure at once; with entered set, every unit
+// signals it first, and every unit but that one then holds until its context
+// ends.
 //
 // It is unavailable to detection: no plan derives a unit for it, so the
 // foreground run neither builds nor seals the scopes the deferred queue is
@@ -185,13 +194,15 @@ func (p *heavyFixtureProvider) IndexUnit(ctx context.Context, req provider.UnitR
 
 	if p.entered != nil {
 		p.entered <- struct{}{}
-		<-ctx.Done()
-		return model.ProviderResult{RunID: req.Run, State: model.RunCanceled}, model.Canceled(ctx.Err())
 	}
 	if p.fail == plan.Key(req.Unit.ProviderID, req.Unit.ScopeKey) {
 		return model.ProviderResult{RunID: req.Run, State: model.RunFailed},
 			&model.Error{Code: model.CodeProviderOutputInvalid, Message: "the fixture made this deferred unit fail",
 				Details: map[string]string{model.DetailStderrTail: rawAnalyzerOutput}}
+	}
+	if p.entered != nil {
+		<-ctx.Done()
+		return model.ProviderResult{RunID: req.Run, State: model.RunCanceled}, model.Canceled(ctx.Err())
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded}, nil
 }
