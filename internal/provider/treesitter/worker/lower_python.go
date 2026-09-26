@@ -261,19 +261,10 @@ type pyLower struct {
 	// the variable holding each item's manager.
 	fins []flow.Frame
 	mgrs []int32
-	// exc mirrors the builder's open catch frames and unentered finally
-	// frames, innermost last, so the lowering knows whether an exception may
-	// reach a finally.
-	exc []pyExc
 	// subj is a stack of the subject reads of the match statements being
 	// lowered.
 	subj []int32
 }
-
-// pyExc is one open catch frame, which absorbs every exception raised inside
-// it, or one unentered finally frame; reached marks a finally an exception
-// may reach.
-type pyExc struct{ catch, reached bool }
 
 // start resets j in place to lower fn: every scalar is set anew and every
 // list truncated, keeping its capacity; stmtNo only advances (see seen).
@@ -283,7 +274,7 @@ func (j *pyLower) start(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s
 		l: l, b: b, src: src, k: pySyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
 		buf: j.buf[:0], frames: j.frames[:0], reads: j.reads[:0], seen: j.seen, stmtNo: j.stmtNo + 1,
 		writes: j.writes[:0], first: -1, last: -1, hold: j.hold[:0], fins: j.fins[:0], mgrs: j.mgrs[:0],
-		exc: j.exc[:0], subj: j.subj[:0],
+		subj: j.subj[:0],
 	}
 }
 
@@ -873,7 +864,6 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	}
 	if j.throws > j.thrown {
 		j.b.MayThrow(id)
-		j.escape()
 	}
 	j.thrown = j.throws
 	j.last, j.lastSpan = id, s
@@ -929,57 +919,6 @@ func (j *pyLower) merge(base int) {
 	j.hold = j.hold[:base]
 }
 
-// openCatch opens a catch frame; enterHandler begins its handler.
-func (j *pyLower) openCatch() flow.Frame {
-	j.exc = append(j.exc, pyExc{catch: true})
-	return j.b.OpenCatch()
-}
-
-func (j *pyLower) enterHandler(f flow.Frame, at flow.Span) {
-	j.exc = j.exc[:len(j.exc)-1]
-	j.b.EnterHandler(f, at)
-}
-
-// openFinally opens a finally frame. enterFinally enters it and reports
-// whether normal completion reached it and whether an exception may have;
-// closeFinally closes it, and an exception that reached it, re-raised from
-// its exit, reaches the enclosing frame in turn.
-func (j *pyLower) openFinally() flow.Frame {
-	j.exc = append(j.exc, pyExc{})
-	return j.b.OpenFinally()
-}
-
-func (j *pyLower) enterFinally(f flow.Frame, at flow.Span) (normal, reached bool) {
-	reached = j.exc[len(j.exc)-1].reached
-	j.exc = j.exc[:len(j.exc)-1]
-	return j.b.EnterFinally(f, at), reached
-}
-
-func (j *pyLower) closeFinally(f flow.Frame, normal, reached bool) {
-	j.b.CloseFinally(f, normal)
-	if reached {
-		j.escape()
-	}
-}
-
-// escape records that an exception leaves the current point: it reaches the
-// innermost open frame when that is a finally. It is recorded even where the
-// current point is unreachable (a raise after a return, or a finally whose
-// body cannot complete re-raising), where the builder delivers nothing; the
-// one effect is that a with around such code may fall through past its exit,
-// an edge the program never takes, and no pair is lost.
-func (j *pyLower) escape() {
-	if n := len(j.exc); n > 0 && !j.exc[n-1].catch {
-		j.exc[n-1].reached = true
-	}
-}
-
-// throw moves the fringe to the innermost handler as a raise.
-func (j *pyLower) throw() {
-	j.escape()
-	j.b.Throw()
-}
-
 // block lowers a statement list; Python blocks open no scope.
 func (j *pyLower) block(n *ts.Node) {
 	if n == nil {
@@ -1023,7 +962,7 @@ func (j *pyLower) stmt(n *ts.Node) {
 	case k.raiseStatement:
 		j.children(n, true)
 		j.node(flow.Jump, n, 0, len(j.reads))
-		j.throw()
+		j.b.Throw()
 	case k.breakStatement:
 		j.node(flow.Jump, n, 0, 0)
 		j.b.Break("")
@@ -1287,7 +1226,7 @@ func (j *pyLower) assertStmt(n *ts.Node) {
 		j.reset()
 		j.valueNode(&list[1])
 	}
-	j.throw()
+	j.b.Throw()
 	j.b.Restore(p)
 	j.b.Pop(p)
 	j.done(start)
@@ -1414,15 +1353,15 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 	}
 	var ff, cf flow.Frame
 	if finC != nil {
-		ff = j.openFinally()
+		ff = j.b.OpenFinally()
 	}
 	if firstExcept != nil {
-		cf = j.openCatch()
+		cf = j.b.OpenCatch()
 	}
 	j.block(n.ChildByFieldId(k.fBody))
 	if firstExcept != nil {
 		tEnd := j.b.Push()
-		j.enterHandler(cf, spanOf(firstExcept.Child(0)))
+		j.b.EnterHandler(cf, spanOf(firstExcept.Child(0)))
 		base := len(j.hold)
 		// Mixing except and except* in one try is a syntax error, so the
 		// first clause decides.
@@ -1435,7 +1374,7 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 			// §8.4.2: what no clause matched is re-raised after the last
 			// one, and when every part matched the statement completes.
 			p := j.b.Push()
-			j.throw()
+			j.b.Throw()
 			j.b.Restore(p)
 			j.b.Pop(p)
 		} else {
@@ -1446,7 +1385,7 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 				}
 			}
 			if !caught {
-				j.throw()
+				j.b.Throw()
 			}
 		}
 		j.merge(base)
@@ -1461,11 +1400,11 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		j.block(elseC.ChildByFieldId(k.fBody))
 	}
 	if finC != nil {
-		normal, reached := j.enterFinally(ff, spanOf(finC.Child(0)))
+		normal := j.b.EnterFinally(ff, spanOf(finC.Child(0)))
 		s2, fl := j.kids(finC)
 		j.block(&fl[len(fl)-1])
 		j.done(s2)
-		j.closeFinally(ff, normal, reached)
+		j.b.CloseFinally(ff, normal)
 	}
 	j.done(start)
 }
@@ -1519,12 +1458,12 @@ func (j *pyLower) except(c *ts.Node, star bool) bool {
 		j.bind(alias, nil, 0, 0)
 	}
 	if v >= 0 {
-		f := j.openFinally()
+		f := j.b.OpenFinally()
 		j.block(body)
-		normal, reached := j.enterFinally(f, as)
+		normal := j.b.EnterFinally(f, as)
 		j.reset()
 		j.b.Def(j.node(flow.Stmt, c, 0, 0), v)
-		j.closeFinally(f, normal, reached)
+		j.b.CloseFinally(f, normal)
 	} else {
 		j.block(body)
 	}
@@ -1585,7 +1524,7 @@ func (j *pyLower) withStmt(n *ts.Node) {
 			j.def(a, j.lookup(t))
 			t = nil
 		}
-		j.fins = append(j.fins, j.openFinally())
+		j.fins = append(j.fins, j.b.OpenFinally())
 		if t != nil {
 			// A failing assignment to a pattern or reference target runs
 			// __exit__ (§8.5), so it is bound inside the item's finally.
@@ -1598,7 +1537,7 @@ func (j *pyLower) withStmt(n *ts.Node) {
 		if i > 0 {
 			at = spanOf(items[i].PrevSibling())
 		}
-		normal, reached := j.enterFinally(j.fins[base+i], at)
+		normal := j.b.EnterFinally(j.fins[base+i], at)
 		j.reset()
 		j.throws++ // __exit__
 		x := j.nodeAt(flow.Stmt, flow.Span{Start: kw.Start, End: uint32(items[i].EndByte())}, 0, 0)
@@ -1606,7 +1545,7 @@ func (j *pyLower) withStmt(n *ts.Node) {
 		// __exit__ may suppress an exception that reached it, and then the
 		// statement completes; a break, continue or return that reached it
 		// alone is re-issued and never falls through (§8.5).
-		j.closeFinally(j.fins[base+i], normal || reached, reached)
+		j.b.CloseFinally(j.fins[base+i], normal || j.b.Thrown(j.fins[base+i]))
 	}
 	j.fins, j.mgrs = j.fins[:base], j.mgrs[:base]
 	j.done(start)
