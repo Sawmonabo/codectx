@@ -249,16 +249,19 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 //
 // Each admission pair is read together from the ledger so the two figures are
 // one moment rather than two, and is absent altogether when this composition
-// has no ledger: an unavailable figure is never published as zero, and a zero
-// allocation would read as a process that may run nothing. An allocation the
-// composition marked unobserved -- the platform published no memory or no
+// has no ledger: an unavailable figure is never published as zero. A zero
+// allocation that IS published is an observation -- a host with nothing left
+// over this process's footprint, where heavy children run one at a time. An
+// allocation the composition marked unobserved -- the platform published no memory or no
 // free-space figure, and the ledger admits against a stand-in -- is absent
 // too, because it is not a measurement; what is reserved against it is still
 // a real sum and is reported.
 //
 // The three are the reservations config.BaseFootprint adds to this build's idle
-// overhead from the resources and index blocks; it adds the store's page
-// caches too, which the storage block states. The report states them and
+// overhead from the resources and index blocks; it also adds every page cache
+// the process opens (the store's writer and readers, lexical staging per unit
+// built at once, the tokenizer and the run ledger), which the storage block
+// states. The report states them and
 // derives nothing -- a second implementation of that arithmetic would drift
 // from the one the allocation is computed against. None of the three is
 // checked against a ceiling: the footprint follows the reservations, so there

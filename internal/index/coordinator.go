@@ -296,7 +296,7 @@ func New(o Options) (*Coordinator, error) {
 	c := &Coordinator{opts: o, repo: model.RepositoryID(model.H(domainRepository, filepath.ToSlash(o.Root.Path))),
 		policy: o.Config.TraversalPolicy(), limits: limits, log: o.Logger, now: o.Now,
 		cfgHash: o.Config.AnalysisConfigHash(), workDir: workDir,
-		workers: workerCount(o.Config.Index.Workers, config.CPUs()),
+		workers: workerCount(o.Config),
 		sched:   plan.NewScheduler(o.Admission),
 	}
 	if c.log == nil {
@@ -371,20 +371,16 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 	return out, nil
 }
 
-// workerCount resolves how many units one generation builds at once: one per
-// core this machine allows the process, under the structural ceiling on live
-// sinks. There is no count beside those two. How much of the machine those
+// workerCount resolves how many units one generation builds at once: the
+// configuration's build worker count (config.BuildWorkers -- index.workers, or
+// one per core this machine allows the process), under the structural ceiling
+// on live sinks. It is the same count the base footprint charges each unit
+// built at once for, so the two cannot drift. How much of the machine those
 // units may hold is decided by the reservation ledger every heavy unit is
 // admitted against, so a typed-in ceiling here would be a second gate on the
 // same work, and one nobody measured.
-//
-// cpus is a parameter and not a call so the resolution can be exercised for
-// machines this one is not, exactly as config's own counts are.
-func workerCount(configured, cpus int) int {
-	if configured > 0 {
-		return min(configured, provider.MaxLiveSinks)
-	}
-	return min(cpus, provider.MaxLiveSinks)
+func workerCount(c config.Config) int {
+	return min(config.BuildWorkers(c), provider.MaxLiveSinks)
 }
 
 // buildable refuses an entry point that captures, builds or publishes when the

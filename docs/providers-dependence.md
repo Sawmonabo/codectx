@@ -341,8 +341,9 @@ allocation  = min(MemAvailable - base footprint - safety margin,
 ```
 
 The base footprint is derived from the machine and the configuration -- this
-build's measured idle overhead plus the query, cache and queue reservations
-([configuration](configuration.md)) -- so a host with more cores keeps more for
+build's measured idle overhead plus the query, cache and queue reservations and
+every page cache the process opens ([configuration](configuration.md)) -- so a
+host with more cores keeps more for
 itself and offers its children less.
 
 * The cap is sized to what the unit needs, never to what the machine has. A
