@@ -1123,23 +1123,39 @@ func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
 // pinned indexers, the one that produces this shape sets no occurrence role at
 // all, so the import role cannot seed it.
 //
-// A spelling is bound only when the document holds at least two occurrences
-// that spell it identically, which is the structural minimum of the construct
-// the exemption exists for: an alias that is used produces the occurrence in
-// the alias clause and the occurrence at the use site. An alias declared and
-// never used produces one occurrence -- and no second one for the rule to
-// refuse either, so nothing is lost. A shifted column that lands on a whole
-// token spelling something else produces that spelling once, so it stays
-// refused; a shift landing twice on the same text within one document is the
-// residual stated in docs/providers-scip.md.
+// A spelling is bound only from the alias clause that introduces it, because
+// the clause is the one source a shifted column cannot produce. Counting is
+// not such a source: a tab measured to the wrong stop shifts every line of the
+// same indentation by the same distance, so two identical lines carry the same
+// wrong spelling twice. The clause takes one of two shapes, both spelled
+// `<name> as <spelling>` on one line with <name> the symbol's own name:
 //
-// The tally holds one document's spellings and is discarded with its
-// docSource; it is bounded by that document's occurrences, which
+//   - one occurrence of the symbol ranges over the whole clause; or
+//   - one occurrence of the symbol ranges exactly over <spelling>, and another
+//     ranges exactly over the <name> the clause aliases.
+//
+// A uniform shift moves both occurrences of the second shape by the same
+// distance, so it cannot leave one on the aliased name and the other on the
+// alias; and a cast (`len as u32`) holds only the first token as an occurrence
+// of the symbol, so a shift onto its type binds nothing. The clause occurrence
+// of an alias that is declared and never used binds itself, so it is not
+// refused either. What stays out of reach is stated in docs/providers-scip.md.
+//
+// The candidates are held for one document and discarded with its docSource;
+// they are bounded by that document's occurrences, which
 // MaxOccurrencesPerDocument bounds. A coordinate that does not convert, and a
 // symbol that does not parse, are passed over here and refused by the pass
 // that publishes them, which is where a refusal is counted.
 func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
-	spelled := make(map[string]map[string]int)
+	type spelling struct {
+		raw, name, text string
+		start           uint64
+	}
+	// named holds, per symbol, the end byte of every occurrence ranged exactly
+	// over the symbol's own name; others holds every occurrence ranged exactly
+	// over some other identifier.
+	named := make(map[string]map[uint64]struct{})
+	var others []spelling
 	if err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ?`, []any{ds.doc.idx},
 		func(scan func(...any) error) error {
 			var symbolText string
@@ -1159,40 +1175,93 @@ func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
 				return nil
 			}
 			rng, _ := im.rangeOf(ds, r)
-			if rng == nil {
+			if rng == nil || rng.Start.Byte >= rng.End.Byte || rng.End.Byte > uint64(len(ds.data)) {
 				return nil
 			}
 			text := ds.data[rng.Start.Byte:rng.End.Byte]
-			if !wholeIdentifier(text) || string(text) == name {
+			if cutsAToken(ds.data, rng, text) != "" {
 				return nil
 			}
-			counts := spelled[sym.raw]
-			if counts == nil {
-				counts = make(map[string]int)
-				spelled[sym.raw] = counts
+			switch {
+			case string(text) == name:
+				ends := named[sym.raw]
+				if ends == nil {
+					ends = make(map[uint64]struct{})
+					named[sym.raw] = ends
+				}
+				ends[rng.End.Byte] = struct{}{}
+			case wholeIdentifier(text):
+				others = append(others, spelling{raw: sym.raw, name: name, text: string(text), start: rng.Start.Byte})
+			default:
+				// The whole-clause shape binds from this occurrence alone.
+				alias := trailingIdentifier(text)
+				aliasStart := rng.End.Byte - uint64(len(alias))
+				if nameEnd, ok := aliasClause(ds.data, aliasStart, name); ok && alias != "" && alias != name &&
+					nameEnd-uint64(len(name)) == rng.Start.Byte {
+					ds.bindSpelling(sym.raw, alias)
+				}
 			}
-			counts[string(text)]++
 			return nil
 		}); err != nil {
 		return err
 	}
-	for raw, counts := range spelled {
-		for text, n := range counts {
-			if n < 2 {
-				continue
+	for _, o := range others {
+		if nameEnd, ok := aliasClause(ds.data, o.start, o.name); ok {
+			if _, aliased := named[o.raw][nameEnd]; aliased {
+				ds.bindSpelling(o.raw, o.text)
 			}
-			if ds.spellings == nil {
-				ds.spellings = make(map[string]map[string]struct{})
-			}
-			bound := ds.spellings[raw]
-			if bound == nil {
-				bound = make(map[string]struct{})
-				ds.spellings[raw] = bound
-			}
-			bound[text] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// bindSpelling admits text as a spelling of the symbol raw in this document.
+func (ds *docSource) bindSpelling(raw, text string) {
+	if ds.spellings == nil {
+		ds.spellings = make(map[string]map[string]struct{})
+	}
+	bound := ds.spellings[raw]
+	if bound == nil {
+		bound = make(map[string]struct{})
+		ds.spellings[raw] = bound
+	}
+	bound[text] = struct{}{}
+}
+
+// aliasClause reports whether the bytes before start, on the same line, read
+// `<name> as `: the name as a whole token, then the `as` keyword with at least
+// one blank on each side. It returns the end byte of that name.
+func aliasClause(data []byte, start uint64, name string) (uint64, bool) {
+	i := blanksBefore(data, start)
+	if i == start || i < 2 || string(data[i-2:i]) != "as" {
+		return 0, false
+	}
+	end := blanksBefore(data, i-2)
+	n := uint64(len(name))
+	if end == i-2 || n == 0 || end < n || string(data[end-n:end]) != name {
+		return 0, false
+	}
+	if b := end - n; b > 0 && identifierByte(data[b-1]) {
+		return 0, false
+	}
+	return end, true
+}
+
+// blanksBefore walks back from i over spaces and tabs, never past a line.
+func blanksBefore(data []byte, i uint64) uint64 {
+	for i > 0 && (data[i-1] == ' ' || data[i-1] == '\t') {
+		i--
+	}
+	return i
+}
+
+// trailingIdentifier is the identifier token text ends with, or "".
+func trailingIdentifier(text []byte) string {
+	i := len(text)
+	for i > 0 && identifierByte(text[i-1]) {
+		i--
+	}
+	return string(text[i:])
 }
 
 // defineSymbol resolves one definition occurrence and records its identity,

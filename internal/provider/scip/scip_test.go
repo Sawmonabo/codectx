@@ -1005,7 +1005,7 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // identifier token spells the name its symbol carries. The document leaves its
 // position encoding unspecified, so the per-document encoding probe runs and
 // passes on the first definition, which is correct in every case; the shifted
-// occurrence is the second one.
+// occurrences follow it.
 //
 // The second failure mode, measured on the same project and equally silent:
 // failing the unit on the first refusal threw away all 93,167 occurrences over
@@ -1015,44 +1015,59 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // thinned unit indistinguishable from a whole one.
 //
 // Mutations that must fail this test: probe once per document (drop the range
-// check from occurrenceRange), which republishes the wrong bytes; drop the
-// end-of-token half of the coverage check, which republishes the keyword case;
+// check from occurrenceRange), which republishes the wrong bytes; bind a
+// spelling in bindSpellings because two occurrences of the symbol spell it
+// rather than from an alias clause, which republishes "page" over "name"; drop
+// the end-of-token half of the coverage check, which republishes the keyword
+// case;
 // drop the refusal count from the capability details, which republishes the
 // silence; or drop the coordinate from the exemplar, which hands the operator a
 // file without the line inside it that disagrees.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
-	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
-	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	// columns [10,17) of it; "Start" at columns [5,10) of line 4. Lines 6 and
+	// 7 are the same text, indented by the same two tabs: "page" sits at
+	// columns [6,10) of each and "name" at [11,15).
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n\t\trun(page,name);\n\t\trun(page,name);\n}\n"
 	const (
 		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
 		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
 		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+		symPage    = "scip-go gomod example.com/mod . pkg/Start().(page)"
 	)
 	// exemplar is the coordinate the first refused occurrence claimed, as the
 	// capability row must spell it: zero-based line and column, exactly as the
 	// index wrote them, so an operator opens the disagreeing line directly.
 	cases := []struct {
 		name     string
-		shifted  []byte
+		shifted  [][]byte
+		refused  string
 		exemplar string
 	}{
 		// A declaration on a clean token boundary that is not its own name:
 		// the columns of the parameter, not of the function.
-		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18), "pkg/tabs.go:4:11: "},
+		{"definition", [][]byte{occurrenceRecord(symStart, 1, 4, 11, 18)}, "1", "pkg/tabs.go:4:11: "},
 		// Five columns to the right of "browser" and still inside the line:
 		// "er + br", which starts in the middle of an identifier.
-		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22), "pkg/tabs.go:5:15: "},
+		{"reference", [][]byte{occurrenceRecord(symBrowser, 0, 5, 15, 22)}, "1", "pkg/tabs.go:5:15: "},
 		// Seven columns to the left: "return ", a keyword plus the space
 		// before the identifier. Both ends are wrong -- it covers no whole
 		// token and it does not spell the symbol's name -- and it is the
 		// shift the start-boundary check alone admitted.
-		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10), "pkg/tabs.go:5:3: "},
+		{"reference_onto_a_keyword", [][]byte{occurrenceRecord(symBrowser, 0, 5, 3, 10)}, "1", "pkg/tabs.go:5:3: "},
 		// Four columns to the right and four wider: "browser + b", which
 		// begins on a token boundary and stops in the middle of the next
 		// identifier. Only the end of it is wrong, which is the half of the
 		// coverage rule the three rows above do not exercise.
-		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21), "pkg/tabs.go:5:10: "},
+		{"reference_stopping_inside_the_next_token", [][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 21)}, "1", "pkg/tabs.go:5:10: "},
+		// The same tab shift on two identical lines: each reference to "page"
+		// is five columns right, on "name", a whole token that is not the
+		// symbol's name. The shift repeats the wrong spelling once per line, so
+		// a spelling bound because it recurs would publish "page" over the
+		// bytes of "name" twice; nothing in the document aliases "page" as
+		// "name", so both are refused.
+		{"one_shift_repeated_on_identical_lines", [][]byte{occurrenceRecord(symPage, 0, 6, 11, 15), occurrenceRecord(symPage, 0, 7, 11, 15)},
+			"2", "pkg/tabs.go:6:11: "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1061,10 +1076,10 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 			files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
 				documentWithText("pkg/tabs.go", "go", 0, src,
 					// Clean, refused, clean: the last one is spooled AFTER the
-					// refusal, so a refusal that cost the rest of its document
+					// refusals, so a refusal that cost the rest of its document
 					// would take it with it.
-					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted,
-					occurrenceRecord(symBrowser, 0, 5, 10, 17))))
+					slices.Concat([][]byte{occurrenceRecord(symServer, 1, 2, 5, 11)}, tc.shifted,
+						[][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 17)})...)))
 
 			h := providertest.New(t, files)
 			p := newProvider(t, "tabs.scip")
@@ -1080,8 +1095,8 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
 					t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
 				}
-				if got := cs.Details["refused_occurrences"]; got != "1" {
-					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, "1")
+				if got := cs.Details["refused_occurrences"]; got != tc.refused {
+					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, tc.refused)
 				}
 				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, tc.exemplar) {
 					t.Fatalf("refused_occurrence_exemplar = %q, want the prefix %q: the document and the coordinate it claimed", got, tc.exemplar)
@@ -1227,47 +1242,6 @@ func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 		if got := cs.Details["refused_occurrences"]; got != "" {
 			t.Fatalf("refused_occurrences = %q: a failed encoding probe is one dropped document, not a refused occurrence", got)
 		}
-	}
-}
-
-// TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse holds the boundary of
-// the wrong-bytes guarantee, which docs/providers-scip.md states beside it: a
-// shift that lands on a whole token spelling the same identifier somewhere
-// else publishes, because the two ranges are byte-for-byte the same claim and
-// this provider never adjusts or guesses a coordinate.
-//
-// Failure mode it guards: the guarantee being read, or later written, as
-// total. A page that claimed every occurrence is proved would tell an operator
-// that a located fact of a `partial` unit cannot name the wrong token, and the
-// counts would carry no warning at all for this class. If a later predicate
-// does refuse this occurrence, the residual on that page is stale and the
-// guarantee can be widened -- which is why this asserts publication rather
-// than leaving the class untested.
-func TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse(t *testing.T) {
-	// The same line as the test above. "browser" sits at columns [10,17) and
-	// again at [20,27); the occurrence below is the first one shifted ten
-	// columns right, onto the second.
-	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
-	const (
-		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
-		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
-	)
-	files := fixture(t)
-	files["pkg/tabs.go"] = src
-	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
-		documentWithText("pkg/tabs.go", "go", 0, src,
-			occurrenceRecord(symStart, 1, 4, 5, 10),
-			occurrenceRecord(symBrowser, 0, 5, 20, 27))))
-
-	h := providertest.New(t, files)
-	p := newProvider(t, "tabs.scip")
-	res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := refusedDetail(res); got != "" {
-		t.Fatalf("refused_occurrences = %q: a shift onto a token spelling the same identifier is the measured residual, "+
-			"not something the pinned bytes can refuse -- if it now is, widen the guarantee on docs/providers-scip.md", got)
 	}
 }
 

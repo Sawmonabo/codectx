@@ -334,20 +334,33 @@ aliases an import spells the symbol under a name of its own — `use HashSet as
 Set` makes every later `Set` of that file a correct reference to `HashSet` — and
 the occurrence carries nothing saying so: the indexer that produces this shape
 sets no occurrence role at all, so the import role cannot mark it. A spelling is
-therefore bound by corroboration: the document must hold at least two
-occurrences of that symbol spelling it identically. That is not a threshold
-chosen to fit a measurement, it is the structural minimum of the construct — an
-alias that is *used* produces the occurrence in the alias clause and the
-occurrence at the use site. An alias declared and never used produces one
-occurrence, and no second one for the rule to refuse either, so nothing is lost.
+therefore bound only from the **alias clause** that introduces it, spelled
+`<name> as <spelling>` on one line with `<name>` the symbol's own name: either
+one occurrence of the symbol ranges over the whole clause, or one ranges exactly
+over the spelling and another exactly over the name the clause aliases. That is
+the one source a shifted column cannot produce. Recurrence is not: a tab counted
+to the wrong stop shifts every line of the same indentation by the same distance,
+so two identical lines `\t\trun(page,name);` carry the same wrong spelling twice,
+and a spelling bound because it recurs would publish `page` over the bytes of
+`name`. A uniform shift moves the two occurrences of a clause by the same
+distance, so it cannot leave one on the aliased name and the other on the alias;
+a cast such as `len as u32` holds only its first token as an occurrence of the
+symbol, so a shift onto the type binds nothing. The clause occurrence of an
+alias declared and never used binds itself, so it is not refused. An alias form
+spelled without `as` (`{A => B}`) binds nothing, and its uses are refused rather
+than admitted on a guess.
 A range that is not one identifier token is not name-checked at all: an aliased
 import can put the occurrence on the whole alias clause (`OrderedDict as OD`),
 and an operator reference is punctuation.
 
 Measured over the indexes the six pinned indexers produce from the fixtures of
 the per-platform matrix — 308 occurrences, all nine languages — the proof
-refuses **none** of them. The corroboration rule is what admits 2 of those 308
-(`Set` for `HashSet`); no other spelling in the corpus is corroborated.
+refuses none of the 306 that spell their symbol's own name or are not
+name-checked. The other two are `Set` for `HashSet`, the alias clause and its
+use. Whether that indexer also puts an occurrence on the clause's `HashSet`
+token, which the second clause shape needs, is **unmeasured**; until it is,
+whether the clause admits those two is unmeasured too, and a refusal of them is
+counted like any other rather than published.
 
 **What the proof does not catch.** It compares bytes, and it never adjusts or
 guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
@@ -362,8 +375,10 @@ rather than one identifier token; and **10** zero-width ranges, which name a
 position and no bytes. A shift landing on another token spelling the **same**
 identifier is the remaining kind — two byte-identical ranges are the same claim,
 and nothing in the bytes separates them; it occurs **0** times in this corpus
-under those two shifts, and `internal/provider/scip` holds a fixture case for it
-so the boundary stays stated rather than assumed.
+under those two shifts. The alias clause adds one narrower kind: a line whose
+occurrences carry two *different* shifts (a tab in the middle of the line as
+well as in its indentation) could in principle place one occurrence on a
+clause's aliased name and another on its alias, which a single shift cannot.
 
 The two proofs deliberately have different outcomes, because the two failures
 have different reach. A failed **encoding probe** is a claim about the whole
