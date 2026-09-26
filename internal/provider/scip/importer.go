@@ -854,14 +854,16 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 //	scip-java 0.0.0        position_encoding absent   columns are UTF-16
 //	                       (the only build measured reports "0.0.0-SNAPSHOT")
 //
-// scip-python is UTF-16 rather than the UTF-32 scip.proto suggests for Python
-// indexers, because it is a TypeScript program (a pyright fork), which is why
-// the table is measured and not read off the proto's advice.
+// The Python indexer's columns are UTF-16 rather than the UTF-32 scip.proto
+// suggests for Python indexers, because it is built on a type checker written
+// in TypeScript, which is why the table is measured and not read off the
+// proto's advice.
 //
-// rust-analyzer is deliberately absent: measured at 1.98.0 it declares
-// `position_encoding = UTF8` on every document, so it never reaches this
-// table; a build that stopped declaring it would be an unmeasured pair and
-// stay skipped, which is the right outcome and not a row to write in advance.
+// The Rust indexer is deliberately absent: the pinned build declares
+// `position_encoding = UTF8` on every document (measured), so it never reaches
+// this table; a build that stopped declaring it would be an unmeasured pair
+// and stay skipped, which is the right outcome and not a row to write in
+// advance.
 //
 // `Metadata.text_document_encoding` is deliberately not consulted. All six
 // indexers set it to UTF8 — including the three whose columns are UTF-16 —
@@ -1132,8 +1134,8 @@ func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
 // alone. A range spanning lines is a block span -- measured, a crate's whole
 // file -- and its edges are the file's, not a token's. A range holding no
 // identifier byte at all is punctuation the grammar spells without one:
-// measured, rust-analyzer ranges the reference from `+` to the `add` method it
-// desugars to over the space beside the operator. A range of whitespace alone
+// measured, the Rust indexer ranges the reference from `+` to the `add` method
+// it desugars to over the space beside the operator. A range of whitespace alone
 // is neither: it holds no token at all, which is what a reference shifted onto
 // the gap between two tokens selects, so it is refused.
 func coversWholeTokens(text []byte) string {
