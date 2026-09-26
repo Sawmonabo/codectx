@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,20 +80,12 @@ const (
 // process runners' bursts. To give queries more room, raise `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
-// parserWorkerReservationBytes is what one tree-sitter worker is admitted
-// against, and therefore what the parser runner's budget is sized from. It is
-// the provider's own default restated here so one number sizes both sides
-// rather than a budget guessing at a default it cannot see.
-//
-// Task 20 measured it on this host, with the real worker subprocess and all
-// pinned grammars loaded: one worker peaks at 38.9 MiB over ordinary repository
-// files and grows linearly at about 30.5 MiB per MiB of source, reaching
-// 191.5 MiB at `workspace.max_parse_file_bytes = 5 MiB`. Ledger 113's "roughly
-// seven times over-reserved" reproduces exactly -- but only for ordinary files.
-// Re-pinning to the ~37 MiB that measurement suggests would let a worker exceed
-// its own admission reservation five-fold on a single legal file, so the pin
-// stays at 256 MiB, which leaves about a third of headroom over the parse
-// ceiling. The measurement, not the round number, is the reason.
+// parserWorkerReservationBytes is the memory one parser worker reserves while
+// it runs, and therefore what the parser runner's budget is sized from. One
+// constant sizes both sides, so the budget never guesses at a reservation it
+// cannot see. It is one fixed figure for every worker, whatever the file it
+// parses: it has to cover a worker parsing a file at the largest size
+// workspace.max_parse_file_bytes admits, not an ordinary one.
 const parserWorkerReservationBytes int64 = 256 << 20
 
 // collectorBatchLimit bounds every phase of one retention pass. It restates
@@ -157,9 +148,8 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
 		return unobservedFreeDiskBytes, false
 	}
-	if free > math.MaxInt64 {
-		free = math.MaxInt64
-	}
+	// A measured figure always fits int64: diskfree.Available reports a
+	// product that would not round-trip as unmeasured.
 	allocation := int64(free) - floorBytes
 	if allocation <= 0 {
 		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
@@ -190,16 +180,15 @@ const (
 	// directories, which is what opening a store means -- so `codectx status`
 	// answers while a `watch` session holds the workspace instead of being
 	// refused for a lock it does not need: Section 12.3 makes the active
-	// generation immutable once published, and a report reads only that
-	// (ledger 159 keeps the same path from installing anything, which the
-	// providers now honour by construction).
+	// generation immutable once published, and a report reads only that. The
+	// providers install nothing on this path by construction.
 	modeReport
 	// modeQuery composes for a command that only answers questions: it takes
 	// no lock and, beyond what modeReport already withholds, opens the store
-	// with NO writer connection at all. Every write a query process used to
-	// perform -- the schema check inside a write transaction at open, and the
-	// retention lease each pinned generation inserted -- waited on the write
-	// transaction a concurrent run holds, so a second process was refused
+	// with NO writer connection at all. Any write a query process performed
+	// -- a schema check inside a write transaction at open, a retention lease
+	// inserted per pinned generation -- would wait on the write transaction a
+	// concurrent run holds, so a second process would be refused
 	// `database is busy` for the whole of an index. A reader pool on a
 	// write-ahead log never waits on a writer, so this composition answers
 	// throughout a run and delays none of it.
@@ -455,7 +444,7 @@ type stack struct {
 func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err error) {
 	// os.Executable is resolved once, here, and a failure is fatal: every
 	// later reader of this path would otherwise silently fall back to argv[0],
-	// which a caller controls (ledger 113, 126).
+	// which a caller controls.
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeInternal,
@@ -592,9 +581,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 	// The content store opens before the database: it holds no lock and no
 	// state of its own. A composition that only answers opens it for reading,
-	// which creates nothing and refuses every storing entry point: this is the
-	// open that used to bring a workspace into being -- and fail outright on
-	// one an operator had made read-only -- before anything had read a byte.
+	// which creates nothing and refuses every storing entry point, so a
+	// workspace is never brought into being by a query -- and one an operator
+	// made read-only is never refused -- before anything has read a byte.
 	if o.mode == modeQuery {
 		s.cas, err = snapshot.OpenCASForReading(snapshot.CASDir(s.dataDir))
 	} else {
@@ -1615,18 +1604,18 @@ func (f validatorFunc) Current(ctx context.Context, file model.FileID, hash stri
 // state of a live workspace: nothing published yet, the file absent from the
 // current snapshot, and a deletion tombstone.
 //
-// Note what this cannot decide today, so nobody reads more into it than it
+// Note what this cannot decide, so nobody reads more into it than it
 // says. A generation's snapshot is fixed when the generation begins, so while
 // the session's generation IS the active one the snapshot asked here is the
 // session's own and every pinned hash matches by construction; and when it is
 // not the active one, the gate is already shut by supersession. Precondition 7
-// is therefore subsumed by Superseded at present. It is asked separately anyway
+// is therefore subsumed by Superseded. It is asked separately anyway
 // because the two are different questions -- the readiness contract promises a
 // per-file answer, and the source that would make it decisive is a per-file
-// WORKTREE hash, which this repository does not have yet: coherence is
-// snapshot-level (HEAD plus a dirty flag, internal/index/status.go:88).
-// Ledgered for Task 20; until then the guarantee limit's "pair it with
-// expected-content-hash validation at each write" is what covers the gap.
+// WORKTREE hash, which this repository does not have: coherence is
+// snapshot-level (HEAD plus a dirty flag, internal/index/status.go). The
+// guarantee limit's "pair it with expected-content-hash validation at each
+// write" is what covers the gap.
 func (s *stack) currentSource(ctx context.Context, file model.FileID, hash string) (bool, error) {
 	snap, err := s.activeSnapshot(ctx)
 	if err != nil {
