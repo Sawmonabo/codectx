@@ -229,7 +229,7 @@ const rsTryLabel = " try"
 //     of that name; `{{` is a literal brace and a numbered argument captures
 //     nothing. Which macros format is not known, so a literal a macro does not
 //     format is read too.
-//   - A `?` after an operand (The question mark operator), a return, and a
+//   - A `?` after an operand (The try propagation expression), a return, and a
 //     break or continue can leave the invocation. The invocation is then a
 //     Branch node, Using the tree's reads, whose successors are its
 //     fall-through and each such jump's target, as a `?` is lowered. A jump
