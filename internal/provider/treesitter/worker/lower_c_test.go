@@ -327,6 +327,47 @@ func TestCLoweringGolden(t *testing.T) {
 				"x = ({ g(y); y = z; })@26 -> return x;@50"},
 		},
 		{
+			// GNU C extension, Statements and Declarations in Expressions
+			// (the statements run in order and jumping into the construct is
+			// not permitted), C17 §6.5.2.2 (the arguments are evaluated
+			// before the call; the lowering takes them left to right). x = 1
+			// is an expression statement of the construct's own list with no
+			// label after it, so it runs on every path to the value and takes
+			// the call's earlier read of x. Nodes: x@10, x = 1@30 (Uses x,
+			// defines x, may-defines the owned variable holding the read), 0@37
+			// (defines the construct's result), return g(x, ({ x = 1; 0;
+			// }));@15 (Uses the owned variable and the result). Succ: a
+			// straight line to EXIT.
+			name:     "a statement expression's earlier statement on every path hands the consumer's read off",
+			protects: "a read the consumer makes before a statement expression pairs with the definition that reached it, carried by an earlier statement's assignment that runs whenever the value does",
+			mutation: "treat every statement before the last as skippable (loses x@10 -> x = 1@30: the call's read of x pairs through the name with the assignment after it)",
+			src:      "int f(int x) { return g(x, ({ x = 1; 0; })); }",
+			du: []string{"x@10 -> x = 1@30", "x = 1@30 -> return g(x, ({ x = 1; 0; }));@15",
+				"0@37 -> return g(x, ({ x = 1; 0; }));@15"},
+		},
+		{
+			// GNU C extension, Statements and Declarations in Expressions;
+			// C17 §6.8.6.1 (a goto jumps to its label), §6.8.4.1 (the
+			// substatement of if runs only when the condition is nonzero).
+			// The goto to L can skip x = 1, and x = 2 runs only when c is
+			// nonzero, so neither takes the call's earlier read of x, which
+			// stays on the consumer. Nodes: x@10, c@17, c@41 (Branch), goto
+			// L;@44, x = 1@52, L@59 (the label's node), c@67 (Branch), x =
+			// 2@70, 0@77 (defines the construct's result), return g(x, ({ … }));@22
+			// (Uses x and the result). Succ: c@41→{goto L, x = 1}; goto L→L;
+			// x = 1→L→c@67→{x = 2, 0}; x = 2→0→return. IPDom: c@41 → L;
+			// c@67 → 0.
+			name:     "a statement expression's statement that a jump can skip leaves the consumer's read in place",
+			protects: "a statement a goto can skip, or one nested in an if, hands on none of the consumer's earlier reads, so the read still pairs with the definitions reaching it on the paths that skip the assignment",
+			mutation: "drop the label test (x = 1@52 takes the read: adds x@10 -> x = 1@52, loses x@10 -> return …@22 and x = 2@70 -> return …@22), or keep an if statement on the hand-off (x = 2@70 takes the read: adds x@10 -> x = 2@70 and x = 1@52 -> x = 2@70, loses x@10 -> return …@22 and x = 1@52 -> return …@22)",
+			src:      "int f(int x, int c) { return g(x, ({ if (c) goto L; x = 1; L:; if (c) x = 2; 0; })); }",
+			cd:       []string{"c@41 -> goto L;@44", "c@41 -> x = 1@52", "c@67 -> x = 2@70"},
+			du: []string{"c@17 -> c@41", "c@17 -> c@67", "x@10 -> return g(x, ({ if (c) goto L; x = 1; L:; if (c) x = 2; 0; }));@22",
+				"x = 1@52 -> return g(x, ({ if (c) goto L; x = 1; L:; if (c) x = 2; 0; }));@22",
+				"x = 2@70 -> return g(x, ({ if (c) goto L; x = 1; L:; if (c) x = 2; 0; }));@22",
+				"0@77 -> return g(x, ({ if (c) goto L; x = 1; L:; if (c) x = 2; 0; }));@22"},
+		},
+		{
 			// C17 §6.5.16p3: an assignment expression has the value of the
 			// left operand after the assignment. Nodes: s@15, a@22, s.f =
 			// a@36 (Uses a and s, may-defines s, defines the owned result),
