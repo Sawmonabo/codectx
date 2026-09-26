@@ -137,28 +137,47 @@ beside the database, and it removes neither.
 What it does touch is the shared-memory index beside the log. That file holds
 no database content -- it is the index OF the log, rebuilt from the log -- and
 a reader writes its read mark there, which is how an answer is taken from a
-fixed snapshot without blocking a writer. Where the index is missing, a reader
-creates it, together with the engine's zero-length log stub, because reading a
-log at all needs it; on a workspace an operator has made read-only, an index
-already beside the log is read without being written. Neither file is ever
-removed or resized by a reader, and neither carries a byte of the published
-index.
+fixed snapshot without blocking a writer. Neither file is ever removed or
+resized by a reader, and neither carries a byte of the published index.
 
+What an answering command may create, exactly:
+
+- beside an existing database, in a data directory it can write, the log's
+  shared-memory index and a zero-length log where they are missing, because
+  reading a log needs both;
+- the engine's temporary directory under the data directory, where the data
+  directory can be written;
+- the content store's own directory, where it is missing.
+
+It creates no database and no provider work directory -- both belong to a run.
 A workspace with no database at all is the answer `CTX_NO_ACTIVE_GENERATION`,
-"run `codectx index`": no answering command creates a database, and none
-creates the provider work directories -- both belong to a run. (The content
-store's own directory is still made where it is missing, which is the one
-directory such a command has always made.)
+"run `codectx index`".
 
 That is what lets such a command answer a workspace on **read-only media**, or
-one an operator has locked down. Two things are then different, and neither is
-visible in the answer: the engine's temporary files -- sort spills, statement
+one an operator has locked down, where it creates nothing at all. Whether the
+data directory can be written is asked of the directory itself before the
+store is opened (a directory whose permissions refuse this user and one on a
+filesystem mounted read-only are the same answer), and what is then done
+depends on the log beside the database:
+
+- no log, or a zero-length one: the store is read as an unchanging file, which
+  is the only way a write-ahead-log database can be read without an index
+  beside it; a log with no frames holds nothing the database lacks;
+- a log with frames and its index beside it: the log is read through the
+  existing index, writing neither;
+- a log with frames and no index: the command is refused with
+  `CTX_CONFIG_INVALID`, naming the log and its size. The log holds the newest
+  state, it cannot be read without an index nobody may create there, and
+  reading the database alone would answer from an older generation. The
+  remedy is to make the directory writable and run `codectx index` once, which
+  folds the log into the database, or to copy the data directory to writable
+  storage and set `storage.data_dir` to the copy.
+
+On such a directory the engine's temporary files -- sort spills, statement
 journals past their memory threshold -- go to the process temp directory
-instead of the data directory, and are given back when the command ends; and
-where no log lies beside the database, the store is read as an unchanging file,
-which is the only way a write-ahead-log database can be read without an index
-beside it. A directory a command that BUILDS cannot write is refused instead,
-as `CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
+instead of the data directory, and are given back when the command ends. A
+directory a command that BUILDS cannot write is refused instead, as
+`CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
 operator's to fix, and a run whose spills went elsewhere is what this directory
 exists to prevent.
 

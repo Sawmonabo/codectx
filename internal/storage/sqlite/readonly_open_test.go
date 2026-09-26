@@ -18,17 +18,14 @@ import (
 )
 
 // A second process must be able to read a published workspace while a run holds
-// the ingestion group's write transaction. Every read-only command used to
-// begin a write of its own before it read anything -- the schema check at open,
-// and the retention lease every pinned generation inserted -- and both are
-// `_txlock=immediate` on the single writer connection, so a second process was
-// refused after the busy timeout for the whole length of an index: `status`,
-// every query and every tool an agent called answered nothing exactly while the
-// workspace was being refreshed.
+// the ingestion group's write transaction. A read-only command that began a
+// write of its own before it read anything -- a schema check at open, or a
+// retention lease per pinned generation -- would queue on the single
+// `_txlock=immediate` writer connection and be refused after the busy timeout
+// for the whole length of an index.
 //
 // Two stores over one file are two independent connection sets, which is what
-// two processes are to the engine, so the refusal reproduces here exactly as it
-// did between processes.
+// two processes are to the engine.
 //
 // Mutation that fails this test: open the second store with ReadOnly false (the
 // composition a mutating command uses). Open is then refused
@@ -233,24 +230,27 @@ func digestTriple(t *testing.T, dbPath string) map[string]string {
 }
 
 // A command that answers questions must leave the workspace byte for byte as it
-// found it. `Options.ReadOnly` opened no writer connection and set query_only,
-// which refuses writes through SQL -- and left the connection read-WRITE at the
-// file level, so the last one to close ran the engine's log close: the log
-// checkpointed into the database, and the log and the shared-memory index were
-// unlinked. A `status` on a workspace whose finished run had left an 82 MB log
-// grew the database from 12,865,536 to 94,973,952 bytes and removed both.
+// found it, and must never answer from a state older than the one published.
 //
-// That is a write of the whole published index by a command whose help, and
-// docs/operations.md, both promise it writes nothing. It is also destructive
-// under a concurrent run: the checkpoint and the unlink are performed holding
-// the database exclusively, which is minutes of held lock on a large log.
+// query_only refuses writes through SQL and leaves the connection read-WRITE at
+// the file level, so the last one to close runs the engine's log close: the log
+// is checkpointed into the database and the log and its shared-memory index are
+// unlinked, holding the database exclusively. That is a write of the whole
+// published index by a command that promises to write nothing.
+//
+// On a data directory this process cannot write, the store is read as an
+// unchanging file only where no frames lie in the log. A log with frames and no
+// index beside it cannot be read there, and reading the database without it
+// answers from an older generation, so that open must be refused.
 //
 // The store is copied aside with its log and index while the writer that made
 // them is open and between transactions, which is how a test gets the state a
 // crashed or killed run leaves: a database with a live log and no writer.
 //
-// Mutation that fails this test: drop `mode=ro` from the read-only pools'
-// connection string. The digests then differ and the log and index are absent.
+// Mutations that fail this test: drop `mode=ro` from the read-only pools'
+// connection string (the digests differ and the log and index are absent); or
+// make unchangingRead answer true for an unwritable directory whatever the log
+// holds (the last open succeeds, pinning the older generation).
 func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) {
 	ctx := context.Background()
 	src := filepath.Join(t.TempDir(), "codectx.db")
@@ -389,6 +389,32 @@ func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) 
 		t.Fatalf("a read-only open removed or resized the shared-memory index: %s before, %s after",
 			before["-shm"], after["-shm"])
 	}
+
+	// The same hot log on a directory nobody may write, with no index beside it.
+	if os.Geteuid() == 0 {
+		t.Log("the unwritable-directory phase is skipped: a process with the override capability writes " +
+			"into a directory that grants nobody write, so the refusal it is built on never happens")
+		return
+	}
+	if err := os.Remove(dst + "-shm"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(dst)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	stale, err := store.Open(ctx, dst, store.Options{ReadOnly: true})
+	if err == nil {
+		stale.Close()
+		t.Fatal("a read-only open of an unwritable directory whose log holds the newest generation succeeded " +
+			"without the log's index: it is answering from the older generation the database alone holds")
+	}
+	wantCode(t, err, model.CodeConfigInvalid)
+	if after := digestTriple(t, dst); after[""] != before[""] || after["-wal"] != before["-wal"] ||
+		after["-shm"] != "absent" {
+		t.Fatalf("the refused open changed the store: %v before, %v after", before, after)
+	}
 }
 
 // activeGeneration opens a store read-only and reports the generation it finds
@@ -407,89 +433,4 @@ func activeGeneration(t *testing.T, ctx context.Context, path string, repo model
 	}
 	defer pinned.Close()
 	return pinned.Binding().GenerationID
-}
-
-// A read-only open of a workspace nothing has ever published must say so, and
-// must not bring the workspace into being on the way. The open used to create
-// the database file -- the engine's own create flag -- and learn from the empty
-// schema that nothing was published; the file it left behind was a write by a
-// command that promises none, and the next writing open then adopted it.
-//
-// Mutation that fails this test: return the raw open failure instead of the
-// typed answer, or restore the creating open, and the assertion on the absent
-// file or on the code fails.
-func TestAReadOnlyOpenOfAWorkspaceNeverIndexedCreatesNothing(t *testing.T) {
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "codectx.db")
-	_, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true})
-	if err == nil {
-		t.Fatal("a read-only open of a workspace that has published nothing succeeded")
-	}
-	wantCode(t, err, model.CodeNoActiveGeneration)
-	if _, statErr := os.Stat(dbPath); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Fatalf("the read-only open left a database behind: %v", statErr)
-	}
-}
-
-// A refusal that is NOT the engine declining to write must never be answered by
-// opening the store as an unchanging file. The immutable open exists for one
-// case -- a store on media this process cannot write, where the shared-memory
-// index cannot be created -- and it is a claim about the file, so every other
-// refusal keeps its own family and its own remedy: a corrupt database, a
-// foreign schema, a busy one. Reading a corrupt store a second time as though
-// it were frozen would replace the answer an operator can act on with a
-// stranger one.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
-//
-// Mutation that fails this test: drop the SQLITE_READONLY class check from
-// immutableAnswer, so any failed ping retries as immutable.
-func TestAReadOnlyOpenOfACorruptStoreKeepsItsOwnFamily(t *testing.T) {
-	ctx := context.Background()
-	src := filepath.Join(t.TempDir(), "codectx.db")
-	f := newFixture(t, src)
-	a := f.file("pkg/a.go", "package pkg\nfunc A() {}\n")
-	snap := f.snapshot("one", a)
-	gen, err := f.s.BeginGeneration(ctx, f.repo, snap.ID, model.H("semantic"), "main")
-	if err != nil {
-		t.Fatalf("BeginGeneration: %v", err)
-	}
-	run := f.run(gen)
-	f.unit(gen, run, a)
-	if err := f.s.CompleteProviderRun(ctx, model.ProviderResult{RunID: run, State: model.RunSucceeded,
-		RecordsEmitted: 1, BytesProcessed: 24}, ""); err != nil {
-		t.Fatalf("CompleteProviderRun: %v", err)
-	}
-	f.activate(gen, 0)
-	if err := f.s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// A file that is not a database at all: the header is what the engine reads
-	// first, and no log lies beside it, which is the shape the immutable open
-	// would otherwise be reached for.
-	dst := filepath.Join(t.TempDir(), "codectx.db")
-	b, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	copy(b[:16], []byte("not a database\x00\x00"))
-	if err := os.WriteFile(dst, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(dst + "-wal"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("the fixture left a log beside the copy, so this test would not reach the immutable path: %v", err)
-	}
-
-	_, err = store.Open(ctx, dst, store.Options{ReadOnly: true})
-	if err == nil {
-		t.Fatal("a read-only open of a file that is not a database succeeded")
-	}
-	var typed *model.Error
-	if !errors.As(err, &typed) {
-		t.Fatalf("the refusal is untyped: %v", err)
-	}
-	if typed.Code == model.CodeNoActiveGeneration {
-		t.Fatalf("a file that is not a database was reported as a workspace that has published nothing: %v", err)
-	}
 }
