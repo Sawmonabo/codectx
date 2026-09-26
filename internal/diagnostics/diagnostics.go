@@ -151,15 +151,16 @@ type Options struct {
 	// because a workspace that has recorded no run must still report its
 	// resources; a nil one leaves the run and stage rows out of the block.
 	Ledger RunLedger
-	// Admission is the process's one memory admission ledger, whose allocation
-	// and current total the resource block discloses. It is optional: a
-	// composition without one -- a diagnostics service that starts no heavy
-	// child -- leaves both figures absent rather than reporting them as zero.
+	// Admission is the process's one reservation ledger, for memory and disk,
+	// whose allocations and current totals the resource block discloses. It
+	// is optional: a composition without one -- a diagnostics service that
+	// starts no heavy child -- leaves every figure absent rather than
+	// reporting them as zero.
 	Admission *admission.Ledger
 	Toolchain ToolchainReporter
 	Workspace WorkspaceProber
-	// Now is the clock every check and the report's CheckedAt read (L1). A
-	// test supplies a fixed one so a doctor report is deterministic.
+	// Now is the clock every check and the report's CheckedAt read. A test
+	// supplies a fixed one so a doctor report is deterministic.
 	Now func() time.Time
 }
 
