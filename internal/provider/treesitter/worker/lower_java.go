@@ -182,15 +182,16 @@ const yieldLabel = " yield"
 //     defines and the second operand's node defines again, so SSA merges the
 //     two.
 //   - An assignment or update embedded in a larger expression (`(x = a) *
-//     2`, `f(o.f = a)`, `g(i++)`) is its own node. One of a local defines
-//     the local, a named variable holding the value, which its consumer
-//     Uses; one of a field or element target, which only may-defines its
-//     base, defines an owned result its consumer Uses. At statement level it
-//     is the statement's node and hands on nothing.
+//     2`, `f(o.f = a)`, `g(i++)`) is its own node, which hands its value to
+//     its consumer through an owned result, never through its target: one
+//     of a local defines the local and may-defines the result, one of a
+//     field or element target may-defines its base and defines the result.
+//     So `(x = 1) + (x = 2)` depends on both. At statement level it is the
+//     statement's node and hands on nothing.
 //   - A node defines at most one variable. A yielding node that already
-//     defines one (an arm's result node that is itself an assignment or a
-//     creation) may-defines the construct's result instead, which gives the
-//     same pairs, since only the construct's own yielding nodes define it.
+//     defines one (an embedded assignment to a local, an arm's result node
+//     that is itself one or a creation) may-defines the construct's result
+//     instead (see Lowering).
 //   - The node deciding on `x instanceof P` Uses the tested expression's
 //     reads: the test is folded into it. Each pattern variable's defining
 //     node Uses them too.
@@ -198,9 +199,9 @@ const yieldLabel = " yield"
 //     an existing variable or field, that expression's reads: the
 //     initializer was evaluated once, at the acquiring node.
 //
-// A node that defines v also Uses v when its statement read v before it, a
-// read the statement still holds: a read carried by a nested node (a
-// condition's, a creation's captures) does not count. A write through a
+// A defining node Uses only what its own evaluation reads: `x = x + 1`
+// Uses x, and `y = x + (x = 2)` does not make `x = 2` Use x, since that read
+// is the declarator's. A write through a
 // field or array element of a local (`o.f = v`, `a[i] += v`, `a[i]++`) is a
 // Stmt node spanning the assignment that uses its operands and may-defines
 // (MayDef, non-killing) the local at the base of the target.
@@ -332,15 +333,9 @@ type javaLower struct {
 	// shadow is non-zero while walking nested code for its captures:
 	// declarations then bind -1 and no node is created.
 	shadow int
-	// reads are the variables read by the current statement, in evaluation
-	// order. seen[v] marks v's first read among them: the statement's number
-	// and the read's index in reads, so the mark stays exact when a nested
-	// node's reads are dropped from the end (see has). stmtNo only grows,
-	// across functions too, so a mark a previous function left in seen
-	// never matches it.
-	reads  []int32
-	seen   []javaSeen
-	stmtNo int
+	// reads are the variables the current statement has read that no node
+	// carries yet, in evaluation order.
+	reads []int32
 	// stack saves the enclosing statement's reads across a switch
 	// expression's statements.
 	stack []int32
@@ -389,13 +384,11 @@ type javaLower struct {
 // and every list truncated, never reallocated, so nothing a previous
 // function left behind is read. The lists holding nodes or views of the
 // source (buf, labels, caseBinds, pats) clear what they drop whenever they
-// shrink, so they hold none between functions. seen keeps its marks, which
-// stmtNo, only ever increased, never matches again.
+// shrink, so they hold none between functions.
 func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.TreeCursor, binds *scope) {
 	j.l, j.b, j.src, j.k, j.cur, j.binds = l, b, src, javaSyntaxOf(), cur, binds
 	j.shadow, j.throws, j.thrown, j.labelAt = 0, 0, 0, 0
 	j.first, j.last, j.lastSpan = -1, -1, flow.Span{}
-	j.stmtNo++
 	clear(j.buf)
 	clear(j.labels)
 	clear(j.caseBinds)
@@ -410,12 +403,6 @@ func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.Tree
 // lowered, so the lowering state keeps nothing of the file alive.
 func (j *javaLower) end() {
 	j.l, j.b, j.src, j.cur, j.binds = nil, nil, nil, nil, nil
-}
-
-// javaSeen marks a variable's first read by statement no, at index at of
-// reads.
-type javaSeen struct {
-	no, at int
 }
 
 // javaArm is one switch label's match fringe and the index of its group.
@@ -497,30 +484,12 @@ func (j *javaLower) read(v int32) {
 	if v < 0 {
 		return
 	}
-	if int(v) >= len(j.seen) {
-		j.seen = append(j.seen, make([]javaSeen, int(v)+1-len(j.seen))...)
-	}
-	if !j.has(v) {
-		j.seen[v] = javaSeen{no: j.stmtNo, at: len(j.reads)}
-	}
 	j.reads = append(j.reads, v)
-}
-
-// has reports whether the current statement's reads hold v. A read dropped
-// with a nested node's reads (reads truncated past it) no longer counts:
-// seen marks v's first read, which lies in reads only while v is read there.
-func (j *javaLower) has(v int32) bool {
-	if int(v) >= len(j.seen) {
-		return false
-	}
-	m := j.seen[v]
-	return m.no == j.stmtNo && m.at < len(j.reads) && j.reads[m.at] == v
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (j *javaLower) reset() {
 	j.reads, j.throws, j.thrown = j.reads[:0], 0, 0
-	j.stmtNo++
 }
 
 // node creates a node spanning n that Uses reads[from:to], and MayThrow when
@@ -545,15 +514,10 @@ func (j *javaLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	return id
 }
 
-// def records that node n defines v and, when the statement read v before
-// n, that n Uses v.
+// def records that node n defines v, unless v is -1.
 func (j *javaLower) def(n, v int32) {
-	if v < 0 {
-		return
-	}
-	j.define(n, v)
-	if j.has(v) {
-		j.b.Use(n, v)
+	if v >= 0 {
+		j.define(n, v)
 	}
 }
 
@@ -1741,21 +1705,13 @@ func (j *javaLower) expr(n *ts.Node) int {
 		j.cutPats(m)
 		j.read(res)
 	case k.assignment, k.update:
-		// An embedded assignment's value reaches its consumer through the
-		// local it defines, or, for a field or element target, which only
-		// may-defines its base, through an owned result (see Uses).
+		// An embedded assignment's value reaches its consumer through an
+		// owned result, never through its target (see Uses).
 		r := len(j.reads)
-		var id, v int32
 		if n.KindId() == k.assignment {
-			id, v = j.assign(n)
+			j.hand(j.assign(n), r)
 		} else {
-			id, v = j.update(n)
-		}
-		if v >= 0 {
-			j.reads = j.reads[:r]
-			j.read(v)
-		} else {
-			j.hand(id, r)
+			j.hand(j.update(n), r)
 		}
 	case k.methodInvocation:
 		if o := n.ChildByFieldId(k.fObject); o != nil {
@@ -1838,11 +1794,7 @@ func (j *javaLower) switchValue(n *ts.Node) {
 	j.results = append(j.results, res)
 	j.switchBlock(n, nil, true)
 	j.results = j.results[:len(j.results)-1]
-	j.reads = j.reads[:0]
-	j.stmtNo++
-	for _, v := range j.stack[base:] {
-		j.read(v)
-	}
+	j.reads = append(j.reads[:0], j.stack[base:]...)
 	j.stack = j.stack[:base]
 	j.read(res)
 	j.throws, j.thrown = throws, thrown
@@ -1913,8 +1865,8 @@ func (j *javaLower) targetThrows(t *ts.Node) bool {
 }
 
 // assign lowers `left = right` and `left op= right` as one node spanning n
-// and returns it and the local it defines, or -1.
-func (j *javaLower) assign(n *ts.Node) (int32, int32) {
+// and returns it.
+func (j *javaLower) assign(n *ts.Node) int32 {
 	k := j.k
 	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	compound := n.ChildByFieldId(k.fOperator).KindId() != k.assignOp
@@ -1927,7 +1879,7 @@ func (j *javaLower) assign(n *ts.Node) (int32, int32) {
 		j.value(right)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
-		return id, v
+		return id
 	}
 	j.reference(left)
 	throws := j.targetThrows(left)
@@ -1944,12 +1896,12 @@ func (j *javaLower) assign(n *ts.Node) (int32, int32) {
 	if v := j.base(left); v >= 0 {
 		j.b.MayDef(id, v)
 	}
-	return id, -1
+	return id
 }
 
 // update lowers `x++`, `--x` and their field and array forms as one node
-// spanning n and returns it and the local it defines, or -1.
-func (j *javaLower) update(n *ts.Node) (int32, int32) {
+// spanning n and returns it.
+func (j *javaLower) update(n *ts.Node) int32 {
 	k := j.k
 	arg := j.l.unparen(firstNamed(n))
 	m := len(j.reads)
@@ -1958,7 +1910,7 @@ func (j *javaLower) update(n *ts.Node) (int32, int32) {
 		j.read(v)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
-		return id, v
+		return id
 	}
 	j.reference(arg)
 	if j.targetThrows(arg) {
@@ -1968,7 +1920,7 @@ func (j *javaLower) update(n *ts.Node) (int32, int32) {
 	if v := j.base(arg); v >= 0 {
 		j.b.MayDef(id, v)
 	}
-	return id, -1
+	return id
 }
 
 // cap collects the references n makes to variables of the function being

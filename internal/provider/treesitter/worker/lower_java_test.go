@@ -567,5 +567,19 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"c@24 -> c@44", "x = 1@49 -> y = c ? (x = 1) : 2@40", "2@58 -> y = c ? (x = 1) : 2@40",
 				"x@31 -> return x + y;@61", "x = 1@49 -> return x + y;@61", "y = c ? (x = 1) : 2@40 -> return x + y;@61"},
 		},
+		{
+			// §15.26.1, §15.7.1 (left operand first). Nodes: x = 1@36 and
+			// x = 2@46 (each defines x and may-defines its own owned
+			// result), y = (x = 1) + (x = 2)@31 (Uses both results, defines y), return
+			// y;@54. Succ: a straight line. The declarator reads each
+			// assignment's value, not x, so both assignments reach it,
+			// though x = 2 kills x = 1's definition of x.
+			name:     "two embedded assignments to one local each hand their value to the consumer",
+			protects: "a consumer of several embedded assignments to the same local depends on every one of them, through their result variables rather than the local",
+			mutation: "hand an embedded assignment to a local its value through the local (loses x = 1@36 -> y = (x = 1) + (x = 2)@31)",
+			src:      "class A { int f() { int x; int y = (x = 1) + (x = 2); return y; } }",
+			fn:       1,
+			du:       []string{"x = 1@36 -> y = (x = 1) + (x = 2)@31", "x = 2@46 -> y = (x = 1) + (x = 2)@31", "y = (x = 1) + (x = 2)@31 -> return y;@54"},
+		},
 	})
 }
