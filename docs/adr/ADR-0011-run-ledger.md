@@ -31,8 +31,8 @@ the stall watchdog.
 The decision below replaced all of it, so this paragraph describes the state that motivated the
 decision and not the state of the tree. Each of the six stages is now a span, opened at
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
-`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:291` and
-`internal/provider/dependence/provider.go:861` and `:957`, and its duration line is gone. Each of
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:292` and
+`internal/provider/dependence/provider.go:862` and `:958`, and its duration line is gone. Each of
 the three measurements has a reader: the sampler keeps the tree's peak at
 `internal/process/treesample_linux.go:64` and its CPU ticks at `:80`, and the runner reads the reaped
 child's user and system time into its result at `internal/process/runner.go:634-636`; the span a
