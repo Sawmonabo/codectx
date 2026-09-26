@@ -10,6 +10,7 @@ package plan
 import (
 	"context"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -88,8 +89,16 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			}
 			// A profile runs an indexer over the whole workspace, which is what
 			// its workspace invalidation scope declares; every retained file is
-			// an input.
+			// an input. Its indexer is a heavy child, so the unit carries the
+			// memory and temporary disk the run reserves, for admission on the
+			// process's one ledger. A profile key with no figure is refused
+			// rather than planned with a reservation of zero.
+			mem, disk, ok := scip.ProfileReservation(key)
+			if !ok {
+				return nil, nil, internalErr("the scip provider planned profile scope " + key + " with no reservation")
+			}
 			out = append(out, semantic{providerID: d.ID, scopeKey: key, allFiles: true,
+				admit:    admission.Reservation{MemoryBytes: mem, DiskBytes: disk},
 				contains: func(model.FileVersion) bool { return true }})
 		}
 		return out, nil, nil
@@ -100,9 +109,9 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		}
 		out := make([]semantic, 0, len(dp.Units))
 		for _, u := range dp.Units {
-			// Residual 109: a dependence unit declares its semantic closure and
-			// nothing else -- the files of its own family that it owns, plus
-			// the manifest and lock files it owns (Section 11.6: "the unit's
+			// A dependence unit declares its semantic closure and nothing
+			// else -- the files of its own family that it owns, plus the
+			// manifest and lock files it owns (Section 11.6: "the unit's
 			// source file hashes, its manifest and lock files"). Every file
 			// under the root would fold a README, an image and another
 			// language's sources into the key of the heaviest unit in the
@@ -156,6 +165,10 @@ type semantic struct {
 	allFiles bool
 	heavy    bool
 	family   dependence.Family
+	// admit is what an external-indexer profile unit reserves in both
+	// dimensions while it runs; it is set only for a profile scope, and zero
+	// for every other unit.
+	admit admission.Reservation
 	// bytes is the source byte count the provider's own planner folded for
 	// this unit, which is the figure the family heap estimate was measured
 	// against; the unit's declared inputs are a larger set.

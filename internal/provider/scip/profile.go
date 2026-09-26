@@ -260,6 +260,25 @@ func (p Profile) Name() string { return string(p.Kind) }
 // spec is the build's fixed description of this kind.
 func (p Profile) spec() kindSpec { return kindSpecs[p.Kind] }
 
+// ProfileReservation is the memory and the temporary disk one profile unit
+// reserves while its indexer runs, read from the build's own figures for the
+// kind a profile scope key names. ok is false for a key that is not a profile
+// scope or names a kind this build does not know: there is no figure to
+// report, and none is invented. It is the planner's source for the unit's
+// admission and the same pair the run hands the runner, so the two cannot
+// disagree.
+func ProfileReservation(scopeKey string) (memoryBytes, diskBytes int64, ok bool) {
+	name, _, isProfile := splitProfileScope(scopeKey)
+	if !isProfile {
+		return 0, 0, false
+	}
+	spec, known := kindSpecs[Kind(name)]
+	if !known {
+		return 0, 0, false
+	}
+	return spec.memoryBudgetBytes, spec.diskBudgetBytes, true
+}
+
 // Triggers are the manifests whose presence makes a workspace a candidate for
 // one kind. It is the single source of the trigger mapping: `tools prefetch
 // --for-repo` and the planner read it without resolving a payload, so the
