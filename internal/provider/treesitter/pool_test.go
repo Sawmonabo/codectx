@@ -126,6 +126,20 @@ func awaitHead(p *pool) {
 	}
 }
 
+// awaitQueued returns once n acquirers of p are queued for a worker, so a
+// worker handed back after it sees them rather than going idle.
+func awaitQueued(p *pool, n int) {
+	for {
+		p.mu.Lock()
+		queued := len(p.queued) == n
+		p.mu.Unlock()
+		if queued {
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
 type handout struct {
 	w   *worker
 	err error
@@ -225,6 +239,7 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 		}()
 		<-stuck // the foreign reserver is the ledger's head and does not fit
 		second := acquireAsync(p)
+		awaitQueued(p, 1)
 		p.release(first, true)
 		var release func()
 		select {

@@ -266,10 +266,13 @@ parse while an acquirer of the pool is queued there follows that order:
 No idle worker is reused while an acquirer of the pool is queued, because no
 worker goes idle then. With none queued, a worker coming back goes idle and is
 held for the stage like any room an admitted child holds. The ledger does not
-tell a room holder that a reserver is waiting, so a reserver that arrives while
-the pool holds idle workers waits behind them until a release of the pool stops
-one or the stage's drain stops them all; room is returned by its holder, never
-taken from it.
+tell a room holder that a reserver is waiting, so idle workers are reused
+around another reserver waiting on the ledger: the pool's callers take them
+for as long as there is one. That reserver is admitted only once the pool's
+callers outnumber its idle workers (one of them then queues behind it, and the
+next worker handed back is stopped) or once the stage's drain stops them all.
+Room is returned by its holder, never taken from it, and the order among the
+reservers queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with

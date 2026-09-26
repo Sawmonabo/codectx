@@ -86,13 +86,15 @@ var errWorkerGone = errors.New("treesitter: parser worker exited")
 //
 // No idle worker is reused while an acquirer of this pool is queued, since
 // release never idles one then. With none queued, a worker coming back goes
-// idle and is held for the stage like any room an admitted child holds; the
-// ledger does not tell a room holder that someone is waiting, so a reserver
-// that arrives while this pool holds idle workers waits behind them until a
-// release of this pool stops one or the stage's drain stops them all. That is
-// the order admission itself keeps -- room is returned by its holder, never
-// taken -- and it is the one point where a warm worker is kept rather than
-// given up.
+// idle and is held for the stage like any room an admitted child holds. The
+// ledger does not tell a room holder that someone is waiting, so idle workers
+// ARE reused around another reserver waiting on the ledger: this pool's
+// callers take them for as long as there is one, and the waiter is admitted
+// only once this pool's callers outnumber its idle workers -- one of them then
+// queues behind the waiter, and the next worker handed back is stopped -- or
+// once the stage's drain stops them all. Room is returned by its holder and
+// never taken from it; admission order among the reservers queued on the
+// ledger is kept throughout.
 //
 // Kept idle while an acquirer of this pool is queued, a worker would hold the
 // room that acquirer waits for while nothing ever pumps the ledger, and the
