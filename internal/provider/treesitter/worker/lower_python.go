@@ -153,8 +153,11 @@ var pythonLowering = Lowering{
 //     Stmt node spanning it that defines an iteration variable, and its
 //     head and target nodes Use only that variable. The first clause's
 //     iterable is evaluated by the enclosing function and its iterator
-//     passed in, which no node of the comprehension's graph defines, so its
-//     head and target nodes Use nothing. Each `if` clause is a Branch node
+//     passed in as an implicit argument (§6.2.4): in the comprehension's
+//     graph it is a parameter-like Stmt node after Entry, spanning that
+//     iterable and reading nothing, which defines the first clause's
+//     iteration variable, and that clause's head and target nodes Use it.
+//     Each `if` clause is a Branch node
 //     spanning its condition whose false edge continues with the next
 //     element; the element is its value's nodes (see yield), spanning the
 //     comprehension's body expression (a key: value pair for a dictionary).
@@ -198,12 +201,15 @@ var pythonLowering = Lowering{
 //     result the same way.
 //   - A def or class statement's node defines its name, the variable the
 //     created value travels through.
-//   - A node that defines v also Uses v when its statement read v before
-//     it and no node carries that read yet: in `y = x + (x := 1)` the
-//     assignment expression's node Uses the x read before it. A read a node
-//     of its own carries (a capture, a condition, an operand) is not the
-//     consumer's, so `k = lambda: k` makes the assignment Use the result
-//     variable only.
+//   - A read the consumer folds that its statement makes before a node
+//     defining the same variable (`y = x + (x := 1)`) is carried by that
+//     node (see Lowering): it Uses the earlier value and hands it on through
+//     a variable of the lowering's own that it may-defines, which replaces
+//     the held read, so the consumer pairs with that node and a later
+//     definition of x in the statement (`(x := 2)`) neither re-reads nor
+//     receives it. A read a node of its own carries (a capture, a
+//     condition, an operand) is not held, so `k = lambda: k` makes the
+//     assignment Use the result variable only.
 //   - A value evaluated once and used by several later nodes is a node of
 //     its own defining a variable the lowering owns, which those nodes Use:
 //     a for loop's or later comprehension clause's iterable (the head and
@@ -233,7 +239,10 @@ var pythonLowering = Lowering{
 // a context manager's enter or exit, a class creation, a comprehension's
 // creation, or a class, mapping, sequence or dotted-value pattern; a raise
 // statement's node is also a Throw. The Builder applies MayThrow only inside
-// an open catch or finally frame.
+// an open catch or finally frame. An arithmetic operator does not count,
+// although its special method may raise, and a comparison counts exactly as
+// an arithmetic operator does: a rich comparison, and each comparison of a
+// chain, does not count either.
 //
 // # Scoping
 //
@@ -956,16 +965,33 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	return id
 }
 
-// def records that node n defines v and, when the statement read v before
-// n in a read still pending, that n Uses v.
+// def records that node n defines v. When the statement still holds a read
+// of v from before n, n Uses v and hands that earlier value on through a
+// variable of the lowering's own (see Uses).
 func (j *pyLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
 	j.b.Def(n, v)
-	if j.pending(v) {
-		j.b.Use(n, v)
+	if !j.pending(v) {
+		return
 	}
+	// n reads the earlier value before overwriting it and hands it on
+	// through t, which replaces the held reads of v, so the consumer's folded
+	// read pairs with n rather than with v's later definitions.
+	j.b.Use(n, v)
+	t := j.b.Var()
+	j.b.MayDef(n, t)
+	at := int(j.seen[v].at)
+	for i := at; i < len(j.reads); i++ {
+		if j.reads[i] == v {
+			j.reads[i] = t
+		}
+	}
+	if int(t) >= len(j.seen) {
+		j.seen = append(j.seen, make([]pySeen, int(t)+1-len(j.seen))...)
+	}
+	j.seen[t] = pySeen{stmt: j.stmtNo, at: int32(at)}
 }
 
 // open starts tracking the first node created; close returns it (-1 if none)
@@ -1934,12 +1960,43 @@ func (j *pyLower) comprehension(fn *ts.Node) {
 			break
 		}
 	}
-	j.clauses(clauses, 0, body)
+	// The first iterable is the enclosing function's, its iterator passed
+	// in as an implicit argument (§6.2.4): a parameter-like node spanning
+	// it, reading nothing, defines the first clause's iteration variable.
+	first := &clauses[0]
+	j.reset()
+	it := j.b.Var()
+	j.b.Def(j.nodeAt(flow.Stmt, j.iterable(first, false), 0, 0), it)
+	j.clauses(clauses, 0, body, it)
 	j.done(start)
 }
 
-// clauses lowers comprehension clauses cs[i:] around the element body.
-func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
+// iterable is the span of for clause c's iterable, from its first
+// expression to its last; lower evaluates each of them for its value.
+func (j *pyLower) iterable(c *ts.Node, lower bool) flow.Span {
+	left := c.ChildByFieldId(j.k.fLeft)
+	start, parts := j.kids(c)
+	var lo, hi *ts.Node
+	for p := range parts {
+		if parts[p].StartByte() == left.StartByte() {
+			continue
+		}
+		if lo == nil {
+			lo = &parts[p]
+		}
+		hi = &parts[p]
+		if lower {
+			j.value(&parts[p])
+		}
+	}
+	sp := flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}
+	j.done(start)
+	return sp
+}
+
+// clauses lowers comprehension clauses cs[i:] around the element body; it
+// is the first clause's iteration variable.
+func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node, it int32) {
 	k := j.k
 	if i == len(cs) {
 		j.reset()
@@ -1951,7 +2008,7 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
 		j.reset()
 		j.cond(firstNamed(c))
 		p := j.b.Push()
-		j.clauses(cs, i+1, body)
+		j.clauses(cs, i+1, body, it)
 		j.b.Merge(p)
 		j.b.Pop(p)
 		return
@@ -1959,35 +2016,21 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
 	left := c.ChildByFieldId(k.fLeft)
 	j.reset()
 	if i > 0 {
-		start, parts := j.kids(c)
-		var lo, hi *ts.Node
-		for p := range parts {
-			if parts[p].StartByte() == left.StartByte() {
-				continue
-			}
-			if lo == nil {
-				lo = &parts[p]
-			}
-			hi = &parts[p]
-			j.value(&parts[p])
-		}
-		j.throws++
 		// A later clause's iterable is evaluated once per step of the
 		// clause before it, at a node defining its iteration variable.
-		it := j.b.Var()
-		j.def(j.nodeAt(flow.Stmt, flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}, 0, len(j.reads)), it)
-		j.done(start)
+		sp := j.iterable(c, true)
+		j.throws++
+		it = j.b.Var()
+		j.b.Def(j.nodeAt(flow.Stmt, sp, 0, len(j.reads)), it)
 		j.reset()
-		j.read(it)
 	}
-	// The head and the target Use the iteration variable; the first
-	// clause's iterator is the argument the enclosing function passes, which
-	// no node of this graph defines, so they Use nothing there.
+	// The head and the target Use the iteration variable only.
+	j.read(it)
 	j.throws++
 	h := j.node(flow.Branch, c, 0, len(j.reads))
 	exit := j.b.Push()
 	j.bind(left, nil, 0, len(j.reads))
-	j.clauses(cs, i+1, body)
+	j.clauses(cs, i+1, body, it)
 	j.b.Close(h)
 	j.b.Restore(exit)
 	j.b.Pop(exit)
