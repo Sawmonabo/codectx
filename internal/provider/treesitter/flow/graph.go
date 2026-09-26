@@ -117,8 +117,7 @@ func (e Edges) Len() int { return len(e.pairs) }
 
 // At is the i-th pair.
 func (e Edges) At(i int) (from, to int32) {
-	p := e.pairs[i]
-	return int32(uint32(p >> 32)), int32(uint32(p))
+	return unpack(e.pairs[i])
 }
 
 // pack encodes one pair in the Edges order.
