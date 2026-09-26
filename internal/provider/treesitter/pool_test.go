@@ -140,6 +140,36 @@ func awaitQueued(p *pool, n int) {
 	}
 }
 
+// awaitAdmitted returns the release a reserver is granted on admitted, and
+// fails the test once the pool has made no progress for a whole hang window:
+// neither its idle count nor its count of exited workers has moved. A pool
+// that stops its idle workers moves both within one worker grace, so only a
+// pool that holds its idle room around the reserver trips the detector, and a
+// slow host never does.
+func awaitAdmitted(t *testing.T, p *pool, admitted <-chan func()) func() {
+	t.Helper()
+	progress := func() [2]uint64 {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return [2]uint64{uint64(len(p.idle)), p.exited}
+	}
+	last, moved := progress(), time.Now()
+	sample := time.NewTicker(hangWindow / 600)
+	defer sample.Stop()
+	for {
+		select {
+		case release := <-admitted:
+			return release
+		case <-sample.C:
+			if now := progress(); now != last {
+				last, moved = now, time.Now()
+			} else if time.Since(moved) > hangWindow {
+				t.Fatalf("the reserver waited a whole hang window while the pool held %d idle worker(s) and moved nothing", now[0])
+			}
+		}
+	}
+}
+
 type handout struct {
 	w   *worker
 	err error
@@ -187,11 +217,18 @@ func acquireAsync(p *pool) <-chan handout {
 // "pool head" sees a second worker started. Idle it while an acquirer is
 // queued -> "pool head" hangs. Hand it to any queued acquirer, head or not ->
 // "foreign head" sees the pool acquirer return before the foreign reserver is
-// granted. Drop the ledger's Waiting check from acquire -> "foreign waiter
-// behind an idle worker" sees the pool acquirer handed the idle worker while
-// the foreign reserver is still waiting. Drop it from release -> the worker
+// granted. Drop the ledger's Waiting check from acquire together with the
+// pool's Holder registration (either one alone stops the idle worker) ->
+// "foreign waiter behind an idle worker" sees the pool acquirer handed the
+// idle worker while the foreign reserver is still waiting. Drop it from release -> the worker
 // handed back goes idle, the second foreign reserver is never admitted and the
-// subtest hangs.
+// subtest hangs. Drop the pool's Holder registration from newPool -> "foreign
+// reserver beside an idle, quiet pool" trips the progress detector.
+//
+// "foreign reserver beside an idle, quiet pool": the pool's only worker is
+// idle and the pool makes no further acquire or release -- a stage whose own
+// progress waits on the reserver. The reserver must still be admitted: the
+// ledger's head runs the pool's idle-release step, which stops the worker.
 func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	t.Run("pool head", func(t *testing.T) {
 		p, _, _ := newOneWorkerPool(t)
@@ -331,6 +368,31 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 		p.mu.Unlock()
 		if n != 0 {
 			t.Fatalf("%d worker(s) went idle while a foreign reserver waited", n)
+		}
+	})
+
+	t.Run("foreign reserver beside an idle, quiet pool", func(t *testing.T) {
+		p, room, memory := newOneWorkerPool(t)
+		w, err := p.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("the acquirer was not admitted on an idle ledger: %v", err)
+		}
+		p.release(w, true) // nobody waits, so the worker goes idle
+		foreign := make(chan func(), 1)
+		go func() {
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, nil)
+			if err != nil {
+				t.Errorf("the foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			foreign <- release
+		}()
+		awaitAdmitted(t, p, foreign)()
+		p.mu.Lock()
+		idle := len(p.idle)
+		p.mu.Unlock()
+		if idle != 0 {
+			t.Fatalf("the foreign reserver was admitted while the pool still held %d idle worker(s)", idle)
 		}
 	})
 }

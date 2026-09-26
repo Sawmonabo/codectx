@@ -30,12 +30,19 @@
 // rule that a server is never refused because another project's server is
 // running -- it stops an idle one -- without being able to overtake anything
 // in the queue. A reserver with nothing idle to free brings no makeRoom step;
-// what it holds comes back through release, which pumps. A holder that keeps
-// room warm for reuse asks Waiting before it reuses it: the parser pool hands
-// a worker back to its own acquirer at the head with the reservation it holds,
-// and otherwise, whenever any reserver is waiting, stops the worker rather
-// than reusing or idling it, so the room that worker held reaches the head in
-// order.
+// what it holds comes back through release, which pumps.
+//
+// A holder that keeps room warm for reuse -- the parser pool's idle workers --
+// is told when that room is wanted. It registers an idle-release step with
+// Holder, and whenever the head of the queue does not fit, the head's own
+// waiting goroutine runs its makeRoom step and then every registered step, with
+// no ledger lock held. Such a holder also asks Waiting before it reuses room,
+// and never reuses it while a reserver waits: the parser pool hands a worker
+// back to its own acquirer at the head with the reservation it holds, and
+// otherwise stops it, and its registered step stops its idle workers. Either
+// way the room reaches the head in order and is returned by its holder, never
+// taken from it: only idle room is given back, and the order among the queued
+// reservers is kept.
 package admission
 
 import (
@@ -69,9 +76,13 @@ type Ledger struct {
 	used           int64
 	diskUsed       int64
 	queue          []*waiter
+	// holders are the registered idle-release steps (Holder), keyed by the
+	// registration so each one is removed exactly once. The map is bounded by
+	// the holders this process composes, one per room-keeping pool.
+	holders map[*func()]struct{}
 }
 
-// waiter is one blocked Reserve call. granted, stuck and the queue position are
+// waiter is one blocked Reserve call. granted and the queue position are
 // guarded by the ledger's mutex; ready is closed exactly once, by the grant.
 type waiter struct {
 	bytes     int64
@@ -79,9 +90,10 @@ type waiter struct {
 	granted   bool
 	ready     chan struct{}
 	// stuck carries one wake-up to a waiter that has reached the head of the
-	// queue, does not fit, and brought a way to free room. It is nil for a
-	// reserver that brought none, and the send is non-blocking, so a waiter
-	// that is already awake is never held up by the grant path.
+	// queue and does not fit: it then runs its own makeRoom step, if it
+	// brought one, and every registered holder's step. The send is
+	// non-blocking, so a waiter that is already awake is never held up by the
+	// grant path.
 	stuck   chan struct{}
 	release sync.Once
 }
@@ -127,7 +139,9 @@ func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
 // Whatever it frees goes back through the ordinary release path, which pumps
 // the queue. It is called with no ledger lock held and may call back into the
 // ledger; it may be called again each time the head is pumped and still does
-// not fit, so a reserver whose room frees up later is still asked.
+// not fit, so a reserver whose room frees up later is still asked. Every
+// registered holder's step (Holder) runs right after it, the same way, so idle
+// room another holder keeps reaches this reservation in order.
 //
 // A canceled wait returns CTX_CANCELED and no release function. A wait that is
 // granted at the same moment its context ends gives the permission straight
@@ -154,10 +168,8 @@ func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
 	}
-	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, ready: make(chan struct{})}
-	if makeRoom != nil {
-		w.stuck = make(chan struct{}, 1)
-	}
+	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, ready: make(chan struct{}),
+		stuck: make(chan struct{}, 1)}
 	l.mu.Lock()
 	l.queue = append(l.queue, w)
 	l.pump()
@@ -177,7 +189,10 @@ func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()
 			if granted {
 				return func() { l.release(w) }, nil
 			}
-			makeRoom()
+			if makeRoom != nil {
+				makeRoom()
+			}
+			l.askHolders()
 		case <-ctx.Done():
 			l.mu.Lock()
 			granted := w.granted
@@ -213,6 +228,46 @@ func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
 	return l.diskAllocation, l.diskUsed
 }
 
+// Holder registers an idle-release step: a holder of room it keeps warm for
+// reuse, and would give back when someone needs it, is asked to run it every
+// time the head of the queue does not fit, after the head's own makeRoom step.
+// It runs on the head's waiting goroutine with no ledger lock held, so it may
+// call back into the ledger -- Waiting, and the release of whatever it frees,
+// which pumps. It may be called again on every such pump, so it frees only
+// room it holds idle and does nothing when it holds none. The returned
+// function removes the registration, once, however often it is called.
+func (l *Ledger) Holder(release func()) (unregister func()) {
+	key := &release
+	l.mu.Lock()
+	if l.holders == nil {
+		l.holders = map[*func()]struct{}{}
+	}
+	l.holders[key] = struct{}{}
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			delete(l.holders, key)
+			l.mu.Unlock()
+		})
+	}
+}
+
+// askHolders runs every registered idle-release step, read under the lock and
+// run without it.
+func (l *Ledger) askHolders() {
+	l.mu.Lock()
+	steps := make([]func(), 0, len(l.holders))
+	for step := range l.holders {
+		steps = append(steps, *step)
+	}
+	l.mu.Unlock()
+	for _, step := range steps {
+		step()
+	}
+}
+
 // Waiting reports whether any reserver is queued: one that has not been
 // granted and, since pump grants the head the moment it fits, one whose head
 // does not fit right now. It is a moment's reading for a holder of room that
@@ -244,11 +299,9 @@ func (l *Ledger) pump() {
 		// dimensions cannot be held against each other.
 		if l.admitted > 0 && (head.bytes > 0 && l.used+head.bytes > l.allocation ||
 			head.diskBytes > 0 && l.diskUsed+head.diskBytes > l.diskAllocation) {
-			if head.stuck != nil {
-				select {
-				case head.stuck <- struct{}{}:
-				default:
-				}
+			select {
+			case head.stuck <- struct{}{}:
+			default:
 			}
 			return
 		}

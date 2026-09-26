@@ -263,23 +263,27 @@ parse while an acquirer of the pool is queued there follows that order:
   returns to the ledger, the ledger pumps, and that head is admitted first.
   The pool's acquirer behind it waits its turn.
 
-No idle worker is reused while any reserver waits on the ledger, the pool's
-own or another. The ledger reports whether one is waiting
-(`admission.Ledger.Waiting`), and the pool asks it at every acquire and
-release:
+No idle worker is held or reused while any reserver waits on the ledger, the
+pool's own or another. The ledger reports whether one is waiting
+(`admission.Ledger.Waiting`), and the pool is registered on it as a holder of
+idle room (`admission.Ledger.Holder`) for its whole life:
 
 - A worker coming back while a reserver waits, and no acquirer of the pool is
   the head, is stopped rather than idled.
 - An acquirer that finds idle workers while a reserver waits stops every one
-  of them, so their room returns to the ledger and reaches the head in order,
-  and then queues for a worker of its own behind that reserver.
+  of them and then queues for a worker of its own behind that reserver.
+- Whenever the ledger's head does not fit, the head's waiting goroutine runs
+  the pool's idle-release step, with no ledger lock held, and the pool stops
+  its idle workers at once, whether or not it is acquiring or releasing
+  anything. A stage whose own progress waits on that reserver (a unit of the
+  same tick reserving behind the room idle workers hold) never waits on the
+  stage's drain.
 
+The stopped workers' room returns to the ledger and reaches the head in order.
 With nobody waiting, a worker coming back goes idle and is held for the stage
-like any room an admitted child holds. The ledger is asked, not watched: a
-reserver that arrives while the pool holds idle workers and runs no parse
-waits for the pool's next acquire or release, or for the stage's drain. Room
-is returned by its holder, never taken from it, and the order among the
-reservers queued on the ledger is kept throughout.
+like any room an admitted child holds. Room is returned by its holder, never
+taken from it, only idle room is given back, and the order among the reservers
+queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
