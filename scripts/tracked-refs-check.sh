@@ -27,8 +27,8 @@
 #     round of a review, a round named after its branch, the report a lane
 #     files, a note that a test was left without being compiled or run (in
 #     any casing: "not been", "was not" or "were not" before "run" or
-#     "compiled", the one-word forms with an "un" prefix, "test(s) ... not
-#     run" and a parenthesized "not run"; and a "not run" whose first letter
+#     "compiled", the one-word forms with an "un" prefix, "test(s) not run"
+#     and a parenthesized "not run"; and a "not run" whose first letter
 #     is a capital), a failure named after the corpus run that showed it, and
 #     a ruling cited by its id. These date the moment the work merges and
 #     mean nothing to a reader of the repository. A bare lowercase "not run"
@@ -75,7 +75,7 @@ pattern="$pattern|${w}[Nn]ative-cor[e]([^A-Za-z]|\$)|${w}[Rr]evie[w] (finding|ro
 ran='([Rr][Uu][Nn]|[Cc][Oo][Mm][Pp][Ii][Ll][Ee][Dd])([^A-Za-z-]|$)'
 pattern="$pattern|N[Oo][Tt] [Rr][Uu][Nn]|${w}[Uu][Nn]$ran"
 pattern="$pattern|${w}([Bb][Ee][Ee][Nn]|[Ww][Aa][Ss]|[Ww][Ee][Rr][Ee]) [Nn][Oo][Tt] ([Yy][Ee][Tt] )?$ran"
-pattern="$pattern|${w}[Nn][Oo][Tt] [Bb][Ee][Ee][Nn] $ran|${w}[Tt][Ee][Ss][Tt][Ss]? ([A-Za-z]+ )?[Nn][Oo][Tt] ([Yy][Ee][Tt] )?$ran"
+pattern="$pattern|${w}[Nn][Oo][Tt] [Bb][Ee][Ee][Nn] $ran|${w}[Tt][Ee][Ss][Tt][Ss]? [Nn][Oo][Tt] ([Yy][Ee][Tt] )?$ran"
 pattern="$pattern|\\([Nn][Oo][Tt] ([Yy][Ee][Tt] )?[Rr][Uu][Nn]\\)"
 pattern="$pattern|${w}[Rr]ulin[g] [A-Z]+-?[0-9]"
 home="${w}/(hom[e]|User[s])/[A-Za-z0-9._-]+"

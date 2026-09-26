@@ -662,13 +662,14 @@ const (
 // abandon records every unit a failed publication popped as failed with that
 // publication's error. It is dropped when a later base activation replaced the
 // queue, as keepFailures drops a replaced queue's reasons.
+//
+// The details are the reason and the run id alone. The error's code and safe
+// message travel as the row's code and failure message; its own particulars
+// would share the provider detail budget with these two, and a full budget
+// evicts by key order, which could drop the run id the row exists to name.
 func (l *lateSealer) abandon(epoch int64, popped []deferredUnit, cause error, runID string) {
 	failure := typedFailure(cause)
-	details := make(map[string]string, len(failure.details)+2)
-	maps.Copy(details, withoutRawOutput(failure.details))
-	details["reason"] = reasonPublicationFailed
-	details[detailRunID] = runID
-	failure.details = details
+	failure.details = map[string]string{"reason": reasonPublicationFailed, detailRunID: runID}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(popped) == 0 || l.state.epoch != epoch {
