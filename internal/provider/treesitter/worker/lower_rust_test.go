@@ -609,13 +609,15 @@ func TestRustLoweringGolden(t *testing.T) {
 			// defining the block's result), let r: … = try { … };@46 (Uses
 			// the block's result), r.unwrap_or(0)@84. Succ: a?→{b?, let};
 			// b?→{a? + b?, let}; a? + b?→let→r.unwrap_or(0). IPDom: a? →
-			// let; b? → let. Frontier walks: a? over b? and a? + b?; b? over
+			// let; b? → let. Frontier walks: a? over b? (the walk from b?
+			// reaches a?'s post-dominator let at once, and a? + b? does not
+			// post-dominate b?, which can leave straight to let); b? over
 			// a? + b?.
 			name:     "each question mark completing a try block kills the block's result, reading nothing of it",
 			protects: "b?'s definition of the try block's result is its own value, never a consumer of a?'s, and the let pairs with each `?` whose break reaches it",
 			mutation: "record a `?`'s definition of the try block's result, beside its Ok value, as a may-definition (gains a?@73 -> b?@78, the claim that b? consumed a?'s value), or give a `?` completing a try block no definition of it (loses b?@78 -> let r: Option<i32> = try { a? + b? };@46)",
 			src:      "fn f(a: Option<i32>, b: Option<i32>) -> i32 { let r: Option<i32> = try { a? + b? }; r.unwrap_or(0) }",
-			cd:       []string{"a?@73 -> b?@78", "a?@73 -> a? + b?@73", "b?@78 -> a? + b?@73"},
+			cd:       []string{"a?@73 -> b?@78", "b?@78 -> a? + b?@73"},
 			du: []string{"a@5 -> a?@73", "b@21 -> b?@78", "a?@73 -> a? + b?@73", "b?@78 -> a? + b?@73",
 				"a?@73 -> let r: Option<i32> = try { a? + b? };@46", "b?@78 -> let r: Option<i32> = try { a? + b? };@46",
 				"a? + b?@73 -> let r: Option<i32> = try { a? + b? };@46",
