@@ -71,16 +71,17 @@ var goLowering = Lowering{
 //     the assignment follows every evaluation of the statement, so it
 //     overwrites what the evaluation wrote.
 //   - A condition (if, for, a case value list, a type-case type list) is one
-//     Branch node spanning it; an if or for condition spans its expression
-//     with every enclosing pair of parentheses stripped (see Lowering,
-//     Spans), and a case's value list spans the list, each of whose values
-//     keeps its own parentheses. Every `&&`/`||` in an expression is hoisted
-//     before the node that owns the expression: each operand that is not
-//     itself `&&`/`||` becomes a Branch node carrying its uses, wired by
-//     short-circuit (the left operand of && reaches the right one when true
-//     and skips it when false; || the reverse), and the owning node, whose
-//     value is computed from them, carries every use of the expression,
-//     the operands' included.
+//     Branch node spanning it with every enclosing pair of parentheses
+//     stripped (see Lowering, Spans): an if or for condition spans its
+//     expression so, a case's value list of one value spans that value so
+//     (`case (1):` spans `1`), and a list of several spans the list. Every
+//     `&&`/`||` in an expression is hoisted before the node that owns the
+//     expression: each operand that is not itself `&&`/`||` becomes a
+//     Branch node carrying its own reads, wired by short-circuit (the left
+//     operand of && reaches the right one when true and skips it when
+//     false; || the reverse), and defining the expression's result variable,
+//     a variable the lowering owns; the owning node Uses that variable,
+//     never the operands' names (see Lowering, Uses).
 //   - A for statement without a condition has a Branch head spanning the
 //     `for` keyword; with one, the condition's first node is the head, the
 //     target of the back edge.
@@ -126,19 +127,18 @@ var goLowering = Lowering{
 //     exactly once ("Switch statements"), spanning the tag expression with
 //     every enclosing pair of parentheses stripped (see Lowering, Spans): in
 //     `switch x {` the head is `x`, never the `switch` keyword or the
-//     statement. A switch without a tag, which the specification makes
-//     equivalent to `true`, has no head: its first case condition is its
-//     first node, after its init statement's. A type switch has one spanning
-//     `x := v.(type)` that defines the alias. The head has one successor,
-//     the first case condition. Every case condition (a case value list, a
-//     type-case type list) is a Branch node that Uses its own values' reads
-//     and the tag's variables, since it compares against the tag's value.
-//     Between the head and the conditions a variable is only ever
-//     may-defined (by an address an earlier case value takes, `case g(&x):`,
-//     or a function literal's write), which kills nothing, so each condition
-//     sees the tag's variables as the head read them, and also such an
-//     earlier may-definition: an over-approximation that adds that pair.
-//     Case conditions are tested in source order with default last.
+//     statement. The head Uses the tag's reads and defines a variable the
+//     lowering owns, holding the tag's value. A type switch's head spans
+//     `x := v.(type)`, Uses v's reads, and defines the alias x, which holds
+//     the switched value (without an alias, an owned variable). A switch
+//     without a tag, which the specification makes equivalent to `true`,
+//     has no head: its first case condition is its first node, after its
+//     init statement's. The head has one successor, the first case
+//     condition. Every case condition (a case value list, a type-case type
+//     list) is a Branch node that Uses its own values' reads and the
+//     variable holding the tag, never the tag's names, since it compares
+//     against the tag's value as the head evaluated it. Case conditions are
+//     tested in source order with default last.
 //   - The specification declares a type switch's alias anew in the implicit
 //     block of each clause ("Type switches"); the lowering declares one
 //     variable, defined at the head, for all clauses. The pairs are the same:
@@ -151,12 +151,15 @@ var goLowering = Lowering{
 //   - A select has a Branch head spanning the `select` keyword. Go evaluates
 //     every clause's channel operand and sent value exactly once, in source
 //     order, on entering the select ("Select statements"), so their `&&`/`||`
-//     operands are hoisted before the head, and the head Uses them and
-//     carries the may-definitions of what is not hoisted, a hoisted
-//     operand's being on its own Branch node. Each clause's send or receive is one
-//     node, which Uses those operands again, and Uses and writes a receive's
-//     left-hand side, which Go evaluates and assigns only when the clause is
-//     chosen. `select {}` blocks forever and is lowered as a self-loop.
+//     operands are hoisted before the head, and the head Uses their reads,
+//     carries the may-definitions of what is not hoisted (a hoisted
+//     operand's are on its own Branch node), and defines a variable the
+//     lowering owns, holding the evaluated operands. Each clause's send or
+//     receive is one node, which Uses that variable and none of the
+//     operands' names, and Uses and writes a receive's left-hand side, which
+//     Go evaluates and assigns only when the clause is chosen (a receive
+//     with two targets is two nodes, each Using the variable). `select {}`
+//     blocks forever and is lowered as a self-loop.
 //   - return, break, continue, goto and fallthrough are Jump nodes spanning
 //     the statement; `panic(...)` as a statement is a Jump node followed by
 //     Throw. Every label is its own Stmt node spanning the label identifier,
@@ -166,25 +169,30 @@ var goLowering = Lowering{
 //
 // # Uses
 //
-// Every node follows the consumption rule (see Lowering). What it settles in
-// Go:
+// Every node follows the rule that values travel through variables (see
+// Lowering). What it settles in Go:
 //
+//   - Lowered to nodes of their own, handing their value on through a
+//     variable the lowering owns: an `&&`/`||` expression (its operand nodes
+//     define the result, the owning node Uses it); an expression switch's
+//     tag and a type switch's guard (the head defines it, every case
+//     condition Uses it); a select's clause operands (the head defines it,
+//     every clause node Uses it); a range expression (the iteration
+//     variable).
+//   - Folded into the node that owns the expression, whose own evaluation
+//     their reads are: a function literal (Go has no node for its creation:
+//     the owning node creates the value and consumes it, as `h := func()
+//     {...}` does, so no result variable exists and the node Uses the
+//     captures, as a creating node does); every other expression, a call, a
+//     composite literal and an address-taking included; the uses of a
+//     statement's field, index, indirect and `_` targets, which ride on its
+//     first node.
 //   - An if, for or switch init statement is a node of its own, lowered in
 //     the statement's implicit block before the condition or tag; the
 //     condition or tag does not Use the init statement's reads, and a
 //     variable it declares resolves in that block.
-//   - A condition, a switch tag, a select head and a range expression each
-//     carry their own reads; no node of the body Uses them, and they Use
-//     nothing of the body.
-//   - The node owning an `&&`/`||` expression consumes its operands' values,
-//     so it Uses every operand's reads, while each hoisted operand's Branch
-//     node carries its own reads and may-definitions.
-//   - A function literal is created by the node owning the expression that
-//     holds it, and that node Uses its captures. In Go that node is also the
-//     one consuming the created value (`h := func() {...}` creates and
-//     assigns in one node, as a return, a call argument or a condition does),
-//     so the captures appear once, on it; a later statement that calls h
-//     reads the variable h, never the literal's captures.
+//   - No node of a body Uses a condition's, a tag's, a select head's or a
+//     range expression's reads, and those nodes Use nothing of the body.
 //   - A go or defer statement evaluates the function value and the call's
 //     parameters where it executes ("Go statements", "Defer statements"),
 //     and the call runs later. Its node Uses those reads; a function literal
@@ -225,7 +233,12 @@ func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) 
 	clear(g.rights[:cap(g.rights)])
 	clear(g.targets[:cap(g.targets)])
 	clear(g.lab[:cap(g.lab)])
-	*g = goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
+	shorts := g.shorts
+	if shorts == nil {
+		shorts = map[uintptr]int32{}
+	}
+	clear(shorts)
+	*g = goLower{shorts: shorts, l: l, b: b, src: src, k: goSyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
 		marks: g.marks[:0], results: g.results[:0], buf: g.buf[:0], may: g.may[:0], bases: g.bases[:0],
 		lefts: g.lefts[:0], rights: g.rights[:0], targets: g.targets[:0], hs: g.hs[:0], lab: g.lab[:0]}
 	k := g.k
@@ -282,6 +295,10 @@ type goLower struct {
 	// lefts, rights and targets are one statement's operands.
 	lefts, rights []*ts.Node
 	targets       []goTarget
+	// shorts maps each `&&`/`||` expression hoist has lowered, by node id,
+	// to its owned result variable, which every operand node defines and the
+	// node owning the expression Uses.
+	shorts map[uintptr]int32
 	// hs holds the case-condition fringes of the open switches.
 	hs []flow.Fringe
 	// lab is the stack of the labels of the labelled statements being
@@ -399,13 +416,11 @@ func (g *goLower) isShort(n *ts.Node) bool {
 	return op != nil && (op.KindId() == k.and || op.KindId() == k.or)
 }
 
-// collect appends to buf every variable n reads, short-circuit operands
-// included, and to may the base variable of every address n takes; it
-// resolves a function literal's captures: its reads into buf, its writes into
-// may. The operands of a short-circuit expression are hoisted to Branch
-// nodes of their own, which evaluate them and carry their may-definitions,
-// so collecting the expression for the node that owns it adds their reads
-// only.
+// collect appends to buf every variable n reads and to may the base
+// variable of every address n takes; it resolves a function literal's
+// captures: its reads into buf, its writes into may. A short-circuit
+// expression has been hoisted to operand nodes of their own, which carry its
+// reads and may-definitions, so collecting it adds only its result variable.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
 	case n.KindId() == g.k.identifier:
@@ -415,11 +430,9 @@ func (g *goLower) collect(n *ts.Node) {
 	case g.l.isCallable(n):
 		g.scan(n, g.binds.mark())
 	case g.isShort(n):
-		m := len(g.may)
-		for i := range n.NamedChildCount() {
-			g.collect(n.NamedChild(i))
+		if r, ok := g.shorts[n.Id()]; ok {
+			g.buf = append(g.buf, r)
 		}
-		g.may = g.may[:m]
 	case g.isAddress(n):
 		if e := n.ChildByFieldId(g.k.fOperand); e != nil {
 			g.collect(e)
@@ -503,12 +516,15 @@ func (g *goLower) baseVar(n *ts.Node) int32 {
 }
 
 // hoist lowers every outermost && and || under n, in source order, into
-// operand nodes, leaving the fringe where the owning node begins.
+// operand nodes that each define the expression's result variable, leaving
+// the fringe where the owning node begins.
 func (g *goLower) hoist(n *ts.Node) {
 	switch {
 	case n == nil || g.l.isCallable(n):
 	case g.isShort(n):
-		first, t, f := g.chain(n)
+		r := g.b.Var()
+		g.shorts[n.Id()] = r
+		first, t, f := g.chain(n, r)
 		g.b.Restore(t)
 		g.b.Merge(f)
 		g.b.Pop(first)
@@ -519,26 +535,29 @@ func (g *goLower) hoist(n *ts.Node) {
 	}
 }
 
-// chain lowers the short-circuit expression n and returns saved fringes: t
-// where n is true, f where it is false, and first, the earliest handle it
-// pushed, which releases them all.
-func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
+// chain lowers the short-circuit expression n, whose operand nodes define
+// result variable r, and returns saved fringes: t where n is true, f where it
+// is false, and first, the earliest handle it pushed, which releases them
+// all.
+func (g *goLower) chain(n *ts.Node, r int32) (first, t, f flow.Fringe) {
 	n = g.l.unparen(n)
 	if !g.isShort(n) {
 		g.hoist(n)
-		g.uses(g.node(flow.Branch, n), n)
+		id := g.node(flow.Branch, n)
+		g.uses(id, n)
+		g.b.Def(id, r)
 		t = g.b.Push()
 		return t, t, t
 	}
 	k := g.k
 	and := n.ChildByFieldId(k.fOperator).KindId() == k.and
-	first, lt, lf := g.chain(n.ChildByFieldId(k.fLeft))
+	first, lt, lf := g.chain(n.ChildByFieldId(k.fLeft), r)
 	if and {
 		g.b.Restore(lt)
 	} else {
 		g.b.Restore(lf)
 	}
-	_, rt, rf := g.chain(n.ChildByFieldId(k.fRight))
+	_, rt, rf := g.chain(n.ChildByFieldId(k.fRight), r)
 	if and {
 		g.b.Restore(lf)
 		g.b.Merge(rf)
@@ -549,11 +568,16 @@ func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
 	return first, g.b.Push(), rf
 }
 
-// cond lowers condition e as one Branch node, spanning e with its enclosing
-// parentheses stripped, after its hoisted operands and returns the node.
+// cond lowers condition e as one Branch node after its hoisted operands and
+// returns the node. It spans e with its enclosing parentheses stripped, and a
+// case's value list of one value spans that value so.
 func (g *goLower) cond(e *ts.Node) int32 {
 	g.hoist(e)
-	id := g.node(flow.Branch, g.l.unparen(e))
+	at := e
+	if e.KindId() == g.k.expressionList && e.NamedChildCount() == 1 {
+		at = e.NamedChild(0)
+	}
+	id := g.node(flow.Branch, g.l.unparen(at))
 	g.uses(id, e)
 	return id
 }
@@ -629,21 +653,21 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		}
 	case k.assignmentStatement:
 		g.fill(s.ChildByFieldId(k.fLeft), 0)
-		g.assign(s, s.ChildByFieldId(k.fRight), s.ChildByFieldId(k.fOperator).KindId() != k.assign, false, false)
+		g.assign(s, s.ChildByFieldId(k.fRight), s.ChildByFieldId(k.fOperator).KindId() != k.assign, false, -1)
 	case k.shortVarDeclaration:
 		g.fill(s.ChildByFieldId(k.fLeft), 0)
-		g.assign(s, s.ChildByFieldId(k.fRight), false, true, false)
+		g.assign(s, s.ChildByFieldId(k.fRight), false, true, -1)
 	case k.varDeclaration:
 		for i := range s.NamedChildCount() {
 			switch c := s.NamedChild(i); c.KindId() {
 			case k.varSpec:
 				g.fill(c, k.fName)
-				g.assign(s, c.ChildByFieldId(k.fValue), false, true, false)
+				g.assign(s, c.ChildByFieldId(k.fValue), false, true, -1)
 			case k.varSpecList:
 				for j := range c.NamedChildCount() {
 					if spec := c.NamedChild(j); spec.KindId() == k.varSpec {
 						g.fill(spec, k.fName)
-						g.assign(spec, spec.ChildByFieldId(k.fValue), false, true, false)
+						g.assign(spec, spec.ChildByFieldId(k.fValue), false, true, -1)
 					}
 				}
 			}
@@ -811,7 +835,7 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 	b, k := g.b, g.k
 	right := rc.ChildByFieldId(k.fRight)
 	g.hoist(right)
-	rangeNode := g.node(flow.Stmt, right)
+	rangeNode := g.node(flow.Stmt, g.l.unparen(right))
 	g.uses(rangeNode, right)
 	iter := b.Var()
 	b.Def(rangeNode, iter)
@@ -840,7 +864,7 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 				}
 			default:
 				g.hoist(t)
-				id = g.node(flow.Stmt, t)
+				id = g.node(flow.Stmt, x)
 				g.uses(id, t)
 				if v := g.baseVar(x); v >= 0 {
 					b.MayDef(id, v)
@@ -860,36 +884,35 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 // switchStmt lowers an expression or type switch: its head, then each case
 // condition in source order (default last), then the clause bodies, each
 // entered from its condition and from a fallthrough out of the clause before.
-// The head evaluates the tag once and has one successor, the first case
-// condition, so it is a Stmt; every case condition compares against the tag
-// and uses the tag's variables. No variable is defined between the head and
-// the conditions (a function literal's write there is a may-definition, which
-// kills nothing), so each condition sees the tag's variables exactly as the
-// head read them.
+// The head evaluates the tag once, defines the variable holding it, and has
+// one successor, the first case condition, so it is a Stmt; every case
+// condition compares against the tag and Uses that variable.
 func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 	b, k := g.b, g.k
 	g.open()
 	if init := s.ChildByFieldId(k.fInitializer); init != nil {
 		g.stmt(init, nil)
 	}
-	// The tag's uses stay in buf[tag:tagEnd] until every case condition has
-	// them. They are read before a type switch declares its alias, so
-	// `switch x := x.(type)` reads the outer x.
-	tag := len(g.buf)
+	tag := int32(-1)
 	if value := s.ChildByFieldId(k.fValue); value != nil {
 		g.hoist(value)
-		mlo := len(g.may)
-		g.collect(value)
 		var head int32
 		if typed {
-			head = g.typeSwitchHead(s, value, tag)
+			head = g.typeSwitchHead(s, value)
 		} else {
 			head = g.node(flow.Stmt, g.l.unparen(value))
-			g.useAll(head, tag, len(g.buf))
 		}
-		g.mayAll(head, mlo)
+		// The tag is read before a type switch declares its alias, so
+		// `switch x := x.(type)` reads the outer x.
+		g.uses(head, value)
+		if typed {
+			tag = g.alias(s, head)
+		}
+		if tag < 0 {
+			tag = b.Var()
+			b.Def(head, tag)
+		}
 	}
-	tagEnd := len(g.buf)
 	f := b.OpenSwitch(labels...)
 	base := len(g.hs)
 	for i := range s.NamedChildCount() {
@@ -902,10 +925,11 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 		default:
 			continue
 		}
-		g.useAll(id, tag, tagEnd)
+		if tag >= 0 {
+			b.Use(id, tag)
+		}
 		g.hs = append(g.hs, b.Push())
 	}
-	g.buf = g.buf[:tag]
 	dflt := b.Push()
 	first := dflt
 	if len(g.hs) > base {
@@ -949,9 +973,8 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 	g.close()
 }
 
-// typeSwitchHead creates the Stmt node spanning `x := v.(type)`, which uses
-// v's variables, buf[tag:], and then declares and defines the alias x.
-func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
+// typeSwitchHead creates the Stmt node spanning `x := v.(type)`.
+func (g *goLower) typeSwitchHead(s, value *ts.Node) int32 {
 	start, end := value.StartByte(), value.EndByte()
 	k := g.k
 	alias := s.ChildByFieldId(k.fAlias)
@@ -967,17 +990,27 @@ func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
 			break
 		}
 	}
-	head := g.nodeSpan(flow.Stmt, flow.Span{Start: uint32(start), End: uint32(end)})
-	g.useAll(head, tag, len(g.buf))
+	return g.nodeSpan(flow.Stmt, flow.Span{Start: uint32(start), End: uint32(end)})
+}
+
+// alias declares type switch s's alias x, defines it on head and returns it,
+// or returns -1 when s has none. The alias holds the switched value from the
+// head on, and no case condition writes it, so the type cases Use it as the
+// variable holding the tag.
+func (g *goLower) alias(s *ts.Node, head int32) int32 {
+	alias := s.ChildByFieldId(g.k.fAlias)
 	if alias == nil {
-		return head
+		return -1
 	}
-	if id := firstNamed(alias); id != nil && id.KindId() == k.identifier {
-		if v := g.declare(id); v >= 0 {
-			g.b.Def(head, v)
-		}
+	id := firstNamed(alias)
+	if id == nil || id.KindId() != g.k.identifier {
+		return -1
 	}
-	return head
+	v := g.declare(id)
+	if v >= 0 {
+		g.b.Def(head, v)
+	}
+	return v
 }
 
 // fieldSpan spans every child of n in field, or n when there is none.
@@ -998,8 +1031,8 @@ func (g *goLower) fieldSpan(n *ts.Node, field uint16) flow.Span {
 // communication node then its body. Go evaluates every clause's channel
 // operand and every send's value once, in source order, on entering the
 // select, and the choice among the clauses depends on them, so their
-// short-circuit operands are hoisted before the head and the head uses them
-// all.
+// short-circuit operands are hoisted before the head, the head Uses them all
+// and defines the variable holding them, and every clause's node Uses it.
 func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 	b, k := g.b, g.k
 	for i := range s.NamedChildCount() {
@@ -1016,6 +1049,8 @@ func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 	g.useAll(head, lo, len(g.buf))
 	g.mayAll(head, mlo)
 	g.buf = g.buf[:lo]
+	held := b.Var()
+	b.Def(head, held)
 	d := b.Push()
 	clauses := false
 	for i := range s.NamedChildCount() {
@@ -1027,7 +1062,7 @@ func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 		b.Restore(d)
 		g.open()
 		if comm := c.ChildByFieldId(k.fCommunication); comm != nil {
-			g.comm(comm)
+			g.comm(comm, held)
 		}
 		g.stmts(c)
 		g.close()
@@ -1056,25 +1091,20 @@ func (g *goLower) entered(c *ts.Node) *ts.Node {
 }
 
 // comm lowers a select clause's send or receive. Its channel operand and
-// sent value were evaluated on entering the select: their short-circuit
-// operands are hoisted before the head, which carries their
-// may-definitions, so the clause's node carries only their reads and the
-// writes of a receive's left-hand side, which Go evaluates and assigns when
-// the clause is chosen.
-func (g *goLower) comm(c *ts.Node) {
+// sent value were evaluated on entering the select, at the head, which
+// defined held to hold them, so the clause's node Uses held and none of
+// their names, and carries the reads and writes of a receive's left-hand
+// side, which Go evaluates and assigns when the clause is chosen.
+func (g *goLower) comm(c *ts.Node, held int32) {
 	k := g.k
 	if c.KindId() == k.receiveStatement {
 		if left := c.ChildByFieldId(k.fLeft); left != nil {
 			g.fill(left, 0)
-			g.assign(c, c.ChildByFieldId(k.fRight), false, g.token(c, k.define) != nil, true)
+			g.assign(c, c.ChildByFieldId(k.fRight), false, g.token(c, k.define) != nil, held)
 			return
 		}
 	}
-	id := g.node(flow.Stmt, c)
-	lo, mlo := len(g.buf), len(g.may)
-	g.collect(c)
-	g.useAll(id, lo, len(g.buf))
-	g.buf, g.may = g.buf[:lo], g.may[:mlo]
+	g.b.Use(g.node(flow.Stmt, c), held)
 }
 
 // fill sets lefts to n's children in field, or to its named children other
@@ -1100,10 +1130,11 @@ func (g *goLower) fill(n *ts.Node, field uint16) {
 // may-definition an evaluation makes (an address taken, a function literal's
 // write) lands on the node that evaluates it: a paired value's on its
 // target's node, a non-variable target's operands' and an unpaired right
-// side's on the first node. entered reports that right was evaluated on
-// entering a select, whose head carries its may-definitions, so the clause's
-// nodes carry only its reads and hoist none of its operands.
-func (g *goLower) assign(whole, right *ts.Node, compound, define, entered bool) {
+// side's on the first node. held, when not -1, is the variable a select's
+// head defined when it evaluated right on entering the select: the clause's
+// nodes Use it in place of right, whose reads, may-definitions and hoisted
+// operands are the head's.
+func (g *goLower) assign(whole, right *ts.Node, compound, define bool, held int32) {
 	b := g.b
 	g.rights = g.rights[:0]
 	switch {
@@ -1120,7 +1151,7 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define, entered bool) 
 	for _, n := range g.lefts {
 		g.hoist(n)
 	}
-	if !entered {
+	if held < 0 {
 		for _, n := range g.rights {
 			g.hoist(n)
 		}
@@ -1129,11 +1160,11 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define, entered bool) 
 	lo, mlo := len(g.buf), len(g.may)
 	// value collects a right-hand expression.
 	value := func(n *ts.Node) {
-		m := len(g.may)
-		g.collect(n)
-		if entered {
-			g.may = g.may[:m]
+		if held >= 0 {
+			g.buf = append(g.buf, held)
+			return
 		}
+		g.collect(n)
 	}
 	// Non-variable targets' operands and values come first: the statement's
 	// first node carries them.
