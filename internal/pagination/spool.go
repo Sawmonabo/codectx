@@ -738,23 +738,35 @@ func (s *Spools) live(ctx context.Context, h SpoolHeader, now time.Time) (bool, 
 	return now.Before(expiry), nil
 }
 
-// spoolRefused classifies a failure to write the disk state an answer keeps --
-// continuation spools and external sort runs -- by what the filesystem said. A full disk or an exhausted quota is CTX_DISK_FULL; a
-// directory whose permissions or read-only mount refuse this process is the
-// same family as the spool budget running out -- work this process explicitly
-// could not complete, whose remedy is the operator's; anything else is the
-// fault it is, carried with the operation and the filesystem's own message.
+// spoolRefused classifies a failure to write continuation state. A directory
+// whose permissions or read-only mount refuse this process is the same family
+// as the spool budget running out -- work this process explicitly could not
+// complete, whose remedy is the operator's; every other fault is classified as
+// any disk state this package writes is (diskFault).
 func spoolRefused(op, dir string, cause error) error {
-	switch {
-	case errors.Is(cause, syscall.ENOSPC), errors.Is(cause, syscall.EDQUOT):
-		return &model.Error{Code: model.CodeDiskFull,
-			Message: op + ": this answer keeps state on disk and there is no room under " + dir + ": " +
-				cause.Error(),
-			Remediation: "free disk space or quota under " + dir + ", or narrow the query so the answer fits one page"}
-	case errors.Is(cause, fs.ErrPermission), errors.Is(cause, syscall.EROFS):
+	if errors.Is(cause, fs.ErrPermission) || errors.Is(cause, syscall.EROFS) {
 		return &model.Error{Code: model.CodeResourceLimit,
 			Message:     op + ": this answer keeps state on disk and " + dir + " cannot be written: " + cause.Error(),
 			Remediation: "narrow the query so the answer fits one page, or make the data directory writable"}
+	}
+	return diskFault(op, dir, cause)
+}
+
+// diskFault classifies a failure to write disk state -- spools, external sort
+// runs -- by what the filesystem said: a full disk or an exhausted quota is
+// CTX_DISK_FULL, a directory that refuses this process is the operator's
+// configuration to fix, and anything else is the fault it is, carried with the
+// operation and the filesystem's own message.
+func diskFault(op, dir string, cause error) error {
+	switch {
+	case errors.Is(cause, syscall.ENOSPC), errors.Is(cause, syscall.EDQUOT):
+		return &model.Error{Code: model.CodeDiskFull,
+			Message:     op + ": there is no room under " + dir + ": " + cause.Error(),
+			Remediation: "free disk space or quota under " + dir}
+	case errors.Is(cause, fs.ErrPermission), errors.Is(cause, syscall.EROFS):
+		return &model.Error{Code: model.CodeConfigInvalid,
+			Message:     op + ": this process must write under " + dir + " and cannot: " + cause.Error(),
+			Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
 	}
 	return internalErr(op + ": " + cause.Error())
 }
