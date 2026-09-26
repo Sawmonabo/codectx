@@ -18,8 +18,7 @@ import (
 // TestPythonServerRunsAsItself pins the Definition ADR-0006 chose for python
 // and, more importantly, the shape of its launch: the payload is a native
 // binary, so the resolved argv is the executable itself with the definition's
-// arguments after it and nothing composed in front. The previous python server
-// was hosted by the managed Node runtime, and a definition that kept a
+// arguments after it and nothing composed in front. A definition with a hosted
 // runtime's argument shape would start the wrong process with no test failing.
 func TestPythonServerRunsAsItself(t *testing.T) {
 	def, ok := definitions["ty"]

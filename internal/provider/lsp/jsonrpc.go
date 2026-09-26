@@ -73,7 +73,7 @@ type conn struct {
 	// written counts the bytes sent inside the current window, and windowStart
 	// is when that window opened. The budget is rolling rather than a lifetime
 	// total: a session that lives for hours legitimately sends more bytes than
-	// any one window, and charging them against one cap ended a healthy server
+	// any one window, and charging them against one lifetime cap would end a healthy server
 	// mid-flight. A flood still trips it, because a flood is bytes per unit of
 	// time. Zero maxWrite is no budget at all, which is the default.
 	written     int64

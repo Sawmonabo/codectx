@@ -103,10 +103,10 @@ const utilGo = "package main\n" +
 //   - a crashed server releases the pending call and the overlay reports
 //     failure (resource leak, false readiness);
 //   - a server that reports no serverInfo still opens, bound to the version of
-//     the payload the lock pinned (false readiness: typescript-language-server
-//     answers initialize with no serverInfo, and an empty ProviderVersion fails
-//     OverlayBinding.Validate, which made the overlay permanently unavailable
-//     for the languages it serves).
+//     the payload the lock pinned (false readiness: a server may answer
+//     initialize with no serverInfo, and an empty ProviderVersion fails
+//     OverlayBinding.Validate, which would make the overlay permanently
+//     unavailable for the languages it serves).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
@@ -173,7 +173,7 @@ func runScenario(t *testing.T, enc string) {
 	t.Setenv("CODECTX_LSP_FAKE_ENCODING", enc)
 	cfg := config.Defaults()
 	// The fake reaches the runner the way a real server does: through the
-	// managed toolchain, as a user override of the gopls lock entry. The
+	// managed toolchain, as a user override of a pinned lock entry. The
 	// resolver verifies the override's checksum on every resolution, so this
 	// exercises the real resolution path and opens no socket.
 	resolver := offlineResolver(t, map[string]toolchain.Override{
@@ -191,7 +191,7 @@ func runScenario(t *testing.T, enc string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// In-package: the fake needs two variables no real gopls does.
+	// In-package: the fake needs two variables no real server does.
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
 	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
 		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})

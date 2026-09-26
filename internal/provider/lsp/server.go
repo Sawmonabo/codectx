@@ -311,15 +311,12 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		return outputInvalid("the language server chose position encoding %q, which this client did not offer", truncate(wire, 32))
 	}
 	s.enc = enc
-	// A server that declines to name itself is still identified by the payload
-	// the lock pinned: typescript-language-server answers initialize with no
-	// serverInfo at all (measured), and since the python server became a native
-	// binary that reports one (ADR-0006) it is the only pinned server that
-	// does. An empty ProviderVersion fails OverlayBinding.Validate, which made
-	// the overlay permanently unavailable for typescript, tsx and javascript
-	// with an error in the argument class. The *reported* string keeps feeding
-	// inputDigest unchanged, so a payload that starts reporting a version later
-	// is still a different question.
+	// A server that declines to name itself -- initialize answered with no
+	// serverInfo at all -- is still identified by the payload the lock pinned.
+	// An empty ProviderVersion fails OverlayBinding.Validate, which would make
+	// the overlay permanently unavailable for every language that server
+	// serves. The *reported* string feeds inputDigest unchanged, so a payload
+	// that reports a version is a different question from one that does not.
 	version := ""
 	if result.ServerInfo != nil {
 		version = result.ServerInfo.Version

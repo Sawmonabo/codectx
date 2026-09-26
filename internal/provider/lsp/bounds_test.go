@@ -17,7 +17,7 @@ import (
 )
 
 // TestSymbolFieldsAreBoundedAndTheCutIsRecorded protects the record field bounds
-// at this boundary. The storage ceilings no longer reject an over-long value, so
+// at this boundary. The storage ceilings do not reject an over-long value, so
 // a producer that does not truncate serves the server's whole string into a
 // model record -- a 3000-byte detail becomes a 3000-byte Signature. Every
 // Symbol in this package is built by newSymbol, so bounding there covers the
@@ -151,8 +151,8 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 // every engine unit behind it waits on it. And when the open that is reserving
 // gives up without waking the opens waiting on its entry, they hang.
 //
-// Mutations: publish the entry only after ReserveWith returns (the order slot
-// used to have) -> the second slot call below queues in the ledger instead of
+// Mutations: publish the entry only after ReserveWith returns -> the second
+// slot call below queues in the ledger instead of
 // returning the pending entry, and fails on its guard deadline. Drop the
 // close(e.ready) on a failed reservation -> the waiter in the second case never
 // wakes.
@@ -291,7 +291,7 @@ func (f *fakeCPU) Ticks() (int64, bool) {
 // line speak for the wedged one and it is never detected at all.
 //
 // Mutation: make progress return `c.moved.Load()` unconditionally -- the
-// per-connection wire count the detector used to watch -> the silent computing
+// per-connection wire count alone -> the silent computing
 // server below is declared stalled, and the wedged request under sibling
 // chatter below is not.
 func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
