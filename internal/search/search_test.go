@@ -278,17 +278,17 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"exact/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
 		{"exact/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
 		{"exact/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
-		{"exact/a_two_offset_node_is_served_at_the_precedence_winner",
-			legTwoOffsetNodeServesThePrecedenceWinner},
 		{"cursor/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"page/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"page/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
 		{"page/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
+		{"resolve/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 		{"page/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"page/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
 		{"page/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
-		{"resolve/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 		{"resolve/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
+		{"exact/a_two_offset_node_is_served_at_the_precedence_winner",
+			legTwoOffsetNodeServesThePrecedenceWinner},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
