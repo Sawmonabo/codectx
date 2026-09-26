@@ -10,8 +10,12 @@
 (method_declaration name: (field_identifier) @name body: (block)? @body) @def.method
 ; Both lists are captured whole and the worker pairs each name with the value
 ; in its position; capturing each name and then the list after it would keep
-; one partial match per name open, quadratic in the name count.
-(short_var_declaration left: (expression_list) @bind.names right: (expression_list) @bind.values) @def.function
+; one partial match per name open, quadratic in the name count. Only a
+; statement whose values hold a function literal matches, so a plain `x := v`
+; costs the worker nothing. The literal is not captured and is the pattern's
+; last step, so the matcher does not split a match per literal: a statement
+; binding several matches once.
+(short_var_declaration left: (expression_list) @bind.names right: (expression_list (func_literal)) @bind.values) @def.function
 (type_spec name: (type_identifier) @name type: (_) @body) @def.class
 (type_alias name: (type_identifier) @name type: (_) @body) @def.class
 (field_declaration name: (field_identifier) @name) @def.field
