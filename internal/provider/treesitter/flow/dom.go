@@ -7,13 +7,14 @@ import "slices"
 // Kennedy iterative algorithm over reverse post-order until no entry changes.
 // Entry's immediate dominator is Entry itself; a node unreachable from Entry
 // has -1. The slice is arena-backed (Arena.Bytes) and valid until the next
-// Arena.Begin.
+// Arena.Begin. Arena: 20·N, a depth-first scratch of its own and the result.
 //
 // Neither ControlDependence nor DefUse needs it; it is exposed so the
 // benchmarks measure the routine on the forward graph, and for consumers that
 // need forward dominance.
 func Dominators(g *Graph, a *Arena) []int32 {
-	return dominatorTree(g.successors(), g.predecessors(), EntryNode, a)
+	d := newDFS(g.Len(), a)
+	return dominatorTree(g.successors(), g.predecessors(), EntryNode, &d, a)
 }
 
 // csr is one direction of an adjacency in compressed sparse row form: node
@@ -34,10 +35,10 @@ func (g *Graph) predecessors() csr { return csr{g.predOff, g.pred} }
 // Cooper-Harvey-Kennedy: sweep the reachable nodes in reverse post-order,
 // setting each node's dominator to the intersection of its processed
 // predecessors', until a sweep changes nothing. The sweep count is not
-// bounded by a constant; it runs to convergence. Arena: the order's 16·N
-// plus 4·N for the result.
-func dominatorTree(out, in csr, root int32, a *Arena) []int32 {
-	order, num := reversePostOrder(out, root, a)
+// bounded by a constant; it runs to convergence. The order is computed in
+// search, which it overwrites; the arena holds only the 4·N result.
+func dominatorTree(out, in csr, root int32, search *dfs, a *Arena) []int32 {
+	order, num := search.reversePostOrder(out, root)
 	idom := a.Int32s(len(num))
 	fill(idom, -1)
 	idom[root] = root
@@ -81,17 +82,23 @@ func intersect(idom, num []int32, x, y int32) int32 {
 	return x
 }
 
+// dfs is the scratch of one iterative depth-first search over N nodes: num,
+// order, stack and cursor, 16·N in the arena. Every array is written before
+// it is read on each use, so one dfs serves several searches in sequence, and
+// its arrays serve as scratch between them.
+type dfs struct{ num, order, stack, cursor []int32 }
+
+func newDFS(n int, a *Arena) dfs {
+	return dfs{num: a.Int32s(n), order: a.Int32s(n), stack: a.Int32s(n), cursor: a.Int32s(n)}
+}
+
 // reversePostOrder is an iterative depth-first search from root over out,
 // with an explicit stack and a per-node edge cursor, so the depth is not the
 // goroutine stack's. order lists the nodes root reaches in reverse
 // post-order (order[0] is root); num[n] is n's index in order, or -1 when
-// root does not reach n. Arena: 16·N (num, order, stack, cursor).
-func reversePostOrder(out csr, root int32, a *Arena) (order, num []int32) {
-	n := len(out.off) - 1
-	num = a.Int32s(n)
-	order = a.Int32s(n)
-	stack := a.Int32s(n)
-	cursor := a.Int32s(n)
+// root does not reach n. Both are views of d, valid until d's next use.
+func (d *dfs) reversePostOrder(out csr, root int32) (order, num []int32) {
+	num, order, stack, cursor := d.num, d.order, d.stack, d.cursor
 	fill(num, -1)
 	// num[v] = 0 marks v visited until its final number is written below.
 	num[root] = 0

@@ -36,7 +36,7 @@ import (
 //     50 ms and an exact query at 50 ms, so a whole process per query would
 //     have to answer in zero.
 //   - MEMORY rows are measured against the exec'd release binary (-trimpath,
-//     no race, no coverage), polled with the Task 20 host sampler
+//     no race, no coverage), polled with the host resource sampler
 //     (internal/diagnostics). The sampler sums THIS process's descendants, and
 //     the product under measurement is a descendant, so its tree -- the
 //     codectx process plus its parser workers -- is exactly what is summed and
@@ -47,7 +47,7 @@ import (
 //     land in the native half. The rows therefore report the SUM, which is the
 //     figure Section 23.2 names.
 //   - The STORAGE row is read from the product's own accounting
-//     (`IndexStatus` with Resources set, the Task 20 block), not re-derived by
+//     (`IndexStatus` with Resources set, its resource block), not re-derived by
 //     walking directories a second time.
 
 // --- the corpus scales beyond corpusTiny ------------------------------------
@@ -61,7 +61,7 @@ import (
 // README.md), so a spec of P packages produces 3P+4 files. That arithmetic is
 // what the counts below are chosen against.
 
-// corpusSmallReal is the scale a 30-minute lane can measure on: 124 files,
+// corpusSmallReal is the scale a package test run measures on: 124 files,
 // every required language, one high-fanout case. It is "small but real" in the
 // Section 23.1 sense -- a workload with the same shape as the reference
 // fixture, not a toy with one file per language.
@@ -81,7 +81,7 @@ var corpusOver200Files = corpusSpec{Packages: 120, Seed: 2102}
 // corpusReference is the Section 23.1 reference fixture, and Section 23.1
 // states it in three numbers, not one: ~10,000 files, ~1M lines, ~80 MiB of
 // source. The package count reaches the file count (3P+4), and the wide filler
-// shape reaches the other two -- the original narrow shape gives 10,000 files
+// shape reaches the other two -- the narrow shape gives 10,000 files
 // of ~0.5 KiB, which is a quarter of the lines and a fourteenth of the bytes,
 // and a cold index or a storage ratio measured over that describes a corpus
 // the budgets were not written for.
@@ -89,9 +89,10 @@ var corpusOver200Files = corpusSpec{Packages: 120, Seed: 2102}
 // Generated and counted at this shape (no index): 10,000 files, 1,052,933
 // lines, 86,064,203 bytes = 82.08 MiB. corpora.json records CLONED corpora --
 // it demands an https clone url and a pinned commit per entry -- so a
-// generated fixture is not one of its rows and it is unchanged. This is the
-// VERIFY lane's workload, never a lane's -- the cold-index row alone
-// has a 3-minute budget and -count=5 multiplies it -- and it is declared here
+// generated fixture is not one of its rows and it is unchanged. It is the
+// workload of a full-scale proof run, never of a package test run -- the
+// cold-index row alone has a 3-minute budget and -count=5 multiplies it --
+// and it is declared here
 // so the reference scale has exactly one definition.
 var corpusReference = corpusSpec{Packages: 3332, Seed: 2103, Helpers: 4, HelperLines: 17}
 
@@ -402,10 +403,6 @@ func measure(t *testing.T, target time.Duration, n int, op func()) string {
 	return report
 }
 
-// treePeak polls the Task 20 host sampler while op runs and returns the highest
-// process-tree resident set it observed, in bytes. The parent is excluded: the
-// product runs as a descendant of this test binary (see the file comment), so
-// the descendant sum is the product's whole tree.
 // subjectPeak is treePeak for a row whose subject is ONE spawned process: it
 // samples that pid and its descendants and nothing else.
 //
@@ -413,9 +410,9 @@ func measure(t *testing.T, target time.Duration, n int, op func()) string {
 // measures work this binary does and wrong for a row that measures a child:
 // every other descendant the harness happens to be holding -- the shared
 // fixture's own workspace, a toolchain process, another row's leftovers -- is
-// summed into the subject's figure. The idle-mcp row missed its budget by
-// 60 MiB of parser workers belonging to the fixture, not to the server it
-// names, which is a measurement that charges one process's memory to another.
+// summed into the subject's figure: the fixture's parser workers, for one,
+// would be charged to a server the row names, which is a measurement that
+// charges one process's memory to another.
 func subjectPeak(tb testing.TB, pid int, op func()) uint64 {
 	tb.Helper()
 	var peak uint64
@@ -556,6 +553,10 @@ func workersHeldByThisProcess(tb testing.TB) int {
 	return n
 }
 
+// treePeak polls the host resource sampler while op runs and returns the highest
+// process-tree resident set it observed, in bytes. The parent is excluded: the
+// product runs as a descendant of this test binary (see the file comment), so
+// the descendant sum is the product's whole tree.
 func treePeak(tb testing.TB, op func()) uint64 {
 	tb.Helper()
 	sampler := diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{})
@@ -679,7 +680,7 @@ const raceSkipReason = "budgets are measured on release builds: under the race d
 
 // budgetRow is one Section 23.2 ceiling: what is measured, the frozen target,
 // the corpus scale it is measured at, and the measurement itself. skip is set
-// on the one row this lane does not own.
+// on the one row a package test run does not measure.
 type budgetRow struct {
 	name   string
 	target string
@@ -794,8 +795,8 @@ var budgetRows = []budgetRow{
 	{name: "no-change-refresh", target: budgetNoChangeRefreshP95.String(), spec: corpusSmallReal,
 		measure: measureNoChangeRefresh},
 	{name: "cold-index-reference", target: budgetColdIndexReference.String(), spec: corpusReference,
-		skip: "ruling 2: the reference-fixture cold index is the wave's ONE full-scale pass and belongs to " +
-			"the VERIFY lane; a lane that ran it would contradict the never-cold-index proof tier"},
+		skip: "the reference-fixture cold index is measured by a full-scale proof run, never by a package " +
+			"test run: a test run that cold-indexed the reference fixture would cost the whole host for minutes"},
 	{name: "indexing-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIndexingPeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			peak := treePeak(t, func() { runCLI(t, f, f.execHome, "index", "--full") })
@@ -854,15 +855,15 @@ var budgetRows = []budgetRow{
 	{name: "storage-ratio", target: fmt.Sprintf("%.1fx eligible source bytes", budgetStorageRatio),
 		spec: corpusSmallReal,
 		// The absolute 3.5x ceiling is asserted at REFERENCE scale by the
-		// VERIFY lane, not here, and the reason is in the numbers this row
+		// full-scale proof run, not here, and the reason is in the numbers this row
 		// prints: the store's fixed cost -- schema, page granularity, the
 		// write-ahead log's high-water mark -- is a constant that a corpus of
 		// ~0.5 KiB files cannot amortise, while Section 23.1's reference
 		// fixture is 1M lines over 10k files (~8 KiB each). Measuring the
 		// ratio at small-real scale and failing the gate on it would enforce a
 		// ceiling against a workload Section 23.2 does not define it over, and
-		// a permanently red gate is not a gate either. What this row owes the
-		// wave is the measured decomposition, and that is what it reports.
+		// a permanently red gate is not a gate either. What this row reports
+		// is the measured decomposition.
 		measure: func(t *testing.T, f *budgetFixture) string {
 			var stored uint64
 			for _, part := range []*uint64{f.resources.DatabaseBytes, f.resources.WALBytes, f.resources.CASBytes} {
@@ -875,7 +876,7 @@ var budgetRows = []budgetRow{
 				t.Fatal("the corpus reported no eligible source bytes")
 			}
 			return fmt.Sprintf("%.2fx at small-real scale (%d stored over %d eligible source bytes; "+
-				"db=%d wal=%d cas=%d; cas/source=%.2fx). The %.1fx ceiling is VERIFY's, at reference scale.",
+				"db=%d wal=%d cas=%d; cas/source=%.2fx). The %.1fx ceiling is asserted at reference scale.",
 				float64(stored)/float64(f.sourceBytes), stored, f.sourceBytes,
 				*f.resources.DatabaseBytes, *f.resources.WALBytes, *f.resources.CASBytes,
 				float64(*f.resources.CASBytes)/float64(f.sourceBytes), budgetStorageRatio)
@@ -1227,8 +1228,8 @@ func countCoverage(t *testing.T, ctx context.Context, svc *app.Services, req mod
 
 // --- the published benchmarks ----------------------------------------------
 //
-// Step 4 runs `go test ./internal/bench -run '^$' -bench . -benchmem -count=5`,
-// which selects by FUNCTION name, not by file. Every benchmark below drives the
+// The published set runs as `go test ./internal/bench -run '^$' -bench .
+// -benchmem -count=5`, which selects by FUNCTION name, not by file. Every benchmark below drives the
 // same shared fixture, so the set costs one index however many times -count
 // re-enters them.
 

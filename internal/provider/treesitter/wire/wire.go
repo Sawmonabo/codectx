@@ -1,7 +1,11 @@
 // Package wire is the framed protocol between the tree-sitter provider and
-// its parser worker subprocess (ruling R8-3): length-prefixed JSON frames
-// with a per-frame cap on both sides, so neither process allocates for a
-// length it has not agreed to. The worker never sees storage, identities or
+// its parser worker subprocess. Every message -- a hello, a request, a source
+// file, one fact record, a done or an error -- travels as one or more
+// length-prefixed frames of at most ChunkBytes each; a message longer than one
+// frame continues in frames of the same kind, and the reader reassembles it
+// whole. No message has a size limit of its own: a source file is bounded by
+// workspace.max_parse_file_bytes before it is ever sent, and a record by the
+// file it was extracted from. The worker never sees storage, identities or
 // the resolver: it reports byte offsets and names, and the parent validates
 // every field against the pinned bytes before anything reaches the sink.
 package wire
@@ -12,25 +16,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 )
 
 // Subcommand is the hidden argv[1] under which the codectx binary runs as a
-// parser worker (ruling R8-1); test binaries dispatch on the same argument.
+// parser worker; test binaries dispatch on the same argument.
 const Subcommand = "__ts-worker"
 
-// Kind tags one frame.
+// Kind tags one message and every frame it is sent in.
 type Kind byte
 
 const (
-	// KindHello is the worker's first frame: its identity and fingerprint.
+	// KindHello is the worker's first message: its identity and fingerprint.
 	KindHello Kind = 1
-	// KindRequest opens one parse; KindSource carries the raw bytes.
+	// KindRequest opens one parse; KindSource carries the raw bytes as one
+	// message of exactly Request.SourceBytes bytes.
 	KindRequest Kind = 2
 	KindSource  Kind = 3
-	// Fact frames, one record each, then KindDone or KindError.
+	// Fact messages, one record each, then KindDone or KindError.
 	KindDecl   Kind = 4
 	KindImport Kind = 5
 	KindRef    Kind = 6
@@ -38,19 +44,33 @@ const (
 	KindError  Kind = 8
 )
 
-// Bounds. MaxFactFrameBytes is the per-record cap the parent enforces on
-// every frame from the child. It does not bound the sink record a frame
-// becomes; the bound that does is the parent's own: the largest fact it can
-// build is one node or relation carrying MaxEvidencePerFact (65536, or the user-set clip) evidence
-// rows of about 620 bytes of identifiers and positions plus a native key of
-// at most MaxNativeKeyBytes (2048), so about 167 KiB, well under the 4 MiB
-// max_provider_record_bytes a sink is configured with. MaxSourceBytes is the
-// worker's absolute ceiling on one source frame; the parent's configured
-// workspace.max_parse_file_bytes is enforced before a request is ever sent.
+// ChunkBytes is the transport unit, not a limit on anything carried: the
+// largest payload one frame holds. A message of any length is sent as
+// ceil(length/ChunkBytes) frames, every one but the last flagged to continue,
+// and a frame is never allocated for a length it did not declare within this
+// unit, so a corrupt header costs the reader at most one unit before it is
+// refused as malformed. What a reader holds for one message is what the
+// writer actually sent, grown as the frames arrive.
+//
+// That is the whole bound on the parent's heap for one file's answer: the
+// records the worker extracted from that one file, which is a function of the
+// file's bytes and therefore of workspace.max_parse_file_bytes. No record is
+// ever refused or dropped for its size on the wire. A record the sink is
+// later handed over a user-set resources.max_provider_record_bytes is
+// admitted and counted as a degradation there (package provider, Sink).
+const ChunkBytes = 64 << 10
+
+// MaxSourceOffset is the widest byte offset the parser addresses and the
+// records carry (uint32). It is the width of the parser's coordinates, not a
+// size policy: a file longer than it cannot be addressed at all, so the parent
+// reports such a file unavailable rather than send it and publish wrapped
+// offsets. workspace.max_parse_file_bytes is the only size policy.
+const MaxSourceOffset = math.MaxUint32
+
 const (
-	MaxFactFrameBytes = 64 << 10
-	MaxSourceBytes    = 64 << 20
-	headerBytes       = 5
+	headerBytes = 5
+	// more flags a frame whose message continues in the next frame.
+	more = 0x80
 )
 
 const (
@@ -71,29 +91,12 @@ type Hello struct {
 	Languages   []string `json:"languages"`
 }
 
-// Request opens one parse. The source follows in a KindSource frame of
+// Request opens one parse. The source follows as one KindSource message of
 // exactly SourceBytes bytes.
 type Request struct {
 	Language    string `json:"language"`
 	Path        string `json:"path"`
-	SourceBytes uint32 `json:"source_bytes"`
-	// MaxRecordsPerFile is providers.tree_sitter.max_records_per_file: how
-	// many declarations, imports or references (each counted separately) the
-	// user wants one file to yield. 0 -- the default -- is unlimited.
-	//
-	// It replaces three hard-coded ceilings of 20000, 4000 and 60000 that the
-	// worker and the parent each held a copy of. A generated file names what it
-	// names, and what it yields is bounded by its own size, which
-	// workspace.max_parse_file_bytes already bounds, so an unlimited value
-	// costs one file's heap and never the repository's.
-	//
-	// It travels on the request precisely so the worker and the parent read the
-	// SAME number: the parent's check exists to stop a misbehaving child from
-	// making it buffer more than a healthy one would send, and a parent holding
-	// its own constant would kill a healthy worker's output the moment the
-	// operator raised the limit. A file that reaches it is reported truncated
-	// through Done.Truncated and its structural coverage is partial.
-	MaxRecordsPerFile uint64 `json:"max_records_per_file,omitempty"`
+	SourceBytes uint64 `json:"source_bytes"`
 }
 
 // Decl is one declaration. Offsets are byte offsets into the source; Parent
@@ -164,7 +167,8 @@ type Done struct {
 	Package string `json:"package,omitempty"`
 	// SyntaxErrors reports that the tree contains ERROR or MISSING nodes.
 	SyntaxErrors bool `json:"syntax_errors,omitempty"`
-	// Truncated reports that a per-file record bound was reached.
+	// Truncated reports that the query cursor exceeded its match limit, so
+	// the query did not see every match in the tree.
 	Truncated bool `json:"truncated,omitempty"`
 	// RSSBytes is the worker's resident set after this parse, or 0 when the
 	// platform cannot report it (recorded as unavailable, not zero, upstream).
@@ -177,56 +181,95 @@ type Error struct {
 	Message string `json:"message"`
 }
 
-// ErrFrameTooLarge reports a frame whose declared length exceeds the cap.
-var ErrFrameTooLarge = errors.New("wire: frame exceeds its byte cap")
+// ErrMalformedFrame reports a frame no writer of this protocol produces: a
+// payload longer than ChunkBytes, an unknown continuation, or a continuation
+// of a different kind than the frame it continues.
+var ErrMalformedFrame = errors.New("wire: malformed frame")
 
-// Write emits one frame.
-func Write(w io.Writer, kind Kind, payload []byte) error {
-	if len(payload) > MaxSourceBytes {
-		return ErrFrameTooLarge
+// WriteMessage emits payload under kind as ceil(len/ChunkBytes) frames, or
+// one empty frame when payload is empty.
+func WriteMessage(w io.Writer, kind Kind, payload []byte) error {
+	for {
+		n := min(len(payload), ChunkBytes)
+		var hdr [headerBytes]byte
+		binary.BigEndian.PutUint32(hdr[:4], uint32(n))
+		hdr[4] = byte(kind)
+		if n < len(payload) {
+			hdr[4] |= more
+		}
+		if _, err := w.Write(hdr[:]); err != nil {
+			return err
+		}
+		if n > 0 {
+			if _, err := w.Write(payload[:n]); err != nil {
+				return err
+			}
+		}
+		payload = payload[n:]
+		if len(payload) == 0 {
+			return nil
+		}
 	}
-	var hdr [headerBytes]byte
-	binary.BigEndian.PutUint32(hdr[:4], uint32(len(payload)))
-	hdr[4] = byte(kind)
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	_, err := w.Write(payload)
-	return err
 }
 
-// WriteJSON encodes v and emits it under kind, refusing an encoding larger
-// than max.
-func WriteJSON(w io.Writer, kind Kind, v any, max int) error {
+// WriteJSON encodes v and emits it as one message under kind.
+func WriteJSON(w io.Writer, kind Kind, v any) error {
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	if len(payload) > max {
-		return fmt.Errorf("%w: %d bytes over the %d-byte cap", ErrFrameTooLarge, len(payload), max)
-	}
-	return Write(w, kind, payload)
+	return WriteMessage(w, kind, payload)
 }
 
-// Read reads one frame, refusing to allocate for a length over max. The
-// returned payload is freshly allocated and owned by the caller.
-func Read(r io.Reader, max int) (Kind, []byte, error) {
+// ReadMessage reads one message, reassembling its continuation frames. The
+// returned payload is freshly allocated and owned by the caller. sizeHint is
+// the length the caller expects, when it knows it from a peer it trusts (the
+// worker reading a source the parent announced); it only presizes the buffer
+// and bounds nothing. Zero means unknown, and the buffer grows with what
+// arrives.
+func ReadMessage(r io.Reader, sizeHint int) (Kind, []byte, error) {
+	kind, cont, payload, err := readFrame(r)
+	if err != nil || !cont {
+		return kind, payload, err
+	}
+	msg := make([]byte, 0, max(sizeHint, 2*len(payload)))
+	msg = append(msg, payload...)
+	for cont {
+		var k Kind
+		if k, cont, payload, err = readFrame(r); err != nil {
+			return 0, nil, err
+		}
+		if k != kind {
+			return 0, nil, fmt.Errorf("%w: a kind %d frame continues a kind %d message", ErrMalformedFrame, k, kind)
+		}
+		msg = append(msg, payload...)
+	}
+	return kind, msg, nil
+}
+
+// readFrame reads one frame: its kind, whether the message continues, and its
+// payload.
+func readFrame(r io.Reader) (Kind, bool, []byte, error) {
 	var hdr [headerBytes]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, nil, err
+		return 0, false, nil, err
 	}
 	n := binary.BigEndian.Uint32(hdr[:4])
-	if int64(n) > int64(max) {
-		return 0, nil, fmt.Errorf("%w: %d bytes over the %d-byte cap", ErrFrameTooLarge, n, max)
+	if n > ChunkBytes {
+		return 0, false, nil, fmt.Errorf("%w: a %d-byte frame is longer than the %d-byte transport unit", ErrMalformedFrame, n, ChunkBytes)
+	}
+	cont := hdr[4]&more != 0
+	if cont && n < ChunkBytes {
+		return 0, false, nil, fmt.Errorf("%w: a %d-byte frame continues its message before filling the transport unit", ErrMalformedFrame, n)
 	}
 	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, nil, err
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, false, nil, err
 	}
-	return Kind(hdr[4]), payload, nil
+	return Kind(hdr[4] &^ more), cont, payload, nil
 }
 
 // ResidentBytes reports this process's resident set size and false when the

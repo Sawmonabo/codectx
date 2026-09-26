@@ -8,11 +8,12 @@ package flow
 // with no successor, and, for every non-trivial strongly connected component
 // from which Exit is not reachable, one edge to Exit from its member with the
 // smallest reverse-post-order number. After it every node reaches Exit, so the
-// relation is a tree rooted at Exit and IPDom is total. Without it an
-// infinite loop's nodes would have no post-dominator and their control
-// dependences would be silently lost.
+// relation is a tree rooted at Exit and every node has an immediate
+// post-dominator. Without it an infinite loop's nodes would have no
+// post-dominator and their control dependences would be silently lost.
 type PostDom struct {
-	// ipdom is the immediate post-dominator of every node.
+	// ipdom is the immediate post-dominator of every node, Exit's being Exit;
+	// never -1, reachable from Entry or not. ControlDependence walks it.
 	ipdom []int32
 	// succ is the exit-augmented successor relation the tree was built on;
 	// ControlDependence walks its frontier over it.
@@ -23,20 +24,24 @@ type PostDom struct {
 
 // PostDominators computes the post-dominator tree by the same iterative pass
 // as Dominators, run on the reversed exit-augmented CFG rooted at Exit. Its
-// arrays are arena-backed (Arena.Bytes).
+// arrays are arena-backed (Arena.Bytes). Two depth-first searches run, the
+// forward reverse post-order exit augmentation ranks headers by and the
+// reverse one the tree is built over, both in ONE 16·N scratch, which the
+// strongly-connected-component pass between them also reuses.
+//
+// Arena, with E edges and A augmented edges: the 16·N search scratch, 8·N
+// for the component pass's index and lowlink, two bitsets of ⌈N/64⌉ words,
+// the augmented relation and its reverse 8·(N+1) + 8·(E+A), and the 4·N tree.
 func PostDominators(g *Graph, a *Arena) PostDom {
-	toExit, augmented := exitAugmentation(g, a)
+	search := newDFS(g.Len(), a)
+	toExit, augmented := exitAugmentation(g, &search, a)
 	succ, pred := augment(g, toExit, augmented, a)
 	return PostDom{
-		ipdom:     dominatorTree(pred, succ, ExitNode, a),
+		ipdom:     dominatorTree(pred, succ, ExitNode, &search, a),
 		succ:      succ,
 		augmented: augmented,
 	}
 }
-
-// IPDom is node n's immediate post-dominator; Exit's is Exit. It is never -1
-// for a node of the Graph, reachable from Entry or not.
-func (p PostDom) IPDom(n int32) int32 { return p.ipdom[n] }
 
 // Augmented is the number of edges exit augmentation added: one per
 // successor-less node plus one per non-trivial strongly connected component
@@ -60,12 +65,14 @@ func (p PostDom) Augmented() int { return p.augmented }
 // Entry; members Entry does not reach order after every reachable node, by
 // node id.
 //
-// Arena: forward order 16·N, Tarjan's index, lowlink, component stack, call
-// stack and edge cursor 20·N, and two bitsets of ⌈N/64⌉ words.
-func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
+// The forward order is computed in search. Tarjan's component stack, call
+// stack and edge cursor then reuse search's order, stack and cursor arrays,
+// which the ranking no longer reads (it reads only num); its index and
+// lowlink are 8·N in the arena, with two bitsets of ⌈N/64⌉ words.
+func exitAugmentation(g *Graph, search *dfs, a *Arena) (toExit []uint64, count int) {
 	n := g.Len()
 	fwd := g.successors()
-	_, rpo := reversePostOrder(fwd, EntryNode, a)
+	_, rpo := search.reversePostOrder(fwd, EntryNode)
 	rank := func(v int32) int {
 		if rpo[v] >= 0 {
 			return int(rpo[v])
@@ -80,9 +87,7 @@ func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
 	// is open; -(c+1) once v was emitted in component c.
 	index := a.Int32s(n)
 	low := a.Int32s(n)
-	members := a.Int32s(n)
-	calls := a.Int32s(n)
-	cursor := a.Int32s(n)
+	members, calls, cursor := search.order, search.stack, search.cursor
 	next, comp := int32(0), int32(0)
 	top := 0
 	for root := range int32(n) {
@@ -145,7 +150,7 @@ func exitAugmentation(g *Graph, a *Arena) (toExit []uint64, count int) {
 					switch {
 					case w == m:
 						cyclic = true
-					case w == ExitNode, index[w] != done && bit(reaches, w):
+					case index[w] != done && bit(reaches, w):
 						reached = true
 					}
 				}

@@ -7,9 +7,9 @@ import "slices"
 // post-dominance frontier. The frontier is computed by the Cooper-Harvey-
 // Kennedy recurrence over the exit-augmented successor relation pd was built
 // on: for each node b with at least two augmented successors, walk from each
-// successor up the post-dominator tree to IPDom(b), adding b to the frontier
-// of every node passed. pd must come from PostDominators(g, a) in the same
-// Begin.
+// successor up the post-dominator tree to b's immediate post-dominator,
+// adding b to the frontier of every node passed. pd must come from
+// PostDominators(g, a) in the same Begin.
 //
 // There is no entry-to-exit edge, so nothing is control dependent on Entry
 // unless Entry itself branches. The result is arena-backed, sorted and
@@ -29,8 +29,8 @@ func ControlDependence(g *Graph, pd PostDom, a *Arena) Edges {
 // included). A self-loop makes a loop head control dependent on itself. Exit
 // is the tree's root and controls nothing.
 //
-// Every walk ends: for an edge b→s, IPDom(b) is s or a proper post-dominator
-// of s, so it lies on s's path to the root.
+// Every walk ends: for an edge b→s, b's immediate post-dominator is s or a
+// proper post-dominator of s, so it lies on s's path to the root.
 func frontierWalk(g *Graph, pd PostDom, out []uint64) int {
 	k := 0
 	for b := range int32(g.Len()) {

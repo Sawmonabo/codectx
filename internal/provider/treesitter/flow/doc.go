@@ -8,8 +8,10 @@
 //	lower     a language's lowering drives a Builder obtained from Arena.Begin
 //	          and calls Builder.Finish, yielding a Graph: dense int32 node ids,
 //	          node 0 the Entry, node 1 the synthetic Exit, successor and
-//	          predecessor adjacency, and per node at most one defined variable
-//	          and the distinct variables it reads
+//	          predecessor adjacency, and per node at most one killing
+//	          definition, the variables it may define without killing
+//	          (Builder.MayDef) and the distinct variables it reads; the
+//	          exceptional edges of a try land on a builder-made Handler node
 //	CFG → post-dominators
 //	          PostDominators runs the iterative dominator pass over reverse
 //	          post-order on the REVERSED graph after exit augmentation: an edge
@@ -23,13 +25,17 @@
 //	          relation, WITHOUT the entry-to-exit edge of the original
 //	          formulation; each pair is (controller, dependent)
 //	CFG → def-use
-//	          DefUse builds sparse SSA over the complete, sealed graph with
-//	          trivial-φ removal and resolves every remaining φ transitively, so
-//	          each pair is (defining node, using node); no dominance input
+//	          DefUse builds sparse SSA over the complete, sealed graph,
+//	          memoized per basic block, with a non-killing may-definition as a
+//	          two-operand merge and a Handler taking each predecessor's entry
+//	          values; it resolves every φ transitively, so each pair is
+//	          (defining node, using node); no dominance input
 //
 // Dominators (the forward relation rooted at Entry) is not an input of either
 // result; it is exposed so the benchmarks measure the routine on the forward
-// graph and for consumers that need it.
+// graph and for consumers that need it. PostDominators runs two depth-first
+// searches (forward, for exit augmentation, and reverse, for the tree) over
+// one shared scratch; Dominators, when run, allocates a third.
 //
 // # Lifetime
 //
@@ -44,8 +50,12 @@
 // Nothing here limits a function: there is no node, edge, definition,
 // variable, iteration or time limit, and no preallocation constant. The
 // definition count D is bounded structurally — a definition is a node, and a
-// node defines at most one variable — so D ≤ N. Every fixed point runs to
-// convergence. The per-function bound on the analysis structures,
-// 96·N + 64 bytes, is a claim the benchmarks measure through Arena.Bytes, not
-// one the code assumes or enforces.
+// node makes at most one killing definition — so D ≤ N; may-definitions are
+// bounded by the lowering's records, like uses. Every fixed point runs to
+// convergence. Each pass documents the arena it uses in terms of N, the
+// edges, the variables, the definitions and uses, and, for DefUse, the
+// (block, variable) pairs its lookups visit and the pairs it emits; the
+// total is not linear in N alone. The design's per-function figure of 96·N + 64
+// bytes is what the benchmarks compare Arena.Bytes against, not a bound the
+// code guarantees, assumes or enforces.
 package flow

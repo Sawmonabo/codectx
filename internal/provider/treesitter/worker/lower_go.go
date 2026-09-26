@@ -1,8 +1,6 @@
 package worker
 
 import (
-	"bytes"
-
 	ts "github.com/tree-sitter/go-tree-sitter"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -10,8 +8,9 @@ import (
 
 // goLowering lowers Go functions, methods and function literals.
 var goLowering = Lowering{
-	callable: set("function_declaration", "method_declaration", "func_literal"),
-	lower:    lowerGo,
+	language:  "go",
+	callables: []string{"function_declaration", "method_declaration", "func_literal"},
+	lower:     lowerGo,
 }
 
 // lowerGo lowers one Go callable's parameters and body into b.
@@ -34,34 +33,49 @@ var goLowering = Lowering{
 //     side of a multi-value call) and, for `op=`, its target. Go evaluates
 //     every operand before writing any target, and a node's uses are read
 //     before its own definition only, so the nodes are ordered such that no
-//     node reads a variable an earlier node of the statement wrote; only a
-//     true cycle (a swap) cannot be ordered, and its reads of an
-//     already-written target move to the statement's first node. Uses of
-//     field, index and indirect targets (`x.f`, `a[i]`, `*p`: uses of x, a,
-//     i, p, never a definition) and of `_` targets' values ride on the first
-//     node.
+//     node reads a variable an earlier node of the statement wrote. Only a
+//     true cycle (a swap) cannot be ordered: the target taken to break it
+//     also uses its own variable, and a later node's read of that target
+//     stays and resolves through its node, which read the old value before
+//     writing it — a sound over-approximation. The uses of field, index and
+//     indirect targets (`x.f`, `a[i]`, `*p`: uses of x, a, i, p) and of `_`
+//     targets' values ride on the first node.
+//   - A field, index or indirect target (`x.f = e`, `a[i] = e`, `*p = e`,
+//     `x.f++`, `for a[i] = range xs`) writes part of its base variable: the
+//     write uses the base and is a non-killing may-definition of it, so a
+//     later use sees the write and every definition before it. A statement's
+//     may-definitions ride on its last node.
 //   - A condition (if, for, a case value list, a type-case type list) is one
 //     Branch node spanning it. Every `&&`/`||` in an expression is hoisted
 //     before the node that owns the expression: each operand that is not
 //     itself `&&`/`||` becomes a Branch node carrying its uses, wired by
 //     short-circuit (the left operand of && reaches the right one when true
-//     and skips it when false; || the reverse), and the owning node carries
-//     the remaining uses.
+//     and skips it when false; || the reverse), and the owning node, whose
+//     value is computed from them, carries every use of the expression,
+//     the operands' included.
 //   - A for statement without a condition has a Branch head spanning the
 //     `for` keyword; with one, the condition's first node is the head, the
 //     target of the back edge. A range loop is a Stmt node for the range
-//     expression (evaluated once), a Branch head spanning the `range`
-//     keyword, then one node per key/value target.
-//   - An expression switch has a Branch head for its tag, a type switch one
+//     expression, evaluated once, which defines an iteration variable of the
+//     lowering's own; a Branch head spanning the `range` keyword; then one
+//     node per key/value target. The head and every key/value node use the
+//     iteration variable, so they depend on the range expression as it was
+//     evaluated, never on a write to its variables in the body.
+//   - An expression switch has a Stmt head for its tag, a type switch one
 //     spanning `x := v.(type)` that defines the alias (one variable for all
-//     clauses: no clause can reach another's uses), a select one spanning
-//     the `select` keyword. Case conditions are tested in source order with
-//     default last; each select clause's send or receive is one node.
-//     `select {}` blocks forever and is lowered as a self-loop.
+//     clauses: no clause can reach another's uses); the head has one
+//     successor, the first case condition. Every case condition (a case
+//     value list, a type-case type list) is a Branch node that also uses the
+//     tag's variables, since it compares against the tag. A select has a
+//     Branch head spanning the `select` keyword that uses every clause's
+//     channel operand and sent value, which Go evaluates on entering it.
+//     Case conditions are tested in source order with default last; each
+//     select clause's send or receive is one node. `select {}` blocks
+//     forever and is lowered as a self-loop.
 //   - return, break, continue, goto and fallthrough are Jump nodes spanning
 //     the statement; `panic(...)` as a statement is a Jump node followed by
-//     Throw. A labelled statement with no statement is a Stmt node spanning
-//     it, so a goto to it has a target.
+//     Throw. Every label is its own Stmt node spanning the label identifier,
+//     before the statement it labels, so a goto always lands on it.
 //
 // Declarations of constants and types create no node; they only shadow.
 //
@@ -80,10 +94,14 @@ var goLowering = Lowering{
 //
 // A function literal is its own function, in which enclosing variables are
 // free. In the enclosing function it is part of the expression that creates
-// it: the node owning that expression uses every enclosing variable the
-// literal (or a literal nested in it) reads or writes, resolved with the
-// literal's own declarations shadowing. `defer func() {...}()` is therefore
-// one node carrying the captures.
+// it, resolved with the literal's own declarations shadowing: the node owning
+// that expression uses every enclosing variable the literal (or a literal
+// nested in it) reads, and carries a non-killing may-definition of every
+// enclosing variable it writes (by assignment, op=, ++/--, a range or
+// receive target, or through a field, index or pointer). The literal may run
+// at any later point, or never, so a use after the creating node sees that
+// may-definition and every definition that reached the creating node.
+// `defer func() {...}()` is therefore one node carrying the captures.
 func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 	g := &goLower{l: l, b: b, src: src}
 	g.open()
@@ -98,14 +116,6 @@ func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
 		g.stmts(body)
 	}
 	g.close()
-}
-
-// goBinding maps a name to a variable id, or to -1 for a name that is not a
-// variable of the function being lowered (a constant, a type, or a function
-// literal's own declaration while its captures are resolved).
-type goBinding struct {
-	name []byte
-	v    int32
 }
 
 // goTarget is one variable target of a statement while its nodes are
@@ -125,13 +135,15 @@ type goLower struct {
 	l   *Lowering
 	b   *flow.Builder
 	src []byte
-	// binds is the scope stack, innermost last; marks are block starts.
-	binds []goBinding
+	// binds is the scope chain; marks are block starts.
+	binds scope
 	marks []int
 	// results are the named result variables a bare return uses.
 	results []int32
-	// buf collects variable uses before they are attached to a node.
-	buf []int32
+	// buf collects variable uses, and may the variables written through a
+	// field, index or pointer or by a function literal, before they are
+	// attached to a node.
+	buf, may []int32
 	// lefts, rights and targets are one statement's operands.
 	lefts, rights []*ts.Node
 	targets       []goTarget
@@ -142,11 +154,9 @@ type goLower struct {
 	first   int32
 }
 
-func (g *goLower) span(n *ts.Node) flow.Span {
-	return flow.Span{Start: uint32(n.StartByte()), End: uint32(n.EndByte())}
-}
+func (g *goLower) span(n *ts.Node) flow.Span { return spanOf(n) }
 
-func (g *goLower) text(n *ts.Node) []byte { return g.src[n.StartByte():n.EndByte()] }
+func (g *goLower) text(n *ts.Node) []byte { return textOf(g.src, n) }
 
 func (g *goLower) blank(name []byte) bool { return len(name) == 1 && name[0] == '_' }
 
@@ -161,16 +171,6 @@ func (g *goLower) nodeSpan(k flow.Kind, s flow.Span) int32 {
 	return id
 }
 
-// named0 is n's first named child that is not a comment, or nil.
-func (g *goLower) named0(n *ts.Node) *ts.Node {
-	for i := range n.NamedChildCount() {
-		if c := n.NamedChild(i); c.Kind() != "comment" {
-			return c
-		}
-	}
-	return nil
-}
-
 // token is n's anonymous child spelled kind, or nil.
 func (g *goLower) token(n *ts.Node, kind string) *ts.Node {
 	for i := range n.ChildCount() {
@@ -179,13 +179,6 @@ func (g *goLower) token(n *ts.Node, kind string) *ts.Node {
 		}
 	}
 	return nil
-}
-
-func (g *goLower) unparen(n *ts.Node) *ts.Node {
-	for n != nil && n.Kind() == "parenthesized_expression" {
-		n = g.named0(n)
-	}
-	return n
 }
 
 func (g *goLower) open() { g.marks = append(g.marks, len(g.binds)) }
@@ -199,7 +192,7 @@ func (g *goLower) close() {
 // bind makes name resolve to v in the innermost block; _ binds nothing.
 func (g *goLower) bind(name []byte, v int32) {
 	if !g.blank(name) {
-		g.binds = append(g.binds, goBinding{name: name, v: v})
+		g.binds = append(g.binds, binding{name: name, v: v})
 	}
 }
 
@@ -210,7 +203,7 @@ func (g *goLower) declare(id *ts.Node) int32 {
 	if g.blank(name) {
 		return -1
 	}
-	v := g.b.Var(g.span(id))
+	v := g.b.Var()
 	g.bind(name, v)
 	return v
 }
@@ -224,32 +217,12 @@ func (g *goLower) bindNames(n *ts.Node) {
 	}
 }
 
-// resolve returns the index of the binding name resolves to, or -1.
-func (g *goLower) resolve(name []byte) int {
-	for i := len(g.binds) - 1; i >= 0; i-- {
-		if bytes.Equal(g.binds[i].name, name) {
-			return i
-		}
-	}
-	return -1
-}
-
 // variable is the variable identifier id resolves to, or -1.
-func (g *goLower) variable(id *ts.Node) int32 {
-	if i := g.resolve(g.text(id)); i >= 0 {
-		return g.binds[i].v
-	}
-	return -1
-}
+func (g *goLower) variable(id *ts.Node) int32 { return g.binds.lookup(g.text(id)) }
 
 // declaredHere reports whether name is declared in the innermost block.
 func (g *goLower) declaredHere(name []byte) bool {
-	for i := len(g.binds) - 1; i >= g.marks[len(g.marks)-1]; i-- {
-		if bytes.Equal(g.binds[i].name, name) {
-			return true
-		}
-	}
-	return false
+	return g.binds.find(name, g.marks[len(g.marks)-1]) >= 0
 }
 
 // params declares every named parameter of list, each as a defining node.
@@ -284,8 +257,9 @@ func (g *goLower) isShort(n *ts.Node) bool {
 	return op != nil && (op.Kind() == "&&" || op.Kind() == "||")
 }
 
-// collect appends to buf every variable n reads, skipping hoisted
-// short-circuit operands and resolving a function literal's captures.
+// collect appends to buf every variable n reads, short-circuit operands
+// included, and resolves a function literal's captures: its reads into buf,
+// its writes into may.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
 	case n.Kind() == "identifier":
@@ -294,7 +268,6 @@ func (g *goLower) collect(n *ts.Node) {
 		}
 	case g.l.isCallable(n):
 		g.scan(n, len(g.binds))
-	case g.isShort(n):
 	default:
 		for i := range n.NamedChildCount() {
 			g.collect(n.NamedChild(i))
@@ -302,16 +275,62 @@ func (g *goLower) collect(n *ts.Node) {
 	}
 }
 
-// uses records every variable e reads as a use of node id.
+// uses records every variable e reads as a use of node id, and every
+// enclosing variable a function literal in e writes as a may-definition.
 func (g *goLower) uses(id int32, e *ts.Node) {
-	lo := len(g.buf)
+	lo, mlo := len(g.buf), len(g.may)
 	if e != nil {
 		g.collect(e)
 	}
-	for _, v := range g.buf[lo:] {
+	g.useAll(id, lo, len(g.buf))
+	g.mayAll(id, mlo)
+	g.buf = g.buf[:lo]
+}
+
+// useAll records buf[lo:hi] as uses of node id.
+func (g *goLower) useAll(id int32, lo, hi int) {
+	for _, v := range g.buf[lo:hi] {
 		g.b.Use(id, v)
 	}
-	g.buf = g.buf[:lo]
+}
+
+// mayAll records may[lo:] as may-definitions of node id and truncates may
+// to lo.
+func (g *goLower) mayAll(id int32, lo int) {
+	for _, v := range g.may[lo:] {
+		g.b.MayDef(id, v)
+	}
+	g.may = g.may[:lo]
+}
+
+// baseIdent is the identifier a field, index or indirect target writes
+// through (x in `x.f`, `x[i].f`, `*x`, `(*x).f`), or nil.
+func (g *goLower) baseIdent(n *ts.Node) *ts.Node {
+	for n = g.l.unparen(n); n != nil; n = g.l.unparen(n) {
+		switch n.Kind() {
+		case "identifier":
+			return n
+		case "selector_expression", "index_expression":
+			n = n.ChildByFieldName("operand")
+		case "unary_expression":
+			if op := n.ChildByFieldName("operator"); op == nil || op.Kind() != "*" {
+				return nil
+			}
+			n = n.ChildByFieldName("operand")
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// baseVar is the variable a field, index or indirect target n writes
+// through, or -1.
+func (g *goLower) baseVar(n *ts.Node) int32 {
+	if id := g.baseIdent(n); id != nil {
+		return g.variable(id)
+	}
+	return -1
 }
 
 // hoist lowers every outermost && and || under n, in source order, into
@@ -335,7 +354,7 @@ func (g *goLower) hoist(n *ts.Node) {
 // where n is true, f where it is false, and first, the earliest handle it
 // pushed, which releases them all.
 func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
-	n = g.unparen(n)
+	n = g.l.unparen(n)
 	if !g.isShort(n) {
 		g.hoist(n)
 		g.uses(g.node(flow.Branch, n), n)
@@ -360,10 +379,13 @@ func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
 	return first, g.b.Push(), rf
 }
 
-// cond lowers condition e as one Branch node after its hoisted operands.
-func (g *goLower) cond(e *ts.Node) {
+// cond lowers condition e as one Branch node after its hoisted operands and
+// returns the node.
+func (g *goLower) cond(e *ts.Node) int32 {
 	g.hoist(e)
-	g.uses(g.node(flow.Branch, e), e)
+	id := g.node(flow.Branch, e)
+	g.uses(id, e)
+	return id
 }
 
 // block lowers a braced block in its own scope.
@@ -411,7 +433,7 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 	case "block":
 		g.block(s)
 	case "expression_statement":
-		e := g.named0(s)
+		e := firstNamed(s)
 		g.hoist(e)
 		if g.isPanic(e) {
 			g.uses(g.node(flow.Jump, s), e)
@@ -423,14 +445,16 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		g.hoist(s)
 		g.uses(g.node(flow.Stmt, s), s)
 	case "inc_statement", "dec_statement":
-		e := g.named0(s)
+		e := firstNamed(s)
 		g.hoist(e)
 		id := g.node(flow.Stmt, s)
 		g.uses(id, e)
-		if x := g.unparen(e); x.Kind() == "identifier" {
+		if x := g.l.unparen(e); x.Kind() == "identifier" {
 			if v := g.variable(x); v >= 0 {
 				b.Def(id, v)
 			}
+		} else if v := g.baseVar(x); v >= 0 {
+			b.MayDef(id, v)
 		}
 	case "assignment_statement":
 		g.fill(s.ChildByFieldName("left"), "")
@@ -461,7 +485,7 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		g.hoist(s)
 		id := g.node(flow.Jump, s)
 		g.uses(id, s)
-		if g.named0(s) == nil {
+		if firstNamed(s) == nil {
 			for _, v := range g.results {
 				b.Use(id, v)
 			}
@@ -500,21 +524,22 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 
 // isPanic reports whether e calls the predeclared panic.
 func (g *goLower) isPanic(e *ts.Node) bool {
-	e = g.unparen(e)
+	e = g.l.unparen(e)
 	if e == nil || e.Kind() != "call_expression" {
 		return false
 	}
 	f := e.ChildByFieldName("function")
-	return f != nil && f.Kind() == "identifier" && string(g.text(f)) == "panic" && g.resolve(g.text(f)) < 0
+	return f != nil && f.Kind() == "identifier" && string(g.text(f)) == "panic" && g.binds.find(g.text(f), 0) < 0
 }
 
 // labeled lowers a labelled statement. Go's break and continue name only an
 // enclosing for, switch or select, so the labels reach those frames; every
-// label also names the next node for goto.
+// label is also its own node, the target of goto.
 func (g *goLower) labeled(s *ts.Node, labels []string) {
-	name := string(g.text(s.ChildByFieldName("label")))
+	id := s.ChildByFieldName("label")
+	name := string(g.text(id))
 	labels = append(labels, name)
-	g.b.Label(name)
+	g.b.Label(name, g.span(id))
 	var inner *ts.Node
 	for i := range s.NamedChildCount() {
 		if c := s.NamedChild(i); c.Kind() != "label_name" && c.Kind() != "comment" {
@@ -522,11 +547,9 @@ func (g *goLower) labeled(s *ts.Node, labels []string) {
 			break
 		}
 	}
-	if inner == nil || inner.Kind() == "empty_statement" {
-		g.node(flow.Stmt, s)
-		return
+	if inner != nil && inner.Kind() != "empty_statement" {
+		g.stmt(inner, labels)
 	}
-	g.stmt(inner, labels)
 }
 
 func (g *goLower) ifStmt(s *ts.Node) {
@@ -601,36 +624,50 @@ func (g *goLower) forStmt(s *ts.Node, labels []string) {
 }
 
 // rangeLoop lowers `for k, v := range x`: x once, then a head, then the
-// key and value definitions each iteration.
+// key and value definitions each iteration. The range expression's node
+// defines an iteration variable of its own that the head and every key and
+// value node use, so each depends on x as it was evaluated before the loop,
+// never on a definition of x in the body.
 func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 	b := g.b
 	right := rc.ChildByFieldName("right")
 	g.hoist(right)
-	g.uses(g.node(flow.Stmt, right), right)
+	rangeNode := g.node(flow.Stmt, right)
+	g.uses(rangeNode, right)
+	iter := b.Var()
+	b.Def(rangeNode, iter)
 	f := b.OpenLoop(labels...)
 	head := g.node(flow.Branch, g.token(rc, "range"))
+	b.Use(head, iter)
 	exit := b.Push()
 	if left := rc.ChildByFieldName("left"); left != nil {
 		define := g.token(rc, ":=") != nil
 		for i := range left.NamedChildCount() {
 			t := left.NamedChild(i)
-			x := g.unparen(t)
+			x := g.l.unparen(t)
 			if t.Kind() == "comment" || (x.Kind() == "identifier" && g.blank(g.text(x))) {
 				continue
 			}
+			var id int32
 			switch {
 			case define:
 				v := g.declare(x)
-				b.Def(g.node(flow.Stmt, x), v)
+				id = g.node(flow.Stmt, x)
+				b.Def(id, v)
 			case x.Kind() == "identifier":
-				id := g.node(flow.Stmt, x)
+				id = g.node(flow.Stmt, x)
 				if v := g.variable(x); v >= 0 {
 					b.Def(id, v)
 				}
 			default:
 				g.hoist(t)
-				g.uses(g.node(flow.Stmt, t), t)
+				id = g.node(flow.Stmt, t)
+				g.uses(id, t)
+				if v := g.baseVar(x); v >= 0 {
+					b.MayDef(id, v)
+				}
 			}
+			b.Use(id, iter)
 		}
 	}
 	g.block(body)
@@ -644,33 +681,52 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 // switchStmt lowers an expression or type switch: its head, then each case
 // condition in source order (default last), then the clause bodies, each
 // entered from its condition and from a fallthrough out of the clause before.
+// The head evaluates the tag once and has one successor, the first case
+// condition, so it is a Stmt; every case condition compares against the tag
+// and uses the tag's variables. No variable is defined between the head and
+// the conditions (a function literal's write there is a may-definition, which
+// kills nothing), so each condition sees the tag's variables exactly as the
+// head read them.
 func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 	b := g.b
 	g.open()
 	if init := s.ChildByFieldName("initializer"); init != nil {
 		g.stmt(init, nil)
 	}
+	// The tag's uses stay in buf[tag:tagEnd] until every case condition has
+	// them. They are read before a type switch declares its alias, so
+	// `switch x := x.(type)` reads the outer x.
+	tag := len(g.buf)
 	if value := s.ChildByFieldName("value"); value != nil {
 		g.hoist(value)
+		mlo := len(g.may)
+		g.collect(value)
+		var head int32
 		if typed {
-			g.typeSwitchHead(s, value)
+			head = g.typeSwitchHead(s, value, tag)
 		} else {
-			g.uses(g.node(flow.Branch, value), value)
+			head = g.node(flow.Stmt, value)
+			g.useAll(head, tag, len(g.buf))
 		}
+		g.mayAll(head, mlo)
 	}
+	tagEnd := len(g.buf)
 	f := b.OpenSwitch(labels...)
 	base := len(g.hs)
 	for i := range s.NamedChildCount() {
+		var id int32
 		switch c := s.NamedChild(i); c.Kind() {
 		case "expression_case":
-			g.cond(c.ChildByFieldName("value"))
+			id = g.cond(c.ChildByFieldName("value"))
 		case "type_case":
-			g.nodeSpan(flow.Branch, g.fieldSpan(c, "type"))
+			id = g.nodeSpan(flow.Branch, g.fieldSpan(c, "type"))
 		default:
 			continue
 		}
+		g.useAll(id, tag, tagEnd)
 		g.hs = append(g.hs, b.Push())
 	}
+	g.buf = g.buf[:tag]
 	dflt := b.Push()
 	first := dflt
 	if len(g.hs) > base {
@@ -714,9 +770,9 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 	g.close()
 }
 
-// typeSwitchHead creates the Branch node spanning `x := v.(type)`, which
-// uses v and defines the alias x.
-func (g *goLower) typeSwitchHead(s, value *ts.Node) {
+// typeSwitchHead creates the Stmt node spanning `x := v.(type)`, which uses
+// v's variables, buf[tag:], and then declares and defines the alias x.
+func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
 	start, end := value.StartByte(), value.EndByte()
 	alias := s.ChildByFieldName("alias")
 	if alias != nil {
@@ -731,16 +787,17 @@ func (g *goLower) typeSwitchHead(s, value *ts.Node) {
 			break
 		}
 	}
-	head := g.nodeSpan(flow.Branch, flow.Span{Start: uint32(start), End: uint32(end)})
-	g.uses(head, value)
+	head := g.nodeSpan(flow.Stmt, flow.Span{Start: uint32(start), End: uint32(end)})
+	g.useAll(head, tag, len(g.buf))
 	if alias == nil {
-		return
+		return head
 	}
-	if id := g.named0(alias); id != nil && id.Kind() == "identifier" {
+	if id := firstNamed(alias); id != nil && id.Kind() == "identifier" {
 		if v := g.declare(id); v >= 0 {
 			g.b.Def(head, v)
 		}
 	}
+	return head
 }
 
 // fieldSpan spans every child of n in field name.
@@ -762,11 +819,33 @@ func (g *goLower) fieldSpan(n *ts.Node, name string) flow.Span {
 }
 
 // selectStmt lowers a select: a head reaching every clause, each clause its
-// communication node then its body.
+// communication node then its body. Go evaluates every clause's channel
+// operand and every send's value once, in source order, on entering the
+// select, and the choice among the clauses depends on them, so the head uses
+// them all.
 func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 	b := g.b
 	f := b.OpenSwitch(labels...)
 	head := g.node(flow.Branch, s.Child(0))
+	lo, mlo := len(g.buf), len(g.may)
+	for i := range s.NamedChildCount() {
+		c := s.NamedChild(i)
+		if c.Kind() != "communication_case" {
+			continue
+		}
+		switch comm := c.ChildByFieldName("communication"); {
+		case comm == nil:
+		case comm.Kind() == "receive_statement":
+			if right := comm.ChildByFieldName("right"); right != nil {
+				g.collect(right)
+			}
+		default:
+			g.collect(comm)
+		}
+	}
+	g.useAll(head, lo, len(g.buf))
+	g.mayAll(head, mlo)
+	g.buf = g.buf[:lo]
 	d := b.Push()
 	clauses := false
 	for i := range s.NamedChildCount() {
@@ -818,7 +897,10 @@ func (g *goLower) fill(n *ts.Node, name string) {
 
 // assign lowers a statement assigning right (an expression list, one
 // expression, or nil) to lefts; compound targets are also read, define
-// declares every target not declared in the innermost block.
+// declares every target not declared in the innermost block. A field, index
+// or indirect target is read and may-defines its base variable; every
+// may-definition of the statement rides on its last node, where every target
+// has been written.
 func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	b := g.b
 	g.rights = g.rights[:0]
@@ -840,12 +922,12 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 		g.hoist(n)
 	}
 	paired := len(g.rights) == len(g.lefts)
-	lo := len(g.buf)
+	lo, mlo := len(g.buf), len(g.may)
 	// Non-variable targets' operands and values come first: the statement's
 	// first node carries them.
 	g.targets = g.targets[:0]
 	for i, n := range g.lefts {
-		x := g.unparen(n)
+		x := g.l.unparen(n)
 		t := goTarget{id: x, left: i, v: -1}
 		if x.Kind() == "identifier" {
 			switch name := g.text(x); {
@@ -857,6 +939,9 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 			}
 		} else {
 			g.collect(n)
+			if v := g.baseVar(x); v >= 0 {
+				g.may = append(g.may, v)
+			}
 		}
 		if t.isNew || t.v >= 0 {
 			g.targets = append(g.targets, t)
@@ -865,17 +950,16 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 		}
 	}
 	extra := len(g.buf)
-	shared := len(g.buf)
 	if !paired {
 		for _, n := range g.rights {
 			g.collect(n)
 		}
 	}
-	sharedEnd := len(g.buf)
+	shared := len(g.buf)
 	for i := range g.targets {
 		t := &g.targets[i]
 		if !paired {
-			t.lo, t.hi = shared, sharedEnd
+			t.lo, t.hi = extra, shared
 			continue
 		}
 		t.lo = len(g.buf)
@@ -892,31 +976,32 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	}
 	if len(g.targets) <= 1 {
 		id := g.node(flow.Stmt, whole)
-		for _, v := range g.buf[lo:] {
-			b.Use(id, v)
-		}
+		g.useAll(id, lo, len(g.buf))
 		if len(g.targets) == 1 {
 			b.Def(id, g.targets[0].v)
 		}
+		g.mayAll(id, mlo)
 		g.buf = g.buf[:lo]
 		return
 	}
-	g.order(lo, extra, sharedEnd)
+	g.order(lo, extra, mlo)
 	g.buf = g.buf[:lo]
 }
 
-// order emits one node per variable target so that no node reads a target
-// an earlier node of the statement wrote: it repeatedly takes the first
-// remaining target no other remaining target reads. In a cycle it takes the
-// first remaining one and moves the others' reads of it to the first node.
-// buf[lo:extra] are the first node's own uses, buf[extra:sharedEnd] the
-// shared right side of an unpaired statement.
-func (g *goLower) order(lo, extra, sharedEnd int) {
+// order emits one node per variable target, keeping the statement's
+// invariant: every target node reads the right-hand values as they were
+// before any target of the statement was written. It repeatedly takes the
+// first remaining target no other remaining target reads, so no node reads
+// a variable an earlier node wrote. In a cycle it takes the first remaining
+// target and gives its node a use of its own variable: that use is read
+// before the node's definition, so the remaining targets' reads of the
+// variable, which stay, resolve to this node and through it to the old
+// value. buf[lo:extra] are the first node's own uses; may[mlo:] are the last
+// node's may-definitions.
+func (g *goLower) order(lo, extra, mlo int) {
 	b := g.b
-	var moved []int32
-	seq := make([]int, 0, len(g.targets))
-	for range g.targets {
-		pick := -1
+	for n := range g.targets {
+		pick, cycle := -1, false
 		for i := range g.targets {
 			if !g.targets[i].done && !g.readByOther(i) {
 				pick = i
@@ -926,34 +1011,25 @@ func (g *goLower) order(lo, extra, sharedEnd int) {
 		if pick < 0 {
 			for i := range g.targets {
 				if !g.targets[i].done {
-					pick = i
+					pick, cycle = i, true
 					break
 				}
 			}
-			if g.moveReads(pick, extra, sharedEnd) {
-				moved = append(moved, g.targets[pick].v)
-			}
 		}
-		g.targets[pick].done = true
-		seq = append(seq, pick)
-	}
-	for n, i := range seq {
-		t := g.targets[i]
+		t := &g.targets[pick]
+		t.done = true
 		id := g.node(flow.Stmt, t.id)
 		if n == 0 {
-			for _, v := range g.buf[lo:extra] {
-				b.Use(id, v)
-			}
-			for _, v := range moved {
-				b.Use(id, v)
-			}
+			g.useAll(id, lo, extra)
 		}
-		for _, v := range g.buf[t.lo:t.hi] {
-			if v >= 0 {
-				b.Use(id, v)
-			}
+		g.useAll(id, t.lo, t.hi)
+		if cycle {
+			b.Use(id, t.v)
 		}
 		b.Def(id, t.v)
+		if n == len(g.targets)-1 {
+			g.mayAll(id, mlo)
+		}
 	}
 }
 
@@ -975,36 +1051,12 @@ func (g *goLower) readByOther(i int) bool {
 	return false
 }
 
-// moveReads strips every remaining target's read of target i's variable and
-// reports whether there was one; order gives it to the statement's first
-// node, which runs before any target is written. A shared right side is
-// copied into each reader's own range first, so targets already ordered
-// keep their reads.
-func (g *goLower) moveReads(i, extra, sharedEnd int) (moved bool) {
-	v := g.targets[i].v
-	for j := range g.targets {
-		t := &g.targets[j]
-		if j == i || t.done {
-			continue
-		}
-		if t.lo >= extra && t.hi <= sharedEnd && t.lo < t.hi {
-			start := len(g.buf)
-			g.buf = append(g.buf, g.buf[t.lo:t.hi]...)
-			t.lo, t.hi = start, len(g.buf)
-		}
-		for k := t.lo; k < t.hi; k++ {
-			if g.buf[k] == v {
-				g.buf[k] = -1
-				moved = true
-			}
-		}
-	}
-	return moved
-}
-
 // scan resolves a function literal's captures: every identifier under n
 // that resolves to a binding below base (the enclosing function's) and is a
-// variable, with the literal's own declarations shadowing.
+// variable, with the literal's own declarations shadowing. A capture read
+// goes to buf; a capture written (an assignment, ++/-- or range target, or
+// the base of a field, index or indirect target) goes to may, and to buf as
+// well when the write also reads it (op=, ++/--).
 func (g *goLower) scan(n *ts.Node, base int) {
 	if g.l.isCallable(n) {
 		g.open()
@@ -1023,8 +1075,25 @@ func (g *goLower) scan(n *ts.Node, base int) {
 	}
 	switch n.Kind() {
 	case "identifier":
-		if i := g.resolve(g.text(n)); i >= 0 && i < base && g.binds[i].v >= 0 {
-			g.buf = append(g.buf, g.binds[i].v)
+		if v := g.captured(n, base); v >= 0 {
+			g.buf = append(g.buf, v)
+		}
+		return
+	case "assignment_statement":
+		op := n.ChildByFieldName("operator")
+		read := op != nil && op.Kind() != "="
+		if left := n.ChildByFieldName("left"); left != nil {
+			for i := range left.NamedChildCount() {
+				g.scanWrite(left.NamedChild(i), base, read)
+			}
+		}
+		if right := n.ChildByFieldName("right"); right != nil {
+			g.scan(right, base)
+		}
+		return
+	case "inc_statement", "dec_statement":
+		if e := firstNamed(n); e != nil {
+			g.scanWrite(e, base, true)
 		}
 		return
 	case "block", "if_statement", "for_statement", "expression_switch_statement", "select_statement",
@@ -1071,15 +1140,58 @@ func (g *goLower) scan(n *ts.Node, base int) {
 		g.bindNames(n)
 		return
 	case "range_clause", "receive_statement":
-		if left := n.ChildByFieldName("left"); left != nil && g.token(n, ":=") != nil {
-			g.scan(n.ChildByFieldName("right"), base)
-			for i := range left.NamedChildCount() {
-				g.bind(g.text(left.NamedChild(i)), -1)
-			}
-			return
+		left := n.ChildByFieldName("left")
+		if left == nil {
+			break
 		}
+		if right := n.ChildByFieldName("right"); right != nil {
+			g.scan(right, base)
+		}
+		define := g.token(n, ":=") != nil
+		for i := range left.NamedChildCount() {
+			if define {
+				g.bind(g.text(left.NamedChild(i)), -1)
+			} else {
+				g.scanWrite(left.NamedChild(i), base, false)
+			}
+		}
+		return
 	}
 	g.scanChildren(n, base)
+}
+
+// captured is the enclosing variable identifier id resolves to inside a
+// function literal whose own bindings start at base, or -1.
+func (g *goLower) captured(id *ts.Node, base int) int32 {
+	if i := g.binds.find(g.text(id), 0); i >= 0 && i < base {
+		return g.binds[i].v
+	}
+	return -1
+}
+
+// scanWrite resolves target t of a write inside a function literal: a
+// captured variable t names is written, and read too when read is set; a
+// field, index or indirect target reads its operands and writes its captured
+// base.
+func (g *goLower) scanWrite(t *ts.Node, base int, read bool) {
+	if t.Kind() == "comment" {
+		return
+	}
+	if x := g.l.unparen(t); x.Kind() == "identifier" {
+		if v := g.captured(x, base); v >= 0 {
+			if read {
+				g.buf = append(g.buf, v)
+			}
+			g.may = append(g.may, v)
+		}
+		return
+	}
+	g.scan(t, base)
+	if id := g.baseIdent(t); id != nil {
+		if v := g.captured(id, base); v >= 0 {
+			g.may = append(g.may, v)
+		}
+	}
 }
 
 func (g *goLower) scanChildren(n *ts.Node, base int) {
