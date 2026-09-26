@@ -393,9 +393,9 @@ line. What an operator can read is, in order of how long it lasts:
    the run row.
 
 A provider may contribute only a bounded number of details to one row. The
-figures above take several of those slots, so a busy row can now carry
-`details_omitted` — a count of the provider particulars that did not fit —
-where the same row previously carried them all. The count is published rather
+figures above take several of those slots, so a busy row can carry
+`details_omitted` — a count of the provider particulars that did not fit.
+The count is published rather
 than the drop being silent.
 
 ## Retention, collection and the grace window

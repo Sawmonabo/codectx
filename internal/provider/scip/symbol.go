@@ -238,7 +238,7 @@ func (sym symbol) probeName() (string, bool) {
 	return "", false
 }
 
-// scopeKey is ruling R9-1: a local symbol is scoped to its document, a global
+// scopeKey is the alias scope of a symbol: a local symbol is scoped to its document, a global
 // one to its SCIP package descriptor (manager, name, version).
 func (sym symbol) scopeKey(path string) string {
 	if sym.local {

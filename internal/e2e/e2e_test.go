@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// L0 harness
+// Harness
 // ---------------------------------------------------------------------------
 
 // binary is the codectx under test, built once for the whole test binary. Every
@@ -178,8 +178,8 @@ func (s *sandbox) run(t *testing.T, args ...string) (envelope, int) {
 //
 // sandbox.run cannot serve this row. It pins --json by design, because every
 // other row asserts on the Section 18.2 envelope; the human renderers are a
-// separate output path with separate code, and the wave-F gap this row closes
-// is precisely that nothing had ever executed them against a populated capsule.
+// separate output path with separate code, and this row is what executes
+// them against a populated capsule.
 func (s *sandbox) runText(t *testing.T, args ...string) string {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
@@ -320,8 +320,8 @@ func contentText(res *mcp.CallToolResult) string {
 // generateTinyRepo writes the deterministic repository every row runs against:
 // fixed content, fixed layout, three languages, no network and no VCS history.
 //
-// It is sized against the wave-F finding that sealing a 17-file session needs
-// around 29 round trips: five source files, of which only two are reachable
+// It is sized so the scenario stays small: sealing a 17-file session needs
+// around 29 round trips, so it holds five source files, of which only two are reachable
 // from the TinyRun seed, so `context plan` selects 2-3 files and the whole
 // scenario is a handful of round trips rather than thirty. The two Go files are
 // deliberately a caller and a callee so there is a real call edge to select on;
@@ -392,7 +392,7 @@ func hitKeys(hits []model.SearchHit) []hitKey {
 	return keys
 }
 
-// TestE2ESearchParity is L0's vertical slice: build the index through the CLI,
+// TestE2ESearchParity is the vertical slice: build the index through the CLI,
 // then ask the SAME question of the SAME workspace through the CLI and through
 // `codectx mcp serve` over real stdio, and require the same domain answer.
 //
@@ -447,7 +447,7 @@ func TestE2ESearchParity(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L1 rows
+// Product-boundary rows
 //
 // The one Section 25.1 product-boundary scenario is filled in here as four rows
 // of one table over ONE pass of the harness above -- not four walkthroughs. The
@@ -1469,10 +1469,10 @@ const (
 // projection of a sealed, populated capsule and requires each one to carry its
 // records.
 //
-// This is the wave-F gap. `context capsule` had only ever been rendered for a
-// session with no capsule at all, so writeCapsulePage's populated branches --
-// six of them, one per view -- had never run outside a unit fixture, and each
-// one has an early return that prints "none on this page". A capsule that
+// Without this row `context capsule` is rendered only for a session with no
+// capsule at all, so writeCapsulePage's populated branches -- six of them, one
+// per view -- run nowhere outside a unit fixture, and each one has an early
+// return that prints "none on this page". A capsule that
 // recorded four observations, seven files and a waiver but printed those lines
 // is read by an operator as "nothing was found", which is the opposite of what
 // the record says and is indistinguishable from a working empty session.

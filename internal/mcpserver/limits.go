@@ -34,15 +34,15 @@ type limits struct {
 	// The per-text-field bound (resources.max_query_text_bytes) is a different
 	// bound and stays where it belongs, in each request type's Validate().
 	//
-	// This middleware bounds REQUESTS ONLY and applies no response ceiling, per
-	// the wave-F ruling on review finding F1. What bounds an answer instead:
+	// This middleware bounds REQUESTS ONLY and applies no response ceiling.
+	// What bounds an answer instead:
 	// the generic tools are bounded by resources.max_page_items plus the
 	// bounded record fields of each model type, and codectx_read_source -- the
 	// only tool that returns source bytes -- is bounded by
 	// resources.max_source_response_bytes (7 MiB) in its own handler. A
 	// response gate here would have to marshal every answer twice to weigh it,
-	// which is the speculative infrastructure policy.md forbids, and at 256 KiB
-	// it would refuse every source chunk above that.
+	// and any fixed ceiling below the source bound would refuse the source
+	// chunks above it.
 	maxParamsBytes int64
 	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency:
 	// a query gate and an indexing gate are different resources and sharing one

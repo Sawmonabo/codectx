@@ -559,10 +559,8 @@ func (s IndexStatus) Validate() error {
 // report is optional because an ordinary status must stay cheap: Resources is
 // false by default, and IndexStatus.Resources is nil unless it is set.
 //
-// Ruling Q1 makes this the request of
-// IndexService.IndexStatus(ctx, model.StatusRequest); `codectx status
-// --resources` and the MCP tool's input are its readers. INT re-points the
-// facade, the CLI and the MCP schema onto it.
+// It is the request of IndexService.IndexStatus(ctx, model.StatusRequest);
+// `codectx status --resources` and the MCP tool's input are its readers.
 type StatusRequest struct {
 	Resources bool `json:"resources"`
 }

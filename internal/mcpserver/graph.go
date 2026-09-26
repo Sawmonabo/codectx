@@ -1,6 +1,6 @@
 package mcpserver
 
-// L3 GRAPH + SYMBOL INFO owns this file (digest §4 rows 6 and 8-11).
+// This file holds the symbol-information and graph-traversal handlers.
 // internal/mcpserver never touches a store or an engine: each handler makes one
 // facade call and wraps it. Ranking, paging, cursor codecs and truncation
 // belong to internal/search and internal/graph; re-deriving any of them here
@@ -107,7 +107,7 @@ func (h *handlers) callees(ctx context.Context, _ *mcp.CallToolRequest, in graph
 }
 
 // graph is the one body behind both traversal tools: they differ only in the
-// direction they fix, so writing it twice would be the drift policy.md forbids.
+// direction they fix, so writing it twice would be the drift Section 5.1 forbids.
 // Every bound is passed through verbatim — a zero means "the configured
 // default", never unlimited (Section 20.1), and resolving it is the engine's
 // job, not this package's.

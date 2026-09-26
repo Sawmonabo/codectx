@@ -193,7 +193,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 // as part of opening, so a server an agent starts while the person is indexing
 // in a terminal is refused CTX_WORKSPACE_BUSY at startup and answers nothing at
 // all -- not even the exploration tools, which need neither the lock nor the
-// writer. Mutations that must fail it are quoted in this lane's report:
+// writer. Mutations that must fail it:
 // internal/app/compose.go's `o.locksAtOpen()` -> `o.indexing()` on the lock (the
 // connect is refused busy), and `LazyWriter: o.mode == modeServe` -> false (the
 // open's schema check queues behind the run and is refused `database is busy`).
@@ -309,7 +309,7 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 // refresh and KEEPS it for the rest of the session, so an idle agent server
 // makes `codectx index` in a terminal answer busy for as long as that server
 // lives -- the same coexistence defect from the other side. Mutation that must
-// fail it is quoted in this lane's report: hold the lock for the session in
+// fail it: hold the lock for the session in
 // internal/app/compose.go (drop the release, or never decrement) and the
 // external index below is refused.
 //
@@ -787,7 +787,7 @@ func (s *sandbox) watchCommand(t *testing.T) (*serverLog, func() (envelope, int)
 // never beaten holds nothing under either behaviour, so a row that indexed
 // straight away would pass against the very defect it exists to catch.
 //
-// Mutation that must fail this row is quoted in this lane's report: make
+// Mutation that must fail this row: make
 // locksAtOpen true for the watch composition again and the index below is
 // refused.
 func TestE2EAWatchingCommandLeavesTheWorkspaceToThePerson(t *testing.T) {
@@ -969,9 +969,9 @@ func awaitHolderPID(t *testing.T, s *sandbox, holder *indexChild) int {
 // (internal/index/index_test.go); nothing had ever watched two built binaries
 // do it.
 //
-// Mutation that must fail it is quoted in this lane's report: restore the fixed
-// bound the policy replaced (a ten-second deadline beside the grace in
-// internal/snapshot/lock.go LockWorkspace) and the second process is refused.
+// Mutation that must fail it: put a fixed bound on the wait (a ten-second
+// deadline beside the grace in internal/snapshot/lock.go LockWorkspace) and the
+// second process is refused.
 // The fixture is padded so the holder's run outlasts that bound several times
 // over; the wait the waiter actually did is logged, so the padding is justified
 // by a measurement rather than by a symbol count.

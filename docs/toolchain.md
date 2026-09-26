@@ -301,9 +301,6 @@ which workspace's resolved configuration is read, which matters only on a host
 whose user configuration varies by repository. The path the reports print is the
 one the resolver actually reads, so the two can never disagree.
 
-Older builds put the store at `<data_dir>/tools`, which was per workspace. Those
-directories are inert: nothing reads them any more, and each may be deleted.
-
 None of the four commands creates anything it only reports on: `status`,
 `verify` and `gc` leave a machine with no store exactly as they found it, and the
 store directory appears when the first payload is installed.

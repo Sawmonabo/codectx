@@ -372,7 +372,7 @@ where the workspace is composed, and handed to it.
 ## Context compilation reads the same facts
 
 The context compiler (Section 15) is not a command — it ships as a library the
-workspace exposes, and Task 16's coverage session is its consumer — but it
+workspace exposes, and the coverage session is its consumer — but it
 queries through this same engine and the same pinned generation, so the keys
 above bind identically for it. It pins ONE generation for a whole compile and
 passes that explicit generation into every seed lookup, expansion and batch, so

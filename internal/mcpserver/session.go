@@ -1,12 +1,12 @@
 package mcpserver
 
-// L4 SESSION owns this file (digest §4 rows 12-17). Session id and actor id
+// This file holds the session-lifecycle handlers. Session id and actor id
 // come from TOOL ARGUMENTS, never from MCP wire state, and the facade's
 // Validate() is not replaced by SDK schema validation: required-ness in an
 // inferred schema comes only from the absence of omitempty, so exactly-one-of
 // and distinctness rules still need Validate().
 //
-// Every handler here is the thin shape of digest §1.5 — Validate, one
+// Every handler here is the thin shape — Validate, one
 // ContextService call, wrap in the shared envelope. Validate runs on this side
 // of the seam rather than being left to the facade because h.context is the
 // app.ContextService INTERFACE: the wire contract a client sees must not depend
@@ -25,7 +25,7 @@ import (
 // a client needs no second round trip to learn the session it just opened.
 //
 // A compile that ran out of query deadline answers `truncated` with
-// `next_cursor` and no manifest (ruling C9). No session exists on that path, so
+// `next_cursor` and no manifest. No session exists on that path, so
 // the status is omitted and the client continues by calling this tool again
 // with the same arguments plus `cursor`.
 func (h *handlers) contextPlan(ctx context.Context, _ *mcp.CallToolRequest, in model.PlanRequest) (*mcp.CallToolResult, result[planOutput], error) {
@@ -122,9 +122,9 @@ func (h *handlers) contextInclude(ctx context.Context, _ *mcp.CallToolRequest, i
 // in a log line is a credential in a log line, and a second actor could replay
 // it against the session it was issued for.
 //
-// The bound is checked here and not left to L1's middleware because the
+// The bound is checked here and not left to the request middleware because the
 // middleware's ceiling is resources.max_metadata_response_bytes, which this one
-// response type is explicitly exempt from (digest §6). It bounds the chunk
+// response type is exempt from. It bounds the chunk
 // content — the term the ceiling exists for — and not the serialized envelope:
 // the exact wire accounting is internal/coverage's, which sizes the chunk it
 // issues against this same key plus its envelope allowance. An over-budget body

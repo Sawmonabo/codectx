@@ -11,8 +11,8 @@ description of how a provider is written and what it may rely on.
 
 A provider emits **small immutable units with explicit inputs**. It never
 holds a mutable global graph, never writes SQL, never reads the live checkout
-and never resolves identity on its own. The coordinator (`internal/index`,
-Task 12) decides which units exist, opens each one in storage with its exact
+and never resolves identity on its own. The coordinator (`internal/index`)
+decides which units exist, opens each one in storage with its exact
 inputs and dependencies, and hands the provider a `UnitRequest`; the provider
 produces exactly that unit through the `Sink` and reports a `ProviderResult`.
 
@@ -171,7 +171,7 @@ write failure that cancelled the provider is reported as `failed` with the
 write error, not as `canceled`. An expired deadline is `timed_out` whether it
 arrives as a bare `context.DeadlineExceeded` or typed through
 `model.Canceled`; that check precedes the error-code mapping. `RunUnit` does
-not complete the provider run: the caller (the Task 12 coordinator) reports
+not complete the provider run: the caller (the coordinator) reports
 the aggregate over a provider's units with `Store.CompleteProviderRun`,
 passing `provider.CodeOf(err)` as the diagnostic code.
 
