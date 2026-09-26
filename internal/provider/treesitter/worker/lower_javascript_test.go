@@ -10,7 +10,9 @@ import "testing"
 // smallest-reverse-post-order member of each sink strongly connected
 // component that cannot reach Exit; control dependence is the post-dominance
 // frontier over the augmented graph with no entry-to-exit edge, so nothing
-// depends on Entry and a loop head depends on itself; def-use pairs are
+// depends on Entry and a loop head whose back edge it controls depends on
+// itself (a `break outer` that leaves past a head can take that control
+// from it); def-use pairs are
 // (defining node, using node) with every φ resolved, self-pairs included.
 func TestJavaScriptLoweringGolden(t *testing.T) {
 	runGolden(t, "javascript", []goldenCase{
