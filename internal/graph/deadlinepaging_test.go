@@ -15,7 +15,7 @@ import (
 // TestADeadlineSplitWalkAlwaysAdvances is the livelock proof, and the
 // cross-REQUEST half of the append-only walk state's invariant.
 //
-// Ruling P3 lets the query deadline end a PAGE of an impact walk and carry the
+// The query deadline may end a PAGE of an impact walk and carry the
 // frontier forward in a cursor, even when the page served nothing. Taken alone
 // that rule has a hole: a page whose FIRST adjacency read already runs past the
 // deadline admits nothing and leaves the frontier and the keyset position
@@ -39,7 +39,7 @@ import (
 //	  page can reach an edge at all, the answer TERMINATES -- truncated, with
 //	  reasonDeadlineStalled and no cursor -- instead of minting the cursor again.
 //
-// Mutations, run and pasted in the lane report:
+// Mutations that fail this test:
 //   - walkStalled's call site disabled in impact.go (`if false && walkStalled`),
 //     so a page that admitted nothing mints the continuation anyway: the
 //     no-progress case fails at `page 7: CTX_CURSOR_INVALID: continuation state

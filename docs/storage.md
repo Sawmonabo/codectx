@@ -23,9 +23,9 @@ other table references a node or a relation by that **integer** surrogate:
 `node_facts`, `relation_facts`, `relation_ids`' own two endpoints,
 `native_aliases`, `fact_keys`, `evidence`, `search_units` and
 `context_entries`. `node_ids.canonical_key` is a `BLOB` under a
-`CHECK(length(canonical_key) = 32)` — not the 64-character hex text it used to
-be, and unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
-`repository_id` column any more, because one store is one repository.
+`CHECK(length(canonical_key) = 32)` — 32 bytes, not 64-character hex text, and
+unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
+`repository_id` column, because one store is one repository.
 (`snapshots` and `generations` still carry theirs.)
 
 The two wide text keys are interned the same way. `scope_keys(id, key)` and
@@ -189,7 +189,7 @@ Two importers produce deltas at two different granularities, and
 | Producer | Delta unit | What the applier names |
 |---|---|---|
 | `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
-| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is `internal/index/delta` — shipped. |
+| `internal/provider/dependence/graphcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is `internal/index/delta` — shipped. |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
 survivors. For both importers that is a handful of entries against tens of
@@ -356,8 +356,8 @@ predecessor's declared files against the fresh ones without holding either
 list. It refuses a unit that is not sealed: a building unit's rows are still
 arriving, and a delta diffed against a partial set would name too few replaced
 buckets and carry a stale fact. The dependence applier uses it to compute
-`Replaced.Files`; the manifest of the same rows it used to store beside the
-unit was deleted with it.
+`Replaced.Files`; no manifest of the same rows is stored beside the
+unit.
 
 ## Applier sketch
 
@@ -549,26 +549,32 @@ discard does not depend on how many callers asked. Every charger in a process
 waits under one lock, so the reclaimer's goroutine, the file system shim
 shortening a file the engine owns and a publication trimming its staging
 surface never hand the disk three windows at once. Across processes the turn
-is taken through a small lock file at the cache root: a window's turn is
+is taken through one small lock file per user on the host, in the product's
+directory in the user cache, above every data directory: a window's turn is
 locking that file, waiting out whatever remains of the interval since the last
 recorded turn, recording this one and unlocking, so an index run and a query
-server free at the pace between them rather than at twice it, whichever caches
-they are writing into: the turn is taken through one file per user on the host,
-above every cache root, because the rate belongs to the device and not to a
-directory.
+server free at the pace between them rather than at twice it, whichever data
+directories they are writing into, because the rate belongs to the device and
+not to a directory.
 The remainder is clamped into one interval, because the recorded time is a
 wall clock written by another process and a clock adjustment must cost at most
-one interval rather than hang a run. A process that can reach neither that file
-nor a cache root of its own -- a standalone tool on a read-only home -- keeps
-the pace for itself alone: the same rate while it is the only one, and twice it
-if a second joins, which is why that path is a last resort.
+one interval rather than hang a run. A process with no user cache directory
+takes its turns through the outermost data directory it has registered, and
+so shares the pace only with the processes over that directory. One that can
+reach neither -- a standalone tool on a read-only home -- keeps the pace for
+itself alone: the same rate while it is the only one, and twice it if a second
+joins, which is why that path is a last resort.
 
 A file the process may unlink but may not truncate -- every published blob is
 one, the store making its objects read-only at publication, and nothing bounds
 a blob's size -- reaches the unlink whole, so the unlink is what gives its
 whole length back in one act. Those bytes are therefore charged **before** the
 unlink: the removal waits its own size's worth of windows and the unlink is
-the last thing that happens, rather than the first. A file another name still
+the last thing that happens, rather than the first. The directory is asked
+whether it permits the unlink before the wait: an unlink it refuses is
+reported at once and charges nothing, so an entry stuck behind a refusing
+directory neither repeats its whole length of waits at every retry nor holds
+the entries queued behind it. A file another name still
 reaches owes nothing either way, because unlinking one of an object's names
 gives no blocks back; it is neither paced nor counted until the last name
 goes.
@@ -593,8 +599,13 @@ retried the next time something is queued. It is named, with the reason, in
 `stuck_frees` beside `pending_free_bytes`: that figure climbing and never
 falling is either a run removing faster than the pace gives back, which
 resolves itself, or a removal nothing can make, which does not, and only the
-list beside it tells the two apart. The request that empties the pools reports
-the same list rather than waiting for a removal that will never succeed.
+list beside it tells the two apart. A name stands until its removal is made or
+its entry is gone. A to-free directory that cannot be listed is named the same
+way until a listing succeeds, and one that is no longer on the disk holds
+nothing and is dropped, never named. The request that empties the pools reports
+the same list rather than waiting for a removal that will never succeed. Both
+carry one page of it, at the bound every record list of a response carries,
+and `stuck_frees_omitted` counts the entries past that page.
 
 At activation and abort the writer's page cache is released to the process, so
 a long-lived server does not keep a run's working set resident.
@@ -615,10 +626,21 @@ wrote is the hole a file system would give rather than the previous sort's
 records. Those zeroes are real writes and a gap is as wide as the offset the
 pager jumped to, so the fill waits a window at a time like every other write
 through the shim rather than handing the disk the whole gap at once. The engine shortening its temporary back to zero is a reset of that
-length rather than a free. With no pool named -- a
-process that opens no store -- the engine creates its own under
-`<data_dir>/tmp`, which the process names at start-up, so they live on the disk
-the user gave the data and never on a memory-backed system temp directory.
+length rather than a free.
+
+The pool is the one of the engine's temporary directory, which the process
+names once, at start-up, before any store is opened: `<data_dir>/tmp` for a
+command that builds, so a run's temporaries live on the disk the user gave the
+data and never on a memory-backed system temp directory; for a command that
+only answers, the same directory when a run made it and it can be written, and
+otherwise a directory of the command's own in the process temp directory,
+given back when it closes ([operations](operations.md)). The pool is named only
+after the engine has accepted the directory, which it does only for one it can
+write, and the first directory named holds the pool for the rest of the
+process: named before that check, a directory on read-only media would keep
+the pool while the command fell back to another, and every temporary would be
+taken from the one directory that cannot hold it.
+
 ### The scratch pool
 
 Freeing is the expensive act, so the working files a store writes for its own
@@ -708,10 +730,9 @@ The list is enforced, not narrated: a test walks the source tree and fails on
 any call outside the pacing package that gives a file's blocks back and is
 neither routed through it nor written down beside it with its reason. That is
 every `os.Remove`, `os.RemoveAll`, `os.Truncate` and file `Truncate`, and also
-every TRUNCATING OPEN -- `os.Create`, and `os.OpenFile` with `O_TRUNC` -- which
-frees an existing file's blocks just as a truncation does and passed the
-enumeration unseen until a review added one at a governed site and watched the
-test stay green.
+every TRUNCATING OPEN -- `os.Create`, and `os.OpenFile` with `O_TRUNC`, the
+flags read through any local variable that carries them -- which frees an
+existing file's blocks just as a truncation does.
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.

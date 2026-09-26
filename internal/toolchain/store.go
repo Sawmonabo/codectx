@@ -32,8 +32,10 @@ import (
 // was ever run in.
 type store struct{ dir string }
 
-// lockPollInterval is how often a bounded wait for a per-tool install lock
-// retries.
+// lockPollInterval is how often a wait for a per-tool install lock tries it
+// again. It is a poll cadence, not a bound on the wait: the blocking lock call
+// cannot be interrupted by a context, so a waiter that must still end with its
+// caller's context asks again at this cadence instead.
 const lockPollInterval = 100 * time.Millisecond
 
 func (s *store) toolDir(name string) string    { return filepath.Join(s.dir, name) }
@@ -74,10 +76,20 @@ type toolLock struct {
 	err  error
 }
 
-// acquire takes the install lock for name, retrying until wait has elapsed or
-// ctx ends. wait <= 0 tries exactly once and reports busy immediately, which is
-// what GC uses so collection never blocks behind a running install.
-func (s *store) acquire(ctx context.Context, name string, wait time.Duration) (*toolLock, error) {
+// acquire takes the install lock for name. With wait it keeps trying until
+// the lock is held or ctx ends; without it, it tries exactly once and reports
+// busy at once, which is what GC uses so collection never blocks behind a
+// running install.
+//
+// A waiter has no clock on the holder. The lock is a kernel lock that is
+// released when the holding process exits, so a peer that crashed frees it,
+// and a live peer's download ends on its own when it stops moving (the
+// transfer watch in fetch.go). The peer's extraction and publication are
+// local work with no detector of their own, so a peer wedged there holds the
+// lock until the waiter's ctx ends; that ctx is the caller's bound and the
+// only one a waiter applies. Reporting a peer busy on a clock instead would
+// fail a resolution whose peer was still progressing.
+func (s *store) acquire(ctx context.Context, name string, wait bool) (*toolLock, error) {
 	if err := os.MkdirAll(s.locksDir(), storeDirPerm); err != nil {
 		return nil, ioError("tool lock directory", err)
 	}
@@ -85,17 +97,16 @@ func (s *store) acquire(ctx context.Context, name string, wait time.Duration) (*
 	if err != nil {
 		return nil, ioError("tool lock file", err)
 	}
-	deadline := time.Now().Add(wait)
 	for {
 		held, err := fslock.TryLock(f)
 		if err != nil {
 			f.Close()
-			return nil, internalError("tool install lock: %v", bareCause(err))
+			return nil, internalError("tool install lock: %v", model.BareCause(err))
 		}
 		if held {
 			return &toolLock{f: f}, nil
 		}
-		if !time.Now().Add(lockPollInterval).Before(deadline) {
+		if !wait {
 			f.Close()
 			return nil, (&model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
 				Message:     "another codectx process is installing this managed tool",
@@ -120,7 +131,7 @@ func (l *toolLock) release() error {
 	}
 	l.once.Do(func() {
 		if err := fslock.Unlock(l.f); err != nil {
-			l.err = internalError("tool install unlock: %v", bareCause(err))
+			l.err = internalError("tool install unlock: %v", model.BareCause(err))
 		}
 		if err := l.f.Close(); err != nil && l.err == nil {
 			l.err = ioError("tool lock close", err)
@@ -377,7 +388,7 @@ func (s *store) collectTool(ctx context.Context, lock Lock, e fs.DirEntry) (int,
 		}
 		return 1, nil
 	}
-	held, err := s.acquire(ctx, name, 0)
+	held, err := s.acquire(ctx, name, false)
 	if err != nil {
 		var typed *model.Error
 		if errors.As(err, &typed) && typed.Code == model.CodeWorkspaceBusy {
@@ -445,7 +456,7 @@ func (s *store) sweepStaging(ctx context.Context) (int, error) {
 			}
 			continue
 		}
-		held, err := s.acquire(ctx, t.Name(), 0)
+		held, err := s.acquire(ctx, t.Name(), false)
 		if err != nil {
 			var typed *model.Error
 			if errors.As(err, &typed) && typed.Code == model.CodeWorkspaceBusy {

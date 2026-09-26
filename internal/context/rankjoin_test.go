@@ -38,9 +38,9 @@ func (e *evidenceFixture) EvidenceBatch(_ context.Context, relations []model.Rel
 	return out, nil
 }
 
-// spoolCandidates is the L1 output these passes consume, built here so P-C can
-// be proved before P-A and P-B land: the candidate run in ingest order and the
-// hop run in route order.
+// spoolCandidates is the P-A output these passes consume, built directly so P-C
+// is proved in isolation from P-A and P-B: the candidate run in ingest order
+// and the hop run in route order.
 func spoolCandidates(t *testing.T, s *compileSorts, cands []candidate) (*pagination.SortedRun[candRec], *pagination.SortedRun[hopRec]) {
 	t.Helper()
 	candSort, err := newSort[candRec](s, "test-cand", func(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }, sizeOfCand)
@@ -175,7 +175,7 @@ func TestPassCMatchesWholeSet(t *testing.T) {
 		{name: "edge budget cuts at a node batch boundary", nodes: 20, edges: 6, hops: 4,
 			pageItems: 3, budget: config.Limit(36)},
 		{name: "an unmatchable relation", nodes: 8, edges: 3, hops: 2, pageItems: 4, budget: config.Unlimited, unmatched: true},
-		// Ruling C8: more wanted relations than one keyset page carries. Both
+		// More wanted relations than one keyset page carries. Both
 		// sides must page to exhaustion under an unlimited bound.
 		{name: "more wanted relations than one page", nodes: 60, edges: 6, hops: 4,
 			pageItems: model.MaxPageItems, budget: config.Unlimited},
@@ -324,7 +324,8 @@ func TestPassEMatchesCentralityMap(t *testing.T) {
 	}
 }
 
-// TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound is ruling C8's proof.
+// TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound guards the unlimited edge
+// scan.
 //
 // context.max_graph_edges is Unlimited by default. Reading that absent bound as
 // model.MaxPageItems would stop a scope naming more than one page of relations

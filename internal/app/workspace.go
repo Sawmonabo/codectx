@@ -167,10 +167,15 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
 		Ledger:    s.ledger,
-		// The one memory admission ledger this process composed. Every heavy
-		// unit the coordinator runs is admitted against it, beside the
-		// language servers the manager admits against the same handle.
+		// The one admission ledger, for memory and disk, this process
+		// composed. Every heavy unit the coordinator runs is admitted against
+		// it, beside the language servers the manager admits against the same
+		// handle.
 		Admission: s.admission,
+		// The one observation of the host the admission allocation was
+		// derived from, so the planner sizes every heavy unit against the
+		// reading it is admitted against.
+		Machine: s.machine,
 		// The read-only side of the same file, so a finished run states in its
 		// result what it did. It opens the ledger per call and never writes.
 		RunLedgerReader: runLedger{dir: s.dataDir},
@@ -345,20 +350,20 @@ func (w *Workspace) query(ctx context.Context, gen model.GenerationID, readOnly 
 // and answers in a report as it does in an indexing session.
 //
 // The manifest it returns is the header; the entries, slices and exclusions are
-// read back through the store's manifest pages, which is the surface the
-// coverage session of Task 16 walks.
+// read back through the store's manifest pages, which is the surface a
+// coverage session walks.
 func (w *Workspace) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
 	return w.s.compiler.Compile(ctx, req)
 }
 
-// CompilePage is the CONTINUABLE form of Compile (ruling C7): a compile that
+// CompilePage is the CONTINUABLE form of Compile: a compile that
 // runs out of query deadline ends the pass it is in rather than the answer, and
 // reports the token the next call resumes from. An empty cursor starts a fresh
 // compile.
 //
 // Compile is kept beside it and not reimplemented in terms of this one: its
 // callers ask a question that has no continuation to hand back, and for them a
-// deadline must stay the error it always was.
+// deadline stays an error.
 func (w *Workspace) CompilePage(ctx context.Context, req model.ContextRequest, cursor string) (contextpkg.CompileResult, error) {
 	return w.s.compiler.CompilePage(ctx, req, cursor)
 }
@@ -381,8 +386,8 @@ func (w *Workspace) Close() error {
 }
 
 // maxAmbiguousCandidates bounds the candidate list an ambiguous name is
-// rejected with (ruling Q9). It is an app-internal presentation bound, not a
-// new protocol limit: the answer is the rejection, and a list long enough to
+// rejected with. It is an app-internal presentation bound, not a protocol
+// limit: the answer is the rejection, and a list long enough to
 // flood a terminal would not help the operator disambiguate.
 const maxAmbiguousCandidates = 16
 

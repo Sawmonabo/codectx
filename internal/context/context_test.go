@@ -25,15 +25,15 @@ import (
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// contextFixture is the ONE Task 15 fixture: a small deterministic snapshot
+// contextFixture is the package's ONE compiler fixture: a small deterministic snapshot
 // holding an implementation file, its caller, the interface it satisfies, its
 // test, its documentation, its configuration and one oversized file, published
 // as a single active generation. The unresolved boundary of Section 15.2 is a
 // task token that names none of them, so it is supplied per row rather than
 // stored here.
 //
-// Every fill-in lane shares this builder; a lane that needs one more artifact
-// adds it through its row's setup hook rather than editing the builder.
+// Every row shares this builder; a row that needs one more artifact adds it
+// through its setup hook rather than editing the builder.
 type contextFixture struct {
 	t     *testing.T
 	ctx   stdcontext.Context
@@ -405,9 +405,9 @@ func (f *contextFixture) File(path string) model.FileVersion {
 	return fv
 }
 
-// contextScenarioRow is one row of the single Task 15 scenario table. Each row
+// contextScenarioRow is one row of the single compiler scenario table. Each row
 // names the failure mode it guards, optionally extends the fixture through
-// setup, and asserts in run. Lanes add rows under their own marker only.
+// setup, and asserts in run.
 type contextScenarioRow struct {
 	// name states the invariant the row guards, not the mechanism it uses.
 	name string
@@ -419,7 +419,7 @@ type contextScenarioRow struct {
 	run func(t *testing.T, fx *contextFixture)
 }
 
-// TestContextCompilerScenario is the ONE Task 15 test. It builds the fixture
+// TestContextCompilerScenario is the ONE compiler scenario test. It builds the fixture
 // once before the table so the builder is proved on every run, then gives each
 // row its own fixture so no row can observe another's persisted manifest.
 func TestContextCompilerScenario(t *testing.T) {
@@ -444,7 +444,7 @@ func TestContextCompilerScenario(t *testing.T) {
 	}
 
 	rows := []contextScenarioRow{
-		// L1 SEEDS rows
+		// seed rows
 		{
 			// Guards Section 15.2: the seed steps run in their stated order, so
 			// an identity the caller named can never be outranked by prose or by
@@ -468,8 +468,8 @@ func TestContextCompilerScenario(t *testing.T) {
 				// The oversized artifact is left out: it carries one line
 				// checkpoint for 600 KB, so hydrating a lexical hit inside it is a
 				// typed resource limit that would stop the lexical step before it
-				// contributes. Section 15.4 budgeting is the L4 row's subject, not
-				// this one's.
+				// contributes. Section 15.4 budgeting is the budget rows' subject,
+				// not this one's.
 				for _, spec := range fixtureFiles {
 					if spec.path == "internal/order/generated.go" {
 						continue
@@ -649,7 +649,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L2 SCOPE rows
+		// scope rows
 		{
 			name: "required scope pulls every decision boundary of the seed",
 			// Guards Section 15.2: a plan that omits the caller, the contract,
@@ -722,7 +722,7 @@ func TestContextCompilerScenario(t *testing.T) {
 		},
 		{
 			name: "an unresolved token is discovery but an unresolved explicit seed is an error",
-			// Guards ruling Q7 from both sides: a task token nothing matched
+			// Guards the discovery rule from both sides: a task token nothing matched
 			// must NOT fail the compile (it yields a discovery answer whose
 			// omission is visible as a reasoned exclusion), while an explicit
 			// seed the caller named and the snapshot does not hold MUST fail
@@ -801,9 +801,9 @@ func TestContextCompilerScenario(t *testing.T) {
 		},
 		{
 			name: "a lexical or changed-file seed never enters the required_full prefix",
-			// Guards Section 15.2 and ruling Q7: only a named identity is
+			// Guards Section 15.2: only a named identity is
 			// required in full. Promoting a merely lexical hit or a captured
-			// change makes it mandatory full reading for Task 16's coverage
+			// change makes it mandatory full reading for the coverage
 			// gate -- a required entry is never demoted or dropped later -- and
 			// reorders the manifest, because Requirement is the first Section
 			// 15.3 tie-break key. Nothing fails when this breaks; the actor is
@@ -817,7 +817,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				changed.Requirement = model.RequirementOptional
 
 				// No seed resolves a symbol, so no boundary can be walked: this
-				// is the discovery answer of ruling Q7, not an implementation
+				// is a discovery answer, not an implementation
 				// plan, and it must hold no required entry at all.
 				res, err := expandScope(fx.ctx, fx.scopeEngine(nil, fixtureCapabilities), fx.Gen,
 					fx.Cfg.Context, []candidate{lexical, changed}, fixtureCapabilities)
@@ -849,7 +849,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L3 RANK rows
+		// ranking rows
 		{
 			// Guards the Section 15.3 path contribution: the product of
 			// weight(kind) and the per-edge precision multiplier, decayed once
@@ -907,8 +907,8 @@ func TestContextCompilerScenario(t *testing.T) {
 			// Guards the rest of Section 15.3 through the pinned reader: an edge
 			// with no visible evidence falls back to heuristic precision, each
 			// bounded boost is added at most once, and the tie-break chain is
-			// total. A broken order is invisible here but breaks Task 16, whose
-			// `context next` is an ordinal walk over this order.
+			// total. A broken order is invisible here but breaks `context
+			// next`, which is an ordinal walk over this order.
 			name: "ranking falls back to heuristic precision and orders by the full tie-break chain",
 			run: func(t *testing.T, fx *contextFixture) {
 				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
@@ -1014,7 +1014,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L4 BUDGET rows
+		// budget rows
 		{
 			// Guards the Section 15.4 rule that entry overhead is MEASURED, not
 			// assumed: a budget that counted only the wire-encoded source would
@@ -1182,7 +1182,7 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		{
-			// THE Task 15 invariant: required scope never silently shrinks to
+			// THE compiler invariant: required scope never silently shrinks to
 			// fit a budget. A required file too large for one slice must raise
 			// the typed floor, never be demoted, truncated, or relabelled.
 			name: "a required file larger than the byte budget raises the minimum-budget floor",
@@ -1298,18 +1298,18 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L5 MANIFEST rows
+		// manifest rows
 		{
-			// Task 16's `context next` walks manifest ordinals without
-			// re-sorting, so a plan persisted in any order other than the
-			// Section 15.3 reading order hands the actor required files after
-			// optional ones with nothing in Task 15 failing. The row feeds the
+			// `context next` walks manifest ordinals without re-sorting, so a
+			// plan persisted in any order other than the Section 15.3 reading
+			// order hands the actor required files after optional ones with
+			// nothing in the compiler failing. The row feeds the
 			// manifest pass candidates in deliberately wrong order and asserts
 			// what comes back out of the four Store.Manifest* read methods.
 			name: "manifest ordinals are the actor's reading order and required_full is a prefix",
 			run: func(t *testing.T, fx *contextFixture) {
 				// The row drives the budget and manifest passes directly:
-				// Compile's orchestration is the integration lane's, and the
+				// Compile's orchestration is tested elsewhere, and the
 				// ordering contract lives in these two. Ordinals are assigned
 				// exactly ONCE, by the budget pass's total sort, and the
 				// manifest pass persists them; a second ordering here would
@@ -1473,7 +1473,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// INT rows
+		// end-to-end compile rows
 		{
 			// A manifest identity that depended on the process, the clock or
 			// the database file would make "repeated compile requests reuse the
@@ -1558,7 +1558,7 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		{
-			// Guards row 41 / F15: the manifest notices are INSTALLED on the
+			// Guards the bound disclosures: the manifest notices are INSTALLED on the
 			// compile's result, not merely computable. Both the page-clamp
 			// disclosure and the pointer at the excluded-candidate projection
 			// reach the caller only through Compile's own two assignments, and
@@ -1611,10 +1611,10 @@ func TestContextCompilerScenario(t *testing.T) {
 }
 
 // budgetRowInput builds the candidate set and the hydrated snapshot metadata a
-// `// L4 BUDGET rows` row compiles, standing in for the seed, scope and ranking
-// passes the fill-in lanes own. Scores descend with the given order so the
-// Section 15.3 tie-break order is the order the paths are named in, which is
-// what makes an ordinal assertion readable.
+// `// budget rows` row compiles, standing in for the seed, scope and ranking
+// passes so a row states its candidates directly. Scores descend with the given
+// order so the Section 15.3 tie-break order is the order the paths are named
+// in, which is what makes an ordinal assertion readable.
 func budgetRowInput(fx *contextFixture, paths []string, req model.Requirement) ([]candidate, []model.FileVersion) {
 	fx.t.Helper()
 	cands := make([]candidate, 0, len(paths))
@@ -1649,7 +1649,7 @@ func pathOfEntry(t *testing.T, fx *contextFixture, e model.ContextEntry) string 
 	return ""
 }
 
-// --- Task 15 lane L2 (SCOPE) test support -------------------------------
+// --- scope test support ---------------------------------------------------
 //
 // The fixture publishes no relations (the digest fakes the GraphFactory), and
 // the only sqlite-to-graph.Adjacency adapter is unexported in internal/app, so
@@ -1680,7 +1680,7 @@ func (a *scopeAdjacency) NodesByID(_ stdcontext.Context, ids []model.NodeID) ([]
 }
 
 // EvidenceFor returns no rows: scope asserts requirements and completeness, and
-// per-edge evidence is lane L3's ranking input, not scope's.
+// per-edge evidence is a ranking input, not scope's.
 func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
 	return map[model.RelationID][]model.EvidenceID{}, nil
 }

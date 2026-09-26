@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -14,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -21,24 +23,20 @@ import (
 // supplied index, a private run file for a profile's output.
 type opener func(context.Context) (io.ReadCloser, int64, error)
 
-// fileNativeKey is the workspace-scoped native key prefix of a file node. It
-// is the filesystem provider's key for the same node (R7-2), repeated here
-// because that provider lives in another wave worktree; after the wave merges
-// it and the candidate in enclosingNode consolidate into one shared file-node
-// helper beside filesystem.PathCandidate.
-const fileNativeKey = "file:"
-
 // importer runs one unit. The import is two passes over the index plus one
 // binding pre-pass, all streaming:
 //
 //   - pre-pass: document paths and embedded text hashes decide the source
-//     binding before any fact exists, because the binding decides whether an
-//     occurrence that does not land on the pinned bytes fails the unit
-//     (verified: the index claims to describe these bytes and does not) or
-//     is skipped (unverified: discovery over bytes the index never saw). It
-//     also resolves the duplicate-path rule and rejects documents whose path
-//     escapes the project root, both of which must be known before the first
-//     fact of the first document is published;
+//     binding before any fact exists, because the binding decides the
+//     diagnostic an occurrence that does not land on the pinned bytes is
+//     refused under: CTX_PROVIDER_OUTPUT_INVALID when verified (the index
+//     claims to describe these bytes and does not), or the run's
+//     CTX_SOURCE_BINDING_UNVERIFIED (discovery over bytes the index never
+//     saw). Either way only that occurrence is left out (refuse). It also
+//     resolves the duplicate-path rule, rejects documents whose path escapes
+//     the workspace root, leaves another project's documents to its own unit
+//     and refuses the ones no project owns, all of which must be known before
+//     the first fact of the first document is published;
 //   - pass 1: occurrences and symbols are spooled to the scratch database as
 //     they stream past, each contributing its canonical digest to the
 //     document hash; when a document ends its position encoding is known, so
@@ -70,7 +68,7 @@ type importer struct {
 	sc       *scratch
 	profile  *Profile
 	binding  model.SourceBinding
-	unverify bool // binding is unverified: skip, never fail, on a bad position
+	unverify bool // binding is unverified: every node carries source_binding=unverified
 	meta     metadata
 	// ctx is the run context, carried for the walker's document callback,
 	// which takes none.
@@ -96,8 +94,23 @@ type importer struct {
 	records    uint64
 	indexBytes uint64
 
-	skippedDocs, truncatedEdges int64
-	outsideRoot, duplicatePaths int64
+	truncatedEdges int64
+	// skippedAliases counts call-site aliases left out because the path makes
+	// the alias scope or native key longer than its bound (callsiteAlias).
+	skippedAliases int64
+	// The documents the index described that this import did not admit, one
+	// account per reason, each keeping the first document's path as its
+	// exemplar: outsideRoot is a path that still escapes the workspace root
+	// once joined to the project directory, duplicatePath an earlier document
+	// a later one with the same path superseded, notHeld a path the snapshot
+	// does not hold, unowned a held path outside the unit's project that no
+	// project owns, unencoded a document whose position encoding is neither
+	// declared nor measured for the tool build, and oversize a document over
+	// max_source_file_bytes.
+	outsideRoot, duplicatePath, notHeld, unowned, unencoded, oversize droppedDocs
+	// otherProjectDocs counts the documents left to the unit of the other
+	// project that holds them (ownerOf). It is a partition, not a loss.
+	otherProjectDocs int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
 	// contradict; refusedExemplar is the first one's document, the coordinate
 	// that occurrence claimed and the reason, kept as the example an operator
@@ -107,13 +120,20 @@ type importer struct {
 	// repository and the report is a bounded diagnostic surface.
 	refusedOccurrences int64
 	refusedExemplar    string
-	// encodingDropped counts documents whose assumed position encoding the
-	// pinned bytes contradict; encodingDroppedPath is the first of them. A
-	// failed probe is a whole-document shift, so the document is dropped
-	// rather than any one of its occurrences.
-	encodingDropped     int64
-	encodingDroppedPath string
-	partialCode         string
+	// carriedExemplar is the first unchanged document whose stored manifest
+	// row carries refusals (carryRefusals). It names the exemplar only when
+	// this run refused nothing itself, so there is no coordinate to name.
+	carriedExemplar string
+	// hasOtherProjects says loadProjects recorded at least one other project,
+	// so ownerOf looks a document's directories up only when one can match.
+	hasOtherProjects bool
+	// encodingDropped counts the documents whose assumed position encoding
+	// the pinned bytes contradict; encodingUnproved those none of whose
+	// definitions could check it. A failed probe is a whole-document shift, so
+	// the document is dropped rather than any one of its occurrences.
+	encodingDropped  droppedDocs
+	encodingUnproved droppedDocs
+	partialCode      string
 	// drops is the one account of everything the wire decoder discarded for
 	// exceeding a field bound, across every pass of this import.
 	drops decodeDrops
@@ -172,7 +192,68 @@ const (
 	// and names the first.
 	detailEncodingDropped  = "documents_dropped_encoding"
 	detailEncodingExemplar = "documents_dropped_encoding_exemplar"
+	// detailEncodingUnproved counts documents dropped whole because none of
+	// their definitions could check the assumed encoding, and names the
+	// first: nothing contradicted the guess, and nothing confirmed it.
+	detailEncodingUnproved         = "documents_unproved_encoding"
+	detailEncodingUnprovedExemplar = "documents_unproved_encoding_exemplar"
 )
+
+// The capability-row details of every other document the import left out,
+// each a count with the first document's path as `<name>_exemplar`.
+//
+// Whether a drop degrades the capability depends on whether it loses a fact
+// about source this product serves. Every eligible file is in the snapshot, so
+// a document outside the workspace root or naming a path the snapshot does not
+// hold describes no served bytes: dropping it loses nothing, and it is counted
+// without degrading. Degrading on it would be a false partial -- indexers
+// write synthesized files such as generated test mains outside the workspace
+// on an ordinary run. A duplicate path, a held path no project owns, an
+// unspecified encoding and the source bound each drop facts about a held
+// file, so they degrade: CTX_PROVIDER_OUTPUT_INVALID for the first three,
+// CTX_RESOURCE_LIMIT for the bound.
+const (
+	// detailOutsideRoot counts documents whose path still escapes the
+	// workspace root once joined to the project directory.
+	detailOutsideRoot = "documents_outside_root"
+	// detailDuplicatePath counts documents a later document with the same
+	// path superseded; the last one of a path is the one admitted.
+	detailDuplicatePath = "documents_duplicate_path"
+	// detailNotHeld counts documents naming a path the snapshot does not hold.
+	detailNotHeld = "documents_not_in_snapshot"
+	// detailUnowned counts documents a project unit reached outside its own
+	// directory, through `../`, at a held path no project owns. No unit
+	// publishes them: admitting them would have every sibling unit that
+	// reaches the same directory publish the path again, so the file is
+	// served with no precise facts and the capability is degraded.
+	detailUnowned = "documents_in_no_project"
+	// detailUnencoded counts documents whose position encoding is neither
+	// declared nor measured for the tool build that wrote the index.
+	detailUnencoded = "documents_unspecified_encoding"
+	// detailOversize counts documents over max_source_file_bytes.
+	detailOversize = "documents_over_source_bound"
+	// detailOtherProjects counts the documents left to another project's own
+	// unit. It is informational: that unit publishes those paths, so nothing
+	// is lost and the capability is not degraded for them.
+	detailOtherProjects = "documents_in_other_projects"
+	// detailSkippedAliases counts call-site aliases left out because the
+	// alias scope or native key would exceed its bound (callsiteAlias).
+	detailSkippedAliases = "callsite_aliases_skipped"
+)
+
+// droppedDocs counts documents dropped for one reason and keeps the first
+// one's path as the exemplar.
+type droppedDocs struct {
+	n     int64
+	first string
+}
+
+func (d *droppedDocs) note(path string) {
+	d.n++
+	if d.first == "" {
+		d.first = path
+	}
+}
 
 // limitSeen records the largest figure observed at each bound. It is a
 // measurement, not a gate: nothing consults it until the run is over, which
@@ -230,6 +311,9 @@ type docSource struct {
 	data []byte
 	cur  *source.Cursor
 	enc  source.ColumnEncoding
+	// refused counts the occurrences refused while this docSource was read;
+	// the pass that loaded it records the count (addRefused).
+	refused int64
 	// spellings are the identifiers this document spells for a symbol that
 	// are not the name the symbol carries, per bindSpellings. It is what lets
 	// the name check hold every occurrence to its symbol's name without
@@ -250,6 +334,9 @@ type docRow struct {
 // run imports one index. open is called once per pass.
 func (im *importer) run(ctx context.Context, open opener) error {
 	if err := im.openDelta(ctx); err != nil {
+		return err
+	}
+	if err := im.loadProjects(ctx); err != nil {
 		return err
 	}
 	if im.profile == nil && im.p.manifestPath != "" {
@@ -593,8 +680,8 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 // endDocument binds a finished document to its snapshot file, classifies it
 // against the stored manifest and resolves its definitions. A document the
 // snapshot does not hold, or whose encoding the indexer left unspecified and
-// the per-tool table cannot supply, or whose supplied encoding does not hold
-// against the pinned bytes (encodingHolds), or whose file exceeds the source
+// the per-tool table cannot supply, or whose supplied encoding the pinned bytes
+// contradict or cannot check (encodingHolds), or whose file exceeds the source
 // bound, is skipped and counted: nothing is guessed about it, and it stays out
 // of the fresh manifest, so a later refresh treats it as new rather than
 // inheriting rows nothing stands behind.
@@ -609,8 +696,9 @@ func (im *importer) endDocument(d document) error {
 		return err
 	}
 	if !admitted {
-		// Rejected by the project-root rule or superseded by a later
-		// document with the same path; both were counted in the pre-pass.
+		// Rejected by the workspace-root rule, left to another project's own
+		// unit, owned by no project, or superseded by a later document with
+		// the same path; each was counted in the pre-pass.
 		return im.dropSpool(ctx, d.index)
 	}
 	fv, ok, err := im.lookup(ctx, d.path)
@@ -620,10 +708,11 @@ func (im *importer) endDocument(d document) error {
 	encoding, assumed := im.resolveEncoding(d.encoding)
 	switch {
 	case !ok:
-		im.skippedDocs++
+		// Counted, not degraded: see the details in importer.go.
+		im.notHeld.note(d.path)
 		return im.dropSpool(ctx, d.index)
 	case columnEncoding(encoding) == "":
-		im.skippedDocs++
+		im.unencoded.note(d.path)
 		im.degrade(model.CodeProviderOutputInvalid)
 		return im.dropSpool(ctx, d.index)
 	case im.p.limits.MaxSourceFileBytes.Exceeded(fv.Size):
@@ -632,7 +721,7 @@ func (im *importer) endDocument(d document) error {
 		// converted. Unlimited by default, so this arm is unreachable until
 		// an operator asks for it, and the skip is reported under the key.
 		im.seen.note(limitSourceFileBytes, fv.Size)
-		im.skippedDocs++
+		im.oversize.note(d.path)
 		im.degrade(model.CodeResourceLimit)
 		return im.dropSpool(ctx, d.index)
 	}
@@ -649,20 +738,23 @@ func (im *importer) endDocument(d document) error {
 		return err
 	}
 	if assumed {
-		holds, err := im.encodingHolds(ctx, ds)
+		proof, err := im.encodingHolds(ctx, ds)
 		if err != nil {
 			return err
 		}
-		if !holds {
-			// A failed probe is a claim about the whole document -- its
-			// columns are read in an encoding its bytes contradict -- so the
-			// document is dropped whole and counted, which is the one shift
-			// that is not a per-occurrence refusal.
-			im.skippedDocs++
-			im.encodingDropped++
-			if im.encodingDroppedPath == "" {
-				im.encodingDroppedPath = d.path
-			}
+		// A failed probe is a claim about the whole document -- its columns
+		// are read in an encoding its bytes contradict -- so the document is
+		// dropped whole and counted, which is the one shift that is not a
+		// per-occurrence refusal. A document nothing could check is dropped
+		// too, since an unchecked guess is never admitted, and counted apart,
+		// because nothing contradicted it.
+		switch proof {
+		case encodingContradicted:
+			im.encodingDropped.note(d.path)
+		case encodingUnproved:
+			im.encodingUnproved.note(d.path)
+		}
+		if proof != encodingProved {
 			im.degrade(model.CodeProviderOutputInvalid)
 			return im.dropSpool(ctx, d.index)
 		}
@@ -706,10 +798,14 @@ func (im *importer) endDocument(d document) error {
 		return err
 	}
 	if publish {
-		return nil
+		// Its references are refused, if at all, when pass 2 reads them.
+		return im.addRefused(ctx, row.idx, ds.refused)
 	}
 	// An unchanged document emits no reference, so its occurrences are not
-	// read again.
+	// read again, and the refusals are the stored ones.
+	if err := im.carryRefusals(ctx, row); err != nil {
+		return err
+	}
 	return im.dropSpool(ctx, row.idx)
 }
 
@@ -766,14 +862,16 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 //	scip-java 0.0.0        position_encoding absent   columns are UTF-16
 //	                       (the only build measured reports "0.0.0-SNAPSHOT")
 //
-// scip-python is UTF-16 rather than the UTF-32 scip.proto suggests for Python
-// indexers, because it is a TypeScript program (a pyright fork), which is why
-// the table is measured and not read off the proto's advice.
+// The Python indexer's columns are UTF-16 rather than the UTF-32 scip.proto
+// suggests for Python indexers, because it is built on a type checker written
+// in TypeScript, which is why the table is measured and not read off the
+// proto's advice.
 //
-// rust-analyzer is deliberately absent: measured at 1.98.0 it declares
-// `position_encoding = UTF8` on every document, so it never reaches this
-// table; a build that stopped declaring it would be an unmeasured pair and
-// stay skipped, which is the right outcome and not a row to write in advance.
+// The Rust indexer is deliberately absent: the pinned build declares
+// `position_encoding = UTF8` on every document (measured), so it never reaches
+// this table; a build that stopped declaring it would be an unmeasured pair
+// and stay skipped, which is the right outcome and not a row to write in
+// advance.
 //
 // `Metadata.text_document_encoding` is deliberately not consulted. All six
 // indexers set it to UTF8 — including the three whose columns are UTF-16 —
@@ -821,12 +919,19 @@ func (im *importer) resolveEncoding(declared int32) (enc int32, assumed bool) {
 	return enc, enc != encodingUnspecified
 }
 
-// maxEncodingProbes bounds the definition occurrences encodingHolds reads
-// looking for one it can check. A document whose first maxEncodingProbes
-// definitions all name something the source does not spell literally is
-// skipped, exactly as one with no definition at all is: an unchecked guess is
-// never admitted.
-const maxEncodingProbes = 256
+// encodingProof is what the pinned bytes say about an assumed encoding.
+type encodingProof int
+
+const (
+	// encodingUnproved: no definition of the document could check the guess,
+	// so it is neither confirmed nor contradicted.
+	encodingUnproved encodingProof = iota
+	encodingProved
+	encodingContradicted
+)
+
+// errProbeDecided ends the probe's scan once one definition has decided it.
+var errProbeDecided = errors.New("encoding probe decided")
 
 // encodingHolds proves an assumed position encoding against the document's
 // pinned bytes, once, before any of its occurrences is admitted.
@@ -838,21 +943,27 @@ const maxEncodingProbes = 256
 // source that is not the symbol — the wrong-bytes class nothing downstream can
 // detect. So the guess is checked the only way the index itself allows: the
 // first definition occurrence whose symbol names an identifier the source
-// spells literally (symbol.probeName) must select exactly that identifier.
+// spells literally (symbol.probeName), and whose range selects any bytes, must
+// select exactly that identifier. A zero-width range selects no bytes and so
+// reads the same in every encoding; it proves nothing and is passed over.
+//
+// Every definition is read until one decides, however many are passed over. A
+// document none of whose definitions can check the guess is unproved, which is
+// reported apart from one whose bytes contradict it, and neither is admitted.
 //
 // On a line with a non-ASCII rune before the token the readings disagree and a
 // wrong guess is caught; on an ASCII-only line every reading converts to the
 // same bytes, so there is nothing to catch and the check passes on the truth.
-func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, error) {
-	var checked, holds bool
-	err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq LIMIT ?`,
-		[]any{ds.doc.idx, roleDefinition, maxEncodingProbes}, func(scan func(...any) error) error {
+func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (encodingProof, error) {
+	proof := encodingUnproved
+	err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
+		[]any{ds.doc.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
 			var r [4]int32
 			if err := scan(&symbolText, &r[0], &r[1], &r[2], &r[3]); err != nil {
 				return internal("scip scratch read: " + err.Error())
 			}
-			if checked || symbolText == "" {
+			if symbolText == "" {
 				return nil
 			}
 			sym, err := parseSymbol(symbolText)
@@ -862,24 +973,26 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 			if _, ok := sym.probeName(); !ok {
 				return nil
 			}
+			rng, _ := im.rangeOf(ds, r)
+			if rng != nil && rng.Start.Byte == rng.End.Byte {
+				return nil
+			}
 			// This occurrence decides the document: a symbol that names an
 			// identifier and does not land on it is the failure being looked
-			// for, so a later occurrence is not tried instead.
-			checked = true
-			if r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 {
-				return nil
+			// for, so a later occurrence is not tried instead. The predicate is
+			// the one every occurrence of the document will be held to, applied
+			// before any spelling is bound, so only the symbol's own name proves
+			// an encoding.
+			proof = encodingContradicted
+			if rng != nil && ds.onPinnedBytes(sym, rng) == "" {
+				proof = encodingProved
 			}
-			rng, cerr := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
-			if cerr != nil {
-				return nil
-			}
-			// The same predicate every occurrence of the document will be held
-			// to, so an encoding cannot be proved by one rule and its
-			// occurrences refused by another.
-			holds = ds.onPinnedBytes(sym, &rng) == ""
-			return nil
+			return errProbeDecided
 		})
-	return holds, err
+	if errors.Is(err, errProbeDecided) {
+		err = nil
+	}
+	return proof, err
 }
 
 // loadSource reads one document's exact pinned bytes through the snapshot
@@ -1029,15 +1142,21 @@ func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
 // alone. A range spanning lines is a block span -- measured, a crate's whole
 // file -- and its edges are the file's, not a token's. A range holding no
 // identifier byte at all is punctuation the grammar spells without one:
-// measured, rust-analyzer ranges the reference from `+` to the `add` method it
-// desugars to over the space beside the operator.
+// measured, the Rust indexer ranges the reference from `+` to the `add` method
+// it desugars to over the space beside the operator. A range of whitespace alone
+// is neither: it holds no token at all, which is what a reference shifted onto
+// the gap between two tokens selects, so it is refused.
 func coversWholeTokens(text []byte) string {
-	named := false
+	named, blank := false, true
 	for _, b := range text {
 		if b == '\n' {
 			return ""
 		}
 		named = named || identifierByte(b)
+		blank = blank && spaceByte(b)
+	}
+	if blank {
+		return "the range selects only whitespace"
 	}
 	if !named {
 		return ""
@@ -1101,7 +1220,7 @@ func identifierByte(b byte) bool {
 // reach the operator on the capability row, which is the only channel that
 // reaches one.
 func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
-	im.refusedOccurrences++
+	ds.refused++
 	if im.refusedExemplar == "" {
 		// The path is bounded before the coordinate is appended, so the
 		// coordinate survives the detail's own ceiling: a path may be four
@@ -1123,23 +1242,44 @@ func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
 // pinned indexers, the one that produces this shape sets no occurrence role at
 // all, so the import role cannot seed it.
 //
-// A spelling is bound only when the document holds at least two occurrences
-// that spell it identically, which is the structural minimum of the construct
-// the exemption exists for: an alias that is used produces the occurrence in
-// the alias clause and the occurrence at the use site. An alias declared and
-// never used produces one occurrence -- and no second one for the rule to
-// refuse either, so nothing is lost. A shifted column that lands on a whole
-// token spelling something else produces that spelling once, so it stays
-// refused; a shift landing twice on the same text within one document is the
-// residual stated in docs/providers-scip.md.
+// A spelling is bound only from the alias clause that introduces it, because
+// the clause is the one source a shifted column cannot produce. Counting is
+// not such a source: a tab measured to the wrong stop shifts every line of the
+// same indentation by the same distance, so two identical lines carry the same
+// wrong spelling twice. The clause takes one of two shapes, both spelled
+// `<name> as <spelling>` on one line with <name> the symbol's own name:
 //
-// The tally holds one document's spellings and is discarded with its
-// docSource; it is bounded by that document's occurrences, which
+//   - one occurrence of the symbol ranges over the whole clause; or
+//   - one occurrence of the symbol ranges exactly over <spelling>, and another
+//     ranges exactly over the <name> the clause aliases.
+//
+// Both are measured, and each is what one pinned indexer emits: the Python
+// indexer ranges one occurrence over `OrderedDict as OD` and spells its uses
+// `OD`; the Rust indexer puts one role-less occurrence on `HashSet` and one on
+// `Set` in `HashSet as Set`, and spells its uses `Set`.
+//
+// A uniform shift moves both occurrences of the second shape by the same
+// distance, so it cannot leave one on the aliased name and the other on the
+// alias; and a cast (`len as u32`) holds only the first token as an occurrence
+// of the symbol, so a shift onto its type binds nothing. The clause occurrence
+// of an alias that is declared and never used binds itself, so it is not
+// refused either. What stays out of reach is stated in docs/providers-scip.md.
+//
+// The candidates are held for one document and discarded with its docSource;
+// they are bounded by that document's occurrences, which
 // MaxOccurrencesPerDocument bounds. A coordinate that does not convert, and a
 // symbol that does not parse, are passed over here and refused by the pass
 // that publishes them, which is where a refusal is counted.
 func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
-	spelled := make(map[string]map[string]int)
+	type spelling struct {
+		raw, name, text string
+		start           uint64
+	}
+	// named holds, per symbol, the end byte of every occurrence ranged exactly
+	// over the symbol's own name; others holds every occurrence ranged exactly
+	// over some other identifier.
+	named := make(map[string]map[uint64]struct{})
+	var others []spelling
 	if err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ?`, []any{ds.doc.idx},
 		func(scan func(...any) error) error {
 			var symbolText string
@@ -1159,40 +1299,93 @@ func (im *importer) bindSpellings(ctx context.Context, ds *docSource) error {
 				return nil
 			}
 			rng, _ := im.rangeOf(ds, r)
-			if rng == nil {
+			if rng == nil || rng.Start.Byte >= rng.End.Byte || rng.End.Byte > uint64(len(ds.data)) {
 				return nil
 			}
 			text := ds.data[rng.Start.Byte:rng.End.Byte]
-			if !wholeIdentifier(text) || string(text) == name {
+			if cutsAToken(ds.data, rng, text) != "" {
 				return nil
 			}
-			counts := spelled[sym.raw]
-			if counts == nil {
-				counts = make(map[string]int)
-				spelled[sym.raw] = counts
+			switch {
+			case string(text) == name:
+				ends := named[sym.raw]
+				if ends == nil {
+					ends = make(map[uint64]struct{})
+					named[sym.raw] = ends
+				}
+				ends[rng.End.Byte] = struct{}{}
+			case wholeIdentifier(text):
+				others = append(others, spelling{raw: sym.raw, name: name, text: string(text), start: rng.Start.Byte})
+			default:
+				// The whole-clause shape binds from this occurrence alone.
+				alias := trailingIdentifier(text)
+				aliasStart := rng.End.Byte - uint64(len(alias))
+				if nameEnd, ok := aliasClause(ds.data, aliasStart, name); ok && alias != "" && alias != name &&
+					nameEnd-uint64(len(name)) == rng.Start.Byte {
+					ds.bindSpelling(sym.raw, alias)
+				}
 			}
-			counts[string(text)]++
 			return nil
 		}); err != nil {
 		return err
 	}
-	for raw, counts := range spelled {
-		for text, n := range counts {
-			if n < 2 {
-				continue
+	for _, o := range others {
+		if nameEnd, ok := aliasClause(ds.data, o.start, o.name); ok {
+			if _, aliased := named[o.raw][nameEnd]; aliased {
+				ds.bindSpelling(o.raw, o.text)
 			}
-			if ds.spellings == nil {
-				ds.spellings = make(map[string]map[string]struct{})
-			}
-			bound := ds.spellings[raw]
-			if bound == nil {
-				bound = make(map[string]struct{})
-				ds.spellings[raw] = bound
-			}
-			bound[text] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// bindSpelling admits text as a spelling of the symbol raw in this document.
+func (ds *docSource) bindSpelling(raw, text string) {
+	if ds.spellings == nil {
+		ds.spellings = make(map[string]map[string]struct{})
+	}
+	bound := ds.spellings[raw]
+	if bound == nil {
+		bound = make(map[string]struct{})
+		ds.spellings[raw] = bound
+	}
+	bound[text] = struct{}{}
+}
+
+// aliasClause reports whether the bytes before start, on the same line, read
+// `<name> as `: the name as a whole token, then the `as` keyword with at least
+// one blank on each side. It returns the end byte of that name.
+func aliasClause(data []byte, start uint64, name string) (uint64, bool) {
+	i := blanksBefore(data, start)
+	if i == start || i < 2 || string(data[i-2:i]) != "as" {
+		return 0, false
+	}
+	end := blanksBefore(data, i-2)
+	n := uint64(len(name))
+	if end == i-2 || n == 0 || end < n || string(data[end-n:end]) != name {
+		return 0, false
+	}
+	if b := end - n; b > 0 && identifierByte(data[b-1]) {
+		return 0, false
+	}
+	return end, true
+}
+
+// blanksBefore walks back from i over spaces and tabs, never past a line.
+func blanksBefore(data []byte, i uint64) uint64 {
+	for i > 0 && (data[i-1] == ' ' || data[i-1] == '\t') {
+		i--
+	}
+	return i
+}
+
+// trailingIdentifier is the identifier token text ends with, or "".
+func trailingIdentifier(text []byte) string {
+	i := len(text)
+	for i > 0 && identifierByte(text[i-1]) {
+		i--
+	}
+	return string(text[i:])
 }
 
 // defineSymbol resolves one definition occurrence and records its identity,
@@ -1383,6 +1576,14 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 	if err := im.bindSpellings(ctx, ds); err != nil {
 		return err
 	}
+	if err := im.eachReference(ctx, d, ds); err != nil {
+		return err
+	}
+	return im.addRefused(ctx, d.idx, ds.refused)
+}
+
+// eachReference publishes the reference occurrences of one changed document.
+func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) error {
 	return im.sc.each(ctx, `SELECT symbol, roles, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) = 0 ORDER BY seq`,
 		[]any{d.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
@@ -1420,7 +1621,7 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			// mapped: `reads` and `writes` are the dependence provider's
 			// facts (Section 11.6), derived from the graph's assignment
 			// operators, and two providers publishing one relation kind from
-			// different precisions is the parallel implementation policy.md
+			// different precisions is the parallel implementation Section 5.1
 			// forbids. Every non-definition, non-import occurrence is a
 			// `references` edge here.
 			kind, detail := model.RelReferences, "reference"
@@ -1438,9 +1639,19 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 // call site it finds, so the reconciler merges the two identities wherever the
 // ranges are equal and the `calls` relation gains a precise target. See
 // callsite.go for the key.
+//
+// A zero-width reference names a position and no identifier, so there is no
+// call site to join and nothing is lost by publishing none. An alias over its
+// bound is a lost precise call target, so it is counted and degrades the
+// capability like any other bound that leaves a fact out.
 func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.SourceRange, to model.NodeID) error {
+	if rng.End.Byte <= rng.Start.Byte {
+		return nil
+	}
 	scopeKey, nativeKey, ok := callsiteAlias(p, rng)
 	if !ok {
+		im.skippedAliases++
+		im.degrade(model.CodeResourceLimit)
 		return nil
 	}
 	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scopeKey, NativeKey: nativeKey, NodeID: to}}); err != nil {
@@ -1509,21 +1720,16 @@ func (im *importer) enclosingNode(ctx context.Context, ds *docSource, rng *model
 		return model.NodeID(node), nil
 	}
 	// The file node a file-level occurrence points out of. The candidate is
-	// the one the filesystem provider publishes for the same path — a
-	// workspace-scoped `file:<path>` alias, no defining file and no range — so
-	// resolving it against that declared dependency adopts the identity that
-	// already exists instead of minting a second file node for one path. It
-	// carries no Language because the language of a path is internal/lang,
-	// which Task 7 owns and this worktree does not hold; deriving it here
-	// would be a parallel implementation that drifts. Language is a
-	// publishing unit's own attribute, so omitting it changes no identity.
+	// the filesystem provider's own for the same path -- a workspace-scoped
+	// `file:<path>` key, no defining file and no range -- so resolving it
+	// against that declared dependency adopts the identity that already exists
+	// instead of minting a second file node for one path.
 	end, err := ds.cur.PositionAt(uint64(len(ds.data)))
 	if err != nil {
 		return "", err
 	}
 	whole := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1, Column: 0}, End: end}
-	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: provider.ScopeWorkspace, NativeKey: fileNativeKey + ds.doc.path,
-		Kind: model.NodeFile, Name: path.Base(ds.doc.path), QualifiedName: ds.doc.path}
+	cand := filesystem.PathCandidate(ID, model.NodeFile, ds.doc.path)
 	res, err := im.req.Resolver.Resolve(ctx, cand)
 	if err != nil {
 		return "", err
@@ -1721,7 +1927,7 @@ func (im *importer) result() model.ProviderResult {
 		// What the wire decoder discarded for exceeding a field bound, named
 		// per bound and split by what the bound cost: a whole record whose
 		// identity was unreadable, or one decorative field of a record that is
-		// still published. Silence here was the class-G defect (plan row 26).
+		// still published.
 		if v := summarizeDrops(im.drops.records); v != "" {
 			cs = cs.WithDetail(detailDroppedRecords, v)
 		}
@@ -1751,25 +1957,46 @@ func (im *importer) result() model.ProviderResult {
 		// reads only the diagnostic family and cannot tell one wrong
 		// coordinate from a project the indexer mis-columned throughout.
 		if im.refusedOccurrences > 0 {
+			exemplar := im.refusedExemplar
+			if exemplar == "" {
+				exemplar = im.carriedExemplar + ": refused when this unchanged document was last imported; its rows are carried"
+			}
 			cs = cs.WithDetail(detailRefusedOccurrences, strconv.FormatInt(im.refusedOccurrences, 10)).
-				WithDetail(detailRefusedExemplar, im.refusedExemplar)
+				WithDetail(detailRefusedExemplar, exemplar)
 		}
-		if im.encodingDropped > 0 {
-			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped, 10)).
-				WithDetail(detailEncodingExemplar, im.encodingDroppedPath)
+		if im.encodingDropped.n > 0 {
+			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped.n, 10)).
+				WithDetail(detailEncodingExemplar, im.encodingDropped.first)
+		}
+		if im.encodingUnproved.n > 0 {
+			cs = cs.WithDetail(detailEncodingUnproved, strconv.FormatInt(im.encodingUnproved.n, 10)).
+				WithDetail(detailEncodingUnprovedExemplar, im.encodingUnproved.first)
+		}
+		for _, d := range []struct {
+			name string
+			docs droppedDocs
+		}{{detailOutsideRoot, im.outsideRoot}, {detailDuplicatePath, im.duplicatePath}, {detailNotHeld, im.notHeld},
+			{detailUnowned, im.unowned}, {detailUnencoded, im.unencoded}, {detailOversize, im.oversize}} {
+			if d.docs.n > 0 {
+				cs = cs.WithDetail(d.name, strconv.FormatInt(d.docs.n, 10)).WithDetail(d.name+"_exemplar", d.docs.first)
+			}
+		}
+		if im.otherProjectDocs > 0 {
+			cs = cs.WithDetail(detailOtherProjects, strconv.FormatInt(im.otherProjectDocs, 10))
+		}
+		if im.skippedAliases > 0 {
+			cs = cs.WithDetail(detailSkippedAliases, strconv.FormatInt(im.skippedAliases, 10))
 		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}
 	return r
 }
 
-// report is the full account of the run: the provider result plus the
-// per-document delta and every document and occurrence the import did not
-// admit. RecordsEmitted counts only what reached the sink, so an unchanged
-// document contributes nothing to it.
+// report is the full account of the run: the provider result, whose
+// capability rows name every document and occurrence the import did not
+// admit, plus the per-document delta and the fresh manifest. RecordsEmitted
+// counts only what reached the sink, so an unchanged document contributes
+// nothing to it.
 func (im *importer) report() Report {
-	return Report{
-		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
-		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
-	}
+	return Report{Result: im.result(), Delta: im.delta, Manifest: im.manifest}
 }

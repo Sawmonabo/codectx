@@ -8,7 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// Storage-internal surrogate identities (scale-posture-plan.md S-1..S-3).
+// Storage-internal surrogate identities.
 //
 // A reference site holds an INTEGER surrogate, never the 32-byte canonical
 // BLOB it names. A BLOB record field costs 2N+12 as its serial type plus the
@@ -87,12 +87,12 @@ func nullRelation(r relRef) any {
 type interner interface {
 	// node resolves model.NodeID -> node_ids.id, inserting (canonical, kind,
 	// canonical_key) when absent. canonicalKey is the raw 32 bytes, not hex:
-	// node_ids.canonical_key is BLOB(32) after S-4.
+	// node_ids.canonical_key is BLOB(32).
 	node(ctx context.Context, tx *sql.Tx, id model.NodeID, kind string, canonicalKey []byte) (nodeRef, error)
 	// relation resolves model.RelationID -> relation_ids.id. from and to must
 	// already be resolved by the caller; the interner does not recurse.
 	relation(ctx context.Context, tx *sql.Tx, id model.RelationID, from nodeRef, kind string, to nodeRef) (relRef, error)
-	// scopeKey and nativeKey resolve into the S-3 string dictionaries.
+	// scopeKey and nativeKey resolve into the string dictionaries.
 	scopeKey(ctx context.Context, tx *sql.Tx, key string) (scopeRef, error)
 	nativeKey(ctx context.Context, tx *sql.Tx, key string) (nativeRef, error)
 	// reset drops every cached entry. The writer calls it at each batch

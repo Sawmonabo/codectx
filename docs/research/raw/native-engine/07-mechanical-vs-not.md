@@ -31,14 +31,14 @@ halves and the report must carry both.
 2. **The differential test corpus.** Sized at 2,500–4,500 lines for CFG+CDG alone
    (`docs/research/05` §4) and it scales with the number of languages parity must be proven for.
    It is plausibly larger than the implementation, and it cannot assert equality: two engine runs
-   over the same unmodified tree differ by ~0.01% (`10-round3` §9b), and a claim of equality
+   over the same unmodified tree differ by ~0.01% (`10-engine-empirical` §9b), and a claim of equality
    between two engine runs anywhere in this repository is a defect (`providers-dependence.md`).
 3. **The precision claim.** The engine stamps `static_analysis`. A tree-sitter pass has an exact
    CFG half and a name-resolved half; the honest label is `syntax` (`docs/research/05` §0). That is
    a **product** decision about what the product promises, not an engineering one, and it cannot be
    made by writing code faster.
 4. **`reads`/`writes` has no published algorithm.** It is the engine`s operator target algebra,
-   reverse-engineered across six frontends with four documented gaps (`10-round3` §3). There is no
+   reverse-engineered across six frontends with four documented gaps (`10-engine-empirical` §3). There is no
    textbook to copy and no other tool to copy from — no SCIP indexer sets a write role.
 
 ## The one-line version

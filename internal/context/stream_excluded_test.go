@@ -59,7 +59,7 @@ func TestExcludedRunReplaysIdenticallyWhenItSpills(t *testing.T) {
 			t.Fatalf("replay %d diverged: hash pass saw %+v, write pass saw %+v", i, hashPass[i], writePass[i])
 		}
 		if hashPass[i].Ordinal != i {
-			t.Fatalf("row %d carries ordinal %d; the run is not in C1 ordinal order", i, hashPass[i].Ordinal)
+			t.Fatalf("row %d carries ordinal %d; the run is not in exclusion ordinal order", i, hashPass[i].Ordinal)
 		}
 	}
 }

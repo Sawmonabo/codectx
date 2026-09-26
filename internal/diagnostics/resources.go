@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -60,21 +61,22 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	// it is process accounting: a unit's reservation and the peak its tree
 	// reached belong to the run that started it, not to a stored generation.
 	report.AnalyzerUnits = dependence.ObservedUnits()
-	if len(report.AnalyzerUnits) > 0 {
-		// A unit that peaked above what it was admitted against took memory
-		// the machine had accounted for elsewhere, which is the direction that
-		// freezes a host. The rows above already carry both figures; this is
-		// the count, so an overrun reaches an operator reading the block
-		// rather than only one comparing every row by hand. It is absent where
-		// this process ran no heavy unit -- nothing was measured -- and zero
-		// where it ran them and none overran.
-		overran := int64(0)
-		for _, u := range report.AnalyzerUnits {
-			if u.OverranReservation() {
-				overran++
-			}
-		}
+	// A unit that peaked above what it was admitted against took memory the
+	// machine had accounted for elsewhere, which is the direction that freezes
+	// a host. The rows above carry both figures; this is the count, so an
+	// overrun reaches an operator reading the block rather than only one
+	// comparing every row by hand. It is the provider's own total, which also
+	// counts the units past the rows' bound. It is absent where this process
+	// ran no heavy unit -- nothing was measured -- and zero where it ran them
+	// and none overran.
+	overran, omitted := dependence.ObservedTotals()
+	if len(report.AnalyzerUnits) > 0 || omitted > 0 {
 		report.AnalyzerOverrunUnits = &overran
+	}
+	if omitted > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf(
+			"%d heavy analyzer unit runs are past the %d rows this block carries; the overrun count includes them",
+			omitted, dependence.MaxObservedUnits))
 	}
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
@@ -84,6 +86,20 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		return model.ResourceReport{}, err
 	}
 	return report, nil
+}
+
+// warningText is the operator-facing text of a failure a resource figure was
+// left absent for: a typed error's code, message and remediation, or the
+// error's own text.
+func warningText(err error) string {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		if typed.Remediation != "" {
+			return typed.Code + ": " + typed.Message + " -- " + typed.Remediation
+		}
+		return typed.Code + ": " + typed.Message
+	}
+	return err.Error()
 }
 
 // runLedger fills the run this repository last recorded and the stages it
@@ -105,17 +121,6 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 // does NOT do is stay silent: the reason goes into the block's warnings, so
 // "this workspace never recorded a run" and "your ledger is unreadable" are
 // not the same answer.
-func warningText(err error) string {
-	var typed *model.Error
-	if errors.As(err, &typed) {
-		if typed.Remediation != "" {
-			return typed.Code + ": " + typed.Message + " -- " + typed.Remediation
-		}
-		return typed.Code + ": " + typed.Message
-	}
-	return err.Error()
-}
-
 func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 	if s.opts.Ledger == nil {
 		return
@@ -164,11 +169,14 @@ func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 // A pool that cannot be read leaves the held figure absent rather than short:
 // a partial sum there would read as "the run is holding less than it is",
 // which is the one thing that figure exists to rule out. It leaves the others
-// alone: what the run has freed and what it is waiting to free are counted in
-// the process, not read off the disk, so an unreadable pool says nothing about
-// them. The purposes the freeing WAS for are reported beside it, and an empty
-// map is left absent because a process that has freed nothing for any named
-// purpose has nothing to say rather than a measured zero per purpose.
+// alone: what the run has freed is counted in the process, not read off the
+// disk, so an unreadable pool says nothing about it. A pending figure that
+// cannot be read is absent for the same reason. Neither absence is silent: the
+// reason goes into the block's warnings, so an unreadable figure and a figure
+// this host does not measure are not the same answer. The purposes the
+// freeing WAS for are reported beside it, and an empty map is left absent
+// because a process that has freed nothing for any named purpose has nothing
+// to say rather than a measured zero per purpose.
 func scratchBytes(report *model.ResourceReport) {
 	var total int64
 	readable := true
@@ -176,6 +184,7 @@ func scratchBytes(report *model.ResourceReport) {
 		n, err := a.Bytes()
 		if err != nil {
 			readable = false
+			report.Warnings = append(report.Warnings, "the scratch pools could not be read: "+warningText(err))
 			break
 		}
 		total += n
@@ -185,15 +194,19 @@ func scratchBytes(report *model.ResourceReport) {
 	}
 	if pending, err := paced.PendingFreeBytes(); err == nil {
 		report.PendingFreeBytes = nonNegativeBytes(pending)
+	} else {
+		report.Warnings = append(report.Warnings, "the space waiting to be freed could not be read: "+warningText(err))
 	}
 	// What is waiting, and what is waiting on something that will not
 	// resolve itself. A removal the filesystem refuses keeps its space in the
 	// pending figure for the life of the process, so the figure alone would
 	// read as a backlog the pace is working through.
+	// The list is paged at the response bound, and the rest is counted.
+	var stuckFrees []model.StuckFree
 	for _, stuck := range paced.StuckFrees() {
-		report.StuckFrees = append(report.StuckFrees,
-			model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
+		stuckFrees = append(stuckFrees, model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
 	}
+	report.StuckFrees, report.StuckFreesOmitted = model.PageStuckFrees(stuckFrees)
 	if byPurpose := paced.FreedByPurpose(); len(byPurpose) > 0 {
 		report.FreedByPurpose = make(map[string]uint64, len(byPurpose))
 		for p, n := range byPurpose {
@@ -234,15 +247,23 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 // machine's cores run at once, so all three are always available and a zero
 // there is a real zero.
 //
-// The admission pair is read together from the ledger so the two figures are
+// Each admission pair is read together from the ledger so the two figures are
 // one moment rather than two, and is absent altogether when this composition
-// has no ledger: an unavailable figure is never published as zero, and a zero
-// allocation would read as a process that may run nothing.
+// has no ledger: an unavailable figure is never published as zero. A zero
+// allocation that IS published is an observation -- a host with nothing left
+// over this process's footprint, where heavy children run one at a time. An
+// allocation the composition marked unobserved -- the platform published no memory or no
+// free-space figure, and the ledger admits against a stand-in -- is absent
+// too, because it is not a measurement; what is reserved against it is still
+// a real sum and is reported.
 //
-// The three are exactly what config.BaseFootprint adds to this build's idle
-// overhead to derive what the process holds for itself, so the report states
-// them and derives nothing -- a second implementation of that arithmetic would
-// drift from the one the allocation is computed against. None of the three is
+// The three are the reservations config.BaseFootprint adds to this build's idle
+// overhead from the resources and index blocks; it also adds every page cache
+// the process opens (the store's writer and readers, lexical staging per unit
+// built at once, the tokenizer and the run ledger), which the storage block
+// states. The report states them and
+// derives nothing -- a second implementation of that arithmetic would drift
+// from the one the allocation is computed against. None of the three is
 // checked against a ceiling: the footprint follows the reservations, so there
 // is no figure here for an operator to exceed.
 func (s *Service) reservations(report *model.ResourceReport) {
@@ -256,12 +277,16 @@ func (s *Service) reservations(report *model.ResourceReport) {
 	report.QueueReservationBytes = nonNegativeBytes(s.opts.Config.Index.QueueBytes)
 	if s.opts.Admission != nil {
 		allocation, reserved := s.opts.Admission.Snapshot()
-		report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
+		if s.opts.AdmissionMemoryObserved {
+			report.AdmissionAllocationBytes = nonNegativeBytes(allocation)
+		}
 		report.AdmissionReservedBytes = nonNegativeBytes(reserved)
 		// The ledger gates on two dimensions and a child can wait on either,
 		// so both are disclosed or the report explains only half of a wait.
 		diskAllocation, diskReserved := s.opts.Admission.DiskSnapshot()
-		report.AdmissionDiskAllocationBytes = nonNegativeBytes(diskAllocation)
+		if s.opts.AdmissionDiskObserved {
+			report.AdmissionDiskAllocationBytes = nonNegativeBytes(diskAllocation)
+		}
 		report.AdmissionDiskReservedBytes = nonNegativeBytes(diskReserved)
 	}
 }

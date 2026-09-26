@@ -20,7 +20,7 @@ import (
 // checkpoint is adopted into, the signer that mints the token and the lease
 // store that owns the retention. It is a separate constructor rather than a
 // flag on intCompiler so every other row keeps proving that a compiler composed
-// WITHOUT them behaves exactly as it did before ruling C7.
+// WITHOUT them ends the answer at a deadline with no continuation on offer.
 // release, when non-nil, replaces the graph engine's release. frontHalf defers
 // it, so it runs exactly at the P-F/P-G boundary: that is the seam a row uses
 // to make the deadline fire THERE rather than in the middle of a pass.
@@ -333,9 +333,9 @@ func (b *boundaryClock) halt() error {
 // persistence would be indistinguishable to every later reader from a complete
 // one, because a manifest header carries no "this is a fragment" bit.
 //
-// This is the row C-D3 could not write: it drove the checkpoint by calling it,
-// so compile's own deadline branch never ran and "the deadline path persists no
-// manifest" was an argument about the code rather than a fact about it.
+// The row drives compile's own deadline branch rather than calling the
+// checkpoint directly, so "the deadline path persists no manifest" is a fact
+// about the code rather than an argument about it.
 func TestTheDeadlineBranchWalksEveryBoundaryAndStoresNoManifest(t *testing.T) {
 	t.Parallel()
 	req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}
@@ -483,9 +483,9 @@ func TestTheRestoredEdgeSortStillFoldsDistinctPairs(t *testing.T) {
 
 // A plan deadline that fires while P-A is RUNNING -- between two pages of the
 // graph walk, not behind the pass -- ends the pass with a continuation and
-// never a lost compile (ruling C7, finding B1). P-A is one pass over a walk
-// that spans many pages, so before this the one boundary it could stop at was
-// the one behind it, and a deadline inside it threw the whole walk away.
+// never a lost compile. P-A is one pass over a walk that spans many pages, so
+// a halt that could only stop at the boundary behind it would throw the whole
+// walk away when the deadline fired inside it.
 //
 // The generated fixture is the one that can show it: it admits over three
 // hundred entities and model.MaxPageItems is 200, so the walk is genuinely

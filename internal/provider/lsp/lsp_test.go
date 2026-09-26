@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -103,10 +103,10 @@ const utilGo = "package main\n" +
 //   - a crashed server releases the pending call and the overlay reports
 //     failure (resource leak, false readiness);
 //   - a server that reports no serverInfo still opens, bound to the version of
-//     the payload the lock pinned (false readiness: typescript-language-server
-//     answers initialize with no serverInfo, and an empty ProviderVersion fails
-//     OverlayBinding.Validate, which made the overlay permanently unavailable
-//     for the languages it serves).
+//     the payload the lock pinned (false readiness: a server may answer
+//     initialize with no serverInfo, and an empty ProviderVersion fails
+//     OverlayBinding.Validate, which would make the overlay permanently
+//     unavailable for the languages it serves).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
@@ -140,7 +140,7 @@ func runSilentServerScenario(t *testing.T) {
 	}
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
 	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
-		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func runScenario(t *testing.T, enc string) {
 	t.Setenv("CODECTX_LSP_FAKE_ENCODING", enc)
 	cfg := config.Defaults()
 	// The fake reaches the runner the way a real server does: through the
-	// managed toolchain, as a user override of the gopls lock entry. The
+	// managed toolchain, as a user override of a pinned lock entry. The
 	// resolver verifies the override's checksum on every resolution, so this
 	// exercises the real resolution path and opens no socket.
 	resolver := offlineResolver(t, map[string]toolchain.Override{
@@ -191,10 +191,10 @@ func runScenario(t *testing.T, enc string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// In-package: the fake needs two variables no real gopls does.
+	// In-package: the fake needs two variables no real server does.
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
 	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: 200 * time.Millisecond,
-		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 	}
 	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
 	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: testAdmission(t, 8<<30), IdleTTL: time.Minute,
-		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+		StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +584,96 @@ func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
 	}
 }
 
-// testAdmission is the process memory admission ledger a test manager admits
+// TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited protects the
+// host-freeze invariant on the way out: the room a language server reserved
+// goes back to the admission ledger only after its process has exited and its
+// materialization is removed, on every path that stops it.
+//
+// Failure mode: a stop that gives the room back first lets the ledger admit
+// the next child -- here a 6 GiB unit waiting beside a 4 GiB server in an 8 GiB
+// allocation -- while the stopping server still holds its memory and its tree
+// on disk, so the process briefly holds more than the machine was measured to
+// have.
+//
+// Mutation: give the room back where the entry is removed (stopIdle, expire or
+// Close) instead of in onExit -> the waiting unit is granted while the
+// server's materialization still exists.
+func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*Manager, *server)
+	}{
+		{"make room", func(m *Manager, _ *server) { m.stopIdle() }},
+		{"idle expiry", func(m *Manager, s *server) { m.expire(s) }},
+		{"close", func(m *Manager, _ *server) { _ = m.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := providertest.New(t, map[string]string{"main.go": mainGo})
+			runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CODECTX_LSP_FAKE", "1")
+			t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+			resolver := offlineResolver(t, map[string]toolchain.Override{
+				"gopls": {Executable: exe, Version: "1.2.3", Checksum: fileDigest(t, exe)},
+			})
+			ctx := context.Background()
+			profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
+			const giB int64 = 1 << 30
+			if profile.MemoryBudgetBytes != 4*giB {
+				t.Fatalf("the server reserves %d bytes, want %d; this test's arithmetic no longer holds", profile.MemoryBudgetBytes, 4*giB)
+			}
+			led := testAdmission(t, 8*giB)
+			// The idle timer is kept out of the way: every case stops the server itself.
+			mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: led, IdleTTL: time.Hour,
+				StopTimeout: 500 * time.Millisecond, RequestStallTimeout: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mgr.Close()
+			ov, err := mgr.Open(ctx, h.View, profile)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			srv := ov.s
+			ov.Close()
+			if materializations(t, h.Policy.DataDir) != 1 {
+				t.Fatal("the running server has no materialization; the check below would prove nothing")
+			}
+
+			// A unit that does not fit beside the server waits at the head of
+			// the queue; its make-room step reports that it is there.
+			queued := make(chan struct{})
+			var once sync.Once
+			granted := make(chan int, 1)
+			go func() {
+				release, err := led.Reserve(ctx, 6*giB, func() { once.Do(func() { close(queued) }) })
+				if err != nil {
+					granted <- -1
+					return
+				}
+				granted <- materializations(t, h.Policy.DataDir)
+				release()
+			}()
+			<-queued
+			tc.stop(mgr, srv)
+			if left := <-granted; left != 0 {
+				t.Fatalf("the waiting unit was granted with %d materializations still on disk; the stopped server's room was given back before its process exited", left)
+			}
+		})
+	}
+}
+
+// testAdmission is the process reservation ledger a test manager admits
 // its servers against. Production composes exactly one and hands it to every
 // reserver; a test that only drives the manager composes its own.
 func testAdmission(t *testing.T, allocation int64) *admission.Ledger {

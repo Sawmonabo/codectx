@@ -21,6 +21,8 @@ import (
 // arithmetic in charge) and four chargers wait in parallel, giving the host
 // four windows in one interval.
 func TestEveryChargerInTheProcessWaitsUnderOnePace(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	const chargers = 4
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -28,7 +30,7 @@ func TestEveryChargerInTheProcessWaitsUnderOnePace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			Freed(Window)
+			r.charge(Window, nil)
 		}()
 	}
 	wg.Wait()
@@ -39,29 +41,29 @@ func TestEveryChargerInTheProcessWaitsUnderOnePace(t *testing.T) {
 	}
 }
 
-// paceShareRole selects what a child of this test binary does, and paceShareRoot
-// is the cache root the two processes share.
+// paceShareRole selects what a child of this test binary does, and
+// paceShareDir is the turn directory the two processes share. It is a
+// temporary directory, never the user's cache, so the test takes no turn in
+// the pace of the host it runs on.
 const (
 	paceShareRole = "CODECTX_PACE_SHARE_ROLE"
-	paceShareRoot = "CODECTX_PACE_SHARE_ROOT"
+	paceShareDir  = "CODECTX_PACE_SHARE_DIR"
 )
 
-// The requirement: two processes over one cache are two callers of one host's
+// The requirement: two processes of one user are two callers of one host's
 // disk, and the host tolerates a rate, not a rate each. An index run and a
-// query server over the same cache freeing at the pace each would hand the
-// host twice what was measured to be safe, which is the burst the pace exists
-// to prevent.
+// query server freeing at the pace each would hand the host twice what was
+// measured to be safe, which is the burst the pace exists to prevent.
 //
-// The test is two real processes: one child registers the cache root and
-// waits, the other frees beside it, and the four windows between them take
-// four intervals rather than the two they would take in parallel. It runs in
-// a child of the test binary because the cache root is a process-wide choice
-// made at the first registration, and every other test in this package has
-// registered one of its own.
+// The test is two real processes over one turn directory: one child frees
+// two windows, the other frees two beside it, and the four windows between
+// them take four intervals rather than the two they would take in parallel.
+// It runs in children of the test binary because the turn directory is a
+// process-wide choice.
 //
 // Mutation: drop the turn file (make turn report nil) and each process keeps
 // the pace for itself, so the four windows take two intervals.
-func TestTwoProcessesOverOneCacheShareThePace(t *testing.T) {
+func TestTwoProcessesShareThePace(t *testing.T) {
 	switch os.Getenv(paceShareRole) {
 	case "runner":
 		paceShareRunner(t)
@@ -70,32 +72,32 @@ func TestTwoProcessesOverOneCacheShareThePace(t *testing.T) {
 		paceShareHelper(t)
 		return
 	}
-	root := t.TempDir()
+	dir := t.TempDir()
 	cmd := exec.Command(os.Args[0], "-test.run", "^"+t.Name()+"$", "-test.v")
-	cmd.Env = append(os.Environ(), paceShareRole+"=runner", paceShareRoot+"="+root)
+	cmd.Env = append(os.Environ(), paceShareRole+"=runner", paceShareDir+"="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("two processes over one cache did not share the pace: %v\n%s", err, out)
+		t.Fatalf("two processes did not share the pace: %v\n%s", err, out)
 	}
 }
 
-// paceShareRunner frees two windows over the shared cache root while a second
-// process frees two beside it, and times the four.
+// paceShareRunner frees two windows through the shared turn directory while a
+// second process frees two beside it, and times the four.
 func paceShareRunner(t *testing.T) {
-	root := os.Getenv(paceShareRoot)
-	RegisterToFree(root, func() (string, error) { return "", os.ErrInvalid })
+	dir := os.Getenv(paceShareDir)
+	useTurnDir(reclaim, dir)
 
 	helper := exec.Command(os.Args[0], "-test.run", "^"+t.Name()+"$", "-test.v")
-	helper.Env = append(os.Environ(), paceShareRole+"=helper", paceShareRoot+"="+root)
+	helper.Env = append(os.Environ(), paceShareRole+"=helper", paceShareDir+"="+dir)
 	if err := helper.Start(); err != nil {
 		t.Fatal(err)
 	}
 	// The child's start-up is not part of what is being timed: it says when
 	// it is ready and waits to be let go.
-	if !waitFor(60*time.Second, func() bool { return exists(filepath.Join(root, "ready")) }) {
+	if !waitFor(60*time.Second, func() bool { return exists(filepath.Join(dir, "ready")) }) {
 		t.Fatal("the second process never reached the pace")
 	}
 	start := time.Now()
-	if err := os.WriteFile(filepath.Join(root, "go"), nil, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "go"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	Freed(Window)
@@ -108,23 +110,43 @@ func paceShareRunner(t *testing.T) {
 	// intervals is the bound: the two intervals the processes would take
 	// freeing in parallel is what this rules out.
 	if want := 3 * FreeInterval; elapsed < want {
-		t.Fatalf("two processes over one cache gave the host four windows in %v; at one window per %v that takes at least %v",
+		t.Fatalf("two processes gave the host four windows in %v; at one window per %v that takes at least %v",
 			elapsed, FreeInterval, want)
 	}
 }
 
 // paceShareHelper is the second process: it takes two of the four windows.
 func paceShareHelper(t *testing.T) {
-	root := os.Getenv(paceShareRoot)
-	RegisterToFree(root, func() (string, error) { return "", os.ErrInvalid })
-	if err := os.WriteFile(filepath.Join(root, "ready"), nil, 0o600); err != nil {
+	dir := os.Getenv(paceShareDir)
+	useTurnDir(reclaim, dir)
+	if err := os.WriteFile(filepath.Join(dir, "ready"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !waitFor(60*time.Second, func() bool { return exists(filepath.Join(root, "go")) }) {
+	if !waitFor(60*time.Second, func() bool { return exists(filepath.Join(dir, "go")) }) {
 		t.Fatal("the first process never let the second start")
 	}
 	Freed(Window)
 	Freed(Window)
+}
+
+// useTurnDir points r's turn file at dir instead of the user's cache, so a
+// test never takes a turn in the pace of the host it runs on.
+func useTurnDir(r *reclaimer, dir string) {
+	r.turnDir = func() (string, bool) { return dir, true }
+}
+
+// TestMain points the package's own reclaimer at a temporary turn directory:
+// the tests that free through the exported functions would otherwise take
+// their turns in the user's real cache.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "paced-turn-")
+	if err != nil {
+		panic(err)
+	}
+	useTurnDir(reclaim, dir)
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func exists(path string) bool {

@@ -11,8 +11,8 @@ description of how a provider is written and what it may rely on.
 
 A provider emits **small immutable units with explicit inputs**. It never
 holds a mutable global graph, never writes SQL, never reads the live checkout
-and never resolves identity on its own. The coordinator (`internal/index`,
-Task 12) decides which units exist, opens each one in storage with its exact
+and never resolves identity on its own. The coordinator (`internal/index`)
+decides which units exist, opens each one in storage with its exact
 inputs and dependencies, and hands the provider a `UnitRequest`; the provider
 produces exactly that unit through the `Sink` and reports a `ProviderResult`.
 
@@ -171,7 +171,7 @@ write failure that cancelled the provider is reported as `failed` with the
 write error, not as `canceled`. An expired deadline is `timed_out` whether it
 arrives as a bare `context.DeadlineExceeded` or typed through
 `model.Canceled`; that check precedes the error-code mapping. `RunUnit` does
-not complete the provider run: the caller (the Task 12 coordinator) reports
+not complete the provider run: the caller (the coordinator) reports
 the aggregate over a provider's units with `Store.CompleteProviderRun`,
 passing `provider.CodeOf(err)` as the diagnostic code.
 
@@ -230,7 +230,7 @@ which order its dependencies completed.
 
 ## Conformance harness
 
-`internal/provider/providertest` is the shared fixture Tasks 7–11 build on.
+`internal/provider/providertest` is the shared fixture every provider test builds on.
 `New(t, files)` stands up the real store, CAS, snapshot view, staging
 generation and confined workspace root over a small file set; `Plan`, `Begin`
 and `Run` drive a unit through exactly the production `BeginUnit`, sink,

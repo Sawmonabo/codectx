@@ -10,15 +10,15 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// TestImpactRankResumesTheInterruptedSortItself is ruling P7's proof, and the
-// one the pagination.AdoptRuns/Detach seam was built for.
+// TestImpactRankResumesTheInterruptedSortItself guards the mid-rank
+// continuation, and the pagination.AdoptRuns/Detach seam it depends on.
 //
-// P7 is the deadline that lands after the WALK is complete but before the
-// RANKING is. The walk retention (walkretain.go) already made that resumable,
-// but only by re-sorting the whole retained input on every resumed request: an
-// answer the deadline cut into k legs paid for k rankings. The runs the
-// interrupted sort had already spilled are now moved into the retained state
-// directory and adopted by the next request, which adds only the records those
+// A mid-rank deadline lands after the WALK is complete but before the
+// RANKING is. Re-sorting the whole retained input (walkretain.go) on every
+// resumed request would make an answer the deadline cut into k legs pay for k
+// rankings. The runs the interrupted sort had already spilled are instead
+// moved into the retained state directory and adopted by the next request,
+// which adds only the records those
 // runs do not hold -- so a ranking split across requests does the work of ONE
 // ranking and serves the byte-identical answer.
 //
@@ -33,9 +33,8 @@ import (
 //
 // Mutation proof: make openImpactSort ignore the manifest's runs (take the
 // NewExternalSort branch unconditionally) and feedRankPass skip nothing (drop
-// the `seen <= adopted` early return) -- i.e. re-sort the whole retained input,
-// which is what ruling P7 did before this change. PARITY STILL HOLDS and the
-// run-reuse assertion fails:
+// the `seen <= adopted` early return) -- i.e. re-sort the whole retained
+// input. PARITY STILL HOLDS and the run-reuse assertion fails:
 //
 //	rankresume_test.go: the resumed ranking adopted 0 run(s) and skipped 0
 //	  record(s): it re-sorted the retained input instead of continuing the sort
@@ -54,7 +53,7 @@ func TestImpactRankResumesTheInterruptedSortItself(t *testing.T) {
 
 	// Ground truth: the same query with nothing interrupting the ranking. A
 	// frontier ceiling the fixture never reaches, so the WALK cannot split and
-	// every continuation below is P7's rank continuation and not P3's.
+	// every continuation below is a mid-rank continuation and not a walk one.
 	whole, wholeDir, _ := rankResumeEngine(t, f, 0)
 	all, err := whole.Impact(context.Background(), req)
 	if err != nil {
@@ -184,7 +183,7 @@ func rankResumeEngine(t *testing.T, f *graphFixture, stopAfter int) (*Engine, st
 	limits := fixtureLimits()
 	// Unlimited depth, visited and edge budgets and a frontier ceiling the
 	// fixture never reaches: the RANKING is the only thing the deadline can
-	// interrupt, so every continuation is ruling P7's.
+	// interrupt, so every continuation is a mid-rank one.
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 	limits.MaxPageItems = 100000
 	limits.QueryTimeout = time.Minute
@@ -211,9 +210,9 @@ func rankResumeEngine(t *testing.T, f *graphFixture, stopAfter int) (*Engine, st
 // stop naming them at that instant -- pass 1 does exactly that. Pass 2 did not,
 // and a request that COMPLETED the rank could still mint a rank continuation
 // over the same retained directory: the package-pair ranking that runs next
-// reports the deadline, which is P7's "nothing extra is persisted" branch. The
-// next request then adopted runs that Sorted had already removed and the whole
-// answer -- walked, ranked and on disk -- became unreachable.
+// reports the deadline, which is the mid-rank "nothing extra is persisted"
+// branch. The next request then adopted runs that Sorted had already removed
+// and the whole answer -- walked, ranked and on disk -- became unreachable.
 //
 // The chain here forces that window: cut pass 2 so a resumed request adopts
 // runs, then let the impact rank finish while cutting the PAIR fold, then let

@@ -118,7 +118,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				MaxDepth:      maxDepth,
 				Budget:        b,
 				FrontierBytes: e.limits.FrontierBytes,
-				// Ruling P3, both halves: the deadline ends this page, and it
+				// Both halves of the page rule: the deadline ends this page, and it
 				// does so even before the page admitted an edge, because the
 				// walk's frontier and every record it has admitted are
 				// retained across the request.
@@ -148,7 +148,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		}
 	}
 	if b.deadlineHit && state.More {
-		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
+		// The deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND this leg's pair records forward.
@@ -184,7 +184,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		return model.Page[model.PackageEdge]{}, err
 	}
 	if run == nil {
-		// Ruling P7: the deadline landed mid-RANK, after the walk had finished.
+		// The deadline landed mid-RANK, after the walk had finished.
 		// walkImpact (impact.go) states why the retained input is named rather
 		// than re-walked.
 		markTruncated(&meta, reasonDeadline)
@@ -282,8 +282,8 @@ func validatedPairPage(meta model.QueryMeta, items []model.PackageEdge) (model.P
 const packageDepsEndpoint = "graph.package_dependencies"
 
 // edgeSink accepts the edges a walk admits, ONE AT A TIME, in the shape
-// expand's visit callback delivers them. It is the seam ruling P2's completed
-// walk (lane P-b) hands its edges to: the walk streams, the sink folds each
+// expand's visit callback delivers them. It is the seam a completed walk hands
+// its edges to: the walk streams, the sink folds each
 // batch into the pair sort as it fills, and neither side ever holds the
 // admitted set. A walk that runs to exhaustion can therefore feed a rollup
 // whose peak heap is one batch of edges rather than one of every edge the
@@ -310,7 +310,7 @@ const pairRollupBatch = adjacencyBatch / 2
 // pairRollup is the streaming half of the rollup: it buffers one batch of
 // admitted edges, resolves THAT batch's containers and evidence counts, and
 // emits one pairRecord per surviving edge into the pair sort, which folds the
-// records of one pair into the exact sums ruling P4 requires.
+// records of one pair into exact sums.
 //
 // It holds the request context rather than taking one per edge because
 // edgeSink's signature is expand's visit callback, which carries none; the
@@ -589,7 +589,7 @@ func (s *rollupStats) observe(n int) {
 	}
 }
 
-// rollupRanked is the whole rollup as ruling P4 specifies it: feed streams the
+// rollupRanked is the whole rollup: feed streams the
 // walk's admitted edges into an edgeSink, each batch resolves its own
 // containers and evidence, and rankPairs folds and orders the pairs on disk.
 // The counts it reports are exact sums over every edge fed, not over one page

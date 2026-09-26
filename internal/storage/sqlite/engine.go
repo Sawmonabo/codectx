@@ -2,11 +2,11 @@ package sqlite
 
 import (
 	"database/sql"
-	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"os"
 	"strings"
 	"unsafe"
 
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/libc"
 	"modernc.org/libc/sys/types"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -98,17 +98,22 @@ func SetTempDir(dir string) error {
 	if err := pacedvfs.Register(); err != nil {
 		return internal(err.Error())
 	}
-	// The engine's temporaries come from this directory's scratch pool rather
-	// than being created and unlinked one per sort. The pool is the process's,
-	// as the file system is, and the first store to open names it.
-	pacedvfs.Pool(dir)
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return internal("engine temporary directory: " + err.Error())
 	}
 	defer db.Close()
+	// The engine refuses a directory it cannot write, which makes this pragma
+	// the writability probe, so the pool is named only after it succeeds. The
+	// pool is the process's and the first call names it for good: named
+	// first, a directory on read-only media would hold it while the caller
+	// fell back to another, and every engine temporary would then be taken
+	// from the one directory that cannot hold it.
 	if _, err := db.Exec(`PRAGMA temp_store_directory = '` + strings.ReplaceAll(dir, `'`, `''`) + `'`); err != nil {
 		return internal("engine temporary directory: " + err.Error())
 	}
+	// The engine's temporaries come from this directory's scratch pool rather
+	// than being created and unlinked one per sort.
+	pacedvfs.Pool(dir)
 	return nil
 }

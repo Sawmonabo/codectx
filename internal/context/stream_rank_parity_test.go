@@ -15,11 +15,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// TestStreamedRankingMatchesInMemoryRank is the C-STREAM P-D/P-F parity proof.
+// TestStreamedRankingMatchesInMemoryRank is the P-D/P-F parity proof.
 //
 // The streamed route pass and boost pass must produce, for every candidate, the
 // SAME score, the same bounded reasons IN THE SAME ORDER, the same MorePaths
-// count and the same retained routes as the whole-set `rank` this wave replaces.
+// count and the same retained routes as the whole-set `rank`.
 // It is a parity table over the package's existing fixtures rather than a new
 // golden file on purpose: a golden would freeze today's numbers, while this
 // fails the moment the two pipelines disagree, whatever Section 15.3 says.
@@ -86,7 +86,7 @@ func TestStreamedRankingMatchesInMemoryRank(t *testing.T) {
 		pathLim int64
 		// splitPath moves each candidate's PathFinal into a different
 		// directory from its PathAtRank. No existing fixture distinguishes the
-		// two C3 path values -- every candidate in the package's tests is built
+		// two path values -- every candidate in the package's tests is built
 		// with one Path -- so this is the smallest fixture that does: bucketing
 		// centrality by PathFinal regroups the walked edges and changes the
 		// boost, the score, and the reason that names the package.
@@ -134,7 +134,7 @@ func TestStreamedRankingMatchesInMemoryRank(t *testing.T) {
 				}
 			}
 			// The ranked sort's ORDER is the deliverable, not just its
-			// contents: Task 16's `context next` is an ordinal walk over it and
+			// contents: `context next` is an ordinal walk over it and
 			// P-G assigns each survivor's Index from it, so one record added
 			// before its score was written shifts every later ordinal. On these
 			// rows PathFinal equals the path `rank` sorts on, so the streamed
@@ -173,13 +173,9 @@ func copyCandidates(cands []candidate) []candidate {
 // the ranked candidates by their ingest pathRec/hopRec streams P-D emitted.
 //
 // It is a FIXTURE harness: hopsBySeq below accumulates every retained hop in a
-// map, which is fine for a handful of candidates and is not the shape the
-// wave's heap assertion may reuse.
-//
-// P-E is spelled out here rather than called: passECentrality belongs to lane
-// L2 and is still a stub. It is the frozen folds and nothing else
-// (foldPkgEdgeDistinct then foldPkgCount), and this harness must swap to
-// passECentrality once L2 lands so the proof covers the shipped aggregation.
+// map, which is fine for a handful of candidates and is not the shape a heap
+// assertion may reuse. P-E is the shipped passECentrality, so the proof covers
+// the aggregation the compiler runs.
 func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlite.PinnedReader,
 	cands []candidate, rels map[model.RelationID]model.Relation, splitPath bool) (map[int64]candidate, []int64) {
 	t.Helper()
@@ -232,15 +228,10 @@ func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlit
 		t.Fatalf("passDRouteScoring: %v", err)
 	}
 
-	// P-E, spelled with the frozen folds until lane L2's passECentrality lands.
-	edgeRun := mustSorted(t, sorts, edgeSort)
-	countSort := mustSort(t, sorts, "pkg-count", lessPkg, sizeOfPkgCount).WithFold(foldPkgCount)
-	if err := edgeRun.Each(func(e pkgEdgeRec) error {
-		return countSort.Add(pkgCountRec{Pkg: e.Pkg, Edges: 1})
-	}); err != nil {
-		t.Fatalf("counting package edges: %v", err)
+	countRun, err := c.passECentrality(ctx, sorts, edgeSort)
+	if err != nil {
+		t.Fatalf("passECentrality: %v", err)
 	}
-	countRun := mustSorted(t, sorts, countSort)
 
 	rankedSort := mustSort(t, sorts, "ranked", lessRank, sizeOfCand)
 	if err := c.passFBoosts(ctx, scoredRun, countRun, rankedSort); err != nil {

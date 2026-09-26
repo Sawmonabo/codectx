@@ -1,7 +1,6 @@
 package mcpserver
 
-// L5 GATE owns this file (digest §4 rows 18-23): the review gate and the
-// capsule. Session id and actor id are tool arguments, never wire state.
+// This file holds the review-gate and capsule handlers. Session id and actor id are tool arguments, never wire state.
 
 import (
 	"context"

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,7 +150,7 @@ const (
 )
 
 // decodeDrops counts what the decoder discarded because a value exceeded a
-// field bound (plan row 26). The split is what the bound costs:
+// field bound. The split is what the bound costs:
 //
 //   - An IDENTIFYING field cannot be dropped on its own. A symbol without its
 //     symbol string is not a fact about anything, and `decodeSymbolInfo` ends
@@ -433,14 +434,7 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 	if d.path == "" {
 		return malformed("document " + strconv.FormatInt(index, 10) + " has no relative_path")
 	}
-	// A document's path is relative to what the indexer was run over, which
-	// for a project unit is a directory inside the workspace. Every path the
-	// import resolves, stores and publishes is workspace-relative, so the
-	// project's own directory is put back here, once, before anything sees
-	// the document.
-	if w.pathPrefix != "" {
-		d.path = w.pathPrefix + "/" + d.path
-	}
+	d.path = workspacePath(w.pathPrefix, d.path)
 	if d.hasText {
 		d.textHash = hex.EncodeToString(hasher.Sum(nil))
 	}
@@ -448,6 +442,23 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 		return nil
 	}
 	return w.onDocument(d)
+}
+
+// workspacePath is the workspace-relative path of a document whose
+// relative_path is raw, for an index written against the project directory
+// prefix (empty for the workspace itself). Every path the import resolves,
+// stores and publishes is workspace-relative, so the project's own directory
+// is put back once, before anything sees the document. The join is cleaned, so
+// a project that reaches a file elsewhere in the workspace through `../` names
+// that file by its own workspace path, and only a path that still escapes
+// after the join is outside the root. An absolute path is left as it is:
+// joining would re-root it under the project, and rootRelative refuses it as
+// it stands.
+func workspacePath(prefix, raw string) string {
+	if prefix == "" || strings.HasPrefix(raw, "/") {
+		return raw
+	}
+	return path.Join(prefix, raw)
 }
 
 // decodeOccurrence decodes one bounded Occurrence record. The deprecated
@@ -667,8 +678,8 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 // decodeSignature reads Signature.text, bounded at the signature ceiling. A
 // longer signature is TRUNCATED and flagged, not discarded: a 4 096-byte
 // prefix of a signature answers most questions about the symbol, and this
-// producer yielding nothing where treesitter/facts.go:220 yields a prefix was
-// the whole of F26. Only the prefix is ever read, so a signature of any size
+// producer yielding nothing where the structural provider yields a prefix
+// would make the two disagree. Only the prefix is ever read, so a signature of any size
 // costs the ceiling and not itself.
 //
 // The second result is the ORIGINAL encoded length when the text was cut, and

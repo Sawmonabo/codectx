@@ -51,7 +51,12 @@ type StatusOptions struct {
 	Git    *git.Git
 	Repo   model.RepositoryID
 	States []model.CapabilityState
-	Logger *slog.Logger
+	// RunLedger reads the run ledger beside the store for the deferred units a
+	// failed publication abandoned (recordedAbandonment). It only reads, so a
+	// status process that never builds reads what the building one recorded.
+	// Nil reads none.
+	RunLedger RunLedgerReader
+	Logger    *slog.Logger
 }
 
 // StatusReader answers the Sections 13.2/13.3 status report from ONE store
@@ -76,6 +81,12 @@ type StatusReader struct {
 	// from does not change what they project.
 	watch     *watchState
 	retention *retentionState
+	// late is the coordinator's deferred sealer, whose units a failed
+	// publication abandoned are projected over the active generation's rows
+	// (projectAbandoned) in the process that holds them. It is nil for a
+	// reader built without a coordinator, and it performs no store call
+	// either.
+	late *lateSealer
 }
 
 // NewStatusReader validates the dependencies and builds the reader.
@@ -106,11 +117,11 @@ func NewStatusReader(o StatusOptions) (*StatusReader, error) {
 // `codectx status` takes.
 func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
-		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
+		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, RunLedger: c.opts.RunLedgerReader, Logger: c.log})
 	if err != nil {
 		return nil, err
 	}
-	r.watch, r.retention = &c.watch, &c.retention
+	r.watch, r.retention, r.late = &c.watch, &c.retention, c.late
 	return r, nil
 }
 
@@ -144,10 +155,24 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
+	abandoned := r.late.abandonedFailures(binding.SnapshotID)
+	var ledgerWarning string
+	if len(abandoned) == 0 && reportsDeferred(states) {
+		if abandoned, err = r.recordedAbandonment(ctx, binding.GenerationID); err != nil {
+			logTyped(r.log, "the run ledger could not be read for abandoned deferred units", err,
+				"component", component, "repository_id", string(r.opts.Repo))
+			ledgerWarning = "the run ledger could not be read, so deferred units a failed publication " +
+				"abandoned may be reported as still running"
+		}
+	}
+	states = projectAbandoned(states, abandoned)
 	states, aggregated := boundStates(states, r.log)
 	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
+	}
+	if ledgerWarning != "" {
+		warnings = append(warnings, ledgerWarning)
 	}
 	if aggregated {
 		// Section 18.2: a report that aggregated says so. Nothing was omitted
@@ -174,6 +199,12 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 	failed, omitted, err := r.opts.Store.FailedRuns(ctx, binding.GenerationID)
 	if err != nil {
 		return model.IndexStatus{}, err
+	}
+	// The run row keeps the analyzer's standard-error tail; this answer is
+	// handed to any client of `status --json` and the index-status tool, so it
+	// never carries it.
+	for i := range failed {
+		failed[i].Details = withoutRawOutput(failed[i].Details)
 	}
 	st.FailedUnits, st.FailedUnitsOmitted = failed, omitted
 	if r.watch != nil {
@@ -561,9 +592,9 @@ const (
 //
 // Only those keys go. A fresh row carries its degradations here -- how many
 // oversize records were admitted, which fields were truncated to fit a stored
-// ceiling -- and clearing the whole map made state the only channel that
-// survived the fold, which is why a provider with nothing worse than an
-// admitted-oversize count had to publish `partial` to be heard at all. The
+// ceiling -- and clearing the whole map would make state the only channel that
+// survives the fold, so a provider with nothing worse than an admitted-oversize
+// count would have to publish `partial` to be heard at all. The
 // per-unit noise the fold exists to keep out of the report is the scope name
 // itself: one row per file saying which file it was.
 func withoutScopeNamingDetails(s model.CapabilityState) model.CapabilityState {
@@ -723,7 +754,7 @@ func (r *capabilityReport) addFresh(providerID, capability string) {
 		Scope: provider.ScopeWorkspace, State: model.CapabilityFresh})
 }
 
-// addUnavailable publishes the degradation of residual 113: a provider that
+// addUnavailable publishes the degradation of a provider that
 // detection found available and that produced no unit at all. "Available, zero
 // units" is not fresh coverage, and without this row the capability would be
 // missing from the report entirely, which reads as nothing to worry about.
@@ -738,7 +769,7 @@ func (r *capabilityReport) addUnavailable(providerID, capability string) {
 }
 
 // addDeferred publishes the row of a capability whose work is still running in
-// the background (Section 11.6, ruling Q9): the deferred scope has no member in
+// the background (Section 11.6): the deferred scope has no member in
 // this generation, so the capability cannot be reported as fresh coverage.
 //
 // A `fresh` row already recorded for one of the provider's other scopes is
@@ -759,7 +790,49 @@ func (r *capabilityReport) addDeferred(providerID, capability string, running in
 	r.add(model.CapabilityState{ProviderID: providerID, Capability: capability,
 		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
 		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: running,
-		Details: map[string]string{"reason": "units_deferred"}})
+		Details: map[string]string{"reason": reasonUnitsDeferred}})
+}
+
+// reasonUnitsDeferred is the reason detail of the row addDeferred publishes.
+const reasonUnitsDeferred = "units_deferred"
+
+// reportsDeferred reports whether any row counts deferred units still
+// running, the only rows an abandonment rewrites.
+func reportsDeferred(states []model.CapabilityState) bool {
+	return slices.ContainsFunc(states, func(s model.CapabilityState) bool {
+		return s.Details["reason"] == reasonUnitsDeferred
+	})
+}
+
+// recordedAbandonment is the deferred units a failed publication abandoned
+// while generation gen was active, as the run ledger holds them, per provider:
+// every deferred run since gen's own that carries an abandonment marker scoped
+// to gen, and that run's unit spans (markAbandoned). Each named unit carries
+// its own run's code, message and id, so the row names the run whose
+// publication lost it. This is what status reads in a process other than the
+// one whose publication failed, which holds no in-process record; retention
+// keeps those runs while gen is retained (ledger.Reader.MarkedUnits). A
+// reader with no ledger, and a workspace that has recorded no run, answer none.
+func (r *StatusReader) recordedAbandonment(ctx context.Context, gen model.GenerationID) (map[string]*providerFailures, error) {
+	if r.opts.RunLedger == nil {
+		return nil, nil
+	}
+	marked, err := r.opts.RunLedger.MarkedUnits(ctx, string(r.opts.Repo), int64(gen), stageAbandonment,
+		maxFailedScopesNamed)
+	if err != nil {
+		return nil, err
+	}
+	failed := make(map[string]*providerFailures, len(marked))
+	for _, m := range marked {
+		agg := &providerFailures{units: int(m.Units)}
+		for _, u := range m.Named {
+			agg.named = append(agg.named, failedScope{scopeKey: u.ScopeKey, failure: unitFailure{
+				code: u.DiagnosticCode, message: u.Failure,
+				details: map[string]string{"reason": reasonPublicationFailed, detailRunID: u.RunID}}})
+		}
+		failed[m.Provider] = agg
+	}
+	return failed, nil
 }
 
 // addFailures records one provider capability's failed units. The aggregate
@@ -800,7 +873,7 @@ func (r *capabilityReport) coveredElsewhere(providerID, capability string) {
 }
 
 // addCarried records the provenance distance of one carried stale scope
-// (Section 13.3, ruling Q4).
+// (Section 13.3).
 func (r *capabilityReport) addCarried(providerID, capability, scope string, generations, files int) {
 	r.carried = append(r.carried, model.CapabilityState{ProviderID: providerID, Capability: capability,
 		Scope: scope, State: model.CapabilityStale, DiagnosticCode: model.CodeSnapshotChanged,
@@ -871,12 +944,31 @@ func (f *failureRow) publish() model.CapabilityState {
 	if f.message != "" {
 		row = row.WithDetail(failureMessageDetail, f.message)
 	}
-	for _, k := range slices.Sorted(maps.Keys(f.details)) {
-		if k != model.DetailStderrTail {
-			row = row.WithDetail(k, f.details[k])
-		}
+	details := withoutRawOutput(f.details)
+	for _, k := range slices.Sorted(maps.Keys(details)) {
+		row = row.WithDetail(k, details[k])
 	}
 	return row
+}
+
+// withoutRawOutput is a provider's failure details less the standard-error
+// tail. The tail is raw analyzer output: it is kept on the run row and leaves
+// through no capability row, status answer or log line. The input is never
+// modified; a map that holds no tail is answered as it is.
+func withoutRawOutput(details map[string]string) map[string]string {
+	if _, ok := details[model.DetailStderrTail]; !ok {
+		return details
+	}
+	out := make(map[string]string, len(details)-1)
+	for k, v := range details {
+		if k != model.DetailStderrTail {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // finish publishes the bounded list and how many rows the bound omitted. The

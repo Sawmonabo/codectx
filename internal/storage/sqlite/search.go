@@ -161,13 +161,13 @@ func (r *PinnedReader) nodesInFile(ctx context.Context, file model.FileID, after
 	if afterRaw != nil {
 		// ?4 is the canonical NodeID the cursor carries, matched against the
 		// dictionary column, never against node_facts.node_id -- that column is
-		// now a rebuild-local surrogate (scale-posture-plan.md 3d).
+		// a rebuild-local surrogate.
 		keyset = " AND (" + startKey + " > ?3 OR (" + startKey + " = ?3 AND ni.canonical > ?4))"
 		args = append(args, afterStart, afterRaw)
 	}
 	// Duplicate node ids at one offset are collapsed by the Section 9.4
 	// precedence order -- verified source binding, then provider id, then unit
-	// key -- which is the read-time mechanism ruling Q8 names; it is not
+	// key -- which is the read-time mechanism; it is not
 	// reimplemented here. The grouping key is the keyset key itself, so the
 	// survivor of a group never straddles a page boundary. The same node at
 	// two different offsets is two units disagreeing about the declaration:

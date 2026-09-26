@@ -10,18 +10,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// parseChunkBytes bounds each copy the binding makes of the source while the
+// ParseChunkBytes bounds each copy the binding makes of the source while the
 // parser reads it (readUTF8 copies whatever the callback returns into a C
 // string kept until the parse ends).
-const parseChunkBytes = 64 << 10
-
-// atRecordBound reports whether a per-file record set has reached the bound the
-// request carries. A zero bound -- the default -- is unlimited, so the file
-// yields what it yields; only a value the operator set can stop it, and a file
-// it stops is reported truncated.
-func atRecordBound(max uint64, have int) bool {
-	return max != 0 && uint64(have) >= uint64(max)
-}
+const ParseChunkBytes = 64 << 10
 
 type span struct{ start, end uint }
 
@@ -54,6 +46,17 @@ type importRec struct {
 	span
 	path  string
 	names []string
+	// seen holds names, so a statement naming thousands of bindings (a
+	// generated barrel import) is deduplicated in linear time.
+	seen map[string]bool
+}
+
+// add appends one local name the statement binds, once.
+func (r *importRec) add(name string) {
+	if name != "" && !r.seen[name] {
+		r.seen[name] = true
+		r.names = append(r.names, name)
+	}
 }
 
 type refRec struct {
@@ -69,6 +72,8 @@ type refRec struct {
 // extraction is the state of one parse.
 type extraction struct {
 	g            *grammar
+	f            *fieldIDs // g's field table
+	k            *kindIDs  // g's kind table
 	l            lang.Language
 	path         string
 	src          []byte
@@ -79,18 +84,8 @@ type extraction struct {
 	pkg          string
 	exportRanges map[span]bool
 	exportNames  map[string]bool
-	truncated    bool
-	// maxRecords is the request's MaxRecordsPerFile, the one per-file record
-	// bound; 0 is unlimited.
-	maxRecords uint64
-	// declCount is how many declaration RECORDS this extraction will emit --
-	// one per (range, name start) pair, which is what emit flattens e.decls
-	// into and therefore what the parent counts as it reads the frames back.
-	// len(e.decls) is the number of RANGES and is smaller whenever one range
-	// declares several names (`var a, b = ...`), so bounding on it would let
-	// the worker send more frames than the parent was told to accept and the
-	// parent would fail a healthy unit.
-	declCount int
+	// truncated reports that the query cursor exceeded its match limit.
+	truncated bool
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -107,6 +102,8 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	e.imports = map[span]*importRec{}
 	e.exportRanges = map[span]bool{}
 	e.exportNames = map[string]bool{}
+	e.f = e.g.fieldIDs()
+	e.k = e.g.kindIDs()
 	names := q.CaptureNames()
 
 	cursor := ts.NewQueryCursor()
@@ -167,6 +164,10 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 }
 
 func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Node) {
+	if names, values := caps["bind.names"], caps["bind.values"]; len(names) > 0 && len(values) > 0 {
+		e.addBoundFunctions(kind, node, names[0], values[0])
+		return
+	}
 	d := &decl{node: node, kind: kind, parentIdx: -1, ex: e}
 	if b := caps["body"]; len(b) > 0 {
 		d.body = &b[0]
@@ -185,6 +186,57 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	if d.kind == "test" {
 		d.test = true
 	}
+	e.putDecl(d)
+}
+
+// addBoundFunctions adds one declaration of kind for each name a short
+// variable declaration binds to a function literal: the i-th name is paired
+// with the i-th value, so `x, f := 1, func() {}` declares f alone, and the
+// literal's body ends its signature. The query captures both lists once per
+// statement, and only a statement whose values hold a function literal; the
+// two lists are walked in step with one tree cursor each, comparing kind ids,
+// so the walk is linear in their length and allocates no list.
+func (e *extraction) addBoundFunctions(kind string, node, names, values ts.Node) {
+	left, right := names.Walk(), values.Walk()
+	defer left.Close()
+	defer right.Close()
+	for l, r := nextEntry(left, true), nextEntry(right, true); l && r; l, r = nextEntry(left, false), nextEntry(right, false) {
+		n, v := left.Node(), right.Node()
+		if n.KindId() != e.k.identifier || v.KindId() != e.k.funcLiteral {
+			continue
+		}
+		body := v.ChildByFieldId(e.f.body)
+		if body == nil {
+			continue
+		}
+		e.putDecl(&decl{node: node, kind: kind, parentIdx: -1, ex: e, body: body,
+			name: n.Utf8Text(e.src), nameStart: n.StartByte(), nameEnd: n.EndByte()})
+	}
+}
+
+// nextEntry moves cur to the next entry of the list it walks, or to the
+// first when first is set, and reports whether there is one. Punctuation and
+// extras (a comment between entries) are not entries, so an entry's position
+// is its index in the list.
+func nextEntry(cur *ts.TreeCursor, first bool) bool {
+	var ok bool
+	if first {
+		ok = cur.GotoFirstChild()
+	} else {
+		ok = cur.GotoNextSibling()
+	}
+	for ; ok; ok = cur.GotoNextSibling() {
+		if n := cur.Node(); n.IsNamed() && !n.IsExtra() {
+			return true
+		}
+	}
+	return false
+}
+
+// putDecl records d under its declaration range and name position. Two
+// patterns may capture the same declaration; the more specific kind wins.
+func (e *extraction) putDecl(d *decl) {
+	node := d.node
 	key := span{node.StartByte(), node.EndByte()}
 	byName := e.decls[key]
 	if byName == nil {
@@ -197,41 +249,124 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 		}
 		return
 	}
-	if atRecordBound(e.maxRecords, e.declCount) {
-		e.truncated = true
-		return
-	}
 	byName[d.nameStart] = d
-	e.declCount++
 }
 
 func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	key := span{node.StartByte(), node.EndByte()}
 	rec := e.imports[key]
 	if rec == nil {
-		if atRecordBound(e.maxRecords, len(e.imports)) {
-			e.truncated = true
-			return
-		}
-		rec = &importRec{span: key}
+		rec = &importRec{span: key, seen: map[string]bool{}}
 		e.imports[key] = rec
 	}
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
 		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
 	}
 	for _, n := range caps["import.name"] {
-		if t := n.Utf8Text(e.src); t != "" && !slices.Contains(rec.names, t) {
-			rec.names = append(rec.names, t)
+		rec.add(n.Utf8Text(e.src))
+	}
+	if clauses := caps["import.clause"]; len(clauses) > 0 {
+		ids := e.g.importSyntax(e.l.Name)
+		for i := range clauses {
+			cur := clauses[i].Walk()
+			importClauseBindings(cur, &clauses[i], ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src)) })
+			cur.Close()
 		}
 	}
 }
 
-func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier []ts.Node) {
-	if len(name) == 0 {
+// importSyntax holds the kind and field ids an ECMAScript import clause is
+// read by, resolved once per grammar. The extraction and the JavaScript
+// lowering both walk a clause through importClauseBindings over this table,
+// so they bind the same names and compare integers rather than kind strings.
+type importSyntax struct {
+	identifier, namespaceImport, namedImports, importSpecifier uint16
+	// typeKw is the `type` token of a TypeScript type-only specifier; 0, which
+	// no token has, in a grammar without one.
+	typeKw        uint16
+	fAlias, fName uint16
+}
+
+// resolveImportSyntax resolves the import-clause table of tl, the grammar of
+// language. A kind or field the grammar does not define panics, so a misspelt
+// name can never silently bind nothing.
+func resolveImportSyntax(tl *ts.Language, language string) importSyntax {
+	return importSyntax{
+		identifier:      mustKind(tl, language, "identifier", true),
+		namespaceImport: mustKind(tl, language, "namespace_import", true),
+		namedImports:    mustKind(tl, language, "named_imports", true),
+		importSpecifier: mustKind(tl, language, "import_specifier", true),
+		typeKw:          tl.IdForNodeKind("type", false),
+		fAlias:          mustField(tl, language, "alias"),
+		fName:           mustField(tl, language, "name"),
+	}
+}
+
+// importClauseBindings calls bind with every local name an ECMAScript import
+// clause binds, in source order: the default binding, the namespace binding,
+// and each named specifier's alias, or its name when it has none. typeOnly
+// reports a TypeScript `type` specifier, which binds a name the compiler
+// erases. Every other child (punctuation, a comment between specifiers, an
+// error node) binds nothing, and a specifier whose local name is not an
+// identifier (a string name without an alias) binds nothing. The walk moves
+// cur, which it resets to clause, and allocates no list, so a statement
+// naming any number of specifiers costs time linear in their count; bind must
+// not move cur.
+func importClauseBindings(cur *ts.TreeCursor, clause *ts.Node, s *importSyntax, bind func(local *ts.Node, typeOnly bool)) {
+	cur.Reset(*clause)
+	if !cur.GotoFirstChild() {
 		return
 	}
-	if atRecordBound(e.maxRecords, len(e.refs)) {
-		e.truncated = true
+	for {
+		switch part := cur.Node(); part.KindId() {
+		case s.identifier:
+			bind(part, false)
+		case s.namespaceImport:
+			if id := firstNamed(part); id != nil && id.KindId() == s.identifier {
+				bind(id, false)
+			}
+		case s.namedImports:
+			if cur.GotoFirstChild() {
+				for {
+					if spec := cur.Node(); spec.KindId() == s.importSpecifier {
+						local := spec.ChildByFieldId(s.fAlias)
+						if local == nil {
+							local = spec.ChildByFieldId(s.fName)
+						}
+						if local != nil && local.KindId() == s.identifier {
+							bind(local, hasToken(spec, s.typeKw))
+						}
+					}
+					if !cur.GotoNextSibling() {
+						break
+					}
+				}
+				cur.GotoParent()
+			}
+		}
+		if !cur.GotoNextSibling() {
+			return
+		}
+	}
+}
+
+// hasToken reports whether one of n's direct children is the anonymous token
+// id; id 0 never matches. It indexes the children, which costs time quadratic
+// in their count, so it is for a node of a few children (a specifier).
+func hasToken(n *ts.Node, id uint16) bool {
+	if id == 0 {
+		return false
+	}
+	for i := range n.ChildCount() {
+		if c := n.Child(i); c != nil && !c.IsNamed() && c.KindId() == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier []ts.Node) {
+	if len(name) == 0 {
 		return
 	}
 	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: name[0].Utf8Text(e.src),
@@ -411,7 +546,7 @@ func (e *extraction) doc(d *decl) (uint, uint, bool) {
 			return s, en, true
 		}
 		p := anchor.Parent()
-		if p == nil || !e.g.wrappers[p.Kind()] {
+		if p == nil || !e.k.wrappers.has(p) {
 			return 0, 0, false
 		}
 		anchor = p
@@ -424,7 +559,7 @@ func (e *extraction) precedingComments(n *ts.Node) (uint, uint, bool) {
 	var start, end uint
 	found := false
 	next := n
-	for p := n.PrevNamedSibling(); p != nil && e.g.comments[p.Kind()]; p = p.PrevNamedSibling() {
+	for p := n.PrevNamedSibling(); p != nil && e.k.comments.has(p); p = p.PrevNamedSibling() {
 		if p.EndPosition().Row+1 < next.StartPosition().Row {
 			break
 		}

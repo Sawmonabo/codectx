@@ -186,7 +186,8 @@ func referenceRoutes(g *pathGraph, from, to model.NodeID, kinds []model.Relation
 	return best, found
 }
 
-// TestShortestPathIsExactUnderATinyChunkBudget is the P5 exactness proof. The
+// TestShortestPathIsExactUnderATinyChunkBudget guards the path search's
+// exactness under external memory. The
 // search state -- settled distances, the parent edges of the shortest-path DAG
 // and the tentative cost buckets -- lives in the scratch database, so a chunk
 // budget far smaller than the state changes how many chunks the walk reads and
@@ -381,7 +382,7 @@ func retainedDirs(t *testing.T, dir string) int {
 	return n
 }
 
-// TestPathResumesAcrossPagesWithTheSameAnswer is the P5 continuation proof: a
+// TestPathResumesAcrossPagesWithTheSameAnswer guards the path continuation: a
 // per-page visited budget small enough to force several pages must change only
 // how many requests the answer takes, never the answer. The final page's routes
 // and cost are compared against the same search run in one page, which the
@@ -459,7 +460,7 @@ func TestPathResumesAcrossPagesWithTheSameAnswer(t *testing.T) {
 	}
 }
 
-// TestPathDeadlineMintsAResumableCursor is ruling P3 for the path search: a
+// TestPathDeadlineMintsAResumableCursor is the page rule for the path search: a
 // deadline ends the PAGE, not the answer. The first page is given a deadline it
 // cannot finish under, and the continuation it mints must complete the search.
 //

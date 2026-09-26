@@ -36,7 +36,7 @@ const (
 
 // Language returns the language tag for a root-relative path, or "" when the
 // path says nothing. The table itself lives in internal/lang, which is the
-// one place a path becomes a language tag (R7-4); the name is kept here
+// one place a path becomes a language tag; the name is kept here
 // because it is what the analyzer providers call.
 func Language(rel string) string { return lang.Of(rel) }
 

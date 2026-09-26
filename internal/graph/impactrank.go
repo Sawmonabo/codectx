@@ -11,10 +11,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// The frozen record shapes, folds and comparators the global impact/deps rank
-// is built from (ruling P2/P4). Nothing here walks, sorts or serves: this file
-// is the contract the walk lane writes into and the rollup and paging lanes
-// read out of, so the two halves cannot disagree about what a record means.
+// The record shapes, folds and comparators the global impact/deps rank is
+// built from. Nothing here walks, sorts or serves: this file is the contract
+// the walk writes into and the rollup and paging read out of, so the two
+// halves cannot disagree about what a record means.
 //
 // The shape is the one internal/search already uses for its distinct set: two
 // passes over one pagination.ExternalSort. Pass 1 is keyed by IDENTITY (the
@@ -26,7 +26,7 @@ import (
 //
 // Every fold below is a total, commutative, associative function of the
 // records it merges, and never of the order they arrive in. That is the whole
-// point of this file: under P2 the walk streams into a disk-backed sort, so
+// point of this file: the walk streams into a disk-backed sort, so
 // arrival order is decided by where the run and page boundaries happened to
 // fall. Any field taken from "whichever side arrived first" would make the
 // served answer depend on those boundaries -- the exact defect this programme
@@ -55,7 +55,7 @@ import (
 // stored copy could disagree with the Cost a fold just lowered. scoreMicros()
 // derives it, and lessByRank ranks on that derived value rather than on Cost --
 // the division is integer, so distinct costs collapse to equal scores and
-// ranking on cost would be a strictly finer order than ruling P1's key.
+// ranking on cost would be a strictly finer order than the served key.
 type impactRecord struct {
 	NodeID    model.NodeID       `json:"n"`
 	Depth     int                `json:"d"`
@@ -75,9 +75,9 @@ func (r impactRecord) scoreMicros() int64 { return 1_000_000 / (1 + r.Cost) }
 
 // pairRecord is one (from-package, to-package) pair of the rollup, with the
 // number of symbol edges and the number of evidence records behind it. It is
-// model.PackageEdge's six fields in the sort's record form; ruling P4's
-// "per-pair lists" has no counterpart on PackageEdge and none is invented here,
-// because a field no served type can carry would have no reader.
+// model.PackageEdge's six fields in the sort's record form. A per-pair list of
+// the edges behind a pair has no counterpart on PackageEdge and none is
+// invented here, because a field no served type can carry would have no reader.
 type pairRecord struct {
 	FromNodeID    model.NodeID `json:"f"`
 	ToNodeID      model.NodeID `json:"t"`
@@ -88,8 +88,8 @@ type pairRecord struct {
 }
 
 // edge projects the record onto the served type. The counts are exact sums of
-// every edge the whole walk admitted for this pair, which is what ruling P4
-// requires of the rollup.
+// every edge the whole walk admitted for this pair, which is what the rollup
+// requires.
 func (r pairRecord) edge() model.PackageEdge {
 	return model.PackageEdge{
 		FromNodeID: r.FromNodeID, ToNodeID: r.ToNodeID,
@@ -238,7 +238,7 @@ func mergeReasons(a, b []string) []string {
 }
 
 // foldPair merges two observations of ONE package pair. The counts are summed
-// exactly -- ruling P4 -- and the labels are chosen by a rule that depends on
+// exactly and the labels are chosen by a rule that depends on
 // the two labels alone and never on which arrived first.
 func foldPair(a, b pairRecord) (pairRecord, error) {
 	keep := a
@@ -269,12 +269,12 @@ func mergeLabel(a, b string) string {
 // signal that makes the fold run at all.
 func lessByNode(a, b impactRecord) int { return cmp.Compare(a.NodeID, b.NodeID) }
 
-// lessByRank is pass 2's key and the served order: ruling P1's
+// lessByRank is pass 2's key and the served order:
 // (ScoreMicros desc, Depth asc, NodeID asc).
 //
-// Name left the tie-break with P1. It is known only after hydration, and the
-// whole answer is now ranked before any of it is hydrated, so keeping it would
-// have made the global order depend on a fact the ranking pass does not have.
+// Name is not a tie-break. It is known only after hydration, and the whole
+// answer is ranked before any of it is hydrated, so ranking on it would make
+// the global order depend on a fact the ranking pass does not have.
 // NodeID is unique per record after pass 1's fold, so the order is still total
 // and still deterministic. A served page therefore arrives already ordered and
 // must NOT be re-sorted after hydration.
@@ -344,7 +344,7 @@ type rankedTail struct {
 // this handle mints no continuation.
 func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total }
 
-// rankPairs is the same two passes over the package rollup (ruling P4): pass 1
+// rankPairs is the same two passes over the package rollup: pass 1
 // keys lessByPairKey and folds foldPair, so the counts it reports are exact
 // sums over the whole walk rather than over one page; pass 2 keys lessByPair,
 // which is the order the rollup has always served. Close the returned run.
@@ -354,8 +354,6 @@ func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total 
 // across any number of emitting batches sums to the same counts a single-shot
 // rollup of the same edges would report, and pass 2 orders the distinct pairs
 // globally rather than one batch at a time.
-//
-// Owned by lane P-c.
 func (e *Engine) rankPairs(ctx context.Context,
 	emit func(add func(pairRecord) error) error,
 	stats *rankStats) (*pagination.SortedRun[pairRecord], error) {
@@ -390,7 +388,7 @@ func (e *Engine) rankPairs(ctx context.Context,
 	}
 	stats.observe(byKey.PeakLiveRecords())
 	defer folded.Close()
-	// The deadline ends a page and never the answer (ruling P3), but a
+	// The deadline ends a page and never the answer, but a
 	// cancelled request must not pay for a second pass over a set it will
 	// never serve.
 	if err := ctx.Err(); err != nil {

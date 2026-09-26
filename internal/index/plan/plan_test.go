@@ -1,8 +1,10 @@
 package plan
 
 import (
+	"context"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -357,27 +359,30 @@ func TestARecordedPeakOnlyEverRaisesAReservationAndAnAbsentOneChangesNothing(t *
 
 	for _, tc := range []struct {
 		name  string
-		peaks []RecordedPeak
+		peaks map[string]int64
 		unit  *semantic
 		want  int64
 	}{
 		{name: "the scope's own recorded peak raises the reservation to it",
-			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: huge}}, unit: unit(scope), want: huge},
+			peaks: map[string]int64{scope: huge}, unit: unit(scope), want: huge},
 		{name: "a scope with no history of its own is sized by its language's",
-			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: huge}}, unit: unit(sibling), want: huge},
+			peaks: map[string]int64{scope: huge}, unit: unit(sibling), want: huge},
 		{name: "no ledger at all leaves the derived reservation standing",
 			peaks: nil, unit: unit(scope), want: derived},
 		{name: "a ledger with no peak for this scope or its language leaves it standing",
-			peaks: []RecordedPeak{{ScopeKey: otherLan, PeakBytes: huge}}, unit: unit(scope), want: derived},
+			peaks: map[string]int64{otherLan: huge}, unit: unit(scope), want: derived},
 		{name: "a recorded peak below the derived figure never lowers it",
-			peaks: []RecordedPeak{{ScopeKey: scope, PeakBytes: 1}}, unit: unit(scope), want: derived},
+			peaks: map[string]int64{scope: 1}, unit: unit(scope), want: derived},
 		{name: "the scope's own measurement wins over its language's larger one",
-			peaks: []RecordedPeak{{ScopeKey: sibling, PeakBytes: huge}, {ScopeKey: scope, PeakBytes: huge / 2}},
+			peaks: map[string]int64{sibling: huge, scope: huge / 2},
 			unit:  unit(scope), want: max(derived, huge/2)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b := &builder{peaks: tc.peaks}
-			got := b.reserve(gov, tc.unit, machine).Bytes()
+			b := &builder{}
+			if tc.peaks != nil {
+				b.in.RecordedPeak = ledgerLike(tc.peaks)
+			}
+			got := b.reserve(context.Background(), gov, tc.unit, machine).Bytes()
 			if got != tc.want {
 				t.Fatalf("the unit is admitted against %d bytes, want %d (the family constants derive %d)",
 					got, tc.want, derived)
@@ -386,5 +391,23 @@ func TestARecordedPeakOnlyEverRaisesAReservationAndAnAbsentOneChangesNothing(t *
 				t.Fatalf("the unit is admitted against %d bytes: an absent observation was read as zero", got)
 			}
 		})
+	}
+}
+
+// ledgerLike answers a lookup the way the run ledger's does: the scope's own
+// row, and where it has none and a family prefix is given, the largest row
+// whose key begins with it.
+func ledgerLike(peaks map[string]int64) func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
+	return func(_ context.Context, scopeKey, familyPrefix string) (int64, bool) {
+		if peak, ok := peaks[scopeKey]; ok {
+			return peak, true
+		}
+		largest, observed := int64(0), false
+		for key, peak := range peaks {
+			if familyPrefix != "" && strings.HasPrefix(key, familyPrefix) && peak > largest {
+				largest, observed = peak, true
+			}
+		}
+		return largest, observed
 	}
 }

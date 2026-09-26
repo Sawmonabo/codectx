@@ -21,9 +21,9 @@ import (
 // it is derived from the index bytes and none of it outlives the import.
 //
 // The file is a surface of the provider's scratch pool, taken for the import
-// and given back at its length. It used to be created per import and removed
-// at the end of it, so indexing a repository unit by unit handed the
-// filesystem one import's spool after another in the middle of its work. On a
+// and given back at its length. A file created per import and removed at the
+// end of it would hand the filesystem one import's spool after another in the
+// middle of indexing a repository unit by unit. On a
 // host that discards freed blocks under a sparse virtual disk that stalls
 // every writer on the machine for about a minute, a minute later.
 //
@@ -58,6 +58,11 @@ DROP TABLE IF EXISTS rel;
 DROP TABLE IF EXISTS defs;
 DROP TABLE IF EXISTS edges;
 DROP TABLE IF EXISTS manifest;
+DROP TABLE IF EXISTS docpath;
+DROP TABLE IF EXISTS dochash;
+DROP TABLE IF EXISTS prevdoc;
+DROP TABLE IF EXISTS docdelta;
+DROP TABLE IF EXISTS projects;
 `
 
 const scratchSchema = `

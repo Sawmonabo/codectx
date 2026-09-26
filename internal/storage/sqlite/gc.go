@@ -159,7 +159,7 @@ func (s *Store) collectUnreachableUnits(ctx context.Context) error {
 		AND NOT EXISTS (SELECT 1 FROM unit_dependencies ud WHERE ud.dependency_id = u.id) LIMIT ?2`, 0)
 }
 
-// collectUnreferencedScopeKeys deletes the S-3 scope-key dictionary rows that
+// collectUnreferencedScopeKeys deletes the scope-key dictionary rows that
 // no alias names any more. A dictionary row outlives every unit that referred
 // to it -- deleteUnit removes the alias rows, never the interned string -- so
 // without this pass a store that is rebuilt repeatedly accumulates scope keys

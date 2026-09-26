@@ -12,6 +12,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -171,7 +172,9 @@ type build struct {
 
 // request derives the unit identity exactly as the coordinator does — inputs
 // folded in ascending FileID order, the unit key over the spec plus the
-// analysis configuration — and returns the delta request over it.
+// analysis configuration — and returns the delta request over it. A dependence
+// unit is heavy, so it also carries the reservation the coordinator hands it
+// (see reservation).
 func (f *fixture) request(p provider.Provider, b build) delta.Request {
 	f.t.Helper()
 	d := p.Descriptor()
@@ -193,7 +196,7 @@ func (f *fixture) request(p provider.Provider, b build) delta.Request {
 	if err != nil {
 		f.t.Fatalf("reconcile.New: %v", err)
 	}
-	return delta.Request{
+	req := delta.Request{
 		Generation: b.gen,
 		Previous:   b.previous,
 		Build: model.UnitBuild{Spec: spec, AnalysisConfigHash: b.cfgHash, OriginRunID: run,
@@ -215,6 +218,35 @@ func (f *fixture) request(p provider.Provider, b build) delta.Request {
 		},
 		WorkDir: filepath.Join(f.dir, "work", string(spec.ID)),
 	}
+	if d.ID == dependence.ProviderID {
+		req.Reservation, req.Readmit = f.reservation(b)
+	}
+	return req
+}
+
+// reservation sizes a dependence unit's one reservation as the planner does:
+// the provider's own unit plan for the tree names the scope's family and
+// source bytes, and the governor reserves for them on the machine the provider
+// was built with. newDependence passes no Machine, no floor and no footprint,
+// so the planner's figure and the one the provider's standalone form sizes
+// itself are the same reservation. The fixture runs no admission ledger, so
+// the re-admission is the standalone form's too: there is no grant to
+// exchange, and the stand-in engine never reports the out-of-memory exit that
+// would ask for one.
+func (f *fixture) reservation(b build) (dependence.Reservation, func(context.Context, dependence.Reservation) error) {
+	f.t.Helper()
+	units, err := dependence.PlanUnits(f.ctx, b.tree.view)
+	if err != nil {
+		f.t.Fatalf("PlanUnits: %v", err)
+	}
+	for _, u := range units.Units {
+		if u.ScopeKey == b.scopeKey {
+			res := dependence.NewGovernor(0, 0).Reserve(u.Family, u.Bytes, dependence.Machine{})
+			return res, func(context.Context, dependence.Reservation) error { return nil }
+		}
+	}
+	f.t.Fatalf("the dependence plan of the tree names no unit %q", b.scopeKey)
+	return dependence.Reservation{}, nil
 }
 
 // flush commits the ingestion group. A predecessor a refresh reads through the

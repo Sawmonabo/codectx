@@ -17,7 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 )
 
 // goScope is the scope key of the root Go module of the trees below.
@@ -70,7 +70,7 @@ func (fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (depe
 type factImporter struct{ paths []string }
 
 func (im *factImporter) Import(ctx context.Context, _ string, res provider.Resolver,
-	sink provider.Sink, opts neo4jcsv.Options) (dependence.ImportReport, error) {
+	sink provider.Sink, opts graphcsv.Options) (dependence.ImportReport, error) {
 
 	// The keyed puts are how a fact reaches fact_keys, which is what the
 	// replaced-key set deletes against; the production reader reaches them
@@ -140,7 +140,7 @@ var errNotKeyed = errors.New("the delta build's sink takes no fact keys")
 // put publishes one keyed node fact. A zero FileVersion is the fileless fact
 // the unit's index-level bucket holds.
 func (im *factImporter) put(ctx context.Context, sink provider.DeltaSink, res provider.Resolver,
-	opts neo4jcsv.Options, key, nativeKey string, fv model.FileVersion) error {
+	opts graphcsv.Options, key, nativeKey string, fv model.FileVersion) error {
 
 	cand := model.NodeCandidate{ProviderID: dependence.ProviderID, ScopeKey: opts.UnitScopeKey,
 		NativeKey: nativeKey, Kind: model.NodeFunction, Language: opts.Language, Name: nativeKey}
@@ -165,35 +165,35 @@ func factKey(path, contentHash string) string {
 
 // writeKeys stores a key set in the on-disk form the applier round-trips
 // through storage: the format line and every key in ascending order.
-func writeKeys(path string, keys []string) (neo4jcsv.KeySet, error) {
+func writeKeys(path string, keys []string) (graphcsv.KeySet, error) {
 	f, err := os.Create(path)
 	if err != nil {
-		return neo4jcsv.KeySet{}, err
+		return graphcsv.KeySet{}, err
 	}
 	w := bufio.NewWriter(f)
 	if _, err := w.WriteString("codectx-dependence-keyset v1\n"); err != nil {
 		f.Close()
-		return neo4jcsv.KeySet{}, err
+		return graphcsv.KeySet{}, err
 	}
 	for _, k := range slices.Sorted(slices.Values(keys)) {
 		if _, err := w.WriteString(k + "\n"); err != nil {
 			f.Close()
-			return neo4jcsv.KeySet{}, err
+			return graphcsv.KeySet{}, err
 		}
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()
-		return neo4jcsv.KeySet{}, err
+		return graphcsv.KeySet{}, err
 	}
 	if err := f.Close(); err != nil {
-		return neo4jcsv.KeySet{}, err
+		return graphcsv.KeySet{}, err
 	}
-	return neo4jcsv.LoadKeySet(path)
+	return graphcsv.LoadKeySet(path)
 }
 
 // keysOf reads a key set back. The sets here are three keys long, so holding
 // one is a test fixture's liberty and not the streaming contract's.
-func keysOf(k neo4jcsv.KeySet) (map[string]struct{}, error) {
+func keysOf(k graphcsv.KeySet) (map[string]struct{}, error) {
 	out := map[string]struct{}{}
 	if k.Empty() {
 		return out, nil

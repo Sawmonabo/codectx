@@ -14,14 +14,14 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// TestResumableFrontierCompletesAcrossPages is the row-13 proof: a walk whose
-// visited budget is far smaller than the graph still returns EVERY edge, across
-// pages, and returns each exactly once.
+// TestResumableFrontierCompletesAcrossPages proves that a walk whose visited
+// budget is far smaller than the graph still returns EVERY edge, across pages,
+// and returns each exactly once.
 //
-// Before this wave, spending max_visited_nodes returned a truncated answer with
-// no continuation (cursor.go withheld the token, traverse.go minted one only
-// for a full page), so the edges past the budget were unreachable at any page
-// size. The mutation that proves this row: restore that withholding -- make
+// The failure it guards: spending max_visited_nodes returns a truncated answer
+// with no continuation (cursor.go withholding the token, traverse.go minting
+// one only for a full page), so the edges past the budget are unreachable at
+// any page size. The mutation that proves it: add that withholding -- make
 // traverse.go mint only when `reason == reasonPageFull`, or reinstate the
 // `b.visited >= MaxVisited` guard in nextTraversalCursor -- and the union of the
 // pages is a strict subset of the unlimited answer, so this test fails.
@@ -125,7 +125,7 @@ func TestResumableFrontierCompletesAcrossPages(t *testing.T) {
 	}
 }
 
-// TestDepthBoundIsReportedNotSilent is the row-14 proof. The failure mode: a
+// TestDepthBoundIsReportedNotSilent guards the depth bound. The failure mode: a
 // walk that runs out of depth with nodes still unexpanded falls out of the loop
 // with Truncated=false and no reason at all -- a partial answer that reads as a
 // whole one. It reports reasonDepth, and offers no continuation -- see
@@ -185,7 +185,7 @@ func TestDepthBoundIsReportedNotSilent(t *testing.T) {
 	}
 }
 
-// TestFrontierBytesSpillsAndTerminates is the row-16 proof: a frontier byte
+// TestFrontierBytesSpillsAndTerminates guards the frontier spill: a frontier byte
 // budget smaller than a single edge row must still return every edge, across
 // pages, and must terminate. Admitting at least one edge per level-read is what
 // guarantees that -- without it the resumed page re-reads the same level from
@@ -292,7 +292,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 // endpoints that had no honest continuation: impact and the package rollup used
 // to walk the whole reachable subgraph on one page, holding every admitted edge
 // and every affected node in heap, and then ranked whatever chunk the page had
-// read. Both now run ruling P2's shape -- the request that mints the answer
+// read. Both now run the ranked-answer shape -- the request that mints the answer
 // walks to COMPLETION, streams every admitted edge into a disk-backed sort,
 // ranks the whole answer once, serves the first page and spools the globally
 // ranked remainder behind the `r` cursor.
@@ -454,7 +454,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		}
 		// BOTH lists concatenate to the single-shot answer in the single-shot
 		// order. Uniqueness is implied and asserted separately, because a
-		// duplicate is the specific defect ruling P2 removes.
+		// duplicate is the specific defect a globally ranked answer removes.
 		if len(entries) != len(whole.Entries) {
 			t.Fatalf("the pages served %d affected entit(ies), the single-shot answer %d: an entity is duplicated or missing",
 				len(entries), len(whole.Entries))
@@ -484,7 +484,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		assertPairOrder(t, packages)
 		// The rank KEY, not merely agreement with a single-shot run of the same
 		// build: comparing the pages against a baseline the same code produced
-		// cannot see an order that is wrong in both. Ruling P1 freezes
+		// cannot see an order that is wrong in both. The served key is
 		// (ScoreMicros desc, Depth asc, NodeID asc); Name is not a tie-break.
 		for i := 1; i < len(entries); i++ {
 			prev, cur := entries[i-1], entries[i]
@@ -492,7 +492,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 				(prev.ScoreMicros == cur.ScoreMicros && (prev.Depth < cur.Depth ||
 					(prev.Depth == cur.Depth && prev.NodeID < cur.NodeID)))
 			if !ordered {
-				t.Fatalf("ranks %d and %d are out of ruling P1's order: (score %d, depth %d, %s) then (score %d, depth %d, %s)",
+				t.Fatalf("ranks %d and %d are out of the served order: (score %d, depth %d, %s) then (score %d, depth %d, %s)",
 					i-1, i, prev.ScoreMicros, prev.Depth, prev.NodeID, cur.ScoreMicros, cur.Depth, cur.NodeID)
 			}
 		}
@@ -656,12 +656,12 @@ type slowAdjacency struct {
 	stallAfter int
 }
 
-// TestDeadlineEndsThePageNotTheAnswer is the F8 proof. Ruling Q4 makes
-// query_timeout end a PAGE, not an answer: a walk that runs out of time with
-// edges already admitted must return them, say so, and hand back a cursor --
-// the same contract the page, visited, edge and frontier-byte stops keep.
-// Before this it returned model.GraphResult{} and CTX_QUERY_DEADLINE, so a walk
-// too big for one timeout could never progress at all.
+// TestDeadlineEndsThePageNotTheAnswer guards the page rule: query_timeout ends
+// a PAGE, not an answer. A walk that runs out of time with edges already
+// admitted must return them, say so, and hand back a cursor -- the same
+// contract the page, visited, edge and frontier-byte stops keep. A walk that
+// answered model.GraphResult{} and CTX_QUERY_DEADLINE instead could never
+// progress past one timeout's worth of graph.
 //
 // Mutation (`return walkState{}, err` restored at expand's loop-top check, i.e.
 // deadlineStop deleted): the first page below fails with CTX_QUERY_DEADLINE and
@@ -780,9 +780,9 @@ func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
 	}
 }
 
-// TestFrontierBytesMustBePositive is the F30 proof: frontier_bytes is the only
-// bound on how much of one level is held in heap, so zero there is not
-// "unlimited" the way a scale cap's zero is -- it is no ceiling at all.
+// TestFrontierBytesMustBePositive guards the frontier ceiling: frontier_bytes
+// is the only bound on how much of one level is held in heap, so zero there is
+// not "unlimited" the way a scale cap's zero is -- it is no ceiling at all.
 func TestFrontierBytesMustBePositive(t *testing.T) {
 	f := newGraphFixture(t)
 	limits := fixtureLimits()
@@ -795,13 +795,13 @@ func TestFrontierBytesMustBePositive(t *testing.T) {
 // TestImpactRanksAWalkSplitAcrossRequests is the D14 proof, and the one this
 // programme's whole retention design exists for.
 //
-// Ruling P3 lets the query deadline end a PAGE mid-walk and carry the frontier
-// forward in the `f` cursor; ruling P2 ranks the answer globally. Before the
-// retained pass-1 input, those two could not both be true: the ExternalSort was
-// built per REQUEST, so the leg that finished the walk ranked only what IT
+// The query deadline may end a PAGE mid-walk and carry the frontier forward in
+// the `f` cursor, and the answer is ranked globally. Without the retained
+// pass-1 input those two could not both be true: an ExternalSort built per
+// REQUEST would let the leg that finished the walk rank only what IT
 // admitted -- and the cumulative visited set the cursor carries guarantees the
-// earlier legs' nodes are never admitted again, so their entities were lost
-// with no cursor and no disclosure at all.
+// earlier legs' nodes are never admitted again, so their entities would be
+// lost with no cursor and no disclosure at all.
 //
 // The assertion is therefore not "the pages terminate" but "the pages
 // CONCATENATE to the unbounded walk's answer, in its order, including the
@@ -1059,15 +1059,15 @@ func TestFrontierCeilingDoesNotShrinkTheImpactAnswer(t *testing.T) {
 	}
 }
 
-// TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation is the Defect A proof.
-// Ruling P3 makes the query deadline end a PAGE and never the answer, and for
-// impact that has to hold for EVERY deadline, not only one that arrives after
-// the page admitted an edge: the walk's frontier and every record its earlier
-// legs admitted are retained across the request, so a page that served nothing
-// still carries the walk forward. Before this, a deadline that landed before
-// the page's first edge left expand with the raw CTX_QUERY_DEADLINE, which
-// impactPhaseError turned into Truncated with NO cursor -- the retained walk
-// discarded and its remainder unreachable.
+// TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation guards the page rule
+// at its earliest point. The query deadline ends a PAGE and never the answer,
+// and for impact that has to hold for EVERY deadline, not only one that arrives
+// after the page admitted an edge: the walk's frontier and every record its
+// earlier legs admitted are retained across the request, so a page that served
+// nothing still carries the walk forward. Before this, a deadline that landed
+// before the page's first edge left expand with the raw CTX_QUERY_DEADLINE,
+// which impactPhaseError turned into Truncated with NO cursor -- the retained
+// walk discarded and its remainder unreachable.
 //
 // Mutation (`o.Budget.pageEdges == 0` restored as an unconditional guard in
 // deadlineStop, i.e. DeadlineResumesEmptyPage ignored): the first page below is

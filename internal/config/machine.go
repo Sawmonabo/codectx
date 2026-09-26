@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/ledger"
 )
 
 // IdleFootprintBytes is what this process holds before it reserves anything:
@@ -25,9 +27,15 @@ import (
 const IdleFootprintBytes int64 = 32 * (1 << 20)
 
 // BaseFootprint is what this process holds for itself on this machine under
-// configuration c: the idle overhead above, plus the three reservations it
-// makes up front -- one query slot's memory per core, the parsed-graph cache
-// and the indexing queue.
+// configuration c: the idle overhead above, plus the reservations it makes up
+// front -- one query slot's memory per core, the parsed-graph cache, the
+// indexing queue, and every page cache it opens: the store writer
+// connection's (storage.writer_cache_kib), every reader connection's
+// (storage.reader_cache_kib) in every reader pool the process opens
+// (storeReaderPools), one lexical staging database's per unit a generation
+// builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
+// query tokenizer (TokenizerCacheKiB) and the run ledger's
+// (ledger.FootprintBytes).
 //
 // It is derived from the machine and the configuration rather than compared
 // against a figure. How many queries run at once comes from the cores, so a
@@ -35,7 +43,7 @@ const IdleFootprintBytes int64 = 32 * (1 << 20)
 // smaller allocation, and no core count can make the shipped defaults
 // unresolvable.
 func BaseFootprint(c Config) int64 {
-	total, err := baseFootprintFor(c, QuerySlots())
+	total, err := baseFootprintFor(c)
 	if err != nil {
 		// Validation refuses a configuration whose base-footprint arithmetic
 		// does not fit 64-bit range, so a loaded configuration never reaches
@@ -46,18 +54,83 @@ func BaseFootprint(c Config) int64 {
 	return total
 }
 
-// baseFootprintFor is BaseFootprint against a stated query-slot count, so the
-// arithmetic can be exercised for machines this one is not and so validation
-// and the figure itself come from one implementation rather than two that
-// drift.
-func baseFootprintFor(c Config, querySlots int) (int64, error) {
+// storeHandles is how many store handles this process can hold open at once:
+// the writer's, and in the serving composition a second, query-only handle
+// beside it. Counting the serving case for every composition over-states the
+// others by one handle's pools, which only leaves their children less.
+const storeHandles = 2
+
+// storeReaderPools is how many reader pools of storage.read_connections
+// connections each this process can hold open at once: every store handle
+// opens two, the short-read pool and the posting-stream pool.
+const storeReaderPools = 2 * storeHandles
+
+// LexicalStageCacheKiB is the page cache of one building unit's lexical
+// staging database, which the store opens per unit that publishes search
+// rows. It is the buffer the engine sorts the seal-time read in, so a unit
+// whose vocabulary fits it is ordered without a spill file, and it is an
+// internal layout figure, not a user limit: no count of terms or documents is
+// refused because of it, and a larger unit spills under <data_dir>/tmp. It is
+// stated here, beside the footprint that counts it, because the store reads
+// its configuration from this package.
+const LexicalStageCacheKiB = 16 << 10
+
+// TokenizerCacheKiB is the page cache of a store handle's query tokenizer: one
+// in-memory connection that holds a single query text, at most
+// model.MaxQueryTextBytes, for the length of one call and nothing between
+// calls. An in-memory database cannot spill, so the figure bounds the pages it
+// keeps after a call rather than what one call may use; it is stated for the
+// same reason LexicalStageCacheKiB is.
+const TokenizerCacheKiB = 2 << 10
+
+// BuildWorkers is how many units one generation builds at once:
+// index.workers when it is set, and otherwise one per core this process may
+// run on. The coordinator also holds the count under the provider pool's
+// structural ceiling on live sinks, which can only lower it.
+func BuildWorkers(c Config) int {
+	if c.Index.Workers > 0 {
+		return c.Index.Workers
+	}
+	return CPUs()
+}
+
+// baseFootprintFor is BaseFootprint with the arithmetic's range failure
+// carried, so validation and the figure itself come from one implementation
+// rather than two that drift.
+func baseFootprintFor(c Config) (int64, error) {
 	concurrent, err := mulNoOverflow("query slots * resources.query_memory_bytes",
-		int64(querySlots), c.Resources.QueryMemoryBytes)
+		int64(QuerySlots()), c.Resources.QueryMemoryBytes)
+	if err != nil {
+		return 0, err
+	}
+	writerCache, err := mulNoOverflow("storage.writer_cache_kib * 1024",
+		int64(c.Storage.WriterCacheKiB), 1<<10)
+	if err != nil {
+		return 0, err
+	}
+	readerConnections, err := mulNoOverflow("reader pools * storage.read_connections",
+		storeReaderPools, int64(c.Storage.ReadConnections))
+	if err != nil {
+		return 0, err
+	}
+	readerCacheBytes, err := mulNoOverflow("storage.reader_cache_kib * 1024",
+		int64(c.Storage.ReaderCacheKiB), 1<<10)
+	if err != nil {
+		return 0, err
+	}
+	readerCaches, err := mulNoOverflow("reader connections * storage.reader_cache_kib",
+		readerConnections, readerCacheBytes)
+	if err != nil {
+		return 0, err
+	}
+	stageCaches, err := mulNoOverflow("index.workers (or cores) * lexical staging cache",
+		int64(BuildWorkers(c)), LexicalStageCacheKiB<<10)
 	if err != nil {
 		return 0, err
 	}
 	return addNoOverflow("base footprint of this process",
-		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes)
+		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
+		stageCaches, storeHandles*TokenizerCacheKiB<<10, ledger.FootprintBytes)
 }
 
 // How much CPU-bound work runs at once is a property of the machine, not a
@@ -70,9 +143,11 @@ func baseFootprintFor(c Config, querySlots int) (int64, error) {
 // derived from the hardware would otherwise turn a busy moment on a small
 // machine into a refusal the caller cannot act on.
 
-// CPUs is how many cores this process may run on, never below one: the
-// smaller of the affinity the process was started with and the CPU quota its
-// control group is held to.
+// CPUs is how many cores this process may run on: the smaller of the
+// affinity the process was started with and the CPU quota its control group
+// is held to. It is never below one because neither input is --
+// runtime.NumCPU reports at least one, and a quota is rounded to at least one
+// core (smallestQuota).
 //
 // Both are read because they are different limits. runtime.NumCPU honours
 // affinity, which is what a CPU set restricts; a container CPU limit is
@@ -90,9 +165,6 @@ func CPUs() int {
 	if quota, ok := cpuQuota(); ok && quota < n {
 		n = quota
 	}
-	if n < 1 {
-		return 1
-	}
 	return n
 }
 
@@ -108,7 +180,7 @@ var cpuQuota = observedCPUQuota
 // cgroupRoot is where the control-group filesystem is mounted, and
 // procCgroupPath is where a process reads the groups it is in. A build on a
 // platform that has neither simply finds nothing there, which is the same
-// answer as a host that states no quota, so the reading needs no platform
+// answer as a host that states no limit, so the reading needs no platform
 // split of its own. They are variables so a test can state a hierarchy this
 // host is not in.
 var (
@@ -192,6 +264,82 @@ func smallestQuota(best int, found bool, quota, period int64) (int, bool) {
 	return best, found
 }
 
+// CgroupMemoryHeadroom is how much more memory this process's control groups
+// let it take: the limit less the usage of every group it is in, unified
+// hierarchy first and then the legacy memory controller, smallest over the
+// process's own group and every ancestor. Every group enforces its own limit,
+// so a limit on an ancestor binds exactly as one on the process's own group
+// does, and a container is normally limited on the ancestor.
+//
+// false means no group in the hierarchy states a limit -- no control-group
+// filesystem, "max", or a file this process may not read -- which is not a
+// headroom of zero. A group already at or above its limit is a real reading
+// of zero. A group whose limit is readable and whose usage is not is read at
+// its whole limit: the headroom cannot be more than that.
+func CgroupMemoryHeadroom() (int64, bool) {
+	if headroom, ok := unifiedMemoryHeadroom(); ok {
+		return headroom, true
+	}
+	return legacyMemoryHeadroom()
+}
+
+// unifiedMemoryHeadroom reads memory.max and memory.current from this
+// process's unified group and each of its ancestors.
+func unifiedMemoryHeadroom() (int64, bool) {
+	path, ok := cgroupPathFor("")
+	if !ok {
+		return 0, false
+	}
+	best, found := int64(0), false
+	for _, dir := range cgroupAncestors(filepath.Join(cgroupRoot, path)) {
+		best, found = smallestHeadroom(best, found,
+			readCgroupFile(filepath.Join(dir, "memory.max")),
+			readCgroupFile(filepath.Join(dir, "memory.current")))
+	}
+	return best, found
+}
+
+// legacyMemoryHeadroom reads memory.limit_in_bytes and memory.usage_in_bytes
+// from the legacy memory controller's group and each of its ancestors.
+func legacyMemoryHeadroom() (int64, bool) {
+	path, ok := cgroupPathFor("memory")
+	if !ok {
+		return 0, false
+	}
+	best, found := int64(0), false
+	for _, dir := range cgroupAncestors(filepath.Join(cgroupRoot, "memory", path)) {
+		best, found = smallestHeadroom(best, found,
+			readCgroupFile(filepath.Join(dir, "memory.limit_in_bytes")),
+			readCgroupFile(filepath.Join(dir, "memory.usage_in_bytes")))
+	}
+	return best, found
+}
+
+// legacyUnlimitedMemoryBytes is where the legacy memory controller's spelling
+// of "no limit" begins. It writes no word for it: an unlimited group reports
+// the largest page-aligned count its counter holds, just under 2^63. No host
+// has 2^62 bytes of memory, so a limit at or above it is that spelling and
+// not a limit.
+const legacyUnlimitedMemoryBytes int64 = 1 << 62
+
+// smallestHeadroom folds one group's limit and usage into the smallest
+// headroom seen so far. A limit that does not parse (the unified "max"), is
+// not positive or is the legacy unlimited spelling states nothing.
+func smallestHeadroom(best int64, found bool, limitText, usageText string) (int64, bool) {
+	limit, err := strconv.ParseInt(limitText, 10, 64)
+	if err != nil || limit <= 0 || limit >= legacyUnlimitedMemoryBytes {
+		return best, found
+	}
+	headroom := limit
+	if usage, uerr := strconv.ParseInt(usageText, 10, 64); uerr == nil && usage >= 0 {
+		headroom = max(limit-usage, 0)
+	}
+	if !found || headroom < best {
+		return headroom, true
+	}
+	return best, found
+}
+
 // cgroupPathFor is the group path /proc/self/cgroup states for a controller:
 // the unified line ("0::/path") when controller is empty, otherwise the legacy
 // line whose comma-separated controller list holds it.
@@ -249,28 +397,17 @@ func readCgroupFile(path string) string {
 // dominates a cold index. The kernel is left to share the cores between them
 // and the rest of the machine rather than a core being held back for it: a
 // reserved core is idle in the common case, where nothing else wants it.
-func ParserWorkers() int { return parserWorkersFor(CPUs()) }
-
-func parserWorkersFor(cpus int) int { return cpus }
+func ParserWorkers() int { return CPUs() }
 
 // QuerySlots is how many tool calls run at once: one per core. A query is
 // bounded work over the store rather than a subprocess, so the slot count is
 // what keeps the answers from sharing one core between them; a call that finds
 // no free slot waits.
-func QuerySlots() int { return querySlotsFor(CPUs()) }
-
-func querySlotsFor(cpus int) int { return cpus }
+func QuerySlots() int { return CPUs() }
 
 // GraphSlots is how many of those calls may be graph traversals, half the
 // cores and never below one. A traversal holds a query slot as well as this
 // one and does far more work per slot than a lookup, so letting every core run
 // one would leave nothing answering the cheap calls an agent interleaves with
 // them. A traversal that finds no free slot waits.
-func GraphSlots() int { return graphSlotsFor(CPUs()) }
-
-func graphSlotsFor(cpus int) int {
-	if n := cpus / 2; n > 0 {
-		return n
-	}
-	return 1
-}
+func GraphSlots() int { return max(CPUs()/2, 1) }

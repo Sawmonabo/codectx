@@ -187,7 +187,7 @@ func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scope
 	}
 }
 
-// internedPair resolves a scope key and a native key to their S-3 dictionary
+// internedPair resolves a scope key and a native key to their dictionary
 // surrogates inside a read transaction. A key with no dictionary row yields
 // noRef, which every caller reads as "aliased to nothing" -- the dictionaries
 // are written only by the unit writer, so an unseen key genuinely has no alias.

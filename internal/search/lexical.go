@@ -1,6 +1,7 @@
 package search
 
-// L3 owns this file: generation-local FTS candidate selection, tokenization through Store.Tokenize, and phrase handling from term offsets.
+// Generation-local FTS candidate selection, tokenization through
+// Store.Tokenize, and phrase handling from term offsets.
 
 import (
 	"context"
@@ -92,14 +93,14 @@ func (p storedPostings) TermCounts(ctx context.Context, term string) (occurrence
 // lexicalTokenizer is *sqlite.Store's Tokenize: the exact unicode61 tokenizer
 // search_fts is built with. Query terms come from here and nowhere else — a
 // hand-written splitter or a strings.ToLower would produce terms the index
-// does not contain (digest §4).
+// does not contain.
 type lexicalTokenizer interface {
 	Tokenize(ctx context.Context, text string) ([]string, error)
 }
 
 // lexicalTerm is one scored query unit: a single token, or the ordered token
 // sequence of a quoted phrase. A phrase scores from adjacent offsets, never
-// from the sum of its tokens (digest §4).
+// from the sum of its tokens.
 type lexicalTerm struct{ tokens []string }
 
 // phrase reports whether the term must be matched as an adjacent sequence.
@@ -116,7 +117,7 @@ func (t lexicalTerm) key() string { return strings.Join(t.tokens, " ") }
 // spares the consumer a second hydration over the identical rowid page. Doc is carried BY VALUE, not as a pointer into the tier's
 // per-page slice, so an emit that outlives the page cannot alias a reused row.
 // Occurrences is the number of matched term instances in this document, folded
-// across query terms and indexed columns — L4 sums it when deduplication folds
+// across query terms and indexed columns — the ranker sums it when deduplication folds
 // several documents of one node.
 type lexicalHit struct {
 	RowID       int64
@@ -161,7 +162,7 @@ type lexicalTier struct {
 // newLexicalTier builds the tier. maxTerms is resources.max_query_terms, which
 // is a config.Limit: an unlimited (0) value means every term of the query is
 // scored. The former 0 -> 1 coercion here silently turned "no bound" into the
-// tightest bound in the tree, which is the one reading of 0 the wave forbids.
+// tightest bound in the tree, which is the one reading of 0 the scale posture forbids.
 func newLexicalTier(tok lexicalTokenizer, maxTerms config.Limit, cacheBytes int64) *lexicalTier {
 	return &lexicalTier{tok: tok, stats: newStatsCache(cacheBytes), maxTerms: maxTerms}
 }
@@ -261,7 +262,7 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 	}
 }
 
-// score sums digest §4's per-term contributions for one document.
+// score sums the BM25F per-term contributions for one document.
 func (l *lexicalTier) score(ctx context.Context, streams []*termStream, idfs []float64, rowid, dl int64, avgdl float64) (score float64, occ int64, lower bool, err error) {
 	for i, s := range streams {
 		wtf, n, truncated, err := s.at(ctx, rowid)
@@ -414,7 +415,7 @@ func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource
 }
 
 // phraseDocumentFrequency counts the visible documents whose offsets actually
-// contain the phrase — digest §4 forbids reusing a token's df for a phrase.
+// contain the phrase — a token's df is never reused for a phrase.
 // The phrase can only occur where its first token occurs, so that token's
 // posting list drives the scan; the cost is O(df of the rarest-bound token),
 // which is why the answer is cached per (AnalysisKey, phrase).
@@ -626,7 +627,7 @@ func phraseColumns(groups [][]sqlite.TermOccurrence) []sqlite.SearchColumn {
 // phraseCount counts the phrase's occurrences in one column: the positions at
 // which token j sits exactly j offsets after token 0. Offsets ascend, so
 // membership is a binary search. A truncated offset list makes the answer a
-// lower bound (digest §4), which the second return reports rather than hiding.
+// lower bound, which the second return reports rather than hiding.
 func phraseCount(groups [][]sqlite.TermOccurrence, column sqlite.SearchColumn) (int64, bool) {
 	offsets := make([][]int64, len(groups))
 	truncated := false

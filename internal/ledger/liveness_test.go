@@ -133,8 +133,9 @@ func waitForSpan(t *testing.T, l *Ledger, run *Run) {
 // so the record of live work disappears from under the surface reading it.
 //
 // Mutation: drop `notLive` from either sweep's WHERE clause and the live
-// overlay run is deleted here, which is a status surface reading a run this
-// process is still writing.
+// overlay run, or the index run still in flight from before the cutoff, is
+// deleted here, which is a status surface reading a run this process is still
+// writing.
 func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -149,6 +150,14 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 		}
 	}()
 
+	// An index run that started before the run behind the retained generation
+	// and is still going: older than the cutoff, and live.
+	inFlight, err := l.NewRun(KindIndex, liveRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	_, capture := Start(inFlight.Context(ctx), "capture", "")
+	capture.End(OutcomeOK, Measured{}, nil)
 	serving, err := l.NewRun(KindOverlay, liveRepository)
 	if err != nil {
 		t.Fatalf("new run: %v", err)
@@ -163,8 +172,17 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 		_, span := Start(run.Context(ctx), "server_start", "")
 		span.End(OutcomeOK, Measured{}, nil)
 	}
+	// The run behind the one retained generation, which sets the cutoff.
+	published, err := l.NewRun(KindIndex, liveRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	_, built := Start(published.Context(ctx), "capture", "")
+	built.End(OutcomeOK, Measured{}, nil)
+	published.AttachGeneration(1)
+	published.Finish(OutcomeOK)
 	// A tick that published nothing: it ended, and no generation will ever be
-	// attached to it. It is inside the retained window, so it stays.
+	// attached to it. It started after the cutoff, so it stays.
 	barren, err := l.NewRun(KindDeferred, liveRepository)
 	if err != nil {
 		t.Fatalf("new run: %v", err)
@@ -172,7 +190,12 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	_, sealed := Start(barren.Context(ctx), "seal", "")
 	sealed.End(OutcomeOK, Measured{}, nil)
 	barren.Finish(OutcomeOK)
-	waitForRuns(t, l, 3)
+	waitForRuns(t, l, 5)
+	// The rows exist from their first span; the generation the cutoff reads
+	// is written by a later flush, so one is forced before the sweep.
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	// What a process killed while serving leaves behind: a deadline its writer
 	// never renewed, on a row that still says 'running'.
 	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
@@ -195,18 +218,18 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	if err := l.DeleteOverlayRuns(ctx, ids); err != nil {
 		t.Fatalf("delete overlay runs: %v", err)
 	}
-	if err := l.SweepRuns(ctx, liveRepository, 0); err != nil {
+	if err := l.SweepRuns(ctx, liveRepository, retainedOnly(1)); err != nil {
 		t.Fatalf("sweep the runs: %v", err)
 	}
 	left := runIDs(t, l)
 	slices.Sort(left)
-	want := []string{serving.ID(), barren.ID()}
+	want := []string{inFlight.ID(), serving.ID(), published.ID(), barren.ID()}
 	slices.Sort(want)
 	if !slices.Equal(left, want) {
-		t.Fatalf("after both sweeps the ledger holds %v, want the live overlay run and the tick "+
-			"that published nothing (%v): only the abandoned overlay run's writer is gone, and a "+
-			"run inside the retained window keeps its account whether or not it reached a generation",
-			left, want)
+		t.Fatalf("after both sweeps the ledger holds %v, want the live index and overlay runs, the "+
+			"run behind the retained generation and the tick after it (%v): only the abandoned "+
+			"overlay run's writer is gone, and a run after the cutoff keeps its account whether or "+
+			"not it reached a generation", left, want)
 	}
 }
 
@@ -252,22 +275,29 @@ func runIDs(t *testing.T, l *Ledger) []string {
 	return ids
 }
 
+// retainedOnly answers the sweep's question the way a store holding exactly
+// these generations would.
+func retainedOnly(held ...int64) func(context.Context, int64) (bool, error) {
+	return func(_ context.Context, gen int64) (bool, error) {
+		return slices.Contains(held, gen), nil
+	}
+}
+
 // TestARunsAccountOutlivesItsGeneration protects the one thing the ledger file
-// exists for: that an operator who asks `status --resources` after a run is
-// told what that run cost. A run's rows are about the run, not about the
-// generation it published -- retention keeps only the newest generation of each
-// ref, so the generation an index run activated is deleted the moment a
-// deferred publication extends it on the same ref, seconds later and inside the
-// same command.
+// exists for: that an operator who asks `status --resources` about a run is
+// told what that run cost for as long as the store keeps what it built, and
+// that every run since the oldest such run -- a tick that published nothing,
+// a run whose own generation retention swept -- is told too. The history
+// follows the store's retention, never a count.
 //
-// Mutation: restore a generation-keyed delete -- `DELETE FROM runs WHERE
-// generation_id = ?` for each generation retention swept -- or key this sweep
-// on generation_id at all, and the middle run below loses its spans while the
-// store it built is still the active one.
-//
-// Mutation: drop the `generation_id <> ?` clause from SweepRuns and the active
-// generation's run is swept once RetainedRuns newer runs exist, which is the
-// same operator asking the same question and being told nothing.
+// Mutation: delete every run whose own generation is not retained (key the
+// sweep on generation_id alone) and the swept-generation run and the barren
+// tick after the cutoff are lost. Take the cutoff from the newest retained
+// run instead of the oldest and every run before the active generation's is
+// lost, the older retained ref's run included. Start the cutoff at
+// the first run that names any generation and the early failed run survives.
+// Treat "no run names a retained generation" as "delete every run" and the
+// last sweep below empties the file.
 func TestARunsAccountOutlivesItsGeneration(t *testing.T) {
 	ctx := context.Background()
 	l := New(t.TempDir())
@@ -280,55 +310,64 @@ func TestARunsAccountOutlivesItsGeneration(t *testing.T) {
 		}
 	}()
 
-	// One more run than the window retains, so the bound is actually exercised
-	// rather than merely never reached.
-	const total = RetainedRuns + 2
-	ids := make([]string, 0, total)
-	for i := range total {
-		run, err := l.NewRun(KindIndex, liveRepository)
+	// In start order: a run whose generation retention swept, a run that
+	// failed before any generation, the run behind a retained ref's generation
+	// (the cutoff), a run whose generation was swept since, a tick that
+	// published nothing, and the run behind the active generation. Zero means
+	// no generation attached.
+	generations := []int64{1, 0, 3, 4, 0, 6}
+	ids := make([]string, 0, len(generations))
+	for i, gen := range generations {
+		kind := KindIndex
+		if gen == 0 && i > 2 {
+			kind = KindDeferred
+		}
+		run, err := l.NewRun(kind, liveRepository)
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
 		_, span := Start(run.Context(ctx), "capture", "")
 		span.End(OutcomeOK, Measured{}, nil)
-		// Every run publishes a generation of its own, and every generation
-		// but the first has been swept by retention by the time this sweep
-		// runs: that is the ordinary shape of a workspace indexed twice.
-		run.AttachGeneration(int64(i + 1))
+		if gen != 0 {
+			run.AttachGeneration(gen)
+		}
 		run.Finish(OutcomeOK)
 		ids = append(ids, run.ID())
 	}
 	if err := l.Flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	// The oldest run built the store that is active now. It is outside the
-	// retained window and must survive anyway.
-	if err := l.SweepRuns(ctx, liveRepository, 1); err != nil {
+	if err := l.SweepRuns(ctx, liveRepository, retainedOnly(3, 6)); err != nil {
 		t.Fatalf("sweep the runs: %v", err)
 	}
 
 	left := runIDs(t, l)
-	want := append([]string{ids[0]}, ids[len(ids)-RetainedRuns:]...)
-	slices.Sort(left)
-	slices.Sort(want)
+	want := ids[2:]
 	if !slices.Equal(left, want) {
-		t.Fatalf("after the sweep the ledger holds %v, want %v: the last %d runs and the run that "+
-			"built the active generation, whichever generations retention has deleted",
-			left, want, RetainedRuns)
+		t.Fatalf("after the sweep the ledger holds %v, want %v: every run from the oldest run behind "+
+			"a retained generation on, and none before it", left, want)
 	}
-	// The run immediately inside the window is the reference case: its
-	// generation is long gone and its account is still readable in full.
+	// A store that holds none of the generations the file names -- the file
+	// outlived the store it described -- sweeps nothing.
+	if err := l.SweepRuns(ctx, liveRepository, retainedOnly()); err != nil {
+		t.Fatalf("sweep the runs: %v", err)
+	}
+	if again := runIDs(t, l); !slices.Equal(again, want) {
+		t.Fatalf("with no retained generation the sweep left %v, want %v untouched", again, want)
+	}
+	// The run after the cutoff whose own generation is gone is the reference
+	// case: its account is still readable in full.
 	reader, ok, err := OpenReader(ctx, l.dir)
 	if err != nil || !ok {
 		t.Fatalf("open the reader: %v (%v)", ok, err)
 	}
 	defer func() { _ = reader.Close() }()
-	view, found, err := reader.Run(ctx, ids[len(ids)-1])
+	view, found, err := reader.Run(ctx, ids[3])
 	if err != nil {
 		t.Fatalf("read the run: %v", err)
 	}
 	if !found || len(view.Spans) != 1 {
-		t.Fatalf("the newest run reads back as found=%v with %d spans, want it found with its one "+
+		t.Fatalf("the swept generation's run reads back as found=%v with %d spans, want it found with its one "+
 			"span: a run whose generation is gone must still say what it cost", found, len(view.Spans))
 	}
 }

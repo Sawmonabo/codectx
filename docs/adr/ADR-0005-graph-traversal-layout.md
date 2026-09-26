@@ -42,7 +42,7 @@ b-tree gone [17 §1]. Direction-optimising breadth-first search was evaluated ag
 repository's own degree data (average out-degree 5.91, near-acyclic call graph) and its
 top-down/bottom-up switch would not fire [17 §2.1][S7].
 
-**Rulings that bind this decision.** codectx is greenfield: no backward compatibility and no
+**Rules that bind this decision.** codectx is greenfield: no backward compatibility and no
 migration obligation, so schemas, cursor formats and on-disk layouts change in place and existing
 indexes are rebuilt; the design chosen is the one that meets the requirements, not the smallest
 diff. Every answer stays lossless and globally ordered (ADR-0001 §2.2, §2.3); peak memory is a
@@ -74,7 +74,7 @@ scan of the generation's node facts and one aggregate over evidence. On the refe
 (739 529 relations) the whole build is one sequential pass of ≈30 MB of index rows and writes
 ≈10 MB; the acceptance bound is 5 % of the cold-index wall clock. Because the blob is derived from
 facts already sealed, it is neither a fact nor an identity: no provider version, no analysis
-fingerprint. The schema fingerprint changes, which rebuilds existing stores; the greenfield ruling
+fingerprint. The schema fingerprint changes, which rebuilds existing stores; the greenfield rule
 makes that a rebuild, not a migration.
 
 **Alternatives considered.**
@@ -88,7 +88,7 @@ makes that a rebuild, not a migration.
    ≈14× faster per edge than an embedded b-tree graph backend, with the b-tree taking 7.1× more
    last-level-cache misses [S36], and the whole packed structure is ≈0.8 % of the store [17 §3.1].
    The research note deferred the blob behind a re-measurement on compatibility and diff-size
-   grounds; the greenfield ruling removes those grounds, and two phases touching the same walk code
+   grounds; the greenfield rule removes those grounds, and two phases touching the same walk code
    cost more than one correct design.
 2. *A packed adjacency merged at read time with the relation b-tree as a delta for units re-indexed
    since* [S17][S18][S20]. Steel-man: no rebuild per refresh. Rejected: a generation is immutable

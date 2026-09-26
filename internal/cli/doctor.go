@@ -259,8 +259,7 @@ func deepLabel(deep bool) string {
 // restriction on analyzer execution: Section 21 requires that to be reported,
 // but it is a CHECK, produced behind the facade, and a renderer that asserted
 // it from a boolean would be reporting the flag as the boundary -- precisely
-// the substitution Section 21 forbids. See hand-off 4 in the lane report: no
-// lane currently owns that check.
+// the substitution Section 21 forbids.
 func offlineLabel(offline bool) string {
 	if offline {
 		return "policy checks requested"

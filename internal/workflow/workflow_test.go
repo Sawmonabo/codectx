@@ -1,14 +1,12 @@
-// This is the whole test budget for Task 17: one file, in-package so a lane can
-// prove the unexported readiness, citationsServed and canonicalCapsuleHash
-// directly, one fake and one scenario table.
+// This file holds the workflow service's scenario table: in-package so a row
+// can prove the unexported readiness, citationsServed and canonicalCapsuleHash
+// directly, over one fake store and one fixture.
 //
-// The table is empty here by design. L0 owns the fixture and the runner; each
-// fill-in lane appends its own self-contained scenario under its own marker and
-// nothing else in this file moves. A row exists only to protect an invariant
-// whose silent breakage grants false write readiness, breaks capsule
-// determinism, bypasses an actor or version guard or leaks unsealed facts --
-// re-asserting Task 5's transition table, PutObservation idempotency or
-// PutCapsule's write-once is a redundant test and a defect.
+// A row exists only to protect an invariant whose silent breakage grants false
+// write readiness, breaks capsule determinism, bypasses an actor or version
+// guard or leaks unsealed facts -- re-asserting the store's transition table,
+// PutObservation idempotency or PutCapsule's write-once is a redundant test and
+// a defect.
 package workflow
 
 import (
@@ -40,7 +38,7 @@ type scenario struct {
 func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
-		// L1 rows
+		// limits and advance rows
 		// resources.query_timeout is unlimited by DEFAULT and is a default,
 		// never a ceiling. Both halves were broken here: checkLimits refused a
 		// non-positive value, so the shipped configuration could not compose a
@@ -188,7 +186,7 @@ func TestWorkflowScenarios(t *testing.T) {
 		// The shortfall here is ENTIRELY waived, which is the sharp case: a
 		// guard that adds the waiver count back into the served total never
 		// trips at all on this fixture, so the flag-gated branch becomes
-		// unreachable and ruling Q12's default-false control is bypassed in
+		// unreachable and the default-false waiver flag is bypassed in
 		// silence. The third arm is the other half of the same split -- a
 		// waived file that was also READ leaves nothing short, so it needs no
 		// flag -- and together they pin the guard to read completeness
@@ -220,7 +218,7 @@ func TestWorkflowScenarios(t *testing.T) {
 			}
 
 			// The same session, the same shortfall, the flag on: the recorded
-			// waiver is now the exploratory route ruling Q12 allows, and the
+			// waiver is now the exploratory route the flag allows, and the
 			// readiness gate -- not this guard -- is what keeps it honest.
 			waiverSvc := h.serviceWithWaiverConsolidation(t)
 			if _, _, err := waiverSvc.Advance(ctx, req); err != nil {
@@ -249,7 +247,7 @@ func TestWorkflowScenarios(t *testing.T) {
 				t.Fatalf("a fully read session with a waiver was left at %q", got)
 			}
 		}},
-		// L2 rows
+		// include rows
 		// An include invalidates the prior scope review by moving the scope
 		// version, never by deleting it, and the coverage the actor already
 		// earned at the same content hash survives the INSERT OR IGNORE
@@ -263,7 +261,7 @@ func TestWorkflowScenarios(t *testing.T) {
 			servedHash := h.file(fixtureSession, fileFull).hash
 
 			// The review is inserted through the store rather than through
-			// Record: the eight-category and citation rules are L3's guard, and
+			// Record: the eight-category and citation rules are Record's guard, and
 			// this row needs only a review the gate would count as current.
 			oreq := model.ObservationRequest{
 				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: before.ScopeVersion,
@@ -301,8 +299,8 @@ func TestWorkflowScenarios(t *testing.T) {
 				SessionID: fixtureSession, ActorID: fixtureActor,
 				Seeds: []string{"internal/c/included.go"}, ExpectedVersion: before.StateVersion,
 			})
-			// Include's tail projects the new record through status, which is
-			// real since L4 landed: the include must now succeed outright. The
+			// Include's tail projects the new record through status, so the
+			// include must succeed outright. The
 			// assertions below still read the store, because what this row
 			// protects is the store-visible effect of the include and not the
 			// projection.
@@ -366,7 +364,7 @@ func TestWorkflowScenarios(t *testing.T) {
 				t.Fatalf("the recompiled manifest's file %q never entered the session's scope", extra)
 			}
 		}},
-		// L3 rows
+		// record rows
 		//
 		// A scope review is the one observation that can claim a file was read,
 		// so both rows below are about the same silent failure: a review that is
@@ -376,7 +374,7 @@ func TestWorkflowScenarios(t *testing.T) {
 			partial := h.file(fixtureSession, filePartial)
 			// [30,70) spans the deliberate gap at [40,60): it overlaps two
 			// confirmed intervals and is contained by neither.
-			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCallersConsumers,
+			review := allCategoriesReview(fixtureID("manifest", "canonical"), 1, model.ReviewCallersConsumers,
 				[]model.ClaimReference{{Source: &model.SourceCitation{
 					FileID: filePartial, ContentHash: partial.hash,
 					Bytes: model.ByteRange{Start: 30, End: 70},
@@ -396,7 +394,7 @@ func TestWorkflowScenarios(t *testing.T) {
 			// [0,40) IS confirmed, so the citation guard passes and the refusal
 			// can only come from the file's coverage state: a served interval is
 			// not a read file.
-			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
+			review := allCategoriesReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
 				[]model.ClaimReference{{Source: &model.SourceCitation{
 					FileID: filePartial, ContentHash: partial.hash,
 					Bytes: model.ByteRange{Start: 0, End: 40},
@@ -411,7 +409,7 @@ func TestWorkflowScenarios(t *testing.T) {
 					got, err, model.CodeCoverageIncomplete)
 			}
 		}},
-		// L4 rows
+		// readiness rows
 		// Failure mode: a gate that folds a waiver into readiness grants false
 		// write readiness -- an orchestrator would start writing files nobody
 		// read. Everything §16.3 asks for is arranged here except the waiver,
@@ -442,8 +440,8 @@ func TestWorkflowScenarios(t *testing.T) {
 					st.ScopeComplete, st.Superseded)
 			}
 			// The waived file was also read, and the two counts must part
-			// company on exactly that: fully_served_files drops it (VF3 --
-			// reporting 4 of 4 served beside a waiver reads as full coverage,
+			// company on exactly that: fully_served_files drops it
+			// (reporting 4 of 4 served beside a waiver reads as full coverage,
 			// the claim a waiver exists to deny) while read completeness keeps
 			// it, because a waiver excuses a file from being read and does not
 			// unread one that was. Neither answer is readiness: the waiver is
@@ -596,15 +594,12 @@ func TestWorkflowScenarios(t *testing.T) {
 		// moves, so this row fails the moment Superseded goes back to being a
 		// function of Validator.Current.
 		{name: "readiness/a newer active generation supersedes a session whose files are untouched", run: supersededByNewerGeneration},
-		// L5 rows
+		// capsule rows
 		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
 		{"a waived session seals a capsule carrying the stored waiver reason", capsuleCarriesStoredWaivers},
-		// L6 rows
-		// L7 rows
-		// L8 rows
-		// INT rows
-		// Failure mode: every lane proved its own operation against a fake and
-		// a stub sibling. This drives one session through the whole service --
+		// lifecycle rows
+		// Failure mode: every other row proves one operation in isolation. This
+		// drives one session through the whole service --
 		// review, status, consolidate, seal, both capsule read paths and close
 		// -- so a seam that only shows up when the real neighbour is on the
 		// other side of it (an observation id the service computes differently
@@ -721,20 +716,16 @@ type fakeStore struct {
 	sessions  map[model.SessionID]*fakeSession
 	manifests map[model.ManifestID]model.ContextManifest
 	entries   map[model.ManifestID][]model.ContextEntry
-	// compiled is what Compile returns; a lane that exercises Include points it
+	// compiled is what Compile returns; a row that exercises Include points it
 	// at a manifest it also registered in manifests/entries.
 	compiled model.ContextManifest
 	// current is the Validator's answer: the content hash each file carries
-	// right now. Changing one under a session is how a lane proves the gate is
-	// revalidated per request rather than cached.
+	// right now.
 	current map[model.FileID]string
 	// active is the published generation per repository, the store's
 	// active_generations row. Moving it past a session's pinned generation is
 	// how a row proves supersession.
 	active map[model.RepositoryID]model.GenerationID
-	// compileErr and validateErr let a lane drive the failure paths without a
-	// second fake.
-	compileErr, validateErr error
 	// walks counts, per capsule list, how many times the SESSION STORE was
 	// walked for that list. The seal makes exactly three bounded passes over
 	// the source (count, hash, write) and retains no list between them, so a
@@ -763,18 +754,12 @@ var (
 // harness is what a scenario gets: the service under test and the fake behind
 // it, so a row can arrange store state and then drive the service.
 //
-// This block is the lane-facing surface, and every helper and knob on it --
-// session, file, code, fakeStore.compileErr, fakeStore.validateErr,
-// fakeStore.current, fixtureOther -- is deliberately caller-less until rows land
-// under the markers above. It is not dead code awaiting deletion.
-//
-// Two knobs worth naming. Supersession is a generation fact: INT widened
-// Sessions with the store's ActiveGeneration, so the knob is
-// h.store.active[<repo>] = <newer generation>, and it is deliberately
-// independent of h.store.current[fileFull] = "<another hash>", which drives
-// precondition 7's per-file revalidation. And the capsule size bound is
-// the service's, not the fake's: L5 checks Limits.MaxCapsuleBytes before the
-// write, so the "capsule over max_capsule_bytes fails explicitly" row drives the
+// Two knobs worth naming. Supersession is a generation fact read through
+// Sessions.ActiveGeneration, so the knob is h.store.active[<repo>] = <newer
+// generation>, and it is deliberately independent of h.store.current[fileFull] =
+// "<another hash>", which drives precondition 7's per-file revalidation. And the
+// capsule size bound is the service's, not the fake's: the seal checks
+// Limits.MaxCapsuleBytes before the write, so a capsule-budget row drives the
 // service and never reaches PutCapsule.
 type harness struct {
 	t     *testing.T
@@ -807,7 +792,7 @@ func newHarness(t *testing.T) *harness {
 // serviceWithWaiverConsolidation is the same fake store behind a service whose
 // user-level context.allow_exploratory_waiver_consolidation is on. The flag is
 // a Limits field read at guard time, so the only way to exercise both sides of
-// ruling Q12 against one fixture is a second service over the same store.
+// the flag against one fixture is a second service over the same store.
 func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 	t.Helper()
 	svc, err := New(Options{
@@ -1039,7 +1024,7 @@ func (s *fakeStore) Session(_ context.Context, id model.SessionID, actor string)
 
 // allowed is the store's transition graph, reproduced here only so the fake can
 // refuse what the store refuses. A scenario that asserts on this table rather
-// than on a service guard is re-asserting Task 5 and is a defect.
+// than on a service guard is re-asserting the store's own table and is a defect.
 var allowed = map[model.WorkflowState][]model.WorkflowState{
 	model.StateSweepOpen:       {model.StateVerifyOpen, model.StateClosed},
 	model.StateVerifyOpen:      {model.StateConsolidateOpen, model.StateClosed},
@@ -1539,29 +1524,23 @@ func (s *fakeStore) SessionFilePaths(_ context.Context, session model.SessionID,
 func (s *fakeStore) Compile(_ context.Context, _ model.ContextRequest) (model.ContextManifest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.compileErr != nil {
-		return model.ContextManifest{}, s.compileErr
-	}
 	return s.compiled, nil
 }
 
 func (s *fakeStore) Current(_ context.Context, file model.FileID, hash string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.validateErr != nil {
-		return false, s.validateErr
-	}
 	return s.current[file] == hash, nil
 }
 
-// --- L3 helpers -------------------------------------------------------------
+// --- scope review helpers ---------------------------------------------------
 
-// l3ScopeReview builds an attestation that answers all eight required
+// allCategoriesReview builds an attestation that answers all eight required
 // categories, so a row exercises the guard it names rather than
 // ScopeReview.Validate's completeness check. Only the target category carries
 // references; every other category is answered with an explicit note, which is
 // what the model requires of a category with no references.
-func l3ScopeReview(manifestHash string, scopeVersion int, target model.ScopeReviewCategory,
+func allCategoriesReview(manifestHash string, scopeVersion int, target model.ScopeReviewCategory,
 	refs []model.ClaimReference) *model.ScopeReview {
 	categories := []model.ScopeReviewCategory{
 		model.ReviewCompleteFilesRead, model.ReviewCallersConsumers, model.ReviewContractsTypes,
@@ -1579,10 +1558,10 @@ func l3ScopeReview(manifestHash string, scopeVersion int, target model.ScopeRevi
 	return review
 }
 
-// --- L5 scenario ------------------------------------------------------------
+// --- capsule scenarios ------------------------------------------------------
 
-// capsuleIsDeterministic protects the Section 17.3 identity rule and ruling Q11
-// together, because the same seal answers both: the canonical hash is derived
+// capsuleIsDeterministic protects the Section 17.3 identity rule and the
+// write-once seal together, because the same seal answers both: the canonical hash is derived
 // from the capsule's semantics and never from when it was built, and a repeated
 // completion returns the FIRST stored capsule rather than recomputing one and
 // writing over the sealed identity.
@@ -1602,7 +1581,7 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	// This row seals under a satisfied strict gate, and Capsule.Validate refuses
 	// that beside recorded waivers, so the fixture's waiver is withdrawn whole:
 	// the flag and the record it is derived from. The waived capsule is the row
-	// below; the waiver's own readiness invariant is L4's.
+	// below; the waiver's own readiness invariant is a readiness row.
 	h.file(fixtureSession, fileWaived).waived = false
 	h.store.sessions[fixtureSession].waivers = nil
 
@@ -1720,15 +1699,15 @@ func capsuleRowKeys(t *testing.T, svc *Service, list model.CapsuleList) []string
 	}
 }
 
-// --- L4 helpers -------------------------------------------------------------
+// --- readiness helpers ------------------------------------------------------
 
 // fixtureScopeReview is a current, non-blocking attestation for one actor,
 // written straight into the fake by the rows that need the gate's review
-// precondition already satisfied. Record is another lane's surface and these
-// rows are about the gate, not about how an observation is persisted; the
-// attestation itself is built by l3ScopeReview rather than a second builder.
+// precondition already satisfied. These rows are about the gate, not about how
+// Record persists an observation; the attestation itself is built by
+// allCategoriesReview rather than a second builder.
 func fixtureScopeReview(session model.SessionID, actor string, scopeVersion int) model.Observation {
-	review := l3ScopeReview(fixtureID("manifest", "canonical"), scopeVersion, "", nil)
+	review := allCategoriesReview(fixtureID("manifest", "canonical"), scopeVersion, "", nil)
 	req := model.ObservationRequest{
 		SessionID: session, ActorID: actor, ExpectedScope: scopeVersion,
 		Kind: model.ObservationScopeReview, Review: review, Note: "scope reviewed",
@@ -1783,13 +1762,13 @@ func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
 	}
 }
 
-// --- INT scenarios ----------------------------------------------------------
+// --- lifecycle scenarios ----------------------------------------------------
 
 // supersededByNewerGeneration arranges every Section 16.3 precondition and then
 // publishes a newer generation without touching one byte of pinned source.
 //
-// The mutation this protects against is the one the service actually had before
-// integration: Superseded derived from Validator.Current. Under that derivation
+// The mutation this protects against is Superseded derived from
+// Validator.Current. Under that derivation
 // this row's session reports Superseded false and ReadyForImplementation true,
 // because no file moved -- which is exactly the false write permission the flag
 // exists to withhold.
@@ -1847,15 +1826,14 @@ func supersededByNewerGeneration(t *testing.T, h *harness) {
 }
 
 // sessionLifecycle drives one session through the whole workflow service with
-// every lane's real implementation behind it: Record -> Status -> Advance to
+// every real operation behind it: Record -> Status -> Advance to
 // consolidate -> seal on Advance to complete -> both capsule read paths ->
 // Close.
 //
 // The coverage half of Section 16 (plan, read, acknowledge) is coverage.Service's
 // and is not reachable from this package's fake, so the read side is arranged as
 // the fixture state those operations would have produced -- confirmed ranges on
-// every required file. What this row proves is the workflow seam, which is the
-// only seam Task 17 owns.
+// every required file. What this row proves is the workflow seam.
 func sessionLifecycle(t *testing.T, h *harness) {
 	ctx := context.Background()
 
@@ -1871,7 +1849,7 @@ func sessionLifecycle(t *testing.T, h *harness) {
 	// it from its own request before the write. A service that stored anything
 	// else would break idempotency on retry without any error being raised.
 	full := h.file(fixtureSession, fileFull)
-	review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
+	review := allCategoriesReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
 		[]model.ClaimReference{{Source: &model.SourceCitation{
 			FileID: fileFull, ContentHash: full.hash,
 			Bytes: model.ByteRange{Start: 0, End: 100},

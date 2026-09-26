@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L1. It holds
-// Section 15.2 seed extraction: explicit seeds, backticked identifiers, path tokens, qualified identifiers, exact resolution, lexical terms and changed files, in that order, preserving ambiguity.
+// This file holds Section 15.2 seed extraction: explicit seeds, backticked identifiers, path tokens, qualified identifiers, exact resolution, lexical terms and changed files, in that order, preserving ambiguity.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 package context
 
 import (
@@ -26,7 +25,7 @@ import (
 // bounds; an empty or wholly ambiguous scope is a discovery answer, never an
 // error (Section 15.2).
 type seedSet struct {
-	// sink is where every admitted candidate goes AS IT IS FOUND (ruling C10).
+	// sink is where every admitted candidate goes AS IT IS FOUND.
 	// The candidate set is the repository-sized half of discovery -- the
 	// lexical tier and the changed-file step both page to exhaustion -- so it
 	// is never accumulated here; a producer pushes and the expansion's sorts
@@ -48,8 +47,9 @@ type seedSet struct {
 }
 
 // seedSink is what a Section 15.2 producer writes to. It is the boundary
-// ruling C10 draws: discovery pushes, the expansion's sorts hold, and nothing
-// between them grows with the number of seeds a repository answers.
+// between discovery and expansion: discovery pushes, the expansion's sorts
+// hold, and nothing between them grows with the number of seeds a repository
+// answers.
 type seedSink interface {
 	// Admit takes one discovered seed, in discovery order.
 	Admit(candidate) error
@@ -505,11 +505,10 @@ func (c *Compiler) pageLimit() int {
 
 // pageLimitNotice is the disclosure that goes with pageLimit's clamp.
 //
-// model.MaxPageItems stays: a page size is a bound on ONE read and on the wire
-// shape of a page, not on the answer -- every identity past it is read by the
-// next page -- so it is not the kind of cap this wave removes. What it stopped
-// being is silent. A configured resources.max_page_items above the wire ceiling
-// is reported as "requested N, effective M" on the manifest, so an operator who
+// model.MaxPageItems is a bound on ONE read and on the wire shape of a page,
+// not on the answer: every identity past it is read by the next page. It is
+// not silent either. A configured resources.max_page_items above the wire
+// ceiling is reported as "requested N, effective M" on the manifest, so an operator who
 // raised the setting and saw no change learns why from the answer instead of
 // from the source.
 //

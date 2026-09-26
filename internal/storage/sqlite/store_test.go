@@ -1086,12 +1086,12 @@ func TestStorePublicationScenario(t *testing.T) {
 	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
 		t.Fatalf("RetainByRef(unlimited refs) = %+v, want every one of the four refs retained and the two failed generations swept", r1)
 	}
-	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
+	// max_retained_bytes = 0 is unlimited but still measures what a
 	// stricter limit could free, so `status` can warn before a disk fills. A
 	// silent zero here is a warning that never fires.
 	if r1.BytesReclaimable <= 0 {
 		t.Fatalf("RetainByRef(%+v) reported no reclaimable bytes although two non-active "+
-			"generations are retained; ruling Q10 measures it even when unlimited", r1)
+			"generations are retained; it is measured even when retention is unlimited", r1)
 	}
 	for _, gen := range []model.GenerationID{gen2, genCarry, genOwn, genStale} {
 		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {
@@ -1220,7 +1220,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// capture publishes the same content again; otherwise a snapshot could
 	// name a blob that collection is about to remove.
 	//
-	// L3a row (b). The restore keeps the demoted row's blob_blocks and
+	// Grace protocol row (b). The restore keeps the demoted row's blob_blocks and
 	// line_checkpoints -- that is why the grace protocol deletes the blobs row
 	// and lets the cascade take them, never the other way round. A restore
 	// that produced a ready blob with no blocks reads as present everywhere
@@ -1431,7 +1431,7 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
 //
-// The identity and interned-string columns are surrogates (schema.sql S-1..S-3)
+// The identity and interned-string columns are surrogates (schema.sql)
 // and are compared as they are stored. Both sides of the comparison are units
 // of the SAME database, where one surrogate is one canonical identity, so
 // comparing surrogates is exactly as strong as comparing the canonical ids --
@@ -1925,7 +1925,7 @@ func blobRowCounts(t *testing.T, raw *sql.DB, hash []byte) (blocks, lines int) {
 	return blocks, lines
 }
 
-// L3a row (a). The Section 10.4 grace protocol deletes a blob only after a
+// Grace protocol row (a). The Section 10.4 grace protocol deletes a blob only after a
 // further reachability check made inside the deleting transaction. A blob that
 // becomes referenced again after it was trashed -- an open session's manifest,
 // a unit input written while the collector was between phases -- must be

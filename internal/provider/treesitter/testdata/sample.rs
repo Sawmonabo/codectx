@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet as Set};
 use std::fmt;
+use std::io::{self, Write};
 
 /// Non-ASCII: héllo → 日本
 pub const GREETING: &str = "héllo → 日本";
@@ -19,8 +20,11 @@ impl Server {
     pub fn start(&self) -> usize {
         fn inner(n: &str) -> usize { helper(n) }
         let m: HashMap<String, Set<u8>> = HashMap::new();
-        inner(&self.name) + m.len()
+        io::stdout().flush().ok();
+        inner(&self.name) + m.len() + self.width()
     }
+
+    fn width(&self) -> usize { self.port as usize }
 }
 
 fn helper(name: &str) -> usize { name.len() }

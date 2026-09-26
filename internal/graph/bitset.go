@@ -251,7 +251,7 @@ func bitsetSet[T ~uint64](b *pagedBitset, refs []T) (int64, error) {
 // walk into a set smaller than the count it discloses.
 func (b *pagedBitset) sync() error {
 	// Nothing on disk and no directory to put it in: the set is resident pages
-	// only, and syncing it would be the eager creation item 6 removes. The
+	// only, and syncing it would create a directory eagerly for nothing. The
 	// pages reach disk when one is evicted or when the walk detaches, which is
 	// the only moment a later request can read them.
 	if b.f == nil && !b.home.exists() {

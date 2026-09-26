@@ -1472,7 +1472,7 @@ func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, a
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
-			// Digest Section 11: errors.As, never a type assertion, so a
+			// errors.As, never a type assertion, so a
 			// joined error is unwrapped rather than silently taking the
 			// not-expired branch.
 			var typed *model.Error
@@ -1541,7 +1541,7 @@ func (s *Store) WaiversAfter(ctx context.Context, session model.SessionID, actor
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
-			// Digest Section 11: errors.As, never a type assertion, so a
+			// errors.As, never a type assertion, so a
 			// joined error is unwrapped rather than silently taking the
 			// not-expired branch.
 			var typed *model.Error

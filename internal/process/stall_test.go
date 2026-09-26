@@ -13,7 +13,7 @@ import (
 )
 
 // TestStalledTreeIsTerminatedAndProgressingTreeIsNot protects the one
-// invariant the wall-clock timeout cannot express (Q4): with no wall clock at
+// invariant the wall-clock timeout cannot express: with no wall clock at
 // all, a wedged child must still be stopped, and a slow-but-working child must
 // still be allowed to finish. Both halves are needed -- a detector that only
 // killed would be a timeout under another name.

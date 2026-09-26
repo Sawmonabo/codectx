@@ -250,13 +250,17 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		return nil, internal("database path: " + err.Error())
 	}
 	if opts.ReadOnly {
-		// A read-only open creates nothing, so there is no directory to make
-		// and a database that is not there is the workspace nothing has ever
-		// published -- reported here, in the typed answer that sends the
-		// operator to `codectx index`, because the read-only handle cannot
+		// A read-only open creates neither the data directory nor the
+		// database, so a database that is not there is the workspace nothing
+		// has ever published -- reported here, in the typed answer that sends
+		// the operator to `codectx index`, because the read-only handle cannot
 		// reach the schema check to report it. The engine's read-only mode
 		// refuses to create the file at all, and without this the operator
-		// would read the driver's own "unable to open database file".
+		// would read the driver's own "unable to open database file". What it
+		// may create is beside an existing database: in a directory it can
+		// write, the engine makes the log's shared-memory index and a
+		// zero-length log where they are missing, because reading a log needs
+		// them; in one it cannot write, nothing (see unchangingRead).
 		if _, statErr := os.Stat(abs); errors.Is(statErr, fs.ErrNotExist) {
 			return nil, notPublishedYet()
 		} else if statErr != nil {
@@ -325,7 +329,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// carries the same view of the file.
 	immutable := false
 	if opts.ReadOnly {
-		if immutable, err = immutableAnswer(ctx, abs, readerPragmas); err != nil {
+		if immutable, err = unchangingRead(abs); err != nil {
 			return nil, err
 		}
 	}
@@ -346,8 +350,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// A writer-bearing process creates the schema when the cache is empty; a
 	// read-only one verifies the fingerprint it finds. The verification is the
 	// same comparison, run on the reader pool, so it neither begins a write
-	// transaction nor waits for one another process holds -- which is what
-	// made every report fail while a run was ingesting.
+	// transaction nor waits for one another process holds.
 	switch {
 	case opts.ReadOnly:
 		err = s.verifySchema(ctx)
@@ -372,7 +375,9 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
-	s.tokenizer, err = openPool("", nil, "deferred", 1, false, false)
+	// Its cache is stated so the base footprint counts what it runs with.
+	tokenizerCache := "-" + strconv.Itoa(config.TokenizerCacheKiB)
+	s.tokenizer, err = openPool("", []pragma{{"cache_size", tokenizerCache, tokenizerCache}}, "deferred", 1, false, false)
 	if err != nil {
 		s.closeOpened()
 		return nil, err
@@ -400,7 +405,7 @@ type pragma struct {
 // openPool builds one connection pool over path. readOnly opens every
 // connection of it in the engine's own read-only mode; immutable additionally
 // declares the file unchanging, which is what a store on media this process
-// cannot write needs and nothing else may claim (see immutableAnswer).
+// cannot write needs and nothing else may claim (see unchangingRead).
 //
 // readOnly is what query_only does not do: query_only refuses writes through SQL, and leaves the handle
 // read-WRITE at the file level, so the last connection to close still runs the
@@ -441,52 +446,89 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOn
 	return db, nil
 }
 
-// immutableAnswer reports whether a read-only open of this store has to declare
-// the database unchanging, which is the one way a store on media this process
-// cannot write can be read at all.
+// dirAccess is what a probe of the data directory learned about whether this
+// process may create files in it.
+type dirAccess int
+
+const (
+	dirAccessUnknown dirAccess = iota
+	dirWritable
+	dirReadOnly
+)
+
+// unchangingRead decides, before any connection exists, whether a read-only
+// open of this store must declare the database unchanging, which is the one way
+// a store on media this process cannot write can be read at all.
 //
-// A write-ahead-log database is normally read through the shared-memory index
-// beside it, and a reader CREATES that index where it is missing. On a data
-// directory this process may not write -- read-only media, a workspace an
-// operator has locked down, a mount taken read-only for an audit -- it cannot,
-// and the engine refuses the open outright ("attempt to write a readonly
-// database"). Declaring the file immutable is what lets the engine read the
-// database without an index, and it is a claim about the file, so it is made
-// only where the file cannot change: when the ordinary open is refused AND no
-// log lies beside the database. A log is what a writer appends to, and creating
-// one needs write on the very directory that just refused this process, so a
-// store with no log under a directory nobody may write has nothing that could
-// change under this answer. Where a log IS there, the refusal is returned as
-// it came: reading a database a writer may be appending to as though it were
-// frozen would answer from a torn view of it.
-func immutableAnswer(ctx context.Context, path string, pragmas []pragma) (bool, error) {
-	db, err := openPool(path, pragmas, "deferred", 1, true, false)
+// A write-ahead-log database is read through the shared-memory index beside the
+// log, and a reader CREATES that index where it is missing. In a data directory
+// this process may not write -- read-only media, a workspace an operator has
+// locked down, a mount taken read-only for an audit -- it cannot, so the
+// decision is made from the directory itself (see probeDirAccess) and from what
+// lies beside the database, never from how an attempted open failed:
+//
+//   - A writable directory, or one whose writability this platform cannot
+//     probe, is opened the ordinary read-only way.
+//   - An unwritable directory with no log beside the database, or a zero-length
+//     one, is read as an unchanging file. A log with no frames holds nothing
+//     the database lacks, and a new frame needs a writer that can write the
+//     directory this process cannot.
+//   - An unwritable directory whose log holds frames AND whose index is beside
+//     it is opened the ordinary read-only way: the engine reads the log through
+//     the existing index without writing either.
+//   - An unwritable directory whose log holds frames and has no index is
+//     refused (logUnreadable). The log is the newest state of the database;
+//     reading the database as unchanging without it would answer from an older
+//     state, and without an index the engine cannot read the log at all.
+func unchangingRead(path string) (bool, error) {
+	dir := filepath.Dir(path)
+	access, err := probeDirAccess(dir)
 	if err != nil {
-		return false, err
+		return false, internal("data directory " + dir + ": " + err.Error())
 	}
-	defer db.Close()
-	pingErr := db.PingContext(ctx)
-	if pingErr == nil {
+	if access != dirReadOnly {
 		return false, nil
 	}
-	// Only the engine REFUSING TO WRITE is the case this answers. A corrupt
-	// database, a busy one, a foreign schema, a device error: each has its own
-	// family and its own remedy, and opening any of them a second time as an
-	// unchanging file would replace the answer the operator needs with a
-	// second, stranger failure.
-	var se *sqlite.Error
-	if !errors.As(pingErr, &se) || se.Code()&0xff != sqlite3.SQLITE_READONLY {
-		return false, wrap("open read-only", pingErr)
-	}
-	if _, statErr := os.Stat(path + walSuffix); errors.Is(statErr, fs.ErrNotExist) {
+	log, err := os.Stat(path + walSuffix)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, internal("write-ahead log: " + err.Error())
+	case log.Size() == 0:
 		return true, nil
 	}
-	return false, wrap("open read-only", pingErr)
+	switch _, err := os.Stat(path + shmSuffix); {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, logUnreadable(path, dir, log.Size())
+	default:
+		return false, internal("write-ahead log index: " + err.Error())
+	}
 }
 
-// walSuffix names the write-ahead log beside a database, which is the engine's
-// own naming and not a choice this package makes.
-const walSuffix = "-wal"
+// logUnreadable is the refusal of a store whose newest state is in a log this
+// process can neither read nor fold into the database. It is the operator's to
+// fix, in the family a data directory the process must write and cannot is
+// reported in.
+func logUnreadable(path, dir string, logBytes int64) *model.Error {
+	return &model.Error{Code: model.CodeConfigInvalid,
+		Message: fmt.Sprintf("the write-ahead log beside %s holds %d bytes not yet folded into the database, "+
+			"and %s cannot be written, so the log's index cannot be created and the log cannot be read; "+
+			"reading the database without it would answer from an older state", path, logBytes, dir),
+		Remediation: "Make " + dir + " writable and run `codectx index` once, which folds the log into the " +
+			"database; or copy the data directory to writable storage and set storage.data_dir to the copy.",
+		Details: map[string]string{"wal_bytes": strconv.FormatInt(logBytes, 10)}}
+}
+
+// walSuffix and shmSuffix name the write-ahead log and its shared-memory index
+// beside a database, which is the engine's own naming and not a choice this
+// package makes.
+const (
+	walSuffix = "-wal"
+	shmSuffix = "-shm"
+)
 
 // verifiedConnector wraps the driver connector so every physical connection
 // database/sql opens has its pragmas read back before it joins the pool.
@@ -898,8 +940,7 @@ func wrap(op string, err error) error {
 // and growing the database or the log raises the write/sync/truncate members
 // of the same family, whose PRIMARY code is SQLITE_IOERR (10) -- so a switch
 // on `code & 0xff` would see only SQLITE_IOERR and report CTX_INTERNAL for a
-// disk that is simply full (proved on a filled tmpfs: connect failed with
-// 4874).
+// disk that is simply full.
 //
 // The full extended code is therefore tested, and only the members a space
 // exhaustion actually raises are listed: SQLITE_IOERR_READ, _CORRUPTFS, _DATA

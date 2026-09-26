@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,7 +28,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/joern"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphengine"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
@@ -63,38 +62,30 @@ const (
 	spoolsDirName  = "spools"
 )
 
-// spoolBudgetDivisor is what the shared temporary-file budget is divided by to
-// size the query spools. resources.max_temp_bytes is not a per-consumer budget:
-// the same key is already the whole disk budget of both process runners
-// (compose.go, the shared and parser runners below), so handing the spools the
-// undivided key would let three independent consumers each believe they own it.
-// A query's spools are the smallest of the three claims -- one bounded page of
-// ranked records per live cursor -- so they take the smallest share.
+// spoolBudgetDivisor is what resources.max_temp_bytes is divided by to size
+// the query spools' share of it. The key is one total over every consumer of
+// temporary disk that it bounds: the query spools take this share, and the
+// shared process runner -- the only runner whose children stage temporary
+// bytes -- takes the rest (tempDiskShares). The parser workers exchange
+// everything over pipes and reserve no disk, so they hold no share.
 //
 // The divisor stays a DERIVATION and is deliberately not a `resources.spool_bytes`
-// key. A second key would let an operator set the three shares so they oversubscribe
-// the one budget `max_temp_bytes` exists to cap, which is the failure the single key
-// prevents; and the quantity an operator actually reasons about -- total temporary
-// disk -- is already settable. 8 is the share, not a cap on any one query: three
-// consumers (shared runner, parser runner, spools) claim the budget, the spools are
-// the smallest and shortest-lived claim, and the remaining headroom absorbs the two
-// process runners' bursts. To give queries more room, raise `resources.max_temp_bytes`.
+// key. A second key would let an operator set the shares so they oversubscribe
+// the one budget `max_temp_bytes` exists to cap, which is the failure the single
+// key prevents; and the quantity an operator actually reasons about -- total
+// temporary disk -- is already settable. 8 is the share, not a cap on any one
+// query: the spools hold one bounded page of ranked records per live cursor,
+// the smaller and shorter-lived of the two claims, and the runner's children
+// stage whole materializations. To give queries more room, raise
+// `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
-// parserWorkerReservationBytes is what one tree-sitter worker is admitted
-// against, and therefore what the parser runner's budget is sized from. It is
-// the provider's own default restated here so one number sizes both sides
-// rather than a budget guessing at a default it cannot see.
-//
-// Task 20 measured it on this host, with the real worker subprocess and all
-// pinned grammars loaded: one worker peaks at 38.9 MiB over ordinary repository
-// files and grows linearly at about 30.5 MiB per MiB of source, reaching
-// 191.5 MiB at `workspace.max_parse_file_bytes = 5 MiB`. Ledger 113's "roughly
-// seven times over-reserved" reproduces exactly -- but only for ordinary files.
-// Re-pinning to the ~37 MiB that measurement suggests would let a worker exceed
-// its own admission reservation five-fold on a single legal file, so the pin
-// stays at 256 MiB, which leaves about a third of headroom over the parse
-// ceiling. The measurement, not the round number, is the reason.
+// parserWorkerReservationBytes is the memory one parser worker reserves from
+// the admission ledger while it runs, and the smallest budget the parser
+// runner beneath that ledger is given, so the runner can always hold one
+// worker the ledger admitted alone. It is one fixed figure for every worker,
+// whatever the file it parses: it has to cover a worker parsing a file at the
+// largest size workspace.max_parse_file_bytes admits, not an ordinary one.
 const parserWorkerReservationBytes int64 = 256 << 20
 
 // collectorBatchLimit bounds every phase of one retention pass. It restates
@@ -148,24 +139,40 @@ const unobservedFreeDiskBytes int64 = 1 << 30
 // reason: the ledger observes nothing. What it cannot see is the space another
 // process on the same device takes while this one runs, which is why the floor
 // exists and why the store still attributes a refused write against free space
-// at the moment it fails.
-func freeDiskAllocation(dataDir string, floorBytes int64) int64 {
+// at the moment it fails. The flag is false exactly when the figure is the
+// stand-in, so nothing downstream publishes it as a measurement.
+func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 	free, ok := diskfree.Available(dataDir)
 	if !ok {
 		slog.Warn("this host reports no free-space figure for the data directory, so heavy children are admitted against a conservative stand-in rather than a measurement",
 			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
-		return unobservedFreeDiskBytes
+		return unobservedFreeDiskBytes, false
 	}
-	if free > math.MaxInt64 {
-		free = math.MaxInt64
-	}
+	// A measured figure always fits int64: diskfree.Available reports a
+	// product that would not round-trip as unmeasured.
 	allocation := int64(free) - floorBytes
 	if allocation <= 0 {
 		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
 			"component", "app", "data_dir", dataDir, "free_bytes", free, "min_free_disk_bytes", floorBytes)
-		return 0
+		return 0, true
 	}
-	return allocation
+	return allocation, true
+}
+
+// tempDiskShares splits resources.max_temp_bytes into the shared runner's
+// disk budget and the query spools' budget so the two sum to exactly the
+// ceiling the operator set. Zero, the default, is unlimited and stays
+// unlimited on both sides. Neither share of a set ceiling may round to zero,
+// because zero is read as unlimited by both consumers, so the spools take at
+// least one byte. The runner keeps at least one byte too: validation requires
+// a set ceiling to exceed resources.min_free_disk_bytes, which is positive, so
+// a set ceiling is at least two bytes.
+func tempDiskShares(total int64) (runner, spools int64) {
+	if total <= 0 {
+		return 0, 0
+	}
+	spools = max(total/spoolBudgetDivisor, 1)
+	return total - spools, spools
 }
 
 // childSlots is that division: how many children of the smallest possible size
@@ -189,16 +196,15 @@ const (
 	// directories, which is what opening a store means -- so `codectx status`
 	// answers while a `watch` session holds the workspace instead of being
 	// refused for a lock it does not need: Section 12.3 makes the active
-	// generation immutable once published, and a report reads only that
-	// (ledger 159 keeps the same path from installing anything, which the
-	// providers now honour by construction).
+	// generation immutable once published, and a report reads only that. The
+	// providers install nothing on this path by construction.
 	modeReport
 	// modeQuery composes for a command that only answers questions: it takes
 	// no lock and, beyond what modeReport already withholds, opens the store
-	// with NO writer connection at all. Every write a query process used to
-	// perform -- the schema check inside a write transaction at open, and the
-	// retention lease each pinned generation inserted -- waited on the write
-	// transaction a concurrent run holds, so a second process was refused
+	// with NO writer connection at all. Any write a query process performed
+	// -- a schema check inside a write transaction at open, a retention lease
+	// inserted per pinned generation -- would wait on the write transaction a
+	// concurrent run holds, so a second process would be refused
 	// `database is busy` for the whole of an index. A reader pool on a
 	// write-ahead log never waits on a writer, so this composition answers
 	// throughout a run and delays none of it.
@@ -212,17 +218,17 @@ const (
 	// modeServe composes for the one process that is BOTH: the MCP server
 	// indexes on request and answers questions for the same client, in the
 	// same process, at the same time. It opens a SECOND, read-only handle on
-	// the same database for the read path. Without it every tool call pinned a
+	// the same database for the read path. Without it every tool call would pin a
 	// generation through the writer, and pinning writes a retention lease:
 	// that write force-commits whatever ingestion group the session's own
 	// refresh has open and then waits behind the writer, so one agent query
-	// both cut the run's group short and blocked on it. The reader handle has
+	// would both cut the run's group short and block on it. The reader handle has
 	// no writer connection at all, so a tool call cannot reach either.
 	//
 	// What it does NOT do at startup is take the workspace lock or write. An
 	// agent's server must come up and answer beside an index the person
-	// started in a terminal, and a server that took the lock at its open was
-	// refused outright for the whole of that run -- every exploration tool
+	// started in a terminal, and a server that took the lock at its open would
+	// be refused outright for the whole of that run -- every exploration tool
 	// with it, none of which needs the lock or the writer. So the read-only
 	// handle opens first, the store is opened LazyWriter, and the lock, the
 	// startup recovery and the collection pass are taken at the first
@@ -235,8 +241,8 @@ const (
 	//
 	// The reason is the same one and so is the mechanism. A watch is idle
 	// between its beats, and a session that owned the workspace while it was
-	// idle refused the person's own `codectx index` in the next terminal for
-	// as long as the watch happened to be running -- for nothing, because a
+	// idle would refuse the person's own `codectx index` in the next terminal
+	// for as long as the watch happened to be running -- for nothing, because a
 	// watch between beats is building nothing. So the store opens LazyWriter,
 	// and the lock, the startup recovery and the collection pass are taken by
 	// the beat that builds (Coordinator.reconcile) and given back when that
@@ -309,11 +315,11 @@ type stack struct {
 	root    workspace.Root
 	cfg     config.Config
 	dataDir string
-	// engineTemp is the process temp directory this composition fell back to
-	// for the engine's spills because the data directory would not take them,
-	// and which it therefore owns and gives back at Close. Empty whenever the
-	// spills went where they belong, under the data directory, which no
-	// composition owns alone and none removes.
+	// engineTemp is the directory in the process temp directory an answering
+	// composition gave the engine's spills because it found no writable one
+	// under the data directory (setEngineTempDir); it owns it and gives it
+	// back at Close. Empty whenever the spills go under the data directory,
+	// which no composition owns alone and none removes.
 	engineTemp string
 	store      *sqlite.Store
 	// ledger is this process's run accounting: a stable handle composed by
@@ -392,21 +398,33 @@ type stack struct {
 	queryStore  *sqlite.Store
 	querySearch *search.Service
 	// workflow is the Section 17 guard, review and capsule service the facade
-	// routes every session mutation through. INT wires it.
+	// routes every session mutation through. openWorkflow builds it.
 	workflow *workflow.Service
 
 	// runners are every process runner this stack owns, held only so the
 	// resource sampler can count their live children. Nothing else reads them:
 	// each component keeps its own runner.
 	runners []diagnostics.ProcessCounter
-	// admission is the ONE memory admission ledger of this process, built here
-	// from the one observation of the machine and handed to every reserver:
+	// admission is the one reservation ledger, for memory and disk, of this
+	// process, built here from the one observation of the machine and the one
+	// of the data directory's free space, and handed to every reserver:
 	// the heavy-unit scheduler inside the coordinator, the language-server
 	// manager, and the resource block that discloses it. There is no second
 	// one -- a reserver with a running total of its own is bounded by the same
 	// allocation as this one and nothing sums the two, which is a process free
 	// to reserve a multiple of the machine's memory.
 	admission *admission.Ledger
+	// machine is the one observation of the host this process takes. The
+	// admission allocation is derived from it, and it is handed to the
+	// coordinator's planner and the dependence provider so every heavy unit is
+	// sized against the reading it is admitted against.
+	machine dependence.Machine
+	// admissionMemoryObserved and admissionDiskObserved say whether each of
+	// the ledger's allocations came from a reading of this host rather than a
+	// stand-in, so the resource block never publishes a stand-in as a
+	// measurement.
+	admissionMemoryObserved bool
+	admissionDiskObserved   bool
 	// diagnose produces the Section 22 check list and the Section 23 resource
 	// block; collector is the process-level reclaim pass and the Section 10.4
 	// blob grace protocol. Both are set by openDiagnostics, which needs the
@@ -447,7 +465,7 @@ type stack struct {
 func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err error) {
 	// os.Executable is resolved once, here, and a failure is fatal: every
 	// later reader of this path would otherwise silently fall back to argv[0],
-	// which a caller controls (ledger 113, 126).
+	// which a caller controls.
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeInternal,
@@ -526,8 +544,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 
 	// Section 13.2's single cross-process owner governs indexing. A report
-	// publishes nothing, so it takes no lock: the writer lock on this path made
-	// `codectx status` permanently refused while a `watch` session ran, with a
+	// publishes nothing, so it takes no lock: a writer lock on this path would
+	// refuse `codectx status` for as long as a `watch` session runs, with a
 	// remediation ("wait for the running process to finish") that a watch never
 	// satisfies. internal/index refuses its building entry points when Lock is
 	// nil, so the absence is enforced there rather than trusted here. The
@@ -584,9 +602,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 	// The content store opens before the database: it holds no lock and no
 	// state of its own. A composition that only answers opens it for reading,
-	// which creates nothing and refuses every storing entry point: this is the
-	// open that used to bring a workspace into being -- and fail outright on
-	// one an operator had made read-only -- before anything had read a byte.
+	// which creates nothing and refuses every storing entry point, so a
+	// workspace is never brought into being by a query -- and one an operator
+	// made read-only is never refused -- before anything has read a byte.
 	if o.mode == modeQuery {
 		s.cas, err = snapshot.OpenCASForReading(snapshot.CASDir(s.dataDir))
 	} else {
@@ -667,8 +685,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
+	runnerDisk, spoolDisk := tempDiskShares(cfg.Resources.MaxTempBytes)
 	if s.spools, err = pagination.NewSpools(filepath.Join(s.dataDir, workDirName, spoolsDirName),
-		cfg.Resources.MaxTempBytes/spoolBudgetDivisor, s.store); err != nil {
+		spoolDisk, s.store); err != nil {
 		return nil, err
 	}
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
@@ -685,52 +704,85 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// configuration rather than read from a constant: the reservations this
 	// process makes up front grow with the core count, so a host with more
 	// cores keeps more for itself and offers its children less. The same
-	// figure sizes the units (the governor below), so on a host whose memory
-	// can be observed a unit is sized against the allocation it is admitted
-	// against. Where the host publishes no figure the two deliberately differ:
-	// sizing invents no bound there and admission stands one in. That is
-	// stated on both sides in govern.go and is an open question, not a claim
-	// that they always agree.
-	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
+	// reading and the same footprint size the units (the planner and the
+	// dependence provider are handed s.machine), so a unit is sized against
+	// the allocation it is admitted against.
+	//
+	// The machine is read once. On a host that exposes available memory the
+	// allocation is that reading, and where nothing is left over the
+	// footprint it is zero: an observation under which the ledger runs heavy
+	// children one at a time. Only a host that exposes no figure gets the
+	// stand-in; composition warns about it once, as it does about an observed
+	// zero, and the ledger's surfaces are told it is not an observation.
+	s.machine = dependence.ObserveMachine()
+	var childMemory int64
+	childMemory, s.admissionMemoryObserved = s.machine.SchedulingAllocation(config.BaseFootprint(cfg))
+	switch {
+	case !s.admissionMemoryObserved:
+		slog.Warn("this host publishes no available-memory figure, so heavy children are admitted against a stand-in allocation that is not an observation",
+			"component", "app", "stand_in_allocation_bytes", childMemory)
+	case childMemory == 0:
+		slog.Warn("this host has no available memory beyond this process's own footprint, so heavy children run one at a time",
+			"component", "app", "available_bytes", s.machine.AvailableBytes)
+	}
 	// Disk is the ledger's second dimension and is observed the same way: the
 	// free space under the data directory, less the floor the host keeps, is
 	// what the children may stage between them. It is observed here, once, for
 	// the reason the memory allocation is -- the ledger observes nothing and
 	// derives nothing -- and a child that does not fit it waits rather than
 	// filling the device.
-	childDisk := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
+	var childDisk int64
+	childDisk, s.admissionDiskObserved = freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
 	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
-	// resources.max_temp_bytes is passed through UNCLAMPED, including its
-	// unlimited default of 0: the runner reads a non-positive disk budget as
-	// unlimited and admits every reservation, so the default never refuses a
-	// child at admission. Only a value the operator set refuses one, and it
-	// says so with resources.max_temp_bytes named in the error.
+	// The runner's share of resources.max_temp_bytes (tempDiskShares) is its
+	// disk budget, including the unlimited default of 0: the runner reads a
+	// non-positive disk budget as unlimited and admits every reservation, so
+	// the default never refuses a child at admission. Only a ceiling the
+	// operator set refuses one, and it says so with resources.max_temp_bytes
+	// named in the error.
+	//
 	// The runner beneath the admission gate must never refuse what the gate
-	// admitted. The gate runs a child larger than the whole allocation ALONE
-	// rather than refusing it, and a unit's reservation is its heap cap --
-	// itself bounded by the allocation -- plus the memory its family keeps
-	// outside the heap, so the largest child a unit can present is always
-	// larger than the allocation. A runner budgeted at the allocation would
-	// refuse precisely that unit, with the resource-limit error the whole
-	// memory ruling exists to avoid. This is the same rule the language-server
-	// runner below states: the budget is wide enough for the largest child the
-	// gate above it can admit.
+	// admitted, in memory. The gate runs a child larger than the whole
+	// allocation ALONE rather than refusing it. A dependence unit's
+	// reservation is its heap cap -- itself bounded by the allocation -- plus
+	// the memory its family keeps outside the heap, so the largest child a
+	// unit can present is larger than the allocation; an external indexer's
+	// is its profile's fixed figure, which a small host's allocation can be
+	// below. A runner budgeted at the allocation would refuse precisely those
+	// children, with the resource-limit error memory admission exists to
+	// avoid. This is the same rule the language-server runner below
+	// states: the budget is wide enough for the largest child the gate above
+	// it can admit.
 	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
+	for _, k := range scip.Kinds {
+		if mem, _, ok := scip.ProfileReservation(scip.ProfileScope(string(k), "")); ok {
+			sharedBudget = maxInt64(sharedBudget, mem)
+		}
+	}
 	shared, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     childSlots(sharedBudget),
 		MemoryBudgetBytes: sharedBudget,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
+		DiskBudgetBytes:   runnerDisk,
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Parser workers are CPU-bound, so how many run at once is counted by
+	// cores. They exchange everything with this process over pipes and
+	// reserve no disk, so the runner holds no share of the temporary ceiling.
+	//
+	// Each worker reserves parserWorkerReservationBytes from the one admission
+	// ledger before it runs, so how many run at once is bounded by the
+	// allocation as well as by cores. The runner beneath that gate must never
+	// refuse what it admitted, and the gate runs a worker alone when the
+	// allocation holds less than one, so the runner's budget is the allocation
+	// or one worker's reservation, whichever is larger.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
-		MemoryBudgetBytes: int64(parserWorkers) * parserWorkerReservationBytes,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
+		MemoryBudgetBytes: maxInt64(childMemory, parserWorkerReservationBytes),
 	})
 	if err != nil {
 		return nil, err
@@ -770,6 +822,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if gerr != nil {
 			return nil, gerr
 		}
+		// No wall clock: every plumbing run is ended only when it stops
+		// making progress, after the package's hang-detector window.
 		if s.git, err = git.New(ctx, shared, exePath, 0); err != nil {
 			return nil, err
 		}
@@ -796,9 +850,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxWorkers:          parserWorkers,
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
-		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
 		MaxEvidencePerFact:  evidenceClip(cfg),
 		WorkerMemoryBytes:   parserWorkerReservationBytes,
+		Admission:           s.admission,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,
 		WorkDir:             tsWorkDir,
@@ -926,8 +980,8 @@ const maxRebuildAttempts = 64
 //
 // It is os.Mkdir and not os.MkdirAll because the difference is the whole
 // contract: MkdirAll accepts a directory that already exists, so two
-// `index --rebuild` runs inside the same second silently shared one cache while
-// the second run told the operator a new one had been created. An existing
+// `index --rebuild` runs inside the same second would silently share one cache
+// while the second run told the operator a new one had been created. An existing
 // directory is therefore visible here, and the name gains a `-2`, `-3`, ...
 // suffix until one is free -- the timestamp still names the run, the suffix
 // only distinguishes runs the timestamp cannot.
@@ -974,16 +1028,16 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
 		return nil
 	}
-	// Nothing here installs anything any more: the locator reports the pinned
-	// identity of a payload the store does not hold and the first unit that
-	// needs the engine resolves it. The report path therefore needs no second,
-	// force-offline resolver -- which was itself a defect, because it reported
-	// a merely-uninstalled payload as CTX_TOOL_OFFLINE and told an operator to
-	// turn off an offline mode they had never enabled.
-	locator, err := joern.NewLocator(s.resolver)
+	// Nothing here installs anything: the locator reports the pinned identity
+	// of a payload the store does not hold and the first unit that needs the
+	// engine resolves it. The report path therefore needs no second,
+	// force-offline resolver, which would report a merely-uninstalled payload
+	// as CTX_TOOL_OFFLINE and tell an operator to turn off an offline mode
+	// they never enabled.
+	locator, err := graphengine.NewLocator(s.resolver)
 	if err == nil {
-		var backend *joern.Backend
-		if backend, err = joern.New(ctx, locator, runner); err == nil {
+		var backend *graphengine.Backend
+		if backend, err = graphengine.New(ctx, locator, runner); err == nil {
 			var p *dependence.Provider
 			p, err = dependence.New(backend, dependence.Options{
 				DataDir:              s.dataDir,
@@ -993,6 +1047,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				BaseFootprintBytes:   config.BaseFootprint(s.cfg),
+				Machine:              s.machine,
 				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
 				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,
@@ -1043,45 +1098,48 @@ func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, 
 	}
 }
 
-// openQueries builds the query services that need the repository identity,
-// which only the coordinator derives. It is called by open once the coordinator
-// exists rather than from openStack, because the alternative -- re-deriving the
-// identity here -- would be a second spelling of it that silently drifts the
-// day the first one changes.
 // setEngineTempDir names where every engine handle in this process spills.
 //
 // Under the data directory, on the disk the operator gave the data. A
-// composition that only ANSWERS may find that directory unwritable -- a
-// workspace on read-only media, one an operator has locked down, one mounted
-// read-only for an audit -- and it has nothing to publish there in any case, so
-// its spills go to the process temp directory instead and it gives that
-// directory back when it closes. Falling back is what keeps such a workspace
-// answerable at all: the engine refuses a temp directory it cannot write, and
-// it refused before this process had read a byte.
+// composition that BUILDS creates that directory if it is missing and never
+// falls back: a run whose spills went to a memory filesystem is the failure
+// this directory exists to prevent, and a data directory that will not take
+// them is an operator-fixable configuration, named as one rather than reported
+// as a defect in this build.
 //
-// A composition that BUILDS never falls back. A run whose spills went to a
-// memory filesystem is the failure this directory exists to prevent, and a data
-// directory that will not take them is an operator-fixable configuration, named
-// as one rather than reported as a defect in this build.
+// A composition that only ANSWERS creates nothing under the data directory. It
+// names the directory a run made there when it exists and the engine can
+// write it. Otherwise -- a workspace nothing has built, one on read-only media,
+// one an operator has locked down -- its spills go to a directory of its own
+// in the process temp directory, which it gives back when it closes. Falling
+// back is what keeps such a workspace answerable at all: the engine refuses a
+// temp directory it cannot write, and it refused before this process had read
+// a byte.
 func (s *stack) setEngineTempDir(answersOnly bool) error {
 	under := filepath.Join(s.dataDir, engineTempDirName)
-	err := sqlite.SetTempDir(under)
-	if err == nil || !answersOnly {
-		if err != nil {
+	if !answersOnly {
+		if err := sqlite.SetTempDir(under); err != nil {
 			return dataDirNotWritable(under, err)
 		}
 		return nil
+	}
+	// SetTempDir creates a missing directory, so an answering composition
+	// hands it only one that is already there.
+	if info, err := os.Stat(under); err == nil && info.IsDir() {
+		if sqlite.SetTempDir(under) == nil {
+			return nil
+		}
 	}
 	// A directory of its own, not one named after this process: a name derived
 	// from the pid is one a killed process leaves behind and the next process
 	// to be given that pid adopts, spills and all, and one a second
 	// composition in this process would remove from under the first.
-	fallback, ferr := os.MkdirTemp("", "codectx-engine-")
-	if ferr != nil {
-		return dataDirNotWritable(os.TempDir(), ferr)
+	fallback, err := os.MkdirTemp("", "codectx-engine-")
+	if err != nil {
+		return dataDirNotWritable(os.TempDir(), err)
 	}
-	if ferr := sqlite.SetTempDir(fallback); ferr != nil {
-		return dataDirNotWritable(fallback, ferr)
+	if err := sqlite.SetTempDir(fallback); err != nil {
+		return dataDirNotWritable(fallback, err)
 	}
 	s.engineTemp = fallback
 	return nil
@@ -1098,6 +1156,11 @@ func dataDirNotWritable(dir string, cause error) error {
 		Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
 }
 
+// openQueries builds the query services that need the repository identity,
+// which only the coordinator derives. It is called by open once the coordinator
+// exists rather than from openStack, because the alternative -- re-deriving the
+// identity here -- would be a second spelling of it that silently drifts the
+// day the first one changes.
 func (s *stack) openQueries(repo model.RepositoryID) error {
 	s.repo = repo
 	svc, err := search.New(search.Options{
@@ -1152,8 +1215,7 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 //
 // Both are built in BOTH compositions. `codectx doctor` and `codectx status
 // --resources` open the workspace for a report, so building the reporter only
-// for an indexing run would leave every diagnostic command with no producer --
-// the exact failure Task 20 exists to remove.
+// for an indexing run would leave every diagnostic command with no producer.
 //
 // Every dependency crosses as a narrow interface: neither package sees
 // *sqlite.Store, *toolchain.Resolver, *snapshot.CAS or config.Config's whole
@@ -1166,16 +1228,18 @@ func (s *stack) openDiagnostics() error {
 		// The binary's own identity, read from the same source `codectx
 		// version` reads. Threading it down from the command line would be a
 		// second spelling of a fact this process can always answer for itself.
-		Build:     model.CurrentBuildInfo(),
-		Repo:      s.repo,
-		Root:      s.root.Path,
-		Admission: s.admission,
-		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
-		Store:     storeReader{Store: s.store},
-		Ledger:    runLedger{dir: dataDir},
-		Toolchain: toolchainReporter{r: s.resolver},
-		Workspace: workspaceProber{},
-		Now:       time.Now,
+		Build:                   model.CurrentBuildInfo(),
+		Repo:                    s.repo,
+		Root:                    s.root.Path,
+		Admission:               s.admission,
+		AdmissionMemoryObserved: s.admissionMemoryObserved,
+		AdmissionDiskObserved:   s.admissionDiskObserved,
+		Sampler:                 diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
+		Store:                   storeReader{Store: s.store},
+		Ledger:                  runLedger{dir: dataDir},
+		Toolchain:               toolchainReporter{r: s.resolver},
+		Workspace:               workspaceProber{},
+		Now:                     time.Now,
 	})
 	if err != nil {
 		return err
@@ -1234,8 +1298,8 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 
 // collect runs the one startup collection pass of a composition that has just
 // become the workspace's owner. It is the caller pagination.Spools.Sweep,
-// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC were
-// documented to expect and never had.
+// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC are
+// documented to expect.
 //
 // Like retention after an activation it never fails what triggered it: the
 // state it reclaims is by definition state nothing references, and the only
@@ -1487,7 +1551,7 @@ func (s *stack) locker() index.Locker {
 // indexing run would leave every one of those commands with no service.
 //
 // The store is passed as the narrow coverage.Sessions interface and the CAS
-// never leaves this file: the service sees the frozen interfaces and a Limits
+// never leaves this file: the service sees the interfaces and a Limits
 // resolved here, never *sqlite.Store's wider surface, *snapshot.CAS or
 // config.Config.
 func (s *stack) openCoverage() error {
@@ -1595,18 +1659,18 @@ func (f validatorFunc) Current(ctx context.Context, file model.FileID, hash stri
 // state of a live workspace: nothing published yet, the file absent from the
 // current snapshot, and a deletion tombstone.
 //
-// Note what this cannot decide today, so nobody reads more into it than it
+// Note what this cannot decide, so nobody reads more into it than it
 // says. A generation's snapshot is fixed when the generation begins, so while
 // the session's generation IS the active one the snapshot asked here is the
 // session's own and every pinned hash matches by construction; and when it is
 // not the active one, the gate is already shut by supersession. Precondition 7
-// is therefore subsumed by Superseded at present. It is asked separately anyway
+// is therefore subsumed by Superseded. It is asked separately anyway
 // because the two are different questions -- the readiness contract promises a
 // per-file answer, and the source that would make it decisive is a per-file
-// WORKTREE hash, which this repository does not have yet: coherence is
-// snapshot-level (HEAD plus a dirty flag, internal/index/status.go:88).
-// Ledgered for Task 20; until then the guarantee limit's "pair it with
-// expected-content-hash validation at each write" is what covers the gap.
+// WORKTREE hash, which this repository does not have: coherence is
+// snapshot-level (HEAD plus a dirty flag, internal/index/status.go). The
+// guarantee limit's "pair it with expected-content-hash validation at each
+// write" is what covers the gap.
 func (s *stack) currentSource(ctx context.Context, file model.FileID, hash string) (bool, error) {
 	snap, err := s.activeSnapshot(ctx)
 	if err != nil {
@@ -1681,10 +1745,9 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Logger: s.logger,
 		// The compile's external-sort runs live beside the query spools, under
 		// the same resources.max_temp_bytes area the workspace already sweeps
-		// and reports (ruling C5'), and SortDir is derived from the same store
-		// rather than named twice. The spool store also holds the leased state
-		// directory a deadline-interrupted compile continues from (ruling C7),
-		// which is why the signer and the lease store come with it.
+		// and reports, and SortDir is derived from the same store rather than
+		// named twice. The spool store also holds the leased state directory a
+		// deadline-interrupted compile continues from, which is why the signer and the lease store come with it.
 		Spools: s.spools,
 		Signer: s.signer,
 		Leases: s.leases,
@@ -1824,11 +1887,6 @@ func (s *stack) Close() error {
 	return errors.Join(errs...)
 }
 
-// openResolver builds one managed-toolchain resolver over a resolved
-// configuration. There is exactly one resolver per composition: `tools.offline`
-// is the only thing that refuses a fetch, because a second resolver that
-// refused them regardless reported a payload that is merely not installed as a
-// payload the operator's own offline setting withheld.
 // evidenceClip is index.max_evidence_per_fact as the finite number every
 // producer and the seal compare against. Unlimited (the default) is the model's
 // record ceiling: a fact can never carry more occurrences than the record
@@ -1838,6 +1896,11 @@ func evidenceClip(cfg config.Config) int {
 	return int(cfg.Index.MaxEvidencePerFact.ValueOr(model.MaxEvidencePerFact))
 }
 
+// openResolver builds one managed-toolchain resolver over a resolved
+// configuration. There is exactly one resolver per composition: `tools.offline`
+// is the only thing that refuses a fetch, because a second resolver that
+// refused them regardless would report a payload that is merely not installed
+// as one the operator's own offline setting withheld.
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace, while tools.cache_dir names the tool store

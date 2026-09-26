@@ -180,7 +180,7 @@ type IndexStatus struct {
 	ActivatedAt      *time.Time     `json:"activated_at,omitempty"`
 	Warnings         []string       `json:"warnings,omitempty"`
 	// Resources is the Section 23 accounting block. It is nil on an ordinary
-	// status so a cheap call stays cheap; Task 20 populates it.
+	// status so a cheap call stays cheap.
 	Resources *ResourceReport `json:"resources,omitempty"`
 	// ProvidersDisabled is what IndexResult.ProvidersDisabled is, reported by
 	// the same configuration on the same terms: the providers that are off,
@@ -236,7 +236,7 @@ func (w WatchProcess) Validate() error {
 // unavailable metric is recorded as unavailable, never as zero: a nil field
 // means "not measured on this platform or not sampled", while a zero value is a
 // real measurement of zero. Collapsing the two would let a missing RSS reading
-// read as a process using no memory. Task 20 owns measurement and populates it.
+// read as a process using no memory.
 type ResourceReport struct {
 	ParentRSSBytes        *uint64 `json:"parent_rss_bytes,omitempty"`
 	PeakParentRSSBytes    *uint64 `json:"peak_parent_rss_bytes,omitempty"`
@@ -251,7 +251,14 @@ type ResourceReport struct {
 	// AdmissionReservedBytes the sum currently reserved against it by the
 	// children running now. They are the whole of this process's heavy-memory
 	// accounting: one allocation, one total, whatever the child is. Both are
-	// absent where this process composed no admission ledger.
+	// absent where this process composed no admission ledger. The allocation
+	// is also absent -- never zero -- where it is not an observation of this
+	// host: where the platform published no available-memory figure, the
+	// ledger admits against a stand-in the process warned about once at
+	// composition, and the reserved total is still reported against it. A
+	// host that was read and has no memory to spare beyond this process's own
+	// footprint reports an allocation of zero, which is an observation: its
+	// children are then admitted one at a time.
 	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
 	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
 	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same
@@ -317,8 +324,10 @@ type ResourceReport struct {
 	// make, each with the reason. It is the neighbour PendingFreeBytes needs:
 	// that figure rising and never falling is either a run removing faster
 	// than the pace gives back, which resolves itself, or a removal nothing
-	// can make, which does not, and only this tells the two apart.
-	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// can make, which does not, and only this tells the two apart. It is one
+	// page (PageStuckFrees); StuckFreesOmitted counts the rest.
+	StuckFrees        []StuckFree `json:"stuck_frees,omitempty"`
+	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
 	// AnalyzerUnits is what each heavy analysis unit this process ran was
 	// given and what it used: the reservation it was admitted against, the
 	// heap caps its two steps ran under, the machine-derived allocation those
@@ -339,12 +348,14 @@ type ResourceReport struct {
 	// is a count in its own right and not something an operator has to derive
 	// by reading every unit row. The rows name which ones.
 	//
-	// It counts the units this process RECORDED, which the record's own bound
-	// limits, and it counts none of the units whose process tree this platform
-	// cannot sample: an unsampled peak is not a peak below the reservation, so
-	// it is neither an overrun nor evidence against one. It is absent where
-	// this process ran no heavy unit at all, and zero where it ran them and
-	// none overran.
+	// It counts every unit this process ran, including the unit runs past the
+	// bound of the rows (MaxRecordsPerResult), whose overruns are counted as
+	// they end even though no row names them; so it can exceed the overruns
+	// the rows show, and never falls short of them. It counts none of the
+	// units whose process tree this platform cannot sample: an unsampled peak
+	// is not a peak below the reservation, so it is neither an overrun nor
+	// evidence against one. It is absent where this process ran no heavy unit
+	// at all, and zero where it ran them and none overran.
 	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
 	UnitsReused          *int64 `json:"units_reused,omitempty"`
 	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
@@ -448,6 +459,9 @@ func (r ResourceReport) Validate() error {
 		}
 	}
 	if err := boundStrings("resources.warnings", r.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := validateStuckFrees("resources", r.StuckFrees, r.StuckFreesOmitted); err != nil {
 		return err
 	}
 	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
@@ -554,10 +568,8 @@ func (s IndexStatus) Validate() error {
 // report is optional because an ordinary status must stay cheap: Resources is
 // false by default, and IndexStatus.Resources is nil unless it is set.
 //
-// Ruling Q1 makes this the request of
-// IndexService.IndexStatus(ctx, model.StatusRequest); `codectx status
-// --resources` and the MCP tool's input are its readers. INT re-points the
-// facade, the CLI and the MCP schema onto it.
+// It is the request of IndexService.IndexStatus(ctx, model.StatusRequest);
+// `codectx status --resources` and the MCP tool's input are its readers.
 type StatusRequest struct {
 	Resources bool `json:"resources"`
 }
@@ -689,10 +701,18 @@ type ScratchCollection struct {
 	//
 	// It belongs to the REQUEST and not to a pool: one reclaimer serves the
 	// whole process, so what it could not free is the same list whichever pool
-	// was being emptied when the request waited on it. Reported per pool, the
-	// same entries appeared under each of them and every one of those
-	// attributions but at most one was wrong.
-	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// was being emptied when the request waited on it. It is one page
+	// (PageStuckFrees); StuckFreesOmitted counts the rest.
+	StuckFrees        []StuckFree `json:"stuck_frees,omitempty"`
+	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
+}
+
+// Validate enforces the bound on the stuck removals the collection carries.
+func (c ScratchCollection) Validate() error {
+	if err := validateStuckFrees("scratch_collection", c.StuckFrees, c.StuckFreesOmitted); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ScratchPool is one pool of ScratchCollection: the directory it serves, what
@@ -713,6 +733,34 @@ type ScratchPool struct {
 type StuckFree struct {
 	Entry  string `json:"entry"`
 	Reason string `json:"reason"`
+}
+
+// PageStuckFrees is the page of stuck removals a response carries and the count
+// it leaves out. The reclaimer's list is persistent and grows with every
+// removal the filesystem refuses, so a response carries at most the bound every
+// record list of a response carries, and says how many more there are.
+func PageStuckFrees(all []StuckFree) ([]StuckFree, int64) {
+	if len(all) <= MaxRecordsPerResult {
+		return all, 0
+	}
+	return all[:MaxRecordsPerResult], int64(len(all) - MaxRecordsPerResult)
+}
+
+// validateStuckFrees enforces the page PageStuckFrees makes: no more rows than
+// the response bound, and an omitted count only beside a full page.
+func validateStuckFrees(field string, page []StuckFree, omitted int64) *Error {
+	if len(page) > MaxRecordsPerResult {
+		return invalid("%s.stuck_frees holds %d rows, more than the %d a bounded response carries",
+			field, len(page), MaxRecordsPerResult)
+	}
+	if err := requireNonNegative(field+".stuck_frees_omitted", omitted); err != nil {
+		return err
+	}
+	if omitted > 0 && len(page) < MaxRecordsPerResult {
+		return invalid("%s.stuck_frees_omitted is %d on a page of %d rows that dropped none",
+			field, omitted, len(page))
+	}
+	return nil
 }
 
 // An UntouchedInstance is one pool instance a collection left as it was.

@@ -6,8 +6,8 @@
 // framed, language-neutral facts. It is started only through the shared
 // process runner, so its lifetime, environment and output are bounded there.
 //
-// Native lifecycle (go-tree-sitter v0.25.0, files read in full: parser.go,
-// tree.go, query.go, node.go, tree_cursor.go, language.go, allocator.go):
+// Native lifecycle (go-tree-sitter v0.25.0: parser.go, tree.go, query.go,
+// node.go, tree_cursor.go, language.go, allocator.go):
 // Parser.Close, Tree.Close, Query.Close and QueryCursor.Close free the C
 // objects; nothing is finalized by the garbage collector. Parsing uses
 // Parser.ParseWithOptions with a chunked read callback and nil options: the
@@ -44,7 +44,7 @@ const (
 )
 
 // Main runs the worker loop until stdin ends or ctx is done. It is the entry
-// the hidden `codectx __ts-worker` subcommand calls (ruling R8-1).
+// the hidden `codectx __ts-worker` subcommand calls.
 func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	w := &state{parsers: map[string]*ts.Parser{}, queries: map[string]*ts.Query{}}
 	defer w.close()
@@ -58,14 +58,14 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	for _, l := range lang.All {
 		names = append(names, l.Name)
 	}
-	if err := wire.WriteJSON(out, wire.KindHello, wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names}, wire.MaxFactFrameBytes); err != nil {
+	if err := wire.WriteJSON(out, wire.KindHello, wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names}); err != nil {
 		return exitBadInput
 	}
 	if err := out.Flush(); err != nil {
 		return exitBadInput
 	}
 	for ctx.Err() == nil {
-		kind, payload, err := wire.Read(in, wire.MaxFactFrameBytes)
+		kind, payload, err := wire.ReadMessage(in, 0)
 		if errors.Is(err, io.EOF) {
 			return exitOK
 		}
@@ -74,12 +74,14 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitBadInput
 		}
 		var req wire.Request
-		if err := json.Unmarshal(payload, &req); err != nil || req.SourceBytes > wire.MaxSourceBytes {
+		if err := json.Unmarshal(payload, &req); err != nil || req.SourceBytes > wire.MaxSourceOffset {
 			fmt.Fprintln(stderr, "treesitter worker: malformed request")
 			return exitBadInput
 		}
-		kind, src, err := wire.Read(in, int(req.SourceBytes))
-		if err != nil || kind != wire.KindSource || len(src) != int(req.SourceBytes) {
+		// The source arrives in transport-unit frames and is reassembled here
+		// whole; its announced length only presizes the buffer.
+		kind, src, err := wire.ReadMessage(in, int(req.SourceBytes))
+		if err != nil || kind != wire.KindSource || uint64(len(src)) != req.SourceBytes {
 			fmt.Fprintln(stderr, "treesitter worker: malformed source frame")
 			return exitBadInput
 		}
@@ -118,7 +120,7 @@ func (w *state) verify() error {
 		if !ok {
 			return fmt.Errorf("language %q is pinned but not linked", l.Name)
 		}
-		tl := ts.NewLanguage(g.language())
+		tl := g.tsLanguage()
 		if abi := tl.AbiVersion(); abi != l.ABI {
 			return fmt.Errorf("grammar %s has ABI %d, pinned %d", l.Name, abi, l.ABI)
 		}
@@ -140,44 +142,37 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	l, ok := lang.Lookup(req.Language)
 	g := grammars[req.Language]
 	if !ok || g == nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language})
 	}
 	parser, query, err := w.tools(l, g)
 	if err != nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()})
 	}
-	tree := parser.ParseWithOptions(func(offset int, _ ts.Point) []byte {
-		if offset >= len(src) {
-			return nil
-		}
-		return src[offset:min(offset+parseChunkBytes, len(src))]
-	}, nil, nil)
+	tree := Parse(parser, src, nil)
 	if tree == nil {
 		parser.Reset()
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"})
 	}
 	defer tree.Close()
 	root := tree.RootNode()
 	em := &emitter{w: out}
-	ex := &extraction{g: g, l: l, path: req.Path, src: src, maxRecords: req.MaxRecordsPerFile}
+	ex := &extraction{g: g, l: l, path: req.Path, src: src}
 	if err := ex.run(query, root, em); err != nil {
 		return err
 	}
-	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated || em.truncated}
+	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated}
 	if rss, ok := wire.ResidentBytes(); ok {
 		done.RSSBytes = uint64(rss)
 	}
-	return wire.WriteJSON(out, wire.KindDone, done, wire.MaxFactFrameBytes)
+	return wire.WriteJSON(out, wire.KindDone, done)
 }
 
 // tools returns the language's parser and compiled query, creating them once.
 func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error) {
-	tl := ts.NewLanguage(g.language())
 	p, ok := w.parsers[l.Name]
 	if !ok {
-		p = ts.NewParser()
-		if err := p.SetLanguage(tl); err != nil {
-			p.Close()
+		var err error
+		if p, err = NewParser(l.Name); err != nil {
 			return nil, nil, err
 		}
 		w.parsers[l.Name] = p
@@ -185,7 +180,7 @@ func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error
 	q, ok := w.queries[l.Name]
 	if !ok {
 		var qerr *ts.QueryError
-		q, qerr = ts.NewQuery(tl, l.Query)
+		q, qerr = ts.NewQuery(g.tsLanguage(), l.Query)
 		if qerr != nil {
 			return nil, nil, fmt.Errorf("query pack %s: %s", l.Name, qerr.Error())
 		}
@@ -194,22 +189,50 @@ func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error
 	return p, q, nil
 }
 
-// emitter writes fact frames, dropping a record whose encoding would exceed
-// the per-frame cap and reporting the truncation instead of a bypass.
-type emitter struct {
-	w         io.Writer
-	truncated bool
-}
+// tsLanguage is g's parse-tree language, the one construction every parser,
+// query and lowering of g uses.
+func (g *grammar) tsLanguage() *ts.Language { return ts.NewLanguage(g.language()) }
 
-func (e *emitter) put(kind wire.Kind, v any) error {
-	err := wire.WriteJSON(e.w, kind, v, wire.MaxFactFrameBytes)
-	if errors.Is(err, wire.ErrFrameTooLarge) {
-		e.truncated = true
-		return nil
+// NewParser returns a parser set to the pinned grammar of language; the
+// caller closes it.
+func NewParser(language string) (*ts.Parser, error) {
+	tl, ok := Grammar(language)
+	if !ok {
+		return nil, fmt.Errorf("language %q has no linked grammar", language)
 	}
-	return err
+	p := ts.NewParser()
+	if err := p.SetLanguage(tl); err != nil {
+		p.Close()
+		return nil, fmt.Errorf("set language %s: %w", language, err)
+	}
+	return p, nil
 }
 
-func (e *emitter) decl(d wire.Decl) error  { return e.put(wire.KindDecl, d) }
-func (e *emitter) imp(i wire.Import) error { return e.put(wire.KindImport, i) }
-func (e *emitter) ref(r wire.Ref) error    { return e.put(wire.KindRef, r) }
+// Parse parses src with p the way the worker does: through the read
+// callback in ParseChunkBytes slices, with nil options (see the package
+// comment). observe, when non-nil, sees every slice handed to the parser,
+// the empty end-of-input slice included. It returns nil when the parser
+// produced no tree.
+func Parse(p *ts.Parser, src []byte, observe func(chunk []byte)) *ts.Tree {
+	return p.ParseWithOptions(func(offset int, _ ts.Point) []byte {
+		var chunk []byte
+		if offset < len(src) {
+			chunk = src[offset:min(offset+ParseChunkBytes, len(src))]
+		}
+		if observe != nil {
+			observe(chunk)
+		}
+		return chunk
+	}, nil, nil)
+}
+
+// emitter writes one fact message per record. A record of any length is sent
+// whole, in as many transport-unit frames as it needs; none is dropped for its
+// size.
+type emitter struct {
+	w io.Writer
+}
+
+func (e *emitter) decl(d wire.Decl) error  { return wire.WriteJSON(e.w, wire.KindDecl, d) }
+func (e *emitter) imp(i wire.Import) error { return wire.WriteJSON(e.w, wire.KindImport, i) }
+func (e *emitter) ref(r wire.Ref) error    { return wire.WriteJSON(e.w, wire.KindRef, r) }

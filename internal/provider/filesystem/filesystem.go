@@ -3,11 +3,11 @@
 // the `contains` and `defines` relations between them, the README-style
 // `documents` relation, and the per-file lexical search chunks stored once in
 // the file's own unit. It also owns the single path classification table
-// (R7-4) and the fact emitter every other base provider reuses.
+// and the fact emitter every other base provider reuses.
 //
-// One unit is one file (R7-1). The unit reads exactly its file through the
+// One unit is one file. The unit reads exactly its file through the
 // pinned snapshot view, mints its identities through the resolver and emits
-// its ancestors as idempotent node facts (R7-2), so no unit ever needs a
+// its ancestors as idempotent node facts, so no unit ever needs a
 // repository-wide list and an unchanged file reuses its sealed unit.
 package filesystem
 

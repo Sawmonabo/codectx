@@ -12,7 +12,7 @@ import (
 )
 
 // markdown scans a Markdown document line by line with a small bounded
-// scanner (R7-3): ATX headings become section nodes the document contains,
+// scanner: ATX headings become section nodes the document contains,
 // each with its own name-only search document, and links whose target is a
 // workspace path become
 // `documents` edges to the file or directory they name. Fenced code is

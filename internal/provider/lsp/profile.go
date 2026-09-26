@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -51,20 +50,17 @@ type Definition struct {
 	// repository is this server's kind. Detection reads their metadata through
 	// the confined root and nothing else.
 	RootMarkers []string
-	// MemoryBudgetBytes and DiskBudgetBytes are the runner reservations;
-	// Timeout bounds the server's whole lifetime. The manager's idle TTL
-	// usually stops it long before.
+	// MemoryBudgetBytes and DiskBudgetBytes are the room the server holds in
+	// the admission ledger while it runs. There is no lifetime bound: a server
+	// ends when it has been idle for the manager's idle TTL, when it is
+	// stopped, or when a request finds it making no progress.
 	MemoryBudgetBytes int64
 	DiskBudgetBytes   int64
-	Timeout           time.Duration
 }
 
-// Standard bounds for a language server. A server is an interactive process
-// held open across many requests, so the timeout is a lifetime ceiling rather
-// than a per-request bound (Options.RequestStallTimeout is that one), and the
-// reservations are what the runner accounts before the child starts.
+// Standard reservations for a language server, accounted before the child
+// starts.
 const (
-	serverLifetime     = time.Hour
 	serverMemoryBudget = 4 << 30
 	serverDiskBudget   = 2 << 30
 	serverMemoryLarge  = 8 << 30
@@ -78,54 +74,54 @@ const (
 	substitutionWorkDir = "${work_dir}"
 )
 
-// definitions are the six servers Section 11.5 names. Every one of them was
-// resolved through the real lock and store on this platform before its
-// argument array was pinned; the protocol handshake is exercised against gopls
-// and against the fake server. docs/providers-lsp.md records exactly which.
+// definitions are the six servers Section 11.5 names. Each is resolved through
+// the lock and the store before its argument array is used; the protocol
+// handshake is exercised against the fake server. docs/providers-lsp.md
+// records which servers have been started for real.
 var definitions = map[string]Definition{
 	"gopls": {
 		Name: "gopls", Languages: []string{"go"},
 		Args:              []string{"serve"},
 		EnvAllowlist:      []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
 		RootMarkers:       []string{"go.mod", "go.work"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"rust-analyzer": {
 		Name: "rust-analyzer", Languages: []string{"rust"},
 		EnvAllowlist:      []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
 		RootMarkers:       []string{"Cargo.toml"},
-		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge,
 	},
 	// The python server is a native static binary started with its server
-	// subcommand, so it runs as itself like gopls, clangd and rust-analyzer
-	// rather than under the managed Node runtime (ADR-0006).
+	// subcommand, so it runs as itself, with no managed runtime composed in
+	// front of it (ADR-0006).
 	"ty": {
 		Name: "ty", Languages: []string{"python"},
 		Args:              []string{"server"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"pyproject.toml", "ty.toml", "setup.py", "requirements.txt"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"typescript-language-server": {
 		Name: "typescript-language-server", Languages: []string{"typescript", "tsx", "javascript"},
 		Args:              []string{"--stdio"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"tsconfig.json", "jsconfig.json", "package.json"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	"clangd": {
 		Name: "clangd", Languages: []string{"c", "cpp"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
-		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget,
 	},
 	serverJDTLS: {
 		Name: serverJDTLS, Languages: []string{"java"},
-		// The Equinox launcher needs its application identity and its module
-		// openings as JVM options, before -jar. jdt.ls reflects into java.base
-		// and the upstream launcher passes the same set; the configuration
-		// directory's config.ini repeats the three eclipse.* properties, which
-		// is why the launcher bootstraps even without them (measured), but a
+		// The platform launcher needs its application identity and its module
+		// openings as runtime options, before -jar. The server reflects into
+		// java.base and its own launcher passes the same set; the
+		// configuration directory's config.ini repeats the three eclipse.*
+		// properties, so the launcher also bootstraps without them, but a
 		// payload that stopped carrying them would then fail silently.
 		RuntimeArgs: []string{
 			"-Declipse.application=org.eclipse.jdt.ls.core.id1",
@@ -135,13 +131,14 @@ var definitions = map[string]Definition{
 			"--add-opens", "java.base/java.util=ALL-UNNAMED",
 			"--add-opens", "java.base/java.lang=ALL-UNNAMED",
 		},
-		// Equinox *writes* into its configuration directory -- OSGi caches, a p2
-		// data area, its own error log -- so it is a private copy under the work
-		// directory, seeded from the payload once (see seedPlatformConfig).
-		// Pointed at the payload's own config_<platform>, three failed starts
-		// left four new paths inside a published, digest-identified store
-		// version that `codectx tools verify` cannot see, because verify
-		// rehashes the pinned entry and not the payload tree.
+		// The platform launcher *writes* into its configuration directory --
+		// module caches, a provisioning data area, its own error log -- so it
+		// is a private copy under the work directory, seeded from the payload
+		// once (see seedPlatformConfig). Pointed at the payload's own
+		// config_<platform>, every start would write inside a published,
+		// digest-identified store version, where `codectx tools verify` cannot
+		// see it, because verify rehashes the pinned entry and not the payload
+		// tree.
 		Args: []string{
 			"-configuration", substitutionWorkDir + "/config",
 			"-data", substitutionWorkDir + "/data",
@@ -151,7 +148,7 @@ var definitions = map[string]Definition{
 		// the runtime the lock pinned.
 		EnvAllowlist:      []string{"PATH", "HOME"},
 		RootMarkers:       []string{"pom.xml", "build.gradle", "build.gradle.kts"},
-		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge,
 	},
 }
 
@@ -304,7 +301,7 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 //
 // The last component is the resolved payload's identity, so a payload change
 // gets a new directory. What lives here is derived from the payload and is not
-// rewritten once written: jdtls's Equinox configuration is seeded from the
+// rewritten once written: the java server's platform configuration is seeded from the
 // payload's own config tree and names bundle jars by exact version, so a new
 // payload booted against the previous one's configuration fails at startup with
 // no way back except deleting the directory by hand. The workspace index under
@@ -313,7 +310,7 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 // under <data_dir>/lsp is reclaimed today (the tool store under
 // <data_dir>/tools is swept by `codectx tools gc`, and dependence sweeps its
 // own private tree; neither touches this one), so a machine keeps one tree per
-// jdtls version it has been pinned to.
+// java server version it has been pinned to.
 // That bound is the cost of not rewriting a configuration underneath a running
 // server, and reclaiming it belongs to whoever owns data-directory retention.
 //
@@ -383,18 +380,18 @@ func (p Profile) env() []string {
 }
 
 // serverVersion reduces what a server reports in serverInfo.version to the
-// label the overlay carries. gopls reports a compact JSON build description
-// whose top-level Version field holds the tag; other servers report a short
-// string. The label is bounded to model.MaxIdentifierBytes so the overlay
+// label the overlay carries. One server reports a compact JSON build
+// description whose top-level Version field holds the tag; others report a
+// short string. The label is bounded to model.MaxIdentifierBytes so the overlay
 // binding validates; the full report still feeds the input digest.
 //
 // The report is provenance, never a gate. Nothing compares it against a
 // constraint: the lock's entry digest is what identifies these bytes, and the
 // version a server chooses to print has no fixed relationship to the release
-// it came from — the rust-analyzer release tagged 2026-08-17.4 reports
-// "1.98.0 (88d9e12 2026-08-18)" and the scip-java 0.13.1 payload reports
-// "0.0.0-SNAPSHOT" (both measured here). A constraint written to accept those
-// is a constraint that accepts anything, which is a gate in name only.
+// it came from: a server may print a toolchain version and build date for a
+// release tagged by date, or a placeholder snapshot version. A constraint
+// written to accept those is a constraint that accepts anything, which is a
+// gate in name only.
 // A server that reports nothing falls back to pinned, the version of the
 // payload the lock pinned, which is never empty for a resolved tool.
 func serverVersion(reported, pinned string) string {

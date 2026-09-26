@@ -329,7 +329,7 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 	// rather than by the child exiting: the copy is still in flight there, and
 	// a run that returns without closing the write end leaves it parked on a
 	// pipe forever. The wall clock is the stop decision used here because an
-	// output bound no longer is one.
+	// output bound does not stop a run.
 	requireExecutable(t, "/bin/sh")
 	before = openDescriptors(t)
 	for range 16 {

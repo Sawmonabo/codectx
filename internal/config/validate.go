@@ -44,7 +44,6 @@ func (c Config) validate() error {
 		{"storage.read_connections", int64(c.Storage.ReadConnections)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
-		{"providers.lsp.max_outstanding_requests", int64(c.Providers.LSP.MaxOutstandingRequests)},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
 		{"providers.dependence.unit_memory_floor_bytes", c.Providers.Dependence.UnitMemoryFloorBytes},
 		{"tools.max_fetch_bytes", c.Tools.MaxFetchBytes},
@@ -78,6 +77,7 @@ func (c Config) validate() error {
 		{"resources.max_query_terms", c.Resources.MaxQueryTerms},
 		{"resources.max_provider_record_bytes", c.Resources.MaxProviderRecordBytes},
 		{"providers.lsp.max_overlay_bytes", c.Providers.LSP.MaxOverlayBytes},
+		{"providers.lsp.max_outstanding_requests", c.Providers.LSP.MaxOutstandingRequests},
 		{"context.max_graph_depth", c.Context.MaxGraphDepth},
 		{"context.max_visited_nodes", c.Context.MaxVisitedNodes},
 		{"context.max_graph_edges", c.Context.MaxGraphEdges},
@@ -100,7 +100,6 @@ func (c Config) validate() error {
 		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
 		{"providers.manifest.max_xml_elements", c.Providers.Manifest.MaxXMLElements},
 		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
-		{"providers.tree_sitter.max_records_per_file", c.Providers.TreeSitter.MaxRecordsPerFile},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
 		{"workspace.max_depth", c.Workspace.MaxDepth},
@@ -270,7 +269,7 @@ func (c Config) validateBudgets() error {
 	// the machine they were loaded on, naming no key the operator could lower.
 	// The one thing that can still be wrong is arithmetic that leaves 64-bit
 	// range, and that names the keys that caused it.
-	if _, err := baseFootprintFor(c, QuerySlots()); err != nil {
+	if _, err := baseFootprintFor(c); err != nil {
 		return err
 	}
 	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
@@ -286,7 +285,7 @@ func (c Config) validateBudgets() error {
 		return configInvalid("resources.max_temp_bytes %d does not exceed the free-space reserve resources.min_free_disk_bytes %d; temporary work would always be refused",
 			c.Resources.MaxTempBytes, c.Resources.MinFreeDiskBytes)
 	}
-	// Both pairings are one-sided now: a caller budget can only be "more than
+	// Both pairings are one-sided: a caller budget can only be "more than
 	// the bound" when a bound was set at all. Against an unlimited workspace or
 	// an unlimited manifest there is nothing to exceed.
 	if c.Workspace.MaxFiles.Exceeded(int64(c.Context.DefaultMaxFiles)) {

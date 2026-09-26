@@ -52,7 +52,7 @@ if (numberOfDefinitions > maxNumberOfDefinitions) {
   zero `data_flows_to` for that method. Logged as the paired WARNs
   `"<fullName> has more than <n> definitions"` (`:47`) and `"Skipping."` (`:27`) — exactly the pair
   the product detects (`docs/providers-dependence.md:319`). The product raises 4000 → **40000**
-  (`internal/provider/dependence/joern/joern.go:178,204`; `docs/providers-dependence.md:59,63`).
+  (`internal/provider/dependence/graphengine/graphengine.go:178,204`; `docs/providers-dependence.md:59,63`).
 
 ### (c) Itemized measurement
 
@@ -99,7 +99,7 @@ families has no in-Joern differential oracle.**
 ### (d) What crosses the boundary into the product
 
 `emit.go` (1,285 lines) contains **no** `reaching_def` string; the derivation is in `scratch.go` and
-`rw.go`. Everything below is under `internal/provider/dependence/neo4jcsv/`.
+`rw.go`. Everything below is under `internal/provider/dependence/graphcsv/`.
 
 | Question | Answer, with source |
 |---|---|
@@ -173,7 +173,7 @@ is 7,342 lines over five families).
 
 ### The operator target algebra, as measured
 
-From `docs/research/10-round3-empirical.md` §3 (`raw/rw-fixtures`), reproduced in code at
+From `docs/research/10-engine-empirical.md` §3 (`raw/rw-fixtures`), reproduced in code at
 `rw.go:10-60`: **every frontend lowers every write form into an operator call whose argument 1 is the
 written operand.**
 

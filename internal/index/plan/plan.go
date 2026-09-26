@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -48,8 +49,8 @@ const (
 	// planner refused as units of their own, per family.
 	unplannedProjects = "dependence_projects_unplanned:"
 	// unplannedDuplicateFileNode counts the manifest units whose file node
-	// duplicates the filesystem unit's node for the same file identity
-	// (ruling Q8 as re-ruled, Task 7 residual). See the comment at duplicate().
+	// duplicates the filesystem unit's node for the same file identity. See
+	// the comment at duplicate().
 	unplannedDuplicateFileNode = "manifest_duplicate_file_node"
 )
 
@@ -84,13 +85,18 @@ type Unit struct {
 	// whole file-unit list and would exceed model.MaxDependenciesPerUnit.
 	DependsOn []model.UnitID
 	// Heavy marks a unit that must pass the Scheduler before it runs, and
-	// Reservation is what it is admitted against.
+	// Admission is what it is admitted against in both dimensions: for a
+	// dependence unit the memory its Reservation weighs, for an external
+	// indexer's profile unit the memory and temporary disk its profile
+	// reserves. Reservation is the dependence unit's sizing -- heap caps and
+	// the rest -- which travels to the child; it is zero for every other unit.
 	Heavy       bool
+	Admission   admission.Reservation
 	Reservation dependence.Reservation
 	// Deferred marks a unit that does not block the base generation: under
 	// `providers.dependence.enabled = "auto"` the coordinator runs it as
 	// low-priority background work after base activation and publishes it
-	// through a later generation (Section 11.6, ruling Q9).
+	// through a later generation (Section 11.6).
 	Deferred bool
 }
 
@@ -114,7 +120,8 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 // Carried is one previous sealed unit of a refreshing semantic scope, with the
 // provenance distance Section 13.3 requires it to answer `stale` with. The
 // coordinator attaches it through sqlite.AttachCarried; it is never reported
-// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry.
+// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry --
+// so the scope is counted once, by that unit (Plan.CountReused).
 //
 // It is also the row shape Inputs.CarriedPage reads back: a scope the previous
 // generation already carried is the same unit with the distance it had then,
@@ -128,17 +135,6 @@ type Carried struct {
 	// once per generation, because each of those generations is one the unit
 	// did not see.
 	DistanceGenerations, DistanceFiles int
-}
-
-// RecordedPeak is one scope key's largest recorded process-tree peak, as
-// Inputs.RecordedPeaks answers it. PeakBytes is always a measurement that was
-// actually taken and always above zero: a scope nothing ever sampled has no
-// row at all, because a row carrying zero would be read as "this work costs
-// nothing" and would be the one observation that could lower a reservation
-// instead of raising it.
-type RecordedPeak struct {
-	ScopeKey  string
-	PeakBytes int64
 }
 
 // Plan is one snapshot's complete unit plan.
@@ -162,7 +158,7 @@ type Plan struct {
 	// Carry are the stale predecessors of deferred semantic scopes, to attach
 	// through sqlite.AttachCarried. A carried scope's *deferred* unit is also
 	// in Units, because it runs later, in its own work generation (Section
-	// 11.6, ruling Q1). The coordinator attaches the carried predecessor into
+	// 11.6). The coordinator attaches the carried predecessor into
 	// this generation with sqlite.AttachCarried and must not attach the
 	// deferred unit here: generation_units holds one row per
 	// (generation, provider, scope).
@@ -178,6 +174,16 @@ type Plan struct {
 	// States is Selection.States plus every degradation the planner itself
 	// found, which is the complete capability picture before any unit runs.
 	States []model.CapabilityState
+	// HeavyScopes is every heavy scope this plan derived -- to run, to reuse
+	// or to carry -- in ascending order, and HeavyDerived reports that the
+	// provider that plans heavy units was active, so the list is that
+	// provider's complete scope set for this snapshot rather than an empty
+	// one because nothing was asked. The two together are what the run
+	// ledger's learned peaks are bounded by: a recorded scope the list does
+	// not name no longer exists in this repository. The list is bounded by
+	// the scope count, which the plan already holds in heap.
+	HeavyScopes  []string
+	HeavyDerived bool
 
 	// shared is the spilled, sorted membership of every whole-snapshot unit,
 	// which their Unit.Inputs sequences stream from.
@@ -185,8 +191,22 @@ type Plan struct {
 	// files is the spilled, sorted run of every file-invalidated provider's
 	// unit, which Units streams from. Semantic units are not in it: a package-
 	// or workspace-scoped unit list is bounded by the scope count, never by
-	// the repository, so it stays in heap (H-L1b).
+	// the repository, so it stays in heap.
 	files *pagination.SortedRun[fileUnitRecord]
+}
+
+// CountReused calls add once for every scope Reuse holds, with its provider.
+// It is the one statement of how a plan's scopes are counted, which the run
+// row's planned total and every capability row's units_planned both follow:
+// each unit Units yields is one scope, each Reuse entry is one more, and a
+// Carry row is none, because its scope's deferred unit is already in Units.
+// Adding Carry as well counts every carried scope twice.
+func (p Plan) CountReused(add func(providerID string)) {
+	for key := range p.Reuse {
+		if id, _, ok := strings.Cut(key, scopeSeparator); ok {
+			add(id)
+		}
+	}
 }
 
 // Close releases the plan's two spilled runs: the shared input membership every
@@ -239,25 +259,36 @@ type Inputs struct {
 	// which is the cap the store applies anyway; a nil fetcher is refused
 	// whenever PrevGen is set.
 	CarriedPage func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]Carried, error)
-	// RecordedPeaks is what this workspace has already measured its own heavy
-	// units to cost: the largest process-tree peak recorded for each scope
-	// key, largest first, at most limit rows. It is a function field, in
-	// CarriedPage's style, so this package keeps no dependency on the run
-	// ledger; internal/app supplies it from the reader it already opens.
+	// RecordedPeak is what this workspace has already measured one heavy
+	// scope to cost: the largest process-tree peak recorded for scopeKey, and
+	// where that scope has none and familyPrefix is not empty, the largest
+	// recorded for any scope whose key begins with familyPrefix. The second
+	// result is whether a measurement exists at all. It is a function field,
+	// in CarriedPage's style, so this package keeps no dependency on the run
+	// ledger's storage; the coordinator binds it to the ledger's indexed
+	// lookup for its own repository.
 	//
-	// It is read ONCE per plan, not once per unit: a plan answers every heavy
-	// unit from the one bounded page, so consulting the history costs the same
-	// whether the repository has one heavy unit or sixty.
+	// It is asked once per heavy unit the plan derives and about that unit's
+	// key only, so its cost follows the heavy units this plan holds and never
+	// the size of the history.
 	//
-	// It is advisory in every direction. A nil fetcher, an empty answer and a
-	// scope this workspace has never run all mean the same thing -- no
-	// observation -- and the reservation the family constants derive then
-	// stands exactly as it is. A supplier that cannot read its ledger answers
-	// no rows rather than an error, because an unreadable accounting file must
-	// not refuse a plan; an error that does arrive is a broken supplier and is
-	// returned.
-	RecordedPeaks func(ctx context.Context, limit int) ([]RecordedPeak, error)
-	Config        config.Config
+	// It is advisory in every direction. A nil lookup, a scope this workspace
+	// has never run and a family it has never measured all answer the same
+	// thing -- no observation -- and the reservation the family constants
+	// derive then stands exactly as it is. An unreadable ledger is the
+	// supplier's to report, and it answers no observation: an accounting file
+	// must not refuse a plan.
+	RecordedPeak func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool)
+	// Machine is the composition root's one observation of the host, the
+	// reading the admission allocation was derived from. Every heavy unit's
+	// reservation, heap caps included, is sized against it, so the figure a
+	// unit is admitted at and the cap its children run under come from the
+	// same reading. The planner never observes the machine itself: a second
+	// reading taken while memory is momentarily free would size caps the
+	// allocation never admitted. The zero value is a host that exposes no
+	// available memory.
+	Machine dependence.Machine
+	Config  config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot
 	// units. Empty takes the process temporary directory. The spill lives only
 	// as long as the returned Plan and is removed by Plan.Close.
@@ -307,8 +338,8 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	// Charged in BYTES as well as records for the reason F37 settled for the
-	// input sort: a unit record carries a scope key, which is bounded by
+	// Charged in BYTES as well as records for the same reason as the input
+	// sort: a unit record carries a scope key, which is bounded by
 	// model.MaxScopeKeyBytes rather than fixed, so a record count alone would
 	// be a budget that means something different on every repository.
 	units = units.WithRunBytes(pagination.SortRunBytes(in.Config.Resources.QueryMemoryBytes), sizeOfUnit)
@@ -384,12 +415,6 @@ type builder struct {
 	// that generation -- unit-scoped like Plan.Reuse and Plan.Previous, never
 	// file-scoped.
 	prior map[string]Carried
-	// peaks is the one bounded reading of Inputs.RecordedPeaks this plan
-	// takes, in the order it was answered. It is a slice and not a map
-	// because both questions asked of it -- this scope's own peak, and the
-	// largest peak of this scope's language -- are answered by one pass over
-	// a list the fetcher's limit already bounds.
-	peaks []RecordedPeak
 
 	byProvider map[string][]Unit
 	// overBound records one exemplar path per provider whose scope key does
@@ -450,6 +475,11 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 		scopes, unplanned, err := semanticScopes(ctx, p, det, b.in.View)
 		if err != nil {
 			return err
+		}
+		if d.ID == dependence.ProviderID {
+			// The provider whose units are heavy derived every scope it
+			// builds, which is what lets HeavyScopes be read as complete.
+			b.plan.HeavyDerived = true
 		}
 		for reason, n := range unplanned {
 			b.plan.Unplanned[reason] += n
@@ -645,14 +675,14 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 // the filesystem unit's, which carries the file's metadata, and the manifest
 // unit's, which is nil-valued (manifest.unit.fileNode).
 //
-// Ruling Q8 first put the suppression at plan time. It cannot be there:
-// node_facts' conflict clause is ON CONFLICT(unit_id, node_id) DO NOTHING
-// (internal/storage/sqlite/units.go:459), which is per unit, so both rows are
-// written whatever order the units run in, and no plan-time ordering or
-// dependency suppresses either. Re-ruled: precedence is applied at read time
-// in the query layer (Task 13/14) -- for one node id across the units of the
-// active generation the filesystem provider's row wins over a nil-valued
-// manifest row. The plan counts the duplicate only, which is what this does.
+// The suppression cannot be at plan time: node_facts' conflict clause is ON
+// CONFLICT(unit_id, node_id) DO NOTHING (internal/storage/sqlite/units.go),
+// which is per unit, so both rows are written whatever order the units run
+// in, and no plan-time ordering or dependency suppresses either. Precedence is
+// applied at read time in the query layer -- for one node id across the units
+// of the active generation the filesystem provider's row wins over a
+// nil-valued manifest row. The plan counts the duplicate only, which is what
+// this does.
 func (b *builder) duplicate(fv model.FileVersion) {
 	for _, fp := range b.fileProviders {
 		if fp.id == manifest.ID && fp.gate(fv) {
@@ -671,19 +701,9 @@ func (b *builder) emit(ctx context.Context) error {
 		return err
 	}
 	b.plan.shared = shared
-	if b.in.RecordedPeaks != nil {
-		// model.MaxRecordsPerResult is the bound every other list in the
-		// product carries, and the planner never chooses its own: the page is
-		// as wide as a bounded response, and the reader answers the largest
-		// peaks first, so a repository with more recorded scopes than that
-		// keeps the measurements a reservation could be built on.
-		if b.peaks, err = b.in.RecordedPeaks(ctx, model.MaxRecordsPerResult); err != nil {
-			return err
-		}
-	}
 	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes,
 		config.BaseFootprint(b.in.Config))
-	machine := dependence.ObserveMachine()
+	machine := b.in.Machine
 	deferDependence := b.in.Config.Providers.Dependence.Enabled == config.Auto
 
 	for _, p := range b.in.Selection.Active {
@@ -722,8 +742,17 @@ func (b *builder) emit(ctx context.Context) error {
 				// bytes, which is the figure research measured the per-family
 				// ratio against; the unit's declared inputs are a larger set
 				// (its manifests and lock files) and would inflate it.
-				u.Reservation = b.reserve(gov, s, machine)
+				u.Reservation = b.reserve(ctx, gov, s, machine)
+				u.Admission = admission.Reservation{MemoryBytes: u.Reservation.Bytes()}
 				u.Deferred = deferDependence
+				b.plan.HeavyScopes = append(b.plan.HeavyScopes, s.scopeKey)
+			} else if s.admit != (admission.Reservation{}) {
+				// An external indexer's profile run is a heavy child too. Its
+				// figures are the profile's own, so no governor sizes it and
+				// nothing about it is deferred: it is admitted on the one
+				// ledger beside every other heavy child, in both dimensions.
+				u.Heavy = true
+				u.Admission = s.admit
 			}
 			spec, err := u.Spec(b.cfgHash)
 			if err != nil {
@@ -761,6 +790,8 @@ func (b *builder) emit(ctx context.Context) error {
 		}
 	}
 	b.plan.Units = unitSequence(files, slots)
+	slices.Sort(b.plan.HeavyScopes)
+	b.plan.HeavyScopes = slices.Compact(b.plan.HeavyScopes)
 	b.degradations()
 	return nil
 }
@@ -828,9 +859,9 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 // unobserved peak unconditionally is the one mistake here that would collapse
 // every reservation in the product, which is why the raise is inside the
 // observation test.
-func (b *builder) reserve(gov dependence.Governor, s *semantic, m dependence.Machine) dependence.Reservation {
+func (b *builder) reserve(ctx context.Context, gov dependence.Governor, s *semantic, m dependence.Machine) dependence.Reservation {
 	r := gov.Reserve(s.family, s.bytes, m)
-	if peak, observed := b.recordedPeak(s); observed {
+	if peak, observed := b.recordedPeak(ctx, s); observed {
 		r.ObservedPeakBytes = peak
 	}
 	return r
@@ -851,25 +882,17 @@ func (b *builder) reserve(gov dependence.Governor, s *semantic, m dependence.Mac
 // no process tree at all are every one of them "no observation", and every one
 // of them answers false -- never a peak of zero. A zero returned as observed
 // would be read as a reservation of zero for the work the plan is about.
-func (b *builder) recordedPeak(s *semantic) (int64, bool) {
-	for _, p := range b.peaks {
-		if p.ScopeKey == s.scopeKey {
-			return p.PeakBytes, true
-		}
-	}
-	if s.family == "" {
-		// Not a language-scoped heavy unit, so there is no language whose
-		// history could stand in for this scope's own.
+func (b *builder) recordedPeak(ctx context.Context, s *semantic) (int64, bool) {
+	if b.in.RecordedPeak == nil {
 		return 0, false
 	}
-	prefix := dependence.ScopeKeyPrefix(s.family)
-	largest, observed := int64(0), false
-	for _, p := range b.peaks {
-		if strings.HasPrefix(p.ScopeKey, prefix) && p.PeakBytes > largest {
-			largest, observed = p.PeakBytes, true
-		}
+	// A heavy unit with no language has no family whose history could stand
+	// in for this scope's own, so only its own key is asked about.
+	prefix := ""
+	if s.family != "" {
+		prefix = dependence.ScopeKeyPrefix(s.family)
 	}
-	return largest, observed
+	return b.in.RecordedPeak(ctx, s.scopeKey, prefix)
 }
 
 // carry records the stale predecessor of a refreshing semantic scope with its

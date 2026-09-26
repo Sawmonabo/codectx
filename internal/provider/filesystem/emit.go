@@ -13,7 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 )
 
-// Scope keys. A filesystem or manifest unit is one file (R7-1): its scope is
+// Scope keys. A filesystem or manifest unit is one file: its scope is
 // "file:"+path and its only input is that file's version, so an unchanged
 // file reuses its unit with zero work.
 const scopePrefix = "file:"
@@ -32,7 +32,7 @@ func PathFromScope(scopeKey string) (string, error) {
 	return rel, nil
 }
 
-// Native keys of path-identified nodes (R7-2). They are the alias keys a
+// Native keys of path-identified nodes. They are the alias keys a
 // dependent unit resolves with, at scope provider.ScopeWorkspace.
 const (
 	nativeRepository = "repo:"
@@ -45,7 +45,7 @@ const (
 // configuration / build_target a recognized file defines. Identity is a
 // structural key over the workspace scope, the path and the kind, so every
 // unit that mentions the path mints the same node and storage deduplicates
-// the identity (R7-2). The candidate deliberately carries no FileID: a unit
+// the identity. The candidate deliberately carries no FileID: a unit
 // may only name its own inputs, and a document that links to another file
 // must still resolve that file's identity.
 func PathCandidate(providerID string, kind model.NodeKind, rel string) model.NodeCandidate {

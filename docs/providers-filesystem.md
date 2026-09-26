@@ -12,7 +12,7 @@ from the pinned snapshot view.
 
 ## Units
 
-A unit is one file for both providers (ruling R7-1). The coordinator plans:
+A unit is one file for both providers. The coordinator plans:
 
 | Provider | One unit per | Scope key | Inputs | Dependencies |
 |---|---|---|---|---|
@@ -45,7 +45,7 @@ canonical key. The candidate shapes decide the Section 9.4 basis:
 | dependency | qualified name = ecosystem-qualified name, no file | structural key | `dependency:`+qualified name |
 
 Path-identified nodes carry no `FileID` in their candidate: identity is a
-pure function of the path (ruling R7-2), so every unit that mentions a path
+pure function of the path, so every unit that mentions a path
 mints the same node and storage deduplicates the identity. That is what lets
 a file unit publish its ancestor directories as idempotent facts, a go.work
 unit name the directories it uses, and a Markdown unit link to another
@@ -79,14 +79,13 @@ identity.
   containing directory (or the repository);
 - the file's lexical search chunks (below).
 
-`filesystem.Classify` is the single path classification table (ruling
-R7-4). The language half of it lives in `internal/lang`: `lang.Of(path)` is
-the one place a path becomes a language tag, so the tag a snapshot records in
-its manifest and the tag a provider selects files by cannot drift apart. Its
-table is the union of the two that had diverged — it returns the same tag for
-every path the snapshot table recognized and adds the documentation, build and
-configuration extensions. `filesystem.Language(path)` is a thin call to it and
-stays the name Tasks 8 and 9 use; the tags for the bundled grammars match
+`filesystem.Classify` is the single path classification table. The language
+half of it lives in `internal/lang`: `lang.Of(path)` is the one place a path
+becomes a language tag, so the tag a snapshot records in its manifest and the
+tag a provider selects files by cannot drift apart. Its table covers the source
+languages and the documentation, build and configuration extensions.
+`filesystem.Language(path)` is a thin call to it and stays the name the
+analyzer providers call; the tags for the bundled grammars match
 `tree_sitter.languages`.
 
 Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
@@ -164,7 +163,7 @@ never of the kinds.
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
 | `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
-| Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+| Markdown (and ADRs) | bounded line scanner | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
 
 A heading is its own entity, not a label on the file. Each one gets a
 `section` node, so a query that matches thirty headings of one document answers

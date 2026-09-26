@@ -1,7 +1,6 @@
 package paced
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,20 +9,29 @@ import (
 	"time"
 )
 
-// gateSleep replaces the reclaimer's wait with one that records what it was
-// asked to wait for and then blocks until the test lets it through, so the
-// test observes the reclaimer stopped at a window boundary rather than racing
-// it. It restores the real wait and releases the reclaimer when the test ends.
-func gateSleep(t *testing.T) (waits func() []time.Duration, release func()) {
+// Every test here constructs its own reclaimer, so nothing another test
+// registered, queued or left stuck is in what it reads.
+
+// wakeUp is the wake a new removal gives the worker, which is when a stuck
+// entry is retried.
+func wakeUp(r *reclaimer) {
+	r.mu.Lock()
+	r.wakeLocked()
+	r.mu.Unlock()
+}
+
+// gateSleep replaces r's wait with one that records what it was asked to wait
+// for and then blocks until the test lets it through, so the test observes the
+// reclaimer stopped at a window boundary rather than racing it. It releases
+// the reclaimer when the test ends.
+func gateSleep(t *testing.T, r *reclaimer) (waits func() []time.Duration, release func()) {
 	t.Helper()
-	Drain()
 	var mu sync.Mutex
 	var seen []time.Duration
 	gate := make(chan struct{})
 	var once sync.Once
 	open := func() { once.Do(func() { close(gate) }) }
-	restore := reclaim.sleep
-	reclaim.sleep = func(d time.Duration) {
+	r.sleep = func(d time.Duration) {
 		mu.Lock()
 		seen = append(seen, d)
 		mu.Unlock()
@@ -34,8 +42,7 @@ func gateSleep(t *testing.T) (waits func() []time.Duration, release func()) {
 		// Bounded: a reclaimer that will not run out of work is the failure
 		// the test that used this gate reports, and holding the package open
 		// behind it would replace that failure line with a timeout dump.
-		drainWithin(10 * time.Second)
-		reclaim.sleep = restore
+		drainWithin(r, 10*time.Second)
 	})
 	return func() []time.Duration {
 		mu.Lock()
@@ -48,24 +55,25 @@ func gateSleep(t *testing.T) (waits func() []time.Duration, release func()) {
 // space goes back at the measured pace rather than in a burst. A burst of
 // frees leaves a host that discards freed blocks into a sparse image owing
 // work it never reports, and every disk request in flight a minute later waits
-// a minute -- which is what an index run of a repository did three times. So a
-// removal renames its file into the to-free set and returns with the space
+// a minute. So a removal renames its file into the to-free set and returns with the space
 // still occupied, and the one reclaimer releases one window per interval.
 //
-// Mutation: free at the call site instead of queueing (make RemoveFor call
+// Mutation: free at the call site instead of queueing (make remove call
 // freeInPlace unconditionally) and the caller returns having freed the lot.
 func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	served := t.TempDir()
 	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
-	waits, release := gateSleep(t)
+	r.register(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	waits, release := gateSleep(t, r)
 
 	const windows = 4
 	path := filepath.Join(served, "big")
 	writeFile(t, path, windows*Window)
 	beforeSteps, freed := steps.Load(), FreedByPurpose()[AnalyzerOutput]
 
-	if err := RemoveFor(AnalyzerOutput, path); err != nil {
+	if err := r.remove(AnalyzerOutput, path); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
@@ -74,7 +82,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	// The reclaimer cannot be past its first wait, so at most one window of
 	// the file can have gone: anything less pending is the caller having
 	// freed it on its own path.
-	pending, err := PendingFreeBytes()
+	pending, err := r.pendingFreeBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +92,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	}
 
 	release()
-	Drain()
+	r.drain()
 	if got := steps.Load() - beforeSteps; got != windows {
 		t.Fatalf("the reclaimer freed %d windows; want %d", got, windows)
 	}
@@ -103,7 +111,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 			t.Fatalf("wait %d was %v; want a wait of at most one %v interval", i, d, FreeInterval)
 		}
 	}
-	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+	if pending, err := r.pendingFreeBytes(); err != nil || pending != 0 {
 		t.Fatalf("after draining, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
@@ -119,6 +127,8 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 // Mutation: make shrinkable always report true and the published object is
 // emptied by the removal of the name beside it.
 func TestARemovalNeverEmptiesAnObjectAnotherNameStillReaches(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	dir := t.TempDir()
 	published := filepath.Join(dir, "blob")
 	const size = 2 * Window
@@ -128,7 +138,7 @@ func TestARemovalNeverEmptiesAnObjectAnotherNameStillReaches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := RemoveFor(Materialization, staged); err != nil {
+	if err := r.remove(Materialization, staged); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(staged); !os.IsNotExist(err) {
@@ -143,13 +153,13 @@ func TestARemovalNeverEmptiesAnObjectAnotherNameStillReaches(t *testing.T) {
 	}
 }
 
-// drainWithin waits up to d for the reclaimer to run out of freeable work and
-// reports whether it did. A reclaimer that retries one entry forever never
-// returns, so every wait in this package is bounded and ends in a failure
-// line rather than in the package's timeout.
-func drainWithin(d time.Duration) ([]Stuck, bool) {
+// drainWithin waits up to d for r to run out of freeable work and reports
+// whether it did. A reclaimer that retries one entry forever never returns,
+// so every wait in this package is bounded and ends in a failure line rather
+// than in the package's timeout.
+func drainWithin(r *reclaimer, d time.Duration) ([]Stuck, bool) {
 	done := make(chan []Stuck, 1)
-	go func() { done <- Drain() }()
+	go func() { done <- r.drain() }()
 	select {
 	case stuck := <-done:
 		return stuck, true
@@ -159,11 +169,11 @@ func drainWithin(d time.Duration) ([]Stuck, bool) {
 }
 
 // mustDrain is drainWithin with the failure line.
-func mustDrain(t *testing.T, d time.Duration) []Stuck {
+func mustDrain(t *testing.T, r *reclaimer, d time.Duration) []Stuck {
 	t.Helper()
-	stuck, ok := drainWithin(d)
+	stuck, ok := drainWithin(r, d)
 	if !ok {
-		pending, _ := PendingFreeBytes()
+		pending, _ := r.pendingFreeBytes()
 		t.Fatalf("the reclaimer did not run out of freeable work in %v and %d bytes still await freeing: "+
 			"an entry it cannot free is stopping the ones queued behind it", d, pending)
 	}
@@ -182,18 +192,25 @@ func mustDrain(t *testing.T, d time.Duration) []Stuck {
 //
 // So the failure is recorded with its reason, the entries behind it are freed
 // at the pace, and the stuck one is retried at the next wake rather than
-// immediately.
+// immediately. A refused unlink also costs no wait: the refused child here is
+// one the process may not truncate, so without the check before the charge
+// its whole length would be waited for at every wake it is retried, holding
+// everything queued behind it for as long.
 //
-// Mutation: drop the stuck check from nextEntry, so the first entry is
-// returned again and again, and the file queued behind it is never reached.
+// Mutations: drop the tried check from nextEntries, so the first entry is
+// returned again and again, and the file queued behind it is never reached;
+// drop the unlinkRefused check from freeFile, and the refused child's two
+// windows are waited for before its unlink fails.
 func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability unlinks from a directory it may not write, " +
 			"so the refusal this test is built on never happens and it would pass vacuously")
 	}
 	served := t.TempDir()
 	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	r.register(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
 	// Registered before the reclaimer is gated, and so before anything under
 	// the set can be left unwritable: the temporary directory's own removal
 	// runs after this and would fail on it.
@@ -205,42 +222,49 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 			return nil
 		})
 	})
-	waits, release := gateSleep(t)
+	waits, release := gateSleep(t, r)
 
 	// A tree holding one child that cannot be unlinked, because unlinking
-	// needs write on the directory holding it. The refusal is inside the
-	// tree rather than on it: a removal renames the tree aside first, and a
-	// rename into another parent needs write on what it moves.
+	// needs write on the directory holding it, and cannot be truncated,
+	// because it is read-only. The refusal is inside the tree rather than on
+	// it: a removal renames the tree aside first, and a rename into another
+	// parent needs write on what it moves.
 	tree := filepath.Join(served, "refused")
 	inner := filepath.Join(tree, "inner")
 	if err := os.MkdirAll(inner, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(inner, "child"), 4096)
+	const refusedSize = 2 * Window
+	child := filepath.Join(inner, "child")
+	writeFile(t, child, refusedSize)
+	if err := os.Chmod(child, 0o400); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(inner, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	// The purposes are read in name order, so the refused tree is the entry
 	// the reclaimer reaches first and the file is the one queued behind it.
-	if err := RemoveAllFor(AnalyzerOutput, tree); err != nil {
+	if err := r.remove(AnalyzerOutput, tree); err != nil {
 		t.Fatal(err)
 	}
 	const windows = 4
 	behind := filepath.Join(served, "behind")
 	writeFile(t, behind, windows*Window)
 	freedBefore := FreedByPurpose()[Materialization]
-	if err := RemoveFor(Materialization, behind); err != nil {
+	if err := r.remove(Materialization, behind); err != nil {
 		t.Fatal(err)
 	}
 
 	release()
-	stuck := mustDrain(t, 10*time.Second)
+	stuck := mustDrain(t, r, 10*time.Second)
 
 	if got := FreedByPurpose()[Materialization] - freedBefore; got != windows*Window {
 		t.Fatalf("the file queued behind the refused tree gave back %d bytes; want %d", got, int64(windows*Window))
 	}
-	if got := len(waits()); got < windows {
-		t.Fatalf("freeing the file behind the refused tree waited %d times for %d windows", got, windows)
+	if got := len(waits()); got != windows {
+		t.Fatalf("freeing the file behind the refused tree waited %d times for its %d windows: "+
+			"an unlink the directory refuses was charged to the pace", got, windows)
 	}
 	if len(stuck) != 1 {
 		t.Fatalf("the reclaimer reported %v as stuck; want exactly the refused tree", stuck)
@@ -255,12 +279,12 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 	if _, err := os.Stat(refused); err != nil {
 		t.Fatalf("the stuck entry is not where it was reported: %v", err)
 	}
-	pending, err := PendingFreeBytes()
+	pending, err := r.pendingFreeBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending != 4096 {
-		t.Fatalf("%d bytes await freeing; want the refused child's 4096 and nothing else", pending)
+	if pending != refusedSize {
+		t.Fatalf("%d bytes await freeing; want the refused child's %d and nothing else", pending, int64(refusedSize))
 	}
 
 	// The next wake retries it: the reason it could not be freed has gone, so
@@ -268,11 +292,11 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 	if err := os.Chmod(filepath.Join(refused, "inner"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reclaim.wake()
-	if left := mustDrain(t, 10*time.Second); len(left) != 0 {
+	wakeUp(r)
+	if left := mustDrain(t, r, 10*time.Second); len(left) != 0 {
 		t.Fatalf("the entry was still refused after what stopped it was undone: %v", left)
 	}
-	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+	if pending, err := r.pendingFreeBytes(); err != nil || pending != 0 {
 		t.Fatalf("after the retry, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
@@ -305,14 +329,16 @@ func waitFor(d time.Duration, cond func() bool) bool {
 // Mutation: charge after the unlink (move r.charge below os.Remove in
 // freeFile) and the whole file is gone before the reclaimer's first wait.
 func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability opens a read-only file for writing, " +
 			"so the file this test is built on is truncated a window at a time and it would pass vacuously")
 	}
 	served := t.TempDir()
 	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
-	waits, release := gateSleep(t)
+	r.register(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	waits, release := gateSleep(t, r)
 
 	const windows = 4
 	path := filepath.Join(served, "published")
@@ -321,14 +347,14 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 		t.Fatal(err)
 	}
 	freedBefore := FreedByPurpose()[Materialization]
-	if err := RemoveFor(Materialization, path); err != nil {
+	if err := r.remove(Materialization, path); err != nil {
 		t.Fatal(err)
 	}
 
 	if !waitFor(10*time.Second, func() bool { return len(waits()) > 0 }) {
 		t.Fatal("the reclaimer never reached a wait for a file it cannot truncate")
 	}
-	pending, err := PendingFreeBytes()
+	pending, err := r.pendingFreeBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +367,7 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 	}
 
 	release()
-	mustDrain(t, 10*time.Second)
+	mustDrain(t, r, 10*time.Second)
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("the file survived its removal: %v", err)
 	}
@@ -351,14 +377,14 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 	if got := FreedByPurpose()[Materialization] - freedBefore; got != int64(windows)*Window {
 		t.Fatalf("attributed %d bytes to the purpose; want %d", got, int64(windows)*Window)
 	}
-	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+	if pending, err := r.pendingFreeBytes(); err != nil || pending != 0 {
 		t.Fatalf("after draining, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
 
 // The requirement: an entry the reclaimer cannot even STAT is stuck, not gone.
 //
-// `work` frees an entry, and on a failure asks the filesystem whether the
+// `freeQueued` frees an entry, and on a failure asks the filesystem whether the
 // entry is still there: one that has gone is not stuck, because freeing a
 // file shrinks it before unlinking it and a shrink that failed under an
 // unlink that succeeded holds no byte. But "gone" is exactly one answer --
@@ -371,19 +397,23 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 // The refusal here is a purpose directory that may be read but not searched,
 // which is what a tree the reclaimer can list and cannot descend looks like;
 // the same shape reaches it from a device error or a stale network handle,
-// neither of which a test can construct.
+// neither of which a test can construct. The entry is one a dead run left
+// queued, in place before the set is first used, so the refusal is there
+// before the reclaimer can reach the entry.
 //
-// Mutation: treat every stat error as gone (`if _, gone := os.Lstat(entry);
+// Mutation: treat every stat error as gone (`if _, gone := os.Lstat(q.path);
 // gone != nil`) and this test fails on the wait -- Drain does not return and
 // the entry behind is never freed.
 func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t *testing.T) {
+	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability searches a directory that grants nobody search, " +
 			"so the refusal this test is built on never happens and it would pass vacuously")
 	}
 	served := t.TempDir()
 	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	r.register(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
 	// Registered before anything under the set is made unsearchable, so the
 	// temporary directory's own removal -- which runs after this -- is not the
 	// thing that fails.
@@ -395,16 +425,12 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 			return nil
 		})
 	})
-	Drain()
-
-	refusedFile := filepath.Join(served, "refused")
-	writeFile(t, refusedFile, 4096)
-	if err := RemoveFor(AnalyzerOutput, refusedFile); err != nil {
+	refusedDir := filepath.Join(set, string(AnalyzerOutput))
+	if err := os.MkdirAll(refusedDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, filepath.Join(refusedDir, "1.1"), 4096)
 	// Read but not searched: the reclaimer lists the entry and cannot stat it.
-	// Applied after the rename, which needs both.
-	refusedDir := filepath.Join(set, string(AnalyzerOutput))
 	if err := os.Chmod(refusedDir, 0o400); err != nil {
 		t.Fatal(err)
 	}
@@ -414,11 +440,11 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 	behind := filepath.Join(served, "behind")
 	writeFile(t, behind, behindSize)
 	freedBefore := FreedByPurpose()[Materialization]
-	if err := RemoveFor(Materialization, behind); err != nil {
+	if err := r.remove(Materialization, behind); err != nil {
 		t.Fatal(err)
 	}
 
-	stuck := mustDrain(t, 10*time.Second)
+	stuck := mustDrain(t, r, 10*time.Second)
 
 	if got := FreedByPurpose()[Materialization] - freedBefore; got != behindSize {
 		t.Fatalf("the file queued behind the unstattable entry gave back %d bytes; want %d", got, int64(behindSize))
@@ -437,151 +463,11 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 	if err := os.Chmod(refusedDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reclaim.wake()
-	if left := mustDrain(t, 10*time.Second); len(left) != 0 {
+	wakeUp(r)
+	if left := mustDrain(t, r, 10*time.Second); len(left) != 0 {
 		t.Fatalf("the entry was still refused after what stopped it was undone: %v", left)
 	}
-	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+	if pending, err := r.pendingFreeBytes(); err != nil || pending != 0 {
 		t.Fatalf("after the retry, %d bytes await freeing (%v); want none", pending, err)
-	}
-}
-
-// The requirement: what the reclaimer could not free stays DISCLOSED until it
-// is actually freed.
-//
-// A wake retries a stuck entry, and `queue()` wakes on every removal, so a run
-// -- which queues thousands of removals -- wakes thousands of times. Clearing
-// the whole stuck map at each wake made `stuck_frees` read empty for the whole
-// of a run, in exactly the state it exists to explain: an operator watching
-// `pending_free_bytes` climb was told nothing was wrong, in both surfaces that
-// read it. What a wake clears is the SKIP set -- so the entry is retried --
-// never the record.
-//
-// A directory the reclaimer cannot even list is recorded the same way: every
-// removal queued inside it is space this process is holding and cannot give
-// back, and passing over it silently disclosed none of it.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
-//
-// Mutation: put `clear(r.stuck)` back in wakeLocked (in place of
-// `clear(r.tried)`) and the disclosure is empty after the second removal.
-func TestAStuckEntryStaysDisclosedAcrossTheWakesOfARun(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("a process with the override capability unlinks from a directory it may not write, " +
-			"so the refusal this test is built on never happens and it would pass vacuously")
-	}
-	served := t.TempDir()
-	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
-	t.Cleanup(func() {
-		_ = filepath.WalkDir(served, func(path string, d os.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				_ = os.Chmod(path, 0o700)
-			}
-			return nil
-		})
-	})
-	Drain()
-
-	// One entry that cannot be freed: a tree whose inner directory refuses the
-	// unlink of the child inside it.
-	tree := filepath.Join(served, "refused")
-	inner := filepath.Join(tree, "inner")
-	if err := os.MkdirAll(inner, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(inner, "child"), 4096)
-	if err := os.Chmod(inner, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveAllFor(AnalyzerOutput, tree); err != nil {
-		t.Fatal(err)
-	}
-	if stuck := mustDrain(t, 10*time.Second); len(stuck) != 1 {
-		t.Fatalf("the refused tree is reported as %v; want exactly one stuck entry", stuck)
-	}
-
-	// The wakes of a run: every removal queued after it wakes the reclaimer,
-	// and the entry above is still stuck the whole time.
-	for i := range 20 {
-		name := filepath.Join(served, fmt.Sprintf("queued-%d", i))
-		writeFile(t, name, 4096)
-		if err := RemoveFor(Materialization, name); err != nil {
-			t.Fatal(err)
-		}
-		if got := StuckFrees(); len(got) != 1 {
-			t.Fatalf("after %d further removals the reclaimer discloses %v; want the entry it still "+
-				"cannot free, which is holding the space the operator is watching", i+1, got)
-		}
-	}
-	stuck := mustDrain(t, 10*time.Second)
-	if len(stuck) != 1 {
-		t.Fatalf("after the queued removals the reclaimer reports %v; want the one it cannot free", stuck)
-	}
-	// The reason is the filesystem's, without this process's scratch path in
-	// it: the entry is named by its purpose and its name inside the set, and
-	// where the pool happens to live is not part of the answer.
-	if strings.Contains(stuck[0].Reason, served) {
-		t.Fatalf("the disclosed reason carries the absolute scratch path: %q", stuck[0].Reason)
-	}
-	if !strings.Contains(stuck[0].Reason, "permission denied") {
-		t.Fatalf("the disclosed reason is %q; want what the filesystem said", stuck[0].Reason)
-	}
-
-	// Freed at last: the record goes with it, because an entry no operator can
-	// find explains nothing.
-	if err := os.Chmod(inner, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	reclaim.wake()
-	if left := mustDrain(t, 10*time.Second); len(left) != 0 {
-		t.Fatalf("the entry is still disclosed after it was freed: %v", left)
-	}
-}
-
-// The requirement: a directory the reclaimer cannot LIST is disclosed, not
-// passed over. Everything queued inside it is space this process is holding.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
-//
-// Mutation: drop the recordStuck call from nextEntry's ReadDir failure and
-// StuckFrees is empty while the bytes stay pending.
-func TestAPurposeDirectoryThatCannotBeListedIsDisclosed(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("a process with the override capability lists a directory that grants nobody read, " +
-			"so the refusal this test is built on never happens and it would pass vacuously")
-	}
-	served := t.TempDir()
-	set := filepath.Join(served, "to-free")
-	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
-	t.Cleanup(func() {
-		_ = filepath.WalkDir(served, func(path string, d os.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				_ = os.Chmod(path, 0o700)
-			}
-			return nil
-		})
-	})
-	Drain()
-
-	queued := filepath.Join(served, "queued")
-	writeFile(t, queued, 4096)
-	if err := RemoveFor(AnalyzerOutput, queued); err != nil {
-		t.Fatal(err)
-	}
-	// Neither readable nor searchable: the reclaimer can reach the purpose
-	// directory's name and nothing inside it.
-	purposeDir := filepath.Join(set, string(AnalyzerOutput))
-	if err := os.Chmod(purposeDir, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	reclaim.wake()
-
-	stuck := mustDrain(t, 10*time.Second)
-	if len(stuck) != 1 {
-		t.Fatalf("a purpose directory that cannot be listed is disclosed as %v; want exactly one entry", stuck)
-	}
-	if !strings.Contains(stuck[0].Reason, "permission denied") {
-		t.Fatalf("the disclosed reason is %q; want what the filesystem said", stuck[0].Reason)
 	}
 }

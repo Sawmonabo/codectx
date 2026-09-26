@@ -14,7 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// Retention by distinct ref (Section 12.4, ruling Q10). Every activation
+// Retention by distinct ref (Section 12.4). Every activation
 // records the ref it was built from, and retention keeps the last
 // `retain_refs` refs the user actually indexed rather than the last N
 // snapshots, which is what makes switching A -> B -> C -> A find A's units
@@ -50,14 +50,9 @@ func (c *Coordinator) retain(ctx context.Context) {
 	ctx, span := ledger.Start(ctx, stageRetention, "")
 	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
 	span.AddOut(int64(report.GenerationsSwept))
-	// The ledger is NOT swept with the generations this pass deleted. A run's
-	// account is about the run, not about the generation it happened to
-	// publish: retention keeps the newest generation of each ref, so a
-	// deferred publication -- which extends the base generation on the same
-	// ref, in the same command -- makes the index run's generation a sweep
-	// candidate seconds after it activated, and a ledger keyed to it would
-	// leave `status --resources` with nothing to say about the run that built
-	// the store. The ledger's own bound is sweepLedger's.
+	// The run ledger follows what this pass keeps: the collection pass that
+	// follows every retain sweeps the runs no retained generation stands
+	// behind (sweepLedger).
 	span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
@@ -74,13 +69,14 @@ func (c *Coordinator) retain(ctx context.Context) {
 
 // Collector is the process-level reclaim pass this coordinator schedules. It is
 // the narrow shape of *retention.Collector: the collector owns the Section 10.4
-// blob grace protocol and is the one caller of the five sweep helpers that had
-// none, and the coordinator owns the only moment in the process at which both
-// locks the pass requires are already held.
+// blob grace protocol and the store's sweep helpers, and the coordinator owns
+// the only moment in the process at which both locks the pass requires are
+// already held.
 //
-// It may be nil. A coordinator built without one indexes exactly as before and
-// reclaims nothing on its own -- the composition root always supplies one, and
-// only a coordinator assembled in a test goes without.
+// It may be nil. A coordinator built without one indexes exactly as it
+// otherwise would and reclaims nothing on its own -- the composition root
+// always supplies one, and only a coordinator assembled in a test goes
+// without.
 type Collector interface {
 	Collect(ctx context.Context) (retention.Report, error)
 }
@@ -147,42 +143,53 @@ func recordReclaim(ctx context.Context, freedBefore int64) {
 	span.End(ledger.OutcomeOK, ledger.Measured{ItemsOut: &freed, CPUUnattributed: ledger.CPUOverlapped}, nil)
 }
 
-// sweepLedger is the whole of the ledger file's bound, one page per pass: the
+// sweepLedger is the whole of the run history's bound, one page per pass: the
 // overlay runs of processes that are gone, which belong to no generation and
-// outlive nothing but their own process, and then everything past this
-// repository's last ledger.RetainedRuns runs. Nothing else deletes a ledger
-// row, so a run's account survives for as many runs as the bound names --
-// including the run that built the store, whose generation retention deletes
-// as soon as a later one of the same ref exists.
+// outlive nothing but their own process, and then every run older than the
+// oldest run behind a generation the store still retains. The runs follow the
+// store's own retention, so a run's account lasts as long as what it built or
+// any older result is kept, and no count decides it. The learned peaks are not
+// runs and are not swept here: a plan retires them, by the scopes it names.
 //
-// It is called from the collection pass because that is where the process
-// already reclaims what nothing references, and because both sweeps skip a run
-// whose writer is still live: the run this pass is part of, another process's
-// overlay, and a tick in flight are all live by the same judgement a reader
-// uses, so nothing here can delete a run a status surface has just called live.
-//
-// The active generation is read first and handed to the sweep, which keeps its
-// run however old it is: an operator asking what the active store cost is
-// asking about that run, and the bound must not be what answers them.
+// It is called from the collection pass, which follows retain at every
+// publication, so the store it asks about is the one retention just left; and
+// both sweeps skip a run whose writer is still live: the run this pass is part
+// of, another process's overlay, and a tick in flight are all live by the same
+// judgement a reader uses, so nothing here can delete a run a status surface
+// has just called live.
 //
 // Like the passes around it, a failure never fails the run that published: the
 // rows stay and the next pass takes them, and the diagnostic is logged so a
 // file that is never being swept cannot be silent.
 func (c *Coordinator) sweepLedger(ctx context.Context) {
-	active, err := c.activeGeneration(ctx)
+	overlays, err := c.opts.Ledger.OverlayRuns(ctx)
 	if err == nil {
-		var overlays []string
-		if overlays, err = c.opts.Ledger.OverlayRuns(ctx); err == nil {
-			err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
-		}
+		err = c.opts.Ledger.DeleteOverlayRuns(ctx, overlays)
 	}
 	if err == nil {
-		err = c.opts.Ledger.SweepRuns(ctx, string(c.repo), int64(active))
+		err = c.opts.Ledger.SweepRuns(ctx, string(c.repo), c.generationRetained)
 	}
 	if err != nil {
-		logTyped(c.log, "the ledger runs no generation will collect were not swept", err,
+		logTyped(c.log, "the run ledger's history was not swept", err,
 			"component", component, "repository_id", string(c.repo))
 	}
+}
+
+// generationRetained is the run ledger's question to the store: whether it
+// still holds a generation as a published result. Active and superseded are
+// what RetainByRef keeps; a staging or failed generation never published, and
+// one retention deleted is gone, which the store answers as an argument it
+// does not hold.
+func (c *Coordinator) generationRetained(ctx context.Context, gen int64) (bool, error) {
+	status, err := c.opts.Store.GenerationStatus(ctx, model.GenerationID(gen))
+	var typed *model.Error
+	if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return status == model.GenerationActive || status == model.GenerationSuperseded, nil
 }
 
 // retentionState is what this coordinator knows about its own last retention

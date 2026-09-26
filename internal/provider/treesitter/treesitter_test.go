@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -22,7 +22,7 @@ import (
 )
 
 // TestMain makes this test binary its own parser worker, the way the codectx
-// binary is in production (ruling R8-1): invoked with wire.Subcommand as its
+// binary is in production: invoked with wire.Subcommand as its
 // first argument it runs worker.Main instead of the tests.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
@@ -66,7 +66,7 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -75,6 +75,17 @@ func newProvider(t *testing.T) *treesitter.Provider {
 	}
 	t.Cleanup(p.Close)
 	return p
+}
+
+// newLedger is the reservation ledger a test provider's workers are admitted
+// on: wide enough that admission never queues a test's handful of workers.
+func newLedger(t *testing.T) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(4<<30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
 }
 
 // TestLanguageFixtures runs the shared conformance check over every pinned
@@ -304,7 +315,23 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 		t.Fatalf("%s call-site aliases are not reproducible:\n first %v\nsecond %v", file, keys, keys2)
 	}
 
-	if file != "sample.go" {
+	switch file {
+	case "sample.js":
+		// `ns` is bound by a namespace import, so `ns.start()` is a call
+		// through that import, although the file declares a method start. A
+		// clause walk that binds nothing resolves it to that method instead.
+		wantCallee(t, meta, file, "start", "import")
+		return
+	case "sample.rs":
+		// `use std::io::{self, Write}` binds io, not "self": `io::stdout()`
+		// is a call through the import, and `self.width()` is the file's own
+		// method, resolved to it with no callee placeholder at all. Binding
+		// "self" makes the second a call through an import and drops it.
+		wantCallee(t, meta, file, "stdout", "import")
+		wantCallee(t, meta, file, "width", "")
+		return
+	case "sample.go":
+	default:
 		return
 	}
 	// The Go fixture calls the builtin len and the non-ASCII 日本語; the first
@@ -327,6 +354,25 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	}
 	if !seen[prefix+callsiteOf(t, src, "日本語")] {
 		t.Fatal("the non-ASCII call site published no alias at its byte range")
+	}
+}
+
+// wantCallee asserts the resolution of the callee placeholder a file's call
+// to callee published: resolution "" asserts there is none, because the call
+// resolved to a declaration of the file itself.
+func wantCallee(t *testing.T, meta map[model.NodeID]string, file, callee, resolution string) {
+	t.Helper()
+	var got []string
+	for _, m := range meta {
+		if strings.Contains(m, `"callee":"`+callee+`"`) {
+			got = append(got, m)
+		}
+	}
+	switch {
+	case resolution == "" && len(got) > 0:
+		t.Fatalf("%s: the call to %s published callee placeholders %v; it names the file's own declaration", file, callee, got)
+	case resolution != "" && (len(got) != 1 || !strings.Contains(got[0], `"resolution":"`+resolution+`"`)):
+		t.Fatalf("%s: the call to %s published callee placeholders %v, want one with resolution %s", file, callee, got, resolution)
 	}
 }
 
@@ -358,7 +404,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // set that nothing empties until Close, both leave every product test passing
 // and a resting machine carrying the whole ceiling.
 //
-// Mutation: put the timer back -- keep `w.timer = time.AfterFunc(idleTTL, ...)`
+// Mutation: add an idle timer -- `w.timer = time.AfterFunc(idleTTL, ...)`
 // in release and drop the drain from leaveStage -> "the parse stage ended with
 // 2 worker process(es) still alive".
 func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
@@ -374,7 +420,7 @@ func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -554,7 +600,7 @@ func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 1, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -562,4 +608,43 @@ func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// TestARecordAndASourceLongerThanOneFrameArriveWhole pins that the wire has no
+// size ceiling of its own: a generated barrel import whose one record encodes
+// to more than one transport unit, in a source file that is itself longer than
+// one unit, is parsed and answered whole.
+//
+// Failure mode: a fixed per-frame cap on fact records drops the import and
+// reports the file partial, and a source sent or read as one frame of bounded
+// length refuses the file outright; either way the file's imports are lost.
+//
+// Mutation: make the worker refuse a fact message longer than wire.ChunkBytes
+// instead of continuing it -> Imports is 0 and Truncated is set. Mutation: make
+// the worker read the source as a single frame -> the worker exits on a
+// malformed source frame and the parse fails.
+func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("import { ")
+	const names = 20000
+	for i := range names {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("n" + strconv.Itoa(100000+i))
+	}
+	b.WriteString(" } from \"./barrel\";\n")
+	src := []byte(b.String())
+	if len(src) <= 2*wire.ChunkBytes {
+		t.Fatalf("the fixture is %d bytes; it must span several %d-byte frames", len(src), wire.ChunkBytes)
+	}
+	p := newProvider(t)
+	probe, err := p.ParseProbe(context.Background(), "barrel.js", src)
+	if err != nil {
+		t.Fatalf("a %d-byte source with one %d-name import failed to parse: %v", len(src), names, err)
+	}
+	if probe.Imports != 1 || probe.Truncated {
+		t.Fatalf("the %d-name import arrived as %d imports (truncated %v), want exactly 1 and not truncated",
+			names, probe.Imports, probe.Truncated)
+	}
 }

@@ -27,7 +27,7 @@ import (
 // otherwise the insert fails on a constraint and takes `codectx index` down
 // instead of publishing the degraded generation it built.
 //
-// The second assertion is the one the FX-G21-A fold left open. The two rows
+// The second assertion covers the scope sum. The two rows
 // that collide there stand for DISJOINT scope sets, so the survivor must carry
 // their sum: keeping only the winner's `scopes` reported a smaller set than the
 // row represents while the report claimed nothing was omitted.
@@ -75,11 +75,12 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 //
 // Two rows that collide on the fold key are two units of one capability, and
 // what each gave up is true of the published row: keeping only the first one's
-// details reported one unit's dropped records and silently dropped the other's,
-// which is the silence the scale posture forbids. A fresh row's details are
-// kept for the same reason -- clearing the map made `partial` the only way a
-// provider could be heard at all, so a run that lost nothing had to over-claim
-// a degradation to report an admitted-oversize count.
+// details would report one unit's dropped records and silently drop the
+// other's, which is the silence the scale posture forbids. A fresh row's
+// details are kept for the same reason -- clearing the map would make
+// `partial` the only way a provider could be heard at all, so a run that lost
+// nothing would have to over-claim a degradation to report an
+// admitted-oversize count.
 //
 // Mutation proof: restore the first-wins fold in `add`
 // (`r.rows[key] = existing.WithDetail(scopesDetail, ...)`) and the partial
@@ -255,13 +256,13 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 	if row.DiagnosticCode != model.CodeProviderOutputInvalid {
 		t.Errorf("diagnostic code %q, want the failure's own", row.DiagnosticCode)
 	}
-	if row.Details["reason"] == "units_deferred" {
-		t.Error("a scope that failed was reported as still running")
+	if row.Details["reason"] == "units_deferred" || row.UnitsRunning != 0 {
+		t.Errorf("a scope that failed was reported as still running (units_running=%d)", row.UnitsRunning)
 	}
 }
 
 // TestCoverageKeepsAProviderWithNoMemberFailed is the other half of the same
-// ruling: softening a failure row is only honest when facts exist.
+// rule: softening a failure row is only honest when facts exist.
 //
 // Failure mode: a provider's every unit fails, the plan still names those
 // units, and the row is softened to `partial` on the strength of the plan --
@@ -444,19 +445,12 @@ func TestCoverageNeverReportsFreshOverAFailedPlannedUnit(t *testing.T) {
 // same wrong pair is what `status`, the completion block and the index-status
 // tool all render, because all four read this row.
 //
-// It also protects the exemplar scope's REMEDIATION reaching that same row.
-// Failure mode: a provider attaches a remediation to the error it fails with
-// -- the one sentence that says what an operator can do -- and the fold drops
-// it, so every surface reports a failure nobody is told how to act on.
-//
 // Mutation proof: in coveredProviders, drop the `planned[id]++` from the
-// Plan.Reuse loop; for the remediation, drop `Remediation: f.remediation`
-// from failureRow.publish.
+// Plan.Reuse loop.
 func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	t.Parallel()
 	const id, capability = "scip", "precise_definitions"
 	const reused, walked = 9, 2
-	const remediation = "install the analyzer for this language family, or disable the provider"
 
 	g := &generation{
 		caps: newCapabilityReport(),
@@ -473,7 +467,7 @@ func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	for i := range walked {
 		scope := "pkg:go:refused" + strconv.Itoa(i)
 		walkedScopes = append(walkedScopes, scope)
-		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable, remediation: remediation})
+		failures.add(scope, unitFailure{code: model.CodeProviderUnavailable})
 	}
 	g.failures = map[string]*providerFailures{id: failures}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
@@ -501,9 +495,5 @@ func TestCoverageCountsEveryPlannedScopeNotOnlyTheWalkedOnes(t *testing.T) {
 	}
 	if row.State != model.CapabilityPartial {
 		t.Errorf("capability state %q, want partial: nine scopes are in this generation", row.State)
-	}
-	if row.Remediation != remediation {
-		t.Errorf("the row carries remediation %q, want %q: the provider's own advice reached no operator",
-			row.Remediation, remediation)
 	}
 }

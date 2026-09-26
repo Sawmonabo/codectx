@@ -29,26 +29,30 @@ const cpgKind = "cpg"
 // triggers, the language servers' root markers, the dependence families'
 // project markers, and lang.Of/dependence.FamilyOf for the source check below
 // -- from the packages that own them. There is deliberately no table here: a
-// second copy of the mapping that decides what gets downloaded is exactly the
-// drift policy.md forbids.
+// second copy of the mapping that decides what gets downloaded would drift
+// from the one that decides what runs.
 //
 // The answer is the whole repository's answer, not its root directory's. A
-// repository does not keep its projects at its root: every `package.json` of a
-// measured monorepo sits in a subdirectory, so a root-only marker check
-// resolved no indexer payload at all while each of that repository's projects
-// had an indexer and a language server to run. The traversal is the
-// workspace's own, under the configuration's traversal policy, so an untracked
+// monorepo keeps its projects in subdirectories, so a root-only marker check
+// would resolve no indexer payload at all while each of its projects has an
+// indexer and a language server to run. This walk is the workspace's own
+// traversal under the configuration's traversal policy, so an untracked
 // manifest inside a dependency directory or any other excluded tree is never
-// seen -- the same tree the precise and dependence planners walk, which is what
-// makes what this command installs and what an index needs one question.
+// seen, plus every tracked path forced past those exclusions, as a capture
+// does.
 //
 // A tracked path wins over every exclusion, here as in a capture. Section 10.2
 // forces Git's own membership past ignore rules and past the vendor and
 // generated exclusions, which is why a capture installs ForceInclude and
 // ForceIncludeDir over its staging database: a tracked `third_party/mycrate/
-// Cargo.toml` IS in the manifest, roots a project and plans a unit, so a
-// selection that pruned it installed nothing for a project the index then
-// needs -- the offline runner's mid-index failure again, from the other side.
+// Cargo.toml` is in the capture's manifest, so a selection that pruned it
+// would install nothing for a project that capture holds, and the offline
+// runner would discover the missing payload mid-index.
+//
+// The indexing run's own detection walks with those two hooks too, answered
+// from the pinned snapshot (index/generation.go, forceSnapshotPaths). Tool
+// selection runs before any snapshot exists, so it has neither a staging
+// database nor a snapshot to ask, and streams Git's index instead.
 //
 // The second pass below is that force-include, reached without hooks and
 // without a staging database. A walk carrying the capture's two hooks emits
@@ -269,6 +273,8 @@ func (s *signals) tracked(root workspace.Root, maxFiles int64) error {
 		return err
 	}
 	ctx := context.Background()
+	// The listing has no wall clock: it is ended only when it stops making
+	// progress, after the package's hang-detector window.
 	g, err := git.New(ctx, runner, exe, 0)
 	if err != nil {
 		return err

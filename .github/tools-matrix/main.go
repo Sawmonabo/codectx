@@ -1,5 +1,5 @@
 // Command tools-matrix is the per-platform smoke of the managed analyzer
-// toolchain (Section 11.7 "Verification", Task 22 Step 3). It runs after
+// toolchain (Section 11.7 "Verification"). It runs after
 // `codectx tools prefetch --all` on each operating system of
 // .github/workflows/tools-matrix.yml and answers one question the unit tests
 // cannot: does the payload the lock pinned for *this* platform actually run,
@@ -151,7 +151,7 @@ var indexChecks = []check{
 }
 
 // engineFrontends are the engine's own spellings for the parser of each
-// language family, matching internal/provider/dependence/joern. The engine
+// language family, matching internal/provider/dependence/graphengine. The engine
 // covers all nine languages through six frontends.
 var engineFrontends = []struct {
 	frontend  string

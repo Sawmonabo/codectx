@@ -26,9 +26,9 @@ import (
 // ---------------------------------------------------------------------------
 
 // fakeServices implements the four narrow facade interfaces with one function
-// field per method. Fields, not method bodies: a lane sets only the field its
-// row needs and never edits a shared body, so five lanes adding rows to this
-// file do not conflict over the fake.
+// field per method. Fields, not method bodies: a row sets only the field it
+// needs and never edits a shared body, so rows do not interfere through the
+// fake.
 //
 // A nil field answers with a typed CTX_INTERNAL, so a row that forgets to set
 // the method it exercises fails loudly instead of silently seeing a zero value.
@@ -44,7 +44,7 @@ type fakeServices struct {
 	graphFn      func(context.Context, model.GraphRequest) (model.GraphResult, error)
 	pathFn       func(context.Context, model.PathRequest) (model.PathResult, error)
 	// impactFn tracks ExploreService.Impact, which returns model.ImpactResult
-	// whole (Task 17 INT).
+	// whole.
 	impactFn func(context.Context, model.ImpactRequest) (model.ImpactResult, error)
 
 	planFn          func(context.Context, model.PlanRequest) (model.PlanResult, model.SessionStatus, error)
@@ -253,8 +253,8 @@ func (f *fakeServices) CloseSession(ctx context.Context, r model.SessionRequest,
 const testSchemaVersion = "test-schema-1"
 
 // newTestHandlers builds the handlers seam directly. It does not call New:
-// New and Options are L1's, and building the server here keeps the whole test
-// file independent of L1's landing.
+// building the handlers alone keeps these rows independent of the server's
+// construction.
 func newTestHandlers(f *fakeServices) *handlers {
 	return &handlers{
 		index:   f,
@@ -468,7 +468,7 @@ func TestToolSchemaSnapshot(t *testing.T) {
 			t.Errorf("tool %q is registered but not in the snapshot", name)
 		}
 	}
-	// The continuation argument of ruling C9 is OPTIONAL, so it never enters
+	// The plan's continuation argument is OPTIONAL, so it never enters
 	// the required list above and the table alone would not notice it
 	// disappearing. Its presence is what makes a deadline-truncated plan
 	// resumable over MCP, so it is pinned by name.
@@ -517,8 +517,8 @@ func equalStrings(got, want []string) bool {
 // scenario is one end-to-end tool call over a real client session.
 //
 // facade configures the deterministic seam for this row only; check inspects
-// what actually came back over the transport. Rows live under their lane's
-// marker and nowhere else, so five lanes extend this table without conflicting.
+// what actually came back over the transport. Rows are grouped by the file
+// that holds their handler.
 type scenario struct {
 	name   string
 	facade func(*fakeServices)
@@ -540,18 +540,18 @@ type scenario struct {
 }
 
 var scenarios = []scenario{
-	// L0 row.
+	// The shared envelope.
 	{
 		// Failure mode: the one fully worked tool stops round-tripping — the
 		// envelope loses the build's schema version, warnings serializes as
 		// null instead of [], or the facade's answer does not survive
-		// StructuredContent. Every other lane's handler copies this shape, so
+		// StructuredContent. Every other handler copies this shape, so
 		// this row failing means all 23 are suspect.
 		name: "index_status round-trips the shared envelope",
 		facade: func(f *fakeServices) {
 			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
-				// The request reaches the facade as sent: ruling Q1 makes the
-				// resource block a field of this one answer, and a handler that
+				// The request reaches the facade as sent: the
+				// resource block is a field of this one answer, and a handler that
 				// dropped the flag would report "not measured" for a block the
 				// caller explicitly asked for.
 				if !r.Resources {
@@ -580,7 +580,7 @@ var scenarios = []scenario{
 		},
 	},
 
-	// L1 rows.
+	// Server and request limits.
 	oversizedArgumentsRow(),
 
 	{
@@ -609,7 +609,7 @@ var scenarios = []scenario{
 		wantCallErr: true,
 	},
 
-	// L2 rows.
+	// Index and discovery.
 	{
 		// Failure mode: the MCP surface grows a second shape for the run
 		// ledger. codectx_index_status has no special case for resources: it
@@ -762,8 +762,7 @@ var scenarios = []scenario{
 	},
 	{
 		// Failure mode: a not-yet-implemented producer is laundered into "no
-		// results". Overview has no producer this wave and refuses with a typed
-		// *model.Error; a handler that swallowed it and returned an empty page
+		// results". Overview here refuses with a typed *model.Error; a handler that swallowed it and returned an empty page
 		// would leave the model unable to tell "this repository has no
 		// packages" from "this capability does not exist yet" — the silent
 		// capability reduction Section 30.1 forbids. The fixture code is
@@ -802,7 +801,7 @@ var scenarios = []scenario{
 		},
 	},
 
-	// L3 rows.
+	// Symbol information and graph traversal.
 	{
 		// Failure mode: symbol_info's two facade calls straddle a generation
 		// change, so the evidence describes a different snapshot than the
@@ -854,12 +853,12 @@ var scenarios = []scenario{
 		},
 	},
 
-	// L4 rows.
+	// Session lifecycle.
 	//
 	// Both rows are wrapped in a func literal so the row's fixtures and its
 	// actor-aware facade live in one scope: the first row needs the SAME facade
-	// for two sessions, and package-level helpers would collide with the other
-	// lanes appending at their own markers.
+	// for two sessions, and package-level helpers would collide with other
+	// rows'.
 	func() scenario {
 		const (
 			session  = model.SessionID("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
@@ -1002,7 +1001,7 @@ var scenarios = []scenario{
 		}
 	}(),
 
-	// L5 rows.
+	// Review gate and capsule.
 	{
 		// Failure mode: a waived session is reported ready to implement. A
 		// waiver is an audit record and never grants strict readiness
@@ -1074,7 +1073,7 @@ var scenarios = []scenario{
 		// has been told how much the capsule holds when it has not.
 		//
 		// The row is a closure so the fixture capsule is shared by facade and
-		// check without a package-level helper another lane would collide on.
+		// check without a package-level helper another row would collide on.
 		sessionID := model.SessionID(strings.Repeat("a", 64))
 		manifestHash := strings.Repeat("d", 64)
 		canonicalHash := strings.Repeat("e", 64)

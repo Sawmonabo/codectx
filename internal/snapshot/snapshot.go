@@ -127,25 +127,7 @@ func ioError(op string, err error) error {
 		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the data directory's disk is full",
 			Remediation: "free disk space or move storage.data_dir to a larger volume"}
 	}
-	return internal("%s: %v", op, bareCause(err))
-}
-
-// bareCause strips the path from the OS error wrappers, keeping only the
-// operating-system reason.
-func bareCause(err error) error {
-	var pe *fs.PathError
-	if errors.As(err, &pe) {
-		return pe.Err
-	}
-	var le *os.LinkError
-	if errors.As(err, &le) {
-		return le.Err
-	}
-	var se *os.SyscallError
-	if errors.As(err, &se) {
-		return se.Err
-	}
-	return err
+	return internal("%s: %v", op, model.BareCause(err))
 }
 
 // typed maps any error leaving this package to a *model.Error chain: a bare

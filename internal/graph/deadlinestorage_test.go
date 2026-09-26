@@ -97,7 +97,7 @@ func newStorageDeadlineEngine(t *testing.T, f *graphFixture, adj Adjacency, time
 //	    pages is exactly the uninterrupted answer -- same set, same ORDER, no
 //	    entity listed twice.
 //
-// Mutation, run and pasted in the lane report: isDeadline reverted to the
+// Mutation that fails this test: isDeadline reverted to the
 // typed-only test at traverse.go's readChunk (the shipped behaviour).
 func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	const mids, fanOut = 40, 60

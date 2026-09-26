@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,17 +110,6 @@ func ImportScope(path string) string { return scopeImport + path }
 // repository whose only project is at the root keeps the shortest key there
 // is for it.
 func ProfileScope(name, root string) string { return scopeProfile + name + ":" + root }
-
-// ProfileRoot is the project directory a profile scope key of kind k names,
-// and whether the key is one of that kind at all. It is how a caller outside
-// this package reads a key without owning its spelling.
-func ProfileRoot(key string, k Kind) (string, bool) {
-	name, root, ok := splitProfileScope(key)
-	if !ok || name != string(k) {
-		return "", false
-	}
-	return root, true
-}
 
 // splitProfileScope takes a profile scope key apart into the indexer name and
 // the project directory it is rooted at. The kind name holds no colon, so the
@@ -369,21 +359,24 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 		// typed reason. A deferred kind does plan one -- its payload is pinned
 		// for this platform and the unit fetches it.
 		for _, root := range projectRoots(byKind[k]) {
-			key := ProfileScope(string(k), root)
-			if len(key) > model.MaxScopeKeyBytes {
+			if !plannable(k, root) {
 				// A key that does not fit is refused as a project, never
 				// truncated: two deep directories with a long common prefix
 				// cut to the same key, and every fact of one would then be
 				// attributed to the other. The project is left to the unit
-				// that encloses it, or to none, and the refusal is counted so
-				// the capability cannot be published fresh.
+				// that encloses it, or to none, and Detect names the refusal
+				// under detailUnplannedKeys.
 				continue
 			}
-			out = append(out, key)
+			out = append(out, ProfileScope(string(k), root))
 		}
 	}
 	return out
 }
+
+// detailUnplannedKeys is the detection detail naming the project directories
+// Scopes refuses because their scope key would exceed model.MaxScopeKeyBytes.
+const detailUnplannedKeys = "unplanned_project_keys"
 
 // triggersByKind groups the trigger paths detection recognized by the kind
 // each one triggers, ignoring anything that is not a trigger (the supplied
@@ -418,16 +411,26 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	// projects where its own toolchains expect them, which for a monorepo is
 	// never the root: a root-only check planned nothing at all for a
 	// repository with six indexable projects in subdirectories. The walk is
-	// the policy's own -- it descends into nothing the snapshot excludes, so a
-	// dependency directory's manifests are never seen -- and it is bounded by
-	// provider.MaxDetectionInputs like every other detection.
+	// the policy's own and descends into nothing that policy excludes, so an
+	// excluded dependency directory's manifests are not seen. A tracked path
+	// under an excluded directory is part of the snapshot (Section 10.2), and
+	// this walk sees it exactly when the policy carries the capture's
+	// ForceInclude and ForceIncludeDir hooks; without them such a project
+	// plans no unit. The walk is bounded by provider.MaxDetectionInputs like
+	// every other detection.
 	triggers, truncated, err := p.walkTriggers(ctx, root, policy)
 	if err != nil {
 		return provider.Detection{}, err
 	}
+	unplannable := 0
 	for _, k := range p.runnableKinds() {
 		if len(triggers[k]) == 0 {
 			continue
+		}
+		for _, root := range projectRoots(triggers[k]) {
+			if !plannable(k, root) {
+				unplannable++
+			}
 		}
 		det.Available = true
 		det.InputPaths = append(det.InputPaths, triggers[k]...)
@@ -444,6 +447,12 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 		// project was dropped, and the detail is what makes the capability
 		// visibly short of the repository rather than quietly so.
 		det = det.WithDetail("unplanned_projects", "the workspace holds more project manifests than one detection carries; the projects past the bound are not indexed precisely")
+	}
+	if unplannable > 0 {
+		// Scopes refuses these projects rather than truncate their keys, so
+		// this is the one place that can say they have no unit of their own.
+		det = det.WithDetail(detailUnplannedKeys, strconv.Itoa(unplannable)+
+			" project directories have a scope key longer than the identity bound; their files are indexed by the enclosing project's unit, or not precisely at all")
 	}
 	// A language this workspace triggers whose indexer this machine cannot
 	// supply is named here with the toolchain's own reason, whether or not some
@@ -541,24 +550,16 @@ type ImportOptions struct {
 //
 // Manifest is a private temporary file owned by the caller: Save copies it to
 // durable storage and Close removes it. It is nil only when the import failed.
+//
+// Everything the import left out -- documents it did not admit, refused
+// occurrences, occurrences cut past a relation's evidence bound, call-site
+// aliases over their bound, records and fields the decoder discarded -- is
+// published on Result's capability rows, with a count and an exemplar, which
+// is the one channel that reaches a reader of the generation.
 type Report struct {
 	Result   model.ProviderResult
 	Delta    Delta
 	Manifest *DocumentManifest
-
-	// Documents an index described and this import did not admit. They are
-	// counted, never guessed about: OutsideRoot is a document whose
-	// relative_path escapes the project root, DuplicatePaths a document a
-	// later document with the same path superseded, Skipped a document the
-	// snapshot does not hold or whose encoding or size the import cannot
-	// stand behind.
-	//
-	// Everything else this import left out -- refused occurrences, documents
-	// dropped for an encoding that did not hold, occurrences cut past a
-	// relation's evidence bound, records and fields the decoder discarded --
-	// is published on the capability row's details, which is the channel that
-	// reaches a reader of the generation. It is not repeated here.
-	OutsideRoot, DuplicatePaths, Skipped int64
 }
 
 // IndexUnit builds one unit: the supplied index or one profile run. It is the

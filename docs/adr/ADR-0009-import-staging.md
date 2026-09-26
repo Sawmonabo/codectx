@@ -9,7 +9,7 @@ Accepted.
 The dependence provider imports one unit's analysis export -- a directory of
 node and edge CSV files -- by staging it in a private SQLite database and
 deriving the unit's facts by ordered query ([providers-dependence](../providers-dependence.md#the-staging-database)).
-Measured with the phase-by-phase harness in `internal/provider/dependence/neo4jcsv/scale_test.go`,
+Measured with the phase-by-phase harness in `internal/provider/dependence/graphcsv/scale_test.go`,
 the staging wrote 34.5 times the export's bytes for a 9 MB synthetic export
 and 42 times for a 47 MB one, and an uncapped index of the reference
 repository left a 12.7 GB staging file behind a 1 GB store, writing at the

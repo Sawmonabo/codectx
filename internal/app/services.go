@@ -16,8 +16,8 @@ import (
 )
 
 // Services is the frozen application facade of Section 19.2: the one surface
-// the CLI (Task 18) and the MCP server (Task 19) are planned against, so both
-// product adapters drive the same operations rather than two drifting copies.
+// the CLI and the MCP server are built against, so both product adapters drive
+// the same operations rather than two drifting copies.
 //
 // It is a struct rather than a set of methods on *Workspace because *Workspace
 // already owns the names Search, Coverage and Close, which collide with
@@ -35,7 +35,7 @@ import (
 // workspace's lifetime. The CLI opens and closes a report workspace per
 // command, so a *Services must never be cached across commands.
 //
-// Concurrency (Task 19, Q2): a *Services is safe for concurrent use by multiple
+// Concurrency: a *Services is safe for concurrent use by multiple
 // goroutines over one workspace, which is what lets an MCP server answer
 // several tool calls against a single open workspace. It holds one pointer and
 // no mutable state of its own, and every service it routes to is either
@@ -54,7 +54,7 @@ type Services struct {
 	read bool
 }
 
-// Services is the one accessor Tasks 18 and 19 call. It is cheap: the services
+// Services is the one accessor the CLI and MCP adapters call. It is cheap: the services
 // it routes to were composed when the workspace opened.
 func (w *Workspace) Services() *Services { return &Services{w: w} }
 
@@ -187,7 +187,7 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 // IndexStatus reports the active generation and its capability completeness,
 // and -- only when the request asks for it -- the Section 23 resource block.
 //
-// The block is a request field rather than a second call (ruling Q1) so one
+// The block is a request field rather than a second call so one
 // answer describes one moment: a caller that asked status and then resources
 // would be reading two instants and reporting them as one. It stays off by
 // default because sampling the host walks the content-addressed store and the
@@ -365,13 +365,10 @@ func (s *Services) Path(ctx context.Context, req model.PathRequest) (model.PathR
 // Impact answers bounded impact analysis.
 //
 // It returns the engine's whole model.ImpactResult rather than a page of its
-// entries. L0 froze this method as model.Page[model.ImpactEntry]; INT changed
-// it (the ruling "Rulings on L7 FACADE deviations", D3) because the result
-// also carries the per-package rollup and the visited/edge accounting that
-// `codectx impact` already prints, and model.Page has no home for either. A
-// facade that silently dropped them would make the facade path a downgrade from
-// the command it is meant to replace. This is the only Task 17 change to a
-// frozen facade signature.
+// entries, because the result also carries the per-package rollup and the
+// visited/edge accounting that `codectx impact` prints, and model.Page has no
+// home for either. A facade that silently dropped them would answer less than
+// the command it serves.
 func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error) {
 	if err := req.Validate(); err != nil {
 		return model.ImpactResult{}, err
@@ -398,7 +395,7 @@ func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.I
 // idempotency key, so a session that fails to open leaves a reusable manifest
 // rather than a half-written one.
 //
-// The compile is CONTINUABLE (rulings C7 and C9): when it runs out of query
+// The compile is CONTINUABLE: when it runs out of query
 // deadline it ends the pass it is in and answers a truncated PlanResult
 // carrying the token the caller presents back as PlanRequest.Cursor. No session
 // is opened on that path -- see the truncation branch below.
@@ -410,7 +407,7 @@ func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanR
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
-	// Ruling C9: a compile that ended at a pass boundary is returned BEFORE any
+	// A compile that ended at a pass boundary is returned BEFORE any
 	// session is opened. There is no manifest for a session to bind to -- a
 	// partial plan is never persisted -- so opening one here would leave a
 	// session row pointing at a manifest that does not exist, and the actor
@@ -429,8 +426,8 @@ func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanR
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
-	// The gate-aware status is the workflow evaluator's and nobody else's
-	// (ruling VF1), so the freshly opened session is described by the same
+	// The gate-aware status is the workflow evaluator's and nobody else's,
+	// so the freshly opened session is described by the same
 	// readiness answer every later call reports. The extra read is a session
 	// read, not a second aggregate: Section 16.3 is still decided by one
 	// CoverageSummary call inside that evaluator.
@@ -445,7 +442,7 @@ func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanR
 // workflow readiness evaluator. Every endpoint that answers a status composes
 // this rather than building one, so ready_for_implementation,
 // strict_gate_satisfied and the guarantee limit mean the same thing on all of
-// them (ruling VF1).
+// them.
 func (s *Services) sessionStatus(ctx context.Context, req model.SessionRequest) (model.SessionStatus, error) {
 	wf, err := s.workflow()
 	if err != nil {
@@ -642,9 +639,9 @@ func (s *Services) CapsuleRows(ctx context.Context, req model.SessionRequest, li
 // It spends two calls on purpose. The transition is the workflow service's,
 // which owns the Section 17.1 guards and answers a model.WorkflowStatus; the
 // frozen facade answers a model.SessionStatus, which only the readiness
-// evaluator builds (deviation D2, accepted). There is no second closing path to
-// take instead: ruling VF1 removed coverage.Service.Close along with the
-// duplicate status aggregate that was its only reason to exist.
+// evaluator builds. There is no second closing path to take instead: the
+// coverage service has no Close of its own and no status aggregate beside the
+// evaluator's.
 //
 // A Status that fails after a successful Close loses the report, not the close:
 // the transition is already committed and the caller's next status shows it.

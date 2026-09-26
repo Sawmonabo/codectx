@@ -11,7 +11,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// Ruling C7's continuation token. resume.go persists WHAT a completed pass
+// A compile's continuation token. resume.go persists WHAT a completed pass
 // produced; this file is WHO may read it back.
 //
 // The token carries no plan state, only identity: the leased state directory's
@@ -103,7 +103,7 @@ func cursorInvalid(msg string) error {
 // continuationsAvailable reports whether this workspace can mint and resume a
 // compile continuation at all. A workspace composed without the spool store,
 // the signer or the lease store offers none, and a deadline then ends the
-// answer exactly as it did before ruling C7.
+// answer with no continuation on offer.
 func (c *Compiler) continuationsAvailable() bool {
 	return c.spools != nil && c.signer != nil && c.leases != nil
 }

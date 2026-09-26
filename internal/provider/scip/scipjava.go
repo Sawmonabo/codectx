@@ -19,7 +19,7 @@ import (
 const scipJavaConfigName = "scip-java.json"
 
 // scipJavaTargetRootName is the indexer's own scratch root, kept inside the
-// run directory. Left to its default, scip-java writes its javac option file
+// run directory. Left to its default, the indexer writes its compiler option file
 // and its per-file SCIP output into `<sourceroot>/target`, i.e. into the
 // materialization; --targetroot moves all of it into the run's private scratch
 // so the copy the indexer reads is the copy the input manifest describes.
@@ -40,32 +40,37 @@ type scipJavaProject struct {
 	JavacOptions      []string `json:"javacOptions"`
 }
 
-// requireSources refuses a profile run whose materialization holds no source
-// file the indexer can describe, before the tool is started.
+// requireSources refuses a profile run whose project holds no source file the
+// indexer can describe, before the tool is started.
 //
 // It is not exotic. A root pom.xml with no compilable source is every
 // aggregator POM of a multi-module repository, and a package.json with no
 // TypeScript or JavaScript beside it is every lock-only or metadata-only
-// package directory; a root manifest is exactly what triggers these profiles.
-// Left to the tool, javac refuses and scip-java exits 1, and scip-typescript
-// exits 1 with "no files got indexed" (both measured), so the run fails as
-// CTX_PROVIDER_UNAVAILABLE with a process exit status, no stderr and no
-// remediation -- for a condition this provider can name precisely and the Go
-// path already names as CTX_PROVIDER_OUTPUT_INVALID. The refusal is that same
-// typed one, raised before a tool starts rather than after.
+// package directory; a manifest is exactly what triggers these profiles. Left
+// to the tool, the compiler refuses and the Java indexer exits 1, and the
+// TypeScript indexer exits 1 with "no files got indexed" (both measured), so
+// the run fails as CTX_PROVIDER_UNAVAILABLE with a process exit status, no
+// stderr and no remediation -- for a condition this provider can name
+// precisely and the Go path already names as CTX_PROVIDER_OUTPUT_INVALID. The
+// refusal is that same typed one, raised before a tool starts rather than
+// after.
 //
 // The walk stops at the first match and is bounded by the materialization,
-// which MaxMaterializeBytes already bounds. Directories the indexers never
-// read are skipped so a vendored dependency tree cannot answer for the
-// project's own source.
-func requireSources(matRoot, what string, exts []string, skipDirs []string) error {
+// which MaxMaterializeBytes already bounds. Two kinds of directory are not
+// walked, because their sources are not this project's: a directory the
+// indexers never read (skipDirs), so a vendored dependency tree cannot answer
+// for the project's own source; and a nested project (nested reports one for
+// an absolute directory), whose documents belong to its own unit and are
+// dropped from this one, so the modules of an aggregator POM cannot answer for
+// the aggregator.
+func requireSources(project, what string, exts, skipDirs []string, nested func(dir string) bool) error {
 	found := false
-	err := filepath.WalkDir(matRoot, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(project, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if path != matRoot && slices.Contains(skipDirs, d.Name()) {
+			if path != project && (slices.Contains(skipDirs, d.Name()) || nested(path)) {
 				return fs.SkipDir
 			}
 			return nil
@@ -92,11 +97,11 @@ func requireSources(matRoot, what string, exts []string, skipDirs []string) erro
 // writeScipJavaConfig writes the Java profile's build description into the
 // private materialization, replacing one the repository happened to carry.
 //
-// Why this exists. Without it scip-java drives the project's own build tool,
-// which it looks for on PATH: a machine without Maven or Gradle gets
-// `CTX_PROVIDER_UNAVAILABLE: scip-java exited with status 1` from a product
-// that owns a JDK and pins an indexer (measured). With a configuration file
-// the indexer compiles the sources itself with the managed JDK's own javac, so
+// Why this exists. Without it the indexer drives the project's own build tool,
+// which it looks for on PATH: a machine without that build tool gets
+// `CTX_PROVIDER_UNAVAILABLE ... exited with status 1` from a product that
+// owns a JDK and pins an indexer (measured). With a configuration file
+// the indexer compiles the sources itself with the managed JDK's own compiler, so
 // the Java profile needs no host build tool at all and resolves nothing over
 // the network.
 //
@@ -109,7 +114,7 @@ func requireSources(matRoot, what string, exts []string, skipDirs []string) erro
 // rather than wrong, and the false-readiness gate refuses an index that
 // described nothing at all.
 //
-// A repository's own scip-java.json is not honoured: the argument array, the
+// A repository's own copy of this file is not honoured: the argument array, the
 // environment and the build description are product code (Section 20.2), and a
 // file inside the repository choosing what the indexer compiles is a
 // configuration surface this provider does not offer.
@@ -127,7 +132,7 @@ func writeScipJavaConfig(matRoot string) error {
 	}
 	if err := os.WriteFile(filepath.Join(matRoot, scipJavaConfigName), data, 0o600); err != nil {
 		return &model.Error{Code: model.CodeInternal,
-			Message: "the private scip-java configuration could not be written: " + err.Error()}
+			Message: "the private Java indexer configuration could not be written: " + err.Error()}
 	}
 	return nil
 }

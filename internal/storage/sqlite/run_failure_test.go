@@ -22,8 +22,8 @@ import (
 // the run row is swept once that generation is gone, and a reason kept for a
 // generation nobody can name is a row that grows without bound.
 //
-// Mutation proof: in CompleteProviderRun, add `failure_json = ”` to the
-// UPDATE, and the completed run reports no reason.
+// Mutation proof: in RecordRunFailure, add `AND status = 'running'` to the
+// UPDATE, and the reason of the run already completed is refused.
 func TestRunFailureOutlivesTheFailedRunAndDiesWithItsGeneration(t *testing.T) {
 	f := newFixture(t, filepath.Join(t.TempDir(), "store.db"))
 	snap := f.snapshot("head")
@@ -73,10 +73,14 @@ func TestRunFailureOutlivesTheFailedRunAndDiesWithItsGeneration(t *testing.T) {
 // queue. A `codectx status` in another terminal, and the index-status tool in
 // a server, therefore reported a capability as merely degraded while the work
 // that completes it was still running, and could not say why any scope had no
-// facts at all. Both must come off the stored generation.
+// facts at all. Both must come off the stored generation, and the reason must
+// arrive without the analyzer's standard-error tail, which stays on the run
+// row: this answer is what `status --json` hands any client.
 //
-// Mutation proof: in StatusReader.Status, drop the FailedRuns read; or in
-// failureRow.publish, drop `UnitsRunning: f.running`.
+// Mutation proof: in StatusReader.Status, drop the FailedRuns read, and no
+// failed unit is read; drop its withoutRawOutput loop, and the tail is served;
+// in Store.Activate, insert 0 for units_running, and neither running scope is
+// read.
 func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	f := newFixture(t, path)
@@ -110,15 +114,10 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	// zero here, and the second process would be told this capability is
 	// simply unavailable while its units are being built.
 	//
-	// NOT RUN under the no-test order. This builds the row rather than driving
-	// a late seal, which no test in this package can reach, so it holds the
-	// store and the second handle to the figure and not the counting; what
-	// counts it is internal/index's holdsFreshUnit, over generation_units.
-	//
-	// Mutation: restore the batch-local mirror in coveredProviders -- `case
-	// g.sealed[key]:` in place of the holdsFreshUnit read -- and drop
-	// otherProvider from the Activate list below; the second handle then reads
-	// one row and no running scope for the provider that was not publishing.
+	// This builds the rows rather than driving a late seal, which no test in
+	// this package can reach, so it holds the store and the second handle to
+	// the figure and not to the counting; what counts it is internal/index's
+	// holdsFreshUnit, over generation_units.
 	otherProvider := model.CapabilityState{ProviderID: "dependence", Capability: "calls",
 		Scope: "workspace", State: model.CapabilityUnavailable, DiagnosticCode: model.CodeProviderUnavailable,
 		UnitsRunning: 2, Details: map[string]string{"reason": "units_deferred"}}
@@ -156,6 +155,9 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	if got.ProviderID != reason.ProviderID || got.ScopeKey != reason.ScopeKey ||
 		got.Message != reason.Message || got.Remediation != reason.Remediation {
 		t.Errorf("the reason the second process read is %+v, want %+v", got, reason)
+	}
+	if _, ok := got.Details[model.DetailStderrTail]; ok {
+		t.Errorf("the second process read the analyzer's standard-error tail on a failed unit")
 	}
 	running := map[string]int{}
 	var row model.CapabilityState

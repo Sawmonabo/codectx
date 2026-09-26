@@ -21,7 +21,7 @@ import (
 // native_keys, and asserts the fact rows come back. No other test joins the
 // dictionaries (the delta tests compare surrogate to surrogate, which proves
 // two units agree, not that either names the right identity) and none asserts
-// that the canonical id survives at all, which is the ruling that makes the
+// that the canonical id survives at all, which is the rule that keeps the
 // surrogate storage-internal: model.NodeID on the wire stays canonical.
 func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
@@ -90,7 +90,7 @@ func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 	}
 
 	// The canonical key is stored as the 32-byte digest it is, not as its
-	// 64-character hex rendering (S-4), and it still derives the identity it is
+	// 64-character hex rendering, and it still derives the identity it is
 	// registered under -- which is the whole reason the wire keeps canonical
 	// ids while the store keeps surrogates.
 	var key []byte

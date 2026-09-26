@@ -53,14 +53,10 @@ const (
 // (toolchain.Tool.FingerprintDigest, the last path component of a language
 // server's work directory).
 //
-// It is declared here rather than in the frozen Options because L0 froze no
-// digest source: ToolCollector carries GC alone, and no method on
-// *toolchain.Resolver returns name -> digest today (PinnedFingerprint takes one
-// name; Status carries no digest). This is the L3b -> INT seam named in the
-// report: INT adds that one method to *toolchain.Resolver and hands the same
-// value in as the collector's ToolCollector, which is why the capability is
-// discovered by assertion on the collector's existing tool dependency instead
-// of through a second Options field this lane may not add.
+// ToolCollector carries GC alone, so the digest source is discovered by
+// assertion on the collector's existing tool dependency rather than through a
+// second Options field: *toolchain.Resolver implements PinnedFingerprints and
+// is the value handed in as the collector's ToolCollector.
 //
 // CONTRACT: a name the map does not carry is left entirely alone, and only the
 // digests under a name it does carry are reclaimed. That is deliberately the
@@ -76,10 +72,9 @@ type ToolPins interface {
 	PinnedFingerprints() map[string]string
 }
 
-// sweep gives five landed, caller-less helpers their first caller, in
-// dependency order -- ExpireSessions, then PruneSessions (the first reader of
-// the `storage.closed_session_retention` key, which had none), then
-// (*Spools).Sweep, snapshot.Sweep and (*Resolver).GC -- and then reclaims the
+// sweep runs five reclaimers in dependency order -- ExpireSessions, then
+// PruneSessions (the reader of the `storage.closed_session_retention` key),
+// then (*Spools).Sweep, snapshot.Sweep and (*Resolver).GC -- and then reclaims the
 // one tree nothing reclaims, <data_dir>/lsp.
 //
 // Order is a contract, not a listing order. Expiring a live session past its
@@ -173,8 +168,8 @@ func (c *Collector) sweepServerWorkDirs(ctx context.Context, now time.Time) erro
 		digest, isPinned := pinned[name]
 		if !isPinned {
 			// An overridden or unsupported server is absent from the pinned set
-			// and still live; see the ToolPins contract. Its tree is the INT
-			// ask, not this pass's to guess at.
+			// and still live; see the ToolPins contract. Its tree is not this
+			// pass's to guess at.
 			continue
 		}
 		errs = append(errs, c.sweepServerVersions(ctx, root, name, digest, now))
@@ -259,16 +254,8 @@ func (c *Collector) sweepConfigStaging(workDir string, now time.Time) error {
 // data directory is a private absolute root, which Section 21 keeps out of
 // ordinary reporting. A disk-full failure keeps its own family so an operator
 // is told to free space rather than to report a defect.
-//
-// The bare-cause unwrapping is the third copy in the tree (snapshot.bareCause,
-// toolchain's ioError); both are unexported, so this lane cannot reuse one.
-// Consolidating them into one exported helper is the ask recorded for INT.
 func sweepError(what string, err error) error {
-	var pe *fs.PathError
-	cause := err
-	if errors.As(err, &pe) {
-		cause = pe.Err
-	}
+	cause := model.BareCause(err)
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull,
 			Message:     "retention: " + what + ": the data directory's disk is full",

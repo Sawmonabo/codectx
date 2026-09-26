@@ -1,6 +1,6 @@
 package dependence
 
-// Memory governance for one unit (Section 11.6, ruling of
+// Memory governance for one unit (Section 11.6, as decided in
 // docs/research/00-synthesis.md Section 8).
 //
 // There is no memory ceiling at all. A reservation is a scheduling input and
@@ -82,10 +82,8 @@ const hostShareDenominator = 2
 // buys nothing and takes the host's memory away from everything else running
 // on it.
 //
-// One unit system: the derivations below divide bytes by bytes. Mixing binary
-// GiB with decimal MB is what put the JavaScript row at 48, a figure whose
-// stated derivation did not reproduce and whose product was 1.84x the ceiling
-// it claimed to double.
+// One unit system: the derivations below divide bytes by bytes, never binary
+// GiB by decimal MB.
 var heapPerSourceByte = map[Family]int64{
 	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
 	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
@@ -121,8 +119,7 @@ var residentAboveHeap = map[Family]int64{
 	// the reference run's ledger for this unit, the one datapoint recorded in
 	// bytes rather than in a rounded unit and taken at the cap the product
 	// itself chose: 10,099,015,680 B of peak tree residency against a
-	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB. The 1712 this
-	// replaces read a decimal-GB figure as binary GiB.
+	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB.
 	FamilyJavaScript: 2084 * miB,
 	FamilyPython:     1945 * miB,
 	FamilyRust:       256 * miB,
@@ -161,10 +158,14 @@ type Reservation struct {
 	ResidentBytes int64
 	HelperBytes   int64
 	// AllocationBytes is the machine-derived allocation the cap was bounded
-	// by, or zero when the machine's available memory could not be observed.
-	// Section 22 requires an unavailable metric to be reported as unavailable
-	// rather than as zero, which is what a zero here means: unknown, not none.
-	AllocationBytes int64
+	// by, and AllocationObserved whether the machine's available memory was
+	// observed at all. Section 22 requires an unavailable metric to be
+	// reported as unavailable rather than as zero, which is why the flag is
+	// separate: an observed zero is a host with nothing left over this
+	// process's footprint, where units run one at a time; an unobserved one is
+	// unknown, not none.
+	AllocationBytes    int64
+	AllocationObserved bool
 	// EstimatedBytes is the unbounded estimate before the allocation bound
 	// was applied. A unit whose estimate exceeds its cap is the one that
 	// earns an out-of-memory retry.
@@ -217,10 +218,11 @@ type Machine struct {
 // process's base footprint minus the safety margin, and never more than the
 // share of the machine this product takes (hostShareDenominator), so the host
 // keeps at least the rest of what was available when the run began. It is
-// zero when the host does not expose available memory, which means unknown:
-// with no observation the estimate is used as it stands, because inventing a
-// bound would be a default memory ceiling by another name and the ruling
-// forbids one.
+// zero when the host does not expose available memory, which means unknown,
+// and zero on an observed host whose available memory is at or below the
+// footprint and the margin, which means nothing is left over. Either way no
+// bound is placed on a unit's heap cap: inventing one would be a default
+// memory ceiling by another name, and the product has none.
 func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 	if !m.Observed {
 		return 0
@@ -233,10 +235,16 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 }
 
 // SchedulingAllocation is the one allocation every heavy child of this process
-// is admitted against: the machine-derived allocation, or
-// UnobservedAllocationBytes where the platform does not expose available
-// memory. It is always positive, so admission is always bounded by a sum of
-// reservations and never by a count of children.
+// is admitted against, and whether it is an observation.
+//
+//   - An observed host: the machine-derived allocation (Allocation), observed.
+//     Where available memory is at or below this process's footprint and the
+//     safety margin, that is zero, which is a real reading and not an absence:
+//     nothing is left over for the children, so the admission ledger runs them
+//     one at a time (its runs-alone rule) rather than inventing room.
+//   - A host that does not expose available memory: UnobservedAllocationBytes,
+//     not observed, standing in for the observation the platform withheld,
+//     because a gate with no bound is not a gate.
 //
 // baseFootprintBytes is what this process holds for itself, which its caller
 // derives from this machine and the configuration (config.BaseFootprint). It
@@ -245,11 +253,11 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 // makes up front grow with the machine, and an allocation computed against a
 // fixed figure hands the children memory the parent has already promised
 // itself.
-func (m Machine) SchedulingAllocation(baseFootprintBytes int64) int64 {
-	if alloc := m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes); alloc > 0 {
-		return alloc
+func (m Machine) SchedulingAllocation(baseFootprintBytes int64) (allocation int64, observed bool) {
+	if !m.Observed {
+		return UnobservedAllocationBytes, false
 	}
-	return UnobservedAllocationBytes
+	return m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes), true
 }
 
 // Governor sizes reservations. It holds no state and reads nothing: the
@@ -279,16 +287,19 @@ func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 // admitted against. Nothing here can reject the unit: a cap that is narrower
 // than the estimate costs the unit time, never its facts.
 //
-// Where the machine could not be observed the cap is NOT bounded: a bound
-// invented for an unreadable machine is a default memory ceiling by another
-// name, which docs/research/00-synthesis.md Section 8 forbids. Admission does
-// stand a figure in there (SchedulingAllocation), because a gate with no bound
-// is not a gate, so on those platforms alone a unit is sized without a bound
-// and admitted against the stand-in. That asymmetry is deliberate on both
-// sides and is recorded as an open question rather than resolved here.
+// Where the allocation is zero the cap is NOT bounded. On a machine that could
+// not be observed, a bound invented for it is a default memory ceiling by
+// another name, which docs/research/00-synthesis.md Section 8 forbids;
+// admission stands a figure in there (SchedulingAllocation), because a gate
+// with no bound is not a gate, so on those platforms a unit is sized without a
+// bound and admitted against the stand-in. On an observed machine with nothing
+// left over the footprint, bounding the cap at zero would clamp every unit to
+// the floor and trade its facts for thrash; the unit keeps its estimate and
+// the admission ledger runs it alone, and no out-of-memory retry is offered
+// (RetryCap), because there is no more memory to retry with.
 func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
-		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
+		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin), AllocationObserved: m.Observed}
 	estimate := sourceBytes * heapPerSourceByte[f]
 	if estimate < g.FloorBytes {
 		estimate = g.FloorBytes

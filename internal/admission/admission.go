@@ -1,20 +1,20 @@
 // Package admission is this process's one reservation ledger: every heavy
-// child -- analysis engine runs, external indexers, language servers -- is
-// admitted against a single machine-derived allocation of MEMORY and one of
+// child -- analysis engine runs, external indexers, language servers, parser
+// workers -- is admitted against a single machine-derived allocation of MEMORY and one of
 // DISK, by the SUM of what they reserve in each (ADR-0010 decisions 5 and 6).
 //
 // Two dimensions, one ledger, one total each, one queue. Disk is admitted here
-// and not by a gate of its own for the reason the memory rule gives: a second
-// gate is a second running total, and two gates over one queue would also let
-// a child holding memory wait for disk behind a child holding disk waiting for
-// memory. A waiter is admitted when BOTH dimensions fit and takes both at
-// once, so there is no order in which two reservers can hold half of what the
-// other needs. Two reservers each holding a running total
-// bounded by the same allocation is not one gate: it lets a process reserve a
-// multiple of the machine's memory and freeze the host, which is the failure
-// this package exists to make impossible. Nothing here observes the machine or
-// derives the allocation -- the composition root does that once and hands the
-// figure over -- so there is exactly one place a second total could ever be
+// and not by a gate of its own for the reason memory is: a second gate is a
+// second running total, and two gates over one queue would also let a child
+// holding memory wait for disk behind a child holding disk waiting for memory.
+// A waiter is admitted when every dimension it requests fits, and takes both
+// at once, so there is no order in which two reservers can hold half of what
+// the other needs. Two reservers each holding a running total bounded by the
+// same allocation is not one gate: it lets a process reserve a multiple of the
+// machine's memory and freeze the host, which is the failure this package
+// exists to make impossible. Nothing here observes the machine or derives the
+// allocations -- the composition root does that once and hands the figures
+// over -- so there is exactly one place a second total could ever be
 // introduced.
 //
 // Admission is strict first-in-first-out across every reserver. A waiter that
@@ -29,7 +29,20 @@
 // head and does not fit. That is how the language-server manager keeps its
 // rule that a server is never refused because another project's server is
 // running -- it stops an idle one -- without being able to overtake anything
-// in the queue.
+// in the queue. A reserver with nothing idle to free brings no makeRoom step;
+// what it holds comes back through release, which pumps.
+//
+// A holder that keeps room warm for reuse -- the parser pool's idle workers --
+// is told when that room is wanted. It registers an idle-release step with
+// Holder, and whenever the head of the queue does not fit, the head's own
+// waiting goroutine runs its makeRoom step and then every registered step, with
+// no ledger lock held. Such a holder also asks Waiting before it reuses room,
+// and never reuses it while a reserver waits: the parser pool hands a worker
+// back to its own acquirer at the head with the reservation it holds, and
+// otherwise stops it, and its registered step stops its idle workers. Either
+// way the room reaches the head in order and is returned by its holder, never
+// taken from it: only idle room is given back, and the order among the queued
+// reservers is kept.
 package admission
 
 import (
@@ -39,16 +52,17 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// Ledger admits heavy children against one allocation. It is safe for
+// Ledger admits heavy children against one allocation per dimension. It is safe for
 // concurrent use and holds no resource of its own: what it hands back is
 // permission to run, and the release function returns that permission exactly
 // once.
 type Ledger struct {
 	mu sync.Mutex
 	// allocation is the machine-derived memory allocation every admitted
-	// reservation must sum within. It is always positive, so admission is
-	// bounded by a sum of bytes on every platform and never by a count of
-	// children.
+	// reservation must sum within, so admission is bounded by a sum of bytes
+	// on every platform and never by a count of children. It is never
+	// negative; zero is a real reading -- a host with nothing left over this
+	// process's footprint -- and serializes every child that wants memory.
 	allocation int64
 	// diskAllocation is the same for the temporary disk a child stages its
 	// inputs and writes its outputs into: the free space observed under the
@@ -62,9 +76,13 @@ type Ledger struct {
 	used           int64
 	diskUsed       int64
 	queue          []*waiter
+	// holders are the registered idle-release steps (Holder), keyed by the
+	// registration so each one is removed exactly once. The map is bounded by
+	// the holders this process composes, one per room-keeping pool.
+	holders map[*func()]struct{}
 }
 
-// waiter is one blocked Reserve call. granted, stuck and the queue position are
+// waiter is one blocked Reserve call. granted and the queue position are
 // guarded by the ledger's mutex; ready is closed exactly once, by the grant.
 type waiter struct {
 	bytes     int64
@@ -72,29 +90,30 @@ type waiter struct {
 	granted   bool
 	ready     chan struct{}
 	// stuck carries one wake-up to a waiter that has reached the head of the
-	// queue, does not fit, and brought a way to free room. It is nil for a
-	// reserver that brought none, and the send is non-blocking, so a waiter
-	// that is already awake is never held up by the grant path.
+	// queue and does not fit: it then runs its own makeRoom step, if it
+	// brought one, and every registered holder's step. The send is
+	// non-blocking, so a waiter that is already awake is never held up by the
+	// grant path.
 	stuck   chan struct{}
 	release sync.Once
 }
 
-// NewLedger builds the ledger over the one machine-derived memory allocation
-// and the one disk allocation. A non-positive memory allocation is refused
-// rather than treated as unlimited: an admission gate with no bound is not a
-// gate, and every caller has a positive figure to hand over
-// (dependence.Machine.SchedulingAllocation stands in for an unobservable host).
-//
-// The disk allocation may be zero and may not be negative. Zero is the one
-// reading that is not a stand-in: a host whose free space is already at or
-// below the floor it must keep has nothing to give a child, and every child
-// that wants disk then runs alone rather than being refused. An unobservable
-// free-space figure is NOT zero and must not be passed as one; the composition
-// root stands a conservative figure in for it, exactly as it does for memory.
+// NewLedger builds the ledger over the one memory allocation and the one disk
+// allocation. Either may be zero and neither may be negative. Zero is a real
+// reading: a host whose available memory is already at or below this
+// process's footprint, or whose free space is at or below the floor it must
+// keep, has nothing to give a child, and every child that wants that
+// dimension then runs alone rather than being refused. An unobservable figure
+// is NOT zero and must not be passed as one; the composition root stands a
+// conservative figure in for it (dependence.Machine.SchedulingAllocation for
+// memory), because an admission gate with no bound is not a gate. Whether a
+// figure was observed is not the ledger's concern: it gates against the
+// figure either way, and the composition root tells the surfaces that
+// disclose it.
 func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
-	if allocationBytes <= 0 {
+	if allocationBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "the reservation ledger needs a positive memory allocation"}
+			Message: "the reservation ledger needs a memory allocation that is not negative"}
 	}
 	if diskAllocationBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
@@ -120,7 +139,9 @@ func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
 // Whatever it frees goes back through the ordinary release path, which pumps
 // the queue. It is called with no ledger lock held and may call back into the
 // ledger; it may be called again each time the head is pumped and still does
-// not fit, so a reserver whose room frees up later is still asked.
+// not fit, so a reserver whose room frees up later is still asked. Every
+// registered holder's step (Holder) runs right after it, the same way, so idle
+// room another holder keeps reaches this reservation in order.
 //
 // A canceled wait returns CTX_CANCELED and no release function. A wait that is
 // granted at the same moment its context ends gives the permission straight
@@ -147,10 +168,8 @@ func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
 	}
-	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, ready: make(chan struct{})}
-	if makeRoom != nil {
-		w.stuck = make(chan struct{}, 1)
-	}
+	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, ready: make(chan struct{}),
+		stuck: make(chan struct{}, 1)}
 	l.mu.Lock()
 	l.queue = append(l.queue, w)
 	l.pump()
@@ -161,7 +180,19 @@ func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()
 		case <-w.ready:
 			return func() { l.release(w) }, nil
 		case <-w.stuck:
-			makeRoom()
+			// A wake sent while this waiter was stuck can still be buffered
+			// when a later pump grants it; the grant wins, and room that is no
+			// longer needed -- a warm idle server -- is not freed for nothing.
+			l.mu.Lock()
+			granted := w.granted
+			l.mu.Unlock()
+			if granted {
+				return func() { l.release(w) }, nil
+			}
+			if makeRoom != nil {
+				makeRoom()
+			}
+			l.askHolders()
 		case <-ctx.Done():
 			l.mu.Lock()
 			granted := w.granted
@@ -197,6 +228,59 @@ func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
 	return l.diskAllocation, l.diskUsed
 }
 
+// Holder registers an idle-release step: a holder of room it keeps warm for
+// reuse, and would give back when someone needs it, is asked to run it every
+// time the head of the queue does not fit, after the head's own makeRoom step.
+// It runs on the head's waiting goroutine with no ledger lock held, so it may
+// call back into the ledger -- Waiting, and the release of whatever it frees,
+// which pumps. It may be called again on every such pump, so it frees only
+// room it holds idle and does nothing when it holds none. The returned
+// function removes the registration, once, however often it is called.
+func (l *Ledger) Holder(release func()) (unregister func()) {
+	key := &release
+	l.mu.Lock()
+	if l.holders == nil {
+		l.holders = map[*func()]struct{}{}
+	}
+	l.holders[key] = struct{}{}
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			delete(l.holders, key)
+			l.mu.Unlock()
+		})
+	}
+}
+
+// askHolders runs every registered idle-release step, read under the lock and
+// run without it.
+func (l *Ledger) askHolders() {
+	l.mu.Lock()
+	steps := make([]func(), 0, len(l.holders))
+	for step := range l.holders {
+		steps = append(steps, *step)
+	}
+	l.mu.Unlock()
+	for _, step := range steps {
+		step()
+	}
+}
+
+// Waiting reports whether any reserver is queued: one that has not been
+// granted and, since pump grants the head the moment it fits, one whose head
+// does not fit right now. It is a moment's reading for a holder of room that
+// could either reuse that room itself or give it back. A holder that reuses
+// room while this is true takes it around a waiter that arrived first, which
+// is the overtaking strict first-in-first-out forbids; giving it back instead
+// pumps, and the head is admitted in order.
+func (l *Ledger) Waiting() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queue) > 0
+}
+
 // pump grants the head of the queue for as long as the head fits. The mutex
 // must be held. It stops at the first waiter that does not fit rather than
 // looking past it, which is what makes admission first-in-first-out across
@@ -207,16 +291,17 @@ func (l *Ledger) pump() {
 		// The sums are checked only against something already admitted: an
 		// idle ledger admits any single reservation, whatever it is, so a
 		// child larger than the whole allocation -- of either dimension --
-		// runs alone rather than never. Both must fit, and the head takes both
-		// in one grant, so the two dimensions cannot be held against each
-		// other.
-		if l.admitted > 0 && (l.used+head.bytes > l.allocation ||
-			l.diskUsed+head.diskBytes > l.diskAllocation) {
-			if head.stuck != nil {
-				select {
-				case head.stuck <- struct{}{}:
-				default:
-				}
+		// runs alone rather than never. A dimension is checked only when the
+		// head requests some of it: a child that stages nothing is never held
+		// behind a disk dimension another child filled, and a child that
+		// holds no memory never behind the memory one. Every dimension the
+		// head requests must fit, and it takes both in one grant, so the two
+		// dimensions cannot be held against each other.
+		if l.admitted > 0 && (head.bytes > 0 && l.used+head.bytes > l.allocation ||
+			head.diskBytes > 0 && l.diskUsed+head.diskBytes > l.diskAllocation) {
+			select {
+			case head.stuck <- struct{}{}:
+			default:
 			}
 			return
 		}

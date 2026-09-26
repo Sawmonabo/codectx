@@ -1,9 +1,9 @@
 package index
 
-// The single incremental scenario of Task 12 Step 1, carried across the eight
-// cases the brief names: no-op reuse, ten changed files, a new symbol and
-// dependency, a delete and a rename, an optional provider's failure, a
-// required provider's failure, a concurrent refresh, and a watcher overflow.
+// The single incremental scenario, carried across eight cases: no-op reuse,
+// ten changed files, a new symbol and dependency, a delete and a rename, an
+// optional provider's failure, a required provider's failure, a concurrent
+// refresh, and a watcher overflow.
 // A ninth test covers the carry-distance paging the coordinator feeds the
 // planner.
 //
@@ -87,13 +87,17 @@ type fixture struct {
 	// unless a scenario is about what a watch reports, which needs a
 	// destination it can read back at debug.
 	logger *slog.Logger
+	// admission is the one admission ledger this fixture's coordinators and its
+	// parser workers reserve from, as production composes one per process.
+	admission *admission.Ledger
 }
 
 func newFixture(t *testing.T, files map[string]string) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	f := &fixture{t: t, ctx: ctx, repoDir: filepath.Join(dir, "repo"), dataDir: filepath.Join(dir, "data")}
+	f := &fixture{t: t, ctx: ctx, repoDir: filepath.Join(dir, "repo"), dataDir: filepath.Join(dir, "data"),
+		admission: testAdmission(t)}
 	if err := os.MkdirAll(f.repoDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +221,7 @@ func (f *fixture) treesitter() provider.Provider {
 		f.t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes,
-		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		Admission: f.admission, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: workDir})
 	if err != nil {
 		f.t.Fatal(err)
@@ -247,7 +251,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if locker == nil {
 		locker = heldLock{f.lock}
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: f.admission, CAS: f.cas,
 		Lock: locker, Pool: pool, Logger: f.logger, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
@@ -890,8 +894,10 @@ func TestCarryDistancesPageToTheEnd(t *testing.T) {
 	}
 }
 
-// TestDeferredUnitsAreNotCoverage guards the two false-readiness invariants of
-// Section 11.6 that only the `auto` configuration reaches. Neither can be
+// TestDeferredUnitsAreNotCoverage guards the false-readiness invariants of
+// Section 11.6 that only the `auto` configuration reaches: a deferred scope is
+// not coverage until the generation selects its planned unit, and the stale
+// predecessor carried for it is never that unit. Neither can be
 // driven end to end here: plan.Build marks a unit heavy -- and therefore
 // deferrable -- for the dependence provider alone, and that provider needs the
 // real analysis engine. So the coverage projection and the background queue are
@@ -952,7 +958,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 
 	// The same unit, once the publication generation holds it, is coverage --
 	// and it is the generation's own unit rows that say so, not any record of
-	// what the background batch sealed. NOT RUN under the no-test order.
+	// what the background batch sealed.
 	//
 	// Mutation: restore the in-process mirror by making holdsFreshUnit answer
 	// from a batch-local set instead of Store.SelectedUnit; the sealed unit
@@ -1003,13 +1009,52 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 				s.ProviderID, s.Capability, s.State)
 		}
 	}
+
+	// The reverse direction: a generation whose member for the deferred scope
+	// is the STALE predecessor carried while the scope is rebuilt, beside a
+	// sibling scope of the same provider that did seal fresh. The carried
+	// member exists, but it is not the unit the plan derives, so the scope is
+	// still running and the sibling's fresh row must not speak for the
+	// capability.
+	//
+	// Mutation: make holdsFreshUnit answer true for any selected unit rather
+	// than for the planned spec; the carried member then counts as coverage,
+	// the sibling's fresh row is never demoted, and this fails.
+	rebuilt := held
+	rebuilt.ProviderVersion = "v2"
+	carriedGen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/carried")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g = &generation{c: f.c, gen: carriedGen, caps: newCapabilityReport(), sel: sel,
+		plan: plan.Plan{Units: oneUnit(rebuilt), Carry: []plan.Carried{{Unit: spec.ID, ProviderID: d.ID,
+			ScopeKey: held.ScopeKey, DistanceGenerations: 1, DistanceFiles: 1}}}}
+	if err := g.attachCarried(ctx); err != nil {
+		t.Fatalf("attachCarried: %v", err)
+	}
+	if g.carried != 1 {
+		t.Fatalf("the stale predecessor was not carried into the generation (%d carried)", g.carried)
+	}
+	for _, capability := range d.Capabilities {
+		g.caps.add(model.CapabilityState{ProviderID: d.ID, Capability: capability, Scope: "sibling",
+			State: model.CapabilityFresh})
+	}
+	if err := g.coverage(ctx); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	for _, s := range g.caps.finish(f.c.log) {
+		if s.ProviderID == d.ID && s.State == model.CapabilityFresh {
+			t.Fatalf("%s/%s reported fresh while one of its scopes is answered by a carried stale "+
+				"predecessor whose rebuild is still running", s.ProviderID, s.Capability)
+		}
+	}
 }
 
 // A supplied index whose path resolves to nothing must still be recorded
 // against the published generation. An unresolved path plans no unit, so the
 // row is the only surviving evidence that tells it apart from a run that
 // supplied no index at all -- the distinction doctor's supplied_index check
-// exists to report, and the one that was unobservable before this record.
+// exists to report.
 func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 	f := newFixture(t, map[string]string{"a.go": "package a\n"})
 	f.c.opts.SuppliedIndexes = []SuppliedIndex{{
@@ -1409,7 +1454,7 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: f.admission, CAS: f.cas,
 		Lock: busyLock{}, Watcher: w, Pool: pool})
 	if err != nil {
 		t.Fatalf("New: %v", err)

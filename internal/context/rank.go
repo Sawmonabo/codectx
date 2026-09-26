@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L3. It holds
-// Section 15.3 integer ranking: path contributions, per-edge precision, depth decay, bounded boosts and the total tie-break order.
+// This file holds Section 15.3 integer ranking: path contributions, per-edge precision, depth decay, bounded boosts and the total tie-break order.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 //
 // Section 15.3's score is NOT Section 14.3's traversal ranking. graph.Cost and
 // the impact score 1_000_000/(1+cost) answer "how far did the walk travel";
@@ -358,7 +357,7 @@ func appendReason(reasons []string, reason string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming ranking (C-STREAM passes P-D and P-F)
+// Streaming ranking (passes P-D and P-F)
 // ---------------------------------------------------------------------------
 //
 // The streamed passes below hold plumbing only and no policy: they rebuild one
@@ -379,7 +378,7 @@ func appendReason(reasons []string, reason string) []string {
 // centrality sort by P-D, and `reasons` are appended to Cand.Reasons by P-D --
 // so nothing here is unbounded.
 //
-//   - Pkg is packageOf(PathAtRank), computed once by P-D. Ruling C3: the
+//   - Pkg is packageOf(PathAtRank), computed once by P-D. The
 //     centrality bucket and the boost reason read the AT-RANK path, while
 //     lessRank reads PathFinal. Storing the key keeps the two apart.
 //   - Base is max(originContribution(Origin), routed.best), the rank pass's

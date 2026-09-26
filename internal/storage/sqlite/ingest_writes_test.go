@@ -343,8 +343,8 @@ func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testin
 // activation owes is thousands of merges, each its own committed and
 // unrollbackable ingestion. A loser that pays the cascade before reading the
 // row rebuilds a repository's segment set for an activation that was never
-// going to happen -- work no operator asked for, on the disk the wave is
-// about. The checks therefore run first.
+// going to happen -- work no operator asked for, on the disk this group
+// commit exists to spare. The checks therefore run first.
 //
 // What that spares is exactly this caller and no other: one that had already
 // been overtaken when it arrived. Two activations that start together both

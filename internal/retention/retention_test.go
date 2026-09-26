@@ -9,14 +9,9 @@ import (
 	"time"
 )
 
-// This is the package's ONE scenario table. Every lane adds its rows under its
-// own marker and nowhere else; a per-lane test file is a finding, and so is a
-// row that re-asserts Validate(), a getter or forwarding. Each row names, in
-// its comment, the failure mode it protects against.
-//
-// L0 carries no row here: its one row is the resource-sampling invariant in
-// internal/diagnostics. The table and its fakes exist so L3a and L3b add rows
-// rather than a harness.
+// This is the package's ONE scenario table, grouped by the grace protocol and
+// the sweeps. A row that re-asserts Validate(), a getter or forwarding is a
+// defect. Each row names, in its comment, the failure mode it protects against.
 
 type scenario struct {
 	name string
@@ -24,16 +19,13 @@ type scenario struct {
 }
 
 func TestRetention(t *testing.T) {
-	if len(scenarios) == 0 {
-		t.Skip("no rows yet: L3a and L3b own this table's rows")
-	}
 	for _, s := range scenarios {
 		t.Run(s.name, func(t *testing.T) { s.run(t) })
 	}
 }
 
 var scenarios = []scenario{
-	// L3a rows
+	// grace protocol rows
 	{
 		// Failure mode: the orphan sweep is wired with a window of its own --
 		// zero, or the raw config value the grace phases already rescued --
@@ -80,7 +72,7 @@ var scenarios = []scenario{
 			}
 		},
 	},
-	// L3b rows
+	// sweep rows
 	{
 		// Failure mode: pruning runs before expiry, or with a retention window
 		// this pass invented rather than the configured one, and the FK cascade
@@ -264,7 +256,7 @@ var scenarios = []scenario{
 	},
 }
 
-// --- deterministic fakes for the frozen interfaces --------------------------
+// --- deterministic fakes for the interfaces ---------------------------------
 //
 // Each records what the collector asked it to do, which is how a row proves the
 // pass ran in dependency order and left a live resource alone.
@@ -419,10 +411,9 @@ func newTestCollector(t *testing.T, opts Options) *Collector {
 	return c
 }
 
-// fakeToolPins is fakeTools plus the ToolPins oracle sweep.go asserts for; L3b
-// declares it here because its row must drive both shapes of the tool
-// dependency, one that names the pinned payloads and one that cannot.
-// L3b.
+// fakeToolPins is fakeTools plus the ToolPins oracle sweep.go asserts for. It
+// exists because the sweep row must drive both shapes of the tool dependency,
+// one that names the pinned payloads and one that cannot.
 type fakeToolPins struct {
 	fakeTools
 	pinned map[string]string

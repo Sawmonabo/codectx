@@ -10,7 +10,7 @@ import (
 )
 
 // guaranteeLimit is the Section 16.3 point-in-time warning that rides on every
-// open gate (ruling Q10). Readiness is a statement about the instant it was
+// open gate. Readiness is a statement about the instant it was
 // evaluated and nothing more, so an orchestrator that caches it is authorizing
 // writes against a snapshot that may already have moved. A silent true is the
 // defect this string exists to prevent.
@@ -20,7 +20,6 @@ const guaranteeLimit = "this readiness answer is point-in-time: re-check the gat
 
 // Status is the honest readiness answer for one session (Section 16.3). It is
 // revalidated per request, immediately before answering, and never cached.
-// Owned by L4.
 func (s *Service) Status(ctx context.Context, req model.SessionRequest) (_ model.SessionStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
@@ -49,8 +48,8 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest) (_ model
 // ScopeComplete, the verify phase, the active generation, a current-scope
 // review, a blocking-unresolved scan, waived == 0 and per-request Validator
 // revalidation of every cited source. When the gate is open the result carries
-// the point-in-time guarantee limit (ruling Q10): a silent true is a defect.
-// Owned by L4; INT moved Superseded onto the gate itself.
+// the point-in-time guarantee limit: a silent true is a defect. Superseded
+// rides on the gate itself, so every gate reader sees the same answer.
 //
 // The order is deliberate. The counts, the manifest's own scope answer, the
 // phase and state, the waiver count and the current-source walk are all
@@ -84,7 +83,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// them is precisely a waived-and-read file, and it stays visible because
 	// precondition 6 below shuts the strict gate on any waiver at all.
 	e.Served = c.Served
-	// Task 16's honest weaker answer, otherwise unchanged: an incomplete
+	// Read completeness is the coverage answer with one addition: an incomplete
 	// manifest scope disqualifies the session outright even when the counts
 	// agree.
 	e.ReadComplete = m.ScopeComplete && c.FullyRead == c.Required
@@ -113,7 +112,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		shut = append(shut, "the session lease has expired")
 	}
 
-	// Precondition 2 -- resolved and complete scope. Task 15 compiles an
+	// Precondition 2 -- resolved and complete scope. The compiler turns an
 	// ambiguous or empty scope into a manifest with ScopeComplete=false and no
 	// required_full entries, so this is what stops a session that resolved
 	// nothing from reading as fully read.
@@ -256,7 +255,7 @@ func (e gate) reason(text string) string {
 
 // superseded reports whether a newer generation is active for this
 // repository than the one the session pinned. It is one indexed row read on
-// active_generations; the store owns that read (Task 12) and this package adds
+// active_generations; the store owns that read and this package adds
 // no second spelling of it.
 //
 // CTX_NO_ACTIVE_GENERATION is an answer, not a failure: if nothing is published
@@ -322,7 +321,6 @@ func (s *Service) sourcesCurrent(ctx context.Context, rec sqlite.SessionRecord, 
 // refuses the dishonest combinations -- readiness beside a waiver, readiness
 // without the strict gate, readiness with nothing said about what it
 // guarantees -- so a wrong evaluator fails loudly rather than silently.
-// Owned by L4; GuaranteeLimit added by INT.
 func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.SessionStatus, error) {
 	if rec.ID == "" {
 		return model.SessionStatus{}, typedErrf(model.CodeInternal,
@@ -358,7 +356,7 @@ func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.S
 		FullyServedFiles:        e.Served,
 		WaivedFiles:             e.Waived,
 		// The gate's own words: the point-in-time guarantee limit when it is
-		// open (ruling Q10) and the operator-facing reason when it is shut.
+		// open and the operator-facing reason when it is shut.
 		// Bounded by construction -- every contributing string is authored in
 		// this file and their join is well under model.MaxReasonBytes -- and
 		// SessionStatus.Validate enforces the bound rather than trusting that.

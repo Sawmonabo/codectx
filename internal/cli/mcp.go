@@ -50,7 +50,7 @@ func newMCPCommand(build model.BuildInfo) *cobra.Command {
 // neither it nor the writer -- answer from the moment the session opens,
 // including while another process indexes, and an idle session leaves the
 // workspace to the person's own commands. The facade is documented safe for
-// concurrent use over one workspace (services.go, Task 19 Q2), which is what
+// concurrent use over one workspace (services.go), which is what
 // lets the bounded set of concurrent tool calls share this single instance.
 //
 // stdout belongs to the SDK's framing for this whole invocation: every

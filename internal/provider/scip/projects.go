@@ -32,24 +32,47 @@ package scip
 //     split the empirical round measured: cutting one `tsconfig` project at
 //     subdirectories holding no `tsconfig` of their own loses more than half
 //     of the calls that resolve to the project's own methods
-//     (docs/research/10-round3-empirical.md Section 8). A Python package, a
+//     (docs/research/10-engine-empirical.md Section 8). A Python package, a
 //     Cargo workspace and a compilation database are whole for the same
 //     reason -- whole up to the next directory that declares itself, and no
 //     further.
+//   - A nested project is excluded from the project that encloses it. The
+//     outer unit's indexer still runs over the whole outer directory, because
+//     no profile's argument array can exclude a subtree, so the importer drops
+//     every document under a nested project root instead (importer.ownerOf):
+//     one path is published by exactly one unit. A document a unit reaches
+//     outside its own directory through `../` belongs likewise to the
+//     innermost other project that holds it, and to no unit when none does:
+//     two sibling units reaching one undeclared directory would each admit
+//     it otherwise, so the importer refuses it and degrades the capability. A
+//     nested directory whose scope key does not fit is not a project of its
+//     own (Scopes refuses it), so its files stay with the unit that encloses
+//     it; a project a truncated detection never planned is dropped from the
+//     enclosing unit too, and the detection's `unplanned_projects` detail
+//     already says those projects are not indexed precisely.
 //   - A trigger inside a dependency directory is a project only when the
 //     workspace holds that directory at all. With `workspace.index_vendor`
 //     false, which is the default, `node_modules`, `vendor`, `third_party`,
 //     `bower_components` and `Godeps` are outside the snapshot
 //     (internal/workspace/walk.go), so a `package.json` under `node_modules`
 //     never reaches this rule and nothing indexes a dependency's own manifest
-//     as a project of the repository. With `workspace.index_vendor` true the
-//     operator has asked for those directories to be indexed, their manifests
-//     are in the detection, and they are projects like any other -- bounded,
-//     as the whole detection is, by provider.MaxDetectionInputs.
+//     as a project of the repository. Two things qualify that. The Git ignore
+//     hook excludes an ignored directory whatever `index_vendor` says, so with
+//     it true a gitignored `node_modules` is still not a project; and a
+//     tracked path wins over both exclusions (Section 10.2), so a tracked
+//     `third_party/lib/Cargo.toml` is a project with `index_vendor` false --
+//     but detection sees it only when the policy it is handed carries the
+//     capture's ForceInclude and ForceIncludeDir hooks, since the walk
+//     descends into nothing else the policy excludes. With `index_vendor`
+//     true and no ignore match, those directories' manifests are in the
+//     detection and are projects like any other -- bounded, as the whole
+//     detection is, by provider.MaxDetectionInputs.
 
 import (
 	"slices"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // projectRoots turns the trigger paths detection recognized for one kind into
@@ -82,3 +105,45 @@ var triggerKind = func() map[string]Kind {
 	}
 	return out
 }()
+
+// plannable reports whether the project of kind k at dir gets a unit of its
+// own: its scope key fits the identity bound. Scopes plans exactly these, and
+// the importer excludes exactly these from an enclosing unit, so the two can
+// never disagree about which unit publishes a path.
+func plannable(k Kind, dir string) bool {
+	return len(ProfileScope(string(k), dir)) <= model.MaxScopeKeyBytes
+}
+
+// projectAt reports the project directory the file at rel roots when that
+// directory is a plannable project of kind k.
+func projectAt(k Kind, rel string) (string, bool) {
+	dir, base := "", rel
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		dir, base = rel[:i], rel[i+1:]
+	}
+	if kind, ok := triggerKind[base]; !ok || kind != k {
+		return "", false
+	}
+	return dir, plannable(k, dir)
+}
+
+// nestedProject reports the project directory the file at rel roots when that
+// directory is a plannable project of kind k strictly inside the project at
+// root. Only a trigger of the same kind nests: a project of another kind is
+// indexed by another indexer, whose documents never reach this unit.
+func nestedProject(k Kind, root, rel string) (string, bool) {
+	dir, ok := projectAt(k, rel)
+	if !ok || !strictlyInside(dir, root) {
+		return "", false
+	}
+	return dir, true
+}
+
+// strictlyInside reports whether the root-relative directory dir lies below
+// root and is not root itself; the empty root is the workspace root.
+func strictlyInside(dir, root string) bool {
+	if root == "" {
+		return dir != ""
+	}
+	return strings.HasPrefix(dir, root+"/")
+}

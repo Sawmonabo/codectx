@@ -35,6 +35,11 @@ const CapabilityUnsupportedLabels = "unsupported_labels"
 // bounded detail map. It is a count of labels, not one of them.
 const detailUntrackedLabels = "untracked_labels"
 
+// detailUnanalysedFiles is the capability detail under which a unit reports
+// the source files it handed the engine that the export carries no file node
+// for: the count, a space, and the first such path in path order.
+const detailUnanalysedFiles = "unanalysed_files"
+
 // MaxReportedSkips bounds the skipped-method names a result names one by one.
 // The count is always exact; the names are a sample when a unit skips more
 // than this, because a result list is bounded (Section 6) and a thousand
@@ -44,7 +49,7 @@ const MaxReportedSkips = 32
 // FailureClass is the typed reason a unit did not produce an admissible
 // result. Section 11.6 requires each to be classified, never guessed: every
 // one of them was reproduced against the real engine and is recorded in
-// docs/research/10-round3-empirical.md Section 6.
+// docs/research/10-engine-empirical.md Section 6.
 type FailureClass string
 
 const (
@@ -94,7 +99,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	case FailureTimeout:
 		msg += "the analysis exceeded the unit deadline"
 	case FailureEmptyExport:
-		// emptyExport below names the two causes that remain. This wording is
+		// emptyExport below names the three causes that remain. This wording is
 		// what the product knows without them: which steps ran, and that
 		// nothing came of them.
 		msg += "both analysis steps exited cleanly and produced no method for a unit that has source"
@@ -114,7 +119,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	// The child's own last words. A failure that reports only how many bytes
 	// its child wrote to standard error has discarded the one record of what
-	// went wrong, which is what a 7.5 KB crash on a real repository did.
+	// went wrong.
 	if o.StderrTail != "" {
 		err = err.WithDetail(model.DetailStderrTail, truncate(o.StderrTail, model.MaxDetailBytes))
 	}
@@ -135,27 +140,31 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 			// or the absent detail reads as "the tree used nothing".
 			err = err.WithDetail("observed_peak_bytes_unavailable", "this platform does not sample process-tree memory")
 		}
-		if r.AllocationBytes > 0 {
+		if r.AllocationObserved {
 			err = err.WithDetail("allocation_bytes", strconv.FormatInt(r.AllocationBytes, 10))
 		}
 	}
 	return err
 }
 
-// unreadRemediation is what an operator can do about source the frontend read
-// and drew nothing from. Two causes remain there and the product cannot tell
-// them apart -- source with no definition the frontend parses, and a frontend
-// that failed without saying so -- so it names both rather than asserting the
-// first, which a helper that died behind a zero exit would make false.
+// unreadRemediation is what an operator can do about source the frontend was
+// handed and drew nothing from. Three causes remain there and the product
+// cannot tell them apart -- source with no definition the frontend parses, a
+// frontend whose own fixed rules drop every file of the unit (the
+// JavaScript/TypeScript and C/C++ frontends drop whole classes of path, such
+// as test directories), and a frontend that failed without saying so -- so it
+// names all three rather than asserting the first, which a helper that died
+// behind a zero exit would make false.
 const unreadRemediation = "check that this unit's source files hold method definitions this language family's " +
-	"frontend can parse; if they do, the frontend failed without reporting it"
+	"frontend can parse and lie outside the paths that frontend drops by its own rules " +
+	"(docs/providers-dependence.md, default path exclusions); if they do, the frontend failed without reporting it"
 
 // emptyExport is the typed failure for a unit whose analysis exported no
 // method at all. "the export carries no method" is the symptom, never the
-// reason, so the error names the two causes that remain once the frontend has
-// been given every file of the unit -- source it finds no definition in, and a
-// frontend that failed without reporting it -- and publishes how much source
-// it was handed.
+// reason, so the error names the three causes that remain once the frontend
+// has been given every file of the unit -- source it finds no definition in,
+// a frontend whose own rules dropped every file, and a frontend that failed
+// without reporting it -- and publishes how much source it was handed.
 //
 // files is counted over the one pass that decided what the frontend was
 // given, so a zero there is "nothing reached the frontend" and not a guess.
@@ -192,7 +201,7 @@ type partTally struct {
 }
 
 // subdivisionEmpty is the typed failure for a subdivided unit no part of which
-// produced a method. A unit with no part at all never reaches it: childProjects
+// produced a method. A unit with no part at all never reaches it: subdivide
 // refuses the split before the parts run. "no part produced an honest result" is the same
 // restatement emptyExport removes, so this names the tally instead.
 func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {
@@ -300,6 +309,11 @@ type publication struct {
 	// reported on the unit's capability detail, never silent", so this is what
 	// carries it to the generation.
 	ClippedEvidence int
+	// UnanalysedFiles counts the unit's own source files the engine was handed
+	// and the export carries no file node for, and UnanalysedFirst names the
+	// first of them in path order. No fact of this unit comes from them.
+	UnanalysedFiles int64
+	UnanalysedFirst string
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -330,6 +344,18 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			if names := p.skippedNames(); names != "" {
 				row = row.WithDetail("skipped_method_names", names)
 			}
+		}
+		// A file the engine was handed and did not read degrades every
+		// capability alike: no pass has a fact from it. The count and the
+		// first path travel in one value, "<count> <path>", because this row
+		// may already carry most of the provider's detail budget and a count
+		// without a path, or a path without its count, would not say what was
+		// missed. The key is written before the threshold reports so it is
+		// never the one the budget drops.
+		if p.UnanalysedFiles > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
+			row = row.WithDetail(detailUnanalysedFiles,
+				truncate(strconv.FormatInt(p.UnanalysedFiles, 10)+" "+p.UnanalysedFirst, model.MaxDetailBytes))
 		}
 		// Source analysed under a project boundary that is not its own
 		// degrades every capability of the family alike: a resolution that
@@ -509,15 +535,4 @@ func peakForLog(o Outcome) any {
 		return "unsampled"
 	}
 	return o.PeakBytes
-}
-
-// allocationForLog renders the machine-derived allocation a reservation was
-// bounded by. Zero there means the machine's available memory could not be
-// observed at all (Reservation.AllocationBytes), so a log that printed 0 would
-// claim the host offered the unit nothing.
-func allocationForLog(r Reservation) any {
-	if r.AllocationBytes <= 0 {
-		return "unobserved"
-	}
-	return r.AllocationBytes
 }

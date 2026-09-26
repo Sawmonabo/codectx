@@ -9,10 +9,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// TestConfiguredReasonPathsSurviveToTheStoredEntry pins the class-G chain this
-// wave removes: context.max_reason_paths_per_entry is honoured by the ranking
-// lane, and neither the scope lane, the budget lane nor model.ContextEntry's
-// own validator may silently re-clip the result back to the smaller model
+// TestConfiguredReasonPathsSurviveToTheStoredEntry pins the chain from the
+// setting to the stored entry: context.max_reason_paths_per_entry is honoured
+// by ranking, and neither scope, budgeting nor model.ContextEntry's own
+// validator may silently re-clip the result back to the smaller model
 // constant. The failure it protects against is a manifest that quietly stores
 // three explanation routes when the operator configured more -- or unlimited --
 // with nothing in the answer saying routes were discarded.
@@ -47,7 +47,7 @@ func TestConfiguredReasonPathsSurviveToTheStoredEntry(t *testing.T) {
 	// silence.
 	stored, clipped := evidencePaths(paths)
 	if len(stored) != routes || clipped != 0 {
-		t.Fatalf("evidencePaths stored %d routes and reported %d clipped, want all %d and none clipped: the budget lane re-clipped what rank honoured",
+		t.Fatalf("evidencePaths stored %d routes and reported %d clipped, want all %d and none clipped: budgeting re-clipped what rank honoured",
 			len(stored), clipped, routes)
 	}
 	long := []model.RelationPath{{Relations: make([]model.RelationID, model.MaxRelationsPerPath+1)}}
@@ -77,7 +77,7 @@ func hexID(seed byte) string {
 	return strings.Repeat(fmt.Sprintf("%02x", seed), 32)
 }
 
-// TestBoundedExplanationsReachTheManifestNotices is the row-17/F15 invariant:
+// TestBoundedExplanationsReachTheManifestNotices guards explanation disclosure:
 // the three field cuts the compile applies to an entry's explanation --
 // reasons past the per-entry count, a reason past its byte bound, and the page
 // size a configuration asked for and could not have -- are DISCLOSED on the

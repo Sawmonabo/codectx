@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L4. It holds
-// Section 15.4 budgeting: measured entry sizes, per-slice byte and token bounds, and the CTX_MINIMUM_BUDGET floor.
+// This file holds Section 15.4 budgeting: measured entry sizes, per-slice byte and token bounds, and the CTX_MINIMUM_BUDGET floor.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 package context
 
 import (
@@ -160,15 +159,15 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		Message: "the measured entry size did not settle; it would be a guess rather than a measurement"}
 }
 
-// evidencePaths projects the ranking lane's explanation paths onto the stored
+// evidencePaths projects the ranking pass's explanation paths onto the stored
 // relation-id lists.
 //
-// The path COUNT is not re-bounded here. The ranking lane already applied
+// The path COUNT is not re-bounded here. The ranking pass already applied
 // context.max_reason_paths_per_entry as written -- including a value above
 // model.MaxReasonPathsPerEntry, and including unlimited -- and
 // model.ContextEntry.Validate does not refuse the entry on that count, so a
 // second clip at 3 would discard routes the operator asked to keep after the
-// lane that honoured the setting had produced them. Only the per-path relation
+// pass that honoured the setting had produced them. Only the per-path relation
 // list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
 // the cut is now counted and returned, so a route the manifest stores shorter
 // than the route the walk found is disclosed as a manifest notice instead of
@@ -224,16 +223,16 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 }
 
 // ---------------------------------------------------------------------------
-// Streamed budgeting — C-STREAM passes P-G, P-H and P-I
+// Streamed budgeting — passes P-G, P-H and P-I
 // ---------------------------------------------------------------------------
 //
-// buildPlan above holds five candidate-sized structures at once (`sized`,
-// `charged`, `provisional`, the groups' index lists and `plan.Excluded`). The
-// passes below produce the SAME plan from sorted streams: every list becomes a
-// sorted run, every map a merge join, and the only heap that grows with the
-// answer is the one ruling C4 keeps there -- the slice table and its entry
-// ordinals, which are a function of the resolved budget and not of the
-// repository.
+// The reference buildPlan (stream_parity_test.go) holds five candidate-sized
+// structures at once (`sized`, `charged`, `provisional`, the groups' index
+// lists and `plan.Excluded`). The passes below produce the SAME plan from
+// sorted streams: every list becomes a sorted run, every map a merge join, and
+// the only heap that grows with the answer is the one the design keeps there --
+// the slice table and its entry ordinals, which are a function of the resolved
+// budget and not of the repository.
 //
 // Two invariants make the streamed plan equal to the whole-set one and are
 // worth stating where a reader meets them:
@@ -242,7 +241,7 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 //     the ranked stream. The whole-set `i` is a position in `sized`
 //     (stream_parity_test.go:469-470), so counting a filtered record would
 //     shift every later ordinal and with it every stored slice membership.
-//   - Exclusions keep today's sequence (ruling C1): the pre-sort exclusions in
+//   - Exclusions follow one sequence: the pre-sort exclusions in
 //     expansion order first, then the packer's drops in group order. The first
 //     group is replayed from a run keyed by `Seq` -- the ingest order the
 //     ranked stream destroys -- and the second from a run keyed by
@@ -270,9 +269,9 @@ type planSink interface {
 }
 
 // planParts is what a streamed plan keeps in heap once P-I has run: the slice
-// table (ruling C4: a function of the resolved budget, which is the caller's
-// own declared window) and the three totals the manifest lane reports. The
-// entries and exclusions themselves went to the sink.
+// table (a function of the resolved budget, which is the caller's own declared
+// window) and the three totals the manifest reports. The entries and
+// exclusions themselves went to the sink.
 type planParts struct {
 	Slices           []model.ContextSlice
 	RelationsClipped int64
@@ -285,8 +284,8 @@ type planParts struct {
 // by lessPathSeq and lessHopSeq, both keyed on the candidate's `Seq`).
 //
 // The routes travel separately because candRec deliberately does not carry them
-// (C-L0 report, deviation 2: context.max_reason_paths_per_entry is unlimited by
-// default, so an inline route list has no bound a sort record may assume). Both
+// (context.max_reason_paths_per_entry is unlimited by default, so an inline
+// route list has no bound a sort record may assume). Both
 // budget phases measure entries, and measureEntry reads `candidate.Paths`, so
 // both must re-join the routes to their candidate; P-G re-keys them once from
 // `Seq` to `Index` so that the measuring walks, which run in rank order, read
@@ -355,7 +354,8 @@ type dropRec struct {
 }
 
 // sliceMember is one selected entry's contribution to its slice, held only
-// until the slice table is assembled (ruling C4).
+// until the slice table is assembled; the table is a function of the resolved
+// budget, not of the repository.
 type sliceMember struct {
 	minIndex int64
 	index    int64

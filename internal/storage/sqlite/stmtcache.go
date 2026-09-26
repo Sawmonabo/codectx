@@ -17,8 +17,8 @@ import (
 // publication's CPU, all of it re-parsing a dozen distinct queries.
 //
 // The cache prepares each text once per transaction and reuses the handle for
-// every subsequent row, which is the single-held-statement pattern QPERF-2
-// established for the read paths. It changes no SQL, no bound value and no
+// every subsequent row, the single-held-statement pattern the read paths
+// use. It changes no SQL, no bound value and no
 // result: a *sql.Stmt prepared on a Tx runs on that Tx, so the rows a cached
 // statement sees are exactly the rows the ad-hoc call saw.
 //

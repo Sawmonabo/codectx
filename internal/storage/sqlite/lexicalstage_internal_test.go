@@ -11,8 +11,8 @@ import (
 // staging slot's contract, and both halves are failures that no error would
 // report.
 //
-// Reuse: a staging database used to be created per unit and removed at seal,
-// so a run of a large repository handed the filesystem every one of those
+// Reuse: a staging database created per unit and removed at seal would hand
+// the filesystem, over a run of a large repository, every one of those
 // files' extents, unit after unit, in the middle of its work. On a host that
 // discards freed blocks under a sparse image that stalls every writer on the
 // machine for about a minute. The slot is pooled instead: the file keeps its

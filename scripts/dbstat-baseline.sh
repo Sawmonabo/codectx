@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dbstat-baseline.sh — the one storage measurement every §3 lane re-runs.
+# dbstat-baseline.sh — the one storage measurement every storage change re-runs.
 #
 # Prints, for a codectx SQLite store:
 #   1. per-b-tree bytes  (SUM(pgsize) GROUP BY name), table+index, descending

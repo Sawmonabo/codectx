@@ -10,10 +10,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// TestTheSeedCutSurvivesIntoAValidManifestExclusion protects row 20's seed cut
+// TestTheSeedCutSurvivesIntoAValidManifestExclusion protects the seed cut
 // end to end, through the one place it can go wrong silently.
 //
-// Failure mode it guards: seed discovery used to stop at model.MaxSeeds without
+// Failure mode it guards: seed discovery stopping at its seed bound without
 // saying so. Reporting the cut is only an improvement if the row it produces is
 // a VALID exclusion — model.ContextReference refuses a reference that names
 // neither a node, a file nor a path, so a cut row carrying only a reason would
@@ -67,7 +67,7 @@ func TestTheSeedCutSurvivesIntoAValidManifestExclusion(t *testing.T) {
 		t.Fatalf("a bound of %s over two steps produced %d cut rows, want one per stopped step", limit, len(cuts))
 	}
 
-	// Row 20's other half: a step that stopped at a PAGE boundary rather than
+	// The seed cut's other half: a step that stopped at a PAGE boundary rather than
 	// at context.max_seeds is a different bound and must be disclosed separately, with
 	// the continuation cursor, so the caller knows the read is resumable.
 	out := seedSet{sink: &collectSeeds{}}
@@ -142,8 +142,7 @@ func TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary(t *testing.T) {
 }
 
 // TestChangedFileSeedsKeepReadingPastTheFirstPage is the OTHER half of the
-// bound removal, and the half an earlier review finding A5 records the test above
-// as unable to prove.
+// unbounded read: the half the test above cannot prove.
 //
 // The test above publishes exactly one captured change, so page 1 is full and
 // page 2 is empty: it proves that a full last page is not mistaken for a
@@ -199,7 +198,7 @@ func TestChangedFileSeedsKeepReadingPastTheFirstPage(t *testing.T) {
 	}
 }
 
-// TestTheWalkRootWidthIsTheConfiguredLimit protects finding B2's invariant.
+// TestTheWalkRootWidthIsTheConfiguredLimit protects the walk's root width.
 //
 // Requirement: how WIDE the boundary walk starts is the user-set
 // context.max_start_nodes, and that key is unlimited by default.

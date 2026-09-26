@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/index"
-	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -27,7 +25,7 @@ import (
 // internal/retention know about this application's concrete types. Both
 // packages depend on narrow interfaces and never on *sqlite.Store,
 // *toolchain.Resolver or *snapshot.CAS (their doc.go states the rule), so the
-// composition root is where a concrete type meets a frozen interface. Each
+// composition root is where a concrete type meets an interface. Each
 // adapter here forwards and adapts shape; none of them implements a probe, a
 // measurement or a policy of its own.
 
@@ -172,34 +170,37 @@ func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []m
 	return runRecord(view)
 }
 
-// RecordedPeaks is what this workspace has already measured its heavy units to
-// cost, which the planner raises a unit's reservation to where the constants
-// derive less. It is advisory and must never refuse a plan, so a ledger that
-// is absent or cannot be read answers no rows at all -- not a peak of zero,
-// which would be read as work that costs nothing. A read that fails is logged
-// rather than returned, because the plan it would otherwise fail is the whole
-// index.
-func (l runLedger) RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error) {
+// MarkedUnits reads the unit spans of the deferred runs that marked this
+// generation with the stage, for a status report in any process. A workspace
+// with no ledger answers none; one whose ledger cannot be read reports it, and
+// the report says so.
+func (l runLedger) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+	named int) ([]ledger.MarkedUnits, error) {
 	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
 	if err != nil || !recorded {
-		if err != nil {
-			slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
-				"component", "workspace", "error", err)
-		}
-		return nil, nil
+		return nil, err
 	}
 	defer reader.Close()
-	rows, err := reader.RecordedPeaks(ctx, limit)
+	return reader.MarkedUnits(ctx, repositoryID, generationID, stage, named)
+}
+
+// OpenPeaks opens the learned peaks for one plan. It is advisory and must
+// never refuse a plan: a workspace with no ledger answers a nil lookup, and one
+// whose ledger cannot be opened is logged and answers a nil lookup too, which
+// the plan reads as no observation for every scope. The coordinator closes the
+// reader it is handed. A literal nil is returned, never a nil *ledger.Reader,
+// so the interface compares nil.
+func (l runLedger) OpenPeaks(ctx context.Context) (index.PeakLookup, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
 	if err != nil {
-		slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
+		slog.Warn("the learned peaks could not be read; heavy units are sized from the family estimates alone",
 			"component", "workspace", "error", err)
 		return nil, nil
 	}
-	out := make([]plan.RecordedPeak, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, plan.RecordedPeak{ScopeKey: r.ScopeKey, PeakBytes: r.PeakBytes})
+	if !recorded {
+		return nil, nil
 	}
-	return out, nil
+	return reader, nil
 }
 
 // runRecord is the one place a read run becomes the rows the model carries,
@@ -343,18 +344,7 @@ func (workspaceProber) Readable(ctx context.Context, dir string) error {
 // else is the exit-10 class carrying only the syscall's own cause, which is the
 // same shape internal/snapshot's ioError produces for the same reason.
 func probeError(op string, err error) error {
-	cause := err
-	var pe *fs.PathError
-	var le *os.LinkError
-	var se *os.SyscallError
-	switch {
-	case errors.As(err, &pe):
-		cause = pe.Err
-	case errors.As(err, &le):
-		cause = le.Err
-	case errors.As(err, &se):
-		cause = se.Err
-	}
+	cause := model.BareCause(err)
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull,
 			Message:     "app: could not " + op + ": the disk is full",

@@ -11,12 +11,13 @@ import (
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
-// TestOverlongDeclarationNamesAreTruncatedNotRefused pins the ruling that a
-// storage ceiling on a field truncates and flags rather than failing the unit.
-// Generated code clears MaxQualifiedNameBytes routinely, and the old guard
-// turned one such declaration into CTX_PROVIDER_OUTPUT_INVALID, which publishes
-// nothing for the whole file. Restoring the length arms of that guard makes
-// this fail, which is the mutation that proves it.
+// TestOverlongDeclarationNamesAreTruncatedNotRefused pins that a storage
+// ceiling on a field truncates and flags rather than failing the unit.
+// Generated code clears MaxQualifiedNameBytes routinely, and a length guard
+// that refused the declaration would turn one such declaration into
+// CTX_PROVIDER_OUTPUT_INVALID, which publishes nothing for the whole file.
+// Mutation: refuse a declaration whose name or qualified name is over its
+// storage bound -> this fails.
 func TestOverlongDeclarationNamesAreTruncatedNotRefused(t *testing.T) {
 	src := []byte("func f() {}\n")
 	qualified := strings.Repeat("a", 3000)

@@ -113,8 +113,8 @@ symbols without rescanning):
 - `("file:"+path, "module:"+path)` → file module.
 - `("file:"+path, qualified name)` → every declaration.
 - `("file:"+path, "decl:"+name+"@"+path+":"+startLine+"-"+endLine)` → every
-  declaration. This is the cross-provider declaration key fixed by controller
-  ruling, shared byte-for-byte with the `dependence` provider, whose exported
+  declaration. This is the one cross-provider declaration key, shared
+  byte-for-byte with the `dependence` provider, whose exported
   declaration key is exactly this string:
 
   ```
@@ -187,11 +187,10 @@ counted and the file's capability state becomes `partial`; nothing is dropped
 silently. That count is disclosed on its own, under the `evidence_clipped`
 capability detail -- the same key the filesystem provider reports the same
 bound with -- so an operator can tell how many occurrences their clip cut apart
-from every other bound this file reached. The unresolved callees one file may mint are bounded the same way: at
-most 2000 distinct placeholders, after which a cross-file call is counted, not
-minted, and the file is `partial`. Without that bound a generated or minified
-file with tens of thousands of distinct callee names would publish a node, a
-relation and evidence for each.
+from every other bound this file reached. The unresolved callees one file may mint are unbounded by default; an
+operator who sets `providers.tree_sitter.max_callee_references` bounds the
+distinct placeholders one file mints, and past it a cross-file call is counted,
+not minted, and the file is `partial`.
 
 Search units: one per declaration, ID `H("treesitter-search-v1", fileID,
 nodeID)`, body = attached documentation (comment markers stripped) plus the
@@ -206,16 +205,16 @@ recorded) with one `structure` capability state at the file's scope:
 | State | DiagnosticCode | Meaning |
 |---|---|---|
 | `fresh` | – | parsed without syntax errors, every record within bounds |
-| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was cut (counted under the `evidence_clipped` detail), the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
-| `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than `workspace.max_parse_file_bytes`; not streamed |
+| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, the query exceeded its match limit, evidence past the per-fact bound was cut (counted under the `evidence_clipped` detail), the file reached a user-set `providers.tree_sitter.max_callee_references` bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
+| `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than a user-set `workspace.max_parse_file_bytes`, or longer than the parser's 32-bit offsets address (`wire.MaxSourceOffset`); not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
 
 Failures that fail the unit (output deleted, never sealed): a fact the worker
 sent that does not describe the pinned bytes (`CTX_PROVIDER_OUTPUT_INVALID`:
 range outside the file, offset inside a UTF-8 sequence, parent that does not
 contain its child, unknown kind, over-long name), a worker that failed twice
-(`CTX_PROVIDER_UNAVAILABLE`, retryable), a parse over `ParseTimeout`
-(`CTX_PROVIDER_TIMEOUT`), cancellation (`CTX_CANCELED`), a blob whose length
+(`CTX_PROVIDER_UNAVAILABLE`, retryable), a worker the hang detector ended
+(`CTX_PROVIDER_TIMEOUT`, retryable, detail `stop_reason` = `stalled`), cancellation (`CTX_CANCELED`), a blob whose length
 disagrees with the manifest (`CTX_SOURCE_INTEGRITY`).
 
 ### Language detection
@@ -239,20 +238,60 @@ Path                    WorkerCommand.Path   (production: this binary; tests: th
 Args                    WorkerCommand.Args   (production: ["__ts-worker"])
 Dir                     Options.WorkDir      (absolute private directory)
 Env                     none
-Stdin/MaxStdinBytes     io.Pipe, 1 GiB lifetime budget
-Stdout/MaxStdoutBytes   io.Pipe, 1 GiB lifetime budget
+Stdin/Stdout            io.Pipe, no byte total on either
 MaxStderrBytes          16 KiB
-Timeout/Grace           1 hour / 2 seconds
-MemoryReservationBytes  Options.WorkerMemoryBytes (default 256 MiB)
+Grace                   2 seconds (no timeout)
+CPUProgress             the worker's processor time, read by the hang detector
+MemoryReservationBytes  Options.WorkerMemoryBytes (the composition passes 256 MiB)
 ```
 
-The runner holds one concurrency slot per live worker for the worker's whole
-lifetime, so `process.Limits.MaxConcurrent` must exceed
-the worker count by the number of other children expected to run
-concurrently.
+Before it is started, each worker reserves `Options.WorkerMemoryBytes` on the
+process's one admission ledger (`Options.Admission`), so parser workers wait in
+the same queue, against the same allocation, as every other heavy child; the
+reservation is given back once the runner has reaped the worker. Every
+admission is first-in-first-out on the ledger, and a worker coming back from a
+parse while an acquirer of the pool is queued there follows that order:
 
-Wiring for `cmd/codectx/main.go` (the controller applies it; this package does
-not edit `cmd/`):
+- When the pool's acquirer is the ledger's head (the ledger tells it so
+  through the make-room step, once it is the head and does not fit), the
+  worker is handed to it together with the reservation it holds. That is the
+  grant the ledger would make, without stopping a process to start the same
+  one again, so an allocation that fits fewer workers than acquirers (an
+  observed zero included) keeps its workers warm and runs them one handout at
+  a time.
+- When another reserver is the head, the worker is stopped: its reservation
+  returns to the ledger, the ledger pumps, and that head is admitted first.
+  The pool's acquirer behind it waits its turn.
+
+No idle worker is held or reused while any reserver waits on the ledger, the
+pool's own or another. The ledger reports whether one is waiting
+(`admission.Ledger.Waiting`), and the pool is registered on it as a holder of
+idle room (`admission.Ledger.Holder`) for its whole life:
+
+- A worker coming back while a reserver waits, and no acquirer of the pool is
+  the head, is stopped rather than idled.
+- An acquirer that finds idle workers while a reserver waits stops every one
+  of them and then queues for a worker of its own behind that reserver.
+- Whenever the ledger's head does not fit, the head's waiting goroutine runs
+  the pool's idle-release step, with no ledger lock held, and the pool stops
+  its idle workers at once, whether or not it is acquiring or releasing
+  anything. A stage whose own progress waits on that reserver (a unit of the
+  same tick reserving behind the room idle workers hold) never waits on the
+  stage's drain.
+
+The stopped workers' room returns to the ledger and reaches the head in order.
+With nobody waiting, a worker coming back goes idle and is held for the stage
+like any room an admitted child holds. Room is returned by its holder, never
+taken from it, only idle room is given back, and the order among the reservers
+queued on the ledger is kept throughout.
+
+The runner holds one concurrency slot per live worker for the worker's whole
+life. The composition gives the workers a runner of their own, with
+`process.Limits.MaxConcurrent` equal to the worker count and a memory budget
+that holds every reservation the admission ledger can have granted the workers
+at once, so the runner never refuses a worker the ledger has admitted.
+
+Wiring in `cmd/codectx/main.go`:
 
 ```go
 if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
@@ -268,8 +307,10 @@ ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
+	WorkerMemoryBytes: parserWorkerReservationBytes,
+	Admission:         admissionLedger,
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-	Runner:            sharedRunner,
+	Runner:            parserRunner,
 	WorkDir:           filepath.Join(dataDir, "workers", "treesitter"),
 })
 defer ts.Close()
@@ -277,16 +318,21 @@ defer ts.Close()
 
 ### Protocol (`wire`)
 
-Every frame is a 4-byte big-endian payload length, a 1-byte kind and a JSON
-payload (ruling R8-3). Both sides refuse to allocate for a length over the
-cap they expect: the parent caps every frame from the child at
-`wire.MaxFactFrameBytes` = 64 KiB; the worker caps a request at the same and a source
-frame at the `SourceBytes` the request declared, itself at most
-`wire.MaxSourceBytes` = 64 MiB. The parent enforces
-`workspace.max_parse_file_bytes` before any request is sent.
+Every frame is a 4-byte big-endian payload length, a 1-byte kind (whose high
+bit says the message continues in the next frame) and a slice of the message.
+`wire.ChunkBytes` = 64 KiB is the transport unit, not a limit on anything
+carried: a message of any length is sent as as many frames as it needs, and a
+reader never allocates for a frame longer than one unit, so a corrupt header
+costs it at most one unit before it is refused as malformed. There is no frame
+cap and no source cap: the source is streamed in chunks, and no record is
+dropped or refused for its size on the wire. `workspace.max_parse_file_bytes`
+is the only size policy, enforced by the parent before any request is sent;
+the one other refusal is a file longer than the parser's 32-bit offsets
+address (`wire.MaxSourceOffset`), which is reported unavailable rather than
+published with wrapped offsets.
 
-The frame cap does not bound the sink record a frame becomes; the parent's own
-bounds do. The largest fact the parent can build is one node or relation
+The transport does not bound the sink record a message becomes; the parent's
+own bounds do. The largest fact the parent can build is one node or relation
 carrying `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) evidence rows of roughly 620 bytes of
 identifiers and positions plus a native key of at most `MaxNativeKeyBytes`
 (2048): about 167 KiB, well under the 4 MiB `max_provider_record_bytes` a sink
@@ -319,23 +365,19 @@ Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
 position implementation), rejects offsets inside a UTF-8 sequence, checks
 range containment and every string bound, and maps declaration kinds through
-a closed vocabulary. The per-file record bound
-`providers.tree_sitter.max_records_per_file` -- unlimited by default -- is
-carried on the parse request and applied by the worker when extracting and by
-the parent when reading, from the one configured number, so a misbehaving child
-cannot make the parent buffer more than a healthy one would send and raising the
-bound can never make the parent reject a healthy worker's output. A record whose
-encoding would exceed the frame cap is dropped by the worker and reported as
-truncation, never sent oversize.
+a closed vocabulary. There is no per-file record bound: what the parent holds
+for one file's answer is the records the worker extracted from that file, a
+function of the file's bytes.
 
 ### Lifecycle
 
 - `MaxWorkers` bounds live worker *processes*, not concurrent parses: a worker
   occupies its place in the pool from before it is started until the runner has
   reaped it, so an idle worker and one still shutting down both still count. A
-  unit reuses an idle worker, starts one when the pool is under its bound, or
+  unit reuses an idle worker while no reserver waits on the admission ledger
+  (see Launch), starts one when the pool is under its bound, or
   waits (promptly returning on cancellation) until a worker goes idle or a
-  process exits; it then reads the hello within 30 seconds. A worker stays warm
+  process exits; it then reads the hello under the hang detector below. A worker stays warm
   only while there is parse work in flight: the last unit to finish drains the
   pool, so a process that has stopped parsing holds none. There is no idle
   timer, because a timer would only choose how long a resting machine carries
@@ -343,25 +385,33 @@ truncation, never sent oversize.
   instead would let a caller start a fresh worker while an expiring one still
   held its runner slot and memory reservation, and the runner would then refuse
   an admission the pool itself caused.
-- A healthy worker that has not exhausted a lifetime bound returns to the idle
-  list, where the next parse of the stage reuses it; the drain that follows the
-  last caller closes its stdin, the worker exits on EOF and the runner reaps
-  it. An unhealthy or exhausted worker is stopped at release instead.
-- A worker is recycled (stopped after its current parse) when it has done
-  2048 parses, consumed three quarters of its stdin or stdout lifetime budget,
-  or lived three quarters of its hour, so a healthy worker is never killed by
-  its own budget mid-parse. The parse count bound is defence in depth against
-  any per-parse leak in the native binding: whatever leaks is released with
-  the process.
-- Cancellation or the parse deadline kills the worker through the runner
-  (process tree termination) and closes the parent's end of its stdin at once
+- A healthy worker returns to the idle list, where the next parse of the
+  stage reuses it; the drain that follows the last caller closes its stdin,
+  the worker exits on EOF and the runner reaps it. An unhealthy worker is
+  stopped at release instead. While any reserver waits on the admission
+  ledger, a healthy worker is handed to the pool's acquirer when that acquirer
+  is the ledger's head and stopped otherwise, and idle workers are stopped
+  rather than reused (see Launch). A worker has no lifetime, no parse count, no
+  per-parse deadline and no lifetime byte total: a long parse of a large file
+  is not a hung one, and only progress can tell the two apart.
+- The hang detector runs while a request or the hello is outstanding. A
+  worker is alive for as long as its processor time moves or a byte of its
+  answer arrives, and is ended only when both have stood still for one window
+  (one minute). Where the platform publishes no processor-time reading --
+  before the runner has seen the process, or for the whole run where it cannot
+  sample a running tree -- the detector never fires, because silence alone
+  cannot tell a long parse from a wedged one. The failure is
+  `CTX_PROVIDER_TIMEOUT` with `stop_reason` = `stalled`. There is no
+  configuration key: it is a window, not a limit.
+- Cancellation or the hang detector kills the worker through the runner
+  (process tree termination) and closes the parent's ends of its pipes at once,
   so the runner's stdin copy sees EOF instead of waiting out its grace. The
   worker has no in-process cancellation path and needs none.
 - A worker that breaks protocol or dies mid-parse is stopped and, after a
   successful hello, the parse is retried exactly once on a fresh worker.
   Startup failures (the runner's trust refusal, admission refusal, a missing
-  hello, a fingerprint mismatch), per-file error frames, cancellation and
-  timeouts are not retried.
+  hello, a fingerprint mismatch), per-file error frames, cancellation and a
+  stalled worker are not retried.
 - `Close` closes every idle worker's stdin — concurrently, since each exits on
   EOF within the grace and serial stops would cost one grace after another —
   kills every worker that is not idle, and waits for the runner to reap each.
@@ -374,7 +424,7 @@ truncation, never sent oversize.
   measure RSS with the same `wire.ResidentBytes` helper over
   `/proc/self/statm`. A value that cannot be measured is -1, never 0.
 
-### Native lifecycle in the worker (ruling R8-2)
+### Native lifecycle in the worker
 
 Files read in full from `github.com/tree-sitter/go-tree-sitter@v0.25.0` before
 choosing APIs: `parser.go`, `tree.go`, `query.go`, `node.go`,
@@ -413,6 +463,8 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@def.<kind>` | a declaration of `<kind>` (function, method, class, interface, struct, enum, field, variable, constant, module, namespace, test); its `@name` (or `@declarator` for C) names it, `@body` marks where the signature ends |
 | `@scope` + `@scope.name` | a non-declaration container that contributes to qualified names and turns functions into methods (Rust `impl`) |
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
+| `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
+| `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
 | `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |
@@ -430,11 +482,10 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 
 | Bound | Value | Where |
 |---|---|---|
-| file size | `workspace.max_parse_file_bytes` (default 5 MiB), ≤ 64 MiB | parent, before any request |
-| fact frame | 64 KiB | both sides |
-| declarations / imports / references per file | 20000 / 4000 / 60000 | both sides |
-| evidence per fact | 64 | parent |
-| distinct callee reference nodes per file | 2000 | parent; past it the call is counted, not minted, and the file is `partial` |
+| file size | `workspace.max_parse_file_bytes` (unlimited by default); a file past the parser's 32-bit offsets (`wire.MaxSourceOffset`) is unavailable | parent, before any request |
+| transport unit | `wire.ChunkBytes` (64 KiB) per frame; a message continues across frames | both sides |
+| evidence per fact | `index.max_evidence_per_fact`, or the model's record ceiling (65536) when unset | parent |
+| distinct callee reference nodes per file | `providers.tree_sitter.max_callee_references` (unlimited by default) | parent; past a set bound the call is counted, not minted, and the file is `partial` |
 | call qualifier (receiver text) | `wire.MaxQualifierBytes` (512) | worker; a larger receiver expression is reported as an unnamed qualifier, so the key is `call:.<name>` |
 | call-site alias key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | cross-provider declaration key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
@@ -442,9 +493,7 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | documentation body | 8 KiB | parent |
 | signature | `MaxSignatureBytes` (4 KiB), whitespace-collapsed | parent |
 | workers | one per CPU (`config.ParserWorkers()`) | pool |
-| parse time | `Options.ParseTimeout` (default 60 s) | pool; kills the worker |
-| worker lifetime | 1 h / 2048 parses / 1 GiB each way | pool; recycled at three quarters |
-| hello | 30 s | pool |
+| hang detector | one minute with neither processor time nor answer bytes moving, while a request or the hello is outstanding; never fires without a processor-time reading | pool; kills the worker, `CTX_PROVIDER_TIMEOUT` `stop_reason` = `stalled` |
 | worker stderr | 16 KiB | runner |
 
 ## Third-party licenses
@@ -461,8 +510,7 @@ All MIT:
   Brunsfeld, Ayman Nadeem, Maxim Sokolov and tree-sitter contributors.
 - `github.com/mattn/go-pointer` (binding dependency), Yasuhiro Matsumoto.
 
-`THIRD_PARTY_LICENSES.md` at the repository root is a shared file and should
-carry this inventory; it is reported as a shared change in the Task 8 report.
+`THIRD_PARTY_LICENSES.md` at the repository root carries this inventory.
 
 ## Tests
 

@@ -30,7 +30,7 @@ const queryHashDomain = "codectx.search.v1"
 // path, a language or a node kind, so "a\x00b" and "ab" hash differently.
 const filterSep = "\x00"
 
-// searchQueryHash is the digest §5 preimage for the search endpoint: the
+// searchQueryHash is the cursor query-hash preimage for the search endpoint: the
 // endpoint, the normalized query text and every filter, each group sorted so
 // the caller's argument order cannot mint two cursors for one query, and each
 // joined with a separator no value can contain. A changed filter therefore

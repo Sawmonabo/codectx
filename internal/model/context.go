@@ -162,7 +162,7 @@ type PlanRequest struct {
 	IdempotencyKey string         `json:"idempotency_key,omitempty"`
 
 	// Cursor continues a compile that ended on its query deadline at a pass
-	// boundary (ruling C9). It is the token the previous PlanResult printed as
+	// boundary. It is the token the previous PlanResult printed as
 	// NextCursor, and it is presented beside the SAME request: the token is
 	// bound to the compile's request identity, so a cursor offered with any
 	// other request is refused rather than answered.
@@ -246,12 +246,13 @@ func (e ContextEntry) Validate() error {
 	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
-	// No count bound on evidence_paths. MaxReasonPathsPerEntry is superseded by
-	// the configured context.max_reason_paths_per_entry limit, which the ranking
-	// lane honours as written -- including unlimited. Refusing an entry here for
-	// carrying more routes than the old model constant would fail a persist for
-	// obeying the operator's own setting, and what an entry cannot enumerate is
-	// already disclosed by its MorePaths reason rather than dropped.
+	// No count bound on evidence_paths. The bound is the configured
+	// context.max_reason_paths_per_entry limit, which ranking honours as written
+	// -- including unlimited; MaxReasonPathsPerEntry is a report threshold here,
+	// not a ceiling on a context entry. Refusing an entry here for carrying more
+	// routes than that constant would fail a persist for obeying the operator's
+	// own setting, and what an entry cannot enumerate is already disclosed by its
+	// MorePaths reason rather than dropped.
 	for i, path := range e.EvidencePaths {
 		field := indexed("context_entry.evidence_paths", i)
 		if err := boundCount(field, len(path), MaxRelationsPerPath); err != nil {
@@ -439,8 +440,8 @@ func (m ContextManifest) Validate() error {
 	return nil
 }
 
-// PlanResult is the answer to a plan request. It is ONE type with two shapes
-// (ruling C9): either the finished plan -- the immutable manifest plus the
+// PlanResult is the answer to a plan request. It is ONE type with two shapes:
+// either the finished plan -- the immutable manifest plus the
 // operational session binding the actor uses from here on -- or the report that
 // this call ended on its query deadline at a pass boundary, carrying the token
 // the next call resumes from and nothing else.
@@ -594,8 +595,8 @@ func (r IncludeRequest) Validate() error {
 //
 // Action is deliberately a bounded free-form string, not a closed enum: Section
 // 19.2 names the two categories but fixes no manifest-action vocabulary, and
-// inventing one here would bind Tasks 16 and 17 to spellings the spec never
-// chose. Close it in this file once those tasks fix the set.
+// inventing one here would bind the coverage and workflow services to spellings
+// the spec never chose.
 type NextContextItem struct {
 	Binding     Binding     `json:"binding"`
 	Action      string      `json:"action"`

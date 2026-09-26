@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -108,7 +109,7 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 		}
 		return nil, false, internal("stat " + path + ": " + err.Error())
 	}
-	db, err := openPool(path, readerPragmas(), "deferred", 2, true)
+	db, err := openPool(path, readerPragmas(), "deferred", readerConnections, true)
 	if err != nil {
 		return nil, false, err
 	}
@@ -277,9 +278,10 @@ func (r *Reader) read(ctx context.Context, now time.Time, row *sql.Row) (RunView
 // a running span's elapsed time and every span's share of the run's wall.
 // lapsed says the run's writer stopped refreshing its liveness, in which case a
 // span the run left open never finished and reads as interrupted rather than as
-// one that has been going ever since. The
-// page is model.MaxRecordsPerResult wide, the same bound every other list in
-// the product carries; one extra row is read to tell a full page from a
+// one that has been going ever since, and a span it left planned reads as never
+// admitted rather than as work still waiting to begin. The page is
+// model.MaxRecordsPerResult wide, the same bound every other list in the
+// product carries; one extra row is read to tell a full page from a
 // truncated one, and only a page that is actually truncated pays for the one
 // COUNT that says by how much. The count is a second statement rather than a
 // longer scan because the run's spans are indexed by (run_id, seq): counting
@@ -319,13 +321,20 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		// Judged before the wall below, so an open span of a run whose writer
 		// died reports no measurement rather than an elapsed time that grows
 		// for as long as the row survives.
-		if lapsed && row.Outcome == OutcomeRunning {
-			// The same two columns a stopping collector writes, stated here
-			// rather than written: this reader must never touch the file, and
-			// a cut-off span with no reason reads as a failure whose cause was
-			// never recorded.
-			row.Outcome = OutcomeInterrupted
-			row.DiagnosticCode, row.Failure = model.CodeCanceled, ReasonInterrupted
+		// The same columns a stopping collector writes, stated here rather
+		// than written: this reader must never touch the file. A cut-off span
+		// with no reason reads as a failure whose cause was never recorded,
+		// and a unit still planned when its writer died was never admitted,
+		// exactly as sweepPlanned records it for a run that ended.
+		if lapsed {
+			switch row.Outcome {
+			case OutcomeRunning:
+				row.Outcome = OutcomeInterrupted
+				row.DiagnosticCode, row.Failure = model.CodeCanceled, ReasonInterrupted
+			case OutcomePlanned:
+				row.Outcome = OutcomeUnavailable
+				row.DiagnosticCode, row.Failure = model.CodeProviderUnavailable, ReasonNotAdmitted
+			}
 		}
 		if parent.Valid {
 			seq := parent.Int64
@@ -429,66 +438,134 @@ func (r *Reader) LiveStage(ctx context.Context) (stage string, live bool, err er
 	return stage, true, nil
 }
 
-// A RecordedPeak is the largest process-tree peak this ledger ever recorded
-// for one scope key, across every run it still holds. PeakBytes is a
-// measurement that was actually taken: a scope whose spans carry no peak has
-// no RecordedPeak at all, because "nothing sampled this tree" and "this tree
-// used no memory" are different facts and a zero would state the second.
-type RecordedPeak struct {
-	ScopeKey  string
-	PeakBytes int64
+// RecordedPeak is the largest process-tree peak this ledger holds for one
+// scope of a repository, and whether one is held at all. It is two indexed
+// reads of the high-water table and never a scan: the scope's own row by its
+// key, and only where that row is absent and familyPrefix is not empty, the
+// largest row whose key begins with familyPrefix -- a range over the same key,
+// bounded by that family's own scopes.
+//
+// The second result is the answer. A scope nothing ever sampled, a family
+// with no measured scope and a repository that has never run a heavy unit all
+// answer false with a zero the caller must not read: the table holds only
+// measurements above zero, so a zero here can only mean "no row", and a peak
+// of zero answered as observed would be a reservation of nothing.
+func (r *Reader) RecordedPeak(ctx context.Context, repositoryID, scopeKey, familyPrefix string) (int64, bool, error) {
+	repo, err := model.DecodeID(repositoryID)
+	if err != nil {
+		return 0, false, err
+	}
+	var peak int64
+	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
+		WHERE repository_id = ? AND scope_key = ?`, repo, scopeKey).Scan(&peak)
+	if err == nil {
+		return peak, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, wrap("read the scope's recorded peak", err)
+	}
+	if familyPrefix == "" {
+		return 0, false, nil
+	}
+	// The upper bound is the prefix with its last byte raised by one, which
+	// is the first key that no longer begins with it, so the range reads the
+	// family's rows off the primary key and nothing past them. A family
+	// prefix ends in its separator, so that byte is never the largest one.
+	upper := []byte(familyPrefix)
+	upper[len(upper)-1]++
+	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
+		WHERE repository_id = ? AND scope_key >= ? AND scope_key < ?
+		ORDER BY peak_rss_bytes DESC LIMIT 1`, repo, familyPrefix, string(upper)).Scan(&peak)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, wrap("read the family's recorded peak", err)
+	}
+	return peak, true, nil
 }
 
-// RecordedPeaks is what this workspace has already measured its own heavy work
-// to cost: for each scope key, the largest peak resident size any span
-// recorded for it, largest first, at most limit rows.
+// MarkedUnits is one provider's unit spans in the runs a marker names: how
+// many there are, and the first of them by scope key. A unit span is a
+// top-level span whose stage is its provider's id, which is how a run records
+// every unit it planned.
+type MarkedUnits struct {
+	Provider string
+	Units    int64
+	Named    []MarkedUnit
+}
+
+// MarkedUnit is one named unit and the marker that names its run: the run's
+// id and the marker's diagnostic code and failure text.
+type MarkedUnit struct {
+	ScopeKey       string
+	RunID          string
+	DiagnosticCode string
+	Failure        string
+}
+
+// MarkedUnits reads the unit spans of every deferred run of a repository that
+// holds a top-level span of this stage scoped to generationID in decimal --
+// the marker a run writes to say what it did to the units it planned over that
+// generation -- and that started no earlier than the run that produced the
+// generation. It answers per provider, in provider order, with the count and
+// the first named of them by scope key.
 //
-// It is one indexed-free aggregate over the spans table per reading and never
-// one per scope: a caller takes this page once and answers every scope from
-// it, so the cost of consulting the history does not grow with the number of
-// units consulting it. limit is the explicit finite bound Section 6 requires;
-// a limit outside (0, model.MaxRecordsPerResult] takes that ceiling. Ordering
-// by the peak descending is what makes the truncation safe to reason about --
-// a page that could not hold every scope holds the largest measurements, which
-// are the ones an under-reservation would be built on.
+// The runs it reads are ones retention keeps for as long as the generation is
+// retained: a sweep deletes only runs that started before the oldest run
+// behind a retained generation, and every run read here started at or after
+// the run behind this one (SweepRuns). A generation whose producing run the
+// file no longer holds -- a ledger recreated after the store was built --
+// answers nothing, since no marker can be told apart from one about an
+// earlier generation of the same id.
 //
-// Only peaks above zero are answered. A recorded zero is a real measurement,
-// but it can never raise anything a caller derived, so carrying it would spend
-// a row of the bound on a figure with no effect; a NULL peak is not a
-// measurement at all and is excluded by the same clause.
-func (r *Reader) RecordedPeaks(ctx context.Context, limit int) ([]RecordedPeak, error) {
-	if limit <= 0 || limit > model.MaxRecordsPerResult {
-		limit = model.MaxRecordsPerResult
-	}
-	const query = `SELECT scope_key, MAX(peak_rss_bytes) AS peak FROM spans
-		WHERE peak_rss_bytes > 0 AND scope_key <> ''
-		GROUP BY scope_key ORDER BY peak DESC, scope_key LIMIT ?`
-	rows, err := r.db.QueryContext(ctx, query, limit)
+// The markers are found through the runs index by repository and start, and
+// each run's spans through the run's own key, so the read covers the runs
+// since the generation's own and never the whole span table. The answer is
+// bounded by named per provider.
+func (r *Reader) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+	named int) ([]MarkedUnits, error) {
+	repo, err := model.DecodeID(repositoryID)
 	if err != nil {
-		return nil, wrap("read the recorded peaks", err)
+		return nil, err
+	}
+	const query = `WITH base AS (
+			SELECT MIN(started_at) AS started FROM runs WHERE repository_id = ?1 AND generation_id = ?2
+		), marked AS (
+			SELECT m.run_id, m.diagnostic_code, m.failure_json
+			FROM base, runs r JOIN spans m ON m.run_id = r.run_id
+			WHERE r.repository_id = ?1 AND r.kind = 'deferred' AND r.started_at >= base.started
+			  AND m.parent_id IS NULL AND m.stage = ?3 AND m.scope_key = ?4
+		), units AS (
+			SELECT u.provider, u.scope_key, u.run_id, marked.diagnostic_code, marked.failure_json,
+				ROW_NUMBER() OVER (PARTITION BY u.provider ORDER BY u.scope_key, u.run_id) AS n,
+				COUNT(*) OVER (PARTITION BY u.provider) AS total
+			FROM marked JOIN spans u ON u.run_id = marked.run_id
+			WHERE u.parent_id IS NULL AND u.provider <> '' AND u.stage = u.provider
+		)
+		SELECT provider, total, scope_key, run_id, diagnostic_code, failure_json
+		FROM units WHERE n <= ?5 ORDER BY provider, n`
+	rows, err := r.db.QueryContext(ctx, query, repo, generationID, stage,
+		strconv.FormatInt(generationID, 10), named)
+	if err != nil {
+		return nil, wrap("read the marked units", err)
 	}
 	defer rows.Close()
-	out := make([]RecordedPeak, 0, limit)
+	var out []MarkedUnits
 	for rows.Next() {
-		var row RecordedPeak
-		var peak sql.NullInt64
-		if err := rows.Scan(&row.ScopeKey, &peak); err != nil {
-			return nil, wrap("read the recorded peaks", err)
+		var provider string
+		var total int64
+		var unit MarkedUnit
+		var runID []byte
+		if err := rows.Scan(&provider, &total, &unit.ScopeKey, &runID, &unit.DiagnosticCode, &unit.Failure); err != nil {
+			return nil, wrap("read the marked units", err)
 		}
-		// MAX over a group is NULL where the group holds no measurement. The
-		// WHERE clause already excludes such groups; the guard stands because
-		// reading a NULL back as the zero database/sql would give is exactly
-		// how an absent observation becomes a peak of zero, and a peak of zero
-		// answered as observed would collapse the figure a caller derives from
-		// it.
-		if !peak.Valid || peak.Int64 <= 0 {
-			continue
+		unit.RunID = hex.EncodeToString(runID)
+		if len(out) == 0 || out[len(out)-1].Provider != provider {
+			out = append(out, MarkedUnits{Provider: provider, Units: total})
 		}
-		row.PeakBytes = peak.Int64
-		out = append(out, row)
+		last := &out[len(out)-1]
+		last.Named = append(last.Named, unit)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, wrap("read the recorded peaks", err)
-	}
-	return out, nil
+	return out, wrap("read the marked units", rows.Err())
 }

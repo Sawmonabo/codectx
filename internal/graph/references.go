@@ -187,8 +187,7 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	// The page bound is RESOLVED, not silently clamped: a caller that asked
 	// for more occurrences than the configuration or the wire allows is told
 	// "requested N, effective M" on the answer, exactly as a traversal's
-	// bounds are. Before this the two clamps below happened in silence, which
-	// is the class-G defect this wave removes.
+	// bounds are, so neither clamp below happens in silence.
 	pageLimit, notice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
 	notices = appendNotice(notices, notice)
 	// Only a page bound the CALLER chose is reported against the wire ceiling.

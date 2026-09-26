@@ -71,14 +71,43 @@ func parseTime(s string) (time.Time, error) {
 // the value reading it back must report.
 type pragma struct{ name, set, want string }
 
+// cacheKiB is every ledger connection's page cache, stated rather than left
+// to the engine's default so the footprint the process counts for it is the
+// one the connections run with. The file's rows are small and its reads are
+// one run and a page of spans, so a cache this size holds a reader's whole
+// working set.
+const cacheKiB = 2 << 10
+
+// writerConnections and readerConnections are the two pools' sizes: the
+// collector's one writer, and the connections of one Reader.
+const (
+	writerConnections = 1
+	readerConnections = 2
+)
+
+// readerHandles is how many Readers one process can hold open at once: one on
+// the indexing path -- the learned peaks while a plan is built, the run
+// reading itself back, or the probe of another process's progress while this
+// one waits for the workspace -- and one a status surface opens beside it in a
+// serving process.
+const readerHandles = 2
+
+// FootprintBytes is the memory the run ledger's page caches can hold in one
+// process: the writer's connection and every connection of every reader it
+// can hold open at once. The process's base footprint counts it
+// (config.BaseFootprint), because nothing else reserves it.
+const FootprintBytes int64 = (writerConnections + readerHandles*readerConnections) * cacheKiB << 10
+
 func commonPragmas() []pragma {
 	busy := strconv.FormatInt(busyTimeout.Milliseconds(), 10)
+	cache := "-" + strconv.Itoa(cacheKiB)
 	return []pragma{
 		{"busy_timeout", busy, busy},
 		{"foreign_keys", "ON", "1"},
 		{"journal_mode", "WAL", "wal"},
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
+		{"cache_size", cache, cache},
 	}
 }
 
@@ -99,11 +128,13 @@ func writerPragmas() []pragma {
 // fail on exactly the file a reader is there to read.
 func readerPragmas() []pragma {
 	busy := strconv.FormatInt(busyTimeout.Milliseconds(), 10)
+	cache := "-" + strconv.Itoa(cacheKiB)
 	return []pragma{
 		{"busy_timeout", busy, busy},
 		{"foreign_keys", "ON", "1"},
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
+		{"cache_size", cache, cache},
 		{"query_only", "ON", "1"},
 	}
 }

@@ -1,11 +1,11 @@
 package app
 
-// L8 owns this file: the semantic_source=lsp route of Section 11.5/11.6.
+// This file is the semantic_source=lsp route of Section 11.5/11.6.
 //
 // The facade dispatches here when a SymbolRequest or a ReferenceRequest names
-// semantic_source=lsp; semantic_source=canonical stays with the search service
-// and internal/search is not edited for this route (internal/search/resolve.go
-// keeps answering a direct search call with its own unavailable row).
+// semantic_source=lsp; semantic_source=canonical stays with the search service,
+// and internal/search/resolve.go answers a direct search call with its own
+// unavailable row.
 //
 // Everything this file produces is an OVERLAY answer, never a canonical fact:
 //

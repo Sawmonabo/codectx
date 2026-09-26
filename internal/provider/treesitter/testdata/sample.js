@@ -1,5 +1,6 @@
 import { readFile as rf } from "fs";
 const path = require("path");
+import * as ns from "./ns";
 
 // Non-ASCII before the declarations: héllo → 日本
 export const greeting = "héllo → 日本";
@@ -14,6 +15,7 @@ export class Server {
 }
 
 function helper(name) {
+  ns.start();
   return path.join(greeting, rf(name));
 }
 
