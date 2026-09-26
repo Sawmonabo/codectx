@@ -30,9 +30,12 @@
 // rule that a server is never refused because another project's server is
 // running -- it stops an idle one -- without being able to overtake anything
 // in the queue. A reserver with nothing idle to free brings no makeRoom step;
-// what it holds comes back through release, which pumps -- the parser pool
-// stops a worker it is handed back while one of its acquirers is queued, so
-// the room that worker held reaches the head in order.
+// what it holds comes back through release, which pumps. A holder that keeps
+// room warm for reuse asks Waiting before it reuses it: the parser pool hands
+// a worker back to its own acquirer at the head with the reservation it holds,
+// and otherwise, whenever any reserver is waiting, stops the worker rather
+// than reusing or idling it, so the room that worker held reaches the head in
+// order.
 package admission
 
 import (
@@ -208,6 +211,19 @@ func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.diskAllocation, l.diskUsed
+}
+
+// Waiting reports whether any reserver is queued: one that has not been
+// granted and, since pump grants the head the moment it fits, one whose head
+// does not fit right now. It is a moment's reading for a holder of room that
+// could either reuse that room itself or give it back. A holder that reuses
+// room while this is true takes it around a waiter that arrived first, which
+// is the overtaking strict first-in-first-out forbids; giving it back instead
+// pumps, and the head is admitted in order.
+func (l *Ledger) Waiting() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queue) > 0
 }
 
 // pump grants the head of the queue for as long as the head fits. The mutex

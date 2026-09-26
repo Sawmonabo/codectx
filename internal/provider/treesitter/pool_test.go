@@ -167,6 +167,11 @@ func acquireAsync(p *pool) <-chan handout {
 // that head first; the pool acquirer is admitted only after the head gives the
 // room back, with a worker of its own.
 //
+// "foreign waiter behind an idle worker": the pool's only worker is idle when
+// another reserver queues on the ledger. The next pool acquirer must stop that
+// idle worker rather than reuse it, so the waiter is admitted first, and must
+// then be given a worker of its own.
+//
 // Failure modes: an allocation that fits fewer workers than acquirers makes
 // every parse an exec, a hello, a parse and an exit when a worker handed back
 // is always stopped; a worker kept idle while an acquirer is queued holds the
@@ -180,7 +185,9 @@ func acquireAsync(p *pool) <-chan handout {
 // "pool head" sees a second worker started. Idle it while an acquirer is
 // queued -> "pool head" hangs. Hand it to any queued acquirer, head or not ->
 // "foreign head" sees the pool acquirer return before the foreign reserver is
-// granted.
+// granted. Drop the ledger's Waiting check from acquire -> "foreign waiter
+// behind an idle worker" sees the pool acquirer handed the idle worker while
+// the foreign reserver is still waiting.
 func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	t.Run("pool head", func(t *testing.T) {
 		p, _, _ := newOneWorkerPool(t)
@@ -254,6 +261,48 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 		}
 		if got.w == first || p.stats().WorkersStarted != 2 {
 			t.Fatalf("the pool acquirer was given the worker the foreign head's room was taken from (%d started)", p.stats().WorkersStarted)
+		}
+		p.release(got.w, true)
+	})
+
+	t.Run("foreign waiter behind an idle worker", func(t *testing.T) {
+		p, room, memory := newOneWorkerPool(t)
+		first, err := p.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
+		}
+		p.release(first, true) // nobody waits, so the worker goes idle
+		stuck := make(chan struct{}, 1)
+		foreign := make(chan func(), 1)
+		go func() {
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, func() {
+				select {
+				case stuck <- struct{}{}:
+				default:
+				}
+			})
+			if err != nil {
+				t.Errorf("the foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			foreign <- release
+		}()
+		<-stuck // the foreign reserver waits behind the idle worker's room
+		second := acquireAsync(p)
+		var release func()
+		select {
+		case got := <-second:
+			t.Fatalf("the pool acquirer reused the idle worker (error: %v) while a foreign reserver waited", got.err)
+		case release = <-foreign:
+		}
+		release()
+		got := <-second
+		if got.err != nil {
+			t.Fatalf("the pool acquirer was refused after the foreign reserver released: %v", got.err)
+		}
+		if got.w == first || p.stats().WorkersStarted != 2 {
+			t.Fatalf("the pool acquirer was given the idle worker the foreign reserver waited behind (%d started)",
+				p.stats().WorkersStarted)
 		}
 		p.release(got.w, true)
 	})

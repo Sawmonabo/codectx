@@ -263,15 +263,22 @@ parse while an acquirer of the pool is queued there follows that order:
   returns to the ledger, the ledger pumps, and that head is admitted first.
   The pool's acquirer behind it waits its turn.
 
-No idle worker is reused while an acquirer of the pool is queued, because no
-worker goes idle then. With none queued, a worker coming back goes idle and is
-held for the stage like any room an admitted child holds. The ledger does not
-tell a room holder that a reserver is waiting, so idle workers are reused
-around another reserver waiting on the ledger: the pool's callers take them
-for as long as there is one. That reserver is admitted only once the pool's
-callers outnumber its idle workers (one of them then queues behind it, and the
-next worker handed back is stopped) or once the stage's drain stops them all.
-Room is returned by its holder, never taken from it, and the order among the
+No idle worker is reused while any reserver waits on the ledger, the pool's
+own or another. The ledger reports whether one is waiting
+(`admission.Ledger.Waiting`), and the pool asks it at every acquire and
+release:
+
+- A worker coming back while a reserver waits, and no acquirer of the pool is
+  the head, is stopped rather than idled.
+- An acquirer that finds idle workers while a reserver waits stops every one
+  of them, so their room returns to the ledger and reaches the head in order,
+  and then queues for a worker of its own behind that reserver.
+
+With nobody waiting, a worker coming back goes idle and is held for the stage
+like any room an admitted child holds. The ledger is asked, not watched: a
+reserver that arrives while the pool holds idle workers and runs no parse
+waits for the pool's next acquire or release, or for the stage's drain. Room
+is returned by its holder, never taken from it, and the order among the
 reservers queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
@@ -376,9 +383,10 @@ function of the file's bytes.
 - A healthy worker returns to the idle list, where the next parse of the
   stage reuses it; the drain that follows the last caller closes its stdin,
   the worker exits on EOF and the runner reaps it. An unhealthy worker is
-  stopped at release instead. While an acquirer of the pool is queued on the
-  admission ledger, a healthy worker is handed to it when it is the ledger's
-  head and stopped when another reserver is (see Launch). A worker has no lifetime, no parse count, no
+  stopped at release instead. While any reserver waits on the admission
+  ledger, a healthy worker is handed to the pool's acquirer when that acquirer
+  is the ledger's head and stopped otherwise, and idle workers are stopped
+  rather than reused (see Launch). A worker has no lifetime, no parse count, no
   per-parse deadline and no lifetime byte total: a long parse of a large file
   is not a hung one, and only progress can tell the two apart.
 - The hang detector runs while a request or the hello is outstanding. A
