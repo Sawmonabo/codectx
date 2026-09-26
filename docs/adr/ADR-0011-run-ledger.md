@@ -31,11 +31,11 @@ the stall watchdog.
 The decision below replaced all of it, so this paragraph describes the state that motivated the
 decision and not the state of the tree. Each of the six stages is now a span, opened at
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
-`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:288` and
-`internal/provider/dependence/provider.go:828` and `:924`, and its duration line is gone. Each of
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:291` and
+`internal/provider/dependence/provider.go:861` and `:957`, and its duration line is gone. Each of
 the three measurements has a reader: the sampler keeps the tree's peak at
-`internal/process/treesample_linux.go:65` and its CPU ticks at `:77`, and the runner reads the reaped
-child's user and system time into its result at `internal/process/runner.go:632-634`; the span a
+`internal/process/treesample_linux.go:64` and its CPU ticks at `:80`, and the runner reads the reaped
+child's user and system time into its result at `internal/process/runner.go:634-636`; the span a
 child ran under records all three.
 
 ## Decision
@@ -105,29 +105,32 @@ Two facts about the main store force this, and both are properties of decisions 
 
 The ingestion group holds one transaction open for most of a run and commits when its page cache
 would spill or an exclusive writer waits ([ADR-0008](ADR-0008-ingestion-group.md),
-`internal/storage/sqlite/open.go:488`). Rows written through it are invisible to a second process
+`internal/storage/sqlite/open.go:682`). Rows written through it are invisible to a second process
 until that commit, so a ledger inside it could not answer a question about a run in progress --
 which is half of the requirement.
 
-`Store.Activate` (`internal/storage/sqlite/units.go:1429`) opens an exclusive transaction at
-`:1488` and holds it around the adjacency build and the lexical build (`:1590`, `:1596`). Lexical
-compaction runs just before that transaction (`:1484`) as its own bounded ingestion rather than
-inside it, so the exclusive window is narrower than the whole of activation -- and still wide enough
+`Store.Activate` (`internal/storage/sqlite/units.go:1522`) commits through the writer's
+immediate transaction (`:1581`) and holds it around the adjacency build and the lexical build
+(`:1694`, `:1700`). Lexical compaction runs just before that transaction (`:1577`) as its own
+bounded ingestion rather than inside it, so the write window is narrower than the whole of activation -- and still wide enough
 to matter. Any other writer on that file waits or fails busy for its duration, which is exactly the
 window an operator most wants the ledger to be answering in.
 
 There is a third reason that is not about contention. The main schema's text is hashed into a
 fingerprint (`internal/storage/sqlite/schema.go:31`) that is folded into every analysis key
-(`units.go:1601`), so adding a table there re-keys every analysis unit in the product and
+(`units.go:1705`), so adding a table there re-keys every analysis unit in the product and
 invalidates every existing cache. A diagnostic table is not worth that, and never will be.
 
 So the ledger is its own file beside the store, with its own schema and fingerprint, its own
 write-ahead log, one writer (the collector) and any number of read-only readers at any moment. It
-is found where the store is found and lives under the same directory lock. Its rows do not follow
-generations: the generation a run published is deleted by retention as soon as a later generation
-of the same ref exists, which a deferred publication makes true within the same command, so the
-collection pass keeps each repository's most recent runs, the run that produced the active
-generation, and every live run, and deletes the rest.
+is found where the store is found and lives under the same directory lock. Its rows follow the
+store's retention rather than a count: the collection pass that follows every retention sweep keeps
+the runs behind the generations the store still retains, every run that started since the oldest of
+them, and every live run, and deletes the rest. When no run names a retained generation it deletes
+nothing. A run's account therefore lasts as long as what it built, or any older result, is kept; an
+index run whose generation a deferred publication supersedes on the same ref goes with that
+generation unless an older retained ref's run precedes it, and the deferred run is then the one
+behind the active store.
 
 A run whose writer died is read, never rewritten, as the collector would have closed it: the run
 and every span it left running read as interrupted with no wall, and every unit it left planned
@@ -139,10 +142,10 @@ a run it is still attached to ends.
 The planner raises a heavy unit's reservation to the largest process-tree peak this repository has
 measured for that scope, and for a scope never run here to the largest measured for any scope of the
 same language family ([ADR-0010](ADR-0010-engine-memory.md)). That measurement cannot live only in
-the spans of retained runs: the run history is kept by count, and a scope that the kept runs did not
-touch -- a watch session editing elsewhere for longer than the history lasts -- would lose its
-measurement and be admitted against the family estimate again, which is the direction that
-overruns a host.
+the spans of retained runs: the run history follows the store's retention, and a scope that the
+kept runs did not touch -- a watch session editing elsewhere for longer than the history lasts --
+would lose its measurement and be admitted against the family estimate again, which is the
+direction that overruns a host.
 
 So every span that ends with a measured peak above zero raises its scope's row in a high-water
 table keyed by repository and scope key, in the same transaction as the span's end. A span with no
@@ -157,11 +160,14 @@ Each plan that derived the complete heavy scope set -- the provider that plans h
 active -- retires every row whose key it does not name: a removed project, a renamed root, a
 subdivision part, a key no plan asks about. A plan without that provider names nothing and retires
 nothing, because retiring against it would forget every measurement the next plan with it needs.
+So the keys of other measured spans -- an external indexer's import keys and profile names -- are
+retired only by a plan with that provider active; while it never is, they stay, bounded by those
+scopes and profiles and never growing.
 
 ### 4. The same rows answer on four surfaces
 
 1. **`codectx index`**: one progressive line per finished top-level span through the existing
-   output path (`internal/cli/index.go:565`), and on completion the run row and the top stages by
+   output path (`internal/cli/index.go:593`), and on completion the run row and the top stages by
    wall time with their share. Under `--json`, the same rows in the one envelope.
 2. **`codectx status --resources`**: the ledger of the latest run for this repository -- the live
    one if a run is live, live meaning its writer has renewed the deadline it publishes on the run
@@ -212,8 +218,8 @@ figure is reproduced by `go test -run TestLedgerCost ./internal/bench`.
 A deferred tick whose every unit fails publishes no generation. Its reason therefore has exactly one
 durable home: this ledger — the run row, which says the batch failed and how many units it planned
 and lost, and the unit spans, each naming its scope and its typed diagnostic code. Both survive the
-tick's abort, because the collection pass keeps a repository's recent runs whatever became of the
-generations they wrote.
+tick's abort, because the collection pass keeps every run since the oldest run behind a retained
+generation, whatever became of the generations they wrote.
 
 The store is deliberately not a second home for it. `provider_runs.failure_json` belongs to the work
 generation the abort removes, and a `generation_capabilities` row would have to be written against
@@ -252,9 +258,9 @@ failure on a span row is the one place a failed stage's reason survives the run,
 later diagnosis reads.
 
 The accepted trade-offs: a second database file exists in the workspace directory and is collected
-by its own rules -- the run history by recency, the learned peaks by the scopes a plan still names;
-a learned peak only ever rises while its scope exists, so a scope that shrinks keeps the reservation
-its largest measurement set; a run that produces more events than the
+by its own rules -- the run history by the generations the store retains, the learned peaks by the
+scopes a plan still names; a learned peak only ever rises while its scope exists, so a scope that
+shrinks keeps the reservation its largest measurement set; a run that produces more events than the
 channel bound drops some and says so rather than slowing down; a stage whose CPU cannot be
 attributed reports none, so the CPU column has holes exactly where concurrency is; and the span
 tree is a public shape that the CLI, the MCP tool and the log all depend on, so changing it changes

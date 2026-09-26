@@ -63,15 +63,18 @@ finishes work an earlier run left staged; each tick is its own run. An
 the spans of things a process does outside a run -- today, starting a language
 server.
 
-**A run's account is kept for the last sixteen runs of the workspace, and for
-the run that built the active generation however old it is.** It is not kept
-for as long as the generation it published: retention keeps only the newest
-generation of each ref, so a generation can be swept minutes after it activated
--- a deferred publication extends the base generation on the same ref inside
-the same command -- while "what did the run that built this store cost" is
-still exactly the question being asked. Overlay runs are collected as soon as
-the process that opened them is gone, so a server's starts never crowd out the
-runs that built something.
+**A run's account is kept for as long as the store keeps a result it or an
+earlier run built.** After each retention sweep the ledger keeps the run behind
+every generation retention kept (`index.retain_refs`, `index.max_retained_bytes`)
+and every run that started since the oldest of them -- a tick that published
+nothing and a run that failed included -- and deletes the runs before it. No
+count is involved. One consequence follows from retention keeping only the
+newest generation of each ref: when a deferred publication extends an index
+run's generation on the same ref, that index run's account goes with the
+superseded generation unless an older retained ref's run precedes it, and the
+deferred run is the one behind the active store. A live run is never deleted,
+and when no run names a generation the store still holds, nothing is deleted.
+Overlay runs are collected as soon as the process that opened them is gone.
 
 ### The stages a run records
 
