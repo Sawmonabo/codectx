@@ -1546,7 +1546,7 @@ func (s *stack) locker() index.Locker {
 // indexing run would leave every one of those commands with no service.
 //
 // The store is passed as the narrow coverage.Sessions interface and the CAS
-// never leaves this file: the service sees the frozen interfaces and a Limits
+// never leaves this file: the service sees the interfaces and a Limits
 // resolved here, never *sqlite.Store's wider surface, *snapshot.CAS or
 // config.Config.
 func (s *stack) openCoverage() error {

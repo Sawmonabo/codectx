@@ -256,7 +256,7 @@ var scenarios = []scenario{
 	},
 }
 
-// --- deterministic fakes for the frozen interfaces --------------------------
+// --- deterministic fakes for the interfaces ---------------------------------
 //
 // Each records what the collector asked it to do, which is how a row proves the
 // pass ran in dependency order and left a live resource alone.

@@ -1103,12 +1103,13 @@ const (
 		boostAssociatedTest + boostCentralityMax
 )
 
-// compilerPolicyVersion is the frozen code-side ranking/budget policy label
-// stored in every manifest header. v2 added budget.max_manifest_bytes to the
-// request hash and the canonical projection: a caller budget that decides
-// whether a plan is admitted is part of a request's identity, and the label is
-// what tells a stored v1 manifest apart from a v2 one rather than letting the
-// two collide under one id.
+// compilerPolicyVersion is the code-side ranking/budget policy label stored in
+// every manifest header and folded into its request and canonical hashes. It
+// changes whenever the compiled ranking or budget rules change, so a manifest
+// compiled under other rules never collides with this one under one id.
+// budget.max_manifest_bytes is part of the request hash and the canonical
+// projection because a caller budget that decides whether a plan is admitted is
+// part of a request's identity.
 const compilerPolicyVersion = "codectx.context.v2"
 
 // The model.H domains. Two code paths computing a different preimage would make

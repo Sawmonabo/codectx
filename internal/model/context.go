@@ -595,8 +595,8 @@ func (r IncludeRequest) Validate() error {
 //
 // Action is deliberately a bounded free-form string, not a closed enum: Section
 // 19.2 names the two categories but fixes no manifest-action vocabulary, and
-// inventing one here would bind Tasks 16 and 17 to spellings the spec never
-// chose. Close it in this file once those tasks fix the set.
+// inventing one here would bind the coverage and workflow services to spellings
+// the spec never chose.
 type NextContextItem struct {
 	Binding     Binding     `json:"binding"`
 	Action      string      `json:"action"`

@@ -336,7 +336,7 @@ func (f *graphFixture) Containers(ctx context.Context, kinds []model.NodeKind,
 }
 
 // EvidenceFor hydrates the evidence IDENTITIES backing a page of relations in
-// one call -- the frozen Adjacency port, which is all a traversal needs.
+// one call -- the Adjacency port, which is all a traversal needs.
 func (f *graphFixture) EvidenceFor(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.EvidenceID, error) {
 	rows, err := f.EvidenceRows(ctx, relations, limit)
 	if err != nil {

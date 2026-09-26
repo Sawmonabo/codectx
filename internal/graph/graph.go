@@ -486,7 +486,7 @@ type expandOptions struct {
 var errStopExpansion = errors.New("expansion stopped by visitor")
 
 // EvidenceRowReader is the OPTIONAL hydration seam an Adjacency may also
-// implement. The frozen Adjacency.EvidenceFor returns evidence IDENTITIES,
+// implement. Adjacency.EvidenceFor returns evidence IDENTITIES,
 // which is all a traversal needs to call a path evidence-backed; a reference
 // occurrence additionally needs the precision class, the file and the byte
 // range, and all three live on the evidence row rather than on the relation.
@@ -496,7 +496,7 @@ var errStopExpansion = errors.New("expansion stopped by visitor")
 // the precision the caller assumes.
 //
 // It is a separate optional interface rather than a widening of Adjacency so
-// the frozen port stays frozen and a test fake that has no evidence rows keeps
+// the port stays narrow and a test fake that has no evidence rows keeps
 // compiling; References type-asserts it and falls back to the identity-only
 // read, so the seam's absence costs the occurrence fields and nothing else.
 type EvidenceRowReader interface {
