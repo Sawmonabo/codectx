@@ -139,3 +139,68 @@ func renderNode(g *flow.Graph, src []byte, n int32) string {
 	s := g.Span(n)
 	return strings.Join(strings.Fields(string(src[s.Start:s.End])), " ") + "@" + strconv.FormatUint(uint64(s.Start), 10)
 }
+
+// TestMayDefinitionChainIsLinear protects the def-use pass from a chain of
+// writes through one base, the shape that exhausted a worker's memory: each
+// write is a may-definition of the base (a χ), and pairing a use with every
+// may-definition reaching it asks for a quadratic pair set.
+//
+// Derivation, for n writes `o.f = 0` after the parameter o: the parameter's
+// node is o's one killing definition, and write i Uses o and may-defines it.
+// Write 1 pairs with the parameter alone. Write i > 1 pairs with the
+// parameter, the killing definition behind the chain, and with write i-1,
+// its nearest may-definition; the writes before i-1 are behind that nearest
+// one. So the count is 1 + 2(n-1) = 2n - 1, whatever n is: this asserts the
+// size of the algorithm's output, not a limit.
+//
+// Mutation: pair a use with every may-definition reaching it (write i then
+// pairs with the parameter and all i-1 writes before it), and the count
+// becomes n(n+1)/2, failing the assertion.
+func TestMayDefinitionChainIsLinear(t *testing.T) {
+	const n = 4000
+	for _, c := range []struct{ language, head, write, tail string }{
+		{"javascript", "function f(o) {", " o.f = 0;", " }"},
+		{"go", "package p\nfunc f(o *T) {", "\no.f = 0", "\n}"},
+	} {
+		t.Run(c.language, func(t *testing.T) {
+			src := []byte(c.head + strings.Repeat(c.write, n) + c.tail)
+			tl, ok := Grammar(c.language)
+			if !ok {
+				t.Fatalf("no grammar for %q", c.language)
+			}
+			low, ok := LoweringFor(c.language)
+			if !ok {
+				t.Fatalf("no lowering for %q", c.language)
+			}
+			p := ts.NewParser()
+			defer p.Close()
+			if err := p.SetLanguage(tl); err != nil {
+				t.Fatalf("set language: %v", err)
+			}
+			tree := p.Parse(src, nil)
+			if tree == nil {
+				t.Fatal("the parser produced no tree")
+			}
+			defer tree.Close()
+			var fn *ts.Node
+			found := errors.New("found")
+			_ = low.Functions(tree.RootNode(), func(m *ts.Node) error {
+				if m.Kind() == "function_declaration" {
+					fn = m
+					return found
+				}
+				return nil
+			})
+			if fn == nil {
+				t.Fatal("no function declaration")
+			}
+			var s Scratch
+			defer s.Close()
+			var a flow.Arena
+			g := low.Lower(fn, src, &a, &s)
+			if got, want := flow.DefUse(g, &a).Len(), 2*n-1; got != want {
+				t.Errorf("def-use pairs = %d, want 2n-1 = %d for n = %d writes through one base", got, want, n)
+			}
+		})
+	}
+}
