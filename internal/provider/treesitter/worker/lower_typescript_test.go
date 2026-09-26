@@ -153,10 +153,11 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x@58 -> g(x, y)@83", "y@69 -> g(x, y)@83"},
 		},
 		{
-			// A TypeScript field is a public_field_definition, emitted as the
-			// field without its annotation; its initializer runs in the class
-			// body's unit (ECMA-262 §15.7.14 ClassDefinitionEvaluation).
-			// Branch c@22, arms 1@26 and 2@30.
+			// ECMA-262 §15.7.10 ClassFieldDefinitionEvaluation: the compiler
+			// emits a TypeScript field (public_field_definition) as the field
+			// without its annotation, and its initializer runs in the class
+			// body's unit (§15.7.14 ClassDefinitionEvaluation). Branch c@22,
+			// arms 1@26 and 2@30; c is free in the unit.
 			name:     "a typed field initializer is lowered in the class body's unit",
 			protects: "public_field_definition takes field_definition's place in the class body unit",
 			mutation: "match only field_definition in classBody (the initializer makes no node and cd is empty)",
@@ -188,14 +189,15 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// The compiler's emit of `x as T` is x: the type `typeof y`
 			// evaluates nothing. Nodes: x@11, y@19, the arrow
 			// () => x as typeof y@39 (Uses its capture x), the declarator
-			// g = () => x as typeof y@35 (Uses x, defines g), return g;@60.
+			// g = () => x as typeof y@35 (defines g and Uses nothing: the
+			// captures are the arrow's), return g;@60.
 			name:     "a closure's captures skip the type of an as expression",
 			protects: "the capture collection walks only the operand of a transparent wrapper, never its type",
-			mutation: "walk every child of an as expression in cap (y@19 pairs with the arrow and the declarator)",
+			mutation: "walk every child of an as expression in cap (y@19 -> () => x as typeof y@39 appears)",
 			src:      "function f(x: any, y: any) { const g = () => x as typeof y; return g; }",
 			fn:       1,
 			du: []string{
-				"x@11 -> () => x as typeof y@39", "x@11 -> g = () => x as typeof y@35",
+				"x@11 -> () => x as typeof y@39",
 				"g = () => x as typeof y@35 -> return g;@60",
 			},
 		},
@@ -244,7 +246,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 	// JavaScript's.
 	shared = append(shared,
 		goldenCase{
-			// ECMA-262 §14.12.4 CaseClauseIsSelected; derivation as in the
+			// ECMA-262 §14.12.3 CaseClauseIsSelected; derivation as in the
 			// JavaScript case of the same name.
 			name:     "every case test reads the discriminant",
 			protects: "a case test's decision depends on the discriminant's variables, so their definitions reach every test",
@@ -259,7 +261,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// the same name.
 			name:     "a compound property assignment reads the property before its right side",
 			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25)",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the condition's reads (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -270,7 +272,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 			du: []string{
 				"o@11 -> o.p@25", "c@14 -> c@32",
-				"o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25",
+				"o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		goldenCase{
@@ -289,9 +291,12 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 	)
 	runGolden(t, "typescript", shared)
 	runGolden(t, "tsx", append(shared, goldenCase{
-		// JSX (the JSX specification's JSXElement): a capitalized tag name
-		// is a reference. && is ECMAScript §13.13: Branch a@40, the right
-		// operand <B />@45 reading B, the return@33 reading both.
+		// The compiler's JSX emit: an element is a call whose first
+		// argument is its tag, `<B />` becoming `createElement(B, null)`,
+		// so a capitalized tag name is a read of B. && is ECMA-262 §13.13
+		// Binary Logical Operators, and either operand can be its value:
+		// Branch a@40, the right operand <B />@45 reading B, the return@33
+		// Using both operands' reads.
 		name:     "a JSX element in TSX reads its component",
 		protects: "TSX resolves the JSX kinds its grammar has, so a component tag is a read and a conditional operand",
 		mutation: "resolve the JSX kinds against the typescript grammar for tsx (<B /> reads nothing)",

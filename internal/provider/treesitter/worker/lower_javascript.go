@@ -69,8 +69,11 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //   - A statement is one node: an expression statement spans its expression
 //     (a comma sequence at statement level is one statement per element), a
 //     declarator spans the declarator, return, throw, break and continue span
-//     the statement (kind Jump), a class declaration spans the declaration.
-//     An expression statement that is an assignment or update of an
+//     the statement (kind Jump), a class declaration spans the declaration,
+//     creates the class and defines its name. A break or continue whose
+//     label names no enclosing statement (an early error, ECMA-262 §8.3.2
+//     ContainsUndefinedBreakTarget, §8.3.3) is lowered as the tree stands:
+//     an unresolved jump, counted, with no successor. An expression statement that is an assignment or update of an
 //     identifier is its defining node, not a second node. `var x;` is a
 //     hoisted declaration and no node; `let x;` defines x.
 //   - A function declaration is hoisted: one node at the start of its block,
@@ -78,20 +81,27 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     a Stmt node spanning the declaration creates the function (see nested
 //     callables below) and may-defines the name, so a use after the
 //     declaration sees the captures read there.
-//   - A condition is one Branch node spanning the condition without its
-//     parentheses: if, while, do…while, for. A switch is a Stmt node for the
-//     discriminant then one Branch node per case test, in source order (each
-//     test is evaluated only when the previous failed), that Uses the
-//     discriminant's reads with its own, since it compares the two; a case
-//     body's end
-//     flows into the next body when it does not break. A for…in/for…of loop
-//     is a Stmt node for the iterated expression, evaluated once, then a
-//     Branch head spanning the head clause from the left side to the end of
-//     the iterated expression (whether another element is assigned), which
-//     defines nothing: each name the left side binds is defined on the body
-//     path, after the head, by the destructuring rule below (a bare
-//     identifier is one defining node spanning it), so the exit edge carries
-//     the definitions from before the loop.
+//   - A condition is one Branch node spanning the condition as Spans in
+//     Lowering states: if, while, do…while, for. A switch is a Stmt node for
+//     the discriminant, spanned the same way (`switch (x)` spans x), then
+//     one Branch node per case test, in source order (each test is evaluated
+//     only when the previous failed), that Uses the discriminant's reads with
+//     its own, since it compares the two; a case body's end flows into the
+//     next body when it does not break. A for…in, for…of or
+//     for await…of loop follows the iteration model (see Iteration in
+//     Lowering; ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation): a Stmt node
+//     spanning the iterated expression Uses its reads and defines the
+//     iteration variable, then a Branch head spanning the head clause from
+//     the left side to the end of the iterated expression (whether another
+//     element is assigned) Uses only that variable and defines nothing. On
+//     the body path, after the head, the left side is assigned
+//     (§14.7.5.7 ForIn/OfBodyEvaluation): each name it binds is defined by
+//     the destructuring rule below (a bare identifier is one defining node
+//     spanning it), and a property target `o.p` is evaluated anew on every
+//     iteration, one Stmt node spanning it that Uses o and defines nothing;
+//     each of these nodes Uses the iteration variable, never the iterated
+//     expression's names. The exit edge carries the definitions from before
+//     the loop.
 //   - `&&`, `||`, `??` and the conditional operator: the deciding operand is
 //     a Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -101,9 +111,16 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     `?.`, and one Stmt node spanning the whole chain on the non-nullish
 //     path.
 //   - Destructuring is one defining node per bound name, spanning the name,
-//     so D ≤ N. A default (`a = e` in a pattern or parameter) is a Branch
-//     node spanning the element that defines the name from the incoming
-//     value, then a Stmt node spanning e that defines it from the default.
+//     so D ≤ N; a declarator or assignment whose target is a pattern makes
+//     no node of its own, its element nodes standing for it. A default (`a =
+//     e` in a pattern or parameter) is a Branch node spanning the element
+//     that defines the name from the incoming value and Uses only that
+//     value's reads (a parameter's incoming value, the argument, reads
+//     none), then a Stmt node spanning e that defines it from the default
+//     and Uses only e's reads, since e is evaluated after the test. A catch
+//     parameter is bound by this rule on the handler path, after the
+//     Handler, from a value that reads no variable (a bare identifier is one
+//     defining node spanning it, Using nothing).
 //     Elements are lowered in source order: the language assigns them one at
 //     a time, each step may throw, and a default or computed key reads the
 //     elements assigned before it. Every element node carries every read of
@@ -125,7 +142,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     class's field initializers and static blocks, static and instance
 //     alike, are its class body's unit, lowered in source order: each
 //     initializer is the nodes of its value then one Stmt node spanning the
-//     field definition, and each static block is a block with its own var
+//     field definition, which ends before its `;` (the grammar makes the
+//     `;` a sibling in the class body), and each static block is a block with its own var
 //     scope. The class node in the enclosing function also captures them.
 //   - An expression lowered for its value and ended by a node spanning it (an
 //     expression statement, a conditional operand, an arrow's expression
@@ -146,25 +164,42 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // # Uses
 //
 // Only an identifier resolving to a variable declared in this function is a
-// Use. A node Uses every variable read inside its own span (the value it
-// computes derives from them, since the lowering introduces no temporaries)
-// and no read outside it: a read belongs to the node that evaluates it, and
-// a read no node of its own evaluates (the receiver of a call, an operand of
-// a plain operator) belongs to the node of the enclosing expression that
-// consumes it. An assignment, compound assignment or update of an identifier
-// embedded in a larger expression is its own defining node, and the variable
-// it defined is a read of the node that evaluates the enclosing expression,
-// since the expression's value is the value assigned. A node that defines v
-// also Uses v when its statement read v before it: the enclosing expression
-// consumes that earlier value only after the definition has overwritten it,
-// so the defining node carries it, read before its write (`f(x, x = 1)`),
-// the rule a destructuring swap follows. A destructuring or for…in/for…of
-// defining node also Uses the variables of the value it destructures, and a
-// destructuring element those of its computed key and property target. A
-// property write (`o.p = v`, `a[i] = v`) is a Stmt node spanning the
-// assignment that Uses o, a, i and v and defines nothing; a compound one
-// (`o.p += v`) is first a Stmt node spanning the target, the property read,
-// that Uses o (and a and i), then that write node.
+// Use. A node Uses what the consumption rule gives it (see Lowering) and no
+// read outside its span; a read no node of its own evaluates (the receiver
+// of a call, an operand of a plain operator) is one of the reads of the node
+// of the enclosing expression that consumes it. In JavaScript:
+//
+//   - A conditional expression's condition is read by its Branch node only;
+//     the node consuming the conditional Uses its arms' reads.
+//   - Both operands of `&&`, `||` and `??` are consumed, since either can be
+//     the operator's value: the deciding operand's Branch Uses its reads, the
+//     conditional operand's Stmt node its own, and the consuming node both.
+//   - An optional chain's node Uses its receivers' reads: the value it reads
+//     through or calls is the one each Branch before a `?.` tests.
+//   - A nested callable's or class's captures are read by its creating node
+//     only; a node consuming the created value does not repeat them.
+//   - An assignment, compound assignment or update of an identifier embedded
+//     in a larger expression is its own defining node, and the enclosing
+//     expression consumes its value: its node Uses the assignment's reads
+//     and the variable it defined, since the expression's value is the value
+//     assigned (`while ((m = re.exec(s)) !== null)` Uses re, s and m).
+//   - A destructuring assignment's value is its right side's: a node
+//     consuming it Uses the right side's reads, not those of its elements'
+//     computed keys, defaults and property targets, which are the element
+//     nodes'.
+//
+// A node that defines v also Uses v when its statement read v before it:
+// the enclosing expression consumes that earlier value only after the
+// definition has overwritten it, so the defining node carries it, read
+// before its write (`f(x, x = 1)`), the rule a destructuring swap follows. A
+// read the statement no longer holds (a condition's, a capture) is not such
+// an earlier read. A destructuring defining node also Uses the variables of
+// the value it destructures (for a for…in/for…of left side, the iteration
+// variable), and a destructuring element those of its computed key and
+// property target. A property write (`o.p = v`, `a[i] = v`) is a Stmt node
+// spanning the assignment that Uses o, a, i and v and defines nothing; a
+// compound one (`o.p += v`) is first a Stmt node spanning the target, the
+// property read, that Uses o (and a and i), then that write node.
 //
 // # Exceptions
 //
@@ -236,12 +271,18 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     is bound to no variable throughout the body, since inside an
 //     initializer it names the member (the emitted body assigns each member
 //     as a property of the enum object and reads a member name as that
-//     property).
+//     property). A member's node Uses its initializer's reads only, never
+//     E: the emitted body reaches the enum object through the invoked
+//     function's own parameter E, not the enclosing variable. A member
+//     without an initializer makes no node: its value is a constant the
+//     compiler computes, and no source expression of it is evaluated.
 //   - A namespace with a body runs its body once, immediately, where it
 //     stands (the emitted immediately invoked function), so it is lowered
 //     inline, not as a callable: one Stmt node spanning the leftmost name
 //     of its path that Uses and defines that name, then the body as a block
-//     with its own var scope. A namespace named by a string is ambient.
+//     with its own var scope. A namespace the grammar places in an
+//     expression statement is that namespace, with no node of its own for
+//     the statement. A namespace named by a string is ambient.
 //   - `import x = require(m)` is one Stmt node spanning x that defines it
 //     and may throw; `import x = A.B` is one spanning x that Uses A and
 //     defines x, and may throw when it reads a property.
@@ -339,10 +380,10 @@ type jsLower struct {
 	// captures: declarations then bind -1 and no node is created.
 	shadow int
 	// reads are the variables read by the current statement, in evaluation
-	// order; seen[v] == stmtNo marks v as one of them, stmtNo numbering the
-	// statements.
+	// order; seen[v].stmt == stmtNo marks v as one of them, first recorded
+	// at reads[seen[v].at], stmtNo numbering the statements.
 	reads  []int32
-	seen   []int
+	seen   []jsSeen
 	stmtNo int
 	// writes are the enclosing variables assigned inside the nested callable
 	// or class whose captures are being collected; closure may-defines them
@@ -427,15 +468,36 @@ func (j *jsLower) read(v int32) {
 	}
 	j.reads = append(j.reads, v)
 	if int(v) >= len(j.seen) {
-		j.seen = append(j.seen, make([]int, int(v)+1-len(j.seen))...)
+		j.seen = append(j.seen, make([]jsSeen, int(v)+1-len(j.seen))...)
 	}
-	j.seen[v] = j.stmtNo
+	if j.seen[v].stmt != j.stmtNo {
+		j.seen[v] = jsSeen{stmt: j.stmtNo, at: len(j.reads) - 1}
+	}
+}
+
+// jsSeen marks a variable as read by statement stmt, first at reads[at].
+type jsSeen struct {
+	stmt, at int
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (j *jsLower) reset() {
 	j.reads, j.throws, j.thrown = j.reads[:0], 0, 0
 	j.stmtNo++
+}
+
+// drop removes reads[m:], the reads of a node evaluated separately whose
+// value the enclosing expression does not consume through them (a
+// condition, a callable's captures, a destructuring element): the node that
+// evaluated them already Uses them. A variable read only there is no longer
+// one of the statement's reads, so a later definition does not Use it.
+func (j *jsLower) drop(m int) {
+	for _, v := range j.reads[m:] {
+		if j.seen[v].at >= m {
+			j.seen[v].stmt = 0
+		}
+	}
+	j.reads = j.reads[:m]
 }
 
 // node creates a node spanning n that Uses reads[from:to], and MayThrow when
@@ -474,7 +536,7 @@ func (j *jsLower) def(n, v int32) {
 		return
 	}
 	j.b.Def(n, v)
-	if int(v) < len(j.seen) && j.seen[v] == j.stmtNo {
+	if int(v) < len(j.seen) && j.seen[v].stmt == j.stmtNo {
 		j.b.Use(n, v)
 	}
 }
@@ -483,8 +545,8 @@ func (j *jsLower) def(n, v int32) {
 // unless the last node that lowering made already spans n, or n without its
 // parentheses, with no throw evaluated after it: that node then stands for
 // n. A read-back recorded after it (an assignment's variable) is read by the
-// enclosing expression's node, which reads every variable read inside it; at
-// statement level nothing encloses n.
+// enclosing expression's node, which consumes n's value (see Uses in
+// lowerJavaScript); at statement level nothing encloses n.
 func (j *jsLower) valueNode(n *ts.Node) {
 	m, last := len(j.reads), j.last
 	j.value(n, false)
@@ -734,6 +796,7 @@ func (j *jsLower) closureFrom(n *ts.Node, m int) int32 {
 		j.b.MayDef(id, v)
 	}
 	j.writes = j.writes[:w]
+	j.drop(m)
 	return id
 }
 
@@ -1216,28 +1279,32 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 			j.def(d, j.lookup(left))
 		}
 	}
+	// ForIn/OfHeadEvaluation (ECMA-262 §14.7.5.6) evaluates the iterated
+	// expression once; its node defines the iteration variable it, which the
+	// head and every per-iteration node Use in its place.
 	j.reset()
 	right := n.ChildByFieldId(k.fRight)
 	j.value(right, false)
 	if of {
 		j.throws++
 	}
-	j.node(flow.Stmt, right, 0, len(j.reads))
-	rEnd := len(j.reads)
+	it := j.b.Var()
+	j.b.Def(j.node(flow.Stmt, right, 0, len(j.reads)), it)
 	f := j.b.OpenLoop(labels...)
+	j.reset()
+	j.read(it)
 	if of {
 		j.throws++
-	}
-	property := left.KindId() == k.memberExpression || left.KindId() == k.subscriptExpression
-	if property {
-		j.target(left)
 	}
 	head := flow.Span{Start: uint32(n.ChildByFieldId(k.fLeft).StartByte()), End: uint32(right.EndByte())}
 	h := j.nodeAt(flow.Branch, head, 0, len(j.reads))
 	exit := j.b.Push()
-	if !property {
-		j.bind(left, 0, rEnd)
-	}
+	// ForIn/OfBodyEvaluation (§14.7.5.7) assigns the next value once one
+	// exists, evaluating a property target anew on every iteration: bind
+	// makes that target's node, which Uses it and the target's reads.
+	j.reset()
+	j.read(it)
+	j.bind(left, 0, len(j.reads))
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)
@@ -1433,6 +1500,7 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 		m := len(j.reads)
 		j.value(cond, false)
 		j.node(flow.Branch, cond, m, len(j.reads))
+		j.drop(m)
 		p := j.b.Push()
 		j.valueNode(n.ChildByFieldId(k.fConsequence))
 		t := j.b.Push()
@@ -1556,9 +1624,13 @@ func (j *jsLower) assign(n *ts.Node) (made bool, v int32) {
 		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
 		return true, v
 	case k.objectPattern, k.arrayPattern:
+		// The assignment's value is the right side's; the elements' own
+		// reads (computed keys, defaults, property targets) are their nodes'.
 		j.value(right, false)
+		r := len(j.reads)
 		saved := j.open()
-		j.bind(left, m, len(j.reads))
+		j.bind(left, m, r)
+		j.drop(r)
 		return j.close(saved) >= 0, -1
 	default:
 		// The store happens after the right side is evaluated, so its throw
