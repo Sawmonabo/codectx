@@ -150,7 +150,7 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 		if offset >= len(src) {
 			return nil
 		}
-		return src[offset:min(offset+parseChunkBytes, len(src))]
+		return src[offset:min(offset+ParseChunkBytes, len(src))]
 	}, nil, nil)
 	if tree == nil {
 		parser.Reset()

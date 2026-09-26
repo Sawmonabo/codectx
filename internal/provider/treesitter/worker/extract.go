@@ -10,10 +10,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// parseChunkBytes bounds each copy the binding makes of the source while the
+// ParseChunkBytes bounds each copy the binding makes of the source while the
 // parser reads it (readUTF8 copies whatever the callback returns into a C
 // string kept until the parse ends).
-const parseChunkBytes = 64 << 10
+const ParseChunkBytes = 64 << 10
 
 // atRecordBound reports whether a per-file record set has reached the bound the
 // request carries. A zero bound -- the default -- is unlimited, so the file

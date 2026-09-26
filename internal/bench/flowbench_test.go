@@ -41,13 +41,6 @@ import (
 // input copies, which are reported beside them. A resident-set figure the
 // platform cannot report is JSON null, never 0.
 
-// parseChunk is the size of each slice the read callback hands the parser,
-// the same as the worker's parseChunkBytes (worker/extract.go): the binding
-// copies every slice into a C string held until the parse ends, so the chunk
-// decides that transient cost and must match the worker's for the rows to
-// predict it.
-const parseChunk = 64 << 10
-
 // rows is the benchmark row sink; see openRows.
 var rows struct {
 	mu sync.Mutex
@@ -215,7 +208,7 @@ func (ps parsers) close() {
 	}
 }
 
-// parse parses src the way the worker does, in parseChunk slices, and
+// parse parses src the way the worker does, in worker.ParseChunkBytes slices, and
 // returns the tree (nil when the parser produced none) and the bytes of the
 // C strings the binding copied the slices into: each slice plus its
 // terminator, the empty end-of-input slice included.
@@ -224,7 +217,7 @@ func parse(p *ts.Parser, src []byte) (*ts.Tree, int64) {
 	tree := p.ParseWithOptions(func(offset int, _ ts.Point) []byte {
 		var chunk []byte
 		if offset < len(src) {
-			chunk = src[offset:min(offset+parseChunk, len(src))]
+			chunk = src[offset:min(offset+worker.ParseChunkBytes, len(src))]
 		}
 		copies += int64(len(chunk)) + 1
 		return chunk
