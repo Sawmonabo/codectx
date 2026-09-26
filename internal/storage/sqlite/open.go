@@ -375,7 +375,9 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
-	s.tokenizer, err = openPool("", nil, "deferred", 1, false, false)
+	// Its cache is stated so the base footprint counts what it runs with.
+	tokenizerCache := "-" + strconv.Itoa(config.TokenizerCacheKiB)
+	s.tokenizer, err = openPool("", []pragma{{"cache_size", tokenizerCache, tokenizerCache}}, "deferred", 1, false, false)
 	if err != nil {
 		s.closeOpened()
 		return nil, err

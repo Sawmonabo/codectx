@@ -256,7 +256,7 @@ func (l *Ledger) Attach(ctx context.Context) error {
 	if err := ensureDir(path); err != nil {
 		return err
 	}
-	db, err := openPool(path, writerPragmas(), "immediate", 1, false)
+	db, err := openPool(path, writerPragmas(), "immediate", writerConnections, false)
 	if err != nil {
 		return err
 	}
@@ -721,45 +721,51 @@ func (l *Ledger) DiscardRun(ctx context.Context, run *Run) error {
 // the record of a process another surface has just called live.
 const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
 
-// RetainedRuns is how many of a repository's runs the ledger keeps. It bounds
-// the run history and nothing else: the file exists so an operator can read
-// what the last few runs of this workspace cost, and no decision the product
-// makes reads a run that is older than that. A learned peak is not such a run
-// -- it lives in its scope's high-water row, which this sweep never touches --
-// so how many runs are kept changes what `status --resources` can show about
-// the past and never what a unit is reserved against.
+// SweepRuns deletes the runs no retained generation stands behind, which is
+// the whole of the run history's collection. The history follows what the
+// store keeps rather than a count: the cutoff is the start of the oldest run
+// whose generation retained still reports held, a run that started at or
+// after it is kept whatever it produced, and every run that started before it
+// is deleted -- a run whose generation retention has since swept, a tick that
+// published nothing, and a run whose process died before it reached a
+// generation all leave the file the same way. So the run behind each retained
+// generation keeps its account for as long as the store keeps what it built,
+// and so does every run since the oldest of them, including the failures an
+// operator is investigating.
 //
-// It is a count because what it bounds is a history of runs rather than a
-// quantity of work: a run's rows are not a generation's rows and cannot follow
-// one, because the generation of a run that published is deleted by retention
-// as soon as a later generation of the same ref exists -- which a deferred
-// publication makes true within the same command -- and a ledger kept to a
-// generation's lifetime would lose the account of the run that built the store
-// minutes after it built it.
-const RetainedRuns = 16
-
-// SweepRuns keeps this repository's last RetainedRuns runs and deletes the
-// rest, which is the whole of the run history's collection: a run that
-// published, a tick that published nothing, and a run whose process died
-// before it reached a generation all leave the file the same way.
+// The window is the store's, so it shares the store's consequences. An index
+// run whose generation a deferred publication supersedes on the same ref is
+// deleted once retention sweeps that generation, unless the run behind an
+// older retained ref precedes it: the deferred run is then what built the
+// active store, and it is the run `status --resources` shows.
 //
-// Three classes of row are never deleted:
+// When no run in the file names a retained generation, nothing is deleted.
+// That is the first run of a workspace before the generation it published has
+// been flushed to its row, and a file recreated after the store was built:
+// in both, every run is newer than the store's next cutoff, and deleting them
+// would erase the account of runs the next pass keeps. It cannot grow without
+// bound, because the sweep runs after a publication, and the run that
+// published names the active generation from its next flush on.
+//
+// Two classes of row are never deleted:
 //
 //   - a live run -- one that says 'running' and whose writer has renewed the
 //     deadline it published. That is the run this pass is part of, and it is
 //     also another process's run in flight.
-//   - the run that produced activeGeneration, however old it is: the store an
-//     operator is asking `status --resources` about was built by that run, and
-//     losing its account is the defect this bound exists to avoid. Pass zero
-//     where the repository has no active generation.
 //   - an overlay run, which DeleteOverlayRuns collects by its own writer's
-//     liveness. Overlay runs are per-process and open with no work behind
-//     them, so counting them here would let a server's starts crowd out the
-//     runs that built something.
+//     liveness. Overlay runs are per-process and belong to no generation.
 //
-// One pass deletes at most a page. It is called from the periodic collection,
+// retained answers whether the store still holds a generation as a published
+// result, which is the caller's to know. The caller holds the lock every
+// publication takes, so no run older than the cutoff can publish a retained
+// generation between the scan and the delete. It is asked about each run
+// before the cutoff that names a generation, and about the cutoff's own run,
+// so a pass asks about the runs it and the passes after it delete and one
+// more. The scan reads model.MaxRecordsPerResult rows at a time, and one pass
+// deletes at most that many runs; it is called from the periodic collection,
 // so the next pass takes the rest.
-func (l *Ledger) SweepRuns(ctx context.Context, repositoryID string, activeGeneration int64) error {
+func (l *Ledger) SweepRuns(ctx context.Context, repositoryID string,
+	retained func(ctx context.Context, generationID int64) (bool, error)) error {
 	c := l.current()
 	if c == nil {
 		return nil
@@ -768,19 +774,73 @@ func (l *Ledger) SweepRuns(ctx context.Context, repositoryID string, activeGener
 	if err != nil {
 		return err
 	}
+	cutoff, found, err := c.retainedCutoff(ctx, repo, retained)
+	if err != nil || !found {
+		return err
+	}
 	const query = `DELETE FROM runs WHERE run_id IN (
 		SELECT run_id FROM runs
-		WHERE repository_id = ? AND kind <> 'overlay' AND ` + notLive + `
-		  AND (generation_id IS NULL OR generation_id <> ?)
-		  AND run_id NOT IN (
-			SELECT run_id FROM runs WHERE repository_id = ? AND kind <> 'overlay'
-			ORDER BY started_at DESC LIMIT ?)
+		WHERE repository_id = ? AND kind <> 'overlay' AND ` + notLive + ` AND started_at < ?
 		ORDER BY started_at LIMIT ?)`
 	return c.writeTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, query, repo, formatTime(time.Now()), activeGeneration,
-			repo, RetainedRuns, model.MaxRecordsPerResult)
+		_, err := tx.ExecContext(ctx, query, repo, formatTime(time.Now()), cutoff, model.MaxRecordsPerResult)
 		return wrap("sweep the runs", err)
 	})
+}
+
+// retainedCutoff is the start of the oldest run of repo that names a
+// generation retained still holds, and false when no run does. It walks the
+// runs that name a generation oldest first, a page at a time, and stops at the
+// first retained one; a live run is a candidate like any other, because the
+// run this pass is part of is usually the one behind the active generation.
+// Each page is read out and its rows closed before retained is asked, so no
+// read of this file is open while the caller reads the store.
+func (c *collector) retainedCutoff(ctx context.Context, repo []byte,
+	retained func(context.Context, int64) (bool, error)) (string, bool, error) {
+	type candidate struct {
+		runID      []byte
+		generation int64
+		started    string
+	}
+	var afterStart string
+	var afterID []byte
+	for {
+		rows, err := c.db.QueryContext(ctx, `SELECT run_id, generation_id, started_at FROM runs
+			WHERE repository_id = ? AND kind <> 'overlay' AND generation_id IS NOT NULL
+			  AND (started_at > ? OR (started_at = ? AND run_id > ?))
+			ORDER BY started_at, run_id LIMIT ?`,
+			repo, afterStart, afterStart, afterID, model.MaxRecordsPerResult)
+		if err != nil {
+			return "", false, wrap("read the runs", err)
+		}
+		var page []candidate
+		for rows.Next() {
+			var r candidate
+			if err := rows.Scan(&r.runID, &r.generation, &r.started); err != nil {
+				rows.Close()
+				return "", false, wrap("read the runs", err)
+			}
+			page = append(page, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return "", false, wrap("read the runs", err)
+		}
+		for _, r := range page {
+			held, err := retained(ctx, r.generation)
+			if err != nil {
+				return "", false, err
+			}
+			if held {
+				return r.started, true, nil
+			}
+		}
+		if len(page) < model.MaxRecordsPerResult {
+			return "", false, nil
+		}
+		last := page[len(page)-1]
+		afterStart, afterID = last.started, last.runID
+	}
 }
 
 // RetirePeaks deletes this repository's high-water rows whose scope keys are

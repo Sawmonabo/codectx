@@ -96,7 +96,7 @@ func TestUnopenedLedgerRecordsNothing(t *testing.T) {
 	if len(overlay) != 0 || err != nil {
 		t.Fatalf("overlay runs %v (%v), want none and no failure", overlay, err)
 	}
-	if err := l.SweepRuns(ctx, repositoryID, 7); err != nil {
+	if err := l.SweepRuns(ctx, repositoryID, func(context.Context, int64) (bool, error) { return true, nil }); err != nil {
 		t.Fatalf("sweep the runs: %v", err)
 	}
 	if err := l.DeleteOverlayRuns(ctx, []string{repositoryID}); err != nil {
@@ -601,10 +601,10 @@ func runByID(t *testing.T, dir, id string) ledger.RunView {
 
 // TestALearnedPeakSurvivesRunRetention protects the reservation a heavy scope
 // is admitted against. A scope's measured process-tree peak is what the next
-// plan raises its reservation to, and the run history is swept by count: a
-// scope that more than ledger.RetainedRuns runs leave untouched -- a watch
-// session editing elsewhere -- would otherwise be sized from the family
-// constants again and overrun the host. The other half is the absence rule: a
+// plan raises its reservation to, and the run history is swept with the
+// generations the store retains: a scope no run since the oldest retained
+// generation touched -- a watch session editing elsewhere -- would otherwise
+// be sized from the family constants again and overrun the host. The other half is the absence rule: a
 // scope whose span carried no peak answers no observation, never a peak of
 // zero, which would read as work that costs nothing.
 //
@@ -630,18 +630,19 @@ func TestALearnedPeakSurvivesRunRetention(t *testing.T) {
 	_, span := ledger.Start(runCtx, "parse", unsampled)
 	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	run.Finish(ledger.OutcomeOK)
-	// More runs than the history keeps, none of them touching either scope,
-	// so the run that measured them is swept.
-	for range ledger.RetainedRuns + 1 {
-		later, laterCtx := newRun(t, l)
-		_, span := ledger.Start(laterCtx, "capture", "")
-		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-		later.Finish(ledger.OutcomeOK)
-	}
+	// A later run that touches neither scope publishes the one generation the
+	// store retains, so the run that measured them is before the cutoff and
+	// is swept.
+	later, laterCtx := newRun(t, l)
+	_, capture := ledger.Start(laterCtx, "capture", "")
+	capture.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	later.AttachGeneration(1)
+	later.Finish(ledger.OutcomeOK)
 	if err := l.Flush(ctx); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	if err := l.SweepRuns(ctx, repositoryID, 0); err != nil {
+	onlyTheLater := func(_ context.Context, gen int64) (bool, error) { return gen == 1, nil }
+	if err := l.SweepRuns(ctx, repositoryID, onlyTheLater); err != nil {
 		t.Fatalf("sweep the runs: %v", err)
 	}
 	reader, open, err := ledger.OpenReader(ctx, dir)

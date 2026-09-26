@@ -9,6 +9,7 @@ import (
 
 	"modernc.org/sqlite"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
@@ -35,13 +36,6 @@ import (
 // staged gigabytes and removed them handed the filesystem every one of those
 // extents at once, and on a host that discards freed blocks that stalls every
 // writer on the machine for about a minute.
-
-// lexicalStageCacheKiB is the staging database's page cache. It is the buffer
-// the engine sorts the seal-time read in, so a unit whose vocabulary fits it is
-// ordered without a spill file, and it is an INTERNAL layout constant, not a
-// user limit: no count of terms or documents is refused because of it, a larger
-// unit simply spills under <data_dir>/tmp.
-const lexicalStageCacheKiB = 16 << 10
 
 // stageSchema is appended to and never updated. No secondary index exists
 // while the rows load; the one ordered read at seal is the engine's external
@@ -115,7 +109,7 @@ func (s *Store) openLexicalStage(ctx context.Context) (*lexicalStage, error) {
 func (s *Store) openStageSlot(ctx context.Context, path string) (*lexicalStage, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)",
-		"locking_mode(EXCLUSIVE)", "cache_size(-" + strconv.Itoa(lexicalStageCacheKiB) + ")"} {
+		"locking_mode(EXCLUSIVE)", "cache_size(-" + strconv.Itoa(config.LexicalStageCacheKiB) + ")"} {
 		q.Add("_pragma", p)
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()

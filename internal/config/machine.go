@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/ledger"
 )
 
 // IdleFootprintBytes is what this process holds before it reserves anything:
@@ -27,10 +29,13 @@ const IdleFootprintBytes int64 = 32 * (1 << 20)
 // BaseFootprint is what this process holds for itself on this machine under
 // configuration c: the idle overhead above, plus the reservations it makes up
 // front -- one query slot's memory per core, the parsed-graph cache, the
-// indexing queue, and the store's page caches: the writer connection's
-// (storage.writer_cache_kib) and every reader connection's
+// indexing queue, and every page cache it opens: the store writer
+// connection's (storage.writer_cache_kib), every reader connection's
 // (storage.reader_cache_kib) in every reader pool the process opens
-// (storeReaderPools).
+// (storeReaderPools), one lexical staging database's per unit a generation
+// builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
+// query tokenizer (TokenizerCacheKiB) and the run ledger's
+// (ledger.FootprintBytes).
 //
 // It is derived from the machine and the configuration rather than compared
 // against a figure. How many queries run at once comes from the cores, so a
@@ -49,13 +54,45 @@ func BaseFootprint(c Config) int64 {
 	return total
 }
 
+// storeHandles is how many store handles this process can hold open at once:
+// the writer's, and in the serving composition a second, query-only handle
+// beside it. Counting the serving case for every composition over-states the
+// others by one handle's pools, which only leaves their children less.
+const storeHandles = 2
+
 // storeReaderPools is how many reader pools of storage.read_connections
-// connections each this process can hold open at once. Every store handle
-// opens two -- the short-read pool and the posting-stream pool -- and the
-// serving composition opens a second, query-only handle beside the writer's,
-// with two of its own. Counting the serving case for every composition
-// over-states the others by two pools, which only leaves their children less.
-const storeReaderPools = 4
+// connections each this process can hold open at once: every store handle
+// opens two, the short-read pool and the posting-stream pool.
+const storeReaderPools = 2 * storeHandles
+
+// LexicalStageCacheKiB is the page cache of one building unit's lexical
+// staging database, which the store opens per unit that publishes search
+// rows. It is the buffer the engine sorts the seal-time read in, so a unit
+// whose vocabulary fits it is ordered without a spill file, and it is an
+// internal layout figure, not a user limit: no count of terms or documents is
+// refused because of it, and a larger unit spills under <data_dir>/tmp. It is
+// stated here, beside the footprint that counts it, because the store reads
+// its configuration from this package.
+const LexicalStageCacheKiB = 16 << 10
+
+// TokenizerCacheKiB is the page cache of a store handle's query tokenizer: one
+// in-memory connection that holds a single query text, at most
+// model.MaxQueryTextBytes, for the length of one call and nothing between
+// calls. An in-memory database cannot spill, so the figure bounds the pages it
+// keeps after a call rather than what one call may use; it is stated for the
+// same reason LexicalStageCacheKiB is.
+const TokenizerCacheKiB = 2 << 10
+
+// BuildWorkers is how many units one generation builds at once:
+// index.workers when it is set, and otherwise one per core this process may
+// run on. The coordinator also holds the count under the provider pool's
+// structural ceiling on live sinks, which can only lower it.
+func BuildWorkers(c Config) int {
+	if c.Index.Workers > 0 {
+		return c.Index.Workers
+	}
+	return CPUs()
+}
 
 // baseFootprintFor is BaseFootprint with the arithmetic's range failure
 // carried, so validation and the figure itself come from one implementation
@@ -86,8 +123,14 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	stageCaches, err := mulNoOverflow("index.workers (or cores) * lexical staging cache",
+		int64(BuildWorkers(c)), LexicalStageCacheKiB<<10)
+	if err != nil {
+		return 0, err
+	}
 	return addNoOverflow("base footprint of this process",
-		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches)
+		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
+		stageCaches, storeHandles*TokenizerCacheKiB<<10, ledger.FootprintBytes)
 }
 
 // How much CPU-bound work runs at once is a property of the machine, not a
