@@ -104,9 +104,10 @@ CREATE TABLE spans (
 );
 -- The largest process-tree peak any span ever measured for one scope of one
 -- repository: what the planner raises a heavy unit's reservation to. It is its
--- own table and not an aggregate over spans because runs are swept by count
--- and a scope a run did not touch would otherwise lose its measurement with
--- the runs that took it. A row exists only for a measurement above zero; a
+-- own table and not an aggregate over spans because a run is deleted once it
+-- started before the oldest run whose generation the store still retains, and
+-- a scope the retained runs did not touch would otherwise lose its measurement
+-- with the runs that took it. A row exists only for a measurement above zero; a
 -- scope nothing sampled has no row, never a row of zero. Rows leave only when
 -- a plan that derived this repository's heavy scopes no longer names the key.
 CREATE TABLE scope_peaks (
