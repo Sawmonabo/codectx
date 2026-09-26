@@ -58,14 +58,14 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	for _, l := range lang.All {
 		names = append(names, l.Name)
 	}
-	if err := wire.WriteJSON(out, wire.KindHello, wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names}, wire.MaxFactFrameBytes); err != nil {
+	if err := wire.WriteJSON(out, wire.KindHello, wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names}); err != nil {
 		return exitBadInput
 	}
 	if err := out.Flush(); err != nil {
 		return exitBadInput
 	}
 	for ctx.Err() == nil {
-		kind, payload, err := wire.Read(in, wire.MaxFactFrameBytes)
+		kind, payload, err := wire.ReadMessage(in, 0)
 		if errors.Is(err, io.EOF) {
 			return exitOK
 		}
@@ -74,12 +74,14 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitBadInput
 		}
 		var req wire.Request
-		if err := json.Unmarshal(payload, &req); err != nil || req.SourceBytes > wire.MaxSourceBytes {
+		if err := json.Unmarshal(payload, &req); err != nil || req.SourceBytes > wire.MaxSourceOffset {
 			fmt.Fprintln(stderr, "treesitter worker: malformed request")
 			return exitBadInput
 		}
-		kind, src, err := wire.Read(in, int(req.SourceBytes))
-		if err != nil || kind != wire.KindSource || len(src) != int(req.SourceBytes) {
+		// The source arrives in transport-unit frames and is reassembled here
+		// whole; its announced length only presizes the buffer.
+		kind, src, err := wire.ReadMessage(in, int(req.SourceBytes))
+		if err != nil || kind != wire.KindSource || uint64(len(src)) != req.SourceBytes {
 			fmt.Fprintln(stderr, "treesitter worker: malformed source frame")
 			return exitBadInput
 		}
@@ -140,29 +142,29 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	l, ok := lang.Lookup(req.Language)
 	g := grammars[req.Language]
 	if !ok || g == nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language})
 	}
 	parser, query, err := w.tools(l, g)
 	if err != nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()})
 	}
 	tree := Parse(parser, src, nil)
 	if tree == nil {
 		parser.Reset()
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}, wire.MaxFactFrameBytes)
+		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"})
 	}
 	defer tree.Close()
 	root := tree.RootNode()
 	em := &emitter{w: out}
-	ex := &extraction{g: g, l: l, path: req.Path, src: src, maxRecords: req.MaxRecordsPerFile}
+	ex := &extraction{g: g, l: l, path: req.Path, src: src}
 	if err := ex.run(query, root, em); err != nil {
 		return err
 	}
-	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated || em.truncated}
+	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated}
 	if rss, ok := wire.ResidentBytes(); ok {
 		done.RSSBytes = uint64(rss)
 	}
-	return wire.WriteJSON(out, wire.KindDone, done, wire.MaxFactFrameBytes)
+	return wire.WriteJSON(out, wire.KindDone, done)
 }
 
 // tools returns the language's parser and compiled query, creating them once.
@@ -224,22 +226,13 @@ func Parse(p *ts.Parser, src []byte, observe func(chunk []byte)) *ts.Tree {
 	}, nil, nil)
 }
 
-// emitter writes fact frames, dropping a record whose encoding would exceed
-// the per-frame cap and reporting the truncation instead of a bypass.
+// emitter writes one fact message per record. A record of any length is sent
+// whole, in as many transport-unit frames as it needs; none is dropped for its
+// size.
 type emitter struct {
-	w         io.Writer
-	truncated bool
+	w io.Writer
 }
 
-func (e *emitter) put(kind wire.Kind, v any) error {
-	err := wire.WriteJSON(e.w, kind, v, wire.MaxFactFrameBytes)
-	if errors.Is(err, wire.ErrFrameTooLarge) {
-		e.truncated = true
-		return nil
-	}
-	return err
-}
-
-func (e *emitter) decl(d wire.Decl) error  { return e.put(wire.KindDecl, d) }
-func (e *emitter) imp(i wire.Import) error { return e.put(wire.KindImport, i) }
-func (e *emitter) ref(r wire.Ref) error    { return e.put(wire.KindRef, r) }
+func (e *emitter) decl(d wire.Decl) error  { return wire.WriteJSON(e.w, wire.KindDecl, d) }
+func (e *emitter) imp(i wire.Import) error { return wire.WriteJSON(e.w, wire.KindImport, i) }
+func (e *emitter) ref(r wire.Ref) error    { return wire.WriteJSON(e.w, wire.KindRef, r) }

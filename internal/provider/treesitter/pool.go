@@ -521,7 +521,7 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	// measurement, and a worker queued behind the runner's own admission is
 	// waiting, not hung, so that wait is never read as silence.
 	stalled, stop := w.watch(ctx)
-	kind, payload, err := wire.Read(w.recv, wire.MaxFactFrameBytes)
+	kind, payload, err := wire.ReadMessage(w.recv, 0)
 	stop()
 	var hello wire.Hello
 	if err == nil {
@@ -695,20 +695,15 @@ func (w *worker) stderrLine() string {
 	return line
 }
 
-// extraction is one parsed file as the worker reported it, bounded by the
-// same per-file caps the worker applies so a misbehaving child cannot make
-// the parent buffer more than a healthy one would send.
+// extraction is one parsed file as the worker reported it: every record it
+// extracted, each reassembled whole from its frames. It is held for this one
+// file and released with it, which is what bounds the parent's heap for a
+// parse (see wire.ChunkBytes).
 type extraction struct {
 	decls   []wire.Decl
 	imports []wire.Import
 	refs    []wire.Ref
 	done    wire.Done
-	// overflow records that the parent stopped buffering a record set at the
-	// request's bound. It is folded into done.Truncated, which provider.go
-	// turns into a partial structure capability: a child that sends past the
-	// bound is not a reason to fail the file, and failing it would turn a
-	// user-set bound into a refusal.
-	overflow bool
 }
 
 // perFileError is a worker error frame: the file failed, the worker did not.
@@ -756,29 +751,19 @@ func stalledError(msg string) *model.Error {
 		WithDetail("stop_reason", "stalled")
 }
 
-// atRequestBound is the parent's half of the per-file record bound, read off
-// the SAME request field the worker reads. The check exists to stop a
-// misbehaving child from making the parent buffer more than a healthy one would
-// send, so it must never be stricter than what the worker was told: a parent
-// holding its own constant would kill a healthy worker's output the moment the
-// operator raised the limit. A zero bound is unlimited and the check is a
-// no-op, which is the shipped default. Reaching it drops the frame and flags
-// the file truncated rather than failing the unit: the bound is the operator's
-// and crossing it is a short answer, not a protocol fault.
-func atRequestBound(req wire.Request, have int) bool {
-	return req.MaxRecordsPerFile != 0 && uint64(have) >= req.MaxRecordsPerFile
-}
-
+// exchange sends one request and its source, then reads the answer. Every
+// read goes through w.recv, so each byte of every frame -- continuation frames
+// included -- is progress the hang detector sees as it arrives.
 func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, error) {
-	if err := wire.WriteJSON(w.in, wire.KindRequest, req, wire.MaxFactFrameBytes); err != nil {
+	if err := wire.WriteJSON(w.in, wire.KindRequest, req); err != nil {
 		return nil, err
 	}
-	if err := wire.Write(w.in, wire.KindSource, src); err != nil {
+	if err := wire.WriteMessage(w.in, wire.KindSource, src); err != nil {
 		return nil, err
 	}
 	ex := &extraction{}
 	for {
-		kind, payload, err := wire.Read(w.recv, wire.MaxFactFrameBytes)
+		kind, payload, err := wire.ReadMessage(w.recv, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -788,19 +773,11 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &d); err != nil {
 				return nil, err
 			}
-			if atRequestBound(req, len(ex.decls)) {
-				ex.overflow = true
-				continue
-			}
 			ex.decls = append(ex.decls, d)
 		case wire.KindImport:
 			var i wire.Import
 			if err := json.Unmarshal(payload, &i); err != nil {
 				return nil, err
-			}
-			if atRequestBound(req, len(ex.imports)) {
-				ex.overflow = true
-				continue
 			}
 			ex.imports = append(ex.imports, i)
 		case wire.KindRef:
@@ -808,16 +785,11 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &r); err != nil {
 				return nil, err
 			}
-			if atRequestBound(req, len(ex.refs)) {
-				ex.overflow = true
-				continue
-			}
 			ex.refs = append(ex.refs, r)
 		case wire.KindDone:
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
-			ex.done.Truncated = ex.done.Truncated || ex.overflow
 			w.rss.Store(ex.done.RSSBytes)
 			return ex, nil
 		case wire.KindError:
