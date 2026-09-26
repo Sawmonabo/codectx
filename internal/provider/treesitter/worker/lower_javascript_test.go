@@ -17,6 +17,10 @@ import "testing"
 func TestJavaScriptLoweringGolden(t *testing.T) {
 	runGolden(t, "javascript", []goldenCase{
 		{
+			// ECMA-262 §14.7.3 The while Statement (WhileLoopEvaluation: only a
+			// break leaves `while (true)`) and §14.6 The if Statement. h(a)@45 is
+			// unreachable; the sink component {true@23, a@35, g()@38} is augmented
+			// at true@23, which controls itself and a@35.
 			name:     "infinite loop with a branch inside",
 			protects: "an infinite loop's nodes get post-dominators only through exit augmentation, and `while (true)` has no exit edge",
 			mutation: "drop the sink-component augmentation (every control dependence here is lost), or give `while (true)` a false edge (h(a) becomes reachable and gains a def-use pair)",
@@ -26,6 +30,9 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"a@11 -> a@35"},
 		},
 		{
+			// ECMA-262 §14.7.4 The for Statement (ForBodyEvaluation: a missing test
+			// never ends the loop), §14.6 The if Statement and §14.10 The return
+			// Statement.
 			name:     "region unreachable from exit",
 			protects: "a sink loop inside a branch is augmented at its smallest-reverse-post-order member, the loop head",
 			mutation: "augment every member of the sink component, or its largest member (g() becomes a controller)",
@@ -35,6 +42,11 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"c@11 -> c@20", "c@11 -> return c;@45"},
 		},
 		{
+			// ECMA-262 §14.13 Labelled Statements (LabelledEvaluation hands the
+			// label set to the loop), §14.8 The continue Statement, §14.9 The break
+			// Statement and §14.7.1.1 LoopContinues. `break outer` leaves past a@33,
+			// so ipdom(b@45) = ipdom(g()@54) = ipdom(h()@79) = Exit and a@33, whose
+			// back edge b@45 and g()@54 control, does not depend on itself.
 			name:     "labelled break and continue out of nested loops",
 			protects: "a label on a loop names the loop's own frame, so a labelled continue targets that loop's condition and a labelled break leaves that loop",
 			mutation: "open a block frame for every labelled statement instead of handing a loop its labels (continue outer then names no loop: unresolved becomes 1)",
@@ -49,6 +61,9 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du: []string{"a@11 -> a@33", "b@14 -> b@45"},
 		},
 		{
+			// ECMA-262 §8.3.2 ContainsUndefinedBreakTarget: the label names no
+			// statement, an early error the lowering does not reject; the jump is
+			// counted and augmented to Exit.
 			name:       "break to a missing label",
 			protects:   "a jump to no label is counted, keeps no successor and is augmented to Exit",
 			mutation:   "wire an unresolved break to the innermost loop, or drop the count",
@@ -58,6 +73,10 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			unresolved: 1,
 		},
 		{
+			// ECMA-262 §14.15.3 The try Statement, Runtime Semantics: Evaluation
+			// (TryStatement : try Block Finally runs the Finally on a return
+			// completion) and §14.10 The return Statement. No node throws, so there
+			// is no Handler: return 1;@40 flows into c = b@69, then Exit.
 			name:     "return inside try reaches Exit through the finally",
 			protects: "a return inside a try is intercepted by the finally, which then runs with the definitions reaching the return",
 			mutation: "send the return straight to Exit (b = 0 no longer reaches the finally, and the finally becomes control dependent on c)",
@@ -67,6 +86,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"c@11 -> c@37", "b = 0@20 -> c = b@69", "b = 1@50 -> c = b@69"},
 		},
 		{
+			// ECMA-262 §14.14 The throw Statement, §14.15.2 CatchClauseEvaluation
+			// and §13.3.6 Function Calls (a call may throw).
 			name:     "a throw from the first of several try statements reaches the handler",
 			protects: "an explicit throw inside a try reaches its handler, and every throwing node, not only the last, has an exceptional edge to it",
 			mutation: "send the throw statement to Exit instead of the catch (e and r = e lose their control dependence on c), or skip MayThrow on a call statement (h() loses its three control dependences)",
@@ -82,6 +103,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.13 Binary Logical Operators: either operand can be the
+			// value, so each declarator Uses both operands' reads.
 			name:     "short-circuit && and ?? dependences",
 			protects: "the right operand of && and ?? is control dependent on the left, and the result still uses both",
 			mutation: "lower && or ?? as a plain binary operator (no decision node), or drop the operand reads from the defining node",
@@ -96,6 +119,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §14.7.3 The while Statement, §14.6 The if Statement and §13.4
+			// Update Expressions.
 			name:     "while re-enters its condition and if/else merges both arms",
 			protects: "a while loop's back edge re-enters its condition node and both if/else arms flow on, so both arms' definitions reach the loop, each other and the return, self-pairs included",
 			mutation: "drop the Merge of the then arm's end in ifStmt (s = s + i@67 keeps no successor and every pair from it is lost), or drop the loop's back edge (i < n@45 loses its self-dependence and i++@100 its pair to i < n@45)",
@@ -115,6 +140,14 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §14.3.3 Destructuring Binding Patterns (the Initializer is
+			// evaluated only when the value is undefined) and §15.3 Arrow Function
+			// Definitions. Nodes: o@11; a@24 (Uses o, defines a); the default's
+			// Branch b = a@27 (Uses o, defines b from the incoming value); a@31
+			// (Uses the a of a@24, defines b from the default); the arrow (a) => a +
+			// b@50 (Uses its capture b; its own a shadows); the declarator g = (a)
+			// => a + b@46 (defines g, Uses nothing: the captures are the arrow's);
+			// return g;@64. a@31 depends on b = a@27.
 			name:     "destructuring default and a closure that shadows",
 			protects: "one defining node per bound name, a default as a conditional definition, and a closure's own parameter shadowing the enclosing name",
 			mutation: "resolve names inside the arrow against the enclosing scope only (a@24 gains a use at the arrow), bind the default unconditionally, or give the declarator the arrow's captures (b = a@27 -> g = (a) => a + b@46 and a@31 -> g = (a) => a + b@46 appear)",
@@ -128,6 +161,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.15.5 Destructuring Assignment: the right side is
+			// evaluated once, then the elements are assigned in order.
 			name:     "destructuring swap reads the values from before the statement",
 			protects: "a destructuring element reading a variable an earlier element of the same statement wrote still depends on its old value, through that element's node, which read it before writing",
 			mutation: "attach to each element node only the reads not yet attached to an earlier node (y@23 loses x@20 -> y@23 and y@14 -> y@23), or erase an element's read of a variable an earlier element wrote",
@@ -139,6 +174,9 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.15.2 Assignment Operators, Runtime Semantics: Evaluation
+			// (the right side is evaluated before PutValue) and §14.15.3 The try
+			// Statement.
 			name:     "a throwing assignment in a try leaves the old value to the catch",
 			protects: "an assignment whose right side throws lands on the catch's Handler, which sees the value from before the assignment, not the assignment's",
 			mutation: "carry a node's own definition along its exceptional edge (return x pairs with x = g() only, not with x = 1)",
@@ -148,6 +186,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x = 1@19 -> return x;@55"},
 		},
 		{
+			// ECMA-262 §14.15.3 The try Statement (TryStatement : try Block Finally)
+			// and §13.15.2 Assignment Operators.
 			name:     "a finally sees both a throwing assignment's old value and its new one",
 			protects: "a finally is entered normally with the assignment's value and exceptionally, through its Handler, with the value from before it",
 			mutation: "carry a node's own definition along its exceptional edge (h(x) loses x = 1), or land a MayThrow source on the finally's first node directly (there is no Handler, x = g() controls nothing and h(x) loses x = 1)",
@@ -157,6 +197,11 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x = 1@19 -> h(x)@53", "x = g()@32 -> h(x)@53"},
 		},
 		{
+			// ECMA-262 §14.7.3 The while Statement (the condition is evaluated on
+			// every iteration) and §13.15.2 (an assignment's value is the value
+			// assigned). The condition consumes the embedded assignment's value, so
+			// its Branch Uses the assignment's reads re and s and the m it defined;
+			// the back edge from g(m)@61 re-enters m = re.exec(s)@35.
 			name:     "an assignment embedded in a loop condition flows into the condition",
 			protects: "the node evaluating an expression that embeds `m = e` reads the m it defined, and the loop's back edge re-enters that assignment",
 			mutation: "drop the read-back of the variable an embedded assignment defined (the condition loses m = re.exec(s)@35)",
@@ -174,6 +219,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.15.2 Assignment Operators and §14.3.1 (lexical
+			// declarations).
 			name:     "an assignment embedded in an initializer flows into the declared name",
 			protects: "a declaration whose initializer embeds `x = e` uses the x it defined",
 			mutation: "drop the read-back of the variable an embedded assignment defined (y's definition uses nothing)",
@@ -231,6 +278,12 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.15.2 Assignment Operators (the reference, then the right
+			// side, then PutValue, which may throw) and §13.14 Conditional Operator.
+			// Nodes: o@11, c@14; the Branch c@31 (Uses c) and its arms 1@35 and
+			// 2@39; the write o.p = c ? 1 : 2@25 (Uses o, not the condition's c, may
+			// throw), the catch's Handler catch@43, e@50, h()@55. The write's
+			// successors are the Handler and Exit, so it controls catch, e and h().
 			name:     "a property write whose right side branches is its own throwing node",
 			protects: "a property write is one node after its right side, and only it throws for the store, so the right side's decision does not control the catch",
 			mutation: "count the store's throw before the right side (c@31 gains control of catch@43, e@50 and h()@55), skip the write node when the right side made a node (the write node and its pairs vanish), or give the write the condition's reads (c@14 -> o.p = c ? 1 : 2@25 appears)",
@@ -246,6 +299,9 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §10.2.11 FunctionDeclarationInstantiation (a function
+			// declaration is instantiated before the body runs) and §15.2 Function
+			// Definitions.
 			name:     "a hoisted function declaration captures at its own position",
 			protects: "the hoisted name is defined at the block's start, and the declaration's captures are read where it stands, so a definition before it flows into later uses of the name",
 			mutation: "read the captures on the hoisted node at the block's start (b = a@22 flows nowhere)",
@@ -257,6 +313,12 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §15.3 Arrow Function Definitions (the arrow closes over the
+			// enclosing environment) and §13.15.2 (a compound assignment reads, then
+			// writes). Nodes: xs@11, n = 0@21, the arrow x => { n += x }@39 (Uses
+			// its capture n, may-defines n), the call xs.forEach(x => { n += x })@28
+			// (Uses xs, not the arrow's captures), return n;@57, reached by n = 0
+			// and by the arrow's non-killing may-definition.
 			name:     "a closure's write to an enclosing variable is a may-definition where it is created",
 			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation, the closure node reads only its captures, not the call receiver read before it, and the call consuming the closure does not repeat them",
 			mutation: "record a closure's write as a use only (x => { n += x }@39 loses its pair to return n), as a killing definition (return n loses n = 0@21), attach a read no node evaluated to the next node made (xs@11 -> x => { n += x }@39 appears), or give the call the arrow's captures (n = 0@21 and x => { n += x }@39 pair with xs.forEach(x => { n += x })@28)",
@@ -269,6 +331,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 §13.3.8.1 ArgumentListEvaluation (arguments are evaluated
+			// left to right) and §13.15.2 Assignment Operators.
 			name:     "a definition carries its statement's earlier read of the variable",
 			protects: "a read of x the enclosing call consumes only after `x = 1` overwrote it still reaches the call, through the definition, which reads it before writing",
 			mutation: "drop the Use a defining node records for its statement's earlier read of its variable (x@11 pairs with nothing)",
@@ -277,6 +341,10 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x@11 -> x = 1@28", "x = 1@28 -> return g(x, x = 1);@16"},
 		},
 		{
+			// ECMA-262 §15.7.14 ClassDefinitionEvaluation, §15.7.11
+			// ClassStaticBlockDefinitionEvaluation (a static block has its own var
+			// scope) and §13.14 Conditional Operator. c, f, g and h are free in the
+			// unit, so c is no Use.
 			name:     "class field initializers and static blocks are lowered as the class body's unit",
 			protects: "a field initializer's decision controls its arms, and a static block's statements are lowered in the same unit with their own scope",
 			mutation: "leave field initializers to the class node's captures (the arms lose their control dependence on c@14), or keep static blocks as their own callables (the static block's pairs leave this unit)",
@@ -286,6 +354,12 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			du:       []string{"y = c@42 -> y@53", "y = c@42 -> h(y)@56"},
 		},
 		{
+			// ECMA-262 §13.3.9 Optional Chains, §13.14 Conditional Operator and
+			// §15.3 Arrow Function Definitions. Nodes: a@11, c@14; the Branch a@19
+			// before `?.`, the chain a?.b()@19 (Uses a); the Branch c@34 (Uses c),
+			// its arms the arrow () => a@38 (Uses its capture a) and 0@48; return c
+			// ? () => a : 0;@27, which Uses neither the condition's c nor the
+			// arrow's captures.
 			name:     "an optional call and a callable operand are one node each",
 			protects: "an expression whose own lowering already made the node spanning it takes no second node with the same span, and a return consuming a conditional Uses neither its condition nor an arm's captures",
 			mutation: "always end an expression statement or a conditional operand with its own node (a?.b()@19 and () => a@38 are each made twice: a@11 -> a?.b()@19 and c@34 -> () => a@38 appear twice), or give the return the condition's reads or the arrow's captures (c@14 -> return c ? () => a : 0;@27 or a@11 -> return c ? () => a : 0;@27 appears)",
@@ -297,6 +371,8 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
+			// ECMA-262 Annex B.3.3 FunctionDeclarations in IfStatement Statement
+			// Clauses: the declaration behaves as if it were in a block of its own.
 			name:     "a function declaration as an if body is scoped to that body",
 			protects: "the declaration binds and defines its own name in an implicit block, so it never may-defines an enclosing variable of the same name",
 			mutation: "lower an if body with stmt alone (the hoisted g@43 vanishes and function g() { return c }@34 may-defines the outer g, pairing with return g;@60)",
@@ -308,7 +384,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
-			// ECMAScript §14.12.4 CaseClauseIsSelected: each test compares the
+			// ECMA-262 §14.12.3 CaseClauseIsSelected: each test compares the
 			// discriminant's value with the test's. Nodes: x@11, the
 			// discriminant x@24, Branch 1@34 (true: g()@37, break;@42),
 			// Branch 2@54 (true: h()@57), no default. g() and break depend on
@@ -350,7 +426,7 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			},
 		},
 		{
-			// ECMAScript §16.2.2 ImportDeclaration: each ImportSpecifier binds
+			// ECMA-262 §16.2.2 Imports: each ImportSpecifier of an ImportDeclaration binds
 			// its local name; a comment is not a specifier. Callable 0, the
 			// program: a@9 and b@20 each define their import binding, and
 			// g(a, b)@34 reads both. Straight-line code, so no control
