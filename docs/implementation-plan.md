@@ -2066,16 +2066,20 @@ stall_timeout = "5m"           # hang detector: no stdout/stderr/CPU/output grow
 
 [providers.lsp]
 enabled = "auto"
-# Hang detector for one request: the connection moving no bytes in either
-# direction for this long. There is no deadline on an answer -- a server still
-# indexing a monorepo before its first reply is working, not wedged.
+# Hang detector for one request, the initialize handshake included: the
+# server consuming no processor time for this long (bytes moving on the
+# connection stand in where the platform cannot sample a process tree). There
+# is no deadline on an answer -- a server still indexing a monorepo before its
+# first reply is working, not wedged.
 stall_timeout = "5m"
 # How many servers run at once is the machine's: each is admitted against the
 # same allocation by what its pinned definition reserves. One that does not fit
 # waits, or an idle server is stopped to make room; another project's server
 # already running is never a refusal. Every server of one snapshot reads one
 # shared materialization of it, rooted at its own project directory.
-max_outstanding_requests = 8
+# In-flight requests per server; 0 is unlimited, because every caller already
+# waits on a gate of its own.
+max_outstanding_requests = 0
 idle_ttl = "60s"
 
 [providers.dependence]

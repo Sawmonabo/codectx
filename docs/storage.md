@@ -626,10 +626,21 @@ wrote is the hole a file system would give rather than the previous sort's
 records. Those zeroes are real writes and a gap is as wide as the offset the
 pager jumped to, so the fill waits a window at a time like every other write
 through the shim rather than handing the disk the whole gap at once. The engine shortening its temporary back to zero is a reset of that
-length rather than a free. With no pool named -- a
-process that opens no store -- the engine creates its own under
-`<data_dir>/tmp`, which the process names at start-up, so they live on the disk
-the user gave the data and never on a memory-backed system temp directory.
+length rather than a free.
+
+The pool is the one of the engine's temporary directory, which the process
+names once, at start-up, before any store is opened: `<data_dir>/tmp` for a
+command that builds, so a run's temporaries live on the disk the user gave the
+data and never on a memory-backed system temp directory; for a command that
+only answers, the same directory when a run made it and it can be written, and
+otherwise a directory of the command's own in the process temp directory,
+given back when it closes ([operations](operations.md)). The pool is named only
+after the engine has accepted the directory, which it does only for one it can
+write, and the first directory named holds the pool for the rest of the
+process: named before that check, a directory on read-only media would keep
+the pool while the command fell back to another, and every temporary would be
+taken from the one directory that cannot hold it.
+
 ### The scratch pool
 
 Freeing is the expensive act, so the working files a store writes for its own

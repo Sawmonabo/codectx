@@ -145,8 +145,10 @@ What an answering command may create, exactly:
 - beside an existing database, in a data directory it can write, the log's
   shared-memory index and a zero-length log where they are missing, because
   reading a log needs both;
-- the engine's temporary directory under the data directory, where the data
-  directory can be written;
+- inside the engine's temporary directory under the data directory, where a
+  run already made it and it can be written, the command's own temporary files
+  and the pool they are taken from. An answering command never creates that
+  directory itself;
 - the content store's own directory, where it is missing.
 
 It creates no database and no provider work directory -- both belong to a run.
@@ -173,9 +175,10 @@ depends on the log beside the database:
   folds the log into the database, or to copy the data directory to writable
   storage and set `storage.data_dir` to the copy.
 
-On such a directory the engine's temporary files -- sort spills, statement
-journals past their memory threshold -- go to the process temp directory
-instead of the data directory, and are given back when the command ends. A
+On such a directory, and wherever no run has made the engine's temporary
+directory, the engine's temporary files -- sort spills, statement journals past
+their memory threshold -- go to a directory of the command's own in the process
+temp directory instead, which is given back when the command ends. A
 directory a command that BUILDS cannot write is refused instead, as
 `CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
 operator's to fix, and a run whose spills went elsewhere is what this directory
@@ -329,7 +332,9 @@ built:** a capability's planned total is every scope the plan assigned its
 provider for that generation — the units the run builds, the stale
 predecessors it carries and the sealed units it reuses — and its failed total
 is those of them that did not seal. The row is the only place those two
-numbers are computed. `codectx status`, the completion block of an indexing
+numbers are computed. The `planned` figure on an indexing run's run line
+follows the same rule, so a carried scope is counted once there too.
+`codectx status`, the completion block of an indexing
 run and the `codectx_index_status` tool all render that one row and none of
 them recounts, so one generation cannot read differently on two of them. In
 text output the capability tally is followed by one line per capability that is
@@ -389,8 +394,9 @@ line. What an operator can read is, in order of how long it lasts:
    provider, its diagnostic code, its message and its remediation, and JSON
    output carries the same under `failed_units`. The list is one page, and
    `failed_units_omitted` says how many reasons did not fit it. The tail of the
-   tool's standard error is never printed on any of those surfaces; it stays on
-   the run row.
+   tool's standard error is on none of those surfaces -- no entry of
+   `failed_units` carries `stderr_tail`, in text or JSON output -- and stays on
+   the run row alone.
 
 A provider may contribute only a bounded number of details to one row. The
 figures above take several of those slots, so a busy row can carry
