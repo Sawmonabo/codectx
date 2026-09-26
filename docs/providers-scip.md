@@ -95,8 +95,9 @@ coordinator exists.
 - Declare every eligible snapshot file of the workspace as the unit's
   inputs: a fact may name any file the index describes, and storage refuses
   a fact on an undeclared file. A document naming a path the snapshot does not
-  hold is dropped, counted under `documents_not_in_snapshot` with its path
-  under `documents_not_in_snapshot_exemplar`, and degrades the capability.
+  hold is dropped and counted under `documents_not_in_snapshot` with its path
+  under `documents_not_in_snapshot_exemplar`; it does not degrade the
+  capability (see "Rejected and superseded documents").
 - `Import(ctx, req, sink, opts)` is `IndexUnit` plus the refresh: `opts.Previous`
   is the sealed unit's stored `DocumentManifest` (nil is a full import) and the
   `Report` carries the delta and the fresh manifest; every count of what the
@@ -257,12 +258,18 @@ produce paths that can never join a repository `FileID`. `scip.proto` calls
 reference consumers disagree (`FlattenDocuments` unions, `expt-convert` keeps
 the first), so this importer picks one rule and counts it under
 `documents_duplicate_path`: the last document of a path wins and the earlier ones
-are dropped. Each count names its first document under `<count key>_exemplar`, and
-each degrades the capability with `CTX_PROVIDER_OUTPUT_INVALID`: a dropped
-document is one the index described and the unit publishes nothing for. The
-same holds for a document whose position encoding is neither declared nor
-measured (`documents_unspecified_encoding`) and, under `CTX_RESOURCE_LIMIT`,
-one over `max_source_file_bytes` (`documents_over_source_bound`).
+are dropped. Each count names its first document under `<count key>_exemplar`.
+Whether a drop degrades the capability depends on whether it loses a fact about
+source this product serves. Every eligible file is in the snapshot, so an
+outside-root document and one naming a path the snapshot does not hold
+(`documents_not_in_snapshot`) describe no served bytes: they are counted and do
+not degrade, since degrading would make every Go unit with tests read partial
+over the synthesized test mains. A duplicate path, a document whose position
+encoding is neither declared nor measured (`documents_unspecified_encoding`),
+and one over `max_source_file_bytes` (`documents_over_source_bound`) each drop
+facts about a held file, so they degrade the capability:
+`CTX_PROVIDER_OUTPUT_INVALID` for the first two, `CTX_RESOURCE_LIMIT` for the
+bound.
 
 **Index-level state.** `Index.external_symbols` is an `Index` field, not a
 `Document` field: it belongs to no path, contributes to no document hash and is

@@ -198,11 +198,18 @@ const (
 )
 
 // The capability-row details of every other document the import left out,
-// each a count with the first document's path as `<name>_exemplar`. A dropped
-// document is a file the unit publishes nothing for, so each of them degrades
-// the capability: CTX_PROVIDER_OUTPUT_INVALID for what the index got wrong
-// about the snapshot, CTX_RESOURCE_LIMIT for the one bound that leaves a
-// document out.
+// each a count with the first document's path as `<name>_exemplar`.
+//
+// Whether a drop degrades the capability depends on whether it loses a fact
+// about source this product serves. Every eligible file is in the snapshot, so
+// a document outside the project root or naming a path the snapshot does not
+// hold describes no served bytes: dropping it loses nothing, and it is counted
+// without degrading. Degrading on it would be a false partial -- indexers
+// write synthesized files such as generated test mains outside the root on an
+// ordinary run. A duplicate path, an unspecified encoding and the source bound
+// each drop facts about a held file, so they degrade:
+// CTX_PROVIDER_OUTPUT_INVALID for the first two, CTX_RESOURCE_LIMIT for the
+// bound.
 const (
 	// detailOutsideRoot counts documents whose relative_path escapes the
 	// project root.
@@ -693,8 +700,8 @@ func (im *importer) endDocument(d document) error {
 	encoding, assumed := im.resolveEncoding(d.encoding)
 	switch {
 	case !ok:
+		// Counted, not degraded: see the details in importer.go.
 		im.notHeld.note(d.path)
-		im.degrade(model.CodeProviderOutputInvalid)
 		return im.dropSpool(ctx, d.index)
 	case columnEncoding(encoding) == "":
 		im.unencoded.note(d.path)

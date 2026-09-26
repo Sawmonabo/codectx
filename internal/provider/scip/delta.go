@@ -102,8 +102,8 @@ func (im *importer) openDelta(ctx context.Context) error {
 // refuses has no docpath row, so admits refuses it in every later pass.
 func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 	if !rootRelative(d.path) {
+		// Counted, not degraded: see the details in importer.go.
 		im.outsideRoot.note(d.path)
-		im.degrade(model.CodeProviderOutputInvalid)
 		return false, nil
 	}
 	nested, err := im.inNestedProject(ctx, d.path)
