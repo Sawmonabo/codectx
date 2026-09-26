@@ -39,10 +39,12 @@ package scip
 //   - A nested project is excluded from the project that encloses it. The
 //     outer unit's indexer still runs over the whole outer directory, because
 //     no profile's argument array can exclude a subtree, so the importer drops
-//     every document under a nested project root instead (nestedProject,
-//     importer.seeDocument): one path is published by exactly one unit. A
-//     document a unit reaches outside its own directory through `../` belongs
-//     likewise to the innermost other project that holds it, if any. A
+//     every document under a nested project root instead (importer.ownerOf):
+//     one path is published by exactly one unit. A document a unit reaches
+//     outside its own directory through `../` belongs likewise to the
+//     innermost other project that holds it, and to no unit when none does:
+//     two sibling units reaching one undeclared directory would each admit
+//     it otherwise, so the importer refuses it and degrades the capability. A
 //     nested directory whose scope key does not fit is not a project of its
 //     own (Scopes refuses it), so its files stay with the unit that encloses
 //     it; a project a truncated detection never planned is dropped from the

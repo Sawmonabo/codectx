@@ -33,7 +33,7 @@ import (
 //     decision every later pass filters on, and the occurrences refused in
 //     each document (see carryRefusals).
 //   - projects holds the directories of this kind's other projects, whose
-//     documents belong to their own units (loadProjects).
+//     documents belong to their own units (loadProjects, ownerOf).
 //
 // The four tables are created inside the import's transaction, but the
 // scratch database runs with the journal off, where a rollback is not
@@ -96,22 +96,38 @@ func (im *importer) openDelta(ctx context.Context) error {
 }
 
 // seeDocument is the binding pre-pass's record of one document: it rejects a
-// path that escapes the root (rootRelative), leaves a document of another
-// project to that project's unit (inOtherProject), and resolves the duplicate-path rule. It reports
-// whether the document is one this import may admit at all; a document it
-// refuses has no docpath row, so admits refuses it in every later pass.
+// path that escapes the workspace root (rootRelative), leaves a document of
+// another project to that project's unit and refuses one no project owns
+// (ownerOf), and resolves the duplicate-path rule. It reports whether the
+// document is one this import may admit at all; a document it refuses has no
+// docpath row, so admits refuses it in every later pass.
 func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 	if !rootRelative(d.path) {
 		// Counted, not degraded: see the details in importer.go.
 		im.outsideRoot.note(d.path)
 		return false, nil
 	}
-	other, err := im.inOtherProject(ctx, d.path)
-	if err != nil || other {
-		if other {
-			im.otherProjectDocs++
-		}
+	owner, err := im.ownerOf(ctx, d.path)
+	if err != nil {
 		return false, err
+	}
+	switch owner {
+	case otherUnit:
+		im.otherProjectDocs++
+		return false, nil
+	case noUnit:
+		// A file the snapshot does not hold is the not-held case, which
+		// describes no served bytes; a held one is served with facts no
+		// unit publishes, which is a loss.
+		if _, held, err := im.lookup(ctx, d.path); err != nil || !held {
+			if err == nil {
+				im.notHeld.note(d.path)
+			}
+			return false, err
+		}
+		im.unowned.note(d.path)
+		im.degrade(model.CodeProviderOutputInvalid)
+		return false, nil
 	}
 	var last int64
 	found, err := im.sc.row(ctx, `SELECT last FROM docpath WHERE path = ?`, []any{d.path}, &last)
@@ -156,18 +172,42 @@ func (im *importer) loadProjects(ctx context.Context) error {
 	})
 }
 
-// inOtherProject reports whether the workspace-relative path belongs to a
-// project loadProjects recorded rather than to this unit's own: a path belongs
-// to the innermost project directory that holds it. The walk looks up each of
+// docOwner is which unit publishes a workspace-relative path.
+type docOwner int
+
+const (
+	// ownUnit: the path is inside this unit's project and no nested project
+	// of the same kind holds it.
+	ownUnit docOwner = iota
+	// otherUnit: another project loadProjects recorded holds it, so that
+	// project's unit publishes it.
+	otherUnit
+	// noUnit: the path lies outside this unit's project, reached through
+	// `../`, and no project holds it, so no unit may publish it.
+	noUnit
+)
+
+// ownerOf answers which unit publishes the workspace-relative path: the unit
+// of the innermost project directory that holds it. The walk looks up each of
 // the path's directories from the innermost out and stops at this unit's own
-// root, so a nested project claims its subtree, and a path the unit reaches
-// through `../` belongs to whichever other project holds it, the workspace
-// root's included, or to this unit when none does.
-func (im *importer) inOtherProject(ctx context.Context, p string) (bool, error) {
-	if !im.hasOtherProjects {
-		return false, nil
+// root, so a nested project claims its subtree. A path the unit reaches
+// through `../` is admitted only through the project that owns it, the
+// workspace root's included: two sibling units that both reach a directory no
+// project declares would otherwise each admit its files, and one path would be
+// published twice. A supplied index names workspace paths and belongs to no
+// project, so it owns every path it holds.
+func (im *importer) ownerOf(ctx context.Context, p string) (docOwner, error) {
+	if im.profile == nil {
+		return ownUnit, nil
 	}
 	root := im.profile.Root
+	inside := root == "" || strings.HasPrefix(p, root+"/")
+	if !im.hasOtherProjects {
+		if inside {
+			return ownUnit, nil
+		}
+		return noUnit, nil
+	}
 	for dir := p; ; {
 		if i := strings.LastIndexByte(dir, '/'); i >= 0 {
 			dir = dir[:i]
@@ -175,12 +215,19 @@ func (im *importer) inOtherProject(ctx context.Context, p string) (bool, error) 
 			dir = ""
 		}
 		if dir == root {
-			return false, nil
+			return ownUnit, nil
 		}
 		var one int
 		found, err := im.sc.row(ctx, `SELECT 1 FROM projects WHERE dir = ?`, []any{dir}, &one)
-		if err != nil || found || dir == "" {
-			return found, err
+		switch {
+		case err != nil:
+			return ownUnit, err
+		case found:
+			return otherUnit, nil
+		case dir == "":
+			// Only a path outside this unit's root walks past it to the
+			// workspace root without meeting it.
+			return noUnit, nil
 		}
 	}
 }

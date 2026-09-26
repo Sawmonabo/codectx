@@ -347,7 +347,7 @@ func parseManifestRow(line string) (manifestRow, error) {
 		return manifestRow{}, invalid("scip document manifest row carries no refused-occurrence count after its hash")
 	}
 	if !rootRelative(p) {
-		return manifestRow{}, invalid("scip document manifest names a path that is not inside the project root")
+		return manifestRow{}, invalid("scip document manifest names a path that is not inside the workspace root")
 	}
 	return manifestRow{hash: hash, refused: refused, path: p}, nil
 }
@@ -358,9 +358,9 @@ func parseManifestRow(line string) (manifestRow, error) {
 // cleans it first, so a file the project reaches through `../` is inside it.
 // `.` names the root itself, which is no file.
 //
-// Section 11.4 requires rejecting a document whose path escapes the project
-// root, and it is not a hypothetical: 18 of the 141 documents scip-go emits
-// for this repository are the `go test` mains it generates under `$GOCACHE`,
+// Section 11.4 requires rejecting a document whose path escapes the root, and
+// it is not a hypothetical: 18 of the 141 documents the Go profile's indexer
+// emits for this repository are the test mains it generates under `$GOCACHE`,
 // whose paths are `../../../../../..`-style escapes into a content-addressed
 // build cache (docs/research/12-incremental-scip-lsp.md Section 6.2). Admitting
 // them would bake absolute machine paths into the index, churn about 13% of the

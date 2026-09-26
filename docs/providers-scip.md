@@ -75,9 +75,15 @@ coordinator exists.
   drops every document under a nested project root of the same kind, counted
   under `documents_in_other_projects` without degrading anything, because the
   nested unit publishes those paths. A document a unit reaches outside its own
-  directory through `../` is likewise left to the innermost other project of
-  the same kind that holds it, and kept only when none does. One path is
-  published by exactly one unit.
+  directory through `../` is admitted only through the project that owns it:
+  it is left to the innermost other project of the same kind that holds it,
+  the workspace root's included. When no project holds it, no unit publishes
+  it — two sibling units reaching one undeclared directory would otherwise
+  both admit its files — so it is refused, counted under
+  `documents_in_no_project` with its path under
+  `documents_in_no_project_exemplar`, and the capability is degraded with
+  `CTX_PROVIDER_OUTPUT_INVALID`: the file is still served, with no precise
+  facts. One path is published by exactly one unit.
   A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
@@ -253,9 +259,11 @@ describes are `removed`. A rename is a new `FileID` (Section 9.4), so every
 **Rejected and superseded documents.** A project unit's `relative_path` is
 joined to the project's directory and cleaned first, so a document the project
 reaches through `../` (`app/../shared/x.ts`) is named by its workspace path
-(`shared/x.ts`) and admitted like any other, unless another project owns it. A document whose path still
-escapes the root after that is rejected and counted under `documents_outside_root`: 18 of the 141
-documents `scip-go` emits for this repository are the `go test` mains it writes
+(`shared/x.ts`), and admitted only by the unit of the project that owns it; a held
+path no project owns is refused under `documents_in_no_project` (see "One unit per triggering
+directory" above). A document whose path still escapes the workspace root after that is rejected
+and counted under `documents_outside_root`: 18 of the 141 documents the Go profile's indexer emits
+for this repository are the test mains it writes
 under `$GOCACHE`, whose paths are `../../../../..`-style escapes into a
 content-addressed build cache. Admitting them would bake absolute machine paths
 into the index, churn about 13% of the document set for unrelated reasons, and
@@ -273,9 +281,9 @@ not degrade, since degrading would make every Go unit with tests read partial
 over the synthesized test mains. A duplicate path, a document whose position
 encoding is neither declared nor measured (`documents_unspecified_encoding`),
 and one over `max_source_file_bytes` (`documents_over_source_bound`) each drop
-facts about a held file, so they degrade the capability:
-`CTX_PROVIDER_OUTPUT_INVALID` for the first two, `CTX_RESOURCE_LIMIT` for the
-bound.
+facts about a held file, so they degrade the capability, as a held path no
+project owns does: `CTX_PROVIDER_OUTPUT_INVALID` for all but the bound,
+`CTX_RESOURCE_LIMIT` for the bound.
 
 **Index-level state.** `Index.external_symbols` is an `Index` field, not a
 `Document` field: it belongs to no path, contributes to no document hash and is
