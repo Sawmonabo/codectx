@@ -44,7 +44,7 @@ type Options struct {
 	// DataDir is the data directory; materializations live under
 	// snapshot.MaterializeDir(DataDir).
 	DataDir string
-	// Admission is the process's one memory admission ledger -- the handle the
+	// Admission is the process's one reservation ledger, for memory and disk -- the handle the
 	// composition root built, never a second one: a manager with a running
 	// total of its own would admit servers against an allocation the analysis
 	// engine is already holding, and the process would reserve a multiple of
@@ -182,7 +182,7 @@ func New(opts Options) (*Manager, error) {
 	}
 	def := config.Defaults().Providers.LSP
 	if opts.Admission == nil {
-		return nil, invalid("the lsp manager needs the process memory admission ledger servers are admitted against")
+		return nil, invalid("the lsp manager needs the process reservation ledger servers are admitted against")
 	}
 	if opts.MaxOutstandingRequests < 0 {
 		return nil, invalid("lsp max_outstanding_requests is %s; a bound must not be negative", opts.MaxOutstandingRequests)

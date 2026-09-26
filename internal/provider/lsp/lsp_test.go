@@ -673,7 +673,7 @@ func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
 	}
 }
 
-// testAdmission is the process memory admission ledger a test manager admits
+// testAdmission is the process reservation ledger a test manager admits
 // its servers against. Production composes exactly one and hands it to every
 // reserver; a test that only drives the manager composes its own.
 func testAdmission(t *testing.T, allocation int64) *admission.Ledger {
