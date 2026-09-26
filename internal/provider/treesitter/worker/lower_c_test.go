@@ -128,8 +128,7 @@ func TestCLoweringGolden(t *testing.T) {
 		{
 			// C17 §6.5.3.2: `*p = v` writes the object p points to. Nodes:
 			// p@11, v@18, *p = v@23 (Uses p and v, may-defines p), return
-			// *p;@31, which pairs with the nearest may-definition and with
-			// the killing p@11 that reaches it through it.
+			// *p;@31.
 			name:     "a write through a pointer updates its base without killing it",
 			protects: "a store through *p reaches a later read through p, and so does p's earlier definition",
 			mutation: "record no definition of the base (loses *p = v@23 -> return *p;@31), or a killing one (loses p@11 -> return *p;@31)",
