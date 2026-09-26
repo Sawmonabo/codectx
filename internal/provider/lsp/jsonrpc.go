@@ -70,6 +70,11 @@ type conn struct {
 	cpu cpuProgress
 
 	writeMu sync.Mutex
+	// sending counts the sends waiting on or holding writeMu. A send the
+	// server does not consume parks in the pipe write, which no context
+	// reaches; the request's stall detector reads this to tell a server that
+	// stopped reading its input from one that is merely slow to answer.
+	sending atomic.Int64
 	// written counts the bytes sent inside the current window, and windowStart
 	// is when that window opened. The budget is rolling rather than a lifetime
 	// total: a session that lives for hours legitimately sends more bytes than
@@ -426,6 +431,8 @@ func (c *conn) write(msg message) error {
 // the rolling send budget. Exceeding the budget fails the connection: a
 // truncated frame would leave the server mid-message.
 func (c *conn) send(payload []byte) error {
+	c.sending.Add(1)
+	defer c.sending.Add(-1)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if err := c.failed(); err != nil {

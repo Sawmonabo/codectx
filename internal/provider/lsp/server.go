@@ -349,6 +349,18 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 func (s *server) call(ctx context.Context, method string, params, result any) error {
 	ctx, stalled, stop := s.conn.watchProgress(ctx, s.opts.RequestStallTimeout)
 	defer stop()
+	// A write parked in a pipe the server stopped reading is reached by no
+	// context, so ending the call's context would leave it -- and every call
+	// queued behind the writer lock -- parked. A stall with a send parked is a
+	// server that neither computes, answers nor reads, so the server is
+	// failed, which ends its process and with it the pipe the write waits on.
+	parked := context.AfterFunc(ctx, func() {
+		if stalled() && s.conn.sending.Load() > 0 {
+			s.fail(unavailable("the language server made no progress for %s and stopped reading its input while answering %s",
+				s.opts.RequestStallTimeout, method).WithDetail("method", method).WithDetail("reason", "stalled"))
+		}
+	})
+	defer parked()
 	err := s.conn.call(ctx, method, params, result)
 	if err != nil && stalled() {
 		return unavailable("the language server made no progress for %s while answering %s; it is not responding",

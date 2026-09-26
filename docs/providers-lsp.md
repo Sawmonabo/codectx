@@ -258,10 +258,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 - **Cancellation.** When a call's context ends the client sends
   `$/cancelRequest`, forgets the id and returns `CTX_CANCELED` (or
   `CTX_PROVIDER_TIMEOUT` for a deadline). The connection stays usable.
-  `conn.write` itself is not context-aware, so a call can wait on the writer
-  lock behind a frame the server has not yet consumed; that wait ends when the
-  server reads its input, or when the server is stopped or exits, and not when
-  `providers.lsp.stall_timeout` ends the call's context.
+  A write parked behind a frame the server has not consumed is reached by no
+  context, so when `providers.lsp.stall_timeout` ends a call while a send is
+  parked, the server is failed as `stalled` and its process stopped, which
+  ends the pipe the write waits on.
 - **Server-initiated requests** are handled by explicit policy:
   `workspace/configuration` is answered with `null` per item (at most 64
   items) — codectx supplies no settings; **everything else** is answered with

@@ -43,7 +43,9 @@ var (
 
 // Pool tells this file system which directory's arena to take the engine's
 // temporary files from. It is the store's data directory, passed by whatever
-// opens a store, and it must be called before the first connection.
+// opens a store, and it must be called before the first store is opened: a
+// connection that opens no temporary file, such as the in-memory one the
+// writability check uses, may come first.
 //
 // The first call wins, as registration does. The file system is the process's
 // default and its pool is the process's too; a second store's call must not
