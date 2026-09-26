@@ -60,6 +60,15 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == ledgerArmSubcommand {
 		os.Exit(ledgerArmMain(os.Args[2:]))
 	}
+	// Only the process that runs rows counts native allocations, and it
+	// installs the counter before any row can create a parser: nothing in
+	// this binary creates one in-process outside the native-core rows (every
+	// other row parses in a worker child, which returned above).
+	installNativeCounter()
+	if err := openRows(); err != nil {
+		fmt.Fprintf(os.Stderr, "open the benchmark row file: %v\n", err)
+		os.Exit(1)
+	}
 	if err := os.RemoveAll(benchRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "clear the bench root %s: %v\n", benchRoot, err)
 		os.Exit(1)
@@ -69,6 +78,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	code := m.Run()
+	if err := closeRows(); err != nil {
+		fmt.Fprintf(os.Stderr, "close the benchmark row file: %v\n", err)
+		code = 1
+	}
 	// os.Exit skips deferred calls, so the release is written out here: a run
 	// leaves no tree behind, and repeated runs never accumulate.
 	if err := os.RemoveAll(benchRoot); err != nil {
