@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -45,8 +46,16 @@ const (
 
 // Main runs the worker loop until stdin ends or ctx is done. It is the entry
 // the hidden `codectx __ts-worker` subcommand calls.
+//
+// The loop runs locked to one OS thread, and the C heap is held to one arena
+// before any native object exists, so every parse allocates from the one heap
+// the file boundary returns. Before hello the worker takes that boundary once
+// and reports its standing memory; after every file it takes it again before
+// answering (serve).
 func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
-	w := &state{parsers: map[string]*ts.Parser{}, queries: map[string]*ts.Query{}}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	w := &state{parsers: map[string]*ts.Parser{}, queries: map[string]*ts.Query{}, meter: meter{host: nativeHost()}}
 	defer w.close()
 	if err := w.verify(); err != nil {
 		fmt.Fprintln(stderr, "treesitter worker:", err)
@@ -58,7 +67,9 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	for _, l := range lang.All {
 		names = append(names, l.Name)
 	}
-	if err := wire.WriteJSON(out, wire.KindHello, wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names}); err != nil {
+	// The first boundary has no file before it, so it carries no need.
+	hello := wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names, Memory: w.meter.boundary()}
+	if err := wire.WriteJSON(out, wire.KindHello, hello); err != nil {
 		return exitBadInput
 	}
 	if err := out.Flush(); err != nil {
@@ -96,10 +107,12 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 // state is the worker's native ownership: at most one parser and one compiled
-// query per language, created lazily and closed when the loop ends.
+// query per language, created lazily and closed when the loop ends, and the
+// meter that reads the worker's memory at each file boundary.
 type state struct {
 	parsers map[string]*ts.Parser
 	queries map[string]*ts.Query
+	meter   meter
 }
 
 func (w *state) close() {
@@ -137,31 +150,49 @@ func (w *state) verify() error {
 }
 
 // serve answers one request. A per-file failure is an error frame and the
-// worker stays healthy; a write failure ends the loop.
+// worker stays healthy; a write failure ends the loop. The tree is closed and
+// the file boundary taken before the answer is written, so the parent never
+// admits the next file against memory this one has not returned. An error
+// frame carries no reading, but its boundary is still taken so the next file
+// is measured from a fresh base.
 func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
+	done, fail, err := w.parse(out, req, src)
+	mem := w.meter.boundary()
+	switch {
+	case err != nil:
+		return err
+	case fail != nil:
+		return wire.WriteJSON(out, wire.KindError, *fail)
+	}
+	done.Memory = mem
+	return wire.WriteJSON(out, wire.KindDone, done)
+}
+
+// parse parses one file and streams its facts, closing the tree on every
+// path. It returns the file's Done, or the per-file failure to answer with,
+// or the write error that ends the loop.
+func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *wire.Error, error) {
 	l, ok := lang.Lookup(req.Language)
 	g := grammars[req.Language]
 	if !ok || g == nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language})
+		return wire.Done{}, &wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language}, nil
 	}
 	parser, query, err := w.tools(l, g)
 	if err != nil {
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_INTERNAL", Message: err.Error()})
+		return wire.Done{}, &wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}, nil
 	}
 	tree := Parse(parser, src, nil)
 	if tree == nil {
 		parser.Reset()
-		return wire.WriteJSON(out, wire.KindError, wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"})
+		return wire.Done{}, &wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}, nil
 	}
-	defer tree.Close()
 	root := tree.RootNode()
 	em := &emitter{w: out}
 	ex := &extraction{g: g, l: l, path: req.Path, src: src}
-	if err := ex.run(query, root, em); err != nil {
-		return err
-	}
+	err = ex.run(query, root, em)
 	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated}
-	return wire.WriteJSON(out, wire.KindDone, done)
+	tree.Close()
+	return done, nil, err
 }
 
 // tools returns the language's parser and compiled query, creating them once.
