@@ -250,5 +250,93 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"() -> arr[0] = 1@59 -> r = () -> arr[0] = 1@55", "r = () -> arr[0] = 1@55 -> r.run()@77",
 				"arr = new int[1]@28 -> return arr;@86", "() -> arr[0] = 1@59 -> return arr;@86"},
 		},
+		{
+			// §14.13. Nodes: x@20, x--@30 (the body, entered first), x >
+			// 0@44 (the condition, after the body), return x;@52. Succ:
+			// x--→x > 0→{x--, return}. IPDom: x-- → x > 0 → return. The back
+			// edge targets the body's first node, so x > 0 controls x-- and
+			// itself; x-- kills the parameter before the condition reads x.
+			name:     "a do statement runs its body before its condition",
+			protects: "the first execution of a do body is unconditional and the condition reads the body's definition",
+			mutation: "lower do as while (x > 0@44 comes first and x@20 -> x > 0@44 appears)",
+			src:      "class A { int f(int x) { do { x--; } while (x > 0); return x; } }",
+			fn:       1,
+			cd:       []string{"x > 0@44 -> x--@30", "x > 0@44 -> x > 0@44"},
+			du:       []string{"x@20 -> x--@30", "x--@30 -> x--@30", "x--@30 -> x > 0@44", "x--@30 -> return x;@52"},
+		},
+		{
+			// §14.20.2, §14.15, §14.17. Nodes: x@20, x > 0@32 (head), x >
+			// 5@51, return x;@58, x > 3@72, break;@79, x--@86, g(x)@103 (the
+			// finally), return 0;@113. The return and the break are
+			// intercepted by the finally and re-issued from it. Succ: x >
+			// 0→{x > 5, return 0}; x > 5→{return x, x > 3}; x > 3→{break,
+			// x--}; return x, break, x-- → g(x); g(x)→{x > 0, EXIT, return
+			// 0}. IPDom: x > 5, x > 3, return x, break, x-- → g(x); g(x),
+			// x > 0, return 0 → EXIT. Frontier walks: x > 0 over x > 5, g(x)
+			// and return 0; x > 5 over return x and x > 3; x > 3 over break
+			// and x--; g(x) over x > 0 and return 0.
+			name:     "a finally inside a loop runs before a return leaves the method and before a break leaves the loop",
+			protects: "a return and a break inside a try reach the finally with their definitions, and the finally then continues to EXIT and to the loop's exit",
+			mutation: "send the break straight to the loop's exit (break;@79 bypasses g(x)@103, and x > 0@32 loses g(x)@103)",
+			src:      "class A { int f(int x) { while (x > 0) { try { if (x > 5) return x; if (x > 3) break; x--; } finally { g(x); } } return 0; } }",
+			fn:       1,
+			cd: []string{"x > 0@32 -> x > 5@51", "x > 0@32 -> g(x)@103", "x > 0@32 -> return 0;@113",
+				"x > 5@51 -> return x;@58", "x > 5@51 -> x > 3@72", "x > 3@72 -> break;@79", "x > 3@72 -> x--@86",
+				"g(x)@103 -> x > 0@32", "g(x)@103 -> return 0;@113"},
+			du: []string{"x@20 -> x > 0@32", "x@20 -> x > 5@51", "x@20 -> return x;@58", "x@20 -> x > 3@72",
+				"x@20 -> x--@86", "x@20 -> g(x)@103", "x--@86 -> x > 0@32", "x--@86 -> x > 5@51",
+				"x--@86 -> return x;@58", "x--@86 -> x > 3@72", "x--@86 -> x--@86", "x--@86 -> g(x)@103"},
+		},
+		{
+			// §12.5, §8.3.2, §8.6. Callable 0, the class body: the field
+			// initializer's nodes c@18 (Branch), f()@22, g()@28, then a = c
+			// ? f() : g()@14, then the instance initializer's d@39 (Branch)
+			// and h()@42, in source order. c and d are fields, so nothing is
+			// a use. The static initializer is callable 1, not part of this
+			// unit.
+			name:     "a class body's unit lowers its field initializers and instance initializer blocks",
+			protects: "the decisions inside a field initializer and an instance initializer block are lowered in the class body's unit, and a static initializer is not",
+			mutation: "skip instance initializer blocks in the unit (loses d@39 -> h()@42), or lower the static initializer in the unit (s > 0@75 -> m(s)@82 appears here)",
+			src:      "class A { int a = c ? f() : g(); { if (d) h(); } static { int s = k(); if (s > 0) m(s); } }",
+			fn:       0,
+			cd:       []string{"c@18 -> f()@22", "c@18 -> g()@28", "d@39 -> h()@42"},
+		},
+		{
+			// §8.7, §12.4.2. Callable 1, the static initializer: s =
+			// k()@62, s > 0@75, m(s)@82.
+			name:     "a static initializer is its own callable",
+			protects: "a static initializer's locals and decisions form a function of their own",
+			mutation: "drop static_initializer from the callables (callable 1 does not exist)",
+			src:      "class A { int a = c ? f() : g(); { if (d) h(); } static { int s = k(); if (s > 0) m(s); } }",
+			fn:       1,
+			cd:       []string{"s > 0@75 -> m(s)@82"},
+			du:       []string{"s = k()@62 -> s > 0@75", "s = k()@62 -> m(s)@82"},
+		},
+		{
+			// §14.3, §8.1.3, §6.4.1. Nodes: x@20, y@27, class L { … }@32 (the
+			// local class declaration: uses its captures), return new
+			// L().g(y);@75. g's parameter y shadows the enclosing y inside
+			// L, so only x is captured.
+			name:     "a local class declaration is a node that reads its captures, and its members shadow",
+			protects: "a local class's captured locals are read where it is declared, and a name its method declares is not a capture",
+			mutation: "make no node for a local class declaration (loses x@20 -> class L …), or resolve its body against the enclosing scope only (y@27 pairs with class L …)",
+			src:      "class A { int f(int x, int y) { class L { int g(int y) { return x + y; } } return new L().g(y); } }",
+			fn:       1,
+			du: []string{"x@20 -> class L { int g(int y) { return x + y; } }@32",
+				"y@27 -> return new L().g(y);@75"},
+		},
+		{
+			// §8.10.4. Callable 0 is the record body, 1 the compact
+			// constructor, whose parameters are the record components x@13
+			// and y@20, spanning their identifiers in the header. Nodes: x <
+			// 0@33, x = 0@40, y = x@47. y = x kills the parameter y.
+			name:     "a compact constructor's parameters are its record's components",
+			protects: "a use of a component name in a compact constructor resolves to the implicit parameter, which the body may reassign",
+			mutation: "declare no parameters for a compact constructor (x@13 pairs with nothing)",
+			src:      "record P(int x, int y) { P { if (x < 0) x = 0; y = x; } }",
+			fn:       1,
+			cd:       []string{"x < 0@33 -> x = 0@40"},
+			du:       []string{"x@13 -> x < 0@33", "x@13 -> y = x@47", "x = 0@40 -> y = x@47"},
+		},
 	})
 }
