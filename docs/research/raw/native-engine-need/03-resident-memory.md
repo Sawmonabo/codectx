@@ -63,7 +63,7 @@ java 138, javascript 134, python 108, rust 157, typescript 166, tsx 172). The di
    tsx 10; rust 11; python 12 (each grammar's `src/parser.c` header). Python's NEWLINE, INDENT and DEDENT are
    external, so every line break and indentation change is an 80-byte heap leaf; JavaScript's automatic semicolons
    and template characters likewise.
-2. **Multi-line tokens are never inline** (`size.extent.row == 0`, `src/subtree.c:160`): block comments, docstrings,
+2. **Multi-line tokens are never inline** (`size.extent.row == 0`, `src/subtree.c:161`): block comments, docstrings,
    template and raw strings.
 3. **Token density.** A leaf costs the same whatever its length, so a file that is one long literal costs almost
    nothing per byte, and a file of short tokens costs the most. Hidden rules that the grammar keeps as nodes add
@@ -201,9 +201,9 @@ in a map with their evidence appended per occurrence (`facts.go:718-797`), alias
 `emit` hand everything to the sink in slices of `maxPutRecords` (`facts.go:813-855`). Peak parent holding is therefore
 source + wire records + builder facts, simultaneously.
 
-A `model.Evidence` (`internal/model/facts.go:215-241`) is twelve string or ID fields, a precision, two range
-pointers, a native key and a detail, plus a separately allocated `SourceRange` of two positions
-(`internal/model/source.go:12-23`): on the order of 250–350 bytes per occurrence by its field layout, most strings
+A `model.Evidence` (`internal/model/facts.go:215-241`) is nine string or ID fields, a precision, two range
+pointers (a `SourceRange` of two positions and a `ByteRange`, `internal/model/source.go:12-29`), a native key and a
+detail: on the order of 250–350 bytes per occurrence by its field layout, most strings
 shared. The per-file count of records and occurrences is **unavailable**: no benchmark row records it, so the parent's
 per-file holding cannot be given in bytes here.
 
@@ -337,9 +337,9 @@ the rule's allocations.
   allocator.go:22-36`, `:38-56`, `:105-110`; `allocator.c:8-14`; the library side, `src/alloc.c:33-48`). Every
   `malloc` a parse makes already crosses C → Go → C.
 - A counter that is exact needs the pointer table the benchmark uses, because the binding frees its own `C.CString`
-  copies through the same free hook (`parser.go:326-330`, `node.go:190-191`, `query.go:631-633`, `tree.go:83`,
-  `:101`), so a table-free counter based on usable sizes would subtract memory it never added
-  (`internal/bench/allocator.go:51-73`).
+  copies through the same free hook (`parser.go:326-330`, `node.go:190-191`, `query.go:631-633`; the frees at
+  `tree.go:83` and `:101` are of arrays the runtime allocated through the hook, so those are counted), so a table-free
+  counter based on usable sizes would subtract memory it never added (`internal/bench/allocator.go:51-73`).
 - Its measured cost: `counted_parse_ns / parse_ns` (the table against a paused table that still locks on frees,
   `flowbench_test.go:343-349`) is **p50 1.22–1.36, p90 1.44–1.72, p99 2.17–2.92** across the six summarised
   corpus-language pairs. The pause is not free of the counter, so the full cost against no hook is at least that.

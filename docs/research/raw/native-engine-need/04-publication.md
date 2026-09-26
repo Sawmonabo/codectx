@@ -317,7 +317,9 @@ names, the parent resolves identities, as it does for declarations):
   reused, never minted twice. Two declarations with one name on one line share that key: the alias is omitted and
   counted, as `declKey` omits an over-long key (`facts.go:390-400`).
 - **fields** — the file's `field` declarations by name where the receiver's type is declared in the file; otherwise
-  the target is published as `may_refer_to`, as the importer does for an unresolved target (`emit.go:587-593`).
+  the target is a provider-local unresolved entity with no qualified name and no location, as the importer mints for
+  a target the export did not bind (`emit.go:541-542`, `:587-592`, `:724-727`). `may_refer_to` is the importer's edge
+  for equally supported alternatives only (`emit.go:638-649`).
 - **cross-file names** (a Go package variable in another file) — a provider-local reference node keyed like the
   `call:` placeholder (`facts.go:548-575`), never a guess at another file's node.
 - **call anchors** — the structural callee of the same call site (the in-file declaration or the `call:` node), which
