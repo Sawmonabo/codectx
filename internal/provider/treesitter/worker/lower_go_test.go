@@ -19,6 +19,8 @@ import "testing"
 func TestGoLoweringGolden(t *testing.T) {
 	runGolden(t, "go", []goldenCase{
 		{
+			// Go spec, For statements with single condition: an absent condition is
+			// equivalent to true, so the loop has no exit edge.
 			// Nodes: c@17 (param), for@27 (head), c@36 (if), g()@40.
 			// Succ: ENTRY→c@17→for@27→c@36→{g()@40, for@27}; g()@40→for@27.
 			// {for, c@36, g()} cannot reach EXIT; for@27 is its first RPO
@@ -33,6 +35,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"c@17 -> c@36"},
 		},
 		{
+			// Go spec, Goto statements and Labeled statements: goto L transfers
+			// control to the statement labelled L in the same function.
 			// Nodes: x@17, x > 0@29, return@37, L@47 (the label's own node),
 			// x++@50, goto L@55. Succ: x > 0→{return, L}; return→EXIT;
 			// L→x++→goto L→L. {L, x++, goto L} cannot reach EXIT; L is its
@@ -48,6 +52,9 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"x@17 -> x > 0@29", "x@17 -> x++@50", "x++@50 -> x++@50"},
 		},
 		{
+			// Go spec, Goto statements: a goto transfers control to the statement with
+			// the corresponding label in the same function; with no label M the
+			// program is invalid, and the goto is lowered unresolved.
 			// Nodes: x@17, x > 0@29, goto M@37 (no label M: no successor),
 			// x++@47. Augmentation adds goto M→EXIT.
 			name:       "dangling goto",
@@ -59,6 +66,9 @@ func TestGoLoweringGolden(t *testing.T) {
 			unresolved: 1,
 		},
 		{
+			// Go spec, Break statements and Continue statements: break L terminates
+			// the for labelled L, and continue L begins its next iteration at the
+			// post statement (For statements with for clause).
 			// Nodes: n@17, L@26 (the label's own node, one successor, so it
 			// controls nothing), i := 0@33, i < n@41 (outer head), i++@48 (update),
 			// for@54 (inner head), i > 1@63, continue L@71, break L@85.
@@ -76,6 +86,9 @@ func TestGoLoweringGolden(t *testing.T) {
 				"i := 0@33 -> i > 1@63", "i++@48 -> i > 1@63", "i := 0@33 -> i++@48", "i++@48 -> i++@48"},
 		},
 		{
+			// Go spec, Expression switches and Fallthrough statements: the cases are
+			// compared top-to-bottom, and fallthrough transfers control to the first
+			// statement of the next case clause.
 			// Nodes: x@17, x@33 (tag head, a Stmt), 1@42, x++@45,
 			// fallthrough@50, 2@68, g(x)@71, x--@86, g(x)@93. Both case
 			// conditions compare against the tag, so each uses x, which only
@@ -93,6 +106,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"x@17 -> x--@86", "x++@45 -> g(x)@93", "x@17 -> g(x)@93", "x--@86 -> g(x)@93"},
 		},
 		{
+			// Go spec, If statements and For statements with single condition: each
+			// branch assigns x, and the condition is evaluated before each iteration.
 			// Nodes: c@17, x := 0@31, c@42, x = 1@46, x = 2@61, x < 9@74 (head),
 			// x++@82, return x@89. x < 9 merges φ(φ(x = 1, x = 2), x++); both
 			// branches kill x := 0, which therefore reaches nothing.
@@ -106,6 +121,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"x = 1@46 -> return x@89", "x = 2@61 -> return x@89", "x++@82 -> return x@89"},
 		},
 		{
+			// Go spec, Assignment statements: a tuple assignment proceeds in two
+			// phases, every operand evaluated first, then the targets assigned.
 			// Nodes: a@17, b@20, c@23 (params), c@36, a@39, b@42, return
 			// b@55. Targets read: c nothing, a old b, b old a. c is read by
 			// no other target and goes first; a and b form a cycle, broken
@@ -118,6 +135,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"a@17 -> a@39", "b@20 -> a@39", "a@39 -> b@42", "b@42 -> return b@55"},
 		},
 		{
+			// Go spec, Logical operators: the left operand is evaluated, and then the
+			// right if the condition requires it; the result is computed from both.
 			// Nodes: a@17, b@20, a@40 and b@45 (the hoisted operands),
 			// x := a && b@35, return x@48. Succ: a@40→{b@45, x := a && b};
 			// b@45→x := a && b. IPDom: a@40, b@45 → x := a && b.
@@ -130,6 +149,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"x := a && b@35 -> return x@48"},
 		},
 		{
+			// Go spec, Logical operators and If statements: the condition's value is
+			// computed from both operands, the right one evaluated only if a is true.
 			// Nodes: a@17, b@20, a@33, b@38 (operands), a && b@33 (the
 			// condition), g()@42. Succ: a@33→{b@38, a && b}; b@38→a && b;
 			// a && b→{g(), EXIT}. IPDom: a@33, b@38 → a && b → EXIT.
@@ -141,6 +162,9 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"a@17 -> a@33", "b@20 -> b@38", "a@17 -> a && b@33", "b@20 -> a && b@33"},
 		},
 		{
+			// Go spec, For statements with range clause: the range expression is
+			// evaluated once before beginning the loop, and the blank key `_`
+			// declares no variable.
 			// Nodes: xs@17, sum := 0@33, xs@61 (the range expression, which
 			// defines the iteration variable), range@55 (head), v@50,
 			// sum += v@66, return sum@78. Succ: xs@61→range→{v, return sum};
@@ -155,6 +179,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"sum += v@66 -> return sum@78"},
 		},
 		{
+			// Go spec, Expression switches: each case expression is compared against
+			// the switch expression; with no match and no default the switch ends.
 			// Nodes: x@17, y := 0@30, x@45 (tag head, a Stmt), 1@54 (case
 			// condition), y = 1@57, return y@66. Succ: x@45→1@54→{y = 1,
 			// return y}; y = 1→return y. IPDom: 1@54 → return y.
@@ -166,6 +192,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"x@17 -> x@45", "x@17 -> 1@54", "y := 0@30 -> return y@66", "y = 1@57 -> return y@66"},
 		},
 		{
+			// Go spec, Type switches: the guard reads v, and the alias v is declared
+			// in the implicit block of each clause.
 			// Nodes: v@17, v := v.(type)@37 (head: uses the parameter v,
 			// then defines the alias v), int@58 (type case), return v@63,
 			// return 0@75. Succ: head→int→{return v, return 0}. IPDom: int
@@ -178,6 +206,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"v@17 -> v := v.(type)@37", "v@17 -> int@58", "v := v.(type)@37 -> return v@63"},
 		},
 		{
+			// Go spec, Assignment statements and Selectors: the left operand s.f is
+			// a field selector, written through s.
 			// Nodes: s@17, v@22, s.f = v@33 (uses s and v, may-defines s),
 			// return s@42. A may-definition kills nothing, so both the write
 			// and the parameter reach the return.
@@ -189,6 +219,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"s@17 -> return s@42"},
 		},
 		{
+			// Go spec, Assignment statements and Index expressions: the left operand
+			// m[k] is a map index expression, written through m.
 			// Nodes: m@17, k@32, v@35, m[k] = v@56 (uses m, k and v,
 			// may-defines m), return m@66.
 			name:     "an index write updates its base variable without killing it",
@@ -199,6 +231,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"m[k] = v@56 -> return m@66", "m@17 -> return m@66"},
 		},
 		{
+			// Go spec, Function literals: a function literal is a closure sharing the
+			// variables of the surrounding function.
 			// Nodes: x@17, n := 0@30, h := func() { n += x }@38 (uses n and
 			// x, defines h, may-defines n), h()@62, return n@67. The literal
 			// may run at any later point, or never, so both n := 0 and the
@@ -212,6 +246,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"n := 0@30 -> return n@67"},
 		},
 		{
+			// Go spec, Select statements: every channel operand and sent value is
+			// evaluated exactly once, in source order, on entering the select.
 			// Nodes: a@17, b@20, y@32, x := 0@45, select@53 (head), <-a@67,
 			// x = 1@72, b <- y@84, x = 2@92, return x@101. Succ: select→{<-a,
 			// b <- y}; <-a→x = 1→return x; b <- y→x = 2→return x. IPDom:
@@ -226,6 +262,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"b@20 -> b <- y@84", "y@32 -> b <- y@84", "x = 1@72 -> return x@101", "x = 2@92 -> return x@101"},
 		},
 		{
+			// Go spec, Goto statements, Labeled statements and Blocks: goto L lands
+			// on the label of an empty block.
 			// Nodes: c@17, d@20, c@33, d@40, goto L@44, a()@54, L@59 (the
 			// label's own node; `L: {}` lowers nothing else), b()@74. Succ:
 			// c@33→{d@40, b()}; d@40→{goto L, a()}; goto L→L; a()→L;
@@ -240,6 +278,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"c@17 -> c@33", "d@20 -> d@40"},
 		},
 		{
+			// Go spec, Goto statements and Return statements: the statements after
+			// the return are reached by no path from the function's entry.
 			// Nodes: x@17, return x@30, L@40, x++@43, goto L@48. Succ:
 			// return x→EXIT; L→x++→goto L→L. The cycle has no predecessor
 			// from ENTRY; L is its first member by id, so augmentation adds
