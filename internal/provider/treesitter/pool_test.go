@@ -170,7 +170,9 @@ func acquireAsync(p *pool) <-chan handout {
 // "foreign waiter behind an idle worker": the pool's only worker is idle when
 // another reserver queues on the ledger. The next pool acquirer must stop that
 // idle worker rather than reuse it, so the waiter is admitted first, and must
-// then be given a worker of its own.
+// then be given a worker of its own. When that worker is handed back while a
+// second foreign reserver waits and no pool acquirer is queued, it must be
+// stopped rather than idled, so the second reserver is admitted.
 //
 // Failure modes: an allocation that fits fewer workers than acquirers makes
 // every parse an exec, a hello, a parse and an exit when a worker handed back
@@ -187,7 +189,9 @@ func acquireAsync(p *pool) <-chan handout {
 // "foreign head" sees the pool acquirer return before the foreign reserver is
 // granted. Drop the ledger's Waiting check from acquire -> "foreign waiter
 // behind an idle worker" sees the pool acquirer handed the idle worker while
-// the foreign reserver is still waiting.
+// the foreign reserver is still waiting. Drop it from release -> the worker
+// handed back goes idle, the second foreign reserver is never admitted and the
+// subtest hangs.
 func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	t.Run("pool head", func(t *testing.T) {
 		p, _, _ := newOneWorkerPool(t)
@@ -304,6 +308,29 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 			t.Fatalf("the pool acquirer was given the idle worker the foreign reserver waited behind (%d started)",
 				p.stats().WorkersStarted)
 		}
+		stuckAgain := make(chan struct{}, 1)
+		again := make(chan func(), 1)
+		go func() {
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, func() {
+				select {
+				case stuckAgain <- struct{}{}:
+				default:
+				}
+			})
+			if err != nil {
+				t.Errorf("the second foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			again <- release
+		}()
+		<-stuckAgain // the second foreign reserver waits behind the busy worker's room
 		p.release(got.w, true)
+		(<-again)()
+		p.mu.Lock()
+		n := len(p.idle)
+		p.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("%d worker(s) went idle while a foreign reserver waited", n)
+		}
 	})
 }

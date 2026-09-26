@@ -510,7 +510,9 @@ func (p *pool) release(w *worker, healthy bool) {
 
 // drain stops every worker nobody is using and returns once each has been
 // reaped. It is what ends the stage: a worker is warm for exactly as long as
-// there is parse work in flight, and no longer.
+// there is parse work in flight, and no longer. acquire also calls it within a
+// stage, when it finds idle workers while a reserver waits on the ledger, so
+// their room reaches that reserver in order (see pool).
 //
 // There is no timer here and no setting. A timer would mean a resting machine
 // holds one process per core -- on a sixteen-core host about 320 MB -- for
