@@ -17,6 +17,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -29,10 +30,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
-// maxCacheEntries bounds the directory scan retention performs, so a corrupted
-// or hand-filled cache directory can never turn a refresh into an unbounded
-// walk.
-const maxCacheEntries = 4096
+// cacheDirBatch is how many directory entries one read of the cache
+// directory requests. It bounds the memory of a scan, not its reach: every
+// scan reads until the directory is exhausted, so no entry is ever out of
+// retention's sight.
+const cacheDirBatch = 256
 
 // cacheKeyDomain separates this hash from every other domain-separated hash in
 // the product.
@@ -181,53 +183,107 @@ type entry struct {
 	modTime int64
 }
 
+// older orders entries least recently used first. cmp.Compare, not
+// int(a.modTime-b.modTime): the difference of two nanosecond timestamps
+// overflows a 32-bit int, which would make the order arbitrary on a 32-bit
+// build and let eviction drop the most recently used graph.
+func older(a, b entry) int {
+	if a.modTime != b.modTime {
+		return cmp.Compare(a.modTime, b.modTime)
+	}
+	return strings.Compare(a.path, b.path)
+}
+
+// scan streams every cached graph in the directory to fn, a bounded batch at
+// a time, so a directory of any size is read whole without being held.
+func (c *Cache) scan(fn func(entry)) error {
+	d, err := os.Open(c.dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	for {
+		batch, err := d.ReadDir(cacheDirBatch)
+		for _, de := range batch {
+			if !strings.HasSuffix(de.Name(), ".graph") {
+				continue
+			}
+			info, err := de.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				// Removed since the read listed it, or not a graph at all.
+				continue
+			}
+			fn(entry{path: filepath.Join(c.dir, de.Name()), size: info.Size(), modTime: info.ModTime().UnixNano()})
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
 // evict removes least recently used entries until the directory is within the
 // budget. keep is never evicted: it is the entry just written, and evicting it
 // would make the cache silently useless under pressure.
+//
+// Two streaming passes, so memory never grows with the number of entries. The
+// first sums the directory. The second keeps only the oldest entries whose
+// sizes cover the excess: each entry is added to a set ordered newest first,
+// and the newest is dropped from the set while the rest still cover it, so
+// what is held is the set eviction removes and nothing else. A directory that
+// cannot be read, or that is still over the budget once eviction has removed
+// what it could, is reported: the cache is then holding more than the
+// configured bytes, and the operator is told rather than the disk filling
+// quietly.
 func (c *Cache) evict(keep string) {
-	dirents, err := os.ReadDir(c.dir)
-	if err != nil {
-		return
-	}
-	if len(dirents) > maxCacheEntries {
-		dirents = dirents[:maxCacheEntries]
-	}
-	entries := make([]entry, 0, len(dirents))
 	var total int64
-	for _, d := range dirents {
-		if !strings.HasSuffix(d.Name(), ".graph") {
-			continue
-		}
-		info, err := d.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		total += info.Size()
-		entries = append(entries, entry{path: filepath.Join(c.dir, d.Name()), size: info.Size(), modTime: info.ModTime().UnixNano()})
+	if err := c.scan(func(e entry) { total += e.size }); err != nil {
+		c.overBudget("the dependence graph cache directory could not be read for retention", total, err)
+		return
 	}
 	if total <= c.budget {
 		return
 	}
-	// cmp.Compare, not int(a.modTime-b.modTime): the difference of two
-	// nanosecond timestamps overflows a 32-bit int, which would make the LRU
-	// order arbitrary on a 32-bit build and let eviction drop the most
-	// recently used graph.
-	slices.SortFunc(entries, func(a, b entry) int {
-		if a.modTime != b.modTime {
-			return cmp.Compare(a.modTime, b.modTime)
-		}
-		return strings.Compare(a.path, b.path)
-	})
-	for _, e := range entries {
-		if total <= c.budget {
+	excess := total - c.budget
+	var victims []entry
+	var held int64
+	err := c.scan(func(e entry) {
+		if e.path == keep {
 			return
 		}
-		if e.path == keep {
-			continue
+		i, _ := slices.BinarySearchFunc(victims, e, older)
+		victims = slices.Insert(victims, i, e)
+		held += e.size
+		for len(victims) > 1 && held-victims[len(victims)-1].size >= excess {
+			held -= victims[len(victims)-1].size
+			victims = victims[:len(victims)-1]
+		}
+	})
+	if err != nil {
+		c.overBudget("the dependence graph cache directory could not be read for retention", total, err)
+		return
+	}
+	for _, e := range victims {
+		if total <= c.budget {
+			break
 		}
 		if err := paced.Remove(e.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		total -= e.size
 	}
+	if total > c.budget {
+		c.overBudget("the dependence graph cache is over its byte budget after retention", total, nil)
+	}
+}
+
+// overBudget reports a cache that holds, or may hold, more than its budget.
+func (c *Cache) overBudget(msg string, total int64, err error) {
+	args := []any{"component", component, "cache_bytes", c.budget, "held_bytes", total}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	slog.Warn(msg, args...)
 }
