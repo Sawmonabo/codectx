@@ -64,13 +64,20 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // The goldens render nodes by source text, so the granularity is exact:
 //
 //   - Every parameter bound name is one defining node after Entry, spanning
-//     its identifier; in the program, every import binding is one, spanning
-//     the local name.
+//     its identifier; in the program, every binding of an ES import
+//     statement is one, spanning the local name. A TypeScript import-equals
+//     declaration has no such node: it is one node where it stands (see
+//     TypeScript below).
 //   - A statement is one node: an expression statement spans its expression
 //     (a comma sequence at statement level is one statement per element), a
-//     declarator spans the declarator, return, throw, break and continue span
-//     the statement (kind Jump), a class declaration spans the declaration,
-//     creates the class and defines its name. A break or continue whose
+//     declarator whose name is an identifier spans the declarator (a
+//     destructuring declarator makes no node of its own: its initializer's
+//     node and one node per bound name, by the destructuring rule below),
+//     return, throw, break and continue span the grammar's statement node,
+//     its `;` included (`return c;`), with kind Jump, and a class declaration
+//     spans the declaration, its leading decorators included (`@d class A
+//     {}`; the decorators written before `export` belong to the export
+//     statement and lie outside it), creates the class and defines its name. A break or continue whose
 //     label names no enclosing statement (an early error, ECMA-262 §8.3.2
 //     ContainsUndefinedBreakTarget, §8.3.3) is lowered as the tree stands:
 //     an unresolved jump, counted, with no successor. An expression
@@ -91,7 +98,17 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     (each test is evaluated only when the previous failed), that Uses that
 //     variable and its own reads, since it compares the two (ECMA-262
 //     §14.12.3 CaseClauseIsSelected); a case body's end flows into the next
-//     body when it does not break. A for…in, for…of or for await…of loop
+//     body when it does not break. `default` makes no node: the last case
+//     test's false edge enters the default's body wherever the default
+//     stands, and with no default it goes to the switch's exit (§14.12.2
+//     CaseBlockEvaluation). A loop's back edge enters the first node of its
+//     head: the first node a while's or for's condition's lowering makes
+//     (an embedded assignment's node, a short-circuit's deciding Branch),
+//     not necessarily the loop's Branch; a do…while's body's first node (its
+//     condition's when the body makes none), a continue there entering the
+//     condition's first node; and a for loop's continue enters its update
+//     (its condition's first node when it has none). A for…in, for…of or
+//     for await…of loop
 //     follows the iteration model (see Iteration in Lowering; ECMA-262
 //     §14.7.5.6 ForIn/OfHeadEvaluation): a Stmt node spanning the iterated
 //     expression Uses its reads and defines the iteration variable, then a
@@ -117,7 +134,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     one Stmt node spanning it that Uses its right side's value and defines
 //     its target: an identifier target is killed, and a property target
 //     (`o.p = v`, `a[i] += v`, `o.p++`) may-defines its base variable (o, a;
-//     see Lowering), as every write through a field or element is. A compound
+//     see Lowering), as every write through a field or element is. A property
+//     target's object and index are read by the write node itself, their
+//     reads staying on it when the right side makes nodes of its own (`o.p =
+//     c ? 1 : 2`: the write Uses o, the condition's Branch only c). A compound
 //     property assignment is first a Stmt node spanning the target, the
 //     property read, whose result carries the reference and the old value to
 //     the write node.
@@ -156,7 +176,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     and instance alike, are its class body's unit, lowered in source
 //     order: each initializer is the nodes of its value then one Stmt node
 //     spanning the field definition, which ends before its `;` (the grammar
-//     makes the `;` a sibling in the class body), and each static block is a
+//     makes the `;` a sibling in the class body) and Uses the value's reads
+//     but defines no variable (it writes a property of the instance or the
+//     class, which no variable holds), and each static block is a
 //     block with its own var scope. The class node in the enclosing function
 //     also captures them.
 //   - An expression lowered for its value and ended by a node spanning it (an
@@ -184,9 +206,21 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // # Uses
 //
 // Only an identifier resolving to a variable declared in this function is a
-// Use. Values travel through variables (see Uses in Lowering): a node Uses
-// what its own evaluation reads, the reads no node of their own carries, and
-// the result variables of the nested constructs whose values it consumes.
+// Use. A name that resolves to none (see Names that resolve to no variable
+// in Lowering: a global or other free name, a name declared only inside a
+// nested callable, an enum member's name inside an initializer, a name only
+// a TypeScript `declare` form introduces) is filtered where it enters, by
+// the lookup's -1: read drops it, so reads never holds it, and def drops
+// it, so as an assignment's, compound or logical assignment's, update's,
+// destructuring element's, default's or for…in/for…of left side's target
+// it defines nothing while the node is still made with its other reads;
+// mayDefBase drops it as a property write's base, and capTarget as a
+// nested callable's write, so the creating node may-defines nothing for
+// it. define takes only an owned variable or one def admitted.
+//
+// Values travel through variables (see Uses in Lowering): a node Uses what
+// its own evaluation reads, the reads no node of their own carries, and the
+// result variables of the nested constructs whose values it consumes.
 //
 // Lowered to nodes, each handing its value on through an owned result
 // variable that the consumer Uses:
@@ -199,14 +233,18 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     the other path;
 //   - an optional chain: the Branch before each `?.` defines the result
 //     (undefined on its nullish exit) and hands the receiver on through it,
-//     and the chain's node, which Uses it, defines it again;
+//     and the chain's node, which Uses it, defines it again; that node also
+//     Uses the results of the constructs lowered after the `?.` whose
+//     values it consumes, as every consumer does (`g?.(x = 1)` Uses the
+//     result of x = 1's node);
 //   - a logical assignment: its Branch and its write node, as for `??`;
 //   - an assignment, compound assignment or update: its node defines the
 //     result, the value assigned (for an identifier target, whose variable
 //     it Defs, the result is a MayDef: a node Defs one variable), so two
 //     assignments to one variable in one expression hand on two values;
 //   - a destructuring assignment: the right side's node, whose result is
-//     the assignment's value;
+//     the assignment's value; it is one variable, the incoming value every
+//     element Uses;
 //   - a nested callable's or class's creation: the creating node, whose
 //     result is the created value; its captures are its own evaluation and
 //     the consumer never repeats them.
@@ -254,6 +292,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // the right side's nodes, and the store throws on the write's node after
 // them. The Builder applies MayThrow only inside an open catch or finally
 // frame, where the throwing node's own definitions do not reach the handler.
+// A catch clause has a Handler node only when some node reached it by
+// MayThrow; a throw statement's node enters the clause's first node
+// directly. With neither, the clause's nodes are still made, with no
+// predecessor.
 // An operator is not counted, arithmetic and comparison alike, although
 // either can throw through ToPrimitive (§7.1.1) when an operand is an
 // object whose valueOf or toString throws, and `in` and `instanceof` throw
@@ -310,7 +352,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //
 //   - An enum is one Stmt node spanning its name that Uses and defines the
 //     name (the emitted `E || (E = {})`), then one Stmt node per member
-//     initializer, spanning the member, in order; every member's bare name
+//     initializer, spanning the member, in order, which defines no variable
+//     (the emitted body writes a property of the invoked function's own
+//     parameter); every member's bare name
 //     is bound to no variable throughout the body, since inside an
 //     initializer it names the member (the emitted body assigns each member
 //     as a property of the enum object and reads a member name as that
@@ -326,9 +370,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     with its own var scope. A namespace the grammar places in an
 //     expression statement is that namespace, with no node of its own for
 //     the statement. A namespace named by a string is ambient.
-//   - `import x = require(m)` is one Stmt node spanning x that defines it
-//     and may throw; `import x = A.B` is one spanning x that Uses A and
-//     defines x, and may throw when it reads a property.
+//   - `import x = require(m)` is one Stmt node spanning x, where it stands
+//     (in the program too, never also an import binding after Entry), that
+//     defines it and may throw; `import x = A.B` is one spanning x that
+//     Uses A and defines x, and may throw when it reads a property.
 //   - `export = e` evaluates e like a default export.
 func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch, k *jsSyntax) {
 	// The state is s.js, reset in place: every list keeps its capacity, and

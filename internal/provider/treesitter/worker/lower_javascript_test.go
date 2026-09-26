@@ -618,5 +618,41 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 				"c@34 -> y = x + (c && (x = 1))@25", "y = x + (c && (x = 1))@25 -> return y;@49",
 			},
 		},
+		{
+			// ECMA-262 §9.4.2 ResolveBinding and §9.1.2.1
+			// GetIdentifierReference: f declares no g, so every g resolves
+			// past f's environments to the global one (in sloppy code an
+			// assignment to an unresolvable reference creates a global
+			// property, §6.2.5.6 PutValue, and `delete g` is allowed,
+			// §13.5.1.1), never to a variable of f; h is free too. Nodes: a@11;
+			// g = a@16, g += a@23 and g++@31 (each Uses its reads, defines
+			// nothing); the Branch g@36 and the write g ??= a@36 (Uses a); the
+			// embedded g = a@47 (Uses a, defines its result) and h(g = a)@45
+			// (Uses the result); g.p = a@55 (Uses a, may-defines no base); the
+			// right side a@74 (Uses a, defines the incoming value), the
+			// default's Branch g = a@65 (Uses it) and the default a@69 (Uses
+			// a); the iterated a@87 (Uses a, defines the iteration variable),
+			// the head g of a@82 and the binding g@82 (each Uses it), delete
+			// g@90 (Uses nothing); the arrow () => g += a@110 (Uses its
+			// capture a, may-defines nothing, defines its result), the
+			// declarator c = () => g += a@106 (Uses the result, defines c);
+			// return c;@124.
+			name:     "a name that resolves to no variable is read and written as nothing in every position",
+			protects: "an unresolved name as an assignment, compound, update, logical, embedded, property-base, destructuring-default, iteration, deletion or capture target defines and reads nothing, while its node keeps its other reads",
+			mutation: "drop the v < 0 return in def (flow.Builder.Def panics on g's -1 at g = a@16), in read (seen[-1] panics at g += a@23), in mayDefBase (MayDef(-1) at g.p = a@55) or in capTarget (MayDef(-1) on the arrow's node)",
+			src:      "function f(a) { g = a; g += a; g++; g ??= a; h(g = a); g.p = a; [g = a] = a; for (g of a) delete g; const c = () => g += a; return c; }",
+			fn:       1,
+			cd: []string{
+				"g@36 -> g ??= a@36", "g = a@65 -> a@69",
+				"g of a@82 -> g of a@82", "g of a@82 -> g@82", "g of a@82 -> delete g@90",
+			},
+			du: []string{
+				"a@11 -> g = a@16", "a@11 -> g += a@23", "a@11 -> g ??= a@36", "a@11 -> g = a@47",
+				"g = a@47 -> h(g = a)@45", "a@11 -> g.p = a@55", "a@11 -> a@74", "a@74 -> g = a@65",
+				"a@11 -> a@69", "a@11 -> a@87", "a@87 -> g of a@82", "a@87 -> g@82",
+				"a@11 -> () => g += a@110", "() => g += a@110 -> c = () => g += a@106",
+				"c = () => g += a@106 -> return c;@124",
+			},
+		},
 	})
 }
