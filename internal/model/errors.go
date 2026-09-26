@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 )
 
 // Stable error families of Section 22. Every service raises one of these codes;
@@ -165,6 +167,26 @@ func ClassifyQueryDeadline(ctx context.Context, op string, err error) error {
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return QueryDeadlineExceeded(op, err)
+	}
+	return err
+}
+
+// BareCause strips the path from the operating system's error wrappers
+// (fs.PathError, os.LinkError, os.SyscallError), keeping only the reason. An
+// error message that reaches an ordinary surface names the failure without the
+// host path it happened on; an error that is none of these is returned as is.
+func BareCause(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Err
+	}
+	var se *os.SyscallError
+	if errors.As(err, &se) {
+		return se.Err
 	}
 	return err
 }

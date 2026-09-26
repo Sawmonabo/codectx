@@ -101,7 +101,7 @@ func (s *store) acquire(ctx context.Context, name string, wait bool) (*toolLock,
 		held, err := fslock.TryLock(f)
 		if err != nil {
 			f.Close()
-			return nil, internalError("tool install lock: %v", bareCause(err))
+			return nil, internalError("tool install lock: %v", model.BareCause(err))
 		}
 		if held {
 			return &toolLock{f: f}, nil
@@ -131,7 +131,7 @@ func (l *toolLock) release() error {
 	}
 	l.once.Do(func() {
 		if err := fslock.Unlock(l.f); err != nil {
-			l.err = internalError("tool install unlock: %v", bareCause(err))
+			l.err = internalError("tool install unlock: %v", model.BareCause(err))
 		}
 		if err := l.f.Close(); err != nil && l.err == nil {
 			l.err = ioError("tool lock close", err)

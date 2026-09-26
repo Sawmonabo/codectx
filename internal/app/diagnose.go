@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -331,18 +330,7 @@ func (workspaceProber) Readable(ctx context.Context, dir string) error {
 // else is the exit-10 class carrying only the syscall's own cause, which is the
 // same shape internal/snapshot's ioError produces for the same reason.
 func probeError(op string, err error) error {
-	cause := err
-	var pe *fs.PathError
-	var le *os.LinkError
-	var se *os.SyscallError
-	switch {
-	case errors.As(err, &pe):
-		cause = pe.Err
-	case errors.As(err, &le):
-		cause = le.Err
-	case errors.As(err, &se):
-		cause = se.Err
-	}
+	cause := model.BareCause(err)
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull,
 			Message:     "app: could not " + op + ": the disk is full",

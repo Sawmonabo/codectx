@@ -254,15 +254,8 @@ func (c *Collector) sweepConfigStaging(workDir string, now time.Time) error {
 // data directory is a private absolute root, which Section 21 keeps out of
 // ordinary reporting. A disk-full failure keeps its own family so an operator
 // is told to free space rather than to report a defect.
-//
-// The bare-cause unwrapping is also done by snapshot.bareCause and toolchain's
-// ioError; both are unexported.
 func sweepError(what string, err error) error {
-	var pe *fs.PathError
-	cause := err
-	if errors.As(err, &pe) {
-		cause = pe.Err
-	}
+	cause := model.BareCause(err)
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull,
 			Message:     "retention: " + what + ": the data directory's disk is full",

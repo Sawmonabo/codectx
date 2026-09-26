@@ -48,8 +48,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"syscall"
 
@@ -112,23 +110,5 @@ func ioError(op string, err error) error {
 		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the tool store's disk is full",
 			Remediation: "free disk space or point storage.data_dir at a larger volume"}
 	}
-	return internalError("%s: %v", op, bareCause(err))
-}
-
-// bareCause strips the path from the OS error wrappers, keeping only the
-// operating-system reason.
-func bareCause(err error) error {
-	var pe *fs.PathError
-	if errors.As(err, &pe) {
-		return pe.Err
-	}
-	var le *os.LinkError
-	if errors.As(err, &le) {
-		return le.Err
-	}
-	var se *os.SyscallError
-	if errors.As(err, &se) {
-		return se.Err
-	}
-	return err
+	return internalError("%s: %v", op, model.BareCause(err))
 }
