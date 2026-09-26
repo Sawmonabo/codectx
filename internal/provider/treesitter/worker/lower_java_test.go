@@ -549,5 +549,23 @@ func TestJavaLoweringGolden(t *testing.T) {
 			fn:       1,
 			du:       []string{"o@19 -> o.f = a@33", "a@26 -> o.f = a@33", "o.f = a@33 -> g(o.f = a)@31"},
 		},
+		{
+			// §15.25, §15.26.1. Nodes: c@24, x@31 (params), c@44 (the
+			// condition), x = 1@49 (the first arm, which is its own
+			// assignment node: it defines x, so it may-defines the
+			// conditional's result), 2@58 (the second arm, defining the
+			// result), y = c ? (x = 1) : 2@40 (Uses the result, defines y), return x +
+			// y;@61. Succ: c@44→{x = 1, 2}; both→the declarator→return.
+			// IPDom: c@44, x = 1, 2 → the declarator → return. Frontier
+			// walk: c@44 over x = 1 and 2.
+			name:     "an arm that is an assignment defines its local and may-defines the conditional's result",
+			protects: "a node that already defines a variable yields the construct's value without a second definition, and the local it assigns still reaches later uses",
+			mutation: "Def the result on an arm's node whatever it defines (the builder panics: a node defines at most one variable), or give that arm no share of the result (loses x = 1@49 -> y = c ? (x = 1) : 2@40)",
+			src:      "class A { int f(boolean c, int x) { int y = c ? (x = 1) : 2; return x + y; } }",
+			fn:       1,
+			cd:       []string{"c@44 -> x = 1@49", "c@44 -> 2@58"},
+			du: []string{"c@24 -> c@44", "x = 1@49 -> y = c ? (x = 1) : 2@40", "2@58 -> y = c ? (x = 1) : 2@40",
+				"x@31 -> return x + y;@61", "x = 1@49 -> return x + y;@61", "y = c ? (x = 1) : 2@40 -> return x + y;@61"},
+		},
 	})
 }

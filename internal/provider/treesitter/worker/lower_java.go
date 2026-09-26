@@ -182,10 +182,15 @@ const yieldLabel = " yield"
 //     defines and the second operand's node defines again, so SSA merges the
 //     two.
 //   - An assignment or update embedded in a larger expression (`(x = a) *
-//     2`, `f(o.f = a)`, `g(i++)`) is its own node, which defines its target
-//     (or may-defines a field or element target's base) and an owned result
-//     its consumer Uses. At statement level it is the statement's node and
-//     defines no result.
+//     2`, `f(o.f = a)`, `g(i++)`) is its own node. One of a local defines
+//     the local, a named variable holding the value, which its consumer
+//     Uses; one of a field or element target, which only may-defines its
+//     base, defines an owned result its consumer Uses. At statement level it
+//     is the statement's node and hands on nothing.
+//   - A node defines at most one variable. A yielding node that already
+//     defines one (an arm's result node that is itself an assignment or a
+//     creation) may-defines the construct's result instead, which gives the
+//     same pairs, since only the construct's own yielding nodes define it.
 //   - The node deciding on `x instanceof P` Uses the tested expression's
 //     reads: the test is folded into it. Each pattern variable's defining
 //     node Uses them too.
@@ -343,6 +348,8 @@ type javaLower struct {
 	// being lowered, innermost last: its arm result nodes and its yields
 	// define it.
 	results []int32
+	// defined[n] marks node n as defining a variable already (see define).
+	defined []bool
 	// throws counts throwing constructs evaluated by the current statement;
 	// those past thrown are not yet attached to a node.
 	throws, thrown int
@@ -395,6 +402,7 @@ func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.Tree
 	clear(j.pats)
 	j.buf, j.labels, j.caseBinds, j.pats = j.buf[:0], j.labels[:0], j.caseBinds[:0], j.pats[:0]
 	j.reads, j.stack, j.writes, j.hide, j.results = j.reads[:0], j.stack[:0], j.writes[:0], j.hide[:0], j.results[:0]
+	j.defined = j.defined[:0]
 	j.arms, j.groupAt, j.frames = j.arms[:0], j.groupAt[:0], j.frames[:0]
 }
 
@@ -543,10 +551,26 @@ func (j *javaLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
-	j.b.Def(n, v)
+	j.define(n, v)
 	if j.has(v) {
 		j.b.Use(n, v)
 	}
+}
+
+// define makes node n define v. A node defines at most one variable, so a
+// node that already defines one, an arm's result node that is also an
+// assignment or a creation, may-defines v instead: v is a result variable
+// only the construct's own yielding nodes define, so the pairs are the same.
+func (j *javaLower) define(n, v int32) {
+	if int(n) >= len(j.defined) {
+		j.defined = append(j.defined, make([]bool, int(n)+1-len(j.defined))...)
+	}
+	if j.defined[n] {
+		j.b.MayDef(n, v)
+		return
+	}
+	j.b.Def(n, v)
+	j.defined[n] = true
 }
 
 // valueNode lowers n for its value and ends it with a Stmt node spanning n,
@@ -581,7 +605,7 @@ func (j *javaLower) exprNode(n *ts.Node) (int32, int) {
 func (j *javaLower) hand(id int32, r int) {
 	j.reads = j.reads[:r]
 	res := j.b.Var()
-	j.b.Def(id, res)
+	j.define(id, res)
 	j.read(res)
 }
 
@@ -963,7 +987,7 @@ func (j *javaLower) stmt(n *ts.Node) {
 			// A yield hands its operand's value to the innermost switch
 			// expression.
 			if r := len(j.results); r > 0 {
-				j.b.Def(id, j.results[r-1])
+				j.define(id, j.results[r-1])
 			}
 			j.b.Break(yieldLabel)
 		}
@@ -1215,7 +1239,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	// The selector is evaluated once, at its node, which defines an owned
 	// variable every label and pattern variable node Uses.
 	sv := j.b.Var()
-	j.b.Def(j.node(flow.Stmt, sel, m, len(j.reads)), sv)
+	j.define(j.node(flow.Stmt, sel, m, len(j.reads)), sv)
 	j.reads = j.reads[:m]
 	var f flow.Frame
 	if expr {
@@ -1289,7 +1313,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			case c.KindId() == k.switchLabel:
 			case arrow && expr && c.KindId() == k.expressionStmt:
 				j.reset()
-				j.b.Def(j.valueNode(firstNamed(c)), j.results[len(j.results)-1])
+				j.define(j.valueNode(firstNamed(c)), j.results[len(j.results)-1])
 				j.b.Break(yieldLabel)
 			case arrow:
 				j.stmt(c)
@@ -1672,13 +1696,13 @@ func (j *javaLower) expr(n *ts.Node) int {
 			// where it decides the value.
 			r, res := len(j.reads), j.b.Var()
 			lo := j.keep(m, j.expr(left), and)
-			j.b.Def(j.node(flow.Branch, left, r, len(j.reads)), res)
+			j.define(j.node(flow.Branch, left, r, len(j.reads)), res)
 			j.reads = j.reads[:r]
 			mark := j.binds.mark()
 			j.scopePats(m, lo)
 			p := j.b.Push()
 			id, mid := j.exprNode(right)
-			j.b.Def(id, res)
+			j.define(id, res)
 			end := j.keep(lo, mid, and)
 			j.b.Merge(p)
 			j.b.Pop(p)
@@ -1705,25 +1729,34 @@ func (j *javaLower) expr(n *ts.Node) int {
 		mark := j.binds.mark()
 		p := j.b.Push()
 		j.scopePats(m, mid)
-		j.b.Def(j.valueNode(n.ChildByFieldId(k.fConsequence)), res)
+		j.define(j.valueNode(n.ChildByFieldId(k.fConsequence)), res)
 		j.binds.truncate(mark)
 		t := j.b.Push()
 		j.b.Restore(p)
 		j.scopePats(mid, len(j.pats))
-		j.b.Def(j.valueNode(n.ChildByFieldId(k.fAlternative)), res)
+		j.define(j.valueNode(n.ChildByFieldId(k.fAlternative)), res)
 		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(p)
 		j.cutPats(m)
 		j.read(res)
-	case k.assignment:
-		// An embedded assignment's node defines its target and the owned
-		// result its consumer reads.
+	case k.assignment, k.update:
+		// An embedded assignment's value reaches its consumer through the
+		// local it defines, or, for a field or element target, which only
+		// may-defines its base, through an owned result (see Uses).
 		r := len(j.reads)
-		j.hand(j.assign(n), r)
-	case k.update:
-		r := len(j.reads)
-		j.hand(j.update(n), r)
+		var id, v int32
+		if n.KindId() == k.assignment {
+			id, v = j.assign(n)
+		} else {
+			id, v = j.update(n)
+		}
+		if v >= 0 {
+			j.reads = j.reads[:r]
+			j.read(v)
+		} else {
+			j.hand(id, r)
+		}
 	case k.methodInvocation:
 		if o := n.ChildByFieldId(k.fObject); o != nil {
 			j.value(o)
@@ -1880,8 +1913,8 @@ func (j *javaLower) targetThrows(t *ts.Node) bool {
 }
 
 // assign lowers `left = right` and `left op= right` as one node spanning n
-// and returns it.
-func (j *javaLower) assign(n *ts.Node) int32 {
+// and returns it and the local it defines, or -1.
+func (j *javaLower) assign(n *ts.Node) (int32, int32) {
 	k := j.k
 	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	compound := n.ChildByFieldId(k.fOperator).KindId() != k.assignOp
@@ -1894,7 +1927,7 @@ func (j *javaLower) assign(n *ts.Node) int32 {
 		j.value(right)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
-		return id
+		return id, v
 	}
 	j.reference(left)
 	throws := j.targetThrows(left)
@@ -1911,12 +1944,12 @@ func (j *javaLower) assign(n *ts.Node) int32 {
 	if v := j.base(left); v >= 0 {
 		j.b.MayDef(id, v)
 	}
-	return id
+	return id, -1
 }
 
 // update lowers `x++`, `--x` and their field and array forms as one node
-// spanning n and returns it.
-func (j *javaLower) update(n *ts.Node) int32 {
+// spanning n and returns it and the local it defines, or -1.
+func (j *javaLower) update(n *ts.Node) (int32, int32) {
 	k := j.k
 	arg := j.l.unparen(firstNamed(n))
 	m := len(j.reads)
@@ -1925,7 +1958,7 @@ func (j *javaLower) update(n *ts.Node) int32 {
 		j.read(v)
 		id := j.node(flow.Stmt, n, m, len(j.reads))
 		j.def(id, v)
-		return id
+		return id, v
 	}
 	j.reference(arg)
 	if j.targetThrows(arg) {
@@ -1935,7 +1968,7 @@ func (j *javaLower) update(n *ts.Node) int32 {
 	if v := j.base(arg); v >= 0 {
 		j.b.MayDef(id, v)
 	}
-	return id
+	return id, -1
 }
 
 // cap collects the references n makes to variables of the function being
