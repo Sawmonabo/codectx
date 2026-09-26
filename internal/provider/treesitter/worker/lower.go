@@ -90,6 +90,14 @@ func Grammar(name string) (*ts.Language, bool) {
 // value and hands it on through an owned variable it may-defines, and the
 // consumer Uses that variable in place of the name, so the folded read
 // pairs with the definition that reached it rather than the one after it.
+// The hand-off is made only when the assignment's node runs whenever the
+// consumer does. An assignment inside a conditionally evaluated operand (a
+// short-circuit operand after the deciding one, a conditional's arm, a later
+// operand of a chained comparison, an optional chain's tail) leaves the read
+// on the consumer, where the name still has its earlier definition on the
+// path that skips the assignment: `y = x + (c and (x := 1))` pairs y with
+// the x before it when c is false, and with the assignment, whose value the
+// operator's result also carries, when c is true.
 // Where the language leaves the order of the two unsequenced or
 // indeterminately sequenced (C and C++), the lowering takes source order and
 // says so.
