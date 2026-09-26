@@ -137,28 +137,47 @@ beside the database, and it removes neither.
 What it does touch is the shared-memory index beside the log. That file holds
 no database content -- it is the index OF the log, rebuilt from the log -- and
 a reader writes its read mark there, which is how an answer is taken from a
-fixed snapshot without blocking a writer. Where the index is missing, a reader
-creates it, together with the engine's zero-length log stub, because reading a
-log at all needs it; on a workspace an operator has made read-only, an index
-already beside the log is read without being written. Neither file is ever
-removed or resized by a reader, and neither carries a byte of the published
-index.
+fixed snapshot without blocking a writer. Neither file is ever removed or
+resized by a reader, and neither carries a byte of the published index.
 
+What an answering command may create, exactly:
+
+- beside an existing database, in a data directory it can write, the log's
+  shared-memory index and a zero-length log where they are missing, because
+  reading a log needs both;
+- the engine's temporary directory under the data directory, where the data
+  directory can be written;
+- the content store's own directory, where it is missing.
+
+It creates no database and no provider work directory -- both belong to a run.
 A workspace with no database at all is the answer `CTX_NO_ACTIVE_GENERATION`,
-"run `codectx index`": no answering command creates a database, and none
-creates the provider work directories -- both belong to a run. (The content
-store's own directory is still made where it is missing, which is the one
-directory such a command has always made.)
+"run `codectx index`".
 
 That is what lets such a command answer a workspace on **read-only media**, or
-one an operator has locked down. Two things are then different, and neither is
-visible in the answer: the engine's temporary files -- sort spills, statement
+one an operator has locked down, where it creates nothing at all. Whether the
+data directory can be written is asked of the directory itself before the
+store is opened (a directory whose permissions refuse this user and one on a
+filesystem mounted read-only are the same answer), and what is then done
+depends on the log beside the database:
+
+- no log, or a zero-length one: the store is read as an unchanging file, which
+  is the only way a write-ahead-log database can be read without an index
+  beside it; a log with no frames holds nothing the database lacks;
+- a log with frames and its index beside it: the log is read through the
+  existing index, writing neither;
+- a log with frames and no index: the command is refused with
+  `CTX_CONFIG_INVALID`, naming the log and its size. The log holds the newest
+  state, it cannot be read without an index nobody may create there, and
+  reading the database alone would answer from an older generation. The
+  remedy is to make the directory writable and run `codectx index` once, which
+  folds the log into the database, or to copy the data directory to writable
+  storage and set `storage.data_dir` to the copy.
+
+On such a directory the engine's temporary files -- sort spills, statement
 journals past their memory threshold -- go to the process temp directory
-instead of the data directory, and are given back when the command ends; and
-where no log lies beside the database, the store is read as an unchanging file,
-which is the only way a write-ahead-log database can be read without an index
-beside it. A directory a command that BUILDS cannot write is refused instead,
-as `CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
+instead of the data directory, and are given back when the command ends. A
+directory a command that BUILDS cannot write is refused instead, as
+`CTX_CONFIG_INVALID` naming the directory and the remedy -- it is the
 operator's to fix, and a run whose spills went elsewhere is what this directory
 exists to prevent.
 
@@ -579,7 +598,7 @@ reports `unavailable`. It never reports `0`.
 | Free disk bytes | measured, else `unavailable` | measured, else `unavailable` | measured, else `unavailable` | Reported by the OS for the data directory's filesystem. A filesystem that refuses to answer yields `unavailable`, not `0`. |
 | Unit reuse and parse counts | `unavailable` | `unavailable` | `unavailable` | Counted per indexing run and reported on that run's result, where `codectx index` prints them. They are **not** process-wide totals, and the resource block reports no figure rather than reporting `0` for a process that has indexed nothing this run. No platform differs. |
 | Pending watch events | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row of its own, carrying its process, when it last published itself, its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. There is one row per watching process, not one per repository, keyed by the watch's own session identity and not by its process id, which the operating system reuses: two watches on one workspace — a terminal's and an editor's server — each keep their own row instead of overwriting each other's. `codectx status` lists every watcher whose row is live, with its process and its last beat, in any process, including one that is watching nothing itself; `status --resources` reports the figure of a watch that is covering the workspace while its row is live. A watch that is still waiting for whichever process holds the workspace has reconciled nothing, so it publishes its presence and no figure at all: the count is `unavailable` and `doctor`'s `watch_heartbeat` check says the watch is running but covering nothing, which is a different answer from a covering watch and from a workspace no watch has ever run in. Once a row expires — the watch was killed, or the machine went down — that watcher drops out of the list and its figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. An elapsed deadline is the only death signal, the same rule the run ledger judges a run's writer by, and no process id is ever probed; the next beat published for the workspace deletes the rows that have elapsed. A watch running without filesystem notifications has no queue to count and publishes no figure. |
-| Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. `stuck_frees` names the queued removals the filesystem refused, with the reason, so `pending_free_bytes` that never falls is never left unexplained. |
+| Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. `stuck_frees` names the queued removals the filesystem refused, with the reason, so `pending_free_bytes` that never falls is never left unexplained; it is one page at the response record bound, and `stuck_frees_omitted` counts the rest. |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
 | Per-unit analyzer memory (`analyzer_units`) | measured | reservation and caps only | reservation and caps only | One row per heavy analysis unit this process ran: the reservation it was admitted against, the heap caps its two steps ran under, the machine-derived allocation those caps were bounded by, and the peak its process tree reached. The first three are the governor's own arithmetic and are always present. `allocation_bytes` is absent where the host does not publish available memory, and `observed_peak_bytes` is absent wherever the tree sampler is — the same reader as the process-tree peak above. Reading the row's figures together is the point: a peak far under the cap says the unit was serialized behind memory it never used. It is process accounting and not per generation, so it covers what **this** process has run. |
 | Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |

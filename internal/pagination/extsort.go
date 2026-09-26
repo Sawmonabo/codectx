@@ -160,7 +160,7 @@ func NewExternalSort[T any](dir string, bufRecords int,
 		bufRecords = RunBufferRecords
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, internalErr("external sort directory: " + err.Error())
+		return nil, diskFault("external sort directory", dir, err)
 	}
 	return &ExternalSort[T]{arena: scratch.For(dir), encode: encode, decode: decode,
 		compare: compare, bufN: bufRecords, buf: make([]T, 0, bufRecords)}, nil

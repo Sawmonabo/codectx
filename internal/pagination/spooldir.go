@@ -248,7 +248,7 @@ func dirHeaderFrame(id string, c Cursor) ([]byte, error) {
 func replaceDirHeader(dir string, frame []byte) error {
 	tmp := filepath.Join(dir, spoolDirHeader+".new")
 	if err := os.WriteFile(tmp, frame, 0o600); err != nil {
-		return internalErr("spool adopt: " + err.Error())
+		return spoolRefused("spool adopt", dir, err)
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, spoolDirHeader)); err != nil {
 		_ = paced.Remove(tmp)
