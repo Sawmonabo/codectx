@@ -533,23 +533,35 @@ as heap exhaustion would spend the unit's single retry on a full reparse of a
 unit that had already succeeded.
 
 Every failure also carries `stderr_tail`: the last of what the child wrote to
-its standard error, bounded to what one error detail holds, cut at a line
-boundary. Without it a failure reported only how many bytes the child wrote,
-and a crash on a real repository left nothing that could be read afterwards.
-A failure row is durable storage, so what it may contain is narrower than what
-a log may:
+its standard error, in whole lines taken from the end, bounded to what one
+error detail holds. Each line is reduced before it is counted, so the bound can
+never cut a path in two and leave its leading directories behind as text no
+rule recognises. A final line longer than the whole bound keeps its last
+bytes, from the first field boundary in them, because the exception is at the
+end of the line. A failure row is durable storage, so what it may contain is
+narrower than what a log may:
 
-- The run's private directories are replaced by `(private)`, by name.
-- Every remaining rooted path is reduced to its base name, wherever it sits in
-  a whitespace-delimited field: the child prints paths inside punctuation — a
-  backticked command line, an argument list, a quoted value — and reducing
-  only a field that begins with a separator published the operator's home
-  directory and the repository path. The punctuation around the path stays, so
-  ``cmd: `<abs>/analyzer-parse` `` reads as ``cmd: `analyzer-parse` ``.
-- A path *under* a private directory keeps what follows `(private)`, which is
-  the part that says which step of the run wrote the file. That remainder is
-  not a rooted path: it names something inside a directory the reader is not
+- A path starts at every separator that follows a byte which cannot continue a
+  relative path — a space, a quote, a bracket, a backtick, `=`, `>`, `@`, `|`,
+  `!`, `+`, a comma — so ``cmd: `<abs>/analyzer-parse` ``, `2><abs>/child.log`
+  and `@<abs>/args` are all reduced, and the punctuation around the path
+  stays. A path ends at whitespace, a closing bracket, a quote, `|`, a comma or
+  a semicolon.
+- The run's private directories (the unit's materialization and its work
+  directories) are replaced by `(private)` wherever such a path starts, and
+  the rest of the path is kept: it is the part that says which step of the run
+  wrote the file, and it names something inside a directory the reader is not
   being told.
+- A path under any other directory the backend knows is reduced to its base
+  name, with that directory matched as a whole prefix first, so a known
+  directory whose name holds a space is reduced whole. The known directories
+  are the user's home directory, the directories of the engine's launchers and
+  every absolute directory the child's environment names. Every other rooted
+  path is reduced to its base name the same way.
+- The backend is not told the data directory. A path under it that is under
+  none of the directories above is reduced by the generic rule, and a space in
+  a directory name the backend does not know ends the path there: what follows
+  the space is left as the unrooted text it then is.
 
 Classification depends on the engine logging at WARN, so the child environment
 pins its log level rather than inheriting whatever the host set. The child's
