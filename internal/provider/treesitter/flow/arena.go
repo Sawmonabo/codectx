@@ -7,9 +7,9 @@ package flow
 // Backing is pointer-free and typed only — int32 and uint64 slabs, plus the
 // builder's construction scratch lists — so the collector scans none of it
 // but the one pointer-bearing exception, the builder's short list of label
-// names, which are strings. There is no preallocation constant: a slab that cannot serve a request is
-// replaced by one of at least twice its size and at least the request, so
-// backing grows to the need of the functions seen.
+// names, which are strings. There is no preallocation constant: a slab that
+// cannot serve a request is replaced by one of at least twice its size and at
+// least the request, so backing grows to the need of the functions seen.
 //
 // Lifetime: every slice, Graph, Edges and PostDom handed out is valid until
 // the next Begin, which reclaims all of it.
@@ -59,12 +59,19 @@ func (a *Arena) Int32s(n int) []int32 { return a.i32.take(n) }
 func (a *Arena) Uint64s(n int) []uint64 { return a.u64.take(n) }
 
 // Bytes is the slab bytes handed out since Begin: the two CSRs Builder.Finish
-// builds plus every analysis structure (reverse post-order, dominator arrays,
-// augmentation and strongly-connected-component scratch, frontiers, SSA
-// values and operands, worklists, emitted pairs). These are exactly the
-// structures bounded by 96·N + 64 bytes; the benchmarks report the ratio.
-// A structure grown by need (a list32, a list64, the SSA memo table) counts
-// every array it outgrew, since each stays allocated until the next Begin.
+// builds plus every analysis structure each pass documents (depth-first
+// scratch, dominator arrays, augmentation and strongly-connected-component
+// scratch, frontier pairs, the SSA block layout, definition sites, memo, φs
+// and operands, emitted pairs). A structure grown by need (a list32, a
+// list64, the SSA memo table) counts every array it outgrew, since each stays
+// allocated until the next Begin.
+//
+// The total is not linear in N alone: the CSRs and the post-dominator pass
+// are O(N + E), and DefUse also depends on the variables, uses and
+// definitions, on the (block, variable) pairs its lookups visit and on the
+// pairs it emits (see DefUse). The benchmarks report Bytes against the
+// design's per-function figure of 96·N + 64 bytes; that figure is what they
+// compare against, not a bound this package guarantees.
 func (a *Arena) Bytes() int { return 4*a.i32.handed() + 8*a.u64.handed() }
 
 // ScratchBytes is the construction scratch high-water since Begin, in
@@ -73,7 +80,7 @@ func (a *Arena) Bytes() int { return 4*a.i32.handed() + 8*a.u64.handed() }
 // lists, intercepted jumps, labels and gotos, and the per-node use and
 // may-definition CSRs Finish builds), whether it is read during construction
 // or after Finish. The Graph's node metadata, uses and may-definitions are
-// read from that scratch. It is outside the 96·N + 64 bound and reported
+// read from that scratch. It is not part of Bytes and is reported
 // separately.
 func (a *Arena) ScratchBytes() int { return a.b.scratchHigh() }
 
