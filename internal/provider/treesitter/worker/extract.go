@@ -15,14 +15,6 @@ import (
 // string kept until the parse ends).
 const ParseChunkBytes = 64 << 10
 
-// atRecordBound reports whether a per-file record set has reached the bound the
-// request carries. A zero bound -- the default -- is unlimited, so the file
-// yields what it yields; only a value the operator set can stop it, and a file
-// it stops is reported truncated.
-func atRecordBound(max uint64, have int) bool {
-	return max != 0 && uint64(have) >= uint64(max)
-}
-
 type span struct{ start, end uint }
 
 // decl is one captured declaration before it is numbered and emitted.
@@ -54,6 +46,9 @@ type importRec struct {
 	span
 	path  string
 	names []string
+	// seen holds names, so a statement naming thousands of bindings (a
+	// generated barrel import) is deduplicated in linear time.
+	seen map[string]bool
 }
 
 type refRec struct {
@@ -79,18 +74,8 @@ type extraction struct {
 	pkg          string
 	exportRanges map[span]bool
 	exportNames  map[string]bool
-	truncated    bool
-	// maxRecords is the request's MaxRecordsPerFile, the one per-file record
-	// bound; 0 is unlimited.
-	maxRecords uint64
-	// declCount is how many declaration RECORDS this extraction will emit --
-	// one per (range, name start) pair, which is what emit flattens e.decls
-	// into and therefore what the parent counts as it reads the frames back.
-	// len(e.decls) is the number of RANGES and is smaller whenever one range
-	// declares several names (`var a, b = ...`), so bounding on it would let
-	// the worker send more frames than the parent was told to accept and the
-	// parent would fail a healthy unit.
-	declCount int
+	// truncated reports that the query cursor exceeded its match limit.
+	truncated bool
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -197,30 +182,22 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 		}
 		return
 	}
-	if atRecordBound(e.maxRecords, e.declCount) {
-		e.truncated = true
-		return
-	}
 	byName[d.nameStart] = d
-	e.declCount++
 }
 
 func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	key := span{node.StartByte(), node.EndByte()}
 	rec := e.imports[key]
 	if rec == nil {
-		if atRecordBound(e.maxRecords, len(e.imports)) {
-			e.truncated = true
-			return
-		}
-		rec = &importRec{span: key}
+		rec = &importRec{span: key, seen: map[string]bool{}}
 		e.imports[key] = rec
 	}
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
 		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
 	}
 	for _, n := range caps["import.name"] {
-		if t := n.Utf8Text(e.src); t != "" && !slices.Contains(rec.names, t) {
+		if t := n.Utf8Text(e.src); t != "" && !rec.seen[t] {
+			rec.seen[t] = true
 			rec.names = append(rec.names, t)
 		}
 	}
@@ -228,10 +205,6 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 
 func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier []ts.Node) {
 	if len(name) == 0 {
-		return
-	}
-	if atRecordBound(e.maxRecords, len(e.refs)) {
-		e.truncated = true
 		return
 	}
 	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: name[0].Utf8Text(e.src),

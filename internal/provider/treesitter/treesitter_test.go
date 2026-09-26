@@ -574,3 +574,42 @@ func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 	}
 	return p
 }
+
+// TestARecordAndASourceLongerThanOneFrameArriveWhole pins that the wire has no
+// size ceiling of its own: a generated barrel import whose one record encodes
+// to more than one transport unit, in a source file that is itself longer than
+// one unit, is parsed and answered whole.
+//
+// Failure mode: a fixed per-frame cap on fact records drops the import and
+// reports the file partial, and a source sent or read as one frame of bounded
+// length refuses the file outright; either way the file's imports are lost.
+//
+// Mutation: make the worker refuse a fact message longer than wire.ChunkBytes
+// instead of continuing it -> Imports is 0 and Truncated is set. Mutation: make
+// the worker read the source as a single frame -> the worker exits on a
+// malformed source frame and the parse fails.
+func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("import { ")
+	const names = 20000
+	for i := range names {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("n" + strconv.Itoa(100000+i))
+	}
+	b.WriteString(" } from \"./barrel\";\n")
+	src := []byte(b.String())
+	if len(src) <= 2*wire.ChunkBytes {
+		t.Fatalf("the fixture is %d bytes; it must span several %d-byte frames", len(src), wire.ChunkBytes)
+	}
+	p := newProvider(t)
+	probe, err := p.ParseProbe(context.Background(), "barrel.js", src)
+	if err != nil {
+		t.Fatalf("a %d-byte source with one %d-name import failed to parse: %v", len(src), names, err)
+	}
+	if probe.Imports != 1 || probe.Truncated {
+		t.Fatalf("the %d-name import arrived as %d imports (truncated %v), want exactly 1 and not truncated",
+			names, probe.Imports, probe.Truncated)
+	}
+}

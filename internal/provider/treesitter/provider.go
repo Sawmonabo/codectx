@@ -51,7 +51,7 @@ type WorkerCommand struct {
 }
 
 // Options configure the provider. Nothing here has a default of its own: the
-// three config.Limit fields are unlimited at zero, as config's defaults are;
+// two config.Limit fields are unlimited at zero, as config's defaults are;
 // MaxEvidencePerFact selects the model's ceiling at zero; and the worker
 // count, the per-worker reservation, the ledger, the runner, the worker and
 // its directory come from the composition root and are required. There is no
@@ -64,20 +64,16 @@ type Options struct {
 	// MaxWorkers is one per CPU (config.ParserWorkers): the most parser subprocesses
 	// alive at once.
 	MaxWorkers int
-	// MaxParseFileBytes is workspace.max_parse_file_bytes; a larger file is
-	// reported unavailable, never streamed. Zero is unlimited.
+	// MaxParseFileBytes is workspace.max_parse_file_bytes, the only size
+	// policy on a file: a larger one is reported unavailable, never streamed.
+	// Zero is unlimited. A file of any admitted size is streamed to the worker
+	// in transport-unit frames (wire.ChunkBytes).
 	MaxParseFileBytes config.Limit
 	// MaxCalleeReferences is tree_sitter.max_callee_references: how many
 	// distinct cross-file callee names one file may mint nodes for. Unlimited
 	// by default; past a user-set bound the call is counted into the file's
 	// dropped count and the file reports partial.
 	MaxCalleeReferences config.Limit
-	// MaxRecordsPerFile is tree_sitter.max_records_per_file: how many
-	// declarations, imports or references (each counted separately) one file
-	// may yield. Unlimited by default. It is carried on every parse request so
-	// the worker that extracts and the parent that reads the frames back apply
-	// the one number the operator set.
-	MaxRecordsPerFile config.Limit
 	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
 	// index.max_evidence_per_fact, or the model's record ceiling when they set
 	// none. Zero selects the ceiling. Occurrences past it are counted and
@@ -156,13 +152,6 @@ func New(o Options) (*Provider, error) {
 	// start and parse nothing.
 	if o.MaxWorkers <= 0 {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
-	}
-	// Unlimited is left unlimited: substituting a finite default here would
-	// discard a user's explicit "no bound" with no report. The worker's
-	// class-B source ceiling is enforced at the admission sites below, which
-	// is where a file that exceeds it is reported unavailable.
-	if o.MaxParseFileBytes.Exceeded(wire.MaxSourceBytes) {
-		return nil, invalidOption(fmt.Sprintf("max parse file bytes %d exceed the worker's %d-byte source ceiling", o.MaxParseFileBytes, wire.MaxSourceBytes))
 	}
 	if o.WorkerMemoryBytes <= 0 {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given a %d-byte worker reservation; it needs a positive one", o.WorkerMemoryBytes))
@@ -245,9 +234,11 @@ func (p *Provider) Close() { p.pool.close() }
 // IndexUnit indexes the one file the unit's scope key names. The run always
 // reports succeeded when facts were produced or the file was honestly
 // skipped, with the capability state for the file's scope saying fresh,
-// partial (syntax errors or a record bound reached) or unavailable (over the
-// size limit, not UTF-8, or not a supported language); an unhealthy worker is
-// replaced and the parse retried once; anything else fails the unit.
+// partial (syntax errors, a query that exceeded its match limit, or a bound
+// the builder disclosed) or unavailable (over max_parse_file_bytes, wider than
+// the parser can address, not UTF-8, or not a supported language); an
+// unhealthy worker is replaced and the parse retried once; anything else fails
+// the unit.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 	p.enterStage(ctx)
 	defer p.leaveStage(ctx)
@@ -271,7 +262,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !ok {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) || fv.Size > wire.MaxSourceBytes {
+	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) || fv.Size > wire.MaxSourceOffset {
 		return finish(model.CapabilityUnavailable, model.CodeResourceLimit)
 	}
 	src, err := p.read(ctx, req.Content, fv)
@@ -282,8 +273,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !utf8.Valid(src) {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint32(len(src)),
-		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
+	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src))}, src)
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
@@ -409,11 +399,13 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 	if !ok {
 		return Probe{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "no pinned grammar for " + bound(relPath, 256)}
 	}
-	if p.opts.MaxParseFileBytes.Exceeded(int64(len(src))) || int64(len(src)) > wire.MaxSourceBytes {
+	if p.opts.MaxParseFileBytes.Exceeded(int64(len(src))) {
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file exceeds max parse file bytes"}
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint32(len(src)),
-		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
+	if int64(len(src)) > wire.MaxSourceOffset {
+		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file is longer than the parser's byte offsets can address"}
+	}
+	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint64(len(src))}, src)
 	if err != nil {
 		return Probe{}, err
 	}
