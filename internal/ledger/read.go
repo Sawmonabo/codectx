@@ -429,66 +429,49 @@ func (r *Reader) LiveStage(ctx context.Context) (stage string, live bool, err er
 	return stage, true, nil
 }
 
-// A RecordedPeak is the largest process-tree peak this ledger ever recorded
-// for one scope key, across every run it still holds. PeakBytes is a
-// measurement that was actually taken: a scope whose spans carry no peak has
-// no RecordedPeak at all, because "nothing sampled this tree" and "this tree
-// used no memory" are different facts and a zero would state the second.
-type RecordedPeak struct {
-	ScopeKey  string
-	PeakBytes int64
-}
-
-// RecordedPeaks is what this workspace has already measured its own heavy work
-// to cost: for each scope key, the largest peak resident size any span
-// recorded for it, largest first, at most limit rows.
+// RecordedPeak is the largest process-tree peak this ledger holds for one
+// scope of a repository, and whether one is held at all. It is two indexed
+// reads of the high-water table and never a scan: the scope's own row by its
+// key, and only where that row is absent and familyPrefix is not empty, the
+// largest row whose key begins with familyPrefix -- a range over the same key,
+// bounded by that family's own scopes.
 //
-// It is one indexed-free aggregate over the spans table per reading and never
-// one per scope: a caller takes this page once and answers every scope from
-// it, so the cost of consulting the history does not grow with the number of
-// units consulting it. limit is the explicit finite bound Section 6 requires;
-// a limit outside (0, model.MaxRecordsPerResult] takes that ceiling. Ordering
-// by the peak descending is what makes the truncation safe to reason about --
-// a page that could not hold every scope holds the largest measurements, which
-// are the ones an under-reservation would be built on.
-//
-// Only peaks above zero are answered. A recorded zero is a real measurement,
-// but it can never raise anything a caller derived, so carrying it would spend
-// a row of the bound on a figure with no effect; a NULL peak is not a
-// measurement at all and is excluded by the same clause.
-func (r *Reader) RecordedPeaks(ctx context.Context, limit int) ([]RecordedPeak, error) {
-	if limit <= 0 || limit > model.MaxRecordsPerResult {
-		limit = model.MaxRecordsPerResult
-	}
-	const query = `SELECT scope_key, MAX(peak_rss_bytes) AS peak FROM spans
-		WHERE peak_rss_bytes > 0 AND scope_key <> ''
-		GROUP BY scope_key ORDER BY peak DESC, scope_key LIMIT ?`
-	rows, err := r.db.QueryContext(ctx, query, limit)
+// The second result is the answer. A scope nothing ever sampled, a family
+// with no measured scope and a repository that has never run a heavy unit all
+// answer false with a zero the caller must not read: the table holds only
+// measurements above zero, so a zero here can only mean "no row", and a peak
+// of zero answered as observed would be a reservation of nothing.
+func (r *Reader) RecordedPeak(ctx context.Context, repositoryID, scopeKey, familyPrefix string) (int64, bool, error) {
+	repo, err := model.DecodeID(repositoryID)
 	if err != nil {
-		return nil, wrap("read the recorded peaks", err)
+		return 0, false, err
 	}
-	defer rows.Close()
-	out := make([]RecordedPeak, 0, limit)
-	for rows.Next() {
-		var row RecordedPeak
-		var peak sql.NullInt64
-		if err := rows.Scan(&row.ScopeKey, &peak); err != nil {
-			return nil, wrap("read the recorded peaks", err)
-		}
-		// MAX over a group is NULL where the group holds no measurement. The
-		// WHERE clause already excludes such groups; the guard stands because
-		// reading a NULL back as the zero database/sql would give is exactly
-		// how an absent observation becomes a peak of zero, and a peak of zero
-		// answered as observed would collapse the figure a caller derives from
-		// it.
-		if !peak.Valid || peak.Int64 <= 0 {
-			continue
-		}
-		row.PeakBytes = peak.Int64
-		out = append(out, row)
+	var peak int64
+	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
+		WHERE repository_id = ? AND scope_key = ?`, repo, scopeKey).Scan(&peak)
+	if err == nil {
+		return peak, true, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, wrap("read the recorded peaks", err)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, wrap("read the scope's recorded peak", err)
 	}
-	return out, nil
+	if familyPrefix == "" {
+		return 0, false, nil
+	}
+	// The upper bound is the prefix with its last byte raised by one, which
+	// is the first key that no longer begins with it, so the range reads the
+	// family's rows off the primary key and nothing past them. A family
+	// prefix ends in its separator, so that byte is never the largest one.
+	upper := []byte(familyPrefix)
+	upper[len(upper)-1]++
+	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
+		WHERE repository_id = ? AND scope_key >= ? AND scope_key < ?
+		ORDER BY peak_rss_bytes DESC LIMIT 1`, repo, familyPrefix, string(upper)).Scan(&peak)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, wrap("read the family's recorded peak", err)
+	}
+	return peak, true, nil
 }

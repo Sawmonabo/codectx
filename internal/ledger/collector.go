@@ -485,7 +485,26 @@ func endSpan(ctx context.Context, tx *sql.Tx, e event) (SpanRow, error) {
 		nullBytes(m.PeakRSSBytes), nullBytes(m.ReadBytes), nullBytes(m.WriteBytes), row.ItemsIn, row.ItemsOut,
 		string(e.outcome), m.DiagnosticCode, m.Failure,
 		s.run.id, s.seq)
-	return row, wrap("close a span", err)
+	if err != nil {
+		return row, wrap("close a span", err)
+	}
+	return row, raisePeak(ctx, tx, s, m.PeakRSSBytes)
+}
+
+// raisePeak folds a span's measured process-tree peak into its scope's
+// high-water row, in the same transaction as the span's end. Only a
+// measurement above zero is folded: an absent one is no observation, and a
+// zero can never raise the row, so neither writes anything. A span with no
+// scope key describes no scope a planner could ask about.
+func raisePeak(ctx context.Context, tx *sql.Tx, s *Span, peak *uint64) error {
+	if peak == nil || *peak == 0 || s.scopeKey == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO scope_peaks(repository_id, scope_key, peak_rss_bytes)
+		VALUES(?, ?, ?) ON CONFLICT(repository_id, scope_key)
+		DO UPDATE SET peak_rss_bytes = max(peak_rss_bytes, excluded.peak_rss_bytes)`,
+		s.run.repo, s.scopeKey, int64(*peak))
+	return wrap("record the scope's peak", err)
 }
 
 // nullInt and nullBytes render an absent measurement as SQL NULL rather than

@@ -147,13 +147,14 @@ func recordReclaim(ctx context.Context, freedBefore int64) {
 	span.End(ledger.OutcomeOK, ledger.Measured{ItemsOut: &freed, CPUUnattributed: ledger.CPUOverlapped}, nil)
 }
 
-// sweepLedger is the whole of the ledger file's bound, one page per pass: the
+// sweepLedger is the whole of the run history's bound, one page per pass: the
 // overlay runs of processes that are gone, which belong to no generation and
 // outlive nothing but their own process, and then everything past this
-// repository's last ledger.RetainedRuns runs. Nothing else deletes a ledger
-// row, so a run's account survives for as many runs as the bound names --
-// including the run that built the store, whose generation retention deletes
-// as soon as a later one of the same ref exists.
+// repository's last ledger.RetainedRuns runs. Nothing else deletes a run, so a
+// run's account survives for as many runs as the bound names -- including the
+// run that built the store, whose generation retention deletes as soon as a
+// later one of the same ref exists. The learned peaks are not runs and are not
+// swept here: a plan retires them, by the scopes it names.
 //
 // It is called from the collection pass because that is where the process
 // already reclaims what nothing references, and because both sweeps skip a run
@@ -180,7 +181,7 @@ func (c *Coordinator) sweepLedger(ctx context.Context) {
 		err = c.opts.Ledger.SweepRuns(ctx, string(c.repo), int64(active))
 	}
 	if err != nil {
-		logTyped(c.log, "the ledger runs no generation will collect were not swept", err,
+		logTyped(c.log, "the run ledger's history was not swept", err,
 			"component", component, "repository_id", string(c.repo))
 	}
 }
