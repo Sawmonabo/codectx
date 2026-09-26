@@ -168,6 +168,12 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     or label is scoped to an implicit block of its own, as a braced body
 //     is: a function declaration there is hoisted within it and binds its
 //     name there, never an enclosing variable of the same name.
+//   - A with statement (ECMA-262 §14.11) is a Stmt node spanning its object,
+//     which is evaluated and read, then its body. Given up: that a name in
+//     the body resolves to one of the object's properties, not to the
+//     variable it names; it depends on the object's shape at run time, and
+//     `with` is excluded from strict code (§14.11.1), so modules and classes
+//     never contain it. A body name is the variable it names.
 //   - `export { … }`, `export * from …` and `export { … } from …` evaluate
 //     nothing where they stand (they declare the module's export bindings),
 //     so they make no node, as an import statement makes none.
@@ -218,10 +224,12 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // object literals, JSX elements, and the TypeScript wrappers that evaluate
 // to their operand.
 //
-// A node that defines v while the statement still holds a read of v from
-// before it (`f(x, x = 1)`) reads v before writing it and hands that earlier
-// value to the consumer through an owned variable (a MayDef), which replaces
-// the held reads; a read another node carried (a condition's, a capture) is
+// A read the consumer folds that the statement makes before a node
+// redefines its variable (`f(x, x = 1)`) is carried by that node, as Uses in
+// Lowering states: the node Uses v and may-defines an owned variable that
+// replaces the held reads of v. JavaScript evaluates operands left to right
+// (ECMA-262 §13.3.8.1 ArgumentListEvaluation, §13.15.4), so source order is
+// the language's. A read another node carried (a condition's, a capture) is
 // no longer held.
 //
 // # Exceptions
@@ -239,6 +247,11 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // the right side's nodes, and the store throws on the write's node after
 // them. The Builder applies MayThrow only inside an open catch or finally
 // frame, where the throwing node's own definitions do not reach the handler.
+// An operator is not counted, arithmetic and comparison alike, although
+// either can throw through ToPrimitive (§7.1.1) when an operand is an
+// object whose valueOf or toString throws, and `in` and `instanceof` throw
+// on a non-object: counting them would make almost every node a throw
+// point, and the calls they make are those of the operand's own methods.
 //
 // # Scoping
 //
