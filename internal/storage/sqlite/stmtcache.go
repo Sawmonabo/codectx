@@ -5,29 +5,34 @@ import (
 	"database/sql"
 )
 
-// stmtCache holds the prepared statements of ONE write transaction.
+// stmtCache holds the prepared statements of ONE ingestion group.
 //
 // The unit writer's hot loops -- a fact's input-file check, a relation
 // endpoint's canonical lookup, an evidence row's native-key probe, the
-// dictionary upserts and the evidence insert -- issue the SAME handful of SQL
-// texts once per row. Handed straight to *sql.Tx, each of those calls prepares
-// the statement, runs it and finalises it, so the engine PARSES the text again
-// for every row: measured on a single unit holding 16 000 node facts and
-// 16 000 relation facts, sqlite3Prepare accounted for a quarter of the whole
-// publication's CPU, all of it re-parsing a dozen distinct queries.
+// dictionary upserts and the evidence insert -- and the seal's checks issue the
+// SAME handful of SQL texts once per row or once per unit. Handed straight to
+// *sql.Tx, each of those calls prepares the statement, runs it and finalises
+// it, so the engine PARSES the text again for every row: measured on a single
+// unit holding 16 000 node facts and 16 000 relation facts, sqlite3Prepare
+// accounted for a quarter of the whole publication's CPU, all of it re-parsing
+// a dozen distinct queries.
 //
-// The cache prepares each text once per transaction and reuses the handle for
-// every subsequent row, the single-held-statement pattern the read paths
-// use. It changes no SQL, no bound value and no
-// result: a *sql.Stmt prepared on a Tx runs on that Tx, so the rows a cached
-// statement sees are exactly the rows the ad-hoc call saw.
+// The cache prepares each text once per group and reuses the handle for every
+// later row, batch and unit the group holds, the single-held-statement pattern
+// the read paths use. It changes no SQL, no bound value and no result: a
+// *sql.Stmt prepared on a Tx runs on that Tx, so the rows a cached statement
+// sees are exactly the rows the ad-hoc call saw, and a savepoint rolled back
+// inside the group leaves the prepared statements valid.
 //
-// Lifetime is the transaction's. Every statement is closed when the
-// transaction's closure returns, and the cache is bound to the *sql.Tx it was
-// built for: a caller that reaches it with a different transaction gets a
-// statement prepared on that transaction instead, never a handle from a
-// finished one. Size is the number of DISTINCT SQL texts in the writer's
-// paths -- a dozen -- and never a function of rows, facts or repository size.
+// Lifetime is the group's. The writer goroutine creates the cache when it
+// begins the group's transaction and closes it when it commits or abandons
+// the group (open.go), before the transaction ends; an exclusive write keeps
+// no cache. The cache is bound to the *sql.Tx it was built for: a caller that
+// reaches it with a different transaction gets a statement prepared on that
+// transaction instead, never a handle from a finished one. Only the writer
+// goroutine touches it, so it needs no lock. Size is the number of DISTINCT
+// SQL texts in the writer's paths -- a dozen -- and the seal's nine, and never
+// a function of rows, facts, units or repository size.
 type stmtCache struct {
 	tx *sql.Tx
 	by map[string]*sql.Stmt
@@ -58,11 +63,11 @@ func (c *stmtCache) prepare(ctx context.Context, tx *sql.Tx, query string) (stmt
 	return stmt, true, nil
 }
 
-// close finalises every statement the transaction prepared through the cache.
-// It is called as the transaction's closure returns; the error of a Close is
-// dropped deliberately, as SQLite reports a statement's real failure from the
-// step that produced it and this one runs on the way out of a path that has
-// already decided its outcome.
+// close finalises every statement the group prepared through the cache. It
+// is called as the group ends, before its transaction commits or rolls back;
+// the error of a Close is dropped deliberately, as SQLite reports a
+// statement's real failure from the step that produced it and this one runs
+// on the way out of a group whose outcome is already decided.
 func (c *stmtCache) close() {
 	if c == nil {
 		return
@@ -75,7 +80,7 @@ func (c *stmtCache) close() {
 
 // queryRow, query and exec are the three call shapes the writer's per-row
 // helpers use. Each runs through the cached handle, so the text is parsed once
-// per transaction instead of once per row.
+// per group instead of once per row.
 // A *sql.Row is scanned by its caller, so the statement behind it must outlive
 // this call: when the cache cannot own the handle -- it is nil, or it belongs
 // to another transaction -- the query goes to the transaction itself rather
