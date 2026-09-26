@@ -233,19 +233,21 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"[x + k for x in xs if x]@22 -> return [x + k for x in xs if x]@15"},
 		},
 		{
-			// §6.2.4, the comprehension itself (callable 2). Nodes: for x in
-			// xs@29 (head, reading nothing of its own), x@33 (target),
-			// x@44 (if clause), x + k@23 (element). Succ: head→{x@33,
-			// EXIT}; x@33→x@44→{x + k, head}; x + k→head. IPDom: x@33 →
-			// x@44 → head → EXIT; x + k → head.
+			// §6.2.4, the comprehension itself (callable 2): its first
+			// iterable's iterator is an implicit argument. Nodes: xs@38 (the
+			// parameter-like node defining the iteration variable), for x in
+			// xs@29 (head, Using it), x@33 (target, Using it), x@44 (if
+			// clause), x + k@23 (element). Succ: xs@38→head; head→{x@33,
+			// EXIT}; x@33→x@44→{x + k, head}; x + k→head. IPDom: xs@38 →
+			// head; x@33 → x@44 → head → EXIT; x + k → head.
 			name:     "a comprehension is its own callable with its clauses as nested loops",
 			protects: "each for clause is a loop head, an if clause's false edge continues with the next element, and the element is control dependent on the if clause, which is control dependent on the head",
-			mutation: "lower an if clause's false edge to the comprehension's exit (the head no longer post-dominates x@44, and x@44 -> for x in xs@29 appears)",
+			mutation: "lower an if clause's false edge to the comprehension's exit (the head no longer post-dominates x@44, and x@44 -> for x in xs@29 appears), or give the first iterable no node in the comprehension's graph (xs@38 -> for x in xs@29 and xs@38 -> x@33 disappear)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       2,
 			cd: []string{"for x in xs@29 -> x@33", "for x in xs@29 -> x@44", "for x in xs@29 -> for x in xs@29",
 				"x@44 -> x + k@23"},
-			du: []string{"x@33 -> x@44", "x@33 -> x + k@23"},
+			du: []string{"xs@38 -> for x in xs@29", "xs@38 -> x@33", "x@33 -> x@44", "x@33 -> x + k@23"},
 		},
 		{
 			// §6.14. Lines at 0, 10, 31. Nodes: a@6, lambda b: a + b@15
@@ -628,6 +630,23 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"y = (x := 1) + (x := 2)@10 -> return y@35"},
 		},
 		{
+			// §6.12, §6.16: operands are evaluated left to right, so the
+			// first x is read before either assignment expression. Lines at
+			// 0, 10, 39. Nodes: x@6, x := 1@20 (Uses the earlier x, defines
+			// x, may-defines a variable carrying the earlier value and its
+			// own result variable), x := 2@31 (defines x, may-defines its
+			// result variable; the held read of x is no longer the name),
+			// y = x + (x := 1) + (x := 2)@11 (Uses the carried value and
+			// the two result variables), return y@40.
+			name:     "a read made before an assignment expression reaches its consumer through the assignment's node",
+			protects: "the x the consumer read first pairs with the node that carried it, and a later assignment expression to x in the same statement does not re-read it",
+			mutation: "keep the name in the held reads after the first assignment expression reads it (x := 1@20 -> x := 2@31 appears: the second one re-reads the x the first one wrote)",
+			src:      "def f(x):\n y = x + (x := 1) + (x := 2)\n return y\n",
+			fn:       1,
+			du: []string{"x@6 -> x := 1@20", "x := 1@20 -> y = x + (x := 1) + (x := 2)@11",
+				"x := 2@31 -> y = x + (x := 1) + (x := 2)@11", "y = x + (x := 1) + (x := 2)@11 -> return y@40"},
+		},
+		{
 			// §6.14, §7.2. Lines at 0, 10, 25. Nodes: k@6, lambda: k@15 (the
 			// creating node: captures k, defines the result variable), k =
 			// lambda: k@11 (Uses the result variable, defines k), return
@@ -658,12 +677,12 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §6.2.4, the comprehension itself (callable 2): a later for
 			// clause's iterable is evaluated once per step of the clause
-			// before it. Lines at 0, 11. Nodes: for x in xs@22 (head, Using
-			// nothing: its iterator is the enclosing function's), x@26
-			// (target), x@43 (the second clause's iterable: Uses x, defines
+			// before it. Lines at 0, 11. Nodes: xs@31 (the first iterable's
+			// parameter-like node, defining its iteration variable), for x in
+			// xs@22 (head, Using it), x@26 (target, Using it), x@43 (the second clause's iterable: Uses x, defines
 			// its iteration variable), for y in x@34 (head, Using that
-			// variable), y@38 (target, Using it), y@20 (element). Succ: for
-			// x→{x@26, EXIT}; x@26→x@43→for y; for y→{y@38, for x};
+			// variable), y@38 (target, Using it), y@20 (element). Succ:
+			// xs@31→for x; for x→{x@26, EXIT}; x@26→x@43→for y; for y→{y@38, for x};
 			// y@38→y@20→for y. IPDom: for x → EXIT; x@26 → x@43 → for y →
 			// for x; y@38 → y@20 → for y.
 			name:     "a later comprehension clause's head and target read its iteration variable",
@@ -674,7 +693,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			cd: []string{"for x in xs@22 -> x@26", "for x in xs@22 -> x@43", "for x in xs@22 -> for y in x@34",
 				"for x in xs@22 -> for x in xs@22", "for y in x@34 -> y@38", "for y in x@34 -> y@20",
 				"for y in x@34 -> for y in x@34"},
-			du: []string{"x@26 -> x@43", "x@43 -> for y in x@34", "x@43 -> y@38", "y@38 -> y@20"},
+			du: []string{"xs@31 -> for x in xs@22", "xs@31 -> x@26",
+				"x@26 -> x@43", "x@43 -> for y in x@34", "x@43 -> y@38", "y@38 -> y@20"},
 		},
 	})
 }
