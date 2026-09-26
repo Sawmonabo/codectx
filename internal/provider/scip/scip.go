@@ -111,17 +111,6 @@ func ImportScope(path string) string { return scopeImport + path }
 // is for it.
 func ProfileScope(name, root string) string { return scopeProfile + name + ":" + root }
 
-// ProfileRoot is the project directory a profile scope key of kind k names,
-// and whether the key is one of that kind at all. It is how a caller outside
-// this package reads a key without owning its spelling.
-func ProfileRoot(key string, k Kind) (string, bool) {
-	name, root, ok := splitProfileScope(key)
-	if !ok || name != string(k) {
-		return "", false
-	}
-	return root, true
-}
-
 // splitProfileScope takes a profile scope key apart into the indexer name and
 // the project directory it is rooted at. The kind name holds no colon, so the
 // first one separates them and every later one belongs to the directory.
