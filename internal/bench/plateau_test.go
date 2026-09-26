@@ -5,13 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -126,7 +126,7 @@ func TestParserResourcePlateau(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		MaxWorkers: 1, WorkerMemoryBytes: 256 << 20, Admission: benchAdmission(),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
@@ -281,8 +281,11 @@ func TestIncrementalReuse(t *testing.T) {
 	if err := os.MkdirAll(parsers, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// One ledger for the whole stack, as production composes it: the parser
+	// workers and the coordinator's heavy units reserve on the same one.
+	admit := benchAdmission()
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		WorkerMemoryBytes: 256 << 20, Admission: admit,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +307,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: admit,
 		CAS: cas, Lock: heldLock{lock}, Pool: pool})
 	if err != nil {
 		t.Fatal(err)
@@ -352,11 +355,12 @@ func (h heldLock) Hold(context.Context, index.HoldIntent) (*snapshot.WorkspaceLo
 	return h.l, func() error { return nil }, nil
 }
 
-// benchAdmission is the process memory admission ledger heavy units are
-// admitted against. Production composes exactly one and hands it to every
-// reserver; these tests run fake units, so the allocation is simply wide
-// enough that admission never orders them -- what the ledger admits and when
-// is proved where the ledger lives.
+// benchAdmission is the memory admission ledger one composed stack reserves
+// on: its heavy units and its parser workers alike. Production composes
+// exactly one per process and hands it to every reserver, so a test binds one
+// per stack and passes the same ledger to each constructor. The allocation is
+// wide enough that admission never orders what these tests run -- what the
+// ledger admits and when is proved where the ledger lives.
 func benchAdmission() *admission.Ledger {
 	l, err := admission.NewLedger(64<<30, 64<<30)
 	if err != nil {
