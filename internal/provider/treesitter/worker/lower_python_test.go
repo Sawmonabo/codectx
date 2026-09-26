@@ -413,7 +413,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// (c)@34 (one of two targets, spanning itself, kills c), return
 			// a, b, c@39. The parameters' definitions are all killed.
 			name:     "parenthesized and list del targets kill the names they hold",
-			protects: "`del(x)`, `del [x]` and `del (a), b` delete names like `del x`, rather than failing to lower the function",
+			protects: "`del(a)`, the list element of `del [b], (c)` and its parenthesized target delete names like `del x`, rather than failing to lower the function",
 			mutation: "recurse into a parenthesized target with no statement span (the lowering panics spanning nil), or treat a list target as a plain value (b@9 -> return a, b, c@39 replaces b@30 -> return a, b, c@39)",
 			src:      "def f(a, b, c):\n del(a)\n del [b], (c)\n return a, b, c\n",
 			fn:       1,
@@ -706,6 +706,44 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"for y in x@34 -> for y in x@34"},
 			du: []string{"xs@31 -> for x in xs@22", "xs@31 -> x@26",
 				"x@26 -> x@43", "x@43 -> for y in x@34", "x@43 -> y@38", "y@38 -> y@20"},
+		},
+		{
+			// §7.12: a name declared global in a function is no variable of
+			// it, so g resolves to no variable in every position here (k's own
+			// global declaration makes k's write one too). Lines at 0, 14, 24,
+			// 31, 40, 49, 63, 78, 85, 99, 106, 120, 127, 133, 139, 155, 162,
+			// 172, 183, 191. Nodes: xs@6, m@10 (params), g = 1@25 (assignment
+			// target), g += xs@32 (compound: Uses xs only), g.p = m@41 (the
+			// base of a written attribute: Uses m, may-defines nothing), g :=
+			// 2@55 (embedded: defines the result variable), y = (g := 2)@50,
+			// lambda: g@68 (captures nothing), h = lambda: g@64, del g@79
+			// (deleted), xs@95 (the iterable), g in xs@90 (head), g@90
+			// (iterated target), m as g@112 (with target: defines nothing,
+			// may-defines the manager), with m as g@107 (the exit), h()@135
+			// (may throw), except@140 (Handler), E@147 (a free name: Uses
+			// nothing), g@152 (the except target), except E as g: pass@140
+			// (the deletion of g, still made), def k(): global g g = 3@163
+			// (defines k, may-defines nothing), return y, h, k@192. Succ:
+			// head→{g@90, m as g}; g@90→head; h()→{def k, except};
+			// except→E→{g@152, EXIT (the re-raise)}; g@152→deletion→def k.
+			// IPDom: head → m as g; E, h() → EXIT; g@152 → deletion → def k.
+			name:     "a name that resolves to no variable is a node in every position and defines and reads nothing",
+			protects: "an unresolved assignment, compound, attribute-base, embedded, captured, deleted, iterated, with, except and nested-write name makes its node and no definition or use, and never reaches the Builder or the read tables as -1",
+			mutation: "drop def's or read's v < 0 return (Builder.Def or Use panics on -1, or seen is indexed by -1), mayDefBase's v >= 0 test (Builder.MayDef panics on -1), or site's v >= 0 filter on a nested callable's writes (Builder.MayDef panics on -1); or make the except clause's finally and deleting node only for a variable of the function (except E as g: pass@140 disappears, and E@147 -> except E as g: pass@140 with it)",
+			src: "def f(xs, m):\n global g\n g = 1\n g += xs\n g.p = m\n y = (g := 2)\n h = lambda: g\n del g\n" +
+				" for g in xs:\n  pass\n with m as g:\n  pass\n try:\n  h()\n except E as g:\n  pass\n" +
+				" def k():\n  global g\n  g = 3\n return y, h, k\n",
+			fn: 1,
+			cd: []string{"g in xs@90 -> g@90", "g in xs@90 -> g in xs@90",
+				"h()@135 -> except@140", "h()@135 -> E@147", "h()@135 -> def k(): global g g = 3@163",
+				"h()@135 -> return y, h, k@192",
+				"E@147 -> g@152", "E@147 -> except E as g: pass@140", "E@147 -> def k(): global g g = 3@163",
+				"E@147 -> return y, h, k@192"},
+			du: []string{"xs@6 -> g += xs@32", "m@10 -> g.p = m@41", "g := 2@55 -> y = (g := 2)@50",
+				"lambda: g@68 -> h = lambda: g@64", "xs@6 -> xs@95", "xs@95 -> g in xs@90", "xs@95 -> g@90",
+				"m@10 -> m as g@112", "m as g@112 -> with m as g@107", "h = lambda: g@64 -> h()@135",
+				"y = (g := 2)@50 -> return y, h, k@192", "h = lambda: g@64 -> return y, h, k@192",
+				"def k(): global g g = 3@163 -> return y, h, k@192"},
 		},
 	})
 }
