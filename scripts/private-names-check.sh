@@ -25,7 +25,10 @@
 # Usage:
 #   sh scripts/private-names-check.sh                      tracked paths and content
 #   sh scripts/private-names-check.sh --messages <range>   commit messages in <range>
-# Exit 1 lists every hit.
+# Exit 1 lists every hit. The check fails closed: when git cannot list the
+# tracked files or the commits, when it lists no tracked file, when a tracked
+# file cannot be read, or when the scanner cannot run, it exits 2 with the
+# reason and never reports clean.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -64,12 +67,17 @@ e49d63b2a8a78f048bafc4b4590029603a5a4165ee8bf98af15d62f24cd83479
 fcea588a704287278eb5c63a328ad401d647f09b4cf328192dab65fbe583c33c
 '
 
-# The scanner reads NUL-separated records on stdin: in files mode each record
-# is a tracked path whose name and content are checked; in messages mode each
-# record is a commit id, a newline, and that commit's message.
+# The scanner runs the git command it is given (every argument after the hash
+# list) and reads its NUL-separated records: in files mode each record is a
+# tracked path whose name and content are checked; in messages mode each record
+# is a commit id, a newline, and that commit's message. It exits 0 when clean,
+# 1 when it found a hit, and 2 when it could not check everything: git failed
+# or listed no tracked file, or a tracked file could not be read.
 scan='
 use strict; use warnings; use Digest::SHA qw(sha256_hex);
-my ($mode, $list) = @ARGV;
+my ($mode, $list, @git) = @ARGV;
+my $failed = 0;
+sub failure { print STDERR "private-names-check: $_[0]\n"; $failed++; }
 my %bad = map { $_ => 1 } grep { length } split /\s+/, $list;
 my %seen; my $hits = 0;
 sub hit {
@@ -91,9 +99,12 @@ sub check {
     if (@found) { $hits++; print "$where: private token (sha256 $found[0])\n"; return; }
   }
 }
+open(my $in, q(-|), @git) or do { failure("cannot run @git: $!"); exit 2; };
 local $/ = "\0";
-while (my $rec = <STDIN>) {
+my $records = 0;
+while (my $rec = <$in>) {
   chomp $rec;
+  $records++;
   if ($mode eq q(messages)) {
     my ($id, $body) = split /\n/, $rec, 2;
     my $n = 0;
@@ -101,8 +112,10 @@ while (my $rec = <STDIN>) {
     next;
   }
   check("$rec (file name)", $rec);
-  open(my $fh, q(<:raw), $rec) or next;
-  my $data = do { local $/; <$fh> } // q();
+  my $fh;
+  unless (open($fh, q(<:raw), $rec)) { failure("$rec: cannot open: $!"); next; }
+  my $data = do { local $/; <$fh> };
+  unless (defined $data) { failure("$rec: cannot read: $!"); close $fh; next; }
   close $fh;
   if (index(substr($data, 0, 8000), "\0") >= 0) {
     while ($data =~ /([\x20-\x7e]{4,})/g) { check("$rec (binary, byte " . ($-[1]) . ")", $1); }
@@ -111,21 +124,31 @@ while (my $rec = <STDIN>) {
   my $n = 0;
   for my $line (split /\n/, $data) { $n++; check("$rec:$n", $line); }
 }
-exit($hits ? 1 : 0);
+close($in) or failure("@git failed" . ($! ? ": $!" : " with exit status " . ($? >> 8)));
+failure("@git listed no tracked file") if $mode eq q(files) && !$records;
+exit($failed ? 2 : $hits ? 1 : 0);
 '
 
+# verdict turns the scanner's exit status into the guard's: clean, the hits
+# already listed, or a check that did not complete, which is never clean.
+verdict() {
+  case "$1" in
+  0) echo "private-names-check: ${2:+$2 }clean" ;;
+  1) exit 1 ;;
+  *)
+    echo "private-names-check: ${2:-tracked files} NOT checked (exit $1)" >&2
+    exit 2
+    ;;
+  esac
+}
+
+status=0
 if [ "${1:-}" = "--messages" ]; then
   range="${2:?usage: private-names-check.sh --messages <rev-range>}"
-  if git log -z --format='%H%n%B' "$range" | perl -e "$scan" messages "$hashes"; then
-    echo "private-names-check: commit messages in $range clean"
-  else
-    exit 1
-  fi
+  perl -e "$scan" messages "$hashes" git log -z --format='%H%n%B' "$range" || status=$?
+  verdict "$status" "commit messages in $range"
   exit 0
 fi
 
-if git ls-files -z | perl -e "$scan" files "$hashes"; then
-  echo "private-names-check: clean"
-else
-  exit 1
-fi
+perl -e "$scan" files "$hashes" git ls-files -z || status=$?
+verdict "$status" ""

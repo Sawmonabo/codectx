@@ -39,8 +39,19 @@
 # The private-name guard (scripts/private-names-check.sh) runs here too, over
 # every tracked path and its content, so one check fails on either kind of
 # reference and both lists are printed.
+#
+# The check fails closed: when git cannot list the tracked files, when it lists
+# none, or when a tracked file cannot be searched, it exits 2 with the reason
+# and never reports clean. Each stage writes to a file whose status is checked,
+# because a pipeline's status is only its last command's.
 set -eu
 cd "$(dirname "$0")/.."
+fail() {
+  echo "tracked-refs-check: $* (NOT checked)" >&2
+  exit 2
+}
+tmp="$(mktemp -d)" || fail "cannot create a scratch directory"
+trap 'rm -rf "$tmp"' EXIT
 LC_ALL=C
 export LC_ALL
 w='(^|[^A-Za-z0-9_])'
@@ -53,21 +64,30 @@ pattern="$pattern|${w}[Nn]ative-cor[e]([^A-Za-z]|\$)|${w}[Rr]evie[w] (finding|ro
 pattern="$pattern|${w}[Rr]ulin[g] [A-Z]+-?[0-9]"
 home="${w}/(hom[e]|User[s])/[A-Za-z0-9._-]+"
 allowed='/(hom[e]|User[s])/(tester|private|example-user)([^A-Za-z0-9._-]|$)'
-hits="$(git ls-files -z | grep -zv -E '^\.gitignore$' | xargs -0 grep -n -E "$pattern|$home" 2>/dev/null |
-  PATTERN="$pattern" HOMEPATH="$home" ALLOWED="$allowed" awk '{
+git ls-files -z >"$tmp/files" || fail "git ls-files failed"
+[ -s "$tmp/files" ] || fail "git ls-files listed no tracked file"
+grep -zv -E '^\.gitignore$' <"$tmp/files" >"$tmp/scan" || [ $? -eq 1 ] || fail "cannot filter the file list"
+# grep exits 1 when a batch has no match and 2 when it cannot read a file; the
+# wrapper turns 2 into 255, which stops xargs with a status of its own.
+xargs -0 -r sh -c 'grep -H -n -E -e "$0" -- "$@"; [ $? -le 1 ] || exit 255' "$pattern|$home" \
+  <"$tmp/scan" >"$tmp/matches" || fail "grep could not search every tracked file"
+hits="$(PATTERN="$pattern" HOMEPATH="$home" ALLOWED="$allowed" awk '{
     line = $0
     sub(/^[^:]*:[0-9]+:/, "", line)
     if (line ~ ENVIRON["PATTERN"]) { print; next }
     gsub(ENVIRON["ALLOWED"], " ", line)
     if (line ~ ENVIRON["HOMEPATH"]) print
-  }' || true)"
+  }' "$tmp/matches")" || fail "awk could not filter the matches"
 status=0
 if [ -n "$hits" ]; then
   echo "tracked files reference ignored or host-local paths or name the process:"
   echo "$hits"
   status=1
 fi
-sh scripts/private-names-check.sh || status=1
+names=0
+sh scripts/private-names-check.sh || names=$?
+[ "$names" -le 1 ] || fail "the private-name guard did not complete"
+[ "$names" -eq 0 ] || status=1
 if [ "$status" -ne 0 ]; then
   exit 1
 fi
