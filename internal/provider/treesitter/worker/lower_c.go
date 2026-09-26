@@ -190,12 +190,12 @@ const (
 //   - a statement expression: the node of its last statement (see
 //     Statement expressions);
 //   - an assignment, compound assignment or update embedded in a larger
-//     expression, whatever its target, is a node of its own: with a local
-//     target its value travels through that named variable, which the node
-//     defines and the consumer Uses (`(c = g()) != 0` Uses c); any other
-//     target's node (a field, index or pointer target, whose base it
-//     may-defines) defines an owned result, so `g(s.f = a)` is the node
-//     s.f = a and the call's node Using its result;
+//     expression, whatever its target, is a node of its own, and the
+//     consumer Uses its result, never the target, so `g((x = 1), (x = 2))`
+//     depends on both assignments: a local target is the node's definition,
+//     so the node may-defines the result; any other target's node (a field,
+//     index or pointer target, whose base it may-defines) defines it, so
+//     `g(s.f = a)` is the node s.f = a and the call's node Using its result;
 //   - a lambda's or nested function's creation: the creating node, which
 //     Uses the captures (see Captures).
 //
@@ -203,7 +203,10 @@ const (
 // defines the result, unless its own lowering made one node spanning it
 // that already hands its value on (an embedded assignment, a creating
 // node): a node defines one variable, so that node may-defines the result
-// instead.
+// instead. Each construct owns its result, so only its own yielding nodes
+// define it, and the may-definition gives the consumer the same pairs a
+// definition would (a value reaching through it from an earlier iteration
+// is one the consumer already pairs with).
 //
 // Folded into the node that evaluates them, their reads being that node's
 // own evaluation: every other operator (arithmetic, comparison, bitwise,
@@ -1835,10 +1838,11 @@ func (c *cLower) value(n *ts.Node) int32 {
 		}
 	case k.assignmentExpression, k.updateExpression:
 		// An embedded assignment or update is a node of its own, whatever
-		// its target. A local target is the named variable its value
-		// travels through; the node of any other target (a field, index or
-		// pointer target, whose base it may-defines, or a name that is no
-		// local) defines an owned result.
+		// its target, handing its value on through an owned result that the
+		// consumer Uses, never the target: a local target is the node's
+		// definition, so the node may-defines the result; the node of any
+		// other target (a field, index or pointer target, whose base it
+		// may-defines, or a name that is no local) defines it.
 		m := len(c.reads)
 		var id, v int32
 		if n.KindId() == k.assignmentExpression {
@@ -1848,8 +1852,10 @@ func (c *cLower) value(n *ts.Node) int32 {
 		}
 		switch {
 		case id >= 0 && v >= 0:
-			c.read(v)
-			return v
+			r := c.b.Var()
+			c.b.MayDef(id, r)
+			c.read(r)
+			return r
 		case id < 0:
 			id = c.node(flow.Stmt, n, m)
 		}

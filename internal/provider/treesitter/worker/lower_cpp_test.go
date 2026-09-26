@@ -195,5 +195,18 @@ func TestCppLoweringGolden(t *testing.T) {
 			du: []string{"p@8 -> p@27", "p@27 -> a@19", "p@27 -> b@22", "a@19 -> return a + b;@30",
 				"b@22 -> return a + b;@30"},
 		},
+		{
+			// [expr.ass]: an assignment's result is its left operand, and
+			// [expr.call]: the arguments are indeterminately sequenced, each
+			// evaluated completely before the call. Nodes: x@10, x = 1@25
+			// (defines x, may-defines its result), x = 2@34 (defines x,
+			// killing x = 1, may-defines its own result), return g((x = 1),
+			// (x = 2));@15 (Uses both results). Succ: a straight line to EXIT.
+			name:     "each embedded assignment to a local hands its own value to the consumer",
+			protects: "the consumer of two assignments to one local depends on both, since it Uses each assignment's result and not the local the second one overwrites",
+			mutation: "let the consumer Use the assigned local instead of each result (loses x = 1@25 -> return g((x = 1), (x = 2));@15)",
+			src:      "int f(int x) { return g((x = 1), (x = 2)); }",
+			du:       []string{"x = 1@25 -> return g((x = 1), (x = 2));@15", "x = 2@34 -> return g((x = 1), (x = 2));@15"},
+		},
 	})
 }
