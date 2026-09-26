@@ -576,6 +576,11 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 			"component", component, "repository_id", string(c.repo),
 			"units", b.failed, "published", published, "run_id", run.ID())
 	}
+	if err != nil && ctx.Err() != nil {
+		// Cancelled: settle has just put the sealed units back on the queue,
+		// so nothing is abandoned here.
+		return err
+	}
 	if err != nil {
 		// The sealed units are members of nothing but the work generation this
 		// tick just aborted, so the next retention pass collects them and the
@@ -616,6 +621,8 @@ type poppedUnit struct {
 // neither place. With requeue, every popped unit that did not fail goes back
 // to the head of the queue in the order it was popped -- unless a later base
 // activation replaced the queue, whose epoch this work no longer belongs to.
+// Handed-back units wake the background loop, so a cancelled Drain in a
+// process that keeps running leaves them to the loop rather than to nobody.
 func (l *lateSealer) settle(epoch int64, popped []*poppedUnit, requeue, publishing bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -626,10 +633,15 @@ func (l *lateSealer) settle(epoch int64, popped []*poppedUnit, requeue, publishi
 			back = append(back, pu.d)
 		}
 	}
-	if len(back) > 0 && l.state.epoch == epoch {
-		l.queue = append(back, l.queue...)
-	}
 	l.publishing = publishing
+	if len(back) == 0 || l.state.epoch != epoch {
+		return
+	}
+	l.queue = append(back, l.queue...)
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
 }
 
 // runOne builds one deferred unit in the work generation, under the heavy
