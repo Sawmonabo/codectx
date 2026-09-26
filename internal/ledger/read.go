@@ -277,9 +277,10 @@ func (r *Reader) read(ctx context.Context, now time.Time, row *sql.Row) (RunView
 // a running span's elapsed time and every span's share of the run's wall.
 // lapsed says the run's writer stopped refreshing its liveness, in which case a
 // span the run left open never finished and reads as interrupted rather than as
-// one that has been going ever since. The
-// page is model.MaxRecordsPerResult wide, the same bound every other list in
-// the product carries; one extra row is read to tell a full page from a
+// one that has been going ever since, and a span it left planned reads as never
+// admitted rather than as work still waiting to begin. The page is
+// model.MaxRecordsPerResult wide, the same bound every other list in the
+// product carries; one extra row is read to tell a full page from a
 // truncated one, and only a page that is actually truncated pays for the one
 // COUNT that says by how much. The count is a second statement rather than a
 // longer scan because the run's spans are indexed by (run_id, seq): counting
@@ -319,13 +320,20 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 		// Judged before the wall below, so an open span of a run whose writer
 		// died reports no measurement rather than an elapsed time that grows
 		// for as long as the row survives.
-		if lapsed && row.Outcome == OutcomeRunning {
-			// The same two columns a stopping collector writes, stated here
-			// rather than written: this reader must never touch the file, and
-			// a cut-off span with no reason reads as a failure whose cause was
-			// never recorded.
-			row.Outcome = OutcomeInterrupted
-			row.DiagnosticCode, row.Failure = model.CodeCanceled, ReasonInterrupted
+		// The same columns a stopping collector writes, stated here rather
+		// than written: this reader must never touch the file. A cut-off span
+		// with no reason reads as a failure whose cause was never recorded,
+		// and a unit still planned when its writer died was never admitted,
+		// exactly as sweepPlanned records it for a run that ended.
+		if lapsed {
+			switch row.Outcome {
+			case OutcomeRunning:
+				row.Outcome = OutcomeInterrupted
+				row.DiagnosticCode, row.Failure = model.CodeCanceled, ReasonInterrupted
+			case OutcomePlanned:
+				row.Outcome = OutcomeUnavailable
+				row.DiagnosticCode, row.Failure = model.CodeProviderUnavailable, ReasonNotAdmitted
+			}
 		}
 		if parent.Valid {
 			seq := parent.Int64
