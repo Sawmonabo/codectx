@@ -69,8 +69,11 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //   - A statement is one node: an expression statement spans its expression
 //     (a comma sequence at statement level is one statement per element), a
 //     declarator spans the declarator, return, throw, break and continue span
-//     the statement (kind Jump), a class declaration spans the declaration.
-//     An expression statement that is an assignment or update of an
+//     the statement (kind Jump), a class declaration spans the declaration,
+//     creates the class and defines its name. A break or continue whose
+//     label names no enclosing statement (an early error, ECMA-262 §8.3.2
+//     ContainsUndefinedBreakTarget, §8.3.3) is lowered as the tree stands:
+//     an unresolved jump, counted, with no successor. An expression statement that is an assignment or update of an
 //     identifier is its defining node, not a second node. `var x;` is a
 //     hoisted declaration and no node; `let x;` defines x.
 //   - A function declaration is hoisted: one node at the start of its block,
@@ -78,13 +81,13 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     a Stmt node spanning the declaration creates the function (see nested
 //     callables below) and may-defines the name, so a use after the
 //     declaration sees the captures read there.
-//   - A condition is one Branch node spanning the condition without its
-//     parentheses: if, while, do…while, for. A switch is a Stmt node for the
-//     discriminant then one Branch node per case test, in source order (each
-//     test is evaluated only when the previous failed), that Uses the
-//     discriminant's reads with its own, since it compares the two; a case
-//     body's end
-//     flows into the next body when it does not break. A for…in, for…of or
+//   - A condition is one Branch node spanning the condition as Spans in
+//     Lowering states: if, while, do…while, for. A switch is a Stmt node for
+//     the discriminant, spanned the same way (`switch (x)` spans x), then
+//     one Branch node per case test, in source order (each test is evaluated
+//     only when the previous failed), that Uses the discriminant's reads with
+//     its own, since it compares the two; a case body's end flows into the
+//     next body when it does not break. A for…in, for…of or
 //     for await…of loop follows the iteration model (see Iteration in
 //     Lowering; ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation): a Stmt node
 //     spanning the iterated expression Uses its reads and defines the
@@ -108,9 +111,16 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     `?.`, and one Stmt node spanning the whole chain on the non-nullish
 //     path.
 //   - Destructuring is one defining node per bound name, spanning the name,
-//     so D ≤ N. A default (`a = e` in a pattern or parameter) is a Branch
-//     node spanning the element that defines the name from the incoming
-//     value, then a Stmt node spanning e that defines it from the default.
+//     so D ≤ N; a declarator or assignment whose target is a pattern makes
+//     no node of its own, its element nodes standing for it. A default (`a =
+//     e` in a pattern or parameter) is a Branch node spanning the element
+//     that defines the name from the incoming value and Uses only that
+//     value's reads (a parameter's incoming value, the argument, reads
+//     none), then a Stmt node spanning e that defines it from the default
+//     and Uses only e's reads, since e is evaluated after the test. A catch
+//     parameter is bound by this rule on the handler path, after the
+//     Handler, from a value that reads no variable (a bare identifier is one
+//     defining node spanning it, Using nothing).
 //     Elements are lowered in source order: the language assigns them one at
 //     a time, each step may throw, and a default or computed key reads the
 //     elements assigned before it. Every element node carries every read of
@@ -132,7 +142,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     class's field initializers and static blocks, static and instance
 //     alike, are its class body's unit, lowered in source order: each
 //     initializer is the nodes of its value then one Stmt node spanning the
-//     field definition, and each static block is a block with its own var
+//     field definition, which ends before its `;` (the grammar makes the
+//     `;` a sibling in the class body), and each static block is a block with its own var
 //     scope. The class node in the enclosing function also captures them.
 //   - An expression lowered for its value and ended by a node spanning it (an
 //     expression statement, a conditional operand, an arrow's expression
@@ -260,12 +271,18 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     is bound to no variable throughout the body, since inside an
 //     initializer it names the member (the emitted body assigns each member
 //     as a property of the enum object and reads a member name as that
-//     property).
+//     property). A member's node Uses its initializer's reads only, never
+//     E: the emitted body reaches the enum object through the invoked
+//     function's own parameter E, not the enclosing variable. A member
+//     without an initializer makes no node: its value is a constant the
+//     compiler computes, and no source expression of it is evaluated.
 //   - A namespace with a body runs its body once, immediately, where it
 //     stands (the emitted immediately invoked function), so it is lowered
 //     inline, not as a callable: one Stmt node spanning the leftmost name
 //     of its path that Uses and defines that name, then the body as a block
-//     with its own var scope. A namespace named by a string is ambient.
+//     with its own var scope. A namespace the grammar places in an
+//     expression statement is that namespace, with no node of its own for
+//     the statement. A namespace named by a string is ambient.
 //   - `import x = require(m)` is one Stmt node spanning x that defines it
 //     and may throw; `import x = A.B` is one spanning x that Uses A and
 //     defines x, and may throw when it reads a property.
