@@ -49,26 +49,36 @@ const yieldLabel = " yield"
 //     node. A declarator without an initializer makes no node: it executes
 //     nothing (JLS §14.4.2), and the variable is not definitely assigned.
 //   - A condition is one Branch node spanning the condition without its
-//     parentheses: if, while, do, for. A loop whose condition is the literal
+//     parentheses: if, while, do, for. It is always made, after the nodes
+//     its own evaluation makes (an `&&` or `||` operand's nodes, a pattern
+//     variable's defining node), and the back edge of a while or basic for
+//     re-enters the first of those, since the condition is evaluated again
+//     (JLS §14.12, §14.14.1.2). A loop whose condition is the literal
 //     `true`, or a for without one, has no exit edge: its head is a Stmt node
 //     spanning `true` or the `for` keyword (JLS §14.21).
-//   - An enhanced for (JLS §14.14.2) is a Stmt node spanning the iterated
-//     expression, evaluated once, which defines an iteration variable of the
-//     lowering's own; a Branch head spanning the header from its first
-//     modifier or type to the end of the iterated expression, which uses
-//     that variable; then, on the body path, one node spanning the loop
-//     variable's name that defines it and uses the iteration variable.
+//   - An enhanced for (JLS §14.14.2) follows the iteration model (see
+//     Iteration in Lowering): a Stmt node spanning the iterated expression,
+//     evaluated once, which Uses its reads and defines an iteration variable
+//     of the lowering's own; a Branch head spanning the header from its
+//     first modifier or type to the end of the iterated expression, which
+//     Uses only that variable; then, on the body path, one node spanning the
+//     loop variable's name that defines it and Uses only the iteration
+//     variable. The back edge re-enters the head, never the iterated
+//     expression.
 //   - A switch (JLS §14.11 statement, §15.28 expression) is a Stmt node for
 //     its selector, then one Branch node per `case` label in source order,
-//     spanning the label, each tested only when the previous failed; a
-//     label's node uses the selector's variables, since it compares against
-//     the selector, and its own. A pattern label is followed on its match
-//     path by one defining node per pattern variable, spanning the
-//     variable's identifier and using the selector's variables, then, for a
-//     guard, a Branch node spanning the guard expression whose false edge
-//     joins the next label's test. Several labels of one group all enter its
-//     body. `default` is taken when no label matched; the grammar has no
-//     `case null, default` label, so that source parses with an error node
+//     spanning the label, its guard included, as the grammar holds the guard
+//     in the label, each tested only when the previous failed; a label
+//     listing several constants (`case 2, 3`) is one label and one test
+//     (JLS §14.11.1). A label's node uses the selector's variables, since it
+//     compares against the selector, and its constants' (see Uses). A
+//     pattern label is followed on its match path by one defining node per
+//     pattern variable, spanning the variable's identifier and using the
+//     selector's variables, then, for a guard, a Branch node spanning the
+//     guard expression whose false edge joins the next label's test.
+//     Several labels of one group all enter its body. `default` is taken
+//     when no label matched; the grammar has no `case null, default` label,
+//     so that source parses with an error node
 //     and is lowered as the labels the recovered tree holds. In the colon
 //     form a body's end falls through into the next body; in the arrow form
 //     it leaves the switch. A switch expression without `default` is
@@ -82,7 +92,8 @@ const yieldLabel = " yield"
 //     the yield of its value; `yield e;` is a Jump node spanning the
 //     statement. Every yield breaks to the switch expression's frame (see
 //     yieldLabel); the value is no temporary: the node consuming the switch
-//     expression spans it and uses every variable read inside it.
+//     expression spans it and Uses its selector's and arm results' reads
+//     (see Uses).
 //   - `&&`, `||` and the conditional operator: the deciding operand is a
 //     Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -103,10 +114,10 @@ const yieldLabel = " yield"
 //     the end of its initializer, defining the variable; a resource naming an
 //     existing variable or field acquires nothing. Each resource then opens a
 //     finally whose close is one Stmt node spanning the resource that uses
-//     its variable and may throw; the resources close in reverse order, and the
-//     statement's catch clauses and finally enclose all of them. A
-//     resource's Handler spans the `;` or `)` that ends the resource. The
-//     null test before close is not modelled.
+//     its variable (see Uses) and may throw; the resources close in reverse
+//     order, and the statement's catch clauses and finally enclose all of
+//     them. A resource's Handler spans the `;` or `)` that ends the
+//     resource. The null test before close is not modelled.
 //   - `synchronized (e) { … }` (JLS §14.19) is a Stmt node spanning e, which
 //     may throw, then the block; the monitor exit is not a node.
 //   - `assert c : m;` (JLS §14.10) is a Branch node spanning the `assert`
@@ -145,30 +156,53 @@ const yieldLabel = " yield"
 //
 // Only an identifier resolving to a local variable or parameter declared in
 // this function is a Use; a field, `this.x` included, is not a variable. A
-// node Uses every variable read inside its own span and no read outside it
-// (the seed rule). An assignment or update of a local embedded in a larger
-// expression is its own defining node, and the enclosing expression's node
-// reads the variable it defined. A node that defines v also Uses v when its
-// statement read v before it. A write through a field or array element of a
-// local (`o.f = v`, `a[i] += v`, `a[i]++`) is a Stmt node spanning the
-// assignment that uses its operands and may-defines (MayDef, non-killing)
-// the local at the base of the target.
+// node Uses what the consumption rule (see Lowering) gives it: its own
+// evaluation's reads and those of the value-producing constructs it
+// consumes, each resolved in the scope where it occurs. In Java:
 //
-// The walk that collects the reads of nested code or of a switch
-// expression (see below) treats a plain assignment's local target as
-// written, not read; a compound assignment and an update read it too.
+//   - The node consuming a switch expression Uses its selector's reads and
+//     its arm results' reads: an arrow arm's expression and a yield's
+//     operand, each collected while its arm is lowered, in the arm's scope,
+//     so a pattern variable an arm result reads is the arm's own. A label's
+//     test, a guard, and a condition or statement inside an arm give it
+//     nothing: each is a node of its own, evaluated separately.
+//   - The node consuming `c ? a : b` Uses the arms' reads, not the
+//     condition's; the node consuming `a && b` or `a || b` Uses both
+//     operands' reads, as either operand's value can be the operator's.
+//   - The node deciding on `x instanceof P` Uses the tested expression's
+//     reads: the test is its own evaluation. Each pattern variable's
+//     defining node Uses them too.
+//   - A switch label's node Uses the selector's reads and those of its
+//     constants, not its guard's, which are the guard's Branch node's.
+//   - A resource's close Uses only its variable, or, for a resource naming
+//     an existing variable or field, that expression's reads: the
+//     initializer was evaluated once, at the acquiring node.
+//
+// An assignment or update of a local embedded in a larger expression is its
+// own defining node, and the enclosing expression's node reads the variable
+// it defined. A node that defines v also Uses v when its statement read v
+// before it, a read the statement still holds: a read dropped with a nested
+// node's reads (a condition's, a creation's captures) does not count. A
+// write through a field or array element of a local (`o.f = v`, `a[i] +=
+// v`, `a[i]++`) is a Stmt node spanning the assignment that uses its
+// operands and may-defines (MayDef, non-killing) the local at the base of
+// the target.
 //
 // A lambda (its own function) is one Stmt node spanning it in the enclosing
 // function; an anonymous class's body is its own unit, and the object
 // creation expression is one Stmt node spanning the creation. Either node
-// Uses every enclosing variable referenced inside, resolved with the nested
-// code's own declarations shadowing (a local or parameter of a method of the
-// anonymous class, or one of its fields). A captured local is effectively
-// final (JLS §15.27.2, §8.1.3), so no nested code assigns it; a write
-// through its field or array element inside (`arr[0] = 1`, `box.v = 2`) is
-// the through-a-target rule: a MayDef of the local on the creating node,
-// since when the nested code runs is unknown. A local class declaration's
-// node is its creating node.
+// Uses every enclosing variable referenced inside (the creation also its
+// arguments' reads), resolved with the nested code's own declarations
+// shadowing (a local or parameter of a method of the anonymous class, or
+// one of its fields), and the node consuming the created value does not
+// repeat the captures. The walk that collects them treats a plain
+// assignment's local target as written, not read; a compound assignment and
+// an update read it too. A captured local is effectively final (JLS
+// §15.27.2, §8.1.3), so no nested code assigns it; a write through its
+// field or array element inside (`arr[0] = 1`, `box.v = 2`) is the
+// through-a-target rule: a MayDef of the local on the creating node, since
+// when the nested code runs is unknown. A local class declaration's node is
+// its creating node.
 //
 // # Exceptions
 //
@@ -282,15 +316,22 @@ type javaLower struct {
 	// declarations then bind -1 and no node is created.
 	shadow int
 	// reads are the variables read by the current statement, in evaluation
-	// order; seen[v] == stmtNo marks v as one of them. stmtNo only grows,
+	// order. seen[v] marks v's first read among them: the statement's number
+	// and the read's index in reads, so the mark stays exact when a nested
+	// node's reads are dropped from the end (see has). stmtNo only grows,
 	// across functions too, so a mark a previous function left in seen
-	// never equals it.
+	// never matches it.
 	reads  []int32
-	seen   []int
+	seen   []javaSeen
 	stmtNo int
-	// stack saves reads across a switch expression's statements and holds a
-	// switch's selector reads while its labels are lowered.
+	// stack saves reads across a switch expression's statements, holds a
+	// switch's selector reads while its labels are lowered, and, above a
+	// switch expression's selector reads, collects its arm results' reads
+	// (see switchValue).
 	stack []int32
+	// values counts the switch expressions being lowered; a yield's reads
+	// are collected only inside one.
+	values int
 	// throws counts throwing constructs evaluated by the current statement;
 	// those past thrown are not yet attached to a node.
 	throws, thrown int
@@ -334,7 +375,7 @@ type javaLower struct {
 // stmtNo, only ever increased, never matches again.
 func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.TreeCursor, binds *scope) {
 	j.l, j.b, j.src, j.k, j.cur, j.binds = l, b, src, javaSyntaxOf(), cur, binds
-	j.shadow, j.throws, j.thrown, j.labelAt = 0, 0, 0, 0
+	j.shadow, j.throws, j.thrown, j.labelAt, j.values = 0, 0, 0, 0, 0
 	j.first, j.last, j.lastSpan = -1, -1, flow.Span{}
 	j.stmtNo++
 	clear(j.buf)
@@ -350,6 +391,12 @@ func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.Tree
 // lowered, so the lowering state keeps nothing of the file alive.
 func (j *javaLower) end() {
 	j.l, j.b, j.src, j.cur, j.binds = nil, nil, nil, nil, nil
+}
+
+// javaSeen marks a variable's first read by statement no, at index at of
+// reads.
+type javaSeen struct {
+	no, at int
 }
 
 // javaArm is one switch label's match fringe and the index of its group.
@@ -431,11 +478,24 @@ func (j *javaLower) read(v int32) {
 	if v < 0 {
 		return
 	}
-	j.reads = append(j.reads, v)
 	if int(v) >= len(j.seen) {
-		j.seen = append(j.seen, make([]int, int(v)+1-len(j.seen))...)
+		j.seen = append(j.seen, make([]javaSeen, int(v)+1-len(j.seen))...)
 	}
-	j.seen[v] = j.stmtNo
+	if !j.has(v) {
+		j.seen[v] = javaSeen{no: j.stmtNo, at: len(j.reads)}
+	}
+	j.reads = append(j.reads, v)
+}
+
+// has reports whether the current statement's reads hold v. A read dropped
+// with a nested node's reads (reads truncated past it) no longer counts:
+// seen marks v's first read, which lies in reads only while v is read there.
+func (j *javaLower) has(v int32) bool {
+	if int(v) >= len(j.seen) {
+		return false
+	}
+	m := j.seen[v]
+	return m.no == j.stmtNo && m.at < len(j.reads) && j.reads[m.at] == v
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
@@ -473,7 +533,7 @@ func (j *javaLower) def(n, v int32) {
 		return
 	}
 	j.b.Def(n, v)
-	if int(v) < len(j.seen) && j.seen[v] == j.stmtNo {
+	if j.has(v) {
 		j.b.Use(n, v)
 	}
 }
@@ -873,6 +933,11 @@ func (j *javaLower) stmt(n *ts.Node) {
 		case k.throwStmt:
 			j.b.Throw()
 		default:
+			// The operand is an arm result of the innermost switch
+			// expression, whose results lie on top of stack.
+			if j.values > 0 {
+				j.stack = append(j.stack, j.reads...)
+			}
 			j.b.Break(yieldLabel)
 		}
 	case k.breakStmt:
@@ -1127,6 +1192,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	var f flow.Frame
 	if expr {
 		f = j.b.OpenBlock(yieldLabel)
+		j.values++
 	} else {
 		f = j.b.OpenSwitch(labels...)
 	}
@@ -1151,6 +1217,12 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			}
 		}
 		j.done(s)
+	}
+	// A switch statement's selector reads serve its labels only; a switch
+	// expression keeps them, and its arm results' reads go above them, for
+	// the node consuming its value (see switchValue).
+	if !expr {
+		j.stack = j.stack[:sBase]
 	}
 	// One scope holds the whole switch block: a local declared in a
 	// statement group is in scope in the groups after it (JLS §6.3).
@@ -1197,6 +1269,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			case arrow && expr && c.KindId() == k.expressionStmt:
 				j.reset()
 				j.valueNode(firstNamed(c))
+				j.stack = append(j.stack, j.reads...)
 				j.b.Break(yieldLabel)
 			case arrow:
 				j.stmt(c)
@@ -1231,11 +1304,13 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 		}
 	}
 	j.b.CloseFrame(f)
+	if expr {
+		j.values--
+	}
 	j.b.Pop(base)
 	j.done(start)
 	clear(j.caseBinds[cBase:])
 	j.arms, j.caseBinds, j.groupAt = j.arms[:aBase], j.caseBinds[:cBase], j.groupAt[:gBase]
-	j.stack = j.stack[:sBase]
 }
 
 // caseLabel lowers one `case` label of group g: its test, its pattern
@@ -1552,6 +1627,9 @@ func (j *javaLower) expr(n *ts.Node) int {
 		j.cap(n)
 		j.shadow--
 		j.closure(j.node(flow.Stmt, n, r, len(j.reads)), w)
+		// The creating node Uses the captures; its consumer does not repeat
+		// them.
+		j.reads = j.reads[:r]
 		return m
 	}
 	switch n.KindId() {
@@ -1601,6 +1679,9 @@ func (j *javaLower) expr(n *ts.Node) int {
 		r := len(j.reads)
 		mid := j.expr(cond)
 		j.node(flow.Branch, cond, r, len(j.reads))
+		// The condition is a node of its own: the node consuming the
+		// conditional Uses its arms' reads only.
+		j.reads = j.reads[:r]
 		mark := j.binds.mark()
 		p := j.b.Push()
 		j.scopePats(m, mid)
@@ -1637,11 +1718,14 @@ func (j *javaLower) expr(n *ts.Node) int {
 		}
 		j.throws++
 		if body != nil {
-			w := len(j.writes)
+			a, w := len(j.reads), len(j.writes)
 			j.shadow++
 			j.cap(body)
 			j.shadow--
 			j.closure(j.node(flow.Stmt, n, m, len(j.reads)), w)
+			// The creation Uses its arguments and the captures; its consumer
+			// does not repeat the captures.
+			j.reads = j.reads[:a]
 		}
 		j.done(start)
 	case k.fieldAccess:
@@ -1684,27 +1768,23 @@ func (j *javaLower) expr(n *ts.Node) int {
 
 // switchValue lowers a switch expression inside a larger expression. Its
 // arms run statements, which reset the statement's reads, so the reads of
-// the enclosing statement are saved around it, then every read inside it is
-// added, as the node consuming its value reads them. A throw pending before
-// the switch expression stays pending, so the consuming node also carries it.
+// the enclosing statement are saved on stack around it. switchBlock leaves
+// above them the selector's reads and each arm result's reads, collected
+// while the arm was lowered and so resolved in its scope, and the statement
+// continues with all of them, as the node consuming the value Uses them
+// (see Uses). A throw pending before the switch expression stays pending,
+// so the consuming node also carries it.
 func (j *javaLower) switchValue(n *ts.Node) {
 	base := len(j.stack)
 	j.stack = append(j.stack, j.reads...)
 	throws, thrown := j.throws, j.thrown
 	j.switchBlock(n, nil, true)
-	j.reads = append(j.reads[:0], j.stack[base:]...)
-	j.stack = j.stack[:base]
+	j.reads = j.reads[:0]
 	j.stmtNo++
-	for _, v := range j.reads {
-		j.seen[v] = j.stmtNo
+	for _, v := range j.stack[base:] {
+		j.read(v)
 	}
-	mark, w := j.binds.mark(), len(j.writes)
-	j.shadow++
-	j.cap(n)
-	j.shadow--
-	// The switch expression's own writes were lowered as nodes already.
-	j.binds.truncate(mark)
-	j.writes = j.writes[:w]
+	j.stack = j.stack[:base]
 	j.throws, j.thrown = throws, thrown
 }
 
