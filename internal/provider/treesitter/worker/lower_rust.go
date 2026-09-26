@@ -33,8 +33,12 @@ const rsTryLabel = " try"
 //     `self` token of the receiver.
 //   - A statement is one node: an expression statement, or a block's tail
 //     expression, spans the expression without its `;` and Uses the reads
-//     the consumption rule gives it (below); a let declaration spans the
-//     declaration. An assignment or
+//     the consumption rule gives it (below); a tail is a node even when it
+//     reads nothing, as a literal `2` does. A let declaration spans the
+//     declaration. An if, match, loop, while, for or block makes no node
+//     spanning itself, in statement, tail or valued position: its
+//     conditions, heads, statements and arm values are its nodes, and a
+//     node consuming its value Uses what the consumption rule says. An assignment or
 //     compound assignment is its own defining node, spanning it; return,
 //     break and continue are Jump nodes spanning the expression. A macro
 //     invocation is one node spanning it, read as Macro invocations states:
@@ -70,7 +74,9 @@ const rsTryLabel = " try"
 //     rest of the enclosing expression, so everything after it depends on it.
 //   - `&&` and `||`: the left operand is a Branch node spanning it, the right
 //     operand a Stmt node spanning it, evaluated only on the short-circuit
-//     path.
+//     path. A node spanning the operator (a compound left operand, `a && b`
+//     in `a && b || c`, or the condition) Uses both operands' reads, since
+//     its value is theirs.
 //   - An if condition, a while condition and a match guard are one Branch
 //     node spanning the condition. A let chain (`a && let P = v && b`) is one
 //     Branch per member in source order; each member's false edge leaves the
@@ -101,20 +107,25 @@ const rsTryLabel = " try"
 //     `_` (in any arm, which also makes every later arm unreachable, so they
 //     lower to nothing) or, in the last arm, a bare identifier, which is then
 //     a Stmt node defining the name. A bare identifier in an earlier arm may
-//     name a constant or a unit variant (`None`), so it is a Branch that also
-//     defines the name it would bind.
+//     name a constant or a unit variant (`None`): by The Rust Reference,
+//     Patterns › Identifier patterns, a path pattern takes precedence, which
+//     only name resolution decides. So it is a Branch that also defines the
+//     name it would bind, a variable of the arm that is unread when the name
+//     is a variant.
 //   - A labelled block `'a: { … }` opens a block frame named by its label;
 //     `break 'a v` leaves it, and the block's consuming node Uses v's reads.
 //   - `let P = v else { … };` is a Branch node spanning the declaration; the
 //     else block, which the language requires to diverge, is lowered on its
 //     false edge and ended by a return, so a block that ends in a plain
-//     panicking-macro node never falls into the bindings; the taken path is
-//     one defining node per name. Any other let with an initializer is one
+//     panicking-macro node never falls into the bindings; that return is an
+//     edge to Exit and makes no node. The taken path is one defining node per
+//     name, each Using the initializer's reads, as a let condition's are. Any other let with an initializer is one
 //     node spanning the declaration that defines a bare identifier pattern,
 //     or, for a destructuring pattern, a node that defines nothing followed
 //     by one defining node per bound name. `let x;` declares x and makes no
 //     node. A destructuring assignment is likewise a node for the assignment
-//     then one node per target; its assignees are those of the Reference's
+//     then one node per target, each Using the value's reads (a place target
+//     also its own operands'); its assignees are those of the Reference's
 //     "Destructuring assignments": the elements of a tuple `(a, b) = e` or
 //     array `[a, b] = e`, the arguments of a tuple struct `P(a, b) = e`, and
 //     the fields of a struct `S { x, f: y } = e` (the shorthand's name, the
@@ -127,8 +138,9 @@ const rsTryLabel = " try"
 //     when it runs is unknown. A `move` closure, async or gen block writes
 //     its own copies, by Lowering's rule: its creating node keeps the reads
 //     and may-defines nothing.
-//   - A try block `try { … }` opens a frame named rsTryLabel; a `?` inside
-//     it breaks to the block's end. unsafe and const blocks are inline blocks.
+//   - A try block `try { … }` (the unstable `try_blocks` feature of The Rust
+//     Unstable Book; The Rust Reference does not define it) opens a frame
+//     named rsTryLabel; a `?` inside it breaks to the block's end. unsafe and const blocks are inline blocks.
 //   - A write through a field, index or dereference target (`x.f = e`,
 //     `a[i] += e`, `*p = e`) Uses the target's operands and is a non-killing
 //     may-definition of its base variable, found through field, index and
