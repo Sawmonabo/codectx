@@ -111,15 +111,17 @@ var goLowering = Lowering{
 //     is present and x or len(x) is constant, the range expression is not
 //     evaluated", is not applied: telling whether len(x) is constant needs
 //     x's type, which the lowering does not have, so x's node Uses x's reads
-//     in every case. That adds a pair only where nothing is read: a constant
-//     x reads no variable (a constant name is not a variable), and len(x) is
-//     constant with a variable in x only when x's type is an array or a
-//     pointer to an array and x holds no receive or non-constant call
-//     (specification, "Length and capacity"), so the one addition is a
-//     definition of such an array-typed variable pairing with x's node, and
-//     through the iteration variable with the head and the one target, in a
-//     loop with at most one iteration variable. The over-approximation adds
-//     pairs and gives up none.
+//     in every case. That adds a pair only where nothing is read. A constant
+//     name is not a variable, so a constant expression holds a variable only
+//     as the operand of `len` or `cap` on an array or pointer-to-array
+//     expression holding no receive or non-constant call ("Length and
+//     capacity"), or of `unsafe.Sizeof`, `Alignof` or `Offsetof` ("Package
+//     unsafe"), none of which evaluates it; the same holds for len(x) itself
+//     when x is such an array expression (`range a`, `range len(a)`). The
+//     one addition is a definition of such an operand's variable pairing
+//     with x's node, and through the iteration variable with the head and
+//     the one target, in a loop with at most one iteration variable. The
+//     over-approximation adds pairs and gives up none.
 //   - An expression switch has a Stmt head for its tag, which Go evaluates
 //     exactly once ("Switch statements"), spanning the tag expression with
 //     every enclosing pair of parentheses stripped (see Lowering, Spans): in
@@ -150,7 +152,8 @@ var goLowering = Lowering{
 //     every clause's channel operand and sent value exactly once, in source
 //     order, on entering the select ("Select statements"), so their `&&`/`||`
 //     operands are hoisted before the head, and the head Uses them and
-//     carries their may-definitions. Each clause's send or receive is one
+//     carries the may-definitions of what is not hoisted, a hoisted
+//     operand's being on its own Branch node. Each clause's send or receive is one
 //     node, which Uses those operands again, and Uses and writes a receive's
 //     left-hand side, which Go evaluates and assigns only when the clause is
 //     chosen. `select {}` blocks forever and is lowered as a self-loop.
