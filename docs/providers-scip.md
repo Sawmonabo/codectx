@@ -324,8 +324,12 @@ cut check alone: a range spanning lines is a block span, measured, a crate's
 whole file; and a range holding no identifier byte at all is punctuation the
 grammar spells without one, measured, the reference from `+` to the `add`
 method it desugars to, which one indexer ranges over the space beside the
-operator. A zero-width range selects no bytes, so there are none to contradict;
-measured, every one is a document-level symbol anchored at the start of a file.
+operator. A range of whitespace alone holds no token at all — a reference
+shifted onto the gap between two tokens — and is refused. A zero-width range
+selects no bytes, so there are none to contradict; measured, every one is a
+document-level symbol anchored at the start of a file. It is admitted as an
+occurrence, but it proves nothing about an encoding, so the encoding probe
+passes over it.
 
 **The name check.** A range that is exactly one identifier token, whose symbol's
 last descriptor is a name the grammar spells literally, must select that name or

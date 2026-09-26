@@ -1030,14 +1030,20 @@ func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
 // file -- and its edges are the file's, not a token's. A range holding no
 // identifier byte at all is punctuation the grammar spells without one:
 // measured, rust-analyzer ranges the reference from `+` to the `add` method it
-// desugars to over the space beside the operator.
+// desugars to over the space beside the operator. A range of whitespace alone
+// is neither: it holds no token at all, which is what a reference shifted onto
+// the gap between two tokens selects, so it is refused.
 func coversWholeTokens(text []byte) string {
-	named := false
+	named, blank := false, true
 	for _, b := range text {
 		if b == '\n' {
 			return ""
 		}
 		named = named || identifierByte(b)
+		blank = blank && spaceByte(b)
+	}
+	if blank {
+		return "the range selects only whitespace"
 	}
 	if !named {
 		return ""

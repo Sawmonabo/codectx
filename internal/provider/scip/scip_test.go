@@ -1019,10 +1019,11 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // spelling in bindSpellings because two occurrences of the symbol spell it
 // rather than from an alias clause, which republishes "page" over "name"; drop
 // the end-of-token half of the coverage check, which republishes the keyword
-// case;
-// drop the refusal count from the capability details, which republishes the
-// silence; or drop the coordinate from the exemplar, which hands the operator a
-// file without the line inside it that disagrees.
+// case; admit a range holding no identifier byte whatever it holds, which
+// republishes the whitespace case; drop the refusal count from the capability
+// details, which republishes the silence; or drop the coordinate from the
+// exemplar, which hands the operator a file without the line inside it that
+// disagrees.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4. Lines 6 and
@@ -1060,6 +1061,9 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 		// identifier. Only the end of it is wrong, which is the half of the
 		// coverage rule the three rows above do not exercise.
 		{"reference_stopping_inside_the_next_token", [][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 21)}, "1", "pkg/tabs.go:5:10: "},
+		// One column wide and seven to the right of "browser": the space
+		// between it and "+", which holds no token at all.
+		{"reference_onto_whitespace", [][]byte{occurrenceRecord(symBrowser, 0, 5, 17, 18)}, "1", "pkg/tabs.go:5:17: "},
 		// The same tab shift on two identical lines: each reference to "page"
 		// is five columns right, on "name", a whole token that is not the
 		// symbol's name. The shift repeats the wrong spelling once per line, so
