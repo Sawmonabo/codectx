@@ -45,8 +45,9 @@ type UnitMemory struct {
 	HeapCapBytes       int64
 	ExportHeapCapBytes int64
 	// AllocationBytes is the machine-derived allocation the cap was bounded
-	// by, or zero when the host does not expose available memory.
-	AllocationBytes int64
+	// by, and AllocationObserved whether the host exposed available memory.
+	AllocationBytes    int64
+	AllocationObserved bool
 	// PeakBytes is the highest peak any SAMPLED step's process tree reached,
 	// and PeakUnsampled reports that no step of the unit was sampled at all --
 	// which is why it is a flag and not a zero. One unsampled step does not
@@ -109,7 +110,7 @@ func (a *admitted) observe(o Outcome) {
 func (a *admitted) record(u Unit) {
 	row := UnitMemory{ScopeKey: u.ScopeKey, Family: u.Family, ReservationBytes: a.res.Bytes(),
 		HeapCapBytes: a.res.HeapCapBytes, ExportHeapCapBytes: a.res.ExportHeapCapBytes,
-		AllocationBytes: a.res.AllocationBytes, PeakBytes: a.peak, PeakUnsampled: !a.sampled}
+		AllocationBytes: a.res.AllocationBytes, AllocationObserved: a.res.AllocationObserved, PeakBytes: a.peak, PeakUnsampled: !a.sampled}
 	row.Overran = a.sampled && a.peak > row.ReservationBytes
 	observed.mu.Lock()
 	defer observed.mu.Unlock()
@@ -163,8 +164,8 @@ func ObservedUnits() []model.AnalyzerUnit {
 		row := model.AnalyzerUnit{ScopeKey: model.TruncateDetail(u.ScopeKey), Family: string(u.Family),
 			ReservationBytes: uint64(max(u.ReservationBytes, 0)), HeapCapBytes: uint64(max(u.HeapCapBytes, 0)),
 			ExportHeapCapBytes: uint64(max(u.ExportHeapCapBytes, 0))}
-		if u.AllocationBytes > 0 {
-			alloc := uint64(u.AllocationBytes)
+		if u.AllocationObserved {
+			alloc := uint64(max(u.AllocationBytes, 0))
 			row.AllocationBytes = &alloc
 		}
 		if !u.PeakUnsampled && u.PeakBytes > 0 {

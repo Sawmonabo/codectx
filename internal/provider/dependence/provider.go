@@ -498,12 +498,13 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 		"heap_cap_bytes", adm.res.HeapCapBytes, "reservation_bytes", adm.res.Bytes(),
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
 		"keys_removed", report.Removed}
-	// The allocation is an observation of the machine, and a host that
-	// publishes no available-memory figure leaves it zero. Logging that zero
-	// would tell an operator this unit was admitted against no memory at all;
-	// an unavailable measurement is absent from the line instead, as it is
-	// from the resources block and from a memory failure's details.
-	if adm.res.AllocationBytes > 0 {
+	// The allocation is an observation of the machine. A host that publishes
+	// no available-memory figure has none, and logging a zero would tell an
+	// operator this unit was admitted against no memory at all; an unavailable
+	// measurement is absent from the line instead, as it is from the resources
+	// block and from a memory failure's details. An observed zero is logged:
+	// it is a host with nothing left over this process's footprint.
+	if adm.res.AllocationObserved {
 		fields = append(fields, "allocation_bytes", adm.res.AllocationBytes)
 	}
 	slog.Info("dependence unit imported", fields...)

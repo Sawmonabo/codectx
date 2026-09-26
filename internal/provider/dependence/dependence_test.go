@@ -642,7 +642,7 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 // on a small machine a count admits work whose summed reservations the host
 // cannot hold.
 //
-// Mutation: give the admission ledger a maxHeavy of 1 again -- add
+// Mutation: give the admission ledger a maxHeavy of 1 -- add
 // `maxHeavy int` set to 1 by NewLedger and `if l.admitted >= l.maxHeavy
 // { return }` at the head of pump -> "a 32 GiB machine admitted 1 of four
 // 4 GiB reservations at once; how much runs at once is being decided by a
@@ -969,7 +969,8 @@ func TestTheAdmittedReservationIsTheOneComparedAndRecorded(t *testing.T) {
 // shares.
 func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes), testDiskAllocationBytes)
+	allocation, _ := m.SchedulingAllocation(testBaseFootprintBytes)
+	l, err := admission.NewLedger(allocation, testDiskAllocationBytes)
 	if err != nil {
 		t.Fatalf("the admission ledger was refused: %v", err)
 	}
@@ -1003,6 +1004,13 @@ const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
 // test that only looked at a roomy machine would pass with the base footprint
 // ignored entirely; the small-memory, many-core row is the one that binds on
 // the subtraction, and it is the shape a missing subtraction would refuse.
+//
+// The at-or-below row guards the host-freeze direction: an observed host with
+// nothing left over its footprint must answer an observed zero, under which
+// the admission ledger runs children one at a time. Mutation: return
+// UnobservedAllocationBytes whenever Allocation is zero -> "an observed host
+// at its footprint was allocated 8589934592" -- an invented figure that
+// admits several children onto memory the host does not have.
 func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 	const margin = dependence.DefaultSafetyMarginBytes
 	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
@@ -1017,10 +1025,14 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 	}{
 		{"64 GiB, 16 cores: the host keeps half", 64 << 30, testBaseFootprintBytes, 32 << 30, "host share"},
 		{"8 GiB, 128 cores: the footprint binds", 8 << 30, base128, 8<<30 - base128 - margin, "subtraction"},
+		{"at the footprint: nothing is left over", base128 + margin, base128, 0, "subtraction"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := dependence.Machine{AvailableBytes: c.available, Observed: true}
-			got := m.SchedulingAllocation(c.base)
+			got, observed := m.SchedulingAllocation(c.base)
+			if !observed {
+				t.Errorf("an observed host's allocation of %d was reported as a stand-in", got)
+			}
 			if got != c.want {
 				t.Errorf("allocation is %d, want %d (the %s branch binds): the allocation is not "+
 					"available memory less this process's own footprint, bounded by the host's share",
@@ -1032,7 +1044,9 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 	// This is the whole point of deriving it: a host with more cores reserves
 	// more for itself.
 	m := dependence.Machine{AvailableBytes: 8 << 30, Observed: true}
-	if bigger, smaller := m.SchedulingAllocation(testBaseFootprintBytes), m.SchedulingAllocation(base128); bigger <= smaller {
+	bigger, _ := m.SchedulingAllocation(testBaseFootprintBytes)
+	smaller, _ := m.SchedulingAllocation(base128)
+	if bigger <= smaller {
 		t.Errorf("a %d-byte base footprint left the children %d and a %d-byte one left them %d; "+
 			"a larger footprint must leave a smaller allocation",
 			testBaseFootprintBytes, bigger, base128, smaller)
@@ -1055,7 +1069,7 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
 	for _, available := range []int64{8 << 30, 16 << 30, 64 << 30} {
 		m := dependence.Machine{AvailableBytes: available, Observed: true}
-		allocation := m.SchedulingAllocation(testBaseFootprintBytes)
+		allocation, _ := m.SchedulingAllocation(testBaseFootprintBytes)
 		budget := dependence.MaxChildReservationBytes(allocation)
 		g := dependence.NewGovernor(0, testBaseFootprintBytes)
 

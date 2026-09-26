@@ -80,12 +80,12 @@ const (
 // `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
-// parserWorkerReservationBytes is the memory one parser worker reserves while
-// it runs, and therefore what the parser runner's budget is sized from. One
-// constant sizes both sides, so the budget never guesses at a reservation it
-// cannot see. It is one fixed figure for every worker, whatever the file it
-// parses: it has to cover a worker parsing a file at the largest size
-// workspace.max_parse_file_bytes admits, not an ordinary one.
+// parserWorkerReservationBytes is the memory one parser worker reserves from
+// the admission ledger while it runs, and the smallest budget the parser
+// runner beneath that ledger is given, so the runner can always hold one
+// worker the ledger admitted alone. It is one fixed figure for every worker,
+// whatever the file it parses: it has to cover a worker parsing a file at the
+// largest size workspace.max_parse_file_bytes admits, not an ordinary one.
 const parserWorkerReservationBytes int64 = 256 << 20
 
 // collectorBatchLimit bounds every phase of one retention pass. It restates
@@ -414,6 +414,11 @@ type stack struct {
 	// allocation as this one and nothing sums the two, which is a process free
 	// to reserve a multiple of the machine's memory.
 	admission *admission.Ledger
+	// machine is the one observation of the host this process takes. The
+	// admission allocation is derived from it, and it is handed to the
+	// coordinator's planner and the dependence provider so every heavy unit is
+	// sized against the reading it is admitted against.
+	machine dependence.Machine
 	// admissionMemoryObserved and admissionDiskObserved say whether each of
 	// the ledger's allocations came from a reading of this host rather than a
 	// stand-in, so the resource block never publishes a stand-in as a
@@ -699,21 +704,22 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// configuration rather than read from a constant: the reservations this
 	// process makes up front grow with the core count, so a host with more
 	// cores keeps more for itself and offers its children less. The same
-	// figure sizes the units (the governor below), so on a host whose memory
-	// can be observed a unit is sized against the allocation it is admitted
-	// against. Where the host publishes no figure the two deliberately differ:
-	// sizing invents no bound there and admission stands one in. That is
-	// stated on both sides in govern.go and is an open question, not a claim
-	// that they always agree.
+	// reading and the same footprint size the units (the planner and the
+	// dependence provider are handed s.machine), so a unit is sized against
+	// the allocation it is admitted against.
 	//
-	// The machine is read once. The allocation is an observation only when the
-	// reading produced a positive allocation; otherwise SchedulingAllocation
-	// stands its conservative figure in, and the ledger is told so.
-	machine := dependence.ObserveMachine()
-	baseFootprint := config.BaseFootprint(cfg)
-	childMemory := machine.SchedulingAllocation(baseFootprint)
-	s.admissionMemoryObserved = machine.Observed &&
-		machine.Allocation(baseFootprint, dependence.DefaultSafetyMarginBytes) > 0
+	// The machine is read once. On a host that exposes available memory the
+	// allocation is that reading, and where nothing is left over the
+	// footprint it is zero: an observation under which the ledger runs heavy
+	// children one at a time. Only a host that exposes no figure gets the
+	// stand-in, and the ledger's surfaces are told it is not an observation.
+	s.machine = dependence.ObserveMachine()
+	var childMemory int64
+	childMemory, s.admissionMemoryObserved = s.machine.SchedulingAllocation(config.BaseFootprint(cfg))
+	if s.admissionMemoryObserved && childMemory == 0 {
+		slog.Warn("this host has no available memory beyond this process's own footprint, so heavy children run one at a time",
+			"component", "app", "available_bytes", s.machine.AvailableBytes)
+	}
 	// Disk is the ledger's second dimension and is observed the same way: the
 	// free space under the data directory, less the floor the host keeps, is
 	// what the children may stage between them. It is observed here, once, for
@@ -761,10 +767,17 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// Parser workers are CPU-bound, so how many run at once is counted by
 	// cores. They exchange everything with this process over pipes and
 	// reserve no disk, so the runner holds no share of the temporary ceiling.
+	//
+	// Each worker reserves parserWorkerReservationBytes from the one admission
+	// ledger before it runs, so how many run at once is bounded by the
+	// allocation as well as by cores. The runner beneath that gate must never
+	// refuse what it admitted, and the gate runs a worker alone when the
+	// allocation holds less than one, so the runner's budget is the allocation
+	// or one worker's reservation, whichever is larger.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
-		MemoryBudgetBytes: int64(parserWorkers) * parserWorkerReservationBytes,
+		MemoryBudgetBytes: maxInt64(childMemory, parserWorkerReservationBytes),
 	})
 	if err != nil {
 		return nil, err
@@ -834,6 +847,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxEvidencePerFact:  evidenceClip(cfg),
 		WorkerMemoryBytes:   parserWorkerReservationBytes,
+		Admission:           s.admission,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,
 		WorkDir:             tsWorkDir,
@@ -1028,6 +1042,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				BaseFootprintBytes:   config.BaseFootprint(s.cfg),
+				Machine:              s.machine,
 				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
 				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,

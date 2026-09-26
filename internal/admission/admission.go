@@ -46,9 +46,10 @@ import (
 type Ledger struct {
 	mu sync.Mutex
 	// allocation is the machine-derived memory allocation every admitted
-	// reservation must sum within. It is always positive, so admission is
-	// bounded by a sum of bytes on every platform and never by a count of
-	// children.
+	// reservation must sum within, so admission is bounded by a sum of bytes
+	// on every platform and never by a count of children. It is never
+	// negative; zero is a real reading -- a host with nothing left over this
+	// process's footprint -- and serializes every child that wants memory.
 	allocation int64
 	// diskAllocation is the same for the temporary disk a child stages its
 	// inputs and writes its outputs into: the free space observed under the
@@ -80,24 +81,21 @@ type waiter struct {
 }
 
 // NewLedger builds the ledger over the one memory allocation and the one disk
-// allocation. A non-positive memory allocation is refused rather than treated
-// as unlimited: an admission gate with no bound is not a gate, and every
-// caller has a positive figure to hand over
-// (dependence.Machine.SchedulingAllocation stands in for an unobservable host).
-//
-// The disk allocation may be zero and may not be negative. Zero is a real
-// reading: a host whose free space is already at or below the floor it must
-// keep has nothing to give a child, and every child that wants disk then runs
-// alone rather than being refused. An unobservable free-space figure is NOT
-// zero and must not be passed as one; the composition root stands a
-// conservative figure in for it, exactly as it does for memory. Whether a
+// allocation. Either may be zero and neither may be negative. Zero is a real
+// reading: a host whose available memory is already at or below this
+// process's footprint, or whose free space is at or below the floor it must
+// keep, has nothing to give a child, and every child that wants that
+// dimension then runs alone rather than being refused. An unobservable figure
+// is NOT zero and must not be passed as one; the composition root stands a
+// conservative figure in for it (dependence.Machine.SchedulingAllocation for
+// memory), because an admission gate with no bound is not a gate. Whether a
 // figure was observed is not the ledger's concern: it gates against the
 // figure either way, and the composition root tells the surfaces that
 // disclose it.
 func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
-	if allocationBytes <= 0 {
+	if allocationBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "the reservation ledger needs a positive memory allocation"}
+			Message: "the reservation ledger needs a memory allocation that is not negative"}
 	}
 	if diskAllocationBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,

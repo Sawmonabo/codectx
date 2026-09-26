@@ -140,7 +140,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 			// or the absent detail reads as "the tree used nothing".
 			err = err.WithDetail("observed_peak_bytes_unavailable", "this platform does not sample process-tree memory")
 		}
-		if r.AllocationBytes > 0 {
+		if r.AllocationObserved {
 			err = err.WithDetail("allocation_bytes", strconv.FormatInt(r.AllocationBytes, 10))
 		}
 	}
