@@ -165,20 +165,20 @@ const (
 //     the directive before it controls that arm. A conditional whose last
 //     arm is not `#else` has one more arm, the empty group a build takes
 //     when no condition holds (C17 §6.10.1p6), which binds nothing. The
-//     condition reads no variable. Every other preprocessor line inside a
-//     body produces no node. After the directive a name any arm binds
-//     stands for every binding it has in some build: the arms' variable,
-//     and, when some arm (the empty one included) does not bind the name,
-//     the variable it named before the directive, if any. A read through the name Uses each, and taking its
-//     address, binding a reference to it or writing it by reference from a
-//     callable may-defines each. A definition through it (an assignment, an
-//     update) defines the arms' variable and may-defines the one from before
-//     the directive, since a node defines one variable. Given up against
-//     killing both: that earlier variable's definitions still reach a later
-//     read through the name. A name the arms bind only as no variable (a
+//     condition reads no variable. Every other preprocessor line inside a body
+//     produces no node. After the directive a name any arm binds stands for
+//     every binding it has in some build: the arms' variable, and, when some
+//     arm (the empty one included) does not bind the name, the variable it
+//     named before the directive, if any. A read through the name Uses each,
+//     and taking its address, binding a reference to it or writing it by
+//     reference from a callable may-defines each. A definition through it (an
+//     assignment, an update) defines the arms' variable and may-defines the one
+//     from before the directive, since a node defines one variable. Given up
+//     against killing both: that earlier variable's definitions still reach a
+//     later read through the name. A name the arms bind only as no variable (a
 //     function prototype) is no variable after the directive when every arm
-//     binds it, and otherwise keeps the binding from before it. Inside an
-//     arm that redeclares the name, the name is the arms' variable alone.
+//     binds it, and otherwise keeps the binding from before it. Inside an arm
+//     that redeclares the name, the name is the arms' variable alone.
 //   - A lambda or a nested function definition is its own function; in the
 //     enclosing function its creating expression is one Stmt node spanning
 //     it (see Captures).
@@ -257,26 +257,26 @@ const (
 // A read the consumer folds that an embedded assignment's or update's
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
-// may-defines an owned variable that replaces the held read, so the folded
-// read pairs with the definition that reached it. The hand-off is made only
-// when the defining node runs whenever the consumer does: a definition in
-// the right operand of `&&` or `||` or in an arm of `?:` leaves the read on
-// the consumer. So does a definition in a statement of a statement
-// expression other than its last, unless that statement lies on every path
-// from the expression's start to its value, which the lowering decides by
-// syntax: the statement is an expression statement or a declaration of the
-// expression's own list, and no labelled statement follows it at any depth
-// inside the statement expression. A jump out of the expression reaches no
-// value and the extension forbids a jump into it, so only a goto to a later
-// label can skip such a statement; `g(x, ({ x = 1; 0; }))` hands the call's read of x
-// to x = 1. Every other statement (compound, selection, iteration, labelled,
-// jump) is taken as skippable as a whole: a definition in its body runs on
-// some paths only, and one in an if statement's condition, which runs on
-// every path, is treated alike, which is conservative. Given up: the order of
-// operands the language leaves unsequenced (`x + (x = 1)`, C17 §6.5p2,
-// [intro.execution]) or indeterminately sequenced (the arguments of a call,
-// [expr.call]). The lowering takes one order: left to right, except that
-// an assignment evaluates its right operand before its target's operands.
+// may-defines an owned variable that replaces the held read, so the folded read
+// pairs with the definition that reached it. The hand-off is made only when the
+// defining node runs whenever the consumer does: a definition in the right
+// operand of `&&` or `||` or in an arm of `?:` leaves the read on the consumer.
+// So does a definition in a statement of a statement expression other than its
+// last, unless that statement lies on every path from the expression's start to
+// its value, which the lowering decides by syntax: the statement is an
+// expression statement or a declaration of the expression's own list, and no
+// labelled statement follows it at any depth inside the statement expression. A
+// jump out of the expression reaches no value and the extension forbids a jump
+// into it, so only a goto to a later label can skip such a statement:
+// `g(x, ({ x = 1; 0; }))` hands the call's read of x to x = 1. Every other
+// statement (compound, selection, iteration, labelled, jump) is taken as
+// skippable as a whole: a definition in its body runs on some paths only,
+// and one in an if statement's condition, which runs on every path, is
+// treated alike, which is conservative. Given up: the order of operands the language leaves unsequenced
+// (`x + (x = 1)`, C17 §6.5p2, [intro.execution]) or indeterminately sequenced
+// (the arguments of a call, [expr.call]). The lowering takes one order: left to
+// right, except that an assignment evaluates its right operand before its
+// target's operands.
 //
 // A value evaluated once and used by several nodes is held in a variable
 // (see Lowering): a switch's controlling expression and its case tests, a
@@ -302,8 +302,8 @@ const (
 // reads are, and a node takes only those its own reads cover. A write
 // through the pointer or reference (`*p = 2`, `r = 2`) is given up, as
 // Lowering states: `r = 2`, whose target is the local r, is r's defining
-// node, a Def of r, and the object r refers to is not written. Destructors, setjmp/longjmp and signal handlers are not
-// modelled.
+// node, a Def of r, and the object r refers to is not written. Destructors,
+// setjmp/longjmp and signal handlers are not modelled.
 //
 // # Statement expressions
 //
@@ -1858,7 +1858,7 @@ func (c *cLower) preproc(n *ts.Node) {
 func (c *cLower) rebind(arm, arms int, ends []int) {
 	for i := arm; i < c.parked.mark(); i++ {
 		b := c.parked.at(i)
-		if c.parked.index[b.name] != int32(i) {
+		if !c.parked.isInnermost(i) {
 			// A later binding of the name, in this arm or a later one, is the
 			// innermost and stands for it.
 			continue
@@ -2408,10 +2408,10 @@ func (c *cLower) tail(e *ts.Node, r int32) bool {
 }
 
 // assign lowers `left = right` and `left op= right`. For an identifier
-// target it returns the node of kind kind it created spanning n, which defines v, the
-// target's variable; for a field, index or pointer target it returns -1,
-// leaving the target's reads and may-definition for the node that
-// evaluates n.
+// target it returns the node of kind kind it created spanning n, which
+// defines v, the target's variable; for a field, index or pointer target it
+// returns -1, leaving the target's reads and may-definition for the node
+// that evaluates n.
 func (c *cLower) assign(n *ts.Node, kind flow.Kind) (id, v int32) {
 	k := c.k
 	left, right := c.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)

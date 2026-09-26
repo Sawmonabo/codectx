@@ -523,6 +523,9 @@ func (s *scope) innermost(name []byte) int {
 	return -1
 }
 
+// isInnermost reports whether binding i is its name's innermost binding.
+func (s *scope) isInnermost(i int) bool { return s.index[s.binds[i].name] == int32(i) }
+
 // shadowed is the index of the binding binding i shadows, or -1.
 func (s *scope) shadowed(i int) int { return int(s.binds[i].prev) }
 
