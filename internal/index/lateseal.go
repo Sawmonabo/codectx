@@ -16,13 +16,13 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// Late-sealing dependence units (Section 11.6, rulings Q1 and Q9).
+// Late-sealing dependence units (Section 11.6).
 //
 // Under `providers.dependence.enabled = "auto"` a dependence unit never blocks
 // base readiness: the plan marks it deferred, the base generation carries its
 // previous sealed unit as stale, and this sealer runs it afterwards as
-// low-priority background work -- regardless of whether any query ever asks
-// (Q9), because `auto` that only runs on demand is `false` for every
+// low-priority background work -- regardless of whether any query ever asks,
+// because `auto` that only runs on demand is `false` for every
 // non-interactive user.
 //
 // A sealed unit is published, never merged into the active generation. Storage
@@ -48,10 +48,10 @@ type deferredUnit struct {
 //
 // The epoch is what a tick runs its units by: it is bumped by every enqueue,
 // so a tick that popped its first unit from one queue never takes a unit a
-// later base activation put there -- which is both the "units of two snapshots
-// must never seal into one work generation" rule the snapshot check used to
-// carry, and what lets the tick write every unit's predecessor into the work
-// plan before its first worker starts rather than beside them.
+// later base activation put there. That is what keeps the units of two
+// snapshots out of one work generation, and what lets the tick write every
+// unit's predecessor into the work plan before its first worker starts rather
+// than beside them.
 type queueState struct {
 	snap  model.SnapshotID
 	sel   provider.Selection
@@ -83,7 +83,8 @@ type lateSealer struct {
 
 	mu    sync.Mutex
 	queue []deferredUnit
-	// inflight holds the plan key of every unit a tick is building right now.
+	// inflight holds the plan key of every unit a tick has popped and not yet
+	// settled: building, or built and waiting for the rest of its batch.
 	// Several units of one tick run at once, so it is a set and not one unit:
 	// a queue that reports fewer units than are actually in flight answers for
 	// coverage it does not have, exactly as one that reports only what has not
@@ -329,13 +330,6 @@ func (l *lateSealer) next(epoch int64) (deferredUnit, bool) {
 	return d, true
 }
 
-// finished takes one unit out of the set in flight.
-func (l *lateSealer) finished(d deferredUnit) {
-	l.mu.Lock()
-	delete(l.inflight, plan.Key(d.unit.ProviderID, d.unit.ScopeKey))
-	l.mu.Unlock()
-}
-
 // pending is what the queue holds now: the units in flight plus everything
 // behind them, and the state the tick works over.
 //
@@ -366,17 +360,16 @@ type sealedUnit struct {
 	unit                 model.UnitID
 }
 
-// batch is what one tick produced: the units that sealed. What did NOT seal is
-// not here -- it is kept on the sealer, in `background`, because the
-// publication has to tell a scope that failed from a scope still running, and
-// a scope that failed in an EARLIER tick is just as far from running as one
-// that failed in this one.
+// batch is what one tick produced: the units that sealed and how many did not.
+// The reasons of the ones that did not are kept on the sealer, in
+// `background`, and not here: the publication has to tell a scope that failed
+// from a scope still running, and a scope that failed in an EARLIER tick is
+// just as far from running as one that failed in this one.
 type batch struct {
 	sealed []sealedUnit
-	// failed is this tick's own record of what did not seal, for the run row's
-	// totals and the every-unit-failed path; the queue's record of every tick's
-	// reasons is the sealer's background map.
-	failed map[string]unitFailure
+	// failed counts this tick's units that did not seal, for the run row's
+	// totals and the every-unit-failed path.
+	failed int
 	// work is the generation this tick's units ran in. Their provider runs,
 	// and so the reasons the failed ones recorded, are rows of it, and the
 	// publication copies those rows onto the generation it activates before
@@ -432,16 +425,16 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	// the one where nothing sealed: a run row with no totals would read
 	// `0 planned, 0 succeeded` for a batch that ran, a measurement nobody made.
 	planned := 0
-	b := batch{failed: map[string]unitFailure{}}
+	var b batch
 	defer func() {
 		run.Report(ledger.Totals{UnitsPlanned: int64(planned),
-			UnitsSucceeded: int64(len(b.sealed)), UnitsFailed: int64(len(b.failed))})
+			UnitsSucceeded: int64(len(b.sealed)), UnitsFailed: int64(b.failed)})
 		// A batch whose every unit failed is not an ok run. It returns no
 		// error -- one background unit's failure never stops the others -- and
 		// its publication states failures only, so the run row's outcome is
 		// what says the batch sealed nothing.
 		outcome := endOutcome(err)
-		if err == nil && len(b.sealed) == 0 && len(b.failed) > 0 {
+		if err == nil && len(b.sealed) == 0 && b.failed > 0 {
 			outcome = ledger.OutcomeFailed
 		}
 		run.Finish(outcome)
@@ -489,18 +482,24 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	var (
 		bmu sync.Mutex
 		wg  sync.WaitGroup
+		// popped is every unit this tick took off the queue, in the order it
+		// took them. They stay in the set in flight until settle hands them
+		// back or the batch is published, so no reader of Pending sees a unit
+		// that is neither queued, running nor being published.
+		popped []*poppedUnit
 	)
 	// One unit is popped at a time, so Promote can still see everything that
 	// has not started yet; every unit that seals before the queue empties
 	// publishes through the one generation below, which is the coalescing
 	// Section 11.6 requires.
-	for {
+	for ctx.Err() == nil {
 		d, ok := l.next(state.epoch)
 		if !ok {
 			break
 		}
+		pu := &poppedUnit{d: d}
+		popped = append(popped, pu)
 		if ctx.Err() != nil {
-			l.finished(d)
 			break
 		}
 		planned++
@@ -509,15 +508,13 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer l.finished(d)
 			unit, out, runErr := l.runOne(ctx, work, d, admitted)
-			key := plan.Key(d.unit.ProviderID, d.unit.ScopeKey)
 			if runErr != nil {
 				if ctx.Err() != nil && errors.Is(runErr, ctx.Err()) {
 					// The tick was cancelled, so this unit has no failure of
 					// its own: recording one would write a run-failure row and
-					// warn the operator about work only they stopped. The
-					// batch is thrown away below in any case.
+					// warn the operator about work only they stopped. It goes
+					// back on the queue with the batch below.
 					return
 				}
 				// One background unit's failure does not stop the others, and
@@ -528,10 +525,11 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 				// a foreground one. The row is written before the lock is
 				// taken: the mutex guards this tick's batch and nothing else.
 				failure := work.recordFailure(ctx, d.unit, out, runErr)
-				l.recordBackgroundFailure(key, failure)
+				l.recordBackgroundFailure(state.epoch, plan.Key(d.unit.ProviderID, d.unit.ScopeKey), failure)
 				bmu.Lock()
 				defer bmu.Unlock()
-				b.failed[key] = failure
+				pu.failed = true
+				b.failed++
 				return
 			}
 			bmu.Lock()
@@ -547,10 +545,15 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	}
 	wg.Wait()
 	if ctx.Err() != nil {
+		// A cancelled tick settled nothing but its failures: every other unit
+		// it popped is still outstanding, and dropping it would have Pending,
+		// and the warning a closing coordinator gives, count none of it.
+		l.settle(state.epoch, popped, true, false)
 		abort()
 		return model.Canceled(ctx.Err())
 	}
-	if len(b.sealed) == 0 && len(b.failed) == 0 {
+	if len(b.sealed) == 0 && b.failed == 0 {
+		l.settle(state.epoch, popped, false, false)
 		abort()
 		return nil
 	}
@@ -560,14 +563,18 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	// will finish. The publication re-derives those rows with the failures
 	// folded in and carries their reasons, while every scope keeps answering
 	// from its carried predecessor.
-	l.setPublishing(true)
+	l.settle(state.epoch, popped, false, true)
 	res, published, err = l.publish(ctx, snap, state.sel, state.ref, b)
-	l.setPublishing(false)
+	// A publication the cancellation stopped activated nothing, so its sealed
+	// units go back on the queue exactly as a cancelled build's do; the next
+	// tick publishes each one it still finds sealed and rebuilds any that
+	// retention collected with the aborted work generation.
+	l.settle(state.epoch, popped, err != nil && ctx.Err() != nil, false)
 	abort()
 	if err == nil && len(b.sealed) == 0 {
 		c.log.Warn("every deferred unit of this batch failed",
 			"component", component, "repository_id", string(c.repo),
-			"units", len(b.failed), "published", published, "run_id", run.ID())
+			"units", b.failed, "published", published, "run_id", run.ID())
 	}
 	if err != nil {
 		// The sealed units are members of nothing but the work generation this
@@ -596,12 +603,33 @@ func (l *lateSealer) carryPrevious(work *generation, epoch int64) {
 	}
 }
 
-// setPublishing marks the publication window, which is pending work that is
-// neither queued nor running.
-func (l *lateSealer) setPublishing(on bool) {
+// poppedUnit is one unit a tick took off the queue, and whether it settled
+// with a failure of its own. The flag is written under the tick's batch mutex
+// and read once every worker has returned.
+type poppedUnit struct {
+	d      deferredUnit
+	failed bool
+}
+
+// settle takes the tick's popped units out of the set in flight and sets the
+// publication window in one step, so no reader of Pending sees a unit in
+// neither place. With requeue, every popped unit that did not fail goes back
+// to the head of the queue in the order it was popped -- unless a later base
+// activation replaced the queue, whose epoch this work no longer belongs to.
+func (l *lateSealer) settle(epoch int64, popped []*poppedUnit, requeue, publishing bool) {
 	l.mu.Lock()
-	l.publishing = on
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	back := make([]deferredUnit, 0, len(popped))
+	for _, pu := range popped {
+		delete(l.inflight, plan.Key(pu.d.unit.ProviderID, pu.d.unit.ScopeKey))
+		if requeue && !pu.failed {
+			back = append(back, pu.d)
+		}
+	}
+	if len(back) > 0 && l.state.epoch == epoch {
+		l.queue = append(back, l.queue...)
+	}
+	l.publishing = publishing
 }
 
 // runOne builds one deferred unit in the work generation, under the heavy
@@ -617,7 +645,6 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 	admitted func()) (id model.UnitID, res outcome, err error) {
 
 	defer admitted()
-	started := l.c.now()
 	// The row exists before the unit is admitted, and the deferred close below
 	// gives it a terminal state on every path this call can take; run closes
 	// it first for a unit that reached its provider.
@@ -644,15 +671,17 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 			// work: unavailable with that reason, not a failure of a provider
 			// that was never asked. Ending the span here wins over the deferred
 			// close, which takes the first terminal state a span is given.
-			span.End(ledger.OutcomeUnavailable, ledger.Measured{
-				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			span.End(ledger.OutcomeUnavailable, notAdmitted(provider.CodeOf(admitErr)), nil)
 			return "", outcome{}, admitErr
 		}
 		defer grant.release()
 	}
 	// Past the gate: this reservation is part of the sum the next unit is
-	// admitted against, so the tick may offer that one now.
+	// admitted against, so the tick may offer that one now. The duration the
+	// estimate averages starts here too: what Pending estimates is a unit's
+	// own build, and the wait for admission is the queue's, not the unit's.
 	admitted()
+	started := l.c.now()
 	out, err := work.run(ctx, d.unit, spec, span, grant)
 	if err != nil {
 		return "", out, err
@@ -682,10 +711,8 @@ func (l *lateSealer) observe(d time.Duration) {
 // copied: the plan answers, per scope, with the unit whose identity that
 // snapshot justifies, which for every unchanged member is the member itself,
 // and the spec.ID check below then refuses any sealed unit the current plan
-// does not derive. The named alternative is a storage listing of the active
-// generation's members (a keyset-paged GenerationUnits), which would save a
-// manifest walk per publication but would not give that check for free; it is
-// recorded as a storage follow-up, not taken here.
+// does not derive. A storage listing of the active generation's members would
+// save a manifest walk per publication but would not give that check for free.
 //
 // A publication whose active generation has moved to another snapshot is
 // dropped: publishing over it would replace a newer generation with an older
@@ -788,7 +815,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	}
 	// Failures alone are worth a publication: they turn scopes the active
 	// generation reports running into the failures they are.
-	if len(replacing) == 0 && len(b.failed) == 0 {
+	if len(replacing) == 0 && b.failed == 0 {
 		return model.IndexResult{}, false, nil
 	}
 
@@ -874,9 +901,17 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 // as the queue it came from does. The unit is popped and never retried and its
 // unit row is deleted with it, so this is the only record left that the scope
 // is a failure and not work still in flight.
-func (l *lateSealer) recordBackgroundFailure(key string, f unitFailure) {
+//
+// A reason from a queue a later base activation replaced is dropped, as next
+// drops that queue's units: the replacing queue may hold the same scope again,
+// and a stale failure recorded against it would publish that scope failed
+// before its new unit has even run.
+func (l *lateSealer) recordBackgroundFailure(epoch int64, key string, f unitFailure) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.state.epoch != epoch {
+		return
+	}
 	if l.background == nil {
 		l.background = map[string]unitFailure{}
 	}
@@ -973,13 +1008,13 @@ func (c *Coordinator) Pending() Pending {
 }
 
 // Drain runs the deferred queue to empty in the caller's own goroutine,
-// publishing each batch through the ruling-Q1 publication generation and
-// calling progress after each publication. Nil progress is allowed.
+// publishing each batch through its publication generation and calling
+// progress after each publication. Nil progress is allowed.
 //
-// It is how a one-shot command honours ruling Q9 -- under the shipped
-// `providers.dependence.enabled = "auto"` the deferred units must run whether
-// or not a query ever asks, and a process that closed the coordinator the
-// moment its base generation activated would run none of them.
+// It is how a one-shot command runs the deferred units at all: under the
+// shipped `providers.dependence.enabled = "auto"` they must run whether or not
+// a query ever asks, and a process that closed the coordinator the moment its
+// base generation activated would run none of them.
 //
 // Cancelling returns at once, including while the background loop owns the
 // batch: the wait for the tick slot is abandoned rather than served, because
