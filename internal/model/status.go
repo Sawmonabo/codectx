@@ -180,7 +180,7 @@ type IndexStatus struct {
 	ActivatedAt      *time.Time     `json:"activated_at,omitempty"`
 	Warnings         []string       `json:"warnings,omitempty"`
 	// Resources is the Section 23 accounting block. It is nil on an ordinary
-	// status so a cheap call stays cheap; Task 20 populates it.
+	// status so a cheap call stays cheap.
 	Resources *ResourceReport `json:"resources,omitempty"`
 	// ProvidersDisabled is what IndexResult.ProvidersDisabled is, reported by
 	// the same configuration on the same terms: the providers that are off,
@@ -236,7 +236,7 @@ func (w WatchProcess) Validate() error {
 // unavailable metric is recorded as unavailable, never as zero: a nil field
 // means "not measured on this platform or not sampled", while a zero value is a
 // real measurement of zero. Collapsing the two would let a missing RSS reading
-// read as a process using no memory. Task 20 owns measurement and populates it.
+// read as a process using no memory.
 type ResourceReport struct {
 	ParentRSSBytes        *uint64 `json:"parent_rss_bytes,omitempty"`
 	PeakParentRSSBytes    *uint64 `json:"peak_parent_rss_bytes,omitempty"`
@@ -317,8 +317,10 @@ type ResourceReport struct {
 	// make, each with the reason. It is the neighbour PendingFreeBytes needs:
 	// that figure rising and never falling is either a run removing faster
 	// than the pace gives back, which resolves itself, or a removal nothing
-	// can make, which does not, and only this tells the two apart.
-	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// can make, which does not, and only this tells the two apart. It is one
+	// page (PageStuckFrees); StuckFreesOmitted counts the rest.
+	StuckFrees        []StuckFree `json:"stuck_frees,omitempty"`
+	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
 	// AnalyzerUnits is what each heavy analysis unit this process ran was
 	// given and what it used: the reservation it was admitted against, the
 	// heap caps its two steps ran under, the machine-derived allocation those
@@ -448,6 +450,9 @@ func (r ResourceReport) Validate() error {
 		}
 	}
 	if err := boundStrings("resources.warnings", r.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := validateStuckFrees("resources", r.StuckFrees, r.StuckFreesOmitted); err != nil {
 		return err
 	}
 	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
@@ -689,10 +694,18 @@ type ScratchCollection struct {
 	//
 	// It belongs to the REQUEST and not to a pool: one reclaimer serves the
 	// whole process, so what it could not free is the same list whichever pool
-	// was being emptied when the request waited on it. Reported per pool, the
-	// same entries appeared under each of them and every one of those
-	// attributions but at most one was wrong.
-	StuckFrees []StuckFree `json:"stuck_frees,omitempty"`
+	// was being emptied when the request waited on it. It is one page
+	// (PageStuckFrees); StuckFreesOmitted counts the rest.
+	StuckFrees        []StuckFree `json:"stuck_frees,omitempty"`
+	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
+}
+
+// Validate enforces the bound on the stuck removals the collection carries.
+func (c ScratchCollection) Validate() error {
+	if err := validateStuckFrees("scratch_collection", c.StuckFrees, c.StuckFreesOmitted); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ScratchPool is one pool of ScratchCollection: the directory it serves, what
@@ -713,6 +726,34 @@ type ScratchPool struct {
 type StuckFree struct {
 	Entry  string `json:"entry"`
 	Reason string `json:"reason"`
+}
+
+// PageStuckFrees is the page of stuck removals a response carries and the count
+// it leaves out. The reclaimer's list is persistent and grows with every
+// removal the filesystem refuses, so a response carries at most the bound every
+// record list of a response carries, and says how many more there are.
+func PageStuckFrees(all []StuckFree) ([]StuckFree, int64) {
+	if len(all) <= MaxRecordsPerResult {
+		return all, 0
+	}
+	return all[:MaxRecordsPerResult], int64(len(all) - MaxRecordsPerResult)
+}
+
+// validateStuckFrees enforces the page PageStuckFrees makes: no more rows than
+// the response bound, and an omitted count only beside a full page.
+func validateStuckFrees(field string, page []StuckFree, omitted int64) *Error {
+	if len(page) > MaxRecordsPerResult {
+		return invalid("%s.stuck_frees holds %d rows, more than the %d a bounded response carries",
+			field, len(page), MaxRecordsPerResult)
+	}
+	if err := requireNonNegative(field+".stuck_frees_omitted", omitted); err != nil {
+		return err
+	}
+	if omitted > 0 && len(page) < MaxRecordsPerResult {
+		return invalid("%s.stuck_frees_omitted is %d on a page of %d rows that dropped none",
+			field, omitted, len(page))
+	}
+	return nil
 }
 
 // An UntouchedInstance is one pool instance a collection left as it was.
