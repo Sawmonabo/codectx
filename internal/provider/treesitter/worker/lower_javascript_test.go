@@ -590,5 +590,18 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 			fn:       1,
 			du:       []string{"x = 1@24 -> return (x = 1) + (x = 2);@16", "x = 2@34 -> return (x = 1) + (x = 2);@16"},
 		},
+		{
+			// ECMA-262 §14.11.2 The with Statement, Runtime Semantics: Evaluation:
+			// the object is evaluated, then the body runs in an object
+			// environment. Nodes: o@11, x@14, the object o@25 (Uses o), g(x)@30
+			// (Uses the parameter x: a name's resolution to one of the object's
+			// properties is given up), return x;@38.
+			name:     "a with statement evaluates its object and its body reads the variables it names",
+			protects: "a with statement's object is a node of its own that reads it, and a name in the body is the variable it names",
+			mutation: "drop the with statement's object node (o@11 -> o@25 vanishes), or bind the body's names to nothing inside a with (x@14 -> g(x)@30 vanishes)",
+			src:      "function f(o, x) { with (o) { g(x); } return x; }",
+			fn:       1,
+			du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
+		},
 	})
 }
