@@ -84,7 +84,10 @@ const (
 //     position; the value it keeps across calls is not modelled.
 //   - A condition is one Branch node, spanned as Spans (see Lowering)
 //     states: if, while, do…while, for; a C++ condition that declares a
-//     variable is a Branch node spanning the declaration that defines it. A
+//     variable is a Branch node spanning the declaration that defines it,
+//     and so is an assignment or update that is the whole condition once
+//     its parentheses are stripped (`if ((x = g()))`): one Branch node
+//     spanning it that defines x and branches on the value. A
 //     statement expression's own `(` `)` is an enclosing pair the condition
 //     strips, since both grammars parse `({ … })` as a parenthesized
 //     expression over a compound statement: `while (({ …; e; }))` spans
@@ -213,6 +216,16 @@ const (
 // the comma operator in value position, casts, `sizeof`, generic
 // selection), calls, `new` and `delete`, subscripts, field accesses,
 // dereferences, address-taking and initializer lists.
+//
+// A read the consumer folds that an embedded assignment's or update's
+// definition of the same local follows (`f(x, x = 1)`) is carried by the
+// defining node, as Lowering states: the node Uses the earlier value and
+// may-defines an owned variable that replaces the held read, so the folded
+// read pairs with the definition that reached it. Given up: the order of
+// operands the language leaves unsequenced (`x + (x = 1)`, C17 §6.5p2,
+// [intro.execution]) or indeterminately sequenced (the arguments of a call,
+// [expr.call]). The lowering takes one order: left to right, except that
+// an assignment evaluates its right operand before its target's operands.
 //
 // A value evaluated once and used by several nodes is held in a variable
 // (see Lowering): a switch's controlling expression and its case tests, a
@@ -388,8 +401,9 @@ type cLower struct {
 	// node made takes those from its own first read on (see nodeAt). base is
 	// where the reads of the innermost open statement expression begin (0
 	// outside one): its statements keep the enclosing expression's reads
-	// below base.
+	// below base. held[v] counts v's entries in reads.
 	reads []int32
+	held  []int32
 	base  int
 	// may are the pending may-definitions, each with the position in reads
 	// where the operand that makes it began: a node takes the ones from its
@@ -440,8 +454,8 @@ func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k 
 	c.buf = c.buf[:0]
 	c.blockMark, c.pp, c.ppArm, c.shadow, c.base = 0, -1, -1, 0, 0
 	c.parked.truncate(0)
-	c.reads, c.may, c.shape, c.writes, c.names, c.hs =
-		c.reads[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
+	c.reads, c.held, c.may, c.shape, c.writes, c.names, c.hs =
+		c.reads[:0], c.held[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
 	c.throws, c.thrown, c.seh = 0, 0, 0
 	c.first, c.last, c.lastSpan = -1, -1, flow.Span{}
 }
@@ -530,11 +544,24 @@ func (c *cLower) read(v int32) {
 		return
 	}
 	c.reads = append(c.reads, v)
+	if int(v) >= len(c.held) {
+		c.held = append(c.held, make([]int32, int(v)+1-len(c.held))...)
+	}
+	c.held[v]++
+}
+
+// drop removes reads[m:]: a node carries them, or nothing reads them.
+func (c *cLower) drop(m int) {
+	for _, v := range c.reads[m:] {
+		c.held[v]--
+	}
+	c.reads = c.reads[:m]
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
 func (c *cLower) reset() {
-	c.reads, c.throws, c.thrown = c.reads[:c.base], 0, 0
+	c.drop(c.base)
+	c.throws, c.thrown = 0, 0
 	if c.base == 0 {
 		c.may = c.may[:0]
 	}
@@ -563,7 +590,7 @@ func (c *cLower) nodeAt(kind flow.Kind, s flow.Span, from int) int32 {
 	for _, v := range c.reads[from:] {
 		c.b.Use(id, v)
 	}
-	c.reads = c.reads[:from]
+	c.drop(from)
 	kept := 0
 	for _, m := range c.may {
 		if m.at >= from {
@@ -601,11 +628,31 @@ func (c *cLower) mayDef(at int, v int32) {
 	}
 }
 
-// def records that node n defines v, unless v is -1.
+// def records that node n defines v, unless v is -1. When the statement
+// still holds a read of v that no node carries, made before n by an
+// enclosing expression (`f(x, x = 1)`), n reads that earlier value before
+// overwriting it and hands it on through an owned variable it may-defines,
+// which replaces the held reads (see Uses in lowerC).
 func (c *cLower) def(n, v int32) {
-	if v >= 0 {
-		c.b.Def(n, v)
+	if v < 0 {
+		return
 	}
+	c.b.Def(n, v)
+	if int(v) >= len(c.held) || c.held[v] == 0 {
+		return
+	}
+	c.b.Use(n, v)
+	t := c.b.Var()
+	c.b.MayDef(n, t)
+	for i, x := range c.reads {
+		if x == v {
+			c.reads[i] = t
+		}
+	}
+	if int(t) >= len(c.held) {
+		c.held = append(c.held, make([]int32, int(t)+1-len(c.held))...)
+	}
+	c.held[t], c.held[v] = c.held[v], 0
 }
 
 // result is an owned result variable (see Lowering) that node n defines.
@@ -904,9 +951,9 @@ func (c *cLower) exprStmt(e *ts.Node) {
 		c.exprStmt(u.ChildByFieldId(k.fRight))
 		return
 	case k.assignmentExpression:
-		made, _ = c.assign(u)
+		made, _ = c.assign(u, flow.Stmt)
 	case k.updateExpression:
-		made, _ = c.update(u)
+		made, _ = c.update(u, flow.Stmt)
 	case k.asmExpression:
 		c.asm(u)
 		return
@@ -927,7 +974,7 @@ func (c *cLower) exprStmt(e *ts.Node) {
 func (c *cLower) effect(n *ts.Node) {
 	m := len(c.reads)
 	if r := c.value(n); r >= 0 && len(c.reads) == m+1 && c.thrown == c.throws && !c.pending(m) {
-		c.reads = c.reads[:m]
+		c.drop(m)
 		return
 	}
 	c.node(flow.Stmt, n, m)
@@ -972,7 +1019,7 @@ func (c *cLower) carried(u *ts.Node) (v int32, ok bool) {
 	if v < 0 || c.last == last || c.lastSpan != spanOf(u) || len(c.reads) != m+1 || c.thrown != c.throws || c.pending(m) {
 		return v, false
 	}
-	c.reads = c.reads[:m]
+	c.drop(m)
 	return v, true
 }
 
@@ -1225,8 +1272,22 @@ func (c *cLower) cond(n *ts.Node) int32 {
 	}
 	e := c.l.unparen(n)
 	m := len(c.reads)
-	c.value(e)
-	return c.node(flow.Branch, e, m)
+	// An assignment or update that is the whole condition is the Branch
+	// node itself: it defines its target and branches on the value, as a
+	// condition declaration does.
+	var id int32 = -1
+	switch e.KindId() {
+	case k.assignmentExpression:
+		id, _ = c.assign(e, flow.Branch)
+	case k.updateExpression:
+		id, _ = c.update(e, flow.Branch)
+	default:
+		c.value(e)
+	}
+	if id < 0 {
+		id = c.node(flow.Branch, e, m)
+	}
+	return id
 }
 
 // condDecl lowers a C++ condition declaration `T x = e` as one node of kind
@@ -1846,9 +1907,9 @@ func (c *cLower) value(n *ts.Node) int32 {
 		m := len(c.reads)
 		var id, v int32
 		if n.KindId() == k.assignmentExpression {
-			id, v = c.assign(n)
+			id, v = c.assign(n, flow.Stmt)
 		} else {
-			id, v = c.update(n)
+			id, v = c.update(n, flow.Stmt)
 		}
 		switch {
 		case id >= 0 && v >= 0:
@@ -2078,7 +2139,7 @@ func (c *cLower) stmtExpr(n *ts.Node) int32 {
 	}
 	c.done(start)
 	c.close(s)
-	c.reads = c.reads[:c.base]
+	c.drop(c.base)
 	c.base, c.throws, c.thrown = base, throws, thrown
 	c.read(r)
 	return r
@@ -2104,11 +2165,11 @@ func (c *cLower) tail(e *ts.Node, r int32) bool {
 }
 
 // assign lowers `left = right` and `left op= right`. For an identifier
-// target it returns the node it created spanning n, which defines v, the
+// target it returns the node of kind kind it created spanning n, which defines v, the
 // target's variable; for a field, index or pointer target it returns -1,
 // leaving the target's reads and may-definition for the node that
 // evaluates n.
-func (c *cLower) assign(n *ts.Node) (id, v int32) {
+func (c *cLower) assign(n *ts.Node, kind flow.Kind) (id, v int32) {
 	k := c.k
 	left, right := c.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(c.reads)
@@ -2122,14 +2183,14 @@ func (c *cLower) assign(n *ts.Node) (id, v int32) {
 		c.read(v)
 	}
 	c.value(right)
-	id = c.node(flow.Stmt, n, m)
+	id = c.node(kind, n, m)
 	c.def(id, v)
 	return id, v
 }
 
 // update lowers `x++`, `--x` and their indirect forms, and returns as
 // assign does.
-func (c *cLower) update(n *ts.Node) (id, v int32) {
+func (c *cLower) update(n *ts.Node, kind flow.Kind) (id, v int32) {
 	arg := c.l.unparen(n.ChildByFieldId(c.k.fArgument))
 	if arg.KindId() != c.k.identifier {
 		c.target(arg)
@@ -2138,7 +2199,7 @@ func (c *cLower) update(n *ts.Node) (id, v int32) {
 	m := len(c.reads)
 	v = c.lookup(arg)
 	c.read(v)
-	id = c.node(flow.Stmt, n, m)
+	id = c.node(kind, n, m)
 	c.def(id, v)
 	return id, v
 }

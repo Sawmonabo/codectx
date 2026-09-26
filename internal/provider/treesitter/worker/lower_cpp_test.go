@@ -208,5 +208,19 @@ func TestCppLoweringGolden(t *testing.T) {
 			src:      "int f(int x) { return g((x = 1), (x = 2)); }",
 			du:       []string{"x = 1@25 -> return g((x = 1), (x = 2));@15", "x = 2@34 -> return g((x = 1), (x = 2));@15"},
 		},
+		{
+			// [expr.call]: the arguments are indeterminately sequenced; the
+			// lowering takes source order, so the read of x in the first
+			// argument precedes x = 1. Nodes: x@10, x = 1@27 (Uses the x the
+			// call already read, defines x, may-defines an owned variable
+			// carrying that earlier value and its own result), return g(x, x
+			// = 1);@15 (Uses the carried value and the result). Succ: a
+			// straight line to EXIT.
+			name:     "a read made before an embedded assignment of the same local keeps the earlier value",
+			protects: "the call's first argument reaches the parameter's value through the assignment's node, not the value the assignment stores",
+			mutation: "let the held read of x pair with the definition after it (loses x@10 -> x = 1@27)",
+			src:      "int f(int x) { return g(x, x = 1); }",
+			du:       []string{"x@10 -> x = 1@27", "x = 1@27 -> return g(x, x = 1);@15"},
+		},
 	})
 }
