@@ -111,9 +111,12 @@ type conn struct {
 }
 
 // cpuProgress reports a running child's consumed processor time and whether
-// this platform observes it at all. It is process.CPUProgress in the product
-// -- the handle the runner binds to the sampler that already measures every
-// child -- and one method is the whole of what the hang detector needs.
+// it is observed. It is process.CPUProgress in the product -- the handle the
+// runner binds to the sampler that already measures every child -- and one
+// method is the whole of what the hang detector needs. ok is false where the
+// platform cannot sample a running tree, and also until the sampler's first
+// sweep has found this child's tree; the connection watches its byte count in
+// that window (see progress).
 type cpuProgress interface {
 	Ticks() (int64, bool)
 }
@@ -471,11 +474,15 @@ func (c *conn) send(payload []byte) error {
 // costs a live but effectively idle session, where counting its bytes would
 // cost every wedged request on a busy connection.
 //
-// Where the platform cannot sample a running tree there is no processor-time
-// signal at all, and the connection's byte count stands in. The fallback
-// restores exactly the masking above, which is the right trade for it: it
-// cannot terminate a server that is progressing, and on such a platform there
-// is nothing else to watch.
+// Where there is no processor-time reading -- a platform that cannot sample a
+// running tree, or a child the sampler's first sweep has not found yet, which
+// is the start of every server and so the start of the initialize request --
+// the connection's byte count stands in. The fallback restores exactly the
+// masking above, which is the right trade for it: it cannot terminate a server
+// that is progressing, and while it applies there is nothing else to watch.
+// The first processor-time reading after the fallback differs from the byte
+// count it replaces and so reads as one change, which only ever counts as
+// progress once and never as a stall.
 func (c *conn) progress() int64 {
 	if c.cpu != nil {
 		if ticks, ok := c.cpu.Ticks(); ok {
