@@ -58,8 +58,10 @@ func TestCppLoweringGolden(t *testing.T) {
 			// Nodes: a@10, b@17, the lambda @31 (Uses its captures a and b,
 			// may-defines a only, defines the created closure's owned
 			// result), g = …@27 (defines g, Uses that result and none of the
-			// captures), g()@68, h(a)@73, return b;@79. Succ: a straight line to EXIT. h(a) sees a@10 and the
-			// lambda's non-killing may-definition; return b sees b@17 alone.
+			// captures), g()@68, h(a)@73, return b;@79. Succ: a straight line to EXIT. h(a) pairs with the
+			// lambda, the nearest may-definition of a, and with a@10, the
+			// killing definition reaching it through the lambda; return b
+			// sees b@17 alone.
 			name:     "a lambda's by-reference capture is a may-definition, a by-copy capture is not",
 			protects: "a write through a by-reference capture reaches later uses of the variable, while a write to a by-copy capture stays inside the closure, and the declarator consuming the lambda does not repeat its captures",
 			mutation: "may-define every captured variable written (adds [&a, b]() mutable { a = b; b = 0; }@31 -> return b;@79), or none (loses the lambda's pair with h(a)@73), let the declarator re-read the captures (adds a@10 and b@17 -> g = [&a, b]() mutable { a = b; b = 0; }@27), or give the creating node no result (loses [&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27)",
@@ -113,8 +115,8 @@ func TestCppLoweringGolden(t *testing.T) {
 			// `g(&x);` alone also reads as a declaration of a reference x of
 			// type g ([stmt.ambig]), which a parser without types may pick.
 			// Nodes: x = 1@14 (defines x), g(0, &x)@21 (Uses
-			// x, may-defines x), return x;@31. The may-definition kills
-			// nothing, so the return's x pairs with both.
+			// x, may-defines x), return x;@31. The return's x pairs with the
+			// nearest may-definition and with the killing x = 1 behind it.
 			name:     "taking an address is a may-definition of the variable",
 			protects: "a use after a call that received a variable's address sees the write the call may make through it",
 			mutation: "lower `&x` as a plain read (g(0, &x)@21 -> return x;@31 vanishes), or make it a killing Def (x = 1@14 -> return x;@31 vanishes)",
@@ -199,8 +201,8 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [expr.ass]: an assignment's result is its left operand, and
 			// [expr.call]: the arguments are indeterminately sequenced, each
 			// evaluated completely before the call. Nodes: x@10, x = 1@25
-			// (defines x, may-defines its result), x = 2@34 (defines x,
-			// killing x = 1, may-defines its own result), return g((x = 1),
+			// (defines x and its own result), x = 2@34 (defines x, killing
+			// x = 1, and its own result), return g((x = 1),
 			// (x = 2));@15 (Uses both results). Succ: a straight line to EXIT.
 			name:     "each embedded assignment to a local hands its own value to the consumer",
 			protects: "the consumer of two assignments to one local depends on both, since it Uses each assignment's result and not the local the second one overwrites",
@@ -212,8 +214,8 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [expr.call]: the arguments are indeterminately sequenced; the
 			// lowering takes source order, so the read of x in the first
 			// argument precedes x = 1. Nodes: x@10, x = 1@27 (Uses the x the
-			// call already read, defines x, may-defines an owned variable
-			// carrying that earlier value and its own result), return g(x, x
+			// call already read, defines x, an owned variable carrying that
+			// earlier value, and its own result), return g(x, x
 			// = 1);@15 (Uses the carried value and the result). Succ: a
 			// straight line to EXIT.
 			name:     "a read made before an embedded assignment of the same local keeps the earlier value",
@@ -226,8 +228,8 @@ func TestCppLoweringGolden(t *testing.T) {
 			// [expr.log.and]/1: the right operand is evaluated only when the
 			// left is true; [expr.call]: the arguments are indeterminately
 			// sequenced, taken in source order. Nodes: x@10, c@17, c@34
-			// (Branch, Uses c, defines the && result), x = 1@40 (defines x and
-			// may-defines its result and the && result; it runs only when c
+			// (Branch, Uses c, defines the && result), x = 1@40 (defines x,
+			// its own result and the && result; it runs only when c
 			// is true, so it takes no read held before it), return g(x, c &&
 			// (x = 1));@22 (Uses the held x and the && result). Succ: c@34→
 			// {x = 1, return}; x = 1→return. IPDom: c@34 → return.

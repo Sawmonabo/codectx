@@ -172,10 +172,9 @@ const (
 //     named before the directive, if any. A read through the name Uses each,
 //     and taking its address, binding a reference to it or writing it by
 //     reference from a callable may-defines each. A definition through it (an
-//     assignment, an update) defines the arms' variable and may-defines the one
-//     from before the directive, since a node defines one variable. Given up
-//     against killing both: that earlier variable's definitions still reach a
-//     later read through the name. A name the arms bind only as no variable (a
+//     assignment, an update) is a killing definition of each: whichever build
+//     is taken, the name denotes one of them and the write replaces its value.
+//     A name the arms bind only as no variable (a
 //     function prototype) is no variable after the directive when every arm
 //     binds it, and otherwise keeps the binding from before it. Inside an arm
 //     that redeclares the name, the name is the arms' variable alone.
@@ -232,9 +231,9 @@ const (
 //   - an assignment, compound assignment or update embedded in a larger
 //     expression, whatever its target, is a node of its own, and the
 //     consumer Uses its result, never the target, so `g((x = 1), (x = 2))`
-//     depends on both assignments: a local target is the node's definition,
-//     so the node may-defines the result; any other target's node (a field,
-//     index or pointer target, whose base it may-defines) defines it, so
+//     depends on both assignments: the node defines the result beside its
+//     target, a local target by a definition of its own and any other target
+//     (a field, index or pointer target) by a may-definition of its base, so
 //     `g(s.f = a)` is the node s.f = a and the call's node Using its result;
 //   - a lambda's or nested function's creation: the creating node, which
 //     Uses the captures (see Captures).
@@ -242,11 +241,12 @@ const (
 // A yielding operand, arm or last statement is a Stmt node spanning it that
 // defines the result, unless its own lowering made one node spanning it
 // that already hands its value on (an embedded assignment, a creating
-// node): a node defines one variable, so that node may-defines the result
-// instead. Each construct owns its result, so only its own yielding nodes
-// define it, and the may-definition gives the consumer the same pairs a
-// definition would (a value reaching through it from an earlier iteration
-// is one the consumer already pairs with).
+// node): that node is the yielding node and defines the result too, a node
+// making several killing definitions. Each construct owns its result, so
+// only its own yielding nodes define it: the deciding operand of `&&`, `||`
+// or `a ?: b` and the operand evaluated after it both define it on the path
+// through the latter, which kills the former, whose value reaches the
+// consumer on the path that skips the latter.
 //
 // Folded into the node that evaluates them, their reads being that node's
 // own evaluation: every other operator (arithmetic, comparison, bitwise,
@@ -257,7 +257,7 @@ const (
 // A read the consumer folds that an embedded assignment's or update's
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
-// may-defines an owned variable that replaces the held read, so the folded read
+// defines an owned variable that replaces the held read, so the folded read
 // pairs with the definition that reached it. The hand-off is made only when the
 // defining node runs whenever the consumer does: a definition in the right
 // operand of `&&` or `||` or in an arm of `?:` leaves the read on the consumer.
@@ -283,8 +283,8 @@ const (
 // range for's range and its head and names (see Node granularity), a
 // structured binding's initializer and its names. A write
 // through `*p`, `p->f`, `a[i]` or `s.f` (and an assembly output operand)
-// Uses its operands and is a non-killing may-definition of the base
-// variable on the node that evaluates the enclosing expression. By the
+// Uses its operands and is a may-definition (Lowering, May-definitions) of
+// the base variable on the node that evaluates the enclosing expression. By the
 // address-taking rule of Lowering, so is each of these, which also Uses its
 // operands (`&x` Uses x though it reads no value of x: that is the rule's
 // Use, which pairs the address with the definitions reaching it): taking an
@@ -313,7 +313,7 @@ const (
 // that is an expression statement, its expression is lowered for its value
 // into a node yielding the statement expression's result variable (a Stmt
 // node spanning it that defines it, or the node of an embedded assignment
-// or lambda spanning it, which may-defines it, as Uses states; a comma
+// or lambda spanning it, which defines it too, as Uses states; a comma
 // expression's left operand is a statement of its own and its right operand
 // the value); otherwise the construct has no value and no
 // result. Every other statement is a node of its own, whose reads no later
@@ -751,20 +751,23 @@ func (c *cLower) mayDefs(n, v int32) {
 	}
 }
 
-// def records that node n defines v, unless v is -1, and may-defines every
-// variable v's name also stands for (joined): a node defines one variable,
-// so those keep their earlier definitions. When the statement
-// still holds a read of v that no node carries, made before n by an
-// enclosing expression (`f(x, x = 1)`) on every path reaching n (from
-// reads[sure] on), n reads that earlier value before overwriting it and
-// hands it on through an owned variable it may-defines, which replaces
-// those held reads (see Uses in lowerC).
+// def records that node n defines v and every variable v's name also stands
+// for (joined), each a killing definition, unless v is -1 (see Node
+// granularity: a definition through a name a preprocessor conditional left
+// standing for several bindings).
 func (c *cLower) def(n, v int32) {
-	if v < 0 {
-		return
+	for ; v >= 0; v = c.joined(v) {
+		c.b.Def(n, v)
+		c.handOff(n, v)
 	}
-	c.b.Def(n, v)
-	c.mayDefs(n, c.joined(v))
+}
+
+// handOff hands on a read of v that the statement still holds and no node
+// carries, made before n, which defines v, by an enclosing expression
+// (`f(x, x = 1)`) on every path reaching n (from reads[sure] on): n reads
+// that earlier value before overwriting it and defines an owned variable
+// holding it, which replaces those held reads (see Uses in lowerC).
+func (c *cLower) handOff(n, v int32) {
 	if int(v) >= len(c.held) || c.held[v] == 0 {
 		return
 	}
@@ -784,7 +787,7 @@ func (c *cLower) def(n, v int32) {
 		return
 	}
 	c.b.Use(n, v)
-	c.b.MayDef(n, t)
+	c.b.Def(n, t)
 	if int(t) >= len(c.held) {
 		c.held = append(c.held, make([]int32, int(t)+1-len(c.held))...)
 	}
@@ -1097,9 +1100,9 @@ func (c *cLower) exprStmt(e *ts.Node) {
 		c.exprStmt(u.ChildByFieldId(k.fRight))
 		return
 	case k.assignmentExpression:
-		made, _ = c.assign(u, flow.Stmt)
+		made = c.assign(u, flow.Stmt)
 	case k.updateExpression:
-		made, _ = c.update(u, flow.Stmt)
+		made = c.update(u, flow.Stmt)
 	case k.asmExpression:
 		c.asm(u)
 		return
@@ -1130,13 +1133,12 @@ func (c *cLower) effect(n *ts.Node) {
 // variable r: a Stmt node spanning n. When n was lowered to one node of its
 // own spanning it that hands on its value (an embedded assignment, a
 // creating node), with nothing else pending, that node is the yielding
-// node; it already defines the variable its value travels through, and a
-// node defines one variable, so it may-defines r instead.
+// node, and defines r beside the variable its value travels through.
 func (c *cLower) yield(n *ts.Node, r int32) {
 	m := len(c.reads)
 	u := c.l.unparen(n)
 	if _, ok := c.carried(u); ok {
-		c.b.MayDef(c.last, r)
+		c.b.Def(c.last, r)
 		return
 	}
 	c.b.Def(c.node(flow.Stmt, u, m), r)
@@ -1424,9 +1426,9 @@ func (c *cLower) cond(n *ts.Node) int32 {
 	var id int32 = -1
 	switch e.KindId() {
 	case k.assignmentExpression:
-		id, _ = c.assign(e, flow.Branch)
+		id = c.assign(e, flow.Branch)
 	case k.updateExpression:
-		id, _ = c.update(e, flow.Branch)
+		id = c.update(e, flow.Branch)
 	default:
 		c.value(e)
 	}
@@ -1661,7 +1663,9 @@ func (c *cLower) forRange(n *ts.Node) {
 
 // element declares a range for's bound name as a node that defines it from
 // the iteration variable iter and may-defines elem, the range's base
-// variable when the name is a reference, unless elem is -1.
+// variable when the name is a reference, unless elem is -1. The node does
+// not Use elem: as a may-definition it reads elem's prior version, which
+// pairs it with what reaches it (Lowering, May-definitions).
 func (c *cLower) element(name *ts.Node, iter, elem int32) {
 	v := c.declare(name)
 	id := c.node(flow.Stmt, name, c.base)
@@ -2100,24 +2104,18 @@ func (c *cLower) value(n *ts.Node) int32 {
 	case k.assignmentExpression, k.updateExpression:
 		// An embedded assignment or update is a node of its own, whatever
 		// its target, handing its value on through an owned result that the
-		// consumer Uses, never the target: a local target is the node's
-		// definition, so the node may-defines the result; the node of any
-		// other target (a field, index or pointer target, whose base it
-		// may-defines, or a name that is no local) defines it.
+		// consumer Uses, never the target. The node defines the result beside
+		// its target: a local target by a definition, a field, index or
+		// pointer target by a may-definition of its base, a name that is no
+		// local by nothing.
 		m := len(c.reads)
-		var id, v int32
+		var id int32
 		if n.KindId() == k.assignmentExpression {
-			id, v = c.assign(n, flow.Stmt)
+			id = c.assign(n, flow.Stmt)
 		} else {
-			id, v = c.update(n, flow.Stmt)
+			id = c.update(n, flow.Stmt)
 		}
-		switch {
-		case id >= 0 && v >= 0:
-			r := c.b.Var()
-			c.b.MayDef(id, r)
-			c.read(r)
-			return r
-		case id < 0:
+		if id < 0 {
 			id = c.node(flow.Stmt, n, m)
 		}
 		return c.handOn(id)
@@ -2409,42 +2407,42 @@ func (c *cLower) tail(e *ts.Node, r int32) bool {
 
 // assign lowers `left = right` and `left op= right`. For an identifier
 // target it returns the node of kind kind it created spanning n, which
-// defines v, the target's variable; for a field, index or pointer target it
+// defines the target's variable; for a field, index or pointer target it
 // returns -1, leaving the target's reads and may-definition for the node
 // that evaluates n.
-func (c *cLower) assign(n *ts.Node, kind flow.Kind) (id, v int32) {
+func (c *cLower) assign(n *ts.Node, kind flow.Kind) int32 {
 	k := c.k
 	left, right := c.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(c.reads)
 	if left.KindId() != k.identifier {
 		c.value(right)
 		c.target(left)
-		return -1, -1
+		return -1
 	}
-	v = c.lookup(left)
+	v := c.lookup(left)
 	if n.ChildByFieldId(k.fOperator).KindId() != k.assign {
 		c.read(v)
 	}
 	c.value(right)
-	id = c.node(kind, n, m)
+	id := c.node(kind, n, m)
 	c.def(id, v)
-	return id, v
+	return id
 }
 
 // update lowers `x++`, `--x` and their indirect forms, and returns as
 // assign does.
-func (c *cLower) update(n *ts.Node, kind flow.Kind) (id, v int32) {
+func (c *cLower) update(n *ts.Node, kind flow.Kind) int32 {
 	arg := c.l.unparen(n.ChildByFieldId(c.k.fArgument))
 	if arg.KindId() != c.k.identifier {
 		c.target(arg)
-		return -1, -1
+		return -1
 	}
 	m := len(c.reads)
-	v = c.lookup(arg)
+	v := c.lookup(arg)
 	c.read(v)
-	id = c.node(kind, n, m)
+	id := c.node(kind, n, m)
 	c.def(id, v)
-	return id, v
+	return id
 }
 
 // target lowers a write through a field, index or pointer target, or the
