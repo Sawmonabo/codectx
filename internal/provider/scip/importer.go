@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -107,13 +108,13 @@ type importer struct {
 	// repository and the report is a bounded diagnostic surface.
 	refusedOccurrences int64
 	refusedExemplar    string
-	// encodingDropped counts documents whose assumed position encoding the
-	// pinned bytes contradict; encodingDroppedPath is the first of them. A
-	// failed probe is a whole-document shift, so the document is dropped
-	// rather than any one of its occurrences.
-	encodingDropped     int64
-	encodingDroppedPath string
-	partialCode         string
+	// encodingDropped counts the documents whose assumed position encoding
+	// the pinned bytes contradict; encodingUnproved those none of whose
+	// definitions could check it. A failed probe is a whole-document shift, so
+	// the document is dropped rather than any one of its occurrences.
+	encodingDropped  droppedDocs
+	encodingUnproved droppedDocs
+	partialCode      string
 	// drops is the one account of everything the wire decoder discarded for
 	// exceeding a field bound, across every pass of this import.
 	drops decodeDrops
@@ -172,7 +173,26 @@ const (
 	// and names the first.
 	detailEncodingDropped  = "documents_dropped_encoding"
 	detailEncodingExemplar = "documents_dropped_encoding_exemplar"
+	// detailEncodingUnproved counts documents dropped whole because none of
+	// their definitions could check the assumed encoding, and names the
+	// first: nothing contradicted the guess, and nothing confirmed it.
+	detailEncodingUnproved         = "documents_unproved_encoding"
+	detailEncodingUnprovedExemplar = "documents_unproved_encoding_exemplar"
 )
+
+// droppedDocs counts documents dropped for one reason and keeps the first
+// one's path as the exemplar.
+type droppedDocs struct {
+	n     int64
+	first string
+}
+
+func (d *droppedDocs) note(path string) {
+	d.n++
+	if d.first == "" {
+		d.first = path
+	}
+}
 
 // limitSeen records the largest figure observed at each bound. It is a
 // measurement, not a gate: nothing consults it until the run is over, which
@@ -593,8 +613,8 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 // endDocument binds a finished document to its snapshot file, classifies it
 // against the stored manifest and resolves its definitions. A document the
 // snapshot does not hold, or whose encoding the indexer left unspecified and
-// the per-tool table cannot supply, or whose supplied encoding does not hold
-// against the pinned bytes (encodingHolds), or whose file exceeds the source
+// the per-tool table cannot supply, or whose supplied encoding the pinned bytes
+// contradict or cannot check (encodingHolds), or whose file exceeds the source
 // bound, is skipped and counted: nothing is guessed about it, and it stays out
 // of the fresh manifest, so a later refresh treats it as new rather than
 // inheriting rows nothing stands behind.
@@ -649,20 +669,24 @@ func (im *importer) endDocument(d document) error {
 		return err
 	}
 	if assumed {
-		holds, err := im.encodingHolds(ctx, ds)
+		proof, err := im.encodingHolds(ctx, ds)
 		if err != nil {
 			return err
 		}
-		if !holds {
-			// A failed probe is a claim about the whole document -- its
-			// columns are read in an encoding its bytes contradict -- so the
-			// document is dropped whole and counted, which is the one shift
-			// that is not a per-occurrence refusal.
+		// A failed probe is a claim about the whole document -- its columns
+		// are read in an encoding its bytes contradict -- so the document is
+		// dropped whole and counted, which is the one shift that is not a
+		// per-occurrence refusal. A document nothing could check is dropped
+		// too, since an unchecked guess is never admitted, and counted apart,
+		// because nothing contradicted it.
+		switch proof {
+		case encodingContradicted:
+			im.encodingDropped.note(d.path)
+		case encodingUnproved:
+			im.encodingUnproved.note(d.path)
+		}
+		if proof != encodingProved {
 			im.skippedDocs++
-			im.encodingDropped++
-			if im.encodingDroppedPath == "" {
-				im.encodingDroppedPath = d.path
-			}
 			im.degrade(model.CodeProviderOutputInvalid)
 			return im.dropSpool(ctx, d.index)
 		}
@@ -821,12 +845,19 @@ func (im *importer) resolveEncoding(declared int32) (enc int32, assumed bool) {
 	return enc, enc != encodingUnspecified
 }
 
-// maxEncodingProbes bounds the definition occurrences encodingHolds reads
-// looking for one it can check. A document whose first maxEncodingProbes
-// definitions all name something the source does not spell literally is
-// skipped, exactly as one with no definition at all is: an unchecked guess is
-// never admitted.
-const maxEncodingProbes = 256
+// encodingProof is what the pinned bytes say about an assumed encoding.
+type encodingProof int
+
+const (
+	// encodingUnproved: no definition of the document could check the guess,
+	// so it is neither confirmed nor contradicted.
+	encodingUnproved encodingProof = iota
+	encodingProved
+	encodingContradicted
+)
+
+// errProbeDecided ends the probe's scan once one definition has decided it.
+var errProbeDecided = errors.New("encoding probe decided")
 
 // encodingHolds proves an assumed position encoding against the document's
 // pinned bytes, once, before any of its occurrences is admitted.
@@ -838,21 +869,27 @@ const maxEncodingProbes = 256
 // source that is not the symbol — the wrong-bytes class nothing downstream can
 // detect. So the guess is checked the only way the index itself allows: the
 // first definition occurrence whose symbol names an identifier the source
-// spells literally (symbol.probeName) must select exactly that identifier.
+// spells literally (symbol.probeName), and whose range selects any bytes, must
+// select exactly that identifier. A zero-width range selects no bytes and so
+// reads the same in every encoding; it proves nothing and is passed over.
+//
+// Every definition is read until one decides, however many are passed over. A
+// document none of whose definitions can check the guess is unproved, which is
+// reported apart from one whose bytes contradict it, and neither is admitted.
 //
 // On a line with a non-ASCII rune before the token the readings disagree and a
 // wrong guess is caught; on an ASCII-only line every reading converts to the
 // same bytes, so there is nothing to catch and the check passes on the truth.
-func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, error) {
-	var checked, holds bool
-	err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq LIMIT ?`,
-		[]any{ds.doc.idx, roleDefinition, maxEncodingProbes}, func(scan func(...any) error) error {
+func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (encodingProof, error) {
+	proof := encodingUnproved
+	err := im.sc.each(ctx, `SELECT symbol, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
+		[]any{ds.doc.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
 			var r [4]int32
 			if err := scan(&symbolText, &r[0], &r[1], &r[2], &r[3]); err != nil {
 				return internal("scip scratch read: " + err.Error())
 			}
-			if checked || symbolText == "" {
+			if symbolText == "" {
 				return nil
 			}
 			sym, err := parseSymbol(symbolText)
@@ -862,24 +899,26 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 			if _, ok := sym.probeName(); !ok {
 				return nil
 			}
+			rng, _ := im.rangeOf(ds, r)
+			if rng != nil && rng.Start.Byte == rng.End.Byte {
+				return nil
+			}
 			// This occurrence decides the document: a symbol that names an
 			// identifier and does not land on it is the failure being looked
-			// for, so a later occurrence is not tried instead.
-			checked = true
-			if r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 {
-				return nil
+			// for, so a later occurrence is not tried instead. The predicate is
+			// the one every occurrence of the document will be held to, applied
+			// before any spelling is bound, so only the symbol's own name proves
+			// an encoding.
+			proof = encodingContradicted
+			if rng != nil && ds.onPinnedBytes(sym, rng) == "" {
+				proof = encodingProved
 			}
-			rng, cerr := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
-			if cerr != nil {
-				return nil
-			}
-			// The same predicate every occurrence of the document will be held
-			// to, so an encoding cannot be proved by one rule and its
-			// occurrences refused by another.
-			holds = ds.onPinnedBytes(sym, &rng) == ""
-			return nil
+			return errProbeDecided
 		})
-	return holds, err
+	if errors.Is(err, errProbeDecided) {
+		err = nil
+	}
+	return proof, err
 }
 
 // loadSource reads one document's exact pinned bytes through the snapshot
@@ -1829,9 +1868,13 @@ func (im *importer) result() model.ProviderResult {
 			cs = cs.WithDetail(detailRefusedOccurrences, strconv.FormatInt(im.refusedOccurrences, 10)).
 				WithDetail(detailRefusedExemplar, im.refusedExemplar)
 		}
-		if im.encodingDropped > 0 {
-			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped, 10)).
-				WithDetail(detailEncodingExemplar, im.encodingDroppedPath)
+		if im.encodingDropped.n > 0 {
+			cs = cs.WithDetail(detailEncodingDropped, strconv.FormatInt(im.encodingDropped.n, 10)).
+				WithDetail(detailEncodingExemplar, im.encodingDropped.first)
+		}
+		if im.encodingUnproved.n > 0 {
+			cs = cs.WithDetail(detailEncodingUnproved, strconv.FormatInt(im.encodingUnproved.n, 10)).
+				WithDetail(detailEncodingUnprovedExemplar, im.encodingUnproved.first)
 		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}

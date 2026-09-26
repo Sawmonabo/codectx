@@ -285,16 +285,17 @@ then published at `compiler` precision against source that is not the symbol.
 
 An assumed encoding is therefore **proved once per document before any of its
 occurrences is admitted**: the first definition occurrence whose symbol names
-an identifier the source spells literally must select exactly that identifier.
-Namespace descriptors (package, module and file paths), meta descriptors
-(Python's `__init__`), backtick-escaped names (`<init>`, operators) and `local`
-symbols carry no such name and are passed over; a document in which none of
-the first 256 definitions carries one is skipped rather than admitted on an
-unchecked guess. On a line with a non-ASCII rune before the token the readings
-disagree and a wrong guess is caught; on an ASCII-only line every reading
-converts to the same bytes, so there is nothing to catch. A document whose
-guess does not hold is skipped and the capabilities are `partial` with
-`CTX_PROVIDER_OUTPUT_INVALID`.
+an identifier the source spells literally, and whose range selects any bytes,
+must select exactly that identifier. Namespace descriptors (package, module and
+file paths), meta descriptors (Python's `__init__`), backtick-escaped names
+(`<init>`, operators) and `local` symbols carry no such name, and a zero-width
+range selects no bytes and reads the same in every encoding; all of them are
+passed over, however many there are. On a line with a non-ASCII rune before the
+token the readings disagree and a wrong guess is caught; on an ASCII-only line
+every reading converts to the same bytes, so there is nothing to catch. A
+document whose guess the bytes contradict, and one none of whose definitions
+can check it, are both skipped rather than admitted on an unchecked guess, and
+the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`.
 
 The probe is not the guarantee, only its precondition. **Every** occurrence's
 range is then proved against the bytes it claims to describe — every one to the
@@ -388,7 +389,11 @@ The two proofs deliberately have different outcomes, because the two failures
 have different reach. A failed **encoding probe** is a claim about the whole
 document — every column of it is read in an encoding its bytes contradict — so
 the document is dropped whole, counted under `documents_dropped_encoding` and
-named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
+named by `documents_dropped_encoding_exemplar`. A document none of whose
+definitions can check the guess is dropped whole too, because nothing confirmed
+it, but nothing contradicted it either, so it is counted apart under
+`documents_unproved_encoding` and named by
+`documents_unproved_encoding_exemplar`. A failed **per-occurrence
 proof** reaches exactly one coordinate, so exactly one occurrence is left out:
 it is counted under `refused_occurrences`, the first is named with its reason by
 `refused_occurrence_exemplar` as `<document>:<line>:<column>: <reason>` — the

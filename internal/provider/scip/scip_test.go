@@ -511,18 +511,34 @@ func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth i
 // readings. The document leaves `position_encoding` unspecified, which is how
 // every real scip-typescript, scip-java and scip-python index arrives
 // (measured: none of the three sets the field).
+//
+// A document whose assumed encoding the bytes contradict is dropped whole, and
+// the drop is counted and named on the capability row; silently, it would
+// leave a unit that describes fewer files than its index with nothing saying
+// so. A zero-width definition selects no bytes and reads the same in every
+// encoding, so it must not decide the probe. Mutations that must fail this
+// test: drop the documents_dropped_encoding count or its exemplar, which
+// republishes the silence; or let a zero-width definition prove the encoding in
+// encodingHolds, which admits the wrong-encoding document behind it.
 func TestCallsiteAliasJoin(t *testing.T) {
 	cases := []struct {
 		name          string
 		tool, version string
 		admit         bool
+		// zeroWidth puts a zero-width definition of a named symbol ahead of
+		// the one the probe can check.
+		zeroWidth bool
+		// contradicted is the documents_dropped_encoding the row must publish.
+		contradicted string
 	}{
 		// The measured pair: the columns are read as UTF-16 and the join works.
 		{name: "measured tool and version", tool: "scip-typescript", version: "0.4.0", admit: true},
 		// A tool whose measured encoding is UTF-8 over UTF-16 columns. The
-		// conversion succeeds and selects "n B": the wrong-source case the
-		// self-check exists for.
-		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7"},
+		// conversion succeeds and selects "n B", which starts inside
+		// "function": the wrong-source case the self-check exists for.
+		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7", contradicted: "1"},
+		// The same, behind a zero-width definition the probe must pass over.
+		{name: "wrong tool encoding behind a zero-width definition", tool: "scip-go", version: "0.2.7", zeroWidth: true, contradicted: "1"},
 		// The right tool at a version nothing was measured against.
 		{name: "unmeasured version", tool: "scip-typescript", version: "9.9.9"},
 		// A tool with no measured encoding at all.
@@ -531,9 +547,11 @@ func TestCallsiteAliasJoin(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			files := fixture(t)
-			ref := occurrenceRecord(symBaz, 0, 0, 25, 28)
-			def := occurrenceRecord(symBaz, 1, 0, 25, 28)
-			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, def, ref)))
+			occs := [][]byte{occurrenceRecord(symBaz, 1, 0, 25, 28), occurrenceRecord(symBaz, 0, 0, 25, 28)}
+			if tc.zeroWidth {
+				occs = append([][]byte{occurrenceRecord(symI, 1, 1, 10, 10)}, occs...)
+			}
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, occs...)))
 			inputs := append([]string{"utf16.scip"}, sourcePaths...)
 			p := newProvider(t, "utf16.scip")
 			h := providertest.New(t, files)
@@ -545,6 +563,24 @@ func TestCallsiteAliasJoin(t *testing.T) {
 				if rep.Skipped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
 					t.Fatalf("index of %s %s: skipped=%d, %d nodes, %d relations, %d aliases %v; want the document skipped and nothing published",
 						tc.tool, tc.version, rep.Skipped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
+				}
+				for _, cs := range rep.Result.Capabilities {
+					if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+						t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+					}
+					if got := cs.Details["documents_dropped_encoding"]; got != tc.contradicted {
+						t.Fatalf("documents_dropped_encoding = %q, want %q: a document dropped for its encoding must be counted", got, tc.contradicted)
+					}
+					want := ""
+					if tc.contradicted != "" {
+						want = "web/b.ts"
+					}
+					if got := cs.Details["documents_dropped_encoding_exemplar"]; got != want {
+						t.Fatalf("documents_dropped_encoding_exemplar = %q, want %q", got, want)
+					}
+					if got := cs.Details["refused_occurrences"]; got != "" {
+						t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not refused occurrences", got)
+					}
 				}
 				return
 			}
@@ -1110,53 +1146,6 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	}
 }
 
-// TestFailedEncodingProbeDropsTheDocument protects the one shift that is NOT a
-// per-occurrence refusal. A position encoding assumed from the tool table and
-// contradicted by the bytes shifts every column of that document, so no
-// occurrence of it can be trusted and the document is dropped whole. The
-// failure mode, silent: dropping it without a count leaves an operator reading
-// a unit that describes fewer files than the index held with nothing saying so.
-//
-// The document declares no encoding, so the scip-typescript table entry
-// (UTF-16) is assumed; its one definition sits after a 4-byte rune, where a
-// UTF-16 reading and the truth disagree, and the columns given are the UTF-8
-// ones. Mutation that must fail this test: drop the encodingDropped count (or
-// its detail), which republishes the silence.
-func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
-	// "𝄞" is one UTF-8 4-byte rune and two UTF-16 units. "Start" therefore
-	// begins at UTF-8 column 9 and UTF-16 column 7; the columns below are the
-	// UTF-8 ones, which a UTF-16 reading resolves to bytes that are not it.
-	const src = "// \U0001D11E xx\nfunc Start() {}\n"
-	const symStart = "scip-typescript npm example 1.0.0 src/`a.ts`/Start()."
-
-	files := fixture(t)
-	files["src/a.ts"] = src
-	files["a.scip"] = string(miniIndex("scip-typescript", "0.4.0",
-		documentWithText("src/a.ts", "typescript", 0, src,
-			occurrenceRecord(symStart, 1, 0, 17, 22))))
-
-	h := providertest.New(t, files)
-	p := newProvider(t, "a.scip")
-	res, _, err := h.Run(t, p, scip.ImportScope("a.scip"), append([]string{"a.scip", "src/a.ts"}, sourcePaths...))
-	if err != nil {
-		t.Fatalf("a document whose encoding probe fails must be dropped, not fail the unit: %v", err)
-	}
-	for _, cs := range res.Capabilities {
-		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
-			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
-		}
-		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
-			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
-		}
-		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "src/a.ts" {
-			t.Fatalf("documents_dropped_encoding_exemplar = %q, want src/a.ts", got)
-		}
-	}
-	if got := refusedDetail(res); got != "" {
-		t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not a refused occurrence", got)
-	}
-}
-
 // TestAProbeLandingOnAnotherWholeTokenDropsTheDocument protects the name half
 // of the per-document encoding probe: the half that catches an assumed
 // encoding whose columns still convert cleanly.
@@ -1172,8 +1161,8 @@ func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
 // The probe-deciding occurrence here is a declaration of `Start` ranged over
 // `browser`, one whole identifier token further along the same line: it
 // converts, it is not cut, it covers whole tokens, and it is not `Start`. The
-// conversion-error path that TestFailedEncodingProbeDropsTheDocument fires
-// through is therefore never reached, so this is the half that test misses.
+// cut-token path the wrong-encoding rows of TestCallsiteAliasJoin fail through
+// is therefore never reached, so this is the half those rows miss.
 // Because the probe is a claim about the whole document, the assertions are
 // that nothing of it survives -- no call-site alias from the clean reference
 // spooled after it, no row in the fresh manifest -- and that the drop is
@@ -1247,13 +1236,4 @@ func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 			t.Fatalf("refused_occurrences = %q: a failed encoding probe is one dropped document, not a refused occurrence", got)
 		}
 	}
-}
-
-func refusedDetail(res model.ProviderResult) string {
-	for _, cs := range res.Capabilities {
-		if v := cs.Details["refused_occurrences"]; v != "" {
-			return v
-		}
-	}
-	return ""
 }
