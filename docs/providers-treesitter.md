@@ -269,7 +269,7 @@ ts, err := treesitter.New(treesitter.Options{
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-	Runner:            sharedRunner,
+	Runner:            parserRunner,
 	WorkDir:           filepath.Join(dataDir, "workers", "treesitter"),
 })
 defer ts.Close()

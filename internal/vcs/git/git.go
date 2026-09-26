@@ -120,8 +120,8 @@ type Git struct {
 
 	// MaxFilterDrivers bounds how many configured filter drivers one run
 	// neutralizes. Zero -- the default -- is unlimited: a monorepo really does
-	// configure hundreds, and refusing the repository for it was a scale
-	// refusal. A user-set bound that is passed is reported through OnOverBound
+	// configure hundreds, and refusing the repository for it would be a
+	// scale refusal. A user-set bound that is passed is reported through OnOverBound
 	// and every driver is still neutralized, because neutralizing only some of
 	// them would be worse than neutralizing none.
 	MaxFilterDrivers int64

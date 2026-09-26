@@ -64,8 +64,7 @@ const maxWalkedEntries = 200000
 // Section 22 forbids the alternative -- adding per-process historical peaks
 // reached at different moments describes a moment that never existed.
 //
-// The rule inherited from the L0 slice: a metric that cannot be measured stays
-// nil. It is never defaulted to zero, because a zero resident set reads as a
+// A metric that cannot be measured stays nil. It is never defaulted to zero, because a zero resident set reads as a
 // process using no memory, and Section 23 requires an unavailable figure be
 // reported as unavailable.
 type HostSampler struct {

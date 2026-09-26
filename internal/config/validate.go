@@ -8,6 +8,12 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
+// TempDiskConsumers is how many consumers resources.max_temp_bytes is split
+// between: the shared process runner, whose children stage temporary bytes,
+// and the query spools. The composition's split gives each of them at least
+// one byte of a set ceiling, so validation refuses a ceiling below this count.
+const TempDiskConsumers = 2
+
 // validate enforces the whole resolved configuration, including the cross-field
 // budget rules of Section 20.1's closing paragraph.
 //
@@ -100,7 +106,6 @@ func (c Config) validate() error {
 		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
 		{"providers.manifest.max_xml_elements", c.Providers.Manifest.MaxXMLElements},
 		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
-		{"providers.tree_sitter.max_records_per_file", c.Providers.TreeSitter.MaxRecordsPerFile},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
 		{"workspace.max_depth", c.Workspace.MaxDepth},
@@ -281,6 +286,13 @@ func (c Config) validateBudgets() error {
 	// unlimited temporary budget never lets the workspace fill the disk.
 	if c.Resources.MaxTempBytes < 0 {
 		return configInvalid("resources.max_temp_bytes is %d; use 0 for unlimited", c.Resources.MaxTempBytes)
+	}
+	// A set ceiling is split between TempDiskConsumers, and every share must
+	// be positive because each consumer reads zero as unlimited. A ceiling
+	// smaller than the consumer count cannot be split that way.
+	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes < TempDiskConsumers {
+		return configInvalid("resources.max_temp_bytes is %d; a set ceiling is split between %d consumers of temporary disk and must be at least %d bytes, or 0 for unlimited",
+			c.Resources.MaxTempBytes, TempDiskConsumers, TempDiskConsumers)
 	}
 	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
 		return configInvalid("resources.max_temp_bytes %d does not exceed the free-space reserve resources.min_free_disk_bytes %d; temporary work would always be refused",

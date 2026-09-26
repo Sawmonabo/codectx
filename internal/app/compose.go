@@ -163,15 +163,12 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // disk budget and the query spools' budget so the two sum to exactly the
 // ceiling the operator set. Zero, the default, is unlimited and stays
 // unlimited on both sides. Neither share of a set ceiling may round to zero,
-// because zero is read as unlimited by both consumers; a ceiling too small
-// to split into two positive shares -- one byte -- gives each consumer the
-// ceiling itself, which refuses every real reservation either way.
+// because zero is read as unlimited by both consumers, so the spools take at
+// least one byte; validation refuses a set ceiling below
+// config.TempDiskConsumers, so the runner keeps at least one byte too.
 func tempDiskShares(total int64) (runner, spools int64) {
 	if total <= 0 {
 		return 0, 0
-	}
-	if total < 2 {
-		return total, total
 	}
 	spools = max(total/spoolBudgetDivisor, 1)
 	return total - spools, spools
@@ -220,17 +217,17 @@ const (
 	// modeServe composes for the one process that is BOTH: the MCP server
 	// indexes on request and answers questions for the same client, in the
 	// same process, at the same time. It opens a SECOND, read-only handle on
-	// the same database for the read path. Without it every tool call pinned a
+	// the same database for the read path. Without it every tool call would pin a
 	// generation through the writer, and pinning writes a retention lease:
 	// that write force-commits whatever ingestion group the session's own
 	// refresh has open and then waits behind the writer, so one agent query
-	// both cut the run's group short and blocked on it. The reader handle has
+	// would both cut the run's group short and block on it. The reader handle has
 	// no writer connection at all, so a tool call cannot reach either.
 	//
 	// What it does NOT do at startup is take the workspace lock or write. An
 	// agent's server must come up and answer beside an index the person
-	// started in a terminal, and a server that took the lock at its open was
-	// refused outright for the whole of that run -- every exploration tool
+	// started in a terminal, and a server that took the lock at its open would
+	// be refused outright for the whole of that run -- every exploration tool
 	// with it, none of which needs the lock or the writer. So the read-only
 	// handle opens first, the store is opened LazyWriter, and the lock, the
 	// startup recovery and the collection pass are taken at the first
@@ -243,8 +240,8 @@ const (
 	//
 	// The reason is the same one and so is the mechanism. A watch is idle
 	// between its beats, and a session that owned the workspace while it was
-	// idle refused the person's own `codectx index` in the next terminal for
-	// as long as the watch happened to be running -- for nothing, because a
+	// idle would refuse the person's own `codectx index` in the next terminal
+	// for as long as the watch happened to be running -- for nothing, because a
 	// watch between beats is building nothing. So the store opens LazyWriter,
 	// and the lock, the startup recovery and the collection pass are taken by
 	// the beat that builds (Coordinator.reconcile) and given back when that
@@ -317,11 +314,11 @@ type stack struct {
 	root    workspace.Root
 	cfg     config.Config
 	dataDir string
-	// engineTemp is the process temp directory this composition fell back to
-	// for the engine's spills because the data directory would not take them,
-	// and which it therefore owns and gives back at Close. Empty whenever the
-	// spills went where they belong, under the data directory, which no
-	// composition owns alone and none removes.
+	// engineTemp is the directory in the process temp directory an answering
+	// composition gave the engine's spills because it found no writable one
+	// under the data directory (setEngineTempDir); it owns it and gives it
+	// back at Close. Empty whenever the spills go under the data directory,
+	// which no composition owns alone and none removes.
 	engineTemp string
 	store      *sqlite.Store
 	// ledger is this process's run accounting: a stable handle composed by
@@ -400,7 +397,7 @@ type stack struct {
 	queryStore  *sqlite.Store
 	querySearch *search.Service
 	// workflow is the Section 17 guard, review and capsule service the facade
-	// routes every session mutation through. INT wires it.
+	// routes every session mutation through. openWorkflow builds it.
 	workflow *workflow.Service
 
 	// runners are every process runner this stack owns, held only so the
@@ -541,8 +538,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 
 	// Section 13.2's single cross-process owner governs indexing. A report
-	// publishes nothing, so it takes no lock: the writer lock on this path made
-	// `codectx status` permanently refused while a `watch` session ran, with a
+	// publishes nothing, so it takes no lock: a writer lock on this path would
+	// refuse `codectx status` for as long as a `watch` session runs, with a
 	// remediation ("wait for the running process to finish") that a watch never
 	// satisfies. internal/index refuses its building entry points when Lock is
 	// nil, so the absence is enforced there rather than trusted here. The
@@ -742,8 +739,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// unit can present is larger than the allocation; an external indexer's
 	// is its profile's fixed figure, which a small host's allocation can be
 	// below. A runner budgeted at the allocation would refuse precisely those
-	// children, with the resource-limit error the whole memory ruling exists
-	// to avoid. This is the same rule the language-server runner below
+	// children, with the resource-limit error memory admission exists to
+	// avoid. This is the same rule the language-server runner below
 	// states: the budget is wide enough for the largest child the gate above
 	// it can admit.
 	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
@@ -834,7 +831,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxWorkers:          parserWorkers,
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
-		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
 		MaxEvidencePerFact:  evidenceClip(cfg),
 		WorkerMemoryBytes:   parserWorkerReservationBytes,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
@@ -964,8 +960,8 @@ const maxRebuildAttempts = 64
 //
 // It is os.Mkdir and not os.MkdirAll because the difference is the whole
 // contract: MkdirAll accepts a directory that already exists, so two
-// `index --rebuild` runs inside the same second silently shared one cache while
-// the second run told the operator a new one had been created. An existing
+// `index --rebuild` runs inside the same second would silently share one cache
+// while the second run told the operator a new one had been created. An existing
 // directory is therefore visible here, and the name gains a `-2`, `-3`, ...
 // suffix until one is free -- the timestamp still names the run, the suffix
 // only distinguishes runs the timestamp cannot.
@@ -1012,12 +1008,12 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
 		return nil
 	}
-	// Nothing here installs anything any more: the locator reports the pinned
-	// identity of a payload the store does not hold and the first unit that
-	// needs the engine resolves it. The report path therefore needs no second,
-	// force-offline resolver -- which was itself a defect, because it reported
-	// a merely-uninstalled payload as CTX_TOOL_OFFLINE and told an operator to
-	// turn off an offline mode they had never enabled.
+	// Nothing here installs anything: the locator reports the pinned identity
+	// of a payload the store does not hold and the first unit that needs the
+	// engine resolves it. The report path therefore needs no second,
+	// force-offline resolver, which would report a merely-uninstalled payload
+	// as CTX_TOOL_OFFLINE and tell an operator to turn off an offline mode
+	// they never enabled.
 	locator, err := joern.NewLocator(s.resolver)
 	if err == nil {
 		var backend *joern.Backend
@@ -1081,45 +1077,48 @@ func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, 
 	}
 }
 
-// openQueries builds the query services that need the repository identity,
-// which only the coordinator derives. It is called by open once the coordinator
-// exists rather than from openStack, because the alternative -- re-deriving the
-// identity here -- would be a second spelling of it that silently drifts the
-// day the first one changes.
 // setEngineTempDir names where every engine handle in this process spills.
 //
 // Under the data directory, on the disk the operator gave the data. A
-// composition that only ANSWERS may find that directory unwritable -- a
-// workspace on read-only media, one an operator has locked down, one mounted
-// read-only for an audit -- and it has nothing to publish there in any case, so
-// its spills go to the process temp directory instead and it gives that
-// directory back when it closes. Falling back is what keeps such a workspace
-// answerable at all: the engine refuses a temp directory it cannot write, and
-// it refused before this process had read a byte.
+// composition that BUILDS creates that directory if it is missing and never
+// falls back: a run whose spills went to a memory filesystem is the failure
+// this directory exists to prevent, and a data directory that will not take
+// them is an operator-fixable configuration, named as one rather than reported
+// as a defect in this build.
 //
-// A composition that BUILDS never falls back. A run whose spills went to a
-// memory filesystem is the failure this directory exists to prevent, and a data
-// directory that will not take them is an operator-fixable configuration, named
-// as one rather than reported as a defect in this build.
+// A composition that only ANSWERS creates nothing under the data directory. It
+// names the directory a run made there when it exists and the engine can
+// write it. Otherwise -- a workspace nothing has built, one on read-only media,
+// one an operator has locked down -- its spills go to a directory of its own
+// in the process temp directory, which it gives back when it closes. Falling
+// back is what keeps such a workspace answerable at all: the engine refuses a
+// temp directory it cannot write, and it refused before this process had read
+// a byte.
 func (s *stack) setEngineTempDir(answersOnly bool) error {
 	under := filepath.Join(s.dataDir, engineTempDirName)
-	err := sqlite.SetTempDir(under)
-	if err == nil || !answersOnly {
-		if err != nil {
+	if !answersOnly {
+		if err := sqlite.SetTempDir(under); err != nil {
 			return dataDirNotWritable(under, err)
 		}
 		return nil
+	}
+	// SetTempDir creates a missing directory, so an answering composition
+	// hands it only one that is already there.
+	if info, err := os.Stat(under); err == nil && info.IsDir() {
+		if sqlite.SetTempDir(under) == nil {
+			return nil
+		}
 	}
 	// A directory of its own, not one named after this process: a name derived
 	// from the pid is one a killed process leaves behind and the next process
 	// to be given that pid adopts, spills and all, and one a second
 	// composition in this process would remove from under the first.
-	fallback, ferr := os.MkdirTemp("", "codectx-engine-")
-	if ferr != nil {
-		return dataDirNotWritable(os.TempDir(), ferr)
+	fallback, err := os.MkdirTemp("", "codectx-engine-")
+	if err != nil {
+		return dataDirNotWritable(os.TempDir(), err)
 	}
-	if ferr := sqlite.SetTempDir(fallback); ferr != nil {
-		return dataDirNotWritable(fallback, ferr)
+	if err := sqlite.SetTempDir(fallback); err != nil {
+		return dataDirNotWritable(fallback, err)
 	}
 	s.engineTemp = fallback
 	return nil
@@ -1136,6 +1135,11 @@ func dataDirNotWritable(dir string, cause error) error {
 		Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
 }
 
+// openQueries builds the query services that need the repository identity,
+// which only the coordinator derives. It is called by open once the coordinator
+// exists rather than from openStack, because the alternative -- re-deriving the
+// identity here -- would be a second spelling of it that silently drifts the
+// day the first one changes.
 func (s *stack) openQueries(repo model.RepositoryID) error {
 	s.repo = repo
 	svc, err := search.New(search.Options{
@@ -1273,8 +1277,8 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 
 // collect runs the one startup collection pass of a composition that has just
 // become the workspace's owner. It is the caller pagination.Spools.Sweep,
-// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC were
-// documented to expect and never had.
+// ExpireSessions, PruneSessions, snapshot.Sweep and Resolver.GC are
+// documented to expect.
 //
 // Like retention after an activation it never fails what triggered it: the
 // state it reclaims is by definition state nothing references, and the only
@@ -1720,10 +1724,9 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Logger: s.logger,
 		// The compile's external-sort runs live beside the query spools, under
 		// the same resources.max_temp_bytes area the workspace already sweeps
-		// and reports (ruling C5'), and SortDir is derived from the same store
-		// rather than named twice. The spool store also holds the leased state
-		// directory a deadline-interrupted compile continues from (ruling C7),
-		// which is why the signer and the lease store come with it.
+		// and reports, and SortDir is derived from the same store rather than
+		// named twice. The spool store also holds the leased state directory a
+		// deadline-interrupted compile continues from, which is why the signer and the lease store come with it.
 		Spools: s.spools,
 		Signer: s.signer,
 		Leases: s.leases,
@@ -1863,11 +1866,6 @@ func (s *stack) Close() error {
 	return errors.Join(errs...)
 }
 
-// openResolver builds one managed-toolchain resolver over a resolved
-// configuration. There is exactly one resolver per composition: `tools.offline`
-// is the only thing that refuses a fetch, because a second resolver that
-// refused them regardless reported a payload that is merely not installed as a
-// payload the operator's own offline setting withheld.
 // evidenceClip is index.max_evidence_per_fact as the finite number every
 // producer and the seal compare against. Unlimited (the default) is the model's
 // record ceiling: a fact can never carry more occurrences than the record
@@ -1877,6 +1875,11 @@ func evidenceClip(cfg config.Config) int {
 	return int(cfg.Index.MaxEvidencePerFact.ValueOr(model.MaxEvidencePerFact))
 }
 
+// openResolver builds one managed-toolchain resolver over a resolved
+// configuration. There is exactly one resolver per composition: `tools.offline`
+// is the only thing that refuses a fetch, because a second resolver that
+// refused them regardless would report a payload that is merely not installed
+// as one the operator's own offline setting withheld.
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace, while tools.cache_dir names the tool store
