@@ -41,6 +41,8 @@ package scip
 //     no profile's argument array can exclude a subtree, so the importer drops
 //     every document under a nested project root instead (nestedProject,
 //     importer.seeDocument): one path is published by exactly one unit. A
+//     document a unit reaches outside its own directory through `../` belongs
+//     likewise to the innermost other project that holds it, if any. A
 //     nested directory whose scope key does not fit is not a project of its
 //     own (Scopes refuses it), so its files stay with the unit that encloses
 //     it; a project a truncated detection never planned is dropped from the
@@ -110,19 +112,29 @@ func plannable(k Kind, dir string) bool {
 	return len(ProfileScope(string(k), dir)) <= model.MaxScopeKeyBytes
 }
 
+// projectAt reports the project directory the file at rel roots when that
+// directory is a plannable project of kind k.
+func projectAt(k Kind, rel string) (string, bool) {
+	dir, base := "", rel
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		dir, base = rel[:i], rel[i+1:]
+	}
+	if kind, ok := triggerKind[base]; !ok || kind != k {
+		return "", false
+	}
+	return dir, plannable(k, dir)
+}
+
 // nestedProject reports the project directory the file at rel roots when that
 // directory is a plannable project of kind k strictly inside the project at
 // root. Only a trigger of the same kind nests: a project of another kind is
 // indexed by another indexer, whose documents never reach this unit.
 func nestedProject(k Kind, root, rel string) (string, bool) {
-	dir, base := "", rel
-	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
-		dir, base = rel[:i], rel[i+1:]
-	}
-	if kind, ok := triggerKind[base]; !ok || kind != k || !strictlyInside(dir, root) {
+	dir, ok := projectAt(k, rel)
+	if !ok || !strictlyInside(dir, root) {
 		return "", false
 	}
-	return dir, plannable(k, dir)
+	return dir, true
 }
 
 // strictlyInside reports whether the root-relative directory dir lies below

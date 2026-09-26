@@ -106,9 +106,9 @@ type importer struct {
 	// document whose position encoding is neither declared nor measured for
 	// the tool build, and oversize a document over max_source_file_bytes.
 	outsideRoot, duplicatePath, notHeld, unencoded, oversize droppedDocs
-	// nestedDocs counts the documents left to the unit of the nested project
-	// that holds them (seeDocument). It is a partition, not a loss.
-	nestedDocs int64
+	// otherProjectDocs counts the documents left to the unit of the other
+	// project that holds them (seeDocument). It is a partition, not a loss.
+	otherProjectDocs int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
 	// contradict; refusedExemplar is the first one's document, the coordinate
 	// that occurrence claimed and the reason, kept as the example an operator
@@ -122,9 +122,9 @@ type importer struct {
 	// row carries refusals (carryRefusals). It names the exemplar only when
 	// this run refused nothing itself, so there is no coordinate to name.
 	carriedExemplar string
-	// hasNested says loadNested recorded at least one nested project, so
-	// seeDocument looks a document's directories up only when one can match.
-	hasNested bool
+	// hasOtherProjects says loadProjects recorded at least one other project,
+	// so seeDocument looks a document's directories up only when one can match.
+	hasOtherProjects bool
 	// encodingDropped counts the documents whose assumed position encoding
 	// the pinned bytes contradict; encodingUnproved those none of whose
 	// definitions could check it. A failed probe is a whole-document shift, so
@@ -224,10 +224,10 @@ const (
 	detailUnencoded = "documents_unspecified_encoding"
 	// detailOversize counts documents over max_source_file_bytes.
 	detailOversize = "documents_over_source_bound"
-	// detailNested counts the documents left to a nested project's own unit.
-	// It is informational: another unit publishes those paths, so nothing is
-	// lost and the capability is not degraded for them.
-	detailNested = "documents_in_nested_projects"
+	// detailOtherProjects counts the documents left to another project's own
+	// unit. It is informational: that unit publishes those paths, so nothing
+	// is lost and the capability is not degraded for them.
+	detailOtherProjects = "documents_in_other_projects"
 	// detailSkippedAliases counts call-site aliases left out because the
 	// alias scope or native key would exceed its bound (callsiteAlias).
 	detailSkippedAliases = "callsite_aliases_skipped"
@@ -328,7 +328,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 	if err := im.openDelta(ctx); err != nil {
 		return err
 	}
-	if err := im.loadNested(ctx); err != nil {
+	if err := im.loadProjects(ctx); err != nil {
 		return err
 	}
 	if im.profile == nil && im.p.manifestPath != "" {
@@ -1971,8 +1971,8 @@ func (im *importer) result() model.ProviderResult {
 				cs = cs.WithDetail(d.name, strconv.FormatInt(d.docs.n, 10)).WithDetail(d.name+"_exemplar", d.docs.first)
 			}
 		}
-		if im.nestedDocs > 0 {
-			cs = cs.WithDetail(detailNested, strconv.FormatInt(im.nestedDocs, 10))
+		if im.otherProjectDocs > 0 {
+			cs = cs.WithDetail(detailOtherProjects, strconv.FormatInt(im.otherProjectDocs, 10))
 		}
 		if im.skippedAliases > 0 {
 			cs = cs.WithDetail(detailSkippedAliases, strconv.FormatInt(im.skippedAliases, 10))

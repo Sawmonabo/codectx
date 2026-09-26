@@ -353,7 +353,10 @@ func parseManifestRow(line string) (manifestRow, error) {
 }
 
 // rootRelative reports whether a SCIP `relative_path` names a file inside the
-// project root and can be written to a manifest row.
+// root and can be written to a manifest row. For a project unit the root is
+// the workspace: workspacePath joins the path to the project's directory and
+// cleans it first, so a file the project reaches through `../` is inside it.
+// `.` names the root itself, which is no file.
 //
 // Section 11.4 requires rejecting a document whose path escapes the project
 // root, and it is not a hypothetical: 18 of the 141 documents scip-go emits
@@ -374,7 +377,7 @@ func rootRelative(p string) bool {
 	if strings.HasPrefix(p, "/") || path.Clean(p) != p {
 		return false
 	}
-	if p == ".." || strings.HasPrefix(p, "../") {
+	if p == "." || p == ".." || strings.HasPrefix(p, "../") {
 		return false
 	}
 	for i := 0; i < len(p); i++ {

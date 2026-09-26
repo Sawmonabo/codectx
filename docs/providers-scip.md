@@ -73,8 +73,11 @@ coordinator exists.
   excluded from the one that encloses it**: no profile's argument array can
   exclude a subtree, so the outer indexer still runs over it, and the importer
   drops every document under a nested project root of the same kind, counted
-  under `documents_in_nested_projects` without degrading anything, because the
-  nested unit publishes those paths. One path is published by exactly one unit.
+  under `documents_in_other_projects` without degrading anything, because the
+  nested unit publishes those paths. A document a unit reaches outside its own
+  directory through `../` is likewise left to the innermost other project of
+  the same kind that holds it, and kept only when none does. One path is
+  published by exactly one unit.
   A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
@@ -247,8 +250,11 @@ an empty one, so paths in the stored manifest that the fresh index no longer
 describes are `removed`. A rename is a new `FileID` (Section 9.4), so every
 `git mv` takes this path.
 
-**Rejected and superseded documents.** A document whose `relative_path` escapes
-the project root is rejected and counted under `documents_outside_root`: 18 of the 141
+**Rejected and superseded documents.** A project unit's `relative_path` is
+joined to the project's directory and cleaned first, so a document the project
+reaches through `../` (`app/../shared/x.ts`) is named by its workspace path
+(`shared/x.ts`) and admitted like any other, unless another project owns it. A document whose path still
+escapes the root after that is rejected and counted under `documents_outside_root`: 18 of the 141
 documents `scip-go` emits for this repository are the `go test` mains it writes
 under `$GOCACHE`, whose paths are `../../../../..`-style escapes into a
 content-addressed build cache. Admitting them would bake absolute machine paths

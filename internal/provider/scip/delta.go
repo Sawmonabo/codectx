@@ -32,8 +32,8 @@ import (
 //   - docdelta is the fresh manifest under construction plus the publish
 //     decision every later pass filters on, and the occurrences refused in
 //     each document (see carryRefusals).
-//   - nested holds the project directories nested inside this unit's own
-//     project, whose documents belong to their own units (loadNested).
+//   - projects holds the directories of this kind's other projects, whose
+//     documents belong to their own units (loadProjects).
 //
 // The four tables are created inside the import's transaction, but the
 // scratch database runs with the journal off, where a rollback is not
@@ -45,7 +45,7 @@ var deltaSchema = []string{
 	`CREATE TABLE prevdoc(path TEXT PRIMARY KEY, hash TEXT NOT NULL, refused INTEGER NOT NULL) WITHOUT ROWID`,
 	`CREATE TABLE docdelta(path TEXT PRIMARY KEY, doc INTEGER NOT NULL UNIQUE, hash TEXT NOT NULL, publish INTEGER NOT NULL,
 		refused INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID`,
-	`CREATE TABLE nested(dir TEXT PRIMARY KEY) WITHOUT ROWID`,
+	`CREATE TABLE projects(dir TEXT PRIMARY KEY) WITHOUT ROWID`,
 }
 
 // Digest domains. Each frames one canonical record; the suffix means a change
@@ -96,8 +96,8 @@ func (im *importer) openDelta(ctx context.Context) error {
 }
 
 // seeDocument is the binding pre-pass's record of one document: it rejects a
-// path that escapes the project root, leaves a document of a nested project
-// to that project's unit, and resolves the duplicate-path rule. It reports
+// path that escapes the root (rootRelative), leaves a document of another
+// project to that project's unit (inOtherProject), and resolves the duplicate-path rule. It reports
 // whether the document is one this import may admit at all; a document it
 // refuses has no docpath row, so admits refuses it in every later pass.
 func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
@@ -106,10 +106,10 @@ func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 		im.outsideRoot.note(d.path)
 		return false, nil
 	}
-	nested, err := im.inNestedProject(ctx, d.path)
-	if err != nil || nested {
-		if nested {
-			im.nestedDocs++
+	other, err := im.inOtherProject(ctx, d.path)
+	if err != nil || other {
+		if other {
+			im.otherProjectDocs++
 		}
 		return false, err
 	}
@@ -127,15 +127,15 @@ func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 	return true, im.sc.exec(ctx, `INSERT OR REPLACE INTO docpath(path, last) VALUES(?, ?)`, d.path, d.index)
 }
 
-// loadNested records, for a profile unit, every plannable project of the
-// same kind strictly inside the unit's own project (nestedProject). Each is
+// loadProjects records, for a profile unit, every plannable project of the
+// same kind in the workspace other than the unit's own (projectAt). Each is
 // planned as a unit of its own by Scopes, and no profile's argument array can
-// exclude a subtree from the outer run, so the outer unit drops their
-// documents at seeDocument instead: one path is published by exactly one
-// unit. The set is read from the pinned snapshot the run materialized, so it
-// is the set of projects that snapshot holds, and it is spooled to the
-// scratch database rather than held, as every per-repository set here is.
-func (im *importer) loadNested(ctx context.Context) error {
+// exclude a subtree from a run, so a unit drops the documents another project
+// owns at seeDocument instead: one path is published by exactly one unit. The
+// set is read from the pinned snapshot the run materialized, so it is the set
+// of projects that snapshot holds, and it is spooled to the scratch database
+// rather than held, as every per-repository set here is.
+func (im *importer) loadProjects(ctx context.Context) error {
 	if im.profile == nil {
 		return nil
 	}
@@ -144,33 +144,42 @@ func (im *importer) loadNested(ctx context.Context) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
-		dir, ok := nestedProject(k, root, fv.Path)
-		if !ok {
+		dir, ok := projectAt(k, fv.Path)
+		if !ok || dir == root {
 			return nil
 		}
 		if err := im.sc.charge(int64(len(dir)) + 16); err != nil {
 			return err
 		}
-		im.hasNested = true
-		return im.sc.exec(ctx, `INSERT OR IGNORE INTO nested(dir) VALUES(?)`, dir)
+		im.hasOtherProjects = true
+		return im.sc.exec(ctx, `INSERT OR IGNORE INTO projects(dir) VALUES(?)`, dir)
 	})
 }
 
-// inNestedProject reports whether the workspace-relative path lies inside a
-// project loadNested recorded, by looking up each of its directories.
-func (im *importer) inNestedProject(ctx context.Context, p string) (bool, error) {
-	if !im.hasNested {
+// inOtherProject reports whether the workspace-relative path belongs to a
+// project loadProjects recorded rather than to this unit's own: a path belongs
+// to the innermost project directory that holds it. The walk looks up each of
+// the path's directories from the innermost out and stops at this unit's own
+// root, so a nested project claims its subtree, and a path the unit reaches
+// through `../` belongs to whichever other project holds it, the workspace
+// root's included, or to this unit when none does.
+func (im *importer) inOtherProject(ctx context.Context, p string) (bool, error) {
+	if !im.hasOtherProjects {
 		return false, nil
 	}
+	root := im.profile.Root
 	for dir := p; ; {
-		i := strings.LastIndexByte(dir, '/')
-		if i < 0 {
+		if i := strings.LastIndexByte(dir, '/'); i >= 0 {
+			dir = dir[:i]
+		} else {
+			dir = ""
+		}
+		if dir == root {
 			return false, nil
 		}
-		dir = dir[:i]
 		var one int
-		found, err := im.sc.row(ctx, `SELECT 1 FROM nested WHERE dir = ?`, []any{dir}, &one)
-		if err != nil || found {
+		found, err := im.sc.row(ctx, `SELECT 1 FROM projects WHERE dir = ?`, []any{dir}, &one)
+		if err != nil || found || dir == "" {
 			return found, err
 		}
 	}

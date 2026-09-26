@@ -62,7 +62,7 @@ DROP TABLE IF EXISTS docpath;
 DROP TABLE IF EXISTS dochash;
 DROP TABLE IF EXISTS prevdoc;
 DROP TABLE IF EXISTS docdelta;
-DROP TABLE IF EXISTS nested;
+DROP TABLE IF EXISTS projects;
 `
 
 const scratchSchema = `
