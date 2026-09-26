@@ -49,7 +49,11 @@ const yieldLabel = " yield"
 //     node. A declarator without an initializer makes no node: it executes
 //     nothing (JLS §14.4.2), and the variable is not definitely assigned.
 //   - A condition is one Branch node spanning the condition without its
-//     parentheses: if, while, do, for. A loop whose condition is the literal
+//     parentheses: if, while, do, for. It is always made, after the nodes
+//     its own evaluation makes (an `&&` or `||` operand's nodes, a pattern
+//     variable's defining node), and the back edge of a while or basic for
+//     re-enters the first of those, since the condition is evaluated again
+//     (JLS §14.12, §14.14.1.2). A loop whose condition is the literal
 //     `true`, or a for without one, has no exit edge: its head is a Stmt node
 //     spanning `true` or the `for` keyword (JLS §14.21).
 //   - An enhanced for (JLS §14.14.2) follows the iteration model (see
@@ -63,15 +67,18 @@ const yieldLabel = " yield"
 //     expression.
 //   - A switch (JLS §14.11 statement, §15.28 expression) is a Stmt node for
 //     its selector, then one Branch node per `case` label in source order,
-//     spanning the label, each tested only when the previous failed; a
-//     label's node uses the selector's variables, since it compares against
-//     the selector, and its own. A pattern label is followed on its match
-//     path by one defining node per pattern variable, spanning the
-//     variable's identifier and using the selector's variables, then, for a
-//     guard, a Branch node spanning the guard expression whose false edge
-//     joins the next label's test. Several labels of one group all enter its
-//     body. `default` is taken when no label matched; the grammar has no
-//     `case null, default` label, so that source parses with an error node
+//     spanning the label, its guard included, as the grammar holds the guard
+//     in the label, each tested only when the previous failed; a label
+//     listing several constants (`case 2, 3`) is one label and one test
+//     (JLS §14.11.1). A label's node uses the selector's variables, since it
+//     compares against the selector, and its constants' (see Uses). A
+//     pattern label is followed on its match path by one defining node per
+//     pattern variable, spanning the variable's identifier and using the
+//     selector's variables, then, for a guard, a Branch node spanning the
+//     guard expression whose false edge joins the next label's test.
+//     Several labels of one group all enter its body. `default` is taken
+//     when no label matched; the grammar has no `case null, default` label,
+//     so that source parses with an error node
 //     and is lowered as the labels the recovered tree holds. In the colon
 //     form a body's end falls through into the next body; in the arrow form
 //     it leaves the switch. A switch expression without `default` is
@@ -107,10 +114,10 @@ const yieldLabel = " yield"
 //     the end of its initializer, defining the variable; a resource naming an
 //     existing variable or field acquires nothing. Each resource then opens a
 //     finally whose close is one Stmt node spanning the resource that uses
-//     its variable and may throw; the resources close in reverse order, and the
-//     statement's catch clauses and finally enclose all of them. A
-//     resource's Handler spans the `;` or `)` that ends the resource. The
-//     null test before close is not modelled.
+//     its variable (see Uses) and may throw; the resources close in reverse
+//     order, and the statement's catch clauses and finally enclose all of
+//     them. A resource's Handler spans the `;` or `)` that ends the
+//     resource. The null test before close is not modelled.
 //   - `synchronized (e) { … }` (JLS §14.19) is a Stmt node spanning e, which
 //     may throw, then the block; the monitor exit is not a node.
 //   - `assert c : m;` (JLS §14.10) is a Branch node spanning the `assert`
@@ -162,6 +169,14 @@ const yieldLabel = " yield"
 //   - The node consuming `c ? a : b` Uses the arms' reads, not the
 //     condition's; the node consuming `a && b` or `a || b` Uses both
 //     operands' reads, as either operand's value can be the operator's.
+//   - The node deciding on `x instanceof P` Uses the tested expression's
+//     reads: the test is its own evaluation. Each pattern variable's
+//     defining node Uses them too.
+//   - A switch label's node Uses the selector's reads and those of its
+//     constants, not its guard's, which are the guard's Branch node's.
+//   - A resource's close Uses only its variable, or, for a resource naming
+//     an existing variable or field, that expression's reads: the
+//     initializer was evaluated once, at the acquiring node.
 //
 // An assignment or update of a local embedded in a larger expression is its
 // own defining node, and the enclosing expression's node reads the variable
