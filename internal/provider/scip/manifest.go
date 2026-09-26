@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -15,7 +16,9 @@ import (
 // The document manifest is the per-document membership of one sealed SCIP
 // unit (Section 11.4, "Delta import"): the sorted list of the root-relative
 // paths the import admitted, each with the canonical hash of the SCIP
-// Document it was built from. It exists so a refreshed unit can be applied as
+// Document it was built from and the number of that document's occurrences
+// the import refused, so a refresh that carries the document's rows carries
+// its refusals too (importer.carryRefusals). It exists so a refreshed unit can be applied as
 // a per-document delta instead of a rewrite: the managed indexer still
 // re-indexes the whole unit, but only the documents whose canonical hash
 // changed produce facts, and the stored paths the fresh index no longer
@@ -40,9 +43,10 @@ const (
 	// unit fingerprint is what makes an old manifest reachable at all.
 	documentHashDomain = "scip-document-v1"
 
-	// manifestSeparator is the two-space separator of a manifest row,
-	// matching the input-hash manifest format documented in
-	// docs/providers-scip.md.
+	// manifestSeparator is the two-space separator between the fields of a
+	// manifest row, `<hash>  <refused>  <path>`, matching the input-hash
+	// manifest format documented in docs/providers-scip.md. The path comes
+	// last, so a path holding the separator still parses.
 	manifestSeparator = "  "
 )
 
@@ -95,8 +99,9 @@ func (m *DocumentManifest) Name() string { return m.name }
 func (m *DocumentManifest) Len() int64 { return m.count }
 
 // LoadDocumentManifest opens a stored manifest and validates it completely:
-// the header, one `<hash>  <path>` row per document, hex hashes, root-relative
-// paths and strictly increasing path order. A manifest that fails any of these
+// the header, one `<hash>  <refused>  <path>` row per document, hex hashes,
+// non-negative decimal refusal counts, root-relative paths and strictly
+// increasing path order. A manifest that fails any of these
 // is refused rather than silently treated as an empty previous state, because
 // an empty previous state imports everything and quietly destroys the sharing
 // the caller asked for.
@@ -116,14 +121,14 @@ func LoadDocumentManifest(name string) (*DocumentManifest, error) {
 	var count int64
 	var previous string
 	for sc.Scan() {
-		_, p, err := parseManifestRow(sc.Text())
+		row, err := parseManifestRow(sc.Text())
 		if err != nil {
 			return nil, err
 		}
-		if count > 0 && p <= previous {
+		if count > 0 && row.path <= previous {
 			return nil, invalid("scip document manifest " + name + " is not sorted by path")
 		}
-		previous = p
+		previous = row.path
 		count++
 	}
 	if err := sc.Err(); err != nil {
@@ -254,8 +259,9 @@ func (m *DocumentManifest) Diff(prev *DocumentManifest, fn func(Change) error) (
 
 // manifestRow is one parsed manifest line.
 type manifestRow struct {
-	hash string
-	path string
+	hash    string
+	refused int64
+	path    string
 }
 
 // manifestRows is a one-row lookahead over a manifest file. A nil manifest is
@@ -301,11 +307,11 @@ func (r *manifestRows) peek() (manifestRow, bool, error) {
 		}
 		return manifestRow{}, false, nil
 	}
-	hash, p, err := parseManifestRow(r.sc.Text())
+	row, err := parseManifestRow(r.sc.Text())
 	if err != nil {
 		return manifestRow{}, false, err
 	}
-	r.row, r.loaded = manifestRow{hash: hash, path: p}, true
+	r.row, r.loaded = row, true
 	return r.row, true, nil
 }
 
@@ -318,24 +324,32 @@ func (r *manifestRows) close() {
 	}
 }
 
-// manifestScanner bounds a manifest line at one hash, the separator and one
-// path, so a corrupt file cannot size an allocation.
+// maxCountDigits is the width of the largest int64 in decimal.
+const maxCountDigits = 19
+
+// manifestScanner bounds a manifest line at one hash, one refusal count, the
+// two separators and one path, so a corrupt file cannot size an allocation.
 func manifestScanner(r io.Reader) *bufio.Scanner {
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 4096), model.IDHexLen+len(manifestSeparator)+model.MaxPathBytes)
+	sc.Buffer(make([]byte, 0, 4096), model.IDHexLen+maxCountDigits+2*len(manifestSeparator)+model.MaxPathBytes)
 	return sc
 }
 
-// parseManifestRow splits and validates one `<hash>  <path>` row.
-func parseManifestRow(line string) (hash, p string, err error) {
-	hash, p, ok := strings.Cut(line, manifestSeparator)
+// parseManifestRow splits and validates one `<hash>  <refused>  <path>` row.
+func parseManifestRow(line string) (manifestRow, error) {
+	hash, rest, ok := strings.Cut(line, manifestSeparator)
 	if !ok || !model.ValidHexID(hash) {
-		return "", "", invalid("scip document manifest row does not start with a document hash")
+		return manifestRow{}, invalid("scip document manifest row does not start with a document hash")
+	}
+	count, p, ok := strings.Cut(rest, manifestSeparator)
+	refused, err := strconv.ParseInt(count, 10, 64)
+	if !ok || err != nil || refused < 0 || count != strconv.FormatInt(refused, 10) {
+		return manifestRow{}, invalid("scip document manifest row carries no refused-occurrence count after its hash")
 	}
 	if !rootRelative(p) {
-		return "", "", invalid("scip document manifest names a path that is not inside the project root")
+		return manifestRow{}, invalid("scip document manifest names a path that is not inside the project root")
 	}
-	return hash, p, nil
+	return manifestRow{hash: hash, refused: refused, path: p}, nil
 }
 
 // rootRelative reports whether a SCIP `relative_path` names a file inside the

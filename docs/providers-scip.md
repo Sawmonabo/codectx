@@ -16,7 +16,7 @@ The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 
 ## Coordinator contract
 
-The coordinator of Section 11.1 (Task 12, `internal/app`) is the consumer of
+The coordinator of Section 11.1 (`internal/app`) is the consumer of
 every exported name here: `scip.New`, `Descriptor`, `Detect`,
 `Scopes`/`ImportScope`/`ProfileScope`, `Verify`, `IndexUnit`, and the delta
 form `Import` with `ImportOptions`, `Report`, `DocumentManifest`, `Delta`,
@@ -65,10 +65,22 @@ coordinator exists.
   a project and never reaches the rule while `workspace.index_vendor` is false,
   which is the default, because those directories are then excluded from the
   snapshot; with it enabled the operator has asked for them to be indexed and
-  their manifests are projects like any other. A project whose scope key
+  their manifests are projects like any other. Two things qualify that: the Git
+  ignore hook excludes an ignored directory whatever `index_vendor` says, and a
+  tracked path wins over both exclusions (Section 10.2) — though detection sees
+  a tracked manifest under an excluded directory only when the traversal policy
+  it is handed carries the capture's force-include hooks. **A nested project is
+  excluded from the one that encloses it**: no profile's argument array can
+  exclude a subtree, so the outer indexer still runs over it, and the importer
+  drops every document under a nested project root of the same kind, counted
+  under `documents_in_nested_projects` without degrading anything, because the
+  nested unit publishes those paths. One path is published by exactly one unit.
+  A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
-  project's facts would be attributed to the other. A profile this
+  project's facts would be attributed to the other; its files stay with the
+  unit that encloses it, and the detection names the refusal under
+  `unplanned_project_keys`. A profile this
   machine cannot supply at all — no payload for this platform, a corrupt store
   entry, an invalid override — plans no unit, so a missing tool never costs a
   snapshot materialization or a failed unit. A profile whose payload the lock
@@ -82,12 +94,13 @@ coordinator exists.
   exact.
 - Declare every eligible snapshot file of the workspace as the unit's
   inputs: a fact may name any file the index describes, and storage refuses
-  a fact on an undeclared file. Documents the snapshot does not hold are
-  skipped and counted.
+  a fact on an undeclared file. A document naming a path the snapshot does not
+  hold is dropped, counted under `documents_not_in_snapshot` with its path
+  under `documents_not_in_snapshot_exemplar`, and degrades the capability.
 - `Import(ctx, req, sink, opts)` is `IndexUnit` plus the refresh: `opts.Previous`
   is the sealed unit's stored `DocumentManifest` (nil is a full import) and the
-  `Report` carries the delta, the fresh manifest and every count of what the
-  import did not admit. `IndexUnit` is `Import` with no previous manifest, which
+  `Report` carries the delta and the fresh manifest; every count of what the
+  import did not admit is on the result's capability rows. `IndexUnit` is `Import` with no previous manifest, which
   is all the `provider.Provider` interface can express.
 
 ### A refresh without `--scip-index`
@@ -163,17 +176,25 @@ unit is applied as a per-document delta (Section 11.4, "Delta import";
 `docs/research/12-incremental-scip-lsp.md` Sections 3.3–3.5 and 6.2).
 
 **Document manifest.** `DocumentManifest` is the sorted `(root-relative path,
-canonical document hash)` list of one sealed unit, held as a file rather than a
+canonical document hash, refused occurrences)` list of one sealed unit, held as a file rather than a
 Go slice because a unit may describe up to `MaxDocuments` documents and Section
 6 forbids a whole-repository list in the heap. Its format is
 
 ```
 codectx-scip-documents v1
-<64-hex canonical document hash>  <root-relative path>
+<64-hex canonical document hash>  <refused occurrences>  <root-relative path>
 ...
 ```
 
-sorted by path with strictly increasing paths. `Provider.Version` moves with
+sorted by path with strictly increasing paths. The refusal count is the number
+of the document's occurrences its import refused (see "Positions and
+binding"); a refresh that carries an unchanged document's rows folds that count
+into `refused_occurrences` and degrades the capability exactly as the original
+import did. It is exact rather than an estimate: a refusal depends only on the
+document's occurrences, symbols, resolved encoding and pinned bytes, which the
+canonical document hash covers, so an equal hash refuses the same occurrences.
+When every refusal of a run is carried, `refused_occurrence_exemplar` names the
+first such document instead of a coordinate. `Provider.Version` moves with
 the hash domain, so a manifest written under an earlier mapping is never
 reachable: the old unit has a different `UnitID` and is not reused.
 `LoadDocumentManifest` validates all of that and refuses a malformed file
@@ -226,7 +247,7 @@ describes are `removed`. A rename is a new `FileID` (Section 9.4), so every
 `git mv` takes this path.
 
 **Rejected and superseded documents.** A document whose `relative_path` escapes
-the project root is rejected and counted in `Report.OutsideRoot`: 18 of the 141
+the project root is rejected and counted under `documents_outside_root`: 18 of the 141
 documents `scip-go` emits for this repository are the `go test` mains it writes
 under `$GOCACHE`, whose paths are `../../../../..`-style escapes into a
 content-addressed build cache. Admitting them would bake absolute machine paths
@@ -234,9 +255,14 @@ into the index, churn about 13% of the document set for unrelated reasons, and
 produce paths that can never join a repository `FileID`. `scip.proto` calls
 `relative_path` unique but defines nothing for a duplicate, and its own two
 reference consumers disagree (`FlattenDocuments` unions, `expt-convert` keeps
-the first), so this importer picks one rule and counts it in
-`Report.DuplicatePaths`: the last document of a path wins and the earlier ones
-are dropped. Neither is a capability degradation; both are reported counts.
+the first), so this importer picks one rule and counts it under
+`documents_duplicate_path`: the last document of a path wins and the earlier ones
+are dropped. Each count names its first document under `<count key>_exemplar`, and
+each degrades the capability with `CTX_PROVIDER_OUTPUT_INVALID`: a dropped
+document is one the index described and the unit publishes nothing for. The
+same holds for a document whose position encoding is neither declared nor
+measured (`documents_unspecified_encoding`) and, under `CTX_RESOURCE_LIMIT`,
+one over `max_source_file_bytes` (`documents_over_source_bound`).
 
 **Index-level state.** `Index.external_symbols` is an `Index` field, not a
 `Document` field: it belongs to no path, contributes to no document hash and is
@@ -372,7 +398,7 @@ guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
 the truth publishes. Measured by shifting every one of the 308 occurrences by
 the two column distances observed in the field: of 214 occurrences a +5 shift
 converts at all, 32 still pass, and of 126 a +12 shift converts, 19 still pass —
-against 63 and 45 under the start-boundary rule this replaces. Those survivors,
+against 63 and 45 under a rule that checks only where a range starts. Those survivors,
 by kind: **24** whose symbol carries no name the grammar spells literally (a
 `local` symbol, a namespace, a meta descriptor, a backtick-escaped name), so
 there is nothing to compare the token against; **17** whose range is punctuation
@@ -542,8 +568,9 @@ to a function value — no indexer distinguishes them and none sets a write role
 An alias at a range where tree-sitter found no call site is inert: the join is
 exact-range equality, so it aliases the symbol to a key nothing else names. A
 key that would exceed `model.MaxNativeKeyBytes` or a scope key that would
-exceed `model.MaxScopeKeyBytes` is skipped and counted in
-`Report.SkippedCallsiteAliases`, never truncated into a key that would join the
+exceed `model.MaxScopeKeyBytes` is skipped, counted under
+`callsite_aliases_skipped` and degrades the capability with
+`CTX_RESOURCE_LIMIT`, never truncated into a key that would join the
 wrong range.
 
 ## Bounds
@@ -712,8 +739,12 @@ refused before that indexer starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a
 remediation naming the source-free case. Two profiles apply it, through one
 helper. For Java it is the aggregator POM of a multi-module repository —
 `pom.xml` triggers the profile, the root carries no source of its own — and
-without the check `javac` refuses, the indexer exits 1, and the run fails as
-`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured).
+without the check the compiler refuses, the indexer exits 1, and the run fails
+as `CTX_PROVIDER_UNAVAILABLE` with an exit status (measured). The walk does not
+descend into a nested project of the same kind — a module directory holding its
+own `pom.xml` — because that module is its own unit and its documents are
+dropped from the aggregator's, so the modules' sources cannot answer for the
+aggregator.
 For TypeScript it is a package directory holding only a manifest, a lock file
 and documentation, with no `.ts`/`.js` beside them: measured on a real
 repository, the run failed as `CTX_PROVIDER_UNAVAILABLE: node exited with

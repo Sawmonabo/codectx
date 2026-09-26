@@ -33,20 +33,19 @@ import (
 //	scope `file:pkg/a.go`, key `callsite:pkg/a.go:35-37`
 //
 // Both providers must spell this byte for byte or the join silently produces
-// nothing, so lane A6 and this lane derive it from the same paragraph.
+// nothing, so both derive it from the same paragraph of Section 11.3.
+//
+// rng must advance: a zero-width occurrence has no identifier to join on and
+// cannot be expressed as an inclusive range, so the caller never asks for one.
+// ok is false only when the alias does not fit. A path may be up to
+// model.MaxPathBytes long while an alias scope and native key are bounded at
+// model.MaxScopeKeyBytes and model.MaxNativeKeyBytes, so a long path can
+// overflow either bound. An over-long alias would fail
+// model.NativeAlias.Validate and take the whole unit down for one unjoinable
+// key, so the caller skips it and counts it under callsite_aliases_skipped.
 func callsiteAlias(p string, rng *model.SourceRange) (scopeKey, nativeKey string, ok bool) {
-	// A zero-width occurrence has no identifier to join on, and a range that
-	// does not advance cannot be expressed as an inclusive range at all.
-	if rng == nil || rng.End.Byte <= rng.Start.Byte {
-		return "", "", false
-	}
 	scopeKey = fileScope(p)
 	nativeKey = "callsite:" + p + ":" + strconv.FormatUint(rng.Start.Byte+1, 10) + "-" + strconv.FormatUint(rng.End.Byte, 10)
-	// A path may be up to model.MaxPathBytes long while an alias scope and
-	// native key are bounded at model.MaxScopeKeyBytes and
-	// model.MaxNativeKeyBytes, so a long path can overflow either bound. An
-	// over-long alias would fail model.NativeAlias.Validate and take the whole
-	// unit down for one unjoinable key, so it is skipped and counted instead.
 	if len(scopeKey) > model.MaxScopeKeyBytes || len(nativeKey) > model.MaxNativeKeyBytes {
 		return "", "", false
 	}
