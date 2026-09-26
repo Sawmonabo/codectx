@@ -262,15 +262,35 @@ func firstSegment(s, sep string) string {
 }
 
 // rustUseNames derives the local names of a use path: the last segment, an
-// `as` alias, or every leaf of a `{a, b as c}` list.
+// `as` alias, or every leaf of a `{a, b as c}` list, nested lists included.
+// A list is split only at its own commas, so `{b::{c, d}, e}` binds c, d and
+// e rather than a leaf that carries a brace.
 func rustUseNames(p string) []string {
 	if i := strings.IndexByte(p, '{'); i >= 0 {
 		inner := strings.TrimSuffix(strings.TrimSpace(p[i+1:]), "}")
 		var out []string
-		for _, item := range strings.Split(inner, ",") {
-			if item = strings.TrimSpace(item); item != "" {
+		depth, from := 0, 0
+		for j := 0; j <= len(inner); j++ {
+			if j < len(inner) {
+				switch inner[j] {
+				case '{':
+					depth++
+					continue
+				case '}':
+					depth--
+					continue
+				case ',':
+					if depth > 0 {
+						continue
+					}
+				default:
+					continue
+				}
+			}
+			if item := strings.TrimSpace(inner[from:j]); item != "" {
 				out = append(out, rustUseNames(item)...)
 			}
+			from = j + 1
 		}
 		return out
 	}

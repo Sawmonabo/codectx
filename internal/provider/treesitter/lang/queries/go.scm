@@ -8,7 +8,10 @@
 
 (function_declaration name: (identifier) @name body: (block)? @body) @def.function
 (method_declaration name: (field_identifier) @name body: (block)? @body) @def.method
-(short_var_declaration left: (expression_list (identifier) @name) right: (expression_list (func_literal body: (block) @body))) @def.function
+; Both lists are captured whole and the worker pairs each name with the value
+; in its position; capturing each name and then the list after it would keep
+; one partial match per name open, quadratic in the name count.
+(short_var_declaration left: (expression_list) @bind.names right: (expression_list) @bind.values) @def.function
 (type_spec name: (type_identifier) @name type: (_) @body) @def.class
 (type_alias name: (type_identifier) @name type: (_) @body) @def.class
 (field_declaration name: (field_identifier) @name) @def.field

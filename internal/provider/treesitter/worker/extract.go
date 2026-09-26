@@ -51,6 +51,14 @@ type importRec struct {
 	seen map[string]bool
 }
 
+// add appends one local name the statement binds, once.
+func (r *importRec) add(name string) {
+	if name != "" && !r.seen[name] {
+		r.seen[name] = true
+		r.names = append(r.names, name)
+	}
+}
+
 type refRec struct {
 	span
 	// nameSpan is the callee/type identifier token alone, inside span. The
@@ -152,6 +160,10 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 }
 
 func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Node) {
+	if names, values := caps["bind.names"], caps["bind.values"]; len(names) > 0 && len(values) > 0 {
+		e.addBoundFunctions(kind, node, names[0], values[0])
+		return
+	}
 	d := &decl{node: node, kind: kind, parentIdx: -1, ex: e}
 	if b := caps["body"]; len(b) > 0 {
 		d.body = &b[0]
@@ -170,6 +182,43 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	if d.kind == "test" {
 		d.test = true
 	}
+	e.putDecl(d)
+}
+
+// addBoundFunctions adds one declaration of kind for each name a short
+// variable declaration binds to a function literal: the i-th name is paired
+// with the i-th value, so `x, f := 1, func() {}` declares f alone, and the
+// literal's body ends its signature. The query captures both lists once per
+// statement and they are walked with one tree cursor, linear in their length.
+func (e *extraction) addBoundFunctions(kind string, node, names, values ts.Node) {
+	cur := names.Walk()
+	defer cur.Close()
+	left := withoutComments(names.NamedChildren(cur))
+	right := withoutComments(values.NamedChildren(cur))
+	for i := range min(len(left), len(right)) {
+		if left[i].Kind() != "identifier" || right[i].Kind() != "func_literal" {
+			continue
+		}
+		body := right[i].ChildByFieldName("body")
+		if body == nil {
+			continue
+		}
+		n := left[i]
+		e.putDecl(&decl{node: node, kind: kind, parentIdx: -1, ex: e, body: body,
+			name: n.Utf8Text(e.src), nameStart: n.StartByte(), nameEnd: n.EndByte()})
+	}
+}
+
+// withoutComments drops the comment nodes a list's named children carry
+// between its entries, so an entry's index is its position in the list.
+func withoutComments(nodes []ts.Node) []ts.Node {
+	return slices.DeleteFunc(nodes, func(n ts.Node) bool { return n.Kind() == "comment" })
+}
+
+// putDecl records d under its declaration range and name position. Two
+// patterns may capture the same declaration; the more specific kind wins.
+func (e *extraction) putDecl(d *decl) {
+	node := d.node
 	key := span{node.StartByte(), node.EndByte()}
 	byName := e.decls[key]
 	if byName == nil {
@@ -196,9 +245,43 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
 	}
 	for _, n := range caps["import.name"] {
-		if t := n.Utf8Text(e.src); t != "" && !rec.seen[t] {
-			rec.seen[t] = true
-			rec.names = append(rec.names, t)
+		rec.add(n.Utf8Text(e.src))
+	}
+	for _, c := range caps["import.clause"] {
+		importClauseBindings(c, func(id *ts.Node) { rec.add(id.Utf8Text(e.src)) })
+	}
+}
+
+// importClauseBindings calls bind with every local name an ECMAScript import
+// clause binds, in source order: the default binding, the namespace binding,
+// and each named specifier's alias, or its name when it has none. A specifier
+// whose local name is not an identifier binds nothing. The query captures the
+// clause once per statement and this walks it with one tree cursor, so a
+// statement naming any number of specifiers costs time linear in their count.
+func importClauseBindings(clause ts.Node, bind func(id *ts.Node)) {
+	cur := clause.Walk()
+	defer cur.Close()
+	for _, part := range clause.NamedChildren(cur) {
+		switch part.Kind() {
+		case "identifier":
+			bind(&part)
+		case "namespace_import":
+			if id := childOfKind(part, "identifier"); id != nil {
+				bind(id)
+			}
+		case "named_imports":
+			for _, spec := range part.NamedChildren(cur) {
+				if spec.Kind() != "import_specifier" {
+					continue // a comment between specifiers
+				}
+				local := spec.ChildByFieldName("alias")
+				if local == nil {
+					local = spec.ChildByFieldName("name")
+				}
+				if local != nil && local.Kind() == "identifier" {
+					bind(local)
+				}
+			}
 		}
 	}
 }

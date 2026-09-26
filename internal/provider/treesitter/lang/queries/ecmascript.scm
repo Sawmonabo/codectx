@@ -1,11 +1,11 @@
 ; ECMAScript structural query pack shared by the javascript, typescript and
 ; tsx grammars; javascript.scm and typescript.scm add grammar-specific nodes.
 
-(import_statement source: (string) @import.path) @import
-(import_statement (import_clause (identifier) @import.name) source: (string) @import.path) @import
-(import_statement (import_clause (named_imports (import_specifier !alias name: (identifier) @import.name))) source: (string) @import.path) @import
-(import_statement (import_clause (named_imports (import_specifier alias: (identifier) @import.name))) source: (string) @import.path) @import
-(import_statement (import_clause (namespace_import (identifier) @import.name)) source: (string) @import.path) @import
+; One match per import statement: the clause is captured whole and the worker
+; walks its bindings in source order. A pattern that captured each specifier
+; and then the source after it would keep one partial match per specifier open
+; until the source, which is quadratic in the specifier count.
+(import_statement (import_clause)? @import.clause source: (string) @import.path) @import
 ((call_expression function: (identifier) @import.fn arguments: (arguments . (string) @import.path)) @import
   (#eq? @import.fn "require"))
 
