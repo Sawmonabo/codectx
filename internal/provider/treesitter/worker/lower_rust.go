@@ -75,7 +75,8 @@ const rsTryLabel = " try"
 //     it is folded. The left operand's node defines the operator's result and
 //     the right operand's defines it again, so a node spanning the operator
 //     (a compound left operand, `a && b` in `a && b || c`, or the condition)
-//     Uses the result, never the operands' names.
+//     Uses the result, never the operands' names. No other node spans the
+//     operator: in statement or tail position its operand nodes are all.
 //   - An if condition, a while condition and a match guard are one Branch
 //     node spanning the condition. A let chain (`a && let P = v && b`) is one
 //     Branch per member in source order; each member's false edge leaves the
