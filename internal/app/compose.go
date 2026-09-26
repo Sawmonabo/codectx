@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,14 +81,6 @@ const (
 // `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
-// parserWorkerReservationBytes is the memory one parser worker reserves from
-// the admission ledger while it runs, and the smallest budget the parser
-// runner beneath that ledger is given, so the runner can always hold one
-// worker the ledger admitted alone. It is one fixed figure for every worker,
-// whatever the file it parses: it has to cover a worker parsing a file at the
-// largest size workspace.max_parse_file_bytes admits, not an ordinary one.
-const parserWorkerReservationBytes int64 = 256 << 20
-
 // collectorBatchLimit bounds every phase of one retention pass. It restates
 // internal/storage/sqlite's own collection batch (gcBatchUnits, unexported
 // there) so both halves of a pass agree about how much work one transaction is.
@@ -157,6 +150,52 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 		return 0, true
 	}
 	return allocation, true
+}
+
+// memoryAllocation is the memory this process's children may hold between
+// them, derived from one reading m of the kernel's figure: the smaller of
+// available memory plus the product's own observed residency, less the base
+// footprint and the safety margin, and half of that total
+// (dependence.Machine.SchedulingAllocation over the augmented reading).
+// Counting the product's own residency -- this process's resident set and
+// workerResidentBytes, what its parser workers hold -- means its own growth
+// never throttles it: memory the product already holds is not memory another
+// process could have been given.
+//
+// It is the one derivation of the allocation, at composition (before any
+// parser worker has started, so workerResidentBytes is zero) and between
+// parser files (rederiveAllocation). Where this process's resident set is not
+// reported, it is left out of the sum rather than counted as zero, and the
+// allocation is the smaller figure available memory alone leaves. An
+// unobserved reading is the stand-in allocation, not observed.
+func memoryAllocation(m dependence.Machine, baseFootprintBytes, workerResidentBytes int64) (int64, bool) {
+	if !m.Observed {
+		return m.SchedulingAllocation(baseFootprintBytes)
+	}
+	held := workerResidentBytes
+	if parent, ok := wire.ResidentBytes(); ok {
+		held += parent
+	}
+	return dependence.Machine{AvailableBytes: m.AvailableBytes + held, Observed: true}.
+		SchedulingAllocation(baseFootprintBytes)
+}
+
+// rederiveAllocation is the parser provider's Rederive step: between files it
+// reads the kernel's figure afresh and sets the ledger's allocation to what
+// memoryAllocation derives from it, so a user's editor or browser taking
+// memory narrows what the next file is admitted against, and memory they give
+// back widens it. A reading the platform withholds changes nothing: the last
+// allocation -- the stand-in on a host that never reported one -- stays.
+// Nothing already admitted is taken back (admission.Ledger.SetAllocation).
+func rederiveAllocation(l *admission.Ledger, baseFootprintBytes int64) func(workerResidentBytes int64) {
+	return func(workerResidentBytes int64) {
+		m := dependence.ObserveMachine()
+		if !m.Observed {
+			return
+		}
+		allocation, _ := memoryAllocation(m, baseFootprintBytes, workerResidentBytes)
+		l.SetAllocation(allocation)
+	}
 }
 
 // tempDiskShares splits resources.max_temp_bytes into the shared runner's
@@ -406,18 +445,18 @@ type stack struct {
 	// each component keeps its own runner.
 	runners []diagnostics.ProcessCounter
 	// admission is the one reservation ledger, for memory and disk, of this
-	// process, built here from the one observation of the machine and the one
-	// of the data directory's free space, and handed to every reserver:
+	// process, built here from the composition's reading of the machine and
+	// the one of the data directory's free space, its memory allocation then
+	// re-derived between parser files, and handed to every reserver:
 	// the heavy-unit scheduler inside the coordinator, the language-server
 	// manager, and the resource block that discloses it. There is no second
 	// one -- a reserver with a running total of its own is bounded by the same
 	// allocation as this one and nothing sums the two, which is a process free
 	// to reserve a multiple of the machine's memory.
 	admission *admission.Ledger
-	// machine is the one observation of the host this process takes. The
-	// admission allocation is derived from it, and it is handed to the
-	// coordinator's planner and the dependence provider so every heavy unit is
-	// sized against the reading it is admitted against.
+	// machine is the composition's observation of the host. The admission
+	// allocation starts from it, and it is handed to the coordinator's planner
+	// and the dependence provider, which size every heavy unit against it.
 	machine dependence.Machine
 	// admissionMemoryObserved and admissionDiskObserved say whether each of
 	// the ledger's allocations came from a reading of this host rather than a
@@ -693,30 +732,36 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
 	s.gate = newGraphGate()
 
-	// One observation of the machine, one allocation, and every heavy child of
-	// this process -- graph engine runs, SCIP indexers, language servers --
-	// admitted against it by the sum of what they reserve. Nothing here is a
-	// count of children and nothing is configurable: the allocation is
-	// available memory less this process's own footprint and the safety
-	// margin, never more than the share of the machine the product takes.
+	// One allocation, and every heavy child of this process -- graph engine
+	// runs, SCIP indexers, language servers, parser files -- admitted against
+	// it by the sum of what they reserve. Nothing here is a count of children
+	// and nothing is configurable: the allocation is available memory plus the
+	// product's own residency, less this process's footprint and the safety
+	// margin, never more than the share of that total the product takes
+	// (memoryAllocation).
 	//
 	// The footprint it subtracts is DERIVED from this machine and this
 	// configuration rather than read from a constant: the reservations this
 	// process makes up front grow with the core count, so a host with more
-	// cores keeps more for itself and offers its children less. The same
-	// reading and the same footprint size the units (the planner and the
-	// dependence provider are handed s.machine), so a unit is sized against
-	// the allocation it is admitted against.
+	// cores keeps more for itself and offers its children less. Its idle term
+	// is this process's own resident set, so adding that residency to
+	// available memory and subtracting the footprint leaves what the product
+	// already holds out of what its children compete for.
 	//
-	// The machine is read once. On a host that exposes available memory the
-	// allocation is that reading, and where nothing is left over the
-	// footprint it is zero: an observation under which the ledger runs heavy
-	// children one at a time. Only a host that exposes no figure gets the
-	// stand-in; composition warns about it once, as it does about an observed
-	// zero, and the ledger's surfaces are told it is not an observation.
+	// s.machine is the reading taken here, at composition, and the one the
+	// planner and the dependence provider size units against. The ledger's
+	// allocation starts from it and is then re-derived from a fresh reading
+	// between parser files (rederiveAllocation). On a host that exposes
+	// available memory the allocation is derived from that reading, and where
+	// nothing is left over the footprint it is zero: an observation under
+	// which the ledger runs heavy children one at a time. Only a host that
+	// exposes no figure gets the stand-in; composition warns about it once, as
+	// it does about an observed zero, and the ledger's surfaces are told it is
+	// not an observation.
 	s.machine = dependence.ObserveMachine()
+	baseFootprint := config.BaseFootprint(cfg)
 	var childMemory int64
-	childMemory, s.admissionMemoryObserved = s.machine.SchedulingAllocation(config.BaseFootprint(cfg))
+	childMemory, s.admissionMemoryObserved = memoryAllocation(s.machine, baseFootprint, 0)
 	switch {
 	case !s.admissionMemoryObserved:
 		slog.Warn("this host publishes no available-memory figure, so heavy children are admitted against a stand-in allocation that is not an observation",
@@ -773,16 +818,18 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// cores. They exchange everything with this process over pipes and
 	// reserve no disk, so the runner holds no share of the temporary ceiling.
 	//
-	// Each worker reserves parserWorkerReservationBytes from the one admission
-	// ledger before it runs, so how many run at once is bounded by the
-	// allocation as well as by cores. The runner beneath that gate must never
-	// refuse what it admitted, and the gate runs a worker alone when the
-	// allocation holds less than one, so the runner's budget is the allocation
-	// or one worker's reservation, whichever is larger.
+	// Their memory is admitted on the one ledger and nowhere else: a worker's
+	// observed base and each file's predicted need are reserved there, and the
+	// ledger grants a file whenever no parse is in flight, however large. The
+	// runner reserves nothing per worker, so its memory budget must never
+	// refuse: it is the whole int64 range, which no reservation exceeds and
+	// no sum of them reaches, and not a figure standing in for a machine --
+	// on a host whose allocation is zero a figure derived from it would
+	// refuse the runner itself.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
-		MemoryBudgetBytes: maxInt64(childMemory, parserWorkerReservationBytes),
+		MemoryBudgetBytes: math.MaxInt64,
 	})
 	if err != nil {
 		return nil, err
@@ -851,6 +898,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxEvidencePerFact:  evidenceClip(cfg),
+		Rederive:            rederiveAllocation(s.admission, baseFootprint),
 		Admission:           s.admission,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,
