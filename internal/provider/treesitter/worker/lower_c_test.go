@@ -92,9 +92,8 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"x@10 -> y = x@30", "y = x@30 -> return y;@65", "y = 2@49 -> return y;@65"},
 		},
 		{
-			// Structured exceptions, by the structured exception handling
-			// extension's documented semantics of its try-finally statement:
-			// `__leave` ends the `__try` body, the `__finally` block runs on
+			// Structured exception handling, try-finally statement (the
+			// extension's documented semantics): `__leave` ends the `__try` body, the `__finally` block runs on
 			// every exit, and a call inside the body may raise. Nodes: x@11,
 			// x@28, __leave;@31, g()@40, the Handler __finally@47 (g()
 			// raising), h(x)@59, k()@67. Succ: x@28→{__leave, g()};
@@ -109,9 +108,8 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"x@11 -> x@28", "x@11 -> h(x)@59"},
 		},
 		{
-			// Structured exceptions, by the structured exception handling
-			// extension's documented semantics of its try-except statement: a
-			// dereference in a `__try` body may raise; the `__except` filter
+			// Structured exception handling, try-except statement (the
+			// extension's documented semantics): a dereference in a `__try` body may raise; the `__except` filter
 			// decides whether the handler runs, otherwise the exception
 			// propagates. Nodes: p@11, r = 0@20, r = *p@35, the Handler
 			// __except@45, g()@55 (the filter, a Branch), r = 1@62, return r;@71. Succ: r = *p→{__except, return
@@ -206,9 +204,8 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"fill(buf)@24 -> use(buf[0])@35", "fill(buf)@24 -> g(buf)@48"},
 		},
 		{
-			// Structured exceptions, by the structured exception handling
-			// extension's documented semantics of its try-finally statement:
-			// the `__finally` block runs however the `__try` body is left, a
+			// Structured exception handling, try-finally statement (the
+			// extension's documented semantics): the `__finally` block runs however the `__try` body is left, a
 			// goto out of it included. Nodes: x@10, r = 0@19, x@38, goto
 			// E;@41, r = 1@49, g()@70, E@77, return r;@80. Succ: x@38→{goto
 			// E, r = 1}; goto E→g() (the finally); r = 1→g(); g()→E→return r.
@@ -234,9 +231,12 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70"},
 		},
 		{
-			// The statement-expression extension's documented semantics
-			// permit jumping out of a statement expression; a break in a for
-			// loop's third expression ends that loop. Nodes: n@10, j =
+			// GNU C extension, Statements and Declarations in Expressions:
+			// jumping out of a statement expression is permitted, so a break
+			// in a for loop's third expression ends that loop (C17 §6.8.5.3,
+			// §6.8.6.3). The update is an expression statement whose last
+			// node, j++, does not span it, so it ends with a Stmt node
+			// spanning it that Uses the last statement's j. Nodes: n@10, j =
 			// 0@27, j < n@34, g(j)@71, j > 5@48, break;@55, j++@62, the
 			// update ({ … })@41, return j;@77. Succ: j < n→{g(j), return j};
 			// g(j)→j > 5→{break, j++}; break→return j; j++→({ … })→j < n.
@@ -254,10 +254,12 @@ func TestCLoweringGolden(t *testing.T) {
 		},
 		{
 			// C17 §6.8.6.2p2: a continue jumps to the end of the loop body,
-			// after which a do loop evaluates its condition again; the
-			// statement-expression extension's documented semantics permit
-			// the jump out of the condition. Nodes: n@10, n--@18, n & 1@37,
-			// continue;@44, n > 0@54, the condition { … }@31 (a Branch),
+			// after which a do loop evaluates its condition again; GNU C
+			// extension, Statements and Declarations in Expressions: the jump
+			// out of the condition is permitted. The condition strips the do's
+			// parentheses and the statement expression's own. Nodes: n@10,
+			// n--@18, n & 1@37, continue;@44, n > 0@54, the condition
+			// { … }@31 (a Branch Using n > 0's n),
 			// return n;@66. Succ: n--→n & 1→{continue, n > 0}; continue→
 			// n & 1; n > 0→{ … }→{n--, return n}. IPDom: n & 1 → n > 0;
 			// { … } → return n.
@@ -293,7 +295,7 @@ func TestCLoweringGolden(t *testing.T) {
 				"b = 2@63 -> return a + b + r;@70", "r = r ? a : b@41 -> return a + b + r;@70"},
 		},
 		{
-			// The assembly-goto extension's documented semantics: control may
+			// GNU C extension, Extended Asm, Goto Labels: control may
 			// continue at the next statement or at any listed label. Nodes:
 			// x@10, the Branch asm goto("" : : "r"(x) : : L)@15 (Uses x),
 			// x = 1@46, L@53, return x;@56. Succ: asm→{x = 1, L}; x = 1→L.

@@ -93,8 +93,9 @@ func TestCppLoweringGolden(t *testing.T) {
 			du:       []string{"x@8 -> x@17"},
 		},
 		{
-			// [stmt.select]/2–3 (condition declarations): the declared name is
-			// in scope in both branches and initialized by the condition.
+			// [stmt.pre] (a condition that is a declaration) and [stmt.if]: the
+			// declared name is in scope in both branches and initialized by
+			// the condition.
 			// Nodes: int x = g()@14 (the Branch, defining x), return x;@27,
 			// return 0;@37.
 			name:     "a condition declaration defines its name on the decision node",
