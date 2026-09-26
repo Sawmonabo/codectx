@@ -147,8 +147,9 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// §15.26.1. Nodes: a@25, p@30, v@37, a[v] = v@42 (may-defines
 			// a), p.q.r = v@52 (may-defines p, the local at the base),
 			// this.s = v@63 (a field: defines nothing), return a == p;@75.
-			// A may-definition kills nothing, so both the write and the
-			// parameter reach the return.
+			// Each write is a χ of its base: the return pairs with it, the
+			// nearest may-definition, and with the parameter, the killing
+			// definition that reaches it through the write.
 			name:     "a write through an array element or field of a local may-defines the local",
 			protects: "an element or field write reaches later uses of its base local without killing the local's earlier definition, and a write to a field of this defines no local",
 			mutation: "record no definition of the base (loses a[v] = v@42 and p.q.r = v@52 -> return a == p;@75), or a killing one (loses a@25 and p@30 -> return a == p;@75)",
@@ -249,9 +250,9 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// () -> arr[0] = 1@59 (uses arr, may-defines it: its body writes
 			// an element of the captured array), r = () -> arr[0] = 1@55
 			// (Uses the owned result the lambda defines, not arr),
-			// r.run()@77, return arr;@86. A may-definition kills nothing, so
-			// a use of arr after the creation pairs with the creation and
-			// with the definition before it.
+			// r.run()@77, return arr;@86. The creation is a χ of arr, so a
+			// use of arr after it pairs with the creation, the nearest
+			// may-definition, and with the killing definition before it.
 			name:     "a lambda's write through a captured local's element may-defines the local where it is created",
 			protects: "a use of a captured array after the lambda's creation sees the element write the lambda may perform, and the array's earlier definition, while the declarator consuming the lambda reads only its result",
 			mutation: "record no write through a captured local (loses () -> arr[0] = 1@59 -> return arr;@86), a killing definition (loses arr = new int[1]@28 -> return arr;@86), or let the declarator read the captures instead of the result (gains arr = new int[1]@28 -> r = () -> arr[0] = 1@55)",
@@ -557,15 +558,15 @@ func TestJavaLoweringGolden(t *testing.T) {
 		{
 			// §15.25, §15.26.1. Nodes: c@24, x@31 (params), c@44 (the
 			// condition), x = 1@49 (the first arm, which is its own
-			// assignment node: it defines x, so it may-defines the
-			// conditional's result), 2@58 (the second arm, defining the
+			// assignment node: it defines both x and the conditional's
+			// result, each killing), 2@58 (the second arm, defining the
 			// result), y = c ? (x = 1) : 2@40 (Uses the result, defines y), return x +
 			// y;@61. Succ: c@44→{x = 1, 2}; both→the declarator→return.
 			// IPDom: c@44, x = 1, 2 → the declarator → return. Frontier
 			// walk: c@44 over x = 1 and 2.
-			name:     "an arm that is an assignment defines its local and may-defines the conditional's result",
-			protects: "a node that already defines a variable yields the construct's value without a second definition, and the local it assigns still reaches later uses",
-			mutation: "Def the result on an arm's node whatever it defines (the builder panics: a node defines at most one variable), or give that arm no share of the result (loses x = 1@49 -> y = c ? (x = 1) : 2@40)",
+			name:     "an arm that is an assignment defines both its local and the conditional's result",
+			protects: "a node that assigns a local also yields the construct's value, both by killing definitions, and the local it assigns still reaches later uses",
+			mutation: "give that arm no share of the result (loses x = 1@49 -> y = c ? (x = 1) : 2@40), or make its definition of x a may-definition (gains x@31 -> x = 1@49)",
 			src:      "class A { int f(boolean c, int x) { int y = c ? (x = 1) : 2; return x + y; } }",
 			fn:       1,
 			cd:       []string{"c@44 -> x = 1@49", "c@44 -> 2@58"},
@@ -574,7 +575,7 @@ func TestJavaLoweringGolden(t *testing.T) {
 		},
 		{
 			// §15.26.1, §15.7.1 (left operand first). Nodes: x = 1@36 and
-			// x = 2@46 (each defines x and may-defines its own owned
+			// x = 2@46 (each defines x and its own owned
 			// result), y = (x = 1) + (x = 2)@31 (Uses both results, defines y), return
 			// y;@54. Succ: a straight line. The declarator reads each
 			// assignment's value, not x, so both assignments reach it,
@@ -589,8 +590,8 @@ func TestJavaLoweringGolden(t *testing.T) {
 		{
 			// §15.7.1, §15.26.1. Nodes: x@20, x = 1@38 (defines x; it
 			// carries the declarator's earlier read of x: Uses x's value from
-			// before it and may-defines an owned variable holding it, and
-			// may-defines its own result), y = x + (x = 1)@29 (Uses both owned
+			// before it and defines an owned variable holding it, and
+			// defines its own result), y = x + (x = 1)@29 (Uses both owned
 			// variables, defines y), return y;@46. Succ: a straight line.
 			// Java evaluates the left operand x before the assignment, so
 			// that read sees the parameter, which reaches the declarator
@@ -604,7 +605,7 @@ func TestJavaLoweringGolden(t *testing.T) {
 		},
 		{
 			// §15.25, §15.7.1. Nodes: c@24, x@31 (params), c@49 (the
-			// condition), x = 1@54 (the first arm: defines x, may-defines
+			// condition), x = 1@54 (the first arm: defines x and
 			// the conditional's result), 0@63 (the second arm, defining the
 			// result), y = x + (c ? (x = 1) : 0)@40 (Uses x and the result, defines y), return
 			// y;@67. Succ: c@49→{x = 1, 0}; both→the declarator→return.
@@ -644,6 +645,27 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"a@38 -> x = a@43", "a@38 -> x += a@50", "a@38 -> x = a@65", "x = a@65 -> g(x = a)@63",
 				"a@38 -> () -> { x++; xs[0] = a; }@86", "() -> { x++; xs[0] = a; }@86 -> r = () -> { x++; xs[0] = a; }@82",
 				"a@38 -> xs[0] = a@113"},
+		},
+		{
+			// §15.23, §15.26.1. Nodes: c@28, d@39 (params), c@67 (the
+			// deciding operand's Branch: Uses c, defines the operator's
+			// owned result), b = d@73 (the second operand, its own
+			// assignment node: Uses d, defines b, its own result and the
+			// operator's result, each killing), y = c && (b = d)@63 (Uses
+			// the operator's result, defines y), return y;@81. Succ: c@67→{b
+			// = d, the declarator}; b = d→the declarator→return. IPDom:
+			// c@67, b = d → the declarator. Frontier walk: c@67 over b = d.
+			// On the true path b = d's definition of the result kills
+			// c@67's, so the declarator pairs with c@67 only through the
+			// false edge, and b = d reads no earlier value of the result.
+			name:     "a second operand that assigns a local defines the operator's result by a killing definition",
+			protects: "the yields of one construct's value never read one another: the operand evaluated after the deciding one replaces its value on that path",
+			mutation: "may-define the operator's result on a node that also defines a local (gains c@67 -> b = d@73: the second operand would read the deciding operand's value through the χ)",
+			src:      "class A { boolean f(boolean c, boolean d) { boolean b; boolean y = c && (b = d); return y; } }",
+			fn:       1,
+			cd:       []string{"c@67 -> b = d@73"},
+			du: []string{"c@28 -> c@67", "d@39 -> b = d@73", "c@67 -> y = c && (b = d)@63", "b = d@73 -> y = c && (b = d)@63",
+				"y = c && (b = d)@63 -> return y;@81"},
 		},
 	})
 }
