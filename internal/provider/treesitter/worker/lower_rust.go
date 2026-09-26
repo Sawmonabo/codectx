@@ -120,7 +120,9 @@ const rsTryLabel = " try"
 //     pattern may-defines the base variable of the matched place (x in
 //     `if let Some(ref mut y) = x`) at the binding's node. What that rule
 //     gives up stays given up, for its stated reasons: a write through a
-//     reference, a method call's implicit borrow of its receiver
+//     reference as a definition of the local it refers to (the variable
+//     written through is may-defined, as above), a method call's implicit
+//     borrow of its receiver
 //     (`v.push(1)`), whose borrowing depends on the method's signature, and
 //     a shared borrow `&x` of an interior-mutable type, whose writing
 //     depends on the type.
