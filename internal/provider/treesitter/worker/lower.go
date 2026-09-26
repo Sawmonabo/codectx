@@ -54,22 +54,24 @@ func Grammar(name string) (*ts.Language, bool) {
 //     the deciding operand's node defines the variable, and the operand
 //     evaluated after it defines it again, so SSA merges the two;
 //   - an embedded assignment (`y = (x = a) * 2`, `f(o.f = a)`, `x := e`): the
-//     assignment's node. A local target is the node's definition, so the
-//     node may-defines the owned result (see below); a field, element or
-//     pointer target only may-defines its base, and the node defines the
-//     result. The consumer Uses the result in both cases, never the target:
-//     in `(x := 1) + (x := 2)` it depends on both assignments;
+//     assignment's node. It defines the owned result; a local target is
+//     also its definition, and a field, element or pointer target only
+//     may-defines its base. The consumer Uses the result in both cases,
+//     never the target: in `(x := 1) + (x := 2)` it depends on both
+//     assignments;
 //   - a callable's creation (a lambda, closure, local function, anonymous
 //     class, generator, comprehension, async block): the creating node,
 //     whose value is the created callable; it Uses the enclosing variables
 //     the callable captures, since reading them is its own evaluation.
 //
-// A node defines at most one variable (flow.Builder.Def). A yielding node
-// that already defines a variable (an embedded assignment to a local, an arm
-// whose result is one, `c ? (x = 1) : 2`) may-defines the result instead.
-// The result has no definition outside its construct's yielding nodes and
-// each consumer reads it once, right after they run, so the may-definition
-// reaches the consumer exactly where a definition would.
+// A yielding node that also defines a variable of its own (an embedded
+// assignment to a local, an arm whose result is one, `c ? (x = 1) : 2`)
+// defines the result too: a node may make several killing definitions
+// (flow.Builder.Def). Each construct's result is its own variable, defined
+// only by that construct's yielding nodes, so a killing definition of it
+// kills nothing another yield needs; a may-definition would not do, since it
+// reads the result's prior version (see May-definitions) and would claim that
+// one yield consumed another's value.
 //
 // SSA merges the yielding definitions at the consumer, and the yielding
 // nodes carry the control dependence on the selector or condition that
@@ -87,7 +89,7 @@ func Grammar(name string) (*ts.Language, bool) {
 // A read the consumer folds and that its evaluation makes before an
 // embedded assignment redefines the variable (`y = x + (x = 1)`, `f(x, x =
 // 1)`) is carried by the assignment's node: that node Uses the earlier
-// value and hands it on through an owned variable it may-defines, and the
+// value and hands it on through an owned variable it defines, and the
 // consumer Uses that variable in place of the name, so the folded read
 // pairs with the definition that reached it rather than the one after it.
 // The hand-off is made only when the assignment's node runs whenever the
@@ -131,6 +133,23 @@ func Grammar(name string) (*ts.Language, bool) {
 // flow.Builder (whose Use, MayDef and Def reject it) and never indexes a
 // table of the lowering's own; each lowering states where it filters it.
 //
+// # May-definitions
+//
+// A may-definition of v at node p (flow.Builder.MayDef) is a χ: p reads v's
+// prior version and defines the next one, which may still hold the old
+// value. A use of v pairs with every killing definition of v that reaches
+// it, through any number of may-definitions, and with the nearest
+// may-definitions of v on each path to it, the ones no later may-definition
+// of v follows on that path; p itself pairs with what reaches it by the same
+// rule, whether or not it reads v in the source. Earlier may-writes stay
+// reachable through the chain. A lowering records a may-definition only for
+// a write that may leave the old value in place: a write through an address
+// (see Address-taking), a mutable borrow, a field, an index or a pointer; a
+// closure's write to an enclosing variable, at the node that creates it; and
+// a binding a C preprocessor conditional leaves undecided. Every other
+// definition, an owned result or a hand-off's earlier value included, is
+// killing.
+//
 // # Iteration
 //
 // Every loop over an iterable evaluates the iterable once, before the first
@@ -166,9 +185,9 @@ func Grammar(name string) (*ts.Language, bool) {
 //
 // # Address-taking
 //
-// Every lowering applies one rule. A local gets a non-killing
-// may-definition, which kills nothing, at the node that evaluates the
-// operation, when any of these happens to it:
+// Every lowering applies one rule. A local gets a may-definition (see
+// May-definitions) at the node that evaluates the operation, when any of
+// these happens to it:
 //
 //   - its address is taken: `&x` in Go, C and C++, and `&x.f` and `&x[i]`,
 //     whose base local is x;

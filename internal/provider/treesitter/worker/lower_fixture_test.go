@@ -43,8 +43,13 @@ type goldenCase struct {
 //     graph with no entry-to-exit edge: nothing depends on ENTRY, and a loop
 //     head whose back edge it controls depends on itself.
 //   - Def-use. A pair is (defining node, using node), with every φ resolved
-//     to the definitions it merges. A may-definition kills nothing, so a use
-//     it reaches pairs with it and with every definition reaching its node.
+//     to the definitions it merges. A may-definition is a χ (lower.go,
+//     May-definitions): a use pairs with every killing definition reaching
+//     it through any number of may-definitions, and with the nearest
+//     may-definition on each path, the one no later may-definition of the
+//     variable follows; the may-defining node pairs with what reaches it by
+//     the same rule, whether or not it reads the variable. A node may make
+//     several killing definitions.
 //     A Handler node carries the values on entry to each node that threw to
 //     it. A use that no definition reaches (a node with no path from ENTRY,
 //     a name no node defines) makes no pair.
