@@ -603,8 +603,8 @@ func (b *Builder) Finish() *Graph {
 
 	slices.Sort(b.uses)
 	b.uses = slices.Compact(b.uses)
-	b.useOff = grow(b.useOff, n+1)
-	b.useVars = grow(b.useVars, len(b.uses))
+	b.useOff = resize(b.useOff, n+1)
+	b.useVars = resize(b.useVars, len(b.uses))
 	for i, u := range b.uses {
 		from, v := unpack(u)
 		b.useVars[i] = v
@@ -806,8 +806,8 @@ func prefix(off []int32) {
 	}
 }
 
-// grow returns s resized to n zeroed elements, reusing its capacity.
-func grow(s []int32, n int) []int32 {
+// resize returns s resized to n zeroed elements, reusing its capacity.
+func resize(s []int32, n int) []int32 {
 	s = slices.Grow(s[:0], n)[:n]
 	clear(s)
 	return s
