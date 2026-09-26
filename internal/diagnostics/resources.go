@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -60,21 +61,22 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	// it is process accounting: a unit's reservation and the peak its tree
 	// reached belong to the run that started it, not to a stored generation.
 	report.AnalyzerUnits = dependence.ObservedUnits()
-	if len(report.AnalyzerUnits) > 0 {
-		// A unit that peaked above what it was admitted against took memory
-		// the machine had accounted for elsewhere, which is the direction that
-		// freezes a host. The rows above already carry both figures; this is
-		// the count, so an overrun reaches an operator reading the block
-		// rather than only one comparing every row by hand. It is absent where
-		// this process ran no heavy unit -- nothing was measured -- and zero
-		// where it ran them and none overran.
-		overran := int64(0)
-		for _, u := range report.AnalyzerUnits {
-			if u.OverranReservation() {
-				overran++
-			}
-		}
+	// A unit that peaked above what it was admitted against took memory the
+	// machine had accounted for elsewhere, which is the direction that freezes
+	// a host. The rows above carry both figures; this is the count, so an
+	// overrun reaches an operator reading the block rather than only one
+	// comparing every row by hand. It is the provider's own total, which also
+	// counts the units past the rows' bound. It is absent where this process
+	// ran no heavy unit -- nothing was measured -- and zero where it ran them
+	// and none overran.
+	overran, omitted := dependence.ObservedTotals()
+	if len(report.AnalyzerUnits) > 0 || omitted > 0 {
 		report.AnalyzerOverrunUnits = &overran
+	}
+	if omitted > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf(
+			"%d heavy analyzer unit runs are past the %d rows this block carries; the overrun count includes them",
+			omitted, dependence.MaxObservedUnits))
 	}
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
@@ -199,10 +201,12 @@ func scratchBytes(report *model.ResourceReport) {
 	// resolve itself. A removal the filesystem refuses keeps its space in the
 	// pending figure for the life of the process, so the figure alone would
 	// read as a backlog the pace is working through.
+	// The list is paged at the response bound, and the rest is counted.
+	var stuckFrees []model.StuckFree
 	for _, stuck := range paced.StuckFrees() {
-		report.StuckFrees = append(report.StuckFrees,
-			model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
+		stuckFrees = append(stuckFrees, model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
 	}
+	report.StuckFrees, report.StuckFreesOmitted = model.PageStuckFrees(stuckFrees)
 	if byPurpose := paced.FreedByPurpose(); len(byPurpose) > 0 {
 		report.FreedByPurpose = make(map[string]uint64, len(byPurpose))
 		for p, n := range byPurpose {

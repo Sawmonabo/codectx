@@ -158,7 +158,7 @@ type Options struct {
 	// exactly as it would otherwise, because a nil ledger opens a nil run
 	// whose spans do nothing.
 	Ledger *ledger.Ledger
-	// Admission is the process's one memory admission ledger, and it is
+	// Admission is the process's one admission ledger, for memory and disk, and it is
 	// required: every heavy unit this coordinator runs is admitted against it,
 	// and a coordinator that observed the machine and built its own would be a
 	// second running total bounded by the same allocation -- two gates, two

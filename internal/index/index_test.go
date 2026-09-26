@@ -87,7 +87,7 @@ type fixture struct {
 	// unless a scenario is about what a watch reports, which needs a
 	// destination it can read back at debug.
 	logger *slog.Logger
-	// admission is the one memory ledger this fixture's coordinators and its
+	// admission is the one admission ledger this fixture's coordinators and its
 	// parser workers reserve from, as production composes one per process.
 	admission *admission.Ledger
 }

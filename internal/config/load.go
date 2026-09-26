@@ -10,6 +10,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // ProjectConfigName is the optional per-repository file. It is written by
@@ -17,7 +18,9 @@ import (
 const ProjectConfigName = ".codectx.toml"
 
 const (
-	appDirName     = "codectx"
+	// appDirName is the product's directory under each user base directory,
+	// the one name the reclaimer's cache directory also uses.
+	appDirName     = paced.ProductDirName
 	userConfigName = "config.toml"
 	// toolStoreDirName is the store's directory name under the user data
 	// directory. It matches the name the toolchain package uses under a data

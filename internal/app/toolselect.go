@@ -49,6 +49,11 @@ const cpgKind = "cpg"
 // would install nothing for a project that capture holds, and the offline
 // runner would discover the missing payload mid-index.
 //
+// The indexing run's own detection walks with those two hooks too, answered
+// from the pinned snapshot (index/generation.go, forceSnapshotPaths). Tool
+// selection runs before any snapshot exists, so it has neither a staging
+// database nor a snapshot to ask, and streams Git's index instead.
+//
 // The second pass below is that force-include, reached without hooks and
 // without a staging database. A walk carrying the capture's two hooks emits
 // the paths the policy admits plus the tracked paths under excluded
