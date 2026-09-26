@@ -623,17 +623,27 @@ func TestJavaLoweringGolden(t *testing.T) {
 		},
 		{
 			// JLS §6.5.6.1 (a simple name that is not a local variable or
-			// parameter in scope names a field), §15.26.1, §15.26.2. Nodes:
-			// a@28 (the parameter), x = a@33, x += a@40. x is the field, no
-			// variable of this function, so neither assignment defines one
-			// and the compound one reads only a. Straight line: no control
-			// dependence.
+			// parameter in scope names a field), §15.26.1, §15.26.2, §15.14.2,
+			// §15.27.2. x and xs are fields, no variable of this function, in
+			// every position a name takes: an assignment target, a compound
+			// assignment, an increment, an embedded assignment, a name the
+			// lambda captures (read and incremented there), and the base of an
+			// element write, at statement level and inside the lambda. Nodes:
+			// a@38 (the parameter), x = a@43, x += a@50, x++@58 (Uses and
+			// defines nothing), x = a@65 (the embedded assignment: Uses a,
+			// defines only its owned result), g(x = a)@63 (Uses the result),
+			// () -> { x++; xs[0] = a; }@86 (the lambda: Uses its one capture
+			// a, may-defines nothing, defines the created value), r = () -> {
+			// x++; xs[0] = a; }@82 (Uses it), xs[0] = a@113 (Uses a,
+			// may-defines nothing). Straight line: no control dependence.
 			name:     "an assignment to a field named without this defines no local",
-			protects: "an assignment whose simple name resolves to no local or parameter is lowered as a write that defines nothing, and the lowering never treats the unresolved name as a variable",
-			mutation: "drop the unresolved-name guard in holds (the lowering indexes before the start of its read table and panics on the first such assignment)",
-			src:      "class A { int x; void f(int a) { x = a; x += a; } }",
+			protects: "a name that resolves to no local or parameter is state the pairs do not track in every position it takes: a write to it defines nothing, a read of it Uses nothing, a write through it may-defines nothing, and the lowering never treats it as a variable",
+			mutation: "drop the -1 test in holds (earlier indexes before the start of the read table at x = a@43 and panics), in read (x += a@50 indexes it and panics), in def (x = a@43 reaches the builder's Def with -1 and panics), in assign's test of base (xs[0] = a@113 reaches MayDef with -1 and panics), or in cap's test of base (the lambda's xs[0] = a is recorded as a write and closure passes -1 to MayDef)",
+			src:      "class A { int x; int[] xs; void f(int a) { x = a; x += a; x++; g(x = a); Runnable r = () -> { x++; xs[0] = a; }; xs[0] = a; } }",
 			fn:       1,
-			du:       []string{"a@28 -> x = a@33", "a@28 -> x += a@40"},
+			du: []string{"a@38 -> x = a@43", "a@38 -> x += a@50", "a@38 -> x = a@65", "x = a@65 -> g(x = a)@63",
+				"a@38 -> () -> { x++; xs[0] = a; }@86", "() -> { x++; xs[0] = a; }@86 -> r = () -> { x++; xs[0] = a; }@82",
+				"a@38 -> xs[0] = a@113"},
 		},
 	})
 }
