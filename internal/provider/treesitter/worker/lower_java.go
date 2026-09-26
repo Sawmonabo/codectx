@@ -231,6 +231,20 @@ const yieldLabel = " yield"
 // when the nested code runs is unknown. A local class declaration's node is
 // its creating node.
 //
+// A name that resolves to no variable (see Names that resolve to no
+// variable in Lowering) is -1 from lookup: a field or inherited member named
+// by its simple name, an undeclared name, and, in a capture walk, every name
+// the nested code declares. It takes every position a local takes: an
+// assignment target, a compound assignment, an increment, an embedded
+// assignment or update, a name nested code captures, and the base of a field
+// or element target. It is filtered where it enters: read drops it, so no
+// node Uses it and it never indexes at; holds rejects it, so earlier hands
+// nothing off; def drops it, so no node defines it; and assign, update and
+// cap test base's result before a MayDef or a writes entry. Every other
+// variable the builder or at receives is a fresh Var, a result, or a reads
+// or writes entry that passed those filters. The node the construct makes is
+// still made, with its other operands' reads.
+//
 // # Exceptions
 //
 // MayThrow is given to every node whose own evaluation — the source
