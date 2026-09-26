@@ -39,10 +39,38 @@ type grammar struct {
 	// query captured none.
 	importNames func(path string) []string
 
+	// fields are the field ids the extraction reads, resolved on first use
+	// by fieldIDs.
+	fieldsOnce sync.Once
+	fields     fieldIDs
 	// imports is an ECMAScript grammar's import-clause table, resolved on
 	// first use by importSyntax.
 	importsOnce sync.Once
 	imports     importSyntax
+}
+
+// fieldIDs are the ids of the fields the extraction looks children up by,
+// resolved once per grammar, since a lookup by name converts the name to a
+// C string on every call. A field the grammar does not define is 0, which
+// ChildByFieldId answers with no child, as a lookup by an unknown name does.
+type fieldIDs struct {
+	body, declarator, name, receiver, scope, typ uint16
+}
+
+// fieldIDs is the field table of g, resolved once.
+func (g *grammar) fieldIDs() *fieldIDs {
+	g.fieldsOnce.Do(func() {
+		tl := g.tsLanguage()
+		g.fields = fieldIDs{
+			body:       tl.FieldIdForName("body"),
+			declarator: tl.FieldIdForName("declarator"),
+			name:       tl.FieldIdForName("name"),
+			receiver:   tl.FieldIdForName("receiver"),
+			scope:      tl.FieldIdForName("scope"),
+			typ:        tl.FieldIdForName("type"),
+		}
+	})
+	return &g.fields
 }
 
 // importSyntax is the import-clause table of g, the ECMAScript grammar
@@ -84,14 +112,15 @@ var grammars = map[string]*grammar{
 			d.exported = unicode.IsUpper(r)
 			// A method's receiver type qualifies it: (s *Server) Start is
 			// Server.Start, whether or not Server is declared in this file.
-			if recv := d.node.ChildByFieldName("receiver"); recv != nil {
+			f := d.ex.f
+			if recv := d.node.ChildByFieldId(f.receiver); recv != nil {
 				for n := recv.NamedChild(0); n != nil; n = n.NamedChild(0) {
 					if n.Kind() == "type_identifier" {
 						d.impl = n.Utf8Text(src)
 						break
 					}
 					if n.Kind() == "parameter_declaration" {
-						n = n.ChildByFieldName("type")
+						n = n.ChildByFieldId(f.typ)
 						if n == nil {
 							break
 						}
@@ -184,7 +213,7 @@ func jsRefine(d *decl, _ []byte) {
 	// `const f = (a) => {...}`: the signature runs to the function's own body,
 	// not to the start of the function expression.
 	if d.body != nil && (d.body.Kind() == "arrow_function" || d.body.Kind() == "function_expression") {
-		if inner := d.body.ChildByFieldName("body"); inner != nil {
+		if inner := d.body.ChildByFieldId(d.ex.f.body); inner != nil {
 			d.body = inner
 		}
 	}
@@ -204,6 +233,7 @@ var cWrappers = set("template_declaration", "declaration_list")
 // cRefine finds the identifier below a declarator chain and decides whether a
 // declaration declares a function (a prototype), a variable or a typedef.
 func cRefine(d *decl, src []byte) {
+	f := d.ex.f
 	if d.declarator == nil {
 		if d.node.Kind() == "preproc_def" || d.node.Kind() == "preproc_function_def" {
 			d.macro = true
@@ -216,18 +246,18 @@ func cRefine(d *decl, src []byte) {
 		switch n.Kind() {
 		case "function_declarator":
 			isFunc = true
-			n = n.ChildByFieldName("declarator")
+			n = n.ChildByFieldId(f.declarator)
 		case "pointer_declarator", "array_declarator", "init_declarator", "attributed_declarator", "reference_declarator", "parenthesized_declarator":
-			if c := n.ChildByFieldName("declarator"); c != nil {
+			if c := n.ChildByFieldId(f.declarator); c != nil {
 				n = c
 			} else {
 				n = firstNamedChild(n)
 			}
 		case "qualified_identifier":
-			if scope := n.ChildByFieldName("scope"); scope != nil {
+			if scope := n.ChildByFieldId(f.scope); scope != nil {
 				d.impl = scope.Utf8Text(src)
 			}
-			n = n.ChildByFieldName("name")
+			n = n.ChildByFieldId(f.name)
 		case "destructor_name", "operator_name":
 			d.name = n.Utf8Text(src)
 			d.nameStart, d.nameEnd = n.StartByte(), n.EndByte()

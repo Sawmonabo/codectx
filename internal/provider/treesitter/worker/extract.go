@@ -72,6 +72,7 @@ type refRec struct {
 // extraction is the state of one parse.
 type extraction struct {
 	g            *grammar
+	f            *fieldIDs // g's field table
 	l            lang.Language
 	path         string
 	src          []byte
@@ -100,6 +101,7 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	e.imports = map[span]*importRec{}
 	e.exportRanges = map[span]bool{}
 	e.exportNames = map[string]bool{}
+	e.f = e.g.fieldIDs()
 	names := q.CaptureNames()
 
 	cursor := ts.NewQueryCursor()
@@ -199,7 +201,7 @@ func (e *extraction) addBoundFunctions(kind string, node, names, values ts.Node)
 		if left[i].Kind() != "identifier" || right[i].Kind() != "func_literal" {
 			continue
 		}
-		body := right[i].ChildByFieldName("body")
+		body := right[i].ChildByFieldId(e.f.body)
 		if body == nil {
 			continue
 		}
