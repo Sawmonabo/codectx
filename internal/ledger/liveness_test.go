@@ -191,6 +191,11 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	sealed.End(OutcomeOK, Measured{}, nil)
 	barren.Finish(OutcomeOK)
 	waitForRuns(t, l, 5)
+	// The rows exist from their first span; the generation the cutoff reads
+	// is written by a later flush, so one is forced before the sweep.
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	// What a process killed while serving leaves behind: a deadline its writer
 	// never renewed, on a row that still says 'running'.
 	if err := l.current().writeTx(ctx, func(tx *sql.Tx) error {
