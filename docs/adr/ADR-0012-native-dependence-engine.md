@@ -575,7 +575,7 @@ repository, and are re-measured when any of the three changes.
   nineteen candidate building blocks with licence and last activity, each fetched at a live URL.
 - [05-cfg-cdg-from-treesitter.md](../research/05-cfg-cdg-from-treesitter.md) — the earlier CFG and
   control-dependence sizing and the precision argument this record inherits.
-- [00-synthesis.md §8](../research/00-synthesis.md) — the standing direction ruling: the hosted engine
+- [00-synthesis.md §8](../research/00-synthesis.md) — the standing direction: the hosted engine
   is the MVP backend, the pinned benchmark corpora are the differential oracle for any future native
   engine, and no analysis limit is lowered.
 - [providers-dependence.md](../providers-dependence.md) — what the provider publishes, its failure

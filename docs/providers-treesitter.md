@@ -113,8 +113,8 @@ symbols without rescanning):
 - `("file:"+path, "module:"+path)` → file module.
 - `("file:"+path, qualified name)` → every declaration.
 - `("file:"+path, "decl:"+name+"@"+path+":"+startLine+"-"+endLine)` → every
-  declaration. This is the cross-provider declaration key fixed by controller
-  ruling, shared byte-for-byte with the `dependence` provider, whose exported
+  declaration. This is the one cross-provider declaration key, shared
+  byte-for-byte with the `dependence` provider, whose exported
   declaration key is exactly this string:
 
   ```
