@@ -78,8 +78,8 @@ func TestReadOnlyStoreReadsWhileAnotherHoldsTheWriteTransaction(t *testing.T) {
 	if pinned.Binding().GenerationID != gen {
 		t.Fatalf("pinned generation = %d, want the active %d", pinned.Binding().GenerationID, gen)
 	}
-	// The pin wrote no lease row: that is the write it used to perform, and a
-	// row here would mean the reader had taken the writer connection after all.
+	// The pin wrote no lease row: a row here would mean the reader had taken
+	// the writer connection after all.
 	// Counted in the database rather than asked of the reader, so the assertion
 	// survives the reader having no opinion about leases at all.
 	wantNoLeaseRow(t, ctx, f)
@@ -108,13 +108,12 @@ func TestReadOnlyStoreReadsWhileAnotherHoldsTheWriteTransaction(t *testing.T) {
 // A writerless pin is a SNAPSHOT, not a lease, and the two things that follow
 // from that are what this protects.
 //
-// A query that cannot take a lease used to be refused any generation but the
-// active one, which made a continuation unanswerable the moment the run it was
-// minted against published the next generation -- the exact instant a second
-// process is most likely to be asking. It is allowed now because the lease was
-// never what a read needed: Store.read runs one deferred read transaction per
-// call, so within a call the log snapshot is fixed and a collection in another
-// process cannot take rows out from under the read.
+// A query that cannot take a lease must still be able to pin a generation other
+// than the active one, or a continuation becomes unanswerable the moment the
+// run it was minted against publishes the next generation. The lease is not
+// what a read needs: Store.read runs one deferred read transaction per call, so
+// within a call the log snapshot is fixed and a collection in another process
+// cannot take rows out from under the read.
 //
 // Across calls the generation really can go, and that is the second half: the
 // pin that finds no row must be recognisable as a COLLECTED generation, because

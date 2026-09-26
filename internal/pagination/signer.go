@@ -63,11 +63,12 @@ func OpenSigner(dir string) (*Signer, error) {
 
 // OpenSignerForReading loads the key a process that answers questions signs
 // its continuations with, and creates nothing: not the directory, not the key.
-// A key is made by the run that built the workspace, so a workspace that has
-// one is one an answer can continue; a workspace that has none is incomplete,
-// and saying so with the remedy is the answer -- minting one here would be a
-// write by a command that promises none, and on a workspace an operator has
-// made read-only it would fail with nothing an operator could act on.
+// Every writing composition makes the key beside the database it opens, so a
+// database without one is a cache missing one of its files: CTX_STORAGE_CORRUPT,
+// the family the key file of the wrong length is reported in, with the remedy
+// that mints a new one. Minting one here would be a write by a command that
+// promises none, and on a workspace an operator has made read-only it would
+// fail with nothing an operator could act on.
 func OpenSignerForReading(dir string) (*Signer, error) {
 	return openSigner(dir, true)
 }
@@ -79,10 +80,10 @@ func openSigner(dir string, readOnly bool) (*Signer, error) {
 	key, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if readOnly {
-			return nil, &model.Error{Code: model.CodeWorkspaceNotFound,
-				Message: "this workspace holds no continuation key, so an answer cannot be continued from it",
-				Remediation: "run `codectx index` in this workspace to build it; a command that only answers " +
-					"questions never creates one"}
+			return nil, &model.Error{Code: model.CodeStorageCorrupt,
+				Message: "the cache holds no continuation key at " + path + ", so an answer cannot be continued from it",
+				Remediation: "run `codectx index` in this workspace, which issues a new key; a command that only " +
+					"answers questions never creates one, and cursors and receipts issued under a lost key are invalid"}
 		}
 		key = make([]byte, keyBytes)
 		if _, err := rand.Read(key); err != nil {

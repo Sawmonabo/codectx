@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -273,19 +274,16 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 		return nil, internalErr("spool header: " + err.Error())
 	}
 	// Made here, by the first answer that does not fit one page. A workspace
-	// this process may not write cannot hold continuation state, which is a
-	// bound on the answer and not a defect in this build: it is reported as
-	// the limit it is, with what an operator can do about it.
+	// this process may not write, or a disk with no room, cannot hold
+	// continuation state, which is a bound on the answer and not a defect in
+	// this build: each is reported as what it is (spoolRefused).
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
-		return nil, spoolSpaceRefused(s.dir, err)
+		return nil, spoolRefused("spool directory", s.dir, err)
 	}
 	path := filepath.Join(s.dir, spoolPrefix+id)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		if errors.Is(err, fs.ErrPermission) {
-			return nil, spoolSpaceRefused(s.dir, err)
-		}
-		return nil, internalErr("spool create: " + err.Error())
+		return nil, spoolRefused("spool create", s.dir, err)
 	}
 	sp := &Spool{owner: s, header: h, path: path, file: f, w: bufio.NewWriter(paced.NewWriter(f))}
 	if err := sp.writeFrame(head); err != nil {
@@ -294,11 +292,11 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 	}
 	if err := sp.w.Flush(); err != nil {
 		sp.discard()
-		return nil, internalErr("spool header flush: " + err.Error())
+		return nil, spoolRefused("spool header flush", s.dir, err)
 	}
 	if err := f.Sync(); err != nil {
 		sp.discard()
-		return nil, internalErr("spool header sync: " + err.Error())
+		return nil, spoolRefused("spool header sync", s.dir, err)
 	}
 	return sp, nil
 }
@@ -396,11 +394,11 @@ func (sp *Spool) writeChunk(p []byte, more bool) error {
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], header)
 	if _, err := sp.w.Write(length[:]); err != nil {
-		return internalErr("spool write: " + err.Error())
+		return spoolRefused("spool write", sp.owner.dir, err)
 	}
 	sp.pending += 4
 	if _, err := sp.w.Write(p); err != nil {
-		return internalErr("spool write: " + err.Error())
+		return spoolRefused("spool write", sp.owner.dir, err)
 	}
 	sp.pending += int64(len(p))
 	return nil
@@ -421,7 +419,7 @@ func (sp *Spool) Close() error {
 	}
 	sp.file, sp.w = nil, nil
 	if err != nil {
-		return internalErr("spool close: " + err.Error())
+		return spoolRefused("spool close", sp.owner.dir, err)
 	}
 	return nil
 }
@@ -740,15 +738,25 @@ func (s *Spools) live(ctx context.Context, h SpoolHeader, now time.Time) (bool, 
 	return now.Before(expiry), nil
 }
 
-// spoolSpaceRefused is an answer that needed continuation state the workspace
-// will not take. It is the same family as the spool budget being exhausted --
-// work this process explicitly could not complete -- rather than an internal
-// defect, because the remedy is the operator's.
-func spoolSpaceRefused(dir string, cause error) error {
-	return &model.Error{Code: model.CodeResourceLimit,
-		Message: "this answer needs more than one page and " + dir + " will not take the state it needs: " +
-			cause.Error(),
-		Remediation: "narrow the query so the answer fits one page, or make the data directory writable"}
+// spoolRefused classifies a failure to write the disk state an answer keeps --
+// continuation spools and external sort runs -- by what the filesystem said. A full disk or an exhausted quota is CTX_DISK_FULL; a
+// directory whose permissions or read-only mount refuse this process is the
+// same family as the spool budget running out -- work this process explicitly
+// could not complete, whose remedy is the operator's; anything else is the
+// fault it is, carried with the operation and the filesystem's own message.
+func spoolRefused(op, dir string, cause error) error {
+	switch {
+	case errors.Is(cause, syscall.ENOSPC), errors.Is(cause, syscall.EDQUOT):
+		return &model.Error{Code: model.CodeDiskFull,
+			Message: op + ": this answer keeps state on disk and there is no room under " + dir + ": " +
+				cause.Error(),
+			Remediation: "free disk space or quota under " + dir + ", or narrow the query so the answer fits one page"}
+	case errors.Is(cause, fs.ErrPermission), errors.Is(cause, syscall.EROFS):
+		return &model.Error{Code: model.CodeResourceLimit,
+			Message:     op + ": this answer keeps state on disk and " + dir + " cannot be written: " + cause.Error(),
+			Remediation: "narrow the query so the answer fits one page, or make the data directory writable"}
+	}
+	return internalErr(op + ": " + cause.Error())
 }
 
 func (s *Spools) diskBytes() (int64, error) {

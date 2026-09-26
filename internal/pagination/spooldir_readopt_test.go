@@ -22,12 +22,11 @@ func (noLeases) LeaseExpiry(context.Context, string) (time.Time, error)  { retur
 
 // TestReadoptingAGrownDirectoryChargesItOnce is the incremental-reservation
 // invariant. A paged walk extends ONE retained state directory page after page,
-// so the directory is re-adopted at every page boundary. AdoptDir measures the
-// whole directory and reserves it again while the previous reservation is
-// released only afterwards, which made the shared byte budget hold roughly TWO
-// copies of the cumulative state at every boundary -- and a walk whose state is
-// append-only would still stop being able to mint a continuation at half the
-// budget it actually needs.
+// so the directory is re-adopted at every page boundary. Measuring the whole
+// directory and reserving it again before the previous reservation is released
+// would make the shared byte budget hold roughly TWO copies of the cumulative
+// state at every boundary, and a walk whose state is append-only would stop
+// being able to mint a continuation at half the budget it actually needs.
 //
 // ReadoptDir transfers the previous reservation inside one critical section and
 // claims only the delta, so what the store has charged after the re-adoption is
@@ -103,13 +102,13 @@ func TestReadoptingAGrownDirectoryChargesItOnce(t *testing.T) {
 // the shared byte budget answers CTX_RESOURCE_LIMIT, which is retryable -- the
 // caller is told to present the cursor it already holds again. That promise
 // only holds if a refused re-adoption changed nothing. Stamping the new id and
-// lease into the header before reserving broke it: the directory kept its old
-// NAME and its old reservation but carried the new BINDING, and OpenDir
-// compares the two, so the cursor the caller was told to retry with answered
-// "spool does not belong to this cursor" and the whole walk behind it was gone.
+// lease into the header before reserving would break it: the directory would
+// keep its old NAME and its old reservation but carry the new BINDING, and
+// OpenDir compares the two, so the cursor the caller was told to retry with
+// would answer "spool does not belong to this cursor".
 //
-// Mutation (the stamp moved back ahead of the reservation, as it was): the
-// OpenDir below fails with CTX_CURSOR_INVALID.
+// Mutation (the stamp moved ahead of the reservation): the OpenDir below fails
+// with CTX_CURSOR_INVALID.
 func TestARefusedReadoptionLeavesThePreviousCursorAbleToOpenIt(t *testing.T) {
 	const budget = 16 << 10
 	store, err := NewSpools(t.TempDir(), budget, liveLeases{})
