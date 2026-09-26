@@ -73,7 +73,9 @@ var pythonLowering = Lowering{
 //   - `x := e` is a defining node spanning the assignment expression, and the
 //     node evaluating the enclosing expression reads x.
 //   - try (§8.4): the handler is entered through the builder's Handler node,
-//     spanning the first `except` keyword. Each except or except* clause
+//     spanning the first `except` keyword; for an except* clause that is
+//     `except` alone, since the grammar makes `except` and `*` two tokens
+//     (`except*` renders `except`). Each except or except* clause
 //     with a type is a Branch node spanning its type expression, in source
 //     order. Except clauses: the first that matches runs; an exception no
 //     clause matches is re-raised (Throw) from the last test's false edge,
