@@ -8,6 +8,33 @@ design derives each quantity from the repository and machine in front of it.
 
 ## (a) The observed parse wait: about 6.2 s of worker wall against about 0.13 s of worker CPU
 
+### The observation, and the run behind it
+
+The figure comes from the run ledger's `stage finished` lines (`internal/ledger`) printed by the `internal/e2e`
+package during a capped test pass on 2026-09-25, 23:33–23:38 local time, over the tree of commit `b7b8815`
+(`go test -count=1 ./internal/e2e` under `ulimit -v 6000000`, `GOMEMLIMIT=3GiB`, `GOMAXPROCS=4`). Two index runs in
+that log carry `structural_parse` worker spans; each has four worker spans and one stage span. The lines are
+reproduced here with the run id cut to 12 hex digits, the timestamp dropped, and nothing else changed:
+
+```
+run=335e980fb643 stage=structural_parse seq=20 items_in=1 items_out=12006 outcome=ok wall_ms=7210 cpu_user_ms=88 cpu_sys_ms=15 peak_rss_bytes=40677376 read_bytes=322741 write_bytes=1853709
+run=335e980fb643 stage=structural_parse seq=22 items_in=1 items_out=6005 outcome=ok wall_ms=7209 cpu_user_ms=132 cpu_sys_ms=12 peak_rss_bytes=43089920 read_bytes=388746 write_bytes=1102512
+run=335e980fb643 stage=structural_parse seq=21 items_in=1 items_out=6005 outcome=ok wall_ms=7210 cpu_user_ms=81 cpu_sys_ms=18 peak_rss_bytes=40738816 read_bytes=262712 write_bytes=1003729
+run=335e980fb643 stage=structural_parse seq=19 items_in=1 items_out=12005 outcome=ok wall_ms=7211 cpu_user_ms=97 cpu_sys_ms=13 peak_rss_bytes=40943616 read_bytes=334779 write_bytes=1890037
+run=335e980fb643 stage=structural_parse seq=18 items_in=4 items_out=36021 outcome=ok wall_ms=7212 cpu_unattributed=overlapped
+run=d0e733064b1b stage=structural_parse seq=21 items_in=1 items_out=12006 outcome=ok wall_ms=6174 cpu_user_ms=92 cpu_sys_ms=28 peak_rss_bytes=40783872 read_bytes=322746 write_bytes=1853709
+run=d0e733064b1b stage=structural_parse seq=19 items_in=1 items_out=12005 outcome=ok wall_ms=6176 cpu_user_ms=116 cpu_sys_ms=10 peak_rss_bytes=40542208 read_bytes=334779 write_bytes=1890037
+run=d0e733064b1b stage=structural_parse seq=20 items_in=1 items_out=6005 outcome=ok wall_ms=6175 cpu_user_ms=142 cpu_sys_ms=20 peak_rss_bytes=43409408 read_bytes=388746 write_bytes=1102512
+run=d0e733064b1b stage=structural_parse seq=22 items_in=1 items_out=6005 outcome=ok wall_ms=6174 cpu_user_ms=106 cpu_sys_ms=12 peak_rss_bytes=41021440 read_bytes=262712 write_bytes=1003729
+run=d0e733064b1b stage=structural_parse seq=18 items_in=4 items_out=36021 outcome=ok wall_ms=6177 cpu_unattributed=overlapped
+```
+
+"6.2 s against 0.13 s" is the second run, `d0e733064b1b`: the four worker walls are 6,174–6,176 ms, and user plus
+system CPU is 120, 126, 162 and 118 ms, a mean of 131.5 ms. The first run gives 7,209–7,211 ms against 103–144 ms. In
+both runs every worker's wall equals the stage's wall to within 3 ms, which is what the instrument reading below
+predicts: a worker span is the stage's lifetime, not a parse. The log itself was not kept; the lines above are the
+whole of the evidence.
+
 ### What the instrument measures
 
 - **Wall.** A worker's span is opened in `pool.start` before the runner is called
@@ -109,7 +136,7 @@ cost is that it runs on the writer's transaction under `groupMu` while the group
 
 ### Projected shares of the fixture's wall
 
-Parse and worker start: at most 0.13 s per worker, **about 2% of 6.2 s** (the two figures in the observation). The rest,
+Parse and worker start: at most 0.13 s per worker, **about 2% of 6.2 s** (the run `d0e733064b1b` above). The rest,
 **about 98%, is unit work outside the exchange**; the split between waiting on `groupMu`, SQL execution inside it,
 re-exec after a drain and the provider barrier is **unavailable from reading** and needs the measurement below. No
 share is assigned to fsync, because the reading above shows none on the unit path.
