@@ -92,7 +92,7 @@ type impactAnswer struct {
 }
 
 // walkImpact answers ONE page of an impact query, but never with a partial
-// walk: ruling P2 says the request that MINTS the answer runs the expansion to
+// walk: the request that MINTS the answer runs the expansion to
 // completion, streams every admitted edge into a disk-backed sort, ranks the
 // whole affected set once, serves the first page and spools the globally
 // ranked remainder behind a cursor. Later pages read that spool and walk
@@ -110,7 +110,7 @@ type impactAnswer struct {
 // served page. None of the three is a function of the reachable set.
 //
 // The two ways this still ends early are both pages, never answers: the query
-// deadline (ruling P3) mints the `f` walk continuation with no entries at all
+// deadline mints the `f` walk continuation with no entries at all
 // and the next request carries the walk on, and the user-set depth bound is
 // reported as truncation with the ranked answer it did reach.
 func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
@@ -178,8 +178,8 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
 	answer.Notices = appendNotice(appendNotice(answer.Notices, visitedNotice), edgeNotice)
 
-	// The pass-1 INPUT of this answer is RETAINED across requests: ruling P3
-	// lets the deadline split one walk over several of them, and a sort built
+	// The pass-1 INPUT of this answer is RETAINED across requests: the
+	// deadline may split one walk over several of them, and a sort built
 	// inside one request can only rank that request's leg -- the carried
 	// visited set guarantees the earlier legs are never admitted again, so
 	// their entities would be lost with no disclosure at all (walkretain.go).
@@ -225,7 +225,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				MaxDepth:      maxDepth,
 				Budget:        b,
 				FrontierBytes: e.limits.FrontierBytes,
-				// Ruling P3, both halves: the deadline ends this page, and it
+				// Both halves of the page rule: the deadline ends this page, and it
 				// does so even before the page admitted an edge, because the
 				// walk's frontier and every record it has admitted are
 				// retained across the request.
@@ -260,7 +260,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		}
 	}
 	if b.deadlineHit && state.More {
-		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
+		// The deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND the records this leg admitted
@@ -320,10 +320,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		}
 	}
 	if ranked == nil || pairs == nil {
-		// Ruling P7: the deadline landed mid-RANK, after the walk had finished.
-		// Nothing extra is persisted -- the input both passes read is already
-		// retained -- so the continuation names it with the walk marked
-		// complete and the next request re-sorts from it and serves page 1.
+		// The deadline landed mid-RANK, after the walk had finished. The input
+		// both passes read is already retained, and rankImpact has detached an
+		// interrupted pass's runs into the same directory, so the continuation
+		// names it with the walk marked complete and the next request resumes
+		// the ranking from it and serves page 1.
 		markTruncated(&meta, reasonDeadline)
 		next, err := e.continueRank(ctx, b, impactEndpoint, queryHash, retain)
 		if err != nil {
@@ -489,7 +490,7 @@ func pageWant(limit int, left int64) int {
 }
 
 // impactPage projects one page of ranked records into served entries and
-// hydrates them. The records arrive in ruling P1's order and stay in it.
+// hydrates them. The records arrive in the served order and stay in it.
 func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *impactAnswer,
 	meta *model.QueryMeta) ([]model.ImpactEntry, error) {
 	reasonPaths := e.limits.ReasonPaths()
@@ -732,7 +733,7 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 //
 // The walk cannot simply read one more batch first: the request context
 // carries the SAME deadline (beginImpactQuery), so no adjacency read can
-// succeed past it. So the honest answer is the other one ruling P3's page rule
+// succeed past it. So the honest answer is the other one the page rule
 // allows -- the deadline is terminal for this answer, reported with its own
 // truncation reason, and the caller's remedy is to raise
 // resources.query_timeout. Nothing is lost that the caller did not already
@@ -751,11 +752,12 @@ func walkStalled(b *budget, state walkState, resume *resumeState) bool {
 		state.LevelOffset == c.LevelOffset
 }
 
-// continueRank mints ruling P7's continuation: the walk is EXHAUSTED and the
+// continueRank mints the mid-rank continuation: the walk is EXHAUSTED and the
 // deadline cut the ranking short, so the token names the retained pass-1 input
-// alone -- no frontier, no keyset position -- and the next request runs both
-// passes over it and serves page 1. Nothing extra is persisted: the input the
-// sort would re-read is what every leg has been appending to all along.
+// alone -- no frontier, no keyset position -- and the next request finishes
+// both passes over it and serves page 1. The mint persists nothing itself: the
+// input the sort reads is what every leg has been appending to all along, and
+// an interrupted impact pass's runs were already detached beside it.
 func (e *Engine) continueRank(ctx context.Context, b *budget, endpoint, queryHash string,
 	retain *retainedWalk) (string, error) {
 	return e.nextTraversalCursor(ctx, b, continuation{
@@ -780,9 +782,8 @@ func resumeRetained(r *resumeState) *retainedWalk {
 // the deadline, so waiting past it surfaces as CTX_RESOURCE_LIMIT from the gate
 // rather than as an unbounded wait.
 //
-// It is a free function taking the engine rather than a method so the
-// impact-family files can share it without claiming a name a sibling lane may
-// want on Engine.
+// It is a free function taking the engine rather than a method: it is the
+// impact family's shared entry, not an Engine operation of its own.
 func beginImpactQuery(ctx context.Context, e *Engine) (context.Context, time.Time, func(), error) {
 	// One clock: the deadline is measured on the ENGINE clock, the same one the
 	// walk budget compares against, and it is returned so the caller reuses this
@@ -893,7 +894,7 @@ type impactAccumulator struct {
 	seeds  []model.NodeID
 	isSeed map[model.NodeID]bool
 	// emit streams one record per ADMITTED EDGE straight into the ranking
-	// sort. There is no byNode map and no order slice: ruling P2 runs the walk
+	// sort. There is no byNode map and no order slice: the request runs the walk
 	// to completion, so either would be sized by the reachable set rather than
 	// by the page, and merging a node's records is foldImpact's job inside
 	// pass 1 of the sort.
@@ -958,7 +959,7 @@ func (a *impactAccumulator) Seeds() []model.NodeID { return a.seeds }
 // is the other end of it, one hop deeper and one edge cost further away.
 func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	switch {
-	// The CUMULATIVE counters, not the per-page ones. Under ruling P2 the walk
+	// The CUMULATIVE counters, not the per-page ones. The walk
 	// runs to completion inside one request, so a bound compared against a
 	// counter that runWalkToCompletion resets at every internal boundary could
 	// never be reached: a user-set max_edges would be silently unenforceable
@@ -1074,7 +1075,7 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		entry.Name = clipTo(n.QualifiedName, model.MaxQualifiedNameBytes)
 		out = append(out, entry)
 	}
-	// The page arrives ALREADY ordered, by ruling P1's (ScoreMicros desc,
+	// The page arrives ALREADY ordered, by the served key (ScoreMicros desc,
 	// Depth asc, NodeID asc), which the ranking pass applied over the whole
 	// answer. No tie-break is re-applied here: Name is known only after
 	// hydration, so re-sorting a page by it would reorder one page of a

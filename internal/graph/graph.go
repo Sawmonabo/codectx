@@ -158,7 +158,7 @@ type Engine struct {
 	probe *heapProbe
 	// rankStopAfter is TEST-only: when positive, each ranking pass reports the
 	// query deadline once this request has added that many records to it, which
-	// is the only way to reach ruling P7's mid-rank branch deterministically --
+	// is the only way to reach the mid-rank deadline branch deterministically --
 	// a fixture's ranking is far too fast to be caught by a clock that advances
 	// on adjacency round trips.
 	rankStopAfter int
@@ -266,7 +266,7 @@ type frontierState struct {
 	// Route is the chain of relation surrogates from a seed to this node, Via
 	// last.
 	//
-	// It travels with the frontier because ruling P2's walk runs to completion
+	// It travels with the frontier because a ranked answer's walk runs to completion
 	// and streams its records into a sort: there is no page-local byNode map
 	// left to walk a parent chain through, and model.ImpactEntry.Paths is not
 	// optional (Section 14.3 rejects an entry whose reason nothing backs). It
@@ -389,8 +389,8 @@ type budget struct {
 	// already past. Nil means time.Now, for a budget built without a clock.
 	now func() time.Time
 	// deadlineHit records that the walk stopped because the request's
-	// query_timeout ran out with edges already admitted. Ruling Q4 makes the
-	// deadline end a PAGE, not an answer, so it is a clean finish here and the
+	// query_timeout ran out with edges already admitted. The deadline ends a
+	// PAGE, not an answer, so it is a clean finish here and the
 	// caller turns it into the truncation reason and
 	// the continuation cursor. It is set only by a walk that opted in
 	// (expandOptions.DeadlineStops). For a PAGED traversal it is set only once
@@ -440,8 +440,8 @@ type expandOptions struct {
 	// DeadlineResumesEmptyPage says the walk's progress survives this request
 	// whatever the page served: every record the walk admitted is in the
 	// retained input and the standing frontier becomes the continuation, so a
-	// page that admitted no edge at all still carries the walk forward. Ruling
-	// P3 then applies to EVERY deadline -- it ends the page, never the answer.
+	// page that admitted no edge at all still carries the walk forward. The
+	// page rule then applies to EVERY deadline -- it ends the page, never the answer.
 	// Without it, a deadline that lands before the page's first edge fails the
 	// walk, and for an aggregating operation that failure is the whole retained
 	// walk thrown away with no continuation to reach its remainder.

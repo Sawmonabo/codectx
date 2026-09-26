@@ -65,10 +65,10 @@ func (p *peakCounter) sample() {
 //
 // An aggregating walk mints nothing at its level boundaries: it chains its
 // legs internally and the only cursor its caller can present again is the one
-// the request began with. So every level it crossed stayed on disk until the
-// walk ended -- two files per level, in a directory the continuation byte
-// budget deliberately does not charge, with the depth bound shipping
-// unlimited. That is unbounded peak disk in the wave whose subject is disk.
+// the request began with. Holding every level it crossed on disk until the
+// walk ended would be two files per level, in a directory the continuation
+// byte budget deliberately does not charge, with the depth bound shipping
+// unlimited: unbounded peak disk.
 //
 // Mutation: hold at the level transition whether or not the leg can mint (drop
 // the Mints branch in serveLevel) and the peak is one pair per level.

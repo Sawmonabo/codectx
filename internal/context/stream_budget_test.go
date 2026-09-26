@@ -21,9 +21,9 @@ import (
 // and the typed error when the budget cannot hold the required scope.
 //
 // The fixtures below are candidate-level rather than compiler-level on purpose:
-// the wiring that would let a fixture reach here through Compile is L5's, and a
-// parity test must be able to state the three pre-sort exclusion classes, the
-// three drop reasons and the minimum-budget refusal directly.
+// a parity test must be able to state the three pre-sort exclusion classes, the
+// three drop reasons and the minimum-budget refusal directly, which a fixture
+// reaching here through Compile's seed and scope passes cannot.
 
 // planCollector is the planSink the parity test measures against: it rebuilds
 // today's `plan` value from the streamed entries and exclusions.
@@ -77,7 +77,7 @@ func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b re
 		// hydrateFiles skips an excluded or fileless candidate and writes the
 		// snapshot path only when the candidate carries none; buildPlan then
 		// overwrites the path unconditionally on the surviving branch. That is
-		// the split ruling C3 keeps as PathAtRank and PathFinal.
+		// the split the record keeps as PathAtRank and PathFinal.
 		if c.Excluded == "" && c.FileID != "" {
 			fv, ok := byID[c.FileID]
 			switch {
@@ -151,7 +151,7 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 	files := []model.FileVersion{
 		// The file IDs deliberately sort AGAINST the rank order, so a walk in
 		// file order and a walk in group order are distinguishable: the drops
-		// and each slice's entry ordinals follow group order (ruling C1), and
+		// and each slice's entry ordinals follow group order, and
 		// a fixture whose two orders agreed would prove neither.
 		fileVersion("zzz", "internal/order/service.go", 4096),
 		fileVersion("mmm", "internal/order/handler.go", 2048),
@@ -179,7 +179,7 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 		// A REQUIRED survivor whose pre-set path differs from its snapshot path.
 		// A group's path is the one its lowest-ranked member carries, and it is
 		// what the minimum-budget refusal names as missing, so this is where
-		// reading PathAtRank instead of PathFinal (C3) becomes visible.
+		// reading PathAtRank instead of PathFinal becomes visible.
 		{FileID: "zzz", Path: "internal/order/service_moved.go", Requirement: model.RequirementFull,
 			Origin: originExplicitSeed, ScoreMicros: 1_130_000, Reasons: []string{"named by the task"}},
 		{NodeID: "n-service-place", FileID: "zzz", Path: "internal/order/service.go",
@@ -189,8 +189,8 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 			Requirement: model.RequirementRecommended, Origin: originExpansion, Depth: 1,
 			ScoreMicros: 415_000, MorePaths: 2,
 			Paths: []model.RelationPath{{Relations: long, CostUnits: 9}}},
-		// A survivor whose pre-set path differs from its snapshot path: ruling
-		// C3 keeps both, and every choice below reads PathFinal -- the value
+		// A survivor whose pre-set path differs from its snapshot path: the
+		// record keeps both, and every choice below reads PathFinal -- the value
 		// buildPlan's unconditional overwrite leaves -- for the total order,
 		// the measured entry and the group's path. A fixture where the two
 		// agreed would let PathAtRank pass everywhere.

@@ -11,11 +11,11 @@ import (
 )
 
 // TestImpactHoldsOneEnvelopeWhateverTheWalkAdmits is the structural memory
-// proof rulings P2/P4 exist for: an impact answer over a walk of twenty
-// thousand and then forty thousand reachable nodes holds the SAME constant
-// working set, and that constant is a function of the sort's run budget, the
-// merge fan-in, the served page and the rollup's resolution batch -- never of
-// how many nodes the walk admitted.
+// proof the streamed ranking and rollup exist for: an impact answer over a walk
+// of twenty thousand and then forty thousand reachable nodes holds the SAME
+// constant working set, and that constant is a function of the sort's run
+// budget, the merge fan-in, the served page and the rollup's resolution batch
+// -- never of how many nodes the walk admitted.
 //
 // The envelope is `(run budget + fan-in) + one page + pairRollupBatch`. The
 // three terms are separate because the structures are: the two ranking sorts

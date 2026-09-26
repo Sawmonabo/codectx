@@ -81,7 +81,7 @@ func roundTrip[T any](t *testing.T, name string, want T) {
 // in-memory pipeline sorts candidates with candidate.less, so any disagreement between the two is a
 // different plan, different ordinals and different slice membership.
 //
-// The table draws PathAtRank INDEPENDENTLY of PathFinal (ruling C3 keeps both,
+// The table draws PathAtRank INDEPENDENTLY of PathFinal (the record keeps both,
 // and buildPlan sorts AFTER the unconditional overwrite that sets PathFinal), so
 // a lessRank that read the wrong one disagrees here; scores collide often enough
 // that the path, start byte and entity keys are all reached; and an unset
@@ -168,8 +168,8 @@ func randomCandRecs(t *testing.T, n int) []candRec {
 		}
 		// PathAtRank is drawn INDEPENDENTLY, not derived from PathFinal: a
 		// derived value with a constant prefix orders identically and would let
-		// a lessRank that read the wrong field pass. Ruling C3 exists precisely
-		// because the two can name different packages.
+		// a lessRank that read the wrong field pass. The record keeps both
+		// precisely because the two can name different packages.
 		r.PathAtRank = paths[rng.Intn(len(paths))]
 		switch rng.Intn(3) {
 		case 0:
@@ -294,7 +294,7 @@ func TestFoldsAreOrderIndependent(t *testing.T) {
 	}
 }
 
-// TestCompileSortsReleaseEveryRun proves ruling C5's structural half: every sort
+// TestCompileSortsReleaseEveryRun guards run release: every sort
 // a compile opens is registered for release, so a compile that fails mid-pass
 // leaves no run file behind in the store's shared sort area. It also exercises
 // the sort area end to end -- the byte-budgeted run buffer, lessEntityID and
@@ -419,7 +419,7 @@ func TestCompileSortsReleaseEveryRun(t *testing.T) {
 	}
 
 	if _, err := newCompileSorts(cfg, ""); err == nil {
-		t.Fatal("newCompileSorts accepted an empty sort directory; ruling C5 requires the store's own")
+		t.Fatal("newCompileSorts accepted an empty sort directory; a compile's runs must live in the store's own")
 	}
 }
 

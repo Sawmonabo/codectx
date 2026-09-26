@@ -9,18 +9,14 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// This file is ruling P2's first half: the in-process walk-to-completion, and
-// the two passes that turn what it admitted into one globally ranked answer.
-//
-// The three functions below carry the doc comments impactrank.go froze for
-// them; they live here rather than beside the frozen record shapes so the
-// rollup lane's own fill-in of rankPairs and this lane's fill-in of the walk
-// never edit the same lines.
+// This file is the in-process walk-to-completion, and the two passes that turn
+// what it admitted into one globally ranked answer. The record shapes and
+// their comparators live in impactrank.go.
 
 // runWalkToCompletion expands seeds until the walk is EXHAUSTED, not until a
 // page is full, calling visit once per admitted edge exactly as expand does.
 //
-// It is the seam ruling P2 requires: the request that mints the answer must
+// It is the seam a ranked answer requires: the request that mints the answer must
 // see every admitted edge before anything is ranked, and the page-bounded
 // expand cannot. Internally it chains expand's own continuation -- the spooled
 // resumable frontier -- IN PROCESS, without minting or verifying a signed
@@ -48,7 +44,7 @@ import (
 //     does not report it and a mid-level internal boundary must resume exactly
 //     where the last ADMITTED row left off.
 //
-// The query deadline ends a PAGE and never the answer (ruling P3): a deadline
+// The query deadline ends a PAGE and never the answer: a deadline
 // reached mid-walk returns the walkState the walk had built, with its frontier
 // intact for the caller to persist into the `f` cursor, and a nil error.
 func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, o expandOptions,
@@ -79,7 +75,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			// boundary, and the one expand refuses to resume.
 			return state, nil
 		case o.Budget.deadlineHit:
-			// Ruling P3: out of time with the walk unfinished. The frontier
+			// Out of time with the walk unfinished. The frontier
 			// this state carries becomes the `f` continuation and the next
 			// request carries the walk on; nothing is ranked or served here.
 			return state, nil
@@ -151,7 +147,7 @@ func (e *Engine) walkScratchDir() string {
 // the query deadline and resumed by the next request over the runs it had
 // already spilled. A resumed request ADOPTS those runs rather than re-sorting
 // the whole retained input, so a ranking split across requests does the work of
-// ONE ranking and serves the identical answer (ruling P7).
+// ONE ranking and serves the identical answer.
 //
 // Close the returned run.
 func (e *Engine) rankImpact(ctx context.Context, retain *retainedWalk,
@@ -228,7 +224,7 @@ func (e *Engine) foldImpactPass(ctx context.Context, retain *retainedWalk,
 	return next, nil
 }
 
-// rankImpactPass is pass 2: the folded records in ruling P1's served order.
+// rankImpactPass is pass 2: the folded records in the served order.
 func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
 	prog rankProgress, stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
 	pass2, err := e.openImpactSort(retain, lessByRank, prog.Runs)
@@ -248,7 +244,7 @@ func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
 	// manifest must stop naming them here too. This request can still mint a
 	// rank continuation over this retained directory after the ranking is
 	// done -- the package-pair ranking that runs next reports the deadline as
-	// `pairs == nil`, which is P7's "nothing extra is persisted" branch -- and
+	// `pairs == nil`, which is the mid-rank "nothing extra is persisted" branch -- and
 	// a manifest left naming a removed run resumed into
 	// `external sort adopted run: ... run-000000: no such file or directory`
 	// instead of re-sorting the retained pass-2 input, which is cheap and
@@ -316,7 +312,7 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 	return seen, err
 }
 
-// rankInterrupted reports the query deadline mid-ranking (ruling P7). added is
+// rankInterrupted reports the query deadline mid-ranking. added is
 // how many records THIS request has put into the current pass, which is what
 // the test hook counts: a hook that counted the whole pass would stop a resumed
 // request at the same record it stopped the first one at and never finish.

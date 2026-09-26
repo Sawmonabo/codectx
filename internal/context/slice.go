@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Streamed packing — C-STREAM pass P-H
+// Streamed packing — pass P-H
 // ---------------------------------------------------------------------------
 
 // The four reasons packPlan drops a group with, as constants so the streamed

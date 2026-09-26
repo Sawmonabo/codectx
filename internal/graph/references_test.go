@@ -13,8 +13,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// TestReferencePageBoundIsDisclosedNotClamped is the class-G proof for
-// References. The failure mode: a page bound clamped twice in silence -- once
+// TestReferencePageBoundIsDisclosedNotClamped guards References against a
+// silent clamp. The failure mode: a page bound clamped twice in silence -- once
 // against the configured ceiling, once against the wire ceiling -- so a caller
 // that asked for 50 occurrences and was served 200 cannot tell a clamped page
 // from the end of the answer. The bound is RESOLVED and disclosed, the same way

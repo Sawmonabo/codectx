@@ -985,8 +985,8 @@ const neighborsEndpoint = "graph.neighbors"
 // that default, so a request can tighten a bound but never raise it.
 //
 // It is the FINITE form, for the one bound that is never unlimited: the page
-// item ceiling. Use resolveLimit for every scale bound -- a silent clamp there
-// is the class-G defect this wave removes.
+// item ceiling. Use resolveLimit for every scale bound: a silent clamp there
+// would cap a user-set or unlimited bound without saying so.
 func resolveBound(requested, configured int) int {
 	if requested <= 0 || requested > configured {
 		return configured

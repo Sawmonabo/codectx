@@ -21,12 +21,11 @@ import (
 )
 
 // This is the whole test budget for the graph engine: one shared in-memory
-// Adjacency over a hand-built graph, plus one scenario table. Each fill-in lane
-// adds its cases under its own marker below, so the lanes never edit the same
-// lines. A case exists only to protect a critical invariant -- a silently
-// dropped edge, a nondeterministic order, a budget that resets across pages, a
-// collapsed occurrence count. Cases for getters, wiring or enum spelling are
-// defects, not coverage.
+// Adjacency over a hand-built graph, plus one scenario table whose cases are
+// grouped by the operation they exercise. A case exists only to protect a
+// critical invariant -- a silently dropped edge, a nondeterministic order, a
+// budget that resets across pages, a collapsed occurrence count. Cases for
+// getters, wiring or enum spelling are defects, not coverage.
 //
 // The graph deliberately contains every shape the engine must survive:
 //
@@ -40,9 +39,6 @@ import (
 //	                -contains-> n-z, cost 14).
 //	dependence-only reads / data_flows_to edges alongside ordinary kinds
 //	two packages    pkg-app and pkg-lib, so a rollup has a distinct pair
-//
-// newGraphFixture has no caller until the fill-in lanes land their rows; that
-// is expected for the skeleton commit and is not dead code.
 
 // fixtureID maps a readable fixture name to the 64-lowercase-hex id every
 // model validator requires. The graph below is written in readable names so it
@@ -468,16 +464,16 @@ func fixtureLimits() Limits {
 
 // graphScenario is one invariant under test. The body is a closure rather than
 // typed request/want fields because the operations have incompatible shapes,
-// and a shared struct would make every lane edit the same declaration.
+// and one shared request/want struct would have to carry all of them.
 type graphScenario struct {
 	name string
 	run  func(t *testing.T, f *graphFixture)
 }
 
-// TestGraphScenarios runs every lane's cases against a fresh fixture.
+// TestGraphScenarios runs every case against a fresh fixture.
 func TestGraphScenarios(t *testing.T) {
 	scenarios := []graphScenario{
-		// L1 TRAVERSE rows
+		// traverse rows
 		{
 			// Protects the silent-drop failure mode: a hub whose fan-out exceeds
 			// the edge budget must stop AT the budget, say so, and return every
@@ -615,7 +611,7 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// L2 PATH rows
+		// path rows
 		{
 			// The two n-a -> n-z routes cost exactly the same (calls is 1 per
 			// hop), so nothing about the facts orders them: the ONLY thing that
@@ -660,7 +656,7 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// L3 IMPACT rows
+		// impact rows
 		{
 			// Protects the Section 14.3 entry contract: an impact answer whose
 			// entries carry no reason, or no incoming/outgoing discriminator, is
@@ -751,7 +747,7 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// L5 CURSOR rows
+		// cursor rows
 		{name: "resumed page keeps the cumulative budget, neither reset nor doubled", run: func(t *testing.T, f *graphFixture) {
 			signer, err := pagination.OpenSigner(t.TempDir())
 			if err != nil {
@@ -819,7 +815,7 @@ func TestGraphScenarios(t *testing.T) {
 			// its 260 relation ids all sort ABOVE n-a's four, so the level emits
 			// the high ids first. A resume that skipped on the relation id alone
 			// would drop every n-a row as "already seen" -- a silent gap in a
-			// paged neighbourhood, which is the C1 failure wearing a cursor.
+			// paged neighbourhood, which is the silent-drop failure wearing a cursor.
 			name: "a resumed traversal page repeats no edge and drops none",
 			run: func(t *testing.T, f *graphFixture) {
 				signer, err := pagination.OpenSigner(t.TempDir())
@@ -1044,7 +1040,7 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// L7 REFS rows
+		// refs rows
 		{
 			// Section 9.2: a relation and an occurrence are different counts. The
 			// fixture's n-a -calls-> n-b edge is ONE sealed relation backed by TWO
@@ -1205,7 +1201,7 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// T20-L5 OVERVIEW rows
+		// overview rows
 		{
 			// Protects the silent-omission failure mode: the repository map's
 			// per-container aggregates are read through a keyset loop over
