@@ -63,12 +63,15 @@ const rsTryLabel = " try"
 //     bindings are in scope for its later members and the body only.
 //   - `loop` has a Stmt head spanning the `loop` keyword and no exit edge:
 //     only a break leaves it. A while loop's back edge targets the first node
-//     its condition makes. A for loop is a Stmt node for the iterated
-//     expression, evaluated once, which defines an iteration variable of the
-//     lowering's own; a Branch head spanning the `for` keyword that Uses it;
-//     then one defining node per name the pattern binds, Using it, so the
-//     head and the names depend on the iterated value as it was before the
-//     loop, never on a write to its variables in the body.
+//     its condition makes. A for loop follows Iteration (see Lowering; The
+//     Rust Reference, Expressions › Loops and other breakable expressions ›
+//     Iterator loops: `IntoIterator::into_iter` is called once): a Stmt node
+//     for the iterated expression, Using its reads and defining an iteration
+//     variable of the lowering's own; a Branch head spanning the `for`
+//     keyword that Uses that variable and nothing else; then one defining
+//     node per name the pattern binds, each Using that variable and nothing
+//     else, so the head and the names depend on the iterated value as it was
+//     before the loop, never on a write to its variables in the body.
 //   - A match is a Stmt node for the scrutinee, then its arms in source
 //     order: a Branch node spanning the arm's pattern, then one defining node
 //     per name the pattern binds, then a Branch for the guard, then the arm's
