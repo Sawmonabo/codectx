@@ -147,7 +147,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// a = g(), E → h(a) → EXIT. The Handler carries a@6.
 			name:     "try else runs only on the body's normal end and every exit passes the finally",
 			protects: "the else body is control dependent on the try body's completion, and a handler's return and an unmatched exception both run the finally with the values they carry",
-			mutation: "lower the else body after the handler exits merge (a = a + 1@57 then follows return 0 and loses its dependence on a = g()@18), or skip the finally for the return (a@6 no longer reaches h(a)@79)",
+			mutation: "lower the else body after the handler exits merge (a = a + 1@57 then follows return 0 and loses its dependence on a = g()@18), or skip the finally for the return (return 0@39 leaves straight to EXIT, h(a)@79 no longer post-dominates E@34 or a = g()@18, and E@34 -> h(a)@79 and a = g()@18 -> h(a)@79 appear)",
 			src:      "def f(a):\n try:\n  a = g()\n except E:\n  return 0\n else:\n  a = a + 1\n finally:\n  h(a)\n return a\n",
 			fn:       1,
 			cd: []string{"a = g()@18 -> except@27", "a = g()@18 -> E@34", "a = g()@18 -> a = a + 1@57",
@@ -238,8 +238,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// EXIT}; x@33→x@44→{x + k, head}; x + k→head. IPDom: x@33 →
 			// x@44 → head → EXIT; x + k → head.
 			name:     "a comprehension is its own callable with its clauses as nested loops",
-			protects: "each for clause is a loop head, an if clause's false edge continues with the next element, and the element depends on both",
-			mutation: "lower an if clause's false edge to the comprehension's exit (x@44 -> for x in xs@29 disappears)",
+			protects: "each for clause is a loop head, an if clause's false edge continues with the next element, and the element is control dependent on the if clause, which is control dependent on the head",
+			mutation: "lower an if clause's false edge to the comprehension's exit (the head no longer post-dominates x@44, and x@44 -> for x in xs@29 appears)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       2,
 			cd: []string{"for x in xs@29 -> x@33", "for x in xs@29 -> x@44", "for x in xs@29 -> for x in xs@29",
