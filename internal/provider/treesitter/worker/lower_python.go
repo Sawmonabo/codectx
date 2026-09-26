@@ -276,13 +276,20 @@ func (j *pyLower) done(mark int) { j.buf = j.buf[:mark] }
 func (j *pyLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
 
 // hasToken reports whether n has an anonymous child of kind id.
-func hasToken(n *ts.Node, id uint16) bool {
-	for i := range n.ChildCount() {
-		if c := n.Child(i); !c.IsNamed() && c.KindId() == id {
+func (j *pyLower) hasToken(n *ts.Node, id uint16) bool {
+	c := j.cur
+	c.Reset(*n)
+	if !c.GotoFirstChild() {
+		return false
+	}
+	for {
+		if x := c.Node(); !x.IsNamed() && x.KindId() == id {
 			return true
 		}
+		if !c.GotoNextSibling() {
+			return false
+		}
 	}
-	return false
 }
 
 // pushFrame opens the scope of callable fn and binds its locals: the
@@ -1293,7 +1300,9 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 	}
 	if finC != nil {
 		normal := j.b.EnterFinally(ff, spanOf(finC.Child(0)))
-		j.block(lastNamed(finC))
+		s2, fl := j.kids(finC)
+		j.block(&fl[len(fl)-1])
+		j.done(s2)
 		j.b.CloseFinally(ff, normal)
 	}
 	j.done(start)
@@ -1306,9 +1315,12 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 func (j *pyLower) except(c *ts.Node) bool {
 	k := j.k
 	alias := c.ChildByFieldId(k.fAlias)
-	body := lastNamed(c)
 	j.reset()
+	// The clause's block is its last child; list stays on the stack until
+	// the clause is lowered.
 	start, list := j.kids(c)
+	defer j.done(start)
+	body := &list[len(list)-1]
 	var lo, hi *ts.Node
 	for i := range list {
 		x := &list[i]
@@ -1321,7 +1333,6 @@ func (j *pyLower) except(c *ts.Node) bool {
 		hi = x
 		j.value(x)
 	}
-	j.done(start)
 	if lo == nil {
 		j.block(body)
 		return true
@@ -1346,34 +1357,22 @@ func (j *pyLower) except(c *ts.Node) bool {
 	return false
 }
 
-// lastNamed is n's last named child that is not an extra, or nil.
-func lastNamed(n *ts.Node) *ts.Node {
-	for i := n.NamedChildCount(); i > 0; i-- {
-		if c := n.NamedChild(i - 1); !c.IsExtra() {
-			return c
-		}
-	}
-	return nil
-}
-
 // withStmt lowers with and async with (see Node granularity).
 func (j *pyLower) withStmt(n *ts.Node) {
 	k := j.k
 	var kw flow.Span
-	for i := range n.ChildCount() {
-		if c := n.Child(i); !c.IsNamed() && c.KindId() == k.withKw {
-			kw = spanOf(c)
-			break
+	var clause ts.Node
+	c := j.cur
+	c.Reset(*n)
+	for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
+		switch x := c.Node(); {
+		case !x.IsNamed() && x.KindId() == k.withKw:
+			kw = spanOf(x)
+		case x.KindId() == k.withClause:
+			clause = *x
 		}
 	}
-	var clause *ts.Node
-	for i := range n.NamedChildCount() {
-		if c := n.NamedChild(i); c.KindId() == k.withClause {
-			clause = c
-			break
-		}
-	}
-	start, items := j.kids(clause)
+	start, items := j.kids(&clause)
 	base := len(j.fins)
 	for i := range items {
 		j.reset()
@@ -1441,16 +1440,17 @@ func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
 	k := j.k
 	switch p.KindId() {
 	case k.dottedName:
-		if capture && p.NamedChildCount() == 1 {
-			j.capture(firstNamed(p), mode)
-			return
-		}
-		if mode == patReads {
-			j.ref(firstNamed(p))
-			if p.NamedChildCount() > 1 {
+		start, parts := j.kids(p)
+		switch {
+		case capture && len(parts) == 1:
+			j.capture(&parts[0], mode)
+		case mode == patReads:
+			j.ref(&parts[0])
+			if len(parts) > 1 {
 				j.throws++
 			}
 		}
+		j.done(start)
 	case k.asPattern:
 		start, list := j.kids(p)
 		for i := range list {
@@ -1523,31 +1523,30 @@ func (j *pyLower) capture(name *ts.Node, mode int) {
 // irrefutable reports whether case pattern p always matches (§8.6.2).
 func (j *pyLower) irrefutable(p *ts.Node) bool {
 	k := j.k
+	start, list := j.kids(p)
+	r := false
 	switch p.KindId() {
 	case k.casePattern:
-		if firstNamed(p) == nil {
-			return hasToken(p, k.underscore)
+		if len(list) == 0 {
+			r = j.hasToken(p, k.underscore)
+		} else {
+			r = len(list) == 1 && j.irrefutable(&list[0])
 		}
-		return p.NamedChildCount() == 1 && j.irrefutable(firstNamed(p))
 	case k.dottedName:
-		return p.NamedChildCount() == 1
+		r = len(list) == 1
 	case k.asPattern:
-		c := firstNamed(p)
-		return c != nil && c.KindId() == k.casePattern && j.irrefutable(c)
+		r = len(list) > 0 && list[0].KindId() == k.casePattern && j.irrefutable(&list[0])
 	case k.unionPattern:
-		if hasToken(p, k.underscore) {
-			return true
-		}
-		for i := range p.NamedChildCount() {
-			if j.irrefutable(p.NamedChild(i)) {
-				return true
-			}
+		r = j.hasToken(p, k.underscore)
+		for i := range list {
+			r = r || j.irrefutable(&list[i])
 		}
 	case k.tuplePattern:
 		// A parenthesized group `(p)`, not a one-element sequence `(p,)`.
-		return p.NamedChildCount() == 1 && !hasToken(p, k.comma) && j.irrefutable(p.NamedChild(0))
+		r = len(list) == 1 && !j.hasToken(p, k.comma) && j.irrefutable(&list[0])
 	}
-	return false
+	j.done(start)
+	return r
 }
 
 func (j *pyLower) matchStmt(n *ts.Node) {
