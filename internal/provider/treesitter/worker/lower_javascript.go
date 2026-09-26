@@ -16,13 +16,28 @@ import (
 // field initializers and static blocks.
 var javascriptLowering = Lowering{language: "javascript", callables: jsCallables, lower: jsJavaScript.lower}
 
+// typescriptLowering and tsxLowering lower TypeScript and TSX with the
+// JavaScript lowering, on their own grammars' tables: the callables are
+// JavaScript's (a signature without a body is not one), and the TypeScript
+// forms are lowered as TypeScript in lowerJavaScript states. TSX adds JSX,
+// which the JavaScript lowering already handles.
+var (
+	typescriptLowering = Lowering{language: "typescript", callables: jsCallables, lower: jsTypeScript.lower}
+	tsxLowering        = Lowering{language: "tsx", callables: jsCallables, lower: jsTSX.lower}
+)
+
 // jsCallables are the callable kinds of every grammar the JavaScript lowering
 // runs on.
 var jsCallables = []string{"program", "function_declaration", "function_expression", "arrow_function",
 	"method_definition", "generator_function", "generator_function_declaration", "class_body"}
 
-// jsJavaScript is the JavaScript grammar's syntax table.
-var jsJavaScript = jsGrammar{language: "javascript"}
+// jsJavaScript, jsTypeScript and jsTSX are the syntax tables of the grammars
+// the JavaScript lowering runs on.
+var (
+	jsJavaScript = jsGrammar{language: "javascript"}
+	jsTypeScript = jsGrammar{language: "typescript"}
+	jsTSX        = jsGrammar{language: "tsx"}
+)
 
 // jsGrammar is the syntax table of one grammar the JavaScript lowering runs
 // on, resolved once, on first use.
@@ -161,6 +176,52 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 // start (the strict-mode rule, which modules and classes impose); a catch
 // parameter is scoped to its clause and a `for (let …)` binding to its loop;
 // a switch body is one block. Parameter defaults see the parameters only.
+//
+// # TypeScript
+//
+// Syntax the compiler erases produces no node and binds no variable (the
+// handbook's "Erased Types"): type annotations, type parameters and
+// arguments, interfaces, type aliases, `declare` declarations, overload and
+// method signatures without a body, abstract members, index signatures,
+// `implements` clauses, `import type`, a `type` import specifier, and a
+// `const enum` (removed at compilation, the handbook's "const enums"); an
+// erased subtree is skipped wherever it stands, so a `typeof x` inside a
+// type reads nothing. `e!`, `e as T`, `e satisfies T`, `<T>e` and `f<T>`
+// evaluate to their operand and lower as it: a node the enclosing construct
+// makes for the whole expression (a condition's Branch, a statement's node)
+// spans the expression as written, wrapper included, and a node the
+// operand's own lowering made (an optional chain, a nested callable, an
+// assignment) stands for the wrapper. An assignment target is read through
+// the wrappers, so `x! = e` defines x.
+//
+// The forms that run: a parameter wrapper (required, optional, or a
+// parameter property such as `public x`) is its pattern, and its default is
+// a default by the rule above, the Branch spanning the whole parameter;
+// its decorators are evaluated where the class is created, with the
+// class's other decorators, heritage and computed names. A decorator
+// application is a call: a class node whose class, members or parameters
+// carry a decorator may throw, and an exported class's decorators are read
+// by its node. (This holds for JavaScript decorators too.) `public_field_definition`
+// is the field initializer of the class body's unit. An abstract class is a
+// class. The compiler emits an enum, a namespace and `import x = …` as a
+// `var` with an assignment where the declaration stands, so their names are
+// function-scoped and hoisted like var, and a second declaration of the
+// same name merges into the same variable:
+//
+//   - An enum is one Stmt node spanning its name that Uses and defines the
+//     name (the emitted `E || (E = {})`), then one Stmt node per member
+//     initializer, spanning the member, in order; every member's bare name
+//     is bound to no variable throughout the body, since inside an
+//     initializer it names the member (the handbook's "Enums").
+//   - A namespace with a body runs its body once, immediately, where it
+//     stands (the emitted immediately invoked function), so it is lowered
+//     inline, not as a callable: one Stmt node spanning the leftmost name
+//     of its path that Uses and defines that name, then the body as a block
+//     with its own var scope. A namespace named by a string is ambient.
+//   - `import x = require(m)` is one Stmt node spanning x that defines it
+//     and may throw; `import x = A.B` is one spanning x that Uses A and
+//     defines x, and may throw when it reads a property.
+//   - `export = e` evaluates e like a default export.
 func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k *jsSyntax) {
 	cur := fn.Walk()
 	defer cur.Close()
@@ -211,7 +272,7 @@ func (j *jsLower) classBody(n *ts.Node) {
 	start, list := j.kids(n)
 	for i := range list {
 		switch m := &list[i]; m.KindId() {
-		case k.fieldDefinition:
+		case k.fieldDefinition, k.publicFieldDefinition:
 			if v := m.ChildByFieldId(k.fValue); v != nil {
 				j.reset()
 				j.value(v, false)
@@ -268,6 +329,9 @@ type jsLower struct {
 	opt []flow.Fringe
 	// labels are the statement labels the next statement takes.
 	labels []string
+	// decorated counts the decorators collected: a class whose collection
+	// counted one may throw where it is created.
+	decorated int
 }
 
 // kids pushes n's named, non-extra children (comments are extras) onto buf
@@ -385,10 +449,227 @@ func (j *jsLower) def(n, v int32) {
 func (j *jsLower) valueNode(n *ts.Node) {
 	m, last := len(j.reads), j.last
 	j.value(n, false)
-	if j.last != last && j.lastSpan == spanOf(j.l.unparen(n)) && j.thrown == j.throws {
+	if j.last != last && j.lastSpan == spanOf(j.strip(n)) && j.thrown == j.throws {
 		return
 	}
 	j.node(flow.Stmt, n, m, len(j.reads))
+}
+
+// strip is n without parentheses and without the TypeScript wrappers that
+// evaluate to their operand.
+func (j *jsLower) strip(n *ts.Node) *ts.Node {
+	k := j.k
+	for n != nil {
+		switch n.KindId() {
+		case k.parenthesizedExpression:
+			n = firstNamed(n)
+		case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
+			o := j.operand(n)
+			if o == nil {
+				return n
+			}
+			n = o
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+// operand is the expression a transparent TypeScript wrapper evaluates: its
+// first named child that is not a type argument list or a comment.
+func (j *jsLower) operand(n *ts.Node) *ts.Node {
+	for i := range n.NamedChildCount() {
+		if c := n.NamedChild(i); !c.IsExtra() && c.KindId() != j.k.typeArguments {
+			return c
+		}
+	}
+	return nil
+}
+
+// erased reports whether n is syntax the TypeScript compiler erases.
+func (j *jsLower) erased(n *ts.Node) bool {
+	id := n.KindId()
+	if int(id) >= len(j.k.erased) || !n.IsNamed() {
+		return false
+	}
+	if id == j.k.enumDeclaration {
+		return j.hasTok(n, j.k.constKw)
+	}
+	return j.k.erased[id] || id == j.k.importStatement && j.hasTok(n, j.k.typeKw)
+}
+
+// hasTok reports whether one of n's anonymous children is the token id; an
+// id the grammar lacks (0) is never one.
+func (j *jsLower) hasTok(n *ts.Node, id uint16) bool {
+	if id == 0 {
+		return false
+	}
+	c := j.cur
+	c.Reset(*n)
+	if !c.GotoFirstChild() {
+		return false
+	}
+	for {
+		if x := c.Node(); !x.IsNamed() && x.KindId() == id {
+			return true
+		}
+		if !c.GotoNextSibling() {
+			return false
+		}
+	}
+}
+
+// root is the leftmost identifier of a dotted name (a namespace path, an
+// import alias's target), or n itself.
+func (j *jsLower) root(n *ts.Node) *ts.Node {
+	k := j.k
+	for n != nil && (n.KindId() == k.nestedIdentifier || n.KindId() == k.memberExpression) {
+		n = n.ChildByFieldId(k.fObject)
+	}
+	return n
+}
+
+// paramPattern is the pattern a TypeScript parameter wrapper binds.
+func (j *jsLower) paramPattern(p *ts.Node) *ts.Node {
+	if pat := p.ChildByFieldId(j.k.fPattern); pat != nil {
+		return pat
+	}
+	return p.ChildByFieldId(j.k.fName)
+}
+
+// namespaceOf is the namespace n declares, as a declaration or as the
+// expression of an expression statement, or nil.
+func (j *jsLower) namespaceOf(n *ts.Node) *ts.Node {
+	k := j.k
+	if n.KindId() == k.expressionStatement {
+		if n = firstNamed(n); n == nil {
+			return nil
+		}
+	}
+	if id := n.KindId(); id == k.internalModule || id == k.module {
+		return n
+	}
+	return nil
+}
+
+// enum lowers an enum declaration (see TypeScript in lowerJavaScript).
+func (j *jsLower) enum(n *ts.Node) {
+	k := j.k
+	name := n.ChildByFieldId(k.fName)
+	v := j.lookup(name)
+	j.read(v)
+	j.def(j.node(flow.Stmt, name, 0, 0), v)
+	j.enumMembers(n, true)
+}
+
+// enumMembers binds every member name of an enum to no variable, then walks
+// the member initializers in order, lowering (lower) or collecting the
+// captures of each.
+func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
+	k := j.k
+	body := n.ChildByFieldId(k.fBody)
+	if body == nil {
+		return
+	}
+	mark := len(j.binds)
+	start, list := j.kids(body)
+	for i := range list {
+		member := &list[i]
+		if member.KindId() == k.enumAssignment {
+			member = member.ChildByFieldId(k.fName)
+		}
+		j.binds = append(j.binds, binding{name: j.text(member), v: -1})
+	}
+	for i := range list {
+		m := &list[i]
+		val := m.ChildByFieldId(k.fValue)
+		if m.KindId() != k.enumAssignment || val == nil {
+			continue
+		}
+		if lower {
+			j.reset()
+			j.value(val, false)
+			j.node(flow.Stmt, m, 0, len(j.reads))
+		} else {
+			j.cap(val)
+		}
+	}
+	j.done(start)
+	j.binds = j.binds[:mark]
+}
+
+// namespace lowers a namespace with a body inline (see TypeScript in
+// lowerJavaScript).
+func (j *jsLower) namespace(n *ts.Node) {
+	k := j.k
+	name, body := j.root(n.ChildByFieldId(k.fName)), n.ChildByFieldId(k.fBody)
+	if name == nil || name.KindId() != k.identifier || body == nil {
+		return
+	}
+	v := j.lookup(name)
+	j.read(v)
+	j.def(j.node(flow.Stmt, name, 0, 0), v)
+	mark, savedFn := len(j.binds), j.fnMark
+	j.fnMark = mark
+	j.hoistVars(body)
+	j.block(body)
+	j.binds, j.fnMark = j.binds[:mark], savedFn
+}
+
+// importEquals lowers `import x = require(m)` and `import x = A.B`.
+func (j *jsLower) importEquals(n *ts.Node) {
+	k := j.k
+	start, list := j.kids(n)
+	for i := range list {
+		c := &list[i]
+		switch c.KindId() {
+		case k.importRequireClause:
+			if id := firstNamed(c); id != nil {
+				j.throws++
+				j.def(j.node(flow.Stmt, id, 0, 0), j.lookup(id))
+			}
+		case k.identifier, k.nestedIdentifier:
+			if n.KindId() != k.importAlias || i == 0 {
+				continue
+			}
+			if c.KindId() == k.nestedIdentifier {
+				j.throws++
+			}
+			j.ref(j.root(c))
+			j.def(j.node(flow.Stmt, &list[0], 0, len(j.reads)), j.lookup(&list[0]))
+		}
+	}
+	j.done(start)
+}
+
+// hoistEquals binds, like var, the name an import-equals declaration or an
+// import alias declares.
+func (j *jsLower) hoistEquals(n *ts.Node) {
+	k := j.k
+	start, list := j.kids(n)
+	for i := range list {
+		switch c := &list[i]; {
+		case c.KindId() == k.importRequireClause:
+			if id := firstNamed(c); id != nil {
+				j.declarePattern(id, true)
+			}
+		case n.KindId() == k.importAlias && i == 0:
+			j.declarePattern(c, true)
+		}
+	}
+	j.done(start)
+}
+
+// decorators reads the decorators among n's children.
+func (j *jsLower) decorators(n *ts.Node) {
+	start, list := j.kids(n)
+	for i := range list {
+		if list[i].KindId() == j.k.decorator {
+			j.cap(&list[i])
+		}
+	}
+	j.done(start)
 }
 
 // readBack records v, the variable an embedded assignment just defined, as a
@@ -397,8 +678,12 @@ func (j *jsLower) readBack(v int32) { j.read(v) }
 
 // closure creates the node spanning n, a nested callable or class: it Uses
 // n's captures and may-defines every enclosing variable n assigns.
-func (j *jsLower) closure(n *ts.Node) int32 {
-	m, w := len(j.reads), len(j.writes)
+func (j *jsLower) closure(n *ts.Node) int32 { return j.closureFrom(n, len(j.reads)) }
+
+// closureFrom is closure whose node also Uses reads[m:], read before n (an
+// exported class's decorators).
+func (j *jsLower) closureFrom(n *ts.Node, m int) int32 {
+	w := len(j.writes)
 	if j.l.isCallable(n) {
 		j.capFunction(n)
 	} else {
@@ -456,7 +741,7 @@ func (j *jsLower) predeclare(n *ts.Node) {
 			j.declarePattern(list[i].ChildByFieldId(k.fName), false)
 		}
 		j.done(start)
-	case k.classDeclaration, k.functionDeclaration, k.generatorFunctionDeclaration:
+	case k.classDeclaration, k.abstractClassDeclaration, k.functionDeclaration, k.generatorFunctionDeclaration:
 		j.declare(n.ChildByFieldId(k.fName))
 	case k.exportStatement:
 		if d := n.ChildByFieldId(k.fDeclaration); d != nil {
@@ -495,6 +780,8 @@ func (j *jsLower) declarePattern(p *ts.Node, merge bool) {
 		j.declarePattern(p.ChildByFieldId(k.fLeft), merge)
 	case k.pairPattern:
 		j.declarePattern(p.ChildByFieldId(k.fValue), merge)
+	case k.requiredParameter, k.optionalParameter:
+		j.declarePattern(j.paramPattern(p), merge)
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(p)
 		for i := range list {
@@ -520,6 +807,21 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 			j.declarePattern(n.ChildByFieldId(k.fLeft), true)
 		}
 		j.hoistVars(n.ChildByFieldId(k.fBody))
+	case k.enumDeclaration:
+		if !j.erased(n) {
+			j.declarePattern(n.ChildByFieldId(k.fName), true)
+		}
+	case k.internalModule, k.module, k.expressionStatement:
+		// A namespace's own var names stay in its body's scope.
+		if ns := j.namespaceOf(n); ns != nil && ns.ChildByFieldId(k.fBody) != nil {
+			if name := j.root(ns.ChildByFieldId(k.fName)); name != nil && name.KindId() == k.identifier {
+				j.declarePattern(name, true)
+			}
+		}
+	case k.importStatement, k.importAlias:
+		if !j.erased(n) {
+			j.hoistEquals(n)
+		}
 	case k.program, k.statementBlock, k.ifStatement, k.elseClause, k.forStatement, k.whileStatement, k.doStatement,
 		k.labeledStatement, k.withStatement, k.tryStatement, k.catchClause, k.finallyClause, k.switchStatement,
 		k.switchBody, k.switchCase, k.switchDefault, k.exportStatement:
@@ -534,6 +836,9 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 // imports binds and defines the local names of one import statement.
 func (j *jsLower) imports(n *ts.Node) {
 	k := j.k
+	if j.erased(n) {
+		return
+	}
 	start, list := j.kids(n)
 	for i := range list {
 		c := &list[i]
@@ -552,6 +857,9 @@ func (j *jsLower) imports(n *ts.Node) {
 			case k.namedImports:
 				s3, specs := j.kids(part)
 				for s := range specs {
+					if j.hasTok(&specs[s], k.typeKw) {
+						continue
+					}
 					local := specs[s].ChildByFieldId(k.fAlias)
 					if local == nil {
 						local = specs[s].ChildByFieldId(k.fName)
@@ -579,6 +887,9 @@ func (j *jsLower) stmt(n *ts.Node) {
 	labels := j.labels
 	j.labels = nil
 	j.reset()
+	if j.erased(n) {
+		return
+	}
 	switch n.KindId() {
 	case k.expressionStatement:
 		if e := firstNamed(n); e != nil {
@@ -588,13 +899,20 @@ func (j *jsLower) stmt(n *ts.Node) {
 		j.declaration(n, false)
 	case k.variableDeclaration:
 		j.declaration(n, true)
-	case k.emptyStatement, k.debuggerStatement, k.importStatement, k.hashBangLine:
+	case k.emptyStatement, k.debuggerStatement, k.hashBangLine:
+	case k.importStatement, k.importAlias:
+		// An ES import's bindings are the program's, defined at its start.
+		j.importEquals(n)
+	case k.enumDeclaration:
+		j.enum(n)
+	case k.internalModule, k.module:
+		j.namespace(n)
 	case k.functionDeclaration, k.generatorFunctionDeclaration:
 		id := j.closure(n)
 		if v := j.lookup(n.ChildByFieldId(k.fName)); v >= 0 {
 			j.b.MayDef(id, v)
 		}
-	case k.classDeclaration:
+	case k.classDeclaration, k.abstractClassDeclaration:
 		j.def(j.closure(n), j.lookup(n.ChildByFieldId(k.fName)))
 	case k.statementBlock:
 		j.block(n)
@@ -637,10 +955,23 @@ func (j *jsLower) stmt(n *ts.Node) {
 		j.sub(n.ChildByFieldId(k.fBody))
 	case k.exportStatement:
 		// An export with neither a declaration nor a value evaluates nothing.
-		if d := n.ChildByFieldId(k.fDeclaration); d != nil {
+		d := n.ChildByFieldId(k.fDeclaration)
+		switch {
+		case d != nil && (d.KindId() == k.classDeclaration || d.KindId() == k.abstractClassDeclaration):
+			m, dec := len(j.reads), j.decorated
+			j.decorators(n)
+			if j.decorated > dec {
+				j.throws++
+			}
+			j.def(j.closureFrom(d, m), j.lookup(d.ChildByFieldId(k.fName)))
+		case d != nil:
 			j.stmt(d)
-		} else if v := n.ChildByFieldId(k.fValue); v != nil {
-			j.valueNode(v)
+		case n.ChildByFieldId(k.fValue) != nil:
+			j.valueNode(n.ChildByFieldId(k.fValue))
+		case j.hasTok(n, k.eqTok):
+			if e := firstNamed(n); e != nil {
+				j.valueNode(e)
+			}
 		}
 	default:
 		j.valueNode(n)
@@ -682,7 +1013,10 @@ func (j *jsLower) exprStmt(e *ts.Node) {
 	// made reports that the assignment made the statement's own node; the
 	// variable it defined is not read back, since nothing encloses it.
 	made := false
-	switch u := j.l.unparen(e); u.KindId() {
+	switch u := j.strip(e); u.KindId() {
+	case k.internalModule, k.module:
+		j.namespace(u)
+		return
 	case k.assignmentExpression:
 		made, _ = j.assign(u)
 	case k.augmentedAssignmentExpression:
@@ -842,7 +1176,7 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	k := j.k
 	mark := len(j.binds)
-	left := j.l.unparen(n.ChildByFieldId(k.fLeft))
+	left := j.strip(n.ChildByFieldId(k.fLeft))
 	kw := n.ChildByFieldId(k.fKind)
 	if kw != nil && kw.KindId() != k.varKw {
 		j.declarePattern(left, false)
@@ -1022,9 +1356,16 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 		j.closure(n)
 		return
 	}
+	if j.erased(n) {
+		return
+	}
 	switch id {
 	case k.identifier, k.shorthandPropertyIdentifier:
 		j.ref(n)
+	case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
+		if o := j.operand(n); o != nil {
+			j.value(o, inChain)
+		}
 	case k.binaryExpression:
 		left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
 		switch n.ChildByFieldId(k.fOperator).KindId() {
@@ -1157,7 +1498,7 @@ func (j *jsLower) target(t *ts.Node) {
 // is the variable an identifier target defines, else -1.
 func (j *jsLower) assign(n *ts.Node) (made bool, v int32) {
 	k := j.k
-	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
+	left, right := j.strip(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(j.reads)
 	switch left.KindId() {
 	case k.identifier:
@@ -1186,7 +1527,7 @@ func (j *jsLower) assign(n *ts.Node) (made bool, v int32) {
 // assign.
 func (j *jsLower) update(n *ts.Node) (made bool, v int32) {
 	k := j.k
-	arg := j.l.unparen(n.ChildByFieldId(k.fArgument))
+	arg := j.strip(n.ChildByFieldId(k.fArgument))
 	if arg.KindId() != k.identifier {
 		j.target(arg)
 		return false, -1
@@ -1202,7 +1543,7 @@ func (j *jsLower) update(n *ts.Node) (made bool, v int32) {
 // assign. A logical one always makes its conditional node spanning n.
 func (j *jsLower) augment(n *ts.Node) (made bool, v int32) {
 	k := j.k
-	left, right := j.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
+	left, right := j.strip(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	op := n.ChildByFieldId(k.fOperator).KindId()
 	logical := op == k.andAssign || op == k.orAssign || op == k.nullishAssign
 	m := len(j.reads)
@@ -1248,6 +1589,12 @@ func (j *jsLower) bind(p *ts.Node, from, to int) {
 		j.uses(j.node(flow.Stmt, p, from, to), m, len(j.reads))
 	case k.assignmentPattern:
 		j.defaulted(p.ChildByFieldId(k.fLeft), p.ChildByFieldId(k.fRight), p, from, to)
+	case k.requiredParameter, k.optionalParameter:
+		if v := p.ChildByFieldId(k.fValue); v != nil {
+			j.defaulted(j.paramPattern(p), v, p, from, to)
+		} else {
+			j.bind(j.paramPattern(p), from, to)
+		}
 	case k.restPattern:
 		if c := firstNamed(p); c != nil {
 			j.bind(c, from, to)
@@ -1317,6 +1664,16 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 			j.cap(nm)
 		}
 	}
+	// Parameter decorators are evaluated with the class, outside the method.
+	if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		start, list := j.kids(ps)
+		for i := range list {
+			if pid := list[i].KindId(); pid == k.requiredParameter || pid == k.optionalParameter {
+				j.decorators(&list[i])
+			}
+		}
+		j.done(start)
+	}
 	j.shadow++
 	mark, savedFn := len(j.binds), j.fnMark
 	j.fnMark = mark
@@ -1360,6 +1717,7 @@ func (j *jsLower) capClass(n *ts.Node) {
 			}
 		}
 	}
+	dec := j.decorated
 	j.shadow++
 	mark := len(j.binds)
 	if nm := n.ChildByFieldId(k.fName); nm != nil {
@@ -1377,6 +1735,9 @@ func (j *jsLower) capClass(n *ts.Node) {
 	j.done(start)
 	j.binds = j.binds[:mark]
 	j.shadow--
+	if j.shadow == 0 && j.decorated > dec {
+		j.throws++
+	}
 }
 
 // patternExprs collects the captures of a binding pattern's defaults and
@@ -1392,6 +1753,11 @@ func (j *jsLower) patternExprs(p *ts.Node) {
 			j.cap(key)
 		}
 		j.patternExprs(p.ChildByFieldId(k.fValue))
+	case k.requiredParameter, k.optionalParameter:
+		j.patternExprs(j.paramPattern(p))
+		if v := p.ChildByFieldId(k.fValue); v != nil {
+			j.cap(v)
+		}
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(p)
 		for i := range list {
@@ -1410,16 +1776,32 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.capFunction(n)
 		return
 	}
+	if j.erased(n) {
+		return
+	}
 	switch id {
 	case k.identifier, k.shorthandPropertyIdentifier, k.shorthandPropertyIdentifierPattern:
 		j.ref(n)
+	case k.decorator:
+		j.decorated++
+		j.children(n, false)
+	case k.enumDeclaration:
+		j.enumMembers(n, false)
+	case k.internalModule, k.module:
+		if body := n.ChildByFieldId(k.fBody); body != nil {
+			mark, savedFn := len(j.binds), j.fnMark
+			j.fnMark = mark
+			j.hoistVars(body)
+			j.cap(body)
+			j.binds, j.fnMark = j.binds[:mark], savedFn
+		}
 	case k.assignmentExpression, k.augmentedAssignmentExpression:
 		j.capWrite(n.ChildByFieldId(k.fLeft))
 		j.children(n, false)
 	case k.updateExpression:
 		j.capWrite(n.ChildByFieldId(k.fArgument))
 		j.children(n, false)
-	case k.classDeclaration, k.class:
+	case k.classDeclaration, k.abstractClassDeclaration, k.class:
 		j.capClass(n)
 	case k.classStaticBlock:
 		j.capFunction(n)
@@ -1458,7 +1840,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.binds = j.binds[:mark]
 	case k.forInStatement:
 		mark := len(j.binds)
-		left := j.l.unparen(n.ChildByFieldId(k.fLeft))
+		left := j.strip(n.ChildByFieldId(k.fLeft))
 		if kw := n.ChildByFieldId(k.fKind); kw == nil {
 			j.capWrite(left)
 			j.cap(left)
@@ -1500,7 +1882,7 @@ func (j *jsLower) cap(n *ts.Node) {
 // destructuring target. A property target writes no variable.
 func (j *jsLower) capWrite(t *ts.Node) {
 	k := j.k
-	switch t = j.l.unparen(t); t.KindId() {
+	switch t = j.strip(t); t.KindId() {
 	case k.identifier, k.shorthandPropertyIdentifierPattern:
 		if v := j.lookup(t); v >= 0 {
 			j.writes = append(j.writes, v)
@@ -1567,12 +1949,26 @@ type jsSyntax struct {
 	pairPattern, restPattern, computedPropertyName, jsxOpeningElement, jsxSelfClosingElement,
 	jsxClosingElement uint16
 
-	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw uint16
+	// The TypeScript kinds, optional.
+	requiredParameter, optionalParameter, publicFieldDefinition, abstractClassDeclaration, enumDeclaration,
+	enumAssignment, internalModule, module, nestedIdentifier, importRequireClause, importAlias, nonNullExpression,
+	asExpression, satisfiesExpression, typeAssertion, instantiationExpression, typeArguments, decorator uint16
+	// erased is indexed by kind id: the kinds the TypeScript compiler erases.
+	erased []bool
+
+	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, typeKw uint16
 
 	fAlias, fAlternative, fArgument, fArguments, fBody, fCondition, fConsequence, fDeclaration, fFinalizer,
 	fFunction, fHandler, fIncrement, fIndex, fInitializer, fKey, fKind, fLabel, fLeft, fName, fObject,
-	fOperator, fOptionalChain, fParameter, fParameters, fRight, fValue uint16
+	fOperator, fOptionalChain, fParameter, fParameters, fPattern, fRight, fValue uint16
 }
+
+// jsErased are the kinds the TypeScript compiler erases (see TypeScript in
+// lowerJavaScript), absent from the JavaScript grammar.
+var jsErased = []string{"type_annotation", "type_arguments", "type_parameters", "opting_type_annotation",
+	"omitting_type_annotation", "adding_type_annotation", "asserts_annotation", "type_predicate_annotation",
+	"implements_clause", "interface_declaration", "type_alias_declaration", "ambient_declaration",
+	"function_signature", "method_signature", "abstract_method_signature", "index_signature"}
 
 // resolveJSSyntax resolves language's table. A required name the grammar
 // does not define is a lowering defect and panics, so a misspelt kind can
@@ -1614,6 +2010,22 @@ func resolveJSSyntax(language string) *jsSyntax {
 	s.and, s.or, s.nullish = tok("&&"), tok("||"), tok("??")
 	s.andAssign, s.orAssign, s.nullishAssign = tok("&&="), tok("||="), tok("??=")
 	s.varKw, s.ofKw = tok("var"), tok("of")
+	s.requiredParameter, s.optionalParameter = opt("required_parameter"), opt("optional_parameter")
+	s.publicFieldDefinition, s.abstractClassDeclaration = opt("public_field_definition"), opt("abstract_class_declaration")
+	s.enumDeclaration, s.enumAssignment = opt("enum_declaration"), opt("enum_assignment")
+	s.internalModule, s.module, s.nestedIdentifier = opt("internal_module"), opt("module"), opt("nested_identifier")
+	s.importRequireClause, s.importAlias = opt("import_require_clause"), opt("import_alias")
+	s.nonNullExpression, s.asExpression = opt("non_null_expression"), opt("as_expression")
+	s.satisfiesExpression, s.typeAssertion = opt("satisfies_expression"), opt("type_assertion")
+	s.instantiationExpression, s.typeArguments, s.decorator = opt("instantiation_expression"), opt("type_arguments"), kind("decorator")
+	s.erased = make([]bool, tl.NodeKindCount())
+	for _, name := range jsErased {
+		if id := opt(name); id != 0 {
+			s.erased[id] = true
+		}
+	}
+	s.constKw, s.eqTok, s.typeKw = tok("const"), tok("="), tl.IdForNodeKind("type", false)
+	s.fPattern = tl.FieldIdForName("pattern")
 	s.fAlias, s.fAlternative, s.fArgument, s.fArguments = field("alias"), field("alternative"), field("argument"), field("arguments")
 	s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
 	s.fFinalizer, s.fFunction, s.fHandler, s.fIncrement = field("finalizer"), field("function"), field("handler"), field("increment")
