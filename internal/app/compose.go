@@ -787,6 +787,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if gerr != nil {
 			return nil, gerr
 		}
+		// No wall clock: every plumbing run is ended only when it stops
+		// making progress, after the package's hang-detector window.
 		if s.git, err = git.New(ctx, shared, exePath, 0); err != nil {
 			return nil, err
 		}

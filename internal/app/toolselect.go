@@ -269,6 +269,8 @@ func (s *signals) tracked(root workspace.Root, maxFiles int64) error {
 		return err
 	}
 	ctx := context.Background()
+	// The listing has no wall clock: it is ended only when it stops making
+	// progress, after the package's hang-detector window.
 	g, err := git.New(ctx, runner, exe, 0)
 	if err != nil {
 		return err
