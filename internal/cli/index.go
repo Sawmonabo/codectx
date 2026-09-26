@@ -488,6 +488,10 @@ func drainIndex(cmd *cobra.Command, build model.BuildInfo, args []string, ws *ap
 	if writeErr != nil {
 		return writeErr
 	}
+	// A publication that failed abandoned its units, and the last result
+	// delivered still reports them running; the envelope states them failed
+	// with that publication's reason instead.
+	latest = ws.Coordinator().SettleAbandoned(latest)
 	var warnings []string
 	if pending := ws.Coordinator().Pending(); pending.Units > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d deferred %s not built; run `codectx watch` to finish them",

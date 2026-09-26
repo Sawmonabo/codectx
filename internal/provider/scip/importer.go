@@ -34,9 +34,9 @@ type opener func(context.Context) (io.ReadCloser, int64, error)
 //     CTX_SOURCE_BINDING_UNVERIFIED (discovery over bytes the index never
 //     saw). Either way only that occurrence is left out (refuse). It also
 //     resolves the duplicate-path rule, rejects documents whose path escapes
-//     the project root and leaves a nested project's documents to its own
-//     unit, all of which must be known before the first fact of the first
-//     document is published;
+//     the workspace root, leaves another project's documents to its own unit
+//     and refuses the ones no project owns, all of which must be known before
+//     the first fact of the first document is published;
 //   - pass 1: occurrences and symbols are spooled to the scratch database as
 //     they stream past, each contributing its canonical digest to the
 //     document hash; when a document ends its position encoding is known, so
@@ -100,14 +100,16 @@ type importer struct {
 	skippedAliases int64
 	// The documents the index described that this import did not admit, one
 	// account per reason, each keeping the first document's path as its
-	// exemplar: outsideRoot is a relative_path that escapes the project root,
-	// duplicatePath an earlier document a later one with the same path
-	// superseded, notHeld a path the snapshot does not hold, unencoded a
-	// document whose position encoding is neither declared nor measured for
-	// the tool build, and oversize a document over max_source_file_bytes.
-	outsideRoot, duplicatePath, notHeld, unencoded, oversize droppedDocs
+	// exemplar: outsideRoot is a path that still escapes the workspace root
+	// once joined to the project directory, duplicatePath an earlier document
+	// a later one with the same path superseded, notHeld a path the snapshot
+	// does not hold, unowned a held path outside the unit's project that no
+	// project owns, unencoded a document whose position encoding is neither
+	// declared nor measured for the tool build, and oversize a document over
+	// max_source_file_bytes.
+	outsideRoot, duplicatePath, notHeld, unowned, unencoded, oversize droppedDocs
 	// otherProjectDocs counts the documents left to the unit of the other
-	// project that holds them (seeDocument). It is a partition, not a loss.
+	// project that holds them (ownerOf). It is a partition, not a loss.
 	otherProjectDocs int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
 	// contradict; refusedExemplar is the first one's document, the coordinate
@@ -123,7 +125,7 @@ type importer struct {
 	// this run refused nothing itself, so there is no coordinate to name.
 	carriedExemplar string
 	// hasOtherProjects says loadProjects recorded at least one other project,
-	// so seeDocument looks a document's directories up only when one can match.
+	// so ownerOf looks a document's directories up only when one can match.
 	hasOtherProjects bool
 	// encodingDropped counts the documents whose assumed position encoding
 	// the pinned bytes contradict; encodingUnproved those none of whose
@@ -202,23 +204,29 @@ const (
 //
 // Whether a drop degrades the capability depends on whether it loses a fact
 // about source this product serves. Every eligible file is in the snapshot, so
-// a document outside the project root or naming a path the snapshot does not
+// a document outside the workspace root or naming a path the snapshot does not
 // hold describes no served bytes: dropping it loses nothing, and it is counted
 // without degrading. Degrading on it would be a false partial -- indexers
-// write synthesized files such as generated test mains outside the root on an
-// ordinary run. A duplicate path, an unspecified encoding and the source bound
-// each drop facts about a held file, so they degrade:
-// CTX_PROVIDER_OUTPUT_INVALID for the first two, CTX_RESOURCE_LIMIT for the
-// bound.
+// write synthesized files such as generated test mains outside the workspace
+// on an ordinary run. A duplicate path, a held path no project owns, an
+// unspecified encoding and the source bound each drop facts about a held
+// file, so they degrade: CTX_PROVIDER_OUTPUT_INVALID for the first three,
+// CTX_RESOURCE_LIMIT for the bound.
 const (
-	// detailOutsideRoot counts documents whose relative_path escapes the
-	// project root.
+	// detailOutsideRoot counts documents whose path still escapes the
+	// workspace root once joined to the project directory.
 	detailOutsideRoot = "documents_outside_root"
 	// detailDuplicatePath counts documents a later document with the same
 	// path superseded; the last one of a path is the one admitted.
 	detailDuplicatePath = "documents_duplicate_path"
 	// detailNotHeld counts documents naming a path the snapshot does not hold.
 	detailNotHeld = "documents_not_in_snapshot"
+	// detailUnowned counts documents a project unit reached outside its own
+	// directory, through `../`, at a held path no project owns. No unit
+	// publishes them: admitting them would have every sibling unit that
+	// reaches the same directory publish the path again, so the file is
+	// served with no precise facts and the capability is degraded.
+	detailUnowned = "documents_in_no_project"
 	// detailUnencoded counts documents whose position encoding is neither
 	// declared nor measured for the tool build that wrote the index.
 	detailUnencoded = "documents_unspecified_encoding"
@@ -688,9 +696,9 @@ func (im *importer) endDocument(d document) error {
 		return err
 	}
 	if !admitted {
-		// Rejected by the project-root rule, left to a nested project's own
-		// unit, or superseded by a later document with the same path; each
-		// was counted in the pre-pass.
+		// Rejected by the workspace-root rule, left to another project's own
+		// unit, owned by no project, or superseded by a later document with
+		// the same path; each was counted in the pre-pass.
 		return im.dropSpool(ctx, d.index)
 	}
 	fv, ok, err := im.lookup(ctx, d.path)
@@ -1968,7 +1976,7 @@ func (im *importer) result() model.ProviderResult {
 			name string
 			docs droppedDocs
 		}{{detailOutsideRoot, im.outsideRoot}, {detailDuplicatePath, im.duplicatePath}, {detailNotHeld, im.notHeld},
-			{detailUnencoded, im.unencoded}, {detailOversize, im.oversize}} {
+			{detailUnowned, im.unowned}, {detailUnencoded, im.unencoded}, {detailOversize, im.oversize}} {
 			if d.docs.n > 0 {
 				cs = cs.WithDetail(d.name, strconv.FormatInt(d.docs.n, 10)).WithDetail(d.name+"_exemplar", d.docs.first)
 			}

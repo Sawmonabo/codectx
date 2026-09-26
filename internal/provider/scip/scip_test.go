@@ -668,8 +668,8 @@ func TestDeltaImport(t *testing.T) {
 	}
 
 	// A stored path the fresh index no longer describes is removed, and a
-	// document whose path escapes the project root is never admitted at all
-	// (scip-go emits 18 such `go test` mains for this repository).
+	// document whose path escapes the workspace root is never admitted at all
+	// (the Go profile's indexer emits 18 such test mains for this repository).
 	files["small.scip"] = string(miniIndex("scip-fixture", "0.1.0",
 		documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8)),
 		documentRecord("../../outside/x.go", "go", 1, occurrenceRecord(symBar, 1, 0, 0, 1))))

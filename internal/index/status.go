@@ -76,6 +76,11 @@ type StatusReader struct {
 	// from does not change what they project.
 	watch     *watchState
 	retention *retentionState
+	// late is the coordinator's deferred sealer, whose units a failed
+	// publication abandoned are projected over the active generation's rows
+	// (lateSealer.projectAbandoned). It is nil for a reader built without a
+	// coordinator, and it performs no store call either.
+	late *lateSealer
 }
 
 // NewStatusReader validates the dependencies and builds the reader.
@@ -110,7 +115,7 @@ func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.watch, r.retention = &c.watch, &c.retention
+	r.watch, r.retention, r.late = &c.watch, &c.retention, c.late
 	return r, nil
 }
 
@@ -144,6 +149,9 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
+	if r.late != nil {
+		states = r.late.projectAbandoned(binding.SnapshotID, states)
+	}
 	states, aggregated := boundStates(states, r.log)
 	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
@@ -765,8 +773,11 @@ func (r *capabilityReport) addDeferred(providerID, capability string, running in
 	r.add(model.CapabilityState{ProviderID: providerID, Capability: capability,
 		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
 		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: running,
-		Details: map[string]string{"reason": "units_deferred"}})
+		Details: map[string]string{"reason": reasonUnitsDeferred}})
 }
+
+// reasonUnitsDeferred is the reason detail of the row addDeferred publishes.
+const reasonUnitsDeferred = "units_deferred"
 
 // addFailures records one provider capability's failed units. The aggregate
 // arrives whole rather than one unit at a time, because the row publishes
