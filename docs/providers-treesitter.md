@@ -248,8 +248,14 @@ MemoryReservationBytes  Options.WorkerMemoryBytes (the composition passes 256 Mi
 Before it is started, each worker reserves `Options.WorkerMemoryBytes` on the
 process's one admission ledger (`Options.Admission`), so parser workers wait in
 the same queue, against the same allocation, as every other heavy child; the
-reservation is given back once the runner has reaped the worker. Room for a
-reservation that does not fit is first made by stopping an idle worker.
+reservation is given back once the runner has reaped the worker. The ledger's
+queue is the one order every handout follows: while an acquirer of the pool is
+queued on it, a worker coming back from a parse is stopped rather than kept
+idle, so its reservation returns to the ledger, the ledger pumps, and the
+queue's head is admitted in order. No later caller takes that worker around
+the queued acquirer, and an allocation that holds one worker (an observed zero
+included) runs the workers one at a time instead of stranding the acquirer
+behind an idle worker nothing ever releases.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
@@ -353,7 +359,8 @@ function of the file's bytes.
 - A healthy worker returns to the idle list, where the next parse of the
   stage reuses it; the drain that follows the last caller closes its stdin,
   the worker exits on EOF and the runner reaps it. An unhealthy worker is
-  stopped at release instead. A worker has no lifetime, no parse count, no
+  stopped at release instead, and so is a healthy one while an acquirer of the
+  pool is queued on the admission ledger. A worker has no lifetime, no parse count, no
   per-parse deadline and no lifetime byte total: a long parse of a large file
   is not a hung one, and only progress can tell the two apart.
 - The hang detector runs while a request or the hello is outstanding. A

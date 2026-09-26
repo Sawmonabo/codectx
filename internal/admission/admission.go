@@ -1,6 +1,6 @@
 // Package admission is this process's one reservation ledger: every heavy
-// child -- analysis engine runs, external indexers, language servers -- is
-// admitted against a single machine-derived allocation of MEMORY and one of
+// child -- analysis engine runs, external indexers, language servers, parser
+// workers -- is admitted against a single machine-derived allocation of MEMORY and one of
 // DISK, by the SUM of what they reserve in each (ADR-0010 decisions 5 and 6).
 //
 // Two dimensions, one ledger, one total each, one queue. Disk is admitted here
@@ -29,7 +29,10 @@
 // head and does not fit. That is how the language-server manager keeps its
 // rule that a server is never refused because another project's server is
 // running -- it stops an idle one -- without being able to overtake anything
-// in the queue.
+// in the queue. A reserver with nothing idle to free brings no makeRoom step;
+// what it holds comes back through release, which pumps -- the parser pool
+// stops a worker it is handed back while one of its acquirers is queued, so
+// the room that worker held reaches the head in order.
 package admission
 
 import (
