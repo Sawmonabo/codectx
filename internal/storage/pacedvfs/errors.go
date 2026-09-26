@@ -42,7 +42,7 @@ func Windows() int64 { return windows.Load() }
 // system since the process started. It is the store's spill signal: nothing
 // reaches the log while a group's dirty pages fit the writer's page cache, so
 // a group that has moved this figure is one the cache has begun spilling. The
-// log's own size cannot say that any more, because the log is rewound in
+// log's own size cannot say that, because the log is rewound in
 // place and keeps its high-water length, so a spill that fits inside it
 // changes neither its size nor its header. The count is the process's, not
 // one database's: a second store's log moves it too, which can only make a

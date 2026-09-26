@@ -2,7 +2,7 @@
 // Model Context Protocol, using the pinned official Go SDK for every wire
 // concern.
 //
-// # Import rule (Task 19 digest §3) — checkable by a reviewer
+// # Import rule — checkable by a reviewer
 //
 // This package imports exactly:
 //
@@ -14,7 +14,7 @@
 //     rather than promised in prose, and golang-jwt/oauth2 stay out of the
 //     build graph;
 //   - github.com/google/jsonschema-go/jsonschema — for the ONE input-schema
-//     helper in registry.go only (digest §2). It is the schema library the SDK
+//     helper in registry.go only. It is the schema library the SDK
 //     itself infers with, not a second protocol implementation;
 //   - internal/model — the request, response and error contracts;
 //   - internal/config — the Section 20 bounds;
@@ -24,7 +24,7 @@
 //
 // internal/app must not import this package, and this package must not import
 // internal/cli: the CLI envelope and exit codes are a different adapter's
-// shape, and there is no second error-code table (digest §5).
+// shape, and there is no second error-code table.
 //
 // # Channel discipline
 //
@@ -32,14 +32,4 @@
 // log line on stdout anywhere in this package; every diagnostic goes to the
 // stderr *slog.Logger carried on handlers. A single stray stdout write
 // corrupts the stdio session.
-//
-// # File ownership (Task 19 lane plan)
-//
-//	doc.go, registry.go, handlers.go, result.go  L0
-//	server.go, limits.go                         L1
-//	explore.go                                   L2
-//	graph.go                                     L3
-//	session.go                                   L4
-//	gate.go                                      L5
-//	internal/cli/mcp.go                          INT
 package mcpserver

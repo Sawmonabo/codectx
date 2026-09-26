@@ -84,10 +84,9 @@ func TestRemoveAllShrinksEveryLargeFileBeforeUnlinkingTheTree(t *testing.T) {
 // removal happens. Emptying a file needs write on the file; unlinking it needs
 // write only on the directory, so a large read-only file inside a writable
 // directory -- an analyzer's output tree is full of them -- must still be
-// removed. Thirty-three call sites were converted to this package, and a
-// refusal here would leave a run unable to clear its own scratch.
-// Mutation: drop fs.ErrPermission from ShrinkForRemoval's tolerated failures
-// and the removal fails with "permission denied".
+// removed, or a run is left unable to clear its own scratch.
+// Mutation: drop fs.ErrPermission from empty's tolerated failures and the
+// removal fails with "permission denied".
 func TestARemovalIsNotRefusedForAFileTheProcessMayUnlinkButNotTruncate(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability opens a read-only file for writing, " +

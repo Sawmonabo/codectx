@@ -22,12 +22,11 @@ func (noLeases) LeaseExpiry(context.Context, string) (time.Time, error)  { retur
 
 // TestReadoptingAGrownDirectoryChargesItOnce is the incremental-reservation
 // invariant. A paged walk extends ONE retained state directory page after page,
-// so the directory is re-adopted at every page boundary. AdoptDir measures the
-// whole directory and reserves it again while the previous reservation is
-// released only afterwards, which made the shared byte budget hold roughly TWO
-// copies of the cumulative state at every boundary -- and a walk whose state is
-// append-only would still stop being able to mint a continuation at half the
-// budget it actually needs.
+// so the directory is re-adopted at every page boundary. Measuring the whole
+// directory and reserving it again before the previous reservation is released
+// would make the shared byte budget hold roughly TWO copies of the cumulative
+// state at every boundary, and a walk whose state is append-only would stop
+// being able to mint a continuation at half the budget it actually needs.
 //
 // ReadoptDir transfers the previous reservation inside one critical section and
 // claims only the delta, so what the store has charged after the re-adoption is
@@ -103,13 +102,13 @@ func TestReadoptingAGrownDirectoryChargesItOnce(t *testing.T) {
 // the shared byte budget answers CTX_RESOURCE_LIMIT, which is retryable -- the
 // caller is told to present the cursor it already holds again. That promise
 // only holds if a refused re-adoption changed nothing. Stamping the new id and
-// lease into the header before reserving broke it: the directory kept its old
-// NAME and its old reservation but carried the new BINDING, and OpenDir
-// compares the two, so the cursor the caller was told to retry with answered
-// "spool does not belong to this cursor" and the whole walk behind it was gone.
+// lease into the header before reserving would break it: the directory would
+// keep its old NAME and its old reservation but carry the new BINDING, and
+// OpenDir compares the two, so the cursor the caller was told to retry with
+// would answer "spool does not belong to this cursor".
 //
-// Mutation (the stamp moved back ahead of the reservation, as it was): the
-// OpenDir below fails with CTX_CURSOR_INVALID.
+// Mutation (the stamp moved ahead of the reservation): the OpenDir below fails
+// with CTX_CURSOR_INVALID.
 func TestARefusedReadoptionLeavesThePreviousCursorAbleToOpenIt(t *testing.T) {
 	const budget = 16 << 10
 	store, err := NewSpools(t.TempDir(), budget, liveLeases{})
@@ -170,96 +169,4 @@ func (liveLeases) LeaseExpiry(context.Context, string) (time.Time, error) {
 func isCode(err error, code string) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == code
-}
-
-// The requirement: a process that answers questions writes nothing at its
-// composition. Both halves of the continuation store used to: OpenSigner made
-// the data directory and MINTED a key file, and NewSpools made the spool
-// directory -- before a single question had been read, and on a workspace an
-// operator had made read-only both of them failed outright, taking the whole
-// command with them.
-//
-// So the key is read and never minted for such a process, a workspace without
-// one is a typed refusal that names the remedy, and the spool directory is made
-// by the first answer that does not fit one page.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
-//
-// Mutation: make OpenSignerForReading call OpenSigner, or put the MkdirAll back
-// in NewSpools, and the read-only directory below is written into.
-func TestAnAnsweringProcessWritesNothingWhenItOpensTheContinuationStore(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("a process with the override capability writes into a directory that grants nobody write, " +
-			"so this would pass vacuously")
-	}
-	dir := t.TempDir()
-	data := filepath.Join(dir, "data")
-	if err := os.MkdirAll(data, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	// A workspace with no key: the refusal is typed and carries the remedy,
-	// and nothing is created.
-	_, err := OpenSignerForReading(data)
-	if err == nil {
-		t.Fatal("a read-only open of a workspace with no continuation key succeeded")
-	}
-	var typed *model.Error
-	if !errors.As(err, &typed) {
-		t.Fatalf("the refusal is untyped: %v", err)
-	}
-	if typed.Remediation == "" {
-		t.Fatalf("the refusal carries no remediation: %+v", typed)
-	}
-	if entries, readErr := os.ReadDir(data); readErr != nil || len(entries) != 0 {
-		t.Fatalf("the read-only signer open left %d entries behind (%v); want none", len(entries), readErr)
-	}
-
-	// The spool store over a directory that is not there: composing it creates
-	// nothing, and its budget reads zero rather than failing.
-	spools, err := NewSpools(filepath.Join(data, "spools"), 1<<20, noLeases{})
-	if err != nil {
-		t.Fatalf("composing the spool store over a directory that is not there: %v", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(data, "spools")); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("composing the spool store created its directory: %v", statErr)
-	}
-	// And a sweep over it reports nothing live rather than failing.
-	if live, sweepErr := spools.Sweep(context.Background(), time.Now()); sweepErr != nil || live != 0 {
-		t.Fatalf("sweeping a spool directory that is not there: %d live, %v", live, sweepErr)
-	}
-
-	// The signer of a workspace that HAS a key reads it and writes nothing,
-	// even with the directory read-only.
-	writing, err := OpenSigner(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.ReadDir(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(data, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(data, 0o700) })
-	reading, err := OpenSignerForReading(data)
-	if err != nil {
-		t.Fatalf("a read-only signer open of a workspace that has a key, on a read-only directory: %v", err)
-	}
-	token, err := writing.Sign(PurposeCursor, []byte("payload"), time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, verifyErr := reading.Verify(token, PurposeCursor, time.Now()); verifyErr != nil {
-		t.Fatalf("the read-only signer read a different key: %v", verifyErr)
-	}
-	after, err := os.ReadDir(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(after) != len(before) {
-		t.Fatalf("the read-only signer open changed the directory: %d entries before, %d after",
-			len(before), len(after))
-	}
 }

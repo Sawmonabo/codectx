@@ -1086,12 +1086,12 @@ func TestStorePublicationScenario(t *testing.T) {
 	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
 		t.Fatalf("RetainByRef(unlimited refs) = %+v, want every one of the four refs retained and the two failed generations swept", r1)
 	}
-	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
+	// max_retained_bytes = 0 is unlimited but still measures what a
 	// stricter limit could free, so `status` can warn before a disk fills. A
 	// silent zero here is a warning that never fires.
 	if r1.BytesReclaimable <= 0 {
 		t.Fatalf("RetainByRef(%+v) reported no reclaimable bytes although two non-active "+
-			"generations are retained; ruling Q10 measures it even when unlimited", r1)
+			"generations are retained; it is measured even when retention is unlimited", r1)
 	}
 	for _, gen := range []model.GenerationID{gen2, genCarry, genOwn, genStale} {
 		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {

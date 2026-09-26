@@ -16,7 +16,7 @@ The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 
 ## Coordinator contract
 
-The coordinator of Section 11.1 (Task 12, `internal/app`) is the consumer of
+The coordinator of Section 11.1 (`internal/app`) is the consumer of
 every exported name here: `scip.New`, `Descriptor`, `Detect`,
 `Scopes`/`ImportScope`/`ProfileScope`, `Verify`, `IndexUnit`, and the delta
 form `Import` with `ImportOptions`, `Report`, `DocumentManifest`, `Delta`,
@@ -65,10 +65,22 @@ coordinator exists.
   a project and never reaches the rule while `workspace.index_vendor` is false,
   which is the default, because those directories are then excluded from the
   snapshot; with it enabled the operator has asked for them to be indexed and
-  their manifests are projects like any other. A project whose scope key
+  their manifests are projects like any other. Two things qualify that: the Git
+  ignore hook excludes an ignored directory whatever `index_vendor` says, and a
+  tracked path wins over both exclusions (Section 10.2) — though detection sees
+  a tracked manifest under an excluded directory only when the traversal policy
+  it is handed carries the capture's force-include hooks. **A nested project is
+  excluded from the one that encloses it**: no profile's argument array can
+  exclude a subtree, so the outer indexer still runs over it, and the importer
+  drops every document under a nested project root of the same kind, counted
+  under `documents_in_nested_projects` without degrading anything, because the
+  nested unit publishes those paths. One path is published by exactly one unit.
+  A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
-  project's facts would be attributed to the other. A profile this
+  project's facts would be attributed to the other; its files stay with the
+  unit that encloses it, and the detection names the refusal under
+  `unplanned_project_keys`. A profile this
   machine cannot supply at all — no payload for this platform, a corrupt store
   entry, an invalid override — plans no unit, so a missing tool never costs a
   snapshot materialization or a failed unit. A profile whose payload the lock
@@ -82,12 +94,14 @@ coordinator exists.
   exact.
 - Declare every eligible snapshot file of the workspace as the unit's
   inputs: a fact may name any file the index describes, and storage refuses
-  a fact on an undeclared file. Documents the snapshot does not hold are
-  skipped and counted.
+  a fact on an undeclared file. A document naming a path the snapshot does not
+  hold is dropped and counted under `documents_not_in_snapshot` with its path
+  under `documents_not_in_snapshot_exemplar`; it does not degrade the
+  capability (see "Rejected and superseded documents").
 - `Import(ctx, req, sink, opts)` is `IndexUnit` plus the refresh: `opts.Previous`
   is the sealed unit's stored `DocumentManifest` (nil is a full import) and the
-  `Report` carries the delta, the fresh manifest and every count of what the
-  import did not admit. `IndexUnit` is `Import` with no previous manifest, which
+  `Report` carries the delta and the fresh manifest; every count of what the
+  import did not admit is on the result's capability rows. `IndexUnit` is `Import` with no previous manifest, which
   is all the `provider.Provider` interface can express.
 
 ### A refresh without `--scip-index`
@@ -163,17 +177,25 @@ unit is applied as a per-document delta (Section 11.4, "Delta import";
 `docs/research/12-incremental-scip-lsp.md` Sections 3.3–3.5 and 6.2).
 
 **Document manifest.** `DocumentManifest` is the sorted `(root-relative path,
-canonical document hash)` list of one sealed unit, held as a file rather than a
+canonical document hash, refused occurrences)` list of one sealed unit, held as a file rather than a
 Go slice because a unit may describe up to `MaxDocuments` documents and Section
 6 forbids a whole-repository list in the heap. Its format is
 
 ```
 codectx-scip-documents v1
-<64-hex canonical document hash>  <root-relative path>
+<64-hex canonical document hash>  <refused occurrences>  <root-relative path>
 ...
 ```
 
-sorted by path with strictly increasing paths. `Provider.Version` moves with
+sorted by path with strictly increasing paths. The refusal count is the number
+of the document's occurrences its import refused (see "Positions and
+binding"); a refresh that carries an unchanged document's rows folds that count
+into `refused_occurrences` and degrades the capability exactly as the original
+import did. It is exact rather than an estimate: a refusal depends only on the
+document's occurrences, symbols, resolved encoding and pinned bytes, which the
+canonical document hash covers, so an equal hash refuses the same occurrences.
+When every refusal of a run is carried, `refused_occurrence_exemplar` names the
+first such document instead of a coordinate. `Provider.Version` moves with
 the hash domain, so a manifest written under an earlier mapping is never
 reachable: the old unit has a different `UnitID` and is not reused.
 `LoadDocumentManifest` validates all of that and refuses a malformed file
@@ -226,7 +248,7 @@ describes are `removed`. A rename is a new `FileID` (Section 9.4), so every
 `git mv` takes this path.
 
 **Rejected and superseded documents.** A document whose `relative_path` escapes
-the project root is rejected and counted in `Report.OutsideRoot`: 18 of the 141
+the project root is rejected and counted under `documents_outside_root`: 18 of the 141
 documents `scip-go` emits for this repository are the `go test` mains it writes
 under `$GOCACHE`, whose paths are `../../../../..`-style escapes into a
 content-addressed build cache. Admitting them would bake absolute machine paths
@@ -234,9 +256,20 @@ into the index, churn about 13% of the document set for unrelated reasons, and
 produce paths that can never join a repository `FileID`. `scip.proto` calls
 `relative_path` unique but defines nothing for a duplicate, and its own two
 reference consumers disagree (`FlattenDocuments` unions, `expt-convert` keeps
-the first), so this importer picks one rule and counts it in
-`Report.DuplicatePaths`: the last document of a path wins and the earlier ones
-are dropped. Neither is a capability degradation; both are reported counts.
+the first), so this importer picks one rule and counts it under
+`documents_duplicate_path`: the last document of a path wins and the earlier ones
+are dropped. Each count names its first document under `<count key>_exemplar`.
+Whether a drop degrades the capability depends on whether it loses a fact about
+source this product serves. Every eligible file is in the snapshot, so an
+outside-root document and one naming a path the snapshot does not hold
+(`documents_not_in_snapshot`) describe no served bytes: they are counted and do
+not degrade, since degrading would make every Go unit with tests read partial
+over the synthesized test mains. A duplicate path, a document whose position
+encoding is neither declared nor measured (`documents_unspecified_encoding`),
+and one over `max_source_file_bytes` (`documents_over_source_bound`) each drop
+facts about a held file, so they degrade the capability:
+`CTX_PROVIDER_OUTPUT_INVALID` for the first two, `CTX_RESOURCE_LIMIT` for the
+bound.
 
 **Index-level state.** `Index.external_symbols` is an `Index` field, not a
 `Document` field: it belongs to no path, contributes to no document hash and is
@@ -285,16 +318,17 @@ then published at `compiler` precision against source that is not the symbol.
 
 An assumed encoding is therefore **proved once per document before any of its
 occurrences is admitted**: the first definition occurrence whose symbol names
-an identifier the source spells literally must select exactly that identifier.
-Namespace descriptors (package, module and file paths), meta descriptors
-(Python's `__init__`), backtick-escaped names (`<init>`, operators) and `local`
-symbols carry no such name and are passed over; a document in which none of
-the first 256 definitions carries one is skipped rather than admitted on an
-unchecked guess. On a line with a non-ASCII rune before the token the readings
-disagree and a wrong guess is caught; on an ASCII-only line every reading
-converts to the same bytes, so there is nothing to catch. A document whose
-guess does not hold is skipped and the capabilities are `partial` with
-`CTX_PROVIDER_OUTPUT_INVALID`.
+an identifier the source spells literally, and whose range selects any bytes,
+must select exactly that identifier. Namespace descriptors (package, module and
+file paths), meta descriptors (Python's `__init__`), backtick-escaped names
+(`<init>`, operators) and `local` symbols carry no such name, and a zero-width
+range selects no bytes and reads the same in every encoding; all of them are
+passed over, however many there are. On a line with a non-ASCII rune before the
+token the readings disagree and a wrong guess is caught; on an ASCII-only line
+every reading converts to the same bytes, so there is nothing to catch. A
+document whose guess the bytes contradict, and one none of whose definitions
+can check it, are both skipped rather than admitted on an unchecked guess, and
+the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`.
 
 The probe is not the guarantee, only its precondition. **Every** occurrence's
 range is then proved against the bytes it claims to describe — every one to the
@@ -324,8 +358,12 @@ cut check alone: a range spanning lines is a block span, measured, a crate's
 whole file; and a range holding no identifier byte at all is punctuation the
 grammar spells without one, measured, the reference from `+` to the `add`
 method it desugars to, which one indexer ranges over the space beside the
-operator. A zero-width range selects no bytes, so there are none to contradict;
-measured, every one is a document-level symbol anchored at the start of a file.
+operator. A range of whitespace alone holds no token at all — a reference
+shifted onto the gap between two tokens — and is refused. A zero-width range
+selects no bytes, so there are none to contradict; measured, every one is a
+document-level symbol anchored at the start of a file. It is admitted as an
+occurrence, but it proves nothing about an encoding, so the encoding probe
+passes over it.
 
 **The name check.** A range that is exactly one identifier token, whose symbol's
 last descriptor is a name the grammar spells literally, must select that name or
@@ -334,27 +372,40 @@ aliases an import spells the symbol under a name of its own — `use HashSet as
 Set` makes every later `Set` of that file a correct reference to `HashSet` — and
 the occurrence carries nothing saying so: the indexer that produces this shape
 sets no occurrence role at all, so the import role cannot mark it. A spelling is
-therefore bound by corroboration: the document must hold at least two
-occurrences of that symbol spelling it identically. That is not a threshold
-chosen to fit a measurement, it is the structural minimum of the construct — an
-alias that is *used* produces the occurrence in the alias clause and the
-occurrence at the use site. An alias declared and never used produces one
-occurrence, and no second one for the rule to refuse either, so nothing is lost.
+therefore bound only from the **alias clause** that introduces it, spelled
+`<name> as <spelling>` on one line with `<name>` the symbol's own name: either
+one occurrence of the symbol ranges over the whole clause, or one ranges exactly
+over the spelling and another exactly over the name the clause aliases. That is
+the one source a shifted column cannot produce. Recurrence is not: a tab counted
+to the wrong stop shifts every line of the same indentation by the same distance,
+so two identical lines `\t\trun(page,name);` carry the same wrong spelling twice,
+and a spelling bound because it recurs would publish `page` over the bytes of
+`name`. A uniform shift moves the two occurrences of a clause by the same
+distance, so it cannot leave one on the aliased name and the other on the alias;
+a cast such as `len as u32` holds only its first token as an occurrence of the
+symbol, so a shift onto the type binds nothing. The clause occurrence of an
+alias declared and never used binds itself, so it is not refused. An alias form
+spelled without `as` (`{A => B}`) binds nothing, and its uses are refused rather
+than admitted on a guess.
 A range that is not one identifier token is not name-checked at all: an aliased
 import can put the occurrence on the whole alias clause (`OrderedDict as OD`),
 and an operator reference is punctuation.
 
 Measured over the indexes the six pinned indexers produce from the fixtures of
 the per-platform matrix — 308 occurrences, all nine languages — the proof
-refuses **none** of them. The corroboration rule is what admits 2 of those 308
-(`Set` for `HashSet`); no other spelling in the corpus is corroborated.
+refuses none of the 306 that spell their symbol's own name or are not
+name-checked. The other two are `Set` for `HashSet`, the alias clause and its
+use. Whether that indexer also puts an occurrence on the clause's `HashSet`
+token, which the second clause shape needs, is **unmeasured**; until it is,
+whether the clause admits those two is unmeasured too, and a refusal of them is
+counted like any other rather than published.
 
 **What the proof does not catch.** It compares bytes, and it never adjusts or
 guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
 the truth publishes. Measured by shifting every one of the 308 occurrences by
 the two column distances observed in the field: of 214 occurrences a +5 shift
 converts at all, 32 still pass, and of 126 a +12 shift converts, 19 still pass —
-against 63 and 45 under the start-boundary rule this replaces. Those survivors,
+against 63 and 45 under a rule that checks only where a range starts. Those survivors,
 by kind: **24** whose symbol carries no name the grammar spells literally (a
 `local` symbol, a namespace, a meta descriptor, a backtick-escaped name), so
 there is nothing to compare the token against; **17** whose range is punctuation
@@ -362,14 +413,20 @@ rather than one identifier token; and **10** zero-width ranges, which name a
 position and no bytes. A shift landing on another token spelling the **same**
 identifier is the remaining kind — two byte-identical ranges are the same claim,
 and nothing in the bytes separates them; it occurs **0** times in this corpus
-under those two shifts, and `internal/provider/scip` holds a fixture case for it
-so the boundary stays stated rather than assumed.
+under those two shifts. The alias clause adds one narrower kind: a line whose
+occurrences carry two *different* shifts (a tab in the middle of the line as
+well as in its indentation) could in principle place one occurrence on a
+clause's aliased name and another on its alias, which a single shift cannot.
 
 The two proofs deliberately have different outcomes, because the two failures
 have different reach. A failed **encoding probe** is a claim about the whole
 document — every column of it is read in an encoding its bytes contradict — so
 the document is dropped whole, counted under `documents_dropped_encoding` and
-named by `documents_dropped_encoding_exemplar`. A failed **per-occurrence
+named by `documents_dropped_encoding_exemplar`. A document none of whose
+definitions can check the guess is dropped whole too, because nothing confirmed
+it, but nothing contradicted it either, so it is counted apart under
+`documents_unproved_encoding` and named by
+`documents_unproved_encoding_exemplar`. A failed **per-occurrence
 proof** reaches exactly one coordinate, so exactly one occurrence is left out:
 it is counted under `refused_occurrences`, the first is named with its reason by
 `refused_occurrence_exemplar` as `<document>:<line>:<column>: <reason>` — the
@@ -432,7 +489,7 @@ carries `source_binding=unverified`, every node's metadata says
 `CTX_SOURCE_BINDING_UNVERIFIED`. Project root, matching paths, timestamps and
 tool versions prove nothing.
 
-## Identity and alias scopes (ruling R9-1)
+## Identity and alias scopes
 
 Every node goes through `req.Resolver`; the provider copies
 `Resolution.CanonicalKey` verbatim.
@@ -518,8 +575,9 @@ to a function value — no indexer distinguishes them and none sets a write role
 An alias at a range where tree-sitter found no call site is inert: the join is
 exact-range equality, so it aliases the symbol to a key nothing else names. A
 key that would exceed `model.MaxNativeKeyBytes` or a scope key that would
-exceed `model.MaxScopeKeyBytes` is skipped and counted in
-`Report.SkippedCallsiteAliases`, never truncated into a key that would join the
+exceed `model.MaxScopeKeyBytes` is skipped, counted under
+`callsite_aliases_skipped` and degrades the capability with
+`CTX_RESOURCE_LIMIT`, never truncated into a key that would join the
 wrong range.
 
 ## Bounds
@@ -662,7 +720,7 @@ payload's come last, so a host `JAVA_HOME` can never shadow the pinned
 runtime.
 
 Everything is executed through the shared `internal/process` runner with an
-argv array only (ruling R9-3: no shell anywhere). The run is bounded by the
+argv array only: no shell anywhere. The run is bounded by the
 smaller of the profile's own timeout and `providers.scip.timeout`, by the
 profile's memory and disk reservations, and by 1 MiB of captured output per
 stream.
@@ -688,8 +746,12 @@ refused before that indexer starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a
 remediation naming the source-free case. Two profiles apply it, through one
 helper. For Java it is the aggregator POM of a multi-module repository —
 `pom.xml` triggers the profile, the root carries no source of its own — and
-without the check `javac` refuses, the indexer exits 1, and the run fails as
-`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured).
+without the check the compiler refuses, the indexer exits 1, and the run fails
+as `CTX_PROVIDER_UNAVAILABLE` with an exit status (measured). The walk does not
+descend into a nested project of the same kind — a module directory holding its
+own `pom.xml` — because that module is its own unit and its documents are
+dropped from the aggregator's, so the modules' sources cannot answer for the
+aggregator.
 For TypeScript it is a package directory holding only a manifest, a lock file
 and documentation, with no `.ts`/`.js` beside them: measured on a real
 repository, the run failed as `CTX_PROVIDER_UNAVAILABLE: node exited with

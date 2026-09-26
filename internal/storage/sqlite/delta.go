@@ -30,7 +30,7 @@ import (
 // row, and re-indexes nothing. deleteUnit releases a posting only when no
 // surviving unit's row still names it, exactly as it releases a node id.
 //
-// Two retention granularities are supported because the two wave-A importers
+// Two retention granularities are supported because the two importers
 // have two:
 //
 //   - Per path. A fact's retention bucket is the FileID on its evidence:
@@ -65,7 +65,7 @@ const deltaStatePart = 1 << 20
 // Replaced names everything of the previous unit that the current import has
 // already re-emitted or that no longer exists. Everything else is carried.
 // Naming the complement rather than the survivors is deliberate: for both
-// wave-A importers the replaced set is a handful of entries against tens of
+// importers the replaced set is a handful of entries against tens of
 // thousands of survivors.
 //
 // All three sets are streams, consumed once, and none is ever materialized

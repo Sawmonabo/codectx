@@ -33,7 +33,7 @@ var inPlaceFrees = map[string]string{
 		"given up, so a waiter arriving before the next holder is told nobody recorded themselves rather " +
 		"than handed the name of a process that has let go. Same bounded line, same nothing freed.",
 	"internal/provider/dependence/neo4jcsv/keys.go (*scratch).saveKeys": "creates the key set over the " +
-		"previous import's, which is the one of these that is unbounded -- 153 MB in one recorded run. " +
+		"previous import's, which is the one of these that is unbounded: it is as large as that import's key set. " +
 		"The old set is emptied through paced.Shrink immediately above the create, so by the time the " +
 		"truncating open runs there is nothing left for it to free.",
 	"internal/index/delta/delta.go previousState": "creates the file a predecessor's delta state is " +
@@ -64,8 +64,7 @@ var inPlaceFrees = map[string]string{
 // every writer on the machine for about a minute, a minute later, and nothing
 // inside the machine can observe or wait for it -- so a truncation or an
 // unlink that escapes the reclaimer is the defect this whole mechanism
-// exists to prevent, and one has escaped it three times already by being
-// added somewhere nobody was looking.
+// exists to prevent, and a new one is added wherever nobody is looking.
 //
 // This enumerates the tree instead of trusting a document. A new call to
 // os.Remove, os.RemoveAll, os.Truncate or a file's Truncate outside
@@ -74,23 +73,25 @@ var inPlaceFrees = map[string]string{
 //
 // Mutation: free one raw -- put os.Remove back at any governed call site, or
 // an os.Create over an existing file -- and this names the file and the
-// function. NOT RUN in this round (owner order 2026-09-17).
+// function. Resolving the flags is protected too: make truncatingFlags ignore
+// the enclosing function and the O_TRUNC that init.go reaches through a local
+// variable is missed, so its written-down entry reads as no longer there.
 func TestEveryFreeIsGovernedByThePace(t *testing.T) {
 	root := moduleRoot(t)
 	found := map[string]string{}
 	for _, tree := range []string{"internal", "cmd"} {
 		walkGoFiles(t, filepath.Join(root, tree), func(rel string, file *ast.File, fset *token.FileSet) {
-			ast.Inspect(file, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
+			for _, decl := range file.Decls {
+				fn, _ := decl.(*ast.FuncDecl)
+				ast.Inspect(decl, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok || !rawFree(call, fn) {
+						return true
+					}
+					found[rel+" "+funcName(fn)] = fset.Position(n.Pos()).String()
 					return true
-				}
-				if !rawFree(call) {
-					return true
-				}
-				found[rel+" "+enclosingFunc(file, n.Pos())] = fset.Position(n.Pos()).String()
-				return true
-			})
+				})
+			}
 		})
 	}
 
@@ -111,21 +112,20 @@ func TestEveryFreeIsGovernedByThePace(t *testing.T) {
 	}
 }
 
-// rawFree reports whether a call gives disk space back without this package:
-// os.Remove, os.RemoveAll, os.Truncate, Truncate on a file, or a TRUNCATING
-// OPEN -- os.Create, and os.OpenFile with O_TRUNC.
+// rawFree reports whether a call inside fn (nil at file scope) gives disk
+// space back without this package: os.Remove, os.RemoveAll, os.Truncate,
+// Truncate on a file, or a TRUNCATING OPEN -- os.Create, and os.OpenFile with
+// O_TRUNC.
 //
 // The truncating opens are here because they free exactly what a truncation
 // frees: an existing file's blocks, all of them, in one act, before the first
-// byte of the new contents is written. Reading the enumeration as unlink and
-// truncate alone left nine of them unexamined, and a review proved the gap by
-// putting one at a governed site and watching this test stay green.
+// byte of the new contents is written.
 //
 // A moment in time is truncated too, and says so: it is the result of an
 // expression rather than a named file, and it is cut to a unit of time. Both
 // are ruled out here, so a Truncate that reaches this test is one on
 // something that holds blocks.
-func rawFree(call *ast.CallExpr) bool {
+func rawFree(call *ast.CallExpr, fn *ast.FuncDecl) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
@@ -139,7 +139,7 @@ func rawFree(call *ast.CallExpr) bool {
 		case "Remove", "RemoveAll", "Truncate", "Create":
 			return true
 		case "OpenFile":
-			return truncatingFlags(call)
+			return len(call.Args) >= 2 && truncatingFlags(call.Args[1], fn, map[string]bool{})
 		}
 		return false
 	}
@@ -152,27 +152,77 @@ func rawFree(call *ast.CallExpr) bool {
 	return len(call.Args) != 1 || !qualifiedBy(call.Args[0], "time")
 }
 
-// truncatingFlags reports whether an os.OpenFile call names os.O_TRUNC among
-// its flags. The flags are an or-ed expression, so the whole of it is walked
-// rather than matched: a call that reaches O_TRUNC through a variable is not
-// recognised here, which is why the enumeration is a floor and the list of
-// written-down sites is read by a person.
-func truncatingFlags(call *ast.CallExpr) bool {
-	if len(call.Args) < 2 {
-		return false
-	}
+// truncatingFlags reports whether an os.OpenFile call's flags can carry
+// os.O_TRUNC. The flags are an or-ed expression, so the whole of it is walked
+// rather than matched, and a local variable in it is resolved through every
+// assignment to that name in the enclosing function, so a call that picks its
+// flags into a variable first is read like one that spells them out. A flag
+// passed in from a caller is not resolved, which is why the enumeration is a
+// floor and the list of written-down sites is read by a person.
+func truncatingFlags(flags ast.Expr, fn *ast.FuncDecl, seen map[string]bool) bool {
 	truncating := false
-	ast.Inspect(call.Args[1], func(n ast.Node) bool {
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		if recv, _ := sel.X.(*ast.Ident); recv != nil && recv.Name == "os" && sel.Sel.Name == "O_TRUNC" {
-			truncating = true
+	var names []string
+	ast.Inspect(flags, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			if qualifiedBy(n, "os") && n.Sel.Name == "O_TRUNC" {
+				truncating = true
+			}
+			return false
+		case *ast.Ident:
+			names = append(names, n.Name)
 		}
 		return true
 	})
-	return truncating
+	if truncating || fn == nil || fn.Body == nil {
+		return truncating
+	}
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		for _, value := range assignedTo(fn.Body, name) {
+			if truncatingFlags(value, fn, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// assignedTo is every expression body assigns to the local name: its
+// declarations, its short declarations and its plain and compound
+// assignments.
+func assignedTo(body *ast.BlockStmt, name string) []ast.Expr {
+	var out []ast.Expr
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range n.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+					out = append(out, pairedValue(n.Rhs, i, len(n.Lhs))...)
+				}
+			}
+		case *ast.ValueSpec:
+			for i, id := range n.Names {
+				if id.Name == name {
+					out = append(out, pairedValue(n.Values, i, len(n.Names))...)
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// pairedValue is the value assigned to the i-th of n names: its own when each
+// name has one, and the whole right-hand side when one call answers them all.
+func pairedValue(values []ast.Expr, i, n int) []ast.Expr {
+	if len(values) == n {
+		return values[i : i+1]
+	}
+	return values
 }
 
 // qualifiedBy reports whether e is pkg.Something.
@@ -185,19 +235,16 @@ func qualifiedBy(e ast.Expr, pkg string) bool {
 	return ok && id.Name == pkg
 }
 
-// enclosingFunc names the function or method holding pos.
-func enclosingFunc(file *ast.File, pos token.Pos) string {
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || pos < fn.Pos() || pos > fn.End() {
-			continue
-		}
-		if fn.Recv != nil && len(fn.Recv.List) > 0 {
-			return "(" + types(fn.Recv.List[0].Type) + ")." + fn.Name.Name
-		}
-		return fn.Name.Name
+// funcName names a function or method declaration, or the file scope when
+// there is none.
+func funcName(fn *ast.FuncDecl) string {
+	if fn == nil {
+		return "(file scope)"
 	}
-	return "(file scope)"
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		return "(" + types(fn.Recv.List[0].Type) + ")." + fn.Name.Name
+	}
+	return fn.Name.Name
 }
 
 func types(e ast.Expr) string {

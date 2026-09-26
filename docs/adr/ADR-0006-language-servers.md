@@ -34,7 +34,7 @@ class present in 104 files [19 §2]:
 | pinned Python server | after 15 s | 0.23 s | 138 | 290 MB | not advertised |
 | native Rust checker (`ty` 0.0.81) | **cold** | **0.21 s** | **136** | **168 MB** | advertised and answered |
 
-The settled 138 is [19 §2]'s one-off measurement and did not reproduce in the implementation lane:
+The settled 138 is [19 §2]'s one-off measurement and did not reproduce in the implementation's own measurement:
 with the client the product uses, the pinned server returned 2 cold and 2 after 15, 40 and 60 s
 settle windows, so the decisive comparison is cold 2 versus cold 136 (`docs/providers-lsp.md`).
 The gap this decision rests on is wider than the row above, not narrower.
@@ -85,7 +85,7 @@ and canonical Python facts are unchanged by this decision.
 releases may differ incompatibly; the lock pins an exact version with upstream digests, so the
 product never sees an unreviewed change, and the cost is a faster pin-refresh cadence for this one
 entry, each refresh re-running the overlay verification table. Two answers appeared to differ by two results
-(138 versus 136) between the old and new server; the implementation lane could not reproduce the
+(138 versus 136) between the old and new server; the implementation's own measurement could not reproduce the
 settled 138 at all -- the old server returned 2 cold and 2 after 15, 40 and 60 s -- so there is no
 second location set to diff against, and the verification table records that instead (amended
 2026-09-15). After the swap Python gains the implementation request, the overlay's provider version comes
@@ -111,7 +111,7 @@ same engine, more wrapper, nine months without a release.
 server modified to analyse everything: 84.66 s and 2.9 GB for 1 316 documents on one measured
 repository, the slowest indexer in the set by an order of magnitude [12 §3.1]. No SCIP emitter
 exists on either native checker; building one against the chosen checker's semantic index is
-recorded as the highest-value future tool change and is not a lane-sized task [19 §4].
+recorded as the highest-value future tool change and is not a small task [19 §4].
 
 ## What the change must show
 

@@ -1,7 +1,6 @@
 package mcpserver
 
-// L2 EXPLORE owns this file: the index and discovery handlers (digest §4 rows
-// 1-5 and 7). Handlers are thin — Validate() then ONE facade call then ok().
+// This file holds the index and discovery handlers. Handlers are thin — Validate() then ONE facade call then ok().
 // Ranking, paging, cursor codecs and truncation belong to internal/search;
 // re-deriving any of them here would be a duplicate implementation. Nothing in
 // this package touches a store or an analysis engine.
@@ -14,11 +13,9 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// indexStatus answers codectx_index_status. It is the one tool L0 carries end
-// to end, so that jsonschema reflection over a model type, the shared envelope
-// and the in-memory transport are all proven before a fill-in lane starts.
+// indexStatus answers codectx_index_status.
 //
-// The input is model.StatusRequest (ruling Q1), the same request `codectx
+// The input is model.StatusRequest, the same request `codectx
 // status --resources` builds: the Section 23 accounting block is a field on the
 // answer, and a model that could not ask for it would have to guess at this
 // installation's resource state or go without. It defaults to false, so a
@@ -41,7 +38,7 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, in m
 // serve process's single decision, made once from mcp.watch, and the tool takes
 // emptyInput precisely so a client cannot ask for one here.
 //
-// The route is IndexService.Refresh and only Refresh (digest §4 row 2), which
+// The route is IndexService.Refresh and only Refresh, which
 // takes no arguments at all: Refresh refuses full and rebuild with a remediated
 // CTX_ARGUMENT_INVALID naming `index --full`/`index --rebuild`, so a `full` or
 // `rebuild` argument here could only ever yield that refusal — a dead input
@@ -69,10 +66,9 @@ func (h *handlers) refreshIndex(ctx context.Context, req *mcp.CallToolRequest, _
 
 // repoOverview answers codectx_repo_overview.
 //
-// Overview is a TYPED REFUSAL this wave — its producer is Task 20's — so the
-// only correct thing this handler does with that *model.Error is hand it to
-// toolFailure, which is what every handler here already does with a facade
-// error. There is deliberately NO special case: returning an empty page, an
+// A facade refusal is a typed *model.Error, and the only correct thing this
+// handler does with it is hand it to toolFailure, which is what every handler
+// here does with a facade error. There is deliberately NO special case: returning an empty page, an
 // empty item list or a success envelope with no data would be the silent
 // capability reduction Section 30.1 forbids, because a model told "no results"
 // cannot tell that apart from "this repository has no packages".

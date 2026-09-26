@@ -530,13 +530,6 @@ func (a *Arena) BytesByPurpose() (map[Purpose]int64, error) {
 // ErrInUse refuses to empty an arena while something holds a surface of it.
 var ErrInUse = errors.New("scratch arena in use")
 
-// Empty removes every surface this process's instance holds and every
-// instance no live process has claimed, one window at a time, and forgets
-// them. It is the only place the arena's disk is given back, and it runs only
-// when an operator asks for it: no timer, no threshold, no setting. It
-// returns the bytes it freed.
-//
-// It refuses while any lease of this arena is outstanding, because removing a
 // A Collection is what one request to empty an arena did: the bytes it gave
 // back, and every queued removal the reclaimer could not make. A removal that
 // cannot be made still holds its space, so a collection that reports only its
@@ -561,6 +554,13 @@ type Untouched struct {
 	Reason string
 }
 
+// Empty removes every surface this process's instance holds and every
+// instance no live process has claimed, and forgets them. It is the only place
+// the arena's disk is given back, and it runs only when an operator asks for
+// it: no timer, no threshold, no setting. It reports the bytes it freed and
+// every queued removal the reclaimer could not make.
+//
+// It refuses while any lease of this arena is outstanding, because removing a
 // surface a tenant is writing would corrupt that tenant's work, and it leaves
 // alone the instance of any other process that is still running.
 func (a *Arena) Empty() (Collection, error) {

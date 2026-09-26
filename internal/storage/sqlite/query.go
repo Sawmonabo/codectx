@@ -740,7 +740,7 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 	return out, err
 }
 
-// Lexical primitives for Task 13's generation-scoped BM25 (Section 12.4). The
+// Lexical primitives for the search tier's generation-scoped BM25 (Section 12.4). The
 // store exposes membership-restricted rowids and aggregates; ranking is not
 // implemented here.
 

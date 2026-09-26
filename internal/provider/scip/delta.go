@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -26,18 +27,29 @@ import (
 //   - dochash spools one canonical digest per occurrence and per symbol of the
 //     document being walked, so the document hash can be taken over a sorted
 //     multiset without holding the document.
-//   - prevdoc is the stored unit's manifest, looked up per document.
+//   - prevdoc is the stored unit's manifest, looked up per document, with the
+//     occurrences its import refused in each document.
 //   - docdelta is the fresh manifest under construction plus the publish
-//     decision every later pass filters on.
+//     decision every later pass filters on, and the occurrences refused in
+//     each document (see carryRefusals).
+//   - nested holds the project directories nested inside this unit's own
+//     project, whose documents belong to their own units (loadNested).
+//
+// The four tables are created inside the import's transaction, but the
+// scratch database runs with the journal off, where a rollback is not
+// guaranteed to undo anything, so scratchEmpty drops them like every other
+// table of the pooled surface.
 var deltaSchema = []string{
 	`CREATE TABLE docpath(path TEXT PRIMARY KEY, last INTEGER NOT NULL) WITHOUT ROWID`,
 	`CREATE TABLE dochash(doc INTEGER NOT NULL, digest TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(doc, digest, seq)) WITHOUT ROWID`,
-	`CREATE TABLE prevdoc(path TEXT PRIMARY KEY, hash TEXT NOT NULL) WITHOUT ROWID`,
-	`CREATE TABLE docdelta(path TEXT PRIMARY KEY, doc INTEGER NOT NULL UNIQUE, hash TEXT NOT NULL, publish INTEGER NOT NULL) WITHOUT ROWID`,
+	`CREATE TABLE prevdoc(path TEXT PRIMARY KEY, hash TEXT NOT NULL, refused INTEGER NOT NULL) WITHOUT ROWID`,
+	`CREATE TABLE docdelta(path TEXT PRIMARY KEY, doc INTEGER NOT NULL UNIQUE, hash TEXT NOT NULL, publish INTEGER NOT NULL,
+		refused INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID`,
+	`CREATE TABLE nested(dir TEXT PRIMARY KEY) WITHOUT ROWID`,
 }
 
-// Digest domains. Each frames one canonical record; the version suffix means a
-// change to what a digest covers cannot be mistaken for a changed document.
+// Digest domains. Each frames one canonical record; the suffix means a change
+// to what a digest covers cannot be mistaken for a changed document.
 const (
 	occurrenceDigestDomain = "scip-occurrence-v1"
 	symbolDigestDomain     = "scip-symbol-v1"
@@ -66,14 +78,14 @@ func (im *importer) openDelta(ctx context.Context) error {
 		return invalid("scip document manifest " + im.previous.Name() + " does not start with " + manifestDocumentHeader)
 	}
 	for sc.Scan() {
-		hash, p, err := parseManifestRow(sc.Text())
+		row, err := parseManifestRow(sc.Text())
 		if err != nil {
 			return err
 		}
 		if err := im.sc.charge(int64(len(sc.Text()))); err != nil {
 			return err
 		}
-		if err := im.sc.exec(ctx, `INSERT OR REPLACE INTO prevdoc(path, hash) VALUES(?, ?)`, p, hash); err != nil {
+		if err := im.sc.exec(ctx, `INSERT OR REPLACE INTO prevdoc(path, hash, refused) VALUES(?, ?, ?)`, row.path, row.hash, row.refused); err != nil {
 			return err
 		}
 	}
@@ -83,13 +95,23 @@ func (im *importer) openDelta(ctx context.Context) error {
 	return nil
 }
 
-// seeDocument is the binding pre-pass's record of one document: it resolves
-// the duplicate-path rule and rejects a path that escapes the project root.
-// It reports whether the document is one this import may admit at all.
+// seeDocument is the binding pre-pass's record of one document: it rejects a
+// path that escapes the project root, leaves a document of a nested project
+// to that project's unit, and resolves the duplicate-path rule. It reports
+// whether the document is one this import may admit at all; a document it
+// refuses has no docpath row, so admits refuses it in every later pass.
 func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 	if !rootRelative(d.path) {
-		im.outsideRoot++
+		// Counted, not degraded: see the details in importer.go.
+		im.outsideRoot.note(d.path)
 		return false, nil
+	}
+	nested, err := im.inNestedProject(ctx, d.path)
+	if err != nil || nested {
+		if nested {
+			im.nestedDocs++
+		}
+		return false, err
 	}
 	var last int64
 	found, err := im.sc.row(ctx, `SELECT last FROM docpath WHERE path = ?`, []any{d.path}, &last)
@@ -97,11 +119,61 @@ func (im *importer) seeDocument(ctx context.Context, d document) (bool, error) {
 		return false, err
 	}
 	if found {
-		im.duplicatePaths++
+		im.duplicatePath.note(d.path)
+		im.degrade(model.CodeProviderOutputInvalid)
 	} else if err := im.sc.charge(int64(len(d.path)) + 16); err != nil {
 		return false, err
 	}
 	return true, im.sc.exec(ctx, `INSERT OR REPLACE INTO docpath(path, last) VALUES(?, ?)`, d.path, d.index)
+}
+
+// loadNested records, for a profile unit, every plannable project of the
+// same kind strictly inside the unit's own project (nestedProject). Each is
+// planned as a unit of its own by Scopes, and no profile's argument array can
+// exclude a subtree from the outer run, so the outer unit drops their
+// documents at seeDocument instead: one path is published by exactly one
+// unit. The set is read from the pinned snapshot the run materialized, so it
+// is the set of projects that snapshot holds, and it is spooled to the
+// scratch database rather than held, as every per-repository set here is.
+func (im *importer) loadNested(ctx context.Context) error {
+	if im.profile == nil {
+		return nil
+	}
+	k, root := im.profile.Kind, im.profile.Root
+	return im.req.Content.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+		if fv.Status == model.FileDeleted {
+			return nil
+		}
+		dir, ok := nestedProject(k, root, fv.Path)
+		if !ok {
+			return nil
+		}
+		if err := im.sc.charge(int64(len(dir)) + 16); err != nil {
+			return err
+		}
+		im.hasNested = true
+		return im.sc.exec(ctx, `INSERT OR IGNORE INTO nested(dir) VALUES(?)`, dir)
+	})
+}
+
+// inNestedProject reports whether the workspace-relative path lies inside a
+// project loadNested recorded, by looking up each of its directories.
+func (im *importer) inNestedProject(ctx context.Context, p string) (bool, error) {
+	if !im.hasNested {
+		return false, nil
+	}
+	for dir := p; ; {
+		i := strings.LastIndexByte(dir, '/')
+		if i < 0 {
+			return false, nil
+		}
+		dir = dir[:i]
+		var one int
+		found, err := im.sc.row(ctx, `SELECT 1 FROM nested WHERE dir = ?`, []any{dir}, &one)
+		if err != nil || found {
+			return found, err
+		}
+	}
 }
 
 // admits reports whether the document at this index is the one its path
@@ -260,13 +332,14 @@ func (im *importer) writeManifest(ctx context.Context) (*DocumentManifest, error
 	if _, err := w.WriteString(manifestDocumentHeader + "\n"); err != nil {
 		return fail(internal("scip document manifest: " + err.Error()))
 	}
-	err = im.sc.each(ctx, `SELECT hash, path FROM docdelta ORDER BY path`, nil, func(scan func(...any) error) error {
+	err = im.sc.each(ctx, `SELECT hash, refused, path FROM docdelta ORDER BY path`, nil, func(scan func(...any) error) error {
 		var hash, p string
-		if err := scan(&hash, &p); err != nil {
+		var refused int64
+		if err := scan(&hash, &refused, &p); err != nil {
 			return internal("scip scratch read: " + err.Error())
 		}
 		m.count++
-		_, err := w.WriteString(hash + manifestSeparator + p + "\n")
+		_, err := w.WriteString(hash + manifestSeparator + strconv.FormatInt(refused, 10) + manifestSeparator + p + "\n")
 		return err
 	})
 	if err != nil {
@@ -283,4 +356,38 @@ func (im *importer) writeManifest(ctx context.Context) (*DocumentManifest, error
 		return nil, internal("scip document manifest: " + err.Error())
 	}
 	return m, nil
+}
+
+// addRefused records n occurrences refused in the document at doc by this
+// run, in the unit's total and in the document's fresh manifest row.
+func (im *importer) addRefused(ctx context.Context, doc, n int64) error {
+	if n == 0 {
+		return nil
+	}
+	im.refusedOccurrences += n
+	return im.sc.exec(ctx, `UPDATE docdelta SET refused = refused + ? WHERE doc = ?`, n, doc)
+}
+
+// carryRefusals is addRefused for an unchanged document, whose rows the
+// storage writer carries from the sealed unit. Only its definitions are
+// re-read by this run; its references are not, so the occurrences its
+// original import refused are taken from the stored manifest instead. That is
+// exact rather than an estimate: a refusal is a function of the document's
+// occurrences, symbols, resolved encoding and pinned bytes, which the
+// canonical document hash covers, so an equal hash refuses the same
+// occurrences. Without it a refresh would publish the carried document's
+// missing occurrences as fresh.
+func (im *importer) carryRefusals(ctx context.Context, d docRow) error {
+	var stored int64
+	if _, err := im.sc.row(ctx, `SELECT refused FROM prevdoc WHERE path = ?`, []any{d.path}, &stored); err != nil {
+		return err
+	}
+	if stored == 0 {
+		return nil
+	}
+	if im.carriedExemplar == "" {
+		im.carriedExemplar = d.path
+	}
+	im.degrade(model.CodeProviderOutputInvalid)
+	return im.addRefused(ctx, d.idx, stored)
 }

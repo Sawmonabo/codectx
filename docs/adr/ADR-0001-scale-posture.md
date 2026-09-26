@@ -67,7 +67,7 @@ Three findings dominated the inventory:
 
 1. **One validator loop made the ruling unimplementable.** Around fifty configuration keys were
    rejected at `<= 0` with the message *"no zero or negative setting means unlimited"* — the exact
-   inverse of the ruling. Until that loop changed, no other lane could express an unlimited
+   inverse of the ruling. While that loop stood, no key could express an unlimited
    default at all.
 2. **The refusals were concentrated where a monorepo lives.** A 250 000-file workspace ceiling was
    enforced at three separate sites; a 200 000-entry directory ceiling meant one generated
@@ -123,7 +123,7 @@ library uses for request-scoped tracing [S34].
 *Leave the keys as plain integers and write `if n > 0 && x > n` at every site.* This is the
 smallest diff and needs no new type. It was rejected because the inventory found six separate
 places that already repeated the "zero means broken" convention independently, and the audit
-showed that a hand-written zero check is exactly the defect that keeps recurring: one lane found a
+showed that a hand-written zero check is exactly the defect that keeps recurring: the audit found one
 site reading `size <= 0` (which would have excluded every non-empty file from search) and another
 reading `size > 0` (which would have skipped every manifest) — both silently wrong rather than
 loudly broken. A type makes the wrong spelling fail to compile.
@@ -212,7 +212,7 @@ construction of [S35].
 *Re-deriving the frontier per page from a keyset scan under the pinned generation*, avoiding a spool
 altogether, as mature search systems do with a point-in-time view and `search_after` [S14],
 with the page token opaque and server-minted [S13]. This remains the cheaper design where it
-applies and is not foreclosed; it was not taken this wave because the spool machinery already
+applies and is not foreclosed; it was not taken because the spool machinery already
 existed and worked for one stop reason, so generalising it was a smaller, provable change than
 introducing a second continuation mechanism.
 
@@ -256,7 +256,7 @@ query, and says so.
 **Consequences.** Peak resident memory on this path is now: the resumed frontier (bounded by the
 frontier byte budget) plus this page's admissions (bounded by the page item ceiling) plus one
 level's probe answers plus one page of relations plus one spool record in flight. Nothing scales
-with the graph. The cost side is real and stated for the verification lane: one spool sweep per
+with the graph. The cost side is real and stated for verification: one spool sweep per
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
 released only after the fresh one is written. The two callers that used to expand a whole walk in
@@ -325,7 +325,7 @@ A run read after close returns a typed error rather than zero records — which 
 empty input fold is a unit identity that would reuse forever whatever changed. With this structure
 fixed, the planner's largest remaining structure is the plan's own output: roughly 120 bytes plus a
 scope key per planned file unit, or 50–80 MiB at 300 000 files with two file providers active. That
-is named for the verification lane rather than claimed as solved. A new I/O characteristic is also
+is named for verification rather than claimed as solved. A new I/O characteristic is also
 named: each whole-snapshot unit re-reads the merged file, where it previously read memory.
 
 ### 2.4 Search: a lossless ranked set
@@ -350,8 +350,7 @@ this layer: the record is JSON, and truncating it produces invalid JSON — a si
 into a corruption bug. Chunking across frames is the correct answer, with the assembly bound set to
 the spool's own byte budget so no record can exceed what the budget already admitted.
 
-*A new `spool_bytes` configuration key.* Rejected, twice, by two independent lanes reaching the
-same conclusion: the temporary-disk budget is a single number, and a second key lets its consumers
+*A new `spool_bytes` configuration key.* Rejected: the temporary-disk budget is a single number, and a second key lets its consumers
 be configured to oversubscribe the very budget the first key exists to enforce. The divisor stays a
 documented derivation of the one budget. The same reasoning governs the sort-run budget, which is a
 *share* of the query memory admission rather than a key of its own — a memory budget treated as a
@@ -371,8 +370,8 @@ still serves page 1; mutation (restore the failure) fails with *"a full spool fa
 of ending it"*. Chunking: mutation (restore the record-size refusal) fails with *"a record larger
 than one frame was refused instead of chunked"*.
 
-**The duplicate-primitive incident, and the one-primitive resolution.** Two lanes, working in
-parallel on different problems — the planner's input sort and the search top-K — each independently
+**The duplicate-primitive incident, and the one-primitive resolution.** Two parallel changes on
+different problems — the planner's input sort and the search top-K — each independently
 created a bounded external sort at the *same path* in the pagination package. Both are correct;
 they differ in that the second adds a capped merge fan-in (excess runs are collapsed in groups
 first, so the live set stays constant instead of growing with the input) and derives its run budget
@@ -535,9 +534,9 @@ does not support.
 
 *Keep the severity fold and accept that the loser's counts vanish.* Rejected. The fold kept only
 the most severe of two rows for one provider capability, so the discarded row's scope count was
-lost while the omitted counter stayed at zero — a drop that reported itself as no drop. The review
-that found it rated it Minor on two checks (health can only worsen under the fold, so nothing
-over-claims; and the omitted counter has exactly one consumer) and it was fixed anyway.
+lost while the omitted counter stayed at zero — a drop that reported itself as no drop. The defect is
+Minor on two checks (health can only worsen under the fold, so nothing
+over-claims; and the omitted counter has exactly one consumer) and is fixed regardless.
 
 **Why it was chosen.** The read path was the decisive site: a bare `LIMIT 256` silently dropped the
 tail of the capability report, and that report feeds the completeness field on **every** answer.
@@ -654,12 +653,12 @@ landing near **≈24× on the original corpus**: still far from 3.5×. Either th
 closes most of the remainder, or 3.5× is the wrong number for a store that keeps full evidence and
 provenance per fact. That is the open question the re-measurement answers.
 
-**Why this is a separate wave.** Storage amplification is a **disk** cost; the rest of this record
+**Why storage is a separate decision.** Storage amplification is a **disk** cost; the rest of this record
 is about resident memory and refusals. At today's per-symbol cost a 300 000-file repository
 projects to a multi-gigabyte store — bad, but not an out-of-memory failure on the 47 GiB reference
 host. Blocking the unlimited posture on a 10 000-line package rewrite would trade a measured,
-reported risk for a long stall. The verification lane for this record therefore **reports** the
-ratio and the per-symbol cost; the storage wave's own verification is where they gate.
+reported risk for a long stall. Verification of this record therefore **reports** the
+ratio and the per-symbol cost; the storage records' own verification is where they gate.
 
 **Landed.** The redesign shipped as recorded in
 [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md): integer surrogate identities and
@@ -684,7 +683,7 @@ which streams all eight lists onto the file a page at a time and refuses to writ
 is shorter than the count the seal pinned. The record set resident in any process is one page's
 worth whatever the session recorded.
 
-**Why it took four lanes to land, stated plainly.** Three separate implementation lanes reached this item and
+**Why it could not land in halves, stated plainly.** Three separate implementation attempts reached this item and
 each declined to half-land it, for three different and cumulative reasons. The first found that the
 mechanism named in the plan was wrong: a continuation spool is lease-bound and expiry-stamped,
 while a sealed capsule is a write-once durable artefact replayed by a later session — the
@@ -708,9 +707,9 @@ Three bounded passes over the source — count, hash, then write — are byte-id
 digest. Because no stored golden digest existed anywhere in the tree, two reference digests were
 computed and pinned so the change can be proved rather than asserted.
 
-**Consequences.** The shape the fourth attempt used, and which landed, is one interface lane
+**Consequences.** The shape that landed freezes one interface first
 (schema rows, the writer and reader inside the seal transaction, the counts on the record, page
-validation), then two parallel fill-in lanes, then one integration lane. Each behavioural change
+validation), then fills it in and integrates it. Each behavioural change
 carries a mutation proof: a single-pass hash breaks the pinned digests, a source that buffers a
 list is caught by a walk count rather than by the digest it would reproduce, a tool that drops the
 page cursor never terminates the capsule walk, and an export that stops streaming writes a file
@@ -800,7 +799,7 @@ duplicates an existing assertion.
   its two successors, `context.max_capsule_records_per_list` and
   `context.max_capsule_coverage_files`, are unlimited by default and only an operator-set value
   refuses work.
-- **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage wave's to
+- **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage records' to
   close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
 - **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
@@ -894,7 +893,7 @@ corpus whose only purpose is to prove that the removed workspace ceiling no long
 index to completion. For each it reports wall clock, sampled process-**tree** peak resident memory,
 the storage ratio and bytes per indexed symbol. The gate is: no out-of-memory failure on the 47 GiB
 host, and a peak bounded by page and batch size rather than by file count. The two storage numbers
-are **reported here and gated in the storage wave**.
+are **reported here and gated by the storage records**.
 
 ---
 
