@@ -5,24 +5,32 @@ import (
 	"slices"
 )
 
-// DefUse returns the def-use pairs of g as (defining node, using node): for
-// every node u and every variable v in Uses(u), one pair per definition of v
-// that reaches u along some CFG path.
+// DefUse returns the def-use pairs of g as (defining node, using node).
 //
 // # Semantics
 //
-// A killing definition (Def) of v ends every path it lies on: a use it
-// reaches pairs with it alone. A may-definition (MayDefs) of v at node p is
-// non-killing: a use it reaches pairs with p AND with every definition of v
-// reaching p's entry. Uses read the value before the node's own definitions,
-// so a node can be both ends of a pair only through a loop.
+// A killing definition (Defs) of v ends every path it lies on. A
+// may-definition (MayDefs) of v at node p is a χ: p reads v's prior version
+// and defines the next one, which may still hold the old value. A use of v
+// at node u pairs with
+//   - every killing definition of v that reaches u, through any number of
+//     may-definitions of v, and
+//   - the nearest may-definitions of v on each path to u: the ones no later
+//     may-definition of v follows on that path.
+//
+// Every may-definition of v at p is also a use of v at p (the χ's implicit
+// use), paired by the same rule whether or not p reads v in the source, so
+// the chain of may-writes stays connected and every earlier may-write is
+// reachable from a use through it. Uses read the value before the node's
+// own definitions, so a node can be both ends of a pair only through a loop.
 //
 // The value of v flowing along an edge p → n is:
 //   - when n is a Handler, the value on ENTRY to p: p threw part-way, before
-//     any definition it makes, so neither its Def nor its MayDefs hold there;
-//   - otherwise p itself when v is one of Defs(p), the may-merge {p, entry(p, v)}
-//     when v is one of MayDefs(p), and the value on entry to p when p does
-//     not define v.
+//     any definition it makes, so neither its Defs nor its MayDefs hold
+//     there;
+//   - otherwise p itself when v is one of Defs(p), the may-merge {p,
+//     entry(p, v)} when v is one of MayDefs(p), and the value on entry to p
+//     when p does not define v.
 //
 // This rule applies to a single-predecessor node and to every φ operand
 // alike. A use that no definition reaches (a free variable, or a parameter
@@ -46,9 +54,39 @@ import (
 // all the φ itself or one other value is replaced by that value (by undefined
 // when every operand is the φ itself). A φ that becomes trivial only through
 // a later replacement is left in place. Neither case changes a pair:
-// resolution walks every remaining φ transitively to the definitions it
-// merges, a replacement is always one of the φ's own operands, and so a
-// may-merge never loses p. No pair names a φ.
+// resolution walks every remaining φ transitively, a replacement is always
+// one of the φ's own operands, and so a may-merge never loses p. No pair
+// names a φ.
+//
+// # Resolution
+//
+// A use's entry value is expanded in two modes. In full mode a join expands
+// its operands, a killing definition pairs, and a may-merge pairs its p, the
+// nearest may-definition on that path, and continues with its killing
+// representative in killing mode. In killing mode a join expands its
+// operands, a killing definition pairs and a may-merge pairs nothing and
+// continues with its representative: everything behind a nearest
+// may-definition contributes only its killing definitions.
+//
+// The killing representative of a value is memoized per φ, once per graph:
+// a may-merge's is its second operand's; a join's is the one representative
+// its operands share, ignoring the join itself, and otherwise the join. A
+// chain of may-merges therefore collapses to the killing definitions behind
+// it, and a join all of whose paths lead back to one representative
+// collapses too, so a use never re-walks a chain another use has walked.
+// The representatives are computed by one iterative depth-first pass over
+// the φs a use first needs; a φ met again while its own representative is
+// still being computed stands for itself, which keeps a join that is
+// uniform only around a cycle in place, as trivial-φ removal does.
+//
+// # Complexity
+//
+// A use costs the φs it expands, each at most once per mode (a stamp per
+// mode), plus its pairs, and each φ's representative is computed once. On a
+// chain of may-writes through one base (`o.f = 0;` repeated n times after
+// one killing definition of o), each write pairs with the killing
+// definition and the write before it, so the pairs, and the work, are linear
+// in n rather than quadratic.
 //
 // The result is arena-backed, sorted and deduplicated as Edges promises, and
 // valid until the next Arena.Begin. There is no definition, variable,
@@ -59,31 +97,44 @@ func DefUse(g *Graph, a *Arena) Edges {
 	s.definitionSites()
 	s.chain = a.Int32s(int(s.blocks))
 	s.memo.init(a, int(s.blocks)+len(g.mayDefs))
-	// Phase 1: the value live on entry to every use, and every φ it needs,
-	// operands complete. Resolution waits until no φ is pending.
-	vals := a.Int32s(len(g.uses))
+	// Phase 1: the value live on entry to every use, the χ's implicit uses
+	// included (a may-definition of a variable its node already reads adds
+	// none), and every φ it needs, operands complete. Resolution waits until
+	// no φ is pending.
+	vals := a.Int32s(len(g.uses) + len(g.mayDefs))
+	at := a.Int32s(len(g.uses) + len(g.mayDefs))
 	i := 0
 	for u := range s.n {
-		for _, v := range g.Uses(u) {
-			vals[i] = s.walk(u, v, false)
+		uses := g.Uses(u)
+		for _, v := range uses {
+			vals[i], at[i] = s.walk(u, v, false), u
+			s.complete()
+			i++
+		}
+		for _, v := range g.MayDefs(u) {
+			if _, read := slices.BinarySearch(uses, v); read {
+				continue
+			}
+			vals[i], at[i] = s.walk(u, v, false), u
 			s.complete()
 			i++
 		}
 	}
+	vals, at = vals[:i], at[:i]
 	// Phase 2: resolve each use through φ operands to its defining nodes.
+	phis := len(s.phiSite.s)
 	r := resolver{
-		ssa:      s,
-		phiStamp: a.Int32s(len(s.phiSite.s)),
-		defStamp: a.Int32s(g.Len()),
-		stack:    a.Int32s(len(s.phiSite.s)),
+		ssa:       s,
+		phiStamp:  a.Int32s(phis),
+		killStamp: a.Int32s(phis),
+		defStamp:  a.Int32s(g.Len()),
+		stack:     a.Int32s(2 * phis),
+		rep:       a.Int32s(phis),
+		dfs:       a.Int32s(4 * phis),
 	}
-	r.pairs.s = a.Uint64s(len(g.uses))[:0]
-	i = 0
-	for u := range s.n {
-		for range g.Uses(u) {
-			r.resolve(u, vals[i], int32(i+1))
-			i++
-		}
+	r.pairs.s = a.Uint64s(len(vals))[:0]
+	for j, val := range vals {
+		r.resolve(at[j], val, int32(j+1))
 	}
 	// A pair is stamped once per use, so two uses at one node whose
 	// variables reach the same definition node, a definition's own
@@ -117,8 +168,10 @@ const (
 //   - the φ tables (site, variable, start, replacement, pending), under 80·J,
 //     and operands, under 16·P, each a list grown by doubling that counts
 //     under four times its final length;
-//   - for resolution, 4·U entry values, 8·J stamps and stack, 4·N definition
-//     stamps and at most 8·max(U, 4·R) bytes of pairs.
+//   - for resolution, 8·(U+M) for the entry values and their nodes (the
+//     χ's implicit uses count among the M), 8·J mode stamps, 8·J stack,
+//     4·J representatives and 16·J for their depth-first pass, 4·N
+//     definition stamps and at most 8·max(U+M, 4·R) bytes of pairs.
 //
 // No term is fixed per N: L can reach B·V, and R can exceed N.
 type ssa struct {
@@ -397,50 +450,199 @@ func (s *ssa) find(v int32) int32 {
 }
 
 // resolver pairs each use with the definitions its entry value stands for.
-// A stamp is the use's index + 1, so no per-use clearing is needed, a φ is
-// expanded once per use (the stack holds each at most once) and a
-// definition met on two φ paths is paired once.
+// A stamp is the use's index + 1, so no per-use clearing is needed: a φ is
+// expanded at most once per use in each mode (phiStamp in full mode,
+// killStamp in killing mode, so the stack holds at most two entries per φ)
+// and a definition met on several paths is paired once.
 type resolver struct {
 	*ssa
-	phiStamp, defStamp, stack []int32
-	pairs                     list64
+	phiStamp, killStamp, defStamp []int32
+	// stack holds the φs still to expand: k for full mode, ^k for killing
+	// mode.
+	stack []int32
+	// rep[k] is φ k's killing representative + repBias, 0 while it is
+	// uncomputed and repActive while the depth-first pass computing it has
+	// φ k open.
+	rep []int32
+	// dfs is that pass's stack of open φs, four slots each: the φ, the next
+	// operand slot to read, the representative its operands share so far,
+	// and whether they differ (0 or 1, or 2 before the first operand).
+	dfs   []int32
+	pairs list64
 }
+
+const (
+	// repBias shifts a representative (undefined, a node or a φ value) so
+	// that 0 and repActive are free for the pass's own states.
+	repBias   int32 = 3
+	repActive int32 = 1
+)
 
 // resolve emits (definition, u) for every definition value val reaches
-// through φ operands.
+// under the two-mode rule of DefUse.
 func (r *resolver) resolve(u, val, stamp int32) {
-	top := 0
-	if k, ok := r.reach(u, val, stamp); ok {
-		r.stack[top] = k
-		top++
-	}
+	top := r.reach(u, val, stamp, false, 0)
 	for top > 0 {
 		top--
-		for _, o := range r.operands(r.stack[top]) {
-			if kk, ok := r.reach(u, o, stamp); ok {
-				r.stack[top] = kk
-				top++
+		e := r.stack[top]
+		if e >= 0 {
+			// Full mode.
+			ops := r.operands(e)
+			if r.phiSite.s[e] >= r.n {
+				// A may-merge: its node is the nearest may-definition on
+				// this path; behind it only killing definitions count.
+				top = r.pair(u, ops[0], stamp, top)
+				top = r.reach(u, ops[1], stamp, true, top)
+				continue
 			}
+			for _, o := range ops {
+				top = r.reach(u, o, stamp, false, top)
+			}
+			continue
+		}
+		// Killing mode. A may-merge reaches this stack only as a
+		// representative met while a cycle was open; its node is no killing
+		// definition, so only the value on its entry is read.
+		ops := r.operands(^e)
+		if r.phiSite.s[^e] >= r.n {
+			ops = ops[1:]
+		}
+		for _, o := range ops {
+			top = r.reach(u, o, stamp, true, top)
 		}
 	}
 }
 
-// reach pairs a definition value with u, once per stamp, and reports a φ not
-// yet expanded for this stamp.
-func (r *resolver) reach(u, val, stamp int32) (phi int32, ok bool) {
+// reach pairs val with u when it is a definition, or queues the φ it stands
+// for in the given mode, once per stamp, and returns the new stack height. In
+// killing mode a φ is first replaced by its representative, and only a join
+// that is its own representative is expanded.
+func (r *resolver) reach(u, val, stamp int32, killing bool, top int) int {
 	val = r.find(val)
-	switch {
-	case val == undefined:
-	case val < r.n:
-		if r.defStamp[val] != stamp {
-			r.defStamp[val] = stamp
-			r.pairs.push(r.a, pack(val, u))
-		}
-	case r.phiStamp[val-r.n] != stamp:
-		r.phiStamp[val-r.n] = stamp
-		return val - r.n, true
+	if val == undefined {
+		return top
 	}
-	return 0, false
+	if val < r.n {
+		return r.pair(u, val, stamp, top)
+	}
+	if killing {
+		val = r.represent(val)
+		if val == undefined {
+			return top
+		}
+		if val < r.n {
+			return r.pair(u, val, stamp, top)
+		}
+		k := val - r.n
+		if r.killStamp[k] == stamp {
+			return top
+		}
+		r.killStamp[k] = stamp
+		r.stack[top] = ^k
+		return top + 1
+	}
+	k := val - r.n
+	if r.phiStamp[k] == stamp {
+		return top
+	}
+	r.phiStamp[k] = stamp
+	r.stack[top] = k
+	return top + 1
+}
+
+// pair emits (d, u) once per stamp.
+func (r *resolver) pair(u, d, stamp int32, top int) int {
+	if r.defStamp[d] != stamp {
+		r.defStamp[d] = stamp
+		r.pairs.push(r.a, pack(d, u))
+	}
+	return top
+}
+
+// represent is the killing representative of val: val itself for undefined
+// or a node; for φ k, the representative of its killing definitions, which
+// is undefined, a node, or a join that stands for itself. It is computed on
+// first need by an iterative depth-first pass and memoized.
+func (r *resolver) represent(val int32) int32 {
+	val = r.find(val)
+	if val < r.n {
+		return val
+	}
+	k := val - r.n
+	if m := r.rep[k]; m > repActive {
+		return m - repBias
+	}
+	top := r.open(k, 0)
+	for top > 0 {
+		f := r.dfs[top-4 : top]
+		ops := r.operands(f[0])
+		if f[1] < int32(len(ops)) {
+			o := r.find(ops[f[1]])
+			if o >= r.n {
+				if j := o - r.n; r.rep[j] == 0 {
+					top = r.open(j, top)
+					continue
+				}
+			}
+			f[1]++
+			r.share(f, r.standing(o))
+			continue
+		}
+		// Every operand read: the shared representative, the φ itself when
+		// they differ, undefined when none but the φ itself was met.
+		res := f[2]
+		switch {
+		case f[3] == 2:
+			res = undefined
+		case f[3] == 1:
+			res = r.n + f[0]
+		}
+		r.rep[f[0]] = res + repBias
+		top -= 4
+	}
+	return r.rep[k] - repBias
+}
+
+// open pushes φ k onto the depth-first stack at height top, marked active,
+// and returns the new height. A may-merge's first operand, its own node, is
+// no killing definition, so its reading starts at the second.
+func (r *resolver) open(k int32, top int) int {
+	r.rep[k] = repActive
+	first := int32(0)
+	if r.phiSite.s[k] >= r.n {
+		first = 1
+	}
+	r.dfs[top], r.dfs[top+1], r.dfs[top+2], r.dfs[top+3] = k, first, 0, 2
+	return top + 4
+}
+
+// standing is what operand value o contributes to a representative: o
+// itself for undefined or a node, a finished φ's representative, and an
+// active φ itself.
+func (r *resolver) standing(o int32) int32 {
+	if o < r.n {
+		return o
+	}
+	if m := r.rep[o-r.n]; m > repActive {
+		return m - repBias
+	}
+	return o
+}
+
+// share folds value v into frame f's shared representative, skipping the
+// frame's own φ.
+func (r *resolver) share(f []int32, v int32) {
+	if v == r.n+f[0] {
+		return
+	}
+	switch f[3] {
+	case 2:
+		f[2], f[3] = v, 0
+	case 0:
+		if f[2] != v {
+			f[3] = 1
+		}
+	}
 }
 
 // memo is an open-addressing table from (site, variable) to an int32 value,

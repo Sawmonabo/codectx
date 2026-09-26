@@ -27,10 +27,13 @@
 //	          formulation; each pair is (controller, dependent)
 //	CFG → def-use
 //	          DefUse builds sparse SSA over the complete, sealed graph,
-//	          memoized per basic block, with a non-killing may-definition as a
-//	          two-operand merge and a Handler taking each predecessor's entry
-//	          values; it resolves every φ transitively, so each pair is
-//	          (defining node, using node); no dominance input
+//	          memoized per basic block, with a may-definition as a χ (a
+//	          two-operand merge of the node and the prior version, whose node
+//	          also uses that prior version) and a Handler taking each
+//	          predecessor's entry values; it resolves every φ to the killing
+//	          definitions and the nearest may-definitions behind each use, so
+//	          each pair is (defining node, using node) and a chain of
+//	          may-writes costs linear work; no dominance input
 //
 // Dominators (the forward relation rooted at Entry) is not an input of either
 // result; it is exposed so the benchmarks measure the routine on the forward

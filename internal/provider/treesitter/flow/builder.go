@@ -99,18 +99,22 @@ import (
 //
 // # May-definitions
 //
-// Def is a killing definition: a use it reaches sees it alone. MayDef is a
-// non-killing one: a use it reaches sees it and every definition reaching
-// the may-defining node.
-// The lowerings use MayDef for writes they cannot place exactly. A
-// closure's write to an enclosing variable is a non-killing may-definition of
-// that variable at the node that creates the closure, in every lowering. A
-// write through a field, index or pointer is a non-killing may-definition of
-// its base variable (p in `*p = 2`), never of the local a pointer refers to,
-// which is unknown without points-to analysis. Taking a local's address, or
-// borrowing it mutably, is a non-killing may-definition of that local at the
-// node that evaluates it; the lowerings state the one rule and what it gives
-// up.
+// Def is a killing definition: it ends every path it lies on, and a node may
+// make several, one per variable. MayDef is a χ: the node reads the
+// variable's prior version and defines the next one, which may still hold
+// the old value. A use pairs with every killing definition reaching it
+// through any number of may-definitions and with the nearest may-definition
+// on each path, and the may-defining node pairs with what reaches it by the
+// same rule (see DefUse). The lowerings use MayDef only for writes that may
+// leave the old value in place. A closure's write to an enclosing variable
+// is a may-definition of that variable at the node that creates the
+// closure, in every lowering. A write through a field, index or pointer is a
+// may-definition of its base variable (p in `*p = 2`), never of the local a
+// pointer refers to, which is unknown without points-to analysis. Taking a
+// local's address, or borrowing it mutably, is a may-definition of that
+// local at the node that evaluates it; the lowerings state the one rule and
+// what it gives up. A value a node yields beside a local it assigns is a
+// second killing definition, never a may-definition.
 //
 // # Go defer
 //
@@ -395,8 +399,9 @@ func (b *Builder) Use(n, v int32) {
 }
 
 // MayDef records that node n may define variable v WITHOUT killing the
-// definitions that reach it: a use after n sees n and every definition of v
-// reaching n's entry. A node may carry several; a repeat is recorded once.
+// definitions that reach it: a χ, which reads v's prior version at n and
+// defines the next, so a later use sees n and the killing definitions behind
+// it (see DefUse). A node may carry several; a repeat is recorded once.
 // A MayDef of a variable n Defs is redundant and dropped at Finish, since
 // the killing Def wins. n's uses are still read before any of its
 // definitions. See the May-definitions section for what the lowerings
