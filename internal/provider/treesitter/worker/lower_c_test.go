@@ -313,5 +313,48 @@ func TestCLoweringGolden(t *testing.T) {
 			du: []string{"x@10 -> asm goto(\"\" : : \"r\"(x) : : L)@15", "x@10 -> return x;@56",
 				"x = 1@46 -> return x;@56"},
 		},
+		{
+			// GNU C extension, Statements and Declarations in Expressions: the
+			// last thing in the compound statement is an expression followed
+			// by a semicolon, whose value is the value of the construct; the
+			// statements before it are evaluated for their effect. Nodes:
+			// y@10, z@17, g(y)@33 (Uses y), y = z@39 (Uses z, defines y and
+			// may-defines the statement expression's result), x = ({ g(y);
+			// y = z; })@26 (Uses the result, defines x), return x;@50. Succ:
+			// a straight line to EXIT.
+			name:     "a statement expression's value comes from its last statement's node",
+			protects: "the node consuming a statement expression reaches its value through the last statement's node, and reads nothing an earlier statement read",
+			mutation: "let the declarator re-read the statement expression's names (adds y@10 -> x = ({ g(y); y = z; })@26 and z@17 -> x = ({ g(y); y = z; })@26), or lower the last statement for its effect only (loses y = z@39 -> x = ({ g(y); y = z; })@26)",
+			src:      "int f(int y, int z) { int x = ({ g(y); y = z; }); return x; }",
+			du: []string{"y@10 -> g(y)@33", "z@17 -> y = z@39", "y = z@39 -> x = ({ g(y); y = z; })@26",
+				"x = ({ g(y); y = z; })@26 -> return x;@50"},
+		},
+		{
+			// C17 §6.5.16p3: an assignment expression has the value of the
+			// left operand after the assignment. Nodes: s@15, a@22, s.f =
+			// a@36 (Uses a and s, may-defines s, defines the owned result),
+			// return g(s.f = a);@27 (Uses the result). Succ: a straight line
+			// to EXIT.
+			name:     "an embedded assignment to a field hands its value on through a result",
+			protects: "an assignment to a field inside a larger expression is a node of its own whose value reaches the consumer, which does not re-read its operands",
+			mutation: "fold a field-target assignment into its consumer (s.f = a@36 vanishes, and a@22 and s@15 pair with return g(s.f = a);@27 instead)",
+			src:      "int f(struct S s, int a) { return g(s.f = a); }",
+			du:       []string{"a@22 -> s.f = a@36", "s@15 -> s.f = a@36", "s.f = a@36 -> return g(s.f = a);@27"},
+		},
+		{
+			// C17 §6.8.4.2p3 (a case label's constant expression) and
+			// §6.5.1p5 (a parenthesized expression has the value of the
+			// expression it encloses). Nodes: x@10, x@23 (the controlling
+			// expression, evaluated once, defining the owned switch value),
+			// 1@34 (the test, spanning the value without its parentheses and
+			// Using the switch value), return 1;@38, return 0;@50. Succ:
+			// x@23→1→{return 1, return 0}. IPDom: 1 → EXIT.
+			name:     "a case label's value is spanned without its parentheses",
+			protects: "a parenthesized case value renders as its expression and its test Uses the switch value evaluated once at the controlling expression's node",
+			mutation: "span a case label's value with its parentheses (1@34 renders as (1)@33), or let the test re-read the controlling expression's names (x@23 -> 1@34 becomes x@10 -> 1@34)",
+			src:      "int f(int x) { switch (x) { case (1): return 1; } return 0; }",
+			cd:       []string{"1@34 -> return 1;@38", "1@34 -> return 0;@50"},
+			du:       []string{"x@10 -> x@23", "x@23 -> 1@34"},
+		},
 	})
 }

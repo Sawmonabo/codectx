@@ -181,5 +181,19 @@ func TestCppLoweringGolden(t *testing.T) {
 				"h()@43 -> k()@64"},
 			du: []string{"x@24 -> a(g(x))@33"},
 		},
+		{
+			// [dcl.struct.bind]/1: a structured binding declaration introduces
+			// one object, initialized once from the initializer, and each
+			// name refers to an element of it. Nodes: p@8, p@27 (the
+			// initializer, evaluated once, defining an owned variable), a@19,
+			// b@22 (each defining its name and Using that variable), return
+			// a + b;@30. Succ: a straight line to EXIT.
+			name:     "a structured binding evaluates its initializer once",
+			protects: "each name a structured binding declares reaches the initializer through the one node that evaluates it, never by re-reading the initializer's names",
+			mutation: "let each bound name re-read the initializer's names (p@27 vanishes, and p@8 pairs with a@19 and b@22 directly)",
+			src:      "int f(P p) { auto [a, b] = p; return a + b; }",
+			du: []string{"p@8 -> p@27", "p@27 -> a@19", "p@27 -> b@22", "a@19 -> return a + b;@30",
+				"b@22 -> return a + b;@30"},
+		},
 	})
 }
