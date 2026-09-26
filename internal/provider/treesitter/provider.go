@@ -15,15 +15,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Sawmonabo/codectx/internal/config"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -43,16 +43,20 @@ var fingerprint = lang.Fingerprint()
 
 // WorkerCommand is how a parser worker is started: the absolute path of the
 // executable and its literal arguments. In production it is this binary with
-// the hidden wire.Subcommand argument (ruling R8-1); tests point it at their
+// the hidden wire.Subcommand argument; tests point it at their
 // own test binary, whose TestMain dispatches to worker.Main.
 type WorkerCommand struct {
 	Path string
 	Args []string
 }
 
-// Options configure the provider. Zero values take the defaults below, which
-// match config's: 5 MiB per file, a 60-second parse timeout. The worker count
-// is not among them -- it comes from the machine and is required.
+// Options configure the provider. Nothing here has a default of its own: the
+// three config.Limit fields are unlimited at zero, as config's defaults are;
+// MaxEvidencePerFact selects the model's ceiling at zero; and the worker
+// count, the per-worker reservation, the ledger, the runner, the worker and
+// its directory come from the composition root and are required. There is no
+// parse timeout -- a worker is ended only by a progress-based hang detector
+// (see pool.go).
 type Options struct {
 	// Languages restricts the supported set (config tree_sitter.languages);
 	// empty means every pinned language.
@@ -61,7 +65,7 @@ type Options struct {
 	// alive at once.
 	MaxWorkers int
 	// MaxParseFileBytes is workspace.max_parse_file_bytes; a larger file is
-	// reported unavailable, never streamed.
+	// reported unavailable, never streamed. Zero is unlimited.
 	MaxParseFileBytes config.Limit
 	// MaxCalleeReferences is tree_sitter.max_callee_references: how many
 	// distinct cross-file callee names one file may mint nodes for. Unlimited
@@ -79,23 +83,23 @@ type Options struct {
 	// none. Zero selects the ceiling. Occurrences past it are counted and
 	// disclosed, never dropped in silence.
 	MaxEvidencePerFact int
-	// ParseTimeout bounds one parse; a worker past it is killed and the unit
-	// is CTX_PROVIDER_TIMEOUT.
-	ParseTimeout time.Duration
-	// WorkerMemoryBytes is the memory reservation each worker is admitted
-	// against in the runner.
+	// WorkerMemoryBytes is the memory each worker reserves on Admission, and
+	// the reservation the runner accounts it under. It is one figure for every
+	// worker and every file; it is required and positive.
 	WorkerMemoryBytes int64
+	// Admission is the process's one reservation ledger. Each worker reserves
+	// WorkerMemoryBytes on it before it is started and gives the reservation
+	// back once the runner has reaped it, so parser workers are admitted
+	// against the same allocation, in the same queue, as every other heavy
+	// child. It is required: a pool with a running total of its own beside
+	// the ledger is the oversubscription the ledger exists to prevent.
+	Admission *admission.Ledger
 	// Worker is the worker executable; Runner starts it; WorkDir is the
 	// absolute private directory it runs in.
 	Worker  WorkerCommand
 	Runner  *process.Runner
 	WorkDir string
 }
-
-const (
-	defaultParseTimeout = 60 * time.Second
-	defaultWorkerMemory = 256 << 20
-)
 
 // Provider is the treesitter provider. It is safe for concurrent use; Close
 // stops every worker.
@@ -147,9 +151,9 @@ func (p *Provider) leaveStage(ctx context.Context) {
 // first unit.
 func New(o Options) (*Provider, error) {
 	// A worker count is the caller's one-per-core figure (config.ParserWorkers)
-	// and is never defaulted here: the substitute this replaces restated a
-	// count nothing measured, and a provider composed with no workers would
-	// otherwise start and parse nothing.
+	// and is never defaulted here: a count restated in this package would be
+	// one nothing measured, and a provider composed with no workers would
+	// start and parse nothing.
 	if o.MaxWorkers <= 0 {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
 	}
@@ -160,11 +164,11 @@ func New(o Options) (*Provider, error) {
 	if o.MaxParseFileBytes.Exceeded(wire.MaxSourceBytes) {
 		return nil, invalidOption(fmt.Sprintf("max parse file bytes %d exceed the worker's %d-byte source ceiling", o.MaxParseFileBytes, wire.MaxSourceBytes))
 	}
-	if o.ParseTimeout <= 0 {
-		o.ParseTimeout = defaultParseTimeout
-	}
 	if o.WorkerMemoryBytes <= 0 {
-		o.WorkerMemoryBytes = defaultWorkerMemory
+		return nil, invalidOption(fmt.Sprintf("the parser provider was given a %d-byte worker reservation; it needs a positive one", o.WorkerMemoryBytes))
+	}
+	if o.Admission == nil {
+		return nil, invalidOption("the treesitter provider needs the process reservation ledger its workers are admitted against")
 	}
 	if o.Runner == nil {
 		return nil, invalidOption("the treesitter provider needs the shared process runner")
@@ -189,7 +193,7 @@ func New(o Options) (*Provider, error) {
 		langs[l.Name] = l
 	}
 	return &Provider{opts: o, languages: langs,
-		pool: newPool(o.Runner, o.Worker, o.WorkDir, o.MaxWorkers, o.ParseTimeout, o.WorkerMemoryBytes)}, nil
+		pool: newPool(o.Runner, o.Admission, o.Worker, o.WorkDir, o.MaxWorkers, o.WorkerMemoryBytes)}, nil
 }
 
 func invalidOption(msg string) *model.Error {

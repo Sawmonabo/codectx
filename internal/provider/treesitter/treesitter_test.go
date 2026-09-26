@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -22,7 +22,7 @@ import (
 )
 
 // TestMain makes this test binary its own parser worker, the way the codectx
-// binary is in production (ruling R8-1): invoked with wire.Subcommand as its
+// binary is in production: invoked with wire.Subcommand as its
 // first argument it runs worker.Main instead of the tests.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
@@ -66,7 +66,7 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -75,6 +75,17 @@ func newProvider(t *testing.T) *treesitter.Provider {
 	}
 	t.Cleanup(p.Close)
 	return p
+}
+
+// newLedger is the reservation ledger a test provider's workers are admitted
+// on: wide enough that admission never queues a test's handful of workers.
+func newLedger(t *testing.T) *admission.Ledger {
+	t.Helper()
+	l, err := admission.NewLedger(4<<30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
 }
 
 // TestLanguageFixtures runs the shared conformance check over every pinned
@@ -358,7 +369,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // set that nothing empties until Close, both leave every product test passing
 // and a resting machine carrying the whole ceiling.
 //
-// Mutation: put the timer back -- keep `w.timer = time.AfterFunc(idleTTL, ...)`
+// Mutation: add an idle timer -- `w.timer = time.AfterFunc(idleTTL, ...)`
 // in release and drop the drain from leaveStage -> "the parse stage ended with
 // 2 worker process(es) still alive".
 func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
@@ -374,7 +385,7 @@ func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -554,7 +565,7 @@ func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 1, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
