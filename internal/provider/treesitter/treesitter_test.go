@@ -315,7 +315,23 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 		t.Fatalf("%s call-site aliases are not reproducible:\n first %v\nsecond %v", file, keys, keys2)
 	}
 
-	if file != "sample.go" {
+	switch file {
+	case "sample.js":
+		// `ns` is bound by a namespace import, so `ns.start()` is a call
+		// through that import, although the file declares a method start. A
+		// clause walk that binds nothing resolves it to that method instead.
+		wantCallee(t, meta, file, "start", "import")
+		return
+	case "sample.rs":
+		// `use std::io::{self, Write}` binds io, not "self": `io::stdout()`
+		// is a call through the import, and `self.width()` is the file's own
+		// method, resolved to it with no callee placeholder at all. Binding
+		// "self" makes the second a call through an import and drops it.
+		wantCallee(t, meta, file, "stdout", "import")
+		wantCallee(t, meta, file, "width", "")
+		return
+	case "sample.go":
+	default:
 		return
 	}
 	// The Go fixture calls the builtin len and the non-ASCII 日本語; the first
@@ -338,6 +354,25 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	}
 	if !seen[prefix+callsiteOf(t, src, "日本語")] {
 		t.Fatal("the non-ASCII call site published no alias at its byte range")
+	}
+}
+
+// wantCallee asserts the resolution of the callee placeholder a file's call
+// to callee published: resolution "" asserts there is none, because the call
+// resolved to a declaration of the file itself.
+func wantCallee(t *testing.T, meta map[model.NodeID]string, file, callee, resolution string) {
+	t.Helper()
+	var got []string
+	for _, m := range meta {
+		if strings.Contains(m, `"callee":"`+callee+`"`) {
+			got = append(got, m)
+		}
+	}
+	switch {
+	case resolution == "" && len(got) > 0:
+		t.Fatalf("%s: the call to %s published callee placeholders %v; it names the file's own declaration", file, callee, got)
+	case resolution != "" && (len(got) != 1 || !strings.Contains(got[0], `"resolution":"`+resolution+`"`)):
+		t.Fatalf("%s: the call to %s published callee placeholders %v, want one with resolution %s", file, callee, got, resolution)
 	}
 }
 

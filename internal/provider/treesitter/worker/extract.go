@@ -73,6 +73,7 @@ type refRec struct {
 type extraction struct {
 	g            *grammar
 	f            *fieldIDs // g's field table
+	k            *kindIDs  // g's kind table
 	l            lang.Language
 	path         string
 	src          []byte
@@ -102,6 +103,7 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	e.exportRanges = map[span]bool{}
 	e.exportNames = map[string]bool{}
 	e.f = e.g.fieldIDs()
+	e.k = e.g.kindIDs()
 	names := q.CaptureNames()
 
 	cursor := ts.NewQueryCursor()
@@ -191,30 +193,44 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 // variable declaration binds to a function literal: the i-th name is paired
 // with the i-th value, so `x, f := 1, func() {}` declares f alone, and the
 // literal's body ends its signature. The query captures both lists once per
-// statement and they are walked with one tree cursor, linear in their length.
+// statement, and only a statement whose values hold a function literal; the
+// two lists are walked in step with one tree cursor each, comparing kind ids,
+// so the walk is linear in their length and allocates no list.
 func (e *extraction) addBoundFunctions(kind string, node, names, values ts.Node) {
-	cur := names.Walk()
-	defer cur.Close()
-	left := withoutComments(names.NamedChildren(cur))
-	right := withoutComments(values.NamedChildren(cur))
-	for i := range min(len(left), len(right)) {
-		if left[i].Kind() != "identifier" || right[i].Kind() != "func_literal" {
+	left, right := names.Walk(), values.Walk()
+	defer left.Close()
+	defer right.Close()
+	for l, r := nextEntry(left, true), nextEntry(right, true); l && r; l, r = nextEntry(left, false), nextEntry(right, false) {
+		n, v := left.Node(), right.Node()
+		if n.KindId() != e.k.identifier || v.KindId() != e.k.funcLiteral {
 			continue
 		}
-		body := right[i].ChildByFieldId(e.f.body)
+		body := v.ChildByFieldId(e.f.body)
 		if body == nil {
 			continue
 		}
-		n := left[i]
 		e.putDecl(&decl{node: node, kind: kind, parentIdx: -1, ex: e, body: body,
 			name: n.Utf8Text(e.src), nameStart: n.StartByte(), nameEnd: n.EndByte()})
 	}
 }
 
-// withoutComments drops the comment nodes a list's named children carry
-// between its entries, so an entry's index is its position in the list.
-func withoutComments(nodes []ts.Node) []ts.Node {
-	return slices.DeleteFunc(nodes, func(n ts.Node) bool { return n.Kind() == "comment" })
+// nextEntry moves cur to the next entry of the list it walks, or to the
+// first when first is set, and reports whether there is one. Punctuation and
+// extras (a comment between entries) are not entries, so an entry's position
+// is its index in the list.
+func nextEntry(cur *ts.TreeCursor, first bool) bool {
+	var ok bool
+	if first {
+		ok = cur.GotoFirstChild()
+	} else {
+		ok = cur.GotoNextSibling()
+	}
+	for ; ok; ok = cur.GotoNextSibling() {
+		if n := cur.Node(); n.IsNamed() && !n.IsExtra() {
+			return true
+		}
+	}
+	return false
 }
 
 // putDecl records d under its declaration range and name position. Two
@@ -530,7 +546,7 @@ func (e *extraction) doc(d *decl) (uint, uint, bool) {
 			return s, en, true
 		}
 		p := anchor.Parent()
-		if p == nil || !e.g.wrappers[p.Kind()] {
+		if p == nil || !e.k.wrappers.has(p) {
 			return 0, 0, false
 		}
 		anchor = p
@@ -543,7 +559,7 @@ func (e *extraction) precedingComments(n *ts.Node) (uint, uint, bool) {
 	var start, end uint
 	found := false
 	next := n
-	for p := n.PrevNamedSibling(); p != nil && e.g.comments[p.Kind()]; p = p.PrevNamedSibling() {
+	for p := n.PrevNamedSibling(); p != nil && e.k.comments.has(p); p = p.PrevNamedSibling() {
 		if p.EndPosition().Row+1 < next.StartPosition().Row {
 			break
 		}

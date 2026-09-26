@@ -82,25 +82,11 @@ func TestHangDetectorEndsOnlyAWorkerThatNeitherComputesNorAnswers(t *testing.T) 
 	}
 }
 
-// TestAWorkerHandedBackReachesTheAcquirerQueuedOnTheLedger runs real parser
-// workers on a ledger whose allocation holds exactly one of them, with three
-// acquirers: the first holds the only room, the second queues on the ledger
-// for a worker of its own, and the third arrives once the first has handed
-// its worker back.
-//
-// Failure mode: the parser pool deadlocks on the ledger. A worker handed back
-// while an acquirer is queued goes idle, holding the room that acquirer waits
-// for; nothing pumps the ledger, a later caller takes the idle worker around
-// the queue, and the queued acquirer -- its unit, and the stage it keeps from
-// draining -- never returns. Every wait below is on a result, never on a
-// clock: the deadlock is caught by the test binary's own timeout.
-//
-// Mutation: drop `|| p.reserving > 0` from release, returning the worker to
-// idle while an acquirer is queued -> the second acquirer is never admitted
-// and the test hangs; restore that and pump the ledger through a make-room
-// step that stops idle workers -> in the interleavings where it does not
-// hang, the third acquirer takes the idle worker ahead of the second.
-func TestAWorkerHandedBackReachesTheAcquirerQueuedOnTheLedger(t *testing.T) {
+// newOneWorkerPool is a pool of real parser workers over a ledger whose
+// allocation holds exactly one of them, so the second worker anyone asks for
+// queues on the ledger.
+func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, int64) {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -118,55 +104,157 @@ func TestAWorkerHandedBackReachesTheAcquirerQueuedOnTheLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := newPool(runner, room, WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, t.TempDir(), 2, memory)
-	defer p.close()
-	ctx := context.Background()
+	t.Cleanup(p.close)
+	return p, room, memory
+}
 
-	first, err := p.acquire(ctx)
-	if err != nil {
-		t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
-	}
-	type handout struct {
-		w   *worker
-		err error
-	}
-	second := make(chan handout, 1)
-	go func() {
-		w, err := p.acquire(ctx)
-		second <- handout{w, err}
-	}()
-	// The second acquirer is under the pool's bound and finds nothing idle, so
-	// it reserves; the first worker is handed back only once it is doing so.
+// awaitHead returns once an acquirer of p has been told by the ledger that it
+// is the queue's head and does not fit -- the ledger's own queue state, not
+// the pool's count of callers about to reserve.
+func awaitHead(p *pool) {
 	for {
 		p.mu.Lock()
-		queued := p.reserving == 1
+		head := false
+		for _, a := range p.queued {
+			head = head || a.head && a.handed == nil
+		}
 		p.mu.Unlock()
-		if queued {
-			break
+		if head {
+			return
 		}
 		runtime.Gosched()
 	}
-	p.release(first, true)
-	third := make(chan handout, 1)
-	go func() {
-		w, err := p.acquire(ctx)
-		third <- handout{w, err}
-	}()
+}
 
-	got := <-second
-	if got.err != nil {
-		t.Fatalf("the acquirer queued on the ledger was refused: %v", got.err)
+// awaitQueued returns once n acquirers of p are queued for a worker, so a
+// worker handed back after it sees them rather than going idle.
+func awaitQueued(p *pool, n int) {
+	for {
+		p.mu.Lock()
+		queued := len(p.queued) == n
+		p.mu.Unlock()
+		if queued {
+			return
+		}
+		runtime.Gosched()
 	}
-	// The second worker holds the ledger's only room and nothing is idle, so
-	// the third acquirer cannot have been handed anything yet.
-	select {
-	case late := <-third:
-		t.Fatalf("the third acquirer was handed a worker (error: %v) while the second held the only room", late.err)
-	default:
-	}
-	p.release(got.w, true)
-	late := <-third
-	if late.err != nil {
-		t.Fatalf("the third acquirer was refused: %v", late.err)
-	}
-	p.release(late.w, true)
+}
+
+type handout struct {
+	w   *worker
+	err error
+}
+
+func acquireAsync(p *pool) <-chan handout {
+	ch := make(chan handout, 1)
+	go func() {
+		w, err := p.acquire(context.Background())
+		ch <- handout{w, err}
+	}()
+	return ch
+}
+
+// TestAWorkerHandedBackGoesToTheLedgerHead runs real parser workers on a
+// ledger whose allocation holds exactly one of them.
+//
+// "pool head": the first acquirer holds the only room and the second is the
+// ledger's head. The first worker handed back must reach the second as it is,
+// reservation and process together, and the third acquirer, queued once the
+// second holds that room, must wait until it is handed back again.
+//
+// "foreign head": another reserver is the ledger's head and a pool acquirer is
+// queued behind it. The worker handed back must be stopped so its room reaches
+// that head first; the pool acquirer is admitted only after the head gives the
+// room back, with a worker of its own.
+//
+// Failure modes: an allocation that fits fewer workers than acquirers makes
+// every parse an exec, a hello, a parse and an exit when a worker handed back
+// is always stopped; a worker kept idle while an acquirer is queued holds the
+// room it waits for, nothing pumps the ledger and the acquirer never returns;
+// a worker handed to a pool acquirer queued behind another head takes room
+// around that head and breaks the ledger's first-in-first-out order. Every
+// wait below is on a result or on the ledger's own head signal, never on a
+// clock: a deadlock is caught by the test binary's own timeout.
+//
+// Mutations: stop the worker in release instead of handing it to the head ->
+// "pool head" sees a second worker started. Idle it while an acquirer is
+// queued -> "pool head" hangs. Hand it to any queued acquirer, head or not ->
+// "foreign head" sees the pool acquirer return before the foreign reserver is
+// granted.
+func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
+	t.Run("pool head", func(t *testing.T) {
+		p, _, _ := newOneWorkerPool(t)
+		first, err := p.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
+		}
+		second := acquireAsync(p)
+		awaitHead(p)
+		p.release(first, true)
+		got := <-second
+		if got.err != nil {
+			t.Fatalf("the acquirer at the ledger head was refused: %v", got.err)
+		}
+		if got.w != first || p.stats().WorkersStarted != 1 {
+			t.Fatalf("the head was given a new worker (%d started) instead of the one handed back", p.stats().WorkersStarted)
+		}
+		third := acquireAsync(p)
+		awaitHead(p)
+		select {
+		case late := <-third:
+			t.Fatalf("the third acquirer was handed a worker (error: %v) while the second held the only room", late.err)
+		default:
+		}
+		p.release(got.w, true)
+		late := <-third
+		if late.err != nil {
+			t.Fatalf("the third acquirer was refused: %v", late.err)
+		}
+		if late.w != first || p.stats().WorkersStarted != 1 {
+			t.Fatalf("the third acquirer was given a new worker (%d started) instead of the one handed back", p.stats().WorkersStarted)
+		}
+		p.release(late.w, true)
+	})
+
+	t.Run("foreign head", func(t *testing.T) {
+		p, room, memory := newOneWorkerPool(t)
+		first, err := p.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
+		}
+		stuck := make(chan struct{}, 1)
+		foreign := make(chan func(), 1)
+		go func() {
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, func() {
+				select {
+				case stuck <- struct{}{}:
+				default:
+				}
+			})
+			if err != nil {
+				t.Errorf("the foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			foreign <- release
+		}()
+		<-stuck // the foreign reserver is the ledger's head and does not fit
+		second := acquireAsync(p)
+		awaitQueued(p, 1)
+		p.release(first, true)
+		var release func()
+		select {
+		case got := <-second:
+			t.Fatalf("the pool acquirer queued behind a foreign head was handed a worker (error: %v) before that head", got.err)
+		case release = <-foreign:
+		}
+		release()
+		got := <-second
+		if got.err != nil {
+			t.Fatalf("the pool acquirer was refused after the foreign head released: %v", got.err)
+		}
+		if got.w == first || p.stats().WorkersStarted != 2 {
+			t.Fatalf("the pool acquirer was given the worker the foreign head's room was taken from (%d started)", p.stats().WorkersStarted)
+		}
+		p.release(got.w, true)
+	})
 }

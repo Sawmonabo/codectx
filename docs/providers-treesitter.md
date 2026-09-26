@@ -248,14 +248,31 @@ MemoryReservationBytes  Options.WorkerMemoryBytes (the composition passes 256 Mi
 Before it is started, each worker reserves `Options.WorkerMemoryBytes` on the
 process's one admission ledger (`Options.Admission`), so parser workers wait in
 the same queue, against the same allocation, as every other heavy child; the
-reservation is given back once the runner has reaped the worker. The ledger's
-queue is the one order every handout follows: while an acquirer of the pool is
-queued on it, a worker coming back from a parse is stopped rather than kept
-idle, so its reservation returns to the ledger, the ledger pumps, and the
-queue's head is admitted in order. No later caller takes that worker around
-the queued acquirer, and an allocation that holds one worker (an observed zero
-included) runs the workers one at a time instead of stranding the acquirer
-behind an idle worker nothing ever releases.
+reservation is given back once the runner has reaped the worker. Every
+admission is first-in-first-out on the ledger, and a worker coming back from a
+parse while an acquirer of the pool is queued there follows that order:
+
+- When the pool's acquirer is the ledger's head (the ledger tells it so
+  through the make-room step, once it is the head and does not fit), the
+  worker is handed to it together with the reservation it holds. That is the
+  grant the ledger would make, without stopping a process to start the same
+  one again, so an allocation that fits fewer workers than acquirers (an
+  observed zero included) keeps its workers warm and runs them one handout at
+  a time.
+- When another reserver is the head, the worker is stopped: its reservation
+  returns to the ledger, the ledger pumps, and that head is admitted first.
+  The pool's acquirer behind it waits its turn.
+
+No idle worker is reused while an acquirer of the pool is queued, because no
+worker goes idle then. With none queued, a worker coming back goes idle and is
+held for the stage like any room an admitted child holds. The ledger does not
+tell a room holder that a reserver is waiting, so idle workers are reused
+around another reserver waiting on the ledger: the pool's callers take them
+for as long as there is one. That reserver is admitted only once the pool's
+callers outnumber its idle workers (one of them then queues behind it, and the
+next worker handed back is stopped) or once the stage's drain stops them all.
+Room is returned by its holder, never taken from it, and the order among the
+reservers queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
@@ -359,8 +376,9 @@ function of the file's bytes.
 - A healthy worker returns to the idle list, where the next parse of the
   stage reuses it; the drain that follows the last caller closes its stdin,
   the worker exits on EOF and the runner reaps it. An unhealthy worker is
-  stopped at release instead, and so is a healthy one while an acquirer of the
-  pool is queued on the admission ledger. A worker has no lifetime, no parse count, no
+  stopped at release instead. While an acquirer of the pool is queued on the
+  admission ledger, a healthy worker is handed to it when it is the ledger's
+  head and stopped when another reserver is (see Launch). A worker has no lifetime, no parse count, no
   per-parse deadline and no lifetime byte total: a long parse of a large file
   is not a hung one, and only progress can tell the two apart.
 - The hang detector runs while a request or the hello is outstanding. A
@@ -432,6 +450,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@def.<kind>` | a declaration of `<kind>` (function, method, class, interface, struct, enum, field, variable, constant, module, namespace, test); its `@name` (or `@declarator` for C) names it, `@body` marks where the signature ends |
 | `@scope` + `@scope.name` | a non-declaration container that contributes to qualified names and turns functions into methods (Rust `impl`) |
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
+| `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
 | `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
 | `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
 | `@ref.type` | a type reference |
