@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -82,8 +81,8 @@ type generation struct {
 	// indexing path's record of what did not seal, and a publication
 	// generation is seeded with the foreground generation's copy of it:
 	// those scopes are re-planned by the publication and still have nothing
-	// behind them, so losing them here republishes them as coverage -- which
-	// is how a provider whose every precise unit failed came back `fresh`.
+	// behind them, so losing them here would republish them as coverage and
+	// a provider whose every unit failed as `fresh`.
 	//
 	// It is an aggregate and not a per-unit map because it outlives the run:
 	// a repository can fail thousands of scopes, and what the report needs is
@@ -155,16 +154,18 @@ const maxFailedScopesNamed = 8
 // a capability's planned total is every scope the plan assigned to its
 // provider for this generation -- the units it runs, the stale predecessors it
 // carries and the sealed units it reuses -- and its failed total is those of
-// them that did not seal. Both are counted in exactly one place,
-// coveredProviders, and published in exactly one place, failureRow.publish, as
-// the units_planned and units_failed details of the capability row. The
-// completion block of `codectx index`, `codectx status` and the index-status
-// tool all render that row and none of them recounts, so one generation cannot
-// read differently on two of them.
+// them that did not seal. How a scope is counted is plan.Plan.CountReused's
+// rule, which the run row's planned total follows too; the per-provider
+// figures are counted in coveredProviders and published in exactly one place,
+// failureRow.publish, as the units_planned and units_failed details of the
+// capability row. The completion block of `codectx index`, `codectx status`
+// and the index-status tool all render that row and none of them recounts, so
+// one generation cannot read differently on two of them.
 //
-// Counting only the units the build walks is what published "2 planned, 2
-// failed" for a provider that sealed nine scopes and failed two: a row saying
-// every unit failed over a capability that answers most queries.
+// A total of the walked units alone would leave the reused scopes out, and a
+// provider that sealed nine scopes and failed two would read "2 planned, 2
+// failed": a row saying every unit failed over a capability that answers most
+// queries.
 type providerFailures struct {
 	units   int
 	planned int
@@ -329,8 +330,8 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
 	// Detection walks the workspace itself, so it is given the same Git
 	// exclusion the capture applies. The configured policy alone has no ignore
-	// hook at all, which had detection proposing scopes over every ignored
-	// tree in the checkout -- source the generation can never contain.
+	// hook at all, and detection would propose scopes over every ignored tree
+	// in the checkout -- source the generation can never contain.
 	policy, err := snapshot.TraversalPolicy(ctx, c.policy, c.opts.Root, c.opts.Git)
 	if err != nil {
 		return err
@@ -381,7 +382,10 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 				"component", component, "repository_id", string(c.repo))
 		}
 	}
-	g.planned = int64(len(p.Reuse) + len(p.Carry))
+	// The reused scopes are the planned scopes the build walk never yields;
+	// the walk counts every other one as it reaches it, and the end-of-run
+	// account the ones it never reached.
+	p.CountReused(func(string) { g.planned++ })
 	span.AddOut(g.planned)
 	for _, s := range p.States {
 		g.caps.add(s)
@@ -423,8 +427,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	g.c.collect(ctx)
 	// Deferred work is enqueued only after the base generation is published:
 	// Section 11.6 is explicit that nothing dependence-shaped runs before base
-	// readiness, and ruling Q9 makes the background tick run it even when no
-	// query ever asks.
+	// readiness, and the background tick runs it even when no query ever asks.
 	g.c.late.enqueue(g, deferred)
 	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
@@ -613,6 +616,16 @@ func absent(code string) bool {
 // background sealer instead of running it.
 const reasonDeferred = "the unit is deferred to background work after activation"
 
+// notAdmitted is how a unit that never reached its work ends: the diagnostic
+// code that kept it out and the ledger's own reason. It waited in-process
+// beside other goroutines, so its CPU is the overlapped kind the process-wide
+// counters cannot attribute, and the span says so rather than leaving the
+// columns null with no reason.
+func notAdmitted(code string) ledger.Measured {
+	return ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, DiagnosticCode: code,
+		Failure: ledger.ReasonNotAdmitted}
+}
+
 // int64Ptr is the address of a count a span reports at its end. Measured's
 // fields are pointers because an unavailable measurement is absent and never
 // zero; a count the caller has is always available.
@@ -647,7 +660,7 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 }
 
 // attachCarried carries the stale predecessor of every refreshing deferred
-// scope into this generation (Section 13.3, ruling Q4): the capability keeps
+// scope into this generation (Section 13.3): the capability keeps
 // answering as `stale` with its provenance distance while the fresh unit is
 // built in the background, and is replaced at the next activation.
 func (g *generation) attachCarried(ctx context.Context) (err error) {
@@ -725,7 +738,8 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			// Not this run's work: it is queued for the background sealer,
 			// which records it under its own run. Leaving the row planned
 			// would have this run report it as never admitted.
-			unitSpan.End(ledger.OutcomeSkipped, ledger.Measured{Failure: reasonDeferred}, nil)
+			unitSpan.End(ledger.OutcomeSkipped,
+				ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, Failure: reasonDeferred}, nil)
 			deferred = append(deferred, u)
 			return nil
 		}
@@ -794,8 +808,7 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 			return nil
 		}
 		span := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
-		span.End(ledger.OutcomeUnavailable, ledger.Measured{
-			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		span.End(ledger.OutcomeUnavailable, notAdmitted(model.CodeProviderUnavailable), nil)
 		g.mu.Lock()
 		g.planned++
 		g.mu.Unlock()
@@ -811,9 +824,8 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 }
 
 // unitGroup runs one provider's units with bounded concurrency as the plan
-// hands them over. It is the streaming shape of what was one []plan.Unit per
-// provider: the same worker bound, the same first-fatal-failure-cancels-the
-// -rest precedence, and a live set of at most workers units.
+// hands them over: a live set of at most workers units, and the first fatal
+// failure cancels the rest.
 type unitGroup struct {
 	g      *generation
 	ctx    context.Context
@@ -843,8 +855,7 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 		}
 		// The group stopped admitting before this unit had a worker, so it
 		// never reached its work and says exactly that.
-		span.End(ledger.OutcomeUnavailable, ledger.Measured{
-			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		span.End(ledger.OutcomeUnavailable, notAdmitted(model.CodeProviderUnavailable), nil)
 		return err
 	}
 	u.wg.Add(1)
@@ -886,8 +897,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
 			// a provider that was never asked.
-			span.End(ledger.OutcomeUnavailable, ledger.Measured{
-				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			span.End(ledger.OutcomeUnavailable, notAdmitted(provider.CodeOf(admitErr)), nil)
 			return admitErr
 		}
 		defer grant.release()
@@ -1129,7 +1139,7 @@ func subdivided(out delta.Result) bool {
 	return out.Full && out.FullReason == delta.FullSubdivided
 }
 
-// sourceBinding is how the unit is opened (residual 112): a provider that can
+// sourceBinding is how the unit is opened: a provider that can
 // prove its output is about the captured bytes answers for itself, and every
 // other provider reads only through the pinned view, which is verified by
 // construction.
@@ -1279,8 +1289,8 @@ func typedFailure(cause error) unitFailure {
 }
 
 // coverage publishes the fresh rows and the one degradation that is otherwise
-// invisible: a provider that is available and produced no unit at all
-// (residual 113). "Available, zero units" is not fresh coverage, and without a
+// invisible: a provider that is available and produced no unit at all.
+// "Available, zero units" is not fresh coverage, and without a
 // row for it status would report a capability nothing answers as healthy.
 func (g *generation) coverage(ctx context.Context) (err error) {
 	_, span := ledger.Start(ctx, stageCoverage, "")
@@ -1335,9 +1345,7 @@ type failedScope struct {
 // and, separately, the providers whose only work was deferred. A deferred unit
 // is not a member of this generation: it seals into a later publication, so
 // counting it as coverage would report a capability fresh while nothing had
-// been written for it, which is the false readiness Section 11.6 forbids. The
-// Reuse key is the provider id and the scope key joined by NUL, which is the
-// frozen shape of plan.Key.
+// been written for it, which is the false readiness Section 11.6 forbids.
 //
 // deferred is a COUNT per provider and not a flag: it is published on the
 // capability row, where it is the only way a process other than the one doing
@@ -1348,7 +1356,7 @@ type failedScope struct {
 // generation for every provider, so no in-process record of what one batch
 // sealed may be its authority.
 //
-// published is the narrower question the partial ruling needs: the providers a
+// published is the narrower question the partial state needs: the providers a
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
@@ -1412,20 +1420,14 @@ func (g *generation) coveredProviders(ctx context.Context) (covered map[string]b
 		out[c.ProviderID] = true
 		published[c.ProviderID] = true
 	}
-	for key := range g.plan.Reuse {
-		if id, _, ok := strings.Cut(key, "\x00"); ok {
-			out[id] = true
-			published[id] = true
-			// A reused scope is a scope the plan assigned this provider: it
-			// is sealed already, so the walk above never yields it, and
-			// leaving it out of the total is what let a provider that sealed
-			// nine scopes and failed two publish "2 planned, 2 failed". A
-			// carried scope needs no such addition -- the planner emits its
-			// unit as well as its carry row, so the walk has already counted
-			// it.
-			planned[id]++
-		}
-	}
+	// A reused scope is a scope the plan assigned this provider that the walk
+	// above never yields, because it is sealed already. A carried scope needs
+	// no such addition: its deferred unit is in the walk.
+	g.plan.CountReused(func(id string) {
+		out[id] = true
+		published[id] = true
+		planned[id]++
+	})
 	// The planned total is settled only here, once every source of a planned
 	// scope has been folded in.
 	for id, agg := range failed {
@@ -1485,10 +1487,6 @@ func (g *generation) capabilitiesOf(providerID string) []string {
 	return p.Descriptor().Capabilities
 }
 
-// inputsOf is the re-iterable input stream storage and the dependence applier
-// require: every walk yields the same inputs, in the ascending FileID order
-// the planner already sorted them into. The slice is the plan's own and is
-// never mutated here.
 // healthOf is Section 13.3's whole-generation health. An unavailable optional
 // capability leaves a base generation fresh; anything partial, stale or failed
 // makes it degraded. A generation with no coverage at all is not published:
