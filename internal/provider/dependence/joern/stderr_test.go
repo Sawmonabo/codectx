@@ -213,10 +213,11 @@ func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 // The paths are synthetic. A fixture built from this machine's own home
 // directory would put a host-local path in a tracked file.
 //
-// Mutation: in isPathByte, return true for '>' or '@' -> `2>/home/...` or
-// `@/home/...` survives whole; or drop the known-root match in reduce -> the
-// spaced home directory survives as `Doe/...`; or reduce a private path to its
-// base name -> `(private)/out/export.json` loses the step that wrote it.
+// Mutation: in isPathByte, return true for '>' or '@' ->
+// `2>/home/example-user/...` or `@/home/example-user/...` survives whole; or
+// drop the known-root match in reduce -> the spaced home directory survives as
+// `Doe/...`; or reduce a private path to its base name ->
+// `(private)/out/export.json` loses the step that wrote it.
 func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 	const home = "/home/example-user"
 	const repo = home + "/src/demo-repo"

@@ -17,7 +17,7 @@ import (
 // ever read a run this build did not write. JSON was the first codec for that
 // reason; it cost reflection, a field name on every value and a base64 hop for
 // nothing, and the encode/decode pair is the second-largest frame of
-// Service.rank on a wide query (QPERF-4 §5).
+// Service.rank on a wide query.
 //
 // The trade-off this accepts: a packed codec CAN drift from the struct, where
 // JSON could not. TestCandidateCodecRoundTrip is what pays for that -- it

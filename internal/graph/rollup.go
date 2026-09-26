@@ -282,8 +282,8 @@ func validatedPairPage(meta model.QueryMeta, items []model.PackageEdge) (model.P
 const packageDepsEndpoint = "graph.package_dependencies"
 
 // edgeSink accepts the edges a walk admits, ONE AT A TIME, in the shape
-// expand's visit callback delivers them. It is the seam ruling P2's completed
-// walk (lane P-b) hands its edges to: the walk streams, the sink folds each
+// expand's visit callback delivers them. It is the seam a completed walk hands
+// its edges to: the walk streams, the sink folds each
 // batch into the pair sort as it fills, and neither side ever holds the
 // admitted set. A walk that runs to exhaustion can therefore feed a rollup
 // whose peak heap is one batch of edges rather than one of every edge the

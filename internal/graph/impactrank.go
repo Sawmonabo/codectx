@@ -11,10 +11,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// The frozen record shapes, folds and comparators the global impact/deps rank
-// is built from (ruling P2/P4). Nothing here walks, sorts or serves: this file
-// is the contract the walk lane writes into and the rollup and paging lanes
-// read out of, so the two halves cannot disagree about what a record means.
+// The record shapes, folds and comparators the global impact/deps rank is
+// built from. Nothing here walks, sorts or serves: this file is the contract
+// the walk writes into and the rollup and paging read out of, so the two
+// halves cannot disagree about what a record means.
 //
 // The shape is the one internal/search already uses for its distinct set: two
 // passes over one pagination.ExternalSort. Pass 1 is keyed by IDENTITY (the
@@ -354,8 +354,6 @@ func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total 
 // across any number of emitting batches sums to the same counts a single-shot
 // rollup of the same edges would report, and pass 2 orders the distinct pairs
 // globally rather than one batch at a time.
-//
-// Owned by lane P-c.
 func (e *Engine) rankPairs(ctx context.Context,
 	emit func(add func(pairRecord) error) error,
 	stats *rankStats) (*pagination.SortedRun[pairRecord], error) {

@@ -39,7 +39,7 @@ import (
 //	  page can reach an edge at all, the answer TERMINATES -- truncated, with
 //	  reasonDeadlineStalled and no cursor -- instead of minting the cursor again.
 //
-// Mutations, run and pasted in the lane report:
+// Mutations that fail this test:
 //   - walkStalled's call site disabled in impact.go (`if false && walkStalled`),
 //     so a page that admitted nothing mints the continuation anyway: the
 //     no-progress case fails at `page 7: CTX_CURSOR_INVALID: continuation state

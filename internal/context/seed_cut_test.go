@@ -142,8 +142,7 @@ func TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary(t *testing.T) {
 }
 
 // TestChangedFileSeedsKeepReadingPastTheFirstPage is the OTHER half of the
-// bound removal, and the half an earlier review finding A5 records the test above
-// as unable to prove.
+// unbounded read: the half the test above cannot prove.
 //
 // The test above publishes exactly one captured change, so page 1 is full and
 // page 2 is empty: it proves that a full last page is not mistaken for a

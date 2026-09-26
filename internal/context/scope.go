@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L2. It holds
-// Section 15.2 required-scope expansion over graph.Engine.Impact, the boundary-to-relation allowlist and the ScopeComplete rules.
+// This file holds Section 15.2 required-scope expansion over graph.Engine.Impact, the boundary-to-relation allowlist and the ScopeComplete rules.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 package context
 
 import (
@@ -216,7 +215,7 @@ func degradedCapabilities(reported, disclosed []model.CapabilityState) []model.C
 }
 
 // ---------------------------------------------------------------------------
-// C-STREAM pass P-A: the streamed expansion (lane L1)
+// Pass P-A: the streamed expansion
 // ---------------------------------------------------------------------------
 
 // ingested is what pass P-A hands the rest of the streamed pipeline: the one
@@ -226,8 +225,7 @@ func degradedCapabilities(reported, disclosed []model.CapabilityState) []model.C
 //
 // Excluded candidates are on Cands, not diverted: relationsOnPaths deliberately
 // does not filter on Excluded while hydrateFiles does, and P-I derives the
-// exclusion projection by replaying this spool in seq order (plan Section 2
-// P-A, ruling C1). Every run is registered with the compile's sort area, so all
+// exclusion projection by replaying this spool in seq order. Every run is registered with the compile's sort area, so all
 // three are released by compileSorts.Close on every exit path.
 type ingested struct {
 	Cands *pagination.SortedRun[candRec]
@@ -241,8 +239,8 @@ type ingested struct {
 // spool in (P-B's batches, P-I's exclusion projection). It is total because seq
 // is assigned once per ingested candidate and never reused.
 //
-// L0 froze no seq-primary candRec comparator -- lessRank is score-primary and
-// lessFileIndex file-primary -- so this is the shared one; P-C and P-I replay
+// lessRank is score-primary and lessFileIndex file-primary, so this is the one
+// seq-primary candRec comparator; P-C and P-I replay
 // seq-ordered candidate streams and must use it rather than each defining its
 // own.
 func lessCandSeq(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }

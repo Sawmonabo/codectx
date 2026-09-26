@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L4. It holds
-// Section 15.4 budgeting: measured entry sizes, per-slice byte and token bounds, and the CTX_MINIMUM_BUDGET floor.
+// This file holds Section 15.4 budgeting: measured entry sizes, per-slice byte and token bounds, and the CTX_MINIMUM_BUDGET floor.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 package context
 
 import (
@@ -160,15 +159,15 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		Message: "the measured entry size did not settle; it would be a guess rather than a measurement"}
 }
 
-// evidencePaths projects the ranking lane's explanation paths onto the stored
+// evidencePaths projects the ranking pass's explanation paths onto the stored
 // relation-id lists.
 //
-// The path COUNT is not re-bounded here. The ranking lane already applied
+// The path COUNT is not re-bounded here. The ranking pass already applied
 // context.max_reason_paths_per_entry as written -- including a value above
 // model.MaxReasonPathsPerEntry, and including unlimited -- and
 // model.ContextEntry.Validate does not refuse the entry on that count, so a
 // second clip at 3 would discard routes the operator asked to keep after the
-// lane that honoured the setting had produced them. Only the per-path relation
+// pass that honoured the setting had produced them. Only the per-path relation
 // list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
 // the cut is now counted and returned, so a route the manifest stores shorter
 // than the route the walk found is disclosed as a manifest notice instead of
@@ -270,9 +269,9 @@ type planSink interface {
 }
 
 // planParts is what a streamed plan keeps in heap once P-I has run: the slice
-// table (ruling C4: a function of the resolved budget, which is the caller's
-// own declared window) and the three totals the manifest lane reports. The
-// entries and exclusions themselves went to the sink.
+// table (a function of the resolved budget, which is the caller's own declared
+// window) and the three totals the manifest reports. The entries and
+// exclusions themselves went to the sink.
 type planParts struct {
 	Slices           []model.ContextSlice
 	RelationsClipped int64

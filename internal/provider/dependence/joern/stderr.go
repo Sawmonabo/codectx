@@ -321,7 +321,7 @@ func (r reducer) reduce(line string) string {
 }
 
 // within reports whether s starts with the directory dir as a whole path
-// component: `/home/ann/x` is within `/home/ann`, `/home/anna` is not.
+// component: `/srv/data/x` is within `/srv/data`, `/srv/database` is not.
 func within(s, dir string) bool {
 	if !strings.HasPrefix(s, dir) {
 		return false

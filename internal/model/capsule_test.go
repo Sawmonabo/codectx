@@ -24,7 +24,7 @@ import (
 // count is absorbed BEFORE its records, so the count has to come from its own
 // pass over the source; a hash that streamed the records once and emitted the
 // count afterwards, or omitted it, yields a different digest and fails this
-// test. The mutation is recorded in the lane report.
+// test.
 func TestCapsuleCanonicalHashIsByteIdentical(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

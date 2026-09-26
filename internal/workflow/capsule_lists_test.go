@@ -11,13 +11,11 @@ import (
 // waiverFixtureCount is the waiver population the page-bound row seals. It is a
 // whole multiple of the fixture service's MaxPageItems so the expected call
 // count is exact rather than a ceiling, and it is far larger than one page so a
-// whole-list read cannot hide inside the page bound. The figure is the wave-H
-// audit's own: it walks the loop across ~100 pages, which is what a session-
-// sized answer would have had to hold.
+// whole-list read cannot hide inside the page bound: it walks the loop across
+// ~100 pages, which is what a session-sized answer would have had to hold.
 const waiverFixtureCount = 20000
 
-// TestCapsuleWaiversAreReadOnePageAtATime protects wave-H audit item S5: the
-// seal must read the session's waivers a page at a time, like every other
+// TestCapsuleWaiversAreReadOnePageAtATime protects the rule that the seal must read the session's waivers a page at a time, like every other
 // capsule list, so seal-time heap is a function of the page and not of the
 // session's waiver count.
 //
@@ -84,11 +82,11 @@ func TestCapsuleWaiversAreReadOnePageAtATime(t *testing.T) {
 	}
 }
 
-// TestCapsuleFactOrderIsIndependentOfArrivalOrder closes the wave-H audit's
-// unproven concern 2: capsule.go's fact collector sorts the relation ids WITHIN
+// TestCapsuleFactOrderIsIndependentOfArrivalOrder protects fact order against
+// arrival order: capsule.go's fact collector sorts the relation ids WITHIN
 // one observation and leans on the store's observation-id order ACROSS
-// observations, and no row discriminated it -- the fresh-store determinism row
-// records no observations at all.
+// observations; the fresh-store determinism row records no observations, so it
+// cannot discriminate either.
 //
 // Two stores record the SAME accepted facts, and only the order differs: the
 // observations arrive in a different sequence, and the relation ids inside each

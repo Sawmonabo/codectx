@@ -6,7 +6,7 @@ alternatives and the sources. Read the record first; this page exists so the num
 be checked.
 
 It follows [ADR-0002 — Storage identities](../adr/ADR-0002-storage-identities.md), which cut stored
-bytes per indexed symbol by 37–43 % and removed identity width as the amplifier. The wave-I
+bytes per indexed symbol by 37–43 % and removed identity width as the amplifier. A later
 verification re-measured the §3e gate afterwards and it is still missed: reference corpus 5.47×
 eligible source against a 3.5× budget, a large Python repository 4.54×, promptfoo 4.30×, the second corpus (a configured, Python-majority polyglot monorepo) 7.11×, the reference repository (an unconfigured, JavaScript-majority repository with its dependencies committed) 4.16×;
 2 432–3 600 bytes per indexed symbol against the ~158 B the gate implies. No store was indexed for

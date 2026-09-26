@@ -51,8 +51,6 @@ import (
 // The query deadline ends a PAGE and never the answer (ruling P3): a deadline
 // reached mid-walk returns the walkState the walk had built, with its frontier
 // intact for the caller to persist into the `f` cursor, and a nil error.
-//
-// Owned by lane P-b.
 func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, o expandOptions,
 	visit func(frontierState, Edge) error) (walkState, error) {
 	if o.Budget == nil {
@@ -156,8 +154,6 @@ func (e *Engine) walkScratchDir() string {
 // ONE ranking and serves the identical answer (ruling P7).
 //
 // Close the returned run.
-//
-// Owned by lane P-b.
 func (e *Engine) rankImpact(ctx context.Context, retain *retainedWalk,
 	stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
 	prog, err := retain.rankProgress()

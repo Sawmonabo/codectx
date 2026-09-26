@@ -366,9 +366,8 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 // store sees is a function of the candidate set and not of discovery order. A
 // set larger than one batch is chunked rather than truncated: a silently
 // dropped edge would score a real route as heuristic.
-// It is a thin wrapper: the body moved to rankjoin.go, beside the streamed pass
-// that must reproduce its read log. Lane L5 removes this wrapper when rank
-// stops calling it.
+// It is a thin wrapper over resolvePrecisionWholeSet in rankjoin.go, beside
+// the streamed pass that must reproduce its read log.
 func (c *Compiler) resolvePrecision(ctx context.Context, reader *sqlite.PinnedReader,
 	cands []candidate) (map[model.RelationID]int64, error) {
 	return c.resolvePrecisionWholeSet(ctx, reader, cands)
