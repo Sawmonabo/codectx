@@ -22,6 +22,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -47,8 +48,8 @@ const (
 	// planner refused as units of their own, per family.
 	unplannedProjects = "dependence_projects_unplanned:"
 	// unplannedDuplicateFileNode counts the manifest units whose file node
-	// duplicates the filesystem unit's node for the same file identity
-	// (ruling Q8 as re-ruled, Task 7 residual). See the comment at duplicate().
+	// duplicates the filesystem unit's node for the same file identity. See
+	// the comment at duplicate().
 	unplannedDuplicateFileNode = "manifest_duplicate_file_node"
 )
 
@@ -89,7 +90,7 @@ type Unit struct {
 	// Deferred marks a unit that does not block the base generation: under
 	// `providers.dependence.enabled = "auto"` the coordinator runs it as
 	// low-priority background work after base activation and publishes it
-	// through a later generation (Section 11.6, ruling Q9).
+	// through a later generation (Section 11.6).
 	Deferred bool
 }
 
@@ -113,7 +114,8 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 // Carried is one previous sealed unit of a refreshing semantic scope, with the
 // provenance distance Section 13.3 requires it to answer `stale` with. The
 // coordinator attaches it through sqlite.AttachCarried; it is never reported
-// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry.
+// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry --
+// so the scope is counted once, by that unit (Plan.CountReused).
 //
 // It is also the row shape Inputs.CarriedPage reads back: a scope the previous
 // generation already carried is the same unit with the distance it had then,
@@ -150,7 +152,7 @@ type Plan struct {
 	// Carry are the stale predecessors of deferred semantic scopes, to attach
 	// through sqlite.AttachCarried. A carried scope's *deferred* unit is also
 	// in Units, because it runs later, in its own work generation (Section
-	// 11.6, ruling Q1). The coordinator attaches the carried predecessor into
+	// 11.6). The coordinator attaches the carried predecessor into
 	// this generation with sqlite.AttachCarried and must not attach the
 	// deferred unit here: generation_units holds one row per
 	// (generation, provider, scope).
@@ -183,8 +185,22 @@ type Plan struct {
 	// files is the spilled, sorted run of every file-invalidated provider's
 	// unit, which Units streams from. Semantic units are not in it: a package-
 	// or workspace-scoped unit list is bounded by the scope count, never by
-	// the repository, so it stays in heap (H-L1b).
+	// the repository, so it stays in heap.
 	files *pagination.SortedRun[fileUnitRecord]
+}
+
+// CountReused calls add once for every scope Reuse holds, with its provider.
+// It is the one statement of how a plan's scopes are counted, which the run
+// row's planned total and every capability row's units_planned both follow:
+// each unit Units yields is one scope, each Reuse entry is one more, and a
+// Carry row is none, because its scope's deferred unit is already in Units.
+// Adding Carry as well counts every carried scope twice.
+func (p Plan) CountReused(add func(providerID string)) {
+	for key := range p.Reuse {
+		if id, _, ok := strings.Cut(key, scopeSeparator); ok {
+			add(id)
+		}
+	}
 }
 
 // Close releases the plan's two spilled runs: the shared input membership every
@@ -316,8 +332,8 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	// Charged in BYTES as well as records for the reason F37 settled for the
-	// input sort: a unit record carries a scope key, which is bounded by
+	// Charged in BYTES as well as records for the same reason as the input
+	// sort: a unit record carries a scope key, which is bounded by
 	// model.MaxScopeKeyBytes rather than fixed, so a record count alone would
 	// be a budget that means something different on every repository.
 	units = units.WithRunBytes(pagination.SortRunBytes(in.Config.Resources.QueryMemoryBytes), sizeOfUnit)
@@ -653,14 +669,14 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 // the filesystem unit's, which carries the file's metadata, and the manifest
 // unit's, which is nil-valued (manifest.unit.fileNode).
 //
-// Ruling Q8 first put the suppression at plan time. It cannot be there:
-// node_facts' conflict clause is ON CONFLICT(unit_id, node_id) DO NOTHING
-// (internal/storage/sqlite/units.go:459), which is per unit, so both rows are
-// written whatever order the units run in, and no plan-time ordering or
-// dependency suppresses either. Re-ruled: precedence is applied at read time
-// in the query layer (Task 13/14) -- for one node id across the units of the
-// active generation the filesystem provider's row wins over a nil-valued
-// manifest row. The plan counts the duplicate only, which is what this does.
+// The suppression cannot be at plan time: node_facts' conflict clause is ON
+// CONFLICT(unit_id, node_id) DO NOTHING (internal/storage/sqlite/units.go),
+// which is per unit, so both rows are written whatever order the units run
+// in, and no plan-time ordering or dependency suppresses either. Precedence is
+// applied at read time in the query layer -- for one node id across the units
+// of the active generation the filesystem provider's row wins over a
+// nil-valued manifest row. The plan counts the duplicate only, which is what
+// this does.
 func (b *builder) duplicate(fv model.FileVersion) {
 	for _, fp := range b.fileProviders {
 		if fp.id == manifest.ID && fp.gate(fv) {
