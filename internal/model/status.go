@@ -251,7 +251,14 @@ type ResourceReport struct {
 	// AdmissionReservedBytes the sum currently reserved against it by the
 	// children running now. They are the whole of this process's heavy-memory
 	// accounting: one allocation, one total, whatever the child is. Both are
-	// absent where this process composed no admission ledger.
+	// absent where this process composed no admission ledger. The allocation
+	// is also absent -- never zero -- where it is not an observation of this
+	// host: where the platform published no available-memory figure, the
+	// ledger admits against a stand-in it warned about at composition, and
+	// the reserved total is still reported against it. A host that was read
+	// and has no memory to spare beyond this process's own footprint reports
+	// an allocation of zero, which is an observation: its children are then
+	// admitted one at a time.
 	AdmissionAllocationBytes *uint64 `json:"admission_allocation_bytes,omitempty"`
 	AdmissionReservedBytes   *uint64 `json:"admission_reserved_bytes,omitempty"`
 	// AdmissionDiskAllocationBytes and AdmissionDiskReservedBytes are the same
@@ -341,12 +348,14 @@ type ResourceReport struct {
 	// is a count in its own right and not something an operator has to derive
 	// by reading every unit row. The rows name which ones.
 	//
-	// It counts the units this process RECORDED, which the record's own bound
-	// limits, and it counts none of the units whose process tree this platform
-	// cannot sample: an unsampled peak is not a peak below the reservation, so
-	// it is neither an overrun nor evidence against one. It is absent where
-	// this process ran no heavy unit at all, and zero where it ran them and
-	// none overran.
+	// It counts every unit this process ran, including the unit runs past the
+	// bound of the rows (MaxRecordsPerResult), whose overruns are counted as
+	// they end even though no row names them; so it can exceed the overruns
+	// the rows show, and never falls short of them. It counts none of the
+	// units whose process tree this platform cannot sample: an unsampled peak
+	// is not a peak below the reservation, so it is neither an overrun nor
+	// evidence against one. It is absent where this process ran no heavy unit
+	// at all, and zero where it ran them and none overran.
 	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
 	UnitsReused          *int64 `json:"units_reused,omitempty"`
 	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
