@@ -33,6 +33,10 @@
 #     test data, not a host, and are allowed.
 # A bare `~/` or `$HOME/` is NOT one of them: `~/.local/bin`, `~/.config` and
 # `$XDG_DATA_HOME/...` are product locations this documentation has to name.
+#
+# The private-name guard (scripts/private-names-check.sh) runs here too, over
+# every tracked path and its content, so one check fails on either kind of
+# reference and both lists are printed.
 set -eu
 cd "$(dirname "$0")/.."
 LC_ALL=C
@@ -54,9 +58,14 @@ hits="$(git ls-files -z | grep -zv -E '^\.gitignore$' | xargs -0 grep -n -E "$pa
     gsub(ENVIRON["ALLOWED"], " ", line)
     if (line ~ ENVIRON["HOMEPATH"]) print
   }' || true)"
+status=0
 if [ -n "$hits" ]; then
   echo "tracked files reference ignored or host-local paths or name the process:"
   echo "$hits"
+  status=1
+fi
+sh scripts/private-names-check.sh || status=1
+if [ "$status" -ne 0 ]; then
   exit 1
 fi
 echo "tracked-refs-check: clean"
