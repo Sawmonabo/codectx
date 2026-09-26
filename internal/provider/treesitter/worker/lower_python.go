@@ -174,7 +174,8 @@ var pythonLowering = Lowering{
 //     chained comparison, which short-circuits like `and` (§6.10), so
 //     `return a < b < c` Uses a, b and c.
 //   - An assignment expression `x := e` carries e's reads on its own
-//     defining node; the node consuming it reads x.
+//     defining node; the node consuming it reads x and e's reads too, as
+//     every lowering's consumer of an embedded assignment does.
 //   - A nested callable's creating node Uses its captures and the node
 //     consuming the created value does not repeat them; the consumer still
 //     Uses the reads of the parts evaluated where the callable is created
@@ -182,8 +183,8 @@ var pythonLowering = Lowering{
 //     statement's own evaluation (see Node granularity).
 //   - A node that defines v also Uses v when its statement read v before
 //     it, unless the bullets above leave that read to a node of its own (a
-//     capture, a condition, an assignment expression's value): in `y = x +
-//     (x := 1)` the assignment expression's node Uses the x read before it.
+//     capture, a condition): in `y = x + (x := 1)` the assignment
+//     expression's node Uses the x read before it.
 //   - An unpacking target node Uses the variables of the value it unpacks;
 //     a for target's nodes Use the iteration variable instead (see Node
 //     granularity).
@@ -2037,9 +2038,6 @@ func (j *pyLower) value(n *ts.Node) {
 		j.value(n.ChildByFieldId(k.fValue))
 		v := j.lookup(n.ChildByFieldId(k.fName))
 		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
-		// The consumer reads the name, whose definition carries the
-		// value's reads.
-		j.reads = j.reads[:m]
 		j.read(v)
 	case k.typeKind:
 	default:
