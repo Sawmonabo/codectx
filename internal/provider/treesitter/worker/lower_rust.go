@@ -77,6 +77,12 @@ const rsTryLabel = " try"
 //     (a compound left operand, `a && b` in `a && b || c`, or the condition)
 //     Uses the result, never the operands' names. No other node spans the
 //     operator: in statement or tail position its operand nodes are all.
+//     The left operand's deciding edge (false for `&&`, true for `||`) and
+//     the right operand's node both reach the next node made, which is the
+//     Branch spanning the enclosing operator when one does (in `a && b ||
+//     c`, a's false edge and b's node both enter `a && b`, never c), else
+//     the consumer: the short-circuit edge never bypasses the node Using
+//     the result it defined.
 //   - An if condition, a while condition and a match guard are one Branch
 //     node spanning the condition. A let chain (`a && let P = v && b`) is one
 //     Branch per member in source order; each member's false edge leaves the
@@ -106,11 +112,13 @@ const rsTryLabel = " try"
 //     Branch and every binding node Use the scrutinee's variable, never the
 //     names it was computed from; the guard and the result read the arm's
 //     bindings in the arm's scope. A failed pattern or guard goes to the next
-//     arm's pattern; no arm falls into another. A match has no jump frame, so
-//     a break inside an arm leaves the enclosing loop. Exhaustiveness is not
-//     checked here, so the last arm keeps its false edge, out of the match,
-//     unless its pattern is irrefutable by syntax alone: the wildcard `_` (in
-//     any arm, which also makes every later arm unreachable, so they lower to
+//     arm's first node: its pattern Branch, or, for a `_` arm, which makes no
+//     pattern node, its guard or else its result node. No arm falls into
+//     another. A match has no jump frame, so a break inside an arm leaves the
+//     enclosing loop. Exhaustiveness is not checked here, so the last arm
+//     keeps its false edge, out of the match, unless its pattern is
+//     irrefutable by syntax alone: the wildcard `_` without a guard (in any
+//     arm, which also makes every later arm unreachable, so they lower to
 //     nothing) or, in the last arm, a bare identifier, which is then a Stmt
 //     node defining the name. A bare identifier in an earlier arm may name a
 //     constant or a unit variant (`None`): by The Rust Reference, Patterns ›
@@ -162,7 +170,11 @@ const rsTryLabel = " try"
 //     and may-defines x's base variable at the node evaluating it, the first
 //     node created after it whose span holds it; a `ref mut` binding in a
 //     pattern may-defines the base variable of the matched place (x in
-//     `if let Some(ref mut y) = x`) at the binding's node. What that rule
+//     `if let Some(ref mut y) = x`) at the binding's node. The matched
+//     place is evaluated once, by the node evaluating the value (the let,
+//     the let condition's Branch, the scrutinee's node), which Uses x; the
+//     binding's node carries the may-definition and, as every binding node,
+//     Uses only the owned variable holding the value, never x. What that rule
 //     gives up stays given up, for its stated reasons: a write through a
 //     reference as a definition of the local it refers to (the variable
 //     written through is may-defined, as above), a method call's implicit
@@ -202,6 +214,29 @@ const rsTryLabel = " try"
 // variable Uses only what its own evaluation reads: in `(a, b) = (b, a)` the
 // target nodes Use the assignment's owned variable, never the a and b the
 // assignment read.
+//
+// # Names that resolve to no variable
+//
+// Lowering's section of that name applies. Here lookup returns -1 for a
+// name no declaration in scope binds (a name a macro's expansion declares
+// included, since the expansion is not lowered), for an item of the block
+// (predeclare binds a function, const, static or struct name to -1), for a
+// token-tree label or named argument, and for every name declared inside a
+// nested callable walked for its captures; baseVar returns -1 for a place
+// whose base is such a name or no name. The filters sit where an id is
+// recorded: read drops it before it enters reads, so no node Uses it; def
+// and yield drop it before Def or MayDef; and every other may-definition is
+// recorded only for a variable ≥ 0: a place write's base (assign, targets,
+// compound), a pending `&mut` borrow (value, tokenBorrow), a `ref mut`
+// binding's matched place (bindName), and a nested callable's writes
+// (capWrite, cap, bindName, tokenBorrow). No table of the lowering is
+// indexed by a variable. So an unresolved name as an assignment,
+// compound-assignment, embedded-assignment or destructuring target, a
+// place's base, a borrowed or `ref mut`-matched place, a captured read or
+// write, a token-tree read, borrow or format capture, or an iterated value
+// defines and Uses nothing. Rust has no increment or deletion, and a for
+// pattern always binds new variables, so a name is iterated only as the
+// iterable.
 //
 // # Exceptions
 //
@@ -244,7 +279,8 @@ const rsTryLabel = " try"
 //     fall-through and each such jump's target, as a `?` is lowered. A jump
 //     stays inside the tree when the tree itself holds its target: nothing
 //     leaves a closure (a `|…|` or `||` after a non-operand, running to the
-//     next `,` or `;` of its level), the `{…}` tree after `fn`, or an async or
+//     next `,` or `;` of its level, or to the end of its tree when none
+//     follows, nested trees included), the `{…}` tree after `fn`, or an async or
 //     gen block; an unlabelled break or continue does not leave the `{…}` tree
 //     after `loop`, `while` or `for`, a labelled one does not leave the tree
 //     that declares its label, and a `?` does not leave a try block.

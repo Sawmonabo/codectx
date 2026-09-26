@@ -170,7 +170,7 @@ func TestRustLoweringGolden(t *testing.T) {
 			// mut n = 0; and the creating node reach every later use of n.
 			name:     "a closure's write to a captured variable is a may-definition where it is created",
 			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation",
-			mutation: "record a closure's writes as uses only (loses |d: i32| n += d + x@51 -> n@80), as a killing definition (loses let mut n = 0;@22 -> n@80), give the creating node no result (loses |d: i32| n += d + x@51 -> let mut add = |d: i32| n += d + x;@37), or let the let re-read the captures (gains x@5 and let mut n = 0;@22 -> let mut add = |d: i32| n += d + x;@37)",
+			mutation: "record a closure's writes as uses only (loses |d: i32| n += d + x@51 -> n@80), as a killing definition (loses let mut n = 0;@22 -> n@80), record a compound-assigned capture as a write only, without its read (loses let mut n = 0;@22 -> |d: i32| n += d + x@51, the creating node's Use of the n it only compound-assigns), give the creating node no result (loses |d: i32| n += d + x@51 -> let mut add = |d: i32| n += d + x;@37), or let the let re-read the captures (gains x@5 and let mut n = 0;@22 -> let mut add = |d: i32| n += d + x;@37)",
 			src:      "fn f(x: i32) -> i32 { let mut n = 0; let mut add = |d: i32| n += d + x; add(1); n }",
 			du: []string{"x@5 -> |d: i32| n += d + x@51",
 				"let mut n = 0;@22 -> |d: i32| n += d + x@51",
@@ -557,6 +557,43 @@ func TestRustLoweringGolden(t *testing.T) {
 			src:      "impl S { fn g(&self, x: i32, max: i32, len: usize, v: Vec<i32>) -> String { format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len()) } }",
 			du: []string{"x@21 -> format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len())@76",
 				"v@51 -> format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len())@76"},
+		},
+		{
+			// Items › Static items, and Statements › Declaration statements ›
+			// Item declarations: G is a static item of the block, no local of
+			// f, so predeclare binds it to no variable; Macros By Example ›
+			// Hygiene: `make!(m)` may declare m at the invocation's site, but
+			// the expansion is not lowered, so m resolves to nothing; H, g and
+			// k are named by no declaration in scope. Nodes: v@5, make!(m)@66,
+			// G = (v, 0)@83 (Uses v, defines nothing), m += v@95 (Uses v
+			// only), m = v@112 (the embedded assignment, Uses v), let e = (m =
+			// v);@103 (defines e, Uses nothing), (m, G.1, w) = (v, 1, 2)@120
+			// (Uses v, defines an owned variable), m@121, G.1@124 and w@129
+			// (each Uses it; only w@129 defines, and G.1 may-defines nothing),
+			// G.0 = v@145 (Uses v), g(&mut G)@154 and the println!@165
+			// (token-tree reads of H and m, a `&mut m` borrow and a `{G:?}`
+			// capture: nothing), || { m += v; H = 1; }@203 (Uses the captured
+			// v, may-defines nothing), let c = …;@195, c()@226, H@240 (the
+			// iterated value, defining the iteration variable), for@231,
+			// i@235, let (ref mut y, z) = G;@245 (Uses nothing, defines an
+			// owned variable), y@258 (a `ref mut` binding of an unresolved
+			// place: no may-definition), z@261, k(e, w, y, z)@269. Succ:
+			// straight line to for@231→{i@235, let (ref mut y, z) = G;@245};
+			// i@235→for@231. IPDom: for@231 → let (ref mut y, z) = G;@245.
+			name:     "a name that resolves to no local defines, may-defines and uses nothing in every position",
+			protects: "a static item, a name a macro declares and an undeclared name, as an assignment, compound, embedded or destructuring target, a place's base, a borrowed or ref-mut-matched place, a captured read or write, a token-tree read, borrow or format capture, and an iterated value, never reach flow.Builder as -1 and pair with nothing",
+			mutation: "remove any one -1 filter (read's, def's or yield's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m or H; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
+			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut G); println!(\"{G:?}\", &mut m, H); let c = || { m += v; H = 1; }; c(); for i in H {} let (ref mut y, z) = G; k(e, w, y, z) } }",
+			cd:       []string{"for@231 -> i@235", "for@231 -> for@231"},
+			du: []string{"v@5 -> G = (v, 0)@83", "v@5 -> m += v@95", "v@5 -> m = v@112",
+				"v@5 -> (m, G.1, w) = (v, 1, 2)@120", "v@5 -> G.0 = v@145", "v@5 -> || { m += v; H = 1; }@203",
+				"(m, G.1, w) = (v, 1, 2)@120 -> m@121", "(m, G.1, w) = (v, 1, 2)@120 -> G.1@124",
+				"(m, G.1, w) = (v, 1, 2)@120 -> w@129",
+				"|| { m += v; H = 1; }@203 -> let c = || { m += v; H = 1; };@195",
+				"let c = || { m += v; H = 1; };@195 -> c()@226", "H@240 -> for@231", "H@240 -> i@235",
+				"let (ref mut y, z) = G;@245 -> y@258", "let (ref mut y, z) = G;@245 -> z@261",
+				"let e = (m = v);@103 -> k(e, w, y, z)@269", "w@129 -> k(e, w, y, z)@269",
+				"y@258 -> k(e, w, y, z)@269", "z@261 -> k(e, w, y, z)@269"},
 		},
 	})
 }
