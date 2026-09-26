@@ -62,22 +62,22 @@ const (
 	spoolsDirName  = "spools"
 )
 
-// spoolBudgetDivisor is what the shared temporary-file budget is divided by to
-// size the query spools. resources.max_temp_bytes is not a per-consumer budget:
-// the same key is already the whole disk budget of both process runners
-// (compose.go, the shared and parser runners below), so handing the spools the
-// undivided key would let three independent consumers each believe they own it.
-// A query's spools are the smallest of the three claims -- one bounded page of
-// ranked records per live cursor -- so they take the smallest share.
+// spoolBudgetDivisor is what resources.max_temp_bytes is divided by to size
+// the query spools' share of it. The key is one total over every consumer of
+// temporary disk that it bounds: the query spools take this share, and the
+// shared process runner -- the only runner whose children stage temporary
+// bytes -- takes the rest (tempDiskShares). The parser workers exchange
+// everything over pipes and reserve no disk, so they hold no share.
 //
 // The divisor stays a DERIVATION and is deliberately not a `resources.spool_bytes`
-// key. A second key would let an operator set the three shares so they oversubscribe
-// the one budget `max_temp_bytes` exists to cap, which is the failure the single key
-// prevents; and the quantity an operator actually reasons about -- total temporary
-// disk -- is already settable. 8 is the share, not a cap on any one query: three
-// consumers (shared runner, parser runner, spools) claim the budget, the spools are
-// the smallest and shortest-lived claim, and the remaining headroom absorbs the two
-// process runners' bursts. To give queries more room, raise `resources.max_temp_bytes`.
+// key. A second key would let an operator set the shares so they oversubscribe
+// the one budget `max_temp_bytes` exists to cap, which is the failure the single
+// key prevents; and the quantity an operator actually reasons about -- total
+// temporary disk -- is already settable. 8 is the share, not a cap on any one
+// query: the spools hold one bounded page of ranked records per live cursor,
+// the smaller and shorter-lived of the two claims, and the runner's children
+// stage whole materializations. To give queries more room, raise
+// `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
 // parserWorkerReservationBytes is the memory one parser worker reserves while
@@ -157,6 +157,24 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 		return 0, true
 	}
 	return allocation, true
+}
+
+// tempDiskShares splits resources.max_temp_bytes into the shared runner's
+// disk budget and the query spools' budget so the two sum to exactly the
+// ceiling the operator set. Zero, the default, is unlimited and stays
+// unlimited on both sides. Neither share of a set ceiling may round to zero,
+// because zero is read as unlimited by both consumers; a ceiling too small
+// to split into two positive shares -- one byte -- gives each consumer the
+// ceiling itself, which refuses every real reservation either way.
+func tempDiskShares(total int64) (runner, spools int64) {
+	if total <= 0 {
+		return 0, 0
+	}
+	if total < 2 {
+		return total, total
+	}
+	spools = max(total/spoolBudgetDivisor, 1)
+	return total - spools, spools
 }
 
 // childSlots is that division: how many children of the smallest possible size
@@ -664,8 +682,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
+	runnerDisk, spoolDisk := tempDiskShares(cfg.Resources.MaxTempBytes)
 	if s.spools, err = pagination.NewSpools(filepath.Join(s.dataDir, workDirName, spoolsDirName),
-		cfg.Resources.MaxTempBytes/spoolBudgetDivisor, s.store); err != nil {
+		spoolDisk, s.store); err != nil {
 		return nil, err
 	}
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
@@ -708,35 +727,46 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
-	// resources.max_temp_bytes is passed through UNCLAMPED, including its
-	// unlimited default of 0: the runner reads a non-positive disk budget as
-	// unlimited and admits every reservation, so the default never refuses a
-	// child at admission. Only a value the operator set refuses one, and it
-	// says so with resources.max_temp_bytes named in the error.
+	// The runner's share of resources.max_temp_bytes (tempDiskShares) is its
+	// disk budget, including the unlimited default of 0: the runner reads a
+	// non-positive disk budget as unlimited and admits every reservation, so
+	// the default never refuses a child at admission. Only a ceiling the
+	// operator set refuses one, and it says so with resources.max_temp_bytes
+	// named in the error.
+	//
 	// The runner beneath the admission gate must never refuse what the gate
-	// admitted. The gate runs a child larger than the whole allocation ALONE
-	// rather than refusing it, and a unit's reservation is its heap cap --
-	// itself bounded by the allocation -- plus the memory its family keeps
-	// outside the heap, so the largest child a unit can present is always
-	// larger than the allocation. A runner budgeted at the allocation would
-	// refuse precisely that unit, with the resource-limit error the whole
-	// memory ruling exists to avoid. This is the same rule the language-server
-	// runner below states: the budget is wide enough for the largest child the
-	// gate above it can admit.
+	// admitted, in memory. The gate runs a child larger than the whole
+	// allocation ALONE rather than refusing it. A dependence unit's
+	// reservation is its heap cap -- itself bounded by the allocation -- plus
+	// the memory its family keeps outside the heap, so the largest child a
+	// unit can present is larger than the allocation; an external indexer's
+	// is its profile's fixed figure, which a small host's allocation can be
+	// below. A runner budgeted at the allocation would refuse precisely those
+	// children, with the resource-limit error the whole memory ruling exists
+	// to avoid. This is the same rule the language-server runner below
+	// states: the budget is wide enough for the largest child the gate above
+	// it can admit.
 	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
+	for _, k := range scip.Kinds {
+		if mem, _, ok := scip.ProfileReservation(scip.ProfileScope(string(k), "")); ok {
+			sharedBudget = maxInt64(sharedBudget, mem)
+		}
+	}
 	shared, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     childSlots(sharedBudget),
 		MemoryBudgetBytes: sharedBudget,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
+		DiskBudgetBytes:   runnerDisk,
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Parser workers are CPU-bound, so how many run at once is counted by
+	// cores. They exchange everything with this process over pipes and
+	// reserve no disk, so the runner holds no share of the temporary ceiling.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
 		MemoryBudgetBytes: int64(parserWorkers) * parserWorkerReservationBytes,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
 	})
 	if err != nil {
 		return nil, err

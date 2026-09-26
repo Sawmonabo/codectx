@@ -9,33 +9,29 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// resources.max_temp_bytes is a BOUND, and its default is unlimited. The runner
-// is the site that made flipping that default impossible: it refused to
-// construct at all on a non-positive disk budget, so every runner
-// internal/app/compose.go builds straight from the setting -- the shared
-// analyzer runner and the parser runner -- would have failed APPLICATION
-// CONSTRUCTION rather than any one run. The default must construct and must
-// admit a run; only a value the operator set may refuse one, and it must say
-// which key to raise.
+// resources.max_temp_bytes is a BOUND, and its default is unlimited. A runner
+// built from the default must construct and must admit a run of any disk
+// reservation: a runner that refused a non-positive disk budget would fail
+// application construction rather than any one run. Only a value the operator
+// set may refuse a run, and it must say which key to raise.
 //
-// Mutation proof: restore `|| limits.DiskBudgetBytes <= 0` in NewRunner and
-// this fails with
+// Mutation proof: add `|| limits.DiskBudgetBytes <= 0` to NewRunner's
+// positive-bound check and this fails with
 //
-//	the default temporary budget refused the runner: ... every bound must be positive
+//	the default temporary budget refused the runner: ... both reservations must be positive
 func TestDefaultTemporaryBudgetIsUnlimited(t *testing.T) {
 	cfg := config.Defaults()
 	if cfg.Resources.MaxTempBytes != 0 {
 		t.Fatalf("resources.max_temp_bytes defaults to %d, not unlimited: a bound "+
 			"nobody set must not refuse or truncate work", cfg.Resources.MaxTempBytes)
 	}
-	// Exactly the shape compose.go builds the shared analyzer runner with.
+	// The shape a runner takes from the default ceiling.
 	r, err := NewRunner(Limits{MaxConcurrent: 2, MemoryBudgetBytes: 1 << 30,
 		DiskBudgetBytes: cfg.Resources.MaxTempBytes})
 	if err != nil {
 		t.Fatalf("the default temporary budget refused the runner: %v", err)
 	}
-	// A reservation larger than any budget a 4 GiB default would have allowed:
-	// unlimited means admitted, not merely "large".
+	// A 4 TiB reservation: unlimited means admitted, not merely "large".
 	release, err := r.reserve(context.Background(), Spec{DiskReservationBytes: 1 << 42})
 	if err != nil {
 		t.Fatalf("an unlimited disk budget refused a %d-byte reservation: %v", int64(1)<<42, err)
