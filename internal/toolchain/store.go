@@ -83,9 +83,12 @@ type toolLock struct {
 //
 // A waiter has no clock on the holder. The lock is a kernel lock that is
 // released when the holding process exits, so a peer that crashed frees it,
-// and a live peer's install ends on its own when its fetch stops moving (the
-// transfer watch in fetch.go). What remains is a peer that is progressing,
-// and reporting that one busy would fail a resolution that only had to wait.
+// and a live peer's download ends on its own when it stops moving (the
+// transfer watch in fetch.go). The peer's extraction and publication are
+// local work with no detector of their own, so a peer wedged there holds the
+// lock until the waiter's ctx ends; that ctx is the caller's bound and the
+// only one a waiter applies. Reporting a peer busy on a clock instead would
+// fail a resolution whose peer was still progressing.
 func (s *store) acquire(ctx context.Context, name string, wait bool) (*toolLock, error) {
 	if err := os.MkdirAll(s.locksDir(), storeDirPerm); err != nil {
 		return nil, ioError("tool lock directory", err)
