@@ -2,7 +2,7 @@
 
 Provenance: the benchmark package `internal/bench` (`TestParseMemory`, `TestFunctionAnalysis`, `TestFileAnalysis`;
 row schema in the doc comments of `internal/bench/flowbench_test.go` and `internal/bench/allocator.go`), test binary
-built at commit `b6dd3f6`, run 2026-09-26 by the benchmark task, memory-capped, one corpus at a time, every run exit 0.
+built at commit `36a529f`, run 2026-09-26 by the benchmark task, memory-capped, one corpus at a time, every run exit 0.
 Corpora and pins: kubernetes `dfd7b93a`, home-assistant core `5d010719`, elasticsearch `3273b67c`, vscode `529ee190`,
 rust-lang/rust `5ceaf660`, llvm-project `4257da8e`, and a checkout of the TypeScript compiler at `cf8cf4f6` — which at
 that pin is the compiler's Go port with the TypeScript test data, not a TypeScript project (see `05-`). Only the Go and
