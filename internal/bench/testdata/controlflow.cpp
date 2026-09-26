@@ -3,8 +3,9 @@
 // init-statements and condition declarations, range for over a structured
 // binding, try with typed catch clauses and catch (...), throw and rethrow,
 // a function-try-block on a constructor with member initializers, methods,
-// lambdas capturing by reference and by copy, and a coroutine with co_await,
-// co_yield and co_return. It is a benchmark input, not a proof of coverage:
+// lambdas capturing by reference and by copy, a coroutine with co_await,
+// co_yield and co_return, reference bindings, the alternative tokens `and`
+// and `or`, and delete. It is a benchmark input, not a proof of coverage:
 // the lowering's golden tests are that.
 #include <coroutine>
 #include <map>
@@ -105,4 +106,17 @@ Task coroutine(int n) {
 		co_return n;
 	}
 	co_return 0;
+}
+
+int aliases(int *p, int n) {
+	int x = 0;
+	int &r = x;
+	if (p and n > 0 or x) {
+		r = *p;
+	}
+	for (auto &e : std::vector<int>{1, 2}) {
+		e += n;
+	}
+	delete p;
+	return x;
 }

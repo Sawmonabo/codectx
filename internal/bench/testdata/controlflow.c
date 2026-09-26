@@ -5,8 +5,11 @@
  * last and fallthrough, a case label nested in a loop (Duff's device),
  * short-circuit and conditional operators, embedded assignments, writes
  * through pointers, fields and indexes, block scoping, preprocessor
- * conditionals inside a body, and structured exceptions. It is a benchmark
- * input, not a proof of coverage: the lowering's golden tests are that.
+ * conditionals inside a body, a case label inside a conditional, an
+ * assembly goto, statement expressions (one holding a break in a for
+ * loop's update), comma expressions, arrays passed by decay, and structured
+ * exceptions. It is a benchmark input, not a proof of coverage: the
+ * lowering's golden tests are that.
  */
 #include <stddef.h>
 
@@ -147,7 +150,7 @@ int configured(int x) {
 	return y;
 }
 
-#ifdef _MSC_VER
+#ifdef HAVE_STRUCTURED_EXCEPTIONS
 int guarded(int *p) {
 	int r = 0;
 	__try {
@@ -166,3 +169,34 @@ int guarded(int *p) {
 	return r;
 }
 #endif
+
+int extensions(int x, int n) {
+	char buf[8];
+	int i, j;
+	fill(buf);
+	for (i = 0, j = n; i < j; i++, j--) {
+		x += ({
+			int t = i * j;
+			t > x ? t : x;
+		});
+	}
+	for (j = 3; j < 22; (void)({ ++j; if (j > n) break; j; })) {
+		x ^= j;
+	}
+	switch (x) {
+	case 0:
+		x = 1;
+		break;
+#if defined(WIDE)
+	case 1:
+		x = 2;
+		break;
+#endif
+	default:
+		x = use(buf);
+	}
+	asm goto("" : : "r"(x) : : done);
+	x++;
+done:
+	return x;
+}
