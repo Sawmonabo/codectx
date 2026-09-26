@@ -377,9 +377,8 @@ func (b *builder) identityKey(d *declFact) string {
 	return d.Qualified
 }
 
-// declKey is the cross-provider declaration key of the controller's ruling,
-// the one string a semantic provider and this one both compute for the same
-// declaration:
+// declKey is the cross-provider declaration key: the one string a semantic
+// provider and this one both compute for the same declaration:
 //
 //	scope  "file:" + path
 //	key    "decl:" + <identifier token as written> + "@" + path + ":" + <first line> + "-" + <last line>
@@ -499,9 +498,9 @@ func (b *builder) refs() error {
 			return outputInvalid("reference name is empty, over its bound or not UTF-8")
 		}
 		// The two are checked apart because they fail for different reasons
-		// and a single message cost a lane a debugging round: a name is a
-		// token the grammar captured, a qualifier is a receiver expression
-		// the worker is required to bound before it sends it.
+		// and one message would not say which: a name is a token the grammar
+		// captured, a qualifier is a receiver expression the worker is
+		// required to bound before it sends it.
 		if len(r.Qualifier) > wire.MaxQualifierBytes || !utf8.ValidString(r.Qualifier) {
 			return outputInvalid("reference qualifier is over its bound or not UTF-8")
 		}

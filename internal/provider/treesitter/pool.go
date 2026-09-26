@@ -13,27 +13,38 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// Worker lifetime bounds. Every worker is started through the shared runner
-// with these as its Spec limits and is retired by the pool well before it
-// could reach one, so a healthy worker is never killed by its own budget
-// mid-parse: a parse never begins on a worker past three quarters of any
-// bound. maxParsesPerWorker is defense in depth against any per-parse leak
-// in the native binding: whatever leaks is released with the process.
+// A worker has no wall-clock bound of any kind: no lifetime, no per-parse
+// deadline, no parse count and no lifetime byte total. The large generated
+// file whose size nothing limits is a long parse, not a hung one, and only
+// progress can tell the two apart (see hangWindow).
 const (
-	workerLifetime     = time.Hour
-	workerGrace        = 2 * time.Second
-	workerStdinBudget  = int64(1) << 30
-	workerStdoutBudget = int64(1) << 30
-	workerStderrBytes  = int64(16) << 10
-	maxParsesPerWorker = 2048
-	helloTimeout       = 30 * time.Second
-	stopTimeout        = workerGrace + 6*time.Second
+	// workerGrace is the runner's Spec.Grace and the pool's own wait after
+	// closing a worker's stdin: how long a worker that has been told to exit
+	// may take to do so before it is forced. It bounds an exit, never work --
+	// a worker is only ever stopped when it has nothing left to do.
+	workerGrace = 2 * time.Second
+	// workerStderrBytes bounds the stderr capture buffer, a finite bound on a
+	// buffer and not on work: a worker writes a diagnostic there, never
+	// source, only its first line is ever read (stderrLine), and the runner
+	// drops the excess without ending the run.
+	workerStderrBytes = int64(16) << 10
+	// hangWindow is the hang detector's window, not a size limit and not a
+	// deadline: while a request or the hello is outstanding, a worker that has
+	// neither consumed processor time nor sent a byte for this long is
+	// declared hung and killed. A parse of any size computes, so its processor
+	// time moves for as long as it runs; a minute without one clock tick of
+	// it and without one byte on the wire is a worker that is not running.
+	// That holds where the platform samples processor time; where it does
+	// not, the detector never fires (see watchProgress). It is many times the runner's tree sampling period, so a computing
+	// worker is always seen to move within one window.
+	hangWindow = time.Minute
 )
 
 // errWorkerGone is the pipe error the parent sees once the worker's run has
@@ -42,32 +53,43 @@ var errWorkerGone = errors.New("treesitter: parser worker exited")
 
 // pool is the bounded lazy set of parser workers (Section 11.3, 23.4): at
 // most max live at once, started on demand, reused while there is parse work
-// in flight, drained when there is none, recycled when a lifetime bound
-// approaches and torn down on cancellation.
+// in flight, drained when there is none, replaced when one fails and torn
+// down on cancellation.
 //
 // max bounds live processes, not concurrent parses. A worker occupies its
 // place in live from before it is started until the runner has reaped it, so
 // an idle worker, and one still shutting down, both still count. Bounding
-// callers instead would let a caller start a fresh worker while an expiring
+// callers instead would let a caller start a fresh worker while a retiring
 // one is still alive and still holding its runner slot and memory
 // reservation, and the runner would refuse the admission the pool itself
 // caused.
+//
+// Every worker is admitted on the process's one reservation ledger before it
+// is started and gives its reservation back only once the runner has reaped
+// it, so parser workers and every other heavy child of this process are
+// admitted against one allocation and one running total.
 type pool struct {
-	runner   *process.Runner
-	cmd      WorkerCommand
-	dir      string
-	max      int
-	parseTTL time.Duration
-	memory   int64
+	runner    *process.Runner
+	admission *admission.Ledger
+	cmd       WorkerCommand
+	dir       string
+	max       int
+	memory    int64
 
 	mu sync.Mutex
-	// cond wakes acquirers when a worker becomes idle, a process exits or the
-	// pool closes: the three events that can let a waiting caller proceed.
+	// cond wakes acquirers when a worker becomes idle, a process exits, a
+	// reservation is handed back or the pool closes: the events that can let a
+	// waiting caller proceed.
 	cond   *sync.Cond
 	idle   []*worker
 	live   map[*worker]bool
 	closed bool
-	wg     sync.WaitGroup
+	// reserving counts the acquirers waiting on the ledger for a worker they
+	// will start. They count against max beside live, so no more reservations
+	// are asked for than the pool may start processes, and they are not in
+	// live, because no process of theirs exists yet for close to stop.
+	reserving int
+	wg        sync.WaitGroup
 	// totals is the open structural-parse total of every run parsing through
 	// this pool, which is what a worker's span hangs off. It is keyed by the
 	// run and not held as one span because a deferred publication's tick runs
@@ -84,9 +106,12 @@ type worker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	// in and out are the parent's ends of the worker's stdin and stdout;
-	// childIn and childOut are the ends the runner gives the process.
+	// childIn and childOut are the ends the runner gives the process. recv is
+	// out as the parent reads it: every frame is read through it, so each byte
+	// the worker answers with is counted into received as it arrives.
 	in       *io.PipeWriter
 	out      *io.PipeReader
+	recv     io.Reader
 	childIn  *io.PipeReader
 	childOut *io.PipeWriter
 	done     chan struct{}
@@ -97,18 +122,34 @@ type worker struct {
 	// process is started and ended in the run goroutine, which is where the
 	// child's measured cost first exists.
 	span *ledger.Span
+	// release gives the worker's reservation back to the admission ledger. The
+	// run goroutine calls it once the runner has reaped the process, never
+	// before: until then the memory is still held.
+	release func()
+
+	// cpu and received are the hang detector's two progress signals: the
+	// worker's consumed processor time, sampled by the runner, and the bytes
+	// it has answered with.
+	cpu      *process.CPUProgress
+	received atomic.Int64
 
 	// pid and rss are written by the goroutine driving the worker and read by
 	// stats from any goroutine, so both are atomic rather than guarded by the
 	// pool lock the writers do not hold.
 	pid atomic.Int64
 	rss atomic.Uint64
-	// The remaining fields belong to the goroutine that holds the worker
-	// between acquire and release.
-	parses   int
-	bytesIn  int64
-	bytesOut int64
-	started  time.Time
+}
+
+// countingReader counts every byte read through it into n.
+type countingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countingReader) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	c.n.Add(int64(n))
+	return n, err
 }
 
 // pprofDirEnv is the one variable a parser worker inherits, and only when the
@@ -127,8 +168,8 @@ func workerEnv() []string {
 	return nil
 }
 
-func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, parseTTL time.Duration, memory int64) *pool {
-	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, parseTTL: parseTTL, memory: memory,
+func newPool(runner *process.Runner, admit *admission.Ledger, cmd WorkerCommand, dir string, max int, memory int64) *pool {
+	p := &pool{runner: runner, admission: admit, cmd: cmd, dir: dir, max: max, memory: memory,
 		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{}}
 	p.cond = sync.NewCond(&p.mu)
 	return p
@@ -213,13 +254,22 @@ func newWorker(p *pool) *worker {
 	childIn, in := io.Pipe()
 	out, childOut := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
-	return &worker{p: p, ctx: ctx, cancel: cancel, in: in, out: out, childIn: childIn, childOut: childOut,
-		done: make(chan struct{}), started: time.Now()}
+	w := &worker{p: p, ctx: ctx, cancel: cancel, in: in, out: out, childIn: childIn, childOut: childOut,
+		done: make(chan struct{}), cpu: &process.CPUProgress{}}
+	w.recv = countingReader{r: out, n: &w.received}
+	return w
 }
 
 // acquire returns a worker to parse with: an idle one when the pool has one,
 // otherwise a newly started process, waiting when max processes are already
-// alive. It returns promptly on cancellation.
+// alive or about to be. It returns promptly on cancellation.
+//
+// A new worker's memory is reserved on the ledger before the worker exists,
+// with the pool lock released: the wait is first-in-first-out behind every
+// other heavy child and can be long, and the ledger may call stopIdle back,
+// which takes the lock. The pool is re-checked once the room is granted -- it
+// may have closed, or a worker may have gone idle meanwhile -- and room the
+// caller no longer needs is handed straight back.
 func (p *pool) acquire(ctx context.Context) (*worker, error) {
 	p.mu.Lock()
 	for {
@@ -233,12 +283,30 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			p.mu.Unlock()
 			return w, nil
 		}
-		if len(p.live) < p.max {
-			// The worker is fully constructed — pipes, context, cancel — and
-			// takes its place in live and in the wait group under the same hold
-			// close waits behind, so neither a second acquirer nor a concurrent
-			// close can see a process about to start as absent or half-built.
+		if len(p.live)+p.reserving < p.max {
+			p.reserving++
+			p.mu.Unlock()
+			release, err := p.admission.ReserveWith(ctx, admission.Reservation{MemoryBytes: p.memory}, p.stopIdle)
+			p.mu.Lock()
+			p.reserving--
+			p.cond.Broadcast()
+			if err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+			if p.closed || len(p.idle) > 0 {
+				p.mu.Unlock()
+				release()
+				p.mu.Lock()
+				continue
+			}
+			// The worker is fully constructed — pipes, context, cancel,
+			// reservation — and takes its place in live and in the wait group
+			// under the same hold close waits behind, so neither a second
+			// acquirer nor a concurrent close can see a process about to start
+			// as absent or half-built.
 			w := newWorker(p)
+			w.release = release
 			p.live[w] = true
 			p.started++
 			p.wg.Add(1)
@@ -253,6 +321,23 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			return nil, err
 		}
 	}
+}
+
+// stopIdle stops one worker nobody is using, which gives its reservation back
+// to the ledger once it has exited. It is the make-room step the ledger runs
+// for an acquirer of this pool that has reached the head of the queue and does
+// not fit; a pool holding nothing idle frees nothing and the acquirer waits
+// its turn.
+func (p *pool) stopIdle() {
+	p.mu.Lock()
+	if len(p.idle) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	w := p.idle[0]
+	p.idle = p.idle[1:]
+	p.mu.Unlock()
+	w.stop(false)
 }
 
 // wait blocks until the pool changes or ctx ends, releasing and retaking p.mu
@@ -275,20 +360,19 @@ func (p *pool) wait(ctx context.Context) error {
 	return nil
 }
 
-// release returns a worker after a parse. A worker that is unhealthy or has
-// consumed its share of a lifetime bound is stopped; otherwise it goes idle,
-// reusable by the next parse of this stage and stopped by the drain that
-// follows the last one. Its place in live is given up only when the process
-// has exited, which is what keeps live processes bounded.
+// release returns a worker after a parse. An unhealthy worker is stopped;
+// otherwise it goes idle, reusable by the next parse of this stage and stopped
+// by the drain that follows the last one. Its place in live is given up only
+// when the process has exited, which is what keeps live processes bounded.
 func (p *pool) release(w *worker, healthy bool) {
-	if !healthy || w.exhausted() {
-		w.stop(!healthy)
+	if !healthy {
+		w.stop(true)
 		return
 	}
 	p.mu.Lock()
 	if !p.live[w] {
-		// The process died during or just after this parse — its own lifetime
-		// timeout, a crash, an external kill — and the run goroutine has
+		// The process died during or just after this parse — a crash, an
+		// external kill — and the run goroutine has
 		// already taken it out of live. Returning it to idle would break
 		// idle ⊆ live, make BusyWorkers negative and hand the next caller a
 		// dead worker, spending on a certain errWorkerGone the single retry a
@@ -384,16 +468,27 @@ func (p *pool) close() {
 // run goroutine gives both up once the runner has reaped the process,
 // whatever happens here.
 func (p *pool) start(ctx context.Context, w *worker) error {
+	// Neither pipe carries a lifetime byte total and the run carries no
+	// wall-clock bound: the parent writes one request at a time and the worker
+	// is paced by reading it, a bound on stdout would bound a caller-supplied
+	// writer the runner never truncates, and a lifetime or a total would end a
+	// long healthy stage mid-parse. There is no StallTimeout either: an idle
+	// pooled worker makes no progress by design, so the hang detector runs
+	// only while a request is outstanding (watch), fed the processor time the
+	// runner publishes through CPUProgress.
 	spec := process.Spec{
 		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir, Env: workerEnv(),
-		Stdin: w.childIn, MaxStdinBytes: workerStdinBudget,
-		Stdout: w.childOut, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
-		Timeout: workerLifetime, Grace: workerGrace, MemoryReservationBytes: p.memory,
+		Stdin: w.childIn, Stdout: w.childOut, MaxStderrBytes: workerStderrBytes,
+		Grace: workerGrace, CPUProgress: w.cpu, MemoryReservationBytes: p.memory,
 	}
 	w.span = p.openWorkerSpan(ctx)
 	go func() {
 		defer p.wg.Done()
 		w.result, w.runErr = p.runner.Run(w.ctx, spec)
+		// The runner has reaped the process, so its memory is free: this, and
+		// not the moment the worker was asked to stop, is when the reservation
+		// is given back.
+		w.release()
 		// The worker's cost is known here and nowhere earlier: the run has
 		// returned, so the child has been reaped and its processor time, tree
 		// peak and transferred bytes are on the result. The span is ended
@@ -409,9 +504,9 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		w.childOut.CloseWithError(errWorkerGone)
 		p.mu.Lock()
 		delete(p.live, w)
-		// A worker can die while it sits idle — its lifetime timeout, a crash,
-		// an external kill — and an exited worker is not reusable, so it leaves
-		// the idle list with the live map. Otherwise idle could outnumber live
+		// A worker can die while it sits idle — a crash, an external kill —
+		// and an exited worker is not reusable, so it leaves the idle list
+		// with the live map. Otherwise idle could outnumber live
 		// and the next caller would be handed a dead worker, spending on a
 		// certain errWorkerGone the one retry a real parse failure needs.
 		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
@@ -421,8 +516,12 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		close(w.done)
 	}()
 
-	stop := w.watch(ctx, time.Now().Add(helloTimeout))
-	kind, payload, err := wire.Read(w.out, wire.MaxFactFrameBytes)
+	// The hello is watched by the same hang detector as a parse. Until the
+	// runner has admitted and started the process there is no processor-time
+	// measurement, and a worker queued behind the runner's own admission is
+	// waiting, not hung, so that wait is never read as silence.
+	stalled, stop := w.watch(ctx)
+	kind, payload, err := wire.Read(w.recv, wire.MaxFactFrameBytes)
 	stop()
 	var hello wire.Hello
 	if err == nil {
@@ -433,24 +532,19 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		}
 	}
 	if err != nil {
+		// stop returns once the runner has reaped the process, so the run
+		// goroutine's result and error are final here.
 		w.stop(true)
-		// w.result and w.runErr belong to the run goroutine until done
-		// closes, and stop gives up after stopTimeout without that having
-		// happened, so they are read only behind the same guard stderrLine
-		// uses. Reading them on the timed-out branch races the runner.
-		select {
-		case <-w.done:
-			if w.runErr != nil {
-				// The runner's typed refusal (trust, admission, start failure)
-				// or termination explains the missing hello better than the pipe.
-				return w.runErr
-			}
-		default:
-			return &model.Error{Code: model.CodeProviderUnavailable,
-				Message: "the parser worker did not start and did not exit within " + stopTimeout.String() + ": " + err.Error()}
-		}
 		if ctx.Err() != nil {
 			return model.Canceled(ctx.Err())
+		}
+		if stalled() {
+			return stalledError(fmt.Sprintf("the parser worker made no progress for %s before its hello", hangWindow))
+		}
+		if w.runErr != nil {
+			// The runner's typed refusal (trust, admission, start failure)
+			// or termination explains the missing hello better than the pipe.
+			return w.runErr
 		}
 		return (&model.Error{Code: model.CodeProviderUnavailable, Message: "the parser worker did not start: " + err.Error()}).
 			WithDetail("worker_stderr", w.stderrLine())
@@ -480,38 +574,99 @@ func (p *pool) openWorkerSpan(ctx context.Context) *ledger.Span {
 	return span
 }
 
-// watch cancels the worker when ctx ends or the deadline passes before the
-// returned stop function is called. Cancellation kills the process through
-// the runner, which is the one cancellation path the worker has: it needs
-// no in-process cancellation callback (see package worker).
-func (w *worker) watch(ctx context.Context, deadline time.Time) (stop func()) {
+// watch runs the hang detector over one outstanding hello or request, and
+// kills the worker when ctx ends. It returns a predicate that reports whether
+// it was the detector that killed it, and a stop function to call once the
+// exchange is over. Killing goes through the runner, which is the one
+// cancellation path the worker has: it needs no in-process cancellation
+// callback (see package worker).
+func (w *worker) watch(ctx context.Context) (stalled func() bool, stop func()) {
+	return watchProgress(ctx, w.done, w.cpu, &w.received, hangWindow, w.kill)
+}
+
+// tickSource is the processor-time half of the progress signal:
+// process.CPUProgress in the product.
+type tickSource interface {
+	Ticks() (int64, bool)
+}
+
+// watchProgress is the hang detector. The worker is alive for as long as its
+// processor time moves or a byte of its answer arrives; it is declared hung,
+// and kill is called, only when both have stood still for window. A pooled
+// worker serves one request at a time, so both signals are this request's
+// alone: no sibling can speak for a wedged parse.
+//
+// A processor-time reading that is unavailable (ok false) is no measurement,
+// never zero ticks, and silence is not evidence of a hang without it: a parse
+// computes and says nothing until it is done, so on the wire a long parse and
+// a wedged one look the same. While there is no reading -- before the runner
+// has started the process, and for the whole run on a platform that cannot
+// sample a running tree -- the detector therefore never fires. On such a
+// platform a wedged worker is ended only by the caller's cancellation or by
+// its own exit; the alternative, killing on silence alone, would be the
+// wall-clock kill this detector exists to replace, applied to every long parse.
+//
+// The clock is read only here and compared against itself. Polling at a
+// quarter of the window bounds the overshoot past it, as the runner's own
+// stall watchdog does.
+func watchProgress(ctx context.Context, exited <-chan struct{}, cpu tickSource, received *atomic.Int64,
+	window time.Duration, kill func()) (stalled func() bool, stop func()) {
+
+	var fired atomic.Bool
 	finished := make(chan struct{})
 	var once sync.Once
 	go func() {
-		timer := time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		select {
-		case <-finished:
-		case <-ctx.Done():
-			w.kill()
-		case <-timer.C:
-			w.kill()
-		case <-w.done:
+		ticker := time.NewTicker(max(window/4, 10*time.Millisecond))
+		defer ticker.Stop()
+		var lastTicks, lastBytes int64
+		measured := false
+		quietSince := time.Now()
+		for {
+			select {
+			case <-finished:
+				return
+			case <-exited:
+				return
+			case <-ctx.Done():
+				kill()
+				return
+			case now := <-ticker.C:
+				ticks, ok := cpu.Ticks()
+				bytes := received.Load()
+				if !ok || !measured || ticks != lastTicks || bytes != lastBytes {
+					lastTicks, lastBytes, measured, quietSince = ticks, bytes, ok, now
+					continue
+				}
+				if now.Sub(quietSince) >= window {
+					fired.Store(true)
+					kill()
+					return
+				}
+			}
 		}
 	}()
-	return func() { once.Do(func() { close(finished) }) }
+	return fired.Load, func() { once.Do(func() { close(finished) }) }
 }
 
-// kill terminates the worker through the runner and closes the parent's end
-// of its stdin, so the runner's stdin copy sees end of file at once instead
-// of waiting out its grace on a pipe nobody will write to again.
+// kill terminates the worker through the runner and closes the parent's ends
+// of its pipes: stdin, so the runner's stdin copy sees end of file at once
+// instead of waiting out its grace on a pipe nobody will write to again, and
+// stdout, so a frame the worker had already written fails the runner's copy
+// instead of blocking it on a parent that will never read it -- which is what
+// lets the run return, and stop wait for it, however the worker was left.
 func (w *worker) kill() {
 	w.cancel()
 	w.in.Close()
+	w.out.CloseWithError(errWorkerGone)
 }
 
-// stop ends the worker: gracefully by closing its stdin (it exits on EOF) or
-// forcibly through the runner, and waits a bounded time for the reap.
+// stop ends the worker, gracefully by closing its stdin (it exits on end of
+// file) or forcibly through the runner, and returns once the runner has
+// reaped it. The wait is on the exit, not on a clock: after a kill the runner
+// always returns -- it forces the tree after its grace and reports a tree that
+// would not die as an error -- so the reap is certain. A graceful stop is
+// escalated after workerGrace, which only a worker that ignores the end of its
+// input ever reaches.
 func (w *worker) stop(force bool) {
 	if !force {
 		w.in.Close()
@@ -522,18 +677,7 @@ func (w *worker) stop(force bool) {
 		}
 	}
 	w.kill()
-	select {
-	case <-w.done:
-	case <-time.After(stopTimeout):
-	}
-}
-
-// exhausted reports that another parse might cross a lifetime bound.
-func (w *worker) exhausted() bool {
-	return w.parses >= maxParsesPerWorker ||
-		w.bytesIn > workerStdinBudget*3/4 ||
-		w.bytesOut > workerStdoutBudget*3/4 ||
-		time.Since(w.started) > workerLifetime*3/4
+	<-w.done
 }
 
 // stderrLine is the bounded first line of what the worker wrote to stderr,
@@ -574,22 +718,20 @@ func (e perFileError) Error() string { return e.err.Error() }
 func (e perFileError) Unwrap() error { return e.err }
 
 // parse runs one request on w. The returned error is a perFileError when the
-// worker stays healthy, a cancellation or timeout when the caller's context
-// ended (the worker was killed), and anything else when the worker broke
-// protocol or died, in which case the caller retires it.
+// worker stays healthy, a cancellation when the caller's context ended, a
+// CTX_PROVIDER_TIMEOUT when the hang detector found the worker neither
+// computing nor answering (the worker was killed in both cases), and anything
+// else when the worker broke protocol or died, in which case the caller
+// retires it. There is no deadline on the answer: a parse that is working is
+// never ended for taking long.
 func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byte) (*extraction, error) {
-	deadline := time.Now().Add(p.parseTTL)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	stop := w.watch(ctx, deadline)
+	stalled, stop := w.watch(ctx)
 	defer stop()
 	ex, err := p.exchange(w, req, src)
 	stop()
 	p.mu.Lock()
 	p.parses++
 	p.mu.Unlock()
-	w.parses++
 	if err == nil {
 		return ex, nil
 	}
@@ -600,10 +742,18 @@ func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byt
 	if ctx.Err() != nil {
 		return nil, model.Canceled(ctx.Err())
 	}
-	if time.Now().After(deadline) {
-		return nil, &model.Error{Code: model.CodeProviderTimeout, Message: fmt.Sprintf("parsing %s exceeded %s", req.Path, p.parseTTL), Retryable: true}
+	if stalled() {
+		return nil, stalledError(fmt.Sprintf("the parser worker made no progress for %s while parsing %s", hangWindow, bound(req.Path, 256)))
 	}
 	return nil, err
+}
+
+// stalledError is the hang detector's verdict: a timeout in kind, retryable,
+// and told apart from any other timeout by its stop reason, the way the
+// runner's own stall watchdog reports one.
+func stalledError(msg string) *model.Error {
+	return (&model.Error{Code: model.CodeProviderTimeout, Message: msg, Retryable: true}).
+		WithDetail("stop_reason", "stalled")
 }
 
 // atRequestBound is the parent's half of the per-file record bound, read off
@@ -626,14 +776,12 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 	if err := wire.Write(w.in, wire.KindSource, src); err != nil {
 		return nil, err
 	}
-	w.bytesIn += int64(len(src)) + 64
 	ex := &extraction{}
 	for {
-		kind, payload, err := wire.Read(w.out, wire.MaxFactFrameBytes)
+		kind, payload, err := wire.Read(w.recv, wire.MaxFactFrameBytes)
 		if err != nil {
 			return nil, err
 		}
-		w.bytesOut += int64(len(payload)) + 5
 		switch kind {
 		case wire.KindDecl:
 			var d wire.Decl
