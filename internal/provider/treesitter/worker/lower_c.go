@@ -101,11 +101,12 @@ const (
 //     cCasePrefix and the label's start byte, a name built only for such
 //     nested labels, in a buffer the function's lowering reuses. Statements
 //     before the first case label are reachable only by a jump into them.
-//   - A C++ range for ([stmt.ranged]) is a Stmt node for the range
-//     expression, evaluated once, which defines an iteration variable of the
-//     lowering's own; a Branch head spanning from the declarator to the end
-//     of the range expression, which Uses it; then one defining node per
-//     bound name spanning the name, which Uses it too; a name bound by a
+//   - A C++ range for ([stmt.ranged]) follows Iteration (see Lowering): the
+//     range expression's Stmt node, which defines the iteration variable;
+//     the Branch head, spanning from the declarator to the end of the range
+//     expression and Using only the iteration variable, never the names the
+//     range expression reads; then one defining node per bound name spanning
+//     the name, Using only the iteration variable too. A name bound by a
 //     reference to a non-const type (`auto &e : v`) is bound to an element
 //     of the range, so its node may-defines the range's base variable, as
 //     `&v[i]` does; a reference to a const type (`const auto &e : v`) only
@@ -1282,7 +1283,8 @@ func (c *cLower) forStmt(n *ts.Node) {
 	c.close(s)
 }
 
-// forRange lowers a C++ range for (see Node granularity).
+// forRange lowers a C++ range for (see Node granularity): the head and every
+// bound name Use the iteration variable iter, never the range's reads.
 func (c *cLower) forRange(n *ts.Node) {
 	k := c.k
 	s := c.open()
