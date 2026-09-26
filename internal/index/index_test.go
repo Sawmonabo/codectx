@@ -87,13 +87,17 @@ type fixture struct {
 	// unless a scenario is about what a watch reports, which needs a
 	// destination it can read back at debug.
 	logger *slog.Logger
+	// admission is the one memory ledger this fixture's coordinators and its
+	// parser workers reserve from, as production composes one per process.
+	admission *admission.Ledger
 }
 
 func newFixture(t *testing.T, files map[string]string) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	f := &fixture{t: t, ctx: ctx, repoDir: filepath.Join(dir, "repo"), dataDir: filepath.Join(dir, "data")}
+	f := &fixture{t: t, ctx: ctx, repoDir: filepath.Join(dir, "repo"), dataDir: filepath.Join(dir, "data"),
+		admission: testAdmission(t)}
 	if err := os.MkdirAll(f.repoDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +221,7 @@ func (f *fixture) treesitter() provider.Provider {
 		f.t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes,
-		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		Admission: f.admission, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: workDir})
 	if err != nil {
 		f.t.Fatal(err)
@@ -247,7 +251,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if locker == nil {
 		locker = heldLock{f.lock}
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: f.admission, CAS: f.cas,
 		Lock: locker, Pool: pool, Logger: f.logger, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
@@ -1450,7 +1454,7 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: testAdmission(f.t), CAS: f.cas,
+	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, Admission: f.admission, CAS: f.cas,
 		Lock: busyLock{}, Watcher: w, Pool: pool})
 	if err != nil {
 		t.Fatalf("New: %v", err)

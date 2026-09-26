@@ -14,7 +14,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/index"
-	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -172,34 +171,23 @@ func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []m
 	return runRecord(view)
 }
 
-// RecordedPeaks is what this workspace has already measured its heavy units to
-// cost, which the planner raises a unit's reservation to where the constants
-// derive less. It is advisory and must never refuse a plan, so a ledger that
-// is absent or cannot be read answers no rows at all -- not a peak of zero,
-// which would be read as work that costs nothing. A read that fails is logged
-// rather than returned, because the plan it would otherwise fail is the whole
-// index.
-func (l runLedger) RecordedPeaks(ctx context.Context, limit int) ([]plan.RecordedPeak, error) {
+// OpenPeaks opens the learned peaks for one plan. It is advisory and must
+// never refuse a plan: a workspace with no ledger answers a nil lookup, and one
+// whose ledger cannot be opened is logged and answers a nil lookup too, which
+// the plan reads as no observation for every scope. The coordinator closes the
+// reader it is handed. A literal nil is returned, never a nil *ledger.Reader,
+// so the interface compares nil.
+func (l runLedger) OpenPeaks(ctx context.Context) (index.PeakLookup, error) {
 	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
-	if err != nil || !recorded {
-		if err != nil {
-			slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
-				"component", "workspace", "error", err)
-		}
-		return nil, nil
-	}
-	defer reader.Close()
-	rows, err := reader.RecordedPeaks(ctx, limit)
 	if err != nil {
-		slog.Warn("the recorded peaks could not be read; heavy units are sized from the family estimates alone",
+		slog.Warn("the learned peaks could not be read; heavy units are sized from the family estimates alone",
 			"component", "workspace", "error", err)
 		return nil, nil
 	}
-	out := make([]plan.RecordedPeak, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, plan.RecordedPeak{ScopeKey: r.ScopeKey, PeakBytes: r.PeakBytes})
+	if !recorded {
+		return nil, nil
 	}
-	return out, nil
+	return reader, nil
 }
 
 // runRecord is the one place a read run becomes the rows the model carries,
