@@ -1,4 +1,4 @@
-# The per-platform real-tool gate of Section 11.7 and Task 22 Step 3: on every
+# The per-platform real-tool gate of Section 11.7: on every
 # operating system codectx ships for, install every payload the embedded lock
 # pins, re-verify the store, and index a nine-language fixture with the pinned
 # analyzers. "Unverified against a real tool" is a failure of this workflow, not
