@@ -890,8 +890,10 @@ func TestCarryDistancesPageToTheEnd(t *testing.T) {
 	}
 }
 
-// TestDeferredUnitsAreNotCoverage guards the two false-readiness invariants of
-// Section 11.6 that only the `auto` configuration reaches. Neither can be
+// TestDeferredUnitsAreNotCoverage guards the false-readiness invariants of
+// Section 11.6 that only the `auto` configuration reaches: a deferred scope is
+// not coverage until the generation selects its planned unit, and the stale
+// predecessor carried for it is never that unit. Neither can be
 // driven end to end here: plan.Build marks a unit heavy -- and therefore
 // deferrable -- for the dependence provider alone, and that provider needs the
 // real analysis engine. So the coverage projection and the background queue are
@@ -1001,6 +1003,45 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
 			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
 				s.ProviderID, s.Capability, s.State)
+		}
+	}
+
+	// The reverse direction: a generation whose member for the deferred scope
+	// is the STALE predecessor carried while the scope is rebuilt, beside a
+	// sibling scope of the same provider that did seal fresh. The carried
+	// member exists, but it is not the unit the plan derives, so the scope is
+	// still running and the sibling's fresh row must not speak for the
+	// capability. NOT RUN under the no-test order.
+	//
+	// Mutation: make holdsFreshUnit answer true for any selected unit rather
+	// than for the planned spec; the carried member then counts as coverage,
+	// the sibling's fresh row is never demoted, and this fails.
+	rebuilt := held
+	rebuilt.ProviderVersion = "v2"
+	carriedGen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/carried")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g = &generation{c: f.c, gen: carriedGen, caps: newCapabilityReport(), sel: sel,
+		plan: plan.Plan{Units: oneUnit(rebuilt), Carry: []plan.Carried{{Unit: spec.ID, ProviderID: d.ID,
+			ScopeKey: held.ScopeKey, DistanceGenerations: 1, DistanceFiles: 1}}}}
+	if err := g.attachCarried(ctx); err != nil {
+		t.Fatalf("attachCarried: %v", err)
+	}
+	if g.carried != 1 {
+		t.Fatalf("the stale predecessor was not carried into the generation (%d carried)", g.carried)
+	}
+	for _, capability := range d.Capabilities {
+		g.caps.add(model.CapabilityState{ProviderID: d.ID, Capability: capability, Scope: "sibling",
+			State: model.CapabilityFresh})
+	}
+	if err := g.coverage(ctx); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
+	for _, s := range g.caps.finish(f.c.log) {
+		if s.ProviderID == d.ID && s.State == model.CapabilityFresh {
+			t.Fatalf("%s/%s reported fresh while one of its scopes is answered by a carried stale "+
+				"predecessor whose rebuild is still running", s.ProviderID, s.Capability)
 		}
 	}
 }
