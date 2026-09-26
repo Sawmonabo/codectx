@@ -238,7 +238,8 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
 			// The backend's reduced tail is the only record of what the child
 			// said; a failure that dropped it would leave a count of bytes and
-			// nothing a reader could act on without a rerun.
+			// nothing a reader could act on without a rerun. Mutation: drop
+			// the stderr_tail WithDetail in failure (failure.go).
 			backend: &fakeBackend{parse: dependence.Outcome{Class: dependence.FailureMemory,
 				Exception: "java.lang.OutOfMemoryError", ExitCode: 1,
 				StderrTail: "java.lang.OutOfMemoryError: Java heap space"}},

@@ -228,7 +228,7 @@ func (c *Cache) scan(fn func(entry)) error {
 // budget. keep is never evicted: it is the entry just written, and evicting it
 // would make the cache silently useless under pressure.
 //
-// Two streaming passes, so memory never grows with the number of entries. The
+// Two streaming passes, so memory grows only with what eviction removes. The
 // first sums the directory. The second keeps only the oldest entries whose
 // sizes cover the excess: each entry is added to a set ordered newest first,
 // and the newest is dropped from the set while the rest still cover it, so
