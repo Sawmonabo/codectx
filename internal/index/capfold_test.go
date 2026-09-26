@@ -75,11 +75,12 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 //
 // Two rows that collide on the fold key are two units of one capability, and
 // what each gave up is true of the published row: keeping only the first one's
-// details reported one unit's dropped records and silently dropped the other's,
-// which is the silence the scale posture forbids. A fresh row's details are
-// kept for the same reason -- clearing the map made `partial` the only way a
-// provider could be heard at all, so a run that lost nothing had to over-claim
-// a degradation to report an admitted-oversize count.
+// details would report one unit's dropped records and silently drop the
+// other's, which is the silence the scale posture forbids. A fresh row's
+// details are kept for the same reason -- clearing the map would make
+// `partial` the only way a provider could be heard at all, so a run that lost
+// nothing would have to over-claim a degradation to report an
+// admitted-oversize count.
 //
 // Mutation proof: restore the first-wins fold in `add`
 // (`r.rows[key] = existing.WithDetail(scopesDetail, ...)`) and the partial
@@ -261,7 +262,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 }
 
 // TestCoverageKeepsAProviderWithNoMemberFailed is the other half of the same
-// ruling: softening a failure row is only honest when facts exist.
+// rule: softening a failure row is only honest when facts exist.
 //
 // Failure mode: a provider's every unit fails, the plan still names those
 // units, and the row is softened to `partial` on the strength of the plan --

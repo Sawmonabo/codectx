@@ -14,7 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// Retention by distinct ref (Section 12.4, ruling Q10). Every activation
+// Retention by distinct ref (Section 12.4). Every activation
 // records the ref it was built from, and retention keeps the last
 // `retain_refs` refs the user actually indexed rather than the last N
 // snapshots, which is what makes switching A -> B -> C -> A find A's units
@@ -50,14 +50,12 @@ func (c *Coordinator) retain(ctx context.Context) {
 	ctx, span := ledger.Start(ctx, stageRetention, "")
 	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
 	span.AddOut(int64(report.GenerationsSwept))
-	// The ledger is NOT swept with the generations this pass deleted. A run's
-	// account is about the run, not about the generation it happened to
-	// publish: retention keeps the newest generation of each ref, so a
-	// deferred publication -- which extends the base generation on the same
-	// ref, in the same command -- makes the index run's generation a sweep
-	// candidate seconds after it activated, and a ledger keyed to it would
-	// leave `status --resources` with nothing to say about the run that built
-	// the store. The ledger's own bound is sweepLedger's.
+	// The ledger is not swept with the generations this pass deletes; its
+	// bound is sweepLedger's. A run's account is about the run, not about the
+	// generation it published: a deferred publication extends the base
+	// generation on the same ref, so the index run's generation is a sweep
+	// candidate seconds after it activates, and `status --resources` must
+	// still describe the run that built the store.
 	span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
@@ -74,13 +72,14 @@ func (c *Coordinator) retain(ctx context.Context) {
 
 // Collector is the process-level reclaim pass this coordinator schedules. It is
 // the narrow shape of *retention.Collector: the collector owns the Section 10.4
-// blob grace protocol and is the one caller of the five sweep helpers that had
-// none, and the coordinator owns the only moment in the process at which both
-// locks the pass requires are already held.
+// blob grace protocol and the store's sweep helpers, and the coordinator owns
+// the only moment in the process at which both locks the pass requires are
+// already held.
 //
-// It may be nil. A coordinator built without one indexes exactly as before and
-// reclaims nothing on its own -- the composition root always supplies one, and
-// only a coordinator assembled in a test goes without.
+// It may be nil. A coordinator built without one indexes exactly as it
+// otherwise would and reclaims nothing on its own -- the composition root
+// always supplies one, and only a coordinator assembled in a test goes
+// without.
 type Collector interface {
 	Collect(ctx context.Context) (retention.Report, error)
 }

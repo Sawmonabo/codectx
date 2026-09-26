@@ -1,9 +1,9 @@
 package index
 
-// The single incremental scenario of Task 12 Step 1, carried across the eight
-// cases the brief names: no-op reuse, ten changed files, a new symbol and
-// dependency, a delete and a rename, an optional provider's failure, a
-// required provider's failure, a concurrent refresh, and a watcher overflow.
+// The single incremental scenario, carried across eight cases: no-op reuse,
+// ten changed files, a new symbol and dependency, a delete and a rename, an
+// optional provider's failure, a required provider's failure, a concurrent
+// refresh, and a watcher overflow.
 // A ninth test covers the carry-distance paging the coordinator feeds the
 // planner.
 //
@@ -954,7 +954,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 
 	// The same unit, once the publication generation holds it, is coverage --
 	// and it is the generation's own unit rows that say so, not any record of
-	// what the background batch sealed. NOT RUN under the no-test order.
+	// what the background batch sealed.
 	//
 	// Mutation: restore the in-process mirror by making holdsFreshUnit answer
 	// from a batch-local set instead of Store.SelectedUnit; the sealed unit
@@ -1011,7 +1011,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// sibling scope of the same provider that did seal fresh. The carried
 	// member exists, but it is not the unit the plan derives, so the scope is
 	// still running and the sibling's fresh row must not speak for the
-	// capability. NOT RUN under the no-test order.
+	// capability.
 	//
 	// Mutation: make holdsFreshUnit answer true for any selected unit rather
 	// than for the planned spec; the carried member then counts as coverage,
@@ -1050,7 +1050,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 // against the published generation. An unresolved path plans no unit, so the
 // row is the only surviving evidence that tells it apart from a run that
 // supplied no index at all -- the distinction doctor's supplied_index check
-// exists to report, and the one that was unobservable before this record.
+// exists to report.
 func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 	f := newFixture(t, map[string]string{"a.go": "package a\n"})
 	f.c.opts.SuppliedIndexes = []SuppliedIndex{{

@@ -567,9 +567,9 @@ const (
 //
 // Only those keys go. A fresh row carries its degradations here -- how many
 // oversize records were admitted, which fields were truncated to fit a stored
-// ceiling -- and clearing the whole map made state the only channel that
-// survived the fold, which is why a provider with nothing worse than an
-// admitted-oversize count had to publish `partial` to be heard at all. The
+// ceiling -- and clearing the whole map would make state the only channel that
+// survives the fold, so a provider with nothing worse than an admitted-oversize
+// count would have to publish `partial` to be heard at all. The
 // per-unit noise the fold exists to keep out of the report is the scope name
 // itself: one row per file saying which file it was.
 func withoutScopeNamingDetails(s model.CapabilityState) model.CapabilityState {
@@ -729,7 +729,7 @@ func (r *capabilityReport) addFresh(providerID, capability string) {
 		Scope: provider.ScopeWorkspace, State: model.CapabilityFresh})
 }
 
-// addUnavailable publishes the degradation of residual 113: a provider that
+// addUnavailable publishes the degradation of a provider that
 // detection found available and that produced no unit at all. "Available, zero
 // units" is not fresh coverage, and without this row the capability would be
 // missing from the report entirely, which reads as nothing to worry about.
@@ -806,7 +806,7 @@ func (r *capabilityReport) coveredElsewhere(providerID, capability string) {
 }
 
 // addCarried records the provenance distance of one carried stale scope
-// (Section 13.3, ruling Q4).
+// (Section 13.3).
 func (r *capabilityReport) addCarried(providerID, capability, scope string, generations, files int) {
 	r.carried = append(r.carried, model.CapabilityState{ProviderID: providerID, Capability: capability,
 		Scope: scope, State: model.CapabilityStale, DiagnosticCode: model.CodeSnapshotChanged,

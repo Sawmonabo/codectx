@@ -173,7 +173,7 @@ func New(o Options) (*Watcher, error) {
 	//     of paths changed between two debounce ticks. On a monorepo a branch
 	//     switch or a generated-code run changes every file at once, so an
 	//     unlimited pending set IS the repository-sized heap allocation the
-	//     scale ruling forbids. "Unlimited" is never "load everything into
+	//     memory rule forbids. "Unlimited" is never "load everything into
 	//     heap"; here the two rules point in opposite directions and the memory
 	//     one wins.
 	//   - Nothing is lost when the reservation is exceeded. Overflow does not
@@ -185,8 +185,7 @@ func New(o Options) (*Watcher, error) {
 	//
 	// So a user who writes 0 is asking for the product's reservation, and the
 	// product must have one; an operator who wants a larger window sets a
-	// larger number. Ruling applied: H-L0 report deviation 2, over the plan's
-	// row-12 sentence.
+	// larger number.
 	if o.MaxPaths == 0 {
 		o.MaxPaths = DefaultMaxPaths
 	}
@@ -474,10 +473,9 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 //
 // The excluded trees stay unwatched, which is what keeps that affordable: with
 // the capture's Git ignore predicate in place an ignored build directory is
-// pruned by the same predicate that keeps it out of the snapshot, so an
-// `npm install` under
-// an excluded `node_modules` produces no watches, no events and no full
-// reconciliation of a tree that is not indexed at all.
+// pruned by the same predicate that keeps it out of the snapshot, so a
+// package install under an excluded dependency directory produces no watches,
+// no events and no full reconciliation of a tree that is not indexed at all.
 // Peak RSS: `want` is one entry per ADMITTED DIRECTORY, never one per file,
 // and the loop below stops at a user-set index.watch_max_directories, so the
 // map holds one short relative path per admitted directory -- a 300 000-file
@@ -487,11 +485,10 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // pre-empted here. A tree that exceeds a user-set bound stops at it, reports
 // coverage incomplete and keeps working.
 // It is therefore already bounded by watch-set size rather than repository
-// size, and a streamed diff against a spooled directory list would trade a
-// bounded map for a temp file and buy nothing. (Row 12b asks for a diff
-// against a SQLite watched-directory table; no such table exists and
-// schema.sql is frozen this wave -- but on this bound the diff is not the
-// memory fix it would be for a per-file structure.)
+// size, and a streamed diff against a spooled directory list, or a stored
+// watched-directory table, would trade a bounded map for disk and buy
+// nothing: on this bound the diff is not the memory fix it would be for a
+// per-file structure.
 func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map[string]bool) {
 	want := make(map[string]bool, len(watched)+16)
 	// The root is wanted even when the traversal cannot start: a workspace
