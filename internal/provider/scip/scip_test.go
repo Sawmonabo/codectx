@@ -511,18 +511,34 @@ func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth i
 // readings. The document leaves `position_encoding` unspecified, which is how
 // every real scip-typescript, scip-java and scip-python index arrives
 // (measured: none of the three sets the field).
+//
+// A document whose assumed encoding the bytes contradict is dropped whole, and
+// the drop is counted and named on the capability row; silently, it would
+// leave a unit that describes fewer files than its index with nothing saying
+// so. A zero-width definition selects no bytes and reads the same in every
+// encoding, so it must not decide the probe. Mutations that must fail this
+// test: drop the documents_dropped_encoding count or its exemplar, which
+// republishes the silence; or let a zero-width definition prove the encoding in
+// encodingHolds, which admits the wrong-encoding document behind it.
 func TestCallsiteAliasJoin(t *testing.T) {
 	cases := []struct {
 		name          string
 		tool, version string
 		admit         bool
+		// zeroWidth puts a zero-width definition of a named symbol ahead of
+		// the one the probe can check.
+		zeroWidth bool
+		// contradicted is the documents_dropped_encoding the row must publish.
+		contradicted string
 	}{
 		// The measured pair: the columns are read as UTF-16 and the join works.
 		{name: "measured tool and version", tool: "scip-typescript", version: "0.4.0", admit: true},
 		// A tool whose measured encoding is UTF-8 over UTF-16 columns. The
-		// conversion succeeds and selects "n B": the wrong-source case the
-		// self-check exists for.
-		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7"},
+		// conversion succeeds and selects "n B", which starts inside
+		// "function": the wrong-source case the self-check exists for.
+		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7", contradicted: "1"},
+		// The same, behind a zero-width definition the probe must pass over.
+		{name: "wrong tool encoding behind a zero-width definition", tool: "scip-go", version: "0.2.7", zeroWidth: true, contradicted: "1"},
 		// The right tool at a version nothing was measured against.
 		{name: "unmeasured version", tool: "scip-typescript", version: "9.9.9"},
 		// A tool with no measured encoding at all.
@@ -531,9 +547,11 @@ func TestCallsiteAliasJoin(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			files := fixture(t)
-			ref := occurrenceRecord(symBaz, 0, 0, 25, 28)
-			def := occurrenceRecord(symBaz, 1, 0, 25, 28)
-			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, def, ref)))
+			occs := [][]byte{occurrenceRecord(symBaz, 1, 0, 25, 28), occurrenceRecord(symBaz, 0, 0, 25, 28)}
+			if tc.zeroWidth {
+				occs = append([][]byte{occurrenceRecord(symI, 1, 1, 10, 10)}, occs...)
+			}
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, occs...)))
 			inputs := append([]string{"utf16.scip"}, sourcePaths...)
 			p := newProvider(t, "utf16.scip")
 			h := providertest.New(t, files)
@@ -545,6 +563,24 @@ func TestCallsiteAliasJoin(t *testing.T) {
 				if rep.Skipped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
 					t.Fatalf("index of %s %s: skipped=%d, %d nodes, %d relations, %d aliases %v; want the document skipped and nothing published",
 						tc.tool, tc.version, rep.Skipped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
+				}
+				for _, cs := range rep.Result.Capabilities {
+					if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
+						t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
+					}
+					if got := cs.Details["documents_dropped_encoding"]; got != tc.contradicted {
+						t.Fatalf("documents_dropped_encoding = %q, want %q: a document dropped for its encoding must be counted", got, tc.contradicted)
+					}
+					want := ""
+					if tc.contradicted != "" {
+						want = "web/b.ts"
+					}
+					if got := cs.Details["documents_dropped_encoding_exemplar"]; got != want {
+						t.Fatalf("documents_dropped_encoding_exemplar = %q, want %q", got, want)
+					}
+					if got := cs.Details["refused_occurrences"]; got != "" {
+						t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not refused occurrences", got)
+					}
 				}
 				return
 			}
@@ -1005,7 +1041,7 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // identifier token spells the name its symbol carries. The document leaves its
 // position encoding unspecified, so the per-document encoding probe runs and
 // passes on the first definition, which is correct in every case; the shifted
-// occurrence is the second one.
+// occurrences follow it.
 //
 // The second failure mode, measured on the same project and equally silent:
 // failing the unit on the first refusal threw away all 93,167 occurrences over
@@ -1015,39 +1051,63 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // thinned unit indistinguishable from a whole one.
 //
 // Mutations that must fail this test: probe once per document (drop the range
-// check from occurrenceRange), which republishes the wrong bytes; drop the
-// end-of-token half of the coverage check, which republishes the keyword case;
-// or drop the refusal count from the capability details, which republishes the
-// silence.
+// check from occurrenceRange), which republishes the wrong bytes; bind a
+// spelling in bindSpellings because two occurrences of the symbol spell it
+// rather than from an alias clause, which republishes "page" over "name"; drop
+// the end-of-token half of the coverage check, which republishes the keyword
+// case; admit a range holding no identifier byte whatever it holds, which
+// republishes the whitespace case; drop the refusal count from the capability
+// details, which republishes the silence; or drop the coordinate from the
+// exemplar, which hands the operator a file without the line inside it that
+// disagrees.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
-	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
-	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	// columns [10,17) of it; "Start" at columns [5,10) of line 4. Lines 6 and
+	// 7 are the same text, indented by the same two tabs: "page" sits at
+	// columns [6,10) of each and "name" at [11,15).
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n\t\trun(page,name);\n\t\trun(page,name);\n}\n"
 	const (
 		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
 		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
 		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+		symPage    = "scip-go gomod example.com/mod . pkg/Start().(page)"
 	)
+	// exemplar is the coordinate the first refused occurrence claimed, as the
+	// capability row must spell it: zero-based line and column, exactly as the
+	// index wrote them, so an operator opens the disagreeing line directly.
 	cases := []struct {
-		name    string
-		shifted []byte
+		name     string
+		shifted  [][]byte
+		refused  string
+		exemplar string
 	}{
 		// A declaration on a clean token boundary that is not its own name:
 		// the columns of the parameter, not of the function.
-		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18)},
+		{"definition", [][]byte{occurrenceRecord(symStart, 1, 4, 11, 18)}, "1", "pkg/tabs.go:4:11: "},
 		// Five columns to the right of "browser" and still inside the line:
 		// "er + br", which starts in the middle of an identifier.
-		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22)},
+		{"reference", [][]byte{occurrenceRecord(symBrowser, 0, 5, 15, 22)}, "1", "pkg/tabs.go:5:15: "},
 		// Seven columns to the left: "return ", a keyword plus the space
 		// before the identifier. Both ends are wrong -- it covers no whole
 		// token and it does not spell the symbol's name -- and it is the
 		// shift the start-boundary check alone admitted.
-		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10)},
+		{"reference_onto_a_keyword", [][]byte{occurrenceRecord(symBrowser, 0, 5, 3, 10)}, "1", "pkg/tabs.go:5:3: "},
 		// Four columns to the right and four wider: "browser + b", which
 		// begins on a token boundary and stops in the middle of the next
 		// identifier. Only the end of it is wrong, which is the half of the
 		// coverage rule the three rows above do not exercise.
-		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21)},
+		{"reference_stopping_inside_the_next_token", [][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 21)}, "1", "pkg/tabs.go:5:10: "},
+		// One column wide and seven to the right of "browser": the space
+		// between it and "+", which holds no token at all.
+		{"reference_onto_whitespace", [][]byte{occurrenceRecord(symBrowser, 0, 5, 17, 18)}, "1", "pkg/tabs.go:5:17: "},
+		// The same tab shift on two identical lines: each reference to "page"
+		// is five columns right, on "name", a whole token that is not the
+		// symbol's name. The shift repeats the wrong spelling once per line, so
+		// a spelling bound because it recurs would publish "page" over the
+		// bytes of "name" twice; nothing in the document aliases "page" as
+		// "name", so both are refused.
+		{"one_shift_repeated_on_identical_lines", [][]byte{occurrenceRecord(symPage, 0, 6, 11, 15), occurrenceRecord(symPage, 0, 7, 11, 15)},
+			"2", "pkg/tabs.go:6:11: "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1056,10 +1116,10 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 			files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
 				documentWithText("pkg/tabs.go", "go", 0, src,
 					// Clean, refused, clean: the last one is spooled AFTER the
-					// refusal, so a refusal that cost the rest of its document
+					// refusals, so a refusal that cost the rest of its document
 					// would take it with it.
-					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted,
-					occurrenceRecord(symBrowser, 0, 5, 10, 17))))
+					slices.Concat([][]byte{occurrenceRecord(symServer, 1, 2, 5, 11)}, tc.shifted,
+						[][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 17)})...)))
 
 			h := providertest.New(t, files)
 			p := newProvider(t, "tabs.scip")
@@ -1075,61 +1135,14 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
 					t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
 				}
-				if got := cs.Details["refused_occurrences"]; got != "1" {
-					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, "1")
+				if got := cs.Details["refused_occurrences"]; got != tc.refused {
+					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, tc.refused)
 				}
-				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, "pkg/tabs.go: ") {
-					t.Fatalf("refused_occurrence_exemplar = %q, want the document named", got)
+				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, tc.exemplar) {
+					t.Fatalf("refused_occurrence_exemplar = %q, want the prefix %q: the document and the coordinate it claimed", got, tc.exemplar)
 				}
 			}
 		})
-	}
-}
-
-// TestFailedEncodingProbeDropsTheDocument protects the one shift that is NOT a
-// per-occurrence refusal. A position encoding assumed from the tool table and
-// contradicted by the bytes shifts every column of that document, so no
-// occurrence of it can be trusted and the document is dropped whole. The
-// failure mode, silent: dropping it without a count leaves an operator reading
-// a unit that describes fewer files than the index held with nothing saying so.
-//
-// The document declares no encoding, so the scip-typescript table entry
-// (UTF-16) is assumed; its one definition sits after a 4-byte rune, where a
-// UTF-16 reading and the truth disagree, and the columns given are the UTF-8
-// ones. Mutation that must fail this test: drop the encodingDropped count (or
-// its detail), which republishes the silence.
-func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
-	// "𝄞" is one UTF-8 4-byte rune and two UTF-16 units. "Start" therefore
-	// begins at UTF-8 column 9 and UTF-16 column 7; the columns below are the
-	// UTF-8 ones, which a UTF-16 reading resolves to bytes that are not it.
-	const src = "// \U0001D11E xx\nfunc Start() {}\n"
-	const symStart = "scip-typescript npm example 1.0.0 src/`a.ts`/Start()."
-
-	files := fixture(t)
-	files["src/a.ts"] = src
-	files["a.scip"] = string(miniIndex("scip-typescript", "0.4.0",
-		documentWithText("src/a.ts", "typescript", 0, src,
-			occurrenceRecord(symStart, 1, 0, 17, 22))))
-
-	h := providertest.New(t, files)
-	p := newProvider(t, "a.scip")
-	res, _, err := h.Run(t, p, scip.ImportScope("a.scip"), append([]string{"a.scip", "src/a.ts"}, sourcePaths...))
-	if err != nil {
-		t.Fatalf("a document whose encoding probe fails must be dropped, not fail the unit: %v", err)
-	}
-	for _, cs := range res.Capabilities {
-		if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
-			t.Fatalf("capability %s is %s/%s, want partial/%s", cs.Capability, cs.State, cs.DiagnosticCode, model.CodeProviderOutputInvalid)
-		}
-		if got := cs.Details["documents_dropped_encoding"]; got != "1" {
-			t.Fatalf("documents_dropped_encoding = %q, want %q: a dropped document must be counted", got, "1")
-		}
-		if got := cs.Details["documents_dropped_encoding_exemplar"]; got != "src/a.ts" {
-			t.Fatalf("documents_dropped_encoding_exemplar = %q, want src/a.ts", got)
-		}
-	}
-	if got := refusedDetail(res); got != "" {
-		t.Fatalf("refused_occurrences = %q: a whole-document shift is one dropped document, not a refused occurrence", got)
 	}
 }
 
@@ -1148,8 +1161,8 @@ func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
 // The probe-deciding occurrence here is a declaration of `Start` ranged over
 // `browser`, one whole identifier token further along the same line: it
 // converts, it is not cut, it covers whole tokens, and it is not `Start`. The
-// conversion-error path that TestFailedEncodingProbeDropsTheDocument fires
-// through is therefore never reached, so this is the half that test misses.
+// cut-token path the wrong-encoding rows of TestCallsiteAliasJoin fail through
+// is therefore never reached, so this is the half those rows miss.
 // Because the probe is a claim about the whole document, the assertions are
 // that nothing of it survives -- no call-site alias from the clean reference
 // spooled after it, no row in the fresh manifest -- and that the drop is
@@ -1159,12 +1172,15 @@ func TestFailedEncodingProbeDropsTheDocument(t *testing.T) {
 // document-level probe ignore a name mismatch while the per-occurrence path
 // keeps it, i.e. in `encodingHolds` replace
 //
-//	holds = ds.onPinnedBytes(sym, &rng) == ""
+//	if rng != nil && ds.onPinnedBytes(sym, rng) == "" {
 //
 // with
 //
-//	msg := ds.onPinnedBytes(sym, &rng)
-//	holds = msg == "" || msg == "the occurrence does not select the identifier its symbol names"
+//	msg := ""
+//	if rng != nil {
+//		msg = ds.onPinnedBytes(sym, rng)
+//	}
+//	if rng != nil && (msg == "" || msg == "the occurrence does not select the identifier its symbol names") {
 //
 // The document is then admitted, the declaration is refused as one occurrence,
 // the reference after it publishes its call-site alias and the manifest gains a
@@ -1223,54 +1239,4 @@ func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 			t.Fatalf("refused_occurrences = %q: a failed encoding probe is one dropped document, not a refused occurrence", got)
 		}
 	}
-}
-
-// TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse holds the boundary of
-// the wrong-bytes guarantee, which docs/providers-scip.md states beside it: a
-// shift that lands on a whole token spelling the same identifier somewhere
-// else publishes, because the two ranges are byte-for-byte the same claim and
-// this provider never adjusts or guesses a coordinate.
-//
-// Failure mode it guards: the guarantee being read, or later written, as
-// total. A page that claimed every occurrence is proved would tell an operator
-// that a located fact of a `partial` unit cannot name the wrong token, and the
-// counts would carry no warning at all for this class. If a later predicate
-// does refuse this occurrence, the residual on that page is stale and the
-// guarantee can be widened -- which is why this asserts publication rather
-// than leaving the class untested.
-func TestTheSameTextShiftIsTheResidualTheBytesCannotRefuse(t *testing.T) {
-	// The same line as the test above. "browser" sits at columns [10,17) and
-	// again at [20,27); the occurrence below is the first one shifted ten
-	// columns right, onto the second.
-	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
-	const (
-		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
-		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
-	)
-	files := fixture(t)
-	files["pkg/tabs.go"] = src
-	files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
-		documentWithText("pkg/tabs.go", "go", 0, src,
-			occurrenceRecord(symStart, 1, 4, 5, 10),
-			occurrenceRecord(symBrowser, 0, 5, 20, 27))))
-
-	h := providertest.New(t, files)
-	p := newProvider(t, "tabs.scip")
-	res, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := refusedDetail(res); got != "" {
-		t.Fatalf("refused_occurrences = %q: a shift onto a token spelling the same identifier is the measured residual, "+
-			"not something the pinned bytes can refuse -- if it now is, widen the guarantee on docs/providers-scip.md", got)
-	}
-}
-
-func refusedDetail(res model.ProviderResult) string {
-	for _, cs := range res.Capabilities {
-		if v := cs.Details["refused_occurrences"]; v != "" {
-			return v
-		}
-	}
-	return ""
 }
