@@ -43,8 +43,8 @@ import (
 //     -std=c11 -fPIC only, the typescript module's two bindings likewise).
 //     Hence the cpp scanner's state, the rust scanner's, and the python
 //     scanner's state with its indent and delimiter stacks are libc
-//     allocations the counter never sees; scannerAllocations records which
-//     grammars those are, and their parse rows carry scanner_bytes: null.
+//     allocations the counter never sees; the benchmark rows record which
+//     grammars those are by carrying scanner_bytes: null for them.
 //     The javascript, typescript and tsx scanners allocate nothing (their
 //     create returns NULL); c, go and java have no external scanner; no
 //     grammar's parser.c allocates.
