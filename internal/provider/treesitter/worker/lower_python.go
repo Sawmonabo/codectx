@@ -107,11 +107,11 @@ var pythonLowering = Lowering{
 //     exit is one Stmt node spanning from the `with` keyword to the end of
 //     the item, which Uses the manager's variable only: `__exit__` is
 //     called on the manager entered, not on the context expression's
-//     variables, which the exit's span holds but does not evaluate again. The statement
-//     after the with follows the exit when the body completed normally or an
-//     exception reached the finally, because `__exit__` may suppress it; a
-//     break, continue or return alone is re-issued from the exit and never
-//     falls through. Items close in reverse.
+//     variables, which the exit's span holds but does not evaluate again.
+//     The statement after the with follows the exit when the body completed
+//     normally or an exception reached the finally, because `__exit__` may
+//     suppress it; a break, continue or return alone is re-issued from the
+//     exit and never falls through. Items close in reverse.
 //   - match (§8.6): the subjects are one Stmt node spanning them. Each case is
 //     one node spanning its patterns, in source order, that Uses the
 //     subjects' reads and every value its patterns read (a dotted name, a
@@ -1492,8 +1492,9 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 // grammar parses `except E as n` with E and n as one as-pattern value.
 //
 // With `as n`, n is bound first, and the body runs in a finally whose body
-// is the node deleting n (§8.4.1: n is deleted however the clause ends), a Stmt
-// node spanning the clause; the finally's Handler spans the `as` keyword.
+// is the node deleting n (§8.4.1: n is deleted however the clause ends), a
+// Stmt node spanning the clause; the finally's Handler spans the `as`
+// keyword.
 func (j *pyLower) except(c *ts.Node, star bool) bool {
 	k := j.k
 	j.reset()
