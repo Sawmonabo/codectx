@@ -89,7 +89,7 @@ func pairEngine(t *testing.T, f *graphFixture) *Engine {
 	return e
 }
 
-// TestPackagePairCountsAreExactAndOrderIndependent protects ruling P4's
+// TestPackagePairCountsAreExactAndOrderIndependent protects the rollup's
 // exactness: the pairs a streamed rollup reports -- their set, their global
 // order and their two counts -- are a function of the edges alone, never of
 // the batch boundaries the stream happened to fall on. The fixture's 700 edges
@@ -178,8 +178,8 @@ func TestPackagePairCountsAreExactAndOrderIndependent(t *testing.T) {
 	}
 }
 
-// TestPackageRollupHoldsOneBatchOfEdges protects the memory invariant ruling P4
-// is for: the rollup of an unbounded walk holds ONE resolution batch of edges
+// TestPackageRollupHoldsOneBatchOfEdges protects the rollup's memory
+// invariant: the rollup of an unbounded walk holds ONE resolution batch of edges
 // at a time, never the edges the walk admitted. Twenty thousand edges stream
 // through it and the live set stays at pairRollupBatch.
 //

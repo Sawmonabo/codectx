@@ -25,7 +25,7 @@ import (
 //     budget rather than starting from zero or adding to a running total, so
 //     replaying one page's cursor twice can neither reset nor double the
 //     allowance.
-//  3. One fresh spool per page (the L0 freeze). pagination.Spools.Open streams
+//  3. One fresh spool per page. pagination.Spools.Open streams
 //     from the start and cannot seek, so a resume opens the PREVIOUS page's
 //     spool, replays it to rebuild the frontier, and writes a NEW spool for the
 //     page after it. Replay-and-skip over one growing spool would cost
@@ -114,7 +114,7 @@ type traversalCursor struct {
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
-	// Ranked marks the ranked-tail continuation of ruling P2: the walk is over,
+	// Ranked marks the ranked-tail continuation of a ranked answer: the walk is over,
 	// the answer is globally ordered, and SpoolID names the records ranked
 	// after the page that minted this token. It is an explicit discriminator
 	// rather than an inference from the other fields, because the two
@@ -128,12 +128,12 @@ type traversalCursor struct {
 	// walk continuation without it is a traversal (neighbours), which ranks
 	// nothing and retains nothing.
 	RetainID string `json:"retain_id,omitempty"`
-	// WalkDone marks ruling P7's third shape: the walk is EXHAUSTED and the
-	// ranking is what the deadline cut short. The next request walks nothing --
-	// there is no frontier to walk -- and re-runs both passes over the retained
-	// input RetainID names. It is an explicit discriminator because a walk
-	// continuation with an empty frontier is otherwise indistinguishable from a
-	// finished answer, which mints no cursor at all.
+	// WalkDone marks the third shape, a mid-rank deadline: the walk is EXHAUSTED
+	// and the ranking is what the deadline cut short. The next request walks
+	// nothing -- there is no frontier to walk -- and re-runs both passes over the
+	// retained input RetainID names. It is an explicit discriminator because a
+	// walk continuation with an empty frontier is otherwise indistinguishable from
+	// a finished answer, which mints no cursor at all.
 	WalkDone bool `json:"walk_done,omitempty"`
 	// RankOffset is the BYTE offset in that spool where the next page's first
 	// entity record begins, and RankServed/RankTotal the cumulative answer
@@ -263,7 +263,7 @@ func (c traversalCursor) validateLevel() error {
 	return nil
 }
 
-// validateRanked enforces the ruling P2 half of the payload: the ranked fields
+// validateRanked enforces the ranked half of the payload: the ranked fields
 // are meaningful only on a ranked continuation and meaningless -- and so
 // refused -- on a walk one, which is what keeps a tampered token from steering
 // a walk resume into a ranked spool or the reverse.
@@ -303,7 +303,7 @@ func (c traversalCursor) validateRanked() error {
 			return cursorInvalid("a walk continuation names no retained state")
 		}
 		if c.WalkDone {
-			// Ruling P7's shape: nothing left to walk, the whole answer still
+			// The mid-rank shape: nothing left to walk, the whole answer still
 			// to rank. A token that claimed it while naming a frontier spool or
 			// a keyset position would resume a walk this build believes is
 			// over, and lose whatever that frontier still held.
@@ -418,7 +418,7 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // (visitedstore.go) rather than as a section of this spool. A page therefore
 // writes what its frontier costs, never what the walk behind it costs.
 //
-// Ruling P2 adds a THIRD kind, and one spool shape that is not a walk at all.
+// A ranked answer adds a THIRD kind, and one spool shape that is not a walk at all.
 // An impact or rollup request runs its walk to completion, ranks the whole
 // answer, serves the first page and spools the globally ranked remainder; that
 // spool's leading record is `r`, and every record after it is a bare ranked
@@ -432,10 +432,6 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // directory rather than as a record stream (pathcursor.go) -- so it appears
 // here, in the one vocabulary block, purely so no two continuation shapes can
 // ever claim the same marker. pathCursor.validate is what reads it.
-//
-// The older ranked vocabulary of payload version 1 ("a", "e", "p", "c") is
-// gone and is not revived: it spooled a per-page chunk, which is the shape
-// ruling P2 replaces.
 const (
 	spoolRecordRanked = "r"
 	spoolRecordPath   = "p"
@@ -547,7 +543,7 @@ type continuation struct {
 	// the pass-1 input the two ranking endpoints add to it.
 	Retain *retainedWalk
 	// WalkDone says the frontier is empty because the walk FINISHED, not
-	// because there is nothing to continue: ruling P7's mid-rank deadline. It
+	// because there is nothing to continue: a mid-rank deadline. It
 	// is what lets nextTraversalCursor mint a token for a walk with no
 	// frontier, which it otherwise refuses.
 	WalkDone bool
@@ -736,7 +732,8 @@ func (e *Engine) releaseConsumed(ctx context.Context, spoolID, leaseID string) {
 // no NextCursor, which is the same contract as running out of page items.
 func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuation) (string, error) {
 	// The mint runs on a context DETACHED from the request deadline, and this
-	// is what makes ruling P3 deliverable rather than merely intended. The
+	// is what makes "the deadline ends a page, never the answer" deliverable
+	// rather than merely intended. The
 	// continuation is the LAST thing a timed-out page does, so by definition
 	// the query deadline has already passed when the lease is acquired and the
 	// frontier spilled. Charged against that expired context, the lease write

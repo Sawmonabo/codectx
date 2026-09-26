@@ -12,7 +12,7 @@ import (
 
 // TestStreamedIngestMatchesTheMapDedupe is the P-A invariant: replacing
 // expandScope's `admitted map[string]bool` with a min-seq fold over an entityID
-// sort (ruling C2) yields the SAME survivors, in the SAME admission order, with
+// sort yields the SAME survivors, in the SAME admission order, with
 // the same routes and the same scope verdict.
 //
 // It is one test over three scopes because one survivor set is one invariant:
@@ -116,8 +116,9 @@ func TestStreamedIngestMatchesTheMapDedupe(t *testing.T) {
 	}
 }
 
-// TestStreamedHydrationCarriesBothPathValues is the P-B invariant and ruling
-// C3's proof. The two path writes today's pipeline performs differ, and this
+// TestStreamedHydrationCarriesBothPathValues is the P-B invariant that the
+// record keeps both path values. The two path writes the reference pipeline
+// performs differ, and this
 // row is the smallest fixture that distinguishes them: a candidate whose
 // pre-set Path is NOT its snapshot path keeps that path for ranking
 // (hydrateFiles fills Path only when empty, compiler.go:341) while budgeting
@@ -181,7 +182,7 @@ func TestStreamedHydrationCarriesBothPathValues(t *testing.T) {
 	}
 	if got[1].PathAtRank != "internal/order/moved.go" {
 		t.Fatalf("ranking's path was overwritten with the snapshot path %q; packageOf, "+
-			"centrality and the boost reason read this field (C3)", got[1].PathAtRank)
+			"centrality and the boost reason read this field", got[1].PathAtRank)
 	}
 	if got[1].PathFinal != ports.Path {
 		t.Fatalf("budgeting's path = %q, want the snapshot path %q (budget.go:254)",
@@ -201,7 +202,7 @@ func streamScope(t *testing.T, fx *contextFixture, eng *graph.Engine, seeds []ca
 	t.Helper()
 	sorts := openSorts(t, fx.Cfg)
 	c := &Compiler{cfg: fx.Cfg}
-	// P-A takes the sink the Section 15.2 producers push into (ruling C10), so
+	// P-A takes the sink the Section 15.2 producers push into, so
 	// a test with a slice of seeds pushes them the way discovery would.
 	ingest, err := c.newSeedIngest(sorts)
 	if err != nil {

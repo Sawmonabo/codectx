@@ -13,7 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// Ruling C7: resources.query_timeout must end a PASS of a streamed compile, not
+// resources.query_timeout ends a PASS of a streamed compile, never
 // the answer. This file is the persistence half of that -- how the streams a
 // completed pass produced survive between two calls -- and nothing here decides
 // WHEN a compile stops.
@@ -87,7 +87,7 @@ type checkpointRun struct {
 // checkpointScalars is the non-stream carry. Each field is bounded by something
 // other than the repository -- a verdict, a flag, a count, or the capability
 // report, which is one row per provider -- so holding it in the state file is
-// not the repository-sized list this wave removes.
+// never a repository-sized list.
 type checkpointScalars struct {
 	Completeness     []model.CapabilityState `json:"completeness,omitempty"`
 	ScopeComplete    bool                    `json:"scope_complete"`
@@ -317,15 +317,14 @@ func absoluteRuns(dir string, runs []checkpointRun) ([]pagination.RunRef, error)
 	return out, nil
 }
 
-// The Compile-side half of ruling C7: WHEN a compile stops, what it writes at
+// The Compile-side half of the continuation: WHEN a compile stops, what it writes at
 // that boundary, and how the call after it comes back.
 //
 // EVERY pass boundary is a checkpoint. A compile that runs out of deadline
 // between any two passes persists what the passes it finished produced, records
 // the index of the first unfinished pass and answers a continuation cursor; the
 // next call restores exactly those streams and re-enters the pipeline there. A
-// deadline is therefore never a lost compile, whichever pass it lands behind --
-// which is the whole of ruling C7 and not the single boundary C-D3 could reach.
+// deadline is therefore never a lost compile, whichever pass it lands behind.
 //
 // The pass indices are the plan's P-A..P-I in order. A checkpoint's Pass is the
 // FIRST UNFINISHED pass, so the boundary behind P-A is passHydrate and the last

@@ -77,7 +77,7 @@ func hexID(seed byte) string {
 	return strings.Repeat(fmt.Sprintf("%02x", seed), 32)
 }
 
-// TestBoundedExplanationsReachTheManifestNotices is the row-17/F15 invariant:
+// TestBoundedExplanationsReachTheManifestNotices guards explanation disclosure:
 // the three field cuts the compile applies to an entry's explanation --
 // reasons past the per-entry count, a reason past its byte bound, and the page
 // size a configuration asked for and could not have -- are DISCLOSED on the

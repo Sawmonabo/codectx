@@ -9,11 +9,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// The freeze protects three invariants and nothing else: a record survives the
-// disk round trip unchanged, every fold is independent of the order its
-// records arrive in, and a ranked spool cannot be read as a walk spool or the
-// reverse. Everything else in this file is machinery the fill-in lanes test
-// against their own behaviour.
+// This file protects three invariants of the ranking records and nothing else:
+// a record survives the disk round trip unchanged, every fold is independent
+// of the order its records arrive in, and a ranked spool cannot be read as a
+// walk spool or the reverse. The walk and ranking behaviour built on them is
+// tested where it is exercised.
 
 func TestRankRecordsRoundTripThroughTheSortCodec(t *testing.T) {
 	impacts := []impactRecord{

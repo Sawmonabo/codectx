@@ -223,16 +223,16 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 }
 
 // ---------------------------------------------------------------------------
-// Streamed budgeting — C-STREAM passes P-G, P-H and P-I
+// Streamed budgeting — passes P-G, P-H and P-I
 // ---------------------------------------------------------------------------
 //
-// buildPlan above holds five candidate-sized structures at once (`sized`,
-// `charged`, `provisional`, the groups' index lists and `plan.Excluded`). The
-// passes below produce the SAME plan from sorted streams: every list becomes a
-// sorted run, every map a merge join, and the only heap that grows with the
-// answer is the one ruling C4 keeps there -- the slice table and its entry
-// ordinals, which are a function of the resolved budget and not of the
-// repository.
+// The reference buildPlan (stream_parity_test.go) holds five candidate-sized
+// structures at once (`sized`, `charged`, `provisional`, the groups' index
+// lists and `plan.Excluded`). The passes below produce the SAME plan from
+// sorted streams: every list becomes a sorted run, every map a merge join, and
+// the only heap that grows with the answer is the one the design keeps there --
+// the slice table and its entry ordinals, which are a function of the resolved
+// budget and not of the repository.
 //
 // Two invariants make the streamed plan equal to the whole-set one and are
 // worth stating where a reader meets them:
@@ -241,7 +241,7 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 //     the ranked stream. The whole-set `i` is a position in `sized`
 //     (stream_parity_test.go:469-470), so counting a filtered record would
 //     shift every later ordinal and with it every stored slice membership.
-//   - Exclusions keep today's sequence (ruling C1): the pre-sort exclusions in
+//   - Exclusions follow one sequence: the pre-sort exclusions in
 //     expansion order first, then the packer's drops in group order. The first
 //     group is replayed from a run keyed by `Seq` -- the ingest order the
 //     ranked stream destroys -- and the second from a run keyed by
@@ -284,8 +284,8 @@ type planParts struct {
 // by lessPathSeq and lessHopSeq, both keyed on the candidate's `Seq`).
 //
 // The routes travel separately because candRec deliberately does not carry them
-// (C-L0 report, deviation 2: context.max_reason_paths_per_entry is unlimited by
-// default, so an inline route list has no bound a sort record may assume). Both
+// (context.max_reason_paths_per_entry is unlimited by default, so an inline
+// route list has no bound a sort record may assume). Both
 // budget phases measure entries, and measureEntry reads `candidate.Paths`, so
 // both must re-join the routes to their candidate; P-G re-keys them once from
 // `Seq` to `Index` so that the measuring walks, which run in rank order, read
@@ -354,7 +354,8 @@ type dropRec struct {
 }
 
 // sliceMember is one selected entry's contribution to its slice, held only
-// until the slice table is assembled (ruling C4).
+// until the slice table is assembled; the table is a function of the resolved
+// budget, not of the repository.
 type sliceMember struct {
 	minIndex int64
 	index    int64

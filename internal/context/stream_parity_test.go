@@ -108,7 +108,7 @@ type refScope struct {
 // so instead of quietly compiling a plan around it. An empty or wholly
 // ambiguous extracted scope is NOT an error: it yields a discovery answer with
 // ScopeComplete false, no required entry and every unresolved token kept as its
-// own reasoned exclusion (Section 15.2, ruling Q7).
+// own reasoned exclusion (Section 15.2).
 func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID, cfg config.Context,
 	seeds []candidate, caps []model.CapabilityState) (refScope, error) {
 	if eng == nil {
@@ -158,8 +158,8 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			// full for a named identity, recommended for a lexical hit,
 			// optional for a captured change. Promoting all of them here would
 			// put a merely modified or lexically matched file into the
-			// required_full prefix Task 16 reads as mandatory, which Section
-			// 15.2 and ruling Q7 both forbid. The default stands only for a
+			// required_full prefix the coverage gate reads as mandatory, which
+			// Section 15.2 forbids. The default stands only for a
 			// seed that carries none, which would otherwise rank below optional
 			// and be droppable.
 			s.Requirement = model.RequirementFull
@@ -916,9 +916,9 @@ func (a candidate) less(b candidate) bool {
 // splits an oversized component "at file boundaries with the bounded
 // task/contract header repeated, preserving full-file requirements". The
 // frozen candidate record carries no component identity, and deriving strong
-// components from explanation paths is the ranking lane's data, not
-// budgeting's. The file boundary is therefore the grouping this rule actually
-// needs and the only one this lane can honour without inventing an input: a
+// components from explanation paths is ranking's data, not budgeting's. The
+// file boundary is therefore the grouping this rule actually needs and the
+// only one budgeting can honour without inventing an input: a
 // required file is never split across slices, and a component larger than one
 // slice is split between its files. A component that fits in one slice is
 // unaffected either way, because the entries of a component are contiguous in
@@ -936,7 +936,7 @@ type fileGroup struct {
 // plan is the Section 15.4 result: entries in Section 15.3 tie-break order with
 // ordinals 0..n-1 and required_full as a prefix, slices that reference those
 // ordinals, and one reasoned exclusion for every candidate not selected. The
-// manifest lane persists it unchanged; nothing here is a wire shape.
+// manifest store persists it unchanged; nothing here is a wire shape.
 type plan struct {
 	Entries  []model.ContextEntry
 	Slices   []model.ContextSlice
@@ -1095,7 +1095,7 @@ var parityRequests = []struct {
 	{"routed scope, the tightest budget that fits it", model.ContextRequest{
 		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
 		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 20480, MaxSlices: 5}}, routedScope},
-	// Ruling C8: the relation-kind scan reads an UNLIMITED
+	// The relation-kind scan reads an UNLIMITED
 	// context.max_graph_edges to exhaustion rather than as one page. Under a
 	// scope of more than 200 wanted relations -- model.MaxPageItems is 200 --
 	// a scan that stopped at one page would leave edges untyped, ranking
@@ -1108,8 +1108,8 @@ var parityRequests = []struct {
 }
 
 // generatedParityRequests are the rows compiled over the GENERATED fixture
-// (generated_fixture_test.go) rather than the shared seven-file one. C-P3
-// measured the shared fixture at four wanted relations over seven candidates
+// (generated_fixture_test.go) rather than the shared seven-file one. The
+// shared fixture yields four wanted relations over seven candidates
 // admitted once each, which makes four of the five plan-table mutations
 // structurally unreachable through it; TestTheGeneratedFixtureCanDiscriminate-
 // TheStreamedPasses asserts the generated one has the shape those mutations
@@ -1298,7 +1298,8 @@ func denseScope(fx *contextFixture) []model.Relation {
 	return out
 }
 
-// TestTheStreamedCompileIsByteForByteTheWholeSetPlan is C-STREAM proof (1).
+// TestTheStreamedCompileIsByteForByteTheWholeSetPlan guards the streamed
+// compile's parity with the whole-set reference pipeline.
 //
 // The streamed passes are only correct insofar as they reproduce the whole-set
 // pipeline's answer, and every structure they replaced -- the admitted map, the

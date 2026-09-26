@@ -444,7 +444,7 @@ func TestContextCompilerScenario(t *testing.T) {
 	}
 
 	rows := []contextScenarioRow{
-		// L1 SEEDS rows
+		// seed rows
 		{
 			// Guards Section 15.2: the seed steps run in their stated order, so
 			// an identity the caller named can never be outranked by prose or by
@@ -468,8 +468,8 @@ func TestContextCompilerScenario(t *testing.T) {
 				// The oversized artifact is left out: it carries one line
 				// checkpoint for 600 KB, so hydrating a lexical hit inside it is a
 				// typed resource limit that would stop the lexical step before it
-				// contributes. Section 15.4 budgeting is the L4 row's subject, not
-				// this one's.
+				// contributes. Section 15.4 budgeting is the budget rows' subject,
+				// not this one's.
 				for _, spec := range fixtureFiles {
 					if spec.path == "internal/order/generated.go" {
 						continue
@@ -649,7 +649,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L2 SCOPE rows
+		// scope rows
 		{
 			name: "required scope pulls every decision boundary of the seed",
 			// Guards Section 15.2: a plan that omits the caller, the contract,
@@ -722,7 +722,7 @@ func TestContextCompilerScenario(t *testing.T) {
 		},
 		{
 			name: "an unresolved token is discovery but an unresolved explicit seed is an error",
-			// Guards ruling Q7 from both sides: a task token nothing matched
+			// Guards the discovery rule from both sides: a task token nothing matched
 			// must NOT fail the compile (it yields a discovery answer whose
 			// omission is visible as a reasoned exclusion), while an explicit
 			// seed the caller named and the snapshot does not hold MUST fail
@@ -801,9 +801,9 @@ func TestContextCompilerScenario(t *testing.T) {
 		},
 		{
 			name: "a lexical or changed-file seed never enters the required_full prefix",
-			// Guards Section 15.2 and ruling Q7: only a named identity is
+			// Guards Section 15.2: only a named identity is
 			// required in full. Promoting a merely lexical hit or a captured
-			// change makes it mandatory full reading for Task 16's coverage
+			// change makes it mandatory full reading for the coverage
 			// gate -- a required entry is never demoted or dropped later -- and
 			// reorders the manifest, because Requirement is the first Section
 			// 15.3 tie-break key. Nothing fails when this breaks; the actor is
@@ -817,7 +817,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				changed.Requirement = model.RequirementOptional
 
 				// No seed resolves a symbol, so no boundary can be walked: this
-				// is the discovery answer of ruling Q7, not an implementation
+				// is a discovery answer, not an implementation
 				// plan, and it must hold no required entry at all.
 				res, err := expandScope(fx.ctx, fx.scopeEngine(nil, fixtureCapabilities), fx.Gen,
 					fx.Cfg.Context, []candidate{lexical, changed}, fixtureCapabilities)
@@ -849,7 +849,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L3 RANK rows
+		// ranking rows
 		{
 			// Guards the Section 15.3 path contribution: the product of
 			// weight(kind) and the per-edge precision multiplier, decayed once
@@ -907,8 +907,8 @@ func TestContextCompilerScenario(t *testing.T) {
 			// Guards the rest of Section 15.3 through the pinned reader: an edge
 			// with no visible evidence falls back to heuristic precision, each
 			// bounded boost is added at most once, and the tie-break chain is
-			// total. A broken order is invisible here but breaks Task 16, whose
-			// `context next` is an ordinal walk over this order.
+			// total. A broken order is invisible here but breaks `context
+			// next`, which is an ordinal walk over this order.
 			name: "ranking falls back to heuristic precision and orders by the full tie-break chain",
 			run: func(t *testing.T, fx *contextFixture) {
 				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
@@ -1014,7 +1014,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L4 BUDGET rows
+		// budget rows
 		{
 			// Guards the Section 15.4 rule that entry overhead is MEASURED, not
 			// assumed: a budget that counted only the wire-encoded source would
@@ -1298,7 +1298,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// L5 MANIFEST rows
+		// manifest rows
 		{
 			// `context next` walks manifest ordinals without re-sorting, so a
 			// plan persisted in any order other than the Section 15.3 reading
@@ -1473,7 +1473,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
-		// INT rows
+		// end-to-end compile rows
 		{
 			// A manifest identity that depended on the process, the clock or
 			// the database file would make "repeated compile requests reuse the
@@ -1558,7 +1558,7 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		{
-			// Guards row 41 / F15: the manifest notices are INSTALLED on the
+			// Guards the bound disclosures: the manifest notices are INSTALLED on the
 			// compile's result, not merely computable. Both the page-clamp
 			// disclosure and the pointer at the excluded-candidate projection
 			// reach the caller only through Compile's own two assignments, and
@@ -1611,10 +1611,10 @@ func TestContextCompilerScenario(t *testing.T) {
 }
 
 // budgetRowInput builds the candidate set and the hydrated snapshot metadata a
-// `// L4 BUDGET rows` row compiles, standing in for the seed, scope and ranking
-// passes the fill-in lanes own. Scores descend with the given order so the
-// Section 15.3 tie-break order is the order the paths are named in, which is
-// what makes an ordinal assertion readable.
+// `// budget rows` row compiles, standing in for the seed, scope and ranking
+// passes so a row states its candidates directly. Scores descend with the given
+// order so the Section 15.3 tie-break order is the order the paths are named
+// in, which is what makes an ordinal assertion readable.
 func budgetRowInput(fx *contextFixture, paths []string, req model.Requirement) ([]candidate, []model.FileVersion) {
 	fx.t.Helper()
 	cands := make([]candidate, 0, len(paths))

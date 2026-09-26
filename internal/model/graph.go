@@ -1,11 +1,10 @@
 package model
 
 // Impact analysis request and result shapes of Section 14.3. They live beside
-// the traversal types in query.go rather than inside it because Task 14 owns
-// this file exclusively; the limits, validators and vocabulary they reuse are
-// the ones already declared in validate.go and facts.go. No new limit constant
-// is introduced here: an impact answer is bounded by the same seed, filter,
-// record and reason-path caps as every other query.
+// the traversal types in query.go; the limits, validators and vocabulary they
+// reuse are the ones already declared in validate.go and facts.go. No new limit
+// constant is introduced here: an impact answer is bounded by the same seed,
+// filter, record and reason-path caps as every other query.
 
 // ImpactRequest asks which entities a change to the seed nodes may affect. It
 // carries the same explicit bounds as GraphRequest because impact is a bounded

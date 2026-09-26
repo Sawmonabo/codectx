@@ -21,9 +21,9 @@ import (
 )
 
 // A walk that is split across REQUESTS cannot be ranked from what one request
-// saw. Ruling P2 ranks the whole admitted set in two passes over a
+// saw. A ranked answer ranks the whole admitted set in two passes over a
 // pagination.ExternalSort, and that sort is built and dropped inside one
-// request; ruling P3 lets the query deadline end a page mid-walk and carry the
+// request; the query deadline may end a page mid-walk and carry the
 // frontier forward in the `f` cursor. A request that ranked only its own leg
 // would lose every earlier leg silently: the cumulative visited set the cursor
 // carries guarantees those nodes are never admitted again, so nothing re-walks
@@ -37,10 +37,11 @@ import (
 // pass 1 and pass 2 over the WHOLE retained input. The served order is then the
 // single unbounded walk's order whatever requests it was spread over.
 //
-// Retaining the pass-1 input rather than the sort's runs is what makes ruling
-// P7 work: a deadline that lands mid-RANK persists nothing extra,
-// because the input the sort would re-read is already retained. The next
-// request re-sorts from it, which is O(n log n) over spooled records and holds
+// Retaining the pass-1 input is what makes the mid-rank continuation work: a
+// deadline that lands mid-RANK needs no walk state beyond it, because the
+// input the sort reads is already retained. The runs the interrupted impact
+// sort had spilled are moved in beside it and adopted by the next request (see
+// the rank manifest below), so a split ranking does the work of one and holds
 // nothing more in heap than a fresh rank would.
 //
 // The retention mechanism is the one the shortest-path search uses for its
@@ -509,7 +510,7 @@ func retainCorrupt(err error) error {
 		Message: "graph: the retained walk input ends mid-record: " + err.Error()}
 }
 
-// Ruling P7 -- a deadline that lands after the walk is complete but before the
+// A mid-rank deadline -- one that lands after the walk is complete but before the
 // RANKING is -- is served out of the same directory. The ranking is two
 // sequential external sorts, and both are resumable:
 //

@@ -49,10 +49,10 @@ import (
 // it"), so a hub entity's route list has no bound a record may assume. An
 // inline list would (a) push the encoded record past the external sort's 1 MiB
 // per-record ceiling (pagination/extsort.go:246), failing the compile outright
-// on exactly the repositories this wave exists to serve, and (b) make sizeOfCand
-// useless as a run-budget input, since one wide candidate could fill the whole
-// run buffer alone. Routes therefore travel as their own sorted streams
-// (pathRec, hopRec) keyed by Seq, and P-D rebuilds one candidate's
+// on exactly the large repositories a streamed compile exists to serve, and (b)
+// make sizeOfCand useless as a run-budget input, since one wide candidate could
+// fill the whole run buffer alone. Routes therefore travel as their own sorted
+// streams (pathRec, hopRec) keyed by Seq, and P-D rebuilds one candidate's
 // model.RelationPath values from the contiguous run of hops that carries its
 // Seq. Reasons stay inline: model.MaxReasonsPerEntry x model.MaxReasonBytes is
 // a genuine constant bound the model itself validates.
@@ -70,7 +70,7 @@ type candRec struct {
 	FileID model.FileID `json:"f,omitempty"`
 
 	// PathAtRank and PathFinal are the SAME field in the whole-set candidate,
-	// written twice with different rules, and ruling C3 keeps both because
+	// written twice with different rules, and the record keeps both because
 	// collapsing them is not behaviour-preserving. The whole-set
 	// hydrateFiles -- which now survives only as the reference implementation
 	// in stream_parity_test.go -- writes the snapshot path only when the
@@ -199,7 +199,7 @@ type groupRec struct {
 //
 // A dropped group's reason does not travel here. Drops are written straight to
 // the excluded spool in appendDrops order (stream_parity_test.go:777), which is the
-// exclusion order ruling C1 keeps.
+// exclusion order the plan keeps.
 type decisionRec struct {
 	FileID     model.FileID `json:"f"`
 	Keep       bool         `json:"k,omitempty"`
@@ -227,7 +227,7 @@ func candRecOf(c candidate, seq int64) candRec {
 
 // rankCandidate rehydrates the candidate as RANKING sees it: Path is
 // PathAtRank, the value hydrateFiles' conditional overwrite leaves and the one
-// packageOf, the centrality bucket and the boost reason read (C3). Paths is
+// packageOf, the centrality bucket and the boost reason read. Paths is
 // left nil; the caller attaches the routes it rebuilt from the hop stream.
 func (r candRec) rankCandidate() candidate {
 	c := r.candidate()
@@ -238,7 +238,7 @@ func (r candRec) rankCandidate() candidate {
 // finalCandidate rehydrates the candidate as BUDGETING sees it: Path is
 // PathFinal, the value the reference buildPlan's unconditional overwrite
 // leaves (stream_parity_test.go:438) and the one the total order and the
-// persisted entry read (C3).
+// persisted entry read.
 func (r candRec) finalCandidate() candidate {
 	c := r.candidate()
 	c.Path = r.PathFinal
@@ -286,7 +286,7 @@ func (r relAttrRec) precision() int64 {
 //
 // pagination.ExternalSort compares with a three-way func(a, b T) int, so every
 // comparator here returns a negative, zero or positive value rather than a
-// bool. Two kinds live below and a lane must not turn one into the other:
+// bool. Two kinds live below and neither may be turned into the other:
 //
 //   - TOTAL comparators (lessRank, lessHopSeq, lessPathSeq, lessFileIndex,
 //     lessPkgEdge, lessGroupIndex) end in a key no two records share, so the
@@ -304,8 +304,8 @@ func (r relAttrRec) precision() int64 {
 //
 // It reads PathFinal, because the whole-set sort runs AFTER buildPlan's
 // unconditional path overwrite (stream_parity_test.go:438). Reading PathAtRank instead would order
-// the plan by one path and bucket centrality by another; ruling C3 exists
-// because those two values can differ.
+// the plan by one path and bucket centrality by another; the record carries
+// both because those two values can differ.
 //
 // Totality is load-bearing beyond determinism: P-G assigns each survivor's
 // Index from this order, so a single unresolved tie shifts the ordinal of every
@@ -333,7 +333,7 @@ func lessRank(a, b candRec) int {
 }
 
 // lessEntityID groups a candidate stream by entity identity, for the P-A scope
-// dedupe that replaces expandScope's `admitted map[string]bool` (ruling C2).
+// dedupe that stands in for the reference expandScope's `admitted map[string]bool`.
 //
 // The key is the entity identity ALONE, not (entityID, seq) as the plan's prose
 // spells it: pagination.ExternalSort runs its fold only over records the
@@ -456,7 +456,7 @@ func cmpString(a, b string) int {
 // are equal in the field taken -- so none of them depends on that guarantee and
 // a later change to the merge cannot silently change a result.
 
-// foldMinSeq is the C2 scope dedupe: the candidate with the smallest ingest
+// foldMinSeq is the scope dedupe: the candidate with the smallest ingest
 // sequence survives, which is expandScope's "the earliest step wins"
 // (scope.go:112) exactly. The map it replaces admits the first arrival and
 // ignores every later one; the first arrival IS the minimum seq, so the
@@ -602,7 +602,7 @@ func decodeRecord[T any](b []byte) (T, error) {
 // run buffer each sort gets, and the release list that removes every run on
 // every exit path.
 //
-// The release list is ruling C5's structural half. pagination.ExternalSort
+// The release list is what guarantees every run is removed. pagination.ExternalSort
 // removes its runs when Sorted() consumes them and NOT when a spill, a collapse
 // or an output creation fails (extsort.go:296-303), so every sort owes a Close
 // whatever happened. Registering that Close at construction means a pass cannot
@@ -621,7 +621,7 @@ type compileSorts struct {
 	// release holds one closer per opened sort and sorted run, newest first.
 	release []func() error
 	// observed holds one row per sort this compile opened, in open order, so a
-	// test can assert the memory invariant this wave exists for: every sort's
+	// test can assert the compile's memory invariant: every sort's
 	// live working set stays inside the run budget and the sorts that outgrew
 	// it spilled rather than growing the heap. It is OBSERVATION ONLY -- no
 	// pass reads it and no behaviour depends on it -- and it is bounded by the
@@ -672,7 +672,7 @@ func (s *compileSorts) observations() []sortObservation {
 // at all, and the primitive's own floor then applies, which is a performance
 // choice and never a reason a compile refuses work.
 //
-// sortDir is required rather than defaulted. Ruling C5 puts a compile's runs
+// sortDir is required rather than defaulted. A compile's runs live
 // under the store's sort directory so they are swept and reported; silently
 // falling back to the process temporary directory would put them where nothing
 // reclaims them, and this package already refuses every missing dependency
@@ -767,10 +767,9 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // Passes
 // ---------------------------------------------------------------------------
 //
-// One stub per pass of C-STREAM-plan.md §2, in pipeline order, so the lane
-// split is visible in the package before any of it is written. Each owning lane
-// completes its own body AND its own parameter list; what is frozen here is the
-// set of passes and their order; the arguments each needs are its own.
+// The compile's passes, P-A through P-I, in pipeline order. Each pass takes
+// only the inputs it reads and returns its own output stream; the caller in
+// compiler.go owns the sort area and wires one pass's output to the next.
 
 // passAIngest — pass P-A. expandScope appends to the candidate spool in
 // admission order with a seq on every record instead of building
@@ -782,7 +781,7 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // the exclusion projection by replaying this spool in seq order.
 //
 // It takes the seed SINK the Section 15.2 producers pushed into, not a slice of
-// seeds (ruling C10): by the time this pass runs the seeds are already inside
+// seeds: by the time this pass runs the seeds are already inside
 // the sort area, and what remains is the walk and the folds over them.
 func (c *Compiler) passAIngest(ctx context.Context, in *seedIngest, eng *graph.Engine,
 	gen model.GenerationID, caps []model.CapabilityState, stop func() bool) (*ingested, bool, error) {
@@ -791,12 +790,10 @@ func (c *Compiler) passAIngest(ctx context.Context, in *seedIngest, eng *graph.E
 
 // passBHydrate — pass P-B. Streams the candidate spool in pageLimit()
 // batches, resolves each batch's distinct FileIDs through one FilesByID, and
-// writes SizeBytes, Status, BOTH path fields (C3) and the FileMissing flag onto
-// the record. The accumulating `out`/`byID` of hydrateFiles go away.
-//
-// As with P-A, the parameter list and result are completed by the owning lane:
-// the pass needs the pinned reader and the candidate spool and yields the
-// hydrated spool.
+// writes SizeBytes, Status, BOTH path fields (PathAtRank and PathFinal) and the
+// FileMissing flag onto the record, holding one batch rather than the reference
+// hydrateFiles' accumulating `out`/`byID`. It reads the pinned reader and the
+// candidate run and yields the hydrated run.
 func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 	reader *sqlite.PinnedReader, in *pagination.SortedRun[candRec]) (*pagination.SortedRun[candRec], error) {
 	return c.hydrateStream(ctx, reader, s, in)
@@ -807,8 +804,8 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 // lessHopSeq, so scoreRoutes and scorePath run unchanged on a working set of one
 // candidate. Scored records go to the ranked stream and each admitted
 // (pkg, relationID) to the centrality sort.
-// The parameter list is this lane's to complete (see the header above). The
-// three inputs are sorted runs and not spools because P-D is a three-way
+//
+// The three inputs are sorted runs and not spools because P-D is a three-way
 // merge-join on Seq: the candidate stream in ingest order, the route stream
 // under lessPathSeq and the attributed hop stream under lessHopSeq. The four
 // outputs are sorts the caller owns, so one compile's release list covers them.
@@ -877,7 +874,7 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 		if err != nil {
 			return err
 		}
-		// rankCandidate reads PathAtRank (C3), which is the path packageOf,
+		// rankCandidate reads PathAtRank, which is the path packageOf,
 		// the centrality bucket and the boost reason are taken from.
 		cand := rec.rankCandidate()
 		cand.Paths = ws.paths
@@ -906,7 +903,7 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 		}
 		// The record is mutated in place and never rebuilt through candRecOf,
 		// which would write PathAtRank into PathFinal and collapse the two
-		// values ruling C3 keeps apart.
+		// values the record keeps apart.
 		rec.MorePaths = routed.morePaths
 		// The routes that were not enumerated are disclosed BEFORE the route
 		// reason and before P-F's boost reasons, exactly as rank appends them:
@@ -936,7 +933,8 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 // merge-joins it with P-E's counts, applies boostsFor, clamps, appends the
 // reasons in today's order, and adds every record to the sort whose comparator
 // is lessRank. No fold.
-// The parameter list is this lane's to complete. scored is P-D's output under
+//
+// scored is P-D's output under
 // lessScoredPkg, counts is P-E's aggregate under lessPkg, and ranked is the sort
 // whose comparator is lessRank, which P-G consumes.
 //
@@ -1207,7 +1205,7 @@ func rekeyRoutes(ctx context.Context, s *compileSorts, remap *pagination.Externa
 // three times -- SortedRun.Each re-opens its backing file per call and only
 // refuses after Close -- for the required floor, the packed slice count at that
 // floor, and packPlan's forward walk, which emits decisionRecs in group order
-// and drops to the excluded spool in appendDrops order (C1).
+// and drops to the excluded spool in appendDrops order.
 func (c *Compiler) passHPack(ctx context.Context, s *compileSorts, m *measuredPlan,
 	b resolvedBudget) (*packedPlan, error) {
 	if err := checkRequiredFitsStream(ctx, m.Groups, b); err != nil {
@@ -1232,7 +1230,7 @@ func (c *Compiler) passHPack(ctx context.Context, s *compileSorts, m *measuredPl
 // the final ordinal, re-measures them (phase two), accumulates RelationsClipped
 // and appends to the streamed Plan.Units. Exclusion ordinals stream the excluded
 // spool in P-A order and then the packer's drops in P-H order: the exact
-// sequence buildPlan produces (C1).
+// sequence buildPlan produces.
 func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPlan,
 	p *packedPlan, b resolvedBudget, sink planSink) (planParts, error) {
 	keep, err := newSort(s, "keep", lessKeepIndex, sizeOfKeep)
@@ -1325,7 +1323,7 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 		return planParts{}, err
 	}
 
-	// Exclusion ordinals keep today's sequence (ruling C1): the pre-sort
+	// Exclusion ordinals follow one sequence: the pre-sort
 	// exclusions in expansion order, then the packer's drops in group order.
 	emit := func(c candidate, reason string) error {
 		e := model.ExcludedContextEntry{
@@ -1338,7 +1336,7 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 	}
 	// A pre-sort exclusion carries PathAtRank: buildPlan's unconditional path
 	// overwrite runs only on the surviving branch (budget.go:254), so the
-	// excluded candidate's reference is the path it arrived with (C3).
+	// excluded candidate's reference is the path it arrived with.
 	if err := m.Excluded.Each(func(r candRec) error {
 		if err := ctx.Err(); err != nil {
 			return err

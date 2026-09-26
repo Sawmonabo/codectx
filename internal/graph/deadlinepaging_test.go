@@ -15,7 +15,7 @@ import (
 // TestADeadlineSplitWalkAlwaysAdvances is the livelock proof, and the
 // cross-REQUEST half of the append-only walk state's invariant.
 //
-// Ruling P3 lets the query deadline end a PAGE of an impact walk and carry the
+// The query deadline may end a PAGE of an impact walk and carry the
 // frontier forward in a cursor, even when the page served nothing. Taken alone
 // that rule has a hole: a page whose FIRST adjacency read already runs past the
 // deadline admits nothing and leaves the frontier and the keyset position
