@@ -22,9 +22,25 @@ func Grammar(name string) (*ts.Language, bool) {
 // Lowering turns one language's callables into flow graphs. A callable is a
 // function, method, function-valued literal, or a unit a language runs as
 // code of its own (a JavaScript class body: its field initializers and static
-// blocks); each one, nested or not, is
-// its own function, and its enclosing function sees only the expression that
-// creates it. A Lowering holds no per-function state and is safe to share.
+// blocks); each one, nested or not, is its own function, and its enclosing
+// function sees only the expression that creates it. A Lowering holds no
+// per-function state and is safe to share.
+//
+// # Address-taking
+//
+// Every lowering of a language that can take the address of a local, or
+// borrow it mutably, applies one rule: whatever receives the address may
+// write through it, so the expression is a non-killing may-definition of the
+// local at the node that evaluates it, and it kills nothing. That node also
+// Uses the operand's variables. The address of a field or an element is an
+// address into its base variable, so the base is the local may-defined. The
+// forms are `&x`, `&x.f` and `&a[i]` in Go, `&x`, `&s.f` and `&a[i]` in C and
+// C++, and `&mut x`, `&mut x.f` and `&mut a[i]` in Rust (a shared borrow `&x`
+// cannot write). An address a nested callable takes of an enclosing local is
+// one of the callable's writes, a may-definition on the node that creates
+// it, as its other writes are. An address taken implicitly, by a method call
+// on the local (a Go pointer-receiver method, a Rust `&mut self` method), is
+// not one, since telling it apart needs the receiver's type.
 type Lowering struct {
 	// language names the grammar the kinds below are resolved against.
 	language string

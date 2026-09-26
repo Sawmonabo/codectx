@@ -103,5 +103,19 @@ func TestCppLoweringGolden(t *testing.T) {
 			cd:       []string{"int x = g()@14 -> return x;@27", "int x = g()@14 -> return 0;@37"},
 			du:       []string{"int x = g()@14 -> return x;@27"},
 		},
+		{
+			// [expr.unary.op]/3: `&x` yields a pointer to x, through which the
+			// callee may write it. The call takes a second argument because
+			// `g(&x);` alone also reads as a declaration of a reference x of
+			// type g ([stmt.ambig]), which a parser without types may pick.
+			// Nodes: x = 1@14 (defines x), g(0, &x)@21 (Uses
+			// x, may-defines x), return x;@31. The may-definition kills
+			// nothing, so the return's x pairs with both.
+			name:     "taking an address is a may-definition of the variable",
+			protects: "a use after a call that received a variable's address sees the write the call may make through it",
+			mutation: "lower `&x` as a plain read (g(0, &x)@21 -> return x;@31 vanishes), or make it a killing Def (x = 1@14 -> return x;@31 vanishes)",
+			src:      "int f() { int x = 1; g(0, &x); return x; }",
+			du:       []string{"x = 1@14 -> g(0, &x)@21", "x = 1@14 -> return x;@31", "g(0, &x)@21 -> return x;@31"},
+		},
 	})
 }

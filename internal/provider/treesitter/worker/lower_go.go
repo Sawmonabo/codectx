@@ -45,8 +45,10 @@ var goLowering = Lowering{
 //   - A field, index or indirect target (`x.f = e`, `a[i] = e`, `*p = e`,
 //     `x.f++`, `for a[i] = range xs`) writes part of its base variable: the
 //     write uses the base and is a non-killing may-definition of it, so a
-//     later use sees the write and every definition before it. A statement's
-//     may-definitions ride on its last node.
+//     later use sees the write and every definition before it. Taking an
+//     address (`&x`, `&x.f`, `&a[i]`) uses its operand's variables and
+//     may-defines its base variable, by the address-taking rule of
+//     Lowering. A statement's may-definitions ride on its last node.
 //   - A condition (if, for, a case value list, a type-case type list) is one
 //     Branch node spanning it. Every `&&`/`||` in an expression is hoisted
 //     before the node that owns the expression: each operand that is not
@@ -100,7 +102,8 @@ var goLowering = Lowering{
 // that expression uses every enclosing variable the literal (or a literal
 // nested in it) reads, and carries a non-killing may-definition of every
 // enclosing variable it writes (by assignment, op=, ++/--, a range or
-// receive target, or through a field, index or pointer). The literal may run
+// receive target, through a field, index or pointer, or by taking its
+// address). The literal may run
 // at any later point, or never, so a use after the creating node sees that
 // may-definition and every definition that reached the creating node.
 // `defer func() {...}()` is therefore one node carrying the captures.
@@ -270,8 +273,9 @@ func (g *goLower) isShort(n *ts.Node) bool {
 }
 
 // collect appends to buf every variable n reads, short-circuit operands
-// included, and resolves a function literal's captures: its reads into buf,
-// its writes into may.
+// included, and to may the base variable of every address n takes; it
+// resolves a function literal's captures: its reads into buf, its writes into
+// may.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
 	case n.KindId() == g.k.identifier:
@@ -280,6 +284,13 @@ func (g *goLower) collect(n *ts.Node) {
 		}
 	case g.l.isCallable(n):
 		g.scan(n, len(g.binds))
+	case g.isAddress(n):
+		if e := n.ChildByFieldId(g.k.fOperand); e != nil {
+			g.collect(e)
+			if v := g.baseVar(e); v >= 0 {
+				g.may = append(g.may, v)
+			}
+		}
 	default:
 		for i := range n.NamedChildCount() {
 			g.collect(n.NamedChild(i))
@@ -335,6 +346,15 @@ func (g *goLower) baseIdent(n *ts.Node) *ts.Node {
 		}
 	}
 	return nil
+}
+
+// isAddress reports whether n takes an address, `&e`.
+func (g *goLower) isAddress(n *ts.Node) bool {
+	if n.KindId() != g.k.unaryExpression {
+		return false
+	}
+	op := n.ChildByFieldId(g.k.fOperator)
+	return op != nil && op.KindId() == g.k.amp
 }
 
 // baseVar is the variable a field, index or indirect target n writes
@@ -1071,9 +1091,10 @@ func (g *goLower) readByOther(i int) bool {
 // scan resolves a function literal's captures: every identifier under n
 // that resolves to a binding below base (the enclosing function's) and is a
 // variable, with the literal's own declarations shadowing. A capture read
-// goes to buf; a capture written (an assignment, ++/-- or range target, or
-// the base of a field, index or indirect target) goes to may, and to buf as
-// well when the write also reads it (op=, ++/--).
+// goes to buf; a capture written (an assignment, ++/-- or range target, the
+// base of a field, index or indirect target, or the base of an address the
+// literal takes) goes to may, and to buf as well when the write also reads
+// it (op=, ++/--, and an address-taking, which reads its operand).
 func (g *goLower) scan(n *ts.Node, base int) {
 	k := g.k
 	if g.l.isCallable(n) {
@@ -1114,6 +1135,13 @@ func (g *goLower) scan(n *ts.Node, base int) {
 			g.scanWrite(e, base, true)
 		}
 		return
+	case k.unaryExpression:
+		if g.isAddress(n) {
+			if e := n.ChildByFieldId(k.fOperand); e != nil {
+				g.scanWrite(e, base, true)
+			}
+			return
+		}
 	case k.block, k.ifStatement, k.forStatement, k.expressionSwitchStatement, k.selectStatement,
 		k.expressionCase, k.defaultCase, k.typeCase, k.communicationCase:
 		g.open()
@@ -1231,7 +1259,7 @@ type goSyntax struct {
 	expressionSwitchStatement, typeSwitchStatement, expressionCase, typeCase, defaultCase, selectStatement,
 	communicationCase, receiveStatement uint16
 
-	and, or, star, assign, define, rangeKw, typeKw, rparen uint16
+	and, or, star, amp, assign, define, rangeKw, typeKw, rparen uint16
 
 	fAlias, fAlternative, fBody, fCommunication, fCondition, fConsequence, fFunction, fInitializer, fLabel,
 	fLeft, fName, fOperand, fOperator, fParameters, fReceiver, fResult, fRight, fType, fUpdate, fValue uint16
@@ -1269,7 +1297,7 @@ func goSyntaxOf() *goSyntax {
 		s.expressionSwitchStatement, s.typeSwitchStatement = kind("expression_switch_statement"), kind("type_switch_statement")
 		s.expressionCase, s.typeCase, s.defaultCase = kind("expression_case"), kind("type_case"), kind("default_case")
 		s.selectStatement, s.communicationCase, s.receiveStatement = kind("select_statement"), kind("communication_case"), kind("receive_statement")
-		s.and, s.or, s.star, s.assign = tok("&&"), tok("||"), tok("*"), tok("=")
+		s.and, s.or, s.star, s.amp, s.assign = tok("&&"), tok("||"), tok("*"), tok("&"), tok("=")
 		s.define, s.rangeKw, s.typeKw, s.rparen = tok(":="), tok("range"), tok("type"), tok(")")
 		s.fAlias, s.fAlternative, s.fBody, s.fCommunication = field("alias"), field("alternative"), field("body"), field("communication")
 		s.fCondition, s.fConsequence, s.fFunction = field("condition"), field("consequence"), field("function")

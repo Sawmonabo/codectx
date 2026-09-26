@@ -106,11 +106,11 @@ const rsTryLabel = " try"
 //   - A write through a field, index or dereference target (`x.f = e`,
 //     `a[i] += e`, `*p = e`) Uses the target's operands and is a non-killing
 //     may-definition of its base variable. So is a mutable borrow `&mut x`
-//     (`&mut x.f`, `&mut a[i]`): whatever receives it may write x, so the
-//     first node created after it whose span holds it (the node evaluating
-//     it) Uses and may-defines x's base variable. A method call's implicit
-//     borrow of its receiver (`v.push(1)`) is not a definition of v, since
-//     telling it apart needs the receiver's type.
+//     (`&mut x.f`, `&mut a[i]`), by the address-taking rule of Lowering: the
+//     node evaluating it is the first node created after it whose span holds
+//     it, and it Uses and may-defines x's base variable. A method call's
+//     implicit borrow of its receiver (`v.push(1)`) is not a definition of
+//     v, since telling it apart needs the receiver's type.
 //
 // # Statement and expression kinds
 //

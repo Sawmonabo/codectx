@@ -253,5 +253,17 @@ func TestGoLoweringGolden(t *testing.T) {
 			cd:       []string{"L@40 -> x++@43", "L@40 -> goto L@48", "L@40 -> L@40"},
 			du:       []string{"x@17 -> return x@30", "x++@43 -> x++@43"},
 		},
+		{
+			// Go spec, Address operators: `&x` yields a pointer through which
+			// the callee may write x. Nodes: x := 1@25 (defines x), g(&x)@33
+			// (Uses x, may-defines x), return x@40. Straight line, so no
+			// control dependence; the may-definition kills nothing, so the
+			// return's x pairs with both x := 1 and g(&x).
+			name:     "taking an address is a may-definition of the variable",
+			protects: "a use after a call that received a variable's address sees the write the call may make through it",
+			mutation: "drop the address-taking may-definition in collect (g(&x)@33 -> return x@40 vanishes), or make it a killing Def (x := 1@25 -> return x@40 vanishes)",
+			src:      "package p\nfunc f() int { x := 1; g(&x); return x }",
+			du:       []string{"x := 1@25 -> g(&x)@33", "x := 1@25 -> return x@40", "g(&x)@33 -> return x@40"},
+		},
 	})
 }

@@ -166,5 +166,16 @@ func TestCLoweringGolden(t *testing.T) {
 			src:      "int f(int x) { { int x = x + 1; return x; } }",
 			du:       []string{"x = x + 1@21 -> return x;@32"},
 		},
+		{
+			// C17 §6.5.3.2p3: `&x` yields a pointer to x, through which the
+			// callee may write it. Nodes: x = 1@14 (defines x), g(&x)@21
+			// (Uses x, may-defines x), return x;@28. The may-definition kills
+			// nothing, so the return's x pairs with both x = 1 and g(&x).
+			name:     "taking an address is a may-definition of the variable",
+			protects: "a use after a call that received a variable's address sees the write the call may make through it",
+			mutation: "lower `&x` as a plain read (g(&x)@21 -> return x;@28 vanishes), or make it a killing Def (x = 1@14 -> return x;@28 vanishes)",
+			src:      "int f() { int x = 1; g(&x); return x; }",
+			du:       []string{"x = 1@14 -> g(&x)@21", "x = 1@14 -> return x;@28", "g(&x)@21 -> return x;@28"},
+		},
 	})
 }

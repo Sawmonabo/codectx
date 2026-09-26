@@ -143,8 +143,10 @@ const (
 // v when its statement read v before it. A write through `*p`, `p->f`,
 // `a[i]` or `s.f` (and an assembly output operand) Uses its operands and is
 // a non-killing may-definition of the base variable on the node that
-// consumes it. `&x` is a Use of x; the address escaping, a C++ reference
-// binding and pointer aliasing are not modelled beyond that. Destructors,
+// consumes it. So is taking an address, `&x` (`&s.f`, `&a[i]`), by the
+// address-taking rule of Lowering: it Uses its operands and may-defines its
+// base variable. A C++ reference binding and pointer aliasing are not
+// modelled. Destructors,
 // setjmp/longjmp and signal handlers are not modelled. A GNU statement
 // expression `({ … })` is lowered as its block in place; the node of the
 // enclosing expression Uses its last statement's reads.
@@ -188,7 +190,8 @@ const (
 // enclosing variable its capture list names, its init-captures read and its
 // body references, resolved with the lambda's own scopes so a name it
 // declares shadows. A variable captured by reference (named `&x`, or
-// implicitly under a `&` default) that the body writes is a may-definition
+// implicitly under a `&` default) that the body writes, or whose address it
+// takes, is a may-definition
 // on the creating node; a by-copy capture never is. A nested function
 // definition (a GNU extension) accesses every enclosing variable by
 // reference.
@@ -1396,9 +1399,14 @@ func (c *cLower) value(n *ts.Node) {
 		c.children(n)
 		c.throws++
 	case k.pointerExpression:
-		c.value(n.ChildByFieldId(k.fArgument))
-		if c.seh > 0 && n.ChildByFieldId(k.fOperator).KindId() == k.star {
-			c.throws++
+		switch n.ChildByFieldId(k.fOperator).KindId() {
+		case k.amp:
+			c.target(n.ChildByFieldId(k.fArgument))
+		default:
+			c.value(n.ChildByFieldId(k.fArgument))
+			if c.seh > 0 {
+				c.throws++
+			}
 		}
 	case k.fieldExpression:
 		c.value(n.ChildByFieldId(k.fArgument))
@@ -1477,9 +1485,9 @@ func (c *cLower) update(n *ts.Node) (made bool, v int32) {
 	return true, v
 }
 
-// target lowers a write through a field, index or pointer target: its
-// operands are read and its base variable may-defined by the node that
-// consumes it.
+// target lowers a write through a field, index or pointer target, or the
+// operand of an address-taking: its operands are read and its base variable
+// may-defined by the node that consumes it.
 func (c *cLower) target(t *ts.Node) {
 	c.value(t)
 	if id := c.baseIdent(t); id != nil {
@@ -1657,6 +1665,11 @@ func (c *cLower) cap(n *ts.Node) {
 		c.capKids(n)
 	case k.gnuAsmOutputOperand:
 		c.capWrite(n.ChildByFieldId(k.fValue))
+		c.capKids(n)
+	case k.pointerExpression:
+		if n.ChildByFieldId(k.fOperator).KindId() == k.amp {
+			c.capWrite(n.ChildByFieldId(k.fArgument))
+		}
 		c.capKids(n)
 	case k.compoundStatement, k.ifStatement, k.whileStatement, k.forStatement, k.switchStatement:
 		s := c.open()
