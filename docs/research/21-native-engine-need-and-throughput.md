@@ -220,19 +220,22 @@ measurement.
 
 ## 3. Least resident memory (`03`, `06`)
 
-**Tree bytes per source byte** (per file, files ≥ 4 KiB, native peak, `06`):
+**Native peak bytes per source byte**, per file, over the public corpus matrix (`06`; the counted native peak of the
+parse ÷ the file's source bytes, one row per language from the corpus where it is the majority):
 
-| language | p50 | p99 | max |
-|---|---|---|---|
-| C | 9.6 | — | 260 |
-| Java | 16.8 | — | — |
-| C++ | 18.7 | 45 | 300 |
-| Go | 20.2 | — | — |
-| TypeScript | 22.4 | — | — |
-| Rust | 22.5 | 73 | — |
-| Python | 22.8 | — | — |
+| language (corpus) | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| C (llvm-project) | 9.59 | 21.94 | 31.60 | 260.09 |
+| C++ (llvm-project) | 18.73 | 27.40 | 44.98 | 300.80 |
+| Go (kubernetes) | 20.24 | 27.61 | 36.49 | 80.24 |
+| Java (elasticsearch) | 16.85 | 21.48 | 26.86 | 49.30 |
+| Python (home-assistant core) | 22.77 | 27.84 | 32.99 | 77.92 |
+| Rust (rust-lang/rust) | 22.47 | 37.74 | 72.60 | 147.84 |
+| TypeScript (vscode) | 22.40 | 28.17 | 38.14 | 54.81 |
+| JavaScript (TypeScript checkout; compiler test data, 81.65% with errors) | 25.98 | 42.62 | 70.93 | 109.21 |
 
-Within one language the ratio runs from 0.015× (a file that is one long literal) to about 80×, so no per-grammar
+`03` reports the tree's own bytes (`tree_bytes`, a different instrument) at p50 26.0 / 15.8 / 22.9 for the TypeScript
+checkout's TypeScript, kubernetes Go and home-assistant Python. Within one language the tree ratio runs from 0.015× (a file that is one long literal) to about 80×, so no per-grammar
 constant is possible. The runtime's structure explains the spread (`subtree.h`): a heap node costs about 88 bytes, an
 inline leaf costs its 8-byte slot, and external-scanner tokens and multi-line tokens are always on the heap. The
 structure supplies no number. Scanner bytes are uncounted for Python, C++ and Rust.
@@ -283,8 +286,8 @@ that id would change. It loses on three counts:
 who publishes. The engine importer drops the four families for graduated languages, and the set is deleted at phase 3.
 The native shadow runs offline in the harness and is never attached to a generation.
 
-**The differential harness.** Relocate `FactKey`, `KeySet`, `LoadKeySet` and `Diff`; the ADR's `DedupeSink` does not
-exist.
+**The differential harness.** Relocate `FactKey`, `KeySet`, `LoadKeySet`, `Diff`, `saveKeys` and `markDelta` (no `DedupeSink` exists in the
+code).
 - The comparison key normalises away the owner full name and the operator.
 - Both endpoints become the existing cross-provider declaration key.
 - Each line of the key file carries the digest and its pre-image, so every mismatch can be classified into a signed
