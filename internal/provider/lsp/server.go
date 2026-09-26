@@ -165,7 +165,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	// silence is working, and nothing on the wire says so.
 	cpu := &process.CPUProgress{}
 	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes.Value(),
-		m.opts.MaxOutstandingRequests, cpu, s.handleServerRequest)
+		m.opts.MaxOutstandingRequests.Int(), cpu, s.handleServerRequest)
 
 	workDir := p.workDir(m.opts.DataDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {

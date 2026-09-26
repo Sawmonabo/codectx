@@ -34,10 +34,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
 
-// Options bound one Manager. Every bound is finite; a zero value takes the
-// default from config.Defaults() or the package default named below, and a
-// negative value is rejected, because Section 20.2 forbids a setting that
-// means unlimited.
+// Options configure one Manager. A zero duration or frame bound takes the
+// default from config.Defaults() or the package default named below; the two
+// config.Limit bounds are unlimited at zero, as every such bound is. A
+// negative value is rejected.
 type Options struct {
 	// Runner is the shared process runner every server starts through.
 	Runner *process.Runner
@@ -56,9 +56,10 @@ type Options struct {
 	//
 	// It is not the run ledger below; the two share a word and nothing else.
 	Admission *admission.Ledger
-	// MaxOutstandingRequests caps in-flight requests per server
-	// (providers.lsp.max_outstanding_requests).
-	MaxOutstandingRequests int
+	// MaxOutstandingRequests bounds in-flight requests per server
+	// (providers.lsp.max_outstanding_requests). Unlimited by default: each
+	// caller is already bounded by its own gate.
+	MaxOutstandingRequests config.Limit
 	// RequestStallTimeout is how long a request tolerates the server making no
 	// observable progress before it is declared hung
 	// (providers.lsp.stall_timeout). It is a hang detector, never a deadline on
@@ -175,19 +176,8 @@ func New(opts Options) (*Manager, error) {
 	if opts.Admission == nil {
 		return nil, invalid("the lsp manager needs the process memory admission ledger servers are admitted against")
 	}
-	for _, b := range []struct {
-		name  string
-		value *int
-		def   int
-	}{
-		{"max_outstanding_requests", &opts.MaxOutstandingRequests, def.MaxOutstandingRequests},
-	} {
-		if *b.value < 0 {
-			return nil, invalid("lsp %s is %d; a bound must not be negative", b.name, *b.value)
-		}
-		if *b.value == 0 {
-			*b.value = b.def
-		}
+	if opts.MaxOutstandingRequests < 0 {
+		return nil, invalid("lsp max_outstanding_requests is %s; a bound must not be negative", opts.MaxOutstandingRequests)
 	}
 	for _, b := range []struct {
 		name  string
