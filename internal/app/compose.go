@@ -164,8 +164,9 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // ceiling the operator set. Zero, the default, is unlimited and stays
 // unlimited on both sides. Neither share of a set ceiling may round to zero,
 // because zero is read as unlimited by both consumers, so the spools take at
-// least one byte; validation refuses a set ceiling below
-// config.TempDiskConsumers, so the runner keeps at least one byte too.
+// least one byte. The runner keeps at least one byte too: validation requires
+// a set ceiling to exceed resources.min_free_disk_bytes, which is positive, so
+// a set ceiling is at least two bytes.
 func tempDiskShares(total int64) (runner, spools int64) {
 	if total <= 0 {
 		return 0, 0

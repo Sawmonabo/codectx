@@ -8,12 +8,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// TempDiskConsumers is how many consumers resources.max_temp_bytes is split
-// between: the shared process runner, whose children stage temporary bytes,
-// and the query spools. The composition's split gives each of them at least
-// one byte of a set ceiling, so validation refuses a ceiling below this count.
-const TempDiskConsumers = 2
-
 // validate enforces the whole resolved configuration, including the cross-field
 // budget rules of Section 20.1's closing paragraph.
 //
@@ -287,18 +281,11 @@ func (c Config) validateBudgets() error {
 	if c.Resources.MaxTempBytes < 0 {
 		return configInvalid("resources.max_temp_bytes is %d; use 0 for unlimited", c.Resources.MaxTempBytes)
 	}
-	// A set ceiling is split between TempDiskConsumers, and every share must
-	// be positive because each consumer reads zero as unlimited. A ceiling
-	// smaller than the consumer count cannot be split that way.
-	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes < TempDiskConsumers {
-		return configInvalid("resources.max_temp_bytes is %d; a set ceiling is split between %d consumers of temporary disk and must be at least %d bytes, or 0 for unlimited",
-			c.Resources.MaxTempBytes, TempDiskConsumers, TempDiskConsumers)
-	}
 	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
 		return configInvalid("resources.max_temp_bytes %d does not exceed the free-space reserve resources.min_free_disk_bytes %d; temporary work would always be refused",
 			c.Resources.MaxTempBytes, c.Resources.MinFreeDiskBytes)
 	}
-	// Both pairings are one-sided now: a caller budget can only be "more than
+	// Both pairings are one-sided: a caller budget can only be "more than
 	// the bound" when a bound was set at all. Against an unlimited workspace or
 	// an unlimited manifest there is nothing to exceed.
 	if c.Workspace.MaxFiles.Exceeded(int64(c.Context.DefaultMaxFiles)) {
