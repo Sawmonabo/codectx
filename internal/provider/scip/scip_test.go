@@ -1017,8 +1017,9 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // Mutations that must fail this test: probe once per document (drop the range
 // check from occurrenceRange), which republishes the wrong bytes; drop the
 // end-of-token half of the coverage check, which republishes the keyword case;
-// or drop the refusal count from the capability details, which republishes the
-// silence.
+// drop the refusal count from the capability details, which republishes the
+// silence; or drop the coordinate from the exemplar, which hands the operator a
+// file without the line inside it that disagrees.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
@@ -1028,26 +1029,30 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
 		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
 	)
+	// exemplar is the coordinate the first refused occurrence claimed, as the
+	// capability row must spell it: zero-based line and column, exactly as the
+	// index wrote them, so an operator opens the disagreeing line directly.
 	cases := []struct {
-		name    string
-		shifted []byte
+		name     string
+		shifted  []byte
+		exemplar string
 	}{
 		// A declaration on a clean token boundary that is not its own name:
 		// the columns of the parameter, not of the function.
-		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18)},
+		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18), "pkg/tabs.go:4:11: "},
 		// Five columns to the right of "browser" and still inside the line:
 		// "er + br", which starts in the middle of an identifier.
-		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22)},
+		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22), "pkg/tabs.go:5:15: "},
 		// Seven columns to the left: "return ", a keyword plus the space
 		// before the identifier. Both ends are wrong -- it covers no whole
 		// token and it does not spell the symbol's name -- and it is the
 		// shift the start-boundary check alone admitted.
-		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10)},
+		{"reference_onto_a_keyword", occurrenceRecord(symBrowser, 0, 5, 3, 10), "pkg/tabs.go:5:3: "},
 		// Four columns to the right and four wider: "browser + b", which
 		// begins on a token boundary and stops in the middle of the next
 		// identifier. Only the end of it is wrong, which is the half of the
 		// coverage rule the three rows above do not exercise.
-		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21)},
+		{"reference_stopping_inside_the_next_token", occurrenceRecord(symBrowser, 0, 5, 10, 21), "pkg/tabs.go:5:10: "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1078,8 +1083,8 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 				if got := cs.Details["refused_occurrences"]; got != "1" {
 					t.Fatalf("refused_occurrences = %q, want %q: a thinned unit must say how much it left out", got, "1")
 				}
-				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, "pkg/tabs.go: ") {
-					t.Fatalf("refused_occurrence_exemplar = %q, want the document named", got)
+				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, tc.exemplar) {
+					t.Fatalf("refused_occurrence_exemplar = %q, want the prefix %q: the document and the coordinate it claimed", got, tc.exemplar)
 				}
 			}
 		})
