@@ -7,7 +7,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// result is the ONE response envelope every tool returns (digest §5).
+// result is the ONE response envelope every tool returns.
 //
 // internal/cli.Envelope is the CLI's shape and stays there: three of its six
 // fields are already carried by the protocol — ok by CallToolResult.IsError,
@@ -29,7 +29,7 @@ type result[T any] struct {
 // ok wraps one facade answer in the shared envelope. It is a free function
 // rather than a method because Go does not allow type parameters on methods.
 //
-// Handler pattern, for the five fill-in lanes:
+// Handler pattern:
 //
 //	func (h *handlers) search(ctx context.Context, _ *mcp.CallToolRequest, in model.SearchRequest) (*mcp.CallToolResult, result[model.Page[model.SearchHit]], error) {
 //	    var zero result[model.Page[model.SearchHit]]
@@ -61,9 +61,8 @@ const internalMessage = "internal error"
 // toolForErr installs): when a typed handler returns a non-nil error the SDK
 // DISCARDS the handler's *CallToolResult and builds a fresh one with
 // SetError(err), which sets IsError and puts err.Error() in a TextContent
-// block. StructuredContent is NOT populated on that path. Digest §5's wording
-// ("the structured *model.Error in StructuredContent") therefore does not
-// describe v1.7.0; see deviation D1 in the L0 report. What this type does
+// block. StructuredContent is NOT populated on that path, so the structured
+// *model.Error cannot travel in StructuredContent. What this type does
 // instead is make every byte that survives count: the Section 22 code, the
 // message and, when the domain supplied one, the remediation.
 //
@@ -81,8 +80,8 @@ func (e *toolError) Error() string {
 
 func (e *toolError) Unwrap() error { return e.err }
 
-// toolFailure is the single boundary between a facade error and the wire
-// (digest §5). The split is binary and has no third case:
+// toolFailure is the single boundary between a facade error and the wire.
+// The split is binary and has no third case:
 //
 //   - a *model.Error from the facade is surfaced as-is, so the model never
 //     becomes blind to a domain failure and every code stays the Section 22

@@ -110,10 +110,10 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	// zero here, and the second process would be told this capability is
 	// simply unavailable while its units are being built.
 	//
-	// NOT RUN under the no-test order. This builds the row rather than driving
-	// a late seal, which no test in this package can reach, so it holds the
-	// store and the second handle to the figure and not the counting; what
-	// counts it is internal/index's holdsFreshUnit, over generation_units.
+	// This builds the row rather than driving a late seal, which no test in
+	// this package can reach, so it holds the store and the second handle to
+	// the figure and not the counting; what counts it is internal/index's
+	// holdsFreshUnit, over generation_units.
 	//
 	// Mutation: restore the batch-local mirror in coveredProviders -- `case
 	// g.sealed[key]:` in place of the holdsFreshUnit read -- and drop

@@ -16,7 +16,7 @@ import (
 // and therefore cannot be faked, while app.IndexService, app.ExploreService and
 // app.ContextService exist for exactly this ("The four narrow interfaces below
 // exist for consumers to depend on" — internal/app/services.go) and *Services
-// satisfies them. That is the seam that lets every lane's test rows run against
+// satisfies them. That is the seam that lets every test row run against
 // an in-package fake, and it is why internal/cli/mcp.go can hand ws.Services()
 // to each field.
 //
@@ -30,10 +30,10 @@ type handlers struct {
 	explore app.ExploreService
 	context app.ContextService
 
-	// cfg carries the Section 20 bounds. L1's limitMiddleware reads
+	// cfg carries the Section 20 bounds. limitMiddleware reads
 	// resources.max_metadata_response_bytes and query_timeout from it, and the
-	// two gate sizes from the machine's cores; L4's readSource
-	// reads max_source_response_bytes.
+	// two gate sizes from the machine's cores; readSource reads
+	// max_source_response_bytes.
 	cfg   config.Config
 	build model.BuildInfo
 	log   *slog.Logger
@@ -49,30 +49,28 @@ type handlers struct {
 	indexRun func() (string, bool)
 }
 
-// The frozen per-tool method set. Every name below is registered by
-// registry.go and stubbed in its lane's file; a lane implements its own block
-// and touches no other file. A registration without a handler, or a handler
-// without a registration, is a defect the schema snapshot catches.
+// The per-tool method set. Every name below is registered by registry.go. A
+// registration without a handler, or a handler without a registration, is a
+// defect the schema snapshot catches.
 //
-//	explore.go  — L2: indexStatus, refreshIndex, repoOverview, search, findSymbol, references
-//	graph.go    — L3: symbolInfo, callers, callees, dependencyPath, impact
-//	session.go  — L4: contextPlan, contextStatus, contextNext, contextEntries, contextInclude, readSource
-//	gate.go     — L5: contextAcknowledge, contextWaive, contextRecord, contextAdvance, contextCapsule, contextClose
+//	explore.go  — indexStatus, refreshIndex, repoOverview, search, findSymbol, references
+//	graph.go    — symbolInfo, callers, callees, dependencyPath, impact
+//	session.go  — contextPlan, contextStatus, contextNext, contextEntries, contextInclude, readSource
+//	gate.go     — contextAcknowledge, contextWaive, contextRecord, contextAdvance, contextCapsule, contextClose
 //
-// Frozen by L0 as a comment, implemented by the named lane:
+// The server around them:
 //
-//	server.go            — L1:  func New(Options) (*Server, error); func (*Server) Serve(ctx context.Context) error
-//	limits.go            — L1:  func (s *Server) limitMiddleware() mcp.Middleware
-//	internal/cli/mcp.go  — INT: newMCPCommand(build model.BuildInfo) *cobra.Command
-//	                            for `codectx mcp serve --repo PATH [--watch]`
+//	server.go            — func New(Options) (*Server, error); func (*Server) Serve(ctx context.Context) error
+//	limits.go            — func (s *Server) limitMiddleware() mcp.Middleware
+//	internal/cli/mcp.go  — newMCPCommand(build model.BuildInfo) *cobra.Command
+//	                       for `codectx mcp serve --repo PATH [--watch]`
 //
 // --- Local composite types --------------------------------------------------
 //
 // Every other tool's In is the landed model request type VERBATIM: they already
 // carry complete lowercase JSON tags and no internal-only field, and
-// hand-declaring 23 twins is the parallel implementation policy.md forbids.
-// The types below are the only new ones. A lane that wants another reports to
-// the controller rather than adding it.
+// hand-declaring 23 twins is the parallel implementation Section 5.1 forbids.
+// The types below are the only new ones.
 
 // emptyInput is the argument type of a tool that takes none. The SDK infers
 // `{"type":"object"}` from it, which is what the protocol requires.
@@ -112,7 +110,7 @@ type graphInput struct {
 // planOutput shows the manifest and the opened session's status together, so
 // `context_plan` needs no second round trip — the facade returns both.
 //
-// Status is a POINTER because a truncated plan (ruling C9) opened no session:
+// Status is a POINTER because a truncated plan opened no session:
 // the compile stopped at a pass boundary and answered a continuation cursor
 // instead. A zero SessionStatus on the wire there would show a client a blank
 // session id, an empty phase and a "not ready" gate as though a real session

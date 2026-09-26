@@ -23,9 +23,9 @@ other table references a node or a relation by that **integer** surrogate:
 `node_facts`, `relation_facts`, `relation_ids`' own two endpoints,
 `native_aliases`, `fact_keys`, `evidence`, `search_units` and
 `context_entries`. `node_ids.canonical_key` is a `BLOB` under a
-`CHECK(length(canonical_key) = 32)` — not the 64-character hex text it used to
-be, and unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
-`repository_id` column any more, because one store is one repository.
+`CHECK(length(canonical_key) = 32)` — 32 bytes, not 64-character hex text, and
+unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
+`repository_id` column, because one store is one repository.
 (`snapshots` and `generations` still carry theirs.)
 
 The two wide text keys are interned the same way. `scope_keys(id, key)` and
@@ -356,8 +356,8 @@ predecessor's declared files against the fresh ones without holding either
 list. It refuses a unit that is not sealed: a building unit's rows are still
 arriving, and a delta diffed against a partial set would name too few replaced
 buckets and carry a stale fact. The dependence applier uses it to compute
-`Replaced.Files`; the manifest of the same rows it used to store beside the
-unit was deleted with it.
+`Replaced.Files`; no manifest of the same rows is stored beside the
+unit.
 
 ## Applier sketch
 

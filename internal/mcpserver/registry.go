@@ -11,10 +11,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// register installs the 23 tools of Section 19.2, in the digest §4 order.
+// register installs the 23 tools of Section 19.2, in Section 19.2's order.
 //
-// This is the whole tool surface in one place: there is no per-lane
-// registration file, so a lane adding a tool, dropping one or renaming one is a
+// This is the whole tool surface in one place: there is no second
+// registration file, so adding a tool, dropping one or renaming one is a
 // single-file diff the schema snapshot in mcpserver_test.go fails on. Titles
 // and descriptions are deliberately terse — Section 19.2 requires labels to be
 // compact so tool schemas do not consume unnecessary client context.
@@ -22,7 +22,7 @@ import (
 // No prompts, resources or completion handlers are registered: Section 19.3
 // scopes V1 to tools.
 func register(s *mcp.Server, h *handlers) {
-	// --- L2: index and discovery ---------------------------------------
+	// --- index and discovery -------------------------------------------
 	addTool(s, "codectx_index_status", "Index status",
 		"Active generation, health, coherence and capability completeness. Set resources=true for the accounting block.", h.indexStatus)
 	addTool(s, "codectx_refresh_index", "Refresh index",
@@ -36,15 +36,15 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_find_symbol", "Find symbol",
 		"Resolve a symbol through the canonical index or the LSP overlay.", h.findSymbol)
 
-	// --- L3: symbol composition ----------------------------------------
+	// --- symbol composition --------------------------------------------
 	addTool(s, "codectx_symbol_info", "Symbol info",
 		"Symbol metadata with reference evidence pinned to one generation.", h.symbolInfo)
 
-	// --- L2: references -------------------------------------------------
+	// --- references -----------------------------------------------------
 	addTool(s, "codectx_references", "References",
 		"Reference, implementation or type-definition occurrences of a node.", h.references)
 
-	// --- L3: traversal ---------------------------------------------------
+	// --- traversal -------------------------------------------------------
 	addTool(s, "codectx_callers", "Callers",
 		"Bounded inbound call neighborhood of one or more nodes.", h.callers)
 	addTool(s, "codectx_callees", "Callees",
@@ -58,7 +58,7 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness.", h.impact)
 
-	// --- L4: session lifecycle -------------------------------------------
+	// --- session lifecycle -----------------------------------------------
 	addTool(s, "codectx_context_plan", "Plan context",
 		"Open a read session and return its manifest beside its status.", h.contextPlan)
 	addTool(s, "codectx_context_status", "Context status",
@@ -72,7 +72,7 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_read_source", "Read source",
 		"The only tool that returns source bytes: one bounded chunk with a receipt.", h.readSource)
 
-	// --- L5: review gate and capsule --------------------------------------
+	// --- review gate and capsule ------------------------------------------
 	addTool(s, "codectx_context_acknowledge", "Acknowledge",
 		"Confirm issued read receipts or a fully read file.", h.contextAcknowledge)
 	addTool(s, "codectx_context_waive", "Waive file",
@@ -88,9 +88,9 @@ func register(s *mcp.Server, h *handlers) {
 		"Close a session under its expected state version.", h.contextClose)
 }
 
-// toolCount is the Section 19.2 surface size. Section 19.2 lists 23 tools; the
-// "24" of wave-E Q16 is an off-by-one and is ledgered. There is no doctor tool,
-// which is why this package takes no app.DiagnoseService at all.
+// toolCount is the Section 19.2 surface size: the 23 tools Section 19.2 lists.
+// There is no doctor tool, which is why this package takes no
+// app.DiagnoseService at all.
 const toolCount = 23
 
 // addTool registers one tool with BOTH of its schemas preset from the handler's
@@ -168,7 +168,7 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 
 // capsuleViewExport is the codectx_context_capsule spelling that routes to
 // Export's identity-and-counts metadata instead of one keyset page of one
-// capsule list (digest §4).
+// capsule list.
 const capsuleViewExport = "export"
 
 // stringEnum is the one schema shape in the table above.
