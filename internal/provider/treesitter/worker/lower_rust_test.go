@@ -196,8 +196,9 @@ func TestRustLoweringGolden(t *testing.T) {
 			// lends v mutably, so
 			// the call receiving it may write v. Nodes: let mut v =
 			// Vec::new();@18 (defines v; a path is no read), fill(&mut v)@42
-			// (Uses v, may-defines v), v.len()@56. The may-definition kills
-			// nothing, so both the let and the call reach v.len().
+			// (Uses v, may-defines v), v.len()@56. v.len() pairs with the let,
+			// the killing definition reaching it through the may-definition,
+			// and with the call, the nearest may-definition.
 			name:     "a mutable borrow passed to a call is a may-definition of the borrowed variable",
 			protects: "a mutable borrow passed to a call reaches later uses as a may-definition",
 			mutation: "drop the MayDef on &mut (loses fill(&mut v)@42 -> v.len()@56)",
@@ -240,8 +241,8 @@ func TestRustLoweringGolden(t *testing.T) {
 			// completes the block rather than the function), and
 			// Expressions › Operator expressions › The try propagation
 			// expression. Nodes: a@5, a?@57 (Branch Using a; it defines its
-			// Ok value and, completing the block, may-defines the block's
-			// result), a? + 1@57 (the block's tail, Using the Ok value and
+			// Ok value and, completing the block, the block's result, both
+			// killing), a? + 1@57 (the block's tail, Using the Ok value and
 			// defining the block's result), let r: … = try { … };@30 (Uses
 			// the block's result), r.unwrap_or(0)@67. Succ: a?→{a? + 1, let} (its break lands
 			// after the block); a? + 1→let→r.unwrap_or(0). IPDom: a? → let.
@@ -402,16 +403,17 @@ func TestRustLoweringGolden(t *testing.T) {
 			// reference into the matched place o, through which `*v += 1`
 			// writes o. Nodes: o@9, let Some(ref mut v) = o@45 (Branch,
 			// defining an owned variable holding o's value), v@62 (Uses it,
-			// defines v, may-defines o), *v += 1@71 (may-defines v, the
-			// variable it writes through), o@82. Succ: let→{v, o@82}; v→*v
-			// += 1→o@82. IPDom: let → o@82.
+			// defines v, may-defines o, so it pairs with o@9, the definition
+			// of o reaching it, although it reads only the owned variable),
+			// *v += 1@71 (may-defines v, the variable it writes through),
+			// o@82. Succ: let→{v, o@82}; v→*v += 1→o@82. IPDom: let → o@82.
 			name:     "a ref mut binding is a may-definition of the matched variable",
 			protects: "a write through a `ref mut` binding reaches later reads of the matched variable",
-			mutation: "record no may-definition for a ref mut binding (loses v@62 -> o@82)",
+			mutation: "record no may-definition for a ref mut binding (loses v@62 -> o@82 and o@9 -> v@62)",
 			src:      "fn f(mut o: Option<i32>) -> Option<i32> { if let Some(ref mut v) = o { *v += 1; } o }",
 			cd:       []string{"let Some(ref mut v) = o@45 -> v@62", "let Some(ref mut v) = o@45 -> *v += 1@71"},
 			du: []string{"o@9 -> let Some(ref mut v) = o@45", "let Some(ref mut v) = o@45 -> v@62", "o@9 -> o@82", "v@62 -> *v += 1@71",
-				"v@62 -> o@82"},
+				"v@62 -> o@82", "o@9 -> v@62"},
 		},
 		{
 			// Expressions › `match` expressions, and › Match guards: the
@@ -582,7 +584,7 @@ func TestRustLoweringGolden(t *testing.T) {
 			// i@235→for@231. IPDom: for@231 → let (ref mut y, z) = G;@245.
 			name:     "a name that resolves to no local defines, may-defines and uses nothing in every position",
 			protects: "a static item, a name a macro declares and an undeclared name, as an assignment, compound, embedded or destructuring target, a place's base, a borrowed or ref-mut-matched place, a captured read or write, a token-tree read, borrow or format capture, and an iterated value, never reach flow.Builder as -1 and pair with nothing",
-			mutation: "remove any one -1 filter (read's, def's or yield's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m or H; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
+			mutation: "remove any one -1 filter (read's or def's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m or H; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
 			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut G); println!(\"{G:?}\", &mut m, H); let c = || { m += v; H = 1; }; c(); for i in H {} let (ref mut y, z) = G; k(e, w, y, z) } }",
 			cd:       []string{"for@231 -> i@235", "for@231 -> for@231"},
 			du: []string{"v@5 -> G = (v, 0)@83", "v@5 -> m += v@95", "v@5 -> m = v@112",
@@ -594,6 +596,30 @@ func TestRustLoweringGolden(t *testing.T) {
 				"let (ref mut y, z) = G;@245 -> y@258", "let (ref mut y, z) = G;@245 -> z@261",
 				"let e = (m = v);@103 -> k(e, w, y, z)@269", "w@129 -> k(e, w, y, z)@269",
 				"y@258 -> k(e, w, y, z)@269", "z@261 -> k(e, w, y, z)@269"},
+		},
+		{
+			// The Rust Unstable Book, Language features › try_blocks, and
+			// Expressions › Operator expressions › The try propagation
+			// expression: the operands of `a? + b?` are evaluated left to
+			// right, and whichever `?` meets an error first completes the
+			// block with it. Nodes: a@5, b@21, a?@73 (Branch Using a; defines
+			// its Ok value and the block's result), b?@78 (Branch Using b;
+			// likewise, killing a?'s definition of the result on the path
+			// through it), a? + b?@73 (the tail, Using both Ok values and
+			// defining the block's result), let r: … = try { … };@46 (Uses
+			// the block's result), r.unwrap_or(0)@84. Succ: a?→{b?, let};
+			// b?→{a? + b?, let}; a? + b?→let→r.unwrap_or(0). IPDom: a? →
+			// let; b? → let. Frontier walks: a? over b? and a? + b?; b? over
+			// a? + b?.
+			name:     "each question mark completing a try block kills the block's result, reading nothing of it",
+			protects: "b?'s definition of the try block's result is its own value, never a consumer of a?'s, and the let pairs with each `?` whose break reaches it",
+			mutation: "record a `?`'s definition of the try block's result, beside its Ok value, as a may-definition (gains a?@73 -> b?@78, the claim that b? consumed a?'s value), or give a `?` completing a try block no definition of it (loses b?@78 -> let r: Option<i32> = try { a? + b? };@46)",
+			src:      "fn f(a: Option<i32>, b: Option<i32>) -> i32 { let r: Option<i32> = try { a? + b? }; r.unwrap_or(0) }",
+			cd:       []string{"a?@73 -> b?@78", "a?@73 -> a? + b?@73", "b?@78 -> a? + b?@73"},
+			du: []string{"a@5 -> a?@73", "b@21 -> b?@78", "a?@73 -> a? + b?@73", "b?@78 -> a? + b?@73",
+				"a?@73 -> let r: Option<i32> = try { a? + b? };@46", "b?@78 -> let r: Option<i32> = try { a? + b? };@46",
+				"a? + b?@73 -> let r: Option<i32> = try { a? + b? };@46",
+				"let r: Option<i32> = try { a? + b? };@46 -> r.unwrap_or(0)@84"},
 		},
 	})
 }

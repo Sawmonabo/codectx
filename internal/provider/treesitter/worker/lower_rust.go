@@ -59,14 +59,14 @@ const rsTryLabel = " try"
 //     node). An if, match, loop, while, for or block makes no node spanning
 //     itself, in any position: its conditions, heads, statements and arm
 //     results are its nodes. A while or for loop, an assignment, a compound
-//     assignment and a jump yield `()` or `!`, so they hand over nothing. flow
-//     gives a node one definition, so a yielding node already defining
-//     another variable (the `?` completing a try block, which defines its own
-//     Ok value) may-defines the result: the result is defined only by its
-//     construct's yields, each reaching the consumer on its own path, so the
-//     may-definition adds no pair a definition would not. A jump in a macro's
-//     token tree defines no result, since which tokens make the jumped value
-//     is known only to the expansion.
+//     assignment and a jump yield `()` or `!`, so they hand over nothing. A
+//     yielding node that also defines a variable of its own (the `?`
+//     completing a try block, which defines its own Ok value) defines the
+//     result too, each definition killing (see Lowering). Several `?` on one
+//     path through a try block each define its result, and a later one kills
+//     an earlier one's, whose value leaves the block only on the earlier
+//     one's own edge. A jump in a macro's token tree defines no result, since
+//     which tokens make the jumped value is known only to the expansion.
 //   - `e?` is a Branch node spanning the whole `e?`, after e's nodes, whose
 //     successors are Exit (inside a try block: the end of that block) and the
 //     rest of the enclosing expression, so everything after it depends on it.
@@ -89,8 +89,8 @@ const rsTryLabel = " try"
 //     chain. A let condition `let P = v` is a Branch spanning it, which Uses
 //     v's reads and defines an owned variable holding v, followed on the
 //     taken path by one defining node per name P binds, spanning the name and
-//     Using that variable (so D ≤ N). A let chain's bindings are in scope for
-//     its later members and the body only.
+//     Using that variable. A let chain's bindings are in scope for its later
+//     members and the body only.
 //   - `loop` has a Stmt head spanning the `loop` keyword and no exit edge:
 //     only a break leaves it. A while loop's back edge targets the first node
 //     its condition makes. A for loop follows Iteration (see Lowering; The
@@ -174,13 +174,14 @@ const rsTryLabel = " try"
 //     place is evaluated once, by the node evaluating the value (the let,
 //     the let condition's Branch, the scrutinee's node), which Uses x; the
 //     binding's node carries the may-definition and, as every binding node,
-//     Uses only the owned variable holding the value, never x. What that rule
-//     gives up stays given up, for its stated reasons: a write through a
-//     reference as a definition of the local it refers to (the variable
-//     written through is may-defined, as above), a method call's implicit
-//     borrow of its receiver (`v.push(1)`), whose borrowing depends on the method's signature, and
-//     a shared borrow `&x` of an interior-mutable type, whose writing
-//     depends on the type.
+//     Uses only the owned variable holding the value, never x; as a χ (see
+//     Lowering, May-definitions), it still pairs with the definitions of x
+//     reaching it. What that rule gives up stays given up, for its stated
+//     reasons: a write through a reference as a definition of the local it
+//     refers to (the variable written through is may-defined, as above), a
+//     method call's implicit borrow of its receiver (`v.push(1)`), whose
+//     borrowing depends on the method's signature, and a shared borrow `&x`
+//     of an interior-mutable type, whose writing depends on the type.
 //
 // # Statement and expression kinds
 //
@@ -225,16 +226,15 @@ const rsTryLabel = " try"
 // nested callable walked for its captures; baseVar returns -1 for a place
 // whose base is such a name or no name. The filters sit where an id is
 // recorded: read drops it before it enters reads, so no node Uses it; def
-// and yield drop it before Def or MayDef; and every other may-definition is
-// recorded only for a variable ≥ 0: a place write's base (assign, targets,
-// compound), a pending `&mut` borrow (value, tokenBorrow), a `ref mut`
-// binding's matched place (bindName), and a nested callable's writes
-// (capWrite, cap, bindName, tokenBorrow). No table of the lowering is
-// indexed by a variable. So an unresolved name as an assignment,
-// compound-assignment, embedded-assignment or destructuring target, a
-// place's base, a borrowed or `ref mut`-matched place, a captured read or
-// write, a token-tree read, borrow or format capture, or an iterated value
-// defines and Uses nothing. Rust has no increment or deletion, and a for
+// drops it before Def; and every may-definition is recorded only for a
+// variable ≥ 0: a place write's base (assign, targets, compound), a pending
+// `&mut` borrow (value, tokenBorrow), a `ref mut` binding's matched place
+// (bindName), and a nested callable's writes (capWrite, cap, bindName,
+// tokenBorrow). No table of the lowering is indexed by a variable. So an
+// unresolved name as an assignment, compound-assignment, embedded-assignment
+// or destructuring target, a place's base, a borrowed or `ref mut`-matched
+// place, a captured read or write, a token-tree read, borrow or format
+// capture, or an iterated value defines and Uses nothing. Rust has no increment or deletion, and a for
 // pattern always binds new variables, so a name is iterated only as the
 // iterable.
 //
@@ -331,7 +331,8 @@ type rsLower struct {
 	// first is the first node created since the last open, or -1.
 	first int32
 	// last is the node created last, or -1, lastSpan its span, lastDef
-	// whether it defines a variable, and lastVar that variable.
+	// whether it defines a variable, and lastVar the first variable it
+	// defines.
 	last     int32
 	lastSpan flow.Span
 	lastDef  bool
@@ -491,30 +492,17 @@ func (r *rsLower) node(kind flow.Kind, s flow.Span, from, to int) int32 {
 	return id
 }
 
-// def records that node n defines v, unless v is -1.
+// def records that node n defines v, a killing definition, unless v is -1.
+// A node may define several variables: a node yielding a construct's value
+// defines the construct's result beside a variable of its own (the `?`
+// completing a try block defines its Ok value and the block's result).
 func (r *rsLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
 	r.b.Def(n, v)
-	if n == r.last {
+	if n == r.last && !r.lastDef {
 		r.lastDef, r.lastVar = true, v
-	}
-}
-
-// yield makes node n, the node made last, which yields a construct's value,
-// define the construct's result variable v (nothing when v is -1). flow
-// gives a node one definition, so a node already defining another variable
-// (the `?` that also completes a try block) may-defines v: v is defined only
-// by its construct's yields, each of which reaches the consumer on its own
-// path, so the may-definition adds no pair a definition would not.
-func (r *rsLower) yield(n, v int32) {
-	switch {
-	case v < 0:
-	case n == r.last && r.lastDef:
-		r.b.MayDef(n, v)
-	default:
-		r.def(n, v)
 	}
 }
 
@@ -817,7 +805,7 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 	k := r.k
 	u := r.l.unparen(e)
 	if r.l.isCallable(u) {
-		r.yield(r.closure(u), dst)
+		r.def(r.closure(u), dst)
 		return
 	}
 	switch u.KindId() {
@@ -860,7 +848,7 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 			id = r.node(flow.Stmt, spanOf(u), m, len(r.reads))
 			r.reads = r.reads[:m]
 		}
-		r.yield(id, dst)
+		r.def(id, dst)
 	case k.binaryExpression:
 		if op := u.ChildByFieldId(k.fOperator).KindId(); op == k.and || op == k.or {
 			r.lazy(u, dst)
@@ -870,7 +858,7 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 	default:
 		m := len(r.reads)
 		r.value(u)
-		r.yield(r.node(flow.Stmt, spanOf(u), m, len(r.reads)), dst)
+		r.def(r.node(flow.Stmt, spanOf(u), m, len(r.reads)), dst)
 		r.reads = r.reads[:m]
 	}
 }
@@ -970,10 +958,10 @@ func (r *rsLower) try(n *ts.Node, dst int32) {
 	}
 	id := r.node(flow.Branch, spanOf(n), m, len(r.reads))
 	r.reads = r.reads[:m]
-	r.yield(id, dst)
+	r.def(id, dst)
 	p := r.b.Push()
 	if r.tries > 0 {
-		r.yield(id, r.target(rsTryLabel))
+		r.def(id, r.target(rsTryLabel))
 		r.b.Break(rsTryLabel)
 	} else {
 		r.b.Return()
@@ -995,7 +983,7 @@ func (r *rsLower) lazy(n *ts.Node, dst int32) {
 		id = r.node(flow.Branch, spanOf(r.l.unparen(left)), m, len(r.reads))
 	}
 	r.reads = r.reads[:m]
-	r.yield(id, dst)
+	r.def(id, dst)
 	p := r.b.Push()
 	r.into(right, dst)
 	r.b.Merge(p)
@@ -1735,7 +1723,7 @@ func (r *rsLower) jump(n *ts.Node) {
 		r.b.Return()
 	case k.breakExpression:
 		if len(list) > 0 && (len(list) > 1 || list[0].KindId() != k.label) {
-			r.yield(id, r.target(label))
+			r.def(id, r.target(label))
 		}
 		r.b.Break(label)
 	default:
