@@ -69,14 +69,34 @@ var errWorkerGone = errors.New("treesitter: parser worker exited")
 // it, so parser workers and every other heavy child of this process are
 // admitted against one allocation and one running total.
 //
-// The ledger's queue is the one order every handout follows. While an
-// acquirer of this pool waits on it, a worker coming back from a parse is
-// stopped rather than kept idle: its reservation returns to the ledger, which
-// pumps, so the queue's head -- this pool's acquirer or any other reserver --
-// is asked again, and no later caller can take that worker around the queue.
-// Kept idle instead, the worker would hold the room the queued acquirer waits
-// for while nothing ever pumps the ledger, and the acquirer, its unit and the
-// stage it keeps from draining would wait forever.
+// Every admission is first-in-first-out on the ledger. A worker coming back
+// from a parse while an acquirer of this pool is queued there goes one of two
+// ways, both in the ledger's order:
+//
+//   - When that acquirer is the ledger's head, the worker and the reservation
+//     it holds are handed to it. The head is next in line for exactly that
+//     room, so the handout is the grant the ledger would make, without
+//     stopping one process to start the same one again. The ledger tells an
+//     acquirer it is the head that does not fit through the make-room step;
+//     no other reserver can come before it from then on.
+//   - When the head is another reserver -- a unit, a language server, another
+//     pool -- the worker is stopped: its reservation returns to the ledger,
+//     which pumps, and that head is admitted in order. This pool's acquirer
+//     behind it waits its turn.
+//
+// No idle worker is reused while an acquirer of this pool is queued, since
+// release never idles one then. With none queued, a worker coming back goes
+// idle and is held for the stage like any room an admitted child holds; the
+// ledger does not tell a room holder that someone is waiting, so a reserver
+// that arrives while this pool holds idle workers waits behind them until a
+// release of this pool stops one or the stage's drain stops them all. That is
+// the order admission itself keeps -- room is returned by its holder, never
+// taken -- and it is the one point where a warm worker is kept rather than
+// given up.
+//
+// Kept idle while an acquirer of this pool is queued, a worker would hold the
+// room that acquirer waits for while nothing ever pumps the ledger, and the
+// acquirer, its unit and the stage it keeps from draining would wait forever.
 type pool struct {
 	runner    *process.Runner
 	admission *admission.Ledger
@@ -93,14 +113,14 @@ type pool struct {
 	idle   []*worker
 	live   map[*worker]bool
 	closed bool
-	// reserving counts the acquirers waiting on the ledger for a worker they
-	// will start. They count against max beside live, so no more reservations
-	// are asked for than the pool may start processes, and they are not in
-	// live, because no process of theirs exists yet for close to stop. While
-	// it is above zero, release stops the workers it is handed instead of
-	// idling them, so idle is empty for as long as any acquirer is queued.
-	reserving int
-	wg        sync.WaitGroup
+	// queued are the acquirers waiting on the ledger for a worker, in the
+	// order they asked. They count against max beside live, so no more
+	// reservations are asked for than the pool may start processes, and they
+	// are not in live, because no process of theirs exists yet for close to
+	// stop. While one is waiting and not yet handed a worker, release never
+	// idles a worker, so idle is empty for as long as any acquirer is queued.
+	queued []*acquirer
+	wg     sync.WaitGroup
 	// totals is the open structural-parse total of every run parsing through
 	// this pool, which is what a worker's span hangs off. It is keyed by the
 	// run and not held as one span because a deferred publication's tick runs
@@ -109,6 +129,32 @@ type pool struct {
 	totals map[*ledger.Run]*stageTotal
 
 	started, exited, parses, retries uint64
+}
+
+// acquirer is one caller of acquire waiting on the ledger. Its fields are
+// guarded by the pool lock.
+type acquirer struct {
+	// head is set once the ledger has asked this acquirer to make room: it is
+	// then the queue's head and does not fit, and it stays the head until its
+	// wait ends, since the queue only grows at its tail.
+	head bool
+	// handed is the worker release gave this acquirer at the head, with the
+	// reservation that worker holds; nil until then.
+	handed *worker
+	// cancel ends this acquirer's ledger wait once it has been handed a
+	// worker, so the wait does not also take a second reservation.
+	cancel context.CancelFunc
+}
+
+// waiting reports whether an acquirer is queued that has not been handed a
+// worker. The pool lock must be held.
+func (p *pool) waiting() bool {
+	for _, a := range p.queued {
+		if a.handed == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // worker is one parser subprocess owned by the pool.
@@ -278,8 +324,11 @@ func newWorker(p *pool) *worker {
 // A new worker's memory is reserved on the ledger before the worker exists,
 // with the pool lock released: the wait is first-in-first-out behind every
 // other heavy child and can be long. No worker goes idle while the wait lasts
-// (see release), so the room the ledger grants is room this caller needs;
-// only a pool that closed meanwhile hands it straight back.
+// (see release). The wait ends in one of two ways: the ledger grants the room
+// and this caller starts a worker in it, or, once this caller is the ledger's
+// head, release hands it a worker together with that worker's reservation and
+// the wait is withdrawn. A grant that lands at the same moment as a handout is
+// given straight back, and so is one granted to a pool that closed meanwhile.
 func (p *pool) acquire(ctx context.Context) (*worker, error) {
 	p.mu.Lock()
 	for {
@@ -293,16 +342,51 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			p.mu.Unlock()
 			return w, nil
 		}
-		if len(p.live)+p.reserving < p.max {
-			p.reserving++
+		if len(p.live)+len(p.queued) < p.max {
+			reserving, cancel := context.WithCancel(ctx)
+			a := &acquirer{cancel: cancel}
+			p.queued = append(p.queued, a)
 			p.mu.Unlock()
-			// No make-room step: idle is empty while this acquirer is queued,
-			// and every worker in use comes back through release, which frees
-			// its room while anyone is queued.
-			release, err := p.admission.ReserveWith(ctx, admission.Reservation{MemoryBytes: p.memory}, nil)
+			// The make-room step frees nothing -- idle is empty while this
+			// acquirer is queued -- and only marks it the ledger's head, which
+			// is what lets release hand it the next worker to come back. It
+			// is called with no ledger lock held, so taking the pool lock here
+			// inverts no order: release cancels a wait under the pool lock, and
+			// the ledger's cancellation takes the ledger lock alone.
+			release, err := p.admission.ReserveWith(reserving, admission.Reservation{MemoryBytes: p.memory}, func() {
+				p.mu.Lock()
+				a.head = true
+				p.mu.Unlock()
+			})
+			cancel()
 			p.mu.Lock()
-			p.reserving--
+			p.queued = slices.DeleteFunc(p.queued, func(x *acquirer) bool { return x == a })
 			p.cond.Broadcast()
+			if w := a.handed; w != nil {
+				if err == nil {
+					// Granted as it was handed a worker: the worker's room is
+					// this caller's, so the grant goes back to the ledger.
+					p.mu.Unlock()
+					release()
+					p.mu.Lock()
+				}
+				if p.closed {
+					// close has already counted w among the busy workers it
+					// kills, so it is left to close.
+					p.mu.Unlock()
+					return nil, &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
+				}
+				if !p.live[w] {
+					// The worker died after it was handed over: it is waited
+					// out, as release does, and this caller asks again.
+					p.mu.Unlock()
+					w.stop(false)
+					p.mu.Lock()
+					continue
+				}
+				p.mu.Unlock()
+				return w, nil
+			}
 			if err != nil {
 				p.mu.Unlock()
 				return nil, err
@@ -356,13 +440,15 @@ func (p *pool) wait(ctx context.Context) error {
 	return nil
 }
 
-// release returns a worker after a parse. An unhealthy worker is stopped, and
-// so is a healthy one while an acquirer of this pool is queued on the ledger:
-// its reservation goes back to the ledger once the runner has reaped it, and
-// the ledger's pump hands that room to the queue's head in order (see pool).
-// Otherwise it goes idle, reusable by the next parse of this stage and stopped
-// by the drain that follows the last one. Its place in live is given up only
-// when the process has exited, which is what keeps live processes bounded.
+// release returns a worker after a parse. An unhealthy worker is stopped. A
+// healthy one goes, with its reservation, to the acquirer of this pool that is
+// the ledger's head; while an acquirer of this pool is queued behind another
+// head it is stopped, its reservation goes back to the ledger once the runner
+// has reaped it, and the ledger's pump hands that room to the head in order
+// (see pool). With no acquirer queued it goes idle, reusable by the next parse
+// of this stage and stopped by the drain that follows the last one. Its place
+// in live is given up only when the process has exited, which is what keeps
+// live processes bounded.
 func (p *pool) release(w *worker, healthy bool) {
 	if !healthy {
 		w.stop(true)
@@ -383,7 +469,17 @@ func (p *pool) release(w *worker, healthy bool) {
 		w.stop(false)
 		return
 	}
-	if p.closed || p.reserving > 0 {
+	if !p.closed {
+		for _, a := range p.queued {
+			if a.head && a.handed == nil {
+				a.handed = w
+				a.cancel()
+				p.mu.Unlock()
+				return
+			}
+		}
+	}
+	if p.closed || p.waiting() {
 		p.mu.Unlock()
 		w.stop(false)
 		return
