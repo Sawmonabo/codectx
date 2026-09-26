@@ -64,8 +64,7 @@ const maxWalkedEntries = 200000
 // Section 22 forbids the alternative -- adding per-process historical peaks
 // reached at different moments describes a moment that never existed.
 //
-// The rule inherited from the L0 slice: a metric that cannot be measured stays
-// nil. It is never defaulted to zero, because a zero resident set reads as a
+// A metric that cannot be measured stays nil. It is never defaulted to zero, because a zero resident set reads as a
 // process using no memory, and Section 23 requires an unavailable figure be
 // reported as unavailable.
 type HostSampler struct {
@@ -297,11 +296,6 @@ func PeakParentRSSBytes() *uint64 {
 // Git plumbing command, a language server, a SCIP indexer, the dependence
 // engine -- is native.
 //
-// The split itself has no test row -- the two rows this lane is allotted go to
-// the absent-not-zero invariant and the live-subprocess counter -- and was
-// verified instead by the Task 20 obligation-18 measurement harness, where the
-// parser worker was the sole descendant and was summed into the base figure.
-//
 // Membership is by parent chain, not by process group, because each child is
 // its own group leader (internal/process places it there) and there is no
 // registry of those groups here. The honest limitation, which
@@ -318,21 +312,15 @@ func descendantRSSBytes() (base, native *uint64) {
 		return nil, nil
 	}
 	pageSize := uint64(os.Getpagesize())
+	// Every /proc entry is examined. The sweep is bounded by the processes on
+	// the machine, which the kernel bounds, and it cannot be truncated: a
+	// sweep that stopped early on a busy host could drop an intermediate
+	// ancestor and hide every descendant below it.
 	all := make(map[int]procRecord, len(entries))
-	var scanned int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
 			continue
-		}
-		// The same finite bound the runner's own sweep uses: one pass is
-		// O(processes on the machine), and 4096 is far above the process count
-		// of any host this runs on. Reaching it makes both figures ABSENT
-		// rather than smaller: a truncated sweep can drop an intermediate
-		// ancestor, which hides every descendant below it, and a confidently
-		// smaller number is a wrong measurement where a missing one is not.
-		if scanned++; scanned > maxSampledProcesses {
-			return nil, nil
 		}
 		comm, parent, pages, ok := statProcess(pid)
 		if !ok {
@@ -354,16 +342,6 @@ func descendantRSSBytes() (base, native *uint64) {
 	return &baseTotal, &nativeTotal
 }
 
-// maxAncestorHops bounds the walk up one process's parent chain. A tree this
-// application builds is at most three deep (this process, a runner's child, its
-// own children), so the bound truncates a cycle in a malformed /proc rather
-// than a real chain.
-const maxAncestorHops = 16
-
-// maxSampledProcesses bounds one sweep of /proc, matching the bound the
-// runner's own tree sampler applies for the same reason.
-const maxSampledProcesses = 4096
-
 // procRecord is one process as this sweep read it.
 type procRecord struct {
 	parent int
@@ -375,8 +353,13 @@ type procRecord struct {
 // A chain that leaves the sweep -- the parent exited between the two reads --
 // is not a descendant, which is the same absence the re-parenting limitation
 // documented above produces.
+//
+// The walk is bounded by the sweep itself: a real chain visits each process
+// in it at most once, so a walk longer than the sweep has processes is a cycle
+// in a malformed /proc, and a descendant however deep a child's own tree goes
+// is still found.
 func descends(all map[int]procRecord, pid, root int) bool {
-	for hops := 0; hops < maxAncestorHops; hops++ {
+	for hops := 0; hops <= len(all); hops++ {
 		rec, ok := all[pid]
 		if !ok || rec.parent <= 0 {
 			return false

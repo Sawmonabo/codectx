@@ -14,8 +14,9 @@ import "sync/atomic"
 //
 // The caller allocates one, hands it to the runner in Spec.CPUProgress and
 // reads it while the run is in flight. The runner binds it to the tree sampler
-// once the child exists; before that, and on a platform that cannot sample a
-// running tree at all, it reports nothing observed rather than zero ticks, so
+// once the child exists; before that, before a sweep has found the child's
+// group, and on a platform that cannot sample a running tree at all, it
+// reports nothing observed rather than zero ticks, so
 // no caller reads a missing measurement as "used no processor time"
 // (Section 22).
 type CPUProgress struct {
@@ -23,19 +24,17 @@ type CPUProgress struct {
 }
 
 // Ticks reports the child tree's summed user and system processor time, in
-// whatever unit the platform counts it in, as of the last sweep. ok is false
-// where there is no measurement: no sampler is bound yet, or this platform has
-// none. The value is a change signal, never a duration -- a caller compares it
-// with the previous reading and asks only whether it moved.
+// whatever unit the platform counts it in, as of the last sweep that found the
+// tree. ok is false where there is no measurement: no sampler is bound yet,
+// this platform has none, or no sweep has yet found a member of the child's
+// group. Once the tree has been seen the last figure is kept, including after
+// the child exits. The value is a change signal, never a duration -- a caller
+// compares it with the previous reading and asks only whether it moved.
 func (p *CPUProgress) Ticks() (int64, bool) {
-	if p == nil || !treeSampled {
+	if p == nil {
 		return 0, false
 	}
-	s := p.sampler.Load()
-	if s == nil {
-		return 0, false
-	}
-	return s.cpuTicks(), true
+	return p.sampler.Load().cpuTicks()
 }
 
 // bind publishes the run's tree sampler. A nil handle is the ordinary case --

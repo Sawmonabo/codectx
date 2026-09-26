@@ -157,7 +157,7 @@ func (o *Overlay) locations(ctx context.Context, method string, supported bool, 
 		params = referenceParams{textDocumentPositionParams: params.(textDocumentPositionParams), Context: *refCtx}
 	}
 	var raw json.RawMessage
-	if err := o.call(ctx, method, params, &raw); err != nil {
+	if err := o.s.call(ctx, method, params, &raw); err != nil {
 		return out, err
 	}
 	links, err := decodeLocations(method, raw)
@@ -203,7 +203,7 @@ func (o *Overlay) DocumentSymbols(ctx context.Context, file model.FileID, limit 
 		return out, err
 	}
 	var raw json.RawMessage
-	if err := o.call(ctx, "textDocument/documentSymbol", documentSymbolParams{TextDocument: textDocumentIdentifier{URI: o.s.uris.uri(doc.version.Path)}}, &raw); err != nil {
+	if err := o.s.call(ctx, "textDocument/documentSymbol", documentSymbolParams{TextDocument: textDocumentIdentifier{URI: o.s.uris.uri(doc.version.Path)}}, &raw); err != nil {
 		return out, err
 	}
 	out.Overlay = o.s.binding
@@ -284,7 +284,7 @@ func (o *Overlay) WorkspaceSymbols(ctx context.Context, query string, limit int)
 		return out, invalid("workspace symbol query exceeds %d bytes", model.MaxQueryTextBytes)
 	}
 	var symbols []workspaceSymbol
-	if err := o.call(ctx, "workspace/symbol", workspaceSymbolParams{Query: query}, &symbols); err != nil {
+	if err := o.s.call(ctx, "workspace/symbol", workspaceSymbolParams{Query: query}, &symbols); err != nil {
 		return out, err
 	}
 	out.Overlay = o.s.binding
@@ -331,7 +331,7 @@ func (o *Overlay) PrepareCallHierarchy(ctx context.Context, at At, limit int) (R
 		return out, err
 	}
 	var items []json.RawMessage
-	if err := o.call(ctx, "textDocument/prepareCallHierarchy",
+	if err := o.s.call(ctx, "textDocument/prepareCallHierarchy",
 		textDocumentPositionParams{TextDocument: textDocumentIdentifier{URI: o.s.uris.uri(doc.version.Path)}, Position: pos}, &items); err != nil {
 		return out, err
 	}
@@ -374,7 +374,7 @@ func (o *Overlay) calls(ctx context.Context, method string, item CallItem, limit
 		return out, invalid("the call hierarchy item was not returned by PrepareCallHierarchy on this overlay")
 	}
 	var raw json.RawMessage
-	if err := o.call(ctx, method, callHierarchyCallsParams{Item: item.raw}, &raw); err != nil {
+	if err := o.s.call(ctx, method, callHierarchyCallsParams{Item: item.raw}, &raw); err != nil {
 		return out, err
 	}
 	out.Overlay = o.s.binding
@@ -498,21 +498,6 @@ func (o *Overlay) position(ctx context.Context, at At) (*document, position, err
 		return nil, position{}, err
 	}
 	return doc, pos, nil
-}
-
-// call issues one request under its own hang detector. There is no deadline on
-// the answer: a server that is still working -- computing, or answering -- is
-// working, however long the project it is answering about takes to index.
-func (o *Overlay) call(ctx context.Context, method string, params, result any) error {
-	ctx, stalled, stop := o.s.conn.watchProgress(ctx, o.s.opts.RequestStallTimeout)
-	defer stop()
-	err := o.s.conn.call(ctx, method, params, result)
-	if err != nil && stalled() {
-		return unavailable("the language server made no progress for %s while answering %s; it is not responding",
-			o.s.opts.RequestStallTimeout, method).
-			WithDetail("method", method).WithDetail("reason", "stalled")
-	}
-	return err
 }
 
 // locate validates one server location: a file URI that maps into the

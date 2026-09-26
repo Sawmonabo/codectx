@@ -59,6 +59,12 @@ type server struct {
 	// binding labels every result: provider, server version and input digest.
 	binding model.OverlayBinding
 
+	// room gives the server's reservation back to the admission ledger. It is
+	// called once, by onExit, after the process tree is reaped and the
+	// materialization released: the ledger admits the next child only once
+	// this one no longer holds what it reserved.
+	room func()
+
 	runCancel context.CancelFunc
 	stdinR    *io.PipeReader
 	stdinW    *io.PipeWriter
@@ -111,16 +117,25 @@ func (p pipeStream) Write(b []byte) (int, error) { return p.w.Write(b) }
 var errServerGone = errors.New("the language server process has exited")
 
 // startServer takes a reference to the snapshot's shared tree, starts the
-// pinned payload through the
-// shared runner, performs the initialize/initialized handshake and negotiates
-// the position encoding. Any failure releases the process, the pipes and the
-// materialization before returning.
+// pinned payload through the shared runner, performs the initialize/initialized
+// handshake and negotiates the position encoding. Any failure releases the
+// process, the pipes and the materialization before returning.
+//
+// room is the reservation the server was admitted with, and startServer owns
+// it on every path: a failure before a process exists gives it back at once,
+// and from the launch on it belongs to the server, whose exit gives it back.
 //
 // The executable is not re-hashed here: internal/toolchain hashed the entry at
 // resolution and Profile.Tool carries that digest, so a second read of the same
 // file would prove nothing the fingerprint in the overlay binding does not
 // already commit to.
-func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (srv *server, err error) {
+func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile, room func()) (srv *server, err error) {
+	launched := false
+	defer func() {
+		if !launched {
+			room()
+		}
+	}()
 	snap := view.Header()
 	// A start is lazy, pooled and shared between generations, so it hangs off
 	// the process's overlay run and never off a generation's. It spans the
@@ -165,7 +180,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	// silence is working, and nothing on the wire says so.
 	cpu := &process.CPUProgress{}
 	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes.Value(),
-		m.opts.MaxOutstandingRequests, cpu, s.handleServerRequest)
+		m.opts.MaxOutstandingRequests.Int(), cpu, s.handleServerRequest)
 
 	workDir := p.workDir(m.opts.DataDir)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -213,15 +228,16 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		MaxStdoutBytes:         0,
 		MaxStderrBytes:         0,
 		CPUProgress:            cpu,
-		Timeout:                p.Timeout,
 		Grace:                  m.opts.StopTimeout,
 		MemoryReservationBytes: p.MemoryBudgetBytes,
 		DiskReservationBytes:   p.DiskBudgetBytes,
 	}
 	// From here a process tree exists (or is about to) and onExit will run, so
 	// the manager tracks the server until that happens even if it never
-	// becomes a usable entry. Registering before the goroutine starts means
-	// untrack can never run before track.
+	// becomes a usable entry, and the room is the server's to give back.
+	// Registering before the goroutine starts means untrack can never run
+	// before track.
+	s.room, launched = room, true
 	m.track(s)
 	started := make(chan error, 1)
 	go func() {
@@ -262,10 +278,11 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	return s, nil
 }
 
-// initialize performs the handshake and checks what the server claimed.
+// initialize performs the handshake and checks what the server claimed. The
+// initialize request runs under the same hang detector as every other request
+// and under no deadline: a server loading a large project before it answers is
+// working, and only one that is neither computing nor answering is wedged.
 func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
-	ctx, cancel := context.WithTimeout(ctx, s.opts.StartTimeout)
-	defer cancel()
 	params := initializeParams{
 		ClientInfo:       clientInfo{Name: "codectx", Version: model.CurrentBuildInfo().Version},
 		RootURI:          s.uris.uri(s.profile.Root),
@@ -282,7 +299,7 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		},
 	}
 	var result initializeResult
-	if err := s.conn.call(ctx, "initialize", params, &result); err != nil {
+	if err := s.call(ctx, "initialize", params, &result); err != nil {
 		return err
 	}
 	wire := result.Capabilities.PositionEncoding
@@ -294,15 +311,12 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		return outputInvalid("the language server chose position encoding %q, which this client did not offer", truncate(wire, 32))
 	}
 	s.enc = enc
-	// A server that declines to name itself is still identified by the payload
-	// the lock pinned: typescript-language-server answers initialize with no
-	// serverInfo at all (measured), and since the python server became a native
-	// binary that reports one (ADR-0006) it is the only pinned server that
-	// does. An empty ProviderVersion fails OverlayBinding.Validate, which made
-	// the overlay permanently unavailable for typescript, tsx and javascript
-	// with an error in the argument class. The *reported* string keeps feeding
-	// inputDigest unchanged, so a payload that starts reporting a version later
-	// is still a different question.
+	// A server that declines to name itself -- initialize answered with no
+	// serverInfo at all -- is still identified by the payload the lock pinned.
+	// An empty ProviderVersion fails OverlayBinding.Validate, which would make
+	// the overlay permanently unavailable for every language that server
+	// serves. The *reported* string feeds inputDigest unchanged, so a payload
+	// that reports a version is a different question from one that does not.
 	version := ""
 	if result.ServerInfo != nil {
 		version = result.ServerInfo.Version
@@ -327,6 +341,21 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		return err
 	}
 	return s.conn.notify("initialized", struct{}{})
+}
+
+// call issues one request under its own hang detector. There is no deadline on
+// the answer: a server that is still working -- computing, or answering -- is
+// working, however long the project it is answering about takes to index.
+func (s *server) call(ctx context.Context, method string, params, result any) error {
+	ctx, stalled, stop := s.conn.watchProgress(ctx, s.opts.RequestStallTimeout)
+	defer stop()
+	err := s.conn.call(ctx, method, params, result)
+	if err != nil && stalled() {
+		return unavailable("the language server made no progress for %s while answering %s; it is not responding",
+			s.opts.RequestStallTimeout, method).
+			WithDetail("method", method).WithDetail("reason", "stalled")
+	}
+	return err
 }
 
 // handleServerRequest is the explicit policy for server-initiated requests:
@@ -358,8 +387,8 @@ func (s *server) handleServerRequest(method string, params json.RawMessage) (any
 // stream on both sides so the reader sees end of file and any writer fails
 // instead of blocking on a pipe nobody drains, gives back this server's
 // reference to the shared materialization -- which is removed once the last
-// server of the snapshot has exited -- and reports the exit as a failure
-// unless this was a requested stop.
+// server of the snapshot has exited -- reports the exit as a failure unless
+// this was a requested stop, and gives the server's room back to the ledger.
 func (s *server) onExit(runErr error) {
 	s.stdoutW.Close()
 	s.stdinR.CloseWithError(errServerGone)
@@ -377,6 +406,10 @@ func (s *server) onExit(runErr error) {
 		}
 		s.fail(err)
 	}
+	// The process is gone and the materialization released, so the room it
+	// held is free: given back before exited closes, so every stop that waits
+	// on exited returns with the room already in the ledger.
+	s.room()
 	close(s.exited)
 	// Only now, with the tree reaped and the materialization gone, does Close
 	// no longer have to wait for this server.
@@ -424,17 +457,20 @@ func (s *server) stop() {
 	}
 	s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.StopTimeout)
-	defer cancel()
+	// The stop is already decided, so the whole orderly exit -- the shutdown
+	// answer and the process leaving -- shares one grace period: it bounds how
+	// long a server is given to leave on its own, never how long it may work.
 	// Errors here are not actionable: whatever the server answers, it is told
 	// to exit and its stdin is closed, and the runner terminates what remains.
-	_ = s.conn.call(ctx, "shutdown", nil, nil)
+	grace, cancel := context.WithTimeout(context.Background(), s.opts.StopTimeout)
+	defer cancel()
+	_ = s.conn.call(grace, "shutdown", nil, nil)
 	_ = s.conn.notify("exit", nil)
 	s.conn.fail(unavailable("the language server was stopped"))
 	s.stdinW.Close()
 	select {
 	case <-s.exited:
-	case <-time.After(s.opts.StopTimeout):
+	case <-grace.Done():
 		s.runCancel()
 		<-s.exited
 	}

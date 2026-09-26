@@ -307,13 +307,14 @@ func NewRunner(limits Limits) (*Runner, error) {
 	// the machine the children are given, and a zero-sized one is broken
 	// rather than unbounded.
 	//
-	// It is deliberately NOT made a pass-through beneath the reservation
-	// ledger, as the memory budget was. The memory budget bounded the same
-	// bytes the gate above admits, so a narrower one refused precisely what
-	// the gate had just admitted. This budget is a different quantity: the
-	// ledger admits a child's temporary bytes against the host's real free
-	// space less resources.min_free_disk_bytes, while this is the ceiling an
-	// operator put on temporary bytes on purpose. A default install never
+	// It is deliberately NOT sized to pass through whatever the reservation
+	// ledger above admits, as the memory budget is. The memory budget bounds
+	// the same bytes the gate above admits, so a narrower one would refuse
+	// precisely what the gate had just admitted. This budget is a different
+	// quantity: the ledger admits a child's temporary bytes against the host's
+	// real free space less resources.min_free_disk_bytes, while this is the
+	// runner's share of the ceiling an operator put on temporary bytes on
+	// purpose. A default install never
 	// refuses here -- the key is unlimited -- and an operator who set it asked
 	// for the refusal, which names the key. Widening it to whatever the gate
 	// admits would delete the only place that key is enforced.
@@ -577,8 +578,9 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	defer sampler.stopSampling()
 	// The same figure, published to a caller watching this child's progress
 	// through a protocol of its own. It is bound after the sampler exists and
-	// never unbound: the last sweep's count stays readable, and a caller that
-	// sees it stop moving is reading a child that has stopped.
+	// never unbound: the last count a sweep found stays readable after the
+	// tree exits, and a caller that sees it stop moving is reading a child
+	// that has stopped.
 	spec.CPUProgress.bind(sampler)
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.

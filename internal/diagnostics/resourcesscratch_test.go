@@ -107,8 +107,8 @@ func (refusingLedger) LatestRun(context.Context, model.RepositoryID, model.Gener
 // The requirement: a resource block that could not read something says so.
 //
 // A schema-mismatched or corrupt run ledger produces a typed error with its own
-// remediation, and the block dropped it: no run rows, no warning, no log line,
-// exit 0. That is byte for byte the block a workspace that has never indexed
+// remediation. A block that dropped it -- no run rows, no warning, no log line,
+// exit 0 -- would be byte for byte the block a workspace that has never indexed
 // produces, so an operator diagnosing a problem could not tell "nothing ever
 // recorded a run here" from "your accounting file is unreadable, and here is
 // what to do about it".
@@ -116,8 +116,6 @@ func (refusingLedger) LatestRun(context.Context, model.RepositoryID, model.Gener
 // The figures themselves still stand -- the host readings the sampler produced
 // are true whatever the ledger says -- so this is a warning beside them and not
 // a failure of the call.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
 //
 // Mutation: restore `if err != nil || run == nil { return }` in runLedger and
 // the block comes back with no warnings at all.

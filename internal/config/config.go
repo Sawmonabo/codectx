@@ -315,17 +315,6 @@ type TreeSitter struct {
 	// user-set value that is crossed counts every call past it into the
 	// file's dropped count and reports the file partial.
 	MaxCalleeReferences Limit `toml:"max_callee_references"`
-	// MaxRecordsPerFile is how many declarations, imports or references --
-	// each counted separately -- the user wants one file to yield. Unlimited
-	// by default: it replaces three hard-coded worker ceilings of 20000, 4000
-	// and 60000, and a generated or vendored file that crosses one is a
-	// property of the repository rather than a fault. What a file yields is
-	// bounded by its own size, which workspace.max_parse_file_bytes already
-	// bounds, so an unlimited value costs one file's heap and never the
-	// repository's. A user-set value that is crossed reports the file partial
-	// and its structural coverage truncated; the worker that extracts and the
-	// parent that reads its frames apply the same number.
-	MaxRecordsPerFile Limit `toml:"max_records_per_file"`
 }
 
 // SCIP configures the external index importer.
@@ -384,13 +373,20 @@ type SCIP struct {
 type LSP struct {
 	Enabled Enablement `toml:"enabled"`
 	// StallTimeout is a hang detector and not a deadline on an answer. It is
-	// how long a request tolerates NO bytes moving on the connection in either
-	// direction before the server is declared hung. A server indexing a
-	// monorepo before it answers its first request is working, not wedged, and
-	// a wall-clock request deadline could not tell the two apart; bytes moving
-	// can.
-	StallTimeout           Duration `toml:"stall_timeout"`
-	MaxOutstandingRequests int      `toml:"max_outstanding_requests"`
+	// how long a request -- the initialize handshake included -- tolerates the
+	// server making no progress before the server is declared hung. Progress
+	// is the server process consuming processor time; where the platform
+	// cannot sample a running process tree, bytes moving on the connection in
+	// either direction stand in. A server indexing a large project before it
+	// answers its first request is working, not wedged, and a wall-clock
+	// request deadline could not tell the two apart.
+	StallTimeout Duration `toml:"stall_timeout"`
+	// MaxOutstandingRequests bounds the requests in flight to one server.
+	// Unlimited by default: every caller already waits on a gate of its own --
+	// one request at a time per tool call, and tool calls by the machine's
+	// query slots -- so the product needs no second count here. A user-set
+	// value makes a request wait for a slot under its own context.
+	MaxOutstandingRequests Limit    `toml:"max_outstanding_requests"`
 	IdleTTL                Duration `toml:"idle_ttl"`
 	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
 	// pinned bytes cached for coordinate conversion, and the bytes sent to and
@@ -677,7 +673,6 @@ func Defaults() Config {
 				Enabled:             true,
 				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
 				MaxCalleeReferences: Unlimited,
-				MaxRecordsPerFile:   Unlimited,
 			},
 			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute),
 				MaxIndexBytes: Unlimited, MaxManifestBytes: Unlimited, MaxDocuments: Unlimited,
@@ -686,7 +681,7 @@ func Defaults() Config {
 			LSP: LSP{
 				Enabled:                Auto,
 				StallTimeout:           Duration(5 * time.Minute),
-				MaxOutstandingRequests: 8,
+				MaxOutstandingRequests: Unlimited,
 				IdleTTL:                Duration(60 * time.Second),
 				MaxOverlayBytes:        Unlimited,
 			},

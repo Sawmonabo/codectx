@@ -34,8 +34,8 @@ func TestLimitUnlimitedSpellingsAreOneIdentity(t *testing.T) {
 	}
 }
 
-// TestLimitExceededAndMin protects the two predicates every enforcement site in
-// L1-L5 calls. The failure mode is an unlimited bound read as a zero-sized one,
+// TestLimitExceededAndMin protects the two predicates every enforcement site
+// calls. The failure mode is an unlimited bound read as a zero-sized one,
 // which turns "index everything" into "index nothing" at every call site at
 // once, and a Min that treats unlimited as the bottom of the lattice, which
 // would let an absent bound silently narrow a configured one.

@@ -18,12 +18,6 @@ import (
 // measurement that reads as "used no memory" is worse than no measurement.
 const treeSampled = true
 
-// maxSampledProcesses bounds one sweep of /proc. A sweep is O(processes on the
-// machine), and Section 6 requires a finite bound on every traversal; 4096 is
-// far above the process count of any machine this runs an analysis on, so the
-// bound truncates a pathological /proc rather than a real tree.
-const maxSampledProcesses = 4096
-
 // treeSampler keeps the peak of the summed resident set size over a process
 // group, sampled while the group runs.
 //
@@ -41,10 +35,14 @@ type treeSampler struct {
 	// is closed, so the join in stopSampling is what publishes it.
 	sample treeSample
 	// cpu is the tree's summed user+system time in clock ticks as of the last
-	// sweep. Unlike peak it is read while the run is still going, by the stall
-	// watchdog, so it is atomic: a tree that produces no output but is burning
-	// CPU is working, not wedged.
+	// sweep that found the tree. Unlike peak it is read while the run is still
+	// going, by the stall watchdog, so it is atomic: a tree that produces no
+	// output but is burning CPU is working, not wedged.
 	cpu atomic.Int64
+	// cpuSeen is set by the first sweep that found a member of the group. Until
+	// then cpu holds no measurement, and a reader is told so instead of being
+	// handed a zero it would read as "consumed nothing".
+	cpuSeen atomic.Bool
 }
 
 // startTreeSampler begins sampling the process group pgid every interval. The
@@ -74,7 +72,14 @@ func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
 				s.sample.writeBytes = sums.write
 				s.sample.ioSampled = true
 			}
-			s.cpu.Store(sums.ticks)
+			if sums.found {
+				// Kept across sweeps that find nothing, as the byte counters
+				// are: a sweep after the tree exits must not drop the figure
+				// back to zero, which the watchdog would read as a change and
+				// a live reader as a measurement.
+				s.cpu.Store(sums.ticks)
+				s.cpuSeen.Store(true)
+			}
 			select {
 			case <-s.stop:
 				return
@@ -97,14 +102,15 @@ func (s *treeSampler) stopSampling() treeSample {
 	return s.sample
 }
 
-// cpuTicks reports the tree's summed user+system time as of the last sweep, or
-// zero on a platform or a sweep that could not observe it. A caller uses it
-// only as a change signal, never as a duration.
-func (s *treeSampler) cpuTicks() int64 {
-	if s == nil {
-		return 0
+// cpuTicks reports the tree's summed user+system time as of the last sweep
+// that found it. ok is false until a sweep has found a member of the group:
+// before that there is no measurement, not a measurement of zero. A caller
+// uses the value only as a change signal, never as a duration.
+func (s *treeSampler) cpuTicks() (int64, bool) {
+	if s == nil || !s.cpuSeen.Load() {
+		return 0, false
 	}
-	return s.cpu.Load()
+	return s.cpu.Load(), true
 }
 
 // groupSums is one sweep's totals over a process group.
@@ -113,6 +119,10 @@ type groupSums struct {
 	ticks int64
 	read  int64
 	write int64
+	// found reports that the sweep read at least one member of the group, so
+	// ticks is a measurement of the tree and not the empty sum of a sweep that
+	// ran after it exited or before it was visible.
+	found bool
 	// ioSeen reports that at least one member had readable byte counters, so a
 	// sweep that found the tree is distinguishable from one that found nothing
 	// and from one whose members all denied their counters.
@@ -123,6 +133,11 @@ type groupSums struct {
 // transferred bytes of every live process in the group. Processes that exit
 // mid-sweep are simply absent from the sums; an unreadable /proc yields an
 // empty sweep rather than aborting the run.
+//
+// Every entry /proc lists is examined. The listing is the machine's process
+// table at that instant, which the kernel already bounds, and a sweep cut short
+// at some count would, on a busy host, stop before reaching the group at all
+// and report a live tree as absent.
 func sumGroup(pgid int) groupSums {
 	var sums groupSums
 	entries, err := os.ReadDir("/proc")
@@ -130,19 +145,16 @@ func sumGroup(pgid int) groupSums {
 		return sums
 	}
 	pageSize := int64(os.Getpagesize())
-	var scanned int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
 			continue
 		}
-		if scanned++; scanned > maxSampledProcesses {
-			break
-		}
 		group, pages, cpu, ok := statGroup(pid)
 		if !ok || group != pgid {
 			continue
 		}
+		sums.found = true
 		sums.rss += pages * pageSize
 		sums.ticks += cpu
 		// Only a member of the group is opened a second time, so the extra
@@ -226,9 +238,16 @@ func statGroup(pid int) (pgid int, rssPages, cpuTicks int64, ok bool) {
 	if err != nil || pages < 0 {
 		return 0, 0, 0, false
 	}
-	// CPU time is advisory: a tree whose ticks cannot be parsed simply
-	// contributes no CPU progress, and the byte counters still speak for it.
-	utime, _ := strconv.ParseInt(fields[utimeIndex], 10, 64)
-	stime, _ := strconv.ParseInt(fields[stimeIndex], 10, 64)
-	return group, pages, max(utime, 0) + max(stime, 0), true
+	// A line whose times do not parse is an unreadable one, as a half-read io
+	// file is: summing its member in as zero ticks would record a missing
+	// figure as a measurement.
+	utime, err := strconv.ParseInt(fields[utimeIndex], 10, 64)
+	if err != nil || utime < 0 {
+		return 0, 0, 0, false
+	}
+	stime, err := strconv.ParseInt(fields[stimeIndex], 10, 64)
+	if err != nil || stime < 0 {
+		return 0, 0, 0, false
+	}
+	return group, pages, utime + stime, true
 }

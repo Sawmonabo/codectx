@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"io"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,8 +16,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
-// TestSymbolFieldsAreBoundedAndTheCutIsRecorded protects the R5 contract at
-// this boundary. The storage ceilings no longer reject an over-long value, so
+// TestSymbolFieldsAreBoundedAndTheCutIsRecorded protects the record field bounds
+// at this boundary. The storage ceilings do not reject an over-long value, so
 // a producer that does not truncate serves the server's whole string into a
 // model record -- a 3000-byte detail becomes a 3000-byte Signature. Every
 // Symbol in this package is built by newSymbol, so bounding there covers the
@@ -106,11 +107,11 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 
 	// The unit gives its room back and the same server is admitted at once.
 	releaseUnit()
-	e, starter, err := mgr.slot(context.Background(), key, admission.Reservation{MemoryBytes: 4 * giB})
+	e, room, err := mgr.slot(context.Background(), key, admission.Reservation{MemoryBytes: 4 * giB})
 	if err != nil {
 		t.Fatalf("the waiting server was not admitted once the unit released: %v", err)
 	}
-	if !starter {
+	if room == nil {
 		t.Fatal("the first open of a server was not made its starter")
 	}
 	close(e.ready)
@@ -128,12 +129,134 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	if _, err := sched.Admit(blocked, unit); err == nil {
 		t.Fatal("a 6 GiB unit was admitted while a 4 GiB server held room in the 8 GiB allocation")
 	}
+	// No server was started on that room, so the starter gives it back itself,
+	// as startServer does on a start that never reached a process.
+	room()
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	if allocation, reserved := led.Snapshot(); allocation != 8*giB || reserved != 0 {
 		t.Fatalf("the ledger holds %d of %d bytes after everything released; a leaked reservation shrinks the allocation for the life of the process", reserved, allocation)
 	}
+}
+
+// TestOneServerIsOneReservationHoweverManyOpensAskForIt protects the same
+// host-freeze invariant from the other side: two opens of one server must take
+// one reservation, and an open that stops waiting for room must not strand the
+// opens waiting behind it.
+//
+// Failure modes. When the second open of a server queues a reservation of its
+// own while the first is still waiting for room, that reservation sits in the
+// ledger's first-in-first-out queue for room it will hand straight back, and
+// every engine unit behind it waits on it. And when the open that is reserving
+// gives up without waking the opens waiting on its entry, they hang.
+//
+// Mutations: publish the entry only after ReserveWith returns -> the second
+// slot call below queues in the ledger instead of
+// returning the pending entry, and fails on its guard deadline. Drop the
+// close(e.ready) on a failed reservation -> the waiter in the second case never
+// wakes.
+func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
+	const giB int64 = 1 << 30
+	key := serverKey{snapshot: model.SnapshotID("s"), profile: "p", root: "proj"}
+	server := admission.Reservation{MemoryBytes: 5 * giB}
+	setup := func(t *testing.T) (*Manager, *admission.Ledger, func()) {
+		t.Helper()
+		led, err := admission.NewLedger(8*giB, 64<<30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 64 * giB})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mgr, err := New(Options{Runner: runner, DataDir: t.TempDir(), Admission: led})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A 6 GiB unit holds the allocation, so a 5 GiB server has to wait.
+		releaseUnit, err := led.Reserve(context.Background(), 6*giB, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mgr, led, releaseUnit
+	}
+	type result struct {
+		e    *entry
+		room func()
+		err  error
+	}
+	reserveInBackground := func(ctx context.Context, mgr *Manager) chan result {
+		out := make(chan result, 1)
+		go func() {
+			e, room, err := mgr.slot(ctx, key, server)
+			out <- result{e, room, err}
+		}()
+		// The entry is published before the wait for room begins.
+		for mgr.Servers() == 0 {
+			runtime.Gosched()
+		}
+		return out
+	}
+	// guard only bounds a failing run; a passing one never waits on it.
+	guard := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
+
+	t.Run("a second open waits on the first one's reservation", func(t *testing.T) {
+		mgr, led, releaseUnit := setup(t)
+		first := reserveInBackground(context.Background(), mgr)
+		ctx, cancel := guard()
+		defer cancel()
+		e, room, err := mgr.slot(ctx, key, server)
+		if err != nil || room != nil {
+			t.Fatalf("the second open of a server still waiting for room got room=%v err=%v; it must wait on the pending entry and reserve nothing", room != nil, err)
+		}
+		releaseUnit()
+		got := <-first
+		if got.err != nil || got.room == nil || got.e != e {
+			t.Fatalf("the first open was not the one starter of the entry the second one waits on: %+v", got)
+		}
+		if _, reserved := led.Snapshot(); reserved != server.MemoryBytes {
+			t.Fatalf("the ledger holds %d bytes for one server of %d; two opens reserved it twice", reserved, server.MemoryBytes)
+		}
+		got.room()
+		close(e.ready)
+		if err := mgr.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("an open that stops waiting wakes the opens behind it", func(t *testing.T) {
+		mgr, led, releaseUnit := setup(t)
+		defer releaseUnit()
+		ctx, cancel := context.WithCancel(context.Background())
+		first := reserveInBackground(ctx, mgr)
+		e, room, err := mgr.slot(context.Background(), key, server)
+		if err != nil || room != nil {
+			t.Fatalf("second open: room=%v err=%v, want the pending entry", room != nil, err)
+		}
+		cancel()
+		if got := <-first; got.err == nil {
+			t.Fatal("a reservation whose context ended reported success")
+		}
+		wait, stop := guard()
+		defer stop()
+		select {
+		case <-e.ready:
+		case <-wait.Done():
+			t.Fatal("an open waiting on a start that gave up waiting for room was never woken")
+		}
+		if !e.abandoned || mgr.Servers() != 0 {
+			t.Fatalf("abandoned=%v servers=%d; the entry of a start that never had room must be withdrawn and marked for a retry", e.abandoned, mgr.Servers())
+		}
+		if _, reserved := led.Snapshot(); reserved != 6*giB {
+			t.Fatalf("the ledger holds %d bytes; a withdrawn reservation leaked room", reserved)
+		}
+		if err := mgr.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // fakeCPU is a hand-driven stand-in for the runner's processor-time handle, so
@@ -168,7 +291,7 @@ func (f *fakeCPU) Ticks() (int64, bool) {
 // line speak for the wedged one and it is never detected at all.
 //
 // Mutation: make progress return `c.moved.Load()` unconditionally -- the
-// per-connection wire count the detector used to watch -> the silent computing
+// per-connection wire count alone -> the silent computing
 // server below is declared stalled, and the wedged request under sibling
 // chatter below is not.
 func TestAHangDetectorWatchesTheServersWorkAndNotItsChatter(t *testing.T) {
