@@ -63,7 +63,7 @@ func FreedBytes() int64 {
 //
 // The budget is the host's: bytes freed here and bytes freed by the
 // reclaimer spend the same windows under one lock, and the processes of this
-// user take their windows in turn through one turn file (see UseTurnDir). A
+// user take their windows in turn through one turn file (see hostTurnDir). A
 // run cannot outrun the pace by splitting its freeing across several
 // chargers, and two runs cannot outrun it by being two.
 func Freed(n int64) {

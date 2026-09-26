@@ -558,7 +558,7 @@ directories they are writing into, because the rate belongs to the device and
 not to a directory.
 The remainder is clamped into one interval, because the recorded time is a
 wall clock written by another process and a clock adjustment must cost at most
-one interval rather than hang a run. A process that names no turn directory
+one interval rather than hang a run. A process with no user cache directory
 takes its turns through the outermost data directory it has registered, and
 so shares the pace only with the processes over that directory. One that can
 reach neither -- a standalone tool on a read-only home -- keeps the pace for

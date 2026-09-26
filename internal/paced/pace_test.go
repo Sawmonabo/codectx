@@ -22,6 +22,7 @@ import (
 // four windows in one interval.
 func TestEveryChargerInTheProcessWaitsUnderOnePace(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	const chargers = 4
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -83,7 +84,7 @@ func TestTwoProcessesShareThePace(t *testing.T) {
 // second process frees two beside it, and times the four.
 func paceShareRunner(t *testing.T) {
 	dir := os.Getenv(paceShareDir)
-	UseTurnDir(dir)
+	useTurnDir(reclaim, dir)
 
 	helper := exec.Command(os.Args[0], "-test.run", "^"+t.Name()+"$", "-test.v")
 	helper.Env = append(os.Environ(), paceShareRole+"=helper", paceShareDir+"="+dir)
@@ -117,7 +118,7 @@ func paceShareRunner(t *testing.T) {
 // paceShareHelper is the second process: it takes two of the four windows.
 func paceShareHelper(t *testing.T) {
 	dir := os.Getenv(paceShareDir)
-	UseTurnDir(dir)
+	useTurnDir(reclaim, dir)
 	if err := os.WriteFile(filepath.Join(dir, "ready"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +127,26 @@ func paceShareHelper(t *testing.T) {
 	}
 	Freed(Window)
 	Freed(Window)
+}
+
+// useTurnDir points r's turn file at dir instead of the user's cache, so a
+// test never takes a turn in the pace of the host it runs on.
+func useTurnDir(r *reclaimer, dir string) {
+	r.turnDir = func() (string, bool) { return dir, true }
+}
+
+// TestMain points the package's own reclaimer at a temporary turn directory:
+// the tests that free through the exported functions would otherwise take
+// their turns in the user's real cache.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "paced-turn-")
+	if err != nil {
+		panic(err)
+	}
+	useTurnDir(reclaim, dir)
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func exists(path string) bool {

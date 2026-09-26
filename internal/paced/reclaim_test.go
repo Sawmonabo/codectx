@@ -62,6 +62,7 @@ func gateSleep(t *testing.T, r *reclaimer) (waits func() []time.Duration, releas
 // freeInPlace unconditionally) and the caller returns having freed the lot.
 func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	served := t.TempDir()
 	set := filepath.Join(served, "to-free")
 	r.register(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
@@ -127,6 +128,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 // emptied by the removal of the name beside it.
 func TestARemovalNeverEmptiesAnObjectAnotherNameStillReaches(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	dir := t.TempDir()
 	published := filepath.Join(dir, "blob")
 	const size = 2 * Window
@@ -201,6 +203,7 @@ func mustDrain(t *testing.T, r *reclaimer, d time.Duration) []Stuck {
 // windows are waited for before its unlink fails.
 func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability unlinks from a directory it may not write, " +
 			"so the refusal this test is built on never happens and it would pass vacuously")
@@ -327,6 +330,7 @@ func waitFor(d time.Duration, cond func() bool) bool {
 // freeFile) and the whole file is gone before the reclaimer's first wait.
 func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability opens a read-only file for writing, " +
 			"so the file this test is built on is truncated a window at a time and it would pass vacuously")
@@ -402,6 +406,7 @@ func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) 
 // the entry behind is never freed.
 func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t *testing.T) {
 	r := newReclaimer()
+	useTurnDir(r, t.TempDir())
 	if os.Geteuid() == 0 {
 		t.Skip("a process with the override capability searches a directory that grants nobody search, " +
 			"so the refusal this test is built on never happens and it would pass vacuously")

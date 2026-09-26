@@ -107,12 +107,13 @@ type reclaimer struct {
 	// spending the budget is what takes a turn.
 	spent int64
 	turns int64
-	// turnDir is the directory holding this user's one turn file on the host,
-	// set by the process (see UseTurnDir). paceRoot is the outermost directory
-	// this process has registered, and is where the turn file goes only when
-	// no turn directory was set. Both are guarded by mu. turnFile is whichever
-	// turn file is open, at turnAt, both guarded by paceMu.
-	turnDir  string
+	// turnDir resolves the directory holding this user's one turn file on the
+	// host (see hostTurnDir); a test's reclaimer resolves a temporary one.
+	// paceRoot is the outermost directory this process has registered, and is
+	// where the turn file goes only when turnDir resolves none; it is guarded
+	// by mu. turnFile is whichever turn file is open, at turnAt, both guarded
+	// by paceMu.
+	turnDir  func() (string, bool)
 	paceRoot string
 	turnFile *os.File
 	turnAt   string
@@ -134,6 +135,7 @@ func newReclaimer() *reclaimer {
 		stuck:    map[string]string{},
 		tried:    map[string]bool{},
 		sleep:    time.Sleep,
+		turnDir:  hostTurnDir,
 	}
 	r.cond = sync.NewCond(&r.mu)
 	return r
@@ -764,7 +766,7 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, dir *os.File) (int
 //
 // The budget is the host's, not one removal's, not one process's and not one
 // cache's: every charger waits under paceMu, and every process of this user
-// takes its windows in turn through one turn file (see UseTurnDir), so no two
+// takes its windows in turn through one turn file (see hostTurnDir), so no two
 // of them ever hand the disk two windows in one interval.
 //
 // It reports the part of n still unpaid on return, which is what a caller
@@ -788,25 +790,32 @@ func (r *reclaimer) charge(n int64, dir *os.File) unpaid {
 // of this user take one window's turn at a time.
 const paceFileName = "free-pace.lock"
 
-// UseTurnDir names the directory holding this user's one turn file on the
-// host, and is called once, at process start, with the product's directory in
-// the user cache. The rate a discard costs is a property of the DEVICE
-// underneath, not of a data directory, so the turn cannot be taken per data
-// directory: `codectx index --rebuild` writes into a sibling data directory
-// while a server serves the original, and two directories taking turns
-// separately hand the host twice the measured rate on an ordinary pair of
-// commands. One file above every data directory of this user is what makes
-// the sum of what this product frees on a host the rate that was measured.
+// ProductDirName is the product's own directory under the user's cache,
+// configuration and data bases. It is named once, here, below every package
+// that places a file under one of those bases.
+const ProductDirName = "codectx"
+
+// hostTurnDir is the directory holding this user's one turn file on the host:
+// the product's directory in the user cache. The rate a discard costs is a
+// property of the DEVICE underneath, not of a data directory, so the turn
+// cannot be taken per data directory: `codectx index --rebuild` writes into a
+// sibling data directory while a server serves the original, and two
+// directories taking turns separately hand the host twice the measured rate on
+// an ordinary pair of commands. One file above every data directory of this
+// user is what makes the sum of what this product frees on a host the rate
+// that was measured.
 //
 // The user cache is the one location every process of this user agrees on
 // without being told. Two processes given different user cache directories
 // keep a pace each, and so hand the host twice the measured rate between
 // them; nothing inside a process can see the other, so that case is written
 // down here rather than described as harmless.
-func UseTurnDir(dir string) {
-	reclaim.mu.Lock()
-	reclaim.turnDir = filepath.Clean(dir)
-	reclaim.mu.Unlock()
+func hostTurnDir() (string, bool) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(cache, ProductDirName), true
 }
 
 // takeTurn waits until the host may be handed another window and records that
@@ -847,9 +856,9 @@ func (r *reclaimer) takeTurn() {
 	_, _ = f.WriteAt(record[:], 0)
 }
 
-// turn is this user's turn file, opened once. It is the one in the turn
-// directory the process named; only a process that named none falls back to
-// the outermost directory it registered, which shares the pace with the
+// turn is this user's turn file, opened once. It is the one in the host turn
+// directory; only a process with no user cache directory falls back to the
+// outermost directory it registered, which shares the pace with the
 // processes over that same data directory and no others. It reports nil when
 // there is neither, or when the file cannot be opened -- a read-only cache, a
 // directory already removed -- and the caller then keeps the pace for itself
@@ -858,12 +867,11 @@ func (r *reclaimer) takeTurn() {
 //
 // The caller holds paceMu.
 func (r *reclaimer) turn() *os.File {
-	r.mu.Lock()
-	dir, fallback := r.turnDir, r.paceRoot
-	r.mu.Unlock()
-	named := dir != ""
+	dir, named := r.turnDir()
 	if !named {
-		dir = fallback
+		r.mu.Lock()
+		dir = r.paceRoot
+		r.mu.Unlock()
 	}
 	if dir == "" {
 		return nil
@@ -872,7 +880,7 @@ func (r *reclaimer) turn() *os.File {
 	if r.turnFile != nil && r.turnAt == path {
 		return r.turnFile
 	}
-	// The named turn directory is the product's own and is made on first
+	// The host turn directory is the product's own and is made on first
 	// use. A registered directory is never made here: a directory a caller
 	// may yet remove must not be recreated behind its back.
 	if named {
