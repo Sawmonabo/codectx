@@ -163,15 +163,12 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // disk budget and the query spools' budget so the two sum to exactly the
 // ceiling the operator set. Zero, the default, is unlimited and stays
 // unlimited on both sides. Neither share of a set ceiling may round to zero,
-// because zero is read as unlimited by both consumers; a ceiling too small
-// to split into two positive shares -- one byte -- gives each consumer the
-// ceiling itself, which refuses every real reservation either way.
+// because zero is read as unlimited by both consumers, so the spools take at
+// least one byte; validation refuses a set ceiling below
+// config.TempDiskConsumers, so the runner keeps at least one byte too.
 func tempDiskShares(total int64) (runner, spools int64) {
 	if total <= 0 {
 		return 0, 0
-	}
-	if total < 2 {
-		return total, total
 	}
 	spools = max(total/spoolBudgetDivisor, 1)
 	return total - spools, spools
