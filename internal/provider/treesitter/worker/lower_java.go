@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"bytes"
+	"slices"
 	"sync"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -65,11 +67,18 @@ const yieldLabel = " yield"
 //     variable's identifier and using the selector's variables, then, for a
 //     guard, a Branch node spanning the guard expression whose false edge
 //     joins the next label's test. Several labels of one group all enter its
-//     body. `default` (and `case null, default`) is taken when no label
-//     matched. In the colon form a body's end falls through into the next
-//     body; in the arrow form it leaves the switch. A switch expression
-//     without `default` is exhaustive, and its no-match path throws (JLS
-//     §15.28.2). An arrow arm's expression is a Stmt node spanning it, and
+//     body. `default` is taken when no label matched; the grammar has no
+//     `case null, default` label, so that source parses with an error node
+//     and is lowered as the labels the recovered tree holds. In the colon
+//     form a body's end falls through into the next body; in the arrow form
+//     it leaves the switch. A switch expression without `default` is
+//     exhaustive, and its no-match path throws (JLS §15.28.2); so does that
+//     of a switch statement without `default` whose labels include a pattern
+//     or `null`, an enhanced switch statement, which is exhaustive too (JLS
+//     §14.11.2, §14.11.3: MatchException). Any other switch statement
+//     without `default` is left when no label matches, and so is every
+//     switch whose tree holds an error node, whose recovery may have dropped
+//     its `default`. An arrow arm's expression is a Stmt node spanning it, and
 //     the yield of its value; `yield e;` is a Jump node spanning the
 //     statement. Every yield breaks to the switch expression's frame (see
 //     yieldLabel); the value is no temporary: the node consuming the switch
@@ -87,7 +96,9 @@ const yieldLabel = " yield"
 //     path matching no clause is rethrown. A clause catching `Throwable`
 //     catches everything: its test is a Stmt node and ends the chain. The
 //     builder's Handler spans the first `catch` keyword, or `finally`.
-//   - try-with-resources (JLS §14.20.3.2): each resource declaring a
+//   - try-with-resources (JLS §14.20.3.1, the basic form; the extended
+//     form of §14.20.3.2 adds the statement's own catch clauses and
+//     finally around it): each resource declaring a
 //     variable is an acquiring node spanning the resource from its name to
 //     the end of its initializer, defining the variable; a resource naming an
 //     existing variable or field acquires nothing. Each resource then opens a
@@ -98,14 +109,24 @@ const yieldLabel = " yield"
 //     null test before close is not modelled.
 //   - `synchronized (e) { … }` (JLS §14.19) is a Stmt node spanning e, which
 //     may throw, then the block; the monitor exit is not a node.
-//   - `assert c : m;` (JLS §14.10) is a Branch node spanning c whose false
-//     path is a Stmt node spanning m, when present, then a throw. It is
-//     lowered as if assertions were enabled.
+//   - `assert c : m;` (JLS §14.10) is a Branch node spanning the `assert`
+//     keyword, whether assertions are enabled, whose false edge skips the
+//     statement: a disabled assertion evaluates neither operand. Its true
+//     edge reaches a Branch node spanning c whose false path is a Stmt node
+//     spanning m, when present, then a throw.
 //   - A type body unit lowers, in source order, each field or constant
 //     declarator with an initializer (its value's nodes, then a Stmt node
 //     spanning the declarator), each enum constant (a Stmt node spanning it)
-//     and each instance initializer block. Static initializers, methods,
-//     constructors and nested types are their own callables.
+//     and each instance initializer block. Static initializer blocks,
+//     methods, constructors and nested types are their own callables. A
+//     static field's initializer, a constant's and an enum constant run at
+//     class initialization (JLS §12.4.2), the others at instance creation
+//     (§12.5), yet the unit holds both, in source order: no local or pattern
+//     variable crosses from one initializer to the next, no initializer
+//     expression throws outside a try, and an instance initializer block
+//     must be able to complete normally (§8.6), so the unit's pairs are
+//     exactly each initializer's own, and the order between them adds only
+//     unconditional edges.
 //   - An expression lowered for its value and ended by a node spanning it
 //     takes no second node when the last node its own lowering made already
 //     spans it.
@@ -132,6 +153,10 @@ const yieldLabel = " yield"
 // local (`o.f = v`, `a[i] += v`, `a[i]++`) is a Stmt node spanning the
 // assignment that uses its operands and may-defines (MayDef, non-killing)
 // the local at the base of the target.
+//
+// The walk that collects the reads of nested code or of a switch
+// expression (see below) treats a plain assignment's local target as
+// written, not read; a compound assignment and an update read it too.
 //
 // A lambda (its own function) is one Stmt node spanning it in the enclosing
 // function; an anonymous class's body is its own unit, and the object
@@ -160,15 +185,41 @@ const yieldLabel = " yield"
 // # Scoping
 //
 // A local's scope runs from its declarator to the end of its block (JLS
-// §6.3); a for header's locals are scoped to the loop, a catch parameter to
-// its clause, a resource to the try block and its closes, a switch group's
-// pattern variables to its guard and body. A pattern variable of
-// instanceof is bound in the innermost enclosing block from its test on
-// (an over-approximation of the flow scoping of JLS §6.3.1: a later pattern
-// of the same name is a new variable that shadows it).
+// §6.3), and one declared in a switch block statement group to the end of
+// the switch block; a for header's locals are scoped to the loop, a catch
+// parameter to its clause, a resource to the try block and its closes, a
+// case label's pattern variables, and those its guard introduces when true,
+// to its guard and its rule or group.
+//
+// A pattern variable's scope follows JLS §6.3.1 and §6.3.2. Each
+// expression introduces a set of pattern variables when true and a set
+// when false: `x instanceof P` introduces P's variables when true, `!a`
+// swaps a's sets, `a && b` introduces the union of both when-true sets
+// when true and puts a's when-true set in scope in b, `a || b` does the
+// same with the when-false sets, a parenthesized expression passes its
+// sets on, and `a ? b : c` puts a's when-true set in scope in b and its
+// when-false set in c and introduces nothing; no other expression
+// introduces any. An if statement's condition puts its when-true set in
+// scope in the then statement and its when-false set in the else
+// statement. After the statement, in the rest of the enclosing block or
+// switch group, the if introduces its condition's when-false set when the
+// then statement cannot complete normally and the else statement, if any,
+// can, and its when-true set when only the else statement cannot (§6.3.2.2).
+// A while or basic for condition puts its when-true set in scope in the
+// body (and the update clause), and a while, do or basic for introduces its
+// condition's when-false set when its body holds no break that leaves it
+// (§6.3.2.3 to §6.3.2.5). A labelled statement introduces what its
+// statement does when that statement holds no break that leaves it
+// (§6.3.2.7). Whether a statement can complete normally is decided
+// syntactically by JLS §14.22 (see completes), with every break taken as
+// reachable. No pattern variable outlives its statement otherwise, so none
+// crosses from one member of a type body to the next. The walk that
+// collects nested code's reads applies the same sets, with each pattern
+// variable shadowing an enclosing local only inside its scope.
 func lowerJava(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
-	cur := s.cursor(fn)
-	j := javaLower{l: l, b: b, src: src, k: javaSyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1, stmtNo: 1}
+	j := &s.java
+	j.begin(l, b, src, s.cursor(fn), &s.scope)
+	defer j.end()
 	k := j.k
 	switch fn.KindId() {
 	case k.classBody, k.enumBody, k.interfaceBody, k.annotationTypeBody:
@@ -214,7 +265,8 @@ func lowerJava(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch
 	}
 }
 
-// javaLower is the state of lowering one Java callable.
+// javaLower is the state of lowering one Java callable, kept in the
+// worker's Scratch and reset in place by begin for every function.
 type javaLower struct {
 	l   *Lowering
 	b   *flow.Builder
@@ -230,7 +282,9 @@ type javaLower struct {
 	// declarations then bind -1 and no node is created.
 	shadow int
 	// reads are the variables read by the current statement, in evaluation
-	// order; seen[v] == stmtNo marks v as one of them.
+	// order; seen[v] == stmtNo marks v as one of them. stmtNo only grows,
+	// across functions too, so a mark a previous function left in seen
+	// never equals it.
 	reads  []int32
 	seen   []int
 	stmtNo int
@@ -245,8 +299,11 @@ type javaLower struct {
 	// last is the node created last, or -1, and lastSpan its span.
 	last     int32
 	lastSpan flow.Span
-	// labels are the statement labels the next statement takes.
-	labels []string
+	// labels is the stack of the labels of the labelled statements being
+	// lowered; the next statement takes labels[labelAt:], and labelAt is
+	// len(labels) between statements.
+	labels  []string
+	labelAt int
 	// arms are the match fringes of the switches being lowered, each tagged
 	// with its group; caseBinds and groupAt hold each group's pattern
 	// variables; frames holds the finally frames of the resources being
@@ -258,6 +315,41 @@ type javaLower struct {
 	// writes are the enclosing locals written through a field or array
 	// element inside the nested code whose captures are being collected.
 	writes []int32
+	// pats holds the pattern variables the expressions being lowered
+	// introduce (see Scoping): an expression's sets begin where pats ended
+	// before it, the when-true set first, and expr returns where the
+	// when-false set begins. A variable is in scope only while scopePats has
+	// bound it.
+	pats []binding
+	// hide indexes the bindings a switch block statement group's end takes
+	// out of scope while the group's locals stay (see unbind).
+	hide []int32
+}
+
+// begin resets j in place for the next function: every scalar is set anew
+// and every list truncated, never reallocated, so nothing a previous
+// function left behind is read. The lists holding nodes or views of the
+// source (buf, labels, caseBinds, pats) clear what they drop whenever they
+// shrink, so they hold none between functions. seen keeps its marks, which
+// stmtNo, only ever increased, never matches again.
+func (j *javaLower) begin(l *Lowering, b *flow.Builder, src []byte, cur *ts.TreeCursor, binds *scope) {
+	j.l, j.b, j.src, j.k, j.cur, j.binds = l, b, src, javaSyntaxOf(), cur, binds
+	j.shadow, j.throws, j.thrown, j.labelAt = 0, 0, 0, 0
+	j.first, j.last, j.lastSpan = -1, -1, flow.Span{}
+	j.stmtNo++
+	clear(j.buf)
+	clear(j.labels)
+	clear(j.caseBinds)
+	clear(j.pats)
+	j.buf, j.labels, j.caseBinds, j.pats = j.buf[:0], j.labels[:0], j.caseBinds[:0], j.pats[:0]
+	j.reads, j.stack, j.writes, j.hide = j.reads[:0], j.stack[:0], j.writes[:0], j.hide[:0]
+	j.arms, j.groupAt, j.frames = j.arms[:0], j.groupAt[:0], j.frames[:0]
+}
+
+// end releases the source and the per-call handles once the function is
+// lowered, so the lowering state keeps nothing of the file alive.
+func (j *javaLower) end() {
+	j.l, j.b, j.src, j.cur, j.binds = nil, nil, nil, nil, nil
 }
 
 // javaArm is one switch label's match fringe and the index of its group.
@@ -309,7 +401,12 @@ func (j *javaLower) hasToken(n *ts.Node, id uint16) bool {
 	}
 }
 
-func (j *javaLower) done(mark int) { j.buf = j.buf[:mark] }
+// done pops the child list kids or fieldKids pushed at mark, clearing the
+// nodes it drops.
+func (j *javaLower) done(mark int) {
+	clear(j.buf[mark:])
+	j.buf = j.buf[:mark]
+}
 
 func (j *javaLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
 
@@ -385,12 +482,261 @@ func (j *javaLower) def(n, v int32) {
 // unless the last node that lowering made already spans n, or n without its
 // parentheses, with no throw evaluated after it.
 func (j *javaLower) valueNode(n *ts.Node) {
+	m := len(j.pats)
+	j.exprNode(n)
+	j.cutPats(m)
+}
+
+// exprNode is valueNode leaving n's pattern variable sets on pats, as expr
+// does.
+func (j *javaLower) exprNode(n *ts.Node) int {
 	m, last := len(j.reads), j.last
-	j.value(n)
-	if j.last != last && j.lastSpan == spanOf(j.l.unparen(n)) && j.thrown == j.throws {
-		return
+	mid := j.expr(n)
+	if j.last == last || j.lastSpan != spanOf(j.l.unparen(n)) || j.thrown != j.throws {
+		j.node(flow.Stmt, n, m, len(j.reads))
 	}
-	j.node(flow.Stmt, n, m, len(j.reads))
+	return mid
+}
+
+// scopePats binds pats[from:to] in the innermost scope.
+func (j *javaLower) scopePats(from, to int) {
+	for _, p := range j.pats[from:to] {
+		j.binds.bind(p.name, p.v)
+	}
+}
+
+// keep keeps one set of the expression whose sets begin at from and whose
+// when-false set begins at mid: the when-true set, or the when-false set
+// moved to from. It returns where the kept set ends.
+func (j *javaLower) keep(from, mid int, whenTrue bool) int {
+	if whenTrue {
+		j.cutPats(mid)
+		return mid
+	}
+	n := copy(j.pats[from:], j.pats[mid:])
+	j.cutPats(from + n)
+	return from + n
+}
+
+// cutPats truncates pats to m, clearing what it drops: a pattern variable's
+// name is a view of the source.
+func (j *javaLower) cutPats(m int) {
+	clear(j.pats[m:])
+	j.pats = j.pats[:m]
+}
+
+// swap exchanges the sets of the expression whose sets begin at from and
+// whose when-false set begins at mid, the sets of its complement, and
+// returns where the new when-false set begins.
+func (j *javaLower) swap(from, mid int) int {
+	f := len(j.pats) - mid
+	slices.Reverse(j.pats[from:])
+	slices.Reverse(j.pats[from : from+f])
+	slices.Reverse(j.pats[from+f:])
+	return from + f
+}
+
+// scoped lowers s, a statement standing alone as the body of an if, else,
+// loop or label, in a scope of its own holding pats[from:to].
+func (j *javaLower) scoped(s *ts.Node, from, to int) {
+	mark := j.binds.mark()
+	j.scopePats(from, to)
+	j.stmt(s)
+	j.binds.truncate(mark)
+}
+
+// introduceIf binds in the innermost scope what an if statement introduces
+// (JLS §6.3.2.2; see Scoping), its condition's sets being pats[m:mid] when
+// true and pats[mid:] when false, then drops both sets.
+func (j *javaLower) introduceIf(cons, alt *ts.Node, m, mid int) {
+	end := len(j.pats)
+	switch {
+	case alt == nil:
+		if mid < end && !j.completes(cons) {
+			j.scopePats(mid, end)
+		}
+	case m < end:
+		c, a := j.completes(cons), j.completes(alt)
+		if c && !a {
+			j.scopePats(m, mid)
+		} else if !c && a {
+			j.scopePats(mid, end)
+		}
+	}
+	j.cutPats(m)
+}
+
+// introduceLoop binds in the innermost scope the when-false set pats[mid:]
+// of a while, do or basic for condition when body holds no break leaving it
+// (JLS §6.3.2.3 to §6.3.2.5), then drops the condition's sets from m on.
+func (j *javaLower) introduceLoop(body *ts.Node, m, mid int) {
+	if mid < len(j.pats) && !j.breaks(body, nil) {
+		j.scopePats(mid, len(j.pats))
+	}
+	j.cutPats(m)
+}
+
+// hideFrom records every binding from index from on for unbind.
+func (j *javaLower) hideFrom(from int) {
+	for i := from; i < j.binds.mark(); i++ {
+		j.hide = append(j.hide, int32(i))
+	}
+}
+
+// unbind ends the scope of every binding hide[hm:] indexes while the
+// bindings after them stay in scope: it binds each one's name again to what
+// it shadowed, or to no variable. No later binding of the group can shadow
+// one of them, since Java forbids redeclaring a name within its scope (JLS
+// §6.4).
+func (j *javaLower) unbind(hm int) {
+	for _, i := range j.hide[hm:] {
+		v := int32(-1)
+		if p := j.binds.shadowed(int(i)); p >= 0 {
+			v = j.binds.at(p).v
+		}
+		j.binds.bind(j.binds.at(int(i)).name, v)
+	}
+	j.hide = j.hide[:hm]
+}
+
+// completes reports whether statement n can complete normally, by JLS
+// §14.22 for the statements that decide it here: a jump cannot; a block can
+// when its last statement can; an if with an else when either branch can; a
+// while or basic for whose condition is absent or the literal true, and a
+// do whose condition is that literal, only through a break whose target it
+// is; a labelled statement when its statement can or a break names its
+// label; synchronized when its block can; a try when its finally block, if
+// any, can and its block or a catch block can. Every other statement, a
+// switch statement included, is taken to complete normally, and every break
+// is taken as reachable.
+func (j *javaLower) completes(n *ts.Node) bool {
+	k := j.k
+	switch n.KindId() {
+	case k.returnStmt, k.throwStmt, k.breakStmt, k.continueStmt, k.yieldStmt:
+		return false
+	case k.block:
+		last := lastNamed(n)
+		return last == nil || j.completes(last)
+	case k.ifStmt:
+		alt := n.ChildByFieldId(k.fAlternative)
+		return alt == nil || j.completes(n.ChildByFieldId(k.fConsequence)) || j.completes(alt)
+	case k.whileStmt, k.forStmt, k.doStmt:
+		if c := n.ChildByFieldId(k.fCondition); c != nil && j.l.unparen(c).KindId() != k.trueLit {
+			return true
+		}
+		return j.breaks(n.ChildByFieldId(k.fBody), n)
+	case k.labeledStmt:
+		body := lastNamed(n)
+		return body == nil || j.completes(body) || j.breaks(body, n)
+	case k.synchronizedStmt:
+		return j.completes(n.ChildByFieldId(k.fBody))
+	case k.tryStmt, k.tryWithResources:
+		ok, fin := j.completes(n.ChildByFieldId(k.fBody)), true
+		start, list := j.kids(n)
+		for i := range list {
+			switch c := &list[i]; c.KindId() {
+			case k.catchClause:
+				ok = ok || j.completes(c.ChildByFieldId(k.fBody))
+			case k.finallyClause:
+				if b := firstNamed(c); b != nil {
+					fin = j.completes(b)
+				}
+			}
+		}
+		j.done(start)
+		return ok && fin
+	}
+	return true
+}
+
+// breaks reports whether body holds a break statement (JLS §14.15),
+// outside the callables nested in it, that leaves body when target is nil,
+// or whose target is target, the statement body lies in, otherwise.
+func (j *javaLower) breaks(body, target *ts.Node) bool {
+	k := j.k
+	loop := target != nil && j.breakable(target)
+	c := j.cur
+	c.Reset(*body)
+	// inner counts the loops and switches between body and the node.
+	inner := 0
+	for {
+		n := c.Node()
+		if n.KindId() == k.breakStmt {
+			if l := firstNamed(n); l == nil {
+				if inner == 0 && (target == nil || loop) {
+					return true
+				}
+			} else if target == nil && !j.declared(n, l, body) || target != nil && j.names(target, l) {
+				return true
+			}
+		}
+		if n.IsNamed() && !j.l.isCallable(n) && c.GotoFirstChild() {
+			if j.breakable(n) {
+				inner++
+			}
+			continue
+		}
+		for !c.GotoNextSibling() {
+			if !c.GotoParent() {
+				return false
+			}
+			if j.breakable(c.Node()) {
+				inner--
+			}
+		}
+	}
+}
+
+// breakable reports whether n is the target of an unlabelled break inside
+// it: a loop or a switch.
+func (j *javaLower) breakable(n *ts.Node) bool {
+	switch k := j.k; n.KindId() {
+	case k.whileStmt, k.doStmt, k.forStmt, k.enhancedFor, k.switchExpr:
+		return true
+	}
+	return false
+}
+
+// declared reports whether label l of break brk is declared by a labelled
+// statement from brk's parent up to body, body included.
+func (j *javaLower) declared(brk, l, body *ts.Node) bool {
+	if brk.Id() == body.Id() {
+		return false
+	}
+	for p := brk.Parent(); p != nil; p = p.Parent() {
+		if p.KindId() == j.k.labeledStmt && bytes.Equal(j.text(firstNamed(p)), j.text(l)) {
+			return true
+		}
+		if p.Id() == body.Id() {
+			return false
+		}
+	}
+	return false
+}
+
+// names reports whether label l labels target: target is, or is directly
+// wrapped by, a labelled statement naming l.
+func (j *javaLower) names(target, l *ts.Node) bool {
+	p := target
+	if p.KindId() != j.k.labeledStmt {
+		p = p.Parent()
+	}
+	for ; p != nil && p.KindId() == j.k.labeledStmt; p = p.Parent() {
+		if bytes.Equal(j.text(firstNamed(p)), j.text(l)) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastNamed is n's last named child that is not an extra, or nil.
+func lastNamed(n *ts.Node) *ts.Node {
+	for i := n.NamedChildCount(); i > 0; i-- {
+		if c := n.NamedChild(i - 1); !c.IsExtra() {
+			return c
+		}
+	}
+	return nil
 }
 
 func (j *javaLower) open() int32 {
@@ -484,19 +830,12 @@ func (j *javaLower) block(n *ts.Node) {
 	j.binds.truncate(mark)
 }
 
-// sub lowers n, a statement standing alone as the body of an if, else, loop
-// or label, in a scope of its own.
-func (j *javaLower) sub(n *ts.Node) {
-	mark := j.binds.mark()
-	j.stmt(n)
-	j.binds.truncate(mark)
-}
-
 // stmt lowers one statement.
 func (j *javaLower) stmt(n *ts.Node) {
 	k := j.k
-	labels := j.labels
-	j.labels = nil
+	from := j.labelAt
+	labels := j.labels[from:]
+	j.labelAt = len(j.labels)
 	j.reset()
 	switch n.KindId() {
 	case k.expressionStmt:
@@ -522,7 +861,7 @@ func (j *javaLower) stmt(n *ts.Node) {
 	case k.tryStmt, k.tryWithResources:
 		j.tryStmt(n)
 	case k.labeledStmt:
-		j.labeled(n, labels)
+		j.labeled(n, from)
 	case k.returnStmt, k.throwStmt, k.yieldStmt:
 		if e := firstNamed(n); e != nil {
 			j.value(e)
@@ -621,31 +960,35 @@ func (j *javaLower) declaration(n *ts.Node) {
 func (j *javaLower) ifStmt(n *ts.Node) {
 	k := j.k
 	cond := j.l.unparen(n.ChildByFieldId(k.fCondition))
-	j.value(cond)
+	cons, alt := n.ChildByFieldId(k.fConsequence), n.ChildByFieldId(k.fAlternative)
+	m := len(j.pats)
+	mid := j.expr(cond)
 	j.node(flow.Branch, cond, 0, len(j.reads))
 	p := j.b.Push()
-	j.sub(n.ChildByFieldId(k.fConsequence))
+	j.scoped(cons, m, mid)
 	t := j.b.Push()
 	j.b.Restore(p)
-	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
-		j.sub(alt)
+	if alt != nil {
+		j.scoped(alt, mid, len(j.pats))
 	}
 	j.b.Merge(t)
 	j.b.Pop(p)
+	j.introduceIf(cons, alt, m, mid)
 }
 
 // head lowers a loop condition as the loop's decision node, or as a Stmt
 // node without an exit edge when it is the literal true. It reports whether
-// the loop exits through it.
-func (j *javaLower) head(cond *ts.Node) bool {
+// the loop exits through it, and leaves the condition's pattern variable
+// sets on pats, returning where the when-false set begins.
+func (j *javaLower) head(cond *ts.Node) (exits bool, mid int) {
 	j.reset()
 	if cond.KindId() == j.k.trueLit {
 		j.node(flow.Stmt, cond, 0, 0)
-		return false
+		return false, len(j.pats)
 	}
-	j.value(cond)
+	mid = j.expr(cond)
 	j.node(flow.Branch, cond, 0, len(j.reads))
-	return true
+	return true, mid
 }
 
 // loopEnd closes a loop whose back edge targets h.
@@ -664,30 +1007,36 @@ func (j *javaLower) whileStmt(n *ts.Node, labels []string) {
 	k := j.k
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
-	exits := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
+	m := len(j.pats)
+	exits, mid := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
 	h := j.close(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = j.b.Push()
 	}
-	j.sub(n.ChildByFieldId(k.fBody))
+	body := n.ChildByFieldId(k.fBody)
+	j.scoped(body, m, mid)
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, exits, exit)
+	j.introduceLoop(body, m, mid)
 }
 
 func (j *javaLower) doStmt(n *ts.Node, labels []string) {
 	k := j.k
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
-	j.sub(n.ChildByFieldId(k.fBody))
+	body := n.ChildByFieldId(k.fBody)
+	j.scoped(body, 0, 0)
 	j.b.ContinueHere(f)
-	exits := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
+	m := len(j.pats)
+	exits, mid := j.head(j.l.unparen(n.ChildByFieldId(k.fCondition)))
 	h := j.close(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = j.b.Push()
 	}
 	j.loopEnd(f, h, exits, exit)
+	j.introduceLoop(body, m, mid)
 }
 
 func (j *javaLower) forStmt(n *ts.Node, labels []string) {
@@ -705,19 +1054,24 @@ func (j *javaLower) forStmt(n *ts.Node, labels []string) {
 	j.done(start)
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
-	exits := false
+	exits, m := false, len(j.pats)
+	mid := m
 	if cond := n.ChildByFieldId(k.fCondition); cond == nil {
 		j.reset()
 		j.node(flow.Stmt, n.Child(0), 0, 0)
 	} else {
-		exits = j.head(j.l.unparen(cond))
+		exits, mid = j.head(j.l.unparen(cond))
 	}
 	h := j.close(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = j.b.Push()
 	}
-	j.sub(n.ChildByFieldId(k.fBody))
+	// The condition's when-true set is in scope in the body and the update
+	// clause (JLS §6.3.2.5).
+	j.scopePats(m, mid)
+	body := n.ChildByFieldId(k.fBody)
+	j.scoped(body, 0, 0)
 	j.b.ContinueHere(f)
 	start, ups := j.fieldKids(n, k.fUpdate)
 	for i := range ups {
@@ -726,7 +1080,10 @@ func (j *javaLower) forStmt(n *ts.Node, labels []string) {
 	}
 	j.done(start)
 	j.loopEnd(f, h, exits, exit)
+	// Only the header's locals and the when-true set end with the loop; the
+	// when-false set is introduced after it.
 	j.binds.truncate(mark)
+	j.introduceLoop(body, m, mid)
 }
 
 // enhancedFor lowers `for (T x : e) body` (see Node granularity).
@@ -750,7 +1107,7 @@ func (j *javaLower) enhancedFor(n *ts.Node, labels []string) {
 		j.b.Use(x, it)
 		j.def(x, v)
 	}
-	j.sub(n.ChildByFieldId(k.fBody))
+	j.scoped(n.ChildByFieldId(k.fBody), 0, 0)
 	j.b.ContinueHere(f)
 	j.loopEnd(f, h, true, exit)
 	j.binds.truncate(mark)
@@ -776,7 +1133,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	base := j.b.Push()
 	aBase, cBase, gBase := len(j.arms), len(j.caseBinds), len(j.groupAt)
 	start, groups := j.kids(n.ChildByFieldId(k.fBody))
-	dflt := -1
+	dflt, enhanced := -1, false
 	for g := range groups {
 		j.groupAt = append(j.groupAt, len(j.caseBinds))
 		s, list := j.kids(&groups[g])
@@ -789,10 +1146,15 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 				dflt = g
 				continue
 			}
-			j.caseLabel(c, g, sBase, sEnd)
+			if j.caseLabel(c, g, sBase, sEnd) {
+				enhanced = true
+			}
 		}
 		j.done(s)
 	}
+	// One scope holds the whole switch block: a local declared in a
+	// statement group is in scope in the groups after it (JLS §6.3).
+	bm := j.binds.mark()
 	j.groupAt = append(j.groupAt, len(j.caseBinds))
 	noMatch := j.b.Push()
 	ai := aBase
@@ -815,13 +1177,21 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 				j.b.Restore(noMatch)
 			}
 		}
-		mark := j.binds.mark()
+		// A group's pattern variables, and those its statements introduce,
+		// are in scope for the rest of the group only; its locals stay for
+		// the rest of the switch block. An arrow rule declares no local its
+		// successors see, so its scope simply ends.
+		gm, hm := j.binds.mark(), len(j.hide)
 		for _, cb := range j.caseBinds[j.groupAt[gBase+g]:j.groupAt[gBase+g+1]] {
 			j.binds.bind(cb.name, cb.v)
+		}
+		if !arrow {
+			j.hideFrom(gm)
 		}
 		s, list := j.kids(grp)
 		for i := range list {
 			c := &list[i]
+			before := j.binds.mark()
 			switch {
 			case c.KindId() == k.switchLabel:
 			case arrow && expr && c.KindId() == k.expressionStmt:
@@ -837,13 +1207,21 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 				}
 			default:
 				j.stmt(c)
+				if c.KindId() != k.localVarDecl {
+					j.hideFrom(before)
+				}
 			}
 		}
 		j.done(s)
-		j.binds.truncate(mark)
+		if arrow {
+			j.binds.truncate(gm)
+		} else {
+			j.unbind(hm)
+		}
 	}
+	j.binds.truncate(bm)
 	if dflt < 0 {
-		if expr {
+		if (expr || enhanced) && !n.HasError() {
 			t := j.b.Push()
 			j.b.Restore(noMatch)
 			j.b.Throw()
@@ -855,13 +1233,17 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	j.b.CloseFrame(f)
 	j.b.Pop(base)
 	j.done(start)
+	clear(j.caseBinds[cBase:])
 	j.arms, j.caseBinds, j.groupAt = j.arms[:aBase], j.caseBinds[:cBase], j.groupAt[:gBase]
 	j.stack = j.stack[:sBase]
 }
 
 // caseLabel lowers one `case` label of group g: its test, its pattern
-// variables and its guard. The selector's reads are stack[from:to].
-func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) {
+// variables and its guard, and reports whether the label makes its switch
+// an enhanced one (JLS §14.11.2): a pattern, or `null`. The selector's reads
+// are stack[from:to]. The group's pattern variables are the label's and
+// those its guard introduces when true.
+func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) bool {
 	k := j.k
 	j.reset()
 	for _, v := range j.stack[from:to] {
@@ -869,28 +1251,36 @@ func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) {
 	}
 	sel := len(j.reads)
 	var pattern, guard *ts.Node
+	enhanced := false
 	start, list := j.kids(c)
 	for i := range list {
 		switch e := &list[i]; e.KindId() {
 		case k.pattern:
-			pattern = e
+			pattern, enhanced = e, true
 		case k.guard:
 			guard = e
 		default:
+			if e.KindId() == k.nullLit {
+				enhanced = true
+			}
 			j.value(e)
 		}
 	}
 	j.node(flow.Branch, c, 0, len(j.reads))
 	p := j.b.Push()
-	mark := j.binds.mark()
+	m := len(j.pats)
 	if pattern != nil {
 		j.bindPattern(pattern, 0, sel)
 	}
+	mid := len(j.pats)
 	if guard != nil {
 		if e := firstNamed(guard); e != nil {
+			mark := j.binds.mark()
+			j.scopePats(m, mid)
 			j.reset()
-			j.value(e)
+			mid = j.expr(e)
 			j.node(flow.Branch, e, 0, len(j.reads))
+			j.binds.truncate(mark)
 		}
 	}
 	arm := j.b.Push()
@@ -901,21 +1291,25 @@ func (j *javaLower) caseLabel(c *ts.Node, g, from, to int) {
 			j.b.Merge(arm)
 		}
 	}
-	for i := mark; i < j.binds.mark(); i++ {
-		j.caseBinds = append(j.caseBinds, j.binds.at(i))
-	}
-	j.binds.truncate(mark)
+	j.caseBinds = append(j.caseBinds, j.pats[m:mid]...)
+	j.cutPats(m)
 	j.done(start)
+	return enhanced
 }
 
-// bindPattern declares every variable pattern p binds and, outside a
-// capture walk, defines each on one node spanning its identifier that Uses
-// reads[from:to].
+// bindPattern adds every variable pattern p binds to pats, a new variable
+// or, in a capture walk, -1, and outside a capture walk defines each on one
+// node spanning its identifier that Uses reads[from:to]. None is in scope
+// until scopePats binds it.
 func (j *javaLower) bindPattern(p *ts.Node, from, to int) {
 	k := j.k
 	switch p.KindId() {
 	case k.identifier:
-		v := j.declare(p)
+		v := int32(-1)
+		if j.shadow == 0 {
+			v = j.b.Var()
+		}
+		j.pats = append(j.pats, binding{name: view(j.text(p)), v: v, prev: -1})
 		if j.shadow == 0 {
 			j.def(j.node(flow.Stmt, p, from, to), v)
 		}
@@ -1035,7 +1429,7 @@ func (j *javaLower) catchesAll(ct *ts.Node) bool {
 
 // resources lowers a resource specification and the try block it guards:
 // each resource's acquisition, then a finally per resource around the rest,
-// closed in reverse order (JLS §14.20.3.2).
+// closed in reverse order (JLS §14.20.3.1).
 func (j *javaLower) resources(spec, body *ts.Node) {
 	k := j.k
 	mark, fBase := j.binds.mark(), len(j.frames)
@@ -1077,9 +1471,10 @@ func (j *javaLower) resources(spec, body *ts.Node) {
 	j.binds.truncate(mark)
 }
 
-// labeled hands a loop or switch its labels; any other statement is a block
-// frame only a labelled break targets.
-func (j *javaLower) labeled(n *ts.Node, labels []string) {
+// labeled hands a loop or switch its labels, labels[from:] and its own; any
+// other statement is a block frame only a labelled break targets, and keeps
+// what it introduces unless a break leaves it (JLS §6.3.2.7).
+func (j *javaLower) labeled(n *ts.Node, from int) {
 	k := j.k
 	start, list := j.kids(n)
 	if len(list) < 2 {
@@ -1087,21 +1482,30 @@ func (j *javaLower) labeled(n *ts.Node, labels []string) {
 		j.valueNode(n)
 		return
 	}
-	labels = append(labels, view(j.text(&list[0])))
+	top := len(j.labels)
+	j.labels = append(j.labels, view(j.text(&list[0])))
 	body := &list[len(list)-1]
 	switch body.KindId() {
 	case k.whileStmt, k.doStmt, k.forStmt, k.enhancedFor, k.switchExpr, k.labeledStmt:
-		j.labels = labels
+		j.labelAt = from
 		j.stmt(body)
 	default:
-		f := j.b.OpenBlock(labels...)
-		j.sub(body)
+		f := j.b.OpenBlock(j.labels[from:]...)
+		mark := j.binds.mark()
+		j.stmt(body)
+		if j.binds.mark() > mark && j.breaks(body, nil) {
+			j.binds.truncate(mark)
+		}
 		j.b.CloseFrame(f)
 	}
+	j.labels[top] = ""
+	j.labels, j.labelAt = j.labels[:top], top
 	j.done(start)
 }
 
-// assertStmt lowers `assert c;` and `assert c : m;`.
+// assertStmt lowers `assert c;` and `assert c : m;`: a Branch on the
+// `assert` keyword, whether assertions are enabled, whose false edge skips
+// the statement (JLS §14.10), then the assertion itself.
 func (j *javaLower) assertStmt(n *ts.Node) {
 	start, list := j.kids(n)
 	if len(list) == 0 {
@@ -1109,6 +1513,8 @@ func (j *javaLower) assertStmt(n *ts.Node) {
 		j.valueNode(n)
 		return
 	}
+	j.node(flow.Branch, n.Child(0), 0, 0)
+	skip := j.b.Push()
 	j.value(&list[0])
 	j.node(flow.Branch, &list[0], 0, len(j.reads))
 	p := j.b.Push()
@@ -1119,54 +1525,95 @@ func (j *javaLower) assertStmt(n *ts.Node) {
 	}
 	j.b.Throw()
 	j.b.Restore(p)
-	j.b.Pop(p)
+	j.b.Merge(skip)
+	j.b.Pop(skip)
 	j.done(start)
 }
 
 // value lowers an expression evaluated for its value: reads are recorded,
 // throwing constructs counted, and nodes created for every decision, every
 // conditionally evaluated operand, every definition and every nested
-// callable.
+// callable. The pattern variables it introduces go out of scope with it.
 func (j *javaLower) value(n *ts.Node) {
+	m := len(j.pats)
+	j.expr(n)
+	j.cutPats(m)
+}
+
+// expr is value leaving the pattern variables n introduces on pats (see
+// Scoping): the when-true set from where pats ended before the call, then
+// the when-false set, which begins at the index it returns.
+func (j *javaLower) expr(n *ts.Node) int {
 	k := j.k
+	m := len(j.pats)
 	if j.l.isCallable(n) {
-		m, w := len(j.reads), len(j.writes)
+		r, w := len(j.reads), len(j.writes)
 		j.shadow++
 		j.cap(n)
 		j.shadow--
-		j.closure(j.node(flow.Stmt, n, m, len(j.reads)), w)
-		return
+		j.closure(j.node(flow.Stmt, n, r, len(j.reads)), w)
+		return m
 	}
 	switch n.KindId() {
 	case k.identifier:
 		j.ref(n)
+	case k.parenthesized:
+		if e := firstNamed(n); e != nil {
+			return j.expr(e)
+		}
+	case k.unary:
+		o := n.ChildByFieldId(k.fOperand)
+		if n.ChildByFieldId(k.fOperator).KindId() == k.not {
+			// JLS §6.3.1.3: `!a` swaps a's sets.
+			return j.swap(m, j.expr(o))
+		}
+		j.value(o)
 	case k.binary:
 		left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
-		switch n.ChildByFieldId(k.fOperator).KindId() {
+		switch op := n.ChildByFieldId(k.fOperator).KindId(); op {
 		case k.and, k.or:
-			m := len(j.reads)
-			j.value(left)
-			j.node(flow.Branch, left, m, len(j.reads))
+			// JLS §6.3.1.1, §6.3.1.2: a's when-true (&&) or when-false (||)
+			// set is in scope in b, and the operator introduces the union
+			// of both operands' such sets.
+			and := op == k.and
+			r := len(j.reads)
+			lo := j.keep(m, j.expr(left), and)
+			j.node(flow.Branch, left, r, len(j.reads))
+			mark := j.binds.mark()
+			j.scopePats(m, lo)
 			p := j.b.Push()
-			j.valueNode(right)
+			end := j.keep(lo, j.exprNode(right), and)
 			j.b.Merge(p)
 			j.b.Pop(p)
+			j.binds.truncate(mark)
+			if and {
+				return end
+			}
+			return m
 		default:
 			j.value(left)
 			j.value(right)
 		}
 	case k.ternary:
+		// JLS §6.3.1.4: the condition's when-true set is in scope in the
+		// second operand, its when-false set in the third.
 		cond := n.ChildByFieldId(k.fCondition)
-		m := len(j.reads)
-		j.value(cond)
-		j.node(flow.Branch, cond, m, len(j.reads))
+		r := len(j.reads)
+		mid := j.expr(cond)
+		j.node(flow.Branch, cond, r, len(j.reads))
+		mark := j.binds.mark()
 		p := j.b.Push()
+		j.scopePats(m, mid)
 		j.valueNode(n.ChildByFieldId(k.fConsequence))
+		j.binds.truncate(mark)
 		t := j.b.Push()
 		j.b.Restore(p)
+		j.scopePats(mid, len(j.pats))
 		j.valueNode(n.ChildByFieldId(k.fAlternative))
+		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(p)
+		j.cutPats(m)
 	case k.assignment:
 		j.read(j.assign(n))
 	case k.update:
@@ -1214,12 +1661,13 @@ func (j *javaLower) value(n *ts.Node) {
 		j.children(n)
 		j.throws++
 	case k.instanceofExpr:
-		m := len(j.reads)
+		// JLS §6.3.1.5: the pattern's variables are introduced when true.
+		r := len(j.reads)
 		j.value(n.ChildByFieldId(k.fLeft))
 		if name := n.ChildByFieldId(k.fName); name != nil {
-			j.bindPattern(name, m, len(j.reads))
+			j.bindPattern(name, r, len(j.reads))
 		} else if p := n.ChildByFieldId(k.fPattern); p != nil {
-			j.bindPattern(p, m, len(j.reads))
+			j.bindPattern(p, r, len(j.reads))
 		}
 	case k.switchExpr:
 		j.switchValue(n)
@@ -1231,6 +1679,7 @@ func (j *javaLower) value(n *ts.Node) {
 	default:
 		j.children(n)
 	}
+	return len(j.pats)
 }
 
 // switchValue lowers a switch expression inside a larger expression. Its
@@ -1389,21 +1838,98 @@ func (j *javaLower) cap(n *ts.Node) {
 	switch n.KindId() {
 	case k.identifier:
 		j.ref(n)
-	case k.assignment, k.update:
-		t := n.ChildByFieldId(k.fLeft)
-		if n.KindId() == k.update {
-			t = firstNamed(n)
+	case k.assignment:
+		// A plain assignment writes its local target without reading it; a
+		// compound one reads it too (JLS §15.26.1, §15.26.2).
+		t := j.l.unparen(n.ChildByFieldId(k.fLeft))
+		if t.KindId() != k.identifier {
+			if v := j.base(t); v >= 0 {
+				j.writes = append(j.writes, v)
+			}
+			j.cap(t)
+		} else if n.ChildByFieldId(k.fOperator).KindId() != k.assignOp {
+			j.cap(t)
 		}
-		if t = j.l.unparen(t); t.KindId() != k.identifier {
+		j.cap(n.ChildByFieldId(k.fRight))
+	case k.update:
+		t := j.l.unparen(firstNamed(n))
+		if t.KindId() != k.identifier {
 			if v := j.base(t); v >= 0 {
 				j.writes = append(j.writes, v)
 			}
 		}
-		start, list := j.kids(n)
-		for i := range list {
-			j.cap(&list[i])
+		j.cap(t)
+	case k.parenthesized, k.unary, k.binary, k.ternary, k.instanceofExpr:
+		m := len(j.pats)
+		j.capTest(n)
+		j.cutPats(m)
+	case k.guard:
+		// A guard's when-true set is in scope in its rule or group, as the
+		// label's pattern variables are.
+		m := len(j.pats)
+		if e := firstNamed(n); e != nil {
+			j.scopePats(m, j.capTest(e))
+		}
+		j.cutPats(m)
+		return
+	case k.ifStmt:
+		cons, alt := n.ChildByFieldId(k.fConsequence), n.ChildByFieldId(k.fAlternative)
+		m := len(j.pats)
+		mid := j.capTest(j.l.unparen(n.ChildByFieldId(k.fCondition)))
+		j.capScoped(cons, m, mid)
+		if alt != nil {
+			j.capScoped(alt, mid, len(j.pats))
+		}
+		j.introduceIf(cons, alt, m, mid)
+		return
+	case k.whileStmt:
+		m := len(j.pats)
+		mid := j.capTest(j.l.unparen(n.ChildByFieldId(k.fCondition)))
+		body := n.ChildByFieldId(k.fBody)
+		j.capScoped(body, m, mid)
+		j.introduceLoop(body, m, mid)
+		return
+	case k.doStmt:
+		body := n.ChildByFieldId(k.fBody)
+		j.capScoped(body, 0, 0)
+		m := len(j.pats)
+		j.introduceLoop(body, m, j.capTest(j.l.unparen(n.ChildByFieldId(k.fCondition))))
+		return
+	case k.forStmt:
+		start, inits := j.fieldKids(n, k.fInit)
+		for i := range inits {
+			j.cap(&inits[i])
 		}
 		j.done(start)
+		m := len(j.pats)
+		mid := m
+		if cond := n.ChildByFieldId(k.fCondition); cond != nil {
+			mid = j.capTest(j.l.unparen(cond))
+		}
+		j.scopePats(m, mid)
+		start, ups := j.fieldKids(n, k.fUpdate)
+		for i := range ups {
+			j.cap(&ups[i])
+		}
+		j.done(start)
+		body := n.ChildByFieldId(k.fBody)
+		j.capScoped(body, 0, 0)
+		j.binds.truncate(mark)
+		j.introduceLoop(body, m, mid)
+		return
+	case k.switchGroup:
+		hm := len(j.hide)
+		start, list := j.kids(n)
+		for i := range list {
+			before := j.binds.mark()
+			j.cap(&list[i])
+			if list[i].KindId() != k.localVarDecl {
+				j.hideFrom(before)
+			}
+		}
+		j.done(start)
+		j.unbind(hm)
+		return
 	case k.methodInvocation:
 		if o := n.ChildByFieldId(k.fObject); o != nil {
 			j.cap(o)
@@ -1418,9 +1944,15 @@ func (j *javaLower) cap(n *ts.Node) {
 	case k.labeledStmt:
 		start, list := j.kids(n)
 		if len(list) > 0 {
-			j.cap(&list[len(list)-1])
+			body := &list[len(list)-1]
+			before := j.binds.mark()
+			j.cap(body)
+			if j.binds.mark() > before && j.breaks(body, nil) {
+				j.binds.truncate(before)
+			}
 		}
 		j.done(start)
+		return
 	case k.breakStmt, k.continueStmt, k.annotation, k.markerAnnotation:
 	case k.variableDeclarator:
 		if v := n.ChildByFieldId(k.fValue); v != nil {
@@ -1446,16 +1978,13 @@ func (j *javaLower) cap(n *ts.Node) {
 			j.cap(c)
 		}
 		return
-	case k.instanceofExpr:
-		j.cap(n.ChildByFieldId(k.fLeft))
-		if name := n.ChildByFieldId(k.fName); name != nil {
-			j.capName(name)
-		} else if p := n.ChildByFieldId(k.fPattern); p != nil {
-			j.bindPattern(p, 0, 0)
-		}
-		return
 	case k.pattern:
+		// A case label's pattern: its variables are in scope in the label's
+		// guard and its rule or group.
+		m := len(j.pats)
 		j.bindPattern(n, 0, 0)
+		j.scopePats(m, len(j.pats))
+		j.cutPats(m)
 		return
 	case k.lambda:
 		if ps := n.ChildByFieldId(k.fParameters); ps.KindId() == k.identifier {
@@ -1492,6 +2021,70 @@ func (j *javaLower) cap(n *ts.Node) {
 			return
 		}
 	}
+	j.binds.truncate(mark)
+}
+
+// capTest is cap for an expression whose pattern variable sets matter (JLS
+// §6.3.1), leaving them on pats as expr does and returning where the
+// when-false set begins.
+func (j *javaLower) capTest(n *ts.Node) int {
+	k := j.k
+	m := len(j.pats)
+	switch n.KindId() {
+	case k.parenthesized:
+		if e := firstNamed(n); e != nil {
+			return j.capTest(e)
+		}
+		return m
+	case k.unary:
+		o := n.ChildByFieldId(k.fOperand)
+		if n.ChildByFieldId(k.fOperator).KindId() == k.not {
+			return j.swap(m, j.capTest(o))
+		}
+		j.cap(o)
+		return m
+	case k.binary:
+		left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
+		switch op := n.ChildByFieldId(k.fOperator).KindId(); op {
+		case k.and, k.or:
+			and := op == k.and
+			lo := j.keep(m, j.capTest(left), and)
+			mark := j.binds.mark()
+			j.scopePats(m, lo)
+			end := j.keep(lo, j.capTest(right), and)
+			j.binds.truncate(mark)
+			if and {
+				return end
+			}
+			return m
+		}
+		j.cap(left)
+		j.cap(right)
+		return m
+	case k.ternary:
+		mid := j.capTest(n.ChildByFieldId(k.fCondition))
+		j.capScoped(n.ChildByFieldId(k.fConsequence), m, mid)
+		j.capScoped(n.ChildByFieldId(k.fAlternative), mid, len(j.pats))
+		j.cutPats(m)
+		return m
+	case k.instanceofExpr:
+		j.cap(n.ChildByFieldId(k.fLeft))
+		if name := n.ChildByFieldId(k.fName); name != nil {
+			j.bindPattern(name, 0, 0)
+		} else if p := n.ChildByFieldId(k.fPattern); p != nil {
+			j.bindPattern(p, 0, 0)
+		}
+		return len(j.pats)
+	}
+	j.cap(n)
+	return len(j.pats)
+}
+
+// capScoped is cap for n in a scope of its own holding pats[from:to].
+func (j *javaLower) capScoped(n *ts.Node, from, to int) {
+	mark := j.binds.mark()
+	j.scopePats(from, to)
+	j.cap(n)
 	j.binds.truncate(mark)
 }
 
@@ -1565,15 +2158,18 @@ type javaSyntax struct {
 	finallyClause, labeledStmt, returnStmt, throwStmt, yieldStmt, breakStmt, continueStmt, synchronizedStmt,
 	assertStmt, explicitCtorCall, identifier, assignment, update, binary, ternary, instanceofExpr,
 	methodInvocation, objectCreation, fieldAccess, arrayAccess, cast, arrayCreation, methodReference,
-	annotation, markerAnnotation, classLiteral, this, super, trueLit, parenthesized uint16
+	annotation, markerAnnotation, classLiteral, this, super, trueLit, parenthesized, unary, nullLit,
+	switchGroup uint16
 
-	and, or, assignOp, defaultKw uint16
+	and, or, not, assignOp, defaultKw uint16
 
 	fAlternative, fArguments, fArray, fBody, fCondition, fConsequence, fDeclarator, fIndex, fInit, fLeft,
-	fName, fObject, fOperator, fParameters, fPattern, fResources, fRight, fUpdate, fValue uint16
+	fName, fObject, fOperand, fOperator, fParameters, fPattern, fResources, fRight, fUpdate, fValue uint16
 
 	// scope marks, by kind id, the statements whose declarations a capture
-	// walk drops at their end.
+	// walk drops at their end; cap drops those of the statements it names
+	// itself (if, while, do, for, a labelled statement and a switch block
+	// statement group) by their own rules.
 	scope []bool
 }
 
@@ -1623,18 +2219,20 @@ func javaSyntaxOf() *javaSyntax {
 		s.arrayCreation, s.methodReference = kind("array_creation_expression"), kind("method_reference")
 		s.annotation, s.markerAnnotation, s.classLiteral = kind("annotation"), kind("marker_annotation"), kind("class_literal")
 		s.this, s.super, s.trueLit = kind("this"), kind("super"), kind("true")
-		s.parenthesized = kind("parenthesized_expression")
-		s.and, s.or, s.assignOp, s.defaultKw = tok("&&"), tok("||"), tok("="), tok("default")
+		s.parenthesized, s.unary, s.nullLit = kind("parenthesized_expression"), kind("unary_expression"), kind("null_literal")
+		s.switchGroup = kind("switch_block_statement_group")
+		s.and, s.or, s.not = tok("&&"), tok("||"), tok("!")
+		s.assignOp, s.defaultKw = tok("="), tok("default")
 		s.fAlternative, s.fArguments, s.fArray, s.fBody = field("alternative"), field("arguments"), field("array"), field("body")
 		s.fCondition, s.fConsequence, s.fDeclarator = field("condition"), field("consequence"), field("declarator")
 		s.fIndex, s.fInit, s.fLeft, s.fName = field("index"), field("init"), field("left"), field("name")
-		s.fObject, s.fOperator, s.fParameters = field("object"), field("operator"), field("parameters")
+		s.fObject, s.fOperand, s.fOperator = field("object"), field("operand"), field("operator")
+		s.fParameters = field("parameters")
 		s.fPattern, s.fResources, s.fRight = field("pattern"), field("resources"), field("right")
 		s.fUpdate, s.fValue = field("update"), field("value")
 		s.scope = make([]bool, tl.NodeKindCount())
-		for _, name := range []string{"block", "constructor_body", "switch_block_statement_group", "switch_rule",
-			"for_statement", "enhanced_for_statement", "catch_clause", "try_with_resources_statement", "if_statement",
-			"while_statement"} {
+		for _, name := range []string{"block", "constructor_body", "switch_block", "switch_rule",
+			"enhanced_for_statement", "catch_clause", "try_with_resources_statement"} {
 			s.scope[kind(name)] = true
 		}
 		javaSyntaxTable = s
