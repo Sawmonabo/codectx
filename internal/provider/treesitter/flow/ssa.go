@@ -20,7 +20,7 @@ import (
 // The value of v flowing along an edge p → n is:
 //   - when n is a Handler, the value on ENTRY to p: p threw part-way, before
 //     any definition it makes, so neither its Def nor its MayDefs hold there;
-//   - otherwise p itself when Def(p) is v, the may-merge {p, entry(p, v)}
+//   - otherwise p itself when v is one of Defs(p), the may-merge {p, entry(p, v)}
 //     when v is one of MayDefs(p), and the value on entry to p when p does
 //     not define v.
 //
@@ -203,8 +203,8 @@ func (s *ssa) definitionSites() {
 	vars := s.g.Vars()
 	s.siteOff = s.a.Int32s(vars + 1)
 	for n := range s.n {
-		if d := s.g.Def(n); d >= 0 {
-			s.siteOff[d+1]++
+		for _, v := range s.g.Defs(n) {
+			s.siteOff[v+1]++
 		}
 		for _, v := range s.g.MayDefs(n) {
 			s.siteOff[v+1]++
@@ -214,9 +214,9 @@ func (s *ssa) definitionSites() {
 	s.sites = s.a.Int32s(int(s.siteOff[vars]))
 	// siteOff[v] serves as v's cursor and is shifted back afterwards.
 	for r, n := range s.at {
-		if d := s.g.Def(n); d >= 0 {
-			s.sites[s.siteOff[d]] = int32(r)
-			s.siteOff[d]++
+		for _, v := range s.g.Defs(n) {
+			s.sites[s.siteOff[v]] = int32(r)
+			s.siteOff[v]++
 		}
 		for _, v := range s.g.MayDefs(n) {
 			s.sites[s.siteOff[v]] = int32(r)
@@ -288,7 +288,7 @@ func (s *ssa) walk(n, v int32, inclusive bool) int32 {
 // out is the value of v just after node d, which defines v: d itself for a
 // killing definition, d's may-merge for a may-definition.
 func (s *ssa) out(d, v int32) int32 {
-	if s.g.Def(d) == v {
+	if _, killing := slices.BinarySearch(s.g.Defs(d), v); killing {
 		return d
 	}
 	return s.merge(d, v)

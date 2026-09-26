@@ -26,7 +26,7 @@ const (
 	// a catch or finally (Builder.EnterHandler, Builder.EnterFinally). Every
 	// edge into it is exceptional: its predecessor threw before any
 	// definition it makes, so data flow into a Handler takes each
-	// predecessor's ENTRY values, never its Def or MayDefs. It defines and
+	// predecessor's ENTRY values, never its Defs or MayDefs. It defines and
 	// uses nothing.
 	Handler
 )
@@ -40,8 +40,6 @@ const (
 // node is one node's metadata, written by Builder into construction scratch.
 type node struct {
 	span Span
-	// def is the variable the node defines, -1 if none.
-	def  int32
 	kind Kind
 }
 
@@ -49,20 +47,23 @@ type node struct {
 // per-node def/use record. It is produced by Builder.Finish and is valid
 // until the next Arena.Begin.
 //
-// Layout: nodes, useOff/uses and mayOff/mayDefs live in construction
-// scratch; the two CSRs (succOff/succ, predOff/pred) live in the slabs
-// Arena.Bytes counts. For node n, its uses are uses[useOff[n]:useOff[n+1]],
-// its may-definitions mayDefs[mayOff[n]:mayOff[n+1]], its successors
+// Layout: nodes, useOff/uses, defOff/defs and mayOff/mayDefs live in
+// construction scratch; the two CSRs (succOff/succ, predOff/pred) live in the
+// slabs Arena.Bytes counts. For node n, its uses are
+// uses[useOff[n]:useOff[n+1]], its killing definitions
+// defs[defOff[n]:defOff[n+1]], its may-definitions
+// mayDefs[mayOff[n]:mayOff[n+1]], its successors
 // succ[succOff[n]:succOff[n+1]] and its predecessors
 // pred[predOff[n]:predOff[n+1]]; each list is sorted ascending with no
 // duplicates.
 type Graph struct {
-	nodes                  []node
-	useOff, uses           []int32
-	mayOff, mayDefs        []int32
-	succOff, succ          []int32
-	predOff, pred          []int32
-	vars, defs, unresolved int
+	nodes            []node
+	useOff, uses     []int32
+	defOff, defs     []int32
+	mayOff, mayDefs  []int32
+	succOff, succ    []int32
+	predOff, pred    []int32
+	vars, unresolved int
 }
 
 // Len is the node count N, Entry and Exit included.
@@ -75,18 +76,19 @@ func (g *Graph) Kind(n int32) Kind { return g.nodes[n].kind }
 // range at the function's end.
 func (g *Graph) Span(n int32) Span { return g.nodes[n].span }
 
-// Def is the one variable node n defines, or -1. A multi-assignment or a
-// destructuring lowers to one node per target, so one is always enough.
-func (g *Graph) Def(n int32) int32 { return g.nodes[n].def }
+// Defs are the distinct variables node n defines, each killing, ascending;
+// see Builder.Def. A node that assigns a local and yields its value to a
+// consumer defines both the local and the owned result variable.
+func (g *Graph) Defs(n int32) []int32 { return window(g.defs, g.defOff, n) }
 
 // Uses are the distinct variables node n reads, ascending. Every use is read
-// BEFORE n's own definitions (its Def and its MayDefs) are written, so
+// BEFORE n's own definitions (its Defs and its MayDefs) are written, so
 // `x = x + 1` uses the previous x.
 func (g *Graph) Uses(n int32) []int32 { return window(g.uses, g.useOff, n) }
 
 // MayDefs are the distinct variables node n may define without killing the
-// definitions that reach it, ascending; see Builder.MayDef. It never holds
-// Def(n).
+// definitions that reach it, ascending; see Builder.MayDef. It never holds a
+// variable of Defs(n).
 func (g *Graph) MayDefs(n int32) []int32 { return window(g.mayDefs, g.mayOff, n) }
 
 // Succ are node n's successors, ascending, without duplicates; a self-loop
@@ -100,9 +102,10 @@ func (g *Graph) Pred(n int32) []int32 { return window(g.pred, g.predOff, n) }
 // Vars is the variable count; variable ids are dense in [0, Vars()).
 func (g *Graph) Vars() int { return g.vars }
 
-// Defs is the definition count D, the number of nodes whose Def is not -1.
-// D ≤ N structurally. May-definitions are not counted.
-func (g *Graph) Defs() int { return g.defs }
+// DefCount is the killing-definition count D, the (node, variable) pairs
+// Defs lists over every node. May-definitions are not counted. D is bounded
+// by the lowering's records, as the uses are, not by N.
+func (g *Graph) DefCount() int { return len(g.defs) }
 
 // Unresolved counts jumps whose target was not found (a break, continue or
 // goto naming no open frame or label). Such a node keeps no successor; the

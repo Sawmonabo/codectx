@@ -497,7 +497,7 @@ func TestFunctionAnalysis(t *testing.T) {
 			row.PostDominatorsNs = t2.Sub(t1).Nanoseconds()
 			row.ControlDependenceNs = t3.Sub(t2).Nanoseconds()
 			row.DefUseNs = t4.Sub(t3).Nanoseconds()
-			row.Nodes, row.Defs, row.Vars = g.Len(), g.Defs(), g.Vars()
+			row.Nodes, row.Defs, row.Vars = g.Len(), g.DefCount(), g.Vars()
 			row.ArenaBytes = arena.Bytes()
 			row.BoundBytes = 96*row.Nodes + 64
 			row.BoundRatio = float64(row.ArenaBytes) / float64(row.BoundBytes)
