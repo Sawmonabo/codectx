@@ -1,10 +1,11 @@
 // One Rust function per group of the control-flow and definition forms the
 // Rust lowering's contract names: branches and if let, the question mark
-// operator, loop with a valued break, while and while let, iterator loops
-// with labels, labelled blocks, match with guards, let-else, shadowing,
-// destructuring, compound and place assignments, a method on self, macros,
-// closures, async blocks and a nested function item. It is a benchmark input,
-// not a proof of coverage: the lowering's golden tests are that.
+// operator on Option and on Result, loop with a valued break, while and while
+// let, iterator loops with labels, labelled blocks, match with guards,
+// let-else, let chains, shadowing, destructuring, compound and place
+// assignments, mutable borrows, a method on self, macros, closures, async
+// blocks and a nested function item. It is a benchmark input, not a proof of
+// coverage: the lowering's golden tests are that.
 
 use std::collections::HashMap;
 
@@ -119,4 +120,22 @@ pub fn closures(xs: &[i64]) -> (i64, impl Fn() -> i64) {
     let later = async move { snapshot + a + b };
     drop(later);
     (helper(total), move || snapshot)
+}
+
+pub fn results(input: &str, cap: Option<usize>) -> Result<usize, std::num::ParseIntError> {
+    let mut parsed = Vec::new();
+    push_parsed(&mut parsed, input)?;
+    if let Some(limit) = cap
+        && parsed.len() > limit
+    {
+        parsed.truncate(limit);
+    }
+    Ok(parsed.iter().sum())
+}
+
+fn push_parsed(out: &mut Vec<usize>, input: &str) -> Result<(), std::num::ParseIntError> {
+    for part in input.split(',') {
+        out.push(part.trim().parse()?);
+    }
+    Ok(())
 }
