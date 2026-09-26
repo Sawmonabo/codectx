@@ -6,10 +6,10 @@ package process
 // the platform's path encoding ASCII. A runtime that encodes a file name
 // through that encoding then cannot name a source file holding a letter
 // outside ASCII at all: measured against the pinned analysis payload, a
-// JavaScript project holding one such file failed the whole unit with
-// `java.nio.file.InvalidPathException: Malformed input or input contains
-// unmappable characters`, and the same unit parsed and exported with the
-// locale variables below present and nothing else changed.
+// JavaScript project holding one such file failed the whole unit with the
+// runtime's invalid-path error ("Malformed input or input contains unmappable
+// characters"), and the same unit parsed and exported with the locale
+// variables below present and nothing else changed.
 //
 // The locale is set here rather than by each caller because it is a property
 // of every child this product starts, not of one analyzer: the precise

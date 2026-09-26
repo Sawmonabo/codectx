@@ -26,9 +26,8 @@ import (
 // needs more than this is a lock mistake, not something to discover at run time.
 const (
 	// maxPayloadFiles bounds entries in one archive. The largest payloads the
-	// lock carries are the JDK and the npm-installed Node servers; the local
-	// Joern 4.0.627 distribution is 1,349 files, and this leaves a wide margin
-	// over anything the lock is expected to name.
+	// lock carries are the JDK and the npm-installed Node servers, and this
+	// leaves a wide margin over anything the lock is expected to name.
 	maxPayloadFiles = 50_000
 	// maxUncompressedBytes is the absolute ceiling on what one payload may
 	// expand to.
@@ -309,8 +308,8 @@ func (w *payloadWriter) symlink(name, target string) error {
 
 // untarOrSingleGz decompresses one gzip member and decides what it holds. A
 // gzip member is a tar only when "ustar" sits at offset 257 of the first
-// 512-byte block; anything else is one compressed file, which is how
-// rust-analyzer publishes its unix builds. The decision is made on the
+// 512-byte block; anything else is one compressed file, which is how some
+// language servers publish their unix builds. The decision is made on the
 // decompressed bytes rather than on the URL's suffix, for the same reason the
 // format switch reads magic rather than a name.
 func untarOrSingleGz(ctx context.Context, src io.Reader, w *payloadWriter, entry string) error {

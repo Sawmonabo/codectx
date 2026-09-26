@@ -456,10 +456,10 @@ func (r *Resolver) inspect(name string, e Entry, p Payload, rehash bool) (string
 
 // compose builds the launcher argv for one resolved payload. Section 11.7 gives
 // three shapes and the store's own layout gives a fourth: a JDK-runtime tool
-// whose entry is a launcher script rather than a jar, which is how the Joern
-// distribution ships. That script reads JAVA_HOME (verified against the real
-// Joern 4.0.627 launcher), so the managed JDK reaches it as an environment
-// variable rather than as an argv element.
+// whose entry is a launcher script rather than a jar, which is how a
+// distribution with its own launcher ships. Such a script reads JAVA_HOME, so
+// the managed JDK reaches it as an environment variable rather than as an argv
+// element.
 func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Tool) (Tool, error) {
 	entry := e.entryPath(p)
 	entryPath := filepath.Join(dir, filepath.FromSlash(entry))
@@ -533,9 +533,9 @@ func resolveOverride(name string, ov Override) (Tool, error) {
 	}
 	// ArgvPrefix's "never empty" guarantee is enforced here as well as in
 	// compose, not merely argued from the validOverride call above: consumers
-	// -- joern.Locate among them -- deleted their own prefix checks on the
-	// strength of that guarantee, so it has to hold in code at every point a
-	// Tool is constructed, including one no input reaches today.
+	// index the prefix without checking it, on the strength of that
+	// guarantee, so it has to hold in code at every point a Tool is
+	// constructed, including one no input reaches.
 	if ov.Executable == "" {
 		return Tool{}, internalError("resolved tool %q has no launcher", name)
 	}
