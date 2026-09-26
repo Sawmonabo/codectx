@@ -256,7 +256,7 @@ func (l *Ledger) Attach(ctx context.Context) error {
 	if err := ensureDir(path); err != nil {
 		return err
 	}
-	db, err := openPool(path, writerPragmas(), "immediate", 1, false)
+	db, err := openPool(path, writerPragmas(), "immediate", writerConnections, false)
 	if err != nil {
 		return err
 	}

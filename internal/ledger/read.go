@@ -108,7 +108,7 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 		}
 		return nil, false, internal("stat " + path + ": " + err.Error())
 	}
-	db, err := openPool(path, readerPragmas(), "deferred", 2, true)
+	db, err := openPool(path, readerPragmas(), "deferred", readerConnections, true)
 	if err != nil {
 		return nil, false, err
 	}
