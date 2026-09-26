@@ -80,12 +80,40 @@ var goLowering = Lowering{
 //     the operands' included.
 //   - A for statement without a condition has a Branch head spanning the
 //     `for` keyword; with one, the condition's first node is the head, the
-//     target of the back edge. A range loop is a Stmt node for the range
-//     expression, evaluated once, which defines an iteration variable of the
-//     lowering's own; a Branch head spanning the `range` keyword; then one
-//     node per key/value target. The head and every key/value node use the
-//     iteration variable, so they depend on the range expression as it was
-//     evaluated, never on a write to its variables in the body.
+//     target of the back edge.
+//   - A range loop follows the iteration model of Lowering (the
+//     specification's "For statements with range clause": the range
+//     expression x is evaluated once, before beginning the loop). It is a
+//     Stmt node spanning x, which Uses x's reads and defines an iteration
+//     variable of the lowering's own; a Branch head spanning the `range`
+//     keyword; then one node per key/value target. The head and every
+//     key/value node Use the iteration variable and none of x's reads, so
+//     they depend on x as it was evaluated, never on a write to its
+//     variables in the body. An identifier target, declared by `:=` or
+//     assigned by `=`, spans the identifier and defines it; a field, index or
+//     indirect target (`for a[i] = range xs`) spans the target, Uses its own
+//     operands, which Go evaluates on every iteration as in an assignment,
+//     and may-defines its base, as a write through it does. The same model
+//     covers every kind of x: an integer n (Go evaluates n once and the
+//     iteration values run from 0 to n-1), a channel, and a function
+//     (range-over-func, `for k, v := range seq`): seq is evaluated once at
+//     x's node, the loop body is the yield function Go synthesises, and each
+//     call of it is one iteration, which is the loop's own control flow; a
+//     function literal written as x is created at x's node, which carries
+//     its captures and its writes as any creating node does.
+//     The specification's one exception, "if at most one iteration variable
+//     is present and x or len(x) is constant, the range expression is not
+//     evaluated", is not applied: telling whether len(x) is constant needs
+//     x's type, which the lowering does not have, so x's node Uses x's reads
+//     in every case. That adds a pair only where nothing is read: a constant
+//     x reads no variable (a constant name is not a variable), and len(x) is
+//     constant with a variable in x only when x's type is an array or a
+//     pointer to an array and x holds no receive or non-constant call
+//     (specification, "Length and capacity"), so the one addition is a
+//     definition of such an array-typed variable pairing with x's node, and
+//     through the iteration variable with the head and the one target, in a
+//     loop with at most one iteration variable. The over-approximation adds
+//     pairs and gives up none.
 //   - An expression switch has a Stmt head for its tag, a type switch one
 //     spanning `x := v.(type)` that defines the alias (one variable for all
 //     clauses: no clause can reach another's uses); the head has one
@@ -717,9 +745,10 @@ func (g *goLower) forStmt(s *ts.Node, labels []string) {
 
 // rangeLoop lowers `for k, v := range x`: x once, then a head, then the
 // key and value definitions each iteration. The range expression's node
-// defines an iteration variable of its own that the head and every key and
-// value node use, so each depends on x as it was evaluated before the loop,
-// never on a definition of x in the body.
+// Uses x's reads and defines an iteration variable of its own that the head
+// and every key and value node, of every target form, Use, so each depends
+// on x as it was evaluated before the loop, never on a definition of x in
+// the body.
 func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 	b, k := g.b, g.k
 	right := rc.ChildByFieldId(k.fRight)
