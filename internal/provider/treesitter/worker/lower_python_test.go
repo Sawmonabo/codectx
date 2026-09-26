@@ -647,6 +647,24 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"x := 2@31 -> y = x + (x := 1) + (x := 2)@11", "y = x + (x := 1) + (x := 2)@11 -> return y@40"},
 		},
 		{
+			// §6.11, §6.12: the operand after `and`'s deciding one runs only
+			// when c is true. Lines at 0, 13, 39. Nodes: x@6, c@9, c@23
+			// (Branch: Uses c, defines the result variable), x := 1@30
+			// (defines x, may-defines the result variable; it does not run
+			// whenever the consumer does, so the earlier read of x stays on
+			// the consumer), y = x + (c and (x := 1))@14 (Uses x and the
+			// result variable), return y@40. Succ: c@23→{x := 1, y = …};
+			// x := 1→y = …. IPDom: c@23, x := 1 → y = ….
+			name:     "a conditionally evaluated assignment expression leaves an earlier read on its consumer",
+			protects: "when the operand holding `x := 1` is skipped, the consumer's earlier read of x still pairs with the x before it, and with the assignment when it runs",
+			mutation: "hand the earlier read off to the assignment expression unconditionally (x@6 -> y = x + (c and (x := 1))@14 disappears and x@6 -> x := 1@30 appears)",
+			src:      "def f(x, c):\n y = x + (c and (x := 1))\n return y\n",
+			fn:       1,
+			cd:       []string{"c@23 -> x := 1@30"},
+			du: []string{"c@9 -> c@23", "x@6 -> y = x + (c and (x := 1))@14", "x := 1@30 -> y = x + (c and (x := 1))@14",
+				"c@23 -> y = x + (c and (x := 1))@14", "y = x + (c and (x := 1))@14 -> return y@40"},
+		},
+		{
 			// §6.14, §7.2. Lines at 0, 10, 25. Nodes: k@6, lambda: k@15 (the
 			// creating node: captures k, defines the result variable), k =
 			// lambda: k@11 (Uses the result variable, defines k), return
