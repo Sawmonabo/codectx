@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
@@ -944,7 +945,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	var grant *unitGrant
 	if u.Heavy {
 		var admitErr error
-		if grant, admitErr = admitUnit(ctx, g.c.sched, u.Reservation); admitErr != nil {
+		if grant, admitErr = admitUnit(ctx, g.c.sched, u.Admission); admitErr != nil {
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
 			// a provider that was never asked.
@@ -1007,8 +1008,8 @@ type unitGrant struct {
 	held func()
 }
 
-// admitUnit admits a heavy unit at its planned reservation.
-func admitUnit(ctx context.Context, s *plan.Scheduler, r dependence.Reservation) (*unitGrant, error) {
+// admitUnit admits a heavy unit at its planned admission.
+func admitUnit(ctx context.Context, s *plan.Scheduler, r admission.Reservation) (*unitGrant, error) {
 	release, err := s.Admit(ctx, r)
 	if err != nil {
 		return nil, err
@@ -1026,10 +1027,12 @@ func admitUnit(ctx context.Context, s *plan.Scheduler, r dependence.Reservation)
 // that arrived while it ran, which strict first-in-first-out admission
 // requires of any reservation it has not yet granted. A cancelled or refused
 // re-admission leaves the unit holding nothing and returns the ledger's error.
+// Only a dependence unit is re-admitted, and it reserves memory alone, so the
+// retried reservation is admitted at the memory it weighs.
 func (g *unitGrant) readmit(ctx context.Context, r dependence.Reservation) error {
 	g.held()
 	g.held = func() {}
-	release, err := g.sched.Admit(ctx, r)
+	release, err := g.sched.Admit(ctx, admission.Reservation{MemoryBytes: r.Bytes()})
 	if err != nil {
 		return err
 	}

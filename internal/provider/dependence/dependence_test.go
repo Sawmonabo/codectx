@@ -652,10 +652,11 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// ones being asserted about, not a family estimate that would move with a
 	// re-measurement.
 	const fourGiB = 4 << 30
-	unit := dependence.Reservation{HeapCapBytes: fourGiB}
-	if unit.Bytes() != fourGiB {
-		t.Fatalf("reservation is %d bytes, want %d; this test's arithmetic no longer holds", unit.Bytes(), fourGiB)
+	sized := dependence.Reservation{HeapCapBytes: fourGiB}
+	if sized.Bytes() != fourGiB {
+		t.Fatalf("reservation is %d bytes, want %d; this test's arithmetic no longer holds", sized.Bytes(), fourGiB)
 	}
+	unit := admission.Reservation{MemoryBytes: sized.Bytes()}
 
 	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
 	// four of these reservations.

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -84,8 +85,13 @@ type Unit struct {
 	// whole file-unit list and would exceed model.MaxDependenciesPerUnit.
 	DependsOn []model.UnitID
 	// Heavy marks a unit that must pass the Scheduler before it runs, and
-	// Reservation is what it is admitted against.
+	// Admission is what it is admitted against in both dimensions: for a
+	// dependence unit the memory its Reservation weighs, for an external
+	// indexer's profile unit the memory and temporary disk its profile
+	// reserves. Reservation is the dependence unit's sizing -- heap caps and
+	// the rest -- which travels to the child; it is zero for every other unit.
 	Heavy       bool
+	Admission   admission.Reservation
 	Reservation dependence.Reservation
 	// Deferred marks a unit that does not block the base generation: under
 	// `providers.dependence.enabled = "auto"` the coordinator runs it as
@@ -737,8 +743,16 @@ func (b *builder) emit(ctx context.Context) error {
 				// ratio against; the unit's declared inputs are a larger set
 				// (its manifests and lock files) and would inflate it.
 				u.Reservation = b.reserve(ctx, gov, s, machine)
+				u.Admission = admission.Reservation{MemoryBytes: u.Reservation.Bytes()}
 				u.Deferred = deferDependence
 				b.plan.HeavyScopes = append(b.plan.HeavyScopes, s.scopeKey)
+			} else if s.admit != (admission.Reservation{}) {
+				// An external indexer's profile run is a heavy child too. Its
+				// figures are the profile's own, so no governor sizes it and
+				// nothing about it is deferred: it is admitted on the one
+				// ledger beside every other heavy child, in both dimensions.
+				u.Heavy = true
+				u.Admission = s.admit
 			}
 			spec, err := u.Spec(b.cfgHash)
 			if err != nil {

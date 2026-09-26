@@ -86,10 +86,11 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	// what the composition root builds.
 	sched := plan.NewScheduler(led)
 
-	unit := dependence.Reservation{HeapCapBytes: 6 * giB}
-	if unit.Bytes() != 6*giB {
-		t.Fatalf("the unit reserves %d bytes, want %d; this test's arithmetic no longer holds", unit.Bytes(), 6*giB)
+	sized := dependence.Reservation{HeapCapBytes: 6 * giB}
+	if sized.Bytes() != 6*giB {
+		t.Fatalf("the unit reserves %d bytes, want %d; this test's arithmetic no longer holds", sized.Bytes(), 6*giB)
 	}
+	unit := admission.Reservation{MemoryBytes: sized.Bytes()}
 	releaseUnit, err := sched.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an idle allocation refused one 6 GiB unit: %v", err)
@@ -119,7 +120,7 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	// The sum holds in the other direction too: 4 + 2 fits and is admitted,
 	// 4 + 6 does not and waits. Without one ledger the unit would see an empty
 	// total and be admitted on top of the server.
-	fits, err := sched.Admit(context.Background(), dependence.Reservation{HeapCapBytes: 2 * giB})
+	fits, err := sched.Admit(context.Background(), admission.Reservation{MemoryBytes: 2 * giB})
 	if err != nil {
 		t.Fatalf("a 2 GiB unit was refused beside a 4 GiB server in an 8 GiB allocation: %v", err)
 	}

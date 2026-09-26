@@ -678,7 +678,7 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 	var grant *unitGrant
 	if d.unit.Heavy {
 		var admitErr error
-		if grant, admitErr = admitUnit(ctx, l.c.sched, d.unit.Reservation); admitErr != nil {
+		if grant, admitErr = admitUnit(ctx, l.c.sched, d.unit.Admission); admitErr != nil {
 			// The gate refused or was cancelled, so the unit never reached its
 			// work: unavailable with that reason, not a failure of a provider
 			// that was never asked. Ending the span here wins over the deferred
