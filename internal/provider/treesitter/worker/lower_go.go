@@ -43,12 +43,33 @@ var goLowering = Lowering{
 //     indirect targets (`x.f`, `a[i]`, `*p`: uses of x, a, i, p) and of `_`
 //     targets' values ride on the first node.
 //   - A field, index or indirect target (`x.f = e`, `a[i] = e`, `*p = e`,
-//     `x.f++`, `for a[i] = range xs`) writes part of its base variable: the
+//     `x.f++`, `for a[i] = range xs`) writes through its base variable (The
+//     Go Programming Language Specification, "Assignment statements"): the
 //     write uses the base and is a non-killing may-definition of it, so a
-//     later use sees the write and every definition before it. Taking an
-//     address (`&x`, `&x.f`, `&a[i]`) uses its operand's variables and
-//     may-defines its base variable, by the address-taking rule of
-//     Lowering. A statement's may-definitions ride on its last node.
+//     later use sees the write and every definition before it. For a struct
+//     or array base the write is to part of the variable; for a pointer,
+//     slice or map base it lands in the object the base refers to, and the
+//     may-definition of the base is the conservative account of it that
+//     Lowering's address-taking rule states. The variable a pointer points
+//     to is not written: after `p := &x; *p = 2`, `*p = 2` may-defines p, and
+//     its write to x is given up (see Lowering), so it reaches no use of x.
+//     A statement's write-through may-definitions ride on its last node,
+//     where every target has been written.
+//   - Taking an address (`&x`, `&x.f`, `&a[i]`; the specification's
+//     "Address operators") uses its operand's variables and may-defines its
+//     base variable, by the address-taking rule of Lowering, on the node
+//     that evaluates it, never on the last node of its statement: in a
+//     statement with several targets, the node of the target whose paired
+//     value holds it ("Short variable declarations": `x, y := g(&x), 2` puts
+//     it on x's node), or the first node for an unpaired right side and for
+//     a non-variable target's operands; a hoisted `&&`/`||` operand's own
+//     Branch node, not the node that owns the expression; a select's head
+//     for its channel operands and sent values ("Select statements": they are
+//     evaluated on entering the select), not the clause. A function literal's
+//     writes follow the same rule. A may-definition of a variable on the
+//     node of its statement that assigns it, or on a later one, is dropped:
+//     the assignment follows every evaluation of the statement, so it
+//     overwrites what the evaluation wrote.
 //   - A condition (if, for, a case value list, a type-case type list) is one
 //     Branch node spanning it. Every `&&`/`||` in an expression is hoisted
 //     before the node that owns the expression: each operand that is not
@@ -72,10 +93,12 @@ var goLowering = Lowering{
 //     value list, a type-case type list) is a Branch node that also uses the
 //     tag's variables, since it compares against the tag. A select has a
 //     Branch head spanning the `select` keyword that uses every clause's
-//     channel operand and sent value, which Go evaluates on entering it.
-//     Case conditions are tested in source order with default last; each
-//     select clause's send or receive is one node. `select {}` blocks
-//     forever and is lowered as a self-loop.
+//     channel operand and sent value, which Go evaluates on entering it, and
+//     carries their may-definitions. Case conditions are tested in source
+//     order with default last; each select clause's send or receive is one
+//     node, which uses those operands again and carries only the writes of a
+//     receive's left-hand side. `select {}` blocks forever and is lowered as
+//     a self-loop.
 //   - return, break, continue, goto and fallthrough are Jump nodes spanning
 //     the statement; `panic(...)` as a statement is a Jump node followed by
 //     Throw. Every label is its own Stmt node spanning the label identifier,
@@ -108,8 +131,17 @@ var goLowering = Lowering{
 // may-definition and every definition that reached the creating node.
 // `defer func() {...}()` is therefore one node carrying the captures.
 func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
-	cur := s.cursor(fn)
-	g := &goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: cur, binds: &s.scope}
+	// The state is s.gol, reset in place: every list keeps its capacity, and
+	// the lists holding nodes or views of the previous function's source are
+	// cleared first, so nothing of it outlives its function.
+	g := &s.gol
+	clear(g.lefts[:cap(g.lefts)])
+	clear(g.rights[:cap(g.rights)])
+	clear(g.targets[:cap(g.targets)])
+	clear(g.lab[:cap(g.lab)])
+	*g = goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
+		marks: g.marks[:0], results: g.results[:0], buf: g.buf[:0], may: g.may[:0], bases: g.bases[:0],
+		lefts: g.lefts[:0], rights: g.rights[:0], targets: g.targets[:0], hs: g.hs[:0], lab: g.lab[:0]}
 	k := g.k
 	g.open()
 	if r := fn.ChildByFieldId(k.fReceiver); r != nil {
@@ -127,14 +159,16 @@ func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) 
 
 // goTarget is one variable target of a statement while its nodes are
 // ordered: its identifier, its index among the statement's targets, its
-// variable, and its uses in goLower.buf[lo:hi].
+// variable, its uses in goLower.buf[lo:hi], and the may-definitions its
+// paired value makes in goLower.may[mlo:mhi].
 type goTarget struct {
-	id     *ts.Node
-	left   int
-	v      int32
-	lo, hi int
-	isNew  bool
-	done   bool
+	id       *ts.Node
+	left     int
+	v        int32
+	lo, hi   int
+	mlo, mhi int
+	isNew    bool
+	done     bool
 }
 
 // goLower is the state of lowering one Go callable.
@@ -150,15 +184,23 @@ type goLower struct {
 	marks []int
 	// results are the named result variables a bare return uses.
 	results []int32
-	// buf collects variable uses, and may the variables written through a
-	// field, index or pointer or by a function literal, before they are
-	// attached to a node.
+	// buf collects variable uses, and may the variables an evaluation
+	// may-defines (the base of an address it takes, an enclosing variable a
+	// function literal writes), before they are attached to the node that
+	// evaluates them.
 	buf, may []int32
+	// bases are the base variables one assignment writes through a field,
+	// index or indirect target; they are may-defined where every target has
+	// been written.
+	bases []int32
 	// lefts, rights and targets are one statement's operands.
 	lefts, rights []*ts.Node
 	targets       []goTarget
 	// hs holds the case-condition fringes of the open switches.
 	hs []flow.Fringe
+	// lab is the stack of the labels of the labelled statements being
+	// lowered; a statement's labels are its top.
+	lab []string
 	// marking records the next node created in first.
 	marking bool
 	first   int32
@@ -274,7 +316,10 @@ func (g *goLower) isShort(n *ts.Node) bool {
 // collect appends to buf every variable n reads, short-circuit operands
 // included, and to may the base variable of every address n takes; it
 // resolves a function literal's captures: its reads into buf, its writes into
-// may.
+// may. The operands of a short-circuit expression are hoisted to Branch
+// nodes of their own, which evaluate them and carry their may-definitions,
+// so collecting the expression for the node that owns it adds their reads
+// only.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
 	case n.KindId() == g.k.identifier:
@@ -283,6 +328,12 @@ func (g *goLower) collect(n *ts.Node) {
 		}
 	case g.l.isCallable(n):
 		g.scan(n, g.binds.mark())
+	case g.isShort(n):
+		m := len(g.may)
+		for i := range n.NamedChildCount() {
+			g.collect(n.NamedChild(i))
+		}
+		g.may = g.may[:m]
 	case g.isAddress(n):
 		if e := n.ChildByFieldId(g.k.fOperand); e != nil {
 			g.collect(e)
@@ -492,21 +543,21 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		}
 	case k.assignmentStatement:
 		g.fill(s.ChildByFieldId(k.fLeft), 0)
-		g.assign(s, s.ChildByFieldId(k.fRight), s.ChildByFieldId(k.fOperator).KindId() != k.assign, false)
+		g.assign(s, s.ChildByFieldId(k.fRight), s.ChildByFieldId(k.fOperator).KindId() != k.assign, false, false)
 	case k.shortVarDeclaration:
 		g.fill(s.ChildByFieldId(k.fLeft), 0)
-		g.assign(s, s.ChildByFieldId(k.fRight), false, true)
+		g.assign(s, s.ChildByFieldId(k.fRight), false, true, false)
 	case k.varDeclaration:
 		for i := range s.NamedChildCount() {
 			switch c := s.NamedChild(i); c.KindId() {
 			case k.varSpec:
 				g.fill(c, k.fName)
-				g.assign(s, c.ChildByFieldId(k.fValue), false, true)
+				g.assign(s, c.ChildByFieldId(k.fValue), false, true, false)
 			case k.varSpecList:
 				for j := range c.NamedChildCount() {
 					if spec := c.NamedChild(j); spec.KindId() == k.varSpec {
 						g.fill(spec, k.fName)
-						g.assign(spec, spec.ChildByFieldId(k.fValue), false, true)
+						g.assign(spec, spec.ChildByFieldId(k.fValue), false, true, false)
 					}
 				}
 			}
@@ -573,7 +624,12 @@ func (g *goLower) labeled(s *ts.Node, labels []string) {
 	k := g.k
 	id := s.ChildByFieldId(k.fLabel)
 	name := view(g.text(id))
-	labels = append(labels, name)
+	// labels, those of the labelled statements s is the body of, is the top
+	// of lab; name is pushed after them. The frame the labelled statement
+	// opens copies the names, so they are popped once it is lowered.
+	start := len(g.lab) - len(labels)
+	g.lab = append(g.lab, name)
+	labels = g.lab[start:]
 	g.b.Label(name, g.span(id))
 	var inner *ts.Node
 	for i := range s.NamedChildCount() {
@@ -585,6 +641,7 @@ func (g *goLower) labeled(s *ts.Node, labels []string) {
 	if inner != nil && inner.KindId() != k.emptyStatement {
 		g.stmt(inner, labels)
 	}
+	g.lab = g.lab[:start]
 }
 
 func (g *goLower) ifStmt(s *ts.Node) {
@@ -902,18 +959,26 @@ func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 	b.Pop(d)
 }
 
-// comm lowers a select clause's send or receive.
+// comm lowers a select clause's send or receive. Its channel operand and
+// sent value were evaluated on entering the select, and the head carries
+// their may-definitions, so the clause's node carries only their reads and
+// the writes of a receive's left-hand side, which Go evaluates and assigns
+// when the clause is chosen.
 func (g *goLower) comm(c *ts.Node) {
 	k := g.k
 	if c.KindId() == k.receiveStatement {
 		if left := c.ChildByFieldId(k.fLeft); left != nil {
 			g.fill(left, 0)
-			g.assign(c, c.ChildByFieldId(k.fRight), false, g.token(c, k.define) != nil)
+			g.assign(c, c.ChildByFieldId(k.fRight), false, g.token(c, k.define) != nil, true)
 			return
 		}
 	}
 	g.hoist(c)
-	g.uses(g.node(flow.Stmt, c), c)
+	id := g.node(flow.Stmt, c)
+	lo, mlo := len(g.buf), len(g.may)
+	g.collect(c)
+	g.useAll(id, lo, len(g.buf))
+	g.buf, g.may = g.buf[:lo], g.may[:mlo]
 }
 
 // fill sets lefts to n's children in field, or to its named children other
@@ -934,10 +999,15 @@ func (g *goLower) fill(n *ts.Node, field uint16) {
 // assign lowers a statement assigning right (an expression list, one
 // expression, or nil) to lefts; compound targets are also read, define
 // declares every target not declared in the innermost block. A field, index
-// or indirect target is read and may-defines its base variable; every
-// may-definition of the statement rides on its last node, where every target
-// has been written.
-func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
+// or indirect target is read and may-defines its base variable on the
+// statement's last node, where every target has been written. A
+// may-definition an evaluation makes (an address taken, a function literal's
+// write) lands on the node that evaluates it: a paired value's on its
+// target's node, a non-variable target's operands' and an unpaired right
+// side's on the first node. entered reports that right was evaluated on
+// entering a select, whose head carries its may-definitions, so the clause's
+// nodes carry only its reads.
+func (g *goLower) assign(whole, right *ts.Node, compound, define, entered bool) {
 	b := g.b
 	g.rights = g.rights[:0]
 	switch {
@@ -959,9 +1029,18 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	}
 	paired := len(g.rights) == len(g.lefts)
 	lo, mlo := len(g.buf), len(g.may)
+	// value collects a right-hand expression.
+	value := func(n *ts.Node) {
+		m := len(g.may)
+		g.collect(n)
+		if entered {
+			g.may = g.may[:m]
+		}
+	}
 	// Non-variable targets' operands and values come first: the statement's
 	// first node carries them.
 	g.targets = g.targets[:0]
+	g.bases = g.bases[:0]
 	for i, n := range g.lefts {
 		x := g.l.unparen(n)
 		t := goTarget{id: x, left: i, v: -1}
@@ -976,34 +1055,34 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 		} else {
 			g.collect(n)
 			if v := g.baseVar(x); v >= 0 {
-				g.may = append(g.may, v)
+				g.bases = append(g.bases, v)
 			}
 		}
 		if t.isNew || t.v >= 0 {
 			g.targets = append(g.targets, t)
 		} else if paired {
-			g.collect(g.rights[i])
+			value(g.rights[i])
 		}
 	}
 	extra := len(g.buf)
 	if !paired {
 		for _, n := range g.rights {
-			g.collect(n)
+			value(n)
 		}
 	}
-	shared := len(g.buf)
+	shared, mshared := len(g.buf), len(g.may)
 	for i := range g.targets {
 		t := &g.targets[i]
 		if !paired {
-			t.lo, t.hi = extra, shared
+			t.lo, t.hi, t.mlo, t.mhi = extra, shared, mshared, mshared
 			continue
 		}
-		t.lo = len(g.buf)
-		g.collect(g.rights[t.left])
+		t.lo, t.mlo = len(g.buf), len(g.may)
+		value(g.rights[t.left])
 		if compound {
 			g.buf = append(g.buf, t.v)
 		}
-		t.hi = len(g.buf)
+		t.hi, t.mhi = len(g.buf), len(g.may)
 	}
 	for i := range g.targets {
 		if t := &g.targets[i]; t.isNew {
@@ -1017,11 +1096,14 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 			b.Def(id, g.targets[0].v)
 		}
 		g.mayAll(id, mlo)
+		for _, v := range g.bases {
+			b.MayDef(id, v)
+		}
 		g.buf = g.buf[:lo]
 		return
 	}
-	g.order(lo, extra, mlo)
-	g.buf = g.buf[:lo]
+	g.order(lo, extra, mlo, mshared)
+	g.buf, g.may = g.buf[:lo], g.may[:mlo]
 }
 
 // order emits one node per variable target, keeping the statement's
@@ -1032,9 +1114,13 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 // target and gives its node a use of its own variable: that use is read
 // before the node's definition, so the remaining targets' reads of the
 // variable, which stay, resolve to this node and through it to the old
-// value. buf[lo:extra] are the first node's own uses; may[mlo:] are the last
-// node's may-definitions.
-func (g *goLower) order(lo, extra, mlo int) {
+// value. buf[lo:extra] are the first node's own uses and may[mlo:mshared]
+// its may-definitions; each target's node carries its own; bases are the
+// last node's. A may-definition of a variable a node of the statement has
+// already defined, that node included, is dropped: the statement assigns
+// the variable after every evaluation, so what the evaluation wrote is
+// overwritten.
+func (g *goLower) order(lo, extra, mlo, mshared int) {
 	b := g.b
 	for n := range g.targets {
 		pick, cycle := -1, false
@@ -1057,16 +1143,42 @@ func (g *goLower) order(lo, extra, mlo int) {
 		id := g.node(flow.Stmt, t.id)
 		if n == 0 {
 			g.useAll(id, lo, extra)
+			g.evalMay(id, mlo, mshared)
 		}
 		g.useAll(id, t.lo, t.hi)
+		g.evalMay(id, t.mlo, t.mhi)
 		if cycle {
 			b.Use(id, t.v)
 		}
 		b.Def(id, t.v)
 		if n == len(g.targets)-1 {
-			g.mayAll(id, mlo)
+			for _, v := range g.bases {
+				b.MayDef(id, v)
+			}
 		}
 	}
+}
+
+// evalMay records may[lo:hi] as may-definitions of node id of a statement
+// being ordered, except those of a variable a target node made so far
+// defines (see order).
+func (g *goLower) evalMay(id int32, lo, hi int) {
+	for _, v := range g.may[lo:hi] {
+		if !g.assigned(v) {
+			g.b.MayDef(id, v)
+		}
+	}
+}
+
+// assigned reports whether a target node of the statement being ordered
+// made so far defines v.
+func (g *goLower) assigned(v int32) bool {
+	for i := range g.targets {
+		if t := &g.targets[i]; t.done && t.v == v {
+			return true
+		}
+	}
+	return false
 }
 
 // readByOther reports whether a remaining target other than i reads
