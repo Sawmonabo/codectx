@@ -163,7 +163,7 @@ var scenarios = []scenario{
 		// Failure mode: an ordinary doctor skips the whole-database work but
 		// reports the rows it skipped as `pass`, so an operator reads "the
 		// index database passed its integrity checks" off a run that read no
-		// page of it. Ruling QP-A: nothing is dropped from the report and
+		// page of it. The rule: nothing is dropped from the report and
 		// nothing skipped is claimed as verified -- each such row is
 		// `unverified` and names the flag that verifies it.
 		name: "an ordinary doctor reports the whole-database checks unverified, never passed",
