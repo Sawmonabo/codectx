@@ -601,23 +601,12 @@ func (j *pyLower) scan(n *ts.Node) {
 		j.scan(n.ChildByFieldId(k.fBody))
 		j.scan(n.ChildByFieldId(k.fAlternative))
 	case k.asPattern:
-		// A with item's `as` target; a case pattern's as-pattern is
-		// handled by patternSites.
+		// The `as` target of a with item or an except clause; a case
+		// pattern's as-pattern is walked by pattern.
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.asPatternTarget {
 				j.targetSites(&list[i])
-			} else {
-				j.scan(&list[i])
-			}
-		}
-		j.done(start)
-	case k.exceptClause:
-		alias := n.ChildByFieldId(k.fAlias)
-		start, list := j.kids(n)
-		for i := range list {
-			if alias != nil && list[i].StartByte() == alias.StartByte() {
-				j.targetSites(alias)
 			} else {
 				j.scan(&list[i])
 			}
@@ -1080,11 +1069,9 @@ func (j *pyLower) bind(t *ts.Node, whole *ts.Node, from, to int) {
 			j.bind(&list[i], nil, from, to)
 		}
 		j.done(start)
-	case k.parenthesizedExpression, k.listSplatPattern, k.listSplat, k.asPatternTarget:
+	case k.parenthesizedExpression, k.listSplatPattern, k.listSplat:
 		if c := firstNamed(t); c != nil {
 			j.bind(c, whole, from, to)
-		} else if t.KindId() == k.asPatternTarget {
-			j.def(j.node(flow.Stmt, span, from, to), j.lookup(t))
 		}
 	default:
 		j.value(t)
@@ -1311,31 +1298,32 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 // except lowers one except or except* clause on the handler fringe. A typed
 // clause's test is a Branch, its body's end is held, and the fringe becomes
 // the test's false edge; it reports whether the clause catches everything,
-// leaving its body's end as the fringe.
+// leaving its body's end as the fringe. The grammar parses `except E as n`
+// with E and n as one as-pattern value.
 func (j *pyLower) except(c *ts.Node) bool {
 	k := j.k
-	alias := c.ChildByFieldId(k.fAlias)
 	j.reset()
 	// The clause's block is its last child; list stays on the stack until
 	// the clause is lowered.
 	start, list := j.kids(c)
 	defer j.done(start)
 	body := &list[len(list)-1]
-	var lo, hi *ts.Node
-	for i := range list {
-		x := &list[i]
-		if x.StartByte() == body.StartByte() || alias != nil && x.StartByte() == alias.StartByte() {
-			continue
+	tests := list[:len(list)-1]
+	if len(tests) == 0 {
+		j.block(body)
+		return true
+	}
+	var lo, hi, alias *ts.Node
+	for i := range tests {
+		x := &tests[i]
+		if x.KindId() == k.asPattern {
+			x, alias = j.asParts(x)
 		}
 		if lo == nil {
 			lo = x
 		}
 		hi = x
 		j.value(x)
-	}
-	if lo == nil {
-		j.block(body)
-		return true
 	}
 	j.nodeAt(flow.Branch, flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}, 0, len(j.reads))
 	miss := j.b.Push()
@@ -1355,6 +1343,17 @@ func (j *pyLower) except(c *ts.Node) bool {
 	j.hold = append(j.hold, j.b.Push())
 	j.b.Restore(miss)
 	return false
+}
+
+// asParts splits an as-pattern value `e as t` of a with item or an except
+// clause into e and the target t, which the grammar wraps in an
+// as_pattern_target node holding one expression.
+func (j *pyLower) asParts(v *ts.Node) (e, t *ts.Node) {
+	start, list := j.kids(v)
+	x := list[0]
+	t = firstNamed(&list[1])
+	j.done(start)
+	return &x, t
 }
 
 // withStmt lowers with and async with (see Node granularity).
@@ -1411,18 +1410,11 @@ func (j *pyLower) withStmt(n *ts.Node) {
 
 // withParts is a with item's context expression and its `as` target, or nil.
 func (j *pyLower) withParts(item *ts.Node) (mgr, target *ts.Node) {
-	k := j.k
-	v := item.ChildByFieldId(k.fValue)
-	if v.KindId() != k.asPattern {
+	v := item.ChildByFieldId(j.k.fValue)
+	if v.KindId() != j.k.asPattern {
 		return v, nil
 	}
-	target = v.ChildByFieldId(k.fAlias)
-	if target != nil && target.KindId() == k.asPatternTarget {
-		if c := firstNamed(target); c != nil {
-			target = c
-		}
-	}
-	return firstNamed(v), target
+	return j.asParts(v)
 }
 
 // pattern modes: bind a case pattern's captures as locals, read the values
@@ -1527,8 +1519,9 @@ func (j *pyLower) irrefutable(p *ts.Node) bool {
 	r := false
 	switch p.KindId() {
 	case k.casePattern:
+		// The wildcard `_` is the one pattern with no named node.
 		if len(list) == 0 {
-			r = j.hasToken(p, k.underscore)
+			r = true
 		} else {
 			r = len(list) == 1 && j.irrefutable(&list[0])
 		}
