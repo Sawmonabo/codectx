@@ -247,43 +247,104 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	for _, n := range caps["import.name"] {
 		rec.add(n.Utf8Text(e.src))
 	}
-	for _, c := range caps["import.clause"] {
-		importClauseBindings(c, func(id *ts.Node) { rec.add(id.Utf8Text(e.src)) })
+	if clauses := caps["import.clause"]; len(clauses) > 0 {
+		ids := e.g.importSyntax(e.l.Name)
+		for i := range clauses {
+			cur := clauses[i].Walk()
+			importClauseBindings(cur, &clauses[i], ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src)) })
+			cur.Close()
+		}
+	}
+}
+
+// importSyntax holds the kind and field ids an ECMAScript import clause is
+// read by, resolved once per grammar. The extraction and the JavaScript
+// lowering both walk a clause through importClauseBindings over this table,
+// so they bind the same names and compare integers rather than kind strings.
+type importSyntax struct {
+	identifier, namespaceImport, namedImports, importSpecifier uint16
+	// typeKw is the `type` token of a TypeScript type-only specifier; 0, which
+	// no token has, in a grammar without one.
+	typeKw        uint16
+	fAlias, fName uint16
+}
+
+// resolveImportSyntax resolves the import-clause table of tl, the grammar of
+// language. A kind or field the grammar does not define panics, so a misspelt
+// name can never silently bind nothing.
+func resolveImportSyntax(tl *ts.Language, language string) importSyntax {
+	return importSyntax{
+		identifier:      mustKind(tl, language, "identifier", true),
+		namespaceImport: mustKind(tl, language, "namespace_import", true),
+		namedImports:    mustKind(tl, language, "named_imports", true),
+		importSpecifier: mustKind(tl, language, "import_specifier", true),
+		typeKw:          tl.IdForNodeKind("type", false),
+		fAlias:          mustField(tl, language, "alias"),
+		fName:           mustField(tl, language, "name"),
 	}
 }
 
 // importClauseBindings calls bind with every local name an ECMAScript import
 // clause binds, in source order: the default binding, the namespace binding,
-// and each named specifier's alias, or its name when it has none. A specifier
-// whose local name is not an identifier binds nothing. The query captures the
-// clause once per statement and this walks it with one tree cursor, so a
-// statement naming any number of specifiers costs time linear in their count.
-func importClauseBindings(clause ts.Node, bind func(id *ts.Node)) {
-	cur := clause.Walk()
-	defer cur.Close()
-	for _, part := range clause.NamedChildren(cur) {
-		switch part.Kind() {
-		case "identifier":
-			bind(&part)
-		case "namespace_import":
-			if id := childOfKind(part, "identifier"); id != nil {
-				bind(id)
+// and each named specifier's alias, or its name when it has none. typeOnly
+// reports a TypeScript `type` specifier, which binds a name the compiler
+// erases. Every other child (punctuation, a comment between specifiers, an
+// error node) binds nothing, and a specifier whose local name is not an
+// identifier (a string name without an alias) binds nothing. The walk moves
+// cur, which it resets to clause, and allocates no list, so a statement
+// naming any number of specifiers costs time linear in their count; bind must
+// not move cur.
+func importClauseBindings(cur *ts.TreeCursor, clause *ts.Node, s *importSyntax, bind func(local *ts.Node, typeOnly bool)) {
+	cur.Reset(*clause)
+	if !cur.GotoFirstChild() {
+		return
+	}
+	for {
+		switch part := cur.Node(); part.KindId() {
+		case s.identifier:
+			bind(part, false)
+		case s.namespaceImport:
+			if id := firstNamed(part); id != nil && id.KindId() == s.identifier {
+				bind(id, false)
 			}
-		case "named_imports":
-			for _, spec := range part.NamedChildren(cur) {
-				if spec.Kind() != "import_specifier" {
-					continue // a comment between specifiers
+		case s.namedImports:
+			if cur.GotoFirstChild() {
+				for {
+					if spec := cur.Node(); spec.KindId() == s.importSpecifier {
+						local := spec.ChildByFieldId(s.fAlias)
+						if local == nil {
+							local = spec.ChildByFieldId(s.fName)
+						}
+						if local != nil && local.KindId() == s.identifier {
+							bind(local, hasToken(spec, s.typeKw))
+						}
+					}
+					if !cur.GotoNextSibling() {
+						break
+					}
 				}
-				local := spec.ChildByFieldName("alias")
-				if local == nil {
-					local = spec.ChildByFieldName("name")
-				}
-				if local != nil && local.Kind() == "identifier" {
-					bind(local)
-				}
+				cur.GotoParent()
 			}
 		}
+		if !cur.GotoNextSibling() {
+			return
+		}
 	}
+}
+
+// hasToken reports whether one of n's direct children is the anonymous token
+// id; id 0 never matches. It indexes the children, which costs time quadratic
+// in their count, so it is for a node of a few children (a specifier).
+func hasToken(n *ts.Node, id uint16) bool {
+	if id == 0 {
+		return false
+	}
+	for i := range n.ChildCount() {
+		if c := n.Child(i); c != nil && !c.IsNamed() && c.KindId() == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier []ts.Node) {

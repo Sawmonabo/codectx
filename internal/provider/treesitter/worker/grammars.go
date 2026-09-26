@@ -3,6 +3,7 @@ package worker
 import (
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 	"unsafe"
@@ -37,6 +38,18 @@ type grammar struct {
 	// importNames derives the local names an import path introduces when the
 	// query captured none.
 	importNames func(path string) []string
+
+	// imports is an ECMAScript grammar's import-clause table, resolved on
+	// first use by importSyntax.
+	importsOnce sync.Once
+	imports     importSyntax
+}
+
+// importSyntax is the import-clause table of g, the ECMAScript grammar
+// registered as language, resolved once.
+func (g *grammar) importSyntax(language string) *importSyntax {
+	g.importsOnce.Do(func() { g.imports = resolveImportSyntax(g.tsLanguage(), language) })
+	return &g.imports
 }
 
 func set(kinds ...string) map[string]bool {

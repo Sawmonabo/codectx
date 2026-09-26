@@ -843,7 +843,8 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 	}
 }
 
-// imports binds and defines the local names of one import statement.
+// imports binds and defines the local names of one import statement, walking
+// its clause as the extraction does; a `type` specifier binds nothing.
 func (j *jsLower) imports(n *ts.Node) {
 	k := j.k
 	if j.erased(n) {
@@ -855,33 +856,11 @@ func (j *jsLower) imports(n *ts.Node) {
 		if c.KindId() != k.importClause {
 			continue
 		}
-		s2, parts := j.kids(c)
-		for p := range parts {
-			switch part := &parts[p]; part.KindId() {
-			case k.identifier:
-				j.importName(part)
-			case k.namespaceImport:
-				if id := firstNamed(part); id != nil {
-					j.importName(id)
-				}
-			case k.namedImports:
-				s3, specs := j.kids(part)
-				for s := range specs {
-					if j.hasTok(&specs[s], k.typeKw) {
-						continue
-					}
-					local := specs[s].ChildByFieldId(k.fAlias)
-					if local == nil {
-						local = specs[s].ChildByFieldId(k.fName)
-					}
-					if local.KindId() == k.identifier {
-						j.importName(local)
-					}
-				}
-				j.done(s3)
+		importClauseBindings(j.cur, c, &k.imports, func(local *ts.Node, typeOnly bool) {
+			if !typeOnly {
+				j.importName(local)
 			}
-		}
-		j.done(s2)
+		})
 	}
 	j.done(start)
 }
@@ -1974,7 +1953,7 @@ type jsSyntax struct {
 	ifStatement, elseClause, forStatement, forInStatement, whileStatement, doStatement, switchStatement,
 	switchBody, switchCase, switchDefault, tryStatement, catchClause, finallyClause, labeledStatement,
 	breakStatement, continueStatement, returnStatement, throwStatement, emptyStatement, debuggerStatement,
-	withStatement, importStatement, exportStatement, hashBangLine, importClause, namespaceImport, namedImports,
+	withStatement, importStatement, exportStatement, hashBangLine, importClause,
 	identifier, shorthandPropertyIdentifier, shorthandPropertyIdentifierPattern, parenthesizedExpression,
 	sequenceExpression, assignmentExpression, augmentedAssignmentExpression, binaryExpression, ternaryExpression,
 	updateExpression, callExpression, newExpression, awaitExpression, yieldExpression, memberExpression,
@@ -1989,10 +1968,12 @@ type jsSyntax struct {
 	asExpression, satisfiesExpression, typeAssertion, instantiationExpression, typeArguments, decorator uint16
 	// erased is indexed by kind id: the kinds the TypeScript compiler erases.
 	erased []bool
+	// imports is the import-clause table the extraction shares.
+	imports importSyntax
 
 	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, typeKw uint16
 
-	fAlias, fAlternative, fArgument, fArguments, fBody, fCondition, fConsequence, fDeclaration, fFinalizer,
+	fAlternative, fArgument, fArguments, fBody, fCondition, fConsequence, fDeclaration, fFinalizer,
 	fFunction, fHandler, fIncrement, fIndex, fInitializer, fKey, fKind, fLabel, fLeft, fName, fObject,
 	fOperator, fOptionalChain, fParameter, fParameters, fPattern, fRight, fValue uint16
 }
@@ -2026,7 +2007,7 @@ func resolveJSSyntax(language string) *jsSyntax {
 	s.breakStatement, s.continueStatement, s.returnStatement = kind("break_statement"), kind("continue_statement"), kind("return_statement")
 	s.throwStatement, s.emptyStatement, s.debuggerStatement = kind("throw_statement"), kind("empty_statement"), kind("debugger_statement")
 	s.withStatement, s.importStatement, s.exportStatement = kind("with_statement"), kind("import_statement"), kind("export_statement")
-	s.hashBangLine, s.importClause, s.namespaceImport, s.namedImports = kind("hash_bang_line"), kind("import_clause"), kind("namespace_import"), kind("named_imports")
+	s.hashBangLine, s.importClause, s.imports = kind("hash_bang_line"), kind("import_clause"), resolveImportSyntax(tl, language)
 	s.identifier, s.shorthandPropertyIdentifier = kind("identifier"), kind("shorthand_property_identifier")
 	s.shorthandPropertyIdentifierPattern = kind("shorthand_property_identifier_pattern")
 	s.parenthesizedExpression, s.sequenceExpression = kind("parenthesized_expression"), kind("sequence_expression")
@@ -2060,7 +2041,7 @@ func resolveJSSyntax(language string) *jsSyntax {
 	}
 	s.constKw, s.eqTok, s.typeKw = tok("const"), tok("="), tl.IdForNodeKind("type", false)
 	s.fPattern = tl.FieldIdForName("pattern")
-	s.fAlias, s.fAlternative, s.fArgument, s.fArguments = field("alias"), field("alternative"), field("argument"), field("arguments")
+	s.fAlternative, s.fArgument, s.fArguments = field("alternative"), field("argument"), field("arguments")
 	s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
 	s.fFinalizer, s.fFunction, s.fHandler, s.fIncrement = field("finalizer"), field("function"), field("handler"), field("increment")
 	s.fIndex, s.fInitializer, s.fKey, s.fKind, s.fLabel = field("index"), field("initializer"), field("key"), field("kind"), field("label")

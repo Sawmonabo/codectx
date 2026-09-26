@@ -4,7 +4,7 @@ import "testing"
 
 // TestJavaScriptLoweringGolden pins the control-dependence and def-use pairs
 // of hand-derived JavaScript functions. Each case is callable 1 in Functions
-// preorder (callable 0 is the program). Every pair was derived by hand from
+// preorder unless its fn says otherwise (callable 0 is the program). Every pair was derived by hand from
 // the lowering's documented granularity and the rules: exit augmentation adds
 // an edge to Exit from every successor-less node and from the
 // smallest-reverse-post-order member of each sink strongly connected
@@ -301,6 +301,19 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
 			},
 			du: []string{"c@14 -> c@32", "o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25"},
+		},
+		{
+			// ECMAScript §16.2.2 ImportDeclaration: each ImportSpecifier binds
+			// its local name; a comment is not a specifier. Callable 0, the
+			// program: a@9 and b@20 each define their import binding, and
+			// g(a, b)@34 reads both. Straight-line code, so no control
+			// dependence.
+			name:     "a comment between import specifiers binds nothing",
+			protects: "the lowering walks an import clause as the extraction does and never takes a comment for a specifier (a comment has no name field, so reading one dereferences a nil node)",
+			mutation: "drop the import_specifier kind check in importClauseBindings (the comment is read as a specifier: a nil dereference, or b@20 loses its binding)",
+			src:      "import { a, /* c */ b } from \"m\"; g(a, b);",
+			fn:       0,
+			du:       []string{"a@9 -> g(a, b)@34", "b@20 -> g(a, b)@34"},
 		},
 	})
 }
