@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"sync"
+
 	ts "github.com/tree-sitter/go-tree-sitter"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -103,16 +105,19 @@ var goLowering = Lowering{
 // may-definition and every definition that reached the creating node.
 // `defer func() {...}()` is therefore one node carrying the captures.
 func lowerGo(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte) {
-	g := &goLower{l: l, b: b, src: src}
+	cur := fn.Walk()
+	defer cur.Close()
+	g := &goLower{l: l, b: b, src: src, k: goSyntaxOf(), cur: cur}
+	k := g.k
 	g.open()
-	if r := fn.ChildByFieldName("receiver"); r != nil {
+	if r := fn.ChildByFieldId(k.fReceiver); r != nil {
 		g.params(r, false)
 	}
-	g.params(fn.ChildByFieldName("parameters"), false)
-	if r := fn.ChildByFieldName("result"); r != nil && r.Kind() == "parameter_list" {
+	g.params(fn.ChildByFieldId(k.fParameters), false)
+	if r := fn.ChildByFieldId(k.fResult); r != nil && r.KindId() == k.parameterList {
 		g.params(r, true)
 	}
-	if body := fn.ChildByFieldName("body"); body != nil {
+	if body := fn.ChildByFieldId(k.fBody); body != nil {
 		g.stmts(body)
 	}
 	g.close()
@@ -135,6 +140,9 @@ type goLower struct {
 	l   *Lowering
 	b   *flow.Builder
 	src []byte
+	k   *goSyntax
+	// cur walks one node's children at a time; eachField resets it.
+	cur *ts.TreeCursor
 	// binds is the scope chain; marks are block starts.
 	binds scope
 	marks []int
@@ -171,10 +179,10 @@ func (g *goLower) nodeSpan(k flow.Kind, s flow.Span) int32 {
 	return id
 }
 
-// token is n's anonymous child spelled kind, or nil.
-func (g *goLower) token(n *ts.Node, kind string) *ts.Node {
+// token is n's anonymous child of token kind id, or nil.
+func (g *goLower) token(n *ts.Node, id uint16) *ts.Node {
 	for i := range n.ChildCount() {
-		if c := n.Child(i); !c.IsNamed() && c.Kind() == kind {
+		if c := n.Child(i); c.KindId() == id {
 			return c
 		}
 	}
@@ -210,9 +218,17 @@ func (g *goLower) declare(id *ts.Node) int32 {
 
 // bindNames binds every child of n in field "name" to no variable.
 func (g *goLower) bindNames(n *ts.Node) {
-	for i := range n.ChildCount() {
-		if n.FieldNameForChild(uint32(i)) == "name" {
-			g.bind(g.text(n.Child(i)), -1)
+	g.eachField(n, g.k.fName, func(c *ts.Node) { g.bind(g.text(c), -1) })
+}
+
+// eachField calls visit with every child of n in field, in source order.
+// visit must not walk the tree itself: the walk holds g.cur.
+func (g *goLower) eachField(n *ts.Node, field uint16, visit func(c *ts.Node)) {
+	c := g.cur
+	c.Reset(*n)
+	for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
+		if c.FieldId() == field {
+			visit(c.Node())
 		}
 	}
 }
@@ -231,30 +247,26 @@ func (g *goLower) params(list *ts.Node, result bool) {
 		return
 	}
 	for i := range list.NamedChildCount() {
-		d := list.NamedChild(i)
-		for j := range d.ChildCount() {
-			if d.FieldNameForChild(uint32(j)) != "name" {
-				continue
-			}
-			id := d.Child(j)
+		g.eachField(list.NamedChild(i), g.k.fName, func(id *ts.Node) {
 			v := g.declare(id)
 			if v < 0 {
-				continue
+				return
 			}
 			g.b.Def(g.node(flow.Stmt, id), v)
 			if result {
 				g.results = append(g.results, v)
 			}
-		}
+		})
 	}
 }
 
 func (g *goLower) isShort(n *ts.Node) bool {
-	if n.Kind() != "binary_expression" {
+	k := g.k
+	if n.KindId() != k.binaryExpression {
 		return false
 	}
-	op := n.ChildByFieldName("operator")
-	return op != nil && (op.Kind() == "&&" || op.Kind() == "||")
+	op := n.ChildByFieldId(k.fOperator)
+	return op != nil && (op.KindId() == k.and || op.KindId() == k.or)
 }
 
 // collect appends to buf every variable n reads, short-circuit operands
@@ -262,7 +274,7 @@ func (g *goLower) isShort(n *ts.Node) bool {
 // its writes into may.
 func (g *goLower) collect(n *ts.Node) {
 	switch {
-	case n.Kind() == "identifier":
+	case n.KindId() == g.k.identifier:
 		if v := g.variable(n); v >= 0 {
 			g.buf = append(g.buf, v)
 		}
@@ -306,17 +318,18 @@ func (g *goLower) mayAll(id int32, lo int) {
 // baseIdent is the identifier a field, index or indirect target writes
 // through (x in `x.f`, `x[i].f`, `*x`, `(*x).f`), or nil.
 func (g *goLower) baseIdent(n *ts.Node) *ts.Node {
+	k := g.k
 	for n = g.l.unparen(n); n != nil; n = g.l.unparen(n) {
-		switch n.Kind() {
-		case "identifier":
+		switch n.KindId() {
+		case k.identifier:
 			return n
-		case "selector_expression", "index_expression":
-			n = n.ChildByFieldName("operand")
-		case "unary_expression":
-			if op := n.ChildByFieldName("operator"); op == nil || op.Kind() != "*" {
+		case k.selectorExpression, k.indexExpression:
+			n = n.ChildByFieldId(k.fOperand)
+		case k.unaryExpression:
+			if op := n.ChildByFieldId(k.fOperator); op == nil || op.KindId() != k.star {
 				return nil
 			}
-			n = n.ChildByFieldName("operand")
+			n = n.ChildByFieldId(k.fOperand)
 		default:
 			return nil
 		}
@@ -361,14 +374,15 @@ func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
 		t = g.b.Push()
 		return t, t, t
 	}
-	and := n.ChildByFieldName("operator").Kind() == "&&"
-	first, lt, lf := g.chain(n.ChildByFieldName("left"))
+	k := g.k
+	and := n.ChildByFieldId(k.fOperator).KindId() == k.and
+	first, lt, lf := g.chain(n.ChildByFieldId(k.fLeft))
 	if and {
 		g.b.Restore(lt)
 	} else {
 		g.b.Restore(lf)
 	}
-	_, rt, rf := g.chain(n.ChildByFieldName("right"))
+	_, rt, rf := g.chain(n.ChildByFieldId(k.fRight))
 	if and {
 		g.b.Restore(lf)
 		g.b.Merge(rf)
@@ -398,18 +412,19 @@ func (g *goLower) block(n *ts.Node) {
 // stmts lowers the statement list under n (a block or a case clause) and
 // reports whether it ends with fallthrough.
 func (g *goLower) stmts(n *ts.Node) (fell bool) {
+	k := g.k
 	for i := range n.NamedChildCount() {
 		list := n.NamedChild(i)
-		if list.Kind() != "statement_list" {
+		if list.KindId() != k.statementList {
 			continue
 		}
 		for j := range list.NamedChildCount() {
 			s := list.NamedChild(j)
-			if s.Kind() == "comment" {
+			if s.KindId() == k.comment {
 				continue
 			}
 			g.stmt(s, nil)
-			fell = s.Kind() == "fallthrough_statement"
+			fell = s.KindId() == k.fallthroughStatement
 		}
 	}
 	return fell
@@ -418,7 +433,7 @@ func (g *goLower) stmts(n *ts.Node) (fell bool) {
 // label is the label a break, continue or goto names, or "".
 func (g *goLower) label(s *ts.Node) string {
 	for i := range s.NamedChildCount() {
-		if c := s.NamedChild(i); c.Kind() == "label_name" {
+		if c := s.NamedChild(i); c.KindId() == g.k.labelName {
 			return string(g.text(c))
 		}
 	}
@@ -427,12 +442,12 @@ func (g *goLower) label(s *ts.Node) string {
 
 // stmt lowers statement s; labels are the labels naming it.
 func (g *goLower) stmt(s *ts.Node, labels []string) {
-	b := g.b
-	switch s.Kind() {
-	case "comment", "empty_statement":
-	case "block":
+	b, k := g.b, g.k
+	switch s.KindId() {
+	case k.comment, k.emptyStatement:
+	case k.block:
 		g.block(s)
-	case "expression_statement":
+	case k.expressionStatement:
 		e := firstNamed(s)
 		g.hoist(e)
 		if g.isPanic(e) {
@@ -441,47 +456,47 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 			return
 		}
 		g.uses(g.node(flow.Stmt, s), e)
-	case "send_statement", "go_statement", "defer_statement":
+	case k.sendStatement, k.goStatement, k.deferStatement:
 		g.hoist(s)
 		g.uses(g.node(flow.Stmt, s), s)
-	case "inc_statement", "dec_statement":
+	case k.incStatement, k.decStatement:
 		e := firstNamed(s)
 		g.hoist(e)
 		id := g.node(flow.Stmt, s)
 		g.uses(id, e)
-		if x := g.l.unparen(e); x.Kind() == "identifier" {
+		if x := g.l.unparen(e); x.KindId() == k.identifier {
 			if v := g.variable(x); v >= 0 {
 				b.Def(id, v)
 			}
 		} else if v := g.baseVar(x); v >= 0 {
 			b.MayDef(id, v)
 		}
-	case "assignment_statement":
-		g.fill(s.ChildByFieldName("left"), "")
-		g.assign(s, s.ChildByFieldName("right"), s.ChildByFieldName("operator").Kind() != "=", false)
-	case "short_var_declaration":
-		g.fill(s.ChildByFieldName("left"), "")
-		g.assign(s, s.ChildByFieldName("right"), false, true)
-	case "var_declaration":
+	case k.assignmentStatement:
+		g.fill(s.ChildByFieldId(k.fLeft), 0)
+		g.assign(s, s.ChildByFieldId(k.fRight), s.ChildByFieldId(k.fOperator).KindId() != k.assign, false)
+	case k.shortVarDeclaration:
+		g.fill(s.ChildByFieldId(k.fLeft), 0)
+		g.assign(s, s.ChildByFieldId(k.fRight), false, true)
+	case k.varDeclaration:
 		for i := range s.NamedChildCount() {
-			switch c := s.NamedChild(i); c.Kind() {
-			case "var_spec":
-				g.fill(c, "name")
-				g.assign(s, c.ChildByFieldName("value"), false, true)
-			case "var_spec_list":
+			switch c := s.NamedChild(i); c.KindId() {
+			case k.varSpec:
+				g.fill(c, k.fName)
+				g.assign(s, c.ChildByFieldId(k.fValue), false, true)
+			case k.varSpecList:
 				for j := range c.NamedChildCount() {
-					if spec := c.NamedChild(j); spec.Kind() == "var_spec" {
-						g.fill(spec, "name")
-						g.assign(spec, spec.ChildByFieldName("value"), false, true)
+					if spec := c.NamedChild(j); spec.KindId() == k.varSpec {
+						g.fill(spec, k.fName)
+						g.assign(spec, spec.ChildByFieldId(k.fValue), false, true)
 					}
 				}
 			}
 		}
-	case "const_declaration", "type_declaration":
+	case k.constDeclaration, k.typeDeclaration:
 		for i := range s.NamedChildCount() {
 			g.bindNames(s.NamedChild(i))
 		}
-	case "return_statement":
+	case k.returnStatement:
 		g.hoist(s)
 		id := g.node(flow.Jump, s)
 		g.uses(id, s)
@@ -491,29 +506,29 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 			}
 		}
 		b.Return()
-	case "break_statement":
+	case k.breakStatement:
 		g.node(flow.Jump, s)
 		b.Break(g.label(s))
-	case "continue_statement":
+	case k.continueStatement:
 		g.node(flow.Jump, s)
 		b.Continue(g.label(s))
-	case "goto_statement":
+	case k.gotoStatement:
 		g.node(flow.Jump, s)
 		b.Goto(g.label(s))
-	case "fallthrough_statement":
+	case k.fallthroughStatement:
 		// The enclosing switch carries the fringe into the next clause.
 		g.node(flow.Jump, s)
-	case "labeled_statement":
+	case k.labeledStatement:
 		g.labeled(s, labels)
-	case "if_statement":
+	case k.ifStatement:
 		g.ifStmt(s)
-	case "for_statement":
+	case k.forStatement:
 		g.forStmt(s, labels)
-	case "expression_switch_statement":
+	case k.expressionSwitchStatement:
 		g.switchStmt(s, labels, false)
-	case "type_switch_statement":
+	case k.typeSwitchStatement:
 		g.switchStmt(s, labels, true)
-	case "select_statement":
+	case k.selectStatement:
 		g.selectStmt(s, labels)
 	default:
 		// A statement the parser could not recognise keeps its reads.
@@ -525,45 +540,46 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 // isPanic reports whether e calls the predeclared panic.
 func (g *goLower) isPanic(e *ts.Node) bool {
 	e = g.l.unparen(e)
-	if e == nil || e.Kind() != "call_expression" {
+	if e == nil || e.KindId() != g.k.callExpression {
 		return false
 	}
-	f := e.ChildByFieldName("function")
-	return f != nil && f.Kind() == "identifier" && string(g.text(f)) == "panic" && g.binds.find(g.text(f), 0) < 0
+	f := e.ChildByFieldId(g.k.fFunction)
+	return f != nil && f.KindId() == g.k.identifier && string(g.text(f)) == "panic" && g.binds.find(g.text(f), 0) < 0
 }
 
 // labeled lowers a labelled statement. Go's break and continue name only an
 // enclosing for, switch or select, so the labels reach those frames; every
 // label is also its own node, the target of goto.
 func (g *goLower) labeled(s *ts.Node, labels []string) {
-	id := s.ChildByFieldName("label")
+	k := g.k
+	id := s.ChildByFieldId(k.fLabel)
 	name := string(g.text(id))
 	labels = append(labels, name)
 	g.b.Label(name, g.span(id))
 	var inner *ts.Node
 	for i := range s.NamedChildCount() {
-		if c := s.NamedChild(i); c.Kind() != "label_name" && c.Kind() != "comment" {
+		if c := s.NamedChild(i); c.KindId() != k.labelName && c.KindId() != k.comment {
 			inner = c
 			break
 		}
 	}
-	if inner != nil && inner.Kind() != "empty_statement" {
+	if inner != nil && inner.KindId() != k.emptyStatement {
 		g.stmt(inner, labels)
 	}
 }
 
 func (g *goLower) ifStmt(s *ts.Node) {
-	b := g.b
+	b, k := g.b, g.k
 	g.open()
-	if init := s.ChildByFieldName("initializer"); init != nil {
+	if init := s.ChildByFieldId(k.fInitializer); init != nil {
 		g.stmt(init, nil)
 	}
-	g.cond(s.ChildByFieldName("condition"))
+	g.cond(s.ChildByFieldId(k.fCondition))
 	p := b.Push()
-	g.block(s.ChildByFieldName("consequence"))
+	g.block(s.ChildByFieldId(k.fConsequence))
 	t := b.Push()
 	b.Restore(p)
-	if alt := s.ChildByFieldName("alternative"); alt != nil {
+	if alt := s.ChildByFieldId(k.fAlternative); alt != nil {
 		g.stmt(alt, nil)
 	}
 	b.Merge(t)
@@ -572,11 +588,11 @@ func (g *goLower) ifStmt(s *ts.Node) {
 }
 
 func (g *goLower) forStmt(s *ts.Node, labels []string) {
-	b := g.b
-	body := s.ChildByFieldName("body")
+	b, k := g.b, g.k
+	body := s.ChildByFieldId(k.fBody)
 	var clause, cond, update *ts.Node
 	for i := range s.NamedChildCount() {
-		if c := s.NamedChild(i); c.Kind() != "block" && c.Kind() != "comment" {
+		if c := s.NamedChild(i); c.KindId() != k.block && c.KindId() != k.comment {
 			clause = c
 			break
 		}
@@ -584,15 +600,15 @@ func (g *goLower) forStmt(s *ts.Node, labels []string) {
 	g.open()
 	switch {
 	case clause == nil:
-	case clause.Kind() == "range_clause":
+	case clause.KindId() == k.rangeClause:
 		g.rangeLoop(clause, body, labels)
 		g.close()
 		return
-	case clause.Kind() == "for_clause":
-		if init := clause.ChildByFieldName("initializer"); init != nil {
+	case clause.KindId() == k.forClause:
+		if init := clause.ChildByFieldId(k.fInitializer); init != nil {
 			g.stmt(init, nil)
 		}
-		cond, update = clause.ChildByFieldName("condition"), clause.ChildByFieldName("update")
+		cond, update = clause.ChildByFieldId(k.fCondition), clause.ChildByFieldId(k.fUpdate)
 	default:
 		cond = clause
 	}
@@ -629,23 +645,23 @@ func (g *goLower) forStmt(s *ts.Node, labels []string) {
 // value node use, so each depends on x as it was evaluated before the loop,
 // never on a definition of x in the body.
 func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
-	b := g.b
-	right := rc.ChildByFieldName("right")
+	b, k := g.b, g.k
+	right := rc.ChildByFieldId(k.fRight)
 	g.hoist(right)
 	rangeNode := g.node(flow.Stmt, right)
 	g.uses(rangeNode, right)
 	iter := b.Var()
 	b.Def(rangeNode, iter)
 	f := b.OpenLoop(labels...)
-	head := g.node(flow.Branch, g.token(rc, "range"))
+	head := g.node(flow.Branch, g.token(rc, k.rangeKw))
 	b.Use(head, iter)
 	exit := b.Push()
-	if left := rc.ChildByFieldName("left"); left != nil {
-		define := g.token(rc, ":=") != nil
+	if left := rc.ChildByFieldId(k.fLeft); left != nil {
+		define := g.token(rc, k.define) != nil
 		for i := range left.NamedChildCount() {
 			t := left.NamedChild(i)
 			x := g.l.unparen(t)
-			if t.Kind() == "comment" || (x.Kind() == "identifier" && g.blank(g.text(x))) {
+			if t.KindId() == k.comment || (x.KindId() == k.identifier && g.blank(g.text(x))) {
 				continue
 			}
 			var id int32
@@ -654,7 +670,7 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 				v := g.declare(x)
 				id = g.node(flow.Stmt, x)
 				b.Def(id, v)
-			case x.Kind() == "identifier":
+			case x.KindId() == k.identifier:
 				id = g.node(flow.Stmt, x)
 				if v := g.variable(x); v >= 0 {
 					b.Def(id, v)
@@ -688,16 +704,16 @@ func (g *goLower) rangeLoop(rc, body *ts.Node, labels []string) {
 // kills nothing), so each condition sees the tag's variables exactly as the
 // head read them.
 func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
-	b := g.b
+	b, k := g.b, g.k
 	g.open()
-	if init := s.ChildByFieldName("initializer"); init != nil {
+	if init := s.ChildByFieldId(k.fInitializer); init != nil {
 		g.stmt(init, nil)
 	}
 	// The tag's uses stay in buf[tag:tagEnd] until every case condition has
 	// them. They are read before a type switch declares its alias, so
 	// `switch x := x.(type)` reads the outer x.
 	tag := len(g.buf)
-	if value := s.ChildByFieldName("value"); value != nil {
+	if value := s.ChildByFieldId(k.fValue); value != nil {
 		g.hoist(value)
 		mlo := len(g.may)
 		g.collect(value)
@@ -715,11 +731,11 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 	base := len(g.hs)
 	for i := range s.NamedChildCount() {
 		var id int32
-		switch c := s.NamedChild(i); c.Kind() {
-		case "expression_case":
-			id = g.cond(c.ChildByFieldName("value"))
-		case "type_case":
-			id = g.nodeSpan(flow.Branch, g.fieldSpan(c, "type"))
+		switch c := s.NamedChild(i); c.KindId() {
+		case k.expressionCase:
+			id = g.cond(c.ChildByFieldId(k.fValue))
+		case k.typeCase:
+			id = g.nodeSpan(flow.Branch, g.fieldSpan(c, k.fType))
 		default:
 			continue
 		}
@@ -733,14 +749,14 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 		first = g.hs[base]
 	}
 	var ft flow.Fringe
-	fell, hasDefault, k := false, false, base
+	fell, hasDefault, next := false, false, base
 	for i := range s.NamedChildCount() {
 		c := s.NamedChild(i)
-		switch c.Kind() {
-		case "expression_case", "type_case":
-			b.Restore(g.hs[k])
-			k++
-		case "default_case":
+		switch c.KindId() {
+		case k.expressionCase, k.typeCase:
+			b.Restore(g.hs[next])
+			next++
+		case k.defaultCase:
 			b.Restore(dflt)
 			hasDefault = true
 		default:
@@ -774,14 +790,15 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 // v's variables, buf[tag:], and then declares and defines the alias x.
 func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
 	start, end := value.StartByte(), value.EndByte()
-	alias := s.ChildByFieldName("alias")
+	k := g.k
+	alias := s.ChildByFieldId(k.fAlias)
 	if alias != nil {
 		start = alias.StartByte()
 	}
 	for i := range s.ChildCount() {
-		if c := s.Child(i); !c.IsNamed() && c.Kind() == "type" {
+		if c := s.Child(i); c.KindId() == k.typeKw {
 			end = c.EndByte()
-			if rp := s.Child(i + 1); rp != nil && rp.Kind() == ")" {
+			if rp := s.Child(i + 1); rp != nil && rp.KindId() == k.rparen {
 				end = rp.EndByte()
 			}
 			break
@@ -792,7 +809,7 @@ func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
 	if alias == nil {
 		return head
 	}
-	if id := firstNamed(alias); id != nil && id.Kind() == "identifier" {
+	if id := firstNamed(alias); id != nil && id.KindId() == k.identifier {
 		if v := g.declare(id); v >= 0 {
 			g.b.Def(head, v)
 		}
@@ -800,21 +817,17 @@ func (g *goLower) typeSwitchHead(s, value *ts.Node, tag int) int32 {
 	return head
 }
 
-// fieldSpan spans every child of n in field name.
-func (g *goLower) fieldSpan(n *ts.Node, name string) flow.Span {
+// fieldSpan spans every child of n in field, or n when there is none.
+func (g *goLower) fieldSpan(n *ts.Node, field uint16) flow.Span {
 	s := g.span(n)
 	found := false
-	for i := range n.ChildCount() {
-		if n.FieldNameForChild(uint32(i)) != name {
-			continue
-		}
-		c := n.Child(i)
+	g.eachField(n, field, func(c *ts.Node) {
 		if !found {
 			s.Start = uint32(c.StartByte())
 			found = true
 		}
 		s.End = uint32(c.EndByte())
-	}
+	})
 	return s
 }
 
@@ -824,19 +837,19 @@ func (g *goLower) fieldSpan(n *ts.Node, name string) flow.Span {
 // select, and the choice among the clauses depends on them, so the head uses
 // them all.
 func (g *goLower) selectStmt(s *ts.Node, labels []string) {
-	b := g.b
+	b, k := g.b, g.k
 	f := b.OpenSwitch(labels...)
 	head := g.node(flow.Branch, s.Child(0))
 	lo, mlo := len(g.buf), len(g.may)
 	for i := range s.NamedChildCount() {
 		c := s.NamedChild(i)
-		if c.Kind() != "communication_case" {
+		if c.KindId() != k.communicationCase {
 			continue
 		}
-		switch comm := c.ChildByFieldName("communication"); {
+		switch comm := c.ChildByFieldId(k.fCommunication); {
 		case comm == nil:
-		case comm.Kind() == "receive_statement":
-			if right := comm.ChildByFieldName("right"); right != nil {
+		case comm.KindId() == k.receiveStatement:
+			if right := comm.ChildByFieldId(k.fRight); right != nil {
 				g.collect(right)
 			}
 		default:
@@ -850,13 +863,13 @@ func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 	clauses := false
 	for i := range s.NamedChildCount() {
 		c := s.NamedChild(i)
-		if c.Kind() != "communication_case" && c.Kind() != "default_case" {
+		if c.KindId() != k.communicationCase && c.KindId() != k.defaultCase {
 			continue
 		}
 		clauses = true
 		b.Restore(d)
 		g.open()
-		if comm := c.ChildByFieldName("communication"); comm != nil {
+		if comm := c.ChildByFieldId(k.fCommunication); comm != nil {
 			g.comm(comm)
 		}
 		g.stmts(c)
@@ -872,10 +885,11 @@ func (g *goLower) selectStmt(s *ts.Node, labels []string) {
 
 // comm lowers a select clause's send or receive.
 func (g *goLower) comm(c *ts.Node) {
-	if c.Kind() == "receive_statement" {
-		if left := c.ChildByFieldName("left"); left != nil {
-			g.fill(left, "")
-			g.assign(c, c.ChildByFieldName("right"), false, g.token(c, ":=") != nil)
+	k := g.k
+	if c.KindId() == k.receiveStatement {
+		if left := c.ChildByFieldId(k.fLeft); left != nil {
+			g.fill(left, 0)
+			g.assign(c, c.ChildByFieldId(k.fRight), false, g.token(c, k.define) != nil)
 			return
 		}
 	}
@@ -883,13 +897,16 @@ func (g *goLower) comm(c *ts.Node) {
 	g.uses(g.node(flow.Stmt, c), c)
 }
 
-// fill sets lefts to n's children in field name, or to its named children
-// when name is "".
-func (g *goLower) fill(n *ts.Node, name string) {
+// fill sets lefts to n's children in field, or to its named children other
+// than comments when field is 0, the id of no field.
+func (g *goLower) fill(n *ts.Node, field uint16) {
 	g.lefts = g.lefts[:0]
+	if field != 0 {
+		g.eachField(n, field, func(c *ts.Node) { g.lefts = append(g.lefts, c) })
+		return
+	}
 	for i := range n.ChildCount() {
-		c := n.Child(i)
-		if name == "" && c.IsNamed() && c.Kind() != "comment" || name != "" && n.FieldNameForChild(uint32(i)) == name {
+		if c := n.Child(i); c.IsNamed() && c.KindId() != g.k.comment {
 			g.lefts = append(g.lefts, c)
 		}
 	}
@@ -906,9 +923,9 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	g.rights = g.rights[:0]
 	switch {
 	case right == nil:
-	case right.Kind() == "expression_list":
+	case right.KindId() == g.k.expressionList:
 		for i := range right.NamedChildCount() {
-			if c := right.NamedChild(i); c.Kind() != "comment" {
+			if c := right.NamedChild(i); c.KindId() != g.k.comment {
 				g.rights = append(g.rights, c)
 			}
 		}
@@ -929,7 +946,7 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool) {
 	for i, n := range g.lefts {
 		x := g.l.unparen(n)
 		t := goTarget{id: x, left: i, v: -1}
-		if x.Kind() == "identifier" {
+		if x.KindId() == g.k.identifier {
 			switch name := g.text(x); {
 			case g.blank(name):
 			case define && !g.declaredHere(name):
@@ -1058,96 +1075,97 @@ func (g *goLower) readByOther(i int) bool {
 // the base of a field, index or indirect target) goes to may, and to buf as
 // well when the write also reads it (op=, ++/--).
 func (g *goLower) scan(n *ts.Node, base int) {
+	k := g.k
 	if g.l.isCallable(n) {
 		g.open()
-		for _, field := range [...]string{"parameters", "result"} {
-			if list := n.ChildByFieldName(field); list != nil && list.Kind() == "parameter_list" {
+		for _, field := range [...]uint16{k.fParameters, k.fResult} {
+			if list := n.ChildByFieldId(field); list != nil && list.KindId() == k.parameterList {
 				for i := range list.NamedChildCount() {
 					g.bindNames(list.NamedChild(i))
 				}
 			}
 		}
-		if body := n.ChildByFieldName("body"); body != nil {
+		if body := n.ChildByFieldId(k.fBody); body != nil {
 			g.scan(body, base)
 		}
 		g.close()
 		return
 	}
-	switch n.Kind() {
-	case "identifier":
+	switch n.KindId() {
+	case k.identifier:
 		if v := g.captured(n, base); v >= 0 {
 			g.buf = append(g.buf, v)
 		}
 		return
-	case "assignment_statement":
-		op := n.ChildByFieldName("operator")
-		read := op != nil && op.Kind() != "="
-		if left := n.ChildByFieldName("left"); left != nil {
+	case k.assignmentStatement:
+		op := n.ChildByFieldId(k.fOperator)
+		read := op != nil && op.KindId() != k.assign
+		if left := n.ChildByFieldId(k.fLeft); left != nil {
 			for i := range left.NamedChildCount() {
 				g.scanWrite(left.NamedChild(i), base, read)
 			}
 		}
-		if right := n.ChildByFieldName("right"); right != nil {
+		if right := n.ChildByFieldId(k.fRight); right != nil {
 			g.scan(right, base)
 		}
 		return
-	case "inc_statement", "dec_statement":
+	case k.incStatement, k.decStatement:
 		if e := firstNamed(n); e != nil {
 			g.scanWrite(e, base, true)
 		}
 		return
-	case "block", "if_statement", "for_statement", "expression_switch_statement", "select_statement",
-		"expression_case", "default_case", "type_case", "communication_case":
+	case k.block, k.ifStatement, k.forStatement, k.expressionSwitchStatement, k.selectStatement,
+		k.expressionCase, k.defaultCase, k.typeCase, k.communicationCase:
 		g.open()
 		g.scanChildren(n, base)
 		g.close()
 		return
-	case "type_switch_statement":
+	case k.typeSwitchStatement:
 		g.open()
-		for _, field := range [...]string{"initializer", "value"} {
-			if c := n.ChildByFieldName(field); c != nil {
+		for _, field := range [...]uint16{k.fInitializer, k.fValue} {
+			if c := n.ChildByFieldId(field); c != nil {
 				g.scan(c, base)
 			}
 		}
-		if alias := n.ChildByFieldName("alias"); alias != nil {
+		if alias := n.ChildByFieldId(k.fAlias); alias != nil {
 			for i := range alias.NamedChildCount() {
 				g.bind(g.text(alias.NamedChild(i)), -1)
 			}
 		}
 		for i := range n.NamedChildCount() {
-			if c := n.NamedChild(i); c.Kind() == "type_case" || c.Kind() == "default_case" {
+			if c := n.NamedChild(i); c.KindId() == k.typeCase || c.KindId() == k.defaultCase {
 				g.scan(c, base)
 			}
 		}
 		g.close()
 		return
-	case "short_var_declaration":
-		g.scan(n.ChildByFieldName("right"), base)
-		left := n.ChildByFieldName("left")
+	case k.shortVarDeclaration:
+		g.scan(n.ChildByFieldId(k.fRight), base)
+		left := n.ChildByFieldId(k.fLeft)
 		for i := range left.NamedChildCount() {
-			if id := left.NamedChild(i); id.Kind() == "identifier" && !g.declaredHere(g.text(id)) {
+			if id := left.NamedChild(i); id.KindId() == k.identifier && !g.declaredHere(g.text(id)) {
 				g.bind(g.text(id), -1)
 			}
 		}
 		return
-	case "var_spec":
-		if value := n.ChildByFieldName("value"); value != nil {
+	case k.varSpec:
+		if value := n.ChildByFieldId(k.fValue); value != nil {
 			g.scan(value, base)
 		}
 		g.bindNames(n)
 		return
-	case "const_spec", "type_spec", "type_alias":
+	case k.constSpec, k.typeSpec, k.typeAlias:
 		g.bindNames(n)
 		return
-	case "range_clause", "receive_statement":
-		left := n.ChildByFieldName("left")
+	case k.rangeClause, k.receiveStatement:
+		left := n.ChildByFieldId(k.fLeft)
 		if left == nil {
 			break
 		}
-		if right := n.ChildByFieldName("right"); right != nil {
+		if right := n.ChildByFieldId(k.fRight); right != nil {
 			g.scan(right, base)
 		}
-		define := g.token(n, ":=") != nil
+		define := g.token(n, k.define) != nil
 		for i := range left.NamedChildCount() {
 			if define {
 				g.bind(g.text(left.NamedChild(i)), -1)
@@ -1174,10 +1192,10 @@ func (g *goLower) captured(id *ts.Node, base int) int32 {
 // field, index or indirect target reads its operands and writes its captured
 // base.
 func (g *goLower) scanWrite(t *ts.Node, base int, read bool) {
-	if t.Kind() == "comment" {
+	if t.KindId() == g.k.comment {
 		return
 	}
-	if x := g.l.unparen(t); x.Kind() == "identifier" {
+	if x := g.l.unparen(t); x.KindId() == g.k.identifier {
 		if v := g.captured(x, base); v >= 0 {
 			if read {
 				g.buf = append(g.buf, v)
@@ -1198,4 +1216,68 @@ func (g *goLower) scanChildren(n *ts.Node, base int) {
 	for i := range n.NamedChildCount() {
 		g.scan(n.NamedChild(i), base)
 	}
+}
+
+// goSyntax holds the kind and field ids the Go lowering matches, resolved
+// once by name against the pinned grammar so the walk compares integers
+// rather than converting every node's kind or field to a string.
+type goSyntax struct {
+	identifier, parameterList, binaryExpression, unaryExpression, selectorExpression, indexExpression,
+	callExpression, expressionList, comment, statementList, block, labelName, emptyStatement,
+	expressionStatement, sendStatement, goStatement, deferStatement, incStatement, decStatement,
+	assignmentStatement, shortVarDeclaration, varDeclaration, varSpec, varSpecList, constDeclaration,
+	typeDeclaration, constSpec, typeSpec, typeAlias, returnStatement, breakStatement, continueStatement,
+	gotoStatement, fallthroughStatement, labeledStatement, ifStatement, forStatement, forClause, rangeClause,
+	expressionSwitchStatement, typeSwitchStatement, expressionCase, typeCase, defaultCase, selectStatement,
+	communicationCase, receiveStatement uint16
+
+	and, or, star, assign, define, rangeKw, typeKw, rparen uint16
+
+	fAlias, fAlternative, fBody, fCommunication, fCondition, fConsequence, fFunction, fInitializer, fLabel,
+	fLeft, fName, fOperand, fOperator, fParameters, fReceiver, fResult, fRight, fType, fUpdate, fValue uint16
+}
+
+var (
+	goSyntaxOnce  sync.Once
+	goSyntaxTable *goSyntax
+)
+
+// goSyntaxOf resolves the table once. A name the grammar does not define is
+// a lowering defect and panics, so a misspelt kind can never silently match
+// nothing.
+func goSyntaxOf() *goSyntax {
+	goSyntaxOnce.Do(func() {
+		const language = "go"
+		tl := mustGrammar(language)
+		kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
+		tok := func(name string) uint16 { return mustKind(tl, language, name, false) }
+		field := func(name string) uint16 { return mustField(tl, language, name) }
+		s := &goSyntax{}
+		s.identifier, s.parameterList, s.binaryExpression = kind("identifier"), kind("parameter_list"), kind("binary_expression")
+		s.unaryExpression, s.selectorExpression, s.indexExpression = kind("unary_expression"), kind("selector_expression"), kind("index_expression")
+		s.callExpression, s.expressionList, s.comment = kind("call_expression"), kind("expression_list"), kind("comment")
+		s.statementList, s.block, s.labelName, s.emptyStatement = kind("statement_list"), kind("block"), kind("label_name"), kind("empty_statement")
+		s.expressionStatement, s.sendStatement, s.goStatement = kind("expression_statement"), kind("send_statement"), kind("go_statement")
+		s.deferStatement, s.incStatement, s.decStatement = kind("defer_statement"), kind("inc_statement"), kind("dec_statement")
+		s.assignmentStatement, s.shortVarDeclaration = kind("assignment_statement"), kind("short_var_declaration")
+		s.varDeclaration, s.varSpec, s.varSpecList = kind("var_declaration"), kind("var_spec"), kind("var_spec_list")
+		s.constDeclaration, s.typeDeclaration = kind("const_declaration"), kind("type_declaration")
+		s.constSpec, s.typeSpec, s.typeAlias = kind("const_spec"), kind("type_spec"), kind("type_alias")
+		s.returnStatement, s.breakStatement, s.continueStatement = kind("return_statement"), kind("break_statement"), kind("continue_statement")
+		s.gotoStatement, s.fallthroughStatement, s.labeledStatement = kind("goto_statement"), kind("fallthrough_statement"), kind("labeled_statement")
+		s.ifStatement, s.forStatement, s.forClause, s.rangeClause = kind("if_statement"), kind("for_statement"), kind("for_clause"), kind("range_clause")
+		s.expressionSwitchStatement, s.typeSwitchStatement = kind("expression_switch_statement"), kind("type_switch_statement")
+		s.expressionCase, s.typeCase, s.defaultCase = kind("expression_case"), kind("type_case"), kind("default_case")
+		s.selectStatement, s.communicationCase, s.receiveStatement = kind("select_statement"), kind("communication_case"), kind("receive_statement")
+		s.and, s.or, s.star, s.assign = tok("&&"), tok("||"), tok("*"), tok("=")
+		s.define, s.rangeKw, s.typeKw, s.rparen = tok(":="), tok("range"), tok("type"), tok(")")
+		s.fAlias, s.fAlternative, s.fBody, s.fCommunication = field("alias"), field("alternative"), field("body"), field("communication")
+		s.fCondition, s.fConsequence, s.fFunction = field("condition"), field("consequence"), field("function")
+		s.fInitializer, s.fLabel, s.fLeft, s.fName = field("initializer"), field("label"), field("left"), field("name")
+		s.fOperand, s.fOperator, s.fParameters = field("operand"), field("operator"), field("parameters")
+		s.fReceiver, s.fResult, s.fRight = field("receiver"), field("result"), field("right")
+		s.fType, s.fUpdate, s.fValue = field("type"), field("update"), field("value")
+		goSyntaxTable = s
+	})
+	return goSyntaxTable
 }
