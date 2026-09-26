@@ -45,12 +45,14 @@ type Lowering struct {
 }
 
 // LoweringFor returns the lowering of language, for the languages that have
-// one: go and javascript.
+// one: go, java and javascript.
 func LoweringFor(language string) (*Lowering, bool) {
 	var l *Lowering
 	switch language {
 	case "go":
 		l = &goLowering
+	case "java":
+		l = &javaLowering
 	case "javascript":
 		l = &javascriptLowering
 	default:
