@@ -608,5 +608,24 @@ func TestJavaLoweringGolden(t *testing.T) {
 			fn:       1,
 			du:       []string{"x@20 -> x = 1@38", "x = 1@38 -> y = x + (x = 1)@29", "y = x + (x = 1)@29 -> return y;@46"},
 		},
+		{
+			// §15.25, §15.7.1. Nodes: c@24, x@31 (params), c@49 (the
+			// condition), x = 1@54 (the first arm: defines x, may-defines
+			// the conditional's result), 0@63 (the second arm, defining the
+			// result), y = x + (c ? (x = 1) : 0)@40 (Uses x and the result, defines y), return
+			// y;@67. Succ: c@49→{x = 1, 0}; both→the declarator→return.
+			// IPDom: c@49, x = 1, 0 → the declarator → return. Frontier walk:
+			// c@49 over x = 1 and 0. The assignment runs only on one arm, so
+			// the declarator keeps its read of x: it sees the parameter when
+			// c is false and x = 1 when c is true.
+			name:     "a read before an assignment in a conditional's arm stays on its consumer",
+			protects: "an earlier read is handed to an embedded assignment only when the assignment runs whenever the read's consumer does, so the definition before it still reaches the consumer on the path that skips it",
+			mutation: "hand the earlier read to the assignment unconditionally (loses x@31 -> y = x + (c ? (x = 1) : 0)@40, gains x@31 -> x = 1@54)",
+			src:      "class A { int f(boolean c, int x) { int y = x + (c ? (x = 1) : 0); return y; } }",
+			fn:       1,
+			cd:       []string{"c@49 -> x = 1@54", "c@49 -> 0@63"},
+			du: []string{"c@24 -> c@49", "x@31 -> y = x + (c ? (x = 1) : 0)@40", "x = 1@54 -> y = x + (c ? (x = 1) : 0)@40", "0@63 -> y = x + (c ? (x = 1) : 0)@40",
+				"y = x + (c ? (x = 1) : 0)@40 -> return y;@67"},
+		},
 	})
 }
