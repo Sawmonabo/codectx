@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // index runs one indexing pass, retrying exactly once from the capture when
@@ -319,6 +321,51 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	return nil
 }
 
+// forceSnapshotPaths makes detection see every path the pinned snapshot
+// holds, as the capture's own hooks made the capture admit them. Section 10.2
+// forces a tracked path past ignore rules and past the vendor and generated
+// exclusions, so a tracked `third_party/` project is in the manifest and is
+// planned from it; a detection walk that pruned it would propose no scope for
+// that project, and its unit would be planned with no detection to say the
+// provider sees it. The answers are point and range lookups on the stored
+// manifest, so nothing the size of the repository is held.
+//
+// A hook can only answer yes or no, so the first lookup that fails is kept and
+// every later hook answers no; the returned function reports it, and the
+// caller returns it once detection has finished. A path longer than any manifest path cannot be
+// in the snapshot and is simply not held.
+func (g *generation) forceSnapshotPaths(ctx context.Context, policy *workspace.Policy) func() error {
+	var hookErr error
+	store, id := g.c.opts.Store, g.snap.ID
+	policy.ForceInclude = func(rel string) bool {
+		if hookErr != nil || len(rel) > model.MaxPathBytes {
+			return false
+		}
+		held := false
+		hookErr = g.view.EachFile(ctx, model.FileSelection{Paths: []string{rel}}, func(fv model.FileVersion) error {
+			// A tombstone names a path this snapshot records as gone.
+			held = fv.Status != model.FileDeleted
+			return nil
+		})
+		return hookErr == nil && held
+	}
+	policy.ForceIncludeDir = func(rel string) bool {
+		prefix := rel + "/"
+		if hookErr != nil || len(prefix) > model.MaxPathBytes {
+			return false
+		}
+		// The manifest is ordered bytewise, so the first path after
+		// `rel/` lies beneath rel exactly when anything does.
+		page, err := store.SnapshotFiles(ctx, id, prefix, 1)
+		if err != nil {
+			hookErr = err
+			return false
+		}
+		return len(page) > 0 && strings.HasPrefix(page[0].Path, prefix)
+	}
+	return func() error { return hookErr }
+}
+
 // planUnits selects the providers and derives the plan. A full or rebuilding
 // run plans against no previous generation, so nothing is carried and no unit
 // imports a delta; a unit whose identity is nevertheless already sealed is
@@ -336,8 +383,12 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	hookErr := g.forceSnapshotPaths(ctx, &policy)
 	span.AddIn(int64(g.snap.FileCount))
 	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, policy, c.enablement)
+	if err == nil {
+		err = hookErr()
+	}
 	if err != nil {
 		return err
 	}
