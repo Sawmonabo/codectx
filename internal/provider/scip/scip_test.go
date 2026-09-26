@@ -551,7 +551,7 @@ func TestCallsiteAliasJoin(t *testing.T) {
 			if tc.zeroWidth {
 				occs = append([][]byte{occurrenceRecord(symI, 1, 1, 10, 10)}, occs...)
 			}
-			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, occs...)))
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentWithText("web/b.ts", "typescript", 0, files["web/b.ts"], occs...)))
 			inputs := append([]string{"utf16.scip"}, sourcePaths...)
 			p := newProvider(t, "utf16.scip")
 			h := providertest.New(t, files)
