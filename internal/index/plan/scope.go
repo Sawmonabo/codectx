@@ -78,11 +78,15 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		}
 		var out []semantic
 		for _, key := range sc.Scopes(det) {
-			if !isProfileScope(key) {
+			// Which of the two scope spellings a key is, and what a profile
+			// reserves, are both the scip package's answers: the planner
+			// parses no key. A key with no profile reservation is a supplied
+			// index.
+			mem, disk, isProfile := scip.ProfileReservation(key)
+			if !isProfile {
 				// A supplied index reads exactly one file: the index itself.
 				// It is recognized by rebuilding the scope key from each
-				// candidate path rather than by parsing the key, because the
-				// prefix that spells it is the scip package's own.
+				// candidate path, for the same reason.
 				out = append(out, semantic{providerID: d.ID, scopeKey: key,
 					contains: func(fv model.FileVersion) bool { return scip.ImportScope(fv.Path) == key }})
 				continue
@@ -91,12 +95,7 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			// its workspace invalidation scope declares; every retained file is
 			// an input. Its indexer is a heavy child, so the unit carries the
 			// memory and temporary disk the run reserves, for admission on the
-			// process's one ledger. A profile key with no figure is refused
-			// rather than planned with a reservation of zero.
-			mem, disk, ok := scip.ProfileReservation(key)
-			if !ok {
-				return nil, nil, internalErr("the scip provider planned profile scope " + key + " with no reservation")
-			}
+			// process's one ledger.
 			out = append(out, semantic{providerID: d.ID, scopeKey: key, allFiles: true,
 				admit:    admission.Reservation{MemoryBytes: mem, DiskBytes: disk},
 				contains: func(model.FileVersion) bool { return true }})
@@ -140,19 +139,6 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		return out, unplanned, nil
 	}
 	return nil, nil, internalErr("the planner does not know which unit scopes provider " + d.ID + " builds")
-}
-
-// isProfileScope reports whether a scip scope key names an indexer profile
-// rather than a supplied index, without parsing the key: the scip package owns
-// both spellings, and rebuilding the key from each known kind and the project
-// root the key claims is the only comparison that cannot drift from it.
-func isProfileScope(key string) bool {
-	for _, k := range scip.Kinds {
-		if root, ok := scip.ProfileRoot(key, k); ok && scip.ProfileScope(string(k), root) == key {
-			return true
-		}
-	}
-	return false
 }
 
 // semantic is one planned unit larger than a file, before its inputs are

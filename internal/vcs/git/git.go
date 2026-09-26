@@ -67,8 +67,9 @@ const (
 	// the caller's visit function consumes it, so while one visit blocks --
 	// a staging write waiting on a slow disk -- the pipe fills, Git blocks
 	// writing to it and burns no processor time. The window is therefore the
-	// same five minutes every other child hang detector in the product
-	// defaults to, far above either pause on a working host.
+	// five minutes the configured child hang detectors
+	// (providers.*.stall_timeout) default to, far above either pause on a
+	// working host.
 	DefaultStallWindow = 5 * time.Minute
 	// maxVersionBytes bounds that command's output; the line is short.
 	maxVersionBytes = 4 << 10
