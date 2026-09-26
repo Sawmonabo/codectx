@@ -97,9 +97,12 @@ import (
 // The lowerings use MayDef for writes they cannot place exactly. A
 // closure's write to an enclosing variable is a non-killing may-definition of
 // that variable at the node that creates the closure, in every lowering. A
-// write through a field, index or pointer, and the taking of an address that
-// may be written through, is a non-killing may-definition of its base
-// variable.
+// write through a field, index or pointer is a non-killing may-definition of
+// its base variable (p in `*p = 2`), never of the local a pointer refers to,
+// which is unknown without points-to analysis. Taking a local's address, or
+// borrowing it mutably, is a non-killing may-definition of that local at the
+// node that evaluates it; the lowerings state the one rule and what it gives
+// up.
 //
 // # Go defer
 //

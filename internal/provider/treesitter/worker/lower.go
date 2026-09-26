@@ -28,19 +28,51 @@ func Grammar(name string) (*ts.Language, bool) {
 //
 // # Address-taking
 //
-// Every lowering of a language that can take the address of a local, or
-// borrow it mutably, applies one rule: whatever receives the address may
-// write through it, so the expression is a non-killing may-definition of the
-// local at the node that evaluates it, and it kills nothing. That node also
-// Uses the operand's variables. The address of a field or an element is an
-// address into its base variable, so the base is the local may-defined. The
-// forms are `&x`, `&x.f` and `&a[i]` in Go, `&x`, `&s.f` and `&a[i]` in C and
-// C++, and `&mut x`, `&mut x.f` and `&mut a[i]` in Rust (a shared borrow `&x`
-// cannot write). An address a nested callable takes of an enclosing local is
-// one of the callable's writes, a may-definition on the node that creates
-// it, as its other writes are. An address taken implicitly, by a method call
-// on the local (a Go pointer-receiver method, a Rust `&mut self` method), is
-// not one, since telling it apart needs the receiver's type.
+// Every lowering applies one rule. A local gets a non-killing
+// may-definition, which kills nothing, at the node that evaluates the
+// operation, when any of these happens to it:
+//
+//   - its address is taken: `&x` in Go, C and C++, and `&x.f` and `&x[i]`,
+//     whose base local is x;
+//   - it is mutably borrowed: Rust `&mut x` (`&mut x.f`, `&mut x[i]`), and a
+//     `ref mut` binding in a pattern, which borrows the matched local;
+//   - a C++ reference is bound to it: `T &r = x`;
+//   - in C and C++, it is declared as an array and is evaluated anywhere
+//     other than as the operand of `sizeof`, `&` or a subscript, where it
+//     decays to its address.
+//
+// Whatever receives the address or reference may write through it, and a
+// may-definition of the base local is the conservative account of that
+// write: for a pointer or slice base the write lands in the object it refers
+// to, not in the local, so the may-definition over-approximates rather than
+// states where the storage is. That node also Uses the operand's variables.
+// The node is the one the evaluating expression attaches to, never "the next
+// node made": a lowering records the pending may-definition by position, as
+// it records reads, so an operand evaluated later cannot take it. An address
+// a nested callable takes of an enclosing local is one of the callable's
+// writes, a may-definition on the node that creates it, as its other writes
+// are.
+//
+// Given up, each for the stated reason:
+//
+//   - a write through a pointer or reference (`*p = 2`, `r = 2` for a C++
+//     reference r): without points-to analysis its target is unknown, and
+//     making every such write a may-definition of every address-taken local
+//     would connect every indirect write to every such local. The write
+//     is still a may-definition of the variable it writes through (p in
+//     `*p = 2` and `p->f = 2`), as every write through a field, index or
+//     pointer target is of its base variable, so a later read through p
+//     depends on it; what is given up is the local p points to;
+//   - the implicit receiver borrow of a method call (a Go pointer-receiver
+//     method, a Rust auto-referenced `&mut self` method, a C++ non-const
+//     member function): whether the call borrows depends on the method's
+//     signature;
+//   - a Rust shared borrow `&x` of an interior-mutable type (Cell, RefCell,
+//     an atomic), which can write: whether it can depends on the type.
+//
+// A Rust `move` closure's writes are not definitions of the outer variable:
+// the closure writes its own copy. Its reads are still the creating node's
+// reads.
 type Lowering struct {
 	// language names the grammar the kinds below are resolved against.
 	language string
