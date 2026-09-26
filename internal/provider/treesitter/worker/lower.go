@@ -54,20 +54,22 @@ func Grammar(name string) (*ts.Language, bool) {
 //     the deciding operand's node defines the variable, and the operand
 //     evaluated after it defines it again, so SSA merges the two;
 //   - an embedded assignment (`y = (x = a) * 2`, `f(o.f = a)`, `x := e`): the
-//     assignment's node. Its target is the variable when it is a local: the
-//     node defines x, which holds the value, and the consumer Uses x. A
-//     field, element or pointer target only may-defines its base, and the
-//     node defines the owned result;
+//     assignment's node. A local target is the node's definition, so the
+//     node may-defines the owned result (see below); a field, element or
+//     pointer target only may-defines its base, and the node defines the
+//     result. The consumer Uses the result in both cases, never the target:
+//     in `(x := 1) + (x := 2)` it depends on both assignments;
 //   - a callable's creation (a lambda, closure, local function, anonymous
 //     class, generator, comprehension, async block): the creating node,
 //     whose value is the created callable; it Uses the enclosing variables
 //     the callable captures, since reading them is its own evaluation.
 //
 // A node defines at most one variable (flow.Builder.Def). A yielding node
-// of a construct with several that already defines a variable (an arm whose
-// result is itself an assignment to a local, `c ? (x = 1) : 2`)
-// may-defines the result instead; the result has no definition outside its
-// construct's yielding nodes, so the pairs are the same.
+// that already defines a variable (an embedded assignment to a local, an arm
+// whose result is one, `c ? (x = 1) : 2`) may-defines the result instead.
+// The result has no definition outside its construct's yielding nodes and
+// each consumer reads it once, right after they run, so the may-definition
+// reaches the consumer exactly where a definition would.
 //
 // SSA merges the yielding definitions at the consumer, and the yielding
 // nodes carry the control dependence on the selector or condition that
