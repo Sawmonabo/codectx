@@ -164,11 +164,15 @@ Four findings follow, and each one changes a decision below.
    - In the Go corpus, 228,765 functions took 11.6 s to lower. Post-dominators, control dependence and def-use together
      took 0.54 s.
    - The cause is crossings into the parse-tree library: every access by field name allocated and freed a C string.
-3. **The structural stage's wall time is the store's lock, not the parse.**
+3. **The structural stage's wall time goes to unit work outside the parse, and that work is serialized through the
+   store's lock.**
    - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time is a
-     worker busy about 2% of the time.
-   - Every per-unit store call takes one group mutex (`internal/storage/sqlite/open.go:710`, `:830`). A unit makes
-     about ten such calls, plus one or two per extracted record.
+     worker busy about 2% of the time. That much is measured.
+   - The serialization point was found by reading, not by profiling. Every per-unit store call takes one group mutex
+     (`internal/storage/sqlite/open.go:710`, `:830`), and a unit makes about ten such calls, plus one or two per
+     extracted record.
+   - How the other 98% splits between waiting on the lock, SQL, worker re-execution and the provider barrier is not
+     yet measured. It is the benchmark task's first measurement.
 4. **A C++ header is parsed as C.**
    - `.h` belongs to the C grammar (`internal/provider/treesitter/lang/lang.go:79`).
    - In the compiler-infrastructure corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files.
@@ -420,7 +424,10 @@ A second public instance of each is pinned before its gate is claimed.
 - every construct the lowering handles has a case.
 
 Rust goldens are authored from the Rust Reference, with `?` on both `Result` and `Option` mandatory. Java goldens are
-authored from the Java Language Specification, chapters 14 and 15.
+authored from the Java Language Specification, chapters 14 and 15. The golden tables that exist now were each derived
+once, by the lane that wrote the lowering. So phase 0's equality gate is not claimed until a second, blind derivation of
+every case agrees. That derivation is made from the source text and the reference alone, without the lowering, its
+output or the first table.
 
 | phase | what becomes native | what still needs the engine at the end | the measured condition that ends it |
 |---|---|---|---|

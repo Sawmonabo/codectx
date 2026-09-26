@@ -37,7 +37,7 @@ from the kernel's available-memory figure between files" is not implemented.
 files ≥ 64 KiB have *lower* ratios (p50 17.7 / 17.9) than files < 4 KiB (p50 24.1 / 27.3, max up to 278.1); Go is flat
 (p50 21.0 vs 19.0). The need is affine where it is not flat (an intercept plus a slope), not a bare ratio. **All seven public corpora** (the corpus benchmark finished over llvm-project, kubernetes, elasticsearch,
 home-assistant core, vscode, the TypeScript checkout and rust-lang/rust, all at the commits of the corpus matrix, binary
-`b6dd3f6`; figures from its per-corpus aggregate, files ≥ 4 KiB): native bytes per source byte p50 9.6 (C,
+`36a529f`; figures from its per-corpus aggregate, files ≥ 4 KiB): native bytes per source byte p50 9.6 (C,
 llvm-project) to ≈ 17–26 for every other language; p99 up to 45.0 (C++, llvm-project) and 72.6 (Rust, rust-lang/rust);
 max 300.8 (C++, llvm-project). The largest single-file native need is 303.9 MiB for a 15.4 MiB C file (llvm-project) —
 **above** the 256 MiB constant — then 135.1 MiB for an 8.0 MiB TypeScript file (vscode) and 131.9 MiB for a 2.6 MiB

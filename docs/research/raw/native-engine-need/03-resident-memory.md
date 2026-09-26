@@ -2,7 +2,7 @@
 
 Date 2026-09-26. Evidence is the source at the branch head, the pinned parser library and grammar modules read in the
 Go module cache (cited as `<module>@<version> <path>:<line>`), pages fetched on this date (URLs inline), and the
-**finished** benchmark rows of three public corpora, produced by the benchmark binary built at `b6dd3f6`
+**finished** benchmark rows of three public corpora, produced by the benchmark binary built at `36a529f`
 (`internal/bench/flowbench_test.go` and `internal/bench/allocator.go` define every field):
 
 | corpus | commit | rows | what it exercises |

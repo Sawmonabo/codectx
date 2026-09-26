@@ -1,7 +1,7 @@
 # The native dependence engine: need-derived memory, least wall time, least resident memory, publication, and the corpora that judge it
 
 Research note for the codectx product owner, extending [20-native-engine-post-mvp](20-native-engine-post-mvp.md) and
-[ADR-0012](../adr/ADR-0012-native-dependence-engine.md). Research date 2026-09-26, at commit `b6dd3f6`.
+[ADR-0012](../adr/ADR-0012-native-dependence-engine.md). Research date 2026-09-26, at commit `36a529f`.
 
 **The direction it answers.** The product serves any enterprise codebase, superlarge included. It must size itself from
 what the repository and the machine in front of it need. It must produce the same outputs in the least wall time with
@@ -18,8 +18,8 @@ corpus is evidence for a design and never a constant in code.
 - `05` — corpora and goldens.
 - `06` — the dependence-core benchmark aggregate over the public corpus matrix.
 
-Every figure in the raw files cites `path:line` at `b6dd3f6` or a fetched URL. `06` was produced by the benchmark task
-from a test binary built at `b6dd3f6`, run memory-capped, one corpus at a time. This research ran no benchmark and never
+Every figure in the raw files cites `path:line` at `36a529f` or a fetched URL. `06` was produced by the benchmark task
+from a test binary built at `36a529f`, run memory-capped, one corpus at a time. This research ran no benchmark and never
 ran the product. Its only executions were the four KB-scale probes of `00`.
 
 ## 0. Bottom line
