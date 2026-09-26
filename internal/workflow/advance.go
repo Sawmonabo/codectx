@@ -12,7 +12,7 @@ import (
 // store deliberately does not check -- a resolved seed for a direct verify,
 // required-full coverage plus a current-scope review for verify -> consolidate
 // (or recorded waivers with allow_exploratory_waiver_consolidation), and
-// capsule-before-complete ordering. Owned by L1.
+// capsule-before-complete ordering.
 func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (_ model.WorkflowStatus, _ model.SessionStatus, err error) {
 	var (
 		noTransition model.WorkflowStatus
@@ -58,7 +58,7 @@ func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (_ mode
 // Close closes a session under the caller's expected version. Closing is
 // expressed as AdvanceRequest{Target: StateClosed}: there is no CloseSession on
 // the store and no edge out of complete, so closing a completed session is
-// CTX_VERSION_CONFLICT. Owned by L1.
+// CTX_VERSION_CONFLICT.
 func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedVersion int) (_ model.WorkflowStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.WorkflowStatus{}, err
@@ -188,7 +188,7 @@ func (s *Service) requireConsolidationReady(ctx context.Context, rec sqlite.Sess
 	// mirror-image mistake and the worse one: a waived and UNREAD required file
 	// contributes to that sum, so a session whose entire shortfall is waived
 	// never trips the guard, the branch below is never reached, and the
-	// default-false user flag ruling Q12 puts in front of the exploratory route
+	// default-false user flag in front of the exploratory route
 	// is bypassed. The shortfall is a read fact; the flag gates the exception.
 	if g.FullyRead < g.Required {
 		if g.Waived > 0 && s.limits.AllowExploratoryWaiverConsolidation {
@@ -218,10 +218,10 @@ func (s *Service) requireConsolidationReady(ctx context.Context, rec sqlite.Sess
 // session_id, so a crash between them is retried and never duplicated.
 //
 // buildCapsule does the whole seal -- hash, write-once PutCapsule and the
-// CTX_VERSION_CONFLICT comparison of the returned CanonicalHash (ruling Q11).
-// This guard therefore calls it and does nothing else with the result: INT
-// removed a second hash-write-compare sequence here, which was idempotent but
-// was a second spelling of the one sealing path.
+// CTX_VERSION_CONFLICT comparison of the returned CanonicalHash. This guard
+// therefore calls it and does nothing else with the result: a second
+// hash-write-compare sequence here would be idempotent but a second spelling of
+// the one sealing path.
 func (s *Service) sealCapsule(ctx context.Context, rec sqlite.SessionRecord) error {
 	m, err := s.sessions.Manifest(ctx, rec.ManifestID)
 	if err != nil {

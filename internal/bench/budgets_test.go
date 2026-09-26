@@ -892,8 +892,8 @@ var budgetRows = []budgetRow{
 // traversal is driven directly with those bounds rather than inferred from the
 // manifest, from the widest seed set a request may legally carry.
 //
-// It sweeps the depth as well as reporting the configured depth, because VF2's
-// evidence was a walk that TRUNCATED at the default depth on a 745-file
+// It sweeps the depth as well as reporting the configured depth, because the
+// evidence was a walk that TRUNCATED at the default depth on a small
 // workspace and completed only when the depth was narrowed: the number that
 // decides the pin is how the visited and edge counts grow per hop, and one
 // depth cannot show that.

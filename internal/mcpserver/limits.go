@@ -126,7 +126,7 @@ func waitFailed(ctx context.Context, what string) *model.Error {
 // handler runs. It is installed with (*mcp.Server).AddReceivingMiddleware, so
 // it wraps the session's method handler and no tools/call can route around it.
 //
-// It never manufactures a JSON-RPC error. Digest §5 reserves protocol errors
+// It never manufactures a JSON-RPC error. Protocol errors are reserved
 // for the SDK (unknown tool, malformed frame, unsupported method); a refused
 // call is a DOMAIN failure and goes back as a tool error carrying its Section
 // 22 code, which is also the only shape a client can read the code out of.

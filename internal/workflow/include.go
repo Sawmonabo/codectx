@@ -21,7 +21,7 @@ const includeTask = "context include"
 // IncludeManifest, which bumps the scope and state versions, appends
 // session_manifests and retains same-hash coverage. It never deletes an
 // observation -- the prior scope review stops satisfying readiness because the
-// scope version moved, not because anything was removed. Owned by L2.
+// scope version moved, not because anything was removed.
 func (s *Service) Include(ctx context.Context, req model.IncludeRequest) (_ model.SessionStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err

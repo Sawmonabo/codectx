@@ -133,12 +133,12 @@ func checkLimits(l Limits) error {
 }
 
 // OpenSession compiles nothing: it opens an actor-specific session over a
-// manifest Task 15 has already persisted, acquires the model.LeaseSession
+// manifest the compiler has already persisted, acquires the model.LeaseSession
 // retention lease that stops an expired session from resurrecting deleted
-// source, and answers the session id. Owned by L3.
+// source, and answers the session id.
 //
 // It deliberately reports no model.SessionStatus: workflow.Service.Status is the
-// only producer of one (ruling VF1), because a status this package built could
+// only producer of one, because a status this package built could
 // not answer the Section 16.3 gate and reported a weaker readiness under the
 // same field names. The composition root pairs the id with that status.
 //
@@ -239,11 +239,11 @@ func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
 }
 
 // Status reports this actor's coverage for this session: one page of per-file
-// records keyed on file_id. Owned by L3.
+// records keyed on file_id.
 //
 // The page is keyset paged on file_id, exactly as the store orders it. The
 // session-level counts are NOT reported here: workflow.Service.Status is the one
-// producer of a model.SessionStatus (ruling VF1), and the facade pairs this page
+// producer of a model.SessionStatus, and the facade pairs this page
 // with it.
 func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (_ model.Page[model.FileCoverage], err error) {
 	var emptyPage model.Page[model.FileCoverage]

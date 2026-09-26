@@ -54,7 +54,7 @@ type Services struct {
 	read bool
 }
 
-// Services is the one accessor Tasks 18 and 19 call. It is cheap: the services
+// Services is the one accessor the CLI and MCP adapters call. It is cheap: the services
 // it routes to were composed when the workspace opened.
 func (w *Workspace) Services() *Services { return &Services{w: w} }
 

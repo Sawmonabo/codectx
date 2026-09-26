@@ -1,6 +1,8 @@
 package search
 
-// L2 owns this file: the exact and prefix retrieval tiers (exact_path, exact_qualified_name, qualified_name_prefix, exact_name) that serve resolve, document-symbols, workspace-symbols and definition.
+// The exact and prefix retrieval tiers (exact_path, exact_qualified_name,
+// qualified_name_prefix, exact_name) that serve resolve, document-symbols,
+// workspace-symbols and definition.
 
 import (
 	"container/list"
@@ -14,8 +16,8 @@ import (
 )
 
 // exactReader is the pinned read surface the four non-lexical tiers need. It
-// exists so the tiers depend on the frozen signatures of digest §2 rather than
-// on the concrete reader: every method below is *sqlite.PinnedReader's, byte
+// exists so the tiers depend on the reader's method signatures rather than on
+// the concrete reader: every method below is *sqlite.PinnedReader's, byte
 // for byte, and the assertion under it makes that a build-time fact.
 type exactReader interface {
 	Node(ctx context.Context, id model.NodeID) (sqlite.StoredNode, error)
@@ -35,7 +37,7 @@ var _ exactReader = (*sqlite.PinnedReader)(nil)
 // candidate has no lexical rowid, so the packed hydration cannot serve it -- no
 // segment holds a document for it, and a rowid nothing packs is omitted, which
 // would drop the candidate silently. Everything model.SearchHit needs
-// except Q10's Range is already here — Kind, Name, QualifiedName, Signature,
+// except Range is already here — Kind, Name, QualifiedName, Signature,
 // FileID and Bytes on the node, Path beside it.
 type exactHit struct {
 	Tier model.SearchTier
@@ -43,7 +45,7 @@ type exactHit struct {
 	Node sqlite.StoredNode
 }
 
-// exactTiers is the digest §4 ranking order of the non-lexical tiers, most to
+// exactTiers is the ranking order of the non-lexical tiers, most to
 // least specific. exact_path is not in it: it is keyed by a path, not by a
 // symbol query, so exactCandidates runs it separately.
 var exactTiers = [...]model.SearchTier{
@@ -300,7 +302,7 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 // corpus-sized slice of node_ids never holds more than one keyset page of
 // candidates at a time.
 //
-// Every candidate scores 0 (digest §4, Q6): tier rank, not score, separates the
+// Every candidate scores 0: tier rank, not score, separates the
 // exact tiers, and a candidate that also matched lexically keeps that score when
 // the two are folded together.
 //
@@ -321,8 +323,8 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		// One row per node: where several units publish the same node fact,
 		// Nodes applies the Section 9.4 read-time precedence order (verified
 		// source binding, then provider id, then unit key) inside the query
-		// itself (storage/sqlite/query.go:138-143). Ruling Q1/Q8 puts that
-		// mechanism in storage and this note where Nodes is consumed: nothing
+		// itself. The mechanism lives in storage and this note where Nodes is
+		// consumed: nothing
 		// in this package re-ranks or re-folds provider ids, and a nil-aware
 		// clause would be added here only if a leg showed a nil-valued row
 		// winning.

@@ -105,7 +105,7 @@ func TestCapsuleRecordCeilingsAreUnlimitedByDefault(t *testing.T) {
 	}
 }
 
-// TestCapsuleSealStreamsTheSessionThreePerList protects ruling D3: the seal
+// TestCapsuleSealStreamsTheSessionThreePerList protects the streaming seal: it
 // makes three bounded passes over the SESSION STORE -- count, hash, write --
 // and retains no list between them.
 //

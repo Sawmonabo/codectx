@@ -1220,7 +1220,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// capture publishes the same content again; otherwise a snapshot could
 	// name a blob that collection is about to remove.
 	//
-	// L3a row (b). The restore keeps the demoted row's blob_blocks and
+	// Grace protocol row (b). The restore keeps the demoted row's blob_blocks and
 	// line_checkpoints -- that is why the grace protocol deletes the blobs row
 	// and lets the cascade take them, never the other way round. A restore
 	// that produced a ready blob with no blocks reads as present everywhere
@@ -1925,7 +1925,7 @@ func blobRowCounts(t *testing.T, raw *sql.DB, hash []byte) (blocks, lines int) {
 	return blocks, lines
 }
 
-// L3a row (a). The Section 10.4 grace protocol deletes a blob only after a
+// Grace protocol row (a). The Section 10.4 grace protocol deletes a blob only after a
 // further reachability check made inside the deleting transaction. A blob that
 // becomes referenced again after it was trashed -- an open session's manifest,
 // a unit input written while the collector was between phases -- must be

@@ -1,6 +1,7 @@
 package search
 
-// L2 owns this file: the Resolve endpoint's keyset paging over the tier-ordered exact and prefix candidates.
+// The Resolve endpoint's keyset paging over the tier-ordered exact and prefix
+// candidates.
 
 import (
 	"context"
@@ -122,7 +123,7 @@ func resolveLimit(limit int) int {
 	return limit
 }
 
-// resolveKey is digest §5's keyset key: the tier rank, then the within-tier
+// resolveKey is the resolve keyset key: the tier rank, then the within-tier
 // keyset position that tier pages on. For the symbol tiers, which page on
 // node_id, that position is the node id; for the exact_path tier, which pages
 // on (start_byte, node_id), it is those two joined the same way. Both stay far
@@ -286,8 +287,8 @@ func isDeclaration(n sqlite.StoredNode) bool {
 
 // lspUnavailable is the Section 11.6 answer to semantic_source=lsp: an explicit
 // unavailable capability for the operation that was asked for, never a silently
-// substituted canonical answer. Task 13 is canonical-only, so this returns
-// before any storage read. The capability is named with the operation's own
+// substituted canonical answer. Search serves canonical facts only, so this
+// returns before any storage read. The capability is named with the operation's own
 // Section 18.1 wire spelling, which is the thing the caller cannot have.
 func lspUnavailable(req model.SymbolRequest) model.CapabilityState {
 	id := "lsp"

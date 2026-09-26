@@ -667,8 +667,8 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 // decodeSignature reads Signature.text, bounded at the signature ceiling. A
 // longer signature is TRUNCATED and flagged, not discarded: a 4 096-byte
 // prefix of a signature answers most questions about the symbol, and this
-// producer yielding nothing where treesitter/facts.go:220 yields a prefix was
-// the whole of F26. Only the prefix is ever read, so a signature of any size
+// producer yielding nothing where the structural provider yields a prefix
+// would make the two disagree. Only the prefix is ever read, so a signature of any size
 // costs the ceiling and not itself.
 //
 // The second result is the ORIGINAL encoded length when the text was cut, and

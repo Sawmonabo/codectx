@@ -246,7 +246,7 @@ func assertWalkDirs(t *testing.T, root Root, policy Policy, want []string) {
 	}
 }
 
-// TestFileBudgetIsReportedNotRefused protects the scale-posture ruling at the
+// TestFileBudgetIsReportedNotRefused protects the scale posture at the
 // walk's own budget: a repository holding more files than a user-set
 // workspace.max_files is captured in full, and the operator learns the budget
 // was passed. The behaviour this replaces refused the whole repository, so a

@@ -1,6 +1,6 @@
 package search
 
-// L4 owns this file: the wire format of one candidate inside the query's own
+// The wire format of one candidate inside the query's own
 // external sort runs.
 
 import (

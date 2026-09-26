@@ -27,7 +27,7 @@ import (
 // otherwise the insert fails on a constraint and takes `codectx index` down
 // instead of publishing the degraded generation it built.
 //
-// The second assertion is the one the FX-G21-A fold left open. The two rows
+// The second assertion covers the scope sum. The two rows
 // that collide there stand for DISJOINT scope sets, so the survivor must carry
 // their sum: keeping only the winner's `scopes` reported a smaller set than the
 // row represents while the report claimed nothing was omitted.

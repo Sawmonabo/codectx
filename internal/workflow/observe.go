@@ -14,7 +14,7 @@ import (
 // every citation was already confirmed served to this actor, validates a scope
 // review against the eight required categories, derives the id through
 // model.NewObservationID -- the one Section 17.2 preimage -- and writes through
-// PutObservation. Owned by L3.
+// PutObservation.
 //
 // The per-kind reference rules (at least one relation for accept/reject, at
 // least two distinct claims for a contradiction, a specific node, relation or
@@ -97,7 +97,7 @@ func (s *Service) Record(ctx context.Context, req model.ObservationRequest) (mod
 // Waive records one required-file waiver and reports the resulting status. A
 // waiver is an honest admission that a required file was not read: it never
 // grants strict readiness, and SessionStatus.Validate refuses the combination
-// outright. Owned by L3 (ownership unassigned in the lane plan -- see report).
+// outright.
 //
 // context.allow_exploratory_waiver_consolidation is not consulted here: it
 // gates the verify_open -> consolidate_open transition, not the recording of
@@ -128,12 +128,12 @@ func (s *Service) Waive(ctx context.Context, req model.WaiverRequest) (model.Wai
 // currentReview returns this actor's scope review for the session's current
 // scope version and manifest hash, or nil when none is current. A review from a
 // superseded scope version is not current and does not satisfy the gate.
-// Owned by L3.
 //
-// Its consumer is L4's readiness (digest Section 7, precondition 4), which is
-// the only place a current review is an input; Record does not call it, because
-// a resubmitted observation is already idempotent on the content-derived id and
-// a second review at the same scope version is a new record, not a conflict.
+// Its consumers are readiness (Section 16.3, the current-scope review
+// precondition) and Advance's verify -> consolidate guard, the two places a
+// current review is an input. Record does not call it, because a resubmitted
+// observation is already idempotent on the content-derived id and a second
+// review at the same scope version is a new record, not a conflict.
 func (s *Service) currentReview(ctx context.Context, rec sqlite.SessionRecord, manifestHash string) (*model.Observation, error) {
 	var newest *model.Observation
 	var after model.ObservationID
@@ -168,7 +168,7 @@ func (s *Service) currentReview(ctx context.Context, rec sqlite.SessionRecord, m
 // citationsServed proves every source citation on the given references names an
 // interval already confirmed served to this actor at that content hash, through
 // Sessions.RangeConfirmed. This is what stops a review from marking a file read
-// without the coverage to back it. Owned by L3.
+// without the coverage to back it.
 //
 // Containment is answered in SQL over served_ranges: no interval list crosses
 // into Go and this package merges nothing. An interval spanning the gap between
@@ -254,7 +254,7 @@ func (s *Service) reviewSupported(ctx context.Context, rec sqlite.SessionRecord,
 // served; it does not prove the file was read end to end, and the claim being
 // made here is the stronger one.
 //
-// Per-file coverage state has no other source on the frozen Sessions surface --
+// Per-file coverage state has no other source on the Sessions surface --
 // CoverageSummary answers counts and cannot say which file is short -- so this
 // pages Coverage, bounded by the configured page size and stopped as soon as
 // every cited file is resolved or the keyset has run past the last of them. It

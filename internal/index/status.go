@@ -744,7 +744,7 @@ func (r *capabilityReport) addUnavailable(providerID, capability string) {
 }
 
 // addDeferred publishes the row of a capability whose work is still running in
-// the background (Section 11.6, ruling Q9): the deferred scope has no member in
+// the background (Section 11.6): the deferred scope has no member in
 // this generation, so the capability cannot be reported as fresh coverage.
 //
 // A `fresh` row already recorded for one of the provider's other scopes is
