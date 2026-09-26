@@ -150,7 +150,7 @@ func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord,
 // closed session fails here: only the reporting paths carry on beside
 // CTX_SESSION_EXPIRED, and a confirmation is a mutation.
 //
-// It reports no status of its own (ruling VF1): the facade reads the gate-aware
+// It reports no status of its own: the facade reads the gate-aware
 // model.SessionStatus from workflow.Service.Status after this returns, so what
 // the caller sees is the coverage this call just granted, judged by the one
 // readiness evaluator.

@@ -572,8 +572,7 @@ func TestMaterializeCopiesExactlyTheSelectedFiles(t *testing.T) {
 // of the scale posture: the walk now skips an unrepresentable path and reports
 // a passed file budget instead of failing, so the capture is only honest if
 // both reach Notes. Without this, the walk's report sink could be unset in the
-// one walk that matters and every skip would be silent again -- the class-G
-// defect this replaces, moved one layer up.
+// one walk that matters and every skip would be silent.
 func TestCaptureReportsSkippedAndOverBoundPaths(t *testing.T) {
 	f := newFixture(t, false)
 	f.write("a.go", []byte("package p\n"), 0o644)

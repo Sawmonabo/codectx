@@ -28,7 +28,7 @@ import (
 // activated generation are the smallest corpus that can separate the exact
 // tiers from lexical BM25, exercise an indexed prefix range, carry a Unicode
 // identifier and a literal-punctuation body through the FTS encoder, and fold
-// two occurrences of one node into one hit. Every Task 13 lane asserts against
+// two occurrences of one node into one hit. Every leg asserts against
 // this one corpus so a ranking change cannot be hidden behind a private
 // fixture.
 const (
@@ -80,8 +80,8 @@ type fixture struct {
 	hashes  map[string]string
 }
 
-// newFixture builds and activates the corpus. It runs at every lane's entry so
-// a corpus that no longer publishes is a failure here, not five lanes later.
+// newFixture builds and activates the corpus once per scenario, so a corpus
+// that no longer publishes is a failure here rather than in a later leg.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
@@ -237,8 +237,8 @@ func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc
 	}
 }
 
-// newService builds the service under test over the fixture. The fill-in lanes
-// call it; at the skeleton commit New is not implemented yet.
+// newService builds the service under test over the fixture and closes it
+// when the test ends.
 func newService(t *testing.T, o Options) *Service {
 	t.Helper()
 	s, err := New(o)
@@ -249,27 +249,18 @@ func newService(t *testing.T, o Options) *Service {
 	return s
 }
 
-// leg is one scenario leg. Each Task 13 lane appends its legs under its own
-// marker below, so the inserts never touch the same lines.
+// leg is one scenario leg, named by the component it exercises.
 type leg struct {
 	name string
 	run  func(t *testing.T, f *fixture)
 }
 
-// TestSearchRankingScenario is the single Task 13 scenario: one corpus, one
-// activated generation, every leg a lane contributes. It guards determinism of
+// TestSearchRankingScenario is the package's single scenario: one corpus, one
+// activated generation, every leg. It guards determinism of
 // the Section 14.2 ranking -- a silent reordering or score drift would serve
 // different context for identical inputs.
 func TestSearchRankingScenario(t *testing.T) {
 	legs := []leg{
-
-		// L1 STORAGE rows
-
-		// L2 EXACT rows
-
-		// L3 LEXICAL rows
-
-		// L4 RANK rows
 		{"rank/less_orders_the_full_tie_break_chain", legLessChain},
 		{"rank/quantization_is_the_only_float_boundary", legQuantization},
 		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
@@ -284,28 +275,20 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"cursor/tampered_expired_and_foreign_cursors_are_rejected", legCursorRejections},
 		{"cursor/resolve_pages_by_a_bounded_keyset", legResolveKeyset},
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
-
-		// FX-C13b rows
-		{"fix/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
-		{"fix/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
-		{"fix/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
-		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
-		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
-		{"fix/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
-		{"fix/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
-		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
-
-		// rows added with the ranking fix
-		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
-		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
-		{"fix/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
-
-		// rows added with the tokenizer fix
-		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
-
-		// rows added with the capability-state fix
-		{"fix/a_two_offset_node_is_served_at_the_precedence_winner",
+		{"exact/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
+		{"exact/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
+		{"exact/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
+		{"exact/a_two_offset_node_is_served_at_the_precedence_winner",
 			legTwoOffsetNodeServesThePrecedenceWinner},
+		{"cursor/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
+		{"page/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
+		{"page/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
+		{"page/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
+		{"page/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
+		{"page/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
+		{"page/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
+		{"resolve/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
+		{"resolve/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -314,9 +297,9 @@ func TestSearchRankingScenario(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L4 RANK + CURSORS legs.
+// Ranking and cursor legs.
 //
-// The legs below guard the two invariants this lane owns. Ranking determinism:
+// The legs below guard two invariants. Ranking determinism:
 // identical inputs must produce byte-identical ordering and byte-identical
 // ScoreMicros on every release target, which is why every assertion here is an
 // exact int64 and never "a is before b". Cursor integrity: a continuation must
@@ -409,7 +392,7 @@ func legLessChain(t *testing.T, _ *fixture) {
 func withQName(s scored, q string) scored     { s.Hit.QualifiedName = q; return s }
 func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
 
-// legFoldOrderIndependent is the certification F9 invariant in one package:
+// legFoldOrderIndependent is the fold-order invariant in one package:
 // the served answer must be a pure function of the candidates, never of the
 // order they arrive in. A delta re-index walks the lexical tier in a different
 // search_units.doc_id order than a fresh index of the same tree does -- a
@@ -503,7 +486,7 @@ func legQuantization(t *testing.T, _ *fixture) {
 	}
 }
 
-// legDedupFolds proves digest §4 deduplication: one entity, one hit, the
+// legDedupFolds proves deduplication: one entity, one hit, the
 // lowest tier seen, the lexical score kept, occurrences summed. Folding after
 // paging (or not at all) would serve one node twice inside one page and
 // understate its occurrence count.
@@ -685,7 +668,7 @@ func legQueryHash(t *testing.T, _ *fixture) {
 	}
 }
 
-// legCursorRejections proves digest §5: a tampered, expired, cross-endpoint,
+// legCursorRejections proves cursor integrity: a tampered, expired, cross-endpoint,
 // repinned or requeried cursor is CTX_CURSOR_INVALID. Accepting any of them
 // serves a page from a generation or question the caller never asked about.
 func legCursorRejections(t *testing.T, f *fixture) {
@@ -783,9 +766,9 @@ func legResolveKeyset(t *testing.T, f *fixture) {
 	}
 }
 
-// stubFiles and stubBlobs stand in for the pinned reader and the store while
-// the integration lane decides how the CAS reaches this package (see the
-// report). The CAS itself is real: the bytes, the block digests and the line
+// stubFiles and stubBlobs stand in for the pinned reader and the store behind
+// the hydrator's fileReader and blobReader, so the leg decides exactly which
+// file and blob a hit resolves to. The CAS itself is real: the bytes, the block digests and the line
 // checkpoints under test all come from snapshot.CAS.
 type stubFiles map[model.FileID]model.FileVersion
 
@@ -826,7 +809,7 @@ func (c *countingCAS) ReadRange(ctx context.Context, rec model.BlobRecord, r mod
 	return c.cas.ReadRange(ctx, rec, r)
 }
 
-// legRangeHydration proves digest §4/Q10: a served hit carries a real source
+// legRangeHydration proves that a served hit carries a real source
 // range, resolved from the nearest line checkpoint through the one position
 // implementation, reading a bounded window. A nil Range is a silent capability
 // reduction, and a hand-rolled line count would disagree with source.Cursor at
@@ -905,7 +888,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 		t.Error("hydration accepted a span count that does not match its hits")
 	}
 
-	// VF4(a): a blob whose line checkpoints do NOT reach the hit. On a real
+	// (a) A blob whose line checkpoints do NOT reach the hit. On a real
 	// repository this failed the WHOLE answer with CTX_RESOURCE_LIMIT ("would
 	// read past the bounded window") because one file's checkpoints stopped
 	// short of byte 1.7 M. The gap is walked a window at a time instead, so
@@ -984,7 +967,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 			longCounter.bytes, longSpan.End)
 	}
 
-	// Cancellation and deadline are different answers (digest §6).
+	// Cancellation and deadline are different answers (Section 22).
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	assertCode(t, "canceled", h.hydratePage(canceled, hits, []model.ByteRange{span}), model.CodeCanceled)
@@ -1069,8 +1052,8 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 		t.Error("the query returned no lexical hit to score")
 	}
 	for i, hit := range page.Items {
-		// Digest §4 zeroes the exact and prefix tiers "unless the document
-		// also matched lexically, keeping that score", which is exactly what
+		// The exact and prefix tiers score zero unless the document also
+		// matched lexically, keeping that score, which is exactly what
 		// the top hit here does: its node's two lexical documents fold into
 		// the exact candidate. The exemption is read off the hit's own
 		// reasons, with the production spelling, so it can only apply to a
@@ -1108,8 +1091,8 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 }
 
 // ---------------------------------------------------------------------------
-// FX-C13b regression legs. Each guards one behavioural fix that the review
-// showed no test could see: mutating the fixed line left the suite green.
+// Exact-tier, paging and resolve legs. Each guards one behaviour no other leg
+// sees: mutating the guarded line leaves every other leg green.
 // ---------------------------------------------------------------------------
 
 // stubExact is a pinned read surface holding one file whose declarations are
@@ -1662,8 +1645,8 @@ func rankOrder(t *testing.T, run *pagination.SortedRun[scored]) ([]scored, error
 // legRankedSetIsBoundedByItsRunBudget proves the ranked set is sized by the
 // query memory admission and not by the number of matches. A one-character
 // qualified_name_prefix range-scans a corpus-sized slice of node_ids and every
-// match enters this set (H-L5b concern 2); at 200 000 matches the former
-// map-plus-slice collector held 200 000 entries plus 200 000 servable hits.
+// match enters this set; at 200 000 matches a map-plus-slice collector would
+// hold 200 000 entries plus 200 000 servable hits.
 //
 // The assertion is the sort's live-record high-water mark, which is
 // deterministic and input-independent: it must be IDENTICAL at 20 000 and at
@@ -1709,7 +1692,7 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
 
 }
 
-// legDeadlineEndsThePage is ruling Q4 for search: resources.query_timeout ends
+// legDeadlineEndsThePage is the deadline rule for search: resources.query_timeout ends
 // a PAGE, not an answer. On a real repository this endpoint answered
 // CTX_QUERY_DEADLINE with no page and no cursor, so the widest queries -- the
 // only ones that ever reach the deadline -- were unanswerable rather than
@@ -1753,7 +1736,7 @@ func legDeadlineEndsThePage(t *testing.T, f *fixture) {
 	}
 }
 
-// legUnboundedQueryAnswersInFull is the other half of ruling Q4, and the half a
+// legUnboundedQueryAnswersInFull is the other half of the deadline rule, and the half a
 // shipped default now depends on: resources.query_timeout is unlimited by
 // DEFAULT, and it is a default and never a ceiling.
 //
@@ -2051,7 +2034,7 @@ func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
 // can carry a node at two offsets.
 //
 // It is built apart from the ranking corpus on purpose: fixtureDocs is the one
-// corpus every Task 13 leg asserts against, and a second declaration of one of
+// corpus every other leg asserts against, and a second declaration of one of
 // its nodes would move the answers those legs pin. No search units are
 // published here, so no lexical tier answers and the hit count below is exactly
 // what the exact_path tier emitted.

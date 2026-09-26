@@ -916,7 +916,7 @@ func TestUserSetImportBoundsAreReportedNotRefused(t *testing.T) {
 	}
 }
 
-// TestOverLimitSignatureIsTruncatedNotDropped protects F26: the two producers
+// TestOverLimitSignatureIsTruncatedNotDropped protects signature parity: the two producers
 // of a signature must answer the same way. The structural provider truncates a
 // long signature to its ceiling and flags the cut; this one used to discard it
 // whole, so the same symbol carried a usable prefix from one and nothing at

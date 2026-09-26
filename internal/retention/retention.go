@@ -90,9 +90,10 @@ type Options struct {
 
 // RetentionConfig is the configuration the collector reads, restated so this
 // package takes no dependency on the shape of the whole config tree. DataDir
-// is the absolute data directory; ClosedSessionRetention is the today-dead
-// `storage.closed_session_retention` key L3b gives its first reader; GraceWindow
-// is how long a trashed blob waits before L3a's second reachability check.
+// is the absolute data directory; ClosedSessionRetention is the
+// `storage.closed_session_retention` window the session sweep prunes by;
+// GraceWindow is how long a trashed blob waits before the grace protocol's
+// second reachability check.
 type RetentionConfig struct {
 	DataDir                string
 	ClosedSessionRetention time.Duration
@@ -190,8 +191,8 @@ func New(opts Options) (*Collector, error) {
 	return &Collector{opts: opts}, nil
 }
 
-// Collect runs one pass: the sweeps first (L3b), then the blob grace protocol
-// (L3a), because a session or spool released by a sweep is what makes a blob
+// Collect runs one pass: the sweeps first, then the blob grace protocol,
+// because a session or spool released by a sweep is what makes a blob
 // unreferenced in the same pass rather than the next one.
 //
 // The grace protocol runs even when a sweep step failed, and the two errors are

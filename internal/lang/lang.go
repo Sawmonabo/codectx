@@ -1,13 +1,10 @@
-// Package lang is the single path-to-language table of the codebase (ruling
-// R7-4 and the Task 7 fix-round ruling that unified it with the snapshot
-// manifest's table). A path becomes a language tag here and nowhere else, so
+// Package lang is the single path-to-language table of the codebase, shared by
+// the filesystem provider and the snapshot manifest. A path becomes a language tag here and nowhere else, so
 // the tag a snapshot records in its manifest and the tag a provider selects
 // files by can never drift apart.
 //
-// The table is the union of the two tables that had diverged: it returns the
-// same tag for every path the snapshot table recognized, and recognizes the
-// documentation, build and configuration extensions the filesystem provider
-// added. Classification is by extension and basename only: no file is opened
+// The table covers source languages and the documentation, build and
+// configuration extensions the filesystem provider classifies. Classification is by extension and basename only: no file is opened
 // to guess, and a path with no entry honestly has no language.
 package lang
 

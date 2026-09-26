@@ -230,7 +230,7 @@ which order its dependencies completed.
 
 ## Conformance harness
 
-`internal/provider/providertest` is the shared fixture Tasks 7–11 build on.
+`internal/provider/providertest` is the shared fixture every provider test builds on.
 `New(t, files)` stands up the real store, CAS, snapshot view, staging
 generation and confined workspace root over a small file set; `Plan`, `Begin`
 and `Run` drive a unit through exactly the production `BeginUnit`, sink,
