@@ -216,6 +216,20 @@ var goLowering = Lowering{
 // resolving to a variable is a use (a map key is an expression; a struct
 // field key cannot be told apart without types).
 //
+// A name that resolves to no variable of the function (a package-level
+// name, an undeclared name, a constant or type) follows Lowering's "Names
+// that resolve to no variable". In Go it can stand as a target of an
+// assignment of one or several targets, an `op=` target, a `++`/`--`
+// operand, a range target assigned by `=`, a select receive's target, the
+// base of a field, index or indirect write or of `&`, and a function
+// literal's captured read or write. The filter sits at resolution:
+// variable, baseVar and captured yield -1 for such a name (declare yields
+// it for `_` alone), and every caller tests the variable before it reaches
+// the Builder or buf, may, bases and results; assign keeps such a target
+// out of its targets, so its paired value's reads ride on the statement's
+// first node and it defines nothing. No list of the lowering is indexed by
+// a variable. Go has no embedded assignment and no deletion of a name.
+//
 // A function literal is its own function, in which enclosing variables are
 // free. In the enclosing function it is part of the expression that creates
 // it, resolved with the literal's own declarations shadowing: the node owning

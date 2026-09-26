@@ -404,5 +404,33 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"x@17 -> x > 0@34", "x@17 -> x@60", "x = 1@43 -> x@60", "x@60 -> 1@71",
 				"x@17 -> return x@87", "x = 1@43 -> return x@87"},
 		},
+		{
+			// Go spec, Declarations and scope: n and p are declared in no block
+			// of f, so they are package-level names, not variables of f (the
+			// lowering's "Names that resolve to no variable"). n stands as an
+			// assignment target, an op= target, a ++ operand, one of two
+			// targets, the base of &, a captured write and ++ in a function
+			// literal, and a range target assigned by `=`; p as the base of a
+			// field write. Go has no embedded assignment and no deletion of a
+			// name. Nodes: x@17, xs@24, y := 0@40, n = x@48 (Uses x),
+			// n += x@55 (Uses x), n++@63 (no use, no definition),
+			// n, y = y, n@68 (one node, since n is no target: Uses y, defines
+			// y), p.f = y@81 (Uses y, may-defines nothing), g(&n)@90 (nothing),
+			// defer func() { n = y; n++ }()@97 (Uses the captured y only),
+			// xs@142 (defines the iteration variable), range@136 (head), n@132
+			// (Uses the iteration variable, defines nothing), y++@147,
+			// return y + n@154 (Uses y). Succ: straight line to xs@142, then
+			// range@136→{n@132, return}; n@132→y++@147→range@136. IPDom: n@132
+			// → y++@147 → range@136 → return.
+			name:     "a write to a name that resolves to no variable defines nothing",
+			protects: "an unresolved name in every write position makes its node with its other operands' reads and never reaches flow.Builder as -1",
+			mutation: "drop a variable >= 0 test: on assign's identifier targets (n = x@48 Defs -1 and panics), on an inc/dec identifier (n++@63), on a range target assigned by = (n@132), on captured in scanWrite (the literal's n), or on baseVar in assign or collect (p.f, &n)",
+			src:      "package p\nfunc f(x int, xs []int) int { y := 0; n = x; n += x; n++; n, y = y, n; p.f = y; g(&n); defer func() { n = y; n++ }(); for n = range xs { y++ }; return y + n }",
+			cd:       []string{"range@136 -> n@132", "range@136 -> y++@147", "range@136 -> range@136"},
+			du: []string{"x@17 -> n = x@48", "x@17 -> n += x@55", "y := 0@40 -> n, y = y, n@68",
+				"n, y = y, n@68 -> p.f = y@81", "n, y = y, n@68 -> defer func() { n = y; n++ }()@97",
+				"xs@24 -> xs@142", "xs@142 -> range@136", "xs@142 -> n@132", "n, y = y, n@68 -> y++@147",
+				"y++@147 -> y++@147", "n, y = y, n@68 -> return y + n@154", "y++@147 -> return y + n@154"},
+		},
 	})
 }
