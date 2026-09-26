@@ -117,5 +117,49 @@ func TestCppLoweringGolden(t *testing.T) {
 			src:      "int f() { int x = 1; g(0, &x); return x; }",
 			du:       []string{"x = 1@14 -> g(0, &x)@21", "x = 1@14 -> return x;@31", "g(0, &x)@21 -> return x;@31"},
 		},
+		{
+			// [lex.digraph]/2: `and` and `or` are the same operators as &&
+			// and ||, which evaluate the right operand only when the left
+			// does not decide ([expr.log.and]/1, [expr.log.or]/1). Nodes:
+			// p@11, p@23 (Branch), g(*p)@29, p and g(*p)@23 (Branch), h()@38,
+			// return …@16. Succ: p@23→{g(*p), p and g(*p)}; g(*p)→p and
+			// g(*p)→{h(), return}; h()→return.
+			name:     "the alternative tokens and and or short-circuit",
+			protects: "`p and g(*p)` evaluates g(*p) only when p is nonzero, so the dereference depends on the test",
+			mutation: "match only the && and || tokens (both Branch nodes and their control dependences vanish)",
+			src:      "int f(int *p) { return p and g(*p) or h(); }",
+			cd:       []string{"p@23 -> g(*p)@29", "p and g(*p)@23 -> h()@38"},
+			du: []string{"p@11 -> p@23", "p@11 -> g(*p)@29", "p@11 -> p and g(*p)@23",
+				"p@11 -> return p and g(*p) or h();@16"},
+		},
+		{
+			// [dcl.init.ref]/5: `int &r = x` binds r to x, so a write through
+			// r writes x; the binding is the may-definition of x (the
+			// address-taking rule), and the write `r = 2` through the
+			// reference is given up. Nodes: x = 0@14, &r = x@25 (Uses x,
+			// defines r, may-defines x), r = 2@33, return x;@40.
+			name:     "binding a reference to a local may-defines the local",
+			protects: "a use of x after a reference is bound to it sees the writes the reference may make",
+			mutation: "lower a reference's initializer as a plain read (loses &r = x@25 -> return x;@40)",
+			src:      "int f() { int x = 0; int &r = x; r = 2; return x; }",
+			du:       []string{"x = 0@14 -> &r = x@25", "x = 0@14 -> return x;@40", "&r = x@25 -> return x;@40"},
+		},
+		{
+			// [except.pre]/4: a function-try-block's handlers catch exceptions
+			// from the member initializers and the body; [except.handle]/15:
+			// the end of a constructor's handler rethrows. Rethrowing and
+			// returning both reach EXIT, so the rethrow adds no pair; the case
+			// pins that the try covers the initializers. Nodes: x@24,
+			// a(g(x))@33 (may throw), h()@43 (may throw), the Handler
+			// catch@50, k()@64. Succ: a(g(x))→{h(), catch}; h()→{EXIT,
+			// catch}; catch→k()→EXIT. IPDom: every node → EXIT; catch → k().
+			name:     "a constructor's function-try-block covers its member initializers",
+			protects: "the try statement a constructor's definition holds without a body field is lowered, and a throwing member initializer reaches its handlers",
+			mutation: "lower only a body-field function-try-block (the constructor lowers to x@24 alone: every pair vanishes), or lower the initializers outside the try (a(g(x))@33 loses control of catch@50 and k()@64)",
+			src:      "struct S { int a; S(int x) try : a(g(x)) { h(); } catch (...) { k(); } };",
+			cd: []string{"a(g(x))@33 -> h()@43", "a(g(x))@33 -> catch@50", "a(g(x))@33 -> k()@64", "h()@43 -> catch@50",
+				"h()@43 -> k()@64"},
+			du: []string{"x@24 -> a(g(x))@33"},
+		},
 	})
 }
