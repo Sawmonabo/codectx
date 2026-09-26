@@ -8,7 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// columnWeight is the BM25F per-column weighting of digest §4: a name or
+// columnWeight is the BM25F per-column weighting: a name or
 // qualified-name match outweighs a signature or path match, which outweighs a
 // body match.
 var columnWeight = map[sqlite.SearchColumn]float64{
@@ -19,8 +19,8 @@ var columnWeight = map[sqlite.SearchColumn]float64{
 	sqlite.ColumnBody:          1,
 }
 
-// bm25K1 and bm25B are the term-saturation and length-normalization constants
-// of digest §4.
+// bm25K1 and bm25B are the BM25 term-saturation and length-normalization
+// constants.
 const bm25K1, bm25B = 1.2, 0.75
 
 // weightOf is columnWeight with a closed vocabulary: a column spelling this
@@ -28,7 +28,7 @@ const bm25K1, bm25B = 1.2, 0.75
 // future indexed column cannot silently join the score at body weight.
 func weightOf(c sqlite.SearchColumn) float64 { return columnWeight[c] }
 
-// bm25IDF is digest §4's inverse document frequency,
+// bm25IDF is the BM25 inverse document frequency,
 // ln(1 + (N − df + 0.5) / (df + 0.5)), over the visible document count only.
 // The +0.5 smoothing keeps it strictly positive even at df == N, so no floor
 // or clamp is applied: a clamp here would be a deviation from the formula, not
@@ -46,7 +46,7 @@ func bm25IDF(n, df int64) float64 {
 	return math.Log(1 + (float64(n)-float64(df)+0.5)/(float64(df)+0.5))
 }
 
-// bm25Saturation is the per-term frequency component of digest §4,
+// bm25Saturation is the BM25F per-term frequency component,
 // wtf·(k1+1) / (wtf + k1·(1 − b + b·dl/avgdl)). wtf is the column-weighted sum
 // Σ_c weight(c)·tf(t,d,c) — the weighted sum enters the saturation denominator
 // directly, which is what makes this BM25F rather than five independent BM25
@@ -61,13 +61,11 @@ func bm25Saturation(wtf float64, dl int64, avgdl float64) float64 {
 	return wtf * (bm25K1 + 1) / (wtf + bm25K1*(1-bm25B+bm25B*float64(dl)/avgdl))
 }
 
-// quantizeScore is digest §4's quantization, int64(math.Round(score · 1e6)).
+// quantizeScore is the score quantization, int64(math.Round(score · 1e6)).
 // It is the only float-to-integer conversion in the package: everything after
 // it compares int64 and exact strings, which is what makes ranking identical
 // on every release target. A non-finite score (an impossible corpus) quantizes
 // to 0 rather than to an undefined int64.
-//
-// L4's ranker calls this; it must not redeclare it.
 func quantizeScore(score float64) int64 {
 	if math.IsNaN(score) || math.IsInf(score, 0) {
 		return 0
@@ -76,7 +74,7 @@ func quantizeScore(score float64) int64 {
 }
 
 // statsKey identifies one cached document frequency. Corpus statistics are
-// generation-local (digest §4), so the analysis key of the pinned generation is
+// generation-local, so the analysis key of the pinned generation is
 // part of the identity: a df cached under one generation can never be served
 // to another.
 type statsKey struct {

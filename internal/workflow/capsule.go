@@ -131,7 +131,7 @@ func (s *Service) Export(ctx context.Context, req model.SessionRequest) (model.C
 //
 // It returns the STORED capsule, so a second completion answers with the first
 // capsule and its original timestamp. Sealing before the advance to complete is
-// deliberate and is not atomic with it (ruling Q4): the write is idempotent and
+// deliberate and is not atomic with it: the write is idempotent and
 // write-once, so a crash between the two is retried, never duplicated.
 func (s *Service) buildCapsule(ctx context.Context, rec sqlite.SessionRecord, g gate) (model.Capsule, error) {
 	if rec.State != model.StateConsolidateOpen {

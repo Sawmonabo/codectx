@@ -7,7 +7,7 @@
 // (a workspace-inherited version, a Maven property reference, a PEP 621
 // dynamic field) stays unresolved and says so.
 //
-// One unit is one manifest file (R7-1) and depends on the filesystem unit of
+// One unit is one manifest file and depends on the filesystem unit of
 // the same file, whose file node the manifest's `defines` relation starts
 // from. A malformed file is reported as a failed capability at that file's
 // scope; the unit still seals, so one broken manifest never fails the

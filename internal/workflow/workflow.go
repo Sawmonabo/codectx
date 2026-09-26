@@ -1,7 +1,7 @@
 // Package workflow is the Section 17 service layer: the transition guards, the
 // strict readiness gate, source-backed scope review and deterministic capsule
-// identity. It is a service over work that has already landed -- Task 2 shipped
-// every §17.2/§17.3 model type including NewObservationID, and Task 5 shipped
+// identity. It is a service over the model and the store: internal/model
+// defines every §17.2/§17.3 type including NewObservationID, and the store owns
 // AdvanceSession's transition table and state_version compare-and-swap,
 // IncludeManifest, PutObservation, Observations, Waive, PutCapsule and Capsule.
 //
@@ -11,7 +11,7 @@
 // this package owns only what the store deliberately does not check.
 //
 // This package imports neither internal/config nor *sqlite.Store's wider
-// surface: internal/app supplies the frozen Sessions, Compiler and Validator
+// surface: internal/app supplies the Sessions, Compiler and Validator
 // interfaces and a Limits resolved from configuration.
 package workflow
 
@@ -28,9 +28,7 @@ import (
 )
 
 // Sessions is the only storage surface this package may use. *sqlite.Store
-// satisfies it. Every method here already landed in Task 5, Task 12 or Task 16
-// except the three marked NEW, which L6 and L6b append to the store; no method
-// is redefined, re-spelled or wrapped by this package.
+// satisfies it; no method is redefined, re-spelled or wrapped by this package.
 type Sessions interface {
 	// Session checks exact actor identity and rejects a wrong actor, an
 	// expired session and a closed session -- but it skips the actor check
@@ -78,8 +76,8 @@ type Sessions interface {
 	// Coverage pages one actor's per-file coverage by keyset on file_id. It is
 	// paged only for a user-visible list; counts come from CoverageSummary.
 	Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error)
-	// CoverageSummary is Task 16's aggregate and this package defines no second
-	// one: the readiness gate makes exactly one call per evaluation. Its
+	// CoverageSummary is the coverage package's aggregate and this package
+	// defines no second one: the readiness gate makes exactly one call per evaluation. Its
 	// FullyRead and Served differ only by the waiver clause and answer
 	// different questions -- see sqlite.CoverageCounts.
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
@@ -92,12 +90,12 @@ type Sessions interface {
 	// RangeConfirmed reports whether one interval is already fully confirmed
 	// served to this actor for this file at this content hash. It returns a
 	// bounded boolean, never an interval list: containment is answered in SQL
-	// over served_ranges and no interval list crosses into Go. NEW -- L6.
+	// over served_ranges and no interval list crosses into Go.
 	RangeConfirmed(ctx context.Context, session model.SessionID, actor string, file model.FileID,
 		hash string, r model.ByteRange) (bool, error)
 	// SessionFilePaths resolves a bounded batch of pinned file ids to their
 	// paths. Coverage and manifest records carry identifiers and no path, and
-	// naming a file the operator cannot locate is not an answer. NEW -- L6.
+	// naming a file the operator cannot locate is not an answer.
 	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
 		ids []model.FileID) (map[model.FileID]string, error)
 	// WaiversAfter pages the session's recorded coverage exceptions by keyset
@@ -108,13 +106,12 @@ type Sessions interface {
 	// heap is a function of the page and not of the session's waiver count.
 	WaiversAfter(ctx context.Context, session model.SessionID, actor string,
 		after model.FileID, limit int) ([]model.WaiverRecord, error)
-	// ActiveGeneration is the repository's currently published generation. It
-	// is Task 12's existing read (internal/storage/sqlite/units.go), widened
-	// onto this interface rather than reinvented: supersession is "a newer
-	// generation is active than the one this session pinned", and deriving it
-	// from per-file content hashes instead -- as this service did before INT --
-	// reported Superseded false for the exact case Section 16.3 names, a newer
-	// generation active with the pinned files untouched.
+	// ActiveGeneration is the repository's currently published generation, the
+	// store's existing read (internal/storage/sqlite/units.go). Supersession is
+	// "a newer generation is active than the one this session pinned"; deriving
+	// it from per-file content hashes instead would report Superseded false for
+	// the exact case Section 16.3 names, a newer generation active with the
+	// pinned files untouched.
 	ActiveGeneration(ctx context.Context, repo model.RepositoryID) (model.GenerationID, error)
 }
 
@@ -281,11 +278,11 @@ func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
-// --- shared unexported surface: names frozen by L0, bodies owned by a lane ---
+// --- shared unexported surface ----------------------------------------------
 
 // gate is one readiness evaluation. It is the single value Advance, Status and
 // buildCapsule all read, so the Section 16.3 preconditions are evaluated in one
-// place and never re-derived per caller. Owned by L4.
+// place and never re-derived per caller.
 type gate struct {
 	// ReadComplete is read completeness for the pinned snapshot; Ready is
 	// strict implementation readiness; Strict is the strict gate itself, which
@@ -310,19 +307,18 @@ type gate struct {
 	// Blocking names the unresolved observations that hold the gate shut.
 	Blocking []model.ObservationID
 	// Reason states, for an operator, why the gate is shut -- or, when it is
-	// open, carries the point-in-time guarantee limit (ruling Q10).
+	// open, carries the point-in-time guarantee limit.
 	Reason string
 }
 
 // errNotConsolidating is the sentinel for a capsule asked for outside the one
-// state that produces it. Owned by L5.
+// state that produces it.
 var errNotConsolidating = errors.New("capsule is produced only while consolidate is open")
 
 // --- what wires this package to the rest of the system ----------------------
 //
-// Sessions above is satisfied by *sqlite.Store. The three methods Task 17 added
-// to it live in internal/storage/sqlite/state.go (RangeConfirmed,
-// SessionFilePaths, Waivers) and are append-only there.
+// Sessions above is satisfied by *sqlite.Store; RangeConfirmed,
+// SessionFilePaths and WaiversAfter live in internal/storage/sqlite/state.go.
 //
 // internal/app composes the service: (*stack).openWorkflow builds it after the
 // context compiler exists, resolves Limits from configuration and supplies the

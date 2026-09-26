@@ -59,7 +59,7 @@ type scopeResult struct {
 	// ReasonsDropped and ReasonsTruncated count the Section 15.3 explanation
 	// cuts boundReasons applied across the whole expansion. They are COUNTS and
 	// not one notice per entry: an entry-sized disclosure list is
-	// repository-sized in heap, which is the shape this wave removes, while the
+	// repository-sized in heap, which a streamed compile never holds, while the
 	// two counts are what a caller deciding whether an explanation is whole
 	// actually needs. The compiler turns them into manifest notices.
 	ReasonsDropped   int64
@@ -156,7 +156,7 @@ func boundReasons(reasons []string) (out []string, dropped, truncated int64) {
 // It does NOT floor the setting at model.MaxReasonPathsPerEntry. That constant
 // is a report threshold, not a wire ceiling: rank.go honours a configured value
 // above it, and re-clamping to 3 here would silently undo the operator's
-// setting one lane later. config.Limit owns the test, so unlimited keeps every
+// setting one pass later. config.Limit owns the test, so unlimited keeps every
 // route.
 func boundPaths(paths []model.RelationPath, max config.Limit) ([]model.RelationPath, int64) {
 	if !max.Exceeded(int64(len(paths))) {
@@ -256,23 +256,20 @@ type seedStage struct {
 	firstSeq int64
 }
 
-// seedIngest is the push sink every Section 15.2 producer writes its seeds to
-// (ruling C10).
+// seedIngest is the push sink every Section 15.2 producer writes its seeds to.
 //
-// Before it, extractSeeds accumulated every admitted seed in a slice and a
-// `seen map[string]bool` beside it, and the compile held both until the
-// expansion consumed them: two repository-sized structures on the heap for a
-// pipeline whose whole point is that its peak is one run buffer. Now a producer
-// pushes each seed as it finds it, straight into the sorts the expansion
-// already runs, and nothing between discovery and the walk grows with the seed
-// count.
+// A producer pushes each seed as it finds it, straight into the sorts the
+// expansion already runs, so nothing between discovery and the walk grows with
+// the seed count: a seed slice and a `seen` map held until the expansion
+// consumed them would be two repository-sized structures on the heap of a
+// pipeline whose peak is one run buffer.
 //
-// The dedupe moves with it. `add`'s map keyed on the entity identity, first
-// writer wins, is exactly what the scope-seed sort's lessEntityID comparator
+// The dedupe lives in the sort. First writer wins on the entity identity, which
+// is exactly what the scope-seed sort's lessEntityID comparator
 // and foldMinSeq fold already do over the same key, because seq is assigned in
 // discovery order: the earliest step that found an entity keeps it. A seed
 // carrying NO entity identity has no dedupe key, and is admitted in arrival
-// order rather than dropped -- the map dropped it, silently, for want of a key.
+// order rather than silently dropped for want of a key.
 type seedIngest struct {
 	sorts *compileSorts
 	cfg   config.Context
@@ -336,7 +333,7 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	// The two route sorts are opened here rather than in finishIngest because
 	// the walk emits into them AS EACH PAGE ARRIVES: retaining the pages'
 	// entries until the fold had spoken would make the pass hold the whole
-	// walk, which is the structure this wave removes. They therefore carry the
+	// walk, which a streamed compile never does. They therefore carry the
 	// routes of entries the fold later drops, and finishIngest filters them
 	// against the surviving candidate stream.
 	if in.pathSort, err = newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath); err != nil {
@@ -559,7 +556,7 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 // expandScopeStream is expandScope as sorted streams. It produces the same
 // candidates, in the same admission order, with the same scope verdict, holding
 // one sort run buffer per sort instead of a whole-set candidate list and
-// `admitted map[string]bool` (ruling C2).
+// `admitted map[string]bool`.
 //
 // The dedupe is two folds and no join. Seeds that participate in today's
 // dedupe (resolved, and carrying an entity identity) go through a first
@@ -576,7 +573,7 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 // sink's arrival counter continued by the walk.
 // stop is the pass's own halt question, asked after each page of the walk: a
 // true answer with more walk left ends the PASS with its carry intact instead
-// of ending the compile, and the caller checkpoints it (ruling C7). It is the
+// of ending the compile, and the caller checkpoints it. It is the
 // same predicate runPasses asks at a pass boundary, so a deadline that lands
 // inside the walk and one that lands behind it drive the identical continuation.
 func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *graph.Engine,

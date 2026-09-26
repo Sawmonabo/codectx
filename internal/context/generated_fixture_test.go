@@ -12,9 +12,9 @@ import (
 // generated_fixture_test.go holds the ONE generated fixture of this package and
 // the structural preconditions every proof built on it depends on.
 //
-// Why it exists: C-P3 measured that the shared seven-file fixture yields four
-// wanted relations over seven candidates, so the min-sequence fold (L1), the
-// node dedupe (L2) and the unlimited edge scan (C8) are not merely unproven
+// Why it exists: the shared seven-file fixture yields four wanted relations
+// over seven candidates, so the min-sequence fold, the node dedupe and the
+// unlimited edge scan are not merely unproven
 // against it -- they are structurally unreachable, and a mutation of any of
 // them passes for a reason that says nothing about the mutation. A fixture that
 // cannot discriminate is worse than no fixture, because its green run reads as
@@ -79,7 +79,7 @@ func generatedSpecs() []fixtureFileSpec {
 		sym := fmt.Sprintf("Leaf%03d", i)
 		// A document, not a function. boundaryRequirement (scope.go:77) makes a
 		// function reached in one hop RequirementSymbol -- required, and so
-		// undroppable -- and C-P3 measured that an all-required scope either
+		// undroppable -- and an all-required scope either
 		// fits a budget or refuses it, which is why the two drop-named parity
 		// rows drop nothing. A document is Recommended at one hop, so the
 		// packer has something to drop and the drop ORDER becomes observable.
@@ -92,7 +92,7 @@ func generatedSpecs() []fixtureFileSpec {
 // generatedScope is the edge table. Every leaf hangs off `RootA` once per kind,
 // so the walk admits three hundred entities on routes and names
 // generatedLeaves*len(generatedKinds) distinct relation ids -- far past
-// model.MaxPageItems, which is what ruling C8's unlimited edge scan is about.
+// model.MaxPageItems, which is what the unlimited edge scan must page past.
 // The two routes to `Shared` are the fold's input.
 func generatedScope(fx *contextFixture) []model.Relation {
 	out := make([]model.Relation, 0, generatedLeaves*len(generatedKinds)+4)
@@ -137,12 +137,11 @@ var generatedFullBudget = model.Budget{MaxBytes: 1 << 24, MaxSlices: 4000, MaxFi
 // TestTheGeneratedFixtureCanDiscriminateTheStreamedPasses asserts the fixture's
 // OWN discriminating power, and is the reason this file exists.
 //
-// C-P3 ran six plan-table mutations against the shared seven-file fixture; four
-// of them passed, and only temporary instrumentation revealed why: that scope
-// yields four wanted relations over seven candidates admitted once each, so the
-// min-sequence fold, the node dedupe, the drop order and the unlimited edge
-// scan have no input to get wrong. A green mutation run over a fixture that
-// cannot discriminate reads as evidence and is not any.
+// Mutations of the plan's passes survive against the shared seven-file fixture
+// because that scope yields four wanted relations over seven candidates
+// admitted once each, so the min-sequence fold, the node dedupe, the drop order
+// and the unlimited edge scan have no input to get wrong. A green mutation run
+// over a fixture that cannot discriminate reads as evidence and is not any.
 //
 // So the structural properties every proof on this fixture depends on are
 // asserted here, at measured floors, and a topology change that quietly takes
@@ -169,7 +168,7 @@ func TestTheGeneratedFixtureCanDiscriminateTheStreamedPasses(t *testing.T) {
 	}
 	if len(full.wanted) < 250 {
 		t.Errorf("the entries name %d distinct relations on retained routes, want at least 250; "+
-			"below this the unlimited edge scan of ruling C8 has no input that one page would truncate",
+			"below this the unlimited edge scan has no input that one page would truncate",
 			len(full.wanted))
 	}
 	if len(full.reasons) < 2 {
@@ -192,12 +191,12 @@ func TestTheGeneratedFixtureCanDiscriminateTheStreamedPasses(t *testing.T) {
 	dropped := compileGenerated(t, fx, generatedDropBudget)
 	if len(dropped.excluded) < 100 {
 		t.Errorf("the drop budget produced %d exclusions, want at least 100; "+
-			"C-P3 measured that the two drop-named rows of the shared fixture drop nothing at all",
+			"the two drop-named rows of the shared fixture drop nothing at all",
 			len(dropped.excluded))
 	}
 	if !outOfFileOrder(dropped.excluded) {
 		t.Errorf("every exclusion is in file order, so a drop stream emitted in file order instead of " +
-			"in rank order would produce this same table and the C1 ordinal order is unproven")
+			"in rank order would produce this same table and the exclusion ordinal order is unproven")
 	}
 }
 

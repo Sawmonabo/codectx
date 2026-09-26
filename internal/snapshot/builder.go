@@ -191,8 +191,7 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	// Every traversal and listing bound is reported, not enforced: these two
 	// sinks are the whole reporting path from the walker and from Git into the
 	// capture notes and the operator log. Without them a skipped long path or
-	// a passed user-set budget would be invisible, which is the class-G defect
-	// this replaces.
+	// a passed user-set budget would be invisible.
 	b.Policy.OnSkip = func(rel, reason string) {
 		if reason == workspace.SkipPathTooLong {
 			b.notes.addLongPath(rel)

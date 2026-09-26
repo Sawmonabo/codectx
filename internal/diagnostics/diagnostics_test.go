@@ -519,7 +519,7 @@ var scenarios = []scenario{
 	},
 }
 
-// --- deterministic fakes for the four frozen interfaces ---------------------
+// --- deterministic fakes for the four interfaces ----------------------------
 //
 // They are values, not mocks: a row sets the fields it cares about and reads
 // calls back off the recorder. A row that needs another field adds it here

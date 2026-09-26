@@ -126,7 +126,7 @@ func TestManifestConform(t *testing.T) {
 	}
 }
 
-// TestCanonicalFacts is the single canonical fact-set comparison of Task 7:
+// TestCanonicalFacts is the single canonical fact-set comparison of the base providers:
 // both providers run over the polyglot repository through the production
 // unit path (manifest units depending on their filesystem unit) and the
 // rendered facts must equal the expected set exactly. Failure modes it
@@ -544,7 +544,7 @@ func TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet(t *testing.T) {
 	}
 }
 
-// TestNoDefaultBoundDegradesARealManifest is the VF5 regression: two shapes a
+// TestNoDefaultBoundDegradesARealManifest guards two shapes a
 // real repository holds that the provider degraded on a default
 // configuration. A long CHANGELOG crossed the 1024-entry cap and published
 // `partial`/CTX_RESOURCE_LIMIT with no user-set bound anywhere; a

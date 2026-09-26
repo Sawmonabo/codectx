@@ -86,7 +86,7 @@ func TestStreamedRankingMatchesInMemoryRank(t *testing.T) {
 		pathLim int64
 		// splitPath moves each candidate's PathFinal into a different
 		// directory from its PathAtRank. No existing fixture distinguishes the
-		// two C3 path values -- every candidate in the package's tests is built
+		// two path values -- every candidate in the package's tests is built
 		// with one Path -- so this is the smallest fixture that does: bucketing
 		// centrality by PathFinal regroups the walked edges and changes the
 		// boost, the score, and the reason that names the package.
@@ -134,7 +134,7 @@ func TestStreamedRankingMatchesInMemoryRank(t *testing.T) {
 				}
 			}
 			// The ranked sort's ORDER is the deliverable, not just its
-			// contents: Task 16's `context next` is an ordinal walk over it and
+			// contents: `context next` is an ordinal walk over it and
 			// P-G assigns each survivor's Index from it, so one record added
 			// before its score was written shifts every later ordinal. On these
 			// rows PathFinal equals the path `rank` sorts on, so the streamed

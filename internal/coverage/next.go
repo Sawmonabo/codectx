@@ -17,7 +17,7 @@ import (
 // the read endpoint is the only way to obtain source, and only a confirmed
 // receipt grants coverage.
 //
-// The walk is the frozen Task 15 manifest contract and nothing more: entries
+// The walk is the persisted manifest contract and nothing more: entries
 // persist in Section 15.3 tie-break order, ordinals 0..n-1 are the canonical
 // reading order and the required_full entries occupy a prefix. Next therefore
 // pages ordinals ascending and stops at the first entry that is not

@@ -26,7 +26,7 @@ import (
 
 // memGraphFor builds the reference GraphReader over the shared fixture's own
 // nodes and relations, so the two read paths see one graph. The walk still
-// reads through Adjacency (it is another lane's), so an engine under test
+// reads through Adjacency, a separate port, so an engine under test
 // carries both ports over the same facts.
 func memGraphFor(f *graphFixture) *MemoryGraph {
 	nodes := make([]model.Node, 0, len(f.nodes))
@@ -127,7 +127,7 @@ func TestOverviewCountsAreUnchangedByTheReader(t *testing.T) {
 	golden(t, "overview_items.json", page.Items)
 }
 
-// TestContainmentScanEndsOnTheLastEntry is F7, carried onto the packed reader.
+// TestContainmentScanEndsOnTheLastEntry guards the packed reader's containment scan.
 // The failure mode: a containment scan that reports an incomplete read the
 // moment its edge allowance is reached answers complete=false for a containment
 // set whose entries fill the allowance EXACTLY -- and both callers refuse an

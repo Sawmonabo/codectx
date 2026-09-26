@@ -11,7 +11,7 @@
 // it, so a broken pipe or a failed serialization can never grant coverage.
 //
 // This package imports neither internal/context nor internal/config nor
-// *sqlite.Store's wider surface: internal/app supplies the frozen Sessions and
+// *sqlite.Store's wider surface: internal/app supplies the Sessions and
 // Source interfaces and a Limits resolved from configuration.
 package coverage
 
@@ -30,11 +30,11 @@ import (
 )
 
 // Sessions is the only storage surface this package may use. *sqlite.Store
-// satisfies it; the manifest readers are Task 15's and are consumed read-only,
-// so no method here is defined or redefined by this package except
-// CoverageSummary, which is a coverage aggregate owned by this task.
+// satisfies it. The manifest readers are consumed read-only; CoverageSummary is
+// the one coverage aggregate, and neither this package nor the workflow service
+// defines a second one.
 type Sessions interface {
-	// Manifest reads belong to Task 15's MANIFEST lane. Entries persist in
+	// Manifest reads come from the compiled context manifest. Entries persist in
 	// Section 15.3 tie-break order, ordinals 0..n-1 are the canonical reading
 	// order, and required_full entries occupy a prefix: Next walks ascending
 	// from the first unserved required entry and stops at the end of that
@@ -69,9 +69,10 @@ type Sessions interface {
 	// Coverage pages one actor's per-file coverage by keyset on file_id. Like
 	// Session it reports honestly beside CTX_SESSION_EXPIRED.
 	Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error)
-	// CoverageSummary is the one storage addition of this task (L6): the counts
-	// Status needs in a single round trip instead of paging Coverage. Task 17
-	// consumes the same method and must not define a second one.
+	// CoverageSummary returns the counts Status needs in a single round trip
+	// instead of paging Coverage. It reproduces both branches of the per-file
+	// coverage state switch (union == size, and the zero-length confirmed-EOF
+	// branch); the workflow service consumes the same method.
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	// AcknowledgeFile refuses unless the file is already full_served; it never
 	// creates coverage.
@@ -222,7 +223,7 @@ const sourceEnvelopeBytes = 4096
 // maxRawForWire is the single chunk-size arithmetic in this package. Section
 // 16.2 requires the raw size to be reduced *before* bytes are emitted, so the
 // slicer and the serializer must agree; recomputing any part of this elsewhere
-// is a defect. It is L0's one implemented function.
+// is a defect.
 //
 // The result is the largest raw byte count that satisfies all four bounds:
 //
@@ -246,7 +247,7 @@ const sourceEnvelopeBytes = 4096
 // range to the file size, which this function does not know.
 //
 // It returns a cap only. It never errors on a small result and never inspects
-// EOF: a zero-length chunk at EOF is legal and required, and L1 issues it
+// EOF: a zero-length chunk at EOF is legal and required, and Read issues it
 // without branching on an error here. The error return is reserved for a
 // misconfigured Limits or an unstorable offset, both of which are wiring
 // defects rather than user-correctable input, so they are CTX_INTERNAL.
@@ -292,10 +293,9 @@ func maxRawForWire(requested uint32, offset uint64, l Limits) (uint32, error) {
 	return uint32(raw), nil
 }
 
-// The model.NextContextItem.Action vocabulary. internal/model/context.go
-// assigns this set to Task 16 and deliberately leaves the model field a bounded
-// free-form string, so Task 17 can add workflow actions without editing a
-// frozen file. Owned by L4.
+// The model.NextContextItem.Action vocabulary Next answers. The model field is a
+// bounded free-form string, so the workflow service can add its own actions
+// beside these.
 const (
 	// actionReadSource: a required file still has unserved bytes; read them.
 	actionReadSource = "read_source"
@@ -320,37 +320,3 @@ var errNoSource = errors.New("no unserved required file remains")
 func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
-
-// --- Also frozen by L0; implemented elsewhere -------------------------------
-//
-// These signatures live in files this package does not own. They are recorded
-// here as the map of what wires this package to the rest of the process: the
-// composition root, the storage aggregate and the command tree. Changing one of
-// them changes this package's contract with a file it cannot see.
-//
-//	// internal/app/compose.go -- openQueries-style construction. Deliberately
-//	// not a raw Store() accessor, which would leak the whole storage surface.
-//	func (s *stack) openCoverage() error
-//
-//	// internal/app/workspace.go -- the SourceOpener closes over the stack's
-//	// store (as snapshot.Catalog) and CAS via snapshot.OpenView, memoised per
-//	// snapshot.
-//	func (w *Workspace) Coverage() *coverage.Service
-//
-//	// internal/storage/sqlite/state.go -- one appended aggregate query
-//	// reproducing both branches of the fileCoverage state switch (union ==
-//	// size, and the separate zero-length confirmed-EOF branch). Task 15 must
-//	// not define it; Task 17 consumes it and must not define a second one.
-//	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
-//
-//	// internal/storage/sqlite/state.go -- Task 17's two appended reads, L6's.
-//	// APPEND ONLY; no existing method was edited.
-//	func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
-//	        file model.FileID, hash string, r model.ByteRange) (bool, error)
-//	func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
-//	        ids []model.FileID) (map[model.FileID]string, error)
-//
-//	// internal/cli/context.go -- the Section 18.1 spellings context
-//	// read/acknowledge/status/next/close, registered by one loop line in
-//	// root.go.
-//	func newContextCommands(build model.BuildInfo) []*cobra.Command

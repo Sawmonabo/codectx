@@ -21,8 +21,7 @@ import (
 )
 
 // This file is the whole test budget for the coverage package: one fixture, one
-// oracle and one scenario table whose rows every fill-in lane adds under its own
-// marker. A test here exists only to protect an invariant whose silent breakage
+// oracle and one scenario table, grouped by endpoint. A test here exists only to protect an invariant whose silent breakage
 // serves wrong source bytes, grants false full-read credit or breaks
 // determinism; getters, enum spellings, forwarding and wiring get no row.
 
@@ -99,7 +98,7 @@ func multiByte() []byte {
 	return []byte(strings.Repeat("é中\U0001f600\n", 512))
 }
 
-// newFixtureFiles builds the five files digest section 9 names. Each one exists
+// newFixtureFiles builds the five fixture files. Each one exists
 // because it breaks a different part of the read path.
 func newFixtureFiles() []*fixtureFile {
 	return []*fixtureFile{
@@ -226,8 +225,8 @@ type fakeStore struct {
 	// "the store happened to catch it".
 	confirmCalls int
 
-	// scopeComplete is what the fixture manifest reports. Section 15.3's Q7
-	// compiles an ambiguous or empty scope into a manifest with
+	// scopeComplete is what the fixture manifest reports. The compiler turns
+	// an ambiguous or empty scope into a manifest with
 	// ScopeComplete=false, which is the only thing that separates
 	// "everything required has been read" from "nothing was required".
 	scopeComplete bool
@@ -271,7 +270,7 @@ func (s *fakeStore) Manifest(ctx context.Context, id model.ManifestID) (model.Co
 	}, nil
 }
 
-// ManifestEntries returns entries in the frozen persistence order: ordinals
+// ManifestEntries returns entries in the persisted order: ordinals
 // 0..n-1 are the canonical reading order and the required_full entries occupy a
 // prefix, so Next walks ascending and never sorts.
 func (s *fakeStore) ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error) {
@@ -456,7 +455,7 @@ func (s *fakeStore) Coverage(ctx context.Context, session model.SessionID, actor
 	return out, err
 }
 
-// CoverageSummary is the single-round-trip aggregate L6 adds to the real store.
+// CoverageSummary is the single-round-trip aggregate the real store answers.
 func (s *fakeStore) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error) {
 	fs, err := s.session(session, actor)
 	if fs == nil {
@@ -498,7 +497,7 @@ func (b *byteSet) contains(r model.ByteRange) bool {
 	return true
 }
 
-// RangeConfirmed is the bounded containment test L6 adds to Sessions so Next
+// RangeConfirmed is the bounded containment test Sessions carries so Next
 // can resume at the first byte this actor has not confirmed. Like the real
 // method it refuses the empty interval, answers false rather than failing for a
 // file outside the pinned scope or at another hash, and does not swallow
@@ -520,7 +519,7 @@ func (s *fakeStore) RangeConfirmed(ctx context.Context, session model.SessionID,
 	return set.contains(r), nil
 }
 
-// SessionFilePaths is the bounded batch path reader L6 adds to Sessions so Next
+// SessionFilePaths is the bounded batch path reader Sessions carries so Next
 // can fill NextContextItem.Path. Like the real method it is scoped by the
 // session's own files -- an identifier outside the pinned scope is absent from
 // the map, never named -- and it reports beside CTX_SESSION_EXPIRED.
@@ -719,7 +718,7 @@ func newHarness(t *testing.T) *harness {
 	for i, f := range newFixtureFiles() {
 		files[f.id] = f
 		order = append(order, f.id)
-		// required_full occupies a prefix of the ordinals, which is the frozen
+		// required_full occupies a prefix of the ordinals, which is the persisted
 		// manifest contract Next walks.
 		if i < 4 {
 			required[f.id] = model.RequirementFull
@@ -811,9 +810,7 @@ func (h *harness) checkCoverage(session model.SessionID, actor string, id model.
 
 // --- the scenario table -----------------------------------------------------
 //
-// One table, one marker per fill-in lane. A lane appends its rows under its own
-// marker and nowhere else, so two lanes never touch the same lines. Every row
-// names the failure mode it protects against in a comment and is mutation
+// One table for the whole package, grouped by endpoint. Every row names the failure mode it protects against in a comment and is mutation
 // proved before it is committed.
 
 type scenario struct {
@@ -822,17 +819,15 @@ type scenario struct {
 }
 
 var scenarios = []scenario{
-	// L1 rows
-
-	// L2 rows
+	// receipt rows
 	{
 		// Protects the receipt codec's two bindings: the purpose discriminator,
 		// which is the only thing stopping a cursor token from being spent as a
 		// source receipt, and the chunk id the payload carries into the one
 		// ConfirmChunks call. Breaking either grants full-read credit for bytes
 		// no issued chunk was ever echoed for. It deliberately asserts nothing
-		// about interval merging or confirm idempotency -- those are Task 5's
-		// and are already tested there.
+		// about interval merging or confirm idempotency -- those belong to the
+		// store and are tested there.
 		name: "receipt purpose and chunk binding",
 		run: func(t *testing.T, h *harness) {
 			ctx := context.Background()
@@ -895,9 +890,7 @@ var scenarios = []scenario{
 		},
 	},
 
-	// L3 rows
-
-	// L4 rows
+	// next rows
 
 	// Next must resume at the first byte this actor has not confirmed and must
 	// stay metadata only. A Next that answers zero sends the actor back over
@@ -910,8 +903,8 @@ var scenarios = []scenario{
 	// ConfirmChunks. The fixture's ordinal 0 is the empty file, whose natural
 	// offset is zero, so the row first serves it and then confirms a prefix of
 	// ordinal 1: the assertion is only meaningful once the answer is a nonzero
-	// offset on the next required file. L6 extends it with the out-of-order
-	// confirmation that separates the prefix end from the union size.
+	// offset on the next required file. It then confirms out of order, which
+	// separates the prefix end from the union size.
 	{name: "Next resumes at the first unconfirmed byte without opening the source", run: func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		empty, crlf := model.FileID(hexID(0x20)), model.FileID(hexID(0x21))
@@ -930,7 +923,7 @@ var scenarios = []scenario{
 		}
 		// Coverage is only ever created the way production creates it: an
 		// issued chunk whose receipt is confirmed. Kept local to this row so no
-		// other lane's rows depend on it.
+		// other row depends on it.
 		serve := func(file model.FileID, start, end uint64) {
 			t.Helper()
 			id, err := model.NewRandomID()
@@ -991,7 +984,7 @@ var scenarios = []scenario{
 			t.Fatalf("next answers file %s with %d remaining after a fully read file was waived; want %s with 3 -- a waiver does not unread a file that was read",
 				item.FileID, item.Remaining, crlf)
 		}
-		// L6: a client that confirms out of order leaves a hole. [0,7) and
+		// A client that confirms out of order leaves a hole. [0,7) and
 		// [10,14) is eleven confirmed bytes whose prefix still ends at 7, so the
 		// union size and the resume point part company here. Answering 11 would
 		// hand back a file the actor has a hole in and never ask for bytes 7..10
@@ -1007,24 +1000,15 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// L5 rows
-
-	// L6 rows
-
-	// INT rows
+	// lifecycle rows
 
 	// The whole session lifecycle through the composed service. Every other row
-	// builds a Service literal for one endpoint, so nothing else proves that the
-	// five endpoints agree once New has wired them together: that Acknowledge
-	// really returns the status L3 builds rather than a zero value (the tail
-	// L2's lane could not reach), that Status reports the same session metadata
-	// Acknowledge just did, that Next advances to the file the confirmation did
-	// not cover, and that Close is a compare-and-swap against the version Status
-	// handed out. The readiness assertion is not L3's: L3 pins both flags false
-	// at full coverage on a hand-built Service, while this pins them false
-	// across the whole lifecycle, including the closed session -- the state a
-	// caller is most likely to mistake for "done".
-	{"int/a session reads, confirms, reports, advances and closes", func(t *testing.T, h *harness) {
+	// exercises one endpoint, so nothing else proves that the endpoints agree
+	// once New has wired them together: that Acknowledge really
+	// changes the stored coverage rather than being a no-op, that Status reports
+	// what the confirmation granted, and that Next advances to the file the
+	// confirmation did not cover.
+	{"lifecycle/a session reads, confirms, reports and advances", func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		empty := model.FileID(hexID(0x20))
 		crlf := model.FileID(hexID(0x21))
@@ -1042,7 +1026,7 @@ var scenarios = []scenario{
 				"an issued chunk is not coverage until it is confirmed", resp.Coverage, resp.Receipt)
 		}
 
-		// 2. Acknowledge it. It reports no status of its own (ruling VF1); what
+		// 2. Acknowledge it. It reports no status of its own; what
 		// it changes is the stored coverage, which is what this asserts.
 		if err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
@@ -1086,14 +1070,12 @@ var scenarios = []scenario{
 
 	}},
 
-	// An incomplete manifest scope is not a completed read. Ruling Q7 compiles
+	// An incomplete manifest scope is not a completed read. The compiler turns
 	// an ambiguous or empty scope into a manifest with ScopeComplete=false and
 	// no required_full entries, so the required_full walk exhausts at once and
 	// the count test "0 of 0 served" would otherwise answer actionComplete --
 	// telling the actor the reading is done when the scope never resolved.
-	// L4 could not exercise this branch: the fixture manifest it inherited
-	// reported ScopeComplete unconditionally.
-	{"int/an unresolved scope asks for review, not completion", func(t *testing.T, h *harness) {
+	{"next/an unresolved scope asks for review, not completion", func(t *testing.T, h *harness) {
 		h.store.scopeComplete = false
 		for id := range h.store.required {
 			h.store.required[id] = model.RequirementRecommended
@@ -1110,7 +1092,7 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// FX-D16-B rows
+	// read rows
 
 	// Bytes that are not text reach the client through base64 and through
 	// nothing else, so the encoder has to carry exactly the chunk's bytes.
@@ -1215,8 +1197,8 @@ var scenarios = []scenario{
 	// base64 instead would hand the client a chunk it cannot place in the
 	// text. The request is refused so the client re-reads from a boundary.
 	//
-	// Where the teeth are: the rejection itself is Task 4's, raised twice in
-	// internal/source (PlanChunk's window[0] guard and Cursor.PositionAt's),
+	// Where the teeth are: the rejection itself belongs to internal/source, raised twice there
+	// (PlanChunk's window[0] guard and Cursor.PositionAt's),
 	// and no mutation of internal/coverage makes this row red -- deleting
 	// either source guard alone leaves the other one catching it. What the row
 	// pins here is that Read PROPAGATES the refusal rather than rounding the
@@ -1360,8 +1342,8 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// F2 puts context.WithTimeout(ctx, QueryTimeout) atop
-	// Read, as OpenSession and Status already do. Read is the one endpoint
+	// Read runs under context.WithTimeout(ctx, QueryTimeout), as OpenSession
+	// and Status do. Read is the one endpoint
 	// that touches the CAS and the filesystem, and `--timeout` defaults to
 	// zero precisely so resources.query_timeout applies, so an unbounded Read
 	// is a request with no finite bound at all.
@@ -1385,8 +1367,8 @@ var scenarios = []scenario{
 		// The invariant is "bounded, not hung", and the escape hatch above is
 		// what enforces it exactly. This only keeps the row from passing on an
 		// unrelated failure, so it admits every spelling the deadline may
-		// reach a caller in: FX-D16-A may return ctx.Err() raw, as the landed
-		// timeout sites do, or wrap it in a typed error.
+		// reach a caller in: Read may return ctx.Err() raw, as other timeout
+		// sites do, or wrap it in a typed error.
 		var typedErr *model.Error
 		bounded := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
 			(errors.As(err, &typedErr) && (typedErr.Code == model.CodeQueryDeadline ||
@@ -1397,8 +1379,8 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// F4 assigns NextContextItem.Path from the widened
-	// Sessions. `context next` names the file the actor must read, and a
+	// Next fills NextContextItem.Path from Sessions.SessionFilePaths.
+	// `context next` names the file the actor must read, and a
 	// response carrying only a 64-hex file id names a file the operator
 	// cannot open.
 	{"next/names the path of the file it selects", func(t *testing.T, h *harness) {
@@ -1413,9 +1395,9 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// F18: the status continuation itself. Every other row asks for one page,
-	// so nothing here ever presented a cursor back -- resumeStatus had no
-	// coverage at all in a wave whose binding ruling is cursor pagination.
+	// The status continuation itself. Every other row asks for one page, so
+	// without this row nothing presents a cursor back and resumeStatus, the path
+	// every paged status walk takes, would go untested.
 	// This walks the session's whole required scope at the narrowest and the
 	// widest page and asserts the two properties a continuation must have: a
 	// page that leaves records unserved says so (a cursor, or a truncation

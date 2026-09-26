@@ -45,8 +45,8 @@ func drainCounts(t *testing.T, run *pagination.SortedRun[pkgCountRec]) []pkgCoun
 	return out
 }
 
-// TestCheckpointedRunRestoresIdenticallyAfterSpilling is ruling C7's core
-// invariant: a stream a completed pass produced must survive the interruption
+// TestCheckpointedRunRestoresIdenticallyAfterSpilling guards the continuation's
+// core invariant: a stream a completed pass produced must survive the interruption
 // unchanged, or the resumed compile does not answer the plan an uninterrupted
 // one would. It is asserted on the spilled branch, where the restored order is
 // produced by a merge over adopted runs rather than by one in-heap sort.
@@ -226,7 +226,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 }
 
 // TestACheckpointedRunKeepsItsArrivalOrderUnderANonTotalComparator pins what
-// finding B3 found unpinned: the runs a checkpoint detaches are stored in
+// no other test pins: the runs a checkpoint detaches are stored in
 // DETACH order, because the merge that adopts them breaks ties by run index.
 // Storing them under their os.CreateTemp suffixes instead orders the tied
 // records by a random number, so the resumed compile ranks a package's

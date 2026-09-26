@@ -25,7 +25,7 @@ import (
 // internal/retention know about this application's concrete types. Both
 // packages depend on narrow interfaces and never on *sqlite.Store,
 // *toolchain.Resolver or *snapshot.CAS (their doc.go states the rule), so the
-// composition root is where a concrete type meets a frozen interface. Each
+// composition root is where a concrete type meets an interface. Each
 // adapter here forwards and adapts shape; none of them implements a probe, a
 // measurement or a policy of its own.
 

@@ -357,7 +357,7 @@ func appendReason(reasons []string, reason string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming ranking (C-STREAM passes P-D and P-F)
+// Streaming ranking (passes P-D and P-F)
 // ---------------------------------------------------------------------------
 //
 // The streamed passes below hold plumbing only and no policy: they rebuild one
@@ -378,7 +378,7 @@ func appendReason(reasons []string, reason string) []string {
 // centrality sort by P-D, and `reasons` are appended to Cand.Reasons by P-D --
 // so nothing here is unbounded.
 //
-//   - Pkg is packageOf(PathAtRank), computed once by P-D. Ruling C3: the
+//   - Pkg is packageOf(PathAtRank), computed once by P-D. The
 //     centrality bucket and the boost reason read the AT-RANK path, while
 //     lessRank reads PathFinal. Storing the key keeps the two apart.
 //   - Base is max(originContribution(Origin), routed.best), the rank pass's

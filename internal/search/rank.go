@@ -19,7 +19,7 @@ import (
 // else -- carrying name/qualified name/signature on the ORDERING tuple would
 // size every comparison by the widest symbol in the corpus; the servable facts
 // ride alongside on scored instead. Ordering compares only
-// integers and exact strings; no float reaches a comparison (digest §4).
+// integers and exact strings; no float reaches a comparison.
 type ranked struct {
 	Tier        model.SearchTier
 	ScoreMicros int64
@@ -38,7 +38,7 @@ type ranked struct {
 //
 // Every comparison is on an int, an int64, a uint64 or an exact string in Go's
 // byte order. The struct carries no float field at all, which is what makes
-// "nothing compares floats" (digest §4) structural rather than a convention a
+// "nothing compares floats" structural rather than a convention a
 // later edit could break: a score reaches this function only after
 // quantizeScore has turned it into an int64.
 func (a ranked) cmpBounded(b ranked) int {
@@ -108,10 +108,10 @@ func spanEnd(s *model.ByteRange) int64 {
 	return int64(s.End)
 }
 
-// dedupKey is the digest §4 deduplication key: the node id when the candidate
+// dedupKey is the deduplication key: the node id when the candidate
 // has one, else its file and start byte. Within one generation a path names
 // exactly one file (model.NewFileID hashes the repository and the path), so
-// the path stands in for the file id, which the frozen ranked struct does not
+// the path stands in for the file id, which the ranked struct does not
 // carry.
 func dedupKey(r ranked) string {
 	if r.NodeID != "" {
@@ -268,8 +268,8 @@ func (c *collector) Close() error { return c.dedup.Close() }
 //     OWN score. Comparing accumulated scores instead would let a low-scoring
 //     candidate that had already absorbed a high score out-rank a genuinely
 //     higher-scoring sibling, which is order-dependent.
-//   - Folded is the highest score of the two: digest §4 zeroes the exact tiers
-//     "unless the document also matched lexically, keeping that score", and the
+//   - Folded is the highest score of the two: the exact tiers score zero
+//     unless the document also matched lexically, keeping that score, and the
 //     lexical score is the non-zero one. results() promotes it.
 //   - Occurrences sum, and the reasons of both sides survive up to the Section
 //     14.3 bound.
@@ -422,7 +422,7 @@ type ContentReader interface {
 }
 
 // hydrator fills SearchHit.Range for the hits of ONE page. Returning a nil
-// Range is a silent capability reduction (digest §4), so this runs for every
+// Range is a silent capability reduction (Section 14.2), so this runs for every
 // hit that is actually served -- at most model.MaxPageItems of them -- and not
 // for the candidates that never reach a page.
 type hydrator struct {
@@ -645,7 +645,7 @@ func checkpointIndex(rec model.BlobRecord) source.Index {
 	return idx
 }
 
-// contextErr maps a context failure to the digest §6 codes. model.Canceled
+// contextErr maps a context failure to the Section 22 codes. model.Canceled
 // reports CTX_CANCELED for both causes, but Section 22 separates a caller who
 // stopped asking from a query that ran past its deadline: the latter is an
 // explicit incomplete answer the operator can act on. The remediation names

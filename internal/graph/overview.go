@@ -35,12 +35,12 @@ const overviewEndpoint = "repo_overview"
 
 // ContainerReader is the OPTIONAL enumeration seam an Adjacency may also
 // implement, in the same shape and for the same reason as EvidenceRowReader:
-// the frozen Adjacency port reads facts that HANG OFF node ids the caller
+// the Adjacency port reads facts that HANG OFF node ids the caller
 // already holds, and the repository map has no such seed -- it is the listing
 // of the containers themselves.
 //
-// It is a separate interface rather than a widening of Adjacency so the frozen
-// port stays frozen and every existing fake keeps compiling. Unlike
+// It is a separate interface rather than a widening of Adjacency so the port
+// stays narrow and every existing fake keeps compiling. Unlike
 // EvidenceRowReader there is no degraded fallback: without it there is no
 // container to report, so Overview refuses with CTX_INTERNAL naming the seam
 // rather than answering "this repository contains nothing".

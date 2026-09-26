@@ -2,8 +2,8 @@
 
 - **Status:** Accepted (decisions 1–7 implemented; decisions 8 and 9 accepted and scheduled)
 - **Date:** 2026-09-14
-- **Supersedes:** the direction ruling of 2026-09-13 recorded in
-  [`docs/research/00-synthesis.md` §8](../research/00-synthesis.md#8-direction-ruling-2026-09-13-user-adopted-reviewer-directive),
+- **Supersedes:** the dependence-tier direction of 2026-09-13 recorded in
+  [`docs/research/00-synthesis.md` §8](../research/00-synthesis.md),
   which this record generalises from one provider to the whole product
 - **Inventory and per-class tables:** [`docs/research/15-scale-posture.md`](../research/15-scale-posture.md)
 
@@ -11,10 +11,10 @@
 
 ## 1. Context
 
-### 1.1 What was ruled
+### 1.1 The rule
 
 codectx must index very large enterprise repositories and monorepos, quickly and
-memory-efficiently. The binding ruling has two halves, and the second is the one that makes the
+memory-efficiently. The rule has two halves, and the second is the one that makes the
 first hard.
 
 > **No default limit may refuse a repository, skip a file, fail an analysis unit, drop rows, or
@@ -29,11 +29,11 @@ The reference host for the no-out-of-memory obligation is a 47 GiB machine index
 million-line monorepo.
 
 The second half rules out the cheap reading of the first. Deleting a cap and letting the
-corresponding structure grow to repository size would satisfy the letter of the ruling and
+corresponding structure grow to repository size would satisfy the letter of the rule and
 produce an out-of-memory failure, which is a refusal by another name — a worse one, because it
 carries no diagnosis.
 
-This generalises a narrower ruling already on the record for the dependence tier, which had
+This generalises a narrower rule already on the record for the dependence tier, which had
 established that estimates schedule and serialise work rather than reject it, that only an
 explicit user limit rejects work up front, and that no analysis limit is lowered and no fact
 family omitted in order to fit.
@@ -65,9 +65,9 @@ later sweep does not "fix" them.
 
 Three findings dominated the inventory:
 
-1. **One validator loop made the ruling unimplementable.** Around fifty configuration keys were
+1. **One validator loop made the rule unimplementable.** Around fifty configuration keys were
    rejected at `<= 0` with the message *"no zero or negative setting means unlimited"* — the exact
-   inverse of the ruling. While that loop stood, no key could express an unlimited
+   inverse of the rule. While that loop stood, no key could express an unlimited
    default at all.
 2. **The refusals were concentrated where a monorepo lives.** A 250 000-file workspace ceiling was
    enforced at three separate sites; a 200 000-entry directory ceiling meant one generated
@@ -129,7 +129,7 @@ reading `size > 0` (which would have skipped every manifest) — both silently w
 loudly broken. A type makes the wrong spelling fail to compile.
 
 *Sentinel `-1` for unlimited, keeping `0` as "unset".* Rejected for the configuration surface: the
-ruling's own words are that `0` means unlimited, and two spellings for the same concept
+rule's own words are that `0` means unlimited, and two spellings for the same concept
 (`0`/`"unlimited"`) already stretch the fingerprint contract. The sentinel survives in exactly one
 place where it is needed and is documented there: a *request* field whose `0` must keep meaning
 "inherit the deployment default", so `-1` is the request-side spelling for "no ceiling".
@@ -160,7 +160,7 @@ request may raise them, including to unlimited.
 timeouts that failed an analysis unit (20 minutes for one provider, 45 for another) default to
 `0`, meaning no wall clock at all: a 45-minute default on a monorepo unit is a scale refusal
 wearing a deadline's clothes. But a wedged subprocess with no deadline hangs forever, so a
-detector replaces the clock. It is not a limit under the ruling because it measures **progress,
+detector replaces the clock. It is not a limit under the rule because it measures **progress,
 not elapsed time**: a subprocess that is producing bytes or consuming CPU is never touched,
 however long it runs. Only one that has produced nothing for the stall window is terminated, with
 the reason `stalled`, reported.
@@ -286,8 +286,8 @@ and carry decision of every prior generation: indexes would appear to work while
 everything, or worse, reusing across an identity change. Byte-identical order is a compatibility
 constraint, not a preference.
 
-*Keep the in-heap sort and rely on the host having enough memory.* Rejected by the second binding
-ruling. Measured, the old shape retained roughly **44 MiB** at 300 000 inputs — 88 bytes of headers
+*Keep the in-heap sort and rely on the host having enough memory.* Rejected by the second half of the
+rule. Measured, the old shape retained roughly **44 MiB** at 300 000 inputs — 88 bytes of headers
 plus two 64-byte hex bodies per record — growing linearly, and aliased into every whole-snapshot
 unit.
 
@@ -341,7 +341,7 @@ is removed and the tiers walk their whole keyset.
 
 *A fixed-size min-heap top-K and accept that the tail is lost.* A size-K heap streamed over
 candidates is O(K) regardless of candidate count, so no spill is needed **for ranking**. It was
-rejected as the whole answer because the ruling forbids discarding the tail of the corpus: the
+rejected as the whole answer because the rule forbids discarding the tail of the corpus: the
 requirement is not "the top K are correct", it is "nothing is dropped without saying so". The heap
 remains the right shape for the ranking step; the spool is what makes the tail retrievable.
 
@@ -470,7 +470,7 @@ and routed onward.
 **Alternatives considered.**
 
 *Keep the wall-clock timeouts and simply raise them.* Rejected: any fixed number is a refusal for
-some monorepo unit, and the failure it produces — a failed analysis unit — is one the ruling names
+some monorepo unit, and the failure it produces — a failed analysis unit — is one the rule names
 explicitly.
 
 *A bare semaphore for admission.* Rejected as insufficient. A bare semaphore is backpressure, not
@@ -689,9 +689,9 @@ mechanism named in the plan was wrong: a continuation spool is lease-bound and e
 while a sealed capsule is a write-once durable artefact replayed by a later session — the
 discriminating question being whether a capsule read after its lease expired still serves pages,
 and through a spool it does not. The second found that stripping the count bounds *without* the
-durable rows produces exactly the unbounded heap-resident capsule the second binding ruling
+durable rows produces exactly the unbounded heap-resident capsule the second half of the rule
 forbids — and, worse, that such a change would have **passed** a 300 000-file proof on a 47 GiB
-host while violating the ruling. The third measured the blast radius and found the minimum
+host while violating the rule. The third measured the blast radius and found the minimum
 footprint spans the workflow, server, command-line and storage layers plus five test files that
 carry the byte-identity and replay evidence, which must be rewritten in the same commit or the gate
 is red on a half-landed capsule.
@@ -822,7 +822,7 @@ duplicates an existing assertion.
   and the retained pass-1 input feeds whatever they do not yet hold. No stop on these two endpoints
   returns truncated with no cursor.
 - **`resources.max_temp_bytes` defaults to unlimited; a paged walk no longer re-copies its
-  cumulative visited set.** Both rulings are accepted and both have LANDED.
+  cumulative visited set.** Both decisions are accepted and both have LANDED.
   (a) LANDED. The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
   every other count or size bound: the spool store reads a non-positive cap as unlimited (it
   refuses no write and keeps the accounting the resource envelope reports), the configuration

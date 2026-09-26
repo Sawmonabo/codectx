@@ -1,7 +1,7 @@
 // Package providertest is the shared provider conformance harness (Section
 // 30.2). It stands up the real store, CAS, snapshot view and workspace root
 // over a small in-memory file set, so a provider test exercises the same
-// BeginUnit, sink, resolver, seal and fail paths production uses. Tasks 7–11
+// BeginUnit, sink, resolver, seal and fail paths production uses. Provider tests
 // build their fixtures on it instead of each inventing a storage stub.
 package providertest
 

@@ -23,10 +23,8 @@ import (
 // cursors, Spools hold ranked pages, Resources is Section 20.1.
 //
 // Content is the content-addressed store the composition root already opens.
-// The frozen digest §2 signature carried no such field; without it
-// SearchHit.Range is always nil, which Section 14.2 counts as a silent
-// capability reduction rather than a shortcut, so the field was added here
-// rather than the promise dropped there.
+// Without it SearchHit.Range is always nil, which Section 14.2 counts as a
+// silent capability reduction.
 type Options struct {
 	Store  *sqlite.Store
 	Repo   model.RepositoryID
@@ -192,7 +190,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// search nobody bounded ranks every candidate, and a caller who set a
 	// deadline of their own keeps it (model.QueryDeadline). That search is the
 	// only unbounded part of this answer -- the tiers walk their keysets to
-	// the end -- and ruling Q4 says a deadline ends a PAGE, not an answer: the
+	// the end -- and a deadline ends a PAGE, not an answer: the
 	// hits ranked before it are a real ordered prefix, and a query that
 	// returned nothing at all because it took too long to look is the
 	// refusal the scale posture forbids. Everything after the search (pinning,
@@ -668,7 +666,7 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 			}
 			return c.add(r, exactHitOf(e), reasonFor(e.Tier))
 		}); err != nil {
-		// Ruling Q4: the time budget ends a PAGE, not an answer. What the
+		// The time budget ends a PAGE, not an answer. What the
 		// collector already holds is a real ordered prefix of the answer, and
 		// throwing it away to return an error means the widest queries -- the
 		// only ones that ever reach the deadline -- have no servable answer at
@@ -736,8 +734,7 @@ func isQueryDeadline(err error) bool {
 //
 // Hydration is paid per chunk rather than once for the whole answer: a
 // hydrator caches one blob record per file, so hydrating a whole answer
-// through one of them would be a second structure sized by the answer in place
-// of the one this lane removed.
+// through one of them would be a structure sized by the answer.
 func (s *Service) hydrated(ctx context.Context, reader *sqlite.PinnedReader, chunk []scored) ([]model.SearchHit, error) {
 	hits := make([]model.SearchHit, 0, len(chunk))
 	spans := make([]model.ByteRange, 0, len(chunk))
@@ -833,7 +830,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 		r := ranked{Tier: model.TierLexicalFTS, ScoreMicros: h.ScoreMicros, Path: d.Path,
 			StartByte: d.Bytes.Start, NodeID: d.NodeID, SearchKey: d.ID, RowID: d.RowID,
 			// One per lexical DOCUMENT, so several documents of one node
-			// fold to that many occurrences (digest §4). The matched term
+			// fold to that many occurrences. The matched term
 			// instances inside a document are the score's business, not
 			// the occurrence count's.
 			Occurrences: 1}
@@ -844,7 +841,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 	})
 }
 
-// exactRanked builds the sort tuple of one exact-tier candidate. Digest §4/Q6
+// exactRanked builds the sort tuple of one exact-tier candidate. The ranking
 // scores every exact and prefix tier 0: tier rank, not score, separates them,
 // and a candidate that also matched lexically keeps that lexical score when
 // the two fold together.

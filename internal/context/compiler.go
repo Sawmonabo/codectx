@@ -55,7 +55,7 @@ type Options struct {
 	// SortDir is where a compile writes its external-sort runs: the workspace's
 	// own spool area (pagination.Spools.SortDir), so a compile's temporary
 	// bytes are swept, reported and accounted under resources.max_temp_bytes
-	// exactly as a continuation spool is (ruling C5'). It is required, not
+	// exactly as a continuation spool is. It is required, not
 	// defaulted: falling back to the process temporary directory would put run
 	// files where nothing reclaims them.
 	SortDir string
@@ -165,8 +165,8 @@ type CompileResult struct {
 const truncationDeadline = "deadline"
 
 // CompilePage compiles req, resuming from cursor when one is given, and ends at
-// a pass boundary rather than failing when the query deadline fires (ruling
-// C7). An empty cursor starts the compile from its first pass.
+// a pass boundary rather than failing when the query deadline fires. An empty
+// cursor starts the compile from its first pass.
 //
 // A caller that presents no cursor and ignores NextCursor gets exactly what
 // Compile gives it, because Compile is this method with continuations switched
@@ -264,7 +264,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 
 	// The streamed pipeline's sort area. Every sort and sorted run below is
 	// registered with it, so ONE deferred release removes every run file on
-	// every exit path, error paths included (rulings C5/C5').
+	// every exit path, error paths included.
 	sorts, err := newCompileSorts(c.cfg, c.sortDir)
 	if err != nil {
 		return CompileResult{}, err
@@ -300,7 +300,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// the stop predicate is asked after each pass, and a true answer persists
 	// that boundary's carry and answers a continuation cursor instead of a
 	// plan. A deadline is therefore never a lost compile, whichever pass it
-	// lands behind (ruling C7).
+	// lands behind.
 	st := &compileState{pass: passIngest}
 	if resumed != nil {
 		if err := c.restoreAt(sorts, resumed, st); err != nil {
@@ -477,7 +477,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 		}
 		if err := stage.run(); err != nil {
 			// A user-set deadline that fires INSIDE P-B..P-H is a boundary
-			// event, not a lost compile (ruling C7). Every pass below the cut
+			// event, not a lost compile. Every pass below the cut
 			// one is finished and its carry is on st, and st.pass already NAMES
 			// that boundary -- it advances only after a pass completes -- so
 			// halting here mints exactly the continuation the stop predicate
@@ -524,14 +524,14 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 //
 // An unresolved seed is carried INTO the expansion rather than around it: the
 // expansion is what decides whether an unresolvable identity is the discovery
-// answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit boundary, and
-// it can only decide that if it sees the exclusions.
+// answer of an unmatched task token or the CTX_SCOPE_INCOMPLETE of an explicit
+// boundary, and it can only decide that if it sees the exclusions.
 func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
 	req model.ContextRequest, sorts *compileSorts, st *compileState, stop func() bool,
 ) error {
 	ingest := st.ingest
 	if ingest == nil {
-		// The sink is opened BEFORE discovery: ruling C10 makes seed extraction a
+		// The sink is opened BEFORE discovery: seed extraction is a
 		// producer that pushes into this compile's sorts, so nothing between the
 		// two holds a seed slice.
 		var err error
@@ -742,16 +742,16 @@ func (c *Compiler) stagePack(ctx context.Context, sorts *compileSorts, b resolve
 // exclusions it emits so that method never sees a slice of them.
 //
 // The split is the memory class of each list. An entry list is bounded by the
-// RESOLVED budget -- the caller's own declared window, the same class ruling C4
-// already accepts for EntryOrdinals and the MaxSlices array -- so holding it is
-// a constant-factor extension of an accepted structure. The exclusion list is
-// the one C-STREAM-plan.md §1 names unbounded: it goes to the external sort,
-// whose peak live records are a function of the run budget and never of how
-// many candidates were excluded.
+// RESOLVED budget -- the caller's own declared window, the same class the
+// design already accepts for EntryOrdinals and the MaxSlices array -- so
+// holding it is a constant-factor extension of an accepted structure. The
+// exclusion list is the one with no bound but the candidate count: it goes to
+// the external sort, whose peak live records are a function of the run budget
+// and never of how many candidates were excluded.
 type planBuffer struct {
 	entries []model.ContextEntry
 	// excluded is the spool P-I's exclusions stream into, in the ordinal order
-	// P-I assigns them (ruling C1). It is required: a nil sink here would drop
+	// P-I assigns them. It is required: a nil sink here would drop
 	// every exclusion silently, which is the omission Section 15.4 forbids.
 	excluded *pagination.ExternalSort[model.ExcludedContextEntry]
 }
@@ -770,7 +770,7 @@ func (b *planBuffer) Exclude(e model.ExcludedContextEntry) error {
 }
 
 // lessExcludedOrdinal orders the exclusion projection by the ordinal P-I
-// assigned, which IS ruling C1's sequence (pre-sort exclusions in expansion
+// assigned, which IS the plan's exclusion sequence (pre-sort exclusions in expansion
 // order, then the packer's drops in group order). Ordinals are unique, so the
 // order is total and the sort is a spill-capable identity over an already
 // ordered stream rather than a re-ordering.
@@ -862,13 +862,13 @@ func (c *Compiler) logger() *slog.Logger {
 
 // hydrateStream is pass P-B: hydrateFiles as a stream. It reads the candidate
 // spool in pageLimit() batches, resolves each batch's distinct file ids through
-// ONE FilesByID, writes SizeBytes, Status, both path values (ruling C3) and the
+// ONE FilesByID, writes SizeBytes, Status, both path values and the
 // snapshot-absent flag onto each record, and re-emits it in seq order. The
 // accumulating `out []model.FileVersion` and `byID` of hydrateFiles go away;
 // the held set is one batch of records plus one page of file rows.
 //
-// The two path writes are the two today's pipeline performs and ruling C3
-// keeps apart: hydrateFiles fills Path only when the candidate carries none
+// The two path writes are the two the reference pipeline performs, kept
+// apart: hydrateFiles fills Path only when the candidate carries none
 // (the value ranking reads for packageOf, centrality and its boost reason) and
 // buildPlan overwrites it unconditionally (the value the total order and the
 // persisted entry read). PathAtRank and PathFinal are those two values.
@@ -1103,17 +1103,18 @@ const (
 		boostAssociatedTest + boostCentralityMax
 )
 
-// compilerPolicyVersion is the frozen code-side ranking/budget policy label
-// stored in every manifest header. v2 added budget.max_manifest_bytes to the
-// request hash and the canonical projection: a caller budget that decides
-// whether a plan is admitted is part of a request's identity, and the label is
-// what tells a stored v1 manifest apart from a v2 one rather than letting the
-// two collide under one id.
+// compilerPolicyVersion is the code-side ranking/budget policy label stored in
+// every manifest header and folded into its request and canonical hashes. It
+// changes whenever the compiled ranking or budget rules change, so a manifest
+// compiled under other rules never collides with this one under one id.
+// budget.max_manifest_bytes is part of the request hash and the canonical
+// projection because a caller budget that decides whether a plan is admitted is
+// part of a request's identity.
 const compilerPolicyVersion = "codectx.context.v2"
 
-// The model.H domains. Two lanes computing a different preimage would make the
-// Section 15.1 immutable-manifest reuse lookup silently never hit, so the
-// preimages are frozen here and nowhere else.
+// The model.H domains. Two code paths computing a different preimage would make
+// the Section 15.1 immutable-manifest reuse lookup silently never hit, so the
+// preimages are defined here and nowhere else.
 const (
 	manifestIDDomain    = "codectx.manifest.id.v1"
 	requestHashDomain   = "codectx.manifest.request.v1"

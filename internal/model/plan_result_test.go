@@ -8,7 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// TestPlanResultIsExactlyOneShape pins ruling C9's exactly-one-of rule: a
+// TestPlanResultIsExactlyOneShape pins the exactly-one-of rule: a
 // PlanResult is EITHER a compiled plan (manifest + session) OR a continuation
 // (cursor + truncated), never both and never neither.
 //

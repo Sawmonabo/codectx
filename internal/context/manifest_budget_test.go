@@ -11,7 +11,7 @@ import (
 // manifest must be able to raise a finite deployment default all the way. Zero
 // already means "take the configured value", so without a separate spelling the
 // caller under a finite default could raise the budget to any number except the
-// one it needs; that residual is a scale refusal (plan row 19).
+// one it needs; that residual is a scale refusal.
 //
 // Mutation: resolve model.BudgetUnlimited through pick64 again and the request
 // inherits the deployment ceiling, failing the first case.

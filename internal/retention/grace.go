@@ -65,10 +65,8 @@ type BlobStore interface {
 // ObjectStore removes a published CAS object by content hash. internal/snapshot
 // owns the only derivation of an object's path (CAS.path, unexported), so this
 // package must not rebuild <data>/cas/<hh>/<hash> itself -- that is the
-// duplicate implementation the charter above forbids.
-//
-// Named INT seam: internal/snapshot needs `func (c *CAS) Remove(hash string)
-// error` reusing c.path, and internal/app hands the CAS in as Options.Objects.
+// duplicate implementation the charter above forbids. *snapshot.CAS satisfies
+// it, and internal/app hands the CAS in as Options.Objects.
 type ObjectStore interface {
 	Remove(hash string) error
 	// SweepOrphans removes published objects no blobs row names -- content a

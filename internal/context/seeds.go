@@ -25,7 +25,7 @@ import (
 // bounds; an empty or wholly ambiguous scope is a discovery answer, never an
 // error (Section 15.2).
 type seedSet struct {
-	// sink is where every admitted candidate goes AS IT IS FOUND (ruling C10).
+	// sink is where every admitted candidate goes AS IT IS FOUND.
 	// The candidate set is the repository-sized half of discovery -- the
 	// lexical tier and the changed-file step both page to exhaustion -- so it
 	// is never accumulated here; a producer pushes and the expansion's sorts
@@ -47,8 +47,9 @@ type seedSet struct {
 }
 
 // seedSink is what a Section 15.2 producer writes to. It is the boundary
-// ruling C10 draws: discovery pushes, the expansion's sorts hold, and nothing
-// between them grows with the number of seeds a repository answers.
+// between discovery and expansion: discovery pushes, the expansion's sorts
+// hold, and nothing between them grows with the number of seeds a repository
+// answers.
 type seedSink interface {
 	// Admit takes one discovered seed, in discovery order.
 	Admit(candidate) error

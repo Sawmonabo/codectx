@@ -18,9 +18,9 @@ import (
 // that a compile's memory is a function of the run budget and its paging is a
 // function of the page, not of how large the repository is.
 //
-// It is the C-P4 items 2 and 3 proof. The generated fixture of
-// generated_fixture_test.go proves the pipeline's SHAPE on a topology small
-// enough to reason about; this one proves the SCALE claim, which needs two
+// The generated fixture of generated_fixture_test.go proves the pipeline's
+// SHAPE on a topology small enough to reason about; this one proves the SCALE
+// claim, which needs two
 // sizes and is only evidence if the two answers differ in size while the peak
 // does not.
 
@@ -113,7 +113,8 @@ type scaleObservation struct {
 	pageRows []int
 }
 
-// TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale is C-P4 items 2 and 3.
+// TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale guards the compile's
+// scale claim: peak memory follows the run budget, not the repository.
 //
 // Two compiles over the same topology at two sizes. What is ASSERTED is the
 // structural invariant: every sort of the larger compile peaks at exactly the
@@ -236,12 +237,11 @@ func measureCompileAtScale(t *testing.T, leaves int) scaleObservation {
 // on the same number twice.
 var seedSinkSizes = []int{5000, 50000}
 
-// TestTheSeedSinkPeaksOnTheRunBufferAtEitherSeedCount is ruling C10's proof.
-//
-// Before the ruling, discovery accumulated every admitted seed in a slice and a
-// dedupe map beside it, and both lived until the expansion consumed them: the
-// compile's peak was a function of how many seeds the repository answered. Now
-// a producer pushes each seed into the sort area as it finds it.
+// TestTheSeedSinkPeaksOnTheRunBufferAtEitherSeedCount guards the seed sink: a
+// producer pushes each seed into the sort area as it finds it, so the
+// compile's peak is never a function of how many seeds the repository answers,
+// as it would be if discovery held a seed slice and a dedupe map until the
+// expansion consumed them.
 //
 // Two assertions, both structural and neither a measurement:
 //

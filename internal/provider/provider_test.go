@@ -266,8 +266,8 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 // be reported, not fail it. Failure modes: refusing the record loses every
 // good fact of the unit with it -- one generated symbol takes the whole file's
 // structure out of the index; admitting it silently leaves the caller unable
-// to tell that the bound they set was exceeded, which the ruling forbids just
-// as firmly as the refusal.
+// to tell that the bound they set was exceeded, which the scale posture forbids
+// just as firmly as the refusal.
 func TestOversizeRecordSealsTheUnitAndReportsTheBound(t *testing.T) {
 	h := providertest.New(t, map[string]string{"a.go": "package a\n"})
 	ctx := context.Background()
