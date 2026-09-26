@@ -49,7 +49,7 @@ a run reproducible on any host.
 
 | Scale | Spec | Files | Used by |
 |---|---|---|---|
-| `corpusTiny` | `{Packages: 4, Seed: 21}` | small | the end-to-end scenario's sizing |
+| `corpusTiny` | (L0/L3 default) | small | the end-to-end scenario's sizing |
 | `corpusSmallReal` | `{Packages: 40, Seed: 2101}` | 124 | **every measured row in Section 3** |
 | `corpusOver200Files` | `{Packages: 120, Seed: 2102}` | 364 | the session-status clamp row (Section 3, row 15) |
 | `corpusReference` | `{Packages: 3332, Seed: 2103}` | 10 000 | the Section 23.1 reference workload — measured by the verification pass, not on a bench row (Section 3, rows 9 and 13) |
@@ -92,7 +92,7 @@ Each row builds its own workspace from the generator, opens it through
 measurement describes the product and not a private helper — and samples the
 operation `n` times. Latency rows report **p95 over the stated sample count**;
 memory rows report the sampled peak of the **whole process tree** (parent plus
-parser workers), read by the host sampler.
+parser workers), read by the Task 20 host sampler.
 
 ### What one parser worker costs
 
@@ -357,7 +357,7 @@ from `internal/context`:
 
 | What was pushed | Records | Peak live records per sort | Heap in use, live, after the push | Spilled runs |
 |---|---|---|---|---|
-| Seed push sink, 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
+| Seed push sink (ruling C10), 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
 | Seed push sink, 50 000 entities offered twice | 100 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +144 KiB | seed sorts spill |
 | One compile sort at the primitive's floor run budget | 20 000 | 401 (~2× the run budget in bytes, the record that triggers the spill included) | — | 50 |
 

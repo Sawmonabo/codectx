@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.1 and §2.3 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed
+- **Status:** Partially accepted — §2.1 (lane I-T1) and §2.3 (lane I-T2) implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -112,7 +112,7 @@ probes the next id on disagreement, reusing the read-back the interner already p
 
 **Trade-off accepted.** Ids stop being dense and sequential, and a collision costs an extra probe.
 
-**Measured after implementation, and it qualifies the projection.** Ids stop being
+**Measured after implementation (lane I-T2), and it qualifies the projection.** Ids stop being
 dense, so every `native_key_id` reference widens from a 1–2 byte record field to an 8-byte one, and
 the dictionary's own rowid b-tree stops being densely packed. The projection above counted only the
 dropped automatic index and missed both costs. On a small fixture store (12 233 distinct keys,
@@ -275,7 +275,7 @@ over 420 MB); the external reference point for the lexical-tier budget.
 
 ---
 
-*Every figure in this record is quoted from the verification run's per-b-tree attribution or
+*Every figure in this record is quoted from the wave-I verification run's per-b-tree attribution or
 derived in [`docs/research/16-storage-tier2.md`](../research/16-storage-tier2.md), where the
 arithmetic is shown. §2.1 has been implemented; §2.2–§2.5 have not.*
 

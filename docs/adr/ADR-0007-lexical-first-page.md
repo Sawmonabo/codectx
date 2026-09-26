@@ -129,10 +129,10 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
 
 - **A segment is an immutable packed structure over a set of documents**: the three streams of the
   original Decision 1 (`term.dir`, `term.text`, `post.list`) plus the two per-document attribute
-  streams of Decision 2 (`doc.dir`, `doc.attr`; see its amendment), chunked into parts, with postings inside a segment ascending by
+  streams of Decision 2 (`doc.dir`, `doc.attr`; see its amendment), chunked into parts exactly as before, with postings inside a segment ascending by
   document rowid. `lexical_segments` carries a segment's term and document counts and its packed
   bytes; `lexical_segment_parts` holds the chunks; `generation_segments` is one generation's set, in
-  read order. There is no generation-level parts table, and no ownership table either: the
+  read order. There is no generation-level parts table any more, and no ownership table either: the
   relation "this document lies in this segment" is a column of the document's own row.
 - **The seal folds one segment per unit, from the tokenizer pass the seal already makes.** There is
   no second tokenisation and no second index. The pass that counts a batch's tokens reads its
@@ -317,10 +317,10 @@ wall 763.8 s under the default configuration with every provider on; store 2.29 
 1.97 GB). Fixture: a 210-file repository with 5 279 documents and 260 020 instances. Queries warm,
 three runs after a discarded warm-up, page size 200.
 
-**Consumer-side measurement.** Removing the per-page re-open of the posting scan and the by-rowid
+**Round 1 (consumer side).** Removing the per-page re-open of the posting scan and the by-rowid
 pending batch took `function` from 1.70 s to 1.27 s and `<global>` from 2.11 s to 1.18 s; every page
 of `return` (41 pages, 8 020 items), `user` (35 pages, 6 904 items) and `<rare>` (1 page,
-6 items) was byte-identical before and after. Profile of `function` after that change: ranking 80 %
+6 items) was byte-identical before and after. Profile of `function` after the round: ranking 80 %
 of the process, of which the lexical tier 0.93 s (posting walk 0.33 s, document frequency 0.18 s,
 document hydration 0.16 s, match 0.09 s, statistics 0.09 s, emit 0.08 s) and the collector's
 external sort 0.21 s. Two engine-side shortcuts were rejected: pushing ranking into the index
@@ -328,7 +328,7 @@ engine's own ranking function (a different scoring model: different inverse-docu
 saturation constants, no per-column weights) and a persisted index that reproduces the ranking (an
 approximation of the served order).
 
-**Storage-side measurement.** Query plans of every statement the lexical tier issues: the posting
+**Round 2 (storage side).** Query plans of every statement the lexical tier issues: the posting
 scan is a virtual-table scan of the vocabulary joined per instance to the document row by
 `idx_search_doc` and, through a correlated scalar subquery, to the generation-visibility row by its
 covering unique index; document frequency is the same plan plus `USE TEMP B-TREE FOR count(DISTINCT)`;
@@ -353,6 +353,6 @@ frequency), zero mismatched documents on both stores.
 
 **Baseline first page, reference repository, default configuration:** `function` 1.240 / 1.272 /
 1.245 s at 99.6 MB peak RSS; `<global>` 1.553 / 1.573 / 1.616 s at 103.3 MB; `return` 0.762 s,
-`user` 0.531 s, `<rare>` 0.270 s (medians) at 99.1 / 82.9 / 33.2 MB. Rescaling the consumer-side
+`user` 0.531 s, `<rare>` 0.270 s (medians) at 99.1 / 82.9 / 33.2 MB. Rescaling round 1's
 phase split per term, Decision 1 alone removes about 0.60 s from `function` (to about 0.65 s) and
 about 0.31 s from `<global>` (to about 1.26 s), which is why Decisions 2 and 3 exist.

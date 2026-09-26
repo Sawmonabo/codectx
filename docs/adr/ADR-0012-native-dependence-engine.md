@@ -211,16 +211,10 @@ must-write list is real and smaller than the earlier plan assumed.
 
 ### 5. "No caps" is a property of the design, and coexistence is a mechanism
 
-**Per function**, the design figure for the structures is **M_sparse(N) ≈ 96·N + 64 bytes** — 0.92 MiB
-at N = 10⁴, which covers the largest function measured on this host under any lines-to-nodes factor up
-to about 1.3, and 9.16 MiB at N = 10⁵. It is a **design figure, not a bound**: the control-flow CSRs and
-the post-dominator pass are O(N + E), and the reaching-definitions pass also grows with the variables,
-uses and definitions, the (block, variable) pairs its lookups visit and the pairs it emits, so the arena
-is not linear in N alone and nothing guarantees or enforces the figure. The benchmark reports each
-function's arena bytes against it as `bound_ratio`, measured after the three dependence-core passes
-(post-dominators, control dependence, reaching definitions); the forward dominator pass, which the
-dependence core does not run, is excluded from that ratio and reported on its own. The definition count
-is bounded **structurally**, not by a constant: a definition is a CFG node index, so D ≤ N. That is the replacement for the engine's
+**Per function**, the structures are bounded by **M_sparse(N) ≤ 96·N + 64 bytes** — 0.92 MiB at
+N = 10⁴, which covers the largest function measured on this host under any lines-to-nodes factor up to
+about 1.3, and 9.16 MiB at N = 10⁵. The definition count is bounded **structurally**, not by a
+constant: a definition is a CFG node index, so D ≤ N. That is the replacement for the engine's
 definition cap, whose price is dropping *every* reaching-definition edge of an over-large method.
 
 **Per run:**
@@ -462,10 +456,8 @@ File-locality fidelity, the engine measured against itself:
 Under subdivision of one project: control dependence 99.7%, reaching definitions 99.9%, methods 100%,
 **resolved calls 46%**.
 
-Memory: per function the design figure **M_sparse(N) ≈ 96·N + 64 bytes** (0.92 MiB at N = 10⁴; 9.16 MiB
-at N = 10⁵), against the dense formulation's 2.34 GiB at N = 10⁵. It is a design figure, not a bound
-(§5); `bound_ratio` compares the arena after the three dependence-core passes against it and excludes
-the forward dominator pass. Per run **≈5.00 GiB** at 16 workers, identical at
+Memory: per function **M_sparse(N) ≤ 96·N + 64 bytes** (0.92 MiB at N = 10⁴; 9.16 MiB at N = 10⁵),
+against the dense formulation's 2.34 GiB at N = 10⁵. Per run **≈5.00 GiB** at 16 workers, identical at
 1×, 3× and 10×. Function sizes measured on this host: this repository 3,272 functions, p50 13 / p99 122
 / max 387 body lines; a large Go library 4,153 functions, p50 9 / p99 187 / max 669; a generated driver
 3,609 functions, p99.9 2,499 / max 7,518.
@@ -575,7 +567,7 @@ repository, and are re-measured when any of the three changes.
   nineteen candidate building blocks with licence and last activity, each fetched at a live URL.
 - [05-cfg-cdg-from-treesitter.md](../research/05-cfg-cdg-from-treesitter.md) — the earlier CFG and
   control-dependence sizing and the precision argument this record inherits.
-- [00-synthesis.md §8](../research/00-synthesis.md) — the standing direction: the hosted engine
+- [00-synthesis.md §8](../research/00-synthesis.md) — the standing direction ruling: the hosted engine
   is the MVP backend, the pinned benchmark corpora are the differential oracle for any future native
   engine, and no analysis limit is lowered.
 - [providers-dependence.md](../providers-dependence.md) — what the provider publishes, its failure

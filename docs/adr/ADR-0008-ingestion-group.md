@@ -17,7 +17,7 @@ shows the same shape:
 | reference repository, cert run | 6:18 | 1.8 GB | 76.7 GB | 43× |
 | reference repository, packed-lexical baseline | 12:44 | 2.5 GB | 96.7 GB | 39× |
 | reference repository, packed-lexical delta | 22:15 | 3.2 GB | 136.0 GB | 43× |
-| second corpus, sampled | 6:45 | 624 MB | 46.6 GB | 75× |
+| second corpus, current tip, sampled | 6:45 | 624 MB | 46.6 GB | 75× |
 
 The sampled second-corpus run locates the writes: all but a fraction of a gigabyte of the 47 GB (the
 remainder is the snapshot's content store) were written between "snapshot captured" and "packed
@@ -180,8 +180,8 @@ freed: the existence of a level's admitted file is that level's one-object commi
 pooled file that always exists would need a second durable record ordered after it, a protocol
 whose failure is a silently wrong frontier -- the reclaimer below keeps these frees off the burst
 path, which is all pooling would have bought; the per-unit materialized trees and the indexer run directories;
-the foreign outputs themselves (an indexer's index, the dependence export); and six more
-surfaces the code frees: a published blob when its
+the foreign outputs themselves (an indexer's index, the dependence export); and six surfaces a
+later review found freed by the code and missing from this list: a published blob when its
 snapshot is collected, the trim of a blob's staging surface at publication, a sort run the walk
 adopted and removes itself, a retained search directory, the capture staging, and every journal the
 engine deletes through the shim. The fourth amendment below places all of these behind one paced
@@ -216,8 +216,8 @@ moved on.
 ### Decision 5, amended a fifth time 2026-09-16: one pace per host, and a reclaimer that never stalls or bursts
 
 The first index with the reclaimer finished with nothing worse than 84 ms on an independent write, the
-export directory draining behind the run at the measured pace. What the run had not exercised was
-still wrong. The pace was per charger: every caller that gave bytes back waited on
+export directory draining behind the run at the measured pace. A review of the reclaimer then found
+what the run had not exercised. The pace was per charger: every caller that gave bytes back waited on
 its own, so several at once handed the host several windows per interval, and two processes over one
 store handed it twice the rate. The rate the host tolerates is the host's, not a process's: the pace is
 therefore taken through one lock every process takes for each window it frees, so the sum of what this
