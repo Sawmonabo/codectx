@@ -81,9 +81,15 @@ var goLowering = Lowering{
 //     operand of && reaches the right one when true and skips it when
 //     false; || the reverse), and defining the expression's result variable,
 //     a variable the lowering owns; the owning node Uses that variable,
-//     never the operands' names (see Lowering, Uses).
-//   - A for statement without a condition has a Branch head spanning the
-//     `for` keyword; with one, the condition's first node is the head, the
+//     never the operands' names (see Lowering, Uses). In value position
+//     (`x := a && b`) the last operand's Branch reaches the owning node
+//     whether it is true or false: its two edges are one after
+//     deduplication, so it has one successor and controls nothing.
+//   - A for statement without a condition (`for {`, `for i := 0; ; i++ {`)
+//     has a Branch head spanning the `for` keyword whose one successor is
+//     the body: the specification makes an absent condition equivalent to
+//     true, so the head has no exit edge, and the loop is left only by a
+//     jump. With a condition, the condition's first node is the head, the
 //     target of the back edge.
 //   - A range loop follows the iteration model of Lowering (the
 //     specification's "For statements with range clause": the range
@@ -138,7 +144,11 @@ var goLowering = Lowering{
 //     list) is a Branch node that Uses its own values' reads and the
 //     variable holding the tag, never the tag's names, since it compares
 //     against the tag's value as the head evaluated it. Case conditions are
-//     tested in source order with default last.
+//     tested in source order with default last. `default` makes no node:
+//     wherever it stands, its body is entered from the last case
+//     condition's false edge (from what precedes the first case condition
+//     when there is no case); with no default, that edge leaves the
+//     switch.
 //   - The specification declares a type switch's alias anew in the implicit
 //     block of each clause ("Type switches"); the lowering declares one
 //     variable, defined at the head, for all clauses. The pairs are the same:
@@ -210,11 +220,18 @@ var goLowering = Lowering{
 // statements and each case clause open implicit blocks. `:=` declares a new
 // variable for each name not already declared in the innermost block (an
 // inner-block `:=` shadows), after its right side is read. `_` is never a
-// variable. An identifier is a use only when it resolves to a variable
-// declared in the function being lowered; package-level names, constants
-// and types are not. A composite-literal key that is a bare identifier
-// resolving to a variable is a use (a map key is an expression; a struct
-// field key cannot be told apart without types).
+// variable. A variable a for clause declares is one variable for the whole
+// loop, although the specification gives each iteration its own copy ("For
+// statements with for clause": each iteration's copy is initialised to the
+// previous iteration's value before the post statement runs): the copy
+// holds the value the variable had, so no read sees a different
+// definition; a function literal that captures it and runs later writes
+// its own iteration's copy, which the may-definition of the one variable
+// covers as a superset. An identifier is a use only when it resolves to a
+// variable declared in the function being lowered; package-level names,
+// constants and types are not. A composite-literal key that is a bare
+// identifier resolving to a variable is a use (a map key is an expression;
+// a struct field key cannot be told apart without types).
 //
 // A name that resolves to no variable of the function (a package-level
 // name, an undeclared name, a constant or type) follows Lowering's "Names
