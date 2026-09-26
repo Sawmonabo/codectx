@@ -22,7 +22,7 @@ import (
 // same envelope with exit code 2.
 //
 // The two `tools` rows protect the managed-toolchain boundary of Section 11.7
-// and its exit-code mapping in Task 22 Step 3. `tools status` on an empty store
+// and its exit-code mapping. `tools status` on an empty store
 // must report every lock entry as honestly absent and succeed: a report that
 // silently dropped entries, or failed because nothing is installed, would make
 // an operator believe a language is unsupported when it merely is not fetched
@@ -107,18 +107,14 @@ func TestCommandEnvelope(t *testing.T) {
 		// prefetchNames gives (tools.go): a name the caller did not supply is
 		// their input, not a provider that could not run.
 		//
-		// LANE NOTE (L10): the sibling assertion -- a RESOLVABLE-looking
-		// profile whose payload cannot be resolved surfacing the toolchain's
-		// CTX_TOOL_* verbatim -- is not reachable from this package in this
-		// build. Every CTX_TOOL_* originates in toolchain.Resolver.Resolve
-		// inside lsp.Resolve, which is reached only through the facade's
-		// overlay route (L7/L8), and building a second resolution here would be
-		// the duplicate path the facade exists to prevent. Proving it needs a
-		// real workspace and belongs to the integration/verification lane:
-		// `codectx symbol NAME --semantic-source lsp --profile gopls` under a
-		// user config carrying `[tools]\noffline = true` must exit 5 with
-		// CTX_TOOL_OFFLINE. What this row does pin is that the command never
-		// reaches an empty page on the lsp route.
+		// The sibling case -- a resolvable-looking profile whose payload cannot
+		// be resolved surfacing the toolchain's CTX_TOOL_* verbatim -- is not
+		// reachable from this package. Every CTX_TOOL_* originates in
+		// toolchain.Resolver.Resolve inside lsp.Resolve, which is reached only
+		// through the facade's overlay route, and building a second resolution
+		// here would be the duplicate path the facade exists to prevent. What
+		// this row pins is that the command never reaches an empty page on the
+		// lsp route.
 		{name: "symbol on the lsp overlay without a profile", args: []string{"symbol", "writeSymbolTable", "--semantic-source", "lsp", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "symbol", errCode: "CTX_ARGUMENT_INVALID"},
 		// `context advance` is the guarded transition of Section 17.1, and the
 		// guard is the version the caller presents. An omitted --expected-version
@@ -130,10 +126,9 @@ func TestCommandEnvelope(t *testing.T) {
 		// that is not a workspace, so a check that ran after the open would fail
 		// on the workspace (exit 3) instead of on the flag.
 		{name: "context advance without the version guard", args: []string{"context", "advance", hexID, "consolidate", "--actor", "agent-a", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context advance", errCode: "CTX_ARGUMENT_INVALID"},
-		// T20-L6 rows: `doctor` and `repo-map` are the two Section 18.1
-		// spellings Task 20 adds, and the pair exists to pin the asymmetry
-		// between them, which is a design decision and not an accident of two
-		// commands being written by one lane.
+		// `doctor` and `repo-map` are two Section 18.1 spellings, and the pair
+		// exists to pin the asymmetry between them, which is a design decision
+		// and not an accident.
 		//
 		// `doctor` is the command an operator reaches for when their workspace
 		// is broken. If a failed open failed the command, the one tool meant to
@@ -146,22 +141,17 @@ func TestCommandEnvelope(t *testing.T) {
 		// would render it as a repository containing no packages at all, which
 		// a model consuming the map reads as fact.
 		//
-		// LANE NOTE (T20-L6): the lane plan's second assertion -- `repo-map
-		// --cursor` on a TAMPERED token reporting CTX_CURSOR_INVALID and exit 8
-		// -- is not reachable from this package at fixture scale. The cursor is
-		// verified in graph/cursor.go's verifyContinuation, behind a pinned
-		// generation, so the open of a directory that is not a workspace fails
-		// first and exit 3 is what the row would actually observe; reaching the
-		// verifier needs a real store with an active generation, which is the
-		// verification lane's argv, not this table's. Handed to VERIFY: `codectx
-		// repo-map --cursor <token with one byte changed> --json` against the
-		// proof store must be CTX_CURSOR_INVALID with exit 8. The exit-8 mapping
-		// itself is already in ExitCode's table and is not re-asserted here.
+		// `repo-map --cursor` on a tampered token (CTX_CURSOR_INVALID, exit 8)
+		// is not reachable from this table. The cursor is verified in
+		// graph/cursor.go's verifyContinuation, behind a pinned generation, so
+		// the open of a directory that is not a workspace fails first with
+		// exit 3; reaching the verifier needs a store with an active
+		// generation. The exit-8 mapping itself is in ExitCode's table and is
+		// not re-asserted here.
 		{name: "doctor on a workspace it cannot open", args: []string{"doctor", "--json"}, absentWorkspaceArg: true, exitCode: 0, ok: true, command: "doctor", checkData: checkUnopenableWorkspaceReport},
 		{name: "repo-map on a workspace it cannot open", args: []string{"repo-map", "--json"}, absentWorkspaceArg: true, exitCode: 3, ok: false, command: "repo-map", errCode: "CTX_WORKSPACE_NOT_FOUND"},
-		// L4 rows: the two cases digest Section 6 budgets for this lane are
-		// TestInitRefusesToOverwriteProjectConfig and
-		// TestBrokenStdoutPipeIsNotADefect, at the end of this file. Neither is
+		// Two further cases, TestInitRefusesToOverwriteProjectConfig and
+		// TestBrokenStdoutPipeIsNotADefect, are at the end of this file. Neither is
 		// expressible in this table: it writes to a bytes.Buffer and then asserts
 		// that stdout parses as exactly one envelope, which a broken pipe makes
 		// impossible by construction, and it has no way to name a per-case

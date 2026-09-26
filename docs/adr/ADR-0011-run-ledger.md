@@ -35,7 +35,7 @@ decision and not the state of the tree. Each of the six stages is now a span, op
 `internal/provider/dependence/provider.go:828` and `:924`, and its duration line is gone. Each of
 the three measurements has a reader: the sampler keeps the tree's peak at
 `internal/process/treesample_linux.go:65` and its CPU ticks at `:77`, and the runner reads the reaped
-child's user and system time into its result at `internal/process/runner.go:632-633`; the span a
+child's user and system time into its result at `internal/process/runner.go:632-634`; the span a
 child ran under records all three.
 
 ## Decision
