@@ -422,6 +422,45 @@ func TestRustLoweringGolden(t *testing.T) {
 				"v@62 -> o@82"},
 		},
 		{
+			// Expressions › `match` expressions, and › Match guards: the
+			// match's value is the value of the arm that matched. Nodes: o@5,
+			// k@21, o@52 (the scrutinee, defining an owned variable),
+			// Some(x)@56 (Branch, Using it), x@61 (the binding, Using it),
+			// x > k@67 (the guard, a Branch Using x and k), x@76 (the arm's
+			// result, Using the arm's x and defining the match's result),
+			// k@84 (the `_` arm's result, defining it too; `_` makes no
+			// node), let r = …;@38 (Uses the match's result), r@89. Succ:
+			// o@52→Some(x)→{x@61, k@84}; x@61→x > k→{x@76, k@84};
+			// x@76→let r; k@84→let r; let r→r. IPDom: Some(x) → let r; x@61
+			// → x > k → let r; x@76 → let r; k@84 → let r. Frontier walks:
+			// Some(x) over x@61, x > k and k@84; x > k over x@76 and k@84.
+			name:     "a consumed match hands each arm's result to its consumer through one result variable",
+			protects: "the let consuming a match takes its value from each arm's result node, whose reads resolve in the arm's scope, and never re-reads the scrutinee's or the arms' names",
+			mutation: "give an arm's result node no definition of the match's result (loses x@76 -> let r and k@84 -> let r), or let the let re-read the names inside the match (gains o@5, x@61 and k@21 -> let r)",
+			src:      "fn f(o: Option<i32>, k: i32) -> i32 { let r = match o { Some(x) if x > k => x, _ => k }; r }",
+			cd: []string{"Some(x)@56 -> x@61", "Some(x)@56 -> x > k@67", "Some(x)@56 -> k@84", "x > k@67 -> x@76",
+				"x > k@67 -> k@84"},
+			du: []string{"o@5 -> o@52", "o@52 -> Some(x)@56", "o@52 -> x@61", "x@61 -> x > k@67", "k@21 -> x > k@67",
+				"x@61 -> x@76", "k@21 -> k@84",
+				"x@76 -> let r = match o { Some(x) if x > k => x, _ => k };@38",
+				"k@84 -> let r = match o { Some(x) if x > k => x, _ => k };@38",
+				"let r = match o { Some(x) if x > k => x, _ => k };@38 -> r@89"},
+		},
+		{
+			// Expressions › Assignment expressions › Destructuring
+			// assignments: the right operand is evaluated once, then each
+			// assignee is assigned its part. Nodes: a@9, b@21, (a, b) = (b,
+			// a)@38 (Uses b and a, defines an owned variable holding the
+			// tuple), a@39 and b@42 (each Uses that variable and defines its
+			// name), a - b@55. Straight line.
+			name:     "a destructuring assignment's targets take their parts from the value evaluated once",
+			protects: "each target of `(a, b) = (b, a)` Uses the assignment's value, never the names the assignment read, so a swap pairs the parameters only with the assignment",
+			mutation: "let a target defining a name its statement read also Use that name (gains a@9 -> a@39 and b@21 -> b@42), or give the targets no use of the assignment's value (loses (a, b) = (b, a)@38 -> a@39 and -> b@42)",
+			src:      "fn f(mut a: i32, mut b: i32) -> i32 { (a, b) = (b, a); a - b }",
+			du: []string{"a@9 -> (a, b) = (b, a)@38", "b@21 -> (a, b) = (b, a)@38", "(a, b) = (b, a)@38 -> a@39",
+				"(a, b) = (b, a)@38 -> b@42", "a@39 -> a - b@55", "b@42 -> a - b@55"},
+		},
+		{
 			// Expressions › Operator expressions › Borrow operators, and
 			// Expressions › Place expressions and value expressions: `*p` is
 			// a place, so `&mut *p` may write through p, but `!b` is a value, so `&mut !b` borrows a temporary and never
