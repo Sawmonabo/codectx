@@ -356,5 +356,20 @@ func TestCLoweringGolden(t *testing.T) {
 			cd:       []string{"1@34 -> return 1;@38", "1@34 -> return 0;@50"},
 			du:       []string{"x@10 -> x@23", "x@23 -> 1@34"},
 		},
+		{
+			// C17 §6.8.4.1p2 (the first substatement runs when the controlling
+			// expression compares unequal to 0) and §6.5.16p3 (an assignment
+			// has the value of its left operand after the assignment). Nodes:
+			// x@10, x = g()@20 (the condition with both pairs of parentheses
+			// stripped: one Branch node that defines x and branches on the
+			// value), return x;@30, return 0;@40. Succ: x@10→x = g()→{return
+			// x, return 0}. IPDom: x = g() → EXIT.
+			name:     "an assignment that is the whole condition is the decision node",
+			protects: "a condition that is only an assignment makes one Branch node defining its target, so the branch and the definition are one node",
+			mutation: "lower the assignment as a node of its own before a Branch spanning the same text (adds x = g()@20 -> x = g()@20, the Branch Using the assignment's result)",
+			src:      "int f(int x) { if ((x = g())) return x; return 0; }",
+			cd:       []string{"x = g()@20 -> return x;@30", "x = g()@20 -> return 0;@40"},
+			du:       []string{"x = g()@20 -> return x;@30"},
+		},
 	})
 }
