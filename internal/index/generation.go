@@ -754,8 +754,9 @@ func (g *generation) attachCarried(ctx context.Context) (err error) {
 // build runs every unit the plan did not reuse, provider by provider in
 // dependency order, and returns the deferred ones for the background tick. A
 // provider's units run concurrently; the next provider starts only when the
-// previous one's units are sealed, because storage refuses to open a unit
-// whose declared dependency is not yet sealed.
+// previous one's units are sealed and committed, because a unit resolves
+// against its declared dependencies as of the last commit and storage refuses
+// one whose dependency is not sealed there.
 func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	ctx, span := ledger.Start(ctx, stageBuild, "")
 	defer func() {
@@ -780,6 +781,12 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 				err := group.wait()
 				group = nil
 				if err != nil {
+					return err
+				}
+				// The next provider's units read their dependencies from the
+				// last commit, so what this provider sealed is committed before
+				// the first of them runs: one commit per provider boundary.
+				if err := g.c.opts.Store.Flush(ctx); err != nil {
 					return err
 				}
 			}
@@ -1083,11 +1090,20 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 	if err != nil {
 		return outcome{}, err
 	}
-	runID, err := c.opts.Store.BeginProviderRun(ctx, g.gen, u.ProviderID, u.ProviderVersion)
+	// The unit's candidates resolve against its declared dependencies' aliases,
+	// read once here from the last commit rather than once per candidate. The
+	// read can refuse a dependency that is not committed sealed, so it runs
+	// before the provider run is opened: a refusal after it would leave a run
+	// row `running` that nothing completes.
+	aliases, err := c.opts.Store.DependencyAliases(ctx, u.DependsOn)
 	if err != nil {
 		return outcome{}, err
 	}
-	resolver, err := reconcile.New(c.opts.Store, c.repo, u.DependsOn)
+	resolver, err := reconcile.New(aliases, c.repo, u.DependsOn)
+	if err != nil {
+		return outcome{}, err
+	}
+	runID, err := c.opts.Store.BeginProviderRun(ctx, g.gen, u.ProviderID, u.ProviderVersion)
 	if err != nil {
 		return outcome{}, err
 	}
