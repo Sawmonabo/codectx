@@ -166,10 +166,10 @@ const (
 //     arm is not `#else` has one more arm, the empty group a build takes
 //     when no condition holds (C17 §6.10.1p6), which binds nothing. The
 //     condition reads no variable. Every other preprocessor line inside a
-//     body produces no node. After the directive a name any arm binds stands for every binding it
-//     has in some build: the arms' variable, and, when some arm (the empty
-//     one included) does not bind the name, the variable it named before the
-//     directive, if any. A read through the name Uses each, and taking its
+//     body produces no node. After the directive a name any arm binds
+//     stands for every binding it has in some build: the arms' variable,
+//     and, when some arm (the empty one included) does not bind the name,
+//     the variable it named before the directive, if any. A read through the name Uses each, and taking its
 //     address, binding a reference to it or writing it by reference from a
 //     callable may-defines each. A definition through it (an assignment, an
 //     update) defines the arms' variable and may-defines the one from before
