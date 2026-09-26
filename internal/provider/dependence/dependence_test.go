@@ -173,7 +173,8 @@ func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provid
 	// NewWithImporter, not New: the fake backend writes an export no real
 	// reader can import, so the fault injection has to replace both.
 	p, err := dependence.NewWithImporter(b, fakeImporter{}, dependence.Options{DataDir: dataDir,
-		Timeout: 2 * time.Minute, CacheBytes: 1 << 20, Limits: providertest.Limits})
+		Timeout: 2 * time.Minute, CacheBytes: 1 << 20, Limits: providertest.Limits,
+		Machine: dependence.Machine{AvailableBytes: 32 << 30, Observed: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
