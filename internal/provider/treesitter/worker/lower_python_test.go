@@ -16,7 +16,8 @@ import "testing"
 // augmented graph with no entry-to-exit edge; a def-use pair is (defining
 // node, using node) with every φ resolved; a may-definition kills nothing; a
 // Handler node carries the values on entry to each node that threw to it.
-// Section numbers are those of The Python Language Reference.
+// Every case opens with the section it turns on; section numbers are those
+// of The Python Language Reference, version 3.13.
 func TestPythonLoweringGolden(t *testing.T) {
 	runGolden(t, "python", []goldenCase{
 		{
@@ -54,21 +55,46 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"i = -1@69 -> return i@77"},
 		},
 		{
-			// §8.3. Lines at 0, 11, 25, 33, 42, 49, 57. Nodes: xs@6, xs@21
-			// (the iterable, evaluated once), x in xs@16 (head), x@16 (the
-			// target, on the body path), x@30 (if), break@36, x = 0@51
-			// (else), return x@58. Succ: head→{x@16, x = 0}; x@16→x@30;
-			// x@30→{break, head}; break→return x; x = 0→return x. IPDom:
-			// x@16 → x@30; x@30, head, x = 0 → return x.
+			// §8.3: the iterable is evaluated once, then each item is
+			// assigned to the target. Lines at 0, 11, 25, 33, 42, 49, 57.
+			// Nodes: xs@6, xs@21 (the iterable: Uses xs, defines the
+			// iteration variable), x in xs@16 (head, Using only the
+			// iteration variable), x@16 (the target, on the body path, Using
+			// the iteration variable), x@30 (if), break@36, x = 0@51 (else),
+			// return x@58. Succ: head→{x@16, x = 0}; x@16→x@30; x@30→{break,
+			// head}; break→return x; x = 0→return x. IPDom: x@16 → x@30;
+			// x@30, head, x = 0 → return x.
 			name:     "a for loop's target is defined on the body path and its else on the exhausted path",
-			protects: "the head defines nothing, the target reads the iterable, and a break carries the target's value past the else",
-			mutation: "define the target on the head (x = 0@51 no longer kills it and x@16 -> x@30 becomes x in xs@16 -> x@30), or run the else after a break",
+			protects: "the head defines nothing, the head and the target read the iteration variable the iterable's node defines, not the iterable's names, and a break carries the target's value past the else",
+			mutation: "define the target on the head (x = 0@51 no longer kills it and x@16 -> x@30 becomes x in xs@16 -> x@30), or make the head and the target Use the iterable's reads (xs@6 -> x in xs@16 and xs@6 -> x@16 appear), or run the else after a break",
 			src:      "def f(xs):\n for x in xs:\n  if x:\n   break\n else:\n  x = 0\n return x\n",
 			fn:       1,
 			cd: []string{"x in xs@16 -> x@16", "x in xs@16 -> x@30", "x in xs@16 -> x = 0@51",
 				"x@30 -> break@36", "x@30 -> x in xs@16"},
-			du: []string{"xs@6 -> xs@21", "xs@6 -> x in xs@16", "xs@6 -> x@16",
+			du: []string{"xs@6 -> xs@21", "xs@21 -> x in xs@16", "xs@21 -> x@16",
 				"x@16 -> x@30", "x@16 -> return x@58", "x = 0@51 -> return x@58"},
+		},
+		{
+			// §8.3: the iterable is evaluated once and an iterator created
+			// for it, so a body that changes d does not change what the head
+			// steps. Lines at 0, 10, 23, 37. Nodes: d@6, d@20 (the iterable:
+			// Uses d, defines the iteration variable), k in d@15 (head,
+			// Using only the iteration variable), k@15 (the target, Using
+			// the iteration variable), d[k] = g(k)@25 (Uses k and d,
+			// may-defines d, its base variable, §7.2), return d@38. Succ:
+			// d@20→head→{k@15, return d}; k@15→d[k] = g(k)→head. IPDom:
+			// k@15 → d[k] = g(k) → head → return d. The subscript write's
+			// may-definition kills nothing, so d@6 and it both reach it
+			// around the loop and reach return d.
+			name:     "a body that writes through the iterated name does not reach the loop head",
+			protects: "the head reads the iterator made once from d, so a subscript write to d in the body, a may-definition of d, pairs with the later reads of d and never with the head",
+			mutation: "make the head Use the iterable's reads (d@6 -> k in d@15 and d[k] = g(k)@25 -> k in d@15 appear)",
+			src:      "def f(d):\n for k in d:\n  d[k] = g(k)\n return d\n",
+			fn:       1,
+			cd:       []string{"k in d@15 -> k@15", "k in d@15 -> d[k] = g(k)@25", "k in d@15 -> k in d@15"},
+			du: []string{"d@6 -> d@20", "d@20 -> k in d@15", "d@20 -> k@15", "k@15 -> d[k] = g(k)@25",
+				"d@6 -> d[k] = g(k)@25", "d[k] = g(k)@25 -> d[k] = g(k)@25",
+				"d@6 -> return d@38", "d[k] = g(k)@25 -> return d@38"},
 		},
 		{
 			// §8.2. Lines at 0, 9, 22, 32, 41. Nodes: True@16 (a Stmt head
@@ -83,7 +109,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			cd:       []string{"g()@27 -> True@16", "g()@27 -> g()@27"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 23, 34, 42, 53, 61. Nodes: a@6,
+			// §8.4.1. Lines at 0, 10, 16, 23, 34, 42, 53, 61. Nodes: a@6,
 			// g(a)@18 (may throw), except@24 (Handler), E@31, a = 1@36,
 			// F@50, a = 2@55, return a@62. Succ: g(a)→{return a, except};
 			// except→E→{a = 1, F}; F→{a = 2, EXIT (the re-raise)}; both
@@ -99,7 +125,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du: []string{"a@6 -> g(a)@18", "a@6 -> return a@62", "a = 1@36 -> return a@62", "a = 2@55 -> return a@62"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 22, 33, 41, 50, 58. Nodes: a@6,
+			// §8.4.1. Lines at 0, 10, 16, 22, 33, 41, 50, 58. Nodes: a@6,
 			// g()@18, except@23 (Handler), E@30, a = 1@35, a = 2@52 (the
 			// bare clause, no test), return a@59. E→{a = 1, a = 2}; every
 			// path reaches return a, the IPDom of g() and E.
@@ -112,7 +138,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@6 -> return a@59", "a = 1@35 -> return a@59", "a = 2@52 -> return a@59"},
 		},
 		{
-			// §8.4. Lines at 0, 10, 16, 26, 37, 48, 55, 67, 77, 84. Nodes:
+			// §8.4.3, §8.4.4. Lines at 0, 10, 16, 26, 37, 48, 55, 67, 77, 84. Nodes:
 			// a@6, a = g()@18 (may throw), except@27 (Handler), E@34,
 			// return 0@39, a = a + 1@57 (else), h(a)@79 (finally; no
 			// finally Handler: nothing throws to it part-way), return a@85.
@@ -122,7 +148,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// a = g(), E → h(a) → EXIT. The Handler carries a@6.
 			name:     "try else runs only on the body's normal end and every exit passes the finally",
 			protects: "the else body is control dependent on the try body's completion, and a handler's return and an unmatched exception both run the finally with the values they carry",
-			mutation: "lower the else body after the handler exits merge (a = a + 1@57 then follows return 0 and loses its dependence on a = g()@18), or skip the finally for the return (a@6 no longer reaches h(a)@79)",
+			mutation: "lower the else body after the handler exits merge (a = a + 1@57 then follows return 0 and loses its dependence on a = g()@18), or skip the finally for the return (return 0@39 leaves straight to EXIT, h(a)@79 no longer post-dominates E@34 or a = g()@18, and E@34 -> h(a)@79 and a = g()@18 -> h(a)@79 appear)",
 			src:      "def f(a):\n try:\n  a = g()\n except E:\n  return 0\n else:\n  a = a + 1\n finally:\n  h(a)\n return a\n",
 			fn:       1,
 			cd: []string{"a = g()@18 -> except@27", "a = g()@18 -> E@34", "a = g()@18 -> a = a + 1@57",
@@ -174,7 +200,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"a() as x@16 -> with a() as x@11", "b() as y@26 -> with a() as x, b() as y@11"},
 		},
 		{
-			// §8.6. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
+			// §8.6.2, §8.6.3. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
 			// (subject), (x, y)@27 (a Branch using the subject), x@28 and
 			// y@31 (captures), x@37 (guard), r = y@43, _@56 (irrefutable: a
 			// Stmt, no false edge), r = 0@62, return r@69. Succ: (x, y)→
@@ -191,16 +217,20 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"x@28 -> x@37", "y@31 -> r = y@43", "r = y@43 -> return r@69", "r = 0@62 -> return r@69"},
 		},
 		{
-			// §6.2.4. Lines at 0, 14. Nodes: xs@6, k@10, the comprehension
-			// node@22 (its first iterable xs is evaluated here; k is a
-			// capture; x is the comprehension's own), return …@15.
+			// §6.2.4: the leftmost for clause's iterable is evaluated in the
+			// enclosing scope. Lines at 0, 14. Nodes: xs@6, k@10, the
+			// comprehension node@22 (its first iterable xs is evaluated
+			// here; k is a capture; x is the comprehension's own), return
+			// …@15, which Uses the first iterable's read, a part of its own
+			// statement's evaluation, and not the capture k, which the
+			// creating node carries.
 			name:     "a comprehension's first iterable and captures are uses of its creating node",
-			protects: "the enclosing function evaluates the first iterable, and the comprehension's own target shadows nothing outside it",
-			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node)",
+			protects: "the enclosing function evaluates the first iterable, the comprehension's own target shadows nothing outside it, and the return consuming the comprehension does not repeat its captures",
+			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node), or keep the captures in the consuming statement's reads (k@10 -> return [x + k for x in xs if x]@15 appears)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       1,
 			du: []string{"xs@6 -> [x + k for x in xs if x]@22", "k@10 -> [x + k for x in xs if x]@22",
-				"xs@6 -> return [x + k for x in xs if x]@15", "k@10 -> return [x + k for x in xs if x]@15"},
+				"xs@6 -> return [x + k for x in xs if x]@15"},
 		},
 		{
 			// §6.2.4, the comprehension itself (callable 2). Nodes: for x in
@@ -209,8 +239,8 @@ func TestPythonLoweringGolden(t *testing.T) {
 			// EXIT}; x@33→x@44→{x + k, head}; x + k→head. IPDom: x@33 →
 			// x@44 → head → EXIT; x + k → head.
 			name:     "a comprehension is its own callable with its clauses as nested loops",
-			protects: "each for clause is a loop head, an if clause's false edge continues with the next element, and the element depends on both",
-			mutation: "lower an if clause's false edge to the comprehension's exit (x@44 -> for x in xs@29 disappears)",
+			protects: "each for clause is a loop head, an if clause's false edge continues with the next element, and the element is control dependent on the if clause, which is control dependent on the head",
+			mutation: "lower an if clause's false edge to the comprehension's exit (the head no longer post-dominates x@44, and x@44 -> for x in xs@29 appears)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       2,
 			cd: []string{"for x in xs@29 -> x@33", "for x in xs@29 -> x@44", "for x in xs@29 -> for x in xs@29",
@@ -219,13 +249,14 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §6.14. Lines at 0, 10, 31. Nodes: a@6, lambda b: a + b@15
-			// (captures a), g = lambda b: a + b@11, return g@32.
+			// (captures a), g = lambda b: a + b@11 (consumes the created
+			// value, not the capture: it Uses nothing), return g@32.
 			name:     "a lambda's creating node uses its captures",
-			protects: "a lambda is its own callable and the enclosing function sees only its creation, which reads the enclosing variables it references",
-			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6)",
+			protects: "a lambda is its own callable and the enclosing function sees only its creation, whose node reads the enclosing variables it references and whose consumer does not repeat them",
+			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6), or keep the captures in the assignment's reads (a@6 -> g = lambda b: a + b@11 appears)",
 			src:      "def f(a):\n g = lambda b: a + b\n return g\n",
 			fn:       1,
-			du: []string{"a@6 -> lambda b: a + b@15", "a@6 -> g = lambda b: a + b@11",
+			du: []string{"a@6 -> lambda b: a + b@15",
 				"g = lambda b: a + b@11 -> return g@32"},
 		},
 		{
@@ -309,7 +340,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@6 -> a > 0@18", "a@6 -> m(a)@25", "a@6 -> return a@31"},
 		},
 		{
-			// §8.4. Lines at 0, 9, 16, 22, 28, 44, 51. Nodes: e = 0@10,
+			// §8.4.1. Lines at 0, 9, 16, 22, 28, 44, 51. Nodes: e = 0@10,
 			// g()@24 (may throw), except@29 (Handler), E@36, e@41 (the
 			// binding), h(e)@46 (may throw, into the clause's finally),
 			// as@38 (that finally's Handler), the deletion of e (a Stmt
@@ -390,8 +421,9 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §8.3, §8.2. Lines at 0, 10, 20, 34, 43, 51, 63, 71. Nodes:
-			// a@6, a@17 (while head), a@31 (the iterable), y in a@26 (for
-			// head), y@26 (target), break@37, continue@54 (the for's else),
+			// a@6, a@17 (while head), a@31 (the iterable: Uses a, defines
+			// the iteration variable), y in a@26 (for head) and y@26
+			// (target), each Using only the iteration variable, break@37, continue@54 (the for's else),
 			// a = 0@65, return a@72. The for's frame is closed when its else
 			// runs, so the continue targets the while. Succ: a@17→{a@31,
 			// return a}; a@31→y in a→{y@26, continue}; y@26→break→a = 0→
@@ -404,12 +436,15 @@ func TestPythonLoweringGolden(t *testing.T) {
 			fn:       1,
 			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> a@17",
 				"y in a@26 -> y@26", "y in a@26 -> break@37", "y in a@26 -> a = 0@65", "y in a@26 -> continue@54"},
-			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@72",
-				"a = 0@65 -> a@17", "a = 0@65 -> a@31", "a = 0@65 -> y in a@26", "a = 0@65 -> y@26", "a = 0@65 -> return a@72"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> return a@72",
+				"a@31 -> y in a@26", "a@31 -> y@26",
+				"a = 0@65 -> a@17", "a = 0@65 -> a@31", "a = 0@65 -> return a@72"},
 		},
 		{
 			// §8.3, §8.2. Lines at 0, 10, 20, 34, 42, 50, 59. Nodes: a@6,
-			// a@17 (while head), a@31, y in a@26 (for head), y@26, break@53
+			// a@17 (while head), a@31 (the iterable, defining the iteration
+			// variable), y in a@26 (for head) and y@26, each Using only the
+			// iteration variable, break@53
 			// (the for's else), return a@60. Succ: a@17→{a@31, return a};
 			// a@31→y in a→{y@26, break}; y@26→y in a; break→return a.
 			// IPDom: a@17 → return a; a@31 → y in a → break → return a;
@@ -421,7 +456,7 @@ func TestPythonLoweringGolden(t *testing.T) {
 			fn:       1,
 			cd: []string{"a@17 -> a@31", "a@17 -> y in a@26", "a@17 -> break@53",
 				"y in a@26 -> y@26", "y in a@26 -> y in a@26"},
-			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@6 -> y in a@26", "a@6 -> y@26", "a@6 -> return a@60"},
+			du: []string{"a@6 -> a@17", "a@6 -> a@31", "a@31 -> y in a@26", "a@31 -> y@26", "a@6 -> return a@60"},
 		},
 		{
 			// §8.4.2. Lines at 0, 9, 16, 22, 28, 40, 48, 60, 67. Nodes:

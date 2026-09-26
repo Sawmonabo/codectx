@@ -12,7 +12,8 @@ import (
 // one function; function definitions (async is a modifier of the kind);
 // lambdas; class definitions, whose body is code run once, at definition
 // time, in a scope of its own; and the four comprehensions, each an implicit
-// function of its own (The Python Language Reference §6.2.4).
+// function of its own (§6.2.4; section numbers are those of The Python
+// Language Reference, version 3.13).
 var pythonLowering = Lowering{
 	language: "python",
 	callables: []string{"module", "function_definition", "lambda", "class_definition", "list_comprehension",
@@ -56,11 +57,14 @@ var pythonLowering = Lowering{
 //     is a Stmt node spanning True. A loop's else body is lowered from the
 //     head's false edge after the loop's frame closes, so a break skips it
 //     and a break or continue inside it targets the enclosing loop.
-//   - `for t in e:` is a Stmt node spanning e, evaluated once, then a Branch
-//     head spanning from the start of t to the end of e (whether another
-//     element is assigned), which defines nothing: each name t binds is
-//     defined on the body path by the unpacking rule above, so the exit edge
-//     carries the definitions from before the loop. async for is the same.
+//   - `for t in e:` (§8.3) follows Iteration (see Lowering): a Stmt node
+//     spanning e, evaluated once, defines the loop's iteration variable; the
+//     Branch head, spanning from the start of t to the end of e (whether
+//     another element is assigned), Uses only that variable and defines
+//     nothing. Each name t binds is defined on the body path by the
+//     unpacking rule above, each binding node Using the iteration variable
+//     and none of e's reads, so the exit edge carries the definitions from
+//     before the loop. async for is the same.
 //   - `and`, `or` and the conditional expression: the deciding operand is a
 //     Branch node spanning it, created after the nodes of everything it
 //     evaluates; each conditionally evaluated operand is a Stmt node spanning
@@ -70,7 +74,9 @@ var pythonLowering = Lowering{
 //   - `x := e` is a defining node spanning the assignment expression, and the
 //     node evaluating the enclosing expression reads x.
 //   - try (§8.4): the handler is entered through the builder's Handler node,
-//     spanning the first `except` keyword. Each except or except* clause
+//     spanning the first `except` keyword; for an except* clause that is
+//     `except` alone, since the grammar makes `except` and `*` two tokens
+//     (`except*` renders `except`). Each except or except* clause
 //     with a type is a Branch node spanning its type expression, in source
 //     order. Except clauses: the first that matches runs; an exception no
 //     clause matches is re-raised (Throw) from the last test's false edge,
@@ -80,7 +86,7 @@ var pythonLowering = Lowering{
 //     previous body's end, and after the last clause the statement both
 //     completes and re-raises what no clause matched. `except E as n`
 //     defines n on a node spanning n, and n is deleted however the clause
-//     ends (§8.4): the body runs in a finally whose body is a killing
+//     ends (§8.4.1): the body runs in a finally whose body is a killing
 //     definition of n on a Stmt node spanning the whole clause, and whose
 //     Handler spans the `as` keyword. The else body runs from the try
 //     body's normal end, with the handlers closed, then joins the handler
@@ -88,18 +94,24 @@ var pythonLowering = Lowering{
 //     `finally` keyword.
 //   - with (§8.5), per item in order: the context expression's nodes, then
 //     one acquiring Stmt node spanning the item (entering the manager), which
-//     defines the `as` target when it is a name and may-defines a variable
-//     of the lowering's own holding the manager. The rest of the statement
-//     is a finally: its Handler spans the token introducing the item (the
-//     `with` keyword for the first, the preceding comma for each later one),
-//     a pattern or reference target is bound inside it by the unpacking
-//     rule, from the item's reads (a failing assignment runs `__exit__`),
-//     and its exit is one Stmt node spanning from the `with` keyword to the
-//     end of the item, which Uses the manager's variable. The statement
-//     after the with follows the exit when the body completed normally or an
-//     exception reached the finally, because `__exit__` may suppress it; a
-//     break, continue or return alone is re-issued from the exit and never
-//     falls through. Items close in reverse.
+//     Uses the context expression's reads alone, defines the `as` target
+//     when it is a name and may-defines a variable of the lowering's own
+//     holding the manager. The rest of the statement is a finally: its
+//     Handler spans the token introducing the item (the `with` keyword for
+//     the first, the preceding comma for each later one), a pattern or
+//     reference target is bound inside it by the unpacking rule, from the
+//     item's reads (a failing assignment runs `__exit__`), each binding
+//     node spanning its target (`o.p` in `with m as o.p`) and Using the
+//     reads of the target's object and index itself, which the acquiring
+//     node does not, since they are evaluated after `__enter__`; and its
+//     exit is one Stmt node spanning from the `with` keyword to the end of
+//     the item, which Uses the manager's variable only: `__exit__` is
+//     called on the manager entered, not on the context expression's
+//     variables, which the exit's span holds but does not evaluate again.
+//     The statement after the with follows the exit when the body completed
+//     normally or an exception reached the finally, because `__exit__` may
+//     suppress it; a break, continue or return alone is re-issued from the
+//     exit and never falls through. Items close in reverse.
 //   - match (§8.6): the subjects are one Stmt node spanning them. Each case is
 //     one node spanning its patterns, in source order, that Uses the
 //     subjects' reads and every value its patterns read (a dotted name, a
@@ -122,13 +134,20 @@ var pythonLowering = Lowering{
 //     a non-killing definition) every enclosing variable it assigns —
 //     through nonlocal, through global when the enclosing function is the
 //     module, or through `:=` in a comprehension (§6.12). A def or class
-//     statement's node also defines its name.
+//     statement's node also defines its name. The node consuming the
+//     created value (a return, an assignment) Uses the parts' reads, not the
+//     captures (see Uses).
 //   - A comprehension's graph is its clauses as nested loops: each `for`
 //     clause is a Branch head spanning the clause whose false edge returns to
-//     the enclosing clause's head (the outermost's leaves); a `for` clause
-//     after the first is preceded by a Stmt node spanning its iterable; each
-//     `if` clause is a Branch node spanning its condition whose false edge
-//     continues with the next element; the element is one Stmt node spanning
+//     the enclosing clause's head (the outermost's leaves) and which defines
+//     nothing; its target is defined on the body path by the unpacking rule,
+//     one defining node per bound name spanning it, as a for statement's
+//     is. A `for` clause after the first is preceded by a Stmt node spanning
+//     its iterable, and its head and target nodes Use that iterable's reads;
+//     the first clause's iterable is the enclosing function's, so its head
+//     and target nodes Use nothing. Each `if` clause is a Branch node
+//     spanning its condition whose false edge continues with the next
+//     element; the element is one Stmt node spanning
 //     the comprehension's body expression (a key: value pair for a
 //     dictionary). The first iterable belongs to the enclosing function.
 //   - A lambda's body is one node spanning it, its value.
@@ -143,16 +162,42 @@ var pythonLowering = Lowering{
 //
 // # Uses
 //
-// Only an identifier resolving to a variable of this function is a Use; an
-// attribute name and a keyword argument's name are not reads. A node Uses
-// every variable read inside its own span and no read outside it, as in the
-// seed lowerings, and a node that defines v also Uses v when its statement
-// read v before it. An unpacking target node also Uses the variables of the
-// value it unpacks. A write through an attribute or subscript (`o.p = v`,
-// `a[i] += v`, `del o.p`) Uses the object, index and value and may-defines
-// (MayDef) the base variable of the target (o, a): the object it names is
-// changed and a later read of it sees the write, while the binding is not
-// replaced.
+// A node's Uses follow the consumption rule (see Lowering). Only an
+// identifier resolving to a variable of this function is a Use; an
+// attribute name and a keyword argument's name are not reads. What that
+// rule makes of Python's constructs:
+//
+//   - A statement's node Uses the reads of its own evaluation, operands
+//     that are nodes of their own included when their value is its value:
+//     both operands of `and` and `or`, the arms of a conditional expression
+//     (not its condition, a Branch node of its own), and every operand of a
+//     chained comparison, which short-circuits like `and` (§6.10), so
+//     `return a < b < c` Uses a, b and c.
+//   - An assignment expression `x := e` carries e's reads on its own
+//     defining node; the node consuming it reads x.
+//   - A nested callable's creating node Uses its captures and the node
+//     consuming the created value does not repeat them; the consumer still
+//     Uses the reads of the parts evaluated where the callable is created
+//     (a default, a base, a comprehension's first iterable), which are its
+//     statement's own evaluation (see Node granularity).
+//   - A node that defines v also Uses v when its statement read v before
+//     it, unless the bullets above leave that read to a node of its own (a
+//     capture, a condition, an assignment expression's value): in `y = x +
+//     (x := 1)` the assignment expression's node Uses the x read before it.
+//   - An unpacking target node Uses the variables of the value it unpacks;
+//     a for target's nodes Use the iteration variable instead (see Node
+//     granularity).
+//   - A write through an attribute or subscript (`o.p = v`, `a[i] += v`,
+//     `del o.p`) Uses the object, index and value and may-defines (MayDef)
+//     the base variable of the target (o, a): the object it names is
+//     changed and a later read of it sees the write, while the binding is
+//     not replaced.
+//   - Deleting a name reads nothing: `del x` removes the binding (§7.5),
+//     so its node, and the node deleting an except clause's name, Uses
+//     nothing and is a killing definition that carries no value.
+//   - A match capture is a variable of the function like any other name
+//     (§4.2.1), so the guard and body read the same variable and no read
+//     resolves in a scope of the arm's own.
 //
 // # Exceptions
 //
@@ -235,12 +280,17 @@ type pyLower struct {
 	// is a write to an enclosing callable.
 	walrusOnly  int
 	outerWalrus bool
-	// reads are the variables read by the current statement, in evaluation
-	// order; seen[v] == stmtNo marks v as one of them. stmtNo increases
-	// across every function the Scratch lowers and is never reset, so an
-	// entry an earlier function left in seen is below it and marks nothing.
+	// reads are the variables read by the current statement that its later
+	// nodes may still Use, in evaluation order: a construct whose reads a
+	// node of its own carries and the consumer does not repeat (a
+	// callable's captures, a conditional expression's condition, an
+	// assignment expression's value) truncates them away after that node.
+	// seen[v] is v's first position in reads for statement stmt; pending
+	// checks it against reads. stmtNo increases across every function the
+	// Scratch lowers and is never reset, so an entry an earlier function
+	// left in seen names another statement and marks nothing.
 	reads  []int32
-	seen   []int
+	seen   []pySeen
 	stmtNo int
 	// writes are the enclosing variables assigned inside the nested callable
 	// whose captures are being collected; closure may-defines them.
@@ -282,6 +332,13 @@ func (j *pyLower) start(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s
 // Scratch holds nothing of the file past its lowering.
 func (j *pyLower) finish() {
 	j.l, j.b, j.src, j.cur, j.binds = nil, nil, nil, nil, nil
+}
+
+// pySeen is where a variable was first read in reads, and in which
+// statement.
+type pySeen struct {
+	stmt int
+	at   int32
 }
 
 // pyFrame is one callable's scope: its bindings start at binds[mark]. A
@@ -834,11 +891,24 @@ func (j *pyLower) read(v int32) {
 	if v < 0 {
 		return
 	}
-	j.reads = append(j.reads, v)
-	if int(v) >= len(j.seen) {
-		j.seen = append(j.seen, make([]int, int(v)+1-len(j.seen))...)
+	if !j.pending(v) {
+		if int(v) >= len(j.seen) {
+			j.seen = append(j.seen, make([]pySeen, int(v)+1-len(j.seen))...)
+		}
+		j.seen[v] = pySeen{stmt: j.stmtNo, at: int32(len(j.reads))}
 	}
-	j.seen[v] = j.stmtNo
+	j.reads = append(j.reads, v)
+}
+
+// pending reports whether v is one of reads. reads is only ever cut back
+// to a prefix, so v is in it exactly when its first recorded position
+// still holds it.
+func (j *pyLower) pending(v int32) bool {
+	if int(v) >= len(j.seen) {
+		return false
+	}
+	s := j.seen[v]
+	return s.stmt == j.stmtNo && int(s.at) < len(j.reads) && j.reads[s.at] == v
 }
 
 // reset starts a statement: nothing is read and no throw is pending.
@@ -871,13 +941,13 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 }
 
 // def records that node n defines v and, when the statement read v before
-// n, that n Uses v.
+// n in a read still pending, that n Uses v.
 func (j *pyLower) def(n, v int32) {
 	if v < 0 {
 		return
 	}
 	j.b.Def(n, v)
-	if int(v) < len(j.seen) && j.seen[v] == j.stmtNo {
+	if j.pending(v) {
 		j.b.Use(n, v)
 	}
 }
@@ -1324,13 +1394,17 @@ func (j *pyLower) forStmt(n *ts.Node) {
 	left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
 	j.value(right)
 	j.throws++ // iter()
-	j.node(flow.Stmt, right, 0, len(j.reads))
-	rEnd := len(j.reads)
+	it := j.b.Var()
+	j.def(j.node(flow.Stmt, right, 0, len(j.reads)), it)
 	f := j.b.OpenLoop()
+	j.reset()
 	j.throws++ // next()
-	h := j.nodeAt(flow.Branch, flow.Span{Start: uint32(left.StartByte()), End: uint32(right.EndByte())}, 0, rEnd)
+	h := j.nodeAt(flow.Branch, flow.Span{Start: uint32(left.StartByte()), End: uint32(right.EndByte())}, 0, 0)
+	j.b.Use(h, it)
 	exit := j.b.Push()
-	j.bind(left, nil, 0, rEnd)
+	j.reset()
+	j.read(it)
+	j.bind(left, nil, 0, len(j.reads))
 	j.block(n.ChildByFieldId(k.fBody))
 	j.loopEnd(n, f, h, true, exit)
 }
@@ -1418,8 +1492,9 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 // grammar parses `except E as n` with E and n as one as-pattern value.
 //
 // With `as n`, n is bound first, and the body runs in a finally whose body
-// is the node deleting n (§8.4: n is deleted however the clause ends), a Stmt
-// node spanning the clause; the finally's Handler spans the `as` keyword.
+// is the node deleting n (§8.4.1: n is deleted however the clause ends), a
+// Stmt node spanning the clause; the finally's Handler spans the `as`
+// keyword.
 func (j *pyLower) except(c *ts.Node, star bool) bool {
 	k := j.k
 	j.reset()
@@ -1655,7 +1730,7 @@ func (j *pyLower) capture(name *ts.Node, mode int) {
 	}
 }
 
-// irrefutable reports whether case pattern p always matches (§8.6.2).
+// irrefutable reports whether case pattern p always matches (§8.6.3).
 func (j *pyLower) irrefutable(p *ts.Node) bool {
 	k := j.k
 	start, list := j.kids(p)
@@ -1841,11 +1916,13 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
 // reads[from:] on, which are those of the parts evaluated before it (a
 // decorated definition's decorators) and of its defaults, bases or first
 // iterable, and n's captures, and may-defines every enclosing variable n
-// assigns.
+// assigns. The captures are then dropped from reads: the node consuming
+// the created value does not repeat them.
 func (j *pyLower) closure(n, at *ts.Node, from int) int32 {
 	w := len(j.writes)
-	j.nested(n, true)
+	parts := j.nested(n, true)
 	id := j.node(flow.Stmt, at, from, len(j.reads))
+	j.reads = j.reads[:parts]
 	for _, v := range j.writes[w:] {
 		j.b.MayDef(id, v)
 	}
@@ -1867,8 +1944,9 @@ func (j *pyLower) eval(x *ts.Node, lower bool) {
 
 // nested evaluates the parts of nested callable n evaluated where it is
 // created (lowered when lower, else captured), then collects the captures of
-// its own code in a frame of its own.
-func (j *pyLower) nested(n *ts.Node, lower bool) {
+// its own code in a frame of its own. It returns the length reads had
+// before the captures: every read from there on is one.
+func (j *pyLower) nested(n *ts.Node, lower bool) int {
 	k := j.k
 	id := n.KindId()
 	switch id {
@@ -1883,6 +1961,7 @@ func (j *pyLower) nested(n *ts.Node, lower bool) {
 		j.done(start)
 		j.throws++
 	}
+	parts := len(j.reads)
 	j.shadow++
 	j.pushFrame(n)
 	switch id {
@@ -1895,6 +1974,7 @@ func (j *pyLower) nested(n *ts.Node, lower bool) {
 	}
 	j.popFrame()
 	j.shadow--
+	return parts
 }
 
 // value lowers an expression evaluated for its value: reads are recorded,
@@ -1937,9 +2017,11 @@ func (j *pyLower) value(n *ts.Node) {
 	case k.conditionalExpression:
 		// Children: the value if true, the condition, the value if false.
 		start, list := j.kids(n)
+		// The condition is a node of its own; the consumer Uses the arms.
 		m := len(j.reads)
 		j.value(&list[1])
 		j.node(flow.Branch, &list[1], m, len(j.reads))
+		j.reads = j.reads[:m]
 		p := j.b.Push()
 		j.valueNode(&list[0])
 		t := j.b.Push()
@@ -1955,6 +2037,9 @@ func (j *pyLower) value(n *ts.Node) {
 		j.value(n.ChildByFieldId(k.fValue))
 		v := j.lookup(n.ChildByFieldId(k.fName))
 		j.def(j.node(flow.Stmt, n, m, len(j.reads)), v)
+		// The consumer reads the name, whose definition carries the
+		// value's reads.
+		j.reads = j.reads[:m]
 		j.read(v)
 	case k.typeKind:
 	default:
