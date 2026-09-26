@@ -47,7 +47,8 @@ type Language struct {
 	// it. Where present the worker checks it too.
 	Metadata string
 	// Extensions are the file extensions the grammar declares in its
-	// tree-sitter.json. An extension two grammars declare (".h") is a header
+	// tree-sitter.json, plus ".hh" for C++, a C++ header spelling its
+	// declaration omits. An extension two grammars declare (".h") is a header
 	// whose grammar the repository decides (see Census); every other one
 	// names its language on its own.
 	Extensions []string
