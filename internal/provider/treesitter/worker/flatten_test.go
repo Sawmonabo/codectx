@@ -76,8 +76,9 @@ type flatSource struct {
 // flatSources is every grammar fixture and every golden case's source. The
 // golden cases are literals inside the golden tests, so their sources are
 // read from those files' syntax: each goldenCase literal's src, a string
-// literal or a sum of them. A src of any other form fails, so no case is
-// silently left out.
+// literal or a sum of them. A src of any other form fails, as does a file
+// that runs golden cases with no source found, so no case is silently left
+// out.
 func flatSources(t *testing.T) []flatSource {
 	t.Helper()
 	var out []flatSource
@@ -102,8 +103,13 @@ func flatSources(t *testing.T) []flatSource {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cases := 0
+		cases, golden := 0, false
 		ast.Inspect(file, func(x ast.Node) bool {
+			if call, ok := x.(*ast.CallExpr); ok {
+				if f, ok := call.Fun.(*ast.Ident); ok && f.Name == "runGolden" {
+					golden = true
+				}
+			}
 			lit, ok := x.(*ast.CompositeLit)
 			if !ok {
 				return true
@@ -135,8 +141,8 @@ func flatSources(t *testing.T) []flatSource {
 			}
 			return true
 		})
-		if cases == 0 {
-			t.Fatalf("%s: no golden case source found", path)
+		if golden && cases == 0 {
+			t.Fatalf("%s runs golden cases, and none has a source this reader finds", path)
 		}
 	}
 	return out
