@@ -2,13 +2,16 @@ package index
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -302,7 +305,7 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 // run's id. Once a later publication has folded them into its own rows they
 // must not be subtracted from its count a second time.
 //
-// Mutation: return states unchanged from projectAbandoned, and the row still
+// Mutation: answer nil from abandonedFailures, and the row still
 // reports two units running; drop the clear from keepFailures, and the
 // published generation's row is rewritten again.
 func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
@@ -314,7 +317,7 @@ func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
 		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
 		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: 2,
 		Details: map[string]string{"reason": reasonUnitsDeferred}}}
-	row := l.projectAbandoned("snap", rows)[0]
+	row := projectAbandoned(rows, l.abandonedFailures("snap"))[0]
 	if row.State != model.CapabilityFailed || row.UnitsRunning != 0 || row.DiagnosticCode != model.CodeDiskFull ||
 		row.Details["reason"] != reasonPublicationFailed || row.Details[detailRunID] != "run-1" ||
 		row.Details[model.DetailUnitsFailed] != "2" {
@@ -324,7 +327,7 @@ func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
 	if err := row.Validate(); err != nil {
 		t.Fatalf("the projected row does not validate: %v", err)
 	}
-	if other := l.projectAbandoned("another-snap", rows)[0]; other.State != model.CapabilityUnavailable {
+	if other := projectAbandoned(rows, l.abandonedFailures("another-snap"))[0]; other.State != model.CapabilityUnavailable {
 		t.Fatalf("a row over another snapshot was rewritten to %+v", other)
 	}
 	if kept := l.backgroundFailures(nil); len(kept) != 2 ||
@@ -332,7 +335,118 @@ func TestAnAbandonedDeferredUnitReadsFailedNotRunning(t *testing.T) {
 		t.Fatalf("the next publication's failed scopes are %+v, want both abandoned units", kept)
 	}
 	l.keepFailures(1, nil)
-	if again := l.projectAbandoned("snap", rows)[0]; again.State != model.CapabilityUnavailable {
+	if again := projectAbandoned(rows, l.abandonedFailures("snap"))[0]; again.State != model.CapabilityUnavailable {
 		t.Fatalf("units a publication already stated were projected again: %+v", again)
 	}
+}
+
+// TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess protects the same
+// status in every process but the one whose publication failed. That process
+// alone holds the in-process record, so a `codectx status` or the index-status
+// tool of another process would read the abandoned units as still running for
+// as long as the active generation stands. It must read them from the run
+// ledger -- the deferred run's abandonment marker over its unit spans -- as
+// failed, with reason publication_failed, the publication error's code and
+// that run's id, and only while the generation the marker names is active.
+//
+// The deferred run is recorded here exactly as tickHeld records it (a unit
+// span per popped unit, then abandon and markAbandoned), since no fixture
+// provider can make a real publication fail. The reader is built as another
+// process builds one: a second, read-only store handle, a ledger handle that
+// was never attached, and no deferred sealer.
+//
+// Mutation: skip markAbandoned in tickHeld, or drop the scope_key match from
+// MarkedUnits, and the row still reports two units running, or a row over
+// another generation is rewritten.
+func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
+	f := newFixture(t, map[string]string{"main.go": "package main\n"})
+	ctx := f.ctx
+	c := f.coordinator(append(f.providers(false), &heavyFixtureProvider{}))
+	res, err := c.Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	units := deferredScopes("lost", 2)
+	c.late.mu.Lock()
+	c.late.state = queueState{snap: res.Binding.SnapshotID, epoch: c.late.state.epoch + 1}
+	epoch := c.late.state.epoch
+	c.late.mu.Unlock()
+	run := c.newRun(ledger.KindDeferred)
+	runCtx := run.Context(ctx)
+	for _, d := range units {
+		span := ledger.Plan(runCtx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
+		span.Begin(runCtx)
+		span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	}
+	cause := &model.Error{Code: model.CodeDiskFull, Message: "the store is full"}
+	failure, ok := c.late.abandon(epoch, units, cause, run.ID())
+	if !ok {
+		t.Fatal("abandon recorded nothing for the queue's own epoch")
+	}
+	markAbandoned(runCtx, res.Binding.GenerationID, len(units), failure, cause)
+	run.Finish(ledger.OutcomeFailed)
+	if err := f.ledger.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	second, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("a second, read-only store handle: %v", err)
+	}
+	t.Cleanup(func() { second.Close() })
+	other, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: second,
+		Git: c.opts.Git, Repo: c.repo, RunLedger: dirLedger{f.dataDir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := second.ActiveGeneration(ctx, c.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []model.CapabilityState{{ProviderID: heavyProviderID, Capability: "structure",
+		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
+		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: 2,
+		Details: map[string]string{"reason": reasonUnitsDeferred}}}
+	abandoned, err := other.recordedAbandonment(ctx, active)
+	if err != nil {
+		t.Fatalf("recordedAbandonment: %v", err)
+	}
+	row := projectAbandoned(rows, abandoned)[0]
+	if row.State != model.CapabilityFailed || row.UnitsRunning != 0 || row.DiagnosticCode != model.CodeDiskFull ||
+		row.Details["reason"] != reasonPublicationFailed || row.Details[detailRunID] != run.ID() ||
+		row.Details[model.DetailUnitsFailed] != "2" {
+		t.Fatalf("another process reads the abandoned units as %+v, want failed, none running, %s, %s and run %s",
+			row, model.CodeDiskFull, reasonPublicationFailed, run.ID())
+	}
+	if err := row.Validate(); err != nil {
+		t.Fatalf("the projected row does not validate: %v", err)
+	}
+	later, err := other.recordedAbandonment(ctx, active+1)
+	if err != nil {
+		t.Fatalf("recordedAbandonment: %v", err)
+	}
+	if again := projectAbandoned(rows, later)[0]; again.State != model.CapabilityUnavailable {
+		t.Fatalf("a row over another generation was rewritten to %+v", again)
+	}
+}
+
+// dirLedger is the run-ledger reader another process composes: it opens the
+// file in the data directory per call and only reads. Status asks it for the
+// marked units alone.
+type dirLedger struct{ dir string }
+
+func (dirLedger) Run(context.Context, string) (*model.RunRecord, []model.StageRecord, int64, error) {
+	return nil, nil, 0, nil
+}
+
+func (dirLedger) OpenPeaks(context.Context) (PeakLookup, error) { return nil, nil }
+
+func (d dirLedger) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+	named int) ([]ledger.MarkedUnits, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, d.dir)
+	if err != nil || !recorded {
+		return nil, err
+	}
+	defer reader.Close()
+	return reader.MarkedUnits(ctx, repositoryID, generationID, stage, named)
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -482,4 +483,89 @@ func (r *Reader) RecordedPeak(ctx context.Context, repositoryID, scopeKey, famil
 		return 0, false, wrap("read the family's recorded peak", err)
 	}
 	return peak, true, nil
+}
+
+// MarkedUnits is one provider's unit spans in the runs a marker names: how
+// many there are, and the first of them by scope key. A unit span is a
+// top-level span whose stage is its provider's id, which is how a run records
+// every unit it planned.
+type MarkedUnits struct {
+	Provider string
+	Units    int64
+	Named    []MarkedUnit
+}
+
+// MarkedUnit is one named unit and the marker that names its run: the run's
+// id and the marker's diagnostic code and failure text.
+type MarkedUnit struct {
+	ScopeKey       string
+	RunID          string
+	DiagnosticCode string
+	Failure        string
+}
+
+// MarkedUnits reads the unit spans of every deferred run of a repository that
+// holds a top-level span of this stage scoped to generationID in decimal --
+// the marker a run writes to say what it did to the units it planned over that
+// generation -- and that started no earlier than the run that produced the
+// generation. It answers per provider, in provider order, with the count and
+// the first named of them by scope key.
+//
+// The runs it reads are ones retention keeps for as long as the generation is
+// retained: a sweep deletes only runs that started before the oldest run
+// behind a retained generation, and every run read here started at or after
+// the run behind this one (SweepRuns). A generation whose producing run the
+// file no longer holds -- a ledger recreated after the store was built --
+// answers nothing, since no marker can be told apart from one about an
+// earlier generation of the same id.
+//
+// The markers are found through the runs index by repository and start, and
+// each run's spans through the run's own key, so the read covers the runs
+// since the generation's own and never the whole span table. The answer is
+// bounded by named per provider.
+func (r *Reader) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+	named int) ([]MarkedUnits, error) {
+	repo, err := model.DecodeID(repositoryID)
+	if err != nil {
+		return nil, err
+	}
+	const query = `WITH base AS (
+			SELECT MIN(started_at) AS started FROM runs WHERE repository_id = ?1 AND generation_id = ?2
+		), marked AS (
+			SELECT m.run_id, m.diagnostic_code, m.failure_json
+			FROM base, runs r JOIN spans m ON m.run_id = r.run_id
+			WHERE r.repository_id = ?1 AND r.kind = 'deferred' AND r.started_at >= base.started
+			  AND m.parent_id IS NULL AND m.stage = ?3 AND m.scope_key = ?4
+		), units AS (
+			SELECT u.provider, u.scope_key, u.run_id, marked.diagnostic_code, marked.failure_json,
+				ROW_NUMBER() OVER (PARTITION BY u.provider ORDER BY u.scope_key, u.run_id) AS n,
+				COUNT(*) OVER (PARTITION BY u.provider) AS total
+			FROM marked JOIN spans u ON u.run_id = marked.run_id
+			WHERE u.parent_id IS NULL AND u.provider <> '' AND u.stage = u.provider
+		)
+		SELECT provider, total, scope_key, run_id, diagnostic_code, failure_json
+		FROM units WHERE n <= ?5 ORDER BY provider, n`
+	rows, err := r.db.QueryContext(ctx, query, repo, generationID, stage,
+		strconv.FormatInt(generationID, 10), named)
+	if err != nil {
+		return nil, wrap("read the marked units", err)
+	}
+	defer rows.Close()
+	var out []MarkedUnits
+	for rows.Next() {
+		var provider string
+		var total int64
+		var unit MarkedUnit
+		var runID []byte
+		if err := rows.Scan(&provider, &total, &unit.ScopeKey, &runID, &unit.DiagnosticCode, &unit.Failure); err != nil {
+			return nil, wrap("read the marked units", err)
+		}
+		unit.RunID = hex.EncodeToString(runID)
+		if len(out) == 0 || out[len(out)-1].Provider != provider {
+			out = append(out, MarkedUnits{Provider: provider, Units: total})
+		}
+		last := &out[len(out)-1]
+		last.Named = append(last.Named, unit)
+	}
+	return out, wrap("read the marked units", rows.Err())
 }

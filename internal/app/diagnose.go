@@ -170,6 +170,20 @@ func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []m
 	return runRecord(view)
 }
 
+// MarkedUnits reads the unit spans of the deferred runs that marked this
+// generation with the stage, for a status report in any process. A workspace
+// with no ledger answers none; one whose ledger cannot be read reports it, and
+// the report says so.
+func (l runLedger) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+	named int) ([]ledger.MarkedUnits, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, err
+	}
+	defer reader.Close()
+	return reader.MarkedUnits(ctx, repositoryID, generationID, stage, named)
+}
+
 // OpenPeaks opens the learned peaks for one plan. It is advisory and must
 // never refuse a plan: a workspace with no ledger answers a nil lookup, and one
 // whose ledger cannot be opened is logged and answers a nil lookup too, which

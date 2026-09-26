@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -136,10 +137,11 @@ type lateSealer struct {
 	// No generation holds it until a later publication of this queue folds it
 	// into failedScopes (backgroundFailures) and activates, which moves it
 	// into background (keepFailures). Until then status projects it over the
-	// active generation's rows (projectAbandoned). It is this process's
-	// record: a failed publication wrote nothing durable, so another process
-	// reads the active generation as it was published. It is bounded and
-	// replaced exactly as background is.
+	// active generation's rows (projectAbandoned). This is the writing
+	// process's record, read at once; the run ledger holds the same fact for
+	// every other process, as the deferred run's abandonment marker over its
+	// unit spans (markAbandoned), and status reads that where this record is
+	// empty. It is bounded and replaced exactly as background is.
 	abandoned map[string]abandonedUnit
 	// estimate is the mean duration of the deferred units this process has
 	// completed, and samples how many it is over. Zero samples means the
@@ -635,7 +637,9 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 		// failed with reason publication_failed and this run's id, never as
 		// still running. Saying how much is lost is the difference between a
 		// diagnosable failure and minutes of analysis vanishing.
-		l.abandon(state.epoch, popped, err, run.ID())
+		if failure, ok := l.abandon(state.epoch, popped, err, run.ID()); ok {
+			markAbandoned(ctx, active, len(popped), failure, err)
+		}
 		c.log.Warn("a deferred publication failed and its units are abandoned",
 			"component", component, "repository_id", string(c.repo),
 			"sealed_units", len(b.sealed), "failed_units", len(b.failures), "run_id", run.ID())
@@ -660,20 +664,21 @@ const (
 )
 
 // abandon records every unit a failed publication popped as failed with that
-// publication's error. It is dropped when a later base activation replaced the
-// queue, as keepFailures drops a replaced queue's reasons.
+// publication's error, and reports the failure it recorded. It is dropped, and
+// reports false, when a later base activation replaced the queue, as
+// keepFailures drops a replaced queue's reasons.
 //
 // The details are the reason and the run id alone. The error's code and safe
 // message travel as the row's code and failure message; its own particulars
 // would share the provider detail budget with these two, and a full budget
 // evicts by key order, which could drop the run id the row exists to name.
-func (l *lateSealer) abandon(epoch int64, popped []deferredUnit, cause error, runID string) {
+func (l *lateSealer) abandon(epoch int64, popped []deferredUnit, cause error, runID string) (unitFailure, bool) {
 	failure := typedFailure(cause)
 	failure.details = map[string]string{"reason": reasonPublicationFailed, detailRunID: runID}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(popped) == 0 || l.state.epoch != epoch {
-		return
+		return unitFailure{}, false
 	}
 	if l.abandoned == nil {
 		l.abandoned = map[string]abandonedUnit{}
@@ -682,20 +687,42 @@ func (l *lateSealer) abandon(epoch int64, popped []deferredUnit, cause error, ru
 		l.abandoned[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = abandonedUnit{providerID: d.unit.ProviderID,
 			scopeKey: d.unit.ScopeKey, failure: failure}
 	}
+	return failure, true
 }
 
-// projectAbandoned is a status answer's rows over snapshot snap with this
-// queue's abandoned units folded in. A row that reports a provider's deferred
-// units still running loses the abandoned ones from that count and becomes the
-// failure row coverage would have published for them: failed, or partial when
-// another row of the provider shows facts it holds, with the publication's
-// code, reason and run id. Rows over any other snapshot are answered as they
-// are: the abandoned units were planned over this queue's snapshot alone.
-func (l *lateSealer) projectAbandoned(snap model.SnapshotID, states []model.CapabilityState) []model.CapabilityState {
+// markAbandoned writes the durable half of abandon into the deferred run: one
+// top-level span of stage abandonment, scoped to the active generation the
+// tick extended (in decimal), failed with the publication's code and message,
+// its in count the units abandoned. It is a marker and not a bracket, so its
+// wall is the instant it was written. The run's unit spans are the units it
+// names, since the tick opens one for every unit it pops, and status in any
+// process reads them through ledger.Reader.MarkedUnits while that generation
+// stays active (StatusReader.recordedAbandonment).
+//
+// The generation is the one this tick read at its start. Within one queue the
+// active generation moves only by this queue's own publications, and ticks are
+// serialized, so it is still the generation whose rows count these units
+// deferred; a base activation that replaces it also replaces the queue, and
+// abandon then records nothing.
+func markAbandoned(ctx context.Context, active model.GenerationID, units int, failure unitFailure, cause error) {
+	_, mark := ledger.Start(ctx, stageAbandonment, strconv.FormatInt(int64(active), 10))
+	n := int64(units)
+	mark.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsIn: &n,
+		DiagnosticCode: failure.code, Failure: failure.message}, cause)
+}
+
+// abandonedFailures is this queue's abandoned units per provider, in the form
+// projectAbandoned folds in, or nil when the queue holds none over snapshot
+// snap: the abandoned units were planned over this queue's snapshot alone. A
+// nil sealer holds none.
+func (l *lateSealer) abandonedFailures(snap model.SnapshotID) map[string]*providerFailures {
+	if l == nil {
+		return nil
+	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if len(l.abandoned) == 0 || l.state.snap != snap {
-		l.mu.Unlock()
-		return states
+		return nil
 	}
 	failed := map[string]*providerFailures{}
 	for _, a := range l.abandoned {
@@ -706,7 +733,19 @@ func (l *lateSealer) projectAbandoned(snap model.SnapshotID, states []model.Capa
 		}
 		agg.add(a.scopeKey, a.failure)
 	}
-	l.mu.Unlock()
+	return failed
+}
+
+// projectAbandoned is a status answer's rows with the abandoned units of each
+// provider in failed folded in. A row that reports a provider's deferred units
+// still running loses the abandoned ones from that count and becomes the
+// failure row coverage would have published for them: failed, or partial when
+// another row of the provider shows facts it holds, with the publication's
+// code, reason and run id. Every other row is answered as it is.
+func projectAbandoned(states []model.CapabilityState, failed map[string]*providerFailures) []model.CapabilityState {
+	if len(failed) == 0 {
+		return states
+	}
 	holdsFacts := map[string]bool{}
 	for _, s := range states {
 		switch s.State {
@@ -717,7 +756,7 @@ func (l *lateSealer) projectAbandoned(snap model.SnapshotID, states []model.Capa
 	out := slices.Clone(states)
 	for i, s := range out {
 		agg, ok := failed[s.ProviderID]
-		if !ok || s.Details["reason"] != reasonUnitsDeferred {
+		if !ok || len(agg.named) == 0 || s.Details["reason"] != reasonUnitsDeferred {
 			continue
 		}
 		exemplar := agg.named[0]
@@ -742,7 +781,7 @@ func (l *lateSealer) projectAbandoned(snap model.SnapshotID, states []model.Capa
 // failed one calls it, so the account it hands over names no work in flight
 // that nothing will finish.
 func (c *Coordinator) SettleAbandoned(res model.IndexResult) model.IndexResult {
-	res.Completeness = c.late.projectAbandoned(res.Binding.SnapshotID, res.Completeness)
+	res.Completeness = projectAbandoned(res.Completeness, c.late.abandonedFailures(res.Binding.SnapshotID))
 	res.Health = healthOf(res.Completeness)
 	return res
 }

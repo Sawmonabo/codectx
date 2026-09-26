@@ -95,6 +95,16 @@ subdivided and that part's own steps beneath it; and `seal`, where the unit's
 facts become visible. Beneath the `structural_parse` total sits one span per
 parser worker, each carrying that worker's child process measurements.
 
+A `deferred` run records one unit span per unit it took off the background
+queue. When its publication fails, nothing requeues those units, and the run
+also records an `abandonment` marker: a top-level span, failed with the
+publication's code and message, whose scope is the active generation the run
+extended and whose `in` count is the units it abandoned. It is a marker, not a
+bracket, so its wall is the instant it was written. While that generation stays
+active, status in any process reads the run's units as `failed` with reason
+`publication_failed`, the publication's code and the run's `run_id`, never as
+still running. Retention keeps the run for as long as it keeps the generation.
+
 `server_start`, one per language server, sits under the process's `overlay`
 run rather than under an index run: a server is started lazily, by whatever
 needed it, and no generation owns it.

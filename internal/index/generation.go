@@ -504,9 +504,16 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 // itself and answers a nil lookup, which the plan reads as no observation for
 // every scope. An error that does arrive is a broken supplier and fails the
 // plan.
+//
+// MarkedUnits is the third: the unit spans of the deferred runs that marked a
+// generation with a stage (ledger.Reader.MarkedUnits), which is how status in
+// any process reads the units a failed publication abandoned. A workspace with
+// no ledger answers none.
 type RunLedgerReader interface {
 	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
 	OpenPeaks(ctx context.Context) (PeakLookup, error)
+	MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
+		named int) ([]ledger.MarkedUnits, error)
 }
 
 // PeakLookup is one open reading of the learned peaks, held for the length of

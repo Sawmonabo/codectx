@@ -342,6 +342,9 @@ const (
 	stageRetention     = "retention"
 	stageCollection    = "collection"
 	stageReclaim       = "reclaim"
+	// stageAbandonment is the marker a deferred run writes when its failed
+	// publication abandoned the units it popped (markAbandoned).
+	stageAbandonment = "abandonment"
 )
 
 // buildAppliers binds the delta appliers of the two providers that can

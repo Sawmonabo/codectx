@@ -51,7 +51,12 @@ type StatusOptions struct {
 	Git    *git.Git
 	Repo   model.RepositoryID
 	States []model.CapabilityState
-	Logger *slog.Logger
+	// RunLedger reads the run ledger beside the store for the deferred units a
+	// failed publication abandoned (recordedAbandonment). It only reads, so a
+	// status process that never builds reads what the building one recorded.
+	// Nil reads none.
+	RunLedger RunLedgerReader
+	Logger    *slog.Logger
 }
 
 // StatusReader answers the Sections 13.2/13.3 status report from ONE store
@@ -78,8 +83,9 @@ type StatusReader struct {
 	retention *retentionState
 	// late is the coordinator's deferred sealer, whose units a failed
 	// publication abandoned are projected over the active generation's rows
-	// (lateSealer.projectAbandoned). It is nil for a reader built without a
-	// coordinator, and it performs no store call either.
+	// (projectAbandoned) in the process that holds them. It is nil for a
+	// reader built without a coordinator, and it performs no store call
+	// either.
 	late *lateSealer
 }
 
@@ -111,7 +117,7 @@ func NewStatusReader(o StatusOptions) (*StatusReader, error) {
 // `codectx status` takes.
 func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
-		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
+		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, RunLedger: c.opts.RunLedgerReader, Logger: c.log})
 	if err != nil {
 		return nil, err
 	}
@@ -149,13 +155,24 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
-	if r.late != nil {
-		states = r.late.projectAbandoned(binding.SnapshotID, states)
+	abandoned := r.late.abandonedFailures(binding.SnapshotID)
+	var ledgerWarning string
+	if len(abandoned) == 0 && reportsDeferred(states) {
+		if abandoned, err = r.recordedAbandonment(ctx, binding.GenerationID); err != nil {
+			logTyped(r.log, "the run ledger could not be read for abandoned deferred units", err,
+				"component", component, "repository_id", string(r.opts.Repo))
+			ledgerWarning = "the run ledger could not be read, so deferred units a failed publication " +
+				"abandoned may be reported as still running"
+		}
 	}
+	states = projectAbandoned(states, abandoned)
 	states, aggregated := boundStates(states, r.log)
 	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
+	}
+	if ledgerWarning != "" {
+		warnings = append(warnings, ledgerWarning)
 	}
 	if aggregated {
 		// Section 18.2: a report that aggregated says so. Nothing was omitted
@@ -778,6 +795,45 @@ func (r *capabilityReport) addDeferred(providerID, capability string, running in
 
 // reasonUnitsDeferred is the reason detail of the row addDeferred publishes.
 const reasonUnitsDeferred = "units_deferred"
+
+// reportsDeferred reports whether any row counts deferred units still
+// running, the only rows an abandonment rewrites.
+func reportsDeferred(states []model.CapabilityState) bool {
+	return slices.ContainsFunc(states, func(s model.CapabilityState) bool {
+		return s.Details["reason"] == reasonUnitsDeferred
+	})
+}
+
+// recordedAbandonment is the deferred units a failed publication abandoned
+// while generation gen was active, as the run ledger holds them, per provider:
+// every deferred run since gen's own that carries an abandonment marker scoped
+// to gen, and that run's unit spans (markAbandoned). Each named unit carries
+// its own run's code, message and id, so the row names the run whose
+// publication lost it. This is what status reads in a process other than the
+// one whose publication failed, which holds no in-process record; retention
+// keeps those runs while gen is retained (ledger.Reader.MarkedUnits). A
+// reader with no ledger, and a workspace that has recorded no run, answer none.
+func (r *StatusReader) recordedAbandonment(ctx context.Context, gen model.GenerationID) (map[string]*providerFailures, error) {
+	if r.opts.RunLedger == nil {
+		return nil, nil
+	}
+	marked, err := r.opts.RunLedger.MarkedUnits(ctx, string(r.opts.Repo), int64(gen), stageAbandonment,
+		maxFailedScopesNamed)
+	if err != nil {
+		return nil, err
+	}
+	failed := make(map[string]*providerFailures, len(marked))
+	for _, m := range marked {
+		agg := &providerFailures{units: int(m.Units)}
+		for _, u := range m.Named {
+			agg.named = append(agg.named, failedScope{scopeKey: u.ScopeKey, failure: unitFailure{
+				code: u.DiagnosticCode, message: u.Failure,
+				details: map[string]string{"reason": reasonPublicationFailed, detailRunID: u.RunID}}})
+		}
+		failed[m.Provider] = agg
+	}
+	return failed, nil
+}
 
 // addFailures records one provider capability's failed units. The aggregate
 // arrives whole rather than one unit at a time, because the row publishes
