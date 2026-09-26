@@ -1,6 +1,6 @@
 package dependence
 
-// Memory governance for one unit (Section 11.6, ruling of
+// Memory governance for one unit (Section 11.6, as decided in
 // docs/research/00-synthesis.md Section 8).
 //
 // There is no memory ceiling at all. A reservation is a scheduling input and
@@ -216,8 +216,8 @@ type Machine struct {
 // keeps at least the rest of what was available when the run began. It is
 // zero when the host does not expose available memory, which means unknown:
 // with no observation the estimate is used as it stands, because inventing a
-// bound would be a default memory ceiling by another name and the ruling
-// forbids one.
+// bound would be a default memory ceiling by another name, and the product has
+// none.
 func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 	if !m.Observed {
 		return 0

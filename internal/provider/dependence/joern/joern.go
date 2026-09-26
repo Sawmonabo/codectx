@@ -60,8 +60,8 @@ var frontend = map[dependence.Family]string{
 const maxNumDef = "40000"
 
 // Output bounds. The child's stdout is the banner and is discarded, so it is
-// unbounded: bytes nobody keeps cost no memory, and bounding them once made a
-// talkative run a refusal. Its stderr is the classifier's only input and is
+// unbounded: bytes nobody keeps cost no memory, and a bound on them would make
+// a talkative run a refusal. Its stderr is the classifier's only input and is
 // bounded before it is read -- what the bound drops is reported through
 // process.Result.OutputTruncated, never by failing the unit.
 const (
@@ -257,7 +257,7 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 	// large project would be terminated as stalled mid-work.
 	res, err := b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
 		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputPath})
-	return stepOutcome(res, err, []string{filepath.Dir(req.OutputPath), req.SourceDir})
+	return stepOutcome(res, err, []string{filepath.Dir(req.OutputPath), req.SourceDir}, knownRoots(e))
 }
 
 // Export writes the graph out as the single Neo4j CSV export the importer
@@ -279,7 +279,7 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 	// graph.
 	res, err := b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
 		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputDir})
-	outcome, err := stepOutcome(res, err, []string{filepath.Dir(req.OutputDir), filepath.Dir(req.GraphPath)})
+	outcome, err := stepOutcome(res, err, []string{filepath.Dir(req.OutputDir), filepath.Dir(req.GraphPath)}, knownRoots(e))
 	if err != nil {
 		return dependence.ExportOutcome{}, err
 	}
@@ -308,16 +308,16 @@ func parseArgs(base []string, req dependence.ParseRequest) []string {
 // classifier has to read, and discarding it would turn every classified
 // failure class into one untyped "the tool failed". A child that never
 // started, a denied executable or a broken output stream stays an error.
-func stepOutcome(res process.Result, err error, private []string) (dependence.Outcome, error) {
+func stepOutcome(res process.Result, err error, private, roots []string) (dependence.Outcome, error) {
 	if err == nil {
-		return classify(res, private), nil
+		return classify(res, private, roots), nil
 	}
 	var typed *model.Error
 	if errors.As(err, &typed) && (typed.Code == model.CodeProviderUnavailable || typed.Code == model.CodeProviderTimeout) {
 		// Distinguish "ran and failed" from "never started": the latter leaves
 		// a zero result, which would classify as an unremarkable success.
 		if res.ExitCode != 0 || res.StderrBytes > 0 || res.TimedOut {
-			return classify(res, private), nil
+			return classify(res, private, roots), nil
 		}
 	}
 	return dependence.Outcome{}, err

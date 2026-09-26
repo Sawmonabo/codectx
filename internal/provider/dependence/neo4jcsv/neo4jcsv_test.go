@@ -323,7 +323,7 @@ func TestImport(t *testing.T) {
 			// is the only external method this export publishes, so no node
 			// here may carry an import resolution.
 			//
-			// NOT RUN in this round. Mutation that fails it: in project
+			// Mutation that fails it: in project
 			// (scratch.go), drop the second arm of the invented table's
 			// INSERT, leaving only the speculated-namespace test; `f` is then
 			// published with a resolution of import.
@@ -966,10 +966,10 @@ func (o *carryOut) Seal(ctx context.Context) error {
 
 // TestStagedRowsOverAUserSetBoundImportsAndReports pins the one invariant of
 // providers.dependence.max_staged_rows: crossing it publishes the whole import
-// and says so. The bound used to fail the unit outright, which made a row
-// count — a property of the repository's source — refuse the repository. A
-// regression that restores the refusal, or that stops setting the flag, is the
-// silence the scale posture forbids, and neither shows in any other assertion.
+// and says so. A bound that failed the unit would make a row count — a
+// property of the repository's source — refuse the repository. A regression
+// that refuses, or that stops setting the flag, is the silence the scale
+// posture forbids, and neither shows in any other assertion.
 func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
 	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
@@ -999,12 +999,11 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 }
 
 // TestDerivedRowsOverAUserSetBoundImportsAndReports pins the same invariant for
-// providers.dependence.max_derived_rows. The projected occurrence count used to
-// be a hard 4,000,000 that failed the unit outright, and the projection query
-// carried a matching `LIMIT bound+1` that silently truncated it — a refusal and
-// a silent cut on a count that belongs to the analysed source. The equality
-// assertions below are what catch a restored truncation: a surviving LIMIT under
-// a bound of 1 leaves two occurrences and every published relation behind it.
+// providers.dependence.max_derived_rows. A fixed count that failed the unit,
+// or a projection query carrying a `LIMIT bound+1` that truncated it, would be
+// a refusal or a silent cut on a count that belongs to the analysed source. The
+// equality assertions below are what catch a truncation: a LIMIT under a bound
+// of 1 leaves two occurrences and every published relation behind it.
 func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
 	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})

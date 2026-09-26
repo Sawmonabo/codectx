@@ -25,21 +25,19 @@ import (
 // developer's home directory. The timed pass-crash line is built from the
 // `Pass %s failed in %.0f ms` format string read out of the pass base class in
 // that payload, with the throwable the release logs alongside it.
+// linker-pass-crash.stderr is the head of a real crash's standard error,
+// recorded from a parse of the two source files that reproduce it; its pass
+// line is the untimed `Pass <name> failed` form.
 //
-// Mutation that fails it: in classify (stderr.go), return FailureEngine for an
-// out-of-memory stderr instead of FailureMemory -- the memory cases then fail
-// with the class they were misread as. linker-pass-crash.stderr is the head of a
-// real crash's standard error, recorded from a parse of the two source files
-// that reproduce it; its pass line is the untimed `Pass <name> failed` form,
-// which an earlier parser did not match — so a crash the product could have
-// recognised as reproducible on sight recorded an empty pass name and was
-// parsed a second time for nothing.
-//
-// Mutation: in classify's outcome switch, put the `out.Pass != "",
-// helperCrash, res.ExitCode != 0` case ahead of the `oom && res.ExitCode != 0`
-// case -> a heap-exhausted run whose stderr also carries a failed pass is
-// classed as an engine crash, and the unit loses the one retry a larger cap
-// could have won.
+// Mutations that fail it: in classify (stderr.go), return FailureEngine for an
+// out-of-memory stderr instead of FailureMemory -> the memory cases fail with
+// the class they were misread as; in failedPass, match only the timed form ->
+// the untimed crash records an empty pass name and a crash recognisable as
+// reproducible on sight is parsed a second time; in classify's outcome switch,
+// put the `out.Pass != "", helperCrash, res.ExitCode != 0` case ahead of the
+// `oom && res.ExitCode != 0` case -> a heap-exhausted run whose stderr also
+// carries a failed pass is classed as an engine crash, and the unit loses the
+// one retry a larger cap could have won.
 func TestClassify(t *testing.T) {
 	const passCrash = "2026-09-13 23:10:01.001 WARN  CfgCreationPass           Pass CfgCreationPass failed in 3410 ms\n" +
 		"java.util.NoSuchElementException: next on empty iterator\n" +
@@ -89,7 +87,7 @@ func TestClassify(t *testing.T) {
 			// an observed zero.
 			got := classify(process.Result{Stderr: []byte(c.stderr), ExitCode: c.exit, TimedOut: c.timedOut,
 				StderrBytes: int64(len(c.stderr)), CPUUserMillis: 7, CPUSysMillis: 3,
-				ReadBytes: 11, WriteBytes: 13, TreeUnsampled: true}, nil)
+				ReadBytes: 11, WriteBytes: 13, TreeUnsampled: true}, nil, nil)
 			if got.CPUUserMS != 7 || got.CPUSysMS != 3 || got.CPUUnsampled {
 				t.Errorf("processor time = %d/%d ms (unsampled %t), want the child's 7/3 ms measured",
 					got.CPUUserMS, got.CPUSysMS, got.CPUUnsampled)
@@ -130,18 +128,23 @@ func fixture(t *testing.T, name string) string {
 }
 
 // TestClassifyKeepsTheChildsLastWords protects the evidence a failed unit
-// leaves behind. Failure mode: a unit crashed on a real repository, its 7,584
-// bytes of standard error were counted and thrown away, and the only record
-// left was the count -- so nothing outside a rerun could say what the child
-// had reported. The tail must survive, bounded to what one error detail
-// carries, and it must not carry the private directories this run made for the
-// child: a diagnostic an operator reads is not the place to publish where the
-// repository was materialized.
+// leaves behind. Failure mode: a crashed unit's standard error is counted and
+// thrown away, so nothing outside a rerun can say what the child reported.
+// The tail must survive, bounded to what one error detail carries, and it
+// must not carry the private directories this run made for the child: a
+// diagnostic an operator reads is not the place to publish where the
+// repository was materialized. The budget must be spent after the reduction,
+// in whole lines: a cut taken before it can fall inside a path and leave the
+// path's leading directories behind as unrooted text, and a final line longer
+// than the budget must keep its end, which is where the exception is.
 //
-// Mutation: in stderrTail, take the FIRST model.MaxDetailBytes of the buffer
-// instead of the last -> the tail carries the child's startup banner and the
-// exception that ended the run is gone; or drop the private-path redaction
-// and the detail publishes the run's materialization directory.
+// Mutation: in stderrTail, take the FIRST lines instead of the last -> the
+// tail carries the child's startup banner and the exception that ended the
+// run is gone; or drop the private-path replacement -> the detail publishes
+// the run's materialization directory; or cut the raw buffer to the budget
+// before reducing it -> the long-home case publishes the tail of the home
+// directory's name; or return "" when the last line alone exceeds the budget
+// -> the over-long line case loses its exception.
 func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 	const private = "/var/data/codectx/abc123/work/run-7"
 	stderr := "the first line, far enough back to be cut\n" +
@@ -151,7 +154,7 @@ func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 		"\tat java.base/sun.nio.fs.UnixPath.encode(UnixPath.java:145)\n"
 
 	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))},
-		[]string{private})
+		[]string{private}, nil)
 	if got.Class != dependence.FailureEngine {
 		t.Fatalf("class = %q, want an engine failure", got.Class)
 	}
@@ -170,36 +173,72 @@ func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
 	if len(got.StderrTail) > model.MaxDetailBytes {
 		t.Errorf("the tail is %d bytes, more than one error detail carries", len(got.StderrTail))
 	}
+
+	// A home directory long enough that the budget boundary falls inside it,
+	// with the exception after it on the same line.
+	home := "/home/" + strings.Repeat("longusername", model.MaxDetailBytes/12)
+	cut := "refused " + home + "/src/demo-repo/pkg/handler.go\n" +
+		"java.lang.IllegalStateException: " + home + "/src/demo-repo/pkg/handler.go\n"
+	got = classify(process.Result{Stderr: []byte(cut), ExitCode: 1, StderrBytes: int64(len(cut))}, nil, nil)
+	if strings.Contains(got.StderrTail, "longusername") || strings.Contains(got.StderrTail, "demo-repo") {
+		t.Errorf("a path the budget split survives in part: %q", got.StderrTail)
+	}
+	if !strings.Contains(got.StderrTail, "IllegalStateException: handler.go") {
+		t.Errorf("the tail lost the line the path sat on: %q", got.StderrTail)
+	}
+
+	long := strings.Repeat("frame ", model.MaxDetailBytes) + "java.lang.StackOverflowError\n"
+	got = classify(process.Result{Stderr: []byte(long), ExitCode: 1, StderrBytes: int64(len(long))}, nil, nil)
+	if !strings.HasSuffix(got.StderrTail, "java.lang.StackOverflowError") || len(got.StderrTail) > model.MaxDetailBytes {
+		t.Errorf("a final line over the budget did not keep its bounded end: %d bytes ending %q",
+			len(got.StderrTail), got.StderrTail[max(0, len(got.StderrTail)-40):])
+	}
+	if !strings.HasPrefix(got.StderrTail, "frame ") {
+		t.Errorf("the over-long line starts inside a field: %q", got.StderrTail[:min(40, len(got.StderrTail))])
+	}
 }
 
 // TestClassifyReducesPunctuatedPaths protects the privacy of a durable failure
 // row. Failure mode: the child prints absolute paths inside punctuation -- a
-// backticked command line, an argument list, a quoted value -- and a reduction
-// that only fired on a field beginning with a separator let the whole
+// backticked command line, an argument list, a quoted value, a redirection, an
+// argument file -- and a reduction that missed any opener let the whole
 // directory chain, including the operator's home directory and the repository
 // path, travel through the failure detail into provider_runs.failure_json,
-// which outlives every log. The other half is asserted with it: a tail whose
-// base names are gone diagnoses nothing, and a path under a directory this run
-// made keeps the part inside that directory, which says which step wrote the
-// file.
+// which outlives every log. A known directory whose name holds a space must
+// be reduced whole, not up to the space. The other half is asserted with it: a
+// tail whose base names are gone diagnoses nothing, and a path under a
+// directory this run made keeps the part inside that directory, which says
+// which step wrote the file.
 //
 // The paths are synthetic. A fixture built from this machine's own home
 // directory would put a host-local path in a tracked file.
+//
+// Mutation: in isPathByte, return true for '>' or '@' -> `2>/home/...` or
+// `@/home/...` survives whole; or drop the known-root match in reduce -> the
+// spaced home directory survives as `Doe/...`; or reduce a private path to its
+// base name -> `(private)/out/export.json` loses the step that wrote it.
 func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 	const home = "/home/example-user"
 	const repo = home + "/src/demo-repo"
+	const spaced = "/srv/Jane Doe"
+	const work = "/var/data/run-3/work"
 	stderr := "2026-09-14 08:00:00.000 ERROR Runner cmd: `" + home + "/.local/bin/analyzer-parse --language go`\n" +
 		"java.lang.RuntimeException: refused List(" + repo + "/units/unit-4, --output)\n" +
 		"\tat Importer.read(Importer.scala:88) file=\"" + repo + "/pkg/handler.go\"\n" +
-		"java.nio.file.NoSuchFileException: (private)/out/export.json\n"
+		"child 2>" + home + "/logs/child.log @" + home + "/args/parse.args|" + home + "/bin/next\n" +
+		"runtime " + spaced + "/runtime/bin/java exited\n" +
+		"java.nio.file.NoSuchFileException: " + work + "/out/export.json\n"
 
-	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))}, nil)
-	for _, outside := range []string{"example-user", "demo-repo", "/home", ".local", "/src", "/pkg", "/units"} {
+	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))},
+		[]string{work}, []string{spaced})
+	for _, outside := range []string{"example-user", "demo-repo", "/home", ".local", "/src", "/pkg", "/units",
+		"/logs", "/args", "Jane", "Doe", "/runtime", "run-3"} {
 		if strings.Contains(got.StderrTail, outside) {
 			t.Errorf("the tail publishes %q, a directory outside the workspace: %q", outside, got.StderrTail)
 		}
 	}
-	for _, kept := range []string{"`analyzer-parse", "List(unit-4,", "file=\"handler.go\"", "(private)/out/export.json"} {
+	for _, kept := range []string{"`analyzer-parse", "List(unit-4,", "file=\"handler.go\"", "(private)/out/export.json",
+		"2>child.log", "@parse.args|next", "runtime java exited"} {
 		if !strings.Contains(got.StderrTail, kept) {
 			t.Errorf("the redaction destroyed the diagnostic: %q is not in %q", kept, got.StderrTail)
 		}
@@ -216,8 +255,11 @@ func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 // The second half protects the families the delimiter must not reach: a
 // frontend that rejects the option writes a warning into the stderr the
 // classifier reads, and the option would enter the cache key of a family whose
-// graph it cannot change. Mutation that fails it: return the Java suffix for
-// every family.
+// graph it cannot change.
+//
+// Mutation: in parseArgs, append frontendArgs before the source directory ->
+// the first half fails; in frontendArgs, return the Java suffix for every
+// family -> the second half fails.
 func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
 	java := frontendArgs(dependence.FamilyJava)
 	args := parseArgs([]string{"--base"}, dependence.ParseRequest{
