@@ -113,6 +113,15 @@ func (c *collector) flush(batch []event, running map[*Span]struct{}, sweep map[*
 				}
 				continue
 			}
+			// A need observation names the repository and no run row, so it
+			// neither creates the run's row nor is skipped with a discarded
+			// run's: the measurement is true whatever became of the run.
+			if e.kind == eventNeed {
+				if err := foldNeed(ctx, tx, e.run.repo, e.need); err != nil {
+					return err
+				}
+				continue
+			}
 			run := e.span.run
 			// A run whose rows have been deleted is not written again. The
 			// span's insert would otherwise recreate the run row through
@@ -495,7 +504,9 @@ func endSpan(ctx context.Context, tx *sql.Tx, e event) (SpanRow, error) {
 // high-water row, in the same transaction as the span's end. Only a
 // measurement above zero is folded: an absent one is no observation, and a
 // zero can never raise the row, so neither writes anything. A span with no
-// scope key describes no scope a planner could ask about.
+// scope key describes no scope a planner could ask about: a parser worker's
+// span is one, because a worker is not a scope, and what a worker measures of
+// each file reaches the need model through Run.ObserveNeed instead.
 func raisePeak(ctx context.Context, tx *sql.Tx, s *Span, peak *uint64) error {
 	if peak == nil || *peak == 0 || s.scopeKey == "" {
 		return nil
@@ -505,6 +516,25 @@ func raisePeak(ctx context.Context, tx *sql.Tx, s *Span, peak *uint64) error {
 		DO UPDATE SET peak_rss_bytes = max(peak_rss_bytes, excluded.peak_rss_bytes)`,
 		s.run.repo, s.scopeKey, int64(*peak))
 	return wrap("record the scope's peak", err)
+}
+
+// foldNeed writes one file's need observation into its class's row, in the
+// same transaction as the rest of the batch: the model state is replaced by
+// the observation's, which already folds in every earlier one, the
+// observation is counted, and an overrun -- a need above the reservation -- is
+// counted with the drift raised to it.
+func foldNeed(ctx context.Context, tx *sql.Tx, repo []byte, o *NeedObservation) error {
+	overrun := 0
+	if o.NeedBytes > o.ReservedBytes {
+		overrun = 1
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO need_models(
+		repository_id, language, fingerprint, size_class, state, observations, overruns, max_drift_bytes)
+		VALUES(?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(repository_id, language, fingerprint, size_class)
+		DO UPDATE SET state = excluded.state, observations = observations + 1,
+			overruns = overruns + excluded.overruns, max_drift_bytes = max(max_drift_bytes, excluded.max_drift_bytes)`,
+		repo, o.Key.Language, o.Key.Fingerprint, o.Key.SizeClass, o.State, overrun, o.NeedBytes-o.ReservedBytes)
+	return wrap("record the file's need", err)
 }
 
 // nullInt and nullBytes render an absent measurement as SQL NULL rather than

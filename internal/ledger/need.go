@@ -1,6 +1,12 @@
 package ledger
 
-import "context"
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+)
 
 // NeedKey names one learned need model within a repository: the language, the
 // grammar fingerprint the files were parsed under, and the file-size class.
@@ -22,20 +28,76 @@ type NeedObservation struct {
 }
 
 // RepositoryID is the repository this run records, as the hex the ledger's
-// readers take.
+// readers take, and empty for a run that records nothing.
 func (r *Run) RepositoryID() string {
-	panic("ledger: RepositoryID is not built yet")
+	if r == nil {
+		return ""
+	}
+	return hex.EncodeToString(r.repo)
 }
 
 // ObserveNeed records one file's observation. The model state it carries is
 // written to the observation store in the same transaction as the
 // observation, whatever becomes of the generation it was taken under.
+//
+// It crosses the bus like every other event, so it never waits: a full bus
+// drops it and counts the drop on the run row, and the next observation's
+// state, which folds in everything before it, supersedes what was lost. The
+// state is copied, so the caller may reuse its buffer at once.
+//
+// An observation the store would refuse -- no language, no fingerprint, no
+// state, a negative class, or a negative figure, which no measurement is -- is
+// counted as dropped too rather than published: written, it would fail the
+// transaction it shares with every other event of the batch and lose them all.
+// A nil or stopped run records nothing.
 func (r *Run) ObserveNeed(o NeedObservation) {
-	panic("ledger: ObserveNeed is not built yet")
+	if r == nil {
+		return
+	}
+	if o.Key.Language == "" || o.Key.Fingerprint == "" || o.Key.SizeClass < 0 || len(o.State) == 0 ||
+		o.NeedBytes < 0 || o.ReservedBytes < 0 {
+		if !r.stopped.Load() {
+			r.dropped.Add(1)
+			r.dirty.Store(true)
+		}
+		return
+	}
+	o.State = bytes.Clone(o.State)
+	r.c.publish(event{kind: eventNeed, run: r, need: &o})
 }
 
 // NeedModel is the persisted model state for key in this run's repository,
-// and false when none is recorded.
+// and false when none is recorded. A nil run and a run whose collector has
+// detached read nothing and answer false, not an error, exactly as they record
+// nothing: the store is read through the run's own attachment.
+//
+// It reads what has been written, so an observation still on the bus is not in
+// the answer; the caller that published it holds the newer state already. It
+// reads through the collector's one connection, so it is never called from a
+// subscriber, which runs while a flush holds that connection.
 func (r *Run) NeedModel(ctx context.Context, key NeedKey) ([]byte, bool, error) {
-	panic("ledger: NeedModel is not built yet")
+	if r == nil || r.detached() {
+		return nil, false, nil
+	}
+	var state []byte
+	err := r.c.db.QueryRowContext(ctx, `SELECT state FROM need_models
+		WHERE repository_id = ? AND language = ? AND fingerprint = ? AND size_class = ?`,
+		r.repo, key.Language, key.Fingerprint, key.SizeClass).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		// A detach leaves the handle before it closes the database, so a read
+		// that lost that race is a detached read.
+		if r.detached() {
+			return nil, false, nil
+		}
+		return nil, false, wrap("read the need model", err)
+	}
+	return state, true, nil
 }
+
+// detached reports whether the attachment this run belongs to is no longer
+// the handle's current one: it has detached, or is detaching, and its
+// database is closed or about to be.
+func (r *Run) detached() bool { return r.c.l.current() != r.c }
