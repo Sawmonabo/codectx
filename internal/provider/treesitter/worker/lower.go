@@ -34,7 +34,9 @@ func Grammar(name string) (*ts.Language, bool) {
 //
 //   - a switch or match expression's selector and its arm results (an arm's
 //     value expression, the operand of the `yield` or valued `break` that
-//     leaves it, a block's tail expression);
+//     leaves it, a block's tail expression), and in the same way the operand
+//     of a valued `break` a consumed loop or labelled block is left by, and
+//     of a `?` that completes a consumed try block with its error;
 //   - a conditional expression's arms (`c ? a : b`, a Python `a if c else b`,
 //     a valued `if` in Rust): the arm values, not the condition, which is a
 //     node of its own evaluated before either arm;
