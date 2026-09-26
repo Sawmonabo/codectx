@@ -3,8 +3,8 @@ package worker
 import "testing"
 
 // TestCppLoweringGolden pins the C++ additions of the C-family lowering on
-// hand-derived functions, with TestCLoweringGolden's derivation rules.
-// Offsets are byte offsets into src.
+// hand-derived functions. Offsets are byte offsets into src. The derivation
+// and rendering rules are runGolden's.
 func TestCppLoweringGolden(t *testing.T) {
 	runGolden(t, "cpp", []goldenCase{
 		{

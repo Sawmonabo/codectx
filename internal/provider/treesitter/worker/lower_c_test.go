@@ -5,10 +5,7 @@ import "testing"
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
 // pairs on hand-derived functions. A wrong pair here is a wrong dependence
 // fact served to every consumer. Offsets are byte offsets into src. The
-// derivation rules are TestGoLoweringGolden's: exit augmentation, the
-// post-dominance frontier with nothing depending on ENTRY, every φ resolved,
-// a may-definition killing nothing, and a node with no path from ENTRY
-// reaching a use with no definition.
+// derivation and rendering rules are runGolden's.
 func TestCLoweringGolden(t *testing.T) {
 	runGolden(t, "c", []goldenCase{
 		{

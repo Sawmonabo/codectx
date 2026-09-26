@@ -6,16 +6,8 @@ import "testing"
 // pairs on hand-derived functions. A wrong pair here is a wrong dependence
 // fact served to every consumer. Each source is one line after the package
 // clause, so a node's offset is its column plus 10.
-//
-// Derivation rules: augmentation adds an edge to EXIT from every node with
-// no successor and from the smallest-reverse-post-order member of each sink
-// strongly connected component that cannot reach EXIT; control dependence
-// is the post-dominance frontier over the augmented graph with no
-// entry-to-exit edge (nothing depends on ENTRY; a loop head whose back edge
-// it controls depends on itself); a def-use pair is (defining node, using
-// node) with every φ resolved to the definitions it merges; a may-definition
-// kills nothing, so a use it reaches pairs with it and with every definition
-// reaching its node. Every label is its own node, spanning the label.
+// The derivation and rendering rules are runGolden's. Every label is its own
+// node, spanning the label.
 func TestGoLoweringGolden(t *testing.T) {
 	runGolden(t, "go", []goldenCase{
 		{

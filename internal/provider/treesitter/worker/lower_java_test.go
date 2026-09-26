@@ -6,13 +6,7 @@ import "testing"
 // hand-derived Java methods. Each source is one class; callable 0 in
 // Functions preorder is its class body, so each case is callable 1, the
 // method. Every pair was derived by hand from the lowering's documented
-// granularity and the rules: exit augmentation adds an edge to Exit from
-// every successor-less node and from the smallest-reverse-post-order member
-// of each sink strongly connected component that cannot reach Exit; control
-// dependence is the post-dominance frontier over the augmented graph with
-// no entry-to-exit edge, so nothing depends on Entry and a loop head
-// depends on itself; def-use pairs are (defining node, using node) with
-// every φ resolved, and a Handler takes each predecessor's entry values.
+// granularity and runGolden's derivation and rendering rules.
 // Section numbers cite The Java Language Specification, Java SE 21 Edition.
 func TestJavaLoweringGolden(t *testing.T) {
 	runGolden(t, "java", []goldenCase{

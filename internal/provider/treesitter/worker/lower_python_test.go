@@ -9,14 +9,7 @@ import "testing"
 // inside it callable 2. Each source is indented by one space per level, and
 // each case's comment gives the byte offset every line starts at.
 //
-// Derivation rules, as in the other goldens: augmentation adds an edge to
-// EXIT from every node with no successor and from the smallest-reverse-
-// post-order member of each sink strongly connected component that cannot
-// reach EXIT; control dependence is the post-dominance frontier over the
-// augmented graph with no entry-to-exit edge; a def-use pair is (defining
-// node, using node) with every φ resolved; a may-definition kills nothing; a
-// Handler node carries the values on entry to each node that threw to it.
-// Every case opens with the section it turns on; section numbers are those
+// The derivation and rendering rules are runGolden's. Every case opens with the section it turns on; section numbers are those
 // of The Python Language Reference, version 3.13.
 func TestPythonLoweringGolden(t *testing.T) {
 	runGolden(t, "python", []goldenCase{

@@ -93,12 +93,13 @@ func Grammar(name string) (*ts.Language, bool) {
 // The hand-off is made only when the assignment's node runs whenever the
 // consumer does. An assignment inside a conditionally evaluated operand (a
 // short-circuit operand after the deciding one, a conditional's arm, a later
-// operand of a chained comparison, an optional chain's tail) leaves the read
-// on the consumer, where the name still has its earlier definition on the
-// path that skips the assignment: `y = x + (c and (x := 1))` pairs y with
-// the x before it when c is false, and with the assignment, whose value the
-// operator's result also carries, when c is true.
-// Where the language leaves the order of the two unsequenced or
+// operand of a chained comparison, an optional chain's tail, a statement of
+// a GNU C statement expression that some path from the expression's start
+// to its value skips) leaves the read on the consumer, where the name still
+// has its earlier definition on the path that skips the assignment: `y = x +
+// (c and (x := 1))` pairs y with the x before it when c is false, and with
+// the assignment, whose value the operator's result also carries, when c is
+// true. Where the language leaves the order of the two unsequenced or
 // indeterminately sequenced (C and C++), the lowering takes source order and
 // says so.
 //
@@ -114,6 +115,21 @@ func Grammar(name string) (*ts.Language, bool) {
 // binding, a match capture) is read by the arm's own nodes, so `return
 // switch (o) { case Integer i when i > 0 -> i; … }` pairs the arm's result
 // node i with the return through the result variable.
+//
+// # Names that resolve to no variable
+//
+// A name can resolve to no variable of the function being lowered: a field
+// or member named without its object, a global or module name, a name no
+// declaration in scope binds, an import, a name a macro introduces, or a
+// binding that shadows without being a variable (scope.lookup returns -1
+// for all of them). Such a name is state the dependence facts do not
+// track, in every position: a read of it Uses nothing, a write to it
+// (plain, compound, an increment, an embedded assignment, a deletion, an
+// iteration target) defines and may-defines nothing, and a callable that
+// captures it captures nothing. The node the construct makes is still made,
+// with the reads and definitions of its other operands. -1 never reaches
+// flow.Builder (whose Use, MayDef and Def reject it) and never indexes a
+// table of the lowering's own; each lowering states where it filters it.
 //
 // # Iteration
 //

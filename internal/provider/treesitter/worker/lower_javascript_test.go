@@ -4,16 +4,11 @@ import "testing"
 
 // TestJavaScriptLoweringGolden pins the control-dependence and def-use pairs
 // of hand-derived JavaScript functions. Each case is callable 1 in Functions
-// preorder unless its fn says otherwise (callable 0 is the program). Every pair was derived by hand from
-// the lowering's documented granularity and the rules: exit augmentation adds
-// an edge to Exit from every successor-less node and from the
-// smallest-reverse-post-order member of each sink strongly connected
-// component that cannot reach Exit; control dependence is the post-dominance
-// frontier over the augmented graph with no entry-to-exit edge, so nothing
-// depends on Entry and a loop head whose back edge it controls depends on
-// itself (a `break outer` that leaves past a head can take that control
-// from it); def-use pairs are
-// (defining node, using node) with every φ resolved, self-pairs included.
+// preorder unless its fn says otherwise (callable 0 is the program). Every
+// pair was derived by hand from the lowering's documented granularity and
+// runGolden's derivation and rendering rules, self-pairs included; a `break
+// outer` that leaves past a loop head can take the head's control of itself
+// from it.
 func TestJavaScriptLoweringGolden(t *testing.T) {
 	runGolden(t, "javascript", []goldenCase{
 		{

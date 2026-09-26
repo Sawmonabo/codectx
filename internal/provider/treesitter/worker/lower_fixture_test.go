@@ -24,11 +24,32 @@ type goldenCase struct {
 	unresolved                    int
 }
 
-// runGolden checks every case of language, one subtest per case. A node
-// renders as ENTRY, EXIT or "<source text, whitespace collapsed>@<start
-// byte>" (the offset keeps two identical statements distinct), a pair as
-// "<from> -> <to>", and the sorted rendered lists must equal cd and du
-// exactly.
+// runGolden checks every case of language, one subtest per case. Every
+// golden table derives its cases by these rules, and states only what its
+// language adds:
+//
+//   - Rendering. A node renders as ENTRY, EXIT or "<source text of its span,
+//     whitespace collapsed>@<start byte>", every other node alike, a Handler
+//     included (a catch clause's Handler spans the clause's keyword, so it
+//     renders as catch@<offset>); the offset keeps two identical statements
+//     distinct. A pair renders as "<from> -> <to>", and the sorted rendered
+//     lists must equal cd and du exactly.
+//   - Exit augmentation. An edge to EXIT is added from every node with no
+//     successor, and from the smallest-reverse-post-order member of each
+//     sink strongly connected component that cannot reach EXIT. A node with
+//     no predecessor keeps its successors and gains no such edge unless it
+//     has none.
+//   - Control dependence is the post-dominance frontier over the augmented
+//     graph with no entry-to-exit edge: nothing depends on ENTRY, and a loop
+//     head whose back edge it controls depends on itself.
+//   - Def-use. A pair is (defining node, using node), with every φ resolved
+//     to the definitions it merges. A may-definition kills nothing, so a use
+//     it reaches pairs with it and with every definition reaching its node.
+//     A Handler node carries the values on entry to each node that threw to
+//     it. A use that no definition reaches (a node with no path from ENTRY,
+//     a name no node defines) makes no pair.
+//   - Unresolved is the count of jumps (a break, continue or goto) whose
+//     target names no open frame or label.
 func runGolden(t *testing.T, language string, cases []goldenCase) {
 	t.Helper()
 	tl, ok := Grammar(language)

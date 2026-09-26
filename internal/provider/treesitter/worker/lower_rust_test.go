@@ -8,15 +8,7 @@ import "testing"
 // node's offset is its column; each case is callable 0 in Functions
 // preorder, and each cites the section of The Rust Reference it follows.
 //
-// Derivation rules: augmentation adds an edge to EXIT from every node with
-// no successor and from the smallest-reverse-post-order member of each sink
-// strongly connected component that cannot reach EXIT; control dependence is
-// the post-dominance frontier over the augmented graph with no entry-to-exit
-// edge (nothing depends on ENTRY; a loop head whose back edge it controls
-// depends on itself); a def-use pair is (defining node, using node) with
-// every φ resolved to the definitions it merges; a may-definition kills
-// nothing, so a use it reaches pairs with it and with every definition
-// reaching its node.
+// The derivation and rendering rules are runGolden's.
 func TestRustLoweringGolden(t *testing.T) {
 	runGolden(t, "rust", []goldenCase{
 		{
