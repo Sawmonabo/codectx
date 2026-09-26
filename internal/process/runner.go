@@ -577,8 +577,9 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	defer sampler.stopSampling()
 	// The same figure, published to a caller watching this child's progress
 	// through a protocol of its own. It is bound after the sampler exists and
-	// never unbound: the last sweep's count stays readable, and a caller that
-	// sees it stop moving is reading a child that has stopped.
+	// never unbound: the last count a sweep found stays readable after the
+	// tree exits, and a caller that sees it stop moving is reading a child
+	// that has stopped.
 	spec.CPUProgress.bind(sampler)
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.

@@ -38,8 +38,8 @@ const minStallPoll = 10 * time.Millisecond
 // which is the signal a tool that writes its answer straight to an output file
 // and says nothing on either pipe has. That last signal is what keeps the
 // detector honest where there is no CPU sampling: on a platform with no tree
-// sampler cpuTicks is a constant zero, so without it a quiet writer would have
-// had no signal at all and would have been killed mid-work.
+// sampler there is no CPU figure at all, so without it a quiet writer would
+// have no signal and would be killed mid-work.
 //
 // A nil watchdog is the disabled form: stalledC returns a nil channel, which
 // blocks forever in a select, and stopWatching does nothing. That is how a
@@ -97,9 +97,14 @@ func startStallWatchdog(timeout time.Duration, outPipe, errPipe *streamPipe, sam
 // sound because each is monotonic: any advance changes the sum, and only a tree
 // where none of them advanced leaves it unchanged. A signal the platform or the
 // caller does not supply contributes a constant zero, which neither invents
-// progress nor hides another signal's.
+// progress nor hides another signal's. The CPU figure is such a constant until
+// the sampler first finds the tree, and afterwards holds its last reading
+// across sweeps that find nothing, so the tree's exit is not read as a change.
+// The sum is only ever compared with itself, so these zeros are never reported
+// as a measurement.
 func stallProgress(outPipe, errPipe *streamPipe, sampler *treeSampler, progressFiles []string) int64 {
-	return outPipe.progressed() + errPipe.progressed() + sampler.cpuTicks() + progressBytes(progressFiles)
+	cpu, _ := sampler.cpuTicks()
+	return outPipe.progressed() + errPipe.progressed() + cpu + progressBytes(progressFiles)
 }
 
 // progressBytes sums the bytes the run has written to the outputs the caller

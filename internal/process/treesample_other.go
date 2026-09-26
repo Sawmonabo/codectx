@@ -20,6 +20,7 @@ func startTreeSampler(int, time.Duration) *treeSampler { return nil }
 // ioSampled is what makes the runner report the byte figures as absent.
 func (s *treeSampler) stopSampling() treeSample { return treeSample{} }
 
-// cpuTicks is always zero here: with no tree sampling there is no CPU signal,
-// so the stall watchdog is left with the portable byte counters alone.
-func (s *treeSampler) cpuTicks() int64 { return 0 }
+// cpuTicks never has a measurement here: with no tree sampling there is no CPU
+// signal, so the stall watchdog is left with the pipes and the named output
+// files, and a CPUProgress reader with its own fallback.
+func (s *treeSampler) cpuTicks() (int64, bool) { return 0, false }
