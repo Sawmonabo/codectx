@@ -12,7 +12,8 @@ import (
 // one function; function definitions (async is a modifier of the kind);
 // lambdas; class definitions, whose body is code run once, at definition
 // time, in a scope of its own; and the four comprehensions, each an implicit
-// function of its own (The Python Language Reference §6.2.4).
+// function of its own (§6.2.4; section numbers are those of The Python
+// Language Reference, version 3.13).
 var pythonLowering = Lowering{
 	language: "python",
 	callables: []string{"module", "function_definition", "lambda", "class_definition", "list_comprehension",
@@ -85,7 +86,7 @@ var pythonLowering = Lowering{
 //     previous body's end, and after the last clause the statement both
 //     completes and re-raises what no clause matched. `except E as n`
 //     defines n on a node spanning n, and n is deleted however the clause
-//     ends (§8.4): the body runs in a finally whose body is a killing
+//     ends (§8.4.1): the body runs in a finally whose body is a killing
 //     definition of n on a Stmt node spanning the whole clause, and whose
 //     Handler spans the `as` keyword. The else body runs from the try
 //     body's normal end, with the handlers closed, then joins the handler
@@ -138,10 +139,15 @@ var pythonLowering = Lowering{
 //     captures (see Uses).
 //   - A comprehension's graph is its clauses as nested loops: each `for`
 //     clause is a Branch head spanning the clause whose false edge returns to
-//     the enclosing clause's head (the outermost's leaves); a `for` clause
-//     after the first is preceded by a Stmt node spanning its iterable; each
-//     `if` clause is a Branch node spanning its condition whose false edge
-//     continues with the next element; the element is one Stmt node spanning
+//     the enclosing clause's head (the outermost's leaves) and which defines
+//     nothing; its target is defined on the body path by the unpacking rule,
+//     one defining node per bound name spanning it, as a for statement's
+//     is. A `for` clause after the first is preceded by a Stmt node spanning
+//     its iterable, and its head and target nodes Use that iterable's reads;
+//     the first clause's iterable is the enclosing function's, so its head
+//     and target nodes Use nothing. Each `if` clause is a Branch node
+//     spanning its condition whose false edge continues with the next
+//     element; the element is one Stmt node spanning
 //     the comprehension's body expression (a key: value pair for a
 //     dictionary). The first iterable belongs to the enclosing function.
 //   - A lambda's body is one node spanning it, its value.
@@ -1486,7 +1492,7 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 // grammar parses `except E as n` with E and n as one as-pattern value.
 //
 // With `as n`, n is bound first, and the body runs in a finally whose body
-// is the node deleting n (§8.4: n is deleted however the clause ends), a Stmt
+// is the node deleting n (§8.4.1: n is deleted however the clause ends), a Stmt
 // node spanning the clause; the finally's Handler spans the `as` keyword.
 func (j *pyLower) except(c *ts.Node, star bool) bool {
 	k := j.k
@@ -1723,7 +1729,7 @@ func (j *pyLower) capture(name *ts.Node, mode int) {
 	}
 }
 
-// irrefutable reports whether case pattern p always matches (§8.6.2).
+// irrefutable reports whether case pattern p always matches (§8.6.3).
 func (j *pyLower) irrefutable(p *ts.Node) bool {
 	k := j.k
 	start, list := j.kids(p)
