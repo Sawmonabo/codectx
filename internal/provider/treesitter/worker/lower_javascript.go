@@ -77,7 +77,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte)
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do…while, for. A switch is a Stmt node for the
 //     discriminant then one Branch node per case test, in source order (each
-//     test is evaluated only when the previous failed); a case body's end
+//     test is evaluated only when the previous failed), that Uses the
+//     discriminant's reads with its own, since it compares the two; a case
+//     body's end
 //     flows into the next body when it does not break. A for…in/for…of loop
 //     is a Stmt node for the iterated expression, evaluated once, then a
 //     Branch head spanning the head clause from the left side to the end of
@@ -329,6 +331,10 @@ type jsLower struct {
 	opt []flow.Fringe
 	// labels are the statement labels the next statement takes.
 	labels []string
+	// held keeps the reads of the discriminants of the switches whose case
+	// tests are being lowered; match holds their case tests' fringes.
+	held  []int32
+	match []flow.Fringe
 	// decorated counts the decorators collected: a class whose collection
 	// counted one may throw where it is created.
 	decorated int
@@ -1223,6 +1229,12 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	disc := j.l.unparen(n.ChildByFieldId(k.fValue))
 	j.value(disc, false)
 	j.node(flow.Stmt, disc, 0, len(j.reads))
+	// Each case test compares the discriminant's value with its own, so its
+	// Branch reads what the discriminant read; held keeps those reads past
+	// the resets of the hoisted declarations and the tests.
+	hb := len(j.held)
+	j.held = append(j.held, j.reads...)
+	he := len(j.held)
 	mark := len(j.binds)
 	start, cases := j.kids(n.ChildByFieldId(k.fBody))
 	// A case's statements are its named children after the test value.
@@ -1248,7 +1260,10 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 		j.done(s)
 	}
 	f := j.b.OpenSwitch(labels...)
-	match := make([]flow.Fringe, len(cases))
+	// match[c] is the fringe of case c's test; a nested switch in a body
+	// pushes past it, so it is indexed from fb, not sliced.
+	fb := len(j.match)
+	j.match = append(j.match, make([]flow.Fringe, len(cases))...)
 	pushed := false
 	var firstPush flow.Fringe
 	for c := range cases {
@@ -1256,21 +1271,25 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 			continue
 		}
 		j.reset()
+		for _, dv := range j.held[hb:he] {
+			j.read(dv)
+		}
 		v := cases[c].ChildByFieldId(k.fValue)
 		j.value(v, false)
 		j.node(flow.Branch, v, 0, len(j.reads))
-		match[c] = j.b.Push()
+		j.match[fb+c] = j.b.Push()
 		if !pushed {
-			firstPush, pushed = match[c], true
+			firstPush, pushed = j.match[fb+c], true
 		}
 	}
+	j.held = j.held[:hb]
 	noMatch := j.b.Push()
 	if !pushed {
 		firstPush = noMatch
 	}
 	hasDefault := false
 	for c := range cases {
-		h := match[c]
+		h := j.match[fb+c]
 		if cases[c].KindId() != k.switchCase {
 			h, hasDefault = noMatch, true
 		}
@@ -1290,6 +1309,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	}
 	j.b.CloseFrame(f)
 	j.b.Pop(firstPush)
+	j.match = j.match[:fb]
 	j.done(start)
 	j.binds = j.binds[:mark]
 }

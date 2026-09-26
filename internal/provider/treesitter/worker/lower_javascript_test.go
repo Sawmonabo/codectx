@@ -271,5 +271,19 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 				"c@11 -> c@31", "c@11 -> function g() { return c }@34", "g = 0@20 -> return g;@60",
 			},
 		},
+		{
+			// ECMAScript §14.12.4 CaseClauseIsSelected: each test compares the
+			// discriminant's value with the test's. Nodes: x@11, the
+			// discriminant x@24, Branch 1@34 (true: g()@37, break;@42),
+			// Branch 2@54 (true: h()@57), no default. g() and break depend on
+			// 1@34, as does 2@54 on its false edge; h() on 2@54 only.
+			name:     "every case test reads the discriminant",
+			protects: "a case test's decision depends on the discriminant's variables, so their definitions reach every test",
+			mutation: "reset the discriminant's reads before each case test (x@11 -> 1@34 and x@11 -> 2@54 vanish)",
+			src:      "function f(x) { switch (x) { case 1: g(); break; case 2: h(); } }",
+			fn:       1,
+			cd:       []string{"1@34 -> g()@37", "1@34 -> break;@42", "1@34 -> 2@54", "2@54 -> h()@57"},
+			du:       []string{"x@11 -> x@24", "x@11 -> 1@34", "x@11 -> 2@54"},
+		},
 	})
 }
