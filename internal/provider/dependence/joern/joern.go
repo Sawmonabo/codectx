@@ -8,15 +8,16 @@
 // distribution. There is no product-owned analysis script, no interpreter
 // server and no second export:
 //
-//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph> --frontend-args --no-default-exclude
+//	joern-parse  --language <frontend> --max-num-def 40000 <source> --output <graph> [--frontend-args --no-default-exclude]
 //	joern-export <graph> --repr=all --format=neo4jcsv --out <export>
 //
-// Both were run against Joern 4.0.627 on all six frontends before they were
-// pinned; the runs are recorded in the lane report. The engine is not
-// run-to-run deterministic, so those runs establish that each frontend parses
-// and exports, not that two runs of one are equal. `--repr=pdg|cdg|ddg` is
-// not implemented for CSV or GraphML in this release, and the single `all`
-// export already carries every edge family the provider imports.
+// The bracketed suffix is passed to the Java frontend alone (frontendArgs).
+// Both commands were run against Joern 4.0.627 on all six frontends before
+// they were pinned, and both exit 0 on each. The engine is not run-to-run
+// deterministic, so those runs establish that each frontend parses and
+// exports, not that two runs of one are equal. `--repr=pdg|cdg|ddg` is not
+// implemented for CSV or GraphML in this release, and the single `all` export
+// already carries every edge family the provider imports.
 package joern
 
 import (
@@ -171,19 +172,43 @@ func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
 	return b.resolved, nil
 }
 
-// clearDefaultExclusions empties the frontend's own default set of excluded
-// path patterns for this parse. The Java frontend of the pinned payload is the
-// only one that carries a non-empty default, and `test` is one of its nine
-// folder names, so without this the frontend silently reads no file whose path
-// holds a `test` component -- a whole package tree, not only a source root.
+// frontendArgs is the argument suffix handed to the frontend itself for a
+// family, after the delimiter that separates the frontend's arguments from the
+// parse tool's. Only the Java frontend receives one: the option that empties
+// its default set of excluded path patterns. That set holds `test`, so without
+// it the Java frontend reads no file whose path has a `test` component -- a
+// whole package tree, not only a source root.
+//
+// The option is not given to any other family, because on the pinned payload
+// it changes nothing for them. Measured by whether a file under a `test`
+// directory reaches the exported graph, with the option and without it:
+//
+//	Java                    8 and 0 -- the only family it changes
+//	Go                      2 and 2
+//	Rust                    4 and 4
+//	C/C++                   0 and 0 -- accepted, not honoured
+//	JavaScript/TypeScript   0 -- rejected as an unknown option
+//	Python                  included -- rejected as an unknown option
+//
+// A rejected option is a warning on the frontend's standard error, which is
+// the classifier's only input, and it would be part of the cache key of a
+// family whose graph it cannot change. Keeping it to the one family it affects
+// keeps both clean. The files the other frontends still drop by their own
+// fixed rules are not recovered by any argument; the provider discloses them
+// instead, by comparing the unit's files with the export's file nodes.
 //
 // The delimiter hands everything after it to the frontend rather than to the
-// parse tool, so it is appended last, after the paths the parse tool reads
-// itself; anything placed after the delimiter would never reach the parse
-// tool. The frontend's own file-selection default is the product's to decide,
-// not the frontend's: the frontend is pointed at a private materialization
-// that already holds exactly the files this unit owns.
-var clearDefaultExclusions = []string{"--frontend-args", "--no-default-exclude"}
+// parse tool, so the suffix is appended last, after the paths the parse tool
+// reads itself; anything placed after the delimiter would never reach the
+// parse tool. The frontend is pointed at a private materialization that
+// already holds exactly the files this unit owns, so which files exist for it
+// to read is the product's decision, not the frontend's default.
+func frontendArgs(f dependence.Family) []string {
+	if f == dependence.FamilyJava {
+		return []string{"--frontend-args", "--no-default-exclude"}
+	}
+	return nil
+}
 
 // pinnedArgs is the pinned parse argument array for a family, without the
 // paths and without the frontend arguments that must trail them. Argv and
@@ -194,9 +219,10 @@ func pinnedArgs(f dependence.Family) []string {
 
 // Argv is the pinned parse argument array for a family, without the paths. It
 // is what the cache key folds in, so changing a pinned argument invalidates
-// every cached graph instead of silently reusing one built differently.
+// every cached graph of that family instead of silently reusing one built
+// differently, and a family whose argv did not change keeps its graphs.
 func (b *Backend) Argv(f dependence.Family) []string {
-	return append(pinnedArgs(f), clearDefaultExclusions...)
+	return append(pinnedArgs(f), frontendArgs(f)...)
 }
 
 // NeutralOptions is the frontend's fixed allowlist of semantics-neutral parse
@@ -204,10 +230,10 @@ func (b *Backend) Argv(f dependence.Family) []string {
 // changes results (the Rust helper's --no-sysroot drops type resolution, the
 // overlay switches drop whole fact families), so there is nothing that could
 // be added to confirm a crash without changing what a success would mean. The
-// option that empties the default exclusions is no exception -- it changes
-// which files are read, which is the whole point of it -- and it is not a
-// retry lever in any case: every parse passes it, so a confirmation rerun
-// carries it already.
+// option that empties the Java frontend's default exclusions is no exception
+// -- it changes which files are read, which is the whole point of it -- and it
+// is not a retry lever in any case: every Java parse passes it, so a
+// confirmation rerun carries it already.
 func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
 
 // Parse builds the graph for one unit. The heap cap reaches the frontend
@@ -263,7 +289,8 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 }
 
 // parseArgs assembles one parse command line. The order is the contract: the
-// delimiter that hands the rest of the line to the frontend stands last, so
+// delimiter that hands the rest of the line to the frontend stands last, when
+// the family has one (frontendArgs), so
 // the source directory and the output path still reach the parse tool itself.
 // Anything appended after it would be read by the frontend instead, and the
 // parse tool would run with no input path at all.
@@ -272,7 +299,7 @@ func parseArgs(base []string, req dependence.ParseRequest) []string {
 	args = append(args, pinnedArgs(req.Family)...)
 	args = append(args, req.ExtraArgs...)
 	args = append(args, req.SourceDir, "--output", req.OutputPath)
-	return append(args, clearDefaultExclusions...)
+	return append(args, frontendArgs(req.Family)...)
 }
 
 // stepOutcome turns the runner's result and error into the neutral outcome, or

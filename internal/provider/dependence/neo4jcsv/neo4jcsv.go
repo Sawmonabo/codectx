@@ -51,7 +51,7 @@ const ProviderID = "dependence"
 
 // Evidence details. They name the graph relation the fact was derived from in
 // neutral terms and are the only vocabulary published on an evidence row
-// (Section 11.6 and the Task 11 contract).
+// (Section 11.6).
 const (
 	detailCDG        = "cdg"
 	detailReachDef   = "reaching_def"
@@ -152,6 +152,12 @@ type Options struct {
 	// PreviousKeys is the key set the previous sealed run of this unit
 	// published. The zero value is the absent set and means a full import.
 	PreviousKeys KeySet
+	// Expected reports whether a snapshot file is one the engine was handed
+	// to analyse for this export: a source file of the export's language
+	// family inside the directory the engine parsed. Every such file the
+	// export carries no file node for is counted in Report.UnanalysedFiles.
+	// Nil expects nothing and counts nothing.
+	Expected func(model.FileVersion) bool
 
 	// Repository identifies the repository RelationIDs are derived in.
 	Repository model.RepositoryID
@@ -280,6 +286,14 @@ type Report struct {
 	IgnoredFiles int
 	// BytesRead is the export bytes this import consumed.
 	BytesRead uint64
+	// UnanalysedFiles counts the Options.Expected files for which the export
+	// carries no file node: source the engine was handed and did not read, so
+	// no fact of this import comes from it. UnanalysedFirst is the first of
+	// them in path order, "" when there is none. The count is the export's own
+	// record, never a copy of any frontend's exclusion rules, so it covers
+	// every reason a frontend drops a file, known or not.
+	UnanalysedFiles int64
+	UnanalysedFirst string
 	// StagedRows is how many rows this import staged, and OverStagedRows
 	// whether that crossed a user-set Options.MaxStagedRows. Crossing it
 	// stages and publishes everything anyway; the flag is what keeps the
@@ -314,6 +328,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if opts.MaxEvidencePerFact <= 0 {
 		opts.MaxEvidencePerFact = model.MaxEvidencePerFact
 	}
+	sc.filePath = func(name string) string { return normalizePath(name, opts.ProjectRoot, opts.UnitRoot) }
 	e := &emitter{sc: sc, res: res, sink: sink, opts: opts, language: opts.Language}
 	if err := e.stageFiles(ctx); err != nil {
 		return rep, err
@@ -322,6 +337,9 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes, opts.MaxExportFiles)
 	rep.BytesRead = uint64(n)
 	if err != nil {
+		return rep, err
+	}
+	if rep.UnanalysedFiles, rep.UnanalysedFirst, err = sc.unanalysed(ctx); err != nil {
 		return rep, err
 	}
 	opts.phase(PhaseExportStaged)

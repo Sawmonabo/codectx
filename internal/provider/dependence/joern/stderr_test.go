@@ -212,15 +212,31 @@ func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 // output path placed after it would leave the parse tool with no input at all
 // -- a whole language family that analyses nothing, with no compile error and
 // no diagnostic from the engine to say so.
+//
+// The second half protects the families the delimiter must not reach: a
+// frontend that rejects the option writes a warning into the stderr the
+// classifier reads, and the option would enter the cache key of a family whose
+// graph it cannot change. Mutation that fails it: return the Java suffix for
+// every family.
 func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
+	java := frontendArgs(dependence.FamilyJava)
 	args := parseArgs([]string{"--base"}, dependence.ParseRequest{
 		Family: dependence.FamilyJava, SourceDir: "/src", OutputPath: "/out/graph"})
-	tail := args[len(args)-len(clearDefaultExclusions):]
-	if strings.Join(tail, " ") != strings.Join(clearDefaultExclusions, " ") {
-		t.Fatalf("the parse argv ends with %q, not with the frontend delimiter %q", tail, clearDefaultExclusions)
+	tail := args[len(args)-len(java):]
+	if len(java) == 0 || strings.Join(tail, " ") != strings.Join(java, " ") {
+		t.Fatalf("the parse argv ends with %q, not with the frontend delimiter %q", tail, java)
 	}
-	head := args[:len(args)-len(clearDefaultExclusions)]
+	head := args[:len(args)-len(java)]
 	if got := strings.Join(head, " "); !strings.HasSuffix(got, "/src --output /out/graph") {
 		t.Errorf("the paths do not precede the frontend delimiter: %q", got)
+	}
+	for _, f := range dependence.Families {
+		if f == dependence.FamilyJava {
+			continue
+		}
+		args := parseArgs([]string{"--base"}, dependence.ParseRequest{Family: f, SourceDir: "/src", OutputPath: "/out/graph"})
+		if got := strings.Join(args, " "); !strings.HasSuffix(got, "/src --output /out/graph") {
+			t.Errorf("family %s is handed frontend arguments it does not honour: %q", f, got)
+		}
 	}
 }

@@ -6,10 +6,13 @@ nine supported languages. It is the Section 11.6 provider: extraction-lazy,
 cached, governed per unit, and honest about every way an analysis can come
 back incomplete.
 
-The analysis engine behind it is identified by its tool lock entry and its
-licence record. Everywhere the provider speaks — the provider id, capability
-names, evidence details, error details, log fields, query results, and this
-document — it is "the engine".
+This is the only product document that names the engine behind it in prose.
+Elsewhere the name appears only as an identifier (the tool lock entry, the
+backend package path), in the pages that install and configure it, in licence
+and source lists, and in the dated research reports under `docs/research/`.
+Everywhere else — the provider id, the
+configuration table, capability names, evidence details, error details, log
+fields, query results — it is "the engine".
 
 ## What it publishes
 
@@ -127,29 +130,29 @@ capability.
 
 ## The engine
 
-The backend is a code-property-graph engine pinned by the Section 11.7 tool
-lock as its `kind: cpg` entry (runtime `jdk`, Apache-2.0; recorded in
-`THIRD_PARTY_LICENSES.md`). The version verified for
+The backend is [Joern](https://github.com/joernio/joern), pinned by the
+Section 11.7 tool lock as the `joern` entry (`kind: cpg`, runtime `jdk`,
+Apache-2.0; recorded in `THIRD_PARTY_LICENSES.md`). The version verified for
 this implementation is **4.0.627**.
 
 Two noninteractive commands, one exact argv each, no product-owned analysis
-script and no interpreter server: a **parse** that is given the unit's
-frontend, the definition cap, the unit's private materialization and a private
-output graph, and an **export** that writes every representation of that graph
-as CSV into a private export directory.
+script and no interpreter server:
 
-* The Java parse alone is also given the option that empties its frontend's
-  default path exclusions; see the default path exclusions below for why no
-  other family is given it.
-* The definition cap is 40000, replacing the engine default of 4000. Measured
-  on a 1.05M-line Python tree: 23% more parse time, 3% more memory, every
-  skipped method removed, and no change to any other fact count beyond the
-  run-to-run variance below — the measured control-dependence and call counts
-  were equal (`docs/research/10-engine-empirical.md` §9a). It is part of the
-  cache key and there is no second parse at a higher limit.
-* The single export of every representation carries every edge family the
-  importer reads (calls, control dependence, reaching definitions and
-  containment). The narrower dependence-only representations are not
+```text
+joern-parse  --language <frontend> --max-num-def 40000 <private materialization> --output <private graph> [--frontend-args --no-default-exclude]
+joern-export <private graph> --repr=all --format=neo4jcsv --out <private export>
+```
+
+* The bracketed suffix is passed to the Java frontend alone; see the default
+  path exclusions below for why no other family is given it.
+* `--max-num-def 40000` replaces the engine default of 4000. Measured on a
+  1.05M-line Python tree: 23% more parse time, 3% more memory, every skipped
+  method removed, and no change to any other fact count beyond the run-to-run
+  variance below — the measured CDG and CALL counts were equal
+  (`docs/research/10-round3-empirical.md` §9a). It is part of the cache key and
+  there is no second parse at a higher limit.
+* The single `all` export carries every edge family the importer reads
+  (`CALL`, `CDG`, `REACHING_DEF`, `CONTAINS`). `--repr=pdg|cdg|ddg` is not
   implemented for CSV or GraphML in this release; there is no GraphML path.
 * The engine's argument parser rejects a repeated option, so the
   semantics-neutral option allowlist must never restate a pinned one.
@@ -158,18 +161,17 @@ as CSV into a private export directory.
 argv over the same unmodified 161-file tree (this repository, Go frontend)
 produced `nodes=13675 relations=52310 aliases=16922` and
 `nodes=13677 relations=52311 aliases=16926` — a band of about 0.01%, also seen
-as control dependence −4 / reaching definitions −6 on a 1.5M-line Java
-repository
-(`docs/research/10-engine-empirical.md` §4). Nothing in the provider assumes
+as CDG −4 / REACHING_DEF −6 on a 1.5M-line Java repository
+(`docs/research/10-round3-empirical.md` §4). Nothing in the provider assumes
 two runs are equal: the graph cache replays a stored graph rather than
 reparsing, fact keys are derived from source-side identity rather than from
 engine node ids, and every parity claim in this document and in the code is
 bounded by this band. A claim of *equality* between two engine runs anywhere
 in the repository is a defect.
 
-**No version probe.** The parse command rejects a version option as unknown
-and the engine's console launcher drops into its interactive console, so the
-engine's version and payload digest come from the lock entry that installed it and
+**No version probe.** `joern-parse --version` is rejected as an unknown option
+and `joern --version` drops into the interactive console, so the engine's
+version and payload digest come from the lock entry that installed it and
 travel on `Detection.ObservedVersion` and the descriptor version. The lock
 entry's *name* stays in the lock: `ObservedVersion` renders
 `engine <version> <digest>`, because detection is a product surface.
@@ -190,9 +192,9 @@ cache key are the same string whether the payload landed before the process
 started or during it. The first `Parse` or `Export` resolves the command lines,
 and that is what installs the payload: the first unit that actually needs the
 engine pays the fetch, at unit time, under the scheduler's reservation gate.
-Resolving at construction would make every `codectx index`, `refresh` and
-`watch` download roughly two gigabytes before the snapshot is even captured,
-in every repository, whether or not the planner emits a dependence unit —
+Resolving at construction instead made every `codectx index`, `refresh` and
+`watch` download roughly two gigabytes before the snapshot was even captured,
+in every repository, whether or not the planner would emit a dependence unit —
 which is exactly the delay to base readiness Section 11.6 forbids. The
 resolution is memoized with its error, so a payload that cannot be installed is
 attempted once rather than once per language family, and the resolved digest is
@@ -228,7 +230,7 @@ re-checked against the identity construction already published.
 
 | Payload digest | Release |
 |---|---|
-| `964655bd…` (the engine's release archive, SHA-256 verified locally) | 4.0.627 |
+| `964655bd…` (`joern-cli.zip`, SHA-256 verified locally) | 4.0.627 |
 
 The lock is the authority; this table is the human-readable index that
 `status`, `doctor` and each provider's reported `ObservedVersion` resolve against.
@@ -273,7 +275,7 @@ helper, so loose `.rs` files are left unanalysed rather than published as an
 empty unit.
 
 These rules are parity measurements, not preferences
-(`docs/research/10-engine-empirical.md` §5–§8): splitting one TypeScript
+(`docs/research/10-round3-empirical.md` §5–§8): splitting one TypeScript
 project four ways kept 99.7% of control-dependence edges but only 46% of the
 calls that resolved to internal methods; Python packages keep 100% of methods
 and dependence edges and alias their cross-package calls by full name; a
@@ -341,9 +343,8 @@ allocation  = min(MemAvailable - base footprint - safety margin,
 ```
 
 The base footprint is derived from the machine and the configuration -- this
-build's measured idle overhead plus the query, cache and queue reservations and
-every page cache the process opens ([configuration](configuration.md)) -- so a
-host with more cores keeps more for
+build's measured idle overhead plus the query, cache and queue reservations
+([configuration](configuration.md)) -- so a host with more cores keeps more for
 itself and offers its children less.
 
 * The cap is sized to what the unit needs, never to what the machine has. A
@@ -365,7 +366,7 @@ itself and offers its children less.
   browser of the person indexing their repository; an allocation of
   "everything but the safety margin" handed one analyzer a 42 GB heap cap on
   a 47 GB machine. It is a design constant, not a setting, for the same
-  reason the product has no default ceiling: it decides how the product
+  reason the ruling forbids a default ceiling: it decides how the product
   shares a machine, not how much work it will do. A unit whose estimate
   exceeds even the allocation still runs, whole, at the allocation.
 * The cap is placed on the engine's frontend heap. It is lossless everywhere
@@ -514,7 +515,7 @@ the tree sum at one instant, never a sum of per-process high-water marks
 reached at different instants, and it is therefore higher than
 `/usr/bin/time %M`, which reports the largest single process — by tens to
 hundreds of megabytes on this engine, whose orchestrator JVM, frontend and
-helpers are separate processes (`docs/research/10-engine-empirical.md` §1).
+helpers are separate processes (`docs/research/10-round3-empirical.md` §1).
 The figure is what the memory governor's estimate is checked against. Where
 the platform cannot observe a running tree — anything but Linux today — the
 detail is absent and a memory failure says so under
@@ -532,35 +533,23 @@ as heap exhaustion would spend the unit's single retry on a full reparse of a
 unit that had already succeeded.
 
 Every failure also carries `stderr_tail`: the last of what the child wrote to
-its standard error, in whole lines taken from the end, bounded to what one
-error detail holds. Each line is reduced before it is counted, so the bound can
-never cut a path in two and leave its leading directories behind as text no
-rule recognises. A final line longer than the whole bound keeps its last
-bytes, from the first field boundary in them, because the exception is at the
-end of the line. A failure row is durable storage, so what it may contain is
-narrower than what a log may:
+its standard error, bounded to what one error detail holds, cut at a line
+boundary. Without it a failure reported only how many bytes the child wrote,
+and a crash on a real repository left nothing that could be read afterwards.
+A failure row is durable storage, so what it may contain is narrower than what
+a log may:
 
-- A path starts at every separator that follows a byte which cannot continue a
-  relative path — a space, a quote, a bracket, a backtick, `=`, `>`, `@`, `|`,
-  `!`, `+`, a comma — so ``cmd: `<abs>/analyzer-parse` ``, `2><abs>/child.log`
-  and `@<abs>/args` are all reduced, and the punctuation around the path
-  stays. A path ends at whitespace, a closing bracket, a quote, `|`, a comma or
-  a semicolon.
-- The run's private directories (the unit's materialization and its work
-  directories) are replaced by `(private)` wherever such a path starts, and
-  the rest of the path is kept: it is the part that says which step of the run
-  wrote the file, and it names something inside a directory the reader is not
+- The run's private directories are replaced by `(private)`, by name.
+- Every remaining rooted path is reduced to its base name, wherever it sits in
+  a whitespace-delimited field: the child prints paths inside punctuation — a
+  backticked command line, an argument list, a quoted value — and reducing
+  only a field that begins with a separator published the operator's home
+  directory and the repository path. The punctuation around the path stays, so
+  ``cmd: `<abs>/analyzer-parse` `` reads as ``cmd: `analyzer-parse` ``.
+- A path *under* a private directory keeps what follows `(private)`, which is
+  the part that says which step of the run wrote the file. That remainder is
+  not a rooted path: it names something inside a directory the reader is not
   being told.
-- A path under any other directory the backend knows is reduced to its base
-  name, with that directory matched as a whole prefix first, so a known
-  directory whose name holds a space is reduced whole. The known directories
-  are the user's home directory, the directories of the engine's launchers and
-  every absolute directory the child's environment names. Every other rooted
-  path is reduced to its base name the same way.
-- The backend is not told the data directory. A path under it that is under
-  none of the directories above is reduced by the generic rule, and a space in
-  a directory name the backend does not know ends the path there: what follows
-  the space is left as the unrooted text it then is.
 
 Classification depends on the engine logging at WARN, so the child environment
 pins its log level rather than inheriting whatever the host set. The child's
@@ -568,8 +557,8 @@ environment is built by the product and inherits nothing, which also means it
 inherits no locale: every child is given a UTF-8 one, because a C locale makes
 the platform's path encoding ASCII and a runtime that encodes a file name
 through it cannot open a source file whose name holds a letter outside ASCII
-at all. One such file failed a 4,984-file project with the
-runtime's invalid-path exception; the same project parsed and exported with
+at all. One such file failed a 4,984-file project with
+`java.nio.file.InvalidPathException`; the same project parsed and exported with
 the locale set and nothing else changed. Setting the encoding as a runtime
 property instead does not work and was measured not to: the runtime derives its
 path encoding from the locale and ignores the property.
@@ -604,7 +593,7 @@ in the parse or in the export, and is never used for memory.
    project whose parse succeeds at every heap cap and whose whole-unit export
    dies at every one of them, while each of its subdivided parts exports
    cleanly, is a measured shape, not a hypothetical: reporting it as a failed
-   unit would throw away every fact the engine could still produce for that project.
+   unit threw away every fact the engine could still produce for that project.
    Memory, the unit deadline and an export that exits cleanly holding no method
    keep their own paths and are never subdivided — the first two are properties
    of what the unit was given, the third a statement about the frontend's own
@@ -665,7 +654,8 @@ carried into the new generation until the fresh one replaces it (Section 13.3).
 
 ## Refresh and delta
 
-The engine has no incremental mode, no merge and no per-file export, so a
+The engine has no incremental mode, no merge and no per-file export
+([upstream issue #5757](https://github.com/joernio/joern/issues/5757)), so a
 refreshed unit is a whole parse and export — unless the cache key still
 matches, in which case nothing runs at all. That is the upstream project's own
 answer, not an inference from its documentation: asked on its issue tracker
@@ -770,7 +760,7 @@ present and usable. `Result.Filtered` is how a caller tells the two apart —
 had nothing to give.
 
 Measured through the applier against the real engine, over one named fixture:
-the Go fixture of the export reader's test data (the `pkg:go:` unit,
+`internal/provider/dependence/neo4jcsv/testdata/src/gofix` (the `pkg:go:` unit,
 `go.mod` + `app/app.go` + `helper/helper.go`, 38 fact keys) as the predecessor,
 refreshed after adding one file, `extra/extra.go`, declaring `func Note() int {
 return 7 }`. The refresh kept its filter and inherited **14 relations and 29
@@ -807,8 +797,7 @@ sort; only the edges whose endpoint several entities resolved to, and
 
 The result is that an import's disk traffic is a small constant times its
 export -- 6.6× on the synthetic export of the importer's scale test, with a
-staging cache small enough that every sort spills, against 34.5× for the
-row-at-a-time staging [ADR-0009](adr/ADR-0009-import-staging.md) measured --
+staging cache small enough that every sort spills, against 34.5× before --
 and that every byte is written once, sequentially, with a bounded window in
 flight rather than in a burst at each commit. The page
 cache of the staging database is `providers.dependence.staging_cache_kib`

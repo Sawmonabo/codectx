@@ -33,7 +33,7 @@ const (
 	// classification or pinned argument arrays change. The descriptor version
 	// is this plus the engine payload digest, so a unit built by one engine
 	// release is never reused for another.
-	adapterVersion = "5"
+	adapterVersion = "6"
 	// ScopeWorkspace is the scope of the C/C++ unit, the one unit that is the
 	// whole repository.
 	ScopeWorkspace = provider.ScopeWorkspace
@@ -220,15 +220,28 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // noninteractively, so name, version and digest come from the resolved
 // payload, which is where the lock recorded them.
 //
-// Detection reads only the repository's project markers, stops at the bound,
-// and never walks the tree into memory: it accumulates at most
-// provider.MaxDetectionInputs paths and one boolean, whatever the repository's
-// size. It traverses where the filesystem and treesitter providers answer from
-// a constant because neither question it must answer — which projects exist,
-// and whether any analysable source exists at all — can be answered without
-// looking.
+// Detection reads only the repository's project markers, stops once it has
+// what it needs, and never walks the tree into memory: it accumulates at most
+// provider.MaxDetectionInputs paths and two booleans, whatever the
+// repository's size. It traverses where the filesystem and treesitter
+// providers answer from a constant because neither question it must answer —
+// which projects exist, and whether any analysable source exists at all — can
+// be answered without looking.
+//
+// The walk is workspace.Walk under the policy the caller hands in, and Walk
+// honours the policy's ForceInclude and ForceIncludeDir hooks: a caller that
+// passes the capture's hooks has every tracked path under an excluded
+// directory -- a vendored `third_party/` project -- seen here exactly as the
+// capture saw it. A caller that passes none has such a path skipped, and a
+// repository whose only analysable source lies there is reported unavailable.
+//
+// InputPaths names the recognized markers and plans nothing: every unit is
+// planned from the pinned snapshot (PlanUnits). A workspace with more markers
+// than the bound lists the first provider.MaxDetectionInputs the walk met, in
+// path order, and says so under detailInputPaths; no project loses its unit
+// to the bound.
 func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy workspace.Policy) (provider.Detection, error) {
-	inputs, languages, err := detectInputs(ctx, root, policy)
+	inputs, languages, truncated, err := detectInputs(ctx, root, policy)
 	if err != nil {
 		return provider.Detection{}, err
 	}
@@ -240,20 +253,33 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	// engine is never named on one (Section 11.6). The version
 	// and the payload digest are the whole of the provenance a reader needs:
 	// docs/providers-dependence.md maps a digest to its release.
-	return provider.Detection{Available: true, Capabilities: Capabilities, InputPaths: inputs,
-		ObservedVersion: truncate("engine "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}, nil
+	det := provider.Detection{Available: true, Capabilities: Capabilities, InputPaths: inputs,
+		ObservedVersion: truncate("engine "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}
+	if truncated {
+		// A marker, not a refusal: the value is not a CTX_ code, so the
+		// registry publishes no degraded row for it. Nothing was refused.
+		det = det.WithDetail(detailInputPaths, "the workspace holds more than "+itoa(int64(provider.MaxDetectionInputs))+
+			" project markers; the first the walk met are listed, and every project is planned from the snapshot")
+	}
+	return det, nil
 }
+
+// detailInputPaths is the detection detail that says InputPaths stopped at
+// its bound.
+const detailInputPaths = "input_paths"
 
 // stopWalk ends a bounded detection walk without making an early stop look
 // like a failure.
 var stopWalk = errors.New("detection input bound reached")
 
-// detectInputs collects the project markers detection recognized, bounded by
-// provider.MaxDetectionInputs, and reports whether any analysable source
-// exists at all.
-func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Policy) ([]string, bool, error) {
+// detectInputs collects the project markers detection recognized, at most
+// provider.MaxDetectionInputs of them, reports whether any analysable source
+// exists at all, and whether a marker past the bound was met. The walk stops
+// as soon as both further questions are settled: a marker past the bound has
+// been seen and so has analysable source.
+func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Policy) ([]string, bool, bool, error) {
 	var inputs []string
-	var languages bool
+	var languages, truncated bool
 	err := workspace.Walk(ctx, root, policy, func(f workspace.File) error {
 		if !languages && FamilyOf(lang.Of(f.Path)) != "" {
 			languages = true
@@ -261,23 +287,24 @@ func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Pol
 		base := filepath.Base(f.Path)
 		for _, fam := range Families {
 			if slices.Contains(projectMarkers[fam], base) {
-				inputs = append(inputs, f.Path)
+				if len(inputs) < provider.MaxDetectionInputs {
+					inputs = append(inputs, f.Path)
+				} else {
+					truncated = true
+				}
 				break
 			}
 		}
-		if len(inputs) >= provider.MaxDetectionInputs && languages {
+		if truncated && languages {
 			return stopWalk
 		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, stopWalk) {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	slices.Sort(inputs)
-	if len(inputs) > provider.MaxDetectionInputs {
-		inputs = inputs[:provider.MaxDetectionInputs]
-	}
-	return inputs, languages, nil
+	return inputs, languages, truncated, nil
 }
 
 // ImportOptions carry what the provider.Provider interface has no room for:
@@ -415,6 +442,10 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 	// took off them is disclosed on the capability, not only in the line
 	// logged below.
 	pub.ClippedEvidence = int(report.ClippedEvidence)
+	// Source files of this unit the engine was handed and that the export has
+	// no file node for. Nothing of them reached a fact, so a unit that
+	// published the rest fresh would claim facts for files it never read.
+	pub.UnanalysedFiles, pub.UnanalysedFirst = report.UnanalysedFiles, report.UnanalysedFirst
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
@@ -456,6 +487,7 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
+		"unanalysed_files", report.UnanalysedFiles,
 		"truncated_fields", len(report.TruncatedFields),
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
@@ -601,13 +633,14 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// from the planner's Unit.Files, which foldSizes arbitrates across the
 	// whole plan: only this pass knows what reached the frontend.
 	var files int64
+	handed := unit.handed(unit.Root)
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
 			Include: func(fv model.FileVersion) bool {
 				if !unit.Contains(fv.Path) {
 					return false
 				}
-				if fv.Status != model.FileDeleted && FamilyOf(lang.Of(fv.Path)) == unit.Family {
+				if handed(fv) {
 					files++
 				}
 				return true
@@ -901,7 +934,7 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
 		// not a crash and must not be worded as one, and it must not be
-		// worded as itself either: the failure names the two causes that
+		// worded as itself either: the failure names the three causes that
 		// remain and how much source the frontend was handed.
 		out.Outcome.Class = FailureEmptyExport
 		return ExportOutcome{}, out.Outcome, emptyExport(unit, out.Outcome, adm.res, files)
@@ -964,6 +997,11 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 // TSX nodes javascript), which is accurate for every located fact and
 // approximate for the fileless remainder.
 //
+// Expected is the set of files the engine was handed for this export: the
+// unit's own source files under unitRoot. Every one of them the export has no
+// file node for is counted by the import and published on the unit's rows, so
+// a file a frontend dropped by a rule of its own is never silently missing.
+//
 // PreviousKeys and KeysPath come from the coordinator's delta applier
 // (docs/providers-dependence.md §Refresh and delta). A run handed the previous
 // unit's key set publishes only the relations whose key changed; a run handed
@@ -993,8 +1031,8 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
 		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles, StagingCacheKiB: p.opts.StagingCacheKiB,
-		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
-		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
+		MaxEvidencePerFact: p.opts.MaxEvidencePerFact, Expected: unit.handed(unitRoot),
+		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return ImportReport{}, err
@@ -1015,9 +1053,17 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
 	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (ImportReport, int, error) {
 
-	children, err := childProjects(source, unit)
+	children, err := childProjects(source)
 	if err != nil {
 		return ImportReport{}, 0, err
+	}
+	if len(children) == 0 {
+		// The unit fails on the crash that forced the split, so the error
+		// carries that crash's own figures -- its exit code, pass, exception
+		// and last words -- and not a step that never ran.
+		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, adm.res).
+			WithDetail("reason", "the unit has no boundary below it to split along").
+			WithRemediation("the failing pass and exception on this failure are what identifies the defect upstream")
 	}
 	// The parts are all parsed and imported whatever the count. A user-set
 	// providers.dependence.max_units_per_family says how many parts of one
@@ -1043,6 +1089,9 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
+	// The parts whose export was imported, by directory name. It is bounded by
+	// the entries of one directory, which childProjects already holds.
+	imported := make(map[string]bool, len(children))
 	// What the parts did, so a unit no part of which produced a method can say
 	// which of the two things happened to them rather than restating that
 	// nothing came out.
@@ -1098,13 +1147,52 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		}
 		total = merge(total, report)
 		admitted++
+		imported[child] = true
 		part.End(ledger.OutcomeOK, bracketed(), nil)
 		_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
 	}
 	if admitted == 0 {
 		return ImportReport{}, 0, subdivisionEmpty(unit, crash, adm.res, tally, files)
 	}
+	// Each imported part counted its own files the export did not read. The
+	// unit's files that no imported part covers -- those directly in the unit's
+	// root, in a directory the split does not descend into, or in a part that
+	// failed or exported nothing -- reached no fact either, and are counted
+	// here, so the unit's figure is over the union of its parts: every file the
+	// unit owns and published no fact for.
+	outside, first, err := outsideParts(ctx, req.Content, unit, imported)
+	if err != nil {
+		return ImportReport{}, 0, err
+	}
+	total = merge(total, ImportReport{UnanalysedFiles: outside, UnanalysedFirst: first})
 	return total, overParts, nil
+}
+
+// outsideParts counts the unit's own source files that lie under no imported
+// part of a subdivided unit, and names the first in path order. It streams the
+// pinned manifest and holds only the count and that one path.
+func outsideParts(ctx context.Context, view model.SnapshotView, unit Unit, imported map[string]bool) (int64, string, error) {
+	handed := unit.handed(unit.Root)
+	var n int64
+	var first string
+	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+		if !handed(fv) {
+			return nil
+		}
+		rel := fv.Path
+		if unit.Root != "" {
+			rel = strings.TrimPrefix(rel, unit.Root+"/")
+		}
+		if part, _, nested := strings.Cut(rel, "/"); nested && imported[part] {
+			return nil
+		}
+		n++
+		if first == "" || fv.Path < first {
+			first = fv.Path
+		}
+		return nil
+	})
+	return n, first, err
 }
 
 // childProjects lists the immediate subdirectories of a unit's root that hold
@@ -1115,8 +1203,9 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 // crashed unit's source from the only run that can still analyse it, and would
 // do it without a word: the unit would seal, partial for the subdivision, with
 // no sign that the tail of its source was never parsed. The caller reports the
-// count against the user's threshold instead.
-func childProjects(source string, unit Unit) ([]string, error) {
+// count against the user's threshold instead. An empty list is the caller's
+// to refuse: only it holds the crash the refusal must report.
+func childProjects(source string) ([]string, error) {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return nil, internalErr("the dependence unit could not be subdivided: " + err.Error())
@@ -1129,11 +1218,6 @@ func childProjects(source string, unit Unit) ([]string, error) {
 		out = append(out, e.Name())
 	}
 	slices.Sort(out)
-	if len(out) == 0 {
-		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
-			WithDetail("reason", "the unit has no boundary below it to split along").
-			WithRemediation("the failing pass and exception on the crash that forced this split are what identifies the defect upstream")
-	}
 	return out, nil
 }
 
@@ -1162,6 +1246,10 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
+	a.UnanalysedFiles += b.UnanalysedFiles
+	if b.UnanalysedFirst != "" && (a.UnanalysedFirst == "" || b.UnanalysedFirst < a.UnanalysedFirst) {
+		a.UnanalysedFirst = b.UnanalysedFirst
+	}
 	// Each part stages into its own scratch and compares its own rows against
 	// the threshold, so three parts of ten rows each cross a bound of fifteen
 	// that none of them crossed alone. The unit's count is the sum, and the
