@@ -82,10 +82,8 @@ const hostShareDenominator = 2
 // buys nothing and takes the host's memory away from everything else running
 // on it.
 //
-// One unit system: the derivations below divide bytes by bytes. Mixing binary
-// GiB with decimal MB is what put the JavaScript row at 48, a figure whose
-// stated derivation did not reproduce and whose product was 1.84x the ceiling
-// it claimed to double.
+// One unit system: the derivations below divide bytes by bytes, never binary
+// GiB by decimal MB.
 var heapPerSourceByte = map[Family]int64{
 	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
 	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
@@ -121,8 +119,7 @@ var residentAboveHeap = map[Family]int64{
 	// the reference run's ledger for this unit, the one datapoint recorded in
 	// bytes rather than in a rounded unit and taken at the cap the product
 	// itself chose: 10,099,015,680 B of peak tree residency against a
-	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB. The 1712 this
-	// replaces read a decimal-GB figure as binary GiB.
+	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB.
 	FamilyJavaScript: 2084 * miB,
 	FamilyPython:     1945 * miB,
 	FamilyRust:       256 * miB,

@@ -894,10 +894,91 @@ func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
 	}
 }
 
+// admittedAt runs the unit through Import at a reservation the caller
+// admitted, which is what the coordinator's delta applier does.
+type admittedAt struct {
+	*dependence.Provider
+	run *ledger.Run
+	res dependence.Reservation
+}
+
+func (a admittedAt) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	ctx = context.WithValue(a.run.Context(ctx), requestKey{}, req)
+	rep, err := a.Import(ctx, req, sink, dependence.ImportOptions{Reservation: a.res,
+		Readmit: func(context.Context, dependence.Reservation) error { return nil }})
+	return rep.Result, err
+}
+
+// TestTheAdmittedReservationIsTheOneComparedAndRecorded protects the rule that
+// a unit has one reservation: the one the planner sized, learned peak
+// included, and the coordinator admitted. A provider that re-derived its own
+// from the family constants would compare a peak the learned figure covers
+// against a smaller figure nobody admitted, and mark every run of that unit
+// CTX_RESOURCE_LIMIT "over reservation" while the resources block counted it
+// as an overrun.
+//
+// Mutation proof: size the reservation inside Import again
+// (`p.gov.Reserve(unit.Family, unit.Bytes, p.opts.Machine)` in place of the
+// carried one) and the parse stage carries CTX_RESOURCE_LIMIT and the unit's
+// row reports the constants' figure.
+func TestTheAdmittedReservationIsTheOneComparedAndRecorded(t *testing.T) {
+	led := ledger.New(t.TempDir())
+	if err := led.Attach(context.Background()); err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	var mu sync.Mutex
+	rows := map[string]ledger.SpanRow{}
+	led.Subscribe(func(r ledger.SpanRow) {
+		mu.Lock()
+		defer mu.Unlock()
+		rows[r.Stage] = r
+	})
+	h := providertest.New(t, repo)
+	run, err := led.NewRun(ledger.KindIndex, string(h.Repo))
+	if err != nil {
+		t.Fatalf("open a run: %v", err)
+	}
+	// The planner's figure: the constants for this unit, raised to a learned
+	// peak well above them. The tree then peaks between the two.
+	admitted := dependence.NewGovernor(0, 0).Reserve(dependence.FamilyGo, 1<<10, dependence.Machine{})
+	derived := admitted.Bytes()
+	admitted.ObservedPeakBytes = 4 * derived
+	peak := 2 * derived
+	b := &fakeBackend{parse: dependence.Outcome{PeakBytes: peak, CPUUnsampled: true, IOUnsampled: true}}
+	p := admittedAt{Provider: newProviderIn(t, b, t.TempDir()).(carrier).Provider, run: run, res: admitted}
+	if _, _, err := h.Run(t, p, rootScope, []string{"app.go", "go.mod"}); err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	run.Finish(ledger.OutcomeOK)
+	if err := led.Stop(); err != nil {
+		t.Fatalf("stop the ledger: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := rows["parse"]; got.DiagnosticCode != "" {
+		t.Errorf("the parse stage peaked at %d bytes under an admitted %d and carries %q (%s): "+
+			"the step was compared against a reservation nobody admitted", peak, admitted.Bytes(), got.DiagnosticCode, got.Failure)
+	}
+	var found bool
+	for _, u := range dependence.ObservedUnits() {
+		if u.ScopeKey != rootScope {
+			continue
+		}
+		found = true
+		if u.ReservationBytes != uint64(admitted.Bytes()) || u.OverranReservation() {
+			t.Errorf("the unit's row records a reservation of %d (over: %v), want the admitted %d and no overrun",
+				u.ReservationBytes, u.OverranReservation(), admitted.Bytes())
+		}
+	}
+	if !found {
+		t.Errorf("the unit recorded no row on the resources block")
+	}
+}
+
 // schedulerLedger is the process admission ledger a scheduler front is bound
-// to, over the allocation this machine observation derives. The scheduler no
-// longer observes a machine itself: the allocation and the running total
-// belong to the one ledger every heavy child of the process shares.
+// to, over the allocation this machine observation derives. The allocation and
+// the running total belong to the one ledger every heavy child of the process
+// shares.
 func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 	t.Helper()
 	l, err := admission.NewLedger(m.SchedulingAllocation(testBaseFootprintBytes), testDiskAllocationBytes)

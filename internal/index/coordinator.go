@@ -165,6 +165,12 @@ type Options struct {
 	// totals, one machine, and a process free to reserve twice what the host
 	// has.
 	Admission *admission.Ledger
+	// Machine is the composition root's one observation of the host: the
+	// reading Admission's allocation was derived from, handed over so the
+	// planner sizes every heavy unit's reservation and heap caps against the
+	// same reading. The coordinator never observes the machine itself. The
+	// zero value is a host that exposes no available memory.
+	Machine dependence.Machine
 	// RunLedgerReader reads back the rows this process's runs recorded: how a
 	// finished run states in its own result what it did, and what this
 	// workspace has already measured its heavy units to cost, which the plan

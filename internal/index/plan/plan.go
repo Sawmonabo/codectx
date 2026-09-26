@@ -257,7 +257,16 @@ type Inputs struct {
 	// not refuse a plan; an error that does arrive is a broken supplier and is
 	// returned.
 	RecordedPeaks func(ctx context.Context, limit int) ([]RecordedPeak, error)
-	Config        config.Config
+	// Machine is the composition root's one observation of the host, the
+	// reading the admission allocation was derived from. Every heavy unit's
+	// reservation, heap caps included, is sized against it, so the figure a
+	// unit is admitted at and the cap its children run under come from the
+	// same reading. The planner never observes the machine itself: a second
+	// reading taken while memory is momentarily free would size caps the
+	// allocation never admitted. The zero value is a host that exposes no
+	// available memory.
+	Machine dependence.Machine
+	Config  config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot
 	// units. Empty takes the process temporary directory. The spill lives only
 	// as long as the returned Plan and is removed by Plan.Close.
@@ -683,7 +692,7 @@ func (b *builder) emit(ctx context.Context) error {
 	}
 	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes,
 		config.BaseFootprint(b.in.Config))
-	machine := dependence.ObserveMachine()
+	machine := b.in.Machine
 	deferDependence := b.in.Config.Providers.Dependence.Enabled == config.Auto
 
 	for _, p := range b.in.Selection.Active {

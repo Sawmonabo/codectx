@@ -634,9 +634,10 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 		// immutable, so it is published now rather than rebuilt.
 		return spec.ID, outcome{}, nil
 	}
+	var grant *unitGrant
 	if d.unit.Heavy {
-		release, admitErr := l.c.sched.Admit(ctx, d.unit.Reservation)
-		if admitErr != nil {
+		var admitErr error
+		if grant, admitErr = admitUnit(ctx, l.c.sched, d.unit.Reservation); admitErr != nil {
 			// The gate refused or was cancelled, so the unit never reached its
 			// work: unavailable with that reason, not a failure of a provider
 			// that was never asked. Ending the span here wins over the deferred
@@ -645,12 +646,12 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
 			return "", outcome{}, admitErr
 		}
-		defer release()
+		defer grant.release()
 	}
 	// Past the gate: this reservation is part of the sum the next unit is
 	// admitted against, so the tick may offer that one now.
 	admitted()
-	out, err := work.run(ctx, d.unit, spec, span)
+	out, err := work.run(ctx, d.unit, spec, span, grant)
 	if err != nil {
 		return "", out, err
 	}
@@ -751,7 +752,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	in := plan.Inputs{View: view, Selection: sel, Store: c.opts.Store, PrevGen: active,
-		CarriedPage: c.carriedPage(active), Config: c.opts.Config, TempDir: c.workDir}
+		CarriedPage: c.carriedPage(active), Config: c.opts.Config, TempDir: c.workDir, Machine: c.opts.Machine}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return model.IndexResult{}, false, err
