@@ -1211,8 +1211,6 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 // row. Deleting the comparison from `onPinnedBytes` outright is a wider
 // mutation that TestOccurrenceMustDescribeThePinnedBytes/definition already
 // catches, so it does not describe this gap.
-//
-// This test was written but has not been compiled and has not been run.
 func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 	// The same line as the two tests above. On line 4 "Start" sits at columns
 	// [5,10) and "browser" at [11,18); on line 2 "Server" sits at [5,11) and
