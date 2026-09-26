@@ -35,6 +35,7 @@ hashes='
 05838e3655a4a94307f02c663e8ad9fb285867be3d3f7570902526683eabd88e
 09b375ad5d712887a5ff068ddab85c2891d6ed4e537e24c0a2d0ee5c72b8c4f7
 1fbd0e9cfa108d0edf1ad334527d76e142e1bd7c621376b15a2fe8b3af222ef0
+264f6ad2195a0011191601330de89e7a6ddb7daa00d6a97d49745f03b4a907c0
 2899b48cc5049d7a60745350f355ebdc1a093adbfa599dbc9bdb418496e1811e
 2a87fb36539cf37b688fd2084a4277e3cf8e1c67aec97e1865226867081e64e3
 2c2f2bfc0753f1ea7e4460c2b620aa509b8fb1f52c7a1b509c8ead46c41d3d40
@@ -42,6 +43,7 @@ hashes='
 39cc3013eaed0aeee3eb447c7fe84c07bc9310c96b1c3c17e702059efd3128fd
 3aed69afb3da4ca1d138a21cd35992d95fa4a88eb73239990100b91dd97fa7f8
 3d55fbffa6a1ce1381d7b8789edae994e2b1ab3f41c1b687a03715223ac68668
+4b876d8835ef71d69b242cb4899a2bb7d0033c4bc79c68613ff7af0fd64230ad
 67d55f34b8b804346faefe2c34197dd3a6cfed2be92476c733431588646fce1d
 67e7a00defafec49d95c12fc3a17888263fe9470b3765dfe853b247844520028
 7d84202ec06371b4911d9d8d0c2ded75b745af8139ce18d928f1ef2c677c70a1
@@ -57,6 +59,7 @@ b696ec19b1e95356f45db8ec4736266d08cca80b6e9bc9db6dc4155b070f7376
 c2bd4d80632dd731b32b8f45f0fe4c1c70bd50b8442983cb02bc4ce4db37e0e6
 c8cfe6ae87210fc5eac9b3548a1d4081686dae0deb832b1d20985f0313d0375d
 de6f7047330aad6a0a5d893289f929fdc7e24ef92a7fa22f31b2a0b7804410ab
+e412ee94d2457b7841cc5f7dfd152bd259a465b7649e75a2d652d043ff9e92c6
 e49d63b2a8a78f048bafc4b4590029603a5a4165ee8bf98af15d62f24cd83479
 fcea588a704287278eb5c63a328ad401d647f09b4cf328192dab65fbe583c33c
 '
@@ -69,7 +72,13 @@ use strict; use warnings; use Digest::SHA qw(sha256_hex);
 my ($mode, $list) = @ARGV;
 my %bad = map { $_ => 1 } grep { length } split /\s+/, $list;
 my %seen; my $hits = 0;
-sub hit { my ($t) = @_; my $l = lc $t; return $seen{$l} //= ($bad{sha256_hex($l)} ? substr(sha256_hex($l), 0, 12) : q()); }
+sub hit {
+  my ($t) = @_; my $l = lc $t;
+  # A name with digits glued on (a numbered copy of a checkout) is checked with them removed as well.
+  (my $bare = $l) =~ s/[0-9]+$//;
+  return $seen{$l} //= (($bad{sha256_hex($l)} || ($bare ne $l && length($bare) >= 4 && $bad{sha256_hex($bare)}))
+    ? substr(sha256_hex($l), 0, 12) : q());
+}
 sub check {
   my ($where, $text) = @_;
   for my $run (split /[^A-Za-z0-9_-]+/, $text) {
