@@ -6,19 +6,13 @@ import "testing"
 // pairs on hand-derived functions. A wrong pair here is a wrong dependence
 // fact served to every consumer. Each source is one line after the package
 // clause, so a node's offset is its column plus 10.
-//
-// Derivation rules: augmentation adds an edge to EXIT from every node with
-// no successor and from the smallest-reverse-post-order member of each sink
-// strongly connected component that cannot reach EXIT; control dependence
-// is the post-dominance frontier over the augmented graph with no
-// entry-to-exit edge (nothing depends on ENTRY; a loop head whose back edge
-// it controls depends on itself); a def-use pair is (defining node, using
-// node) with every φ resolved to the definitions it merges; a may-definition
-// kills nothing, so a use it reaches pairs with it and with every definition
-// reaching its node. Every label is its own node, spanning the label.
+// The derivation and rendering rules are runGolden's. Every label is its own
+// node, spanning the label.
 func TestGoLoweringGolden(t *testing.T) {
 	runGolden(t, "go", []goldenCase{
 		{
+			// Go spec, For statements with single condition: an absent condition is
+			// equivalent to true, so the loop has no exit edge.
 			// Nodes: c@17 (param), for@27 (head), c@36 (if), g()@40.
 			// Succ: ENTRY→c@17→for@27→c@36→{g()@40, for@27}; g()@40→for@27.
 			// {for, c@36, g()} cannot reach EXIT; for@27 is its first RPO
@@ -33,6 +27,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"c@17 -> c@36"},
 		},
 		{
+			// Go spec, Goto statements and Labeled statements: goto L transfers
+			// control to the statement labelled L in the same function.
 			// Nodes: x@17, x > 0@29, return@37, L@47 (the label's own node),
 			// x++@50, goto L@55. Succ: x > 0→{return, L}; return→EXIT;
 			// L→x++→goto L→L. {L, x++, goto L} cannot reach EXIT; L is its
@@ -48,6 +44,9 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"x@17 -> x > 0@29", "x@17 -> x++@50", "x++@50 -> x++@50"},
 		},
 		{
+			// Go spec, Goto statements: a goto transfers control to the statement with
+			// the corresponding label in the same function; with no label M the
+			// program is invalid, and the goto is lowered unresolved.
 			// Nodes: x@17, x > 0@29, goto M@37 (no label M: no successor),
 			// x++@47. Augmentation adds goto M→EXIT.
 			name:       "dangling goto",
@@ -59,6 +58,9 @@ func TestGoLoweringGolden(t *testing.T) {
 			unresolved: 1,
 		},
 		{
+			// Go spec, Break statements and Continue statements: break L terminates
+			// the for labelled L, and continue L begins its next iteration at the
+			// post statement (For statements with for clause).
 			// Nodes: n@17, L@26 (the label's own node, one successor, so it
 			// controls nothing), i := 0@33, i < n@41 (outer head), i++@48 (update),
 			// for@54 (inner head), i > 1@63, continue L@71, break L@85.
@@ -76,10 +78,14 @@ func TestGoLoweringGolden(t *testing.T) {
 				"i := 0@33 -> i > 1@63", "i++@48 -> i > 1@63", "i := 0@33 -> i++@48", "i++@48 -> i++@48"},
 		},
 		{
+			// Go spec, Expression switches and Fallthrough statements: the cases are
+			// compared top-to-bottom, and fallthrough transfers control to the first
+			// statement of the next case clause.
 			// Nodes: x@17, x@33 (tag head, a Stmt), 1@42, x++@45,
-			// fallthrough@50, 2@68, g(x)@71, x--@86, g(x)@93. Both case
-			// conditions compare against the tag, so each uses x, which only
-			// the parameter defines before them. Succ: x@33→1@42→{x++, 2@68};
+			// fallthrough@50, 2@68, g(x)@71, x--@86, g(x)@93. The head reads
+			// x once and defines the variable holding the tag; both case
+			// conditions Use that variable, so each pairs with the head,
+			// never with x's definitions. Succ: x@33→1@42→{x++, 2@68};
 			// x++→fallthrough→g(x)@71; 2@68→{g(x)@71, x--}; g(x)@71 and
 			// x-- → g(x)@93 → EXIT. IPDom: 1@42, 2@68, g(x)@71, x-- →
 			// g(x)@93; fallthrough → g(x)@71; x++ → fallthrough.
@@ -89,10 +95,12 @@ func TestGoLoweringGolden(t *testing.T) {
 			src:      "package p\nfunc f(x int) { switch x { case 1: x++; fallthrough; case 2: g(x); default: x-- }; g(x) }",
 			cd: []string{"1@42 -> x++@45", "1@42 -> fallthrough@50", "1@42 -> g(x)@71", "1@42 -> 2@68",
 				"2@68 -> g(x)@71", "2@68 -> x--@86"},
-			du: []string{"x@17 -> x@33", "x@17 -> 1@42", "x@17 -> 2@68", "x@17 -> x++@45", "x++@45 -> g(x)@71", "x@17 -> g(x)@71",
+			du: []string{"x@17 -> x@33", "x@33 -> 1@42", "x@33 -> 2@68", "x@17 -> x++@45", "x++@45 -> g(x)@71", "x@17 -> g(x)@71",
 				"x@17 -> x--@86", "x++@45 -> g(x)@93", "x@17 -> g(x)@93", "x--@86 -> g(x)@93"},
 		},
 		{
+			// Go spec, If statements and For statements with single condition: each
+			// branch assigns x, and the condition is evaluated before each iteration.
 			// Nodes: c@17, x := 0@31, c@42, x = 1@46, x = 2@61, x < 9@74 (head),
 			// x++@82, return x@89. x < 9 merges φ(φ(x = 1, x = 2), x++); both
 			// branches kill x := 0, which therefore reaches nothing.
@@ -106,6 +114,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"x = 1@46 -> return x@89", "x = 2@61 -> return x@89", "x++@82 -> return x@89"},
 		},
 		{
+			// Go spec, Assignment statements: a tuple assignment proceeds in two
+			// phases, every operand evaluated first, then the targets assigned.
 			// Nodes: a@17, b@20, c@23 (params), c@36, a@39, b@42, return
 			// b@55. Targets read: c nothing, a old b, b old a. c is read by
 			// no other target and goes first; a and b form a cycle, broken
@@ -118,29 +128,40 @@ func TestGoLoweringGolden(t *testing.T) {
 			du:       []string{"a@17 -> a@39", "b@20 -> a@39", "a@39 -> b@42", "b@42 -> return b@55"},
 		},
 		{
+			// Go spec, Logical operators: the left operand is evaluated, and then the
+			// right if the condition requires it; the result is computed from both.
 			// Nodes: a@17, b@20, a@40 and b@45 (the hoisted operands),
-			// x := a && b@35, return x@48. Succ: a@40→{b@45, x := a && b};
-			// b@45→x := a && b. IPDom: a@40, b@45 → x := a && b.
+			// x := a && b@35, return x@48. Each operand node defines the
+			// expression's result variable, and x := a && b Uses it: SSA
+			// merges a@40's definition (a false) with b@45's. Succ:
+			// a@40→{b@45, x := a && b}; b@45→x := a && b. IPDom: a@40, b@45
+			// → x := a && b.
 			name:     "a short-circuit value uses both operands",
-			protects: "the node owning an && expression reads both operands, so its definition depends on them",
-			mutation: "skip && and || subtrees when collecting a node's uses (loses a@17 -> x := a && b@35 and b@20 -> x := a && b@35)",
+			protects: "the node owning an && expression Uses the result both operand nodes define, so its definition depends on each operand's evaluation",
+			mutation: "give the owning node no use of the short-circuit result (loses a@40 -> x := a && b@35 and b@45 -> x := a && b@35), or let it re-read the operands' names (adds a@17 -> x := a && b@35)",
 			src:      "package p\nfunc f(a, b bool) bool { x := a && b; return x }",
 			cd:       []string{"a@40 -> b@45"},
-			du: []string{"a@17 -> a@40", "b@20 -> b@45", "a@17 -> x := a && b@35", "b@20 -> x := a && b@35",
+			du: []string{"a@17 -> a@40", "b@20 -> b@45", "a@40 -> x := a && b@35", "b@45 -> x := a && b@35",
 				"x := a && b@35 -> return x@48"},
 		},
 		{
+			// Go spec, Logical operators and If statements: the condition's value is
+			// computed from both operands, the right one evaluated only if a is true.
 			// Nodes: a@17, b@20, a@33, b@38 (operands), a && b@33 (the
 			// condition), g()@42. Succ: a@33→{b@38, a && b}; b@38→a && b;
-			// a && b→{g(), EXIT}. IPDom: a@33, b@38 → a && b → EXIT.
+			// a && b→{g(), EXIT}. IPDom: a@33, b@38 → a && b → EXIT. The
+			// operand nodes define the result variable the condition Uses.
 			name:     "a short-circuit condition uses both operands",
-			protects: "an if condition built from && reads both operands, so its branch depends on them",
-			mutation: "skip && and || subtrees when collecting a node's uses (loses a@17 -> a && b@33 and b@20 -> a && b@33)",
+			protects: "an if condition built from && Uses the result both operand nodes define, so its branch depends on each operand's evaluation",
+			mutation: "give the condition no use of the short-circuit result (loses a@33 -> a && b@33 and b@38 -> a && b@33), or let it re-read the operands' names (adds a@17 -> a && b@33)",
 			src:      "package p\nfunc f(a, b bool) { if a && b { g() } }",
 			cd:       []string{"a@33 -> b@38", "a && b@33 -> g()@42"},
-			du:       []string{"a@17 -> a@33", "b@20 -> b@38", "a@17 -> a && b@33", "b@20 -> a && b@33"},
+			du:       []string{"a@17 -> a@33", "b@20 -> b@38", "a@33 -> a && b@33", "b@38 -> a && b@33"},
 		},
 		{
+			// Go spec, For statements with range clause: the range expression is
+			// evaluated once before beginning the loop, and the blank key `_`
+			// declares no variable.
 			// Nodes: xs@17, sum := 0@33, xs@61 (the range expression, which
 			// defines the iteration variable), range@55 (head), v@50,
 			// sum += v@66, return sum@78. Succ: xs@61→range→{v, return sum};
@@ -155,32 +176,40 @@ func TestGoLoweringGolden(t *testing.T) {
 				"sum += v@66 -> return sum@78"},
 		},
 		{
+			// Go spec, Expression switches: each case expression is compared against
+			// the switch expression; with no match and no default the switch ends.
 			// Nodes: x@17, y := 0@30, x@45 (tag head, a Stmt), 1@54 (case
 			// condition), y = 1@57, return y@66. Succ: x@45→1@54→{y = 1,
-			// return y}; y = 1→return y. IPDom: 1@54 → return y.
+			// return y}; y = 1→return y. IPDom: 1@54 → return y. The head
+			// defines the variable holding the tag, which 1@54 Uses.
 			name:     "an expression switch's case condition reads the tag",
-			protects: "a case condition compares against the tag, so the case and its body depend on the tag's variables",
-			mutation: "give case conditions only their own values' uses (loses x@17 -> 1@54)",
+			protects: "a case condition compares against the tag's value as the head evaluated it, so the case and its body depend on the head",
+			mutation: "give case conditions only their own values' uses (loses x@45 -> 1@54), or let them re-read the tag's names (x@17 -> 1@54 appears)",
 			src:      "package p\nfunc f(x int) int { y := 0; switch x { case 1: y = 1 }; return y }",
 			cd:       []string{"1@54 -> y = 1@57"},
-			du:       []string{"x@17 -> x@45", "x@17 -> 1@54", "y := 0@30 -> return y@66", "y = 1@57 -> return y@66"},
+			du:       []string{"x@17 -> x@45", "x@45 -> 1@54", "y := 0@30 -> return y@66", "y = 1@57 -> return y@66"},
 		},
 		{
+			// Go spec, Type switches: the guard reads v, and the alias v is declared
+			// in the implicit block of each clause.
 			// Nodes: v@17, v := v.(type)@37 (head: uses the parameter v,
-			// then defines the alias v), int@58 (type case), return v@63,
-			// return 0@75. Succ: head→int→{return v, return 0}. IPDom: int
-			// → EXIT.
-			name:     "a type switch's type case reads the switched value, not the alias",
-			protects: "a type case tests the switched value, read before the alias shadowing it is declared",
-			mutation: "give type-case nodes no uses (loses v@17 -> int@58), or collect the tag after declaring the alias (v := v.(type)@37 -> int@58 replaces v@17 -> int@58)",
+			// then defines the alias v, which holds the switched value),
+			// int@58 (type case, Using the alias as the variable holding the
+			// tag), return v@63, return 0@75. Succ: head→int→{return v,
+			// return 0}. IPDom: int → EXIT.
+			name:     "a type switch's type case tests the value the head evaluated",
+			protects: "the guard reads the outer v before the alias shadowing it is declared, and a type case tests the value the head holds",
+			mutation: "give type-case nodes no uses (loses v := v.(type)@37 -> int@58), or collect the guard after declaring the alias (loses v@17 -> v := v.(type)@37)",
 			src:      "package p\nfunc f(v any) int { switch v := v.(type) { case int: return v }; return 0 }",
 			cd:       []string{"int@58 -> return v@63", "int@58 -> return 0@75"},
-			du:       []string{"v@17 -> v := v.(type)@37", "v@17 -> int@58", "v := v.(type)@37 -> return v@63"},
+			du:       []string{"v@17 -> v := v.(type)@37", "v := v.(type)@37 -> int@58", "v := v.(type)@37 -> return v@63"},
 		},
 		{
+			// Go spec, Assignment statements and Selectors: the left operand s.f is
+			// a field selector, written through s.
 			// Nodes: s@17, v@22, s.f = v@33 (uses s and v, may-defines s),
-			// return s@42. A may-definition kills nothing, so both the write
-			// and the parameter reach the return.
+			// return s@42. The may-definition is a χ: the return pairs with
+			// the write and, through it, with the parameter it passes on.
 			name:     "a field write updates its base variable without killing it",
 			protects: "a write to s.f reaches a later use of s, and so does s's earlier definition",
 			mutation: "record no definition of the base (loses s.f = v@33 -> return s@42), or a killing one (loses s@17 -> return s@42)",
@@ -189,6 +218,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"s@17 -> return s@42"},
 		},
 		{
+			// Go spec, Assignment statements and Index expressions: the left operand
+			// m[k] is a map index expression, written through m.
 			// Nodes: m@17, k@32, v@35, m[k] = v@56 (uses m, k and v,
 			// may-defines m), return m@66.
 			name:     "an index write updates its base variable without killing it",
@@ -199,6 +230,8 @@ func TestGoLoweringGolden(t *testing.T) {
 				"m[k] = v@56 -> return m@66", "m@17 -> return m@66"},
 		},
 		{
+			// Go spec, Function literals: a function literal is a closure sharing the
+			// variables of the surrounding function.
 			// Nodes: x@17, n := 0@30, h := func() { n += x }@38 (uses n and
 			// x, defines h, may-defines n), h()@62, return n@67. The literal
 			// may run at any later point, or never, so both n := 0 and the
@@ -212,20 +245,26 @@ func TestGoLoweringGolden(t *testing.T) {
 				"n := 0@30 -> return n@67"},
 		},
 		{
+			// Go spec, Select statements: every channel operand and sent value is
+			// evaluated exactly once, in source order, on entering the select.
 			// Nodes: a@17, b@20, y@32, x := 0@45, select@53 (head), <-a@67,
 			// x = 1@72, b <- y@84, x = 2@92, return x@101. Succ: select→{<-a,
 			// b <- y}; <-a→x = 1→return x; b <- y→x = 2→return x. IPDom:
-			// select → return x. x := 0 is killed on both clauses.
+			// select → return x. x := 0 is killed on both clauses. The head
+			// defines the variable holding the evaluated operands, and each
+			// clause node Uses it, never a, b or y.
 			name:     "a select head reads every channel operand and sent value",
-			protects: "which select clause runs depends on the channels and sent values Go evaluates on entering the select",
-			mutation: "give the select head no uses (loses a@17, b@20 and y@32 -> select@53)",
+			protects: "which select clause runs depends on the channels and sent values Go evaluates on entering the select, and each clause communicates the values the head evaluated",
+			mutation: "give the select head no uses (loses a@17, b@20 and y@32 -> select@53), or let a clause re-read its operands' names (adds a@17 -> <-a@67)",
 			src:      "package p\nfunc f(a, b chan int, y int) int { x := 0; select { case <-a: x = 1; case b <- y: x = 2 }; return x }",
 			cd: []string{"select@53 -> <-a@67", "select@53 -> x = 1@72", "select@53 -> b <- y@84",
 				"select@53 -> x = 2@92"},
-			du: []string{"a@17 -> select@53", "b@20 -> select@53", "y@32 -> select@53", "a@17 -> <-a@67",
-				"b@20 -> b <- y@84", "y@32 -> b <- y@84", "x = 1@72 -> return x@101", "x = 2@92 -> return x@101"},
+			du: []string{"a@17 -> select@53", "b@20 -> select@53", "y@32 -> select@53", "select@53 -> <-a@67",
+				"select@53 -> b <- y@84", "x = 1@72 -> return x@101", "x = 2@92 -> return x@101"},
 		},
 		{
+			// Go spec, Goto statements, Labeled statements and Blocks: goto L lands
+			// on the label of an empty block.
 			// Nodes: c@17, d@20, c@33, d@40, goto L@44, a()@54, L@59 (the
 			// label's own node; `L: {}` lowers nothing else), b()@74. Succ:
 			// c@33→{d@40, b()}; d@40→{goto L, a()}; goto L→L; a()→L;
@@ -240,6 +279,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"c@17 -> c@33", "d@20 -> d@40"},
 		},
 		{
+			// Go spec, Goto statements and Return statements: the statements after
+			// the return are reached by no path from the function's entry.
 			// Nodes: x@17, return x@30, L@40, x++@43, goto L@48. Succ:
 			// return x→EXIT; L→x++→goto L→L. The cycle has no predecessor
 			// from ENTRY; L is its first member by id, so augmentation adds
@@ -257,8 +298,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			// Go spec, Address operators: `&x` yields a pointer through which
 			// the callee may write x. Nodes: x := 1@25 (defines x), g(&x)@33
 			// (Uses x, may-defines x), return x@40. Straight line, so no
-			// control dependence; the may-definition kills nothing, so the
-			// return's x pairs with both x := 1 and g(&x).
+			// control dependence; the may-definition is a χ, so the return's
+			// x pairs with g(&x) and, through it, with x := 1.
 			name:     "taking an address is a may-definition of the variable",
 			protects: "a use after a call that received a variable's address sees the write the call may make through it",
 			mutation: "drop the address-taking may-definition in collect (g(&x)@33 -> return x@40 vanishes), or make it a killing Def (x := 1@25 -> return x@40 vanishes)",
@@ -282,34 +323,115 @@ func TestGoLoweringGolden(t *testing.T) {
 		{
 			// Go spec, Select statements: the channel operand and the sent
 			// value `&x` are evaluated once, on entering the select, so the
-			// head select@45 Uses ch and x and may-defines x; the clause node
-			// ch <- &x@59 Uses them again and writes nothing. The head has one
+			// head select@45 Uses ch and x, may-defines x and defines the
+			// variable holding the operands; the clause node ch <- &x@59 Uses
+			// that variable and writes nothing. The head has one
 			// successor, so there is no control dependence. return x@72 is
-			// reached by x := 0@37 and the head's non-killing may-definition.
+			// reached by the head's may-definition, a χ, and through it by
+			// x := 0@37.
 			name:     "a select clause's address-taking is may-defined once, at the head",
 			protects: "an address taken in a select's channel operand or sent value is a may-definition of the head that evaluates it, not of the clause",
 			mutation: "collect a send clause's operands with their may-definitions on its node (ch <- &x@59 -> return x@72 appears)",
 			src:      "package p\nfunc f(ch chan *int) int { x := 0; select { case ch <- &x: }; return x }",
-			du: []string{"ch@17 -> select@45", "x := 0@37 -> select@45", "ch@17 -> ch <- &x@59",
-				"x := 0@37 -> ch <- &x@59", "select@45 -> ch <- &x@59",
+			du: []string{"ch@17 -> select@45", "x := 0@37 -> select@45", "select@45 -> ch <- &x@59",
 				"x := 0@37 -> return x@72", "select@45 -> return x@72"},
 		},
 		{
 			// Go spec, Logical operators and Address operators: g(&x) is
 			// evaluated only when a is true, by its own hoisted Branch
-			// g(&x)@47, which Uses x and may-defines it; the condition
-			// a && g(&x)@42 reads a and x and writes nothing. Nodes: a@17,
+			// g(&x)@47, which Uses x and may-defines it; both operand nodes
+			// define the result variable, which the condition a && g(&x)@42
+			// Uses, and it writes nothing. Nodes: a@17,
 			// x := 0@31, the operand Branch a@42, g(&x)@47, the condition,
 			// return x@58. a@42 reaches the condition directly when false,
 			// so it controls g(&x)@47 only.
 			name:     "a short-circuit operand's address-taking is on the operand's node",
 			protects: "an address taken inside a hoisted && operand is a may-definition of the operand's node, not also of the node owning the expression",
-			mutation: "keep the may-definitions of short-circuit operands when collecting the owning node (a && g(&x)@42 -> return x@58 appears)",
+			mutation: "collect a short-circuit expression's operands, with their may-definitions, on the owning node (a && g(&x)@42 -> return x@58 appears)",
 			src:      "package p\nfunc f(a bool) int { x := 0; if a && g(&x) { }; return x }",
 			cd:       []string{"a@42 -> g(&x)@47"},
-			du: []string{"a@17 -> a@42", "a@17 -> a && g(&x)@42", "x := 0@31 -> g(&x)@47",
-				"x := 0@31 -> a && g(&x)@42", "g(&x)@47 -> a && g(&x)@42",
+			du: []string{"a@17 -> a@42", "a@42 -> a && g(&x)@42", "x := 0@31 -> g(&x)@47",
+				"g(&x)@47 -> a && g(&x)@42",
 				"x := 0@31 -> return x@58", "g(&x)@47 -> return x@58"},
+		},
+		{
+			// Go spec, Select statements: the sent value a && g(&x) is
+			// evaluated on entering the select, so its operands are hoisted
+			// before the head. Nodes: a@17, ch@25, x := 0@45, the operand
+			// Branches a@73 (Uses a) and g(&x)@78 (Uses x, may-defines x),
+			// both defining the result variable; select@53 (Uses ch and the
+			// result, defines the variable holding the operands); the clause
+			// ch <- a && g(&x)@67 (Uses that variable); return x@88. Succ:
+			// a@73→{g(&x)@78, select@53}; g(&x)@78→select@53→clause→return
+			// x→EXIT. IPDom: a@73, g(&x)@78 → select@53 → clause → return x.
+			// Frontier walk: a@73 over g(&x)@78.
+			name:     "a select clause's short-circuit operands are evaluated before the head",
+			protects: "the && operands of a sent value run on entering the select, so the head sees their result and their writes",
+			mutation: "hoist a select clause's short-circuit operands at the clause, after the head (loses a@73 -> select@53 and g(&x)@78 -> select@53)",
+			src:      "package p\nfunc f(a bool, ch chan bool) int { x := 0; select { case ch <- a && g(&x): }; return x }",
+			cd:       []string{"a@73 -> g(&x)@78"},
+			du: []string{"a@17 -> a@73", "x := 0@45 -> g(&x)@78", "ch@25 -> select@53", "a@73 -> select@53",
+				"g(&x)@78 -> select@53", "select@53 -> ch <- a && g(&x)@67", "x := 0@45 -> return x@88",
+				"g(&x)@78 -> return x@88"},
+		},
+		{
+			// Go spec, Select statements: the receive's channel operand is
+			// evaluated on entering the select, and its left-hand side is
+			// assigned when the clause is chosen. Nodes: a@17, y@29 (params),
+			// select@42 (Uses a, defines the variable holding the operand),
+			// y = <-a@56 (Uses that variable, defines y), return y@68. One
+			// successor each, so no control dependence; y = <-a kills the
+			// parameter y on the only path to the return.
+			name:     "a select receive clause assigns the value the head evaluated",
+			protects: "a receive clause's assignment depends on the head that evaluated its channel, never on the channel's names again",
+			mutation: "let a receive clause collect its right-hand side itself (adds a@17 -> y = <-a@56)",
+			src:      "package p\nfunc f(a chan int, y int) int { select { case y = <-a: }; return y }",
+			du:       []string{"a@17 -> select@42", "select@42 -> y = <-a@56", "y = <-a@56 -> return y@68"},
+		},
+		{
+			// Go spec, If statements and Expression switches: a condition, a
+			// tag and a case value are expressions, and a parenthesized
+			// expression is the expression inside it. Nodes: x@17, x > 0@34
+			// (condition), x = 1@43, x@60 (tag head, defines the variable
+			// holding the tag), 1@71 (case condition, Uses it), return 2@75,
+			// return x@87. Succ: x > 0→{x = 1, x@60}; x = 1→x@60→1@71→
+			// {return 2, return x}. IPDom: x > 0, x = 1 → x@60 → 1@71 →
+			// EXIT. Frontier walks: x > 0 over x = 1; 1@71 over both returns.
+			name:     "a parenthesized condition, tag and case value span the expression inside",
+			protects: "a node spanning an expression renders it with its enclosing parentheses stripped, so its pairs name the expression",
+			mutation: "span a condition, a tag or a one-value case list as parsed (x > 0@34, x@60 and 1@71 render as (x > 0)@33, (x)@59 and (1)@70)",
+			src:      "package p\nfunc f(x int) int { if (x > 0) { x = 1 }; switch (x) { case (1): return 2 }; return x }",
+			cd:       []string{"x > 0@34 -> x = 1@43", "1@71 -> return 2@75", "1@71 -> return x@87"},
+			du: []string{"x@17 -> x > 0@34", "x@17 -> x@60", "x = 1@43 -> x@60", "x@60 -> 1@71",
+				"x@17 -> return x@87", "x = 1@43 -> return x@87"},
+		},
+		{
+			// Go spec, Declarations and scope: n and p are declared in no block
+			// of f, so they are package-level names, not variables of f (the
+			// lowering's "Names that resolve to no variable"). n stands as an
+			// assignment target, an op= target, a ++ operand, one of two
+			// targets, the base of &, a captured write and ++ in a function
+			// literal, and a range target assigned by `=`; p as the base of a
+			// field write. Go has no embedded assignment and no deletion of a
+			// name. Nodes: x@17, xs@24, y := 0@40, n = x@48 (Uses x),
+			// n += x@55 (Uses x), n++@63 (no use, no definition),
+			// n, y = y, n@68 (one node, since n is no target: Uses y, defines
+			// y), p.f = y@81 (Uses y, may-defines nothing), g(&n)@90 (nothing),
+			// defer func() { n = y; n++ }()@97 (Uses the captured y only),
+			// xs@142 (defines the iteration variable), range@136 (head), n@132
+			// (Uses the iteration variable, defines nothing), y++@147,
+			// return y + n@154 (Uses y). Succ: straight line to xs@142, then
+			// range@136→{n@132, return}; n@132→y++@147→range@136. IPDom: n@132
+			// → y++@147 → range@136 → return.
+			name:     "a write to a name that resolves to no variable defines nothing",
+			protects: "an unresolved name in every write position makes its node with its other operands' reads and never reaches flow.Builder as -1",
+			mutation: "drop a variable >= 0 test: on assign's identifier targets (n = x@48 Defs -1 and panics), on an inc/dec identifier (n++@63), on a range target assigned by = (n@132), on captured in scanWrite (the literal's n), or on baseVar in assign or collect (p.f, &n)",
+			src:      "package p\nfunc f(x int, xs []int) int { y := 0; n = x; n += x; n++; n, y = y, n; p.f = y; g(&n); defer func() { n = y; n++ }(); for n = range xs { y++ }; return y + n }",
+			cd:       []string{"range@136 -> n@132", "range@136 -> y++@147", "range@136 -> range@136"},
+			du: []string{"x@17 -> n = x@48", "x@17 -> n += x@55", "y := 0@40 -> n, y = y, n@68",
+				"n, y = y, n@68 -> p.f = y@81", "n, y = y, n@68 -> defer func() { n = y; n++ }()@97",
+				"xs@24 -> xs@142", "xs@142 -> range@136", "xs@142 -> n@132", "n, y = y, n@68 -> y++@147",
+				"y++@147 -> y++@147", "n, y = y, n@68 -> return y + n@154", "y++@147 -> return y + n@154"},
 		},
 	})
 }

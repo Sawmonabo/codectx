@@ -8,9 +8,10 @@
 //	lower     a language's lowering drives a Builder obtained from Arena.Begin
 //	          and calls Builder.Finish, yielding a Graph: dense int32 node ids,
 //	          node 0 the Entry, node 1 the synthetic Exit, successor and
-//	          predecessor adjacency, and per node at most one killing
-//	          definition, the variables it may define without killing
-//	          (Builder.MayDef) and the distinct variables it reads; the
+//	          predecessor adjacency, and per node the variables it defines,
+//	          each killing (Builder.Def), the variables it may define
+//	          without killing (Builder.MayDef) and the distinct variables it
+//	          reads; the
 //	          exceptional edges of a try land on a builder-made Handler node
 //	CFG → post-dominators
 //	          PostDominators runs the iterative dominator pass over reverse
@@ -26,10 +27,13 @@
 //	          formulation; each pair is (controller, dependent)
 //	CFG → def-use
 //	          DefUse builds sparse SSA over the complete, sealed graph,
-//	          memoized per basic block, with a non-killing may-definition as a
-//	          two-operand merge and a Handler taking each predecessor's entry
-//	          values; it resolves every φ transitively, so each pair is
-//	          (defining node, using node); no dominance input
+//	          memoized per basic block, with a may-definition as a χ (a
+//	          two-operand merge of the node and the prior version, whose node
+//	          also uses that prior version) and a Handler taking each
+//	          predecessor's entry values; it resolves every φ to the killing
+//	          definitions and the nearest may-definitions behind each use, so
+//	          each pair is (defining node, using node) and a chain of
+//	          may-writes costs linear work; no dominance input
 //
 // Dominators (the forward relation rooted at Entry) is not an input of either
 // result; it is exposed so the benchmarks measure the routine on the forward
@@ -49,9 +53,9 @@
 //
 // Nothing here limits a function: there is no node, edge, definition,
 // variable, iteration or time limit, and no preallocation constant. The
-// definition count D is bounded structurally — a definition is a node, and a
-// node makes at most one killing definition — so D ≤ N; may-definitions are
-// bounded by the lowering's records, like uses. Every fixed point runs to
+// killing definitions and may-definitions are bounded by the lowering's
+// records, like uses: a node may define several variables, so D is not
+// bounded by N. Every fixed point runs to
 // convergence. Each pass documents the arena it uses in terms of N, the
 // edges, the variables, the definitions and uses, and, for DefUse, the
 // (block, variable) pairs its lookups visit and the pairs it emits; the

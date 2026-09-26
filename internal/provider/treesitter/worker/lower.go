@@ -26,11 +26,170 @@ func Grammar(name string) (*ts.Language, bool) {
 // function sees only the expression that creates it. A Lowering holds no
 // per-function state and is safe to share.
 //
+// # Uses: values travel through variables
+//
+// Every lowering applies one rule for which variables a node Uses. A value
+// computed at one node and used at another always travels through a
+// variable: a named one, or one the lowering owns (flow.Builder.Var, bound to
+// no name). No node re-reads names on another node's behalf. A node Uses
+// what its own evaluation reads: the reads that no node of their own
+// carries.
+//
+// A nested value-producing construct that a lowering lowers to nodes of its
+// own hands its value to the node consuming it through an owned result
+// variable. Every node that yields the value defines that variable, and the
+// consumer Uses it:
+//
+//   - a switch or match expression: each arm's result node, and the `yield`
+//     or valued `break` that leaves it;
+//   - a conditional (`c ? a : b`, a Python `a if c else b`, a valued `if` in
+//     Rust): each arm's result node;
+//   - a block, loop or labelled block consumed as a value: its tail node,
+//     and each valued `break` that leaves it;
+//   - a try block consumed as a value: its tail node, and each `?` that
+//     completes it with its error;
+//   - a GNU C statement expression: the node of its last statement;
+//   - a short-circuit operator (`&&`, `||`, `and`, `or`, `??`) in value
+//     position: each operand node, on the path where it decides the value:
+//     the deciding operand's node defines the variable, and the operand
+//     evaluated after it defines it again, so SSA merges the two;
+//   - an embedded assignment (`y = (x = a) * 2`, `f(o.f = a)`, `x := e`): the
+//     assignment's node. It defines the owned result; a local target is
+//     also its definition, and a field, element or pointer target only
+//     may-defines its base. The consumer Uses the result in both cases,
+//     never the target: in `(x := 1) + (x := 2)` it depends on both
+//     assignments;
+//   - a callable's creation (a lambda, closure, local function, anonymous
+//     class, generator, comprehension, async block): the creating node,
+//     whose value is the created callable; it Uses the enclosing variables
+//     the callable captures, since reading them is its own evaluation.
+//
+// A yielding node that also defines a variable of its own (an embedded
+// assignment to a local, an arm whose result is one, `c ? (x = 1) : 2`)
+// defines the result too: a node may make several killing definitions
+// (flow.Builder.Def). Each construct's result is its own variable, defined
+// only by that construct's yielding nodes, so a killing definition of it
+// kills nothing another yield needs; a may-definition would not do, since it
+// reads the result's prior version (see May-definitions) and would claim that
+// one yield consumed another's value.
+//
+// SSA merges the yielding definitions at the consumer, and the yielding
+// nodes carry the control dependence on the selector or condition that
+// chose them, as `if (c) y = 1; else y = 2;` already does: in `y = switch
+// (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }` the
+// declarator depends on both yields and on the default arm's node through
+// the result variable, the yields depend on c through control, and the
+// selector is read once, at its own node.
+//
+// A lowering may instead fold a construct into one node, with no nodes for
+// its parts: the construct's reads are then that node's own evaluation, and
+// no owned variable exists. Each lowering states exactly which constructs it
+// folds and which it lowers to nodes.
+//
+// A read the consumer folds and that its evaluation makes before an
+// embedded assignment redefines the variable (`y = x + (x = 1)`, `f(x, x =
+// 1)`) is carried by the assignment's node: that node Uses the earlier
+// value and hands it on through an owned variable it defines, and the
+// consumer Uses that variable in place of the name, so the folded read
+// pairs with the definition that reached it rather than the one after it.
+// The hand-off is made only when the assignment's node runs whenever the
+// consumer does. An assignment inside a conditionally evaluated operand (a
+// short-circuit operand after the deciding one, a conditional's arm, a later
+// operand of a chained comparison, an optional chain's tail, a statement of
+// a GNU C statement expression that some path from the expression's start
+// to its value skips) leaves the read on the consumer, where the name still
+// has its earlier definition on the path that skips the assignment: `y = x +
+// (c and (x := 1))` pairs y with the x before it when c is false, and with
+// the assignment, whose value the operator's result also carries, when c is
+// true. Where the language leaves the order of the two unsequenced or
+// indeterminately sequenced (C and C++), the lowering takes source order and
+// says so.
+//
+// A value evaluated once and used by several later nodes is evaluated at a
+// node of its own, which defines an owned variable; the later nodes Use that
+// variable, never the names the value was computed from. That covers a
+// switch's selector and its case labels, a match scrutinee or subject and
+// its arms and patterns, a with statement's entered value and its targets, a
+// Go select clause's operands, and a loop's iterable (see Iteration).
+//
+// Each read is resolved in the scope where it occurs, on the node that
+// carries it: a binding scoped to an arm (a pattern variable, a guard's
+// binding, a match capture) is read by the arm's own nodes, so `return
+// switch (o) { case Integer i when i > 0 -> i; … }` pairs the arm's result
+// node i with the return through the result variable.
+//
+// # Names that resolve to no variable
+//
+// A name can resolve to no variable of the function being lowered: a field
+// or member named without its object, a global or module name, a name no
+// declaration in scope binds, an import, a name a macro introduces, or a
+// binding that shadows without being a variable (scope.lookup returns -1
+// for all of them). Such a name is state the dependence facts do not
+// track, in every position: a read of it Uses nothing, a write to it
+// (plain, compound, an increment, an embedded assignment, a deletion, an
+// iteration target) defines and may-defines nothing, and a callable that
+// captures it captures nothing. The node the construct makes is still made,
+// with the reads and definitions of its other operands. -1 never reaches
+// flow.Builder (whose Use, MayDef and Def reject it) and never indexes a
+// table of the lowering's own; each lowering states where it filters it.
+//
+// # May-definitions
+//
+// A may-definition of v at node p (flow.Builder.MayDef) is a χ: p reads v's
+// prior version and defines the next one, which may still hold the old
+// value. A use of v pairs with every killing definition of v that reaches
+// it, through any number of may-definitions, and with the nearest
+// may-definitions of v on each path to it, the ones no later may-definition
+// of v follows on that path; p itself pairs with what reaches it by the same
+// rule, whether or not it reads v in the source. Earlier may-writes stay
+// reachable through the chain. A lowering records a may-definition only for
+// a write that may leave the old value in place: a write through an address
+// (see Address-taking), a mutable borrow, a field, an index or a pointer; a
+// closure's write to an enclosing variable, at the node that creates it; and
+// such a write to a name a C preprocessor conditional leaves bound to
+// several variables, which may-defines each (a plain assignment through
+// the name defines each, killing). Every other
+// definition, an owned result or a hand-off's earlier value included, is
+// killing.
+//
+// # Iteration
+//
+// Every loop over an iterable evaluates the iterable once, before the first
+// iteration, at a node of its own, in every language: the Java enhanced for
+// (JLS §14.14.2), the C++ range for ([stmt.ranged]), the Python for and
+// async for (Language Reference §8.3) and each for clause of a comprehension
+// (§6.2.4; a later clause's iterable once per iteration of the clause
+// before it), the JavaScript for…in, for…of and for await…of (ECMA-262
+// §14.7.5.6, ForIn/OfHeadEvaluation), the Rust for (The Rust Reference,
+// Iterator loops: `IntoIterator::into_iter` once) and the Go range clause
+// (The Go Programming Language Specification, For statements with range
+// clause). That node is a Stmt node spanning the iterated expression; it
+// Uses the expression's reads and defines an iteration variable the lowering
+// owns. The loop head Uses only that variable, never the names read in the
+// iterated expression, and each per-iteration binding node Uses it too.
+//
+// The iterator is created once, so a body that rebinds the iterated name
+// does not change the iteration, and `for k in d: d[k] = f(k)`, whose body
+// may-defines d, does not reach the head's next step. A head that read the
+// iterated names would pair with every such definition. Go's one exception,
+// a range expression the specification does not evaluate at all, is stated
+// in its lowering.
+//
+// # Spans
+//
+// Every node that spans an expression (a condition, a selector, a case
+// label's value, an operand, an arm's result) spans it with every enclosing
+// pair of parentheses stripped (unparen): each pair the grammar parses as a
+// parenthesized expression, the statement's own parentheses included,
+// however deeply they nest. A GNU C statement expression's own `(` `)` is
+// such a pair, so a condition `({ …; e; })` spans the compound statement
+// `{ …; e; }`.
+//
 // # Address-taking
 //
-// Every lowering applies one rule. A local gets a non-killing
-// may-definition, which kills nothing, at the node that evaluates the
-// operation, when any of these happens to it:
+// Every lowering applies one rule. A local gets a may-definition (see
+// May-definitions) at the node that evaluates the operation, when any of
+// these happens to it:
 //
 //   - its address is taken: `&x` in Go, C and C++, and `&x.f` and `&x[i]`,
 //     whose base local is x;
@@ -46,7 +205,11 @@ func Grammar(name string) (*ts.Language, bool) {
 // may-definition of the base local is the conservative account of that
 // write: for a pointer or slice base the write lands in the object it refers
 // to, not in the local, so the may-definition over-approximates rather than
-// states where the storage is. That node also Uses the operand's variables.
+// states where the storage is. That node also Uses the operand's variables,
+// the reads its own evaluation makes: a `ref mut` binding in a pattern reads
+// the matched value through the owned variable its scrutinee's node defines
+// (see Uses), so it Uses that variable and may-defines the local, and the
+// scrutinee's node carries the read of the local.
 // The node is the one the evaluating expression attaches to, never "the next
 // node made": a lowering records the pending may-definition by position, as
 // it records reads, so an operand evaluated later cannot take it. An address
@@ -380,6 +543,9 @@ func (s *scope) innermost(name []byte) int {
 	}
 	return -1
 }
+
+// isInnermost reports whether binding i is its name's innermost binding.
+func (s *scope) isInnermost(i int) bool { return s.index[s.binds[i].name] == int32(i) }
 
 // shadowed is the index of the binding binding i shadows, or -1.
 func (s *scope) shadowed(i int) int { return int(s.binds[i].prev) }

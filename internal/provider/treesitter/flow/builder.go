@@ -99,18 +99,22 @@ import (
 //
 // # May-definitions
 //
-// Def is a killing definition: a use it reaches sees it alone. MayDef is a
-// non-killing one: a use it reaches sees it and every definition reaching
-// the may-defining node.
-// The lowerings use MayDef for writes they cannot place exactly. A
-// closure's write to an enclosing variable is a non-killing may-definition of
-// that variable at the node that creates the closure, in every lowering. A
-// write through a field, index or pointer is a non-killing may-definition of
-// its base variable (p in `*p = 2`), never of the local a pointer refers to,
-// which is unknown without points-to analysis. Taking a local's address, or
-// borrowing it mutably, is a non-killing may-definition of that local at the
-// node that evaluates it; the lowerings state the one rule and what it gives
-// up.
+// Def is a killing definition: it ends every path it lies on, and a node may
+// make several, one per variable. MayDef is a χ: the node reads the
+// variable's prior version and defines the next one, which may still hold
+// the old value. A use pairs with every killing definition reaching it
+// through any number of may-definitions and with the nearest may-definition
+// on each path, and the may-defining node pairs with what reaches it by the
+// same rule (see DefUse). The lowerings use MayDef only for writes that may
+// leave the old value in place. A closure's write to an enclosing variable
+// is a may-definition of that variable at the node that creates the
+// closure, in every lowering. A write through a field, index or pointer is a
+// may-definition of its base variable (p in `*p = 2`), never of the local a
+// pointer refers to, which is unknown without points-to analysis. Taking a
+// local's address, or borrowing it mutably, is a may-definition of that
+// local at the node that evaluates it; the lowerings state the one rule and
+// what it gives up. A value a node yields beside a local it assigns is a
+// second killing definition, never a may-definition.
 //
 // # Go defer
 //
@@ -122,7 +126,7 @@ import (
 // # Defects
 //
 // A call that violates this contract is a lowering defect, never a property
-// of the input, and panics: a second Def on one node, a node or variable id
+// of the input, and panics: a node or variable id
 // out of range, Node given the Entry, Exit or Handler kind, a frame closed
 // out of order, or a Frame handle used after its frame was closed, or a
 // Fringe handle used after it was popped (directly or by popping an earlier
@@ -142,10 +146,11 @@ type Builder struct {
 	// edges are the raw (from, to) edges, packed as pack does; Finish sorts
 	// and deduplicates them.
 	edges []uint64
-	// uses and mayDefs are the raw (node, variable) reads and
-	// may-definitions, packed as pack does; Finish sorts and deduplicates
-	// them into useOff/useVars and mayOff/mayVars.
-	uses, mayDefs []uint64
+	// uses, defs and mayDefs are the raw (node, variable) reads, killing
+	// definitions and may-definitions, packed as pack does; Finish sorts and
+	// deduplicates them into useOff/useVars, defOff/defVars and
+	// mayOff/mayVars.
+	uses, defs, mayDefs []uint64
 	// saved holds every pushed fringe back to back; savedOff[i] is where the
 	// i-th live saved fringe starts, and it ends where the next starts (or at
 	// len(saved)). savedGen[i] is its handle, ascending along the stack.
@@ -165,6 +170,7 @@ type Builder struct {
 	labels          []label
 	gotos           []pendingGoto
 	useOff, useVars []int32
+	defOff, defVars []int32
 	mayOff, mayVars []int32
 
 	// vars is the variable count.
@@ -172,9 +178,9 @@ type Builder struct {
 	// gen is the last Fringe or Frame handle issued.
 	gen int32
 	// high is the scratch high-water sampled so far; see scratchHigh.
-	high             int
-	defs, unresolved int
-	finished         bool
+	high       int
+	unresolved int
+	finished   bool
 	// sorted reports that labels is sorted by name, stably, so each name's
 	// labels stay in declaration order; Label clears it.
 	sorted bool
@@ -272,11 +278,12 @@ func (b *Builder) reset(a *Arena, fn Span) {
 	clear(b.names)
 	*b = Builder{
 		a:        a,
-		nodes:    append(b.nodes[:0], node{span: fn, def: -1, kind: Entry}, node{span: Span{fn.End, fn.End}, def: -1, kind: Exit}),
+		nodes:    append(b.nodes[:0], node{span: fn, kind: Entry}, node{span: Span{fn.End, fn.End}, kind: Exit}),
 		in:       append(b.in[:0], false, false),
 		cur:      b.cur[:0],
 		edges:    b.edges[:0],
 		uses:     b.uses[:0],
+		defs:     b.defs[:0],
 		mayDefs:  b.mayDefs[:0],
 		saved:    b.saved[:0],
 		savedOff: b.savedOff[:0],
@@ -289,6 +296,8 @@ func (b *Builder) reset(a *Arena, fn Span) {
 		gotos:    b.gotos[:0],
 		useOff:   b.useOff[:0],
 		useVars:  b.useVars[:0],
+		defOff:   b.defOff[:0],
+		defVars:  b.defVars[:0],
 		mayOff:   b.mayOff[:0],
 		mayVars:  b.mayVars[:0],
 	}
@@ -299,7 +308,7 @@ func (b *Builder) reset(a *Arena, fn Span) {
 // it is what Arena.ScratchBytes reports.
 //
 // Only cur, saved/savedOff/savedGen and frames shrink during construction,
-// and edges, uses and mayDefs when Finish deduplicates them; every other list
+// and edges, uses, defs and mayDefs when Finish deduplicates them; every other list
 // only grows. mark samples the in-use total immediately before each such
 // shrink and at the end of Finish, so between two samples the total only
 // grows and the largest sample (or the current total, before Finish) is the
@@ -329,6 +338,7 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.cur), cap(b.cur))*4 +
 		count(len(b.edges), cap(b.edges))*8 +
 		count(len(b.uses), cap(b.uses))*8 +
+		count(len(b.defs), cap(b.defs))*8 +
 		count(len(b.mayDefs), cap(b.mayDefs))*8 +
 		count(len(b.saved), cap(b.saved))*4 +
 		count(len(b.savedOff), cap(b.savedOff))*4 +
@@ -341,6 +351,8 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.gotos), cap(b.gotos))*int(unsafe.Sizeof(pendingGoto{})) +
 		count(len(b.useOff), cap(b.useOff))*4 +
 		count(len(b.useVars), cap(b.useVars))*4 +
+		count(len(b.defOff), cap(b.defOff))*4 +
+		count(len(b.defVars), cap(b.defVars))*4 +
 		count(len(b.mayOff), cap(b.mayOff))*4 +
 		count(len(b.mayVars), cap(b.mayVars))*4
 }
@@ -387,9 +399,10 @@ func (b *Builder) Use(n, v int32) {
 }
 
 // MayDef records that node n may define variable v WITHOUT killing the
-// definitions that reach it: a use after n sees n and every definition of v
-// reaching n's entry. A node may carry several; a repeat is recorded once.
-// A MayDef of the variable n Defs is redundant and dropped at Finish, since
+// definitions that reach it: a χ, which reads v's prior version at n and
+// defines the next, so a later use sees n and the killing definitions behind
+// it (see DefUse). A node may carry several; a repeat is recorded once.
+// A MayDef of a variable n Defs is redundant and dropped at Finish, since
 // the killing Def wins. n's uses are still read before any of its
 // definitions. See the May-definitions section for what the lowerings
 // record with it.
@@ -399,16 +412,14 @@ func (b *Builder) MayDef(n, v int32) {
 	b.mayDefs = append(b.mayDefs, pack(n, v))
 }
 
-// Def records that node n defines variable v. A node defines at most one
-// variable; a second call on the same node panics.
+// Def records that node n defines variable v, killing every definition of
+// v that reaches n. A node may define several variables, each killing: an
+// assignment that yields its value defines the local and the result its
+// consumer reads. A repeat is recorded once.
 func (b *Builder) Def(n, v int32) {
 	b.checkNode(n)
 	b.checkVar(v)
-	if b.nodes[n].def != -1 {
-		panic("flow: Builder.Def called twice on one node")
-	}
-	b.nodes[n].def = v
-	b.defs++
+	b.defs = append(b.defs, pack(n, v))
 }
 
 // Push saves a copy of the current fringe and returns its handle. The current
@@ -761,19 +772,27 @@ func (b *Builder) Finish() *Graph {
 	b.clearCur()
 	b.resolveGotos()
 
-	// Deduplication shrinks edges, uses and mayDefs; nothing in scratch grows
-	// until the CSRs below, so one sample here covers all three.
+	// Deduplication shrinks edges, uses, defs and mayDefs; nothing in scratch
+	// grows until the CSRs below, so one sample here covers all four.
 	b.mark()
 	n := len(b.nodes)
 	slices.Sort(b.edges)
 	b.edges = slices.Compact(b.edges)
 	slices.Sort(b.uses)
 	b.uses = slices.Compact(b.uses)
+	slices.Sort(b.defs)
+	b.defs = slices.Compact(b.defs)
 	slices.Sort(b.mayDefs)
 	b.mayDefs = slices.Compact(b.mayDefs)
+	// A may-definition of a variable its node also defines is dropped: the
+	// killing definition wins. Both lists are sorted by (node, variable), so
+	// one merge walk finds every such pair.
+	d := 0
 	b.mayDefs = slices.DeleteFunc(b.mayDefs, func(p uint64) bool {
-		m, v := unpack(p)
-		return b.nodes[m].def == v
+		for d < len(b.defs) && b.defs[d] < p {
+			d++
+		}
+		return d < len(b.defs) && b.defs[d] == p
 	})
 	succOff, succ := b.a.Int32s(n+1), b.a.Int32s(len(b.edges))
 	predOff, pred := b.a.Int32s(n+1), b.a.Int32s(len(b.edges))
@@ -796,6 +815,7 @@ func (b *Builder) Finish() *Graph {
 	predOff[0] = 0
 
 	b.useOff, b.useVars = varCSR(b.uses, n, b.useOff, b.useVars)
+	b.defOff, b.defVars = varCSR(b.defs, n, b.defOff, b.defVars)
 	b.mayOff, b.mayVars = varCSR(b.mayDefs, n, b.mayOff, b.mayVars)
 	b.mark()
 
@@ -803,6 +823,8 @@ func (b *Builder) Finish() *Graph {
 		nodes:      b.nodes,
 		useOff:     b.useOff,
 		uses:       b.useVars,
+		defOff:     b.defOff,
+		defs:       b.defVars,
 		mayOff:     b.mayOff,
 		mayDefs:    b.mayVars,
 		succOff:    succOff,
@@ -810,7 +832,6 @@ func (b *Builder) Finish() *Graph {
 		predOff:    predOff,
 		pred:       pred,
 		vars:       b.vars,
-		defs:       b.defs,
 		unresolved: b.unresolved,
 	}
 	return &b.g
@@ -1005,7 +1026,7 @@ func (b *Builder) push(head, n int32) int32 {
 // fringe, and returns its id.
 func (b *Builder) newNode(k Kind, s Span) int32 {
 	n := int32(len(b.nodes))
-	b.nodes = append(b.nodes, node{span: s, def: -1, kind: k})
+	b.nodes = append(b.nodes, node{span: s, kind: k})
 	b.in = append(b.in, false)
 	return n
 }

@@ -6,13 +6,7 @@ import "testing"
 // hand-derived Java methods. Each source is one class; callable 0 in
 // Functions preorder is its class body, so each case is callable 1, the
 // method. Every pair was derived by hand from the lowering's documented
-// granularity and the rules: exit augmentation adds an edge to Exit from
-// every successor-less node and from the smallest-reverse-post-order member
-// of each sink strongly connected component that cannot reach Exit; control
-// dependence is the post-dominance frontier over the augmented graph with
-// no entry-to-exit edge, so nothing depends on Entry and a loop head
-// depends on itself; def-use pairs are (defining node, using node) with
-// every φ resolved, and a Handler takes each predecessor's entry values.
+// granularity and runGolden's derivation and rendering rules.
 // Section numbers cite The Java Language Specification, Java SE 21 Edition.
 func TestJavaLoweringGolden(t *testing.T) {
 	runGolden(t, "java", []goldenCase{
@@ -24,18 +18,20 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// yield 3}; both yields and x@114 → declarator → return. The
 			// loop has no back edge: its body always yields. IPDom: case 1,
 			// c@76 → declarator. Frontier walks: case 1 over c@76 and
-			// x@114; c@76 over both yields. The declarator reads every
-			// variable read inside the switch expression.
+			// x@114; c@76 over both yields. The selector x@52 Uses x and
+			// defines the selector's variable, which case 1 Uses. Both
+			// yields and the default arm's x@114 define the switch
+			// expression's result, which the declarator Uses: its value
+			// depends on c through the yields' control dependence on c@76.
 			name:     "a yield inside a loop leaves the switch expression, not the loop",
-			protects: "yield breaks to the innermost switch expression through a loop inside the arm, so the statement after the loop runs only when the loop exits normally",
-			mutation: "issue Break(\"\") at yield (yield 2 lands on yield 3: c@76 loses control of yield 3;@92 and case 1@57 gains it)",
+			protects: "yield breaks to the innermost switch expression through a loop inside the arm, so the statement after the loop runs only when the loop exits normally, and every yield and arm result reaches the consuming node through the result variable",
+			mutation: "issue Break(\"\") at yield (yield 2 lands on yield 3: c@76 loses control of yield 3;@92 and case 1@57 gains it, and yield 2;@81 -> y = switch (x) { … }@40 is lost), give the yields no definition of the result (loses yield 2;@81 and yield 3;@92 -> y = switch (x) { … }@40), or let the label read the selector's names (x@20 -> case 1@57 replaces x@52 -> case 1@57)",
 			src:      "class A { int f(int x, boolean c) { int y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }; return y; } }",
 			fn:       1,
 			cd: []string{"case 1@57 -> c@76", "case 1@57 -> x@114",
 				"c@76 -> yield 2;@81", "c@76 -> yield 3;@92"},
-			du: []string{"x@20 -> x@52", "x@20 -> case 1@57", "x@20 -> x@114", "c@31 -> c@76",
-				"x@20 -> y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40",
-				"c@31 -> y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40",
+			du: []string{"x@20 -> x@52", "x@52 -> case 1@57", "x@20 -> x@114", "c@31 -> c@76",
+				"yield 2;@81 -> y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40", "yield 3;@92 -> y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40", "x@114 -> y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40",
 				"y = switch (x) { case 1 -> { while (c) { yield 2; } yield 3; } default -> x; }@40 -> return y;@120"},
 		},
 		{
@@ -46,15 +42,16 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// 3→return. IPDom: y = 1→y = 2→break→return; case 1, case 2 →
 			// return. Frontier walks: case 1 over y = 1, y = 2, break;
 			// and case 2; case 2 over y = 2, break; and y = 3. y = 0 and
-			// y = 1 are killed on every path.
+			// y = 1 are killed on every path. The selector x@44 defines the
+			// selector's variable, which both labels Use.
 			name:     "a colon-form case body falls through into the next body",
-			protects: "a colon-form body without break continues into the next group's body, and each label is tested only when the previous failed",
-			mutation: "end every colon-form body with a break (y = 1@57 reaches return y;@104 and case 1@57 loses y = 2@72 and break;@79)",
+			protects: "a colon-form body without break continues into the next group's body, each label is tested only when the previous failed, and each label reads the selector's value, evaluated once",
+			mutation: "end every colon-form body with a break (y = 1@57 reaches return y;@104 and case 1@49 loses y = 2@72 and break;@79), or let a label read the selector's names (x@20 -> case 1@49 replaces x@44 -> case 1@49)",
 			src:      "class A { int f(int x) { int y = 0; switch (x) { case 1: y = 1; case 2: y = 2; break; default: y = 3; } return y; } }",
 			fn:       1,
 			cd: []string{"case 1@49 -> y = 1@57", "case 1@49 -> y = 2@72", "case 1@49 -> break;@79",
 				"case 1@49 -> case 2@64", "case 2@64 -> y = 2@72", "case 2@64 -> break;@79", "case 2@64 -> y = 3@95"},
-			du: []string{"x@20 -> x@44", "x@20 -> case 1@49", "x@20 -> case 2@64",
+			du: []string{"x@20 -> x@44", "x@44 -> case 1@49", "x@44 -> case 2@64",
 				"y = 2@72 -> return y;@104", "y = 3@95 -> return y;@104"},
 		},
 		{
@@ -62,14 +59,15 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// 1@49, case 2, 3@66 (one label, one test), y = 1@59, y = 2@81,
 			// return y;@92. Succ: case 1→{y = 1, case 2, 3}; y = 1→return;
 			// case 2, 3→{y = 2, return} (no default: the switch is left);
-			// y = 2→return. IPDom: every node → return.
+			// y = 2→return. IPDom: every node → return. Both labels Use the
+			// variable the selector x@44 defines.
 			name:     "an arrow-form arm leaves the switch statement",
 			protects: "an arrow arm never falls through, and a switch statement without default is left when no label matches",
-			mutation: "let an arrow arm fall into the next arm (y = 1@59 no longer reaches return y;@92)",
+			mutation: "let an arrow arm fall into the next arm (y = 1@59 no longer reaches return y;@92), or let a label read the selector's names (x@20 -> case 2, 3@66 replaces x@44 -> case 2, 3@66)",
 			src:      "class A { int f(int x) { int y = 0; switch (x) { case 1 -> y = 1; case 2, 3 -> { y = 2; } } return y; } }",
 			fn:       1,
 			cd:       []string{"case 1@49 -> y = 1@59", "case 1@49 -> case 2, 3@66", "case 2, 3@66 -> y = 2@81"},
-			du: []string{"x@20 -> x@44", "x@20 -> case 1@49", "x@20 -> case 2, 3@66",
+			du: []string{"x@20 -> x@44", "x@44 -> case 1@49", "x@44 -> case 2, 3@66",
 				"y = 0@29 -> return y;@92", "y = 1@59 -> return y;@92", "y = 2@81 -> return y;@92"},
 		},
 		{
@@ -133,23 +131,25 @@ func TestJavaLoweringGolden(t *testing.T) {
 		},
 		{
 			// §15.27.2. Nodes: x@20, n = x@29, () -> g(n)@49 (the lambda:
-			// uses its capture n), r = () -> g(n)@45, r.run()@61, return
-			// n;@70. A capture is effectively final, so the lambda defines
-			// nothing and n = x alone reaches return n.
+			// uses its capture n and defines the owned result, the created
+			// lambda), r = () -> g(n)@45 (Uses the result), r.run()@61,
+			// return n;@70. A capture is effectively final, so the lambda
+			// defines no local and n = x alone reaches return n.
 			name:     "a lambda's capture is a use where it is created and never a definition",
-			protects: "the lambda node and its declarator read the captured local, and the local's definition still reaches later uses unmerged",
-			mutation: "record a capture as a may-definition (() -> g(n)@49 gains a pair to return n;@70), or leave captures unread (n = x@29 loses its pairs to the lambda and its declarator)",
+			protects: "the lambda node reads the captured local and hands the created value to its declarator through the result variable, and the local's definition still reaches later uses unmerged",
+			mutation: "record a capture as a may-definition (() -> g(n)@49 gains a pair to return n;@70), leave captures unread (n = x@29 loses its pair to the lambda), or let the declarator read the captures instead of the result (n = x@29 -> r = () -> g(n)@45 replaces () -> g(n)@49 -> r = () -> g(n)@45)",
 			src:      "class A { int f(int x) { int n = x; Runnable r = () -> g(n); r.run(); return n; } }",
 			fn:       1,
-			du: []string{"x@20 -> n = x@29", "n = x@29 -> () -> g(n)@49", "n = x@29 -> r = () -> g(n)@45",
+			du: []string{"x@20 -> n = x@29", "n = x@29 -> () -> g(n)@49", "() -> g(n)@49 -> r = () -> g(n)@45",
 				"r = () -> g(n)@45 -> r.run()@61", "n = x@29 -> return n;@70"},
 		},
 		{
 			// §15.26.1. Nodes: a@25, p@30, v@37, a[v] = v@42 (may-defines
 			// a), p.q.r = v@52 (may-defines p, the local at the base),
 			// this.s = v@63 (a field: defines nothing), return a == p;@75.
-			// A may-definition kills nothing, so both the write and the
-			// parameter reach the return.
+			// Each write is a χ of its base: the return pairs with it, the
+			// nearest may-definition, and with the parameter, the killing
+			// definition that reaches it through the write.
 			name:     "a write through an array element or field of a local may-defines the local",
 			protects: "an element or field write reaches later uses of its base local without killing the local's earlier definition, and a write to a field of this defines no local",
 			mutation: "record no definition of the base (loses a[v] = v@42 and p.q.r = v@52 -> return a == p;@75), or a killing one (loses a@25 and p@30 -> return a == p;@75)",
@@ -193,18 +193,21 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"x@31 -> x > 0@43", "x@31 -> x@51", "o@24 -> o@68", "x@31 -> g(x)@73"},
 		},
 		{
-			// §15.20.2, §6.3.2.2. Nodes: o@23, s@54 (the pattern variable,
-			// defined from o), !(o instanceof String s)@32 (the condition),
-			// return 0;@58, return s.length();@68. The pattern variable of a
-			// negated test is in scope after the if whose then branch cannot
-			// complete normally.
+			// §15.20.2, §6.3.2.2. Nodes: o@23, o@34 (the tested value,
+			// evaluated once: Uses o, defines an owned variable), s@54 (the
+			// pattern variable, defined from that variable), !(o instanceof
+			// String s)@32 (the condition, the test folded into it: Uses the
+			// variable), return 0;@58, return s.length();@68. The pattern
+			// variable of a negated test is in scope after the if whose then
+			// branch cannot complete normally.
 			name:     "an instanceof pattern variable is defined by the test and in scope after the if",
-			protects: "a use of a pattern variable after an if that exits on the failed test resolves to the pattern's definition",
-			mutation: "scope the pattern variable to the if statement (loses s@54 -> return s.length();@68)",
+			protects: "a use of a pattern variable after an if that exits on the failed test resolves to the pattern's definition, and the tested value is read once, at its own node",
+			mutation: "scope the pattern variable to the if statement (loses s@54 -> return s.length();@68), or let the binding and the test read the tested expression's names (o@23 -> s@54 and o@23 -> !(o instanceof String s)@32 replace the o@34 pairs)",
 			src:      "class A { int f(Object o) { if (!(o instanceof String s)) return 0; return s.length(); } }",
 			fn:       1,
 			cd:       []string{"!(o instanceof String s)@32 -> return 0;@58", "!(o instanceof String s)@32 -> return s.length();@68"},
-			du:       []string{"o@23 -> s@54", "o@23 -> !(o instanceof String s)@32", "s@54 -> return s.length();@68"},
+			du: []string{"o@23 -> o@34", "o@34 -> s@54", "o@34 -> !(o instanceof String s)@32",
+				"s@54 -> return s.length();@68"},
 		},
 		{
 			// §14.11.1, §15.28 (guards). Nodes: o@23, o@43 (selector), case
@@ -213,46 +216,50 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// (default), return …@28. Succ: case→{i@61, 0}; i@61→i >
 			// 0→{i@77, 0}; i@77, 0 → return. IPDom: case, i > 0 → return;
 			// i@61 → i > 0. Frontier walks: case over i@61, i > 0 and 0;
-			// i > 0 over i@77 and 0. The return reads only o: every other
-			// name inside the switch is its own pattern variable.
+			// i > 0 over i@77 and 0. The selector o@43 defines the
+			// selector's variable, which the label and the pattern variable
+			// node Use. The arm result i@77, reading the arm's pattern
+			// variable, and the default arm's 0@91 define the result the
+			// return Uses.
 			name:     "a guarded pattern label falls to the next label when its guard fails",
-			protects: "a guard is tested only after its pattern matched, its false edge joins the no-match path, and the pattern variable is defined before the guard reads it",
-			mutation: "send a failed guard to the arm's body (i > 0@68 controls nothing), or bind the pattern variable after the guard (loses i@61 -> i > 0@68)",
+			protects: "a guard is tested only after its pattern matched, its false edge joins the no-match path, the pattern variable is defined before the guard reads it, and the arm result reading the pattern variable reaches the consuming node through the result variable",
+			mutation: "send a failed guard to the arm's body (i > 0@68 controls nothing), bind the pattern variable after the guard (loses i@61 -> i > 0@68), or give an arrow arm's result node no definition of the result (loses i@77 and 0@91 -> return switch (o) { … };@28)",
 			src:      "class A { int f(Object o) { return switch (o) { case Integer i when i > 0 -> i; default -> 0; }; } }",
 			fn:       1,
 			cd: []string{"case Integer i when i > 0@48 -> i@61", "case Integer i when i > 0@48 -> i > 0@68",
 				"case Integer i when i > 0@48 -> 0@91", "i > 0@68 -> i@77", "i > 0@68 -> 0@91"},
-			du: []string{"o@23 -> o@43", "o@23 -> case Integer i when i > 0@48", "o@23 -> i@61", "i@61 -> i > 0@68",
-				"i@61 -> i@77", "o@23 -> return switch (o) { case Integer i when i > 0 -> i; default -> 0; };@28"},
+			du: []string{"o@23 -> o@43", "o@43 -> case Integer i when i > 0@48", "o@43 -> i@61", "i@61 -> i > 0@68",
+				"i@61 -> i@77", "i@77 -> return switch (o) { case Integer i when i > 0 -> i; default -> 0; };@28", "0@91 -> return switch (o) { case Integer i when i > 0 -> i; default -> 0; };@28"},
 		},
 		{
 			// §15.9.5, §8.3. Nodes: x@23, y@30, the creation new Object() {
-			// … }@42 (uses its captures), the return @35. The anonymous
-			// class's field x shadows the parameter x throughout its body,
-			// so only y is captured.
+			// … }@42 (uses its captures, defines the owned result), the
+			// return @35 (Uses the result). The anonymous class's field x
+			// shadows the parameter x throughout its body, so only y is
+			// captured.
 			name:     "an anonymous class's field shadows an enclosing local of the same name",
-			protects: "a name the anonymous class declares is resolved to its own member, so it is no capture of the enclosing local",
-			mutation: "resolve names inside the class body against the enclosing scope only (x@23 pairs with the creation and the return)",
+			protects: "a name the anonymous class declares is resolved to its own member, so it is no capture of the enclosing local, and the created object reaches its consumer through the result variable",
+			mutation: "resolve names inside the class body against the enclosing scope only (x@23 pairs with the creation), or let the return read the captures instead of the result (y@30 -> return new Object() { … };@35 replaces the creation's pair to it)",
 			src:      "class A { Object f(int x, int y) { return new Object() { int x = 1; int g() { return x + y; } }; } }",
 			fn:       1,
 			du: []string{"y@30 -> new Object() { int x = 1; int g() { return x + y; } }@42",
-				"y@30 -> return new Object() { int x = 1; int g() { return x + y; } };@35"},
+				"new Object() { int x = 1; int g() { return x + y; } }@42 -> return new Object() { int x = 1; int g() { return x + y; } };@35"},
 		},
 		{
 			// §15.27.2, §15.26.1. Nodes: arr = new int[1]@28, the lambda
 			// () -> arr[0] = 1@59 (uses arr, may-defines it: its body writes
 			// an element of the captured array), r = () -> arr[0] = 1@55
-			// (reads arr inside its span), r.run()@77, return arr;@86. A
-			// may-definition kills nothing, so a use of arr after the
-			// creation pairs with the creation and with the definition before
-			// it.
+			// (Uses the owned result the lambda defines, not arr),
+			// r.run()@77, return arr;@86. The creation is a χ of arr, so a
+			// use of arr after it pairs with the creation, the nearest
+			// may-definition, and with the killing definition before it.
 			name:     "a lambda's write through a captured local's element may-defines the local where it is created",
-			protects: "a use of a captured array after the lambda's creation sees the element write the lambda may perform, and the array's earlier definition",
-			mutation: "record no write through a captured local (loses () -> arr[0] = 1@59 -> return arr;@86), or a killing definition (loses arr = new int[1]@28 -> return arr;@86)",
+			protects: "a use of a captured array after the lambda's creation sees the element write the lambda may perform, and the array's earlier definition, while the declarator consuming the lambda reads only its result",
+			mutation: "record no write through a captured local (loses () -> arr[0] = 1@59 -> return arr;@86), a killing definition (loses arr = new int[1]@28 -> return arr;@86), or let the declarator read the captures instead of the result (gains arr = new int[1]@28 -> r = () -> arr[0] = 1@55)",
 			src:      "class A { int[] f() { int[] arr = new int[1]; Runnable r = () -> arr[0] = 1; r.run(); return arr; } }",
 			fn:       1,
-			du: []string{"arr = new int[1]@28 -> () -> arr[0] = 1@59", "arr = new int[1]@28 -> r = () -> arr[0] = 1@55",
-				"() -> arr[0] = 1@59 -> r = () -> arr[0] = 1@55", "r = () -> arr[0] = 1@55 -> r.run()@77",
+			du: []string{"arr = new int[1]@28 -> () -> arr[0] = 1@59", "() -> arr[0] = 1@59 -> r = () -> arr[0] = 1@55",
+				"r = () -> arr[0] = 1@55 -> r.run()@77",
 				"arr = new int[1]@28 -> return arr;@86", "() -> arr[0] = 1@59 -> return arr;@86"},
 		},
 		{
@@ -296,15 +303,17 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// §12.5, §8.3.2, §8.6. Callable 0, the class body: the field
 			// initializer's nodes c@18 (Branch), f()@22, g()@28, then a = c
 			// ? f() : g()@14, then the instance initializer's d@39 (Branch)
-			// and h()@42, in source order. c and d are fields, so nothing is
-			// a use. The static initializer is callable 1, not part of this
-			// unit.
+			// and h()@42, in source order. c and d are fields, so they are
+			// no use; the arms f()@22 and g()@28 define the conditional's
+			// owned result, which the declarator Uses. The static
+			// initializer is callable 1, not part of this unit.
 			name:     "a class body's unit lowers its field initializers and instance initializer blocks",
 			protects: "the decisions inside a field initializer and an instance initializer block are lowered in the class body's unit, and a static initializer is not",
-			mutation: "skip instance initializer blocks in the unit (loses d@39 -> h()@42), or lower the static initializer in the unit (s > 0@75 -> m(s)@82 appears here)",
+			mutation: "skip instance initializer blocks in the unit (loses d@39 -> h()@42), lower the static initializer in the unit (s > 0@75 -> m(s)@82 appears here), or give a conditional's arms no definition of its result (loses f()@22 and g()@28 -> a = c ? f() : g()@14)",
 			src:      "class A { int a = c ? f() : g(); { if (d) h(); } static { int s = k(); if (s > 0) m(s); } }",
 			fn:       0,
 			cd:       []string{"c@18 -> f()@22", "c@18 -> g()@28", "d@39 -> h()@42"},
+			du:       []string{"f()@22 -> a = c ? f() : g()@14", "g()@28 -> a = c ? f() : g()@14"},
 		},
 		{
 			// §8.7, §12.4.2. Callable 1, the static initializer: s =
@@ -353,15 +362,16 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// walks: case 1 over y = 1, break, return 0 and case 2; case 2
 			// over y = 2, return y and return 0. The y of the second group is
 			// the local the first group declared: its scope is the rest of the
-			// switch block.
+			// switch block. Both labels Use the variable the selector x@33
+			// defines.
 			name:     "a local declared in a colon-form switch group is in scope in the groups after it",
 			protects: "an assignment and a use of a local in a later statement group resolve to the local an earlier group declared",
-			mutation: "truncate the scope at the end of each colon-form group (loses y = 2@72 -> return y;@79)",
+			mutation: "truncate the scope at the end of each colon-form group (loses y = 2@72 -> return y;@79), or let a label read the selector's names (x@20 -> case 2@64 replaces x@33 -> case 2@64)",
 			src:      "class A { int f(int x) { switch (x) { case 1: int y = 1; break; case 2: y = 2; return y; } return 0; } }",
 			fn:       1,
 			cd: []string{"case 1@38 -> y = 1@50", "case 1@38 -> break;@57", "case 1@38 -> return 0;@91",
 				"case 1@38 -> case 2@64", "case 2@64 -> y = 2@72", "case 2@64 -> return y;@79", "case 2@64 -> return 0;@91"},
-			du: []string{"x@20 -> x@33", "x@20 -> case 1@38", "x@20 -> case 2@64", "y = 2@72 -> return y;@79"},
+			du: []string{"x@20 -> x@33", "x@33 -> case 1@38", "x@33 -> case 2@64", "y = 2@72 -> return y;@79"},
 		},
 		{
 			// §14.11.2, §14.11.3. S is a sealed interface permitting exactly
@@ -373,48 +383,59 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// 2→return y. IPDom: case P, case Q → EXIT; p → y = 1 → return y.
 			// Frontier walks: case P over p, y = 1, return y and case Q; case
 			// Q over q, y = 2 and return y. y = 0 is killed on every path to
-			// the return.
+			// the return. The labels and the pattern variable nodes Use the
+			// variable the selector o@42 defines.
 			name:     "a pattern switch statement without default throws when no label matches",
 			protects: "an enhanced switch statement's no-match path leaves by a throw, so the statement after it depends on the labels and no definition before the switch reaches it unkilled",
-			mutation: "leave a pattern switch statement without default through its no-match edge (gains y = 0@27 -> return y;@87, and return y;@87 loses its control dependences)",
+			mutation: "leave a pattern switch statement without default through its no-match edge (gains y = 0@27 -> return y;@87, and return y;@87 loses its control dependences), or let a pattern variable node read the selector's names (o@18 -> p@54 replaces o@42 -> p@54)",
 			src:      "class A { int f(S o) { int y = 0; switch (o) { case P p -> y = 1; case Q q -> y = 2; } return y; } }",
 			fn:       1,
 			cd: []string{"case P p@47 -> p@54", "case P p@47 -> y = 1@59", "case P p@47 -> return y;@87",
 				"case P p@47 -> case Q q@66", "case Q q@66 -> q@73", "case Q q@66 -> y = 2@78", "case Q q@66 -> return y;@87"},
-			du: []string{"o@18 -> o@42", "o@18 -> case P p@47", "o@18 -> p@54", "o@18 -> case Q q@66", "o@18 -> q@73",
+			du: []string{"o@18 -> o@42", "o@42 -> case P p@47", "o@42 -> p@54", "o@42 -> case Q q@66", "o@42 -> q@73",
 				"y = 1@59 -> return y;@87", "y = 2@78 -> return y;@87"},
 		},
 		{
-			// §6.3.2.5, §6.3.1.3, §6.3.1.5. Nodes: o@23, s@57 (the pattern
-			// variable, defined from o, the loop head's first node),
-			// !(o instanceof String s)@35 (the condition), return
-			// s.length();@65. Succ: s→condition→{s (back edge through the
-			// empty body), return}. The condition introduces s when false and
-			// the body holds no break, so s is in scope after the loop.
+			// §6.3.2.5, §6.3.1.3, §6.3.1.5, §14.14.1.2. Nodes: o@23, o@37
+			// (the tested value, the loop head's first node: Uses o, defines
+			// an owned variable), s@57 (the pattern variable, defined from
+			// it), !(o instanceof String s)@35 (the condition, Using it),
+			// return s.length();@65. Succ: o@37→s→condition→{o@37 (back edge
+			// through the empty body: the condition is evaluated again),
+			// return}. IPDom: o@37 → s → condition → return. Frontier walk:
+			// the condition over o@37, s and itself. The condition
+			// introduces s when false and the body holds no break, so s is in
+			// scope after the loop.
 			name:     "a basic for condition's when-false pattern variable is in scope after a loop no break leaves",
 			protects: "a use after the loop resolves to the pattern variable the negated test defines, while only the header's locals end with the loop",
-			mutation: "truncate the condition's pattern variables with the header's locals at the loop's end (loses s@57 -> return s.length();@65)",
+			mutation: "truncate the condition's pattern variables with the header's locals at the loop's end (loses s@57 -> return s.length();@65), or send the back edge to the condition's Branch (loses !(o instanceof String s)@35 -> o@37 and -> s@57)",
 			src:      "class A { int f(Object o) { for (; !(o instanceof String s);) {} return s.length(); } }",
 			fn:       1,
-			cd:       []string{"!(o instanceof String s)@35 -> s@57", "!(o instanceof String s)@35 -> !(o instanceof String s)@35"},
-			du:       []string{"o@23 -> s@57", "o@23 -> !(o instanceof String s)@35", "s@57 -> return s.length();@65"},
+			cd: []string{"!(o instanceof String s)@35 -> o@37", "!(o instanceof String s)@35 -> s@57",
+				"!(o instanceof String s)@35 -> !(o instanceof String s)@35"},
+			du: []string{"o@23 -> o@37", "o@37 -> s@57", "o@37 -> !(o instanceof String s)@35",
+				"s@57 -> return s.length();@65"},
 		},
 		{
-			// §6.3.1.1, §6.3.2.2, §8.3. Nodes: o@33, s@62 (the pattern
-			// variable), o instanceof String s@42 (the && left operand),
+			// §6.3.1.1, §6.3.2.2, §8.3, §15.20.2. Nodes: o@33, o@42 (the
+			// tested value: Uses o, defines an owned variable), s@62 (the
+			// pattern variable, Using it), o instanceof String s@42 (the &&
+			// left operand, the test folded into it: Uses it),
 			// s.isEmpty()@67, o instanceof String s && s.isEmpty()@42 (the
 			// if's condition), g(s)@82, return s.length();@90. s is in scope
 			// in the && right operand and the then block; the if introduces
 			// nothing (its condition has no when-false set), so the s of the
-			// return is the field.
+			// return is the field. The left operand's Branch and, on its true
+			// path, s.isEmpty()@67 define the operator's owned result, which
+			// the if's Branch Uses.
 			name:     "a pattern variable is in scope only where its test is true, not after the if",
 			protects: "a when-true pattern variable reaches the && right operand and the then statement, and a later use of the same name resolves to the field",
-			mutation: "keep an instanceof pattern variable in scope for the rest of the block (gains s@62 -> return s.length();@90)",
+			mutation: "keep an instanceof pattern variable in scope for the rest of the block (gains s@62 -> return s.length();@90), let the if's Branch read the operands' names instead of the operator's result (o@42 and s@62 -> o instanceof String s && s.isEmpty()@42 replace the operands' pairs to it), or let the test read the tested expression's names (o@33 -> o instanceof String s@42 replaces o@42's pair to it)",
 			src:      "class A { String s; int f(Object o) { if (o instanceof String s && s.isEmpty()) { g(s); } return s.length(); } }",
 			fn:       1,
 			cd:       []string{"o instanceof String s@42 -> s.isEmpty()@67", "o instanceof String s && s.isEmpty()@42 -> g(s)@82"},
-			du: []string{"o@33 -> s@62", "o@33 -> o instanceof String s@42", "o@33 -> o instanceof String s && s.isEmpty()@42",
-				"s@62 -> s.isEmpty()@67", "s@62 -> o instanceof String s && s.isEmpty()@42", "s@62 -> g(s)@82"},
+			du: []string{"o@33 -> o@42", "o@42 -> s@62", "o@42 -> o instanceof String s@42", "o instanceof String s@42 -> o instanceof String s && s.isEmpty()@42",
+				"s@62 -> s.isEmpty()@67", "s.isEmpty()@67 -> o instanceof String s && s.isEmpty()@42", "s@62 -> g(s)@82"},
 		},
 		{
 			// §6.3.2.2, §6.4, §15.9.5. Nodes: o@26, s@36, the creation new
@@ -422,31 +443,34 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// g, the if introduces the negated test's s after it, since its
 			// then statement cannot complete normally, so the s of g's last
 			// return is g's pattern variable, which shadows the parameter s;
-			// only o is captured.
+			// only o is captured. The creation defines the owned result the
+			// return Uses.
 			name:     "in nested code a pattern variable introduced after an if shadows an enclosing local",
 			protects: "the capture walk applies the when-false set an if introduces, so a name it shadows is no capture",
-			mutation: "drop a negated instanceof's pattern variable at the end of its if in the capture walk (s@36 pairs with the creation and the return)",
+			mutation: "drop a negated instanceof's pattern variable at the end of its if in the capture walk (s@36 pairs with the creation)",
 			src:      "class A { Object f(Object o, String s) { return new Object() { int g() { if (!(o instanceof String s)) return 0; return s.length(); } }; } }",
 			fn:       1,
 			du: []string{"o@26 -> new Object() { int g() { if (!(o instanceof String s)) return 0; return s.length(); } }@48",
-				"o@26 -> return new Object() { int g() { if (!(o instanceof String s)) return 0; return s.length(); } };@41"},
+				"new Object() { int g() { if (!(o instanceof String s)) return 0; return s.length(); } }@48 -> return new Object() { int g() { if (!(o instanceof String s)) return 0; return s.length(); } };@41"},
 		},
 		{
 			// §15.28.2, §15.26.1. Nodes: x@20, z = 0@29, x@52 (selector),
 			// case 1@57, z = 5@69, yield 1;@76, 0@98 (default arm), the
 			// declarator y = switch …@40, return y + z;@104. Succ: case
 			// 1→{z = 5, 0}; z = 5→yield 1→declarator; 0→declarator;
-			// declarator→return. The declarator reads the variables read
-			// inside the switch expression: x only, since the arm writes z
-			// without reading it.
+			// declarator→return. yield 1 and the default arm's 0 define the
+			// switch expression's result, which the declarator Uses; z = 5
+			// is a statement of the arm, a node of its own, which writes z
+			// without reading it. case 1 Uses the variable the selector x@52
+			// defines.
 			name:     "a plain assignment inside a switch expression is no read of its target by the consuming node",
-			protects: "the node consuming a switch expression uses what the arms read, not what they only write",
-			mutation: "record a plain assignment's local target as a read in the capture walk (gains z = 0@29 -> y = switch (x) { … }@40)",
+			protects: "the node consuming a switch expression uses only its result variable, not what a statement inside an arm reads or writes",
+			mutation: "let the consuming node take every variable referenced inside the switch expression, a plain assignment's target included (gains z = 0@29 -> y = switch (x) { … }@40)",
 			src:      "class A { int f(int x) { int z = 0; int y = switch (x) { case 1 -> { z = 5; yield 1; } default -> 0; }; return y + z; } }",
 			fn:       1,
 			cd:       []string{"case 1@57 -> z = 5@69", "case 1@57 -> yield 1;@76", "case 1@57 -> 0@98"},
-			du: []string{"x@20 -> x@52", "x@20 -> case 1@57",
-				"x@20 -> y = switch (x) { case 1 -> { z = 5; yield 1; } default -> 0; }@40",
+			du: []string{"x@20 -> x@52", "x@52 -> case 1@57",
+				"yield 1;@76 -> y = switch (x) { case 1 -> { z = 5; yield 1; } default -> 0; }@40", "0@98 -> y = switch (x) { case 1 -> { z = 5; yield 1; } default -> 0; }@40",
 				"z = 0@29 -> return y + z;@104", "z = 5@69 -> return y + z;@104",
 				"y = switch (x) { case 1 -> { z = 5; yield 1; } default -> 0; }@40 -> return y + z;@104"},
 		},
@@ -499,6 +523,149 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"h(r)@81 -> return r;@89"},
 			du: []string{"r = 0@24 -> h(r)@81", "r = g()@37 -> h(r)@81", "r = 1@62 -> h(r)@81",
 				"r = 0@24 -> return r;@89", "r = g()@37 -> return r;@89", "r = 1@62 -> return r;@89"},
+		},
+		{
+			// §15.25, §15.26.1. Nodes: x@20, x > 0@29 (the condition, a
+			// Branch using x), 1@37 and 2@41 (the arms, each defining the
+			// conditional's owned result), x = x > 0 ? 1 : 2@25 (Uses the
+			// result, defines x), return x;@44. Succ: x > 0→{1, 2}; 1,
+			// 2→the assignment→return. IPDom: x > 0, 1, 2 → the assignment
+			// → return. Frontier walk: x > 0 over 1 and 2. The condition's
+			// read of x is its own node's, so the assignment, which defines
+			// x, does not Use x.
+			name:     "a conditional hands its arms' values to its consumer, and its condition's reads stay on the condition",
+			protects: "the node consuming a conditional depends on the arms through the result variable and not on the condition's variables, even when it defines the variable the condition read",
+			mutation: "give the arms no definition of the result (loses 1@37 and 2@41 -> x = x > 0 ? 1 : 2@25), leave the condition's reads to the consumer (gains x@20 -> x = x > 0 ? 1 : 2@25), or let a defining node Use a variable its statement read on a nested node (gains x@20 -> x = x > 0 ? 1 : 2@25)",
+			src:      "class A { int f(int x) { x = x > 0 ? 1 : 2; return x; } }",
+			fn:       1,
+			cd:       []string{"x > 0@29 -> 1@37", "x > 0@29 -> 2@41"},
+			du: []string{"x@20 -> x > 0@29", "1@37 -> x = x > 0 ? 1 : 2@25", "2@41 -> x = x > 0 ? 1 : 2@25",
+				"x = x > 0 ? 1 : 2@25 -> return x;@44"},
+		},
+		{
+			// §15.26.1, §15.12.4.2. Nodes: o@19, a@26, o.f = a@33 (the
+			// embedded assignment: Uses o and a, may-defines o, defines the
+			// owned result), g(o.f = a)@31 (Uses the result). Succ: a
+			// straight line. No local carries the assigned value to the
+			// call, so only the result variable does.
+			name:     "an embedded assignment to a field hands its value to its consumer through a result variable",
+			protects: "a call whose argument assigns a field depends on the assignment node, and does not re-read the assignment's operands",
+			mutation: "give an embedded assignment no result (loses o.f = a@33 -> g(o.f = a)@31), or leave its reads to the consumer (o@19 and a@26 -> g(o.f = a)@31 replace o.f = a@33 -> g(o.f = a)@31)",
+			src:      "class A { void f(P o, int a) { g(o.f = a); } }",
+			fn:       1,
+			du:       []string{"o@19 -> o.f = a@33", "a@26 -> o.f = a@33", "o.f = a@33 -> g(o.f = a)@31"},
+		},
+		{
+			// §15.25, §15.26.1. Nodes: c@24, x@31 (params), c@44 (the
+			// condition), x = 1@49 (the first arm, which is its own
+			// assignment node: it defines both x and the conditional's
+			// result, each killing), 2@58 (the second arm, defining the
+			// result), y = c ? (x = 1) : 2@40 (Uses the result, defines y), return x +
+			// y;@61. Succ: c@44→{x = 1, 2}; both→the declarator→return.
+			// IPDom: c@44, x = 1, 2 → the declarator → return. Frontier
+			// walk: c@44 over x = 1 and 2.
+			name:     "an arm that is an assignment defines both its local and the conditional's result",
+			protects: "a node that assigns a local also yields the construct's value, both by killing definitions, and the local it assigns still reaches later uses",
+			mutation: "give that arm no share of the result (loses x = 1@49 -> y = c ? (x = 1) : 2@40), or make its definition of x a may-definition (gains x@31 -> x = 1@49)",
+			src:      "class A { int f(boolean c, int x) { int y = c ? (x = 1) : 2; return x + y; } }",
+			fn:       1,
+			cd:       []string{"c@44 -> x = 1@49", "c@44 -> 2@58"},
+			du: []string{"c@24 -> c@44", "x = 1@49 -> y = c ? (x = 1) : 2@40", "2@58 -> y = c ? (x = 1) : 2@40",
+				"x@31 -> return x + y;@61", "x = 1@49 -> return x + y;@61", "y = c ? (x = 1) : 2@40 -> return x + y;@61"},
+		},
+		{
+			// §15.26.1, §15.7.1 (left operand first). Nodes: x = 1@36 and
+			// x = 2@46 (each defines x and its own owned
+			// result), y = (x = 1) + (x = 2)@31 (Uses both results, defines y), return
+			// y;@54. Succ: a straight line. The declarator reads each
+			// assignment's value, not x, so both assignments reach it,
+			// though x = 2 kills x = 1's definition of x.
+			name:     "two embedded assignments to one local each hand their value to the consumer",
+			protects: "a consumer of several embedded assignments to the same local depends on every one of them, through their result variables rather than the local",
+			mutation: "hand an embedded assignment to a local its value through the local (loses x = 1@36 -> y = (x = 1) + (x = 2)@31)",
+			src:      "class A { int f() { int x; int y = (x = 1) + (x = 2); return y; } }",
+			fn:       1,
+			du:       []string{"x = 1@36 -> y = (x = 1) + (x = 2)@31", "x = 2@46 -> y = (x = 1) + (x = 2)@31", "y = (x = 1) + (x = 2)@31 -> return y;@54"},
+		},
+		{
+			// §15.7.1, §15.26.1. Nodes: x@20, x = 1@38 (defines x; it
+			// carries the declarator's earlier read of x: Uses x's value from
+			// before it and defines an owned variable holding it, and
+			// defines its own result), y = x + (x = 1)@29 (Uses both owned
+			// variables, defines y), return y;@46. Succ: a straight line.
+			// Java evaluates the left operand x before the assignment, so
+			// that read sees the parameter, which reaches the declarator
+			// through x = 1's carried value, not x = 1's definition of x.
+			name:     "a read made before an embedded assignment redefines its variable sees the earlier value",
+			protects: "the value a consumer read before an embedded assignment overwrote the variable reaches the consumer from the definition that preceded the assignment",
+			mutation: "leave the declarator's read of x to pair with the nearest definition (loses x@20 -> x = 1@38, so the parameter no longer reaches the declarator)",
+			src:      "class A { int f(int x) { int y = x + (x = 1); return y; } }",
+			fn:       1,
+			du:       []string{"x@20 -> x = 1@38", "x = 1@38 -> y = x + (x = 1)@29", "y = x + (x = 1)@29 -> return y;@46"},
+		},
+		{
+			// §15.25, §15.7.1. Nodes: c@24, x@31 (params), c@49 (the
+			// condition), x = 1@54 (the first arm: defines x and
+			// the conditional's result), 0@63 (the second arm, defining the
+			// result), y = x + (c ? (x = 1) : 0)@40 (Uses x and the result, defines y), return
+			// y;@67. Succ: c@49→{x = 1, 0}; both→the declarator→return.
+			// IPDom: c@49, x = 1, 0 → the declarator → return. Frontier walk:
+			// c@49 over x = 1 and 0. The assignment runs only on one arm, so
+			// the declarator keeps its read of x: it sees the parameter when
+			// c is false and x = 1 when c is true.
+			name:     "a read before an assignment in a conditional's arm stays on its consumer",
+			protects: "an earlier read is handed to an embedded assignment only when the assignment runs whenever the read's consumer does, so the definition before it still reaches the consumer on the path that skips it",
+			mutation: "hand the earlier read to the assignment unconditionally (loses x@31 -> y = x + (c ? (x = 1) : 0)@40, gains x@31 -> x = 1@54)",
+			src:      "class A { int f(boolean c, int x) { int y = x + (c ? (x = 1) : 0); return y; } }",
+			fn:       1,
+			cd:       []string{"c@49 -> x = 1@54", "c@49 -> 0@63"},
+			du: []string{"c@24 -> c@49", "x@31 -> y = x + (c ? (x = 1) : 0)@40", "x = 1@54 -> y = x + (c ? (x = 1) : 0)@40", "0@63 -> y = x + (c ? (x = 1) : 0)@40",
+				"y = x + (c ? (x = 1) : 0)@40 -> return y;@67"},
+		},
+		{
+			// JLS §6.5.6.1 (a simple name that is not a local variable or
+			// parameter in scope names a field), §15.26.1, §15.26.2, §15.14.2,
+			// §15.27.2. x and xs are fields, no variable of this function, in
+			// every position a name takes: an assignment target, a compound
+			// assignment, an increment, an embedded assignment, a name the
+			// lambda captures (read and incremented there), and the base of an
+			// element write, at statement level and inside the lambda. Nodes:
+			// a@38 (the parameter), x = a@43, x += a@50, x++@58 (Uses and
+			// defines nothing), x = a@65 (the embedded assignment: Uses a,
+			// defines only its owned result), g(x = a)@63 (Uses the result),
+			// () -> { x++; xs[0] = a; }@86 (the lambda: Uses its one capture
+			// a, may-defines nothing, defines the created value), r = () -> {
+			// x++; xs[0] = a; }@82 (Uses it), xs[0] = a@113 (Uses a,
+			// may-defines nothing). Straight line: no control dependence.
+			name:     "an assignment to a field named without this defines no local",
+			protects: "a name that resolves to no local or parameter is state the pairs do not track in every position it takes: a write to it defines nothing, a read of it Uses nothing, a write through it may-defines nothing, and the lowering never treats it as a variable",
+			mutation: "drop the -1 test in holds (earlier indexes before the start of the read table at x = a@43 and panics), in read (x += a@50 indexes it and panics), in def (x = a@43 reaches the builder's Def with -1 and panics), in assign's test of base (xs[0] = a@113 reaches MayDef with -1 and panics), or in cap's test of base (the lambda's xs[0] = a is recorded as a write and closure passes -1 to MayDef)",
+			src:      "class A { int x; int[] xs; void f(int a) { x = a; x += a; x++; g(x = a); Runnable r = () -> { x++; xs[0] = a; }; xs[0] = a; } }",
+			fn:       1,
+			du: []string{"a@38 -> x = a@43", "a@38 -> x += a@50", "a@38 -> x = a@65", "x = a@65 -> g(x = a)@63",
+				"a@38 -> () -> { x++; xs[0] = a; }@86", "() -> { x++; xs[0] = a; }@86 -> r = () -> { x++; xs[0] = a; }@82",
+				"a@38 -> xs[0] = a@113"},
+		},
+		{
+			// §15.23, §15.26.1. Nodes: c@28, d@39 (params), c@67 (the
+			// deciding operand's Branch: Uses c, defines the operator's
+			// owned result), b = d@73 (the second operand, its own
+			// assignment node: Uses d, defines b, its own result and the
+			// operator's result, each killing), y = c && (b = d)@63 (Uses
+			// the operator's result, defines y), return y;@81. Succ: c@67→{b
+			// = d, the declarator}; b = d→the declarator→return. IPDom:
+			// c@67, b = d → the declarator. Frontier walk: c@67 over b = d.
+			// On the true path b = d's definition of the result kills
+			// c@67's, so the declarator pairs with c@67 only through the
+			// false edge, and b = d reads no earlier value of the result.
+			name:     "a second operand that assigns a local defines the operator's result by a killing definition",
+			protects: "the yields of one construct's value never read one another: the operand evaluated after the deciding one replaces its value on that path",
+			mutation: "may-define the operator's result on a node that also defines a local (gains c@67 -> b = d@73: the second operand would read the deciding operand's value through the χ)",
+			src:      "class A { boolean f(boolean c, boolean d) { boolean b; boolean y = c && (b = d); return y; } }",
+			fn:       1,
+			cd:       []string{"c@67 -> b = d@73"},
+			du: []string{"c@28 -> c@67", "d@39 -> b = d@73", "c@67 -> y = c && (b = d)@63", "b = d@73 -> y = c && (b = d)@63",
+				"y = c && (b = d)@63 -> return y;@81"},
 		},
 	})
 }

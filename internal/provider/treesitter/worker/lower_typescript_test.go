@@ -105,7 +105,7 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// 2@25, g(x)@34; x = 2 kills x = 1.
 			name:     "a namespace body runs inline where it stands",
 			protects: "a namespace's statements are ordinary definitions of the enclosing function, not a closure's may-definitions",
-			mutation: "lower a namespace body as a nested callable (g(x) also pairs with x = 1@4, a may-definition)",
+			mutation: "lower a namespace body as a nested callable (its creating node may-defines x, so g(x) pairs with it and, through it, with x = 1@4)",
 			src:      "let x = 1; namespace N { x = 2; } g(x);",
 			fn:       0,
 			du:       []string{"x = 2@25 -> g(x)@34"},
@@ -153,16 +153,19 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x@58 -> g(x, y)@83", "y@69 -> g(x, y)@83"},
 		},
 		{
-			// A TypeScript field is a public_field_definition, emitted as the
-			// field without its annotation; its initializer runs in the class
-			// body's unit (ECMA-262 §15.7.14 ClassDefinitionEvaluation).
-			// Branch c@22, arms 1@26 and 2@30.
+			// ECMA-262 §15.7.10 ClassFieldDefinitionEvaluation: the compiler
+			// emits a TypeScript field (public_field_definition) as the field
+			// without its annotation, and its initializer runs in the class
+			// body's unit (§15.7.14 ClassDefinitionEvaluation). Branch c@22,
+			// arms 1@26 and 2@30, each defining the conditional's result, which
+			// the field x: number = c ? 1 : 2@10 Uses; c is free in the unit.
 			name:     "a typed field initializer is lowered in the class body's unit",
 			protects: "public_field_definition takes field_definition's place in the class body unit",
-			mutation: "match only field_definition in classBody (the initializer makes no node and cd is empty)",
+			mutation: "match only field_definition in classBody (the initializer makes no node and cd and du are empty)",
 			src:      "class A { x: number = c ? 1 : 2; }",
 			fn:       1,
 			cd:       []string{"c@22 -> 1@26", "c@22 -> 2@30"},
+			du:       []string{"1@26 -> x: number = c ? 1 : 2@10", "2@30 -> x: number = c ? 1 : 2@10"},
 		},
 	}
 	shared = append(shared,
@@ -170,46 +173,50 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			// The compiler's emit of `f?.(a)` is ECMA-262's optional call
 			// (§13.3.9 OptionalChain): when f is null or undefined nothing
 			// right of `?.` is evaluated. Nodes: g@11, x = 0@25, the Branch
-			// g@32 before `?.`, x = 1@36 and the chain g?.(x = 1)@32 (Uses g
-			// and the x it read back) on the non-nullish path, return x;@44,
-			// reached by x = 0 on the nullish path and x = 1 on the other.
+			// g@32 before `?.` (Uses g, hands the callee on through the chain's
+			// result), x = 1@36 (defines x and its own result) and the chain
+			// g?.(x = 1)@32 (Uses both results) on the non-nullish path, return
+			// x;@44, reached by x = 0 on the nullish path and x = 1 on the other.
 			name:     "a TypeScript optional call short-circuits its arguments",
 			protects: "the anonymous `?.` of a TypeScript optional call is an optional chain, so its arguments are conditional and the definition before them still reaches past the call",
-			mutation: "test only the optional_chain field in chain (g@32 and its control dependences vanish, and return x;@44 loses x = 0@25)",
+			mutation: "test only the optional_chain field in chain (g@32 and its control dependences vanish, and return x;@44 loses x = 0@25), or give the chain node the callee's reads (g@11 -> g?.(x = 1)@32 appears)",
 			src:      "function f(g: any) { let x = 0; g?.(x = 1); return x; }",
 			fn:       1,
 			cd:       []string{"g@32 -> x = 1@36", "g@32 -> g?.(x = 1)@32"},
 			du: []string{
-				"g@11 -> g@32", "g@11 -> g?.(x = 1)@32", "x = 1@36 -> g?.(x = 1)@32",
+				"g@11 -> g@32", "g@32 -> g?.(x = 1)@32", "x = 1@36 -> g?.(x = 1)@32",
 				"x = 0@25 -> return x;@44", "x = 1@36 -> return x;@44",
 			},
 		},
 		goldenCase{
 			// The compiler's emit of `x as T` is x: the type `typeof y`
 			// evaluates nothing. Nodes: x@11, y@19, the arrow
-			// () => x as typeof y@39 (Uses its capture x), the declarator
-			// g = () => x as typeof y@35 (Uses x, defines g), return g;@60.
+			// () => x as typeof y@39 (Uses its capture x, defines its result),
+			// the declarator g = () => x as typeof y@35 (Uses the result,
+			// defines g), return g;@60.
 			name:     "a closure's captures skip the type of an as expression",
 			protects: "the capture collection walks only the operand of a transparent wrapper, never its type",
-			mutation: "walk every child of an as expression in cap (y@19 pairs with the arrow and the declarator)",
+			mutation: "walk every child of an as expression in cap (y@19 -> () => x as typeof y@39 appears)",
 			src:      "function f(x: any, y: any) { const g = () => x as typeof y; return g; }",
 			fn:       1,
 			du: []string{
-				"x@11 -> () => x as typeof y@39", "x@11 -> g = () => x as typeof y@35",
+				"x@11 -> () => x as typeof y@39", "() => x as typeof y@39 -> g = () => x as typeof y@35",
 				"g = () => x as typeof y@35 -> return g;@60",
 			},
 		},
 		goldenCase{
 			// The compiler's emit of `[y!] = a` is `[y] = a`, an ECMA-262
 			// destructuring assignment (§13.15.5.5 IteratorDestructuringAssignmentEvaluation)
-			// that binds y. Nodes: a@11, y = 0@25, the element y@33 (Uses a,
-			// defines y), return y;@42; y@33 kills y = 0.
+			// that binds y, its right side evaluated once. Nodes: a@11,
+			// y = 0@25, the right side a@39 (Uses a, defines the incoming
+			// value), the element y@33 (Uses it, defines y), return y;@42;
+			// y@33 kills y = 0.
 			name:     "a destructuring element through a non-null assertion defines the variable",
 			protects: "pattern elements are read through the transparent wrappers, so the element kills the earlier definition",
-			mutation: "drop the strip at the start of bind (y@33 defines nothing: a@11 -> y@33 and y@33 -> return y;@42 vanish and y = 0@25 -> return y;@42 appears)",
+			mutation: "drop the strip at the start of bind (y@33 vanishes with a@39 -> y@33 and y@33 -> return y;@42, and y = 0@25 -> return y;@42 appears)",
 			src:      "function f(a: any) { let y = 0; [y!] = a; return y; }",
 			fn:       1,
-			du:       []string{"a@11 -> y@33", "y@33 -> return y;@42"},
+			du:       []string{"a@11 -> a@39", "a@39 -> y@33", "y@33 -> return y;@42"},
 		},
 		goldenCase{
 			// The compiler's emit of an enum outside a file's top level is a
@@ -244,22 +251,22 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 	// JavaScript's.
 	shared = append(shared,
 		goldenCase{
-			// ECMA-262 §14.12.4 CaseClauseIsSelected; derivation as in the
+			// ECMA-262 §14.12.3 CaseClauseIsSelected; derivation as in the
 			// JavaScript case of the same name.
 			name:     "every case test reads the discriminant",
-			protects: "a case test's decision depends on the discriminant's variables, so their definitions reach every test",
-			mutation: "reset the discriminant's reads before each case test (x@11 -> 1@34 and x@11 -> 2@54 vanish)",
+			protects: "a case test's decision reads the discriminant's value through the node that evaluated it once",
+			mutation: "give each case test the discriminant's reads instead of its value (x@11 -> 1@34 and x@11 -> 2@54 appear, x@24 -> 1@34 and x@24 -> 2@54 vanish)",
 			src:      "function f(x) { switch (x) { case 1: g(); break; case 2: h(); } }",
 			fn:       1,
 			cd:       []string{"1@34 -> g()@37", "1@34 -> break;@42", "1@34 -> 2@54", "2@54 -> h()@57"},
-			du:       []string{"x@11 -> x@24", "x@11 -> 1@34", "x@11 -> 2@54"},
+			du:       []string{"x@11 -> x@24", "x@24 -> 1@34", "x@24 -> 2@54"},
 		},
 		goldenCase{
 			// ECMA-262 §13.15.2; derivation as in the JavaScript case of
 			// the same name.
 			name:     "a compound property assignment reads the property before its right side",
-			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25)",
+			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node, the store reading the old value through the read's result",
+			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (c@14 -> o.p += c ? 1 : 2@25 appears)",
 			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
 			fn:       1,
 			cd: []string{
@@ -269,8 +276,8 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
 			},
 			du: []string{
-				"o@11 -> o.p@25", "c@14 -> c@32",
-				"o@11 -> o.p += c ? 1 : 2@25", "c@14 -> o.p += c ? 1 : 2@25",
+				"o@11 -> o.p@25", "c@14 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25",
+				"1@36 -> o.p += c ? 1 : 2@25", "2@40 -> o.p += c ? 1 : 2@25", "o@11 -> o.p += c ? 1 : 2@25",
 			},
 		},
 		goldenCase{
@@ -287,20 +294,57 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 		},
 	)
+	shared = append(shared,
+		goldenCase{
+			// The compiler's emit: a `declare` declaration emits no code, so
+			// `declare let g` binds no variable and g names the global the
+			// program assumes (ECMA-262 §9.4.2 ResolveBinding), never a
+			// variable of f; h is free too. The wrappers are erased, so each
+			// target is g read through them; `delete g` is left out, the
+			// compiler rejecting a delete of anything but a property
+			// reference. Nodes: x@31; g! = x@41 and (g as
+			// any) += x@49 (each Uses x, defines nothing), g++@66 (Uses
+			// nothing); the embedded g! = x@73 (Uses x, defines its result) and
+			// h(g! = x)@71 (Uses the result); (g as any).p = x@82 (Uses x,
+			// may-defines no base); the right side x@107 (Uses x, defines the
+			// incoming value) and the element g@101 (Uses it); the iterated
+			// x@120 (Uses x, defines the iteration variable), the head g of
+			// x@115 and the binding g@115 (each Uses it), h(g)@123 (Uses
+			// nothing); the arrow () => g! += x@139 (Uses its capture x,
+			// may-defines nothing, defines its result), the declarator c = ()
+			// => g! += x@135 (Uses the result, defines c); return c;@154.
+			name:     "a name only a declare form introduces is read and written as nothing through the wrappers",
+			protects: "an ambient name reached through a transparent wrapper as an assignment, compound, update, embedded, property-base, destructuring, iteration or capture target defines and reads nothing, while its node keeps its other reads",
+			mutation: "drop the v < 0 return in def (flow.Builder.Def panics on g's -1 at g! = x@41), in read (seen[-1] panics at (g as any) += x@49), in mayDefBase (MayDef(-1) at (g as any).p = x@82) or in capTarget (MayDef(-1) on the arrow's node)",
+			src:      "declare let g: any; function f(x: any) { g! = x; (g as any) += x; g++; h(g! = x); (g as any).p = x; [g!] = x; for (g of x) h(g); const c = () => g! += x; return c; }",
+			fn:       1,
+			cd:       []string{"g of x@115 -> g of x@115", "g of x@115 -> g@115", "g of x@115 -> h(g)@123"},
+			du: []string{
+				"x@31 -> g! = x@41", "x@31 -> (g as any) += x@49", "x@31 -> g! = x@73", "g! = x@73 -> h(g! = x)@71",
+				"x@31 -> (g as any).p = x@82", "x@31 -> x@107", "x@107 -> g@101",
+				"x@31 -> x@120", "x@120 -> g of x@115", "x@120 -> g@115",
+				"x@31 -> () => g! += x@139", "() => g! += x@139 -> c = () => g! += x@135",
+				"c = () => g! += x@135 -> return c;@154",
+			},
+		},
+	)
 	runGolden(t, "typescript", shared)
 	runGolden(t, "tsx", append(shared, goldenCase{
-		// JSX (the JSX specification's JSXElement): a capitalized tag name
-		// is a reference. && is ECMAScript §13.13: Branch a@40, the right
-		// operand <B />@45 reading B, the return@33 reading both.
+		// The compiler's JSX emit: an element is a call whose first
+		// argument is its tag, `<B />` becoming `createElement(B, null)`,
+		// so a capitalized tag name is a read of B. && is ECMA-262 §13.13
+		// Binary Logical Operators, and either operand can be its value:
+		// the Branch a@40 (Uses a) and the right operand <B />@45 (Uses B)
+		// each define the operator's result, which the return@33 Uses.
 		name:     "a JSX element in TSX reads its component",
 		protects: "TSX resolves the JSX kinds its grammar has, so a component tag is a read and a conditional operand",
-		mutation: "resolve the JSX kinds against the typescript grammar for tsx (<B /> reads nothing)",
+		mutation: "resolve the JSX kinds against the typescript grammar for tsx (<B /> reads nothing: B@23 -> <B />@45 vanishes), or give the return the operands' reads instead of the result (a@11 -> return a && <B />;@33 appears)",
 		src:      "function f(a: boolean, B: any) { return a && <B />; }",
 		fn:       1,
 		cd:       []string{"a@40 -> <B />@45"},
 		du: []string{
 			"a@11 -> a@40", "B@23 -> <B />@45",
-			"a@11 -> return a && <B />;@33", "B@23 -> return a && <B />;@33",
+			"a@40 -> return a && <B />;@33", "<B />@45 -> return a && <B />;@33",
 		},
 	}))
 }
