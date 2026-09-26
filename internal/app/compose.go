@@ -148,13 +148,14 @@ const unobservedFreeDiskBytes int64 = 1 << 30
 // reason: the ledger observes nothing. What it cannot see is the space another
 // process on the same device takes while this one runs, which is why the floor
 // exists and why the store still attributes a refused write against free space
-// at the moment it fails.
-func freeDiskAllocation(dataDir string, floorBytes int64) int64 {
+// at the moment it fails. The flag is false exactly when the figure is the
+// stand-in, so nothing downstream publishes it as a measurement.
+func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 	free, ok := diskfree.Available(dataDir)
 	if !ok {
 		slog.Warn("this host reports no free-space figure for the data directory, so heavy children are admitted against a conservative stand-in rather than a measurement",
 			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
-		return unobservedFreeDiskBytes
+		return unobservedFreeDiskBytes, false
 	}
 	if free > math.MaxInt64 {
 		free = math.MaxInt64
@@ -163,9 +164,9 @@ func freeDiskAllocation(dataDir string, floorBytes int64) int64 {
 	if allocation <= 0 {
 		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
 			"component", "app", "data_dir", dataDir, "free_bytes", free, "min_free_disk_bytes", floorBytes)
-		return 0
+		return 0, true
 	}
-	return allocation
+	return allocation, true
 }
 
 // childSlots is that division: how many children of the smallest possible size
@@ -691,15 +692,24 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// sizing invents no bound there and admission stands one in. That is
 	// stated on both sides in govern.go and is an open question, not a claim
 	// that they always agree.
-	childMemory := dependence.ObserveMachine().SchedulingAllocation(config.BaseFootprint(cfg))
+	//
+	// The machine is read once. The allocation is an observation only when the
+	// reading produced a positive allocation; otherwise SchedulingAllocation
+	// stands its conservative figure in, and the ledger is told so.
+	machine := dependence.ObserveMachine()
+	baseFootprint := config.BaseFootprint(cfg)
+	childMemory := machine.SchedulingAllocation(baseFootprint)
+	memoryObserved := machine.Allocation(baseFootprint, dependence.DefaultSafetyMarginBytes) > 0
 	// Disk is the ledger's second dimension and is observed the same way: the
 	// free space under the data directory, less the floor the host keeps, is
 	// what the children may stage between them. It is observed here, once, for
 	// the reason the memory allocation is -- the ledger observes nothing and
 	// derives nothing -- and a child that does not fit it waits rather than
 	// filling the device.
-	childDisk := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
-	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
+	childDisk, diskObserved := freeDiskAllocation(cfg.Storage.DataDir, cfg.Resources.MinFreeDiskBytes)
+	if s.admission, err = admission.NewLedger(
+		admission.Allocation{Bytes: childMemory, Observed: memoryObserved},
+		admission.Allocation{Bytes: childDisk, Observed: diskObserved}); err != nil {
 		return nil, err
 	}
 	// resources.max_temp_bytes is passed through UNCLAMPED, including its
