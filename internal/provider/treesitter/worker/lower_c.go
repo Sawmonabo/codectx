@@ -73,9 +73,13 @@ const (
 //     per name, spanning the name, each reading the initializer. A `static`
 //     local is a variable whose initializer is a defining node at its
 //     position; the value it keeps across calls is not modelled.
-//   - A condition is one Branch node spanning the condition without its
-//     parentheses: if, while, do…while, for; a C++ condition that declares
-//     a variable is a Branch node spanning the declaration that defines it.
+//   - A condition is one Branch node, spanned as Spans (see Lowering)
+//     states: if, while, do…while, for; a C++ condition that declares a
+//     variable is a Branch node spanning the declaration that defines it. A
+//     statement expression's own `(` `)` is an enclosing pair the condition
+//     strips, since both grammars parse `({ … })` as a parenthesized
+//     expression over a compound statement: `while (({ …; e; }))` spans
+//     `{ …; e; }`.
 //     An init-statement of a C++ if, switch or range for is lowered before
 //     the condition as a statement. A loop whose condition is `true` or a
 //     nonzero integer literal (`while (1)`), and a for without a condition,
