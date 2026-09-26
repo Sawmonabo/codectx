@@ -314,11 +314,11 @@ type stack struct {
 	root    workspace.Root
 	cfg     config.Config
 	dataDir string
-	// engineTemp is the process temp directory this composition fell back to
-	// for the engine's spills because the data directory would not take them,
-	// and which it therefore owns and gives back at Close. Empty whenever the
-	// spills went where they belong, under the data directory, which no
-	// composition owns alone and none removes.
+	// engineTemp is the directory in the process temp directory an answering
+	// composition gave the engine's spills because it found no writable one
+	// under the data directory (setEngineTempDir); it owns it and gives it
+	// back at Close. Empty whenever the spills go under the data directory,
+	// which no composition owns alone and none removes.
 	engineTemp string
 	store      *sqlite.Store
 	// ledger is this process's run accounting: a stable handle composed by
@@ -1077,45 +1077,48 @@ func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, 
 	}
 }
 
-// openQueries builds the query services that need the repository identity,
-// which only the coordinator derives. It is called by open once the coordinator
-// exists rather than from openStack, because the alternative -- re-deriving the
-// identity here -- would be a second spelling of it that silently drifts the
-// day the first one changes.
 // setEngineTempDir names where every engine handle in this process spills.
 //
 // Under the data directory, on the disk the operator gave the data. A
-// composition that only ANSWERS may find that directory unwritable -- a
-// workspace on read-only media, one an operator has locked down, one mounted
-// read-only for an audit -- and it has nothing to publish there in any case, so
-// its spills go to the process temp directory instead and it gives that
-// directory back when it closes. Falling back is what keeps such a workspace
-// answerable at all: the engine refuses a temp directory it cannot write, and
-// it refused before this process had read a byte.
+// composition that BUILDS creates that directory if it is missing and never
+// falls back: a run whose spills went to a memory filesystem is the failure
+// this directory exists to prevent, and a data directory that will not take
+// them is an operator-fixable configuration, named as one rather than reported
+// as a defect in this build.
 //
-// A composition that BUILDS never falls back. A run whose spills went to a
-// memory filesystem is the failure this directory exists to prevent, and a data
-// directory that will not take them is an operator-fixable configuration, named
-// as one rather than reported as a defect in this build.
+// A composition that only ANSWERS creates nothing under the data directory. It
+// names the directory a run made there when it exists and the engine can
+// write it. Otherwise -- a workspace nothing has built, one on read-only media,
+// one an operator has locked down -- its spills go to a directory of its own
+// in the process temp directory, which it gives back when it closes. Falling
+// back is what keeps such a workspace answerable at all: the engine refuses a
+// temp directory it cannot write, and it refused before this process had read
+// a byte.
 func (s *stack) setEngineTempDir(answersOnly bool) error {
 	under := filepath.Join(s.dataDir, engineTempDirName)
-	err := sqlite.SetTempDir(under)
-	if err == nil || !answersOnly {
-		if err != nil {
+	if !answersOnly {
+		if err := sqlite.SetTempDir(under); err != nil {
 			return dataDirNotWritable(under, err)
 		}
 		return nil
+	}
+	// SetTempDir creates a missing directory, so an answering composition
+	// hands it only one that is already there.
+	if info, err := os.Stat(under); err == nil && info.IsDir() {
+		if sqlite.SetTempDir(under) == nil {
+			return nil
+		}
 	}
 	// A directory of its own, not one named after this process: a name derived
 	// from the pid is one a killed process leaves behind and the next process
 	// to be given that pid adopts, spills and all, and one a second
 	// composition in this process would remove from under the first.
-	fallback, ferr := os.MkdirTemp("", "codectx-engine-")
-	if ferr != nil {
-		return dataDirNotWritable(os.TempDir(), ferr)
+	fallback, err := os.MkdirTemp("", "codectx-engine-")
+	if err != nil {
+		return dataDirNotWritable(os.TempDir(), err)
 	}
-	if ferr := sqlite.SetTempDir(fallback); ferr != nil {
-		return dataDirNotWritable(fallback, ferr)
+	if err := sqlite.SetTempDir(fallback); err != nil {
+		return dataDirNotWritable(fallback, err)
 	}
 	s.engineTemp = fallback
 	return nil
@@ -1132,6 +1135,11 @@ func dataDirNotWritable(dir string, cause error) error {
 		Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
 }
 
+// openQueries builds the query services that need the repository identity,
+// which only the coordinator derives. It is called by open once the coordinator
+// exists rather than from openStack, because the alternative -- re-deriving the
+// identity here -- would be a second spelling of it that silently drifts the
+// day the first one changes.
 func (s *stack) openQueries(repo model.RepositoryID) error {
 	s.repo = repo
 	svc, err := search.New(search.Options{
@@ -1859,11 +1867,6 @@ func (s *stack) Close() error {
 	return errors.Join(errs...)
 }
 
-// openResolver builds one managed-toolchain resolver over a resolved
-// configuration. There is exactly one resolver per composition: `tools.offline`
-// is the only thing that refuses a fetch, because a second resolver that
-// refused them regardless reported a payload that is merely not installed as a
-// payload the operator's own offline setting withheld.
 // evidenceClip is index.max_evidence_per_fact as the finite number every
 // producer and the seal compare against. Unlimited (the default) is the model's
 // record ceiling: a fact can never carry more occurrences than the record
@@ -1873,6 +1876,11 @@ func evidenceClip(cfg config.Config) int {
 	return int(cfg.Index.MaxEvidencePerFact.ValueOr(model.MaxEvidencePerFact))
 }
 
+// openResolver builds one managed-toolchain resolver over a resolved
+// configuration. There is exactly one resolver per composition: `tools.offline`
+// is the only thing that refuses a fetch, because a second resolver that
+// refused them regardless would report a payload that is merely not installed
+// as one the operator's own offline setting withheld.
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace, while tools.cache_dir names the tool store
