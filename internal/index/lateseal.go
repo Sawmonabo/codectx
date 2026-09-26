@@ -565,7 +565,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	l.setPublishing(false)
 	abort()
 	if err == nil && len(b.sealed) == 0 {
-		c.log.Warn("every deferred unit of this batch failed; their scopes are published failed",
+		c.log.Warn("every deferred unit of this batch failed",
 			"component", component, "repository_id", string(c.repo),
 			"units", len(b.failed), "published", published, "run_id", run.ID())
 	}
@@ -815,8 +815,15 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	// The reasons this generation's capability rows state are copied onto it:
 	// the active generation's -- the foreground pass's and every earlier
 	// batch's, each carried forward by the publication before -- and this
-	// batch's own, from the work generation that is aborted next.
-	err = c.opts.Store.CarryRunFailures(ctx, pubGen, active, b.work)
+	// batch's own, from the work generation that is aborted next. A scope this
+	// generation seals takes no reason with it: its fresh unit is the answer.
+	sealed := make([]sqlite.RunScope, 0, len(replacing))
+	for _, s := range b.sealed {
+		if _, ok := replacing[plan.Key(s.providerID, s.scopeKey)]; ok {
+			sealed = append(sealed, sqlite.RunScope{ProviderID: s.providerID, ScopeKey: s.scopeKey})
+		}
+	}
+	err = c.opts.Store.CarryRunFailures(ctx, pubGen, sealed, active, b.work)
 	if err == nil {
 		err = l.attach(ctx, g, replacing)
 	}

@@ -229,6 +229,9 @@ func (p *countingHeavyProvider) IndexUnit(ctx context.Context, req provider.Unit
 // standard-error tail stays on the run row and never reaches failed_units,
 // which `status --json` and the index-status tool hand to any client.
 //
+// A reason is carried only while its scope stays failed: once a later batch
+// seals the scope, its old reason must leave failed_units.
+//
 // Mutation: in tickHeld, abort and return when nothing sealed, and no
 // publication is delivered. Mutation: drop the CarryRunFailures call from
 // publishOnce, and status lists no failed unit. Mutation: drop the
@@ -261,6 +264,9 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	st, err := f.status(c)
 	if err != nil {
 		t.Fatalf("status: %v", err)
+	}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("the status answer does not validate: %v", err)
 	}
 	if st.Binding.GenerationID != published[0].Binding.GenerationID {
 		t.Fatalf("status answers generation %d, want the publication %d",
@@ -308,5 +314,26 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 		t.Fatalf("no span of the failed batch names the scope %q with its typed reason among the %d "+
 			"recorded spans",
 			units[0].unit.ScopeKey, len(view.Spans))
+	}
+
+	// A later batch seals the scope that failed. The publication extends the
+	// generation that carries the old reason, and must not carry it on: the
+	// scope would be listed failed beside a capability row that reports it
+	// covered, in every generation after.
+	//
+	// Mutation: pass no sealed scopes to CarryRunFailures in publishOnce, and
+	// the answered failure is still listed.
+	p.reset(1)
+	if err := f.tick(c, units, res.Binding.SnapshotID, sel); err != nil {
+		t.Fatalf("tickHeld (the scope seals): %v", err)
+	}
+	if n := len(c.late.take()); n != 1 {
+		t.Fatalf("the batch that sealed the scope delivered %d publication(s), want one", n)
+	}
+	if st, err = f.status(c); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(st.FailedUnits) != 0 {
+		t.Fatalf("status still lists %+v as failed after a later batch sealed it", st.FailedUnits)
 	}
 }
