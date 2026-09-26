@@ -26,6 +26,69 @@ func Grammar(name string) (*ts.Language, bool) {
 // function sees only the expression that creates it. A Lowering holds no
 // per-function state and is safe to share.
 //
+// # Uses: the consumption rule
+//
+// Every lowering applies one rule for which variables a node Uses. A node
+// Uses what its own evaluation reads, plus the reads of every nested
+// value-producing construct whose value it consumes:
+//
+//   - a switch or match expression's selector and its arm results (an arm's
+//     value expression, the operand of the `yield` or valued `break` that
+//     leaves it, a block's tail expression);
+//   - a conditional expression's arms (`c ? a : b`, a Python `a if c else b`,
+//     a valued `if` in Rust): the arm values, not the condition, which is a
+//     node of its own evaluated before either arm;
+//   - a statement expression's value, the value of its last statement;
+//   - a short-circuit operand of `&&`, `||`, `and`, `or`, `??`, whose value
+//     is the operator's value.
+//
+// A node does not Use the reads of a nested node that is evaluated
+// separately and only sits inside its span. Such a node carries its reads
+// itself. That covers a loop's iterated expression (see Iteration), a
+// condition or loop head inside a consumed block, a statement of a consumed
+// block other than the one producing its value, and a nested callable's
+// body: the node that creates a callable (a lambda, closure, local
+// function, anonymous class, generator or comprehension, an async block)
+// Uses the enclosing variables it captures, and a node consuming the
+// created value does not repeat them.
+//
+// Each read is resolved in the scope where it occurs. A binding scoped to
+// an arm (a pattern variable, a guard's binding, a match capture) resolves
+// in that arm, never in the consumer's scope, where it may be out of scope
+// or name another variable: `return switch (o) { case Integer i when i > 0
+// -> i; … }` makes the return Use the arm's i.
+//
+// # Iteration
+//
+// Every loop over an iterable evaluates the iterable once, before the first
+// iteration, at a node of its own, in every language: the Java enhanced for
+// (JLS §14.14.2), the C++ range for ([stmt.ranged]), the Python for and
+// async for (Language Reference §8.3), the JavaScript for…in, for…of and for
+// await…of (ECMA-262 §14.7.5.6, ForIn/OfHeadEvaluation), the Rust for (The
+// Rust Reference, Iterator loops: `IntoIterator::into_iter` once) and the Go
+// range clause (The Go Programming Language Specification, For statements
+// with range clause). That node is a Stmt node spanning the iterated
+// expression; it Uses the expression's reads and defines an iteration
+// variable the lowering owns (flow.Builder.Var, bound to no name). The loop
+// head Uses only that variable, never the names read in the iterated
+// expression, and each per-iteration binding node Uses it too.
+//
+// The iterator is created once, so a body that rebinds the iterated name
+// does not change the iteration, and `for k in d: d[k] = f(k)`, whose body
+// may-defines d, does not reach the head's next step. A head that read the
+// iterated names would pair with every such definition. Go's one exception,
+// a range expression the specification does not evaluate at all, is stated
+// in its lowering.
+//
+// # Spans
+//
+// A condition, and a switch's or match's selector, spans its expression
+// with every enclosing pair of parentheses stripped (unparen): each pair the
+// grammar parses as a parenthesized expression, the statement's own
+// parentheses included, however deeply they nest. A GNU C statement
+// expression's own `(` `)` is such a pair, so a condition `({ …; e; })`
+// spans the compound statement `{ …; e; }`.
+//
 // # Address-taking
 //
 // Every lowering applies one rule. A local gets a non-killing
