@@ -20,8 +20,8 @@ import "testing"
 func TestRustLoweringGolden(t *testing.T) {
 	runGolden(t, "rust", []goldenCase{
 		{
-			// Expressions › Operator expressions › The question mark
-			// operator: `x?` returns from the function when x is None.
+			// Expressions › Operator expressions › The try propagation
+			// expression: `x?` returns from the function when x is None.
 			// Nodes: x@5 (param), x?@46 (Branch), let y = x?;@38, Some(y)@50
 			// (the tail). Succ: x@5→x?→{EXIT, let}; let→Some(y)→EXIT.
 			// IPDom: let → Some(y) → EXIT; x? → EXIT. Frontier walk from the
@@ -35,38 +35,44 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Expressions › Loops and other breakable expressions › Infinite
-			// loops, and › Break and loop values. Nodes: n@5, let mut i =
+			// loops, and › `break` and loop values. Nodes: n@5, let mut i =
 			// 0;@22, loop@45 (Stmt head), i += 1@52, i > n@63, break i *
-			// 2@71, let r = …;@37 (Uses every read inside it: i and n), r@89.
+			// 2@71, let r = …;@37 (Uses the valued break's operand read, i,
+			// and neither the statement i += 1 nor the condition's n), r@89.
 			// Succ: loop→i += 1→i > n→{break, loop}; break→let r→r. The loop
 			// has no exit edge. IPDom: i > n → break → let r; loop → i += 1
 			// → i > n. Frontier walk from i > n→loop: loop, i += 1, i > n.
+			// The one definition of i reaching let r is i += 1@52 (the path
+			// i += 1 → i > n → break → let r).
 			name:     "a loop leaves only by its valued break, which the let consumes",
-			protects: "`loop` has no exit edge of its own, and the let receiving a break's value reads the variables the break read",
-			mutation: "give `loop` a false edge out of its head (loop@45 becomes a controller of i += 1 and i > n), or give the consuming let only its direct reads (loses i += 1@52 -> let r and n@5 -> let r)",
+			protects: "`loop` has no exit edge of its own, and the let receiving a break's value reads the variables the break's operand read, not the loop body's other reads",
+			mutation: "give `loop` a false edge out of its head (loop@45 becomes a controller of i += 1 and i > n), carry no valued break's reads to its loop (loses i += 1@52 -> let r), or let the consuming let Use every read inside the loop (gains n@5 -> let r)",
 			src:      "fn f(n: i32) -> i32 { let mut i = 0; let r = loop { i += 1; if i > n { break i * 2; } }; r }",
 			cd:       []string{"i > n@63 -> loop@45", "i > n@63 -> i += 1@52", "i > n@63 -> i > n@63"},
-			du: []string{"n@5 -> i > n@63", "n@5 -> let r = loop { i += 1; if i > n { break i * 2; } };@37",
+			du: []string{"n@5 -> i > n@63",
 				"let mut i = 0;@22 -> i += 1@52", "i += 1@52 -> i += 1@52", "i += 1@52 -> i > n@63",
 				"i += 1@52 -> break i * 2@71", "i += 1@52 -> let r = loop { i += 1; if i > n { break i * 2; } };@37",
 				"let r = loop { i += 1; if i > n { break i * 2; } };@37 -> r@89"},
 		},
 		{
-			// Expressions › Block expressions › Labelled block expressions.
-			// Nodes: c@5, x@14, c@48, break 'a x@52, 0@66, let v = …;@31, v@71.
+			// Expressions › Loops and other breakable expressions › Labeled
+			// block expressions.
+			// Nodes: c@5, x@14, c@48, break 'a x@52, 0@66, let v = …;@31 (Uses
+			// the break's operand x and the tail 0, which reads nothing; the
+			// if statement's condition c is not the block's value), v@71.
 			// Succ: c@48→{break, 0}; break→let v (the block frame); 0→let v.
 			// IPDom: c@48 → let v.
 			name:     "a labelled block's valued break leaves the block, not the function",
-			protects: "`break 'a v` lands after the labelled block, where both the break and the block's tail flow into the consuming let",
-			mutation: "open no frame for a labelled block (the break names no frame: unresolved becomes 1, and the break keeps no successor, so augmentation sends it to Exit and c@48 gains let v = 'a: { if c { break 'a x; } 0 };@31 and v@71 as dependents; the def-use pairs are unchanged)",
+			protects: "`break 'a v` lands after the labelled block, where both the break and the block's tail flow into the consuming let, which Uses the break's operand and not the condition",
+			mutation: "open no builder frame for a labelled block (the break names no frame: unresolved becomes 1, and the break keeps no successor, so augmentation sends it to Exit and c@48 gains let v = 'a: { if c { break 'a x; } 0 };@31 and v@71 as dependents), carry no labelled break's reads to its block (loses x@14 -> let v), or let the consuming let Use the condition's read (gains c@5 -> let v)",
 			src:      "fn f(c: bool, x: i32) -> i32 { let v = 'a: { if c { break 'a x; } 0 }; v }",
 			cd:       []string{"c@48 -> break 'a x@52", "c@48 -> 0@66"},
-			du: []string{"c@5 -> c@48", "x@14 -> break 'a x@52", "c@5 -> let v = 'a: { if c { break 'a x; } 0 };@31",
+			du: []string{"c@5 -> c@48", "x@14 -> break 'a x@52",
 				"x@14 -> let v = 'a: { if c { break 'a x; } 0 };@31", "let v = 'a: { if c { break 'a x; } 0 };@31 -> v@71"},
 		},
 		{
 			// Expressions › Loops and other breakable expressions ›
-			// Predicate pattern loops. Nodes: s@9, let mut t = 0;@31, let
+			// Predicate loops › `while let` patterns. Nodes: s@9, let mut t = 0;@31, let
 			// Some(x) = s.pop()@52 (the head, a Branch), x@61 (defines x on
 			// the taken path, Using the value's reads), t += x@76, t@86.
 			// Succ: head→{x, t@86}; x→t += x→head. IPDom: x → t += x → head
@@ -82,7 +88,7 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Expressions › Loops and other breakable expressions › Iterator
-			// loops, › Loop labels, › continue expressions. Nodes: v@5, let
+			// loops, › Loop labels, › `continue` expressions. Nodes: v@5, let
 			// mut n = 0;@25, v@53 (outer iterated value, defines the
 			// iteration variable), for@44 (outer head), a@48, v@66, for@57
 			// (inner head), b@61, a == b@73, continue 'o@82, n += b@97, n@109.
@@ -104,7 +110,7 @@ func TestRustLoweringGolden(t *testing.T) {
 				"n += b@97 -> n += b@97", "let mut n = 0;@25 -> n@109", "n += b@97 -> n@109"},
 		},
 		{
-			// Expressions › Match expressions, and › Match guards. Nodes:
+			// Expressions › `match` expressions, and › Match guards. Nodes:
 			// o@5, k@21, o@44 (scrutinee), None@48 (a Branch: an earlier
 			// arm's bare identifier may name a unit variant; it also defines
 			// the name it would bind), 0@56, Some(x)@59, x@64, x > k@70,
@@ -126,7 +132,8 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Statements › Let statements (a let introduces a new binding,
-			// shadowing), and Expressions › If and if let expressions. Nodes:
+			// shadowing), and Expressions › `if` expressions › `if let`
+			// patterns. Nodes:
 			// o@5, d@21, let d = d + 1;@38 (reads the parameter d, defines
 			// a new variable), let Some(v) = o@56 (Branch), v@65, v@74, d@85.
 			// Succ: head→{v@65, d@85}; v@65→v@74. IPDom: head → EXIT.
@@ -152,24 +159,27 @@ func TestRustLoweringGolden(t *testing.T) {
 			du: []string{"o@5 -> let Some(v) = o else { panic!(\"none\") };@30", "o@5 -> v@39", "v@39 -> v@71"},
 		},
 		{
-			// Expressions › Closure expressions (capture modes). Nodes: x@5,
+			// Expressions › Closure expressions, and Types › Closure types ›
+			// Capture modes (a non-move closure captures n by unique
+			// borrow). Nodes: x@5,
 			// let mut n = 0;@22, |d: i32| n += d + x@51 (Uses n and x,
 			// may-defines n; its own parameter d shadows), let mut add =
-			// …;@37 (Uses every read in its span: n and x), add(1)@72, n@80.
+			// …;@37 (Uses nothing: the captures are the creating node's),
+			// add(1)@72, n@80.
 			// The closure may run at any later point, or never, so both let
 			// mut n = 0; and the creating node reach every later use of n.
 			name:     "a closure's write to a captured variable is a may-definition where it is created",
 			protects: "a use after a closure's creation sees both the closure's write and the definition reaching the creation",
-			mutation: "record a closure's writes as uses only (loses |d: i32| n += d + x@51 -> n@80), or as a killing definition (loses let mut n = 0;@22 -> n@80)",
+			mutation: "record a closure's writes as uses only (loses |d: i32| n += d + x@51 -> n@80), as a killing definition (loses let mut n = 0;@22 -> n@80), or let the consuming let repeat the captures (gains x@5, let mut n = 0;@22 and |d: i32| n += d + x@51 -> let mut add = |d: i32| n += d + x;@37)",
 			src:      "fn f(x: i32) -> i32 { let mut n = 0; let mut add = |d: i32| n += d + x; add(1); n }",
-			du: []string{"x@5 -> |d: i32| n += d + x@51", "x@5 -> let mut add = |d: i32| n += d + x;@37",
-				"let mut n = 0;@22 -> |d: i32| n += d + x@51", "let mut n = 0;@22 -> let mut add = |d: i32| n += d + x;@37",
-				"|d: i32| n += d + x@51 -> let mut add = |d: i32| n += d + x;@37",
+			du: []string{"x@5 -> |d: i32| n += d + x@51",
+				"let mut n = 0;@22 -> |d: i32| n += d + x@51",
 				"let mut add = |d: i32| n += d + x;@37 -> add(1)@72",
 				"|d: i32| n += d + x@51 -> n@80", "let mut n = 0;@22 -> n@80"},
 		},
 		{
-			// Items › Associated items › Methods (self is the receiver), and
+			// Items › Associated items › Associated functions and methods ›
+			// Methods (self is the receiver), and
 			// Expressions › Assignment expressions (a place expression). Nodes:
 			// self@19, v@25, self.a = v@42 (Uses self and v, may-defines
 			// self), self.a@54.
@@ -181,7 +191,8 @@ func TestRustLoweringGolden(t *testing.T) {
 				"self@19 -> self.a@54"},
 		},
 		{
-			// Expressions › Borrow operators: `&mut v` lends v mutably, so
+			// Expressions › Operator expressions › Borrow operators: `&mut v`
+			// lends v mutably, so
 			// the call receiving it may write v. Nodes: let mut v =
 			// Vec::new();@18 (defines v; a path is no read), fill(&mut v)@42
 			// (Uses v, may-defines v), v.len()@56. The may-definition kills
@@ -208,8 +219,8 @@ func TestRustLoweringGolden(t *testing.T) {
 			du:       []string{"c@5 -> c@34", "x@14 -> return g(x)@64", "x@14 -> x@79"},
 		},
 		{
-			// Expressions › Operator expressions › The question mark
-			// operator: on a Result, `e?` returns Err(From::from(err)) from
+			// Expressions › Operator expressions › The try propagation
+			// expression: on a Result, `e?` returns Err(From::from(err)) from
 			// the function when e is Err, and is the Ok value otherwise.
 			// Nodes: s@5, s.parse()?@69 (Branch), let n: i32 = …;@56, Ok(n +
 			// 1)@81. Succ: s@5→s.parse()?→{EXIT, let}; let→Ok→EXIT. IPDom:
@@ -223,11 +234,13 @@ func TestRustLoweringGolden(t *testing.T) {
 				"let n: i32 = s.parse()?;@56 -> Ok(n + 1)@81"},
 		},
 		{
-			// Expressions › Operator expressions › The question mark
-			// operator, inside a try block (a block the unstable try_blocks
-			// feature adds, whose `?` completes the block rather than the
-			// function). Nodes: a@5, a?@57 (Branch), a? + 1@57 (the block's
-			// tail), let r: … = try { … };@30 (Uses every read in its span),
+			// The Rust Unstable Book, Language features › try_blocks (The
+			// Rust Reference does not define try blocks: a `?` in one
+			// completes the block rather than the function), and
+			// Expressions › Operator expressions › The try propagation
+			// expression. Nodes: a@5, a?@57 (Branch), a? + 1@57 (the block's
+			// tail), let r: … = try { … };@30 (Uses the tail's read of a,
+			// which the `?` also carries to the block's end),
 			// r.unwrap_or(0)@67. Succ: a?→{a? + 1, let} (its break lands
 			// after the block); a? + 1→let→r.unwrap_or(0). IPDom: a? → let.
 			name:     "a question mark inside a try block leaves the block, not the function",
@@ -239,7 +252,7 @@ func TestRustLoweringGolden(t *testing.T) {
 				"let r: Option<i32> = try { a? + 1 };@30 -> r.unwrap_or(0)@67"},
 		},
 		{
-			// Expressions › If and if let expressions › Chains of
+			// Expressions › `if` expressions › Chains of
 			// conditions: the operands of a let chain are evaluated in
 			// order, each only when the ones before it hold, and a let
 			// operand's bindings are in scope for the later operands and the
@@ -289,7 +302,7 @@ func TestRustLoweringGolden(t *testing.T) {
 				"i += 2@51 -> i < n@43", "i += 2@51 -> i += 2@51", "let mut i = 0;@22 -> i@61", "i += 2@51 -> i@61"},
 		},
 		{
-			// Patterns › Wildcard pattern, and Expressions › Match
+			// Patterns › Wildcard pattern, and Expressions › `match`
 			// expressions: `_` matches any value, so the match cannot fall
 			// out and a later arm is unreachable. Nodes: o@5, o@36 (the
 			// scrutinee), Some(x)@40 (Branch), x@45, x@51, 0@59; the None
@@ -318,59 +331,61 @@ func TestRustLoweringGolden(t *testing.T) {
 				"s@54 -> y@115", "a@100 -> a + x + y@124", "x@112 -> a + x + y@124", "y@115 -> a + x + y@124"},
 		},
 		{
-			// Expressions › Block expressions › Async blocks: an async block
+			// Expressions › Block expressions › `async` blocks: an async block
 			// captures what it uses and runs only when its future is polled,
 			// so it is its own function; a gen block is lowered the same way.
 			// Nodes: n@9, async { n += 1; }@36 (Uses n, may-defines n), let
-			// fut = …;@26, drop(fut)@55, n@66.
+			// fut = …;@26 (Uses nothing: the captures are the creating
+			// node's), drop(fut)@55, n@66.
 			name:     "an async block is its own function and its write is a may-definition where it is created",
 			protects: "the async block's body is not inline code of the enclosing function: its write kills nothing there",
-			mutation: "lower an async block's body inline as a plain block (n += 1@44 becomes a killing definition, so n@9 -> n@66 is lost)",
+			mutation: "lower an async block's body inline as a plain block (n += 1@44 becomes a killing definition, so n@9 -> n@66 is lost), or let the consuming let repeat the captures (gains n@9 and async { n += 1; }@36 -> let fut = async { n += 1; };@26)",
 			src:      "fn f(mut n: i32) -> i32 { let fut = async { n += 1; }; drop(fut); n }",
-			du: []string{"n@9 -> async { n += 1; }@36", "n@9 -> let fut = async { n += 1; };@26",
-				"async { n += 1; }@36 -> let fut = async { n += 1; };@26",
+			du: []string{"n@9 -> async { n += 1; }@36",
 				"let fut = async { n += 1; };@26 -> drop(fut)@55", "n@9 -> n@66", "async { n += 1; }@36 -> n@66"},
 		},
 		{
 			// Expressions › Closure expressions: a closure's parameters are
 			// patterns binding in its body, so a parameter x shadows the
 			// enclosing x there. Nodes: x@5, y@13, |x: i32| x + y@38 (Uses
-			// y only), let g = …;@30, g(1) + x@54.
+			// y only), let g = …;@30 (Uses nothing: the captures are the
+			// creating node's), g(1) + x@54.
 			name:     "a closure parameter shadows the enclosing variable of its name",
 			protects: "a closure's use of its own parameter is not a capture of the enclosing variable",
-			mutation: "resolve a closure's parameter names through the enclosing scope (x@5 -> |x: i32| x + y@38 and x@5 -> let g = |x: i32| x + y;@30 appear)",
+			mutation: "resolve a closure's parameter names through the enclosing scope (x@5 -> |x: i32| x + y@38 appears)",
 			src:      "fn f(x: i32, y: i32) -> i32 { let g = |x: i32| x + y; g(1) + x }",
-			du: []string{"y@13 -> |x: i32| x + y@38", "y@13 -> let g = |x: i32| x + y;@30",
+			du: []string{"y@13 -> |x: i32| x + y@38",
 				"let g = |x: i32| x + y;@30 -> g(1) + x@54", "x@5 -> g(1) + x@54"},
 		},
 		{
-			// Expressions › Closure expressions › Capture modes: a `move`
+			// Types › Closure types › Capture modes, and Expressions ›
+			// Closure expressions: a `move`
 			// closure captures by value, so `n += 1` writes the closure's
 			// copy of n, never the enclosing n. Nodes: n@9, move || n +=
-			// 1@38 (Uses n, may-defines nothing), let mut g = …;@26, g()@54,
-			// n@59.
+			// 1@38 (Uses n, may-defines nothing), let mut g = …;@26 (Uses
+			// nothing: the captures are the creating node's), g()@54, n@59.
 			name:     "a move closure's write is not a definition of the enclosing variable",
 			protects: "only the definitions before a move closure reach a later read of a variable it writes",
-			mutation: "keep a move closure's writes as may-definitions (gains move || n += 1@38 -> n@59 and move || n += 1@38 -> let mut g = move || n += 1;@26)",
+			mutation: "keep a move closure's writes as may-definitions (gains move || n += 1@38 -> n@59)",
 			src:      "fn f(mut n: i32) -> i32 { let mut g = move || n += 1; g(); n }",
-			du: []string{"n@9 -> move || n += 1@38", "n@9 -> let mut g = move || n += 1;@26",
+			du: []string{"n@9 -> move || n += 1@38",
 				"let mut g = move || n += 1;@26 -> g()@54", "n@9 -> n@59"},
 		},
 		{
-			// Statements › Expression statements, and Expressions › If and if
-			// let expressions: `s = 1` inside the if's block is a statement
-			// of its own whose value is 1, so it reads nothing, although the
-			// let consuming the if read s in the condition. Nodes: s@9, s >
-			// 0@37 (Branch), s = 1@45, 2@52, 3@63, let t = …;@26 (Uses the
-			// condition's read), t + s@68. Succ: s > 0→{s = 1, 3}; s = 1→2→
-			// let; 3→let. IPDom: s > 0 → let.
+			// Statements › Expression statements, and Expressions › `if`
+			// expressions: `s = 1` inside the if's block is a statement
+			// of its own, not the block's value, and reads nothing. The let
+			// consuming the if Uses the arm values' reads only: the tails 2
+			// and 3 read nothing, and the condition's read of s is the
+			// condition node's. Nodes: s@9, s > 0@37 (Branch), s = 1@45,
+			// 2@52, 3@63, let t = …;@26 (Uses nothing), t + s@68. Succ: s >
+			// 0→{s = 1, 3}; s = 1→2→let; 3→let. IPDom: s > 0 → let.
 			name:     "a statement inside a valued expression reads only its own operands",
-			protects: "an enclosing statement's earlier reads are not a nested statement's reads, so an assignment inside a valued if does not use the variable it assigns",
-			mutation: "start a nested statement's reads at the enclosing statement's (s = 1@45 then Uses s: gains s@9 -> s = 1@45)",
+			protects: "the let consuming a valued if Uses neither the condition's reads nor a non-final statement's, so no false pair joins the assignment s = 1 to the let",
+			mutation: "let the consuming let Use the condition's read of s (gains s@9 -> let t and the false pair s = 1@45 -> let t, although the let takes 2 or 3, never s)",
 			src:      "fn f(mut s: i32) -> i32 { let t = if s > 0 { s = 1; 2 } else { 3 }; t + s }",
 			cd:       []string{"s > 0@37 -> s = 1@45", "s > 0@37 -> 2@52", "s > 0@37 -> 3@63"},
-			du: []string{"s@9 -> s > 0@37", "s@9 -> let t = if s > 0 { s = 1; 2 } else { 3 };@26",
-				"s = 1@45 -> let t = if s > 0 { s = 1; 2 } else { 3 };@26", "s@9 -> t + s@68", "s = 1@45 -> t + s@68",
+			du: []string{"s@9 -> s > 0@37", "s@9 -> t + s@68", "s = 1@45 -> t + s@68",
 				"let t = if s > 0 { s = 1; 2 } else { 3 };@26 -> t + s@68"},
 		},
 		{
@@ -389,9 +404,9 @@ func TestRustLoweringGolden(t *testing.T) {
 				"v@62 -> o@82"},
 		},
 		{
-			// Expressions › Borrow operators, and Place expressions and value
-			// expressions: `*p` is a place, so `&mut *p` may write through p,
-			// but `!b` is a value, so `&mut !b` borrows a temporary and never
+			// Expressions › Operator expressions › Borrow operators, and
+			// Expressions › Place expressions and value expressions: `*p` is
+			// a place, so `&mut *p` may write through p, but `!b` is a value, so `&mut !b` borrows a temporary and never
 			// writes b. Nodes: p@5, b@18, g(&mut !b, &mut *p)@37 (Uses b and
 			// p, may-defines p only), h(*p)@58, b@65.
 			name:     "a mutable borrow reaches its base through a dereference but not through a value operator",
@@ -404,7 +419,7 @@ func TestRustLoweringGolden(t *testing.T) {
 		{
 			// Macros › Macro invocation (the arguments are a token tree the
 			// expansion evaluates), and Expressions › Operator expressions ›
-			// The question mark operator: `g(s)?` returns from the function
+			// The try propagation expression: `g(s)?` returns from the function
 			// on an error. Nodes: s@5, println!("{}", g(s)?)@34 (a Branch
 			// Using s; g and the literal read nothing), Ok(1)@57. Succ:
 			// println!→{EXIT, Ok(1)}; Ok(1)→EXIT. IPDom: println! → EXIT.
@@ -417,7 +432,7 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Macros › Macro invocation, Expressions › Return expressions,
-			// and › Lazy boolean operators (`c || return 0` returns when c is
+			// and › Operator expressions › Lazy boolean operators (`c || return 0` returns when c is
 			// false). The `||` follows an operand, so it is no closure. Nodes:
 			// c@5, assert!(c || return 0)@23 (a Branch Using c), 1@47. Succ:
 			// assert!→{EXIT, 1}; 1→EXIT. IPDom: assert! → EXIT.
@@ -429,8 +444,8 @@ func TestRustLoweringGolden(t *testing.T) {
 			du:       []string{"c@5 -> assert!(c || return 0)@23"},
 		},
 		{
-			// Expressions › Operator expressions › The question mark
-			// operator (it returns from the enclosing function or closure),
+			// Expressions › Operator expressions › The try propagation
+			// expression (it returns from the enclosing function or closure),
 			// and › Closure expressions. The `o?` is in the closure `|| …`,
 			// so the invocation does not jump. Nodes: o@5, println!(…)@38
 			// (a Stmt Using o), Some(1)@77.
@@ -441,7 +456,7 @@ func TestRustLoweringGolden(t *testing.T) {
 			du:       []string{"o@5 -> println!(\"{:?}\", (|| Some(o? + 1))())@38"},
 		},
 		{
-			// Expressions › Loops and other breakable expressions › break
+			// Expressions › Loops and other breakable expressions › `break`
 			// expressions: an unlabelled break leaves the innermost loop,
 			// here the one inside the token tree. Nodes: x@5,
 			// println!(…)@22 (a Stmt Using x), x@57.
@@ -464,8 +479,9 @@ func TestRustLoweringGolden(t *testing.T) {
 				"let mut v = vec![1];@18 -> v.len()@81", "println!(\"{:?}\", std::mem::take(&mut v))@39 -> v.len()@81"},
 		},
 		{
-			// Format strings follow the std::fmt library documentation (not
-			// the Reference): Named parameters (an implicit `{x}` captures
+			// Macros › Macro invocation, with format strings by the std::fmt
+			// library documentation (The Rust Reference does not define
+			// them): Named parameters (an implicit `{x}` captures
 			// the variable x unless a named argument x is passed), Width
 			// (`w$` names the width argument, captured the same way), and
 			// Escaping (`{{` is a literal brace). Nodes: x@5, w@13, y@23,
@@ -480,7 +496,8 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Paths (a segment names a module, type or item, not a local),
-			// Expressions › Field access and Method-call expressions (the
+			// Expressions › Field access expressions and › Method-call
+			// expressions (the
 			// name after `.` is a field or method), and the std::fmt library
 			// documentation's Named parameters (`y = e` names an argument).
 			// Nodes: self@15, x@21, max@29, len@39, v@51, format!(…)@76
