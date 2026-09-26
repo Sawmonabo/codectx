@@ -167,7 +167,7 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// workspace lock and the indexing mutex a collection pass requires.
 		Collector: s.collector,
 		Ledger:    s.ledger,
-		// The one memory admission ledger this process composed. Every heavy
+		// The one admission ledger, for memory and disk, this process composed. Every heavy
 		// unit the coordinator runs is admitted against it, beside the
 		// language servers the manager admits against the same handle.
 		Admission: s.admission,
