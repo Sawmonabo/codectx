@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,38 +62,30 @@ const (
 	spoolsDirName  = "spools"
 )
 
-// spoolBudgetDivisor is what the shared temporary-file budget is divided by to
-// size the query spools. resources.max_temp_bytes is not a per-consumer budget:
-// the same key is already the whole disk budget of both process runners
-// (compose.go, the shared and parser runners below), so handing the spools the
-// undivided key would let three independent consumers each believe they own it.
-// A query's spools are the smallest of the three claims -- one bounded page of
-// ranked records per live cursor -- so they take the smallest share.
+// spoolBudgetDivisor is what resources.max_temp_bytes is divided by to size
+// the query spools' share of it. The key is one total over every consumer of
+// temporary disk that it bounds: the query spools take this share, and the
+// shared process runner -- the only runner whose children stage temporary
+// bytes -- takes the rest (tempDiskShares). The parser workers exchange
+// everything over pipes and reserve no disk, so they hold no share.
 //
 // The divisor stays a DERIVATION and is deliberately not a `resources.spool_bytes`
-// key. A second key would let an operator set the three shares so they oversubscribe
-// the one budget `max_temp_bytes` exists to cap, which is the failure the single key
-// prevents; and the quantity an operator actually reasons about -- total temporary
-// disk -- is already settable. 8 is the share, not a cap on any one query: three
-// consumers (shared runner, parser runner, spools) claim the budget, the spools are
-// the smallest and shortest-lived claim, and the remaining headroom absorbs the two
-// process runners' bursts. To give queries more room, raise `resources.max_temp_bytes`.
+// key. A second key would let an operator set the shares so they oversubscribe
+// the one budget `max_temp_bytes` exists to cap, which is the failure the single
+// key prevents; and the quantity an operator actually reasons about -- total
+// temporary disk -- is already settable. 8 is the share, not a cap on any one
+// query: the spools hold one bounded page of ranked records per live cursor,
+// the smaller and shorter-lived of the two claims, and the runner's children
+// stage whole materializations. To give queries more room, raise
+// `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
-// parserWorkerReservationBytes is what one tree-sitter worker is admitted
-// against, and therefore what the parser runner's budget is sized from. It is
-// the provider's own default restated here so one number sizes both sides
-// rather than a budget guessing at a default it cannot see.
-//
-// Task 20 measured it on this host, with the real worker subprocess and all
-// pinned grammars loaded: one worker peaks at 38.9 MiB over ordinary repository
-// files and grows linearly at about 30.5 MiB per MiB of source, reaching
-// 191.5 MiB at `workspace.max_parse_file_bytes = 5 MiB`. Ledger 113's "roughly
-// seven times over-reserved" reproduces exactly -- but only for ordinary files.
-// Re-pinning to the ~37 MiB that measurement suggests would let a worker exceed
-// its own admission reservation five-fold on a single legal file, so the pin
-// stays at 256 MiB, which leaves about a third of headroom over the parse
-// ceiling. The measurement, not the round number, is the reason.
+// parserWorkerReservationBytes is the memory one parser worker reserves while
+// it runs, and therefore what the parser runner's budget is sized from. One
+// constant sizes both sides, so the budget never guesses at a reservation it
+// cannot see. It is one fixed figure for every worker, whatever the file it
+// parses: it has to cover a worker parsing a file at the largest size
+// workspace.max_parse_file_bytes admits, not an ordinary one.
 const parserWorkerReservationBytes int64 = 256 << 20
 
 // collectorBatchLimit bounds every phase of one retention pass. It restates
@@ -157,9 +148,8 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 			"component", "app", "data_dir", dataDir, "stand_in_disk_allocation_bytes", unobservedFreeDiskBytes)
 		return unobservedFreeDiskBytes, false
 	}
-	if free > math.MaxInt64 {
-		free = math.MaxInt64
-	}
+	// A measured figure always fits int64: diskfree.Available reports a
+	// product that would not round-trip as unmeasured.
 	allocation := int64(free) - floorBytes
 	if allocation <= 0 {
 		slog.Warn("the data directory has less free space than the floor the host keeps, so heavy children that stage to disk run one at a time",
@@ -167,6 +157,24 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 		return 0, true
 	}
 	return allocation, true
+}
+
+// tempDiskShares splits resources.max_temp_bytes into the shared runner's
+// disk budget and the query spools' budget so the two sum to exactly the
+// ceiling the operator set. Zero, the default, is unlimited and stays
+// unlimited on both sides. Neither share of a set ceiling may round to zero,
+// because zero is read as unlimited by both consumers; a ceiling too small
+// to split into two positive shares -- one byte -- gives each consumer the
+// ceiling itself, which refuses every real reservation either way.
+func tempDiskShares(total int64) (runner, spools int64) {
+	if total <= 0 {
+		return 0, 0
+	}
+	if total < 2 {
+		return total, total
+	}
+	spools = max(total/spoolBudgetDivisor, 1)
+	return total - spools, spools
 }
 
 // childSlots is that division: how many children of the smallest possible size
@@ -190,16 +198,15 @@ const (
 	// directories, which is what opening a store means -- so `codectx status`
 	// answers while a `watch` session holds the workspace instead of being
 	// refused for a lock it does not need: Section 12.3 makes the active
-	// generation immutable once published, and a report reads only that
-	// (ledger 159 keeps the same path from installing anything, which the
-	// providers now honour by construction).
+	// generation immutable once published, and a report reads only that. The
+	// providers install nothing on this path by construction.
 	modeReport
 	// modeQuery composes for a command that only answers questions: it takes
 	// no lock and, beyond what modeReport already withholds, opens the store
-	// with NO writer connection at all. Every write a query process used to
-	// perform -- the schema check inside a write transaction at open, and the
-	// retention lease each pinned generation inserted -- waited on the write
-	// transaction a concurrent run holds, so a second process was refused
+	// with NO writer connection at all. Any write a query process performed
+	// -- a schema check inside a write transaction at open, a retention lease
+	// inserted per pinned generation -- would wait on the write transaction a
+	// concurrent run holds, so a second process would be refused
 	// `database is busy` for the whole of an index. A reader pool on a
 	// write-ahead log never waits on a writer, so this composition answers
 	// throughout a run and delays none of it.
@@ -455,7 +462,7 @@ type stack struct {
 func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err error) {
 	// os.Executable is resolved once, here, and a failure is fatal: every
 	// later reader of this path would otherwise silently fall back to argv[0],
-	// which a caller controls (ledger 113, 126).
+	// which a caller controls.
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeInternal,
@@ -592,9 +599,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 	// The content store opens before the database: it holds no lock and no
 	// state of its own. A composition that only answers opens it for reading,
-	// which creates nothing and refuses every storing entry point: this is the
-	// open that used to bring a workspace into being -- and fail outright on
-	// one an operator had made read-only -- before anything had read a byte.
+	// which creates nothing and refuses every storing entry point, so a
+	// workspace is never brought into being by a query -- and one an operator
+	// made read-only is never refused -- before anything has read a byte.
 	if o.mode == modeQuery {
 		s.cas, err = snapshot.OpenCASForReading(snapshot.CASDir(s.dataDir))
 	} else {
@@ -675,8 +682,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
+	runnerDisk, spoolDisk := tempDiskShares(cfg.Resources.MaxTempBytes)
 	if s.spools, err = pagination.NewSpools(filepath.Join(s.dataDir, workDirName, spoolsDirName),
-		cfg.Resources.MaxTempBytes/spoolBudgetDivisor, s.store); err != nil {
+		spoolDisk, s.store); err != nil {
 		return nil, err
 	}
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
@@ -719,35 +727,46 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
-	// resources.max_temp_bytes is passed through UNCLAMPED, including its
-	// unlimited default of 0: the runner reads a non-positive disk budget as
-	// unlimited and admits every reservation, so the default never refuses a
-	// child at admission. Only a value the operator set refuses one, and it
-	// says so with resources.max_temp_bytes named in the error.
+	// The runner's share of resources.max_temp_bytes (tempDiskShares) is its
+	// disk budget, including the unlimited default of 0: the runner reads a
+	// non-positive disk budget as unlimited and admits every reservation, so
+	// the default never refuses a child at admission. Only a ceiling the
+	// operator set refuses one, and it says so with resources.max_temp_bytes
+	// named in the error.
+	//
 	// The runner beneath the admission gate must never refuse what the gate
-	// admitted. The gate runs a child larger than the whole allocation ALONE
-	// rather than refusing it, and a unit's reservation is its heap cap --
-	// itself bounded by the allocation -- plus the memory its family keeps
-	// outside the heap, so the largest child a unit can present is always
-	// larger than the allocation. A runner budgeted at the allocation would
-	// refuse precisely that unit, with the resource-limit error the whole
-	// memory ruling exists to avoid. This is the same rule the language-server
-	// runner below states: the budget is wide enough for the largest child the
-	// gate above it can admit.
+	// admitted, in memory. The gate runs a child larger than the whole
+	// allocation ALONE rather than refusing it. A dependence unit's
+	// reservation is its heap cap -- itself bounded by the allocation -- plus
+	// the memory its family keeps outside the heap, so the largest child a
+	// unit can present is larger than the allocation; an external indexer's
+	// is its profile's fixed figure, which a small host's allocation can be
+	// below. A runner budgeted at the allocation would refuse precisely those
+	// children, with the resource-limit error the whole memory ruling exists
+	// to avoid. This is the same rule the language-server runner below
+	// states: the budget is wide enough for the largest child the gate above
+	// it can admit.
 	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
+	for _, k := range scip.Kinds {
+		if mem, _, ok := scip.ProfileReservation(scip.ProfileScope(string(k), "")); ok {
+			sharedBudget = maxInt64(sharedBudget, mem)
+		}
+	}
 	shared, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     childSlots(sharedBudget),
 		MemoryBudgetBytes: sharedBudget,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
+		DiskBudgetBytes:   runnerDisk,
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Parser workers are CPU-bound, so how many run at once is counted by
+	// cores. They exchange everything with this process over pipes and
+	// reserve no disk, so the runner holds no share of the temporary ceiling.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
 		MemoryBudgetBytes: int64(parserWorkers) * parserWorkerReservationBytes,
-		DiskBudgetBytes:   cfg.Resources.MaxTempBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -787,6 +806,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if gerr != nil {
 			return nil, gerr
 		}
+		// No wall clock: every plumbing run is ended only when it stops
+		// making progress, after the package's hang-detector window.
 		if s.git, err = git.New(ctx, shared, exePath, 0); err != nil {
 			return nil, err
 		}
@@ -1613,18 +1634,18 @@ func (f validatorFunc) Current(ctx context.Context, file model.FileID, hash stri
 // state of a live workspace: nothing published yet, the file absent from the
 // current snapshot, and a deletion tombstone.
 //
-// Note what this cannot decide today, so nobody reads more into it than it
+// Note what this cannot decide, so nobody reads more into it than it
 // says. A generation's snapshot is fixed when the generation begins, so while
 // the session's generation IS the active one the snapshot asked here is the
 // session's own and every pinned hash matches by construction; and when it is
 // not the active one, the gate is already shut by supersession. Precondition 7
-// is therefore subsumed by Superseded at present. It is asked separately anyway
+// is therefore subsumed by Superseded. It is asked separately anyway
 // because the two are different questions -- the readiness contract promises a
 // per-file answer, and the source that would make it decisive is a per-file
-// WORKTREE hash, which this repository does not have yet: coherence is
-// snapshot-level (HEAD plus a dirty flag, internal/index/status.go:88).
-// Ledgered for Task 20; until then the guarantee limit's "pair it with
-// expected-content-hash validation at each write" is what covers the gap.
+// WORKTREE hash, which this repository does not have: coherence is
+// snapshot-level (HEAD plus a dirty flag, internal/index/status.go). The
+// guarantee limit's "pair it with expected-content-hash validation at each
+// write" is what covers the gap.
 func (s *stack) currentSource(ctx context.Context, file model.FileID, hash string) (bool, error) {
 	snap, err := s.activeSnapshot(ctx)
 	if err != nil {

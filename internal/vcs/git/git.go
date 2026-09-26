@@ -52,11 +52,25 @@ import (
 const MinimumVersion = "2.31.0"
 
 const (
-	// DefaultTimeout bounds one plumbing run. Listing a quarter-million-file
-	// index is seconds; a run that takes longer than this is stuck.
-	DefaultTimeout = 10 * time.Minute
-	// versionTimeout bounds the one `git version` run New performs.
-	versionTimeout = 30 * time.Second
+	// DefaultStallWindow is how long one plumbing run may make no observable
+	// progress -- no byte on either pipe and, where the platform samples a
+	// running tree, no processor time -- before the runner ends it as
+	// stalled. It is a hang detector and not a size budget: a run on any
+	// repository that keeps moving is never ended, however long it takes, and
+	// a wedged one is ended however small the repository is.
+	//
+	// The window has to outlast the longest pause a live run shows. Two such
+	// pauses exist. Git itself can be silent while it works: `git status`
+	// stats and re-hashes the worktree before it writes its first record, and
+	// where no tree sampler exists (every platform but Linux) that phase has
+	// no signal at all. And a streaming run's output is read only as fast as
+	// the caller's visit function consumes it, so while one visit blocks --
+	// a staging write waiting on a slow disk -- the pipe fills, Git blocks
+	// writing to it and burns no processor time. The window is therefore the
+	// five minutes the configured child hang detectors
+	// (providers.*.stall_timeout) default to, far above either pause on a
+	// working host.
+	DefaultStallWindow = 5 * time.Minute
 	// maxVersionBytes bounds that command's output; the line is short.
 	maxVersionBytes = 4 << 10
 	grace           = 5 * time.Second
@@ -97,10 +111,12 @@ var safeConfig = []string{"-c", "core.fsmonitor=false"}
 
 // Git executes plumbing against one absolute Git executable.
 type Git struct {
-	runner  *process.Runner
-	path    string
-	env     []string
-	timeout time.Duration
+	runner *process.Runner
+	path   string
+	env    []string
+	// stall is every run's hang-detector window (process.Spec.StallTimeout).
+	// No run has a wall-clock bound.
+	stall time.Duration
 
 	// MaxFilterDrivers bounds how many configured filter drivers one run
 	// neutralizes. Zero -- the default -- is unlimited: a monorepo really does
@@ -155,17 +171,20 @@ func Locate() (string, error) {
 // New records the absolute executable, captures the allowlisted environment
 // once, and runs `git version` once through the runner to refuse a Git older
 // than MinimumVersion (a typed, non-retryable CTX_PROVIDER_UNAVAILABLE). That
-// is the only process New spawns; captures do not repeat it. timeout <= 0
-// selects DefaultTimeout.
-func New(ctx context.Context, runner *process.Runner, executable string, timeout time.Duration) (*Git, error) {
+// is the only process New spawns; captures do not repeat it.
+//
+// stall is the hang-detector window of every run, the version check
+// included; stall <= 0 selects DefaultStallWindow. No run has a wall-clock
+// bound: a run is ended only when it stops making progress.
+func New(ctx context.Context, runner *process.Runner, executable string, stall time.Duration) (*Git, error) {
 	if runner == nil {
 		return nil, internal("git requires the shared process runner")
 	}
 	if !filepath.IsAbs(executable) {
 		return nil, &model.Error{Code: model.CodeTrustRequired, Message: "the git executable path is not absolute"}
 	}
-	if timeout <= 0 {
-		timeout = DefaultTimeout
+	if stall <= 0 {
+		stall = DefaultStallWindow
 	}
 	env := append([]string(nil), fixedEnv...)
 	for _, name := range envAllowlist {
@@ -173,7 +192,7 @@ func New(ctx context.Context, runner *process.Runner, executable string, timeout
 			env = append(env, name+"="+value)
 		}
 	}
-	g := &Git{runner: runner, path: executable, env: env, timeout: timeout}
+	g := &Git{runner: runner, path: executable, env: env, stall: stall}
 	if err := g.checkVersion(ctx); err != nil {
 		return nil, err
 	}
@@ -185,9 +204,7 @@ func New(ctx context.Context, runner *process.Runner, executable string, timeout
 // is the working directory: `git version` consults no repository.
 func (g *Git) checkVersion(ctx context.Context) error {
 	var out bytes.Buffer
-	probe := *g
-	probe.timeout = versionTimeout
-	if _, err := probe.run(ctx, filepath.Dir(g.path), &out, maxVersionBytes, "version"); err != nil {
+	if _, err := g.run(ctx, filepath.Dir(g.path), &out, maxVersionBytes, "version"); err != nil {
 		return err
 	}
 	version, ok := parseVersion(out.String())
@@ -330,7 +347,7 @@ func (g *Git) Head(ctx context.Context, root string) (string, error) {
 // --quiet makes "HEAD is not a symbolic ref" exit 1 with no diagnostic, which
 // is the detached case. A missing repository is Git's own fatal exit 128, and
 // only that message is read as "not a repository": any other failure — an
-// unreadable or damaged repository, a timeout — is returned as the typed error
+// unreadable or damaged repository, a stalled run — is returned as the typed error
 // it is, rather than collapsing into the same "" a caller would take for a
 // plain directory.
 func (g *Git) SymbolicRef(ctx context.Context, root string) (string, error) {
@@ -650,7 +667,7 @@ func (g *Git) runStderr(ctx context.Context, root string, extraEnv []string, sin
 		Stderr:         &stderr,
 		MaxStdoutBytes: maxStdout,
 		MaxStderrBytes: maxStderrBytes,
-		Timeout:        g.timeout,
+		StallTimeout:   g.stall,
 		Grace:          grace,
 	})
 	if err != nil {

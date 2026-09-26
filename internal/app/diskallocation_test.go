@@ -43,3 +43,27 @@ func TestFreeDiskAllocationRecordsWhatWasMeasured(t *testing.T) {
 			unmeasured, observed, unobservedFreeDiskBytes)
 	}
 }
+
+// resources.max_temp_bytes is one total over every consumer of temporary disk
+// it bounds, so an operator ceiling of X admits at most X across the shared
+// runner and the query spools together, and the unlimited default stays
+// unlimited on both. Mutations this fails on:
+//   - the runner handed the whole ceiling beside the spools' share: X admits
+//     X plus an eighth of X;
+//   - a share rounding to zero on a small ceiling: that consumer reads zero as
+//     unlimited and the ceiling no longer bounds it;
+//   - the default split into anything but two unlimited shares.
+func TestTemporaryCeilingHoldsAcrossEveryConsumer(t *testing.T) {
+	if runner, spools := tempDiskShares(0); runner != 0 || spools != 0 {
+		t.Fatalf("the unlimited default split into runner %d and spools %d; want both unlimited", runner, spools)
+	}
+	for _, total := range []int64{2, 7, spoolBudgetDivisor, 1<<30 + 3} {
+		runner, spools := tempDiskShares(total)
+		if runner <= 0 || spools <= 0 {
+			t.Fatalf("a ceiling of %d gave runner %d and spools %d; a zero share is unlimited", total, runner, spools)
+		}
+		if runner+spools != total {
+			t.Fatalf("a ceiling of %d admits %d (runner %d + spools %d)", total, runner+spools, runner, spools)
+		}
+	}
+}
