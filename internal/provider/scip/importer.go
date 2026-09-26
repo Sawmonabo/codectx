@@ -1243,6 +1243,11 @@ func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
 //   - one occurrence of the symbol ranges exactly over <spelling>, and another
 //     ranges exactly over the <name> the clause aliases.
 //
+// Both are measured, and each is what one pinned indexer emits: the Python
+// indexer ranges one occurrence over `OrderedDict as OD` and spells its uses
+// `OD`; the Rust indexer puts one role-less occurrence on `HashSet` and one on
+// `Set` in `HashSet as Set`, and spells its uses `Set`.
+//
 // A uniform shift moves both occurrences of the second shape by the same
 // distance, so it cannot leave one on the aliased name and the other on the
 // alias; and a cast (`len as u32`) holds only the first token as an occurrence

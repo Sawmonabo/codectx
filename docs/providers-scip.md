@@ -395,10 +395,15 @@ Measured over the indexes the six pinned indexers produce from the fixtures of
 the per-platform matrix — 308 occurrences, all nine languages — the proof
 refuses none of the 306 that spell their symbol's own name or are not
 name-checked. The other two are `Set` for `HashSet`, the alias clause and its
-use. Whether that indexer also puts an occurrence on the clause's `HashSet`
-token, which the second clause shape needs, is **unmeasured**; until it is,
-whether the clause admits those two is unmeasured too, and a refusal of them is
-counted like any other rather than published.
+use, and the clause admits both. Measured with the pinned build on the
+fixture's `use std::collections::{HashMap, HashSet as Set};`, the indexer puts
+two occurrences of the `HashSet` symbol on that line, neither with a role: one
+exactly on the clause's `HashSet` token (columns 32–39) and one exactly on
+`Set` (columns 43–46). That is the second clause shape, so `Set` is bound, the clause's own `Set` is admitted and so is
+the later `Set<u8>`. The whole-clause shape is the one the Python indexer
+emits: its occurrence ranges over `OrderedDict as OD`, and measured with a use
+of `OD` added to a copy of the fixture, the use is an occurrence of the `OrderedDict`
+symbol spelled `OD`, which that clause binds.
 
 **What the proof does not catch.** It compares bytes, and it never adjusts or
 guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
