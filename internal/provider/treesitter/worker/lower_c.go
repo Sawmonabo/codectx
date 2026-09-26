@@ -221,7 +221,15 @@ const (
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
 // may-defines an owned variable that replaces the held read, so the folded
-// read pairs with the definition that reached it. Given up: the order of
+// read pairs with the definition that reached it. The hand-off is made only
+// when the defining node runs whenever the consumer does: a definition in
+// the right operand of `&&` or `||`, in an arm of `?:`, or in a statement
+// of a statement expression other than its last, which a jump inside it may
+// skip, leaves the read on the consumer. Given up for the last case: when no
+// jump skips that statement, the consumer's read pairs with the definition
+// inside the statement expression only, losing the earlier one; most shapes
+// that reach it, such as `x + ({ x = 1; 0; })`, leave the read and the
+// definition unsequenced. Given up: the order of
 // operands the language leaves unsequenced (`x + (x = 1)`, C17 §6.5p2,
 // [intro.execution]) or indeterminately sequenced (the arguments of a call,
 // [expr.call]). The lowering takes one order: left to right, except that
@@ -401,10 +409,13 @@ type cLower struct {
 	// node made takes those from its own first read on (see nodeAt). base is
 	// where the reads of the innermost open statement expression begin (0
 	// outside one): its statements keep the enclosing expression's reads
-	// below base. held[v] counts v's entries in reads.
+	// below base. held[v] counts v's entries in reads. sure is where the
+	// reads begin that were made on every path reaching the node being
+	// lowered: a definition hands on only those (see def).
 	reads []int32
 	held  []int32
 	base  int
+	sure  int
 	// may are the pending may-definitions, each with the position in reads
 	// where the operand that makes it began: a node takes the ones from its
 	// own first read on (see nodeAt).
@@ -452,7 +463,7 @@ func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k 
 	c.l, c.b, c.src, c.k, c.cur, c.binds = l, b, src, k, s.cursor(fn), &s.scope
 	clear(c.buf[:cap(c.buf)])
 	c.buf = c.buf[:0]
-	c.blockMark, c.pp, c.ppArm, c.shadow, c.base = 0, -1, -1, 0, 0
+	c.blockMark, c.pp, c.ppArm, c.shadow, c.base, c.sure = 0, -1, -1, 0, 0, 0
 	c.parked.truncate(0)
 	c.reads, c.held, c.may, c.shape, c.writes, c.names, c.hs =
 		c.reads[:0], c.held[:0], c.may[:0], c.shape[:0], c.writes[:0], c.names[:0], c.hs[:0]
@@ -630,9 +641,10 @@ func (c *cLower) mayDef(at int, v int32) {
 
 // def records that node n defines v, unless v is -1. When the statement
 // still holds a read of v that no node carries, made before n by an
-// enclosing expression (`f(x, x = 1)`), n reads that earlier value before
-// overwriting it and hands it on through an owned variable it may-defines,
-// which replaces the held reads (see Uses in lowerC).
+// enclosing expression (`f(x, x = 1)`) on every path reaching n (from
+// reads[sure] on), n reads that earlier value before overwriting it and
+// hands it on through an owned variable it may-defines, which replaces
+// those held reads (see Uses in lowerC).
 func (c *cLower) def(n, v int32) {
 	if v < 0 {
 		return
@@ -641,18 +653,37 @@ func (c *cLower) def(n, v int32) {
 	if int(v) >= len(c.held) || c.held[v] == 0 {
 		return
 	}
-	c.b.Use(n, v)
-	t := c.b.Var()
-	c.b.MayDef(n, t)
-	for i, x := range c.reads {
-		if x == v {
-			c.reads[i] = t
+	moved := int32(0)
+	t := int32(-1)
+	for i := c.sure; i < len(c.reads); i++ {
+		if c.reads[i] != v {
+			continue
 		}
+		if t < 0 {
+			t = c.b.Var()
+		}
+		c.reads[i] = t
+		moved++
 	}
+	if t < 0 {
+		return
+	}
+	c.b.Use(n, v)
+	c.b.MayDef(n, t)
 	if int(t) >= len(c.held) {
 		c.held = append(c.held, make([]int32, int(t)+1-len(c.held))...)
 	}
-	c.held[t], c.held[v] = c.held[v], 0
+	c.held[t], c.held[v] = moved, c.held[v]-moved
+}
+
+// maybe lowers the operand n, evaluated only on some paths reaching the
+// consumer, for its value into a node defining r: a definition inside it
+// hands on none of the reads held before it.
+func (c *cLower) maybe(n *ts.Node, r int32) {
+	sure := c.sure
+	c.sure = len(c.reads)
+	c.yield(n, r)
+	c.sure = sure
 }
 
 // result is an owned result variable (see Lowering) that node n defines.
@@ -1932,7 +1963,7 @@ func (c *cLower) value(n *ts.Node) int32 {
 			c.value(u)
 			r := c.result(c.node(flow.Branch, u, m))
 			p := c.b.Push()
-			c.yield(right, r)
+			c.maybe(right, r)
 			c.b.Merge(p)
 			c.b.Pop(p)
 			c.read(r)
@@ -1955,11 +1986,11 @@ func (c *cLower) value(n *ts.Node) int32 {
 		}
 		p := c.b.Push()
 		if cons != nil {
-			c.yield(cons, r)
+			c.maybe(cons, r)
 		}
 		t := c.b.Push()
 		c.b.Restore(p)
-		c.yield(n.ChildByFieldId(k.fAlternative), r)
+		c.maybe(n.ChildByFieldId(k.fAlternative), r)
 		c.b.Merge(t)
 		c.b.Pop(p)
 		c.read(r)
@@ -2119,14 +2150,19 @@ func (c *cLower) children(n *ts.Node) {
 // node of its last statement when that is an expression statement, or -1
 // when the construct has no value.
 func (c *cLower) stmtExpr(n *ts.Node) int32 {
-	base, throws, thrown := c.base, c.throws, c.thrown
+	base, throws, thrown, sure := c.base, c.throws, c.thrown, c.sure
 	c.base = len(c.reads)
 	r := int32(-1)
 	s := c.open()
 	start, list := c.kids(n)
 	for i := range list {
 		if i < len(list)-1 || list[i].KindId() != c.k.expressionStatement {
+			// A jump inside the statement expression may skip this
+			// statement on a path that still reaches the value, so its
+			// definitions hand on none of the enclosing reads.
+			c.sure = c.base
 			c.stmt(&list[i])
+			c.sure = sure
 			continue
 		}
 		c.reset()

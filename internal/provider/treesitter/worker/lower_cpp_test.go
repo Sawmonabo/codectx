@@ -222,5 +222,22 @@ func TestCppLoweringGolden(t *testing.T) {
 			src:      "int f(int x) { return g(x, x = 1); }",
 			du:       []string{"x@10 -> x = 1@27", "x = 1@27 -> return g(x, x = 1);@15"},
 		},
+		{
+			// [expr.log.and]/1: the right operand is evaluated only when the
+			// left is true; [expr.call]: the arguments are indeterminately
+			// sequenced, taken in source order. Nodes: x@10, c@17, c@34
+			// (Branch, Uses c, defines the && result), x = 1@40 (defines x and
+			// may-defines its result and the && result; it runs only when c
+			// is true, so it takes no read held before it), return g(x, c &&
+			// (x = 1));@22 (Uses the held x and the && result). Succ: c@34→
+			// {x = 1, return}; x = 1→return. IPDom: c@34 → return.
+			name:     "a read held before a conditionally evaluated assignment stays on the consumer",
+			protects: "on the path that skips an assignment in a && operand the consumer still sees the local's earlier definition, and on the other path the assignment",
+			mutation: "hand the held read off to the assignment unconditionally (adds x@10 -> x = 1@40, loses x@10 -> return g(x, c && (x = 1));@22)",
+			src:      "int f(int x, int c) { return g(x, c && (x = 1)); }",
+			cd:       []string{"c@34 -> x = 1@40"},
+			du: []string{"c@17 -> c@34", "x@10 -> return g(x, c && (x = 1));@22", "x = 1@40 -> return g(x, c && (x = 1));@22",
+				"c@34 -> return g(x, c && (x = 1));@22"},
+		},
 	})
 }
