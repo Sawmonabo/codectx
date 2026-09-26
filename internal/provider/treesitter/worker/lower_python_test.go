@@ -200,37 +200,37 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"a() as x@16 -> with a() as x@11", "b() as y@26 -> with a() as x, b() as y@11"},
 		},
 		{
-			// §8.6.2, §8.6.3. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6, p@17
-			// (subject), (x, y)@27 (a Branch using the subject), x@28 and
-			// y@31 (captures), x@37 (guard), r = y@43, _@56 (irrefutable: a
+			// §8.6.2, §8.6.3. Lines at 0, 10, 20, 40, 49, 59, 68. Nodes: p@6,
+			// p@17 (the subject, evaluated once: Uses p and defines the
+			// subject's variable), (x, y)@27 (a Branch Using the subject's
+			// variable), x@28 and y@31 (captures, Using it too), x@37 (guard), r = y@43, _@56 (irrefutable: a
 			// Stmt, no false edge), r = 0@62, return r@69. Succ: (x, y)→
 			// {x@28, _}; x@28→y@31→x@37→{r = y, _}; _→r = 0; both arms →
 			// return r. IPDom: (x, y), x@37 → return r; x@28 → y@31 → x@37.
 			name:     "a failed guard reaches the next case and the wildcard has no false edge",
 			protects: "captures are defined on the taken path from the subject, a guard's false edge continues with the next case, and an irrefutable last case never falls out of the match",
-			mutation: "give the wildcard case a false edge (_@56 gains control of r = 0@62), or send a failed guard past the match (x@37 loses x@37 -> _@56)",
+			mutation: "give the wildcard case a false edge (_@56 gains control of r = 0@62), or send a failed guard past the match (x@37 loses x@37 -> _@56), or make the case and capture nodes Use the subject's reads (p@6 -> (x, y)@27, p@6 -> x@28, p@6 -> y@31 and p@6 -> _@56 replace the pairs from p@17)",
 			src:      "def f(p):\n match p:\n  case (x, y) if x:\n   r = y\n  case _:\n   r = 0\n return r\n",
 			fn:       1,
 			cd: []string{"(x, y)@27 -> x@28", "(x, y)@27 -> y@31", "(x, y)@27 -> x@37", "(x, y)@27 -> _@56",
 				"(x, y)@27 -> r = 0@62", "x@37 -> r = y@43", "x@37 -> _@56", "x@37 -> r = 0@62"},
-			du: []string{"p@6 -> p@17", "p@6 -> (x, y)@27", "p@6 -> x@28", "p@6 -> y@31", "p@6 -> _@56",
+			du: []string{"p@6 -> p@17", "p@17 -> (x, y)@27", "p@17 -> x@28", "p@17 -> y@31", "p@17 -> _@56",
 				"x@28 -> x@37", "y@31 -> r = y@43", "r = y@43 -> return r@69", "r = 0@62 -> return r@69"},
 		},
 		{
 			// §6.2.4: the leftmost for clause's iterable is evaluated in the
 			// enclosing scope. Lines at 0, 14. Nodes: xs@6, k@10, the
 			// comprehension node@22 (its first iterable xs is evaluated
-			// here; k is a capture; x is the comprehension's own), return
-			// …@15, which Uses the first iterable's read, a part of its own
-			// statement's evaluation, and not the capture k, which the
-			// creating node carries.
+			// here; k is a capture; x is the comprehension's own; it
+			// defines the created value's result variable), return …@15,
+			// which Uses that variable only.
 			name:     "a comprehension's first iterable and captures are uses of its creating node",
-			protects: "the enclosing function evaluates the first iterable, the comprehension's own target shadows nothing outside it, and the return consuming the comprehension does not repeat its captures",
-			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node), or keep the captures in the consuming statement's reads (k@10 -> return [x + k for x in xs if x]@15 appears)",
+			protects: "the enclosing function evaluates the first iterable, the comprehension's own target shadows nothing outside it, and the created value reaches the return through the creating node's result variable, not through the creating node's reads",
+			mutation: "leave the first iterable to the comprehension's own graph (xs@6 no longer reaches the comprehension node), or let the return re-read the creating node's reads (xs@6 -> return …@15 and k@10 -> return …@15 replace [x + k for x in xs if x]@22 -> return …@15)",
 			src:      "def f(xs, k):\n return [x + k for x in xs if x]\n",
 			fn:       1,
 			du: []string{"xs@6 -> [x + k for x in xs if x]@22", "k@10 -> [x + k for x in xs if x]@22",
-				"xs@6 -> return [x + k for x in xs if x]@15"},
+				"[x + k for x in xs if x]@22 -> return [x + k for x in xs if x]@15"},
 		},
 		{
 			// §6.2.4, the comprehension itself (callable 2). Nodes: for x in
@@ -249,14 +249,14 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §6.14. Lines at 0, 10, 31. Nodes: a@6, lambda b: a + b@15
-			// (captures a), g = lambda b: a + b@11 (consumes the created
-			// value, not the capture: it Uses nothing), return g@32.
+			// (captures a; defines the created value's result variable),
+			// g = lambda b: a + b@11 (Uses the result variable), return g@32.
 			name:     "a lambda's creating node uses its captures",
-			protects: "a lambda is its own callable and the enclosing function sees only its creation, whose node reads the enclosing variables it references and whose consumer does not repeat them",
-			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6), or keep the captures in the assignment's reads (a@6 -> g = lambda b: a + b@11 appears)",
+			protects: "a lambda is its own callable and the enclosing function sees only its creation, whose node reads the enclosing variables it references and hands the created value to its consumer through a variable",
+			mutation: "resolve a lambda's body against the enclosing scope as plain reads of the assignment (the lambda node loses a@6), or let the assignment re-read the captures (a@6 -> g = lambda b: a + b@11 replaces lambda b: a + b@15 -> g = lambda b: a + b@11)",
 			src:      "def f(a):\n g = lambda b: a + b\n return g\n",
 			fn:       1,
-			du: []string{"a@6 -> lambda b: a + b@15",
+			du: []string{"a@6 -> lambda b: a + b@15", "lambda b: a + b@15 -> g = lambda b: a + b@11",
 				"g = lambda b: a + b@11 -> return g@32"},
 		},
 		{
@@ -373,17 +373,22 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"class C: a = 1 def m(self): return a@11 -> return C@56"},
 		},
 		{
-			// §6.10. Lines at 0, 16. Nodes: a@6, b@9, c@12, a < b@24
-			// (Branch), c@32 (evaluated only when a < b), return a < b <
-			// c@17.
+			// §6.10: b is evaluated once, and c only when a < b holds. Lines
+			// at 0, 16. Nodes: a@6, b@9, c@12, a < b@24 (Branch: Uses a and
+			// b, defines the result variable, the value when it fails, and
+			// may-defines a variable holding b), c@32 (evaluated only when a
+			// < b holds: Uses c and the held b, makes b < c and defines the
+			// result variable), return a < b < c@17 (Uses the result
+			// variable). Succ: a < b→{c, return}; c→return. IPDom: a < b, c
+			// → return.
 			name:     "a chained comparison evaluates its later operand only when the earlier comparison holds",
-			protects: "the operand after a comparison in a chain is control dependent on that comparison",
-			mutation: "lower a chained comparison as a plain expression (a < b@24 and c@32 are not made and the control dependence disappears)",
+			protects: "the operand after a comparison in a chain is control dependent on that comparison, the middle operand's value reaches the last comparison through a variable, and the chain's value reaches the return from both comparisons",
+			mutation: "lower a chained comparison as a plain expression (a < b@24 and c@32 are not made and the control dependence disappears), or let the return re-read the operands (a@6, b@9 and c@12 -> return a < b < c@17 replace the pairs from a < b@24 and c@32)",
 			src:      "def f(a, b, c):\n return a < b < c\n",
 			fn:       1,
 			cd:       []string{"a < b@24 -> c@32"},
-			du: []string{"a@6 -> a < b@24", "b@9 -> a < b@24", "c@12 -> c@32",
-				"a@6 -> return a < b < c@17", "b@9 -> return a < b < c@17", "c@12 -> return a < b < c@17"},
+			du: []string{"a@6 -> a < b@24", "b@9 -> a < b@24", "c@12 -> c@32", "a < b@24 -> c@32",
+				"a < b@24 -> return a < b < c@17", "c@32 -> return a < b < c@17"},
 		},
 		{
 			// §7.2. Lines at 0, 13, 22. Nodes: o@6, v@9, o.p = v@14 (reads
@@ -490,19 +495,20 @@ func TestPythonLoweringGolden(t *testing.T) {
 		{
 			// §8.5: a failing assignment to the target runs __exit__. Lines
 			// at 0, 13, 29, 36. Nodes: m@6, o@9, m as o.p@19 (enter, reads
-			// m, may-defines the manager), o.p@24 (the target's write: reads
-			// m and o, may-defines o, may throw into the item's finally),
+			// m, defines the entered value's variable and may-defines the
+			// manager's), o.p@24 (the target's write: Uses the entered value
+			// and o, may-defines o, may throw into the item's finally),
 			// with@14 (that finally's Handler), with m as o.p@14 (the exit),
 			// return o@37. Succ: o.p→{with@14, exit}; with@14→exit;
 			// exit→{EXIT (the re-raise), return o}. IPDom: o.p, with@14 →
 			// exit → EXIT.
 			name:     "a with item's reference target is bound inside the item's finally",
-			protects: "an exception assigning a with item's target reaches the manager's exit, as one in the body does",
-			mutation: "bind a reference target before opening the item's finally (with@14 disappears and the exit controls nothing)",
+			protects: "an exception assigning a with item's target reaches the manager's exit, as one in the body does, and the target is bound from the entered value, not from the context expression's names",
+			mutation: "bind a reference target before opening the item's finally (with@14 disappears and the exit controls nothing), or bind it from the context expression's reads (m@6 -> o.p@24 replaces m as o.p@19 -> o.p@24)",
 			src:      "def f(m, o):\n with m as o.p:\n  pass\n return o\n",
 			fn:       1,
 			cd:       []string{"o.p@24 -> with@14", "with m as o.p@14 -> return o@37"},
-			du: []string{"m@6 -> m as o.p@19", "m@6 -> o.p@24", "o@9 -> o.p@24", "m as o.p@19 -> with m as o.p@14",
+			du: []string{"m@6 -> m as o.p@19", "m as o.p@19 -> o.p@24", "o@9 -> o.p@24", "m as o.p@19 -> with m as o.p@14",
 				"o@9 -> return o@37", "o.p@24 -> return o@37"},
 		},
 		{
@@ -541,6 +547,134 @@ func TestPythonLoweringGolden(t *testing.T) {
 			src:      "def f(m):\n with m:\n  m = 0\n return m\n",
 			fn:       1,
 			du:       []string{"m@6 -> m@16", "m@16 -> with m@11", "m = 0@21 -> return m@28"},
+		},
+		{
+			// §6.13: the condition is evaluated first, then one arm, whose
+			// value is the expression's. Lines at 0, 16, 35. Nodes: a@6,
+			// b@9, c@12, c@26 (the condition's Branch), a@21 and b@33 (the
+			// arms, each defining the result variable), y = a if c else
+			// b@17 (Uses the result variable, defines y), return y@36.
+			// Succ: c@26→{a@21, b@33}→y = …→return y. IPDom: c@26, a@21,
+			// b@33 → y = ….
+			name:     "a conditional expression hands the chosen arm's value to its consumer through a variable",
+			protects: "the assignment depends on each arm's node through the result variable and on the condition only through control of the arms, never by re-reading the condition's or the arms' names",
+			mutation: "let the consumer re-read the condition and the arms (c@12 -> y = a if c else b@17, a@6 -> y = a if c else b@17 and b@9 -> y = a if c else b@17 replace the pairs from a@21 and b@33)",
+			src:      "def f(a, b, c):\n y = a if c else b\n return y\n",
+			fn:       1,
+			cd:       []string{"c@26 -> a@21", "c@26 -> b@33"},
+			du: []string{"a@6 -> a@21", "b@9 -> b@33", "c@12 -> c@26",
+				"a@21 -> y = a if c else b@17", "b@33 -> y = a if c else b@17", "y = a if c else b@17 -> return y@36"},
+		},
+		{
+			// §6.11: the left operand decides, and the right one is
+			// evaluated only when it does not. Lines at 0, 13. Nodes: a@6,
+			// b@9, a@21 (Branch: Uses a, defines the result variable), b@26
+			// (defines it again), return a or b@14 (Uses it). Succ:
+			// a@21→{b@26, return}; b@26→return. IPDom: a@21, b@26 → return.
+			name:     "a short-circuit operator's value reaches its consumer from each operand that can decide it",
+			protects: "the return depends on the deciding operand's node and on the operand after it through the result variable, not on the operands' names",
+			mutation: "let the consumer re-read the operands (a@6 -> return a or b@14 and b@9 -> return a or b@14 replace the pairs from a@21 and b@26)",
+			src:      "def f(a, b):\n return a or b\n",
+			fn:       1,
+			cd:       []string{"a@21 -> b@26"},
+			du:       []string{"a@6 -> a@21", "b@9 -> b@26", "a@21 -> return a or b@14", "b@26 -> return a or b@14"},
+		},
+		{
+			// §6.10: every operand is evaluated at most once. Lines at 0, 19.
+			// Nodes: a@6, b@9, c@12, d@15, a < b@27 (Branch: Uses a and b,
+			// defines the result variable, holds b), c@35 (Uses c, defines
+			// a variable holding c), b < c@31 (Branch: Uses the two held
+			// variables, defines the result variable), d@39 (Uses d and the
+			// held c, makes c < d, defines the result variable), return a <
+			// b < c < d@20. Succ: a < b→{c@35, return}; c@35→b < c→{d@39,
+			// return}; d@39→return. IPDom: a < b, b < c, d@39 → return;
+			// c@35 → b < c.
+			name:     "a middle comparison of a chain reads the operands held for it",
+			protects: "an operand of a chain is read once, at the node evaluating it, and a later comparison reads its value through the held variable, so b is never re-read by name",
+			mutation: "let a later comparison re-read its operands (b@9 -> b < c@31 and c@12 -> b < c@31 replace a < b@27 -> b < c@31 and c@35 -> b < c@31)",
+			src:      "def f(a, b, c, d):\n return a < b < c < d\n",
+			fn:       1,
+			cd:       []string{"a < b@27 -> c@35", "a < b@27 -> b < c@31", "b < c@31 -> d@39"},
+			du: []string{"a@6 -> a < b@27", "b@9 -> a < b@27", "c@12 -> c@35", "d@15 -> d@39",
+				"a < b@27 -> b < c@31", "c@35 -> b < c@31", "c@35 -> d@39",
+				"a < b@27 -> return a < b < c < d@20", "b < c@31 -> return a < b < c < d@20", "d@39 -> return a < b < c < d@20"},
+		},
+		{
+			// §6.12: the assignment expression's value is the value it
+			// assigns. Lines at 0, 10, 28. Nodes: a@6, x := a@16 (Uses a,
+			// defines x, may-defines the result variable), y = (x := a) *
+			// 2@11 (Uses the result variable, defines y), return x + y@29
+			// (Uses x and y).
+			name:     "an assignment expression's value travels through its result variable",
+			protects: "the node consuming `x := a` reads the result variable the assignment expression's node may-defines, and does not re-read the value's names",
+			mutation: "let the consumer re-read the assigned value's reads (a@6 -> y = (x := a) * 2@11 appears)",
+			src:      "def f(a):\n y = (x := a) * 2\n return x + y\n",
+			fn:       1,
+			du: []string{"a@6 -> x := a@16", "x := a@16 -> y = (x := a) * 2@11", "x := a@16 -> return x + y@29",
+				"y = (x := a) * 2@11 -> return x + y@29"},
+		},
+		{
+			// §6.12: each assignment expression's value is the value it
+			// assigns when it is evaluated. Lines at 0, 9, 34. Nodes: x :=
+			// 1@15 and x := 2@26 (each defines x and may-defines its own
+			// result variable), y = (x := 1) + (x := 2)@10 (Uses the two
+			// result variables, defines y), return y@35.
+			name:     "two assignment expressions to one name each reach their consumer",
+			protects: "the consumer of `(x := 1) + (x := 2)` reads each assignment expression's result variable, so it depends on the first assignment although the second rebinds x before it",
+			mutation: "let the consumer read the assigned name instead of the result variable (x := 1@15 -> y = (x := 1) + (x := 2)@10 disappears)",
+			src:      "def f():\n y = (x := 1) + (x := 2)\n return y\n",
+			fn:       1,
+			du: []string{"x := 1@15 -> y = (x := 1) + (x := 2)@10", "x := 2@26 -> y = (x := 1) + (x := 2)@10",
+				"y = (x := 1) + (x := 2)@10 -> return y@35"},
+		},
+		{
+			// §6.14, §7.2. Lines at 0, 10, 25. Nodes: k@6, lambda: k@15 (the
+			// creating node: captures k, defines the result variable), k =
+			// lambda: k@11 (Uses the result variable, defines k), return
+			// k@26. The statement read k before its assignment, but the
+			// creating node carries that read, so the assignment does not
+			// repeat it.
+			name:     "a defining node does not repeat a read a nested node carries",
+			protects: "an assignment defining a name the statement read earlier Uses it only when no node of its own carries that read, so a lambda capturing the name it is assigned to pairs its capture with the creating node alone",
+			mutation: "make a defining node repeat every earlier read of its variable in the statement (k@6 -> k = lambda: k@11 appears)",
+			src:      "def f(k):\n k = lambda: k\n return k\n",
+			fn:       1,
+			du:       []string{"k@6 -> lambda: k@15", "lambda: k@15 -> k = lambda: k@11", "k = lambda: k@11 -> return k@26"},
+		},
+		{
+			// §7.2: the right side is evaluated once, then assigned to the
+			// targets from left to right. Lines at 0, 13, 26. Nodes: a@6,
+			// b@9, b, a@21 (the right side: Uses b and a, defines a
+			// variable holding the tuple), a@14 and b@17 (the targets, each
+			// Using that variable), return a - b@27.
+			name:     "an unpacking assignment binds every target from the value evaluated once",
+			protects: "a swap's second target reads the tuple, not the name the first target just rebound",
+			mutation: "bind each target from the right side's reads (a@14 -> b@17 appears: the second target reads the a the first one wrote)",
+			src:      "def f(a, b):\n a, b = b, a\n return a - b\n",
+			fn:       1,
+			du: []string{"a@6 -> b, a@21", "b@9 -> b, a@21", "b, a@21 -> a@14", "b, a@21 -> b@17",
+				"a@14 -> return a - b@27", "b@17 -> return a - b@27"},
+		},
+		{
+			// §6.2.4, the comprehension itself (callable 2): a later for
+			// clause's iterable is evaluated once per step of the clause
+			// before it. Lines at 0, 11. Nodes: for x in xs@22 (head, Using
+			// nothing: its iterator is the enclosing function's), x@26
+			// (target), x@43 (the second clause's iterable: Uses x, defines
+			// its iteration variable), for y in x@34 (head, Using that
+			// variable), y@38 (target, Using it), y@20 (element). Succ: for
+			// x→{x@26, EXIT}; x@26→x@43→for y; for y→{y@38, for x};
+			// y@38→y@20→for y. IPDom: for x → EXIT; x@26 → x@43 → for y →
+			// for x; y@38 → y@20 → for y.
+			name:     "a later comprehension clause's head and target read its iteration variable",
+			protects: "a later for clause's iterable is evaluated at its own node, and its head and target read the iterator made there, not the names the iterable reads",
+			mutation: "make a later clause's head and target Use its iterable's reads (x@26 -> for y in x@34 and x@26 -> y@38 appear)",
+			src:      "def f(xs):\n return [y for x in xs for y in x]\n",
+			fn:       2,
+			cd: []string{"for x in xs@22 -> x@26", "for x in xs@22 -> x@43", "for x in xs@22 -> for y in x@34",
+				"for x in xs@22 -> for x in xs@22", "for y in x@34 -> y@38", "for y in x@34 -> y@20",
+				"for y in x@34 -> for y in x@34"},
+			du: []string{"x@26 -> x@43", "x@43 -> for y in x@34", "x@43 -> y@38", "y@38 -> y@20"},
 		},
 	})
 }
