@@ -4,9 +4,8 @@
 // name with the standard library "context" package, which it imports unaliased
 // below at file scope; consumers alias this package contextpkg.
 //
-// This file holds every symbol that crosses a lane boundary. The signatures
-// here are frozen: a lane that needs a different one reports the need rather
-// than changing it.
+// This file holds every symbol the compile's stages share: the compiler, its
+// options and the one intermediate record every stage reads.
 package context
 
 import (
@@ -963,7 +962,7 @@ func (c *Compiler) hydrateStream(ctx context.Context, reader *sqlite.PinnedReade
 	return trackRun(s, run), nil
 }
 
-// candidate is the ONE intermediate record that crosses lane boundaries: seed
+// candidate is the ONE intermediate record the compile's stages share: seed
 // extraction fills it, scope marks its requirement, rank scores it, budget
 // sizes and packs it, manifest persists it. Nothing else is shared state.
 type candidate struct {

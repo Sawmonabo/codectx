@@ -76,9 +76,9 @@ func roundTrip[T any](t *testing.T, name string, want T) {
 	}
 }
 
-// TestLessRankMatchesCandidateLess is the parity linchpin of the whole wave: the
-// streamed pipeline sorts candRecs with lessRank where today's pipeline sorts
-// candidates with candidate.less, so any disagreement between the two is a
+// TestLessRankMatchesCandidateLess is the parity linchpin of the streamed
+// compile: the streamed pipeline sorts candRecs with lessRank where the
+// in-memory pipeline sorts candidates with candidate.less, so any disagreement between the two is a
 // different plan, different ordinals and different slice membership.
 //
 // The table draws PathAtRank INDEPENDENTLY of PathFinal (ruling C3 keeps both,

@@ -300,8 +300,9 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 // and a parity fixture small enough to run in seconds never does: ExternalSort
 // answers a run that fit its buffer from the buffer itself. A mistyped or
 // missing struct tag would therefore pass the whole suite and first surface on
-// a repository large enough to spill -- exactly the case this wave exists for.
-// The round trip is asserted directly instead, as C-L0 asserts it for its own.
+// a repository large enough to spill -- exactly the case streaming exists for.
+// The round trip is asserted directly instead, as the other streamed records'
+// round trips are.
 func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
 	cand := candRec{Seq: 7, Index: 3, NodeID: "n1", FileID: "f1", PathAtRank: "a.go",
 		PathFinal: "b.go", Requirement: model.RequirementSymbol, Origin: originExpansion,

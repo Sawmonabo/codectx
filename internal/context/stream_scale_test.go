@@ -130,7 +130,7 @@ func TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale(t *testing.T) {
 	// Publishing two fixtures of scaledLeaves files costs more than a minute
 	// EACH before a compile starts, so this proof is opt-in rather than part of
 	// every run of this package: leaving it in the default gate would put
-	// minutes on every lane's `go test ./internal/context`, and several times
+	// minutes on every `go test ./internal/context`, and several times
 	// that under -race. The numbers it produces are recorded in
 	// docs/performance.md; run it with CODECTX_SCALE_PROOF=1 to reproduce them.
 	if os.Getenv(scaleProofEnv) == "" {

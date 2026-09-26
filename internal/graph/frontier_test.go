@@ -14,14 +14,14 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// TestResumableFrontierCompletesAcrossPages is the row-13 proof: a walk whose
-// visited budget is far smaller than the graph still returns EVERY edge, across
-// pages, and returns each exactly once.
+// TestResumableFrontierCompletesAcrossPages proves that a walk whose visited
+// budget is far smaller than the graph still returns EVERY edge, across pages,
+// and returns each exactly once.
 //
-// Before this wave, spending max_visited_nodes returned a truncated answer with
-// no continuation (cursor.go withheld the token, traverse.go minted one only
-// for a full page), so the edges past the budget were unreachable at any page
-// size. The mutation that proves this row: restore that withholding -- make
+// The failure it guards: spending max_visited_nodes returns a truncated answer
+// with no continuation (cursor.go withholding the token, traverse.go minting
+// one only for a full page), so the edges past the budget are unreachable at
+// any page size. The mutation that proves it: add that withholding -- make
 // traverse.go mint only when `reason == reasonPageFull`, or reinstate the
 // `b.visited >= MaxVisited` guard in nextTraversalCursor -- and the union of the
 // pages is a strict subset of the unlimited answer, so this test fails.
