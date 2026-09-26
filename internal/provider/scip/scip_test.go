@@ -467,7 +467,7 @@ func appendBytes(b []byte, field int, payload []byte) []byte {
 // occurrence exists, is keyed on the one-based inclusive byte range of the
 // source text needle, and names node.
 //
-// This is the key lane A6's tree-sitter provider computes for the same call
+// This is the key the tree-sitter provider computes for the same call
 // site with the same formula (`facts.go:callsiteKey`), so a disagreement of
 // one byte or one base silently produces an empty join: the `calls` relation
 // then keeps its syntactic callee and never acquires the compiler-resolved
@@ -558,11 +558,17 @@ func TestCallsiteAliasJoin(t *testing.T) {
 			got, rep := importDelta(t, h, p, scip.ImportScope("utf16.scip"), inputs, nil)
 
 			if !tc.admit {
-				// Nothing is published and the document is counted skipped:
+				// Nothing is published and the document is counted dropped:
 				// an unproved encoding never becomes a fact.
-				if rep.Skipped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
-					t.Fatalf("index of %s %s: skipped=%d, %d nodes, %d relations, %d aliases %v; want the document skipped and nothing published",
-						tc.tool, tc.version, rep.Skipped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
+				dropped := 0
+				for _, key := range []string{"documents_dropped_encoding", "documents_unproved_encoding", "documents_unspecified_encoding"} {
+					if rep.Result.Capabilities[0].Details[key] == "1" {
+						dropped++
+					}
+				}
+				if dropped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
+					t.Fatalf("index of %s %s: %d drop counts, %d nodes, %d relations, %d aliases %v; want the document dropped once and nothing published",
+						tc.tool, tc.version, dropped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
 				}
 				for _, cs := range rep.Result.Capabilities {
 					if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {
@@ -669,8 +675,9 @@ func TestDeltaImport(t *testing.T) {
 		documentRecord("../../outside/x.go", "go", 1, occurrenceRecord(symBar, 1, 0, 0, 1))))
 	smallInputs := append([]string{"small.scip"}, sourcePaths...)
 	_, rep4 := importDelta(t, providertest.New(t, files), newProvider(t, "small.scip"), scip.ImportScope("small.scip"), smallInputs, stored)
-	if rep4.OutsideRoot != 1 || rep4.Manifest.Len() != 1 {
-		t.Fatalf("index with an escaping path: outside_root=%d manifest=%d, want 1 rejected and 1 admitted", rep4.OutsideRoot, rep4.Manifest.Len())
+	outside := rep4.Result.Capabilities[0].Details
+	if outside["documents_outside_root"] != "1" || outside["documents_outside_root_exemplar"] != "../../outside/x.go" || rep4.Manifest.Len() != 1 {
+		t.Fatalf("index with an escaping path: details=%v manifest=%d, want 1 rejected, named, and 1 admitted", outside, rep4.Manifest.Len())
 	}
 	got := classes(t, rep4.Manifest, stored)
 	if len(got[scip.ClassRemoved]) != 3 {
@@ -805,7 +812,7 @@ func TestManagedToolIdentity(t *testing.T) {
 	})
 }
 
-// TestOverLimitFieldsAreDroppedAndCounted protects plan row 26: a value over a
+// TestOverLimitFieldsAreDroppedAndCounted protects the field bounds: a value over a
 // wire field bound is degradation of that record, never a refusal of the
 // index. One 128-KiB generated symbol name in a monorepo's index used to abort
 // the whole import, so the unit published nothing at all -- the maximal
@@ -815,8 +822,8 @@ func TestManagedToolIdentity(t *testing.T) {
 // IDENTIFYING field (the occurrence's symbol) drops that RECORD, because a
 // symbol-less occurrence is a fact about nothing; an over-limit DECORATIVE
 // field (the symbol's display name) drops only the FIELD and the record is
-// still published. Both are counted per bound on the unit's capability row --
-// silence there is the class-G defect this replaces.
+// still published. Both are counted per bound on the unit's capability row,
+// because a drop nothing reports is indistinguishable from a whole unit.
 func TestOverLimitFieldsAreDroppedAndCounted(t *testing.T) {
 	files := fixture(t)
 	longSymbol := "scip-fixture . . " + strings.Repeat("x", model.MaxNativeKeyBytes)
@@ -1060,6 +1067,12 @@ func documentWithText(path, language string, encoding uint64, text string, occur
 // details, which republishes the silence; or drop the coordinate from the
 // exemplar, which hands the operator a file without the line inside it that
 // disagrees.
+//
+// A third, equally silent: a refresh carries an unchanged document's rows and
+// never re-reads its references, so without the refusal count stored in the
+// document manifest the refreshed unit reads fresh with 0 refused while the
+// refused occurrences are still missing. Mutation that must fail this test:
+// drop the carryRefusals call from endDocument.
 func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 	// Line 5 mixes indentation: two spaces then a tab. "browser" sits at
 	// columns [10,17) of it; "Start" at columns [5,10) of line 4. Lines 6 and
@@ -1121,10 +1134,8 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 					slices.Concat([][]byte{occurrenceRecord(symServer, 1, 2, 5, 11)}, tc.shifted,
 						[][]byte{occurrenceRecord(symBrowser, 0, 5, 10, 17)})...)))
 
-			h := providertest.New(t, files)
-			p := newProvider(t, "tabs.scip")
-			got, rep := importDelta(t, h, p, scip.ImportScope("tabs.scip"),
-				append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...), nil)
+			inputs := append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...)
+			got, rep := importDelta(t, providertest.New(t, files), newProvider(t, "tabs.scip"), scip.ImportScope("tabs.scip"), inputs, nil)
 			// The clean reference after the refusal still published its
 			// call-site alias, which is what separates "one occurrence
 			// refused" from "the document dropped".
@@ -1140,6 +1151,19 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 				}
 				if got := cs.Details["refused_occurrence_exemplar"]; !strings.HasPrefix(got, tc.exemplar) {
 					t.Fatalf("refused_occurrence_exemplar = %q, want the prefix %q: the document and the coordinate it claimed", got, tc.exemplar)
+				}
+			}
+			// The same index again, as a refresh of the unit just sealed: every
+			// document is unchanged and carried, and so are its refusals.
+			stored, _ := saveManifest(t, rep.Manifest, "documents.txt")
+			_, again := importDelta(t, providertest.New(t, files), newProvider(t, "tabs.scip"), scip.ImportScope("tabs.scip"), inputs, stored)
+			if again.Delta.Changed != 0 {
+				t.Fatalf("refresh delta = %+v, want every document unchanged", again.Delta)
+			}
+			for _, cs := range again.Result.Capabilities {
+				if cs.State != model.CapabilityPartial || cs.Details["refused_occurrences"] != tc.refused || cs.Details["refused_occurrence_exemplar"] == "" {
+					t.Fatalf("refreshed capability %s is %s with details %v, want partial with %s refused occurrences and an exemplar: the carried document's occurrences are still missing",
+						cs.Capability, cs.State, cs.Details, tc.refused)
 				}
 			}
 		})
@@ -1168,7 +1192,7 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 // spooled after it, no row in the fresh manifest -- and that the drop is
 // counted with its exemplar.
 //
-// Mutation that must fail this test, NOT applied and NOT run: let the
+// Mutation that must fail this test: let the
 // document-level probe ignore a name mismatch while the per-occurrence path
 // keeps it, i.e. in `encodingHolds` replace
 //

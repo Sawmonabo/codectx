@@ -149,7 +149,7 @@ const (
 )
 
 // decodeDrops counts what the decoder discarded because a value exceeded a
-// field bound (plan row 26). The split is what the bound costs:
+// field bound. The split is what the bound costs:
 //
 //   - An IDENTIFYING field cannot be dropped on its own. A symbol without its
 //     symbol string is not a fact about anything, and `decodeSymbolInfo` ends

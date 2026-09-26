@@ -23,8 +23,8 @@ import (
 // Kind is one of the six precise indexers Section 11.4 names. The value is
 // also the name of the entry in the embedded tool lock and the name the
 // index's own `tool_info` must declare, which is what lets one constant carry
-// the identity of the profile end to end. Confirmed against a real index from
-// each of the six on this platform; see the lane report.
+// the identity of the profile end to end, confirmed against a real index from
+// each of the six on this platform.
 type Kind string
 
 const (
@@ -74,7 +74,7 @@ type argPaths struct {
 // declared network posture, the runner reservations and the run's own bound.
 //
 // Every argument array below was run against a real fixture through the
-// resolved payload before it was pinned; the runs are in the lane report.
+// resolved payload before it was pinned.
 type kindSpec struct {
 	triggers []string
 	args     func(argPaths) []string
@@ -451,23 +451,41 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 				Message: "the snapshot holds no project directory at " + prof.Root})
 		}
 	}
+	// nested answers requireSources with the rule the importer drops nested
+	// projects' documents by, so the directories the source check passes over
+	// are exactly the ones whose documents this unit will not publish.
+	nested := func(dir string) bool {
+		rel, err := filepath.Rel(mat.Root(), dir)
+		if err != nil {
+			return false
+		}
+		rel = filepath.ToSlash(rel)
+		for _, t := range prof.Triggers() {
+			if _, ok := nestedProject(prof.Kind, prof.Root, rel+"/"+t); !ok {
+				continue
+			}
+			if info, err := os.Lstat(filepath.Join(dir, t)); err == nil && info.Mode().IsRegular() {
+				return true
+			}
+		}
+		return false
+	}
 	switch prof.Kind {
 	case KindClang:
 		if err := normalizeCompileCommands(input, p.limits.MaxManifestBytes, seen); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindTypeScript:
-		// Refused before node starts, not diagnosed from its exit status. A
-		// package directory holding only a manifest and a lock file -- the
-		// measured second failure of this profile -- has nothing for this indexer to
-		// describe. node_modules is skipped: a dependency's own sources are
-		// not this project's.
-		if err := requireSources(input, "TypeScript", []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}, []string{"node_modules"}); err != nil {
+		// Refused before the indexer starts, not diagnosed from its exit
+		// status. A package directory holding only a manifest and a lock file
+		// has nothing for this indexer to describe. node_modules is skipped: a
+		// dependency's own sources are not this project's.
+		if err := requireSources(input, "TypeScript", []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}, []string{"node_modules"}, nested); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindJava:
 		// Refused before the JVM starts, not diagnosed from its exit status.
-		if err := requireSources(input, "Java", []string{".java"}, nil); err != nil {
+		if err := requireSources(input, "Java", []string{".java"}, nil, nested); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 		if err := writeScipJavaConfig(input); err != nil {
@@ -528,10 +546,9 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 // and, once it exists, the digest of the input manifest that binds the run to
 // its inputs.
 //
-// model.Error.Details is the only run-level diagnostic channel the frozen
-// provider contract offers: model.CapabilityState carries a diagnostic code
-// and nothing else, and model.ProviderResult carries no details at all. See
-// the report's "Shared-helper changes needed".
+// model.Error.Details is where a failed run's diagnostics go: the run returns
+// an error rather than a model.ProviderResult, so no capability row of this
+// run exists to carry them.
 func (p *Provider) profileError(prof Profile, manifestSHA string, err error) error {
 	var typed *model.Error
 	if !errors.As(err, &typed) {
