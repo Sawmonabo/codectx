@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,48 +28,40 @@ import (
 const (
 	// maxRedirects is Section 11.7's "at most three redirects".
 	maxRedirects = 3
-	// fetchAttempts is the fixed attempt budget of Section 22: a transport or
-	// server fault is retried a bounded number of times inside the one deadline
-	// the caller gave, and a digest mismatch is never retried at all.
+	// fetchAttempts is the finite attempt budget of Section 22: a transport or
+	// server fault, or a transfer the hang detector ended, is retried at once
+	// up to this many attempts in all, and a digest mismatch is never retried.
+	// There is no pause between attempts: a pause is a fixed wait, and a fault
+	// that the next attempt cannot outlast is reported after the last one.
 	fetchAttempts = 3
-	// retryBackoff is the pause between attempts. It is fixed rather than
-	// exponential because the whole budget is already bounded by the deadline.
-	retryBackoff = 2 * time.Second
-	// dialTimeout and tlsTimeout bound connection setup so a black-holed host
-	// cannot hold an attempt open before a byte moves.
-	dialTimeout = 30 * time.Second
-	tlsTimeout  = 30 * time.Second
-	// transferStall is how long a started transfer may deliver no bytes at all
-	// before it is treated as wedged.
+	// transferStall is the fetch path's hang-detector window: an attempt --
+	// connection setup, the response, and the body -- is ended only once
+	// nothing at all has arrived for this long.
 	//
-	// It is a hang detector and not a budget for the download. A payload is as
-	// large as a language runtime and the link it arrives over is whatever the
-	// operator has, so no wall clock can tell a slow transfer from a dead one:
-	// a deadline over the whole fetch is a rate requirement in disguise, and it
+	// It is not a budget for the download. A payload is as large as a language
+	// runtime and the link it arrives over is whatever the operator has, so no
+	// wall clock can tell a slow transfer from a dead one: a deadline over the
+	// fetch, or over any phase of it, is a rate requirement in disguise, and it
 	// terminates the download that is working on the slower link. What
-	// separates the two is whether bytes arrive at all.
+	// separates the two is whether anything arrives at all.
 	//
-	// It sits above the response-header timeout so a host that is answering
-	// slowly is ended by that bound, which is about the answer, rather than by
-	// this one, which is about the body.
+	// It is a constant and not a configuration key because nothing about a
+	// slow link or a large payload calls for a different value: those are
+	// served by the byte signal, which never ends a transfer that is moving.
+	// The window only says how long a host that has sent nothing is believed
+	// to be working, and no operator setting makes that host's answer come.
 	transferStall = 60 * time.Second
-	// installWait is how long a resolution waits for another process's install
-	// of the same tool before reporting it busy. It is a queueing bound and not
-	// a deadline on the peer: the peer's own transfer watch decides whether it
-	// is progressing, and this only decides how long this process is willing to
-	// stand behind it rather than fail with a busy store.
-	installWait = 10 * time.Minute
 )
 
 // assetDelegates names the hosts an asset host may hand a download body to. It
 // is keyed by the host the lock names, never by the host actually dialed, so a
 // mirror standing in front of that publisher forwards the same delegation.
-// Section 11.7 allows redirects "to the same host set"; a GitHub release asset
-// is answered by github.com with a 302 to a separate content host, so the set
-// is the lock's host plus the hosts that host is known to delegate to. Observed
-// 2026-09-13: github.com -> release-assets.githubusercontent.com. A redirect
-// anywhere else is refused; the digest check behind it is the real boundary,
-// this keeps a hijacked redirect from becoming a request to an arbitrary host.
+// Section 11.7 allows redirects "to the same host set"; the release host the
+// lock names answers an asset request with a 302 to a separate content host,
+// so the set is the lock's host plus the hosts that host delegates to. A
+// redirect anywhere else is refused; the digest check behind it is the real
+// boundary, this keeps a hijacked redirect from becoming a request to an
+// arbitrary host.
 var assetDelegates = map[string][]string{
 	"github.com": {"release-assets.githubusercontent.com", "objects.githubusercontent.com"},
 }
@@ -90,12 +81,13 @@ func newFetcher(transport http.RoundTripper, mirror *url.URL, maxBytes int64, lo
 		transport = &http.Transport{
 			// Section 11.7 requires the standard proxy environment to be
 			// honored: HTTP_PROXY, HTTPS_PROXY and NO_PROXY.
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
-			TLSHandshakeTimeout:   tlsTimeout,
-			ResponseHeaderTimeout: tlsTimeout,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConnsPerHost:   2,
+			//
+			// No phase carries a clock of its own: connection setup, the
+			// handshake and the wait for headers are all inside the attempt's
+			// transfer watch, which ends them when nothing has moved.
+			Proxy:               http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConnsPerHost: 2,
 		}
 	}
 	return &fetcher{
@@ -167,7 +159,7 @@ func (f *fetcher) target(raw string) (*url.URL, string, error) {
 // download streams one payload into dst while hashing it, and reports a typed
 // failure unless the bytes are exactly the size and digest the lock pinned. The
 // payload is never buffered: it goes to the staging file and the hash in one
-// pass, so a several-hundred-megabyte JDK costs one 32-KiB copy buffer.
+// pass, so a several-hundred-megabyte runtime costs one 32-KiB copy buffer.
 func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload, dst *os.File) error {
 	if p.Size > f.maxBytes {
 		return resourceLimit("tool %q payload is %d bytes, over the %d-byte tools.max_fetch_bytes cap", name, p.Size, f.maxBytes)
@@ -188,11 +180,6 @@ func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload,
 			if err := rewind(dst); err != nil {
 				return err
 			}
-			select {
-			case <-ctx.Done():
-				return model.Canceled(ctx.Err())
-			case <-time.After(retryBackoff):
-			}
 		}
 		err := f.attempt(ctx, name, target, p, dst)
 		if err == nil {
@@ -211,35 +198,46 @@ func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload,
 }
 
 // attempt performs one request and one verified stream, under a hang detector
-// on the bytes received rather than a deadline on the whole of it.
+// on what arrives rather than a deadline on any part of it.
 func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p Payload, dst *os.File) error {
 	// The request runs under a context this function can end on its own, which
-	// is what aborts a transfer that has stopped delivering. The caller's
-	// context still ends it too, and the two are told apart below: the watch
-	// reports whether it was the one that fired.
+	// is what aborts an attempt that has stopped moving. The caller's context
+	// still ends it too, and the two are told apart below: the watch reports
+	// whether it was the one that fired.
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return fetchFailed(name, "the payload request cannot be built", false)
 	}
+	// The watch starts before the request, so a host that accepts nothing, or
+	// accepts the connection and never answers, is ended by the same window as
+	// a body that stops: before the response nothing has arrived, which is no
+	// progress. The body is attached once there is one.
+	body := &progressReader{}
+	watch := watchTransfer(body, f.stall, cancel)
+	defer watch.stop()
 	resp, err := f.client.Do(req)
 	if err != nil {
+		if watch.fired() {
+			return fetchFailed(name, "the payload host delivered nothing for "+f.stall.String(), true)
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return model.Canceled(ctxErr)
 		}
 		return fetchFailed(name, "the payload host could not be reached", true)
 	}
 	defer resp.Body.Close()
+	// The response itself is the host moving: its arrival restarts the quiet
+	// window, so the time it took is not charged to the body's first byte.
+	body.moved.Add(1)
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		return fetchFailed(name, "the payload host answered "+resp.Status, retryable)
 	}
+	body.r = resp.Body
 
 	sum := sha256.New()
-	body := &progressReader{r: resp.Body}
-	watch := watchTransfer(body, f.stall, cancel)
-	defer watch.stop()
 	// One byte past the declared size is read so a longer body is detected as a
 	// disagreement with the lock instead of being silently truncated to it.
 	n, err := io.Copy(io.MultiWriter(dst, sum), io.LimitReader(body, p.Size+1))
@@ -265,7 +263,8 @@ func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p P
 }
 
 // progressReader counts every byte it hands on, which is the only honest
-// progress signal a download has. The package already counts bytes this way
+// progress signal a download has. Its reader is attached once the response
+// exists; the watch reads only the counter, so it can run before then. The package already counts bytes this way
 // where a payload is expanded (see the payload byte budget in extract.go); this
 // is the same counting one layer earlier, on the wire.
 type progressReader struct {
@@ -281,10 +280,10 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// transferWatch ends a transfer that has stopped moving. It is the fetch
-// path's hang detector: a transfer that delivered even one byte inside the
-// window is progressing however slow it is, and only one that delivered none
-// has stopped.
+// transferWatch ends an attempt that has stopped moving. It is the fetch
+// path's hang detector: an attempt that received even one byte, or its
+// response, inside the window is progressing however slow it is, and only one
+// that received nothing has stopped.
 type transferWatch struct {
 	stalled atomic.Bool
 	halt    chan struct{}
