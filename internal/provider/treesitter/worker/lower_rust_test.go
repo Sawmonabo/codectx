@@ -204,5 +204,96 @@ func TestRustLoweringGolden(t *testing.T) {
 			src:      "fn f(x: i32) -> i32 { fn g() -> i32 { x } g() + x }",
 			du:       []string{"x@5 -> g() + x@42"},
 		},
+		{
+			// Macros › Macro invocation (the arguments are a token tree the
+			// expansion evaluates), and Expressions › Operator expressions ›
+			// The question mark operator: `g(s)?` returns from the function
+			// on an error. Nodes: s@5, println!("{}", g(s)?)@34 (a Branch
+			// Using s; g and the literal read nothing), Ok(1)@57. Succ:
+			// println!→{EXIT, Ok(1)}; Ok(1)→EXIT. IPDom: println! → EXIT.
+			name:     "a question mark inside a macro's arguments is a branch to the exit",
+			protects: "everything after a macro invocation whose token tree holds `e?` is control dependent on it",
+			mutation: "walk only a token tree's named children, or lower the invocation as a plain node (println!(\"{}\", g(s)?)@34 controls nothing)",
+			src:      "fn f(s: &str) -> Result<i32, E> { println!(\"{}\", g(s)?); Ok(1) }",
+			cd:       []string{"println!(\"{}\", g(s)?)@34 -> Ok(1)@57"},
+			du:       []string{"s@5 -> println!(\"{}\", g(s)?)@34"},
+		},
+		{
+			// Macros › Macro invocation, Expressions › Return expressions,
+			// and › Lazy boolean operators (`c || return 0` returns when c is
+			// false). The `||` follows an operand, so it is no closure. Nodes:
+			// c@5, assert!(c || return 0)@23 (a Branch Using c), 1@47. Succ:
+			// assert!→{EXIT, 1}; 1→EXIT. IPDom: assert! → EXIT.
+			name:     "a return inside a macro's arguments is a branch to the exit",
+			protects: "a return in a token tree leaves the function, so what follows the invocation depends on it",
+			mutation: "leave return out of the token-tree jumps, or read `c ||` as a closure head (assert!(c || return 0)@23 controls nothing)",
+			src:      "fn f(c: bool) -> i32 { assert!(c || return 0); 1 }",
+			cd:       []string{"assert!(c || return 0)@23 -> 1@47"},
+			du:       []string{"c@5 -> assert!(c || return 0)@23"},
+		},
+		{
+			// Expressions › Operator expressions › The question mark
+			// operator (it returns from the enclosing function or closure),
+			// and › Closure expressions. The `o?` is in the closure `|| …`,
+			// so the invocation does not jump. Nodes: o@5, println!(…)@38
+			// (a Stmt Using o), Some(1)@77.
+			name:     "a question mark inside a closure in a macro's arguments stays in the closure",
+			protects: "a jump a closure written in a token tree makes is the closure's, never a jump of the enclosing function",
+			mutation: "ignore closure heads in token trees (println!@38 becomes a Branch controlling Some(1)@77)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { println!(\"{:?}\", (|| Some(o? + 1))()); Some(1) }",
+			du:       []string{"o@5 -> println!(\"{:?}\", (|| Some(o? + 1))())@38"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › break
+			// expressions: an unlabelled break leaves the innermost loop,
+			// here the one inside the token tree. Nodes: x@5,
+			// println!(…)@22 (a Stmt Using x), x@57.
+			name:     "a break inside a loop in a macro's arguments stays in that loop",
+			protects: "an unlabelled break whose loop is written in the token tree is no jump of the enclosing function",
+			mutation: "ignore loop heads in token trees (the break is issued with no loop open: unresolved becomes 1)",
+			src:      "fn f(x: i32) -> i32 { println!(\"{}\", loop { break x; }); x }",
+			du:       []string{"x@5 -> println!(\"{}\", loop { break x; })@22", "x@5 -> x@57"},
+		},
+		{
+			// Expressions › Operator expressions › Borrow operators: `&mut
+			// v` in the token tree lends v mutably to take, which may write
+			// it. Nodes: let mut v = vec![1];@18, println!(…)@39 (Uses v,
+			// may-defines v; std, mem and take are path segments), v.len()@81.
+			name:     "a mutable borrow inside a macro's arguments is a may-definition of the borrowed variable",
+			protects: "`&mut x` in a token tree reaches later uses of x as a may-definition on the invocation",
+			mutation: "record no borrow for `& mut` tokens (loses println!(…)@39 -> v.len()@81)",
+			src:      "fn f() -> usize { let mut v = vec![1]; println!(\"{:?}\", std::mem::take(&mut v)); v.len() }",
+			du: []string{"let mut v = vec![1];@18 -> println!(\"{:?}\", std::mem::take(&mut v))@39",
+				"let mut v = vec![1];@18 -> v.len()@81", "println!(\"{:?}\", std::mem::take(&mut v))@39 -> v.len()@81"},
+		},
+		{
+			// Format strings follow the std::fmt library documentation (not
+			// the Reference): Named parameters (an implicit `{x}` captures
+			// the variable x unless a named argument x is passed), Width
+			// (`w$` names the width argument, captured the same way), and
+			// Escaping (`{{` is a literal brace). Nodes: x@5, w@13, y@23,
+			// z@31, v@39, format!(…)@64 (Uses x and w by capture, v by the
+			// named argument's value; y is the named argument, z is text).
+			name:     "format-string captures are reads unless a named argument or an escaped brace",
+			protects: "`{x}` and `{:w$}` read the variables they capture, and neither a named argument nor `{{z}}` reads a local",
+			mutation: "read no format captures (loses x@5 and w@13 -> format!), ignore named arguments or `=` (adds y@23 -> format!), or ignore `{{` (adds z@31 -> format!)",
+			src:      "fn f(x: i32, w: usize, y: i32, z: i32, v: Vec<i32>) -> String { format!(\"{x:>w$}{y}{{z}}\", y = v.len()) }",
+			du: []string{"x@5 -> format!(\"{x:>w$}{y}{{z}}\", y = v.len())@64", "w@13 -> format!(\"{x:>w$}{y}{{z}}\", y = v.len())@64",
+				"v@39 -> format!(\"{x:>w$}{y}{{z}}\", y = v.len())@64"},
+		},
+		{
+			// Paths (a segment names a module, type or item, not a local),
+			// Expressions › Field access and Method-call expressions (the
+			// name after `.` is a field or method), and the std::fmt library
+			// documentation's Named parameters (`y = e` names an argument).
+			// Nodes: self@15, x@21, max@29, len@39, v@51, format!(…)@76
+			// (Uses x and v only).
+			name:     "path segments, field and method names, and named arguments in a token tree are not reads",
+			protects: "a local whose name is also a path segment, a method name or a named argument is not read by the invocation",
+			mutation: "read names before or after `::` (adds self@15 and max@29 -> format!), or after `.` (adds len@39 -> format!)",
+			src:      "impl S { fn g(&self, x: i32, max: i32, len: usize, v: Vec<i32>) -> String { format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len()) } }",
+			du: []string{"x@21 -> format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len())@76",
+				"v@51 -> format!(\"{} {} {y}\", self::h(x), i32::max(x, 1), y = v.len())@76"},
+		},
 	})
 }
