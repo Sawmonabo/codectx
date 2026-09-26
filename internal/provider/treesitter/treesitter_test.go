@@ -66,7 +66,7 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
+		MaxWorkers: 2, Rederive: func(int64) {}, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -420,7 +420,7 @@ func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
+		MaxWorkers: 2, Rederive: func(int64) {}, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -600,7 +600,7 @@ func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
+		MaxWorkers: 1, Rederive: func(int64) {}, Admission: newLedger(t),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})

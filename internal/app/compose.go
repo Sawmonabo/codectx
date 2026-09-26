@@ -851,7 +851,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxEvidencePerFact:  evidenceClip(cfg),
-		WorkerMemoryBytes:   parserWorkerReservationBytes,
 		Admission:           s.admission,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,

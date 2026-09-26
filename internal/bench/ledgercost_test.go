@@ -412,7 +412,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	// workers and the coordinator's heavy units reserve on the same one.
 	admit := benchAdmission()
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerMemoryBytes: 256 << 20, Admission: admit,
+		Rederive: func(int64) {}, Admission: admit,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		return ledgerArmResult{}, err

@@ -79,16 +79,12 @@ type Options struct {
 	// none. Zero selects the ceiling. Occurrences past it are counted and
 	// disclosed, never dropped in silence.
 	MaxEvidencePerFact int
-	// WorkerMemoryBytes is the memory each worker reserves on Admission, and
-	// the reservation the runner accounts it under. It is one figure for every
-	// worker and every file; it is required and positive.
-	WorkerMemoryBytes int64
 	// Rederive re-derives the admission allocation from the kernel's figure
 	// and the product's own residency, of which workerResidentBytes is the
 	// parser workers' part; the pool calls it between files. It is required.
 	Rederive func(workerResidentBytes int64)
 	// Admission is the process's one reservation ledger. Each worker reserves
-	// WorkerMemoryBytes on it before it is started and gives the reservation
+	// its memory on it before it is started and gives the reservation
 	// back once the runner has reaped it, so parser workers are admitted
 	// against the same allocation, in the same queue, as every other heavy
 	// child. It is required: a pool with a running total of its own beside
@@ -157,9 +153,6 @@ func New(o Options) (*Provider, error) {
 	if o.MaxWorkers <= 0 {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
 	}
-	if o.WorkerMemoryBytes <= 0 {
-		return nil, invalidOption(fmt.Sprintf("the parser provider was given a %d-byte worker reservation; it needs a positive one", o.WorkerMemoryBytes))
-	}
 	if o.Admission == nil {
 		return nil, invalidOption("the treesitter provider needs the process reservation ledger its workers are admitted against")
 	}
@@ -186,7 +179,7 @@ func New(o Options) (*Provider, error) {
 		langs[l.Name] = l
 	}
 	return &Provider{opts: o, languages: langs,
-		pool: newPool(o.Runner, o.Admission, o.Worker, o.WorkDir, o.MaxWorkers, o.WorkerMemoryBytes)}, nil
+		pool: newPool(o.Runner, o.Admission, o.Worker, o.WorkDir, o.MaxWorkers, 0)}, nil
 }
 
 func invalidOption(msg string) *model.Error {
