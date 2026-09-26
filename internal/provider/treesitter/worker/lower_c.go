@@ -57,8 +57,9 @@ const (
 //     initializer spanning it ([class.base.init]).
 //   - A statement is one node: an expression statement spans its
 //     expression (a comma expression at statement level is one statement
-//     per operand), an initialized declarator spans the init declarator and
-//     defines the name, return, co_return, throw, break, continue, goto and
+//     per operand), an initialized declarator spans the init declarator,
+//     defines the name and comes after the nodes its initializer makes (a
+//     lambda's creating node included), return, co_return, throw, break, continue, goto and
 //     `__leave` span the statement (kind Jump). An expression statement
 //     that is an assignment or update of an identifier is its defining
 //     node. A declarator without an initializer makes no node (the object's
@@ -91,7 +92,8 @@ const (
 //     evaluates; each conditionally evaluated operand is a Stmt node
 //     spanning it (C17 §6.5.13–§6.5.15). The two-operand conditional
 //     `a ?: b` evaluates only b conditionally.
-//   - A switch is a Stmt node for the controlling expression, then one
+//   - A switch is a Stmt node for the controlling expression, spanned as a
+//     condition is (Spans, see Lowering: `switch (x)` spans x), then one
 //     Branch node per case label spanning the label's value, in source
 //     order, each Using the controlling expression's variables (the outcome
 //     compares against it; case values are constants), then the case
@@ -100,10 +102,13 @@ const (
 //     no label matches, whatever its position. A case or default label
 //     nested below another statement of the switch body (a label inside a
 //     loop of the body, or inside a preprocessor conditional) is reached
-//     through the builder's Label and Goto: its Branch node jumps to a
-//     label node spanning the `case` or `default` keyword, named by
-//     cCasePrefix and the label's start byte, a name built only for such
-//     nested labels, in a buffer the function's lowering reuses. Statements
+//     through the builder's Label and Goto: its Branch node's true edge
+//     goes straight to a label node spanning the `case` or `default`
+//     keyword (the jump makes no node of its own), and its false edge to
+//     the next label's test, the last test's to the no-match path. The
+//     label node is named by cCasePrefix and the label's start byte, a name
+//     built only for such nested labels, in a buffer the function's
+//     lowering reuses. Statements
 //     before the first case label are reachable only by a jump into them.
 //   - A C++ range for ([stmt.ranged]) follows Iteration (see Lowering): the
 //     range expression's Stmt node, which defines the iteration variable;
@@ -117,8 +122,10 @@ const (
 //     reads it.
 //   - Every label is its own Stmt node spanning the label identifier, before
 //     the statement it labels, so a goto always lands on it (C17 §6.8.6.1).
-//     An assembly statement with goto labels is a Branch node spanning the
-//     expression, with an edge to each label and one to the next statement.
+//     An assembly statement is one node spanning the assembly expression,
+//     without the statement's semicolon: with goto labels a Branch node with
+//     an edge to each label and one to the next statement, otherwise a Stmt
+//     node.
 //   - A preprocessor conditional inside a function body (`#if`, `#ifdef`,
 //     `#ifndef`, `#elif`, `#elifdef`, `#elifndef`, `#else`) keeps every
 //     branch as reachable code, since the lowering cannot know which one
@@ -130,7 +137,9 @@ const (
 //     code after it sees every arm's declarations. A declaration in one arm
 //     and a redeclaration of the same name in a sibling arm at the same
 //     block level are one variable, so a use after the directive sees both.
-//     The condition reads no variable. Every other preprocessor line inside
+//     The condition reads no variable. The `#else` node's only successor is
+//     its arm, since nothing skips the last arm: it controls nothing, and
+//     the condition of the directive before it controls that arm. Every other preprocessor line inside
 //     a body produces no node.
 //   - A lambda or a nested function definition is its own function; in the
 //     enclosing function its creating expression is one Stmt node spanning
@@ -234,8 +243,10 @@ const (
 // exception handling extension's documented semantics of its try-finally
 // and try-except statements): inside a `__try` body every call and every
 // dereference (`*p`, `->`, `[]`) may raise. `__try/__finally` is
-// a finally; `__try/__except (filter)` is a catch whose filter is a Branch
-// node spanning the filter expression, true into the handler, false
+// a finally whose Handler node spans the `__finally` keyword;
+// `__try/__except (filter)` is a catch: its Handler node spans the
+// `__except` keyword, and its filter is a Branch node spanning the filter
+// expression without its parentheses, true into the handler, false
 // rethrowing; resumption at the fault is not modelled. `__leave` breaks to
 // the end of the `__try` body. A `__finally` runs on every way out of its
 // `__try` body, a goto to a label outside it included: the builder routes
