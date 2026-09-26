@@ -139,8 +139,11 @@ const yieldLabel = " yield"
 // Uses every enclosing variable referenced inside, resolved with the nested
 // code's own declarations shadowing (a local or parameter of a method of the
 // anonymous class, or one of its fields). A captured local is effectively
-// final (JLS §15.27.2, §8.1.3), so a capture is a Use at creation and never
-// a MayDef.
+// final (JLS §15.27.2, §8.1.3), so no nested code assigns it; a write
+// through its field or array element inside (`arr[0] = 1`, `box.v = 2`) is
+// the through-a-target rule: a MayDef of the local on the creating node,
+// since when the nested code runs is unknown. A local class declaration's
+// node is its creating node.
 //
 // # Exceptions
 //
@@ -253,6 +256,9 @@ type javaLower struct {
 	caseBinds []binding
 	groupAt   []int
 	frames    []flow.Frame
+	// writes are the enclosing locals written through a field or array
+	// element inside the nested code whose captures are being collected.
+	writes []int32
 }
 
 // javaArm is one switch label's match fringe and the index of its group.
@@ -552,10 +558,11 @@ func (j *javaLower) stmt(n *ts.Node) {
 	case k.assertStmt:
 		j.assertStmt(n)
 	case k.classDecl, k.recordDecl, k.enumDecl, k.interfaceDecl, k.annotationTypeDecl:
+		w := len(j.writes)
 		j.shadow++
 		j.capType(n)
 		j.shadow--
-		j.node(flow.Stmt, n, 0, len(j.reads))
+		j.closure(j.node(flow.Stmt, n, 0, len(j.reads)), w)
 	case k.explicitCtorCall:
 		if o := n.ChildByFieldId(k.fObject); o != nil {
 			j.value(o)
@@ -1120,11 +1127,11 @@ func (j *javaLower) assertStmt(n *ts.Node) {
 func (j *javaLower) value(n *ts.Node) {
 	k := j.k
 	if j.l.isCallable(n) {
-		m := len(j.reads)
+		m, w := len(j.reads), len(j.writes)
 		j.shadow++
 		j.cap(n)
 		j.shadow--
-		j.node(flow.Stmt, n, m, len(j.reads))
+		j.closure(j.node(flow.Stmt, n, m, len(j.reads)), w)
 		return
 	}
 	switch n.KindId() {
@@ -1180,10 +1187,11 @@ func (j *javaLower) value(n *ts.Node) {
 		}
 		j.throws++
 		if body != nil {
+			w := len(j.writes)
 			j.shadow++
 			j.cap(body)
 			j.shadow--
-			j.node(flow.Stmt, n, m, len(j.reads))
+			j.closure(j.node(flow.Stmt, n, m, len(j.reads)), w)
 		}
 		j.done(start)
 	case k.fieldAccess:
@@ -1238,12 +1246,23 @@ func (j *javaLower) switchValue(n *ts.Node) {
 	for _, v := range j.reads {
 		j.seen[v] = j.stmtNo
 	}
-	mark := len(j.binds)
+	mark, w := len(j.binds), len(j.writes)
 	j.shadow++
 	j.cap(n)
 	j.shadow--
-	j.binds = j.binds[:mark]
+	// The switch expression's own writes were lowered as nodes already.
+	j.binds, j.writes = j.binds[:mark], j.writes[:w]
 	j.throws, j.thrown = throws, thrown
+}
+
+// closure makes node id, which creates a lambda, an anonymous class or a
+// local class, may-define every enclosing local written through a field or
+// array element inside it (writes[w:]), then drops those writes.
+func (j *javaLower) closure(id int32, w int) {
+	for _, v := range j.writes[w:] {
+		j.b.MayDef(id, v)
+	}
+	j.writes = j.writes[:w]
 }
 
 // children lowers n's named children for their values.
@@ -1366,6 +1385,21 @@ func (j *javaLower) cap(n *ts.Node) {
 	switch n.KindId() {
 	case k.identifier:
 		j.ref(n)
+	case k.assignment, k.update:
+		t := n.ChildByFieldId(k.fLeft)
+		if n.KindId() == k.update {
+			t = firstNamed(n)
+		}
+		if t = j.l.unparen(t); t.KindId() != k.identifier {
+			if v := j.base(t); v >= 0 {
+				j.writes = append(j.writes, v)
+			}
+		}
+		start, list := j.kids(n)
+		for i := range list {
+			j.cap(&list[i])
+		}
+		j.done(start)
 	case k.methodInvocation:
 		if o := n.ChildByFieldId(k.fObject); o != nil {
 			j.cap(o)

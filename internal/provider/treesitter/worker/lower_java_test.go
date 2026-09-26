@@ -233,5 +233,22 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"y@30 -> new Object() { int x = 1; int g() { return x + y; } }@42",
 				"y@30 -> return new Object() { int x = 1; int g() { return x + y; } };@35"},
 		},
+		{
+			// §15.27.2, §15.26.1. Nodes: arr = new int[1]@28, the lambda
+			// () -> arr[0] = 1@59 (uses arr, may-defines it: its body writes
+			// an element of the captured array), r = () -> arr[0] = 1@55
+			// (reads arr inside its span), r.run()@77, return arr;@86. A
+			// may-definition kills nothing, so a use of arr after the
+			// creation pairs with the creation and with the definition before
+			// it.
+			name:     "a lambda's write through a captured local's element may-defines the local where it is created",
+			protects: "a use of a captured array after the lambda's creation sees the element write the lambda may perform, and the array's earlier definition",
+			mutation: "record no write through a captured local (loses () -> arr[0] = 1@59 -> return arr;@86), or a killing definition (loses arr = new int[1]@28 -> return arr;@86)",
+			src:      "class A { int[] f() { int[] arr = new int[1]; Runnable r = () -> arr[0] = 1; r.run(); return arr; } }",
+			fn:       1,
+			du: []string{"arr = new int[1]@28 -> () -> arr[0] = 1@59", "arr = new int[1]@28 -> r = () -> arr[0] = 1@55",
+				"() -> arr[0] = 1@59 -> r = () -> arr[0] = 1@55", "r = () -> arr[0] = 1@55 -> r.run()@77",
+				"arr = new int[1]@28 -> return arr;@86", "() -> arr[0] = 1@59 -> return arr;@86"},
+		},
 	})
 }
