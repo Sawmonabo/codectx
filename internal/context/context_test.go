@@ -25,15 +25,15 @@ import (
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// contextFixture is the ONE Task 15 fixture: a small deterministic snapshot
+// contextFixture is the package's ONE compiler fixture: a small deterministic snapshot
 // holding an implementation file, its caller, the interface it satisfies, its
 // test, its documentation, its configuration and one oversized file, published
 // as a single active generation. The unresolved boundary of Section 15.2 is a
 // task token that names none of them, so it is supplied per row rather than
 // stored here.
 //
-// Every fill-in lane shares this builder; a lane that needs one more artifact
-// adds it through its row's setup hook rather than editing the builder.
+// Every row shares this builder; a row that needs one more artifact adds it
+// through its setup hook rather than editing the builder.
 type contextFixture struct {
 	t     *testing.T
 	ctx   stdcontext.Context
@@ -405,9 +405,9 @@ func (f *contextFixture) File(path string) model.FileVersion {
 	return fv
 }
 
-// contextScenarioRow is one row of the single Task 15 scenario table. Each row
+// contextScenarioRow is one row of the single compiler scenario table. Each row
 // names the failure mode it guards, optionally extends the fixture through
-// setup, and asserts in run. Lanes add rows under their own marker only.
+// setup, and asserts in run.
 type contextScenarioRow struct {
 	// name states the invariant the row guards, not the mechanism it uses.
 	name string
@@ -419,7 +419,7 @@ type contextScenarioRow struct {
 	run func(t *testing.T, fx *contextFixture)
 }
 
-// TestContextCompilerScenario is the ONE Task 15 test. It builds the fixture
+// TestContextCompilerScenario is the ONE compiler scenario test. It builds the fixture
 // once before the table so the builder is proved on every run, then gives each
 // row its own fixture so no row can observe another's persisted manifest.
 func TestContextCompilerScenario(t *testing.T) {
@@ -1182,7 +1182,7 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		{
-			// THE Task 15 invariant: required scope never silently shrinks to
+			// THE compiler invariant: required scope never silently shrinks to
 			// fit a budget. A required file too large for one slice must raise
 			// the typed floor, never be demoted, truncated, or relabelled.
 			name: "a required file larger than the byte budget raises the minimum-budget floor",
@@ -1300,16 +1300,16 @@ func TestContextCompilerScenario(t *testing.T) {
 		},
 		// L5 MANIFEST rows
 		{
-			// Task 16's `context next` walks manifest ordinals without
-			// re-sorting, so a plan persisted in any order other than the
-			// Section 15.3 reading order hands the actor required files after
-			// optional ones with nothing in Task 15 failing. The row feeds the
+			// `context next` walks manifest ordinals without re-sorting, so a
+			// plan persisted in any order other than the Section 15.3 reading
+			// order hands the actor required files after optional ones with
+			// nothing in the compiler failing. The row feeds the
 			// manifest pass candidates in deliberately wrong order and asserts
 			// what comes back out of the four Store.Manifest* read methods.
 			name: "manifest ordinals are the actor's reading order and required_full is a prefix",
 			run: func(t *testing.T, fx *contextFixture) {
 				// The row drives the budget and manifest passes directly:
-				// Compile's orchestration is the integration lane's, and the
+				// Compile's orchestration is tested elsewhere, and the
 				// ordering contract lives in these two. Ordinals are assigned
 				// exactly ONCE, by the budget pass's total sort, and the
 				// manifest pass persists them; a second ordering here would
@@ -1649,7 +1649,7 @@ func pathOfEntry(t *testing.T, fx *contextFixture, e model.ContextEntry) string 
 	return ""
 }
 
-// --- Task 15 lane L2 (SCOPE) test support -------------------------------
+// --- scope test support ---------------------------------------------------
 //
 // The fixture publishes no relations (the digest fakes the GraphFactory), and
 // the only sqlite-to-graph.Adjacency adapter is unexported in internal/app, so
@@ -1680,7 +1680,7 @@ func (a *scopeAdjacency) NodesByID(_ stdcontext.Context, ids []model.NodeID) ([]
 }
 
 // EvidenceFor returns no rows: scope asserts requirements and completeness, and
-// per-edge evidence is lane L3's ranking input, not scope's.
+// per-edge evidence is a ranking input, not scope's.
 func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
 	return map[model.RelationID][]model.EvidenceID{}, nil
 }

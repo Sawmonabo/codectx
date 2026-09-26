@@ -9,9 +9,6 @@
 // possible: each map the pipeline holds today becomes a sort-merge join over
 // one of these records, and each nested map a streaming aggregation through one
 // of these folds.
-//
-// The signatures in this file are frozen. A lane that needs a different one
-// reports the need rather than changing it.
 package context
 
 import (
@@ -775,7 +772,7 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // completes its own body AND its own parameter list; what is frozen here is the
 // set of passes and their order; the arguments each needs are its own.
 
-// passAIngest — §2 P-A, lane L1. expandScope appends to the candidate spool in
+// passAIngest — pass P-A. expandScope appends to the candidate spool in
 // admission order with a seq on every record instead of building
 // the whole-set candidate list (refScope.Candidates, stream_parity_test.go),
 // and its `admitted map[string]bool` becomes a sort under
@@ -792,7 +789,7 @@ func (c *Compiler) passAIngest(ctx context.Context, in *seedIngest, eng *graph.E
 	return c.expandScopeStream(ctx, in, eng, gen, caps, stop)
 }
 
-// passBHydrate — §2 P-B, lane L1. Streams the candidate spool in pageLimit()
+// passBHydrate — pass P-B. Streams the candidate spool in pageLimit()
 // batches, resolves each batch's distinct FileIDs through one FilesByID, and
 // writes SizeBytes, Status, BOTH path fields (C3) and the FileMissing flag onto
 // the record. The accumulating `out`/`byID` of hydrateFiles go away.
@@ -805,7 +802,7 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 	return c.hydrateStream(ctx, reader, s, in)
 }
 
-// passDRouteScoring — §2 P-D, lane L3. Merge-joins the candidate stream with the
+// passDRouteScoring — pass P-D. Merge-joins the candidate stream with the
 // attributed hop stream on seq; a candidate's hops are contiguous under
 // lessHopSeq, so scoreRoutes and scorePath run unchanged on a working set of one
 // candidate. Scored records go to the ranked stream and each admitted
@@ -935,7 +932,7 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 	return trackRun(s, run), nil
 }
 
-// passFBoosts — §2 P-F, lane L3. Sorts the ranked stream by package,
+// passFBoosts — pass P-F. Sorts the ranked stream by package,
 // merge-joins it with P-E's counts, applies boostsFor, clamps, appends the
 // reasons in today's order, and adds every record to the sort whose comparator
 // is lessRank. No fold.
@@ -993,7 +990,7 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 	})
 }
 
-// passGMeasure — §2 P-G, lane L4. Applies the three `sized` filters on ingest
+// passGMeasure — pass P-G. Applies the three `sized` filters on ingest
 // from the ranked sort -- Excluded != "", FileID == "", and P-B's FileMissing
 // flag -- each emitting its exclusion, so Index counts survivors only and
 // matches today's positions exactly. Re-emits under lessFileIndex, where a
@@ -1206,7 +1203,7 @@ func rekeyRoutes(ctx context.Context, s *compileSorts, remap *pagination.Externa
 	return paths, hops, nil
 }
 
-// passHPack — §2 P-H, lane L4. Walks the group stream ordered by lessGroupIndex
+// passHPack — pass P-H. Walks the group stream ordered by lessGroupIndex
 // three times -- SortedRun.Each re-opens its backing file per call and only
 // refuses after Close -- for the required floor, the packed slice count at that
 // floor, and packPlan's forward walk, which emits decisionRecs in group order
@@ -1230,7 +1227,7 @@ func (c *Compiler) passHPack(ctx context.Context, s *compileSorts, m *measuredPl
 	return &packedPlan{Verdicts: run}, nil
 }
 
-// passIEmit — §2 P-I, lane L4. Sorts decisions under lessDecision, merge-joins
+// passIEmit — pass P-I. Sorts decisions under lessDecision, merge-joins
 // them with the measured stream, re-sorts the kept candidates by Index to assign
 // the final ordinal, re-measures them (phase two), accumulates RelationsClipped
 // and appends to the streamed Plan.Units. Exclusion ordinals stream the excluded

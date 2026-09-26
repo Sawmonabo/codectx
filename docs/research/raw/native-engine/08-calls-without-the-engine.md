@@ -1,6 +1,6 @@
 # Native-engine research, raw evidence — can SCIP + LSP replace the engine's call graph? The measured answer on the reference repository itself
 
-Source: `docs/research/19-language-server-and-indexer-matrix.md` §2 **[MEASURED]**, lane TOOLS-R,
+Source: `docs/research/19-language-server-and-indexer-matrix.md` §2 **[MEASURED]**,
 2026-09-15, linux/amd64. Method: JSON-RPC driver, `initialize` → `initialized` → `didOpen` → one
 `textDocument/references` (`includeDeclaration: true`) → `shutdown` → `exit`, `/usr/bin/time -v`
 wrapping the server process.

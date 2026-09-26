@@ -1006,14 +1006,12 @@ func assertCode(t *testing.T, what string, err error, want string) {
 	}
 }
 
-// legEndToEndRanking is the digest §9 retrieval leg: the whole Section 14.2
-// order over the real corpus, through the real service. It is the only leg
-// here that needs the retrieval lanes (L2 exact, L3 lexical) and the
-// integration lane (L6 search.go orchestration); until those land it fails at
-// New with "search.New is not implemented", which is the intended state.
+// legEndToEndRanking is the end-to-end retrieval leg: the whole Section 14.2
+// order over the real corpus, through the real service, exact and lexical
+// retrieval together.
 //
-// It asserts exact int64 ScoreMicros for the exact tiers -- digest §4 fixes
-// them at 0 for a document that did not also match lexically, and a non-zero
+// It asserts exact int64 ScoreMicros for the exact tiers -- they are fixed at
+// 0 for a document that did not also match lexically, and a non-zero
 // value there would mean tier ordering had quietly become score ordering.
 func legEndToEndRanking(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)

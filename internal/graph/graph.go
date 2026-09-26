@@ -247,7 +247,7 @@ func New(o Options) (*Engine, error) {
 
 // Neighbors lives in traverse.go.
 
-// References is implemented in references.go (lane L7).
+// References is implemented in references.go.
 
 // frontierState is one admitted node's position in a walk: how far it sits from
 // the nearest seed, what it cost to reach, and the edge that reached it.

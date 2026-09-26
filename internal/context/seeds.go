@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L1. It holds
-// Section 15.2 seed extraction: explicit seeds, backticked identifiers, path tokens, qualified identifiers, exact resolution, lexical terms and changed files, in that order, preserving ambiguity.
+// This file holds Section 15.2 seed extraction: explicit seeds, backticked identifiers, path tokens, qualified identifiers, exact resolution, lexical terms and changed files, in that order, preserving ambiguity.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 package context
 
 import (
@@ -505,11 +504,10 @@ func (c *Compiler) pageLimit() int {
 
 // pageLimitNotice is the disclosure that goes with pageLimit's clamp.
 //
-// model.MaxPageItems stays: a page size is a bound on ONE read and on the wire
-// shape of a page, not on the answer -- every identity past it is read by the
-// next page -- so it is not the kind of cap this wave removes. What it stopped
-// being is silent. A configured resources.max_page_items above the wire ceiling
-// is reported as "requested N, effective M" on the manifest, so an operator who
+// model.MaxPageItems is a bound on ONE read and on the wire shape of a page,
+// not on the answer: every identity past it is read by the next page. It is
+// not silent either. A configured resources.max_page_items above the wire
+// ceiling is reported as "requested N, effective M" on the manifest, so an operator who
 // raised the setting and saw no change learns why from the answer instead of
 // from the source.
 //

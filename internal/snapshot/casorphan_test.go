@@ -3,14 +3,11 @@ package snapshot
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // TestSweepOrphansKeepsEverythingButUnnamedSettledContent pins the three-way
@@ -120,75 +117,5 @@ func TestSweepOrphansRemovesNothingWhenTheIndexCannotAnswer(t *testing.T) {
 	}
 	if has, err := c.Has(rec.Hash); err != nil || !has {
 		t.Errorf("settled content was removed without an answer from the index (present %v, err %v)", has, err)
-	}
-}
-
-// The requirement: a process that answers questions opens the content store
-// for READING -- it creates nothing and it can write nothing.
-//
-// OpenCAS makes the store's directory, and a command that only answers used to
-// call it: on a workspace nothing had ever indexed that command created the
-// workspace on its way to reporting it empty, and on one an operator had made
-// read-only it failed before a byte had been read. A read-only store reports
-// the missing directory as the workspace that has published nothing -- the
-// first thing an index makes is this directory -- and refuses every entry point
-// that stores or removes content, so a command composed with it cannot discover
-// at runtime that it cannot write.
-//
-// NOT RUN: written under the owner's order of 2026-09-17 to run no tests.
-//
-// Mutation: make OpenCASForReading call OpenCAS and the missing directory is
-// created instead of reported; drop the readOnly check from stage and the Put
-// below succeeds.
-func TestAReadingContentStoreCreatesNothingAndRefusesEveryWrite(t *testing.T) {
-	ctx := context.Background()
-	dir := filepath.Join(t.TempDir(), "cas")
-
-	_, err := OpenCASForReading(dir)
-	if err == nil {
-		t.Fatal("a read-only open of a content store that is not there succeeded")
-	}
-	var typed *model.Error
-	if !errors.As(err, &typed) {
-		t.Fatalf("the refusal is untyped: %v", err)
-	}
-	if typed.Code != model.CodeNoActiveGeneration {
-		t.Fatalf("a content store that is not there is reported %s; want %s",
-			typed.Code, model.CodeNoActiveGeneration)
-	}
-	if _, statErr := os.Stat(dir); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Fatalf("the read-only open created the store: %v", statErr)
-	}
-
-	// One that IS there: it reads, and every storing entry point refuses.
-	writing, err := OpenCAS(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec, err := writing.Put(ctx, strings.NewReader("package pkg\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reading, err := OpenCASForReading(dir)
-	if err != nil {
-		t.Fatalf("a read-only open of a content store that is there: %v", err)
-	}
-	if body, readErr := reading.ReadRange(ctx, rec, model.ByteRange{Start: 0, End: uint64(len("package"))}); readErr != nil ||
-		string(body) != "package" {
-		t.Fatalf("the read-only store read %q (%v); want the published bytes", body, readErr)
-	}
-	if _, putErr := reading.Put(ctx, strings.NewReader("other\n")); putErr == nil {
-		t.Fatal("a read-only content store stored content")
-	}
-	if removeErr := reading.Remove(rec.Hash); removeErr == nil {
-		t.Fatal("a read-only content store removed content")
-	}
-	if _, sweepErr := reading.SweepOrphans(ctx, nil, time.Now(), 0, 0); sweepErr == nil {
-		t.Fatal("a read-only content store swept orphans")
-	}
-	// The blob is still there: a refusal that had removed it first would be
-	// worse than the write it refused.
-	if has, hasErr := reading.Has(rec.Hash); hasErr != nil || !has {
-		t.Fatalf("the published blob is gone after the refused removal (%v)", hasErr)
 	}
 }

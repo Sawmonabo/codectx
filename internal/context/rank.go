@@ -1,8 +1,7 @@
-// This file is owned by Task 15 lane L3. It holds
-// Section 15.3 integer ranking: path contributions, per-edge precision, depth decay, bounded boosts and the total tie-break order.
+// This file holds Section 15.3 integer ranking: path contributions, per-edge precision, depth decay, bounded boosts and the total tie-break order.
 //
 // The shared contract it builds on (candidate, the ranking constants and the
-// typed error constructors) is frozen in compiler.go and is not edited here.
+// typed error constructors) is defined in compiler.go.
 //
 // Section 15.3's score is NOT Section 14.3's traversal ranking. graph.Cost and
 // the impact score 1_000_000/(1+cost) answer "how far did the walk travel";

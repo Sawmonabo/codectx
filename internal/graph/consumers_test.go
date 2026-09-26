@@ -13,7 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// This file is lane GP-L3's own test budget: the identity proofs that the
+// This file holds the identity proofs that the
 // consumers moved onto graph.GraphReader (ADR-0005) answer exactly what the
 // containment-walking implementations answered, and the direction proof for the
 // shortest-path search.
