@@ -963,7 +963,11 @@ func (j *pyLower) closeFinally(f flow.Frame, normal, reached bool) {
 }
 
 // escape records that an exception leaves the current point: it reaches the
-// innermost open frame when that is a finally.
+// innermost open frame when that is a finally. It is recorded even where the
+// current point is unreachable (a raise after a return, or a finally whose
+// body cannot complete re-raising), where the builder delivers nothing; the
+// one effect is that a with around such code may fall through past its exit,
+// an edge the program never takes, and no pair is lost.
 func (j *pyLower) escape() {
 	if n := len(j.exc); n > 0 && !j.exc[n-1].catch {
 		j.exc[n-1].reached = true
