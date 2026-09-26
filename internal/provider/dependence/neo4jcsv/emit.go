@@ -402,8 +402,7 @@ func (l *lineIndex) scan(fromLine int64, fromStart int, line int64) (start, end 
 	return start, end, true
 }
 
-// declarationKey is the fixed cross-provider strong key for a declaration
-// (controller ruling R11-3):
+// declarationKey is the fixed cross-provider strong key for a declaration:
 //
 //	scope: "file:" + <root-relative slash path>
 //	key:   "decl:" + <identifier token as written> + "@" + <path> +

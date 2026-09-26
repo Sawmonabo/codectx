@@ -119,7 +119,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	// The child's own last words. A failure that reports only how many bytes
 	// its child wrote to standard error has discarded the one record of what
-	// went wrong, which is what a 7.5 KB crash on a real repository did.
+	// went wrong.
 	if o.StderrTail != "" {
 		err = err.WithDetail(model.DetailStderrTail, truncate(o.StderrTail, model.MaxDetailBytes))
 	}

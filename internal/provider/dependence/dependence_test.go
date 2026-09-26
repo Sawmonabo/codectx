@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"maps"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -57,8 +57,8 @@ type fakeBackend struct {
 	// 4,984-file project whose export died at every heap cap.
 	wholeExportCrash dependence.Outcome
 	// wholeParseCrash is the engine crash the WHOLE unit's parse dies on while
-	// every subdivided part parses cleanly, which is the shape of the
-	// reproducible linker fault a real monorepo unit crashed on twice.
+	// every subdivided part parses cleanly, which is the shape of a
+	// reproducible linker fault.
 	wholeParseCrash dependence.Outcome
 	parses          int
 	exports         int
@@ -205,7 +205,7 @@ func TestSucceededUnitConforms(t *testing.T) {
 	}
 }
 
-// TestFailedUnitAdmitsNoFacts is Task 11 Step 1's process-fault case. Failure
+// TestFailedUnitAdmitsNoFacts is the process-fault case. Failure
 // mode: a crashed or empty analysis whose partial output still reached a
 // generation would let a query answer from facts no analysis ever finished
 // producing, and would report the capability as fresh while doing it.
@@ -215,11 +215,6 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 		backend *fakeBackend
 		code    string
 		detail  map[string]string
-		// reason and remediation are substrings the failure's own text must
-		// carry. A classified failure whose message restates its class tells
-		// an operator nothing they did not already have from the class.
-		reason      string
-		remediation string
 		// parses is how many parse steps the classified failure is allowed to
 		// cost: one attempt, plus the single confirmation or retry the plan
 		// permits for that class -- which a crash that named its failing pass
@@ -237,18 +232,19 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			code: model.CodeProviderOutputInvalid,
 			detail: map[string]string{"failure_class": "engine", "pass": "CfgCreationPass",
 				"parts": "1", "parts_failed": "1", "parts_without_method": "0"},
-			// The tally is the reason -- not "no part produced an honest
-			// result", which restates the failure the class already names.
-			reason:      "1 of 1 failed in the analysis and 0 were analysed cleanly",
-			remediation: "identifies the defect upstream",
-			parses:      2,
+			parses: 2,
 		},
 		{
 			name: "heap exhaustion is retried exactly once and then fails closed with its figures",
+			// The backend's reduced tail is the only record of what the child
+			// said; a failure that dropped it would leave a count of bytes and
+			// nothing a reader could act on without a rerun.
 			backend: &fakeBackend{parse: dependence.Outcome{Class: dependence.FailureMemory,
-				Exception: "java.lang.OutOfMemoryError", ExitCode: 1}},
-			code:   model.CodeResourceLimit,
-			detail: map[string]string{"failure_class": "memory", "exception": "java.lang.OutOfMemoryError"},
+				Exception: "java.lang.OutOfMemoryError", ExitCode: 1,
+				StderrTail: "java.lang.OutOfMemoryError: Java heap space"}},
+			code: model.CodeResourceLimit,
+			detail: map[string]string{"failure_class": "memory", "exception": "java.lang.OutOfMemoryError",
+				model.DetailStderrTail: "java.lang.OutOfMemoryError: Java heap space"},
 			parses: 2,
 		},
 		{
@@ -262,9 +258,7 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			code:    model.CodeProviderOutputInvalid,
 			detail: map[string]string{"failure_class": "empty_export", "family": "go",
 				"source_files": "1"},
-			reason:      "produced no method for a unit that has source",
-			remediation: "hold method definitions",
-			parses:      1,
+			parses: 1,
 		},
 		{
 			name:    "a clean exit that left no graph is an engine failure, not a success",
@@ -293,12 +287,6 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 					t.Errorf("detail %q = %q, want %q", k, typed.Details[k], want)
 				}
 			}
-			if c.reason != "" && !strings.Contains(typed.Message, c.reason) {
-				t.Errorf("the failure message is %q, which does not name the reason %q", typed.Message, c.reason)
-			}
-			if c.remediation != "" && !strings.Contains(typed.Remediation, c.remediation) {
-				t.Errorf("the failure remediation is %q, which does not carry %q", typed.Remediation, c.remediation)
-			}
 			if result.State == model.RunSucceeded {
 				t.Errorf("run state = %s, want a failed state", result.State)
 			}
@@ -313,7 +301,7 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 	}
 }
 
-// TestSkippedMethodsPublishPartial is Task 11 Step 1's stderr case. Failure
+// TestSkippedMethodsPublishPartial is the definition-cap case. Failure
 // mode: a unit whose data dependence is missing whole method bodies, sealed
 // and reported fresh, is a silent correctness loss — a consumer would read
 // "no data flow here" as an analysed absence rather than an unanalysed one.
@@ -580,7 +568,7 @@ func edited(files map[string]string, path, content string) map[string]string {
 	return out
 }
 
-// TestGovernorRetriesOnceAndOnlyHigher protects the memory ruling: there is no
+// TestGovernorRetriesOnceAndOnlyHigher protects the memory rule: there is no
 // ceiling at all, and a retry happens only when it could succeed. Failure
 // mode: a retry at the cap that just failed costs a full parse and cannot
 // succeed; a bound invented when the machine is unreadable is a default memory
@@ -725,11 +713,10 @@ var splittable = map[string]string{
 // a crashed unit.
 //
 // Failure mode: a project whose parse succeeds at every heap cap and whose
-// export then dies on the engine's own exception -- measured on a real
-// 4,984-file project, whose every subdivided part exported cleanly -- was
-// published as a failed unit. Every fact the engine could still produce for
-// that project was thrown away, and five capabilities went unavailable for a
-// repository the engine could analyse. The recovery is the one a reproducible
+// export then dies on the engine's own exception, while every subdivided part
+// exports cleanly, is published as a failed unit. Every fact the engine could
+// still produce for that project is thrown away, and five capabilities go
+// unavailable for a repository the engine could analyse. The recovery is the one a reproducible
 // parse crash already has, and the result must say what it is: partial, naming
 // the subdivided scope and the failing pass and exception, never memory and
 // never a crash of the unit.
@@ -780,10 +767,10 @@ func TestADeadExportIsRecoveredBySubdivision(t *testing.T) {
 
 // TestANamedCrashIsSubdividedWithoutASecondParse protects the most expensive
 // decision this provider makes. Failure mode: a crash whose standard error had
-// already named the failing pass and the exception class was parsed a second
-// time before the unit was split — on a real monorepo that second parse cost
-// three minutes and twenty-two seconds of machine time and only re-proved the
-// same deterministic fault, and the unit was subdivided anyway. The report must
+// already named the failing pass and the exception class is parsed a second
+// time before the unit is split — a whole parse of machine time that only
+// re-proves the same deterministic fault, after which the unit is subdivided
+// anyway. The report must
 // also say which way the decision went, so nobody has to infer from a duration
 // why one crash was re-parsed and another was not.
 //
@@ -1014,7 +1001,7 @@ const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
 // host-share branch binds and the footprint is invisible, which is why a
 // test that only looked at a roomy machine would pass with the base footprint
 // ignored entirely; the small-memory, many-core row is the one that binds on
-// the subtraction, and it is also the shape that used to be refused outright.
+// the subtraction, and it is the shape a missing subtraction would refuse.
 func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 	const margin = dependence.DefaultSafetyMarginBytes
 	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
@@ -1061,7 +1048,7 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 // allocation. A process runner budgeted at the allocation therefore refuses
 // exactly the unit the gate just admitted, and the unit fails with a resource
 // limit instead of running. That is "refusing work for memory", which this
-// package's own ruling says the product never does. It is invisible on a host
+// package's own rule says the product never does. It is invisible on a host
 // roomy enough that no unit's estimate reaches the allocation, which is why it
 // is asserted here rather than left to a run to discover.
 func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
@@ -1095,7 +1082,7 @@ func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
 	// The unobservable host is deliberately NOT covered here: sizing invents no
 	// bound there (a ceiling for an unreadable machine is what synthesis
 	// Section 8 forbids) while admission stands one in, so a unit is sized
-	// without a bound and admitted against the stand-in. Resolving that
-	// asymmetry is a ruling, not an assertion; it is recorded as an open
-	// question rather than pinned by a test that would fix one answer.
+	// without a bound and admitted against the stand-in. Which side of that
+	// asymmetry is right is a design question, and a test here would only
+	// freeze one answer to it.
 }

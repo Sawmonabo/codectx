@@ -60,8 +60,8 @@ var frontend = map[dependence.Family]string{
 const maxNumDef = "40000"
 
 // Output bounds. The child's stdout is the banner and is discarded, so it is
-// unbounded: bytes nobody keeps cost no memory, and bounding them once made a
-// talkative run a refusal. Its stderr is the classifier's only input and is
+// unbounded: bytes nobody keeps cost no memory, and a bound on them would make
+// a talkative run a refusal. Its stderr is the classifier's only input and is
 // bounded before it is read -- what the bound drops is reported through
 // process.Result.OutputTruncated, never by failing the unit.
 const (

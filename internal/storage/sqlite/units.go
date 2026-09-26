@@ -228,7 +228,7 @@ func (s *Store) CarryRunFailures(ctx context.Context, gen model.GenerationID, se
 }
 
 // FailedRuns is one page of the typed reasons the runs of one generation
-// failed, oldest first, with the number of reasons that did not fit the page.
+// failed, in provider order, oldest first within a provider, with the number of reasons that did not fit the page.
 //
 // It is keyed by GENERATION and not by run id, which is what makes it
 // answerable at all: the reasons are on the run rows, a status report holds no
