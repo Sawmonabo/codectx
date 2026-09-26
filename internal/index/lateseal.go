@@ -107,9 +107,7 @@ type lateSealer struct {
 	// durable is left for a later publication to find: the scope is re-planned
 	// deferred by every later generation and, with only that tick's failures
 	// in hand, published as still running for ever -- an over-claim of work
-	// nothing will finish, which Section 13.3 forbids outright. A tick whose
-	// every unit failed publishes nothing at all, so its reasons would
-	// otherwise be discarded entirely.
+	// nothing will finish, which Section 13.3 forbids outright.
 	//
 	// It is bounded by the queue it describes: one entry per queued scope at
 	// worst, and it is replaced with the queue for the same reason foreground
@@ -376,9 +374,14 @@ type sealedUnit struct {
 type batch struct {
 	sealed []sealedUnit
 	// failed is this tick's own record of what did not seal, for the run row's
-	// totals and the every-unit-failed path; the queue's durable record of every
-	// tick's reasons is the sealer's background map.
+	// totals and the every-unit-failed path; the queue's record of every tick's
+	// reasons is the sealer's background map.
 	failed map[string]unitFailure
+	// work is the generation this tick's units ran in. Their provider runs,
+	// and so the reasons the failed ones recorded, are rows of it, and the
+	// publication copies those rows onto the generation it activates before
+	// the work generation is aborted.
+	work model.GenerationID
 }
 
 // tick takes the tick slot and runs one batch, abandoning the attempt if ctx
@@ -426,18 +429,17 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	published := false
 	// What this tick popped and what became of it. They are declared here
 	// because the run row's totals are reported on every exit path, including
-	// the one where nothing sealed: a deferred run whose counts were only ever
-	// reported by the index path rendered `0 planned, 0 succeeded` for a batch
-	// it had plainly run, which is a measurement nobody made.
+	// the one where nothing sealed: a run row with no totals would read
+	// `0 planned, 0 succeeded` for a batch that ran, a measurement nobody made.
 	planned := 0
 	b := batch{failed: map[string]unitFailure{}}
 	defer func() {
 		run.Report(ledger.Totals{UnitsPlanned: int64(planned),
 			UnitsSucceeded: int64(len(b.sealed)), UnitsFailed: int64(len(b.failed))})
-		// A batch whose every unit failed is not an ok run. It publishes
-		// nothing and returns no error -- one background unit's failure never
-		// stops the others, and the next index plans them again -- so the run
-		// row is the only place that says the batch got nowhere.
+		// A batch whose every unit failed is not an ok run. It returns no
+		// error -- one background unit's failure never stops the others -- and
+		// its publication states failures only, so the run row's outcome is
+		// what says the batch sealed nothing.
 		outcome := endOutcome(err)
 		if err == nil && len(b.sealed) == 0 && len(b.failed) > 0 {
 			outcome = ledger.OutcomeFailed
@@ -464,8 +466,9 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 	if err != nil {
 		return err
 	}
+	b.work = workGen
 	// The work generation is aborted on every path, and only after the
-	// publication has attached what it holds (ruling Q1).
+	// publication has attached its sealed units and copied its failure rows.
 	abort := func() {
 		if err := c.opts.Store.Abort(context.WithoutCancel(ctx), workGen); err != nil {
 			logTyped(c.log, "the deferred work generation could not be aborted", err,
@@ -547,26 +550,25 @@ func (l *lateSealer) tickHeld(ctx context.Context, state queueState) (err error)
 		abort()
 		return model.Canceled(ctx.Err())
 	}
-	if len(b.sealed) == 0 {
+	if len(b.sealed) == 0 && len(b.failed) == 0 {
 		abort()
-		if len(b.failed) > 0 {
-			// Nothing published, so no capability row states it and the work
-			// generation that held the provider-run failure rows is gone with
-			// the abort. What survives is this run: its unit spans carry each
-			// scope's typed reason, its row says the batch failed, and this
-			// line is what an operator watching the log sees at the moment it
-			// happens. Every scope keeps answering from its carried
-			// predecessor and the next index plans them again.
-			c.log.Warn("every deferred unit of this batch failed; nothing was published",
-				"component", component, "repository_id", string(c.repo),
-				"units", len(b.failed), "run_id", run.ID())
-		}
 		return nil
 	}
+	// A batch whose every unit failed publishes too. Its scopes are no longer
+	// running, and the active generation's capability rows say they are: left
+	// in place, every later status would report work in flight that nothing
+	// will finish. The publication re-derives those rows with the failures
+	// folded in and carries their reasons, while every scope keeps answering
+	// from its carried predecessor.
 	l.setPublishing(true)
 	res, published, err = l.publish(ctx, snap, state.sel, state.ref, b)
 	l.setPublishing(false)
 	abort()
+	if err == nil && len(b.sealed) == 0 {
+		c.log.Warn("every deferred unit of this batch failed; their scopes are published failed",
+			"component", component, "repository_id", string(c.repo),
+			"units", len(b.failed), "published", published, "run_id", run.ID())
+	}
 	if err != nil {
 		// The sealed units are members of nothing but the work generation this
 		// tick just aborted, so the next retention pass collects them and the
@@ -784,7 +786,9 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	}); err != nil {
 		return model.IndexResult{}, false, err
 	}
-	if len(replacing) == 0 {
+	// Failures alone are worth a publication: they turn scopes the active
+	// generation reports running into the failures they are.
+	if len(replacing) == 0 && len(b.failed) == 0 {
 		return model.IndexResult{}, false, nil
 	}
 
@@ -808,7 +812,14 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	var binding model.Binding
 	var states []model.CapabilityState
 	var health model.GenerationHealth
-	err = l.attach(ctx, g, replacing)
+	// The reasons this generation's capability rows state are copied onto it:
+	// the active generation's -- the foreground pass's and every earlier
+	// batch's, each carried forward by the publication before -- and this
+	// batch's own, from the work generation that is aborted next.
+	err = c.opts.Store.CarryRunFailures(ctx, pubGen, active, b.work)
+	if err == nil {
+		err = l.attach(ctx, g, replacing)
+	}
 	if err == nil {
 		err = g.coverage(ctx)
 	}

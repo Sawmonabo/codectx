@@ -144,6 +144,10 @@ func deferredScopes(prefix string, n int, reserve int64) []deferredUnit {
 
 const heavyProviderID = "heavy-fixture"
 
+// rawAnalyzerOutput is the standard-error tail a failed unit of the counting
+// provider carries, which the run row keeps and no status answer may.
+const rawAnalyzerOutput = "a stack trace naming source paths"
+
 // countingHeavyProvider is a provider that emits nothing and reports how many
 // of its units were inside IndexUnit at once. A unit waits there until the
 // barrier the case expects is reached, so a correct sealer passes at once and
@@ -204,28 +208,33 @@ func (p *countingHeavyProvider) IndexUnit(ctx context.Context, req provider.Unit
 	}
 	if p.fail == plan.Key(req.Unit.ProviderID, req.Unit.ScopeKey) {
 		return model.ProviderResult{RunID: req.Run, State: model.RunFailed},
-			&model.Error{Code: model.CodeProviderOutputInvalid, Message: "the fixture made this deferred unit fail"}
+			&model.Error{Code: model.CodeProviderOutputInvalid, Message: "the fixture made this deferred unit fail",
+				Details: map[string]string{model.DetailStderrTail: rawAnalyzerOutput}}
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded}, nil
 }
 
-// TestAnAllFailedDeferredBatchKeepsItsReason protects the record of the one
-// deferred outcome that has nowhere else to go. When every unit of a batch
-// fails, nothing is published: no capability row is written, because there is
-// no publication generation, and the provider-run rows that hold each unit's
-// reason are written against the work generation the tick aborts. The run
-// ledger is what is left, and a tick that reported itself as an ok run with no
-// units, or whose rows were swept because it reached no generation, would leave
-// an operator with a log line and nothing durable at all.
+// TestAnAllFailedDeferredBatchKeepsItsReason protects the reasons of a
+// deferred batch whose every unit failed.
 //
-// Mutation: report the totals only on the publishing path (as the index path
-// did) and the run reads `0 planned, 0 succeeded` for a batch it ran.
+// Failure mode: the provider-run rows holding each unit's reason are written
+// against the work generation the tick aborts, and status reads the reasons of
+// the ACTIVE generation, so a deferred failure reached no failed_units list
+// while the capability row named it; a batch whose every unit failed published
+// nothing at all and left the active generation claiming its scopes were still
+// running. The batch must publish, its reasons must be the published
+// generation's, and the run row must say the batch failed.
 //
-// Mutation: finish the run with endOutcome(err) alone and a batch whose every
+// It also protects the privacy rule on the status answer: the analyzer's
+// standard-error tail stays on the run row and never reaches failed_units,
+// which `status --json` and the index-status tool hand to any client.
+//
+// Mutation: in tickHeld, abort and return when nothing sealed, and no
+// publication is delivered. Mutation: drop the CarryRunFailures call from
+// publishOnce, and status lists no failed unit. Mutation: drop the
+// withoutRawOutput loop from StatusReader.Status, and the tail is served.
+// Mutation: finish the run with endOutcome(err) alone, and a batch whose every
 // unit failed reads as an ok run.
-//
-// Mutation: key the ledger sweep on generation_id again -- the run reaches no
-// generation, so the collection pass deletes it and its spans.
 func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n"})
 	ctx := f.ctx
@@ -245,20 +254,31 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 	if err := f.tick(c, units, res.Binding.SnapshotID, sel); err != nil {
 		t.Fatalf("tickHeld: %v", err)
 	}
-	// Nothing published, so nothing is delivered: the reason is in the ledger
-	// or it is nowhere.
-	if published := c.late.take(); len(published) != 0 {
-		t.Fatalf("a batch whose every unit failed delivered %d publication(s)", len(published))
+	published := c.late.take()
+	if len(published) != 1 {
+		t.Fatalf("a batch whose every unit failed delivered %d publication(s), want one", len(published))
 	}
-	// The row must be on disk and terminal BEFORE the collection pass: a run
-	// that is still live is one no sweep would touch, so a sweep run ahead of
-	// the flush would prove nothing about what a sweep does.
+	st, err := f.status(c)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Binding.GenerationID != published[0].Binding.GenerationID {
+		t.Fatalf("status answers generation %d, want the publication %d",
+			st.Binding.GenerationID, published[0].Binding.GenerationID)
+	}
+	if len(st.FailedUnits) != 1 || st.FailedUnits[0].ScopeKey != units[0].unit.ScopeKey {
+		t.Fatalf("status lists failed units %+v, want the one deferred scope that failed", st.FailedUnits)
+	}
+	if _, ok := st.FailedUnits[0].Details[model.DetailStderrTail]; ok {
+		t.Fatal("the status answer carries the analyzer's standard-error tail")
+	}
+	kept, _, err := f.store.FailedRuns(ctx, st.Binding.GenerationID)
+	if err != nil || len(kept) != 1 || kept[0].Details[model.DetailStderrTail] != rawAnalyzerOutput {
+		t.Fatalf("the run row keeps %+v (err=%v), want the reason with its standard-error tail", kept, err)
+	}
 	if err := f.ledger.Flush(ctx); err != nil {
 		t.Fatalf("flush the ledger: %v", err)
 	}
-	// The collection pass is what would sweep a run that reached no generation,
-	// so it runs before the read rather than after it.
-	c.collect(ctx)
 	reader, ok, err := ledger.OpenReader(ctx, f.dataDir)
 	if err != nil || !ok {
 		t.Fatalf("OpenReader: %v, present=%v", err, ok)
@@ -285,8 +305,8 @@ func TestAnAllFailedDeferredBatchKeepsItsReason(t *testing.T) {
 		}
 	}
 	if !reason {
-		t.Fatalf("no span of the failed batch names the scope %q with its typed reason; the %d "+
-			"recorded spans are the only durable account of why the batch published nothing",
+		t.Fatalf("no span of the failed batch names the scope %q with its typed reason among the %d "+
+			"recorded spans",
 			units[0].unit.ScopeKey, len(view.Spans))
 	}
 }

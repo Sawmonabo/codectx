@@ -162,6 +162,49 @@ func (s *Store) RecordRunFailure(ctx context.Context, id model.ProviderRunID, fa
 	})
 }
 
+// CarryRunFailures copies the recorded failure reasons of every run of the
+// source generations onto gen, which must still be staging and belong to the
+// same repository.
+//
+// A generation that publishes work other generations ran holds none of their
+// run rows: a deferred publication extends the active generation with units a
+// short-lived work generation built, and the scopes that failed along the way
+// -- in the foreground pass the queue was planned over, in an earlier batch, or
+// in this one -- are named failed by its capability rows while FailedRuns,
+// which reads by generation, would find no reason for any of them. Copying the
+// rows gives the published generation the reasons its own capability rows
+// state, and the copies die with it exactly as the originals die with theirs.
+// The sources are left as they are: a publication that loses its activation is
+// aborted, and a moved row would take the active generation's reasons with it.
+//
+// Each copy is a run row of its own under a fresh random id, so no two
+// generations ever share one row. The copy is one statement and holds nothing
+// in memory, whatever number of reasons it moves.
+func (s *Store) CarryRunFailures(ctx context.Context, gen model.GenerationID, from ...model.GenerationID) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
+		target, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
+		if err != nil {
+			return err
+		}
+		for _, src := range from {
+			if src == 0 || src == gen {
+				continue
+			}
+			_, err := tx.ExecContext(ctx, `INSERT INTO provider_runs(id, generation_id, provider_id, provider_version,
+				status, counters_json, diagnostic_code, failure_json, started_at, completed_at)
+				SELECT randomblob(32), ?, pr.provider_id, pr.provider_version, pr.status, pr.counters_json,
+					pr.diagnostic_code, pr.failure_json, pr.started_at, pr.completed_at
+				FROM provider_runs pr JOIN generations g ON g.id = pr.generation_id
+				WHERE pr.generation_id = ? AND g.repository_id = ? AND pr.failure_json != ''`,
+				int64(gen), int64(src), target.repo)
+			if err != nil {
+				return wrap("provider_runs", err)
+			}
+		}
+		return nil
+	})
+}
+
 // FailedRuns is one page of the typed reasons the runs of one generation
 // failed, oldest first, with the number of reasons that did not fit the page.
 //
