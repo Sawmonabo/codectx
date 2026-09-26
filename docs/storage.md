@@ -549,26 +549,32 @@ discard does not depend on how many callers asked. Every charger in a process
 waits under one lock, so the reclaimer's goroutine, the file system shim
 shortening a file the engine owns and a publication trimming its staging
 surface never hand the disk three windows at once. Across processes the turn
-is taken through a small lock file at the cache root: a window's turn is
+is taken through one small lock file per user on the host, in the product's
+directory in the user cache, above every data directory: a window's turn is
 locking that file, waiting out whatever remains of the interval since the last
 recorded turn, recording this one and unlocking, so an index run and a query
-server free at the pace between them rather than at twice it, whichever caches
-they are writing into: the turn is taken through one file per user on the host,
-above every cache root, because the rate belongs to the device and not to a
-directory.
+server free at the pace between them rather than at twice it, whichever data
+directories they are writing into, because the rate belongs to the device and
+not to a directory.
 The remainder is clamped into one interval, because the recorded time is a
 wall clock written by another process and a clock adjustment must cost at most
-one interval rather than hang a run. A process that can reach neither that file
-nor a cache root of its own -- a standalone tool on a read-only home -- keeps
-the pace for itself alone: the same rate while it is the only one, and twice it
-if a second joins, which is why that path is a last resort.
+one interval rather than hang a run. A process that names no turn directory
+takes its turns through the outermost data directory it has registered, and
+so shares the pace only with the processes over that directory. One that can
+reach neither -- a standalone tool on a read-only home -- keeps the pace for
+itself alone: the same rate while it is the only one, and twice it if a second
+joins, which is why that path is a last resort.
 
 A file the process may unlink but may not truncate -- every published blob is
 one, the store making its objects read-only at publication, and nothing bounds
 a blob's size -- reaches the unlink whole, so the unlink is what gives its
 whole length back in one act. Those bytes are therefore charged **before** the
 unlink: the removal waits its own size's worth of windows and the unlink is
-the last thing that happens, rather than the first. A file another name still
+the last thing that happens, rather than the first. The directory is asked
+whether it permits the unlink before the wait: an unlink it refuses is
+reported at once and charges nothing, so an entry stuck behind a refusing
+directory neither repeats its whole length of waits at every retry nor holds
+the entries queued behind it. A file another name still
 reaches owes nothing either way, because unlinking one of an object's names
 gives no blocks back; it is neither paced nor counted until the last name
 goes.
@@ -593,7 +599,10 @@ retried the next time something is queued. It is named, with the reason, in
 `stuck_frees` beside `pending_free_bytes`: that figure climbing and never
 falling is either a run removing faster than the pace gives back, which
 resolves itself, or a removal nothing can make, which does not, and only the
-list beside it tells the two apart. The request that empties the pools reports
+list beside it tells the two apart. A name stands until its removal is made or
+its entry is gone. A to-free directory that cannot be listed is named the same
+way until a listing succeeds, and one that is no longer on the disk holds
+nothing and is dropped, never named. The request that empties the pools reports
 the same list rather than waiting for a removal that will never succeed. Both
 carry one page of it, at the bound every record list of a response carries,
 and `stuck_frees_omitted` counts the entries past that page.

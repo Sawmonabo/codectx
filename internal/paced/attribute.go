@@ -62,10 +62,10 @@ func FreedBytes() int64 {
 // -- and makes that caller wait the pace those bytes owe before it goes on.
 //
 // The budget is the host's: bytes freed here and bytes freed by the
-// reclaimer spend the same windows under one lock, and the processes over one
-// cache take their windows in turn through a file at its root. A run cannot
-// outrun the pace by splitting its freeing across several chargers, and two
-// runs over one cache cannot outrun it by being two.
+// reclaimer spend the same windows under one lock, and the processes of this
+// user take their windows in turn through one turn file (see UseTurnDir). A
+// run cannot outrun the pace by splitting its freeing across several
+// chargers, and two runs cannot outrun it by being two.
 func Freed(n int64) {
 	attribute("", n)
 	reclaim.charge(n, nil)
@@ -104,16 +104,6 @@ func attribute(p Purpose, n int64) {
 	freedMu.Unlock()
 }
 
-// RemoveFor removes one file or empty directory as Remove does and attributes
-// the bytes it releases to p. RemoveAllFor does the same for a tree.
-//
-// The removal renames the path into the to-free set that serves it and
-// returns; the reclaimer frees it, and attributes it, as the space actually
-// goes back to the filesystem. So the purpose travels with the path -- it is
-// the name of the directory the path is renamed into -- and a process that
-// exits with removals still queued has not yet accounted them, because it has
-// not yet freed them. The next process to claim the same set frees them and
-// accounts them as its own.
 // QueueForRemoval renames path into the to-free set that serves it, so the
 // space is given back off the caller's path, and reports whether it did.
 //
@@ -127,20 +117,20 @@ func attribute(p Purpose, n int64) {
 //
 // A path no set serves cannot be renamed anywhere, and freeing it is then the
 // caller's own.
-func QueueForRemoval(path string) bool { return queue("", path) }
+func QueueForRemoval(path string) bool { return reclaim.queue("", path) }
 
-func RemoveFor(p Purpose, path string) error {
-	if queue(p, path) {
-		return nil
-	}
-	return freeInPlace(p, path)
-}
+// RemoveFor removes one file or empty directory as Remove does and attributes
+// the bytes it releases to p.
+//
+// The removal renames the path into the to-free set that serves it and
+// returns; the reclaimer frees it, and attributes it, as the space actually
+// goes back to the filesystem. So the purpose travels with the path -- it is
+// the name of the directory the path is renamed into -- and a process that
+// exits with removals still queued has not yet accounted them, because it has
+// not yet freed them. The next process to claim the same set frees them and
+// accounts them as its own.
+func RemoveFor(p Purpose, path string) error { return reclaim.remove(p, path) }
 
 // RemoveAllFor removes a tree as RemoveAll does and attributes the bytes it
 // releases to p. Symbolic links are removed, never followed.
-func RemoveAllFor(p Purpose, dir string) error {
-	if queue(p, dir) {
-		return nil
-	}
-	return freeInPlace(p, dir)
-}
+func RemoveAllFor(p Purpose, dir string) error { return reclaim.remove(p, dir) }
