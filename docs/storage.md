@@ -719,10 +719,9 @@ The list is enforced, not narrated: a test walks the source tree and fails on
 any call outside the pacing package that gives a file's blocks back and is
 neither routed through it nor written down beside it with its reason. That is
 every `os.Remove`, `os.RemoveAll`, `os.Truncate` and file `Truncate`, and also
-every TRUNCATING OPEN -- `os.Create`, and `os.OpenFile` with `O_TRUNC` -- which
-frees an existing file's blocks just as a truncation does and passed the
-enumeration unseen until a review added one at a governed site and watched the
-test stay green.
+every TRUNCATING OPEN -- `os.Create`, and `os.OpenFile` with `O_TRUNC`, the
+flags read through any local variable that carries them -- which frees an
+existing file's blocks just as a truncation does.
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.
