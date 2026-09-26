@@ -46,7 +46,8 @@ directions at once: hundreds of times too large for the median file and too smal
 uncounted for Python, C++ and Rust in every corpus. The same bytes vary by content by three orders of magnitude: a 4,029,319-byte
 Go file peaked at 0.92 MB and a 1,144,573-byte one at 17 KB (data literals), against 39.2 MB for a 1,501,771-byte one.
 Transient above the final tree is small: (peak − tree) / source p50 0.004, max 6.4 B/B on files ≥ 64 KiB; the input
-copies the binding makes are 1.00–2.00× the source (p50 1.23).
+copies the binding makes are 1.00–2.00× the source on the TypeScript checkout's 159 files ≥ 64 KiB (p50 1.23), and
+1.00–2.29× on the matrix's 3,827 (p50 1.01; §3 gives every population).
 
 ## 1. The finding that reframes the design: two quantities, not one
 
@@ -235,15 +236,37 @@ reserved at a **structural prior**, with no constant fitted to a repository:
   v0.25.0 `src/subtree.h:248-250`). On LP64, hand-computed from `subtree.h:111-154`: header fields 44 bytes, 11 flag
   bits 2 bytes, union aligned to 8 at offset 48, union 32 bytes (the `ExternalScannerState` arm: 24 + 4 → 32) —
   `sizeof(SubtreeHeapData) = 80`; `sizeof(Subtree) = 8` (a union of a pointer and 8 bytes of inline data). Each heap
-  node costs 80 + its 8-byte slot in its parent's allocation, plus allocator chunk overhead (≤ 16 bytes, an
-  assumption about glibc); so `s_node ≈ 104`. The benchmark must assert both sizes through cgo.
-- `c_copy = 2` (the binding's input copies, observed 1.00–2.00×), `c_src = 1` (the worker's Go-side source buffer).
+  node costs 80 + its 8-byte slot in its parent's allocation + allocator chunk overhead (≤ 16 bytes, an
+  assumption about glibc): `s_node = 80 + 8 + 16 = 104`. The benchmark must assert both sizes through cgo.
+- `c_copy = 2` (the binding's input copies), `c_src = 1` (the worker's Go-side source buffer).
+- So the prior is `base_w + source_bytes × (104 + 2 + 1) = base_w + 107 × source_bytes`.
 
-Verdict on the hint: **confirmed as a prior, refuted as a bound.** Across all seven corpora, **none of 3,827 files
-≥ 64 KiB** has a native need above 104 B/B (the TypeScript checkout's maximum is 76.4), and the GLR transient (max
-6.4 B/B) fits inside it; but **9 of 74,059 files ≥ 4 KiB** exceed it (worst 301 B/B, a 10,479-byte C++ file in
-llvm-project; then 260 C, 150 JavaScript with a syntax error, four Rust files 106–148) — counts computed per file over
-every finished parse row, not from the aggregate. But "≤ one heap node per source byte" is an
+`c_copy = 2` is a prior term, not a bound. The adapter copies every chunk the read callback returns into a C string
+held until the parse ends (`internal/bench/allocator.go:51-56`), so a chunk the parser reads again is copied again.
+Over the finished tree parse rows of the seven corpora (`input_copy_bytes ÷ source_bytes`, per file): 230,366
+non-empty files, p50 1.002, p99 1.235, max 51.6, 212 above 2; the 74,059 files ≥ 4 KiB, p99 1.387, max 51.6, 20
+above 2; the 3,827 files ≥ 64 KiB, p50 1.013, p99 1.849, max 2.29, 12 above 2.
+
+**The count, at the prior as derived.** The prior covers three terms, so each file is compared on the same three:
+its counted native peak (`native_peak_bytes`) + its measured input copies (`input_copy_bytes`) + its source bytes
+(the buffer), against `107 × source_bytes`; the worker base is on both sides and drops out. Counted per file over
+every finished `origin = tree` parse row of the seven corpora (230,566 rows; the row files behind `06`), not from the
+aggregate:
+
+| population | files | above 107 B/B | largest (B/B) |
+|---|---|---|---|
+| ≥ 64 KiB | 3,827 | 0 | 89.25 (a 78,294-byte Rust file, rust-lang/rust) |
+| ≥ 4 KiB | 74,059 | 9 | 302.8 (a 10,479-byte C++ file, llvm-project) |
+
+The nine, by the same quantity: 302.8 C++ and 262.1 C (llvm-project), 152.4 JavaScript (vscode, with a syntax error), 149.8, 144.1 and
+125.5 Rust (rust-lang/rust), 113.9 C (llvm-project), 111.2 JavaScript (the TypeScript checkout, also with a syntax error),
+108.0 Rust (rust-lang/rust). The counted native peak alone exceeds 107 B/B on 8 of the 74,059 (the 106.0 B/B Rust file
+drops out) and on none of the 3,827, whose largest is 87.25 B/B (the same Rust file; the TypeScript checkout's largest
+is 76.4).
+
+Verdict on the hint: **confirmed as a prior, refuted as a bound.** The prior holds on every file ≥ 64 KiB, and the
+GLR transient (max 6.4 B/B) fits inside it; it is exceeded by 9 of 74,059 files ≥ 4 KiB. But "≤ one heap node per
+source byte" is an
 assumption, not a theorem: unary chains (`expression → identifier`) and zero-width tokens (missing nodes, scanner
 indent/dedent) can exceed it, and files < 4 KiB reach 278 B/B (the per-parse intercept; absolute bytes are tiny). The
 design does not need a bound — an overrun runs — so a prior is sufficient. With longest-first dispatch the prior is

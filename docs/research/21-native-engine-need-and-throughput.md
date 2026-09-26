@@ -8,7 +8,7 @@ what the repository and the machine in front of it need. It must produce the sam
 the least resident memory. No constant, threshold or reservation may be fitted to one repository: a figure measured on a
 corpus is evidence for a design and never a constant in code.
 
-**What this note rests on.** Seven raw files under `raw/native-engine-need/`, cited by number:
+**What this note rests on.** Eight raw files under `raw/native-engine-need/`, cited by number:
 
 - `00` — host probes of the peak-memory mechanisms.
 - `01` — need-derived memory.
@@ -17,10 +17,13 @@ corpus is evidence for a design and never a constant in code.
 - `04` — publication.
 - `05` — corpora and goldens.
 - `06` — the dependence-core benchmark aggregate over the public corpus matrix.
+- `07` — a CPU profile of the lowering walk, and the per-function aggregate, at `a3386d7`.
 
-Every figure in the raw files cites `path:line` at `36a529f` or a fetched URL. `06` was produced by the benchmark task
-from a test binary built at `36a529f`, run memory-capped, one corpus at a time. This research ran no benchmark and never
-ran the product. Its only executions were the four KB-scale probes of `00`.
+Every figure in the raw files cites `path:line` at `36a529f` (`07`: at `a3386d7`) or a fetched URL. `06` and `07` were
+produced by the benchmark task from test binaries built at those commits, run memory-capped, one corpus at a time. The
+6.2 s / 0.13 s observation in `02` §a is the run ledger's output from a capped test pass of `internal/e2e` at
+`b7b8815`, reproduced there. This research ran no benchmark, no test and never ran the product. Its only executions
+were the four KB-scale probes of `00`.
 
 ## 0. Bottom line
 
@@ -29,15 +32,18 @@ ran the product. Its only executions were the four KB-scale probes of `00`.
      about 2% of the time (`02` §a).
    - The stage's wall is the per-unit work around the parse. Every per-unit store call takes one mutex: ingestion calls
      at `internal/storage/sqlite/open.go:710` and reads at `:830`. A unit makes about ten of those calls, plus one or
-     two reads per extracted record.
-   - The disk is not the cause: under the ingestion group a file unit costs zero commits and zero fsyncs.
+     two reads per extracted record (`02` §a, the per-unit table).
+   - The disk is not the cause: under the ingestion group a file unit costs zero commits and zero fsyncs (`02` §a).
 2. **In the native engine's own code, the per-function lowering walk dominates, not the algorithms.**
    - kubernetes Go: 228,765 functions, 11.6 s in total, of which the three dependence passes are 0.54 s (`06`).
-   - The Go lowering resolves fields by name 49 times. The binding allocates a C string on every one of those calls
-     (`go-tree-sitter@v0.25.0/node.go:189-192`).
+   - At `36a529f` the Go lowering resolved fields by name at 49 call sites, and the binding allocates a C string on
+     every such call (`go-tree-sitter@v0.25.0/node.go:189-192`; `06`, the lead's source checks).
    - The JavaScript lowering already resolves field ids once per process.
+   - At `a3386d7` the Go lowering reads fields by id only, and lowering is still the cost: about 44 µs per function on
+     kubernetes Go. A CPU profile puts at least 44% of all samples in per-node native accessor calls (`KindId`,
+     `NamedChild`, `IsNamed`, cursor steps), which dominate both the lowering and the walk that finds functions (`07`).
 3. **The 256 MiB per parser worker is wrong in both directions.**
-   - The median file needs under 1 MiB of native memory in every language.
+   - The median file needs under 1 MiB of native memory in every language (`06`).
    - The largest file measured needs 303.9 MiB: a 15.4 MiB C file in llvm-project (`06`).
    - A per-file need is observable exactly by the worker itself (`00` P1), but only if the worker returns freed pages
      between files. Otherwise the C allocator reuses what it holds and the reading is censored (`01` §1, `03` §a).
@@ -86,18 +92,24 @@ ran the product. Its only executions were the four KB-scale probes of `00`.
   runs-alone rule; Buck2's scheduler states the same rule ("the first running scene is never suspended").
 - **Learn a model.** Keep a decaying 5%-bucket histogram of need per source byte, per repository, language, grammar
   fingerprint and size class. Reserve its weighted p99, which is the sample maximum below 100 observations. The
-  half-life is measured in that repository's own file count for the language. The model is persisted per generation.
+  half-life is measured in that repository's own file count for the language. The model is persisted per generation
+  (`01` §2(f)).
 - **The first file of a never-seen language** is reserved at a structural prior:
 
-  > worker base + source bytes × (80 + 8 + allocator overhead, per heap node, from `subtree.h:111-154,248-250`; + 2
-  > for the binding's input copies; + 1 for the worker's buffer) ≈ base + 107 × bytes.
+  > worker base + source bytes × (104 per heap node: 80 for `SubtreeHeapData` + 8 for its slot in the parent + 16 of
+  > allocator chunk overhead, from `subtree.h:111-154,248-250`; + 2 for the binding's input copies; + 1 for the
+  > worker's buffer) = base + 107 × bytes (`01` §3).
 
   - Nothing in the prior is fitted to a repository.
-  - It holds on all 3,827 files of 64 KiB or more across the seven corpora.
-  - It is exceeded by 9 of 74,059 files of 4 KiB or more (the worst is 301 B/B). That is acceptable because an overrun
-    runs; it is never refused.
+  - Each file is compared on the prior's own three terms: counted native peak + measured input copies + source bytes,
+    against 107 × source bytes (`01` §3, counted per file over the row files behind `06`).
+  - It holds on all 3,827 files of 64 KiB or more across the seven corpora; the largest is 89.25 B/B (`01` §3).
+  - It is exceeded by 9 of 74,059 files of 4 KiB or more (the worst is 302.8 B/B, a 10,479-byte C++ file; `01` §3).
+    That is acceptable because an overrun runs; it is never refused.
+  - The copy term is a prior, not a bound: a re-read chunk is copied again, and copies reach 51.6× the source on
+    small files (`01` §3).
   - Longest-first dispatch pays the prior on the largest file of each language: about 1.7 GB reserved against
-    303.9 MiB observed. The cost is concurrency for one file, never a failure.
+    303.9 MiB observed (`01` §3). The cost is concurrency for one file, never a failure.
 - **Re-derive the allocation between files.** Take the smaller of available memory plus the product's own observed
   residency (less base and margin) and half of that figure. Counting the product's own residency means its own growth
   never throttles it. `ObserveMachine` (`internal/provider/dependence/machine_linux.go:31-43`) already takes the smaller
@@ -114,12 +126,12 @@ VPA (decaying histogram, percentile) and SQL Server memory-grant feedback (perce
 oscillation problem). Bazel, Pants, PostgreSQL and Spark all use static figures (`01` §4, with URLs).
 
 **Trade-off.** The ledger gains an adjust operation, the worker trims between files, one table is persisted, p99 is a
-design constant, and about 1% of files overrun by design, each one disclosed.
+design constant, and about 1% of files overrun by design, each one disclosed (`01` §2(f)).
 
 **Measurement to confirm** (per repository class):
 - Σ reserved against Σ observed.
 - Peak tree residency against today's 256 MiB design at the same worker count.
-- Overruns at most 2% after the first generation.
+- Overruns at most 2% after the first generation (`01` §2(f)).
 - Trimmed parse wall within noise of the untrimmed.
 - The prior at or above the observed need on the largest file of every language.
 
@@ -146,17 +158,20 @@ too while a group is open (`open.go:829-834`), which during a cold build is alwa
 - `CompleteProviderRun`.
 
 Every call is a savepoint of one open group. With a 1 GiB writer cache and `synchronous=NORMAL` (ADR-0004), a unit
-commits nothing and syncs nothing.
+commits nothing and syncs nothing (`02` §a, commits and fsyncs per unit).
 
 **Contributing causes.**
 - **Drain and re-exec.** The stage can drain mid-provider: `leaveStage` runs when `IndexUnit` returns
   (`provider.go:244`), before flush, seal and run completion, so all in-flight units can be outside the stage at once.
   The pool then drains (`pool.go:411`) and the next unit re-executes a worker.
-- **Worker start.** Each worker re-executes the whole binary (`cmd/codectx/main.go:22`) and verifies nine grammars.
-- **The wire.** It makes one JSON message and four synchronous `io.Pipe` hand-offs per record.
+- **Worker start.** Each worker re-executes the whole binary (`cmd/codectx/main.go:22`) and verifies nine grammars
+  (`02` §a, contributing cause 2).
+- **The wire.** It makes one JSON message and four synchronous `io.Pipe` hand-offs per record (`02` §a, contributing
+  cause 3).
 - **The provider barrier.** `generation.go:771-778` holds the next provider until the previous one has sealed.
 
-**Shares.** Parse plus start is at most 2% of the stage. The other 98% is unit work outside the exchange. How that 98%
+**Shares.** Parse plus start is at most 2% of the stage. The other 98% is unit work outside the exchange (`02` §a,
+the projected shares). How that 98%
 splits between lock wait, SQL, re-exec and the barrier is unavailable from reading; the measurement below closes it.
 
 **Recommendation.**
@@ -168,7 +183,7 @@ splits between lock wait, SQL, re-exec and the barrier is unavailable from readi
 **Alternative.** Raise concurrency. It loses: WAL admits one writer, so more units add lock holders, not capacity.
 
 **Measurement.** A mutex profile or a sub-span on `groupMu`; per-unit phase times; `WorkersStarted`; the runner queue
-time. Pass: stage wall ≤ 2 × Σ worker CPU ÷ `ParserWorkers`, and `WorkersStarted ≤ MaxWorkers`.
+time. Pass: stage wall ≤ 2 × Σ worker CPU ÷ `ParserWorkers`, and `WorkersStarted ≤ MaxWorkers` (`02` §a).
 
 ### (b) One pass per file
 
@@ -179,18 +194,22 @@ A separate pass would re-parse every file. In the benchmark's per-file rows, par
 for JavaScript on the TypeScript checkout (`02` §b). Version independence is kept anyway, by two capability rows on one
 unit.
 
-**Within the pass, the lowering is the cost** (`06`). On kubernetes Go, 95% of the per-function time is lowering, about
-48 µs per function. The cheap first step is to switch the Go lowering to field ids: the id path already exists
-(`worker/lower.go:96-102`) and needs no new dependency. How much of the 48 µs the per-call C-string allocation explains
-is unavailable until a CPU profile of the lowering walk is taken.
+**Within the pass, the lowering is the cost** (`06`). On kubernetes Go at `36a529f`, 95% of the per-function time is
+lowering, about 48 µs per function. At `a3386d7` the Go lowering uses field ids, and the figure is about 44 µs (`07`
+§c). The lowering changed in other ways between the two commits, so the difference is not the C-string allocation's
+share. The profile (`07` §b) reads the rest: of 66.46 s of
+samples, the parse is 29%, two lowerings per function 34% and the walk that finds functions about 22%, and per-node
+native crossings (`KindId`, `NamedChild`, `IsNamed`, `NamedChildCount`, cursor steps) are at least 29.4 s of it, about
+75% of the walk plus the lowering. The lever is fewer native calls per node visited, in the walk and the lowering alike.
+`runtime.cgocall`'s 79% is not that share: it includes the time spent inside C, the parse among it (`07` §b).
 
 **Measurement.** One-pass against parse-then-reparse wall, per language and class. Wire bytes per edge, binary frames
-against JSON. A lowering profile.
+against JSON. Native calls per node visited, per language.
 
 ### (c) Scheduling
 
 - Today's order is path order (`plan.go:1163`).
-- Parse time ranks with source bytes at Spearman ρ 0.82–0.86 per language.
+- Parse time ranks with source bytes at Spearman ρ 0.82–0.86 per language on the TypeScript checkout (`02` §c).
 - A list-scheduling replay of the rows (`02` §c, not a run) gives these makespans:
 
   | workers | path order | largest-first by bytes |
@@ -202,7 +221,7 @@ against JSON. A lowering profile.
 central queue does not have. The worker count is `min(CPUs, allocation ÷ observed need)`.
 
 The gain is zero while (a) keeps the stage store-bound, so (a) comes first. Pass: makespan within 5% of
-max(Σ cost ÷ workers, largest file).
+max(Σ cost ÷ workers, largest file) (`02` §c).
 
 ### (d) Store write throughput
 
@@ -216,7 +235,8 @@ max(Σ cost ÷ workers, largest file).
 the store, and the resolver reads `idx_alias_lookup` during the run. Deferring the query-only name indexes is left to the
 measurement.
 
-**Measurement.** Writer busy time ÷ stage wall. At 80% or more the writer saturates and index order is the next lever.
+**Measurement.** Writer busy time ÷ stage wall. At 80% or more the writer saturates and index order is the next lever
+(`02` §d).
 
 ## 3. Least resident memory (`03`, `06`)
 
@@ -235,21 +255,24 @@ parse ÷ the file's source bytes, one row per language from the corpus where it 
 | JavaScript (TypeScript checkout; compiler test data, 81.65% with errors) | 25.98 | 42.62 | 70.93 | 109.21 |
 
 `03` reports the tree's own bytes (`tree_bytes`, a different instrument) at p50 26.0 / 15.8 / 22.9 for the TypeScript
-checkout's TypeScript, kubernetes Go and home-assistant Python. Within one language the tree ratio runs from 0.015× (a file that is one long literal) to about 80×, so no per-grammar
-constant is possible. The runtime's structure explains the spread (`subtree.h`): a heap node costs about 88 bytes, an
-inline leaf costs its 8-byte slot, and external-scanner tokens and multi-line tokens are always on the heap. The
-structure supplies no number. Scanner bytes are uncounted for Python, C++ and Rust.
+checkout's TypeScript, kubernetes Go and home-assistant Python (`03` §a, the per-file table). Within one language the
+tree ratio runs from 0.015× (a file that is one long literal) to about 80×, so no per-grammar constant is possible
+(`03` §a). The runtime's structure explains the spread (`subtree.h`; `03` §a, `01` §3): a heap node costs 80 bytes
+plus its 8-byte slot before allocator overhead, an inline leaf costs its 8-byte slot, and external-scanner tokens and
+multi-line tokens are always on the heap. The structure supplies no number. Scanner bytes are uncounted for Python,
+C++ and Rust (`06`).
 
 **What the counter misses.**
 - **A new high.** On a file that sets the worker's high, resident-set growth is about the counted peak plus the
-  binding's input copies, up to 2× the source (`parser.go:272-278`).
-- **Every other file.** The resident set does not move on about 95% of files, because glibc reuses freed memory. This is
-  why per-file measurement needs the trim of §1.
+  binding's input copies (`parser.go:272-278`; `03` §a): 1.00–2.29× the source on files of 64 KiB or more, and up to
+  51.6× on small files, because a re-read chunk is copied again (`01` §3).
+- **Every other file.** The resident set does not move on about 95% of files, because glibc reuses freed memory (`03`
+  §a). This is why per-file measurement needs the trim of §1.
 
 **Recommendations.**
 - **Return memory at the file boundary.** Close the tree, drop the arena's backing (removing the 1 MiB threshold, which
-  fired for 3 of about 351,000 functions while the arena kept 0.4–1.25 MB), and call `malloc_trim(0)`. Then reset the
-  peak.
+  fired for 3 of about 351,000 functions while the arena kept 0.4–1.25 MB, `03` §c), and call `malloc_trim(0)`. Then
+  reset the peak.
 - **Keep one C heap.** Pin the parse loop to one OS thread. On glibc, set `MALLOC_ARENA_MAX=1` in the worker's spawn
   environment.
 - **Stop double-buffering in the parent.** Decode each frame straight into the builder, dropping the intermediate
@@ -258,7 +281,7 @@ structure supplies no number. Scanner bytes are uncounted for Python, C++ and Ru
   - reference resolution needs every declaration first (`facts.go:667`);
   - retry-once would put duplicates into the sink.
 - **Leave `GOGC` and `GOMEMLIMIT` unset,** for a different reason than before. Counting C allocation is possible (the
-  binding routes it through Go, `allocator.go:22-36`), but in the worker the memory the limit would govern is small, and
+  binding routes it through Go, `go-tree-sitter@v0.25.0/allocator.go:38-56` and `:105-110`), but in the worker the memory the limit would govern is small, and
   the coordinator's retained records are already bounded by the sink pool (`sink.go:50-70`). A limit would add only the
   thrashing risk the Go GC guide describes (https://go.dev/doc/gc-guide).
 
@@ -293,9 +316,9 @@ code).
 - Each line of the key file carries the digest and its pre-image, so every mismatch can be classified into a signed
   cause.
 - `data_flows_to` causes: φ-depth, engine over-kill, substring over-connection, the depth-8 cutoff, call-site endpoints,
-  the Go package initialiser, byte range only, and cross-file globals.
-- Control-dependence causes: exit augmentation (29 of 228,765 kubernetes Go functions need it), try-block modelling, and
-  operator conditions.
+  the Go package initialiser, byte range only, and cross-file globals (`04` §c).
+- Control-dependence causes: exit augmentation (29 of 228,765 kubernetes Go functions need it, `04`, "What the code
+  says"), try-block modelling, and operator conditions.
 
 **Per-file reindexing.** The four families reuse structural file units on a fingerprint match. `calls` becomes a linking
 unit keyed on per-file export and call-site table digests, so an edit to a function body does not trigger a relink. This
@@ -315,7 +338,8 @@ difference, with an unexplained residue within the band from two engine runs.
 
 ## 5. Corpora and goldens (`05`, `06`)
 
-**Pins.** All seven clones are shallow at pins that match their HEADs, and the product reads one tree, never history.
+**Pins.** All seven clones are shallow at pins that match their HEADs, and the product reads one tree, never history
+(`05`, "Pins").
 
 | corpus | commit |
 |---|---|
@@ -328,7 +352,7 @@ difference, with an unexplained residue within the band from two engine runs.
 | TypeScript checkout | `cf8cf4f6` |
 
 **The TypeScript checkout is not a TypeScript project at that pin.** It is the compiler's Go port with the TypeScript
-test data: 12,508 of its 12,799 `.ts` files are test data. It instantiates configured Go, unconfigured TypeScript test
+test data: 12,508 of its 12,799 `.ts` files are test data (`05`, "Vendored, generated, largest files"). It instantiates configured Go, unconfigured TypeScript test
 cases and generated JavaScript, and a TypeScript-majority production repository must come from elsewhere (vscode).
 `internal/bench/corpora.json` should gain the seven entries as unmeasured, each naming its class.
 
@@ -373,7 +397,7 @@ Each is a column or row, measured per repository class:
 - `groupMu` wait and per-unit phase times;
 - `WorkersStarted`;
 - writer busy fraction;
-- a CPU profile of the lowering walk;
+- a CPU profile of every lowering but Go's (`07` profiles Go alone);
 - scanner bytes (Python, C++, Rust);
 - `sizeof(SubtreeHeapData)` asserted through cgo.
 
@@ -384,5 +408,7 @@ Each is a column or row, measured per repository class:
 - **The trim's cost:** never measured.
 - **Scanner allocations:** uncounted by design.
 - **macOS and Windows release and available-memory calls:** named, not fetched.
-- **Native cost for Python, Java, C/C++, Rust and TypeScript:** no lowering exists yet.
+- **Native cost for Python, Java, C/C++, Rust and TypeScript at `36a529f`:** no lowering existed there. At `a3386d7`
+  `07` §c has their per-function aggregate, but home-assistant core and llvm-project stop at a lowering panic, one
+  Python and one C, so those figures cover a prefix of each corpus.
 - **An unconfigured public whole-repository corpus:** none is pinned.
