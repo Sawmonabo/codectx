@@ -81,13 +81,21 @@ import (
 //
 // Any break, continue, return or throw whose destination lies outside an open
 // finally is intercepted by the innermost such finally and re-issued from
-// the finally's exit fringe by CloseFinally.
+// the finally's exit fringe by CloseFinally. So is a goto whose label lies
+// outside it (see Goto).
 //
 // # Goto
 //
 // Labels are function-scoped: Label creates the label's own node on the
 // current fringe, and Goto resolves at Finish against labels declared before
-// or after it. A goto to no label increments Unresolved.
+// or after it. A goto to no label increments Unresolved. A goto issued in the
+// try part of a finally (its try body and catch handlers) leaves the finally
+// unless the first declaration of its label lies in that try part too; every
+// label of the try part is declared by EnterFinally, so EnterFinally decides.
+// A leaving goto enters the finally there, as an intercepted jump does, and
+// CloseFinally re-issues it from the finally's exit fringe as a goto of the
+// same label, which an enclosing finally examines in turn. A goto issued in a
+// finally body is outside that finally.
 //
 // # May-definitions
 //
@@ -155,7 +163,7 @@ type Builder struct {
 	// clears it so it never keeps a caller's strings alive.
 	names           []string
 	labels          []label
-	gotos           []gotoJump
+	gotos           []pendingGoto
 	useOff, useVars []int32
 	mayOff, mayVars []int32
 
@@ -167,7 +175,10 @@ type Builder struct {
 	high             int
 	defs, unresolved int
 	finished         bool
-	g                Graph
+	// sorted reports that labels is sorted by name, stably, so each name's
+	// labels stay in declaration order; Label clears it.
+	sorted bool
+	g      Graph
 }
 
 // Fringe is a handle to a saved fringe on the builder's LIFO stack. It is
@@ -198,6 +209,8 @@ const (
 	continueJump
 	throwJump
 	returnJump
+	// gotoJump's rec target is the index in names of the goto's label.
+	gotoJump
 )
 
 // toExit is the destination frame index of a jump that goes to Exit.
@@ -218,6 +231,11 @@ type frame struct {
 	conts int32
 	// recs heads a finally's intercepted jumps in Builder.recs.
 	recs int32
+	// gotoAt is the number of gotos issued before the frame opened, and
+	// nodeAt the number of nodes: a finally examines the gotos from gotoAt
+	// on, and a label whose node is at or past nodeAt was declared inside
+	// it.
+	gotoAt, nodeAt int32
 	// gen is the frame's handle.
 	gen     int32
 	kind    frameKind
@@ -228,7 +246,7 @@ type frame struct {
 type item struct{ node, next int32 }
 
 // rec is one distinct intercepted jump: its kind and destination frame index
-// (toExit for Exit).
+// (toExit for Exit), or for a goto the index in names of its label.
 type rec struct {
 	target, next int32
 	kind         jumpKind
@@ -237,9 +255,13 @@ type rec struct {
 // label binds names[name] to its node.
 type label struct{ name, node int32 }
 
-// gotoJump is one Goto: the label name it targets and the item list of the
-// nodes it moves.
-type gotoJump struct{ name, sources int32 }
+// pendingGoto is one Goto: the label name it targets and the item list of
+// the nodes it moves. left marks one a finally took over at EnterFinally;
+// the finally re-issues it and it resolves nothing itself.
+type pendingGoto struct {
+	name, sources int32
+	left          bool
+}
 
 // reset starts a function spanning fn on arena a: it discards every node,
 // variable, fringe, frame, label and pending goto, keeps the scratch lists'
@@ -316,7 +338,7 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.recs), cap(b.recs))*int(unsafe.Sizeof(rec{})) +
 		count(len(b.names), cap(b.names))*int(unsafe.Sizeof("")) +
 		count(len(b.labels), cap(b.labels))*int(unsafe.Sizeof(label{})) +
-		count(len(b.gotos), cap(b.gotos))*int(unsafe.Sizeof(gotoJump{})) +
+		count(len(b.gotos), cap(b.gotos))*int(unsafe.Sizeof(pendingGoto{})) +
 		count(len(b.useOff), cap(b.useOff))*4 +
 		count(len(b.useVars), cap(b.useVars))*4 +
 		count(len(b.mayOff), cap(b.mayOff))*4 +
@@ -453,8 +475,11 @@ func (b *Builder) OpenBlock(labels ...string) Frame {
 
 // ContinueHere adds every continue pending on loop frame f to the current
 // fringe. Call it where the continue target begins, so the next node created
-// receives them. Every loop calls it exactly where its continue target is; a
-// continue issued on f after it is a lowering defect CloseFrame reports.
+// receives them. Every loop calls it where its continue target is. A continue
+// issued on f after that, by code on the loop's continue path itself (a for
+// loop's update clause holding a statement expression), is pending until a
+// later ContinueHere adds it where the language lands it; one still pending
+// at CloseFrame is a lowering defect CloseFrame reports.
 func (b *Builder) ContinueHere(f Frame) {
 	i, ok := slices.BinarySearchFunc(b.frames, int32(f), func(fr frame, g int32) int { return int(fr.gen - g) })
 	if !ok || b.frames[i].kind != loopFrame {
@@ -579,8 +604,9 @@ func (b *Builder) OpenFinally() Frame {
 	return b.open(finallyFrame, nil)
 }
 
-// EnterFinally adds every intercepted jump and Throw source to the current
-// fringe and, when a node reached f by MayThrow, ONE Handler node spanning
+// EnterFinally adds every intercepted jump and Throw source, and the sources
+// of every goto that leaves the finally (see Goto), to the current fringe
+// and, when a node reached f by MayThrow, ONE Handler node spanning
 // at (the finally keyword) with an edge from each such node and none from
 // the fringe. The finally body's first node so receives normal completion,
 // every interception and the Handler. normal reports whether normal
@@ -594,6 +620,7 @@ func (b *Builder) EnterFinally(f Frame, at Span) (normal bool) {
 	}
 	fr.entered = true
 	normal = len(b.cur) > 0
+	b.leaveGotos(fr)
 	b.addList(fr.sources)
 	if h := b.handler(fr.mayThrow, at); h != -1 {
 		b.add(h)
@@ -602,8 +629,8 @@ func (b *Builder) EnterFinally(f Frame, at Span) (normal bool) {
 }
 
 // CloseFinally pops finally frame f and re-issues, from the finally body's
-// exit fringe, every intercepted break, continue, return and throw, and
-// every intercepted MayThrow source as a throw, toward its original
+// exit fringe, every intercepted break, continue, return, throw and leaving
+// goto, and every intercepted MayThrow source as a throw, toward its original
 // destination, searching only the frames outside f (an outer finally
 // intercepts again). The current fringe becomes that exit fringe if normal,
 // else empty. Each distinct (kind, destination) is re-issued once.
@@ -615,6 +642,10 @@ func (b *Builder) CloseFinally(f Frame, normal bool) {
 	r := fr.recs
 	b.popFrame(i)
 	for ; r != -1; r = b.recs[r].next {
+		if b.recs[r].kind == gotoJump {
+			b.addGoto(b.recs[r].target, b.cur)
+			continue
+		}
 		b.deliver(b.recs[r].kind, b.recs[r].target, b.cur)
 	}
 	if !normal {
@@ -630,20 +661,66 @@ func (b *Builder) Label(name string, at Span) int32 {
 	n := b.Node(Stmt, at)
 	b.names = append(b.names, name)
 	b.labels = append(b.labels, label{name: int32(len(b.names) - 1), node: n})
+	b.sorted = false
 	return n
 }
 
 // Goto moves the current fringe to label name's node and empties it; the
-// label may be declared before or after, and resolves at Finish. No such
-// label increments Unresolved.
+// label may be declared before or after, and resolves at Finish, through
+// every finally the goto leaves (see Goto). No such label increments
+// Unresolved.
 func (b *Builder) Goto(name string) {
 	b.names = append(b.names, name)
-	g := gotoJump{name: int32(len(b.names) - 1), sources: -1}
-	for _, n := range b.cur {
+	b.addGoto(int32(len(b.names)-1), b.cur)
+	b.clearCur()
+}
+
+// addGoto records a goto of the label names[name] moving sources.
+func (b *Builder) addGoto(name int32, sources []int32) {
+	g := pendingGoto{name: name, sources: -1}
+	for _, n := range sources {
 		g.sources = b.push(g.sources, n)
 	}
 	b.gotos = append(b.gotos, g)
-	b.clearCur()
+}
+
+// leaveGotos hands finally frame fr, being entered, every reachable goto
+// issued in its try part whose label's first declaration does not lie in
+// that try part: its sources join fr's, and fr records it for CloseFinally
+// to re-issue. A goto an inner finally already took over is skipped; its
+// re-issue, a later goto, is examined instead.
+func (b *Builder) leaveGotos(fr *frame) {
+	for i := int(fr.gotoAt); i < len(b.gotos); i++ {
+		g := &b.gotos[i]
+		if g.left || g.sources == -1 {
+			continue
+		}
+		if l, ok := b.labelNamed(b.names[g.name]); ok && l.node >= fr.nodeAt {
+			continue
+		}
+		for c := g.sources; c != -1; c = b.items[c].next {
+			fr.sources = b.push(fr.sources, b.items[c].node)
+		}
+		g.left = true
+		b.record(fr, gotoJump, g.name)
+	}
+}
+
+// labelNamed is the first-declared label named name. It sorts labels by name
+// first when a Label since the last sort left them unsorted; the sort is
+// stable, so each name's labels stay in declaration order across sorts.
+func (b *Builder) labelNamed(name string) (label, bool) {
+	if !b.sorted {
+		slices.SortStableFunc(b.labels, func(x, y label) int { return strings.Compare(b.names[x.name], b.names[y.name]) })
+		b.sorted = true
+	}
+	i, ok := slices.BinarySearchFunc(b.labels, name, func(l label, name string) int {
+		return strings.Compare(b.names[l.name], name)
+	})
+	if !ok {
+		return label{}, false
+	}
+	return b.labels[i], true
 }
 
 // Finish first routes the fringe still open at the end of the body to Exit
@@ -722,20 +799,20 @@ func (b *Builder) Finish() *Graph {
 }
 
 // resolveGotos adds an edge from every goto source to its label's node, and
-// counts every goto whose label no Label declared.
+// counts every goto whose label no Label declared. A goto a finally took
+// over resolves through its re-issue instead.
 func (b *Builder) resolveGotos() {
-	byName := func(x, y label) int { return strings.Compare(b.names[x.name], b.names[y.name]) }
-	slices.SortStableFunc(b.labels, byName)
 	for _, g := range b.gotos {
-		i, ok := slices.BinarySearchFunc(b.labels, b.names[g.name], func(l label, name string) int {
-			return strings.Compare(b.names[l.name], name)
-		})
+		if g.left {
+			continue
+		}
+		l, ok := b.labelNamed(b.names[g.name])
 		if !ok {
 			b.unresolved++
 			continue
 		}
 		for c := g.sources; c != -1; c = b.items[c].next {
-			b.edges = append(b.edges, pack(b.items[c].node, b.labels[i].node))
+			b.edges = append(b.edges, pack(b.items[c].node, l.node))
 		}
 	}
 }
@@ -793,10 +870,10 @@ func (b *Builder) intercept(i int32, k jumpKind, t int32, sources []int32) {
 }
 
 // record adds the jump (k, t) to finally frame fr's re-issues, once per
-// distinct pair.
+// distinct pair; two gotos of one label text are one pair.
 func (b *Builder) record(fr *frame, k jumpKind, t int32) {
 	for r := fr.recs; r != -1; r = b.recs[r].next {
-		if b.recs[r].kind == k && b.recs[r].target == t {
+		if rc := b.recs[r]; rc.kind == k && (rc.target == t || k == gotoJump && b.names[rc.target] == b.names[t]) {
 			return
 		}
 	}
@@ -822,6 +899,7 @@ func (b *Builder) open(k frameKind, labels []string) Frame {
 	b.frames = append(b.frames, frame{
 		lab0: lab0, lab1: int32(len(b.names)),
 		sources: -1, mayThrow: -1, conts: -1, recs: -1,
+		gotoAt: int32(len(b.gotos)), nodeAt: int32(len(b.nodes)),
 		gen: b.gen, kind: k,
 	})
 	return Frame(b.gen)
