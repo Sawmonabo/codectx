@@ -1431,7 +1431,7 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
 //
-// The identity and interned-string columns are surrogates (schema.sql S-1..S-3)
+// The identity and interned-string columns are surrogates (schema.sql)
 // and are compared as they are stored. Both sides of the comparison are units
 // of the SAME database, where one surrogate is one canonical identity, so
 // comparing surrogates is exactly as strong as comparing the canonical ids --

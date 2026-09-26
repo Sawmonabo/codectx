@@ -24,9 +24,9 @@ import (
 // exists at a time.
 //
 // Memory is a function of cache capacity, never of repository size. Three
-// bounded LRUs (node ids, relation ids, and one shared dictionary for the S-3
+// bounded LRUs (node ids, relation ids, and one shared dictionary for the
 // string tables) each hold `capacity` entries; with the measured average key
-// widths of the S-3 sizing -- 32-byte canonical ids rendered as 64-char hex,
+// widths measured when the dictionaries were sized -- 32-byte canonical ids rendered as 64-char hex,
 // scope keys averaging 34 B and native keys 52 B -- one entry costs roughly
 // 64-128 B of key plus ~80 B of map bucket and list element, so the default
 // capacity of 1000 (Options.BatchRecords) puts the whole interner well under
@@ -41,7 +41,7 @@ type dbInterner struct {
 	// strings is the shared dictionary cache for scope_keys and native_keys.
 	// Its keys are the interned string prefixed with a one-byte table tag,
 	// which is injective for any key content and so needs no separator. The
-	// two tables draw from one vocabulary (the S-3 sizing measured
+	// two tables draw from one vocabulary (their sizing measured
 	// evidence.native_key's 52 711 distinct values as a subset of
 	// native_aliases.native_key's 216 385), so one cache of a given capacity
 	// serves both better than two of half the size.
@@ -73,7 +73,7 @@ const (
 const internCacheFloor = 256
 
 // canonicalKeyBytes is the width node_ids.canonical_key is pinned to by
-// CHECK(length(canonical_key) = 32); S-4 made it a BLOB of raw bytes, not hex.
+// CHECK(length(canonical_key) = 32): a BLOB of raw bytes, not hex.
 const canonicalKeyBytes = 32
 
 var _ interner = (*dbInterner)(nil)
@@ -123,7 +123,7 @@ func (in *dbInterner) node(ctx context.Context, tx *sql.Tx, id model.NodeID, kin
 		// the conflict was on UNIQUE(kind, canonical_key): a different node
 		// already owns this (kind, key). model.NewNodeID derives the canonical
 		// id from exactly those two values plus the repository, and one store
-		// is one repository (S-5), so the caller passed an inconsistent
+		// is one repository, so the caller passed an inconsistent
 		// triple. Report it; never retry, and never loop.
 		return noRef, internal(fmt.Sprintf("node id %s: kind %q and canonical key %s are already bound to a different node id",
 			id, kind, idHex(canonicalKey)))

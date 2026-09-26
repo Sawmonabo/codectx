@@ -391,9 +391,9 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	}
 
 	// The replaced scope keys arrive as text and the alias rows carry scope
-	// surrogates (S-3), so the exclusion is resolved through scope_keys. A
+	// surrogates, so the exclusion is resolved through scope_keys. A
 	// replaced scope that was never interned matches no row, which is the same
-	// outcome the text comparison had.
+	// outcome a text comparison would have.
 	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id)
 		SELECT ?3, na.scope_key_id, na.native_key_id, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
 			AND na.scope_key_id NOT IN (SELECT sk.id FROM scope_keys sk JOIN cx_carry_scopes c ON c.scope_key = sk.key)

@@ -317,10 +317,10 @@ func (s *Store) countUnits(ctx context.Context, repoRaw []byte) (int64, error) {
 // own record accounting (recordOverhead per row plus the stored text, in
 // bytes: length() counts characters, so text columns are cast to BLOB first).
 //
-// The alias and evidence rows no longer carry their scope key and native key as
-// text: S-3 interned both into scope_keys / native_keys and the rows hold an
-// INTEGER reference, which recordOverhead already covers. Those strings are
-// therefore no longer counted here, and deliberately not replaced by a join
+// The alias and evidence rows carry their scope key and native key as INTEGER
+// references into scope_keys / native_keys, which recordOverhead already
+// covers. Those strings are therefore not counted here, and deliberately not
+// counted by a join
 // back to the dictionary: a dictionary row is shared by every generation that
 // ever used the key, so charging its bytes to one generation would both
 // over-count what that generation holds and claim as reclaimable bytes that

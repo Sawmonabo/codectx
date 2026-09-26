@@ -161,7 +161,7 @@ func (r *PinnedReader) nodesInFile(ctx context.Context, file model.FileID, after
 	if afterRaw != nil {
 		// ?4 is the canonical NodeID the cursor carries, matched against the
 		// dictionary column, never against node_facts.node_id -- that column is
-		// now a rebuild-local surrogate (scale-posture-plan.md 3d).
+		// a rebuild-local surrogate.
 		keyset = " AND (" + startKey + " > ?3 OR (" + startKey + " = ?3 AND ni.canonical > ?4))"
 		args = append(args, afterStart, afterRaw)
 	}

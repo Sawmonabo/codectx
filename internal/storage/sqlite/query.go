@@ -475,7 +475,7 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 		// The keyset carries the canonical RelationID, never relation_ids.id:
 		// a surrogate is meaningful only inside one store and one rebuild, so a
 		// cursor that carried it would decode to a different edge after a
-		// reindex (scale-posture-plan.md 3d).
+		// reindex.
 		where = append(where, "ri.canonical > ?")
 		args = append(args, afterRaw)
 	}

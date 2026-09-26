@@ -649,7 +649,7 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 			return &model.Error{Code: model.CodeProviderOutputInvalid,
 				Message: "node id does not derive from its repository, kind and canonical key", Details: map[string]string{"node_id": string(f.Node.ID)}}
 		}
-		// node_ids.canonical_key is BLOB(32) (S-4): the key is stored as the
+		// node_ids.canonical_key is BLOB(32): the key is stored as the
 		// digest it is, not as its 64-character hex rendering. Every minted key
 		// comes from model.CanonicalNodeKey, so a key that is not a digest is
 		// a producer that bypassed the resolver, refused here rather than by a
@@ -1043,7 +1043,7 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 // resolving them again per row would buy nothing. Exactly one of them is
 // valid, which is what the evidence CHECK constraint requires.
 //
-// evidence.id stays the canonical 32-byte digest (S-6 dropped): the id is a
+// evidence.id is the canonical 32-byte digest, not a surrogate: the id is a
 // pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
 // what makes a republished occurrence idempotent.
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {

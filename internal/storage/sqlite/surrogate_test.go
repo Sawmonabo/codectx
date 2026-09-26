@@ -90,7 +90,7 @@ func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 	}
 
 	// The canonical key is stored as the 32-byte digest it is, not as its
-	// 64-character hex rendering (S-4), and it still derives the identity it is
+	// 64-character hex rendering, and it still derives the identity it is
 	// registered under -- which is the whole reason the wire keeps canonical
 	// ids while the store keeps surrogates.
 	var key []byte
