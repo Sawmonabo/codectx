@@ -6,10 +6,13 @@ nine supported languages. It is the Section 11.6 provider: extraction-lazy,
 cached, governed per unit, and honest about every way an analysis can come
 back incomplete.
 
-The analysis engine behind it is identified by its tool lock entry and its
-licence record. Everywhere the provider speaks — the provider id, capability
-names, evidence details, error details, log fields, query results, and this
-document — it is "the engine".
+This is the only product document that names the engine behind it in prose.
+Elsewhere the name appears only as an identifier (the tool lock entry, the
+backend package path), in the pages that install and configure it, in licence
+and source lists, and in the dated research reports under `docs/research/`.
+Everywhere else — the provider id, the
+configuration table, capability names, evidence details, error details, log
+fields, query results — it is "the engine".
 
 ## What it publishes
 
@@ -115,9 +118,7 @@ state that is not `fresh` carries the machine-readable particulars of why in
 bounded `details` pairs: `skipped_methods` (the exact count) and
 `skipped_method_names` (a sample, whole names only) on a `partial`
 `data_flows_to`, `subdivided` and `backend_failure` on every capability of a
-subdivided unit, and `unanalysed_files` on every capability of a unit with a
-source file the frontend was handed and did not read (see the default path
-exclusions below). Export rows the importer recognised but does not map are
+subdivided unit. Export rows the importer recognised but does not map are
 reported once, under the `unsupported_labels` pseudo-capability, `unavailable`,
 with a label-to-count map ordered by count and an `untracked_labels` count for
 whatever did not fit. The particulars are never encoded into extra capability
@@ -127,29 +128,27 @@ capability.
 
 ## The engine
 
-The backend is a code-property-graph engine pinned by the Section 11.7 tool
-lock as its `kind: cpg` entry (runtime `jdk`, Apache-2.0; recorded in
-`THIRD_PARTY_LICENSES.md`). The version verified for
+The backend is [Joern](https://github.com/joernio/joern), pinned by the
+Section 11.7 tool lock as the `joern` entry (`kind: cpg`, runtime `jdk`,
+Apache-2.0; recorded in `THIRD_PARTY_LICENSES.md`). The version verified for
 this implementation is **4.0.627**.
 
 Two noninteractive commands, one exact argv each, no product-owned analysis
-script and no interpreter server: a **parse** that is given the unit's
-frontend, the definition cap, the unit's private materialization and a private
-output graph, and an **export** that writes every representation of that graph
-as CSV into a private export directory.
+script and no interpreter server:
 
-* The Java parse alone is also given the option that empties its frontend's
-  default path exclusions; see the default path exclusions below for why no
-  other family is given it.
-* The definition cap is 40000, replacing the engine default of 4000. Measured
-  on a 1.05M-line Python tree: 23% more parse time, 3% more memory, every
-  skipped method removed, and no change to any other fact count beyond the
-  run-to-run variance below — the measured control-dependence and call counts
-  were equal (`docs/research/10-engine-empirical.md` §9a). It is part of the
-  cache key and there is no second parse at a higher limit.
-* The single export of every representation carries every edge family the
-  importer reads (calls, control dependence, reaching definitions and
-  containment). The narrower dependence-only representations are not
+```text
+joern-parse  --language <frontend> --max-num-def 40000 <private materialization> --output <private graph> --frontend-args --no-default-exclude
+joern-export <private graph> --repr=all --format=neo4jcsv --out <private export>
+```
+
+* `--max-num-def 40000` replaces the engine default of 4000. Measured on a
+  1.05M-line Python tree: 23% more parse time, 3% more memory, every skipped
+  method removed, and no change to any other fact count beyond the run-to-run
+  variance below — the measured CDG and CALL counts were equal
+  (`docs/research/10-round3-empirical.md` §9a). It is part of the cache key and
+  there is no second parse at a higher limit.
+* The single `all` export carries every edge family the importer reads
+  (`CALL`, `CDG`, `REACHING_DEF`, `CONTAINS`). `--repr=pdg|cdg|ddg` is not
   implemented for CSV or GraphML in this release; there is no GraphML path.
 * The engine's argument parser rejects a repeated option, so the
   semantics-neutral option allowlist must never restate a pinned one.
@@ -158,18 +157,17 @@ as CSV into a private export directory.
 argv over the same unmodified 161-file tree (this repository, Go frontend)
 produced `nodes=13675 relations=52310 aliases=16922` and
 `nodes=13677 relations=52311 aliases=16926` — a band of about 0.01%, also seen
-as control dependence −4 / reaching definitions −6 on a 1.5M-line Java
-repository
-(`docs/research/10-engine-empirical.md` §4). Nothing in the provider assumes
+as CDG −4 / REACHING_DEF −6 on a 1.5M-line Java repository
+(`docs/research/10-round3-empirical.md` §4). Nothing in the provider assumes
 two runs are equal: the graph cache replays a stored graph rather than
 reparsing, fact keys are derived from source-side identity rather than from
 engine node ids, and every parity claim in this document and in the code is
 bounded by this band. A claim of *equality* between two engine runs anywhere
 in the repository is a defect.
 
-**No version probe.** The parse command rejects a version option as unknown
-and the engine's console launcher drops into its interactive console, so the
-engine's version and payload digest come from the lock entry that installed it and
+**No version probe.** `joern-parse --version` is rejected as an unknown option
+and `joern --version` drops into the interactive console, so the engine's
+version and payload digest come from the lock entry that installed it and
 travel on `Detection.ObservedVersion` and the descriptor version. The lock
 entry's *name* stays in the lock: `ObservedVersion` renders
 `engine <version> <digest>`, because detection is a product surface.
@@ -190,9 +188,9 @@ cache key are the same string whether the payload landed before the process
 started or during it. The first `Parse` or `Export` resolves the command lines,
 and that is what installs the payload: the first unit that actually needs the
 engine pays the fetch, at unit time, under the scheduler's reservation gate.
-Resolving at construction would make every `codectx index`, `refresh` and
-`watch` download roughly two gigabytes before the snapshot is even captured,
-in every repository, whether or not the planner emits a dependence unit —
+Resolving at construction instead made every `codectx index`, `refresh` and
+`watch` download roughly two gigabytes before the snapshot was even captured,
+in every repository, whether or not the planner would emit a dependence unit —
 which is exactly the delay to base readiness Section 11.6 forbids. The
 resolution is memoized with its error, so a payload that cannot be installed is
 attempted once rather than once per language family, and the resolved digest is
@@ -228,7 +226,7 @@ re-checked against the identity construction already published.
 
 | Payload digest | Release |
 |---|---|
-| `964655bd…` (the engine's release archive, SHA-256 verified locally) | 4.0.627 |
+| `964655bd…` (`joern-cli.zip`, SHA-256 verified locally) | 4.0.627 |
 
 The lock is the authority; this table is the human-readable index that
 `status`, `doctor` and each provider's reported `ObservedVersion` resolve against.
@@ -273,7 +271,7 @@ helper, so loose `.rs` files are left unanalysed rather than published as an
 empty unit.
 
 These rules are parity measurements, not preferences
-(`docs/research/10-engine-empirical.md` §5–§8): splitting one TypeScript
+(`docs/research/10-round3-empirical.md` §5–§8): splitting one TypeScript
 project four ways kept 99.7% of control-dependence edges but only 46% of the
 calls that resolved to internal methods; Python packages keep 100% of methods
 and dependence edges and alias their cross-package calls by full name; a
@@ -341,9 +339,8 @@ allocation  = min(MemAvailable - base footprint - safety margin,
 ```
 
 The base footprint is derived from the machine and the configuration -- this
-build's measured idle overhead plus the query, cache and queue reservations and
-every page cache the process opens ([configuration](configuration.md)) -- so a
-host with more cores keeps more for
+build's measured idle overhead plus the query, cache and queue reservations
+([configuration](configuration.md)) -- so a host with more cores keeps more for
 itself and offers its children less.
 
 * The cap is sized to what the unit needs, never to what the machine has. A
@@ -365,7 +362,7 @@ itself and offers its children less.
   browser of the person indexing their repository; an allocation of
   "everything but the safety margin" handed one analyzer a 42 GB heap cap on
   a 47 GB machine. It is a design constant, not a setting, for the same
-  reason the product has no default ceiling: it decides how the product
+  reason the ruling forbids a default ceiling: it decides how the product
   shares a machine, not how much work it will do. A unit whose estimate
   exceeds even the allocation still runs, whole, at the allocation.
 * The cap is placed on the engine's frontend heap. It is lossless everywhere
@@ -400,19 +397,7 @@ itself and offers its children less.
   the failed attempt must be below the allocation. A retry with no more memory
   behind it cost 100 s on a 1.05M-line Python tree and could not have
   succeeded. Where the platform does not sample the tree peak, only the first
-  condition applies; an unsampled peak is absent, never zero. The retry is
-  re-admitted before it runs: the unit returns its grant and is admitted again
-  at the larger reservation, behind whatever queued while it ran, because a
-  reservation above the allocation is admitted only when nothing else holds
-  one. That larger reservation is the unit's from then on; the export runs,
-  and the unit is compared and recorded, against it.
-* A unit has exactly one reservation. The planner sizes it from the unit's
-  source bytes and the one machine reading the admission allocation was derived
-  from, raised to the largest peak this workspace has recorded for the scope;
-  the coordinator admits the unit at it and hands it to the provider, which
-  runs every child under its caps and compares every step's peak against it.
-  The provider never sizes a second one, except in the standalone
-  provider-interface form that nothing admitted, which sizes it the same way.
+  condition applies; an unsampled peak is absent, never zero.
 * Units are never split for memory and no analysis limit is ever lowered to
   make one fit. The summed reservations against the machine-derived allocation
   are the whole of the coordinator's scheduling input — there is no count of
@@ -422,11 +407,7 @@ itself and offers its children less.
   per unit in the `status --resources` accounting block. It is process
   accounting rather than a capability detail: an observed peak differs on
   every run, and a capability row's details fold into the analysis key, where
-  two identical runs must key identically. The rows are as many as a bounded
-  response carries; a unit past them is counted as omitted, and the count of
-  units over their reservation includes the omitted ones, so it never
-  under-reports. A step that crashed or timed out keeps its own failure class
-  on its stage row; only a step that succeeded is marked over reservation.
+  two identical runs must key identically.
 
 ## Failure classes
 
@@ -437,62 +418,77 @@ Every one of these was reproduced against the real engine.
 | `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
 | `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable, **or** the untimed `Pass <name> failed` at ERROR that a pass which dies before it is timed leaves | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. A parse crash that names **both** is taken as reproducible on first sight and is not re-parsed: it goes straight to subdivision. Siblings are unaffected. |
 | `engine` (crash that names no pass) | `Process exited with code <n>` on stderr, a clean exit that left no graph, a signal death, or any non-zero exit with nothing said about a pass | same code. For the zero-exit helper crash the exit status is a lie and the empty result is the only honest signal. Nothing here identifies the defect, so the one confirmation below is kept before anything is split. |
-| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`, the count of the unit's own source files the materialization handed the frontend. Not worded as a crash, because none happened, and not worded as itself either: the frontend is given every file of the unit, so three causes remain and the failure names all three — source holding no definition this family's frontend parses, a frontend whose own fixed rules drop every file of the unit (see the default path exclusions below), and a frontend that failed without reporting it. A unit whose every file is dropped fails here, before any import, so it carries no `unanalysed_files`; a unit whose files are only partly dropped seals and discloses them under that detail. |
+| `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`, the count of the unit's own source files the materialization handed the frontend. Not worded as a crash, because none happened, and not worded as itself either: the frontend is given every file of the unit (see the exclusion defaults below), so two causes remain and the failure names both — source holding no definition this family's frontend parses, and a frontend that failed without reporting it. |
 | `engine` (no part survived subdivision) | a subdivided unit no part of which produced a method | same code, with `source_files`, `parts`, `parts_failed` and `parts_without_method`. The reason is that tally — never "no part produced an honest result", which restates the class. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
 
-### The frontends' default path exclusions, and how they are disclosed
+### The frontends' default path exclusions, and which the parse clears
 
-A frontend can drop files it is pointed at before anything is parsed, by
-fixed rules of its own. Measured on the pinned payload, with a file under a
-`test` directory in each family's fixture: both steps exit 0 on all six
-families, and whether that file reaches the exported graph is
+Each frontend of the payload carries a set of default exclude patterns that it
+applies to the files it is pointed at, before anything is parsed. The Java
+frontend's set is the only non-empty one, and it holds `test`. Measured on the
+pinned payload over three one-class fixtures whose code is identical and whose
+only difference is the path: `com/x/Main.java` exported five method rows;
+`com/test/Main.java` exported none; and `com/example/test/utils/Main.java`,
+with the frontend pointed at the `src/main/java` source root above it, also
+exported none. All three runs exited 0 from both steps and wrote nothing to
+standard error, and the two that exported nothing carried no file row for the
+source at all, not merely no method. A package directory triggers it exactly as
+a source root does, so no choice of input directory escapes it.
 
-| Family | Given the option | Not given it | What the frontend drops by its own rules |
-|---|---|---|---|
-| Java | read | dropped | the folders `.git`, `.mvn`, `.gradle`, `build`, `target`, `out`, `node_modules`, `.idea` and `test`, wherever they sit in the path — cleared by the option |
-| JavaScript, TypeScript, TSX | rejected; dropped | dropped | the folders `node_modules`, `venv`, `docs`, `test`, `tests`, `e2e`, `e2e-beta`, `examples`, `cypress`, `jest-cache`, `eslint-rules`, `codemods`, `flow-typed`, `i18n`, `vendor`, `www`, `dist` and `build`; spec, mock, end-to-end and test script files; `test*.json`; build-tool configuration files; and minified or bundled files. No option reaches these rules. |
-| C, C++ | accepted, not honoured; dropped | dropped | dot-folders, `test` and `tests` folders, and `CMakeFiles`. No option reaches these rules. |
-| Go | read | read | nothing observed |
-| Rust | read | read | nothing observed |
-| Python | rejected; read | read | nothing observed |
+**It is turned off, and the pinned parse turns it off.** The payload ships no
+Scala sources, so the citations below are the compiled classes of the payload,
+by their path under the payload root and by the `Compiled from` file and member
+`javap` reports for each.
 
-**The Java option.** The option that empties the Java frontend's default set
-is passed to the Java parse alone, as the last argument of its command line,
-after the delimiter that hands everything following it to the frontend rather
-than to the parse tool. It changes nothing for the other families: C/C++, Go
-and Rust accept it and read the same files either way, and the
-JavaScript/TypeScript and Python frontends reject it with an unknown-option
-warning on standard error — the stream the failure classifier reads. It is
-therefore kept out of their command lines, and out of their cache keys, which
-fold each family's own argument array. Clearing the Java set also un-ignores
-`build`, `target`, `out`, `node_modules` and the dot-directories. That is
-correct here and not a widening: the frontend is never pointed at a checkout.
-It is pointed at a private materialization holding exactly the files the unit
-owns, so which files exist for it to read is the product's decision, taken
-once, upstream.
+* `joern-cli/lib/io.joern.x2cpg-4.0.627.jar`, `io.joern.x2cpg.X2Cpg$`
+  (`X2Cpg.scala`), private `commandLineParser`: the fourth option it defines is
+  `no-default-exclude`, a valueless option declared `hidden()` — which is why
+  it appears in no `--help` output. Its action, `commandLineParser$$anonfun$5`,
+  is `withDefaultIgnoredFilesRegex(Nil)`: it does not add a pattern, it
+  replaces the whole default set with the empty one. `X2Cpg.parseCommandLine`
+  wraps every frontend's own parser with this one, so every frontend accepts it.
+* Same jar, `io.joern.x2cpg.frontendspecific.javasrc2cpg.package$`
+  (`package.scala`), field `JvmDefaultIgnoredFolders`: the nine folder names
+  `.git`, `.mvn`, `.gradle`, `build`, `target`, `out`, `node_modules`, `.idea`
+  and **`test`**, each passed through `Pattern.quote` and expanded into two
+  unanchored regexes, `(^|/)\Qname\E($|/)` and `(^|\\)\Qname\E($|\\)`.
+  That is the exact pattern that drops the fixtures above.
+* `joern-cli/frontends/javasrc2cpg/lib/io.joern.javasrc2cpg-4.0.627.jar`,
+  `io.joern.javasrc2cpg.JavaSrc2Cpg$` (`JavaSrc2Cpg.scala`) takes that list as
+  `DefaultIgnoredFilesRegex`, and `io.joern.javasrc2cpg.Config$`
+  (`Main.scala`) seeds the config field `defaultIgnoredFilesRegex` from it.
+  `io.joern.javasrc2cpg.util.SourceParser$` reads that **config field** when it
+  determines the files to parse, so emptying the field empties the exclusion.
+* `joern-cli/lib/io.joern.joern-cli-4.0.627.jar`,
+  `io.joern.joerncli.CpgBasedTool$`: `ARGS_DELIMITER` is `--frontend-args`, and
+  `splitArgs` returns everything before it as the parse tool's own arguments
+  and everything after it, with the delimiter dropped, as the frontend's.
+  `io.joern.console.cpgcreation.JavaSrcCpgGenerator.generate` places those
+  arguments ahead of the input path and `--output` it appends itself. The
+  delimiter therefore stands **last** in the pinned parse argv, after the paths
+  the parse tool reads itself.
 
-**What no option reaches is disclosed.** The JavaScript/TypeScript and C/C++
-frontends' own rules have no switch, so a unit of either family can hand the
-frontend files that never reach the graph. The import does not copy those rules
-to predict the drop. It compares the unit's own source files — the files of the
-unit's family the materialization handed the frontend — with the export's file
-nodes, as one join over the on-disk staging database, and every file with no
-file node is counted. A unit with any such file publishes **every** capability
-`partial` with `CTX_PROVIDER_OUTPUT_INVALID` and
-`unanalysed_files = "<count> <first path>"`, the path being the first such file
-in path order: no fact of any pass comes from those files. The count and the
-path share one value because a busy row fills most of the bounded detail map,
-and either half alone would not say what was missed. Because the comparison
-reads the export's own record, it also catches a file a frontend skipped for a
-reason nobody has measured, on any family.
+Clearing the whole default set also un-ignores `build`, `target`, `out`,
+`node_modules` and the dot-directories. That is correct here and not a
+widening: the frontend is never pointed at a checkout. It is pointed at a
+private materialization holding exactly the files the unit owns, so which files
+exist for it to read is the product's decision, taken once, upstream.
 
-A subdivided unit is counted over the union of its parts: each imported part
-compares its own files with its own export, and one streaming pass over the
-manifest counts the unit's files that lie under no imported part — files in the
-unit's root directory, in a dot-directory the split does not descend into, or
-in a part that failed or exported no method.
+**The one exclusion no argument reaches.** The JavaScript frontend does not use
+the configuration mechanism above for its own list. In
+`joern-cli/frontends/jssrc2cpg/lib/io.joern.jssrc2cpg-4.0.627.jar`,
+`io.joern.jssrc2cpg.utils.AstGenRunner` (`AstGenRunner.scala`),
+`isIgnoredByDefault` tests three fixed lists held on the companion object and
+reads no configuration field at all; among them are
+`(conf|test|spec|[.-]min|\.d)\.(js|jsx|cjs|mjs|xsjs|xsjslib|ts|tsx)$`,
+`.*[.-]test\.js`, `.*[.-]spec\.js` and `.*[.-]e2e\.js`. Consequence, on
+payload 4.0.627: a JavaScript unit's test, spec and end-to-end files are not
+analysed and no dependence fact is published for them, whatever arguments the
+parse is given. The other frontends this provider drives — C/C++, Go, Python
+and Rust — define no default set of their own: their configuration types only
+implement the setter, and the inherited default is empty.
 
 **What is run a second time, and what is not.** Heap exhaustion keeps the one
 retry described above, and only when more memory is actually available. A
@@ -514,7 +510,7 @@ the tree sum at one instant, never a sum of per-process high-water marks
 reached at different instants, and it is therefore higher than
 `/usr/bin/time %M`, which reports the largest single process — by tens to
 hundreds of megabytes on this engine, whose orchestrator JVM, frontend and
-helpers are separate processes (`docs/research/10-engine-empirical.md` §1).
+helpers are separate processes (`docs/research/10-round3-empirical.md` §1).
 The figure is what the memory governor's estimate is checked against. Where
 the platform cannot observe a running tree — anything but Linux today — the
 detail is absent and a memory failure says so under
@@ -532,35 +528,23 @@ as heap exhaustion would spend the unit's single retry on a full reparse of a
 unit that had already succeeded.
 
 Every failure also carries `stderr_tail`: the last of what the child wrote to
-its standard error, in whole lines taken from the end, bounded to what one
-error detail holds. Each line is reduced before it is counted, so the bound can
-never cut a path in two and leave its leading directories behind as text no
-rule recognises. A final line longer than the whole bound keeps its last
-bytes, from the first field boundary in them, because the exception is at the
-end of the line. A failure row is durable storage, so what it may contain is
-narrower than what a log may:
+its standard error, bounded to what one error detail holds, cut at a line
+boundary. Without it a failure reported only how many bytes the child wrote,
+and a crash on a real repository left nothing that could be read afterwards.
+A failure row is durable storage, so what it may contain is narrower than what
+a log may:
 
-- A path starts at every separator that follows a byte which cannot continue a
-  relative path — a space, a quote, a bracket, a backtick, `=`, `>`, `@`, `|`,
-  `!`, `+`, a comma — so ``cmd: `<abs>/analyzer-parse` ``, `2><abs>/child.log`
-  and `@<abs>/args` are all reduced, and the punctuation around the path
-  stays. A path ends at whitespace, a closing bracket, a quote, `|`, a comma or
-  a semicolon.
-- The run's private directories (the unit's materialization and its work
-  directories) are replaced by `(private)` wherever such a path starts, and
-  the rest of the path is kept: it is the part that says which step of the run
-  wrote the file, and it names something inside a directory the reader is not
+- The run's private directories are replaced by `(private)`, by name.
+- Every remaining rooted path is reduced to its base name, wherever it sits in
+  a whitespace-delimited field: the child prints paths inside punctuation — a
+  backticked command line, an argument list, a quoted value — and reducing
+  only a field that begins with a separator published the operator's home
+  directory and the repository path. The punctuation around the path stays, so
+  ``cmd: `<abs>/analyzer-parse` `` reads as ``cmd: `analyzer-parse` ``.
+- A path *under* a private directory keeps what follows `(private)`, which is
+  the part that says which step of the run wrote the file. That remainder is
+  not a rooted path: it names something inside a directory the reader is not
   being told.
-- A path under any other directory the backend knows is reduced to its base
-  name, with that directory matched as a whole prefix first, so a known
-  directory whose name holds a space is reduced whole. The known directories
-  are the user's home directory, the directories of the engine's launchers and
-  every absolute directory the child's environment names. Every other rooted
-  path is reduced to its base name the same way.
-- The backend is not told the data directory. A path under it that is under
-  none of the directories above is reduced by the generic rule, and a space in
-  a directory name the backend does not know ends the path there: what follows
-  the space is left as the unrooted text it then is.
 
 Classification depends on the engine logging at WARN, so the child environment
 pins its log level rather than inheriting whatever the host set. The child's
@@ -568,8 +552,8 @@ environment is built by the product and inherits nothing, which also means it
 inherits no locale: every child is given a UTF-8 one, because a C locale makes
 the platform's path encoding ASCII and a runtime that encodes a file name
 through it cannot open a source file whose name holds a letter outside ASCII
-at all. One such file failed a 4,984-file project with the
-runtime's invalid-path exception; the same project parsed and exported with
+at all. One such file failed a 4,984-file project with
+`java.nio.file.InvalidPathException`; the same project parsed and exported with
 the locale set and nothing else changed. Setting the encoding as a runtime
 property instead does not work and was measured not to: the runtime derives its
 path encoding from the locale and ignores the property.
@@ -604,7 +588,7 @@ in the parse or in the export, and is never used for memory.
    project whose parse succeeds at every heap cap and whose whole-unit export
    dies at every one of them, while each of its subdivided parts exports
    cleanly, is a measured shape, not a hypothetical: reporting it as a failed
-   unit would throw away every fact the engine could still produce for that project.
+   unit threw away every fact the engine could still produce for that project.
    Memory, the unit deadline and an export that exits cleanly holding no method
    keep their own paths and are never subdivided — the first two are properties
    of what the unit was given, the third a statement about the frontend's own
@@ -665,7 +649,8 @@ carried into the new generation until the fresh one replaces it (Section 13.3).
 
 ## Refresh and delta
 
-The engine has no incremental mode, no merge and no per-file export, so a
+The engine has no incremental mode, no merge and no per-file export
+([upstream issue #5757](https://github.com/joernio/joern/issues/5757)), so a
 refreshed unit is a whole parse and export — unless the cache key still
 matches, in which case nothing runs at all. That is the upstream project's own
 answer, not an inference from its documentation: asked on its issue tracker
@@ -770,7 +755,7 @@ present and usable. `Result.Filtered` is how a caller tells the two apart —
 had nothing to give.
 
 Measured through the applier against the real engine, over one named fixture:
-the Go fixture of the export reader's test data (the `pkg:go:` unit,
+`internal/provider/dependence/neo4jcsv/testdata/src/gofix` (the `pkg:go:` unit,
 `go.mod` + `app/app.go` + `helper/helper.go`, 38 fact keys) as the predecessor,
 refreshed after adding one file, `extra/extra.go`, declaring `func Note() int {
 return 7 }`. The refresh kept its filter and inherited **14 relations and 29
@@ -807,8 +792,7 @@ sort; only the edges whose endpoint several entities resolved to, and
 
 The result is that an import's disk traffic is a small constant times its
 export -- 6.6× on the synthetic export of the importer's scale test, with a
-staging cache small enough that every sort spills, against 34.5× for the
-row-at-a-time staging [ADR-0009](adr/ADR-0009-import-staging.md) measured --
+staging cache small enough that every sort spills, against 34.5× before --
 and that every byte is written once, sequentially, with a bounded window in
 flight rather than in a burst at each commit. The page
 cache of the staging database is `providers.dependence.staging_cache_kib`
