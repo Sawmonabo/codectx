@@ -258,10 +258,11 @@ func lowered(l lang.Language) bool {
 }
 
 // warmLowerings lowers and analyses every callable of the first fixture of
-// each lowered language into a, untimed and on a parser of its own, so that
-// what a lowering resolves once per process (its kind and field tables) and
-// the arena's first backing are paid before any timed window opens.
-func warmLowerings(t *testing.T, a *flow.Arena) {
+// each lowered language into a and s, untimed and on a parser of its own, so
+// that what a lowering resolves once per process (its kind and field tables),
+// the arena's first backing and the scratch's first lists are paid before any
+// timed window opens.
+func warmLowerings(t *testing.T, a *flow.Arena, s *worker.Scratch) {
 	t.Helper()
 	ps := parsers{}
 	defer ps.close()
@@ -278,7 +279,7 @@ func warmLowerings(t *testing.T, a *flow.Arena) {
 		}
 		defer tree.Close()
 		if err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
-			passes(l.Lower(fn, in.src, a), a)
+			passes(l.Lower(fn, in.src, a, s), a)
 			return nil
 		}); err != nil {
 			t.Fatalf("%s: %v", in.path, err)
@@ -468,7 +469,9 @@ func TestFunctionAnalysis(t *testing.T) {
 	native.SetCounting(false)
 	defer native.SetCounting(true)
 	var arena flow.Arena
-	warmLowerings(t, &arena)
+	var scratch worker.Scratch
+	defer scratch.Close()
+	warmLowerings(t, &arena, &scratch)
 	inputs(t, lowered, func(in input) {
 		l, _ := worker.LoweringFor(in.language.Name)
 		tree, _ := parse(ps.get(t, in.language), in.src)
@@ -480,9 +483,9 @@ func TestFunctionAnalysis(t *testing.T) {
 		err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
 			row := functionRow{Row: "function", Origin: in.origin, Path: in.path, Language: in.language.Name,
 				Kind: fn.Kind(), StartByte: fn.StartByte(), EndByte: fn.EndByte(), StartLine: fn.StartPosition().Row + 1}
-			passes(l.Lower(fn, in.src, &arena), &arena)
+			passes(l.Lower(fn, in.src, &arena, &scratch), &arena)
 			t0 := time.Now()
-			g := l.Lower(fn, in.src, &arena)
+			g := l.Lower(fn, in.src, &arena, &scratch)
 			t1 := time.Now()
 			pd := flow.PostDominators(g, &arena)
 			t2 := time.Now()
@@ -561,7 +564,9 @@ func TestFileAnalysis(t *testing.T) {
 	defer timing.close()
 	defer native.SetCounting(true)
 	var arena flow.Arena
-	warmLowerings(t, &arena)
+	var scratch worker.Scratch
+	defer scratch.Close()
+	warmLowerings(t, &arena, &scratch)
 	// run is one end to end over in with p; it reports false when there was
 	// no tree.
 	run := func(in input, p *ts.Parser, row *fileRow) bool {
@@ -573,7 +578,7 @@ func TestFileAnalysis(t *testing.T) {
 		defer tree.Close()
 		row.Functions, row.Nodes, row.ArenaPeakBytes = 0, 0, 0
 		err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
-			g := l.Lower(fn, in.src, &arena)
+			g := l.Lower(fn, in.src, &arena, &scratch)
 			passes(g, &arena)
 			row.Functions++
 			row.Nodes += g.Len()
