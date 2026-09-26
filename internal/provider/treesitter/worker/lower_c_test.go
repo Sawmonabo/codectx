@@ -171,8 +171,9 @@ func TestCLoweringGolden(t *testing.T) {
 		{
 			// C17 §6.5.3.2p3: `&x` yields a pointer to x, through which the
 			// callee may write it. Nodes: x = 1@14 (defines x), g(&x)@21
-			// (Uses x, may-defines x), return x;@28. The may-definition kills
-			// nothing, so the return's x pairs with both x = 1 and g(&x).
+			// (Uses x, may-defines x), return x;@28. The return's x pairs
+			// with the nearest may-definition g(&x) and with the killing
+			// x = 1 that reaches it through it.
 			name:     "taking an address is a may-definition of the variable",
 			protects: "a use after a call that received a variable's address sees the write the call may make through it",
 			mutation: "lower `&x` as a plain read (g(&x)@21 -> return x;@28 vanishes), or make it a killing Def (x = 1@14 -> return x;@28 vanishes)",
@@ -318,7 +319,7 @@ func TestCLoweringGolden(t *testing.T) {
 			// by a semicolon, whose value is the value of the construct; the
 			// statements before it are evaluated for their effect. Nodes:
 			// y@10, z@17, g(y)@33 (Uses y), y = z@39 (Uses z, defines y and
-			// may-defines the statement expression's result), x = ({ g(y);
+			// the statement expression's result), x = ({ g(y);
 			// y = z; })@26 (Uses the result, defines x), return x;@50. Succ:
 			// a straight line to EXIT.
 			name:     "a statement expression's value comes from its last statement's node",
@@ -336,7 +337,7 @@ func TestCLoweringGolden(t *testing.T) {
 			// is an expression statement of the construct's own list with no
 			// label after it, so it runs on every path to the value and takes
 			// the call's earlier read of x. Nodes: x@10, x = 1@30 (Uses x,
-			// defines x, may-defines the owned variable holding the read), 0@37
+			// defines x and the owned variable holding the read), 0@37
 			// (defines the construct's result), return g(x, ({ x = 1; 0;
 			// }));@15 (Uses the owned variable and the result). Succ: a
 			// straight line to EXIT.
@@ -430,16 +431,17 @@ func TestCLoweringGolden(t *testing.T) {
 			// A is undefined, so after the directive x is the #ifdef group's
 			// variable in one build and the parameter in the other. Nodes:
 			// x@10, A@24 (Branch), x = 1@32, g(x)@48 (Uses both variables),
-			// x = 2@56 (defines the group's variable and may-defines the
-			// parameter), return x;@66 (after the block, the parameter).
+			// x = 2@56 (a killing definition of both: whichever build is
+			// taken, x names one of them and the write replaces it), return
+			// x;@66 (after the block, the parameter, which x = 2 killed).
 			// Succ: A→{x = 1, g(x)}; x = 1→g(x)→x = 2→return x. IPDom: A →
 			// g(x).
 			name:     "a name only one arm declares stands for both bindings after the directive",
-			protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there may write either without killing the enclosing variable's earlier value",
-			mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(x)@48 and x = 2@56 -> return x;@66), or let the write define the enclosing variable instead of may-defining it (loses x@10 -> return x;@66)",
+			protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there kills both, so the enclosing variable's earlier value does not reach past it",
+			mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(x)@48 and x = 2@56 -> return x;@66, adds x@10 -> return x;@66), or let the write may-define the enclosing variable instead of killing it (adds x@10 -> x = 2@56 and x@10 -> return x;@66)",
 			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(x);\n  x = 2;\n } return x; }",
 			cd:       []string{"A@24 -> x = 1@32"},
-			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x@10 -> return x;@66", "x = 2@56 -> return x;@66"},
+			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x = 2@56 -> return x;@66"},
 		},
 		{
 			// C17 §6.7.6.3 (a block-scope `int g(int);` declares a function,
@@ -472,6 +474,25 @@ func TestCLoweringGolden(t *testing.T) {
 			src:      "int f(void) { int x[2]; {\n#ifdef A\n  int x = 1;\n#endif\n  h(x); } return x[0]; }",
 			cd:       []string{"A@33 -> x = 1@41"},
 			du:       []string{"x = 1@41 -> h(x)@57", "h(x)@57 -> return x[0];@65"},
+		},
+		{
+			// C17 §6.10.1p6 (one group kept, so after the directive x is the
+			// #ifdef group's variable or the parameter) and §6.5.2.2 (the
+			// arguments are evaluated before the call; the lowering takes them
+			// left to right). Nodes: x@10, A@24 (Branch), x = 1@32, x = 2@53
+			// (kills both variables; it Uses both, since the call read both
+			// before it, and defines an owned variable holding each earlier
+			// value and its own result), g(x, x = 2)@48 (Uses those owned
+			// variables and the result), return x;@64 (the parameter). Succ:
+			// A→{x = 1, x = 2}; x = 1→x = 2→g(x, x = 2)→return x. IPDom: A →
+			// x = 2.
+			name:     "a write through a name a conditional left standing for two bindings hands on the held read of each",
+			protects: "the call's read of x made before x = 2 pairs with the definitions that reached it in both builds, the parameter's included, rather than with the write after it",
+			mutation: "hand off only the arms' variable's held read (the parameter's read stays on the call, which pairs it with x = 2@53: loses x@10 -> x = 2@53)",
+			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(x, x = 2);\n } return x; }",
+			cd:       []string{"A@24 -> x = 1@32"},
+			du: []string{"x@10 -> x = 2@53", "x = 1@32 -> x = 2@53", "x = 2@53 -> g(x, x = 2)@48",
+				"x = 2@53 -> return x;@64"},
 		},
 	})
 }
