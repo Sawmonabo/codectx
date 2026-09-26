@@ -55,29 +55,30 @@ func TestCppLoweringGolden(t *testing.T) {
 		{
 			// [expr.prim.lambda.capture]/10–12: `&a` captures by reference, `b`
 			// by copy, so only the write to a changes the enclosing variable.
-			// Nodes: a@10, b@17, the lambda @31 (Uses a and b, may-defines a
-			// only), g = …@27 (defines g), g()@68, h(a)@73, return b;@79.
+			// Nodes: a@10, b@17, the lambda @31 (Uses its captures a and b,
+			// may-defines a only), g = …@27 (defines g and Uses nothing: the
+			// captures are the creating node's), g()@68, h(a)@73, return
+			// b;@79. Succ: a straight line to EXIT. h(a) sees a@10 and the
+			// lambda's non-killing may-definition; return b sees b@17 alone.
 			name:     "a lambda's by-reference capture is a may-definition, a by-copy capture is not",
-			protects: "a write through a by-reference capture reaches later uses of the variable, while a write to a by-copy capture stays inside the closure",
-			mutation: "may-define every captured variable written (adds [&a, b]() mutable { a = b; b = 0; }@31 -> return b;@79), or none (loses the lambda's pair with h(a)@73)",
+			protects: "a write through a by-reference capture reaches later uses of the variable, while a write to a by-copy capture stays inside the closure, and the declarator consuming the lambda does not repeat its captures",
+			mutation: "may-define every captured variable written (adds [&a, b]() mutable { a = b; b = 0; }@31 -> return b;@79), or none (loses the lambda's pair with h(a)@73), or leave the captures to the declarator consuming the lambda (adds a@10, b@17 and [&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27)",
 			src:      "int f(int a, int b) { auto g = [&a, b]() mutable { a = b; b = 0; }; g(); h(a); return b; }",
 			du: []string{"a@10 -> [&a, b]() mutable { a = b; b = 0; }@31", "b@17 -> [&a, b]() mutable { a = b; b = 0; }@31",
-				"a@10 -> g = [&a, b]() mutable { a = b; b = 0; }@27", "b@17 -> g = [&a, b]() mutable { a = b; b = 0; }@27",
-				"[&a, b]() mutable { a = b; b = 0; }@31 -> g = [&a, b]() mutable { a = b; b = 0; }@27",
 				"g = [&a, b]() mutable { a = b; b = 0; }@27 -> g()@68",
 				"a@10 -> h(a)@73", "[&a, b]() mutable { a = b; b = 0; }@31 -> h(a)@73", "b@17 -> return b;@79"},
 		},
 		{
 			// [expr.prim.lambda.capture]/7, 12: under a `&` default an
-			// odr-used variable is captured by reference. Nodes: a@10, the
-			// lambda @24 (Uses a, may-defines a), g = …@20, g()@42, return
-			// a;@47.
+			// odr-used variable is captured by reference, and binding the
+			// reference Uses a, as taking its address does. Nodes: a@10, the
+			// lambda @24 (Uses a, may-defines a), g = …@20 (defines g, Uses
+			// nothing), g()@42, return a;@47. Succ: a straight line to EXIT.
 			name:     "an implicit by-reference capture that is written is a may-definition",
 			protects: "a variable captured implicitly under [&] and written in the body is may-defined where the lambda is created",
-			mutation: "treat an implicit capture as by copy (loses [&]() { a = 1; }@24 -> return a;@47)",
+			mutation: "treat an implicit capture as by copy (loses [&]() { a = 1; }@24 -> return a;@47), or leave the captures to the declarator consuming the lambda (adds a@10 and [&]() { a = 1; }@24 -> g = [&]() { a = 1; }@20)",
 			src:      "int f(int a) { auto g = [&]() { a = 1; }; g(); return a; }",
-			du: []string{"a@10 -> [&]() { a = 1; }@24", "a@10 -> g = [&]() { a = 1; }@20",
-				"[&]() { a = 1; }@24 -> g = [&]() { a = 1; }@20", "g = [&]() { a = 1; }@20 -> g()@42",
+			du: []string{"a@10 -> [&]() { a = 1; }@24", "g = [&]() { a = 1; }@20 -> g()@42",
 				"a@10 -> return a;@47", "[&]() { a = 1; }@24 -> return a;@47"},
 		},
 		{
@@ -92,8 +93,9 @@ func TestCppLoweringGolden(t *testing.T) {
 			du:       []string{"x@8 -> x@17"},
 		},
 		{
-			// [stmt.select]/2–3 (condition declarations): the declared name is
-			// in scope in both branches and initialized by the condition.
+			// [stmt.pre] (a condition that is a declaration) and [stmt.if]: the
+			// declared name is in scope in both branches and initialized by
+			// the condition.
 			// Nodes: int x = g()@14 (the Branch, defining x), return x;@27,
 			// return 0;@37.
 			name:     "a condition declaration defines its name on the decision node",
