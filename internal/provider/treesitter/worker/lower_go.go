@@ -71,7 +71,10 @@ var goLowering = Lowering{
 //     the assignment follows every evaluation of the statement, so it
 //     overwrites what the evaluation wrote.
 //   - A condition (if, for, a case value list, a type-case type list) is one
-//     Branch node spanning it. Every `&&`/`||` in an expression is hoisted
+//     Branch node spanning it; an if or for condition spans its expression
+//     with every enclosing pair of parentheses stripped (see Lowering,
+//     Spans), and a case's value list spans the list, each of whose values
+//     keeps its own parentheses. Every `&&`/`||` in an expression is hoisted
 //     before the node that owns the expression: each operand that is not
 //     itself `&&`/`||` becomes a Branch node carrying its uses, wired by
 //     short-circuit (the left operand of && reaches the right one when true
@@ -115,7 +118,12 @@ var goLowering = Lowering{
 //     loop with at most one iteration variable. The over-approximation adds
 //     pairs and gives up none.
 //   - An expression switch has a Stmt head for its tag, which Go evaluates
-//     exactly once ("Switch statements"); a type switch has one spanning
+//     exactly once ("Switch statements"), spanning the tag expression with
+//     every enclosing pair of parentheses stripped (see Lowering, Spans): in
+//     `switch x {` the head is `x`, never the `switch` keyword or the
+//     statement. A switch without a tag, which the specification makes
+//     equivalent to `true`, has no head: its first case condition is its
+//     first node, after its init statement's. A type switch has one spanning
 //     `x := v.(type)` that defines the alias. The head has one successor,
 //     the first case condition. Every case condition (a case value list, a
 //     type-case type list) is a Branch node that Uses its own values' reads
@@ -535,11 +543,11 @@ func (g *goLower) chain(n *ts.Node) (first, t, f flow.Fringe) {
 	return first, g.b.Push(), rf
 }
 
-// cond lowers condition e as one Branch node after its hoisted operands and
-// returns the node.
+// cond lowers condition e as one Branch node, spanning e with its enclosing
+// parentheses stripped, after its hoisted operands and returns the node.
 func (g *goLower) cond(e *ts.Node) int32 {
 	g.hoist(e)
-	id := g.node(flow.Branch, e)
+	id := g.node(flow.Branch, g.l.unparen(e))
 	g.uses(id, e)
 	return id
 }
@@ -870,7 +878,7 @@ func (g *goLower) switchStmt(s *ts.Node, labels []string, typed bool) {
 		if typed {
 			head = g.typeSwitchHead(s, value, tag)
 		} else {
-			head = g.node(flow.Stmt, value)
+			head = g.node(flow.Stmt, g.l.unparen(value))
 			g.useAll(head, tag, len(g.buf))
 		}
 		g.mayAll(head, mlo)
