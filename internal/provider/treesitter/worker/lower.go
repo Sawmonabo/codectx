@@ -84,6 +84,16 @@ func Grammar(name string) (*ts.Language, bool) {
 // no owned variable exists. Each lowering states exactly which constructs it
 // folds and which it lowers to nodes.
 //
+// A read the consumer folds and that its evaluation makes before an
+// embedded assignment redefines the variable (`y = x + (x = 1)`, `f(x, x =
+// 1)`) is carried by the assignment's node: that node Uses the earlier
+// value and hands it on through an owned variable it may-defines, and the
+// consumer Uses that variable in place of the name, so the folded read
+// pairs with the definition that reached it rather than the one after it.
+// Where the language leaves the order of the two unsequenced or
+// indeterminately sequenced (C and C++), the lowering takes source order and
+// says so.
+//
 // A value evaluated once and used by several later nodes is evaluated at a
 // node of its own, which defines an owned variable; the later nodes Use that
 // variable, never the names the value was computed from. That covers a
