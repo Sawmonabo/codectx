@@ -1,5 +1,16 @@
-// One JavaScript function per control-flow form the lowering handles, so
-// the dependence-core benchmarks exercise every path of it.
+// One JavaScript function per group of the control-flow and definition forms
+// the JavaScript lowering's contract names: branches, the conditional and
+// logical operators, logical assignment, the loop forms, labels and labelled
+// blocks, switch fall-through, try/catch/finally, optional chains,
+// generators, async iteration, var hoisting, block-scoped function
+// declarations, sequence expressions, chained and property assignment,
+// spread and new, destructuring with defaults, import bindings, classes with
+// heritage, fields and a static block, and closures. It is a benchmark input,
+// not a proof of coverage: the lowering's golden tests are that.
+
+import defaultExport, { named as alias } from "./module.js";
+
+const configured = alias(defaultExport);
 
 function branches(x, y) {
   if (x > y) {
@@ -104,4 +115,34 @@ class Counter {
 
 function forever(emit) {
   for (;;) emit(1);
+}
+
+function declarations(a, b) {
+  var hoisted = a;
+  let later;
+  (later = hoisted), b++, a--;
+  a ??= b;
+  b ||= a;
+  hoisted &&= later;
+  a = b = hoisted;
+  const list = [...arguments];
+  list[0] = new Date(a);
+  {
+    function inner() {
+      return later;
+    }
+    later = inner();
+  }
+  while (true) {
+    if (a > b) break;
+    a++;
+  }
+  return list;
+}
+
+class Registry extends Map {
+  static defaults = {};
+  static {
+    Registry.defaults.size = configured;
+  }
 }

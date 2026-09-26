@@ -73,7 +73,7 @@ const corpusPrefix = "Ctxbench"
 //
 // Helpers and HelperLines are the per-file SHAPE, and they exist because
 // Section 23.1 pins the reference fixture by lines and bytes as well as by
-// files: 10,000 files of the original ~0.5 KiB filler is a quarter of the
+// files: 10,000 files of the narrow ~0.5 KiB filler is a quarter of the
 // line count and a fourteenth of the byte count the reference workload names,
 // so a measurement over it describes a much smaller corpus than the one the
 // budgets were written for. Helpers is the number of generated function
@@ -529,10 +529,10 @@ func TestFingerprintParity(t *testing.T) {
 // --- the pinned corpora manifest -------------------------------------------
 
 // corpusEntry is one pinned real repository recorded beside the results as the
-// Step 2 differential oracle. The generated corpus above is the reference
+// differential oracle. The generated corpus above is the reference
 // workload (Section 23.1: real repositories are "an additional signal, not a
 // moving substitute for the fixed fixture"), so an entry here is a record, not
-// an input this package fetches: nothing in this lane clones anything.
+// an input this package fetches: nothing here clones anything.
 type corpusEntry struct {
 	Name        string `json:"name"`
 	URL         string `json:"url"`

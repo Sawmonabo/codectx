@@ -210,8 +210,7 @@ func TestLedgerCost(t *testing.T) {
 // doing at that moment, and the drift that dominates the unpaired ranges
 // cancels. Comparing a difference of medians against the wider arm's range
 // instead would let one slow repetition in either arm widen the range enough
-// to absorb a real and repeatable difference -- which is exactly what was
-// observed here before this rule replaced it.
+// to absorb a real and repeatable difference.
 //
 // The verdict is WITHIN NOISE when the per-repetition differences straddle
 // zero: the sign of the difference is then not stable from repetition to
@@ -409,8 +408,11 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	if err := os.MkdirAll(parsers, 0o700); err != nil {
 		return ledgerArmResult{}, err
 	}
+	// One ledger for the whole stack, as production composes it: the parser
+	// workers and the coordinator's heavy units reserve on the same one.
+	admit := benchAdmission()
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		WorkerMemoryBytes: 256 << 20, Admission: admit,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		return ledgerArmResult{}, err
@@ -444,7 +446,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 			return ledgerArmResult{}, err
 		}
 	}
-	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: benchAdmission(),
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry, Admission: admit,
 		CAS: cas, Lock: heldLock{lock}, Pool: pool, Ledger: led})
 	if err != nil {
 		return ledgerArmResult{}, err
