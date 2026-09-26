@@ -57,6 +57,15 @@ var javascriptLowering = Lowering{
 //     so D ≤ N. A default (`a = e` in a pattern or parameter) is a Branch
 //     node spanning the element that defines the name from the incoming
 //     value, then a Stmt node spanning e that defines it from the default.
+//     Elements are lowered in source order: the language assigns them one at
+//     a time, each step may throw, and a default or computed key reads the
+//     elements assigned before it. Every element node carries every read of
+//     the incoming value, so each one reads the right-hand values as they
+//     were before any element of the statement was written — directly, or,
+//     for a variable an earlier element wrote (`[x, y] = [y, x]`), through
+//     that element's node, which read the old value before writing it: the
+//     Go lowering's rule for a cyclic multi-assignment, a sound
+//     over-approximation.
 //   - A nested callable or class is its own function; in the enclosing
 //     function its creating expression is one Stmt node spanning it, which
 //     Uses every enclosing variable referenced inside it, resolved with its
@@ -1048,7 +1057,8 @@ func (j *jsLower) augment(n *ts.Node) {
 }
 
 // bind lowers a binding or assignment pattern whose incoming value read
-// reads[from:to]: one defining node per bound name.
+// reads[from:to]: one defining node per bound name, in source order, each
+// using all of reads[from:to] (see Destructuring in lowerJavaScript).
 func (j *jsLower) bind(p *ts.Node, from, to int) {
 	k := j.k
 	switch p.KindId() {

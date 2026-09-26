@@ -98,5 +98,17 @@ func TestGoLoweringGolden(t *testing.T) {
 				"x = 1@46 -> x++@82", "x = 2@61 -> x++@82", "x++@82 -> x++@82",
 				"x = 1@46 -> return x@89", "x = 2@61 -> return x@89", "x++@82 -> return x@89"},
 		},
+		{
+			// Nodes: a@17, b@20, c@23 (params), c@36, a@39, b@42, return
+			// b@55. Targets read: c nothing, a old b, b old a. c is read by
+			// no other target and goes first; a and b form a cycle, broken
+			// at a, whose node also uses its own old value; b's read of a
+			// stays and resolves to a@39, which carries old a.
+			name:     "cyclic multi-assignment keeps the later target's read",
+			protects: "every target of a multi-assignment depends on the right-hand values as they were before any target was written, a swap included",
+			mutation: "erase the later target's read of the cycle-broken target (b@42 loses a@39 -> b@42), or give the old value to the statement's first node instead of the cycle-broken target's (a@17 -> c@36 replaces a@17 -> a@39)",
+			src:      "package p\nfunc f(a, b, c int) int { c, a, b = 0, b, a; return b }",
+			du:       []string{"a@17 -> a@39", "b@20 -> a@39", "a@39 -> b@42", "b@42 -> return b@55"},
+		},
 	})
 }

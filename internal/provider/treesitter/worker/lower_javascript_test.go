@@ -126,5 +126,16 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 				"g = (a) => a + b@46 -> return g;@64",
 			},
 		},
+		{
+			name:     "destructuring swap reads the values from before the statement",
+			protects: "a destructuring element reading a variable an earlier element of the same statement wrote still depends on its old value, through that element's node, which read it before writing",
+			mutation: "attach to each element node only the reads not yet attached to an earlier node (y@23 loses x@20 -> y@23 and y@14 -> y@23), or erase an element's read of a variable an earlier element wrote",
+			src:      "function f(x, y) { [x, y] = [y, x]; return x + y; }",
+			fn:       1,
+			du: []string{
+				"x@11 -> x@20", "y@14 -> x@20", "y@14 -> y@23", "x@20 -> y@23",
+				"x@20 -> return x + y;@36", "y@23 -> return x + y;@36",
+			},
+		},
 	})
 }
