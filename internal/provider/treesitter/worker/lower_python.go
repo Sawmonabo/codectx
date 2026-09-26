@@ -42,16 +42,20 @@ var pythonLowering = Lowering{
 //     per target, spanning the target, in source order, each using every read
 //     of the right side. An annotation without a value (`x: int`) evaluates
 //     nothing and makes no node. pass, global and nonlocal make no node.
-//   - `del t`: with one target, one node spanning the statement; with several,
-//     one node per target spanning it. Deleting a name is a killing
-//     definition of it that carries no value, so no use after it pairs with
-//     a definition before it; deleting an attribute or subscript is a write
-//     through it (see Uses).
+//   - `del t` (§7.5): with one target, one node spanning the statement (so
+//     does `del(x)`: parentheses around a target are transparent); with
+//     several, one node per target spanning it, parentheses included; the
+//     elements of a tuple or list target are targets of their own, each
+//     spanning itself (`del [a]` makes a node spanning a). Deleting a name
+//     is a killing definition of it that carries no value, so no use after
+//     it pairs with a definition before it; deleting an attribute or
+//     subscript is a write through it (see Uses).
 //   - A condition is one Branch node spanning it without its parentheses: if,
 //     each elif (evaluated only when the conditions before it were false),
 //     while. `while True:` has no exit edge, only a break leaves it: its head
 //     is a Stmt node spanning True. A loop's else body is lowered from the
-//     head's false edge, so a break skips it.
+//     head's false edge after the loop's frame closes, so a break skips it
+//     and a break or continue inside it targets the enclosing loop.
 //   - `for t in e:` is a Stmt node spanning e, evaluated once, then a Branch
 //     head spanning from the start of t to the end of e (whether another
 //     element is assigned), which defines nothing: each name t binds is
@@ -68,26 +72,34 @@ var pythonLowering = Lowering{
 //   - try (§8.4): the handler is entered through the builder's Handler node,
 //     spanning the first `except` keyword. Each except or except* clause
 //     with a type is a Branch node spanning its type expression, in source
-//     order; an exception no clause matches is re-raised (Throw) from the
-//     last test's false edge. A bare `except:` catches everything and ends
-//     the chain. `except E as n` defines n on a node spanning n, and the
-//     clause's end deletes n (§8.4), a killing definition on a Stmt node
-//     spanning the whole clause. The else body runs from the try body's
-//     normal end, with the handlers closed, then joins the handler exits;
-//     finally is the builder's finally, its Handler spanning the `finally`
-//     keyword.
+//     order. Except clauses: the first that matches runs; an exception no
+//     clause matches is re-raised (Throw) from the last test's false edge,
+//     and a bare `except:` catches everything and ends the chain. Except*
+//     clauses (§8.4.2): every clause matching a part of the group runs, so
+//     each test is reached from the previous test's false edge and from the
+//     previous body's end, and after the last clause the statement both
+//     completes and re-raises what no clause matched. `except E as n`
+//     defines n on a node spanning n, and n is deleted however the clause
+//     ends (§8.4): the body runs in a finally whose body is a killing
+//     definition of n on a Stmt node spanning the whole clause, and whose
+//     Handler spans the `as` keyword. The else body runs from the try
+//     body's normal end, with the handlers closed, then joins the handler
+//     exits; finally is the builder's finally, its Handler spanning the
+//     `finally` keyword.
 //   - with (§8.5), per item in order: the context expression's nodes, then
 //     one acquiring Stmt node spanning the item (entering the manager), which
-//     defines the `as` target when it is a name (a pattern target is bound by
-//     the unpacking rule, from the item's reads). The rest of the statement
+//     defines the `as` target when it is a name and may-defines a variable
+//     of the lowering's own holding the manager. The rest of the statement
 //     is a finally: its Handler spans the token introducing the item (the
 //     `with` keyword for the first, the preceding comma for each later one),
+//     a pattern or reference target is bound inside it by the unpacking
+//     rule, from the item's reads (a failing assignment runs `__exit__`),
 //     and its exit is one Stmt node spanning from the `with` keyword to the
-//     end of the item, which Uses the variables the context expression read
-//     (the manager is a value the lowering does not name, so the exit reads
-//     what produced it). The finally closes normally even when only an
-//     exception reached it, because `__exit__` may suppress it. Items close
-//     in reverse.
+//     end of the item, which Uses the manager's variable. The statement
+//     after the with follows the exit when the body completed normally or an
+//     exception reached the finally, because `__exit__` may suppress it; a
+//     break, continue or return alone is re-issued from the exit and never
+//     falls through. Items close in reverse.
 //   - match (§8.6): the subjects are one Stmt node spanning them. Each case is
 //     one node spanning its patterns, in source order, that Uses the
 //     subjects' reads and every value its patterns read (a dotted name, a
@@ -103,13 +115,14 @@ var pythonLowering = Lowering{
 //     Stmt node spanning m, when present, then a Throw.
 //   - A nested callable is its own function; in the enclosing function its
 //     creating expression or statement is one Stmt node spanning it (a
-//     decorated definition spans the decorators too) after the nodes of the
-//     parts evaluated there (decorators, defaults, bases, a comprehension's
-//     first iterable), which Uses every enclosing variable referenced inside
-//     it and may-defines (MayDef, a non-killing definition) every enclosing
-//     variable it assigns — through nonlocal, through global when the
-//     enclosing function is the module, or through `:=` in a comprehension
-//     (§6.12). A def or class statement's node also defines its name.
+//     decorated definition spans the decorators too, §8.7) after the nodes
+//     of the parts evaluated there (decorators, defaults, bases, a
+//     comprehension's first iterable), which Uses the reads of those parts
+//     and every enclosing variable read inside it, and may-defines (MayDef,
+//     a non-killing definition) every enclosing variable it assigns —
+//     through nonlocal, through global when the enclosing function is the
+//     module, or through `:=` in a comprehension (§6.12). A def or class
+//     statement's node also defines its name.
 //   - A comprehension's graph is its clauses as nested loops: each `for`
 //     clause is a Branch head spanning the clause whose false edge returns to
 //     the enclosing clause's head (the outermost's leaves); a `for` clause
@@ -164,10 +177,17 @@ var pythonLowering = Lowering{
 // declared global or nonlocal in a callable is not its local (§7.12, §7.13).
 // A class body's names are visible only to the class body itself, never to
 // the callables nested in it (§4.2.2), and a comprehension's for targets are
-// its own. Blocks introduce no scope.
+// its own. A name a global statement declares anywhere in the module's
+// nested functions and classes is a variable of the module, even when the
+// module's own code never binds it. Blocks introduce no scope. A nested
+// callable reads an enclosing variable wherever it names it, except as a
+// name a plain assignment, `:=`, or a for, with, except, del or case
+// capture target binds, which only writes it; an augmented assignment
+// reads and writes it.
 func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
-	cur := s.cursor(fn)
-	j := pyLower{l: l, b: b, src: src, k: pySyntaxOf(), cur: cur, binds: &s.scope, first: -1, last: -1, stmtNo: 1}
+	j := &s.py
+	j.start(l, b, fn, src, s)
+	defer j.finish()
 	k := j.k
 	id := fn.KindId()
 	j.module = id == k.module
@@ -216,7 +236,9 @@ type pyLower struct {
 	walrusOnly  int
 	outerWalrus bool
 	// reads are the variables read by the current statement, in evaluation
-	// order; seen[v] == stmtNo marks v as one of them.
+	// order; seen[v] == stmtNo marks v as one of them. stmtNo increases
+	// across every function the Scratch lowers and is never reset, so an
+	// entry an earlier function left in seen is below it and marks nothing.
 	reads  []int32
 	seen   []int
 	stmtNo int
@@ -235,11 +257,40 @@ type pyLower struct {
 	// the arm ends of an if chain, the case ends of a match, the handler ends
 	// of a try, the false exits of a chained comparison.
 	hold []flow.Fringe
-	// fins are the finally frames of the with items being lowered.
+	// fins are the finally frames of the with items being lowered, and mgrs
+	// the variable holding each item's manager.
 	fins []flow.Frame
+	mgrs []int32
+	// exc mirrors the builder's open catch frames and unentered finally
+	// frames, innermost last, so the lowering knows whether an exception may
+	// reach a finally.
+	exc []pyExc
 	// subj is a stack of the subject reads of the match statements being
 	// lowered.
 	subj []int32
+}
+
+// pyExc is one open catch frame, which absorbs every exception raised inside
+// it, or one unentered finally frame; reached marks a finally an exception
+// may reach.
+type pyExc struct{ catch, reached bool }
+
+// start resets j in place to lower fn: every scalar is set anew and every
+// list truncated, keeping its capacity; stmtNo only advances (see seen).
+func (j *pyLower) start(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+	clear(j.buf)
+	*j = pyLower{
+		l: l, b: b, src: src, k: pySyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
+		buf: j.buf[:0], frames: j.frames[:0], reads: j.reads[:0], seen: j.seen, stmtNo: j.stmtNo + 1,
+		writes: j.writes[:0], first: -1, last: -1, hold: j.hold[:0], fins: j.fins[:0], mgrs: j.mgrs[:0],
+		exc: j.exc[:0], subj: j.subj[:0],
+	}
+}
+
+// finish drops j's references to the function's source and builder, so the
+// Scratch holds nothing of the file past its lowering.
+func (j *pyLower) finish() {
+	j.l, j.b, j.src, j.cur, j.binds = nil, nil, nil, nil, nil
 }
 
 // pyFrame is one callable's scope: its bindings start at binds[mark]. A
@@ -269,23 +320,29 @@ func (j *pyLower) kids(n *ts.Node) (int, []ts.Node) {
 	return start, j.buf[start:]
 }
 
-func (j *pyLower) done(mark int) { j.buf = j.buf[:mark] }
+// done pops the lists pushed since mark, clearing them so no node of the
+// file outlives it in buf.
+func (j *pyLower) done(mark int) {
+	clear(j.buf[mark:])
+	j.buf = j.buf[:mark]
+}
 
 func (j *pyLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
 
-// hasToken reports whether n has an anonymous child of kind id.
-func (j *pyLower) hasToken(n *ts.Node, id uint16) bool {
+// token is the span of n's first anonymous child of kind id, and whether n
+// has one.
+func (j *pyLower) token(n *ts.Node, id uint16) (flow.Span, bool) {
 	c := j.cur
 	c.Reset(*n)
 	if !c.GotoFirstChild() {
-		return false
+		return flow.Span{}, false
 	}
 	for {
 		if x := c.Node(); !x.IsNamed() && x.KindId() == id {
-			return true
+			return spanOf(x), true
 		}
 		if !c.GotoNextSibling() {
-			return false
+			return flow.Span{}, false
 		}
 	}
 }
@@ -373,6 +430,7 @@ func (j *pyLower) collect(fn *ts.Node) {
 	switch fn.KindId() {
 	case k.module:
 		j.scanKids(fn)
+		j.moduleGlobals(fn)
 	case k.functionDefinition, k.classDefinition:
 		body := fn.ChildByFieldId(k.fBody)
 		j.declarations(body)
@@ -432,6 +490,34 @@ func (j *pyLower) declarations(n *ts.Node) {
 		case k.block, k.ifStatement, k.elifClause, k.elseClause, k.forStatement, k.whileStatement, k.tryStatement,
 			k.exceptClause, k.finallyClause, k.withStatement, k.matchStatement, k.caseClause:
 			j.declarations(c)
+		}
+	}
+	j.done(start)
+}
+
+// moduleGlobals binds, as module variables, the names the global statements
+// of every function and class nested in the module declare, at any depth: a
+// global statement makes its names the module's (§7.12), so a function may
+// assign a module variable the module's own code never binds. n is the
+// module or one of its statements.
+func (j *pyLower) moduleGlobals(n *ts.Node) {
+	k := j.k
+	start, list := j.kids(n)
+	for i := range list {
+		c := &list[i]
+		switch c.KindId() {
+		case k.globalStatement:
+			s2, names := j.kids(c)
+			for x := range names {
+				j.site(&names[x])
+			}
+			j.done(s2)
+		case k.functionDefinition, k.classDefinition:
+			j.moduleGlobals(c.ChildByFieldId(k.fBody))
+		case k.decoratedDefinition, k.block, k.ifStatement, k.elifClause, k.elseClause, k.forStatement,
+			k.whileStatement, k.tryStatement, k.exceptClause, k.finallyClause, k.withStatement, k.matchStatement,
+			k.caseClause:
+			j.moduleGlobals(c)
 		}
 	}
 	j.done(start)
@@ -692,7 +778,7 @@ func (j *pyLower) compParts(list []ts.Node, scanning bool) {
 	for i := range list {
 		c := &list[i]
 		if c.KindId() != k.forInClause {
-			j.part(c, scanning)
+			j.part(c, scanning, false)
 			continue
 		}
 		left := c.ChildByFieldId(k.fLeft)
@@ -702,7 +788,7 @@ func (j *pyLower) compParts(list []ts.Node, scanning bool) {
 			if !isLeft && !firstSeen {
 				continue
 			}
-			j.part(&parts[p], scanning)
+			j.part(&parts[p], scanning, isLeft)
 		}
 		j.done(start)
 		firstSeen = true
@@ -710,13 +796,17 @@ func (j *pyLower) compParts(list []ts.Node, scanning bool) {
 }
 
 // part scans a comprehension part for binding sites, or collects its
-// captures while the comprehension's frame is open.
-func (j *pyLower) part(n *ts.Node, scanning bool) {
-	if scanning || j.walrusOnly > 0 {
+// captures while the comprehension's frame is open; target marks a for
+// clause's target.
+func (j *pyLower) part(n *ts.Node, scanning, target bool) {
+	switch {
+	case scanning || j.walrusOnly > 0:
 		j.scan(n)
-		return
+	case target:
+		j.capTarget(n)
+	default:
+		j.cap(n)
 	}
-	j.cap(n)
 }
 
 // importName is the local name one import clause binds: an alias, or the
@@ -783,6 +873,7 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	}
 	if j.throws > j.thrown {
 		j.b.MayThrow(id)
+		j.escape()
 	}
 	j.thrown = j.throws
 	j.last, j.lastSpan = id, s
@@ -838,6 +929,53 @@ func (j *pyLower) merge(base int) {
 	j.hold = j.hold[:base]
 }
 
+// openCatch opens a catch frame; enterHandler begins its handler.
+func (j *pyLower) openCatch() flow.Frame {
+	j.exc = append(j.exc, pyExc{catch: true})
+	return j.b.OpenCatch()
+}
+
+func (j *pyLower) enterHandler(f flow.Frame, at flow.Span) {
+	j.exc = j.exc[:len(j.exc)-1]
+	j.b.EnterHandler(f, at)
+}
+
+// openFinally opens a finally frame. enterFinally enters it and reports
+// whether normal completion reached it and whether an exception may have;
+// closeFinally closes it, and an exception that reached it, re-raised from
+// its exit, reaches the enclosing frame in turn.
+func (j *pyLower) openFinally() flow.Frame {
+	j.exc = append(j.exc, pyExc{})
+	return j.b.OpenFinally()
+}
+
+func (j *pyLower) enterFinally(f flow.Frame, at flow.Span) (normal, reached bool) {
+	reached = j.exc[len(j.exc)-1].reached
+	j.exc = j.exc[:len(j.exc)-1]
+	return j.b.EnterFinally(f, at), reached
+}
+
+func (j *pyLower) closeFinally(f flow.Frame, normal, reached bool) {
+	j.b.CloseFinally(f, normal)
+	if reached {
+		j.escape()
+	}
+}
+
+// escape records that an exception leaves the current point: it reaches the
+// innermost open frame when that is a finally.
+func (j *pyLower) escape() {
+	if n := len(j.exc); n > 0 && !j.exc[n-1].catch {
+		j.exc[n-1].reached = true
+	}
+}
+
+// throw moves the fringe to the innermost handler as a raise.
+func (j *pyLower) throw() {
+	j.escape()
+	j.b.Throw()
+}
+
 // block lowers a statement list; Python blocks open no scope.
 func (j *pyLower) block(n *ts.Node) {
 	if n == nil {
@@ -881,7 +1019,7 @@ func (j *pyLower) stmt(n *ts.Node) {
 	case k.raiseStatement:
 		j.children(n, true)
 		j.node(flow.Jump, n, 0, len(j.reads))
-		j.b.Throw()
+		j.throw()
 	case k.breakStatement:
 		j.node(flow.Jump, n, 0, 0)
 		j.b.Break("")
@@ -905,8 +1043,9 @@ func (j *pyLower) stmt(n *ts.Node) {
 	case k.matchStatement:
 		j.matchStmt(n)
 	case k.functionDefinition, k.classDefinition:
-		j.def(j.closure(n, n), j.lookup(n.ChildByFieldId(k.fName)))
+		j.def(j.closure(n, n, len(j.reads)), j.lookup(n.ChildByFieldId(k.fName)))
 	case k.decoratedDefinition:
+		from := len(j.reads)
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.decorator {
@@ -916,7 +1055,7 @@ func (j *pyLower) stmt(n *ts.Node) {
 		j.done(start)
 		d := n.ChildByFieldId(k.fDefinition)
 		j.throws++ // applying the decorators calls them
-		j.def(j.closure(d, n), j.lookup(d.ChildByFieldId(k.fName)))
+		j.def(j.closure(d, n, from), j.lookup(d.ChildByFieldId(k.fName)))
 	default:
 		j.valueNode(n)
 	}
@@ -1097,29 +1236,36 @@ func (j *pyLower) deleteStmt(n *ts.Node) {
 	j.done(start)
 }
 
-// delete deletes each target: a name is killed, a reference written.
+// delete deletes each target: a name is killed, a reference written. A
+// target spans stmt, the statement, when it is the statement's only one, and
+// itself otherwise, parentheses included; the elements of a tuple or list
+// target are targets of their own, each spanning itself.
 func (j *pyLower) delete(targets []ts.Node, stmt *ts.Node) {
 	k := j.k
 	for i := range targets {
 		t := &targets[i]
 		span := t
-		if len(targets) == 1 {
+		if len(targets) == 1 && stmt != nil {
 			span = stmt
 		}
+		u := j.l.unparen(t)
+		if u == nil {
+			continue
+		}
 		j.reset()
-		switch t.KindId() {
+		switch u.KindId() {
 		case k.identifier:
-			j.def(j.node(flow.Stmt, span, 0, 0), j.lookup(t))
+			j.def(j.node(flow.Stmt, span, 0, 0), j.lookup(u))
 		case k.attribute, k.subscript:
-			j.reference(t)
+			j.reference(u)
 			j.throws++
-			j.mayDefBase(j.node(flow.Stmt, span, 0, len(j.reads)), t)
-		case k.tuple, k.list, k.parenthesizedExpression:
-			start, list := j.kids(t)
+			j.mayDefBase(j.node(flow.Stmt, span, 0, len(j.reads)), u)
+		case k.tuple, k.list:
+			start, list := j.kids(u)
 			j.delete(list, nil)
 			j.done(start)
 		default:
-			j.value(t)
+			j.value(u)
 			j.node(flow.Stmt, span, 0, len(j.reads))
 		}
 	}
@@ -1137,7 +1283,7 @@ func (j *pyLower) assertStmt(n *ts.Node) {
 		j.reset()
 		j.valueNode(&list[1])
 	}
-	j.b.Throw()
+	j.throw()
 	j.b.Restore(p)
 	j.b.Pop(p)
 	j.done(start)
@@ -1193,21 +1339,26 @@ func (j *pyLower) head(cond *ts.Node) bool {
 }
 
 // loopEnd closes a loop whose back edge targets h: the continue target is
-// the current point; the else body runs from the head's false edge (when
-// exits), and breaks leave past it.
+// the current point. The loop's frame closes before its else body, so a
+// break or continue in the else body targets the enclosing loop (§8.2,
+// §8.3). The else body runs from the head's false edge, saved in exit, when
+// the loop exits through its head, and is unreachable otherwise; the loop's
+// own breaks leave past it.
 func (j *pyLower) loopEnd(n *ts.Node, f flow.Frame, h int32, exits bool, exit flow.Fringe) {
 	j.b.ContinueHere(f)
 	j.b.Close(h)
-	if exits {
-		j.b.Restore(exit)
+	if !exits {
+		// The fringe is empty here: nothing leaves through the head.
+		exit = j.b.Push()
 	}
+	j.b.CloseFrame(f)
+	breaks := j.b.Push()
+	j.b.Restore(exit)
 	if alt := n.ChildByFieldId(j.k.fAlternative); alt != nil {
 		j.block(alt.ChildByFieldId(j.k.fBody))
 	}
-	j.b.CloseFrame(f)
-	if exits {
-		j.b.Pop(exit)
-	}
+	j.b.Merge(breaks)
+	j.b.Pop(exit)
 }
 
 func (j *pyLower) whileStmt(n *ts.Node) {
@@ -1259,24 +1410,40 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 	}
 	var ff, cf flow.Frame
 	if finC != nil {
-		ff = j.b.OpenFinally()
+		ff = j.openFinally()
 	}
 	if firstExcept != nil {
-		cf = j.b.OpenCatch()
+		cf = j.openCatch()
 	}
 	j.block(n.ChildByFieldId(k.fBody))
 	if firstExcept != nil {
 		tEnd := j.b.Push()
-		j.b.EnterHandler(cf, spanOf(firstExcept.Child(0)))
+		j.enterHandler(cf, spanOf(firstExcept.Child(0)))
 		base := len(j.hold)
-		caught := false
-		for i := range list {
-			if c := &list[i]; c.KindId() == k.exceptClause && !caught {
-				caught = j.except(c)
+		// Mixing except and except* in one try is a syntax error, so the
+		// first clause decides.
+		if _, star := j.token(firstExcept, k.star); star {
+			for i := range list {
+				if c := &list[i]; c.KindId() == k.exceptClause {
+					j.except(c, true)
+				}
 			}
-		}
-		if !caught {
-			j.b.Throw()
+			// §8.4.2: what no clause matched is re-raised after the last
+			// one, and when every part matched the statement completes.
+			p := j.b.Push()
+			j.throw()
+			j.b.Restore(p)
+			j.b.Pop(p)
+		} else {
+			caught := false
+			for i := range list {
+				if c := &list[i]; c.KindId() == k.exceptClause && !caught {
+					caught = j.except(c, false)
+				}
+			}
+			if !caught {
+				j.throw()
+			}
 		}
 		j.merge(base)
 		hx := j.b.Push()
@@ -1290,21 +1457,27 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		j.block(elseC.ChildByFieldId(k.fBody))
 	}
 	if finC != nil {
-		normal := j.b.EnterFinally(ff, spanOf(finC.Child(0)))
+		normal, reached := j.enterFinally(ff, spanOf(finC.Child(0)))
 		s2, fl := j.kids(finC)
 		j.block(&fl[len(fl)-1])
 		j.done(s2)
-		j.b.CloseFinally(ff, normal)
+		j.closeFinally(ff, normal, reached)
 	}
 	j.done(start)
 }
 
-// except lowers one except or except* clause on the handler fringe. A typed
-// clause's test is a Branch, its body's end is held, and the fringe becomes
-// the test's false edge; it reports whether the clause catches everything,
-// leaving its body's end as the fringe. The grammar parses `except E as n`
-// with E and n as one as-pattern value.
-func (j *pyLower) except(c *ts.Node) bool {
+// except lowers one except or except* clause on the handler fringe; star
+// reports an except* clause. A typed clause's test is a Branch. An except
+// clause's body's end is held and the fringe becomes the test's false edge;
+// an except* clause's body's end joins that false edge, since every except*
+// clause that matches a part of the group runs (§8.4.2). It reports whether
+// the clause catches everything, leaving its body's end as the fringe. The
+// grammar parses `except E as n` with E and n as one as-pattern value.
+//
+// With `as n`, n is bound first, and the body runs in a finally whose body
+// is the node deleting n (§8.4: n is deleted however the clause ends), a Stmt
+// node spanning the clause; the finally's Handler spans the `as` keyword.
+func (j *pyLower) except(c *ts.Node, star bool) bool {
 	k := j.k
 	j.reset()
 	// The clause's block is its last child; list stays on the stack until
@@ -1318,9 +1491,11 @@ func (j *pyLower) except(c *ts.Node) bool {
 		return true
 	}
 	var lo, hi, alias *ts.Node
+	var as flow.Span
 	for i := range tests {
 		x := &tests[i]
 		if x.KindId() == k.asPattern {
+			as, _ = j.token(x, k.asKw)
 			x, alias = j.asParts(x)
 		}
 		if lo == nil {
@@ -1339,13 +1514,23 @@ func (j *pyLower) except(c *ts.Node) bool {
 		}
 		j.bind(alias, nil, 0, 0)
 	}
-	j.block(body)
 	if v >= 0 {
+		f := j.openFinally()
+		j.block(body)
+		normal, reached := j.enterFinally(f, as)
 		j.reset()
 		j.b.Def(j.node(flow.Stmt, c, 0, 0), v)
+		j.closeFinally(f, normal, reached)
+	} else {
+		j.block(body)
 	}
-	j.hold = append(j.hold, j.b.Push())
-	j.b.Restore(miss)
+	if star {
+		j.b.Merge(miss)
+		j.b.Pop(miss)
+	} else {
+		j.hold = append(j.hold, j.b.Push())
+		j.b.Restore(miss)
+	}
 	return false
 }
 
@@ -1383,14 +1568,25 @@ func (j *pyLower) withStmt(n *ts.Node) {
 		j.value(mgr)
 		j.throws++ // __enter__
 		a := j.node(flow.Stmt, &items[i], 0, len(j.reads))
+		// The manager is defined only here, so a may-definition loses
+		// nothing; a is the node's one killing definition, the target's.
+		m := j.b.Var()
+		j.b.MayDef(a, m)
+		j.mgrs = append(j.mgrs, m)
+		var t *ts.Node
 		if target != nil {
-			if t := j.l.unparen(target); t.KindId() == k.identifier {
-				j.def(a, j.lookup(t))
-			} else {
-				j.bind(t, nil, 0, len(j.reads))
-			}
+			t = j.l.unparen(target)
 		}
-		j.fins = append(j.fins, j.b.OpenFinally())
+		if t != nil && t.KindId() == k.identifier {
+			j.def(a, j.lookup(t))
+			t = nil
+		}
+		j.fins = append(j.fins, j.openFinally())
+		if t != nil {
+			// A failing assignment to a pattern or reference target runs
+			// __exit__ (§8.5), so it is bound inside the item's finally.
+			j.bind(t, nil, 0, len(j.reads))
+		}
 	}
 	j.block(n.ChildByFieldId(k.fBody))
 	for i := len(items) - 1; i >= 0; i-- {
@@ -1398,17 +1594,17 @@ func (j *pyLower) withStmt(n *ts.Node) {
 		if i > 0 {
 			at = spanOf(items[i].PrevSibling())
 		}
-		j.b.EnterFinally(j.fins[base+i], at)
+		normal, reached := j.enterFinally(j.fins[base+i], at)
 		j.reset()
-		mgr, _ := j.withParts(&items[i])
-		w := len(j.writes)
-		j.cap(mgr)
-		j.writes = j.writes[:w]
 		j.throws++ // __exit__
-		j.nodeAt(flow.Stmt, flow.Span{Start: kw.Start, End: uint32(items[i].EndByte())}, 0, len(j.reads))
-		j.b.CloseFinally(j.fins[base+i], true)
+		x := j.nodeAt(flow.Stmt, flow.Span{Start: kw.Start, End: uint32(items[i].EndByte())}, 0, 0)
+		j.b.Use(x, j.mgrs[base+i])
+		// __exit__ may suppress an exception that reached it, and then the
+		// statement completes; a break, continue or return that reached it
+		// alone is re-issued and never falls through (§8.5).
+		j.closeFinally(j.fins[base+i], normal || reached, reached)
 	}
-	j.fins = j.fins[:base]
+	j.fins, j.mgrs = j.fins[:base], j.mgrs[:base]
 	j.done(start)
 }
 
@@ -1534,13 +1730,14 @@ func (j *pyLower) irrefutable(p *ts.Node) bool {
 	case k.asPattern:
 		r = len(list) > 0 && list[0].KindId() == k.casePattern && j.irrefutable(&list[0])
 	case k.unionPattern:
-		r = j.hasToken(p, k.underscore)
+		_, r = j.token(p, k.underscore)
 		for i := range list {
 			r = r || j.irrefutable(&list[i])
 		}
 	case k.tuplePattern:
 		// A parenthesized group `(p)`, not a one-element sequence `(p,)`.
-		r = len(list) == 1 && !j.hasToken(p, k.comma) && j.irrefutable(&list[0])
+		_, comma := j.token(p, k.comma)
+		r = len(list) == 1 && !comma && j.irrefutable(&list[0])
 	}
 	j.done(start)
 	return r
@@ -1681,9 +1878,9 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
 			hi = &parts[p]
 			j.value(&parts[p])
 		}
-		j.done(start)
 		j.throws++
 		j.nodeAt(flow.Stmt, flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}, 0, len(j.reads))
+		j.done(start)
 	}
 	rEnd := len(j.reads)
 	j.throws++
@@ -1697,12 +1894,15 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node) {
 }
 
 // closure creates the node spanning at for nested callable n, after the
-// nodes of the parts evaluated where n is created: it Uses n's captures and
-// may-defines every enclosing variable n assigns.
-func (j *pyLower) closure(n, at *ts.Node) int32 {
-	m, w := len(j.reads), len(j.writes)
+// nodes of the parts evaluated where n is created: it Uses the reads from
+// reads[from:] on, which are those of the parts evaluated before it (a
+// decorated definition's decorators) and of its defaults, bases or first
+// iterable, and n's captures, and may-defines every enclosing variable n
+// assigns.
+func (j *pyLower) closure(n, at *ts.Node, from int) int32 {
+	w := len(j.writes)
 	j.nested(n, true)
-	id := j.node(flow.Stmt, at, m, len(j.reads))
+	id := j.node(flow.Stmt, at, from, len(j.reads))
 	for _, v := range j.writes[w:] {
 		j.b.MayDef(id, v)
 	}
@@ -1764,7 +1964,7 @@ func (j *pyLower) value(n *ts.Node) {
 		return
 	}
 	if j.l.isCallable(n) {
-		j.closure(n, n)
+		j.closure(n, n, len(j.reads))
 		return
 	}
 	switch n.KindId() {
@@ -1866,7 +2066,10 @@ func (j *pyLower) children(n *ts.Node, lower bool) {
 }
 
 // cap collects the references n makes to variables of the function being
-// lowered, honouring every scope n opens.
+// lowered, honouring every scope n opens. A name that a plain assignment,
+// `:=`, or a for, with, except or del target binds is written there, not
+// read (its write was recorded when the callable's sites were scanned); an
+// augmented assignment's target is read too.
 func (j *pyLower) cap(n *ts.Node) {
 	k := j.k
 	if n == nil {
@@ -1879,6 +2082,49 @@ func (j *pyLower) cap(n *ts.Node) {
 	switch n.KindId() {
 	case k.identifier:
 		j.ref(n)
+	case k.assignment:
+		j.capTarget(n.ChildByFieldId(k.fLeft))
+		j.cap(n.ChildByFieldId(k.fRight))
+	case k.namedExpression:
+		j.cap(n.ChildByFieldId(k.fValue))
+	case k.forStatement:
+		j.capTarget(n.ChildByFieldId(k.fLeft))
+		j.cap(n.ChildByFieldId(k.fRight))
+		j.cap(n.ChildByFieldId(k.fBody))
+		j.cap(n.ChildByFieldId(k.fAlternative))
+	case k.asPattern:
+		// The `as` target of a with item or an except clause; a case
+		// pattern's as-pattern is walked by pattern.
+		start, list := j.kids(n)
+		for i := range list {
+			if list[i].KindId() == k.asPatternTarget {
+				j.capTarget(&list[i])
+			} else {
+				j.cap(&list[i])
+			}
+		}
+		j.done(start)
+	case k.deleteStatement:
+		start, list := j.kids(n)
+		for i := range list {
+			j.capTarget(&list[i])
+		}
+		j.done(start)
+	case k.caseClause:
+		// A case pattern reads its values and binds its captures; the
+		// pattern's throw count belongs to the nested callable, not to
+		// the creating node.
+		start, list := j.kids(n)
+		for i := range list {
+			if list[i].KindId() == k.casePattern {
+				t := j.throws
+				j.pattern(&list[i], patReads, true)
+				j.throws = t
+			} else {
+				j.cap(&list[i])
+			}
+		}
+		j.done(start)
 	case k.attribute:
 		j.cap(n.ChildByFieldId(k.fObject))
 	case k.keywordArgument:
@@ -1899,6 +2145,30 @@ func (j *pyLower) cap(n *ts.Node) {
 	}
 }
 
+// capTarget collects the references of a binding target: a name is written
+// and records nothing, an attribute's object and a subscript's value and
+// index are read, and a pattern's elements are targets in turn.
+func (j *pyLower) capTarget(t *ts.Node) {
+	k := j.k
+	if t == nil {
+		return
+	}
+	switch t.KindId() {
+	case k.identifier:
+	case k.attribute:
+		j.cap(t.ChildByFieldId(k.fObject))
+	case k.patternList, k.tuplePattern, k.listPattern, k.tuple, k.list, k.expressionList, k.parenthesizedExpression,
+		k.listSplatPattern, k.listSplat, k.asPatternTarget:
+		start, list := j.kids(t)
+		for i := range list {
+			j.capTarget(&list[i])
+		}
+		j.done(start)
+	default:
+		j.cap(t)
+	}
+}
+
 // pySyntax holds the kind and field ids the Python lowering matches, resolved
 // once by name against the pinned grammar so the walk compares integers
 // rather than converting every node's kind to a string.
@@ -1915,7 +2185,7 @@ type pySyntax struct {
 	dictionarySplatPattern, typedParameter, defaultParameter, typedDefaultParameter, classPattern, keywordPattern,
 	splatPattern, dictPattern, unionPattern, genericType, trueLit uint16
 
-	withKw, comma, underscore uint16
+	withKw, comma, underscore, star, asKw uint16
 
 	fAlias, fAlternative, fArguments, fBody, fCondition, fConsequence, fDefinition, fFunction, fGuard, fLeft,
 	fModuleName, fName, fObject, fParameters, fRight, fSuperclasses, fValue uint16
@@ -1968,6 +2238,9 @@ func pySyntaxOf() *pySyntax {
 		s.keywordPattern, s.splatPattern, s.dictPattern = kind("keyword_pattern"), kind("splat_pattern"), kind("dict_pattern")
 		s.unionPattern, s.genericType, s.trueLit = kind("union_pattern"), kind("generic_type"), kind("true")
 		s.withKw, s.comma, s.underscore = tok("with"), tok(","), tok("_")
+		// The `*` of `except*` is a token of its own that the grammar maps to
+		// the one public `*` kind.
+		s.star, s.asKw = tok("*"), tok("as")
 		s.fAlias, s.fAlternative, s.fArguments = field("alias"), field("alternative"), field("arguments")
 		s.fBody, s.fCondition, s.fConsequence = field("body"), field("condition"), field("consequence")
 		s.fDefinition, s.fFunction, s.fGuard, s.fLeft = field("definition"), field("function"), field("guard"), field("left")
