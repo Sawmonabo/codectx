@@ -184,7 +184,11 @@ func Grammar(name string) (*ts.Language, bool) {
 // may-definition of the base local is the conservative account of that
 // write: for a pointer or slice base the write lands in the object it refers
 // to, not in the local, so the may-definition over-approximates rather than
-// states where the storage is. That node also Uses the operand's variables.
+// states where the storage is. That node also Uses the operand's variables,
+// the reads its own evaluation makes: a `ref mut` binding in a pattern reads
+// the matched value through the owned variable its scrutinee's node defines
+// (see Uses), so it Uses that variable and may-defines the local, and the
+// scrutinee's node carries the read of the local.
 // The node is the one the evaluating expression attaches to, never "the next
 // node made": a lowering records the pending may-definition by position, as
 // it records reads, so an operand evaluated later cannot take it. An address
