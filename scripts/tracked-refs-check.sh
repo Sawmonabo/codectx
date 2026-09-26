@@ -25,8 +25,9 @@
 #     FX-<letter>-<token>), a lane named by its id or by the id of a stage that
 #     froze an interface, a performance-investigation id, a numbered finding or
 #     round of a review, a round named after its branch, the report a lane
-#     files, a note that a test was committed unrun, and a failure named after
-#     the corpus run that showed it, and a ruling cited by its id. These date
+#     files, a note in any casing that a test was committed uncompiled or unrun,
+#     a failure named after the corpus run that showed it, and a ruling cited
+#     by its id. These date
 #     the moment the work merges and mean nothing to a reader of the
 #     repository.
 #   * a home directory, /home/<user>/ or /Users/<user>/, on any machine. The
@@ -48,7 +49,7 @@ pattern="$pattern"'|/[^ "'"'"']*/[.]cache/codect[x]-|/tmp/claude[-]'
 pattern="$pattern|${w}lan[e]/[A-Za-z]|${w}[Ww]av[e]-[A-Za-z]([^A-Za-z]|\$)|F[X]-[A-Z]-[A-Za-z0-9]"
 pattern="$pattern|${w}[Ll]an[e] \\(?[A-Z]+(-[A-Za-z0-9]+|[0-9])|${w}[Ll]an[e]('s)? report"
 pattern="$pattern|${w}L[0-9]+ froz[e]|${w}L[0-9]+ FACAD[E]|${w}[A-Z]+PER[F]-[0-9]"
-pattern="$pattern|${w}[Nn]ative-cor[e]([^A-Za-z]|\$)|${w}[Rr]evie[w] (finding|round)|NOT RU[N]|${w}r[0-9]+ failur[e]"
+pattern="$pattern|${w}[Nn]ative-cor[e]([^A-Za-z]|\$)|${w}[Rr]evie[w] (finding|round)|N[Oo][Tt] [Rr][Uu][Nn]|[Nn][Oo][Tt] [Bb][Ee][Ee][Nn] ([Cc][Oo][Mm][Pp][Ii][Ll][Ee][Dd]|[Rr][Uu][Nn])|${w}r[0-9]+ failur[e]"
 pattern="$pattern|${w}[Rr]ulin[g] [A-Z]+-?[0-9]"
 home="${w}/(hom[e]|User[s])/[A-Za-z0-9._-]+"
 allowed='/(hom[e]|User[s])/(tester|private|example-user)([^A-Za-z0-9._-]|$)'

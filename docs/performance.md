@@ -326,7 +326,8 @@ optimization must clear.
 
 Residual: the fingerprint is captured at tiny scale, one page per query; the
 comparison fails loudly rather than comparing two prefixes if a widened corpus
-outgrows `model.MaxPageItems`. A reference-scale parity pass has not been run.
+outgrows `model.MaxPageItems`. Parity at reference scale is outside what this
+fingerprint establishes.
 
 ## 6. Section 23.5 — the metric set
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -433,14 +434,7 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 	if d.path == "" {
 		return malformed("document " + strconv.FormatInt(index, 10) + " has no relative_path")
 	}
-	// A document's path is relative to what the indexer was run over, which
-	// for a project unit is a directory inside the workspace. Every path the
-	// import resolves, stores and publishes is workspace-relative, so the
-	// project's own directory is put back here, once, before anything sees
-	// the document.
-	if w.pathPrefix != "" {
-		d.path = w.pathPrefix + "/" + d.path
-	}
+	d.path = workspacePath(w.pathPrefix, d.path)
 	if d.hasText {
 		d.textHash = hex.EncodeToString(hasher.Sum(nil))
 	}
@@ -448,6 +442,23 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 		return nil
 	}
 	return w.onDocument(d)
+}
+
+// workspacePath is the workspace-relative path of a document whose
+// relative_path is raw, for an index written against the project directory
+// prefix (empty for the workspace itself). Every path the import resolves,
+// stores and publishes is workspace-relative, so the project's own directory
+// is put back once, before anything sees the document. The join is cleaned, so
+// a project that reaches a file elsewhere in the workspace through `../` names
+// that file by its own workspace path, and only a path that still escapes
+// after the join is outside the root. An absolute path is left as it is:
+// joining would re-root it under the project, and rootRelative refuses it as
+// it stands.
+func workspacePath(prefix, raw string) string {
+	if prefix == "" || strings.HasPrefix(raw, "/") {
+		return raw
+	}
+	return path.Join(prefix, raw)
 }
 
 // decodeOccurrence decodes one bounded Occurrence record. The deprecated

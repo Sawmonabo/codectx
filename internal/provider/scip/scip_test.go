@@ -551,7 +551,7 @@ func TestCallsiteAliasJoin(t *testing.T) {
 			if tc.zeroWidth {
 				occs = append([][]byte{occurrenceRecord(symI, 1, 1, 10, 10)}, occs...)
 			}
-			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, occs...)))
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentWithText("web/b.ts", "typescript", 0, files["web/b.ts"], occs...)))
 			inputs := append([]string{"utf16.scip"}, sourcePaths...)
 			p := newProvider(t, "utf16.scip")
 			h := providertest.New(t, files)
@@ -1211,8 +1211,6 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 // row. Deleting the comparison from `onPinnedBytes` outright is a wider
 // mutation that TestOccurrenceMustDescribeThePinnedBytes/definition already
 // catches, so it does not describe this gap.
-//
-// This test was written but has not been compiled and has not been run.
 func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 	// The same line as the two tests above. On line 4 "Start" sits at columns
 	// [5,10) and "browser" at [11,18); on line 2 "Server" sits at [5,11) and

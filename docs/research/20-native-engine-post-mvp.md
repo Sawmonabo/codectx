@@ -659,10 +659,12 @@ one query engine's extractors are proprietary.
 > = 1.00 GiB + 16 × 256 MiB + 0.0005 GiB ≈ **5.00 GiB** at one worker per CPU on a 16-core host.
 
 **No term names file count, call-site count or repository bytes**, so the figure is **identical at 1×,
-3× and 10×** the reference repository. Per function the structures are bounded by
-**M_sparse(N) ≤ 96·N + 64 bytes** — 0.92 MiB at N = 10⁴, which covers the largest function measured
+3× and 10×** the reference repository. Per function the design figure for the structures is
+**M_sparse(N) ≈ 96·N + 64 bytes** — 0.92 MiB at N = 10⁴, which covers the largest function measured
 on this host (7,518 body lines) under any lines-to-nodes factor up to about 1.3, and 9.16 MiB at
-N = 10⁵. The dense formulation the engine uses needs **2.34 GiB** at that same point, which is the
+N = 10⁵. It is a design figure, not a bound: the reaching-definitions pass also grows with the
+variables, uses and definitions it visits, so the structures are not linear in N alone and nothing
+guarantees or enforces the figure. The dense formulation the engine uses needs **2.34 GiB** at that same point, which is the
 whole argument for replacing it. The definition count is bounded
 **structurally**, not by a policy constant: a definition is a CFG node index, so D ≤ N. That is the
 replacement for the engine's definition cap, whose price is dropping every reaching-definition edge of

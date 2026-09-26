@@ -73,8 +73,11 @@ coordinator exists.
   excluded from the one that encloses it**: no profile's argument array can
   exclude a subtree, so the outer indexer still runs over it, and the importer
   drops every document under a nested project root of the same kind, counted
-  under `documents_in_nested_projects` without degrading anything, because the
-  nested unit publishes those paths. One path is published by exactly one unit.
+  under `documents_in_other_projects` without degrading anything, because the
+  nested unit publishes those paths. A document a unit reaches outside its own
+  directory through `../` is likewise left to the innermost other project of
+  the same kind that holds it, and kept only when none does. One path is
+  published by exactly one unit.
   A project whose scope key
   does not fit the identity bound is refused rather than truncated, because two
   deep directories with a long common prefix cut to the same key and one
@@ -247,8 +250,11 @@ an empty one, so paths in the stored manifest that the fresh index no longer
 describes are `removed`. A rename is a new `FileID` (Section 9.4), so every
 `git mv` takes this path.
 
-**Rejected and superseded documents.** A document whose `relative_path` escapes
-the project root is rejected and counted under `documents_outside_root`: 18 of the 141
+**Rejected and superseded documents.** A project unit's `relative_path` is
+joined to the project's directory and cleaned first, so a document the project
+reaches through `../` (`app/../shared/x.ts`) is named by its workspace path
+(`shared/x.ts`) and admitted like any other, unless another project owns it. A document whose path still
+escapes the root after that is rejected and counted under `documents_outside_root`: 18 of the 141
 documents `scip-go` emits for this repository are the `go test` mains it writes
 under `$GOCACHE`, whose paths are `../../../../..`-style escapes into a
 content-addressed build cache. Admitting them would bake absolute machine paths
@@ -395,10 +401,15 @@ Measured over the indexes the six pinned indexers produce from the fixtures of
 the per-platform matrix — 308 occurrences, all nine languages — the proof
 refuses none of the 306 that spell their symbol's own name or are not
 name-checked. The other two are `Set` for `HashSet`, the alias clause and its
-use. Whether that indexer also puts an occurrence on the clause's `HashSet`
-token, which the second clause shape needs, is **unmeasured**; until it is,
-whether the clause admits those two is unmeasured too, and a refusal of them is
-counted like any other rather than published.
+use, and the clause admits both. Measured with the pinned build on the
+fixture's `use std::collections::{HashMap, HashSet as Set};`, the indexer puts
+two occurrences of the `HashSet` symbol on that line, neither with a role: one
+exactly on the clause's `HashSet` token (columns 32–39) and one exactly on
+`Set` (columns 43–46). That is the second clause shape, so `Set` is bound, the clause's own `Set` is admitted and so is
+the later `Set<u8>`. The whole-clause shape is the one the Python indexer
+emits: its occurrence ranges over `OrderedDict as OD`, and measured with a use
+of `OD` added to a copy of the fixture, the use is an occurrence of the `OrderedDict`
+symbol spelled `OD`, which that clause binds.
 
 **What the proof does not catch.** It compares bytes, and it never adjusts or
 guesses a coordinate, so a shift that lands on bytes it cannot distinguish from
@@ -436,8 +447,11 @@ which is the encoding the refusal is a disagreement about, so that an operator
 opens the disagreeing line instead of re-running the indexer to find it — and
 the unit publishes `partial` with
 `CTX_PROVIDER_OUTPUT_INVALID` rather than failing. Under an unverified binding
-the index describes bytes it never saw, so the same coordinate is a plain skip
-and is counted with the other unverified skips.
+the index describes bytes it never saw, and the same coordinate is refused the
+same way: it is counted under `refused_occurrences` and can be the
+`refused_occurrence_exemplar`, and the unit keeps the
+`CTX_SOURCE_BINDING_UNVERIFIED` it already carries, because an unverified
+binding outranks every later reason.
 
 A unit is never failed over one occurrence. Failing closed on the first refusal
 threw away all 93,167 occurrences of the project above over 4,714 wrong columns:

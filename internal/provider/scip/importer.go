@@ -106,9 +106,9 @@ type importer struct {
 	// document whose position encoding is neither declared nor measured for
 	// the tool build, and oversize a document over max_source_file_bytes.
 	outsideRoot, duplicatePath, notHeld, unencoded, oversize droppedDocs
-	// nestedDocs counts the documents left to the unit of the nested project
-	// that holds them (seeDocument). It is a partition, not a loss.
-	nestedDocs int64
+	// otherProjectDocs counts the documents left to the unit of the other
+	// project that holds them (seeDocument). It is a partition, not a loss.
+	otherProjectDocs int64
 	// refusedOccurrences counts occurrences whose range the pinned bytes
 	// contradict; refusedExemplar is the first one's document, the coordinate
 	// that occurrence claimed and the reason, kept as the example an operator
@@ -122,9 +122,9 @@ type importer struct {
 	// row carries refusals (carryRefusals). It names the exemplar only when
 	// this run refused nothing itself, so there is no coordinate to name.
 	carriedExemplar string
-	// hasNested says loadNested recorded at least one nested project, so
-	// seeDocument looks a document's directories up only when one can match.
-	hasNested bool
+	// hasOtherProjects says loadProjects recorded at least one other project,
+	// so seeDocument looks a document's directories up only when one can match.
+	hasOtherProjects bool
 	// encodingDropped counts the documents whose assumed position encoding
 	// the pinned bytes contradict; encodingUnproved those none of whose
 	// definitions could check it. A failed probe is a whole-document shift, so
@@ -224,10 +224,10 @@ const (
 	detailUnencoded = "documents_unspecified_encoding"
 	// detailOversize counts documents over max_source_file_bytes.
 	detailOversize = "documents_over_source_bound"
-	// detailNested counts the documents left to a nested project's own unit.
-	// It is informational: another unit publishes those paths, so nothing is
-	// lost and the capability is not degraded for them.
-	detailNested = "documents_in_nested_projects"
+	// detailOtherProjects counts the documents left to another project's own
+	// unit. It is informational: that unit publishes those paths, so nothing
+	// is lost and the capability is not degraded for them.
+	detailOtherProjects = "documents_in_other_projects"
 	// detailSkippedAliases counts call-site aliases left out because the
 	// alias scope or native key would exceed its bound (callsiteAlias).
 	detailSkippedAliases = "callsite_aliases_skipped"
@@ -328,7 +328,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 	if err := im.openDelta(ctx); err != nil {
 		return err
 	}
-	if err := im.loadNested(ctx); err != nil {
+	if err := im.loadProjects(ctx); err != nil {
 		return err
 	}
 	if im.profile == nil && im.p.manifestPath != "" {
@@ -854,14 +854,16 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 //	scip-java 0.0.0        position_encoding absent   columns are UTF-16
 //	                       (the only build measured reports "0.0.0-SNAPSHOT")
 //
-// scip-python is UTF-16 rather than the UTF-32 scip.proto suggests for Python
-// indexers, because it is a TypeScript program (a pyright fork), which is why
-// the table is measured and not read off the proto's advice.
+// The Python indexer's columns are UTF-16 rather than the UTF-32 scip.proto
+// suggests for Python indexers, because it is built on a type checker written
+// in TypeScript, which is why the table is measured and not read off the
+// proto's advice.
 //
-// rust-analyzer is deliberately absent: measured at 1.98.0 it declares
-// `position_encoding = UTF8` on every document, so it never reaches this
-// table; a build that stopped declaring it would be an unmeasured pair and
-// stay skipped, which is the right outcome and not a row to write in advance.
+// The Rust indexer is deliberately absent: the pinned build declares
+// `position_encoding = UTF8` on every document (measured), so it never reaches
+// this table; a build that stopped declaring it would be an unmeasured pair
+// and stay skipped, which is the right outcome and not a row to write in
+// advance.
 //
 // `Metadata.text_document_encoding` is deliberately not consulted. All six
 // indexers set it to UTF8 — including the three whose columns are UTF-16 —
@@ -1132,8 +1134,8 @@ func cutsAToken(data []byte, rng *model.SourceRange, text []byte) string {
 // alone. A range spanning lines is a block span -- measured, a crate's whole
 // file -- and its edges are the file's, not a token's. A range holding no
 // identifier byte at all is punctuation the grammar spells without one:
-// measured, rust-analyzer ranges the reference from `+` to the `add` method it
-// desugars to over the space beside the operator. A range of whitespace alone
+// measured, the Rust indexer ranges the reference from `+` to the `add` method
+// it desugars to over the space beside the operator. A range of whitespace alone
 // is neither: it holds no token at all, which is what a reference shifted onto
 // the gap between two tokens selects, so it is refused.
 func coversWholeTokens(text []byte) string {
@@ -1242,6 +1244,11 @@ func (im *importer) refuse(ds *docSource, r [4]int32, msg string) {
 //   - one occurrence of the symbol ranges over the whole clause; or
 //   - one occurrence of the symbol ranges exactly over <spelling>, and another
 //     ranges exactly over the <name> the clause aliases.
+//
+// Both are measured, and each is what one pinned indexer emits: the Python
+// indexer ranges one occurrence over `OrderedDict as OD` and spells its uses
+// `OD`; the Rust indexer puts one role-less occurrence on `HashSet` and one on
+// `Set` in `HashSet as Set`, and spells its uses `Set`.
 //
 // A uniform shift moves both occurrences of the second shape by the same
 // distance, so it cannot leave one on the aliased name and the other on the
@@ -1966,8 +1973,8 @@ func (im *importer) result() model.ProviderResult {
 				cs = cs.WithDetail(d.name, strconv.FormatInt(d.docs.n, 10)).WithDetail(d.name+"_exemplar", d.docs.first)
 			}
 		}
-		if im.nestedDocs > 0 {
-			cs = cs.WithDetail(detailNested, strconv.FormatInt(im.nestedDocs, 10))
+		if im.otherProjectDocs > 0 {
+			cs = cs.WithDetail(detailOtherProjects, strconv.FormatInt(im.otherProjectDocs, 10))
 		}
 		if im.skippedAliases > 0 {
 			cs = cs.WithDetail(detailSkippedAliases, strconv.FormatInt(im.skippedAliases, 10))
