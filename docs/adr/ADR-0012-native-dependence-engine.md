@@ -172,15 +172,17 @@ Four findings follow, and each one changes a decision below.
    - In the Go corpus, 228,765 functions took 11.6 s to lower. Post-dominators, control dependence and def-use together
      took 0.54 s.
    - The cause is crossings into the parse-tree library, measured by a CPU profile of the Go corpus's function rows.
-     Of 66 s of samples, the parse itself is 19.4 s (29%) and lowering 22.5 s (34%). The walk that finds callables
+     Of 66 s of samples, the parse itself is 19.4 s (29%) and lowering 22.5 s (34%). The benchmark lowers every function
+     twice, so lowering one function once costs half that. The walk that finds callables
      costs about 15 s more. Inside both, the dominant cost is one native call per node access: node kind, named child,
      named flag and cursor steps.
    - Resolving field names to ids, which removed a C-string allocation per field lookup, cut the Go corpus's lowering
      only from 11.6 s to 10.5 s.
 3. **The structural stage's wall time goes to unit work outside the parse, and that work is serialized through the
    store's lock.**
-   - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time is a
-     worker busy about 2% of the time. That much is measured.
+   - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time
+     (three workers of one end-to-end test run in the capped test pass of 2026-09-25, recorded in the research note's
+     raw wall-time file) is a worker busy about 2% of the time. That much is measured.
    - The serialization point was found by reading, not by profiling. Every per-unit store call takes one group mutex
      (`internal/storage/sqlite/open.go:710`, `:830`), and a unit makes about ten such calls, plus one or two per
      extracted record.
@@ -328,7 +330,8 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
   - The 107 is derived from the parse-tree runtime's own node layout, not measured on any repository. Per source byte
     it adds 80 + 8 bytes for a heap node, 16 for the C allocator's per-allocation overhead, 2 for the binding's two
     input copies and 1 for the worker's buffer.
-  - How many matrix files exceed it, per size class, is counted in the research note of 2026-09-26, section 1.
+  - It holds on all 3,827 matrix files of 64 KiB or more. It is exceeded by 9 of 74,059 files of 4 KiB or more; the
+    worst is 302.8 bytes per source byte, a 10,479-byte C++ file.
   - An exceeded prior is an overrun that runs and is disclosed, never a refusal. If the prior falls below observed need
     on some class, the first file of a language runs alone.
 
