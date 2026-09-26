@@ -30,6 +30,10 @@ type Lowering struct {
 	language string
 	// callables are the named node kinds that begin a function.
 	callables []string
+	// ambient are the named node kinds whose subtrees hold declarations only,
+	// never code that runs (a TypeScript `declare` block): Functions does not
+	// descend into them, so a callable written there is not a function.
+	ambient []string
 	// lower drives b over fn's parameters and body in source order. It must
 	// not descend into a nested callable (l.isCallable reports one) beyond
 	// the expression that creates it. Begin and Finish are Lower's.
@@ -38,8 +42,9 @@ type Lowering struct {
 	// once resolves callable and paren against the grammar, so every shared
 	// helper compares kind ids rather than kind strings.
 	once sync.Once
-	// callable is indexed by kind id.
-	callable []bool
+	// callable and opaque are indexed by kind id; opaque marks the ambient
+	// kinds.
+	callable, opaque []bool
 	// paren is the kind id of a parenthesized expression.
 	paren uint16
 }
@@ -73,6 +78,10 @@ func (l *Lowering) resolve() {
 		l.callable = make([]bool, tl.NodeKindCount())
 		for _, name := range l.callables {
 			l.callable[mustKind(tl, l.language, name, true)] = true
+		}
+		l.opaque = make([]bool, tl.NodeKindCount())
+		for _, name := range l.ambient {
+			l.opaque[mustKind(tl, l.language, name, true)] = true
 		}
 		l.paren = mustKind(tl, l.language, "parenthesized_expression", true)
 	})
@@ -113,6 +122,12 @@ func (l *Lowering) isCallable(n *ts.Node) bool {
 	return n.IsNamed() && int(id) < len(l.callable) && l.callable[id]
 }
 
+// isAmbient reports whether n is of an ambient kind.
+func (l *Lowering) isAmbient(n *ts.Node) bool {
+	id := n.KindId()
+	return n.IsNamed() && int(id) < len(l.opaque) && l.opaque[id]
+}
+
 // unparen strips parentheses around n.
 func (l *Lowering) unparen(n *ts.Node) *ts.Node {
 	for n != nil && n.KindId() == l.paren {
@@ -125,17 +140,19 @@ func (l *Lowering) unparen(n *ts.Node) *ts.Node {
 // preorder, nested callables included, in one tree-cursor walk. It stops at
 // and returns the first error visit returns. A unit with no code of its own
 // (a class body without initializers or static blocks) is still visited and
-// lowers to Entry -> Exit, so a count of callables counts it.
+// lowers to Entry -> Exit, so a count of callables counts it. The subtree of
+// an ambient kind is not walked.
 func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error {
 	c := root.Walk()
 	defer c.Close()
 	for {
-		if n := c.Node(); l.isCallable(n) {
+		n := c.Node()
+		if l.isCallable(n) {
 			if err := visit(n); err != nil {
 				return err
 			}
 		}
-		if c.GotoFirstChild() {
+		if !l.isAmbient(n) && c.GotoFirstChild() {
 			continue
 		}
 		for !c.GotoNextSibling() {

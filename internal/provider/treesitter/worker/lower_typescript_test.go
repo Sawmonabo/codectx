@@ -12,6 +12,19 @@ import "testing"
 func TestTypeScriptLoweringGolden(t *testing.T) {
 	shared := []goldenCase{
 		{
+			// Handbook "Ambient Declarations": nothing under `declare` runs,
+			// so the declared class's body is no callable and f is the
+			// program's first nested callable (fn 1). f starts at 30: x@41
+			// defines x, the if's Branch x@57 reads it and controls g()@60.
+			name:     "a class body under declare is not a callable",
+			protects: "Functions does not walk an ambient declaration, so declared-only code is never lowered as a function",
+			mutation: "descend into ambient kinds in Functions (fn 1 becomes the declared class body, with no pairs)",
+			src:      "declare class C { m(): void } function f(x: number) { if (x) g(); }",
+			fn:       1,
+			cd:       []string{"x@57 -> g()@60"},
+			du:       []string{"x@41 -> x@57"},
+		},
+		{
 			// Handbook "Erased Types": the annotation is removed; a
 			// parameter's default is ECMAScript's (§10.2.11
 			// FunctionDeclarationInstantiation). Nodes: a@11 defines a; the

@@ -22,9 +22,13 @@ var javascriptLowering = Lowering{language: "javascript", callables: jsCallables
 // forms are lowered as TypeScript in lowerJavaScript states. TSX adds JSX,
 // which the JavaScript lowering already handles.
 var (
-	typescriptLowering = Lowering{language: "typescript", callables: jsCallables, lower: jsTypeScript.lower}
-	tsxLowering        = Lowering{language: "tsx", callables: jsCallables, lower: jsTSX.lower}
+	typescriptLowering = Lowering{language: "typescript", callables: jsCallables, ambient: tsAmbient, lower: jsTypeScript.lower}
+	tsxLowering        = Lowering{language: "tsx", callables: jsCallables, ambient: tsAmbient, lower: jsTSX.lower}
 )
+
+// tsAmbient is the TypeScript `declare` form: nothing under it runs, so a
+// function or class body written there is not a callable.
+var tsAmbient = []string{"ambient_declaration"}
 
 // jsCallables are the callable kinds of every grammar the JavaScript lowering
 // runs on.
