@@ -493,5 +493,102 @@ func TestJavaScriptLoweringGolden(t *testing.T) {
 				"class A { static x = g(); }@21 -> h()@63",
 			},
 		},
+		{
+			// ECMA-262 §13.15.5 Destructuring Assignment: the assignment's value
+			// is its right side's value, evaluated once. Nodes: s@11, k@14, a@23
+			// (let a defines a); the right side s@48 (Uses s, defines the incoming
+			// value); the element a@42 (Uses its computed key's k and the incoming
+			// value, defines a); return g({ [k]: a } = s);@26, which Uses the
+			// incoming value only.
+			name:     "an embedded destructuring assignment hands on its right side's value",
+			protects: "the node consuming an embedded destructuring assignment reads the right side's value through its node's result, never the reads of the elements' keys, defaults or targets",
+			mutation: "give the consumer the right side's reads instead of its result (s@11 -> return g({ [k]: a } = s);@26 appears and s@48 -> return g({ [k]: a } = s);@26 vanishes), or leave the elements' reads to the consumer (k@14 -> return g({ [k]: a } = s);@26 appears)",
+			src:      "function f(s, k) { let a; return g({ [k]: a } = s); }",
+			fn:       1,
+			du:       []string{"s@11 -> s@48", "s@48 -> a@42", "k@14 -> a@42", "s@48 -> return g({ [k]: a } = s);@26"},
+		},
+		{
+			// ECMA-262 §14.7.5.7 ForIn/OfBodyEvaluation: a property target is
+			// evaluated anew on every iteration, after the next value exists, and
+			// PutValue writes through it. Nodes: o@11, xs@14; xs@32 (Uses xs,
+			// defines the iteration variable), the head o.p of xs@25 (Uses it); on
+			// the body path o.p@25 (Uses it and o, may-defines o), g()@36; return
+			// o;@41 on the exit edge. The head controls o.p, g() and itself.
+			name:     "a for…of property target is written on the body path each iteration",
+			protects: "a for…of property target is its own per-iteration node, off the head, and a write through it may-defines its base",
+			mutation: "read the target's object on the loop head (o@11 -> o.p of xs@25 and o.p@25 -> o.p of xs@25 appear), or drop the base may-definition of a property write (o.p@25 -> o.p@25 and o.p@25 -> return o;@41 vanish)",
+			src:      "function f(o, xs) { for (o.p of xs) g(); return o; }",
+			fn:       1,
+			cd:       []string{"o.p of xs@25 -> o.p of xs@25", "o.p of xs@25 -> o.p@25", "o.p of xs@25 -> g()@36"},
+			du: []string{
+				"xs@14 -> xs@32", "xs@32 -> o.p of xs@25", "xs@32 -> o.p@25", "o@11 -> o.p@25", "o.p@25 -> o.p@25",
+				"o@11 -> return o;@41", "o.p@25 -> return o;@41",
+			},
+		},
+		{
+			// ECMA-262 §13.3.8.1 ArgumentListEvaluation (arguments left to right)
+			// and §13.14 Conditional Operator. The condition c is read by its
+			// Branch c@28 alone, so it is no earlier read of the statement when c
+			// = x@39 overwrites c. Nodes: c@11, x@14, the Branch c@28, its arms
+			// 1@32 and 2@36, each defining the conditional's result, c = x@39
+			// (Uses x, defines c), return g(c ? 1 : 2, c = x);@19 (Uses the result
+			// and c).
+			name:     "a read the condition carried is not an earlier read of the statement",
+			protects: "a definition later in a statement takes over only the reads the statement still holds, never one a condition's Branch carried",
+			mutation: "keep a read another node carried as one of the statement's reads (c@11 -> c = x@39 appears)",
+			src:      "function f(c, x) { return g(c ? 1 : 2, c = x); }",
+			fn:       1,
+			cd:       []string{"c@28 -> 1@32", "c@28 -> 2@36"},
+			du: []string{
+				"c@11 -> c@28", "x@14 -> c = x@39", "1@32 -> return g(c ? 1 : 2, c = x);@19",
+				"2@36 -> return g(c ? 1 : 2, c = x);@19", "c = x@39 -> return g(c ? 1 : 2, c = x);@19",
+			},
+		},
+		{
+			// ECMA-262 §13.3.9 Optional Chains: a nullish receiver makes the whole
+			// chain undefined. Nodes: o@11; the Branch o@26 (Uses o) defines the
+			// chain's result on its nullish exit and hands the receiver on; the
+			// chain o?.p@26 (Uses it, defines the result); the declarator v =
+			// o?.p@22 (Uses the result, reached from both); return v;@32.
+			name:     "an optional chain's value reaches its consumer from both exits",
+			protects: "the chain's result is defined on the nullish exit by the Branch and on the other by the chain's node, so its consumer depends on both",
+			mutation: "define the chain's result only on the chain's node (o@26 -> v = o?.p@22 vanishes), or give the chain node the receiver's reads (o@11 -> o?.p@26 appears)",
+			src:      "function f(o) { const v = o?.p; return v; }",
+			fn:       1,
+			cd:       []string{"o@26 -> o?.p@26"},
+			du: []string{
+				"o@11 -> o@26", "o@26 -> o?.p@26", "o@26 -> v = o?.p@22", "o?.p@26 -> v = o?.p@22",
+				"v = o?.p@22 -> return v;@32",
+			},
+		},
+		{
+			// ECMA-262 §13.15.2 Assignment Operators: an embedded property write
+			// stores (PutValue) and its value is the value assigned. Nodes: o@11,
+			// x@14, the write o.p = x@21 (Uses o and x, may-defines o, defines its
+			// result), the call g(o.p = x)@19 (Uses the result), return o;@31,
+			// reached by o@11 and by the write's non-killing may-definition.
+			name:     "an embedded property write is its own node and may-defines its base",
+			protects: "a property write inside a larger expression is a node of its own that may-defines its base variable and hands its value to the consumer through a result",
+			mutation: "fold an embedded property write into its consumer (o.p = x@21 vanishes; o@11 and x@14 pair with g(o.p = x)@19), or drop the base may-definition (o.p = x@21 -> return o;@31 vanishes)",
+			src:      "function f(o, x) { g(o.p = x); return o; }",
+			fn:       1,
+			du: []string{
+				"o@11 -> o.p = x@21", "x@14 -> o.p = x@21", "o.p = x@21 -> g(o.p = x)@19", "o@11 -> return o;@31",
+				"o.p = x@21 -> return o;@31",
+			},
+		},
+		{
+			// ECMA-262 §13.15.2 Assignment Operators (an assignment's value is the
+			// value assigned) and §13.15.4 EvaluateStringOrNumericBinaryExpression
+			// (both operands are evaluated before the operator). Nodes: x@11,
+			// x = 1@24 and x = 2@34 (each defines x and its own result), return
+			// (x = 1) + (x = 2);@16, which Uses both results.
+			name:     "two assignments to one variable in an expression each hand on their own value",
+			protects: "an embedded assignment hands its value to the consumer through a result of its own, so a later assignment to the same variable in the expression does not hide the earlier value",
+			mutation: "let the consumer read the assigned variable instead of the assignment's result (x = 1@24 -> return (x = 1) + (x = 2);@16 vanishes)",
+			src:      "function f(x) { return (x = 1) + (x = 2); }",
+			fn:       1,
+			du:       []string{"x = 1@24 -> return (x = 1) + (x = 2);@16", "x = 2@34 -> return (x = 1) + (x = 2);@16"},
+		},
 	})
 }
