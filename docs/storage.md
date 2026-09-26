@@ -594,7 +594,9 @@ retried the next time something is queued. It is named, with the reason, in
 falling is either a run removing faster than the pace gives back, which
 resolves itself, or a removal nothing can make, which does not, and only the
 list beside it tells the two apart. The request that empties the pools reports
-the same list rather than waiting for a removal that will never succeed.
+the same list rather than waiting for a removal that will never succeed. Both
+carry one page of it, at the bound every record list of a response carries,
+and `stuck_frees_omitted` counts the entries past that page.
 
 At activation and abort the writer's page cache is released to the process, so
 a long-lived server does not keep a run's working set resident.
