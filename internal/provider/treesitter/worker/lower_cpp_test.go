@@ -145,6 +145,20 @@ func TestCppLoweringGolden(t *testing.T) {
 			du:       []string{"x = 0@14 -> &r = x@25", "x = 0@14 -> return x;@40", "&r = x@25 -> return x;@40"},
 		},
 		{
+			// [dcl.ref]/1 and [dcl.init.ref]/5: `const int &c = x` binds c to
+			// x as a const int, a read-only view, so the binding only reads
+			// x; `int &r = x` binds a reference to a non-const type and is a
+			// may-definition of x. Nodes: x = 0@14, &c = x@31 (Uses x,
+			// defines c), &r = x@43 (Uses x, defines r, may-defines x),
+			// return x;@51. No pair leaves &c = x@31.
+			name:     "a reference to a const type only reads the local it binds",
+			protects: "a const reference binding adds no may-definition of the bound local, while a non-const reference binding still does",
+			mutation: "treat every reference binding as a may-definition (adds &c = x@31 -> &r = x@43 and &c = x@31 -> return x;@51), or none (loses &r = x@43 -> return x;@51)",
+			src:      "int f() { int x = 0; const int &c = x; int &r = x; return x; }",
+			du: []string{"x = 0@14 -> &c = x@31", "x = 0@14 -> &r = x@43", "x = 0@14 -> return x;@51",
+				"&r = x@43 -> return x;@51"},
+		},
+		{
 			// [except.pre]/4: a function-try-block's handlers catch exceptions
 			// from the member initializers and the body; [except.handle]/15:
 			// the end of a constructor's handler rethrows. Rethrowing and

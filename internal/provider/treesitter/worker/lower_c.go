@@ -106,9 +106,10 @@ const (
 //     lowering's own; a Branch head spanning from the declarator to the end
 //     of the range expression, which Uses it; then one defining node per
 //     bound name spanning the name, which Uses it too; a name bound by a
-//     reference declarator (`auto &e : v`) is bound to an element of the
-//     range, so its node may-defines the range's base variable, as `&v[i]`
-//     does.
+//     reference to a non-const type (`auto &e : v`) is bound to an element
+//     of the range, so its node may-defines the range's base variable, as
+//     `&v[i]` does; a reference to a const type (`const auto &e : v`) only
+//     reads it.
 //   - Every label is its own Stmt node spanning the label identifier, before
 //     the statement it labels, so a goto always lands on it (C17 §6.8.6.1).
 //     An assembly statement with goto labels is a Branch node spanning the
@@ -163,9 +164,12 @@ const (
 // operands: taking an address, `&x` (`&s.f`, `&a[i]`); evaluating a local
 // declared as an array anywhere but as the operand of sizeof, `&` or a
 // subscript, where it decays to its address (C17 §6.3.2.1p3), as in
-// `fill(buf)`; and binding a C++ reference to an object, `T &r = x` (also
-// `T &r{x}`, `T &r(x)` and `auto &[a, b] = s`), which may-defines its base
-// variable at the declarator's node ([dcl.init.ref]). The may-definition
+// `fill(buf)`; and binding a C++ reference to a non-const type to an
+// object, `T &r = x` (also `T &r{x}`, `T &r(x)`, `T &&r = …` and
+// `auto &[a, b] = s`), which may-defines its base variable at the
+// declarator's node ([dcl.init.ref]). A reference to a const type
+// (`const T &r = x`, [dcl.ref]/1) is a read-only view: its binding only
+// reads the object, as Lowering states. The may-definition
 // lands on that node even when a later operand makes a node first: the
 // may-definition is recorded with the position of its operand's reads, as
 // reads are, and a node takes only those its own reads cover. A write
@@ -910,7 +914,11 @@ func (c *cLower) declaration(n *ts.Node) {
 			// A declaration-level initializer (a C++ condition declaration)
 			// initializes the declarator.
 			if val := n.ChildByFieldId(k.fValue); val != nil {
-				c.value(val)
+				if ctor == k.referenceDeclarator {
+					c.bindRef(val, c.constRef(n, d))
+				} else {
+					c.value(val)
+				}
 				c.def(c.node(flow.Stmt, n, m, len(c.reads)), v)
 				continue
 			}
@@ -932,7 +940,7 @@ func (c *cLower) declaration(n *ts.Node) {
 		if sb := c.binding(inner); sb != nil {
 			// `auto &[a, b] = s` binds a reference to s ([dcl.struct.bind]/1).
 			if inner.KindId() == k.referenceDeclarator {
-				c.bindRef(val)
+				c.bindRef(val, c.constRef(n, inner))
 			} else {
 				c.value(val)
 			}
@@ -952,7 +960,7 @@ func (c *cLower) declaration(n *ts.Node) {
 		}
 		c.arraySizes(inner, v, ctor)
 		if ctor == k.referenceDeclarator {
-			c.bindRef(val)
+			c.bindRef(val, c.constRef(n, inner))
 		} else {
 			c.value(val)
 			if val.KindId() == k.argumentList || val.KindId() == k.initializerList && k.cpp {
@@ -1005,20 +1013,76 @@ func (c *cLower) classType(n *ts.Node) bool {
 }
 
 // bindRef lowers the initializer of a C++ reference, which binds the
-// reference to it ([dcl.init.ref]): the object's base variable is
-// may-defined, by the address-taking rule of Lowering. A braced or
+// reference to it ([dcl.init.ref]). For a reference to a non-const type the
+// object's base variable is may-defined, by the address-taking rule of
+// Lowering; the initializer of a reference to a const type (constRef) is
+// only read, since the reference is a read-only view of it. A braced or
 // parenthesized initializer binds each operand the same way.
-func (c *cLower) bindRef(val *ts.Node) {
+func (c *cLower) bindRef(val *ts.Node, readOnly bool) {
 	k := c.k
+	bind := c.target
+	if readOnly {
+		bind = c.value
+	}
 	if val.KindId() != k.argumentList && val.KindId() != k.initializerList {
-		c.target(val)
+		bind(val)
 		return
 	}
 	start, list := c.kids(val)
 	for i := range list {
-		c.target(&list[i])
+		bind(&list[i])
 	}
 	c.done(start)
+}
+
+// constRef reports whether the reference that declarator d, of declaration
+// or range for n, declares refers to a const-qualified type ([dcl.ref]/1):
+// the qualifiers of the nearest pointer declarator outside the reference
+// (`const T *&r` refers to a non-const pointer), or, with none, the
+// specifiers of n itself (`const T &r`, `T const &&r`, `const auto &[a, b]`);
+// an array of const elements is const, and a reference to a function refers
+// to nothing writable. A const type named through an alias (`using CR =
+// const T &`) is not seen, and that binding stays a may-definition.
+func (c *cLower) constRef(n, d *ts.Node) bool {
+	k := c.k
+	var near *ts.Node
+	for d != nil {
+		switch d.KindId() {
+		case k.referenceDeclarator:
+			switch {
+			case near == nil:
+				return c.constQualified(n)
+			case near.KindId() == k.functionDeclarator:
+				return true
+			default:
+				return c.constQualified(near)
+			}
+		case k.pointerDeclarator, k.functionDeclarator:
+			near = d
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.arrayDeclarator, k.initDeclarator:
+			d = d.ChildByFieldId(k.fDeclarator)
+		case k.parenthesizedDeclarator, k.attributedDeclarator:
+			d = c.inner(d)
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// constQualified reports whether n, a declaration, range for or pointer
+// declarator, carries a `const` type qualifier of its own.
+func (c *cLower) constQualified(n *ts.Node) bool {
+	k := c.k
+	start, list := c.kids(n)
+	defer c.done(start)
+	for i := range list {
+		if list[i].KindId() == k.typeQualifier && string(c.text(&list[i])) == "const" {
+			return true
+		}
+	}
+	return false
 }
 
 // cond lowers a condition as one Branch node (after an init-statement, for
@@ -1237,7 +1301,7 @@ func (c *cLower) forRange(n *ts.Node) {
 	// address-taking rule, as `&v[i]` does.
 	elem := int32(-1)
 	decl := n.ChildByFieldId(k.fDeclarator)
-	if decl.KindId() == k.referenceDeclarator {
+	if decl.KindId() == k.referenceDeclarator && !c.constRef(n, decl) {
 		if id := c.baseIdent(right); id != nil {
 			elem = c.lookup(id)
 		}
@@ -2084,6 +2148,10 @@ func (c *cLower) cap(n *ts.Node) {
 			c.cap(init)
 		}
 		c.cap(n.ChildByFieldId(k.fRight))
+		// An element reference to a non-const type may write the range.
+		if decl := n.ChildByFieldId(k.fDeclarator); decl.KindId() == k.referenceDeclarator && !c.constRef(n, decl) {
+			c.capWrite(n.ChildByFieldId(k.fRight))
+		}
 		c.capNames(n.ChildByFieldId(k.fDeclarator))
 		c.cap(n.ChildByFieldId(k.fBody))
 		c.close(s)
@@ -2116,8 +2184,9 @@ func (c *cLower) cap(n *ts.Node) {
 				inner := d.ChildByFieldId(k.fDeclarator)
 				c.capNames(inner)
 				c.cap(d.ChildByFieldId(k.fValue))
-				// A reference bound to an enclosing object may write it.
-				if _, ctor := c.name(inner); ctor == k.referenceDeclarator || inner.KindId() == k.referenceDeclarator {
+				// A reference to a non-const type bound to an enclosing object
+				// may write it.
+				if _, ctor := c.name(inner); (ctor == k.referenceDeclarator || inner.KindId() == k.referenceDeclarator) && !c.constRef(n, inner) {
 					c.capWrite(d.ChildByFieldId(k.fValue))
 				}
 			default:
@@ -2211,7 +2280,7 @@ type cSyntax struct {
 	offsetofExpression, initializerList, initializerPair, asmExpression, asmOutputOperand,
 	asmGotoList, trueLit, numberLiteral, genericExpression, typeDescriptor, typeIdentifier,
 	abstractArrayDeclarator, abstractPointerDeclarator, abstractParenthesizedDeclarator, primitiveType,
-	sizedTypeSpecifier, enumSpecifier, storageClassSpecifier uint16
+	sizedTypeSpecifier, enumSpecifier, storageClassSpecifier, typeQualifier uint16
 
 	// C++ only.
 	lambdaExpression, lambdaCaptureInitializer, lambdaDefaultCapture, tryStatement, catchClause,
@@ -2278,7 +2347,7 @@ func resolveCSyntax(language string) *cSyntax {
 	s.abstractArrayDeclarator, s.abstractPointerDeclarator = kind("abstract_array_declarator"), kind("abstract_pointer_declarator")
 	s.abstractParenthesizedDeclarator, s.primitiveType = kind("abstract_parenthesized_declarator"), kind("primitive_type")
 	s.sizedTypeSpecifier, s.enumSpecifier = kind("sized_type_specifier"), kind("enum_specifier")
-	s.storageClassSpecifier = kind("storage_class_specifier")
+	s.storageClassSpecifier, s.typeQualifier = kind("storage_class_specifier"), kind("type_qualifier")
 	s.and, s.or, s.assign, s.star, s.arrow, s.amp = tok("&&"), tok("||"), tok("="), tok("*"), tok("->"), tok("&")
 	s.fAlternative, s.fArgument, s.fBody, s.fCondition = field("alternative"), field("argument"), field("body"), field("condition")
 	s.fConsequence, s.fDeclarator, s.fFilter, s.fGotoLabels = field("consequence"), field("declarator"), field("filter"), field("goto_labels")

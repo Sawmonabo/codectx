@@ -36,7 +36,8 @@ func Grammar(name string) (*ts.Language, bool) {
 //     whose base local is x;
 //   - it is mutably borrowed: Rust `&mut x` (`&mut x.f`, `&mut x[i]`), and a
 //     `ref mut` binding in a pattern, which borrows the matched local;
-//   - a C++ reference is bound to it: `T &r = x`;
+//   - a C++ reference to a non-const type is bound to it: `T &r = x`,
+//     `T &&r = std::move(x)`, a range for's `auto &e : x`;
 //   - in C and C++, it is declared as an array and is evaluated anywhere
 //     other than as the operand of `sizeof`, `&` or a subscript, where it
 //     decays to its address.
@@ -67,6 +68,12 @@ func Grammar(name string) (*ts.Language, bool) {
 //     method, a Rust auto-referenced `&mut self` method, a C++ non-const
 //     member function): whether the call borrows depends on the method's
 //     signature;
+//   - a C++ reference to a const type (`const T &r = x`, a range for's
+//     `const auto &e : x`, `const T &&r`) is a use only, never a
+//     may-definition: the language makes it a read-only view, as it makes a
+//     Rust shared borrow, and on common code the may-definition would only
+//     add false pairs. What that gives up is a write after casting the const
+//     away and a write to a `mutable` member;
 //   - a Rust shared borrow `&x` of an interior-mutable type (Cell, RefCell,
 //     an atomic), which can write: whether it can depends on the type.
 //
