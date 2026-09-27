@@ -566,11 +566,13 @@ func TestRustLoweringGolden(t *testing.T) {
 			// Item declarations: G is a static item of the block, no local of
 			// f, so predeclare binds it to no variable; Macros By Example ›
 			// Hygiene: `make!(m)` may declare m at the invocation's site, but
-			// the expansion is not lowered, so m resolves to nothing; H, g and
-			// k are named by no declaration in scope. G is written only as a
-			// place (a reference to a `static mut` is refused by the 2024
-			// edition's static_mut_refs lint), and the borrowed and ref-mut
-			// matched places are H. Nodes: v@5, make!(m)@66,
+			// the expansion is not lowered, so m resolves to nothing; H, J, P,
+			// g and k are named by no declaration in scope, each used as one
+			// type allows: H an integer place (borrowed, captured by the
+			// format string and assigned by the closure), J an iterable, P a
+			// pair whose first element a `ref mut` binding matches. G is
+			// written only as a place (a reference to a `static mut` is
+			// refused by the 2024 edition's static_mut_refs lint). Nodes: v@5, make!(m)@66,
 			// G = (v, 0)@83 (Uses v, defines nothing), m += v@95 (Uses v
 			// only), m = v@112 (the embedded assignment, Uses v), let e = (m =
 			// v);@103 (defines e, Uses nothing), (m, G.1, w) = (v, 1, 2)@120
@@ -580,25 +582,25 @@ func TestRustLoweringGolden(t *testing.T) {
 			// (a token-tree read of m, a `&mut m` borrow and a `{H:?}`
 			// capture, each of `{H:?} {:?}`'s arguments used: nothing),
 			// || { m += v; H = 1; }@205 (Uses the captured v, may-defines
-			// nothing), let c = …;@197, c()@228, H@242 (the iterated value,
+			// nothing), let c = …;@197, c()@228, J@242 (the iterated value,
 			// defining the iteration variable), for@233, i@237, let (ref mut
-			// y, z) = H;@247 (Uses nothing, defines an owned variable), y@260
+			// y, z) = P;@247 (Uses nothing, defines an owned variable), y@260
 			// (a `ref mut` binding of an unresolved place: no
 			// may-definition), z@263, k(e, w, y, z)@271. Succ: straight line
-			// to for@233→{i@237, let (ref mut y, z) = H;@247}; i@237→for@233.
-			// IPDom: for@233 → let (ref mut y, z) = H;@247.
+			// to for@233→{i@237, let (ref mut y, z) = P;@247}; i@237→for@233.
+			// IPDom: for@233 → let (ref mut y, z) = P;@247.
 			name:     "a name that resolves to no local defines, may-defines and uses nothing in every position",
 			protects: "a static item, a name a macro declares and an undeclared name, as an assignment, compound, embedded or destructuring target, a place's base, a borrowed or ref-mut-matched place, a captured read or write, a token-tree read, borrow or format capture, and an iterated value, never reach flow.Builder as -1 and pair with nothing",
-			mutation: "remove any one -1 filter (read's or def's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m or H; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
-			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut H); println!(\"{H:?} {:?}\", &mut m); let c = || { m += v; H = 1; }; c(); for i in H {} let (ref mut y, z) = H; k(e, w, y, z) } }",
+			mutation: "remove any one -1 filter (read's or def's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m, H, J or P; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
+			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut H); println!(\"{H:?} {:?}\", &mut m); let c = || { m += v; H = 1; }; c(); for i in J {} let (ref mut y, z) = P; k(e, w, y, z) } }",
 			cd:       []string{"for@233 -> i@237", "for@233 -> for@233"},
 			du: []string{"v@5 -> G = (v, 0)@83", "v@5 -> m += v@95", "v@5 -> m = v@112",
 				"v@5 -> (m, G.1, w) = (v, 1, 2)@120", "v@5 -> G.0 = v@145", "v@5 -> || { m += v; H = 1; }@205",
 				"(m, G.1, w) = (v, 1, 2)@120 -> m@121", "(m, G.1, w) = (v, 1, 2)@120 -> G.1@124",
 				"(m, G.1, w) = (v, 1, 2)@120 -> w@129",
 				"|| { m += v; H = 1; }@205 -> let c = || { m += v; H = 1; };@197",
-				"let c = || { m += v; H = 1; };@197 -> c()@228", "H@242 -> for@233", "H@242 -> i@237",
-				"let (ref mut y, z) = H;@247 -> y@260", "let (ref mut y, z) = H;@247 -> z@263",
+				"let c = || { m += v; H = 1; };@197 -> c()@228", "J@242 -> for@233", "J@242 -> i@237",
+				"let (ref mut y, z) = P;@247 -> y@260", "let (ref mut y, z) = P;@247 -> z@263",
 				"let e = (m = v);@103 -> k(e, w, y, z)@271", "w@129 -> k(e, w, y, z)@271",
 				"y@260 -> k(e, w, y, z)@271", "z@263 -> k(e, w, y, z)@271"},
 		},
