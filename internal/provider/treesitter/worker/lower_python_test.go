@@ -1187,18 +1187,41 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"y = a + b < a@21 -> return y@61", "y = 0@54 -> return y@61"},
 		},
 		{
-			// §7.2.2, §8.7: annotations are not evaluated where they stand.
-			// Lines at 0, 13, 23, 42, 49. Nodes: T@6, a@9, y: T = a@14 (reads
-			// a only), def g(p: T) -> T: pass@24 (defines g, reads nothing:
-			// neither the parameter's nor the return annotation), return y,
-			// g@50.
-			name:     "annotations are read by no node",
-			protects: "an annotated assignment's, a parameter's and a function's type are not reads of the variables they name",
-			mutation: "read an annotation (T@6 -> y: T = a@14 or T@6 -> def g(p: T) -> T: pass@24 appears)",
+			// §7.2.2, §8.7: a definition's annotations are evaluated where it
+			// is created, a function's annotated assignment's are not. Lines at
+			// 0, 13, 23, 42, 49. Nodes: T@6, a@9, y: T = a@14 (reads a only),
+			// def g(p: T) -> T: pass@24 (defines g, reads T through the
+			// parameter's and the return annotation), return y, g@50.
+			name:     "a nested definition's annotations are reads of its creating node",
+			protects: "a parameter's and a return annotation are evaluated when the definition runs, so the variables they name reach its node, while a function's annotated assignment reads its value alone",
+			mutation: "read no annotation of a definition (T@6 -> def g(p: T) -> T: pass@24 disappears), or evaluate a function's annotated assignment (T@6 -> y: T = a@14 appears)",
 			src:      "def f(T, a):\n y: T = a\n def g(p: T) -> T:\n  pass\n return y, g\n",
 			fn:       1,
-			du: []string{"a@9 -> y: T = a@14", "y: T = a@14 -> return y, g@50",
+			du: []string{"a@9 -> y: T = a@14", "y: T = a@14 -> return y, g@50", "T@6 -> def g(p: T) -> T: pass@24",
 				"def g(p: T) -> T: pass@24 -> return y, g@50"},
+		},
+		{
+			// §7.11.1: under the future import no annotation is evaluated.
+			// Lines at 0, 35, 45, 64, 71. Nodes: T@41, def g(p: T) -> T:
+			// pass@46 (defines g, reads nothing), return g@72.
+			name:     "annotations under the annotations future import are read by no node",
+			protects: "a module that imports annotations from __future__ evaluates none of them, so a definition's annotations are no reads",
+			mutation: "ignore the future import (T@41 -> def g(p: T) -> T: pass@46 appears)",
+			src:      "from __future__ import annotations\ndef f(T):\n def g(p: T) -> T:\n  pass\n return g\n",
+			fn:       1,
+			du:       []string{"def g(p: T) -> T: pass@46 -> return g@72"},
+		},
+		{
+			// §7.2.2, the class body (callable 1): a class body evaluates its
+			// annotations. Lines at 0, 9, 18, 24. Nodes: T = int@10, x: T@19
+			// (a Stmt reading T, binding nothing), y: T = 1@25 (reads T after
+			// its value, defines y).
+			name:     "a class body's annotations are reads where they stand",
+			protects: "an annotated name in a class body evaluates its annotation, with or without a value, so the variable it names reaches that node",
+			mutation: "make no node for an annotation without a value in a class body (T = int@10 -> x: T@19 disappears), or read no annotation of an annotated assignment there (T = int@10 -> y: T = 1@25 disappears)",
+			src:      "class C:\n T = int\n x: T\n y: T = 1\n",
+			fn:       1,
+			du:       []string{"T = int@10 -> x: T@19", "T = int@10 -> y: T = 1@25"},
 		},
 		{
 			// §6.11, §6.12. Lines at 0, 10, 29. Nodes: a@6, a@15 (Branch:
@@ -1383,6 +1406,24 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"E@66 -> y = 0@71", "E@66 -> return y@78"},
 			du: []string{"xs@6 -> [x for x in xs]@42", "[x for x in xs]@42 -> y = [x for x in xs]@38",
 				"y = [x for x in xs]@38 -> return y@78", "y = 0@71 -> return y@78"},
+		},
+		{
+			// §6.14, §6.2.4, §8.4: a comprehension a lambda creates is created
+			// when the lambda runs. Lines at 0, 9, 15, 44, 50, 61, 69. Nodes:
+			// lambda: [x for x in y]@21 (the creating node: not MayThrow), g =
+			// lambda: [x for x in y]@17, h()@46 (may throw), except@51
+			// (Handler, from h() alone), E@58, g = 0@63, return g@70. Succ:
+			// lambda→g = …→h()→{return g, except}; except→E→{g = 0, EXIT};
+			// g = 0→return g. IPDom: h(), E → EXIT; except → E.
+			name:     "a creation inside a nested callable throws there, not at its creating node",
+			protects: "a class or comprehension a lambda's body creates may throw when the lambda runs, so the node creating the lambda has no edge to the handler",
+			mutation: "count the nested creation's throw at the creating node (lambda: [x for x in y]@21 gains an edge to except@51 and controls g = lambda: [x for x in y]@17 and h()@46)",
+			src:      "def f():\n try:\n  g = lambda: [x for x in y]\n  h()\n except E:\n  g = 0\n return g\n",
+			fn:       1,
+			cd: []string{"h()@46 -> return g@70", "h()@46 -> except@51", "h()@46 -> E@58",
+				"E@58 -> g = 0@63", "E@58 -> return g@70"},
+			du: []string{"lambda: [x for x in y]@21 -> g = lambda: [x for x in y]@17",
+				"g = lambda: [x for x in y]@17 -> return g@70", "g = 0@63 -> return g@70"},
 		},
 		{
 			// §8.6.4.8, §8.4. Lines at 0, 10, 16, 27, 40, 49, 60, 68. Nodes:

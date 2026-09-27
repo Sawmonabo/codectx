@@ -28,9 +28,9 @@ var pythonLowering = Lowering{
 // The goldens render nodes by source text, so the granularity is exact:
 //
 //   - Every parameter bound name is one defining node after Entry, spanning
-//     its identifier. A default value, a decorator and a class's bases are
-//     evaluated where the callable is created, so they belong to the
-//     enclosing function, not to the callable's own graph.
+//     its identifier. A default value, an annotation, a decorator and a
+//     class's bases are evaluated where the callable is created, so they
+//     belong to the enclosing function, not to the callable's own graph.
 //   - A statement is one node: an expression statement spans its expression
 //     (a bare tuple statement `a, b` spans the statement), return, raise,
 //     break and continue span the statement (kind Jump), an import makes one
@@ -48,8 +48,9 @@ var pythonLowering = Lowering{
 //     evaluates e once, at a node of its own (see yield) that defines a
 //     variable of the lowering's own, then makes one defining node per
 //     target, spanning the target, in source order, each Using that
-//     variable. An annotation without a value (`x: int`) evaluates
-//     nothing and makes no node. pass, global and nonlocal make no node,
+//     variable. An annotation without a value (`x: int`) binds nothing,
+//     and makes a node only where it evaluates something (see
+//     Annotations). pass, global and nonlocal make no node,
 //     and a global or nonlocal declaration is neither a read nor a write of
 //     the name: a nested callable whose only mention of an enclosing n is
 //     `nonlocal n` gives its creating node no Use and no may-definition of
@@ -167,8 +168,8 @@ var pythonLowering = Lowering{
 //   - A nested callable is its own function; in the enclosing function its
 //     creating expression or statement is one Stmt node spanning it (a
 //     decorated definition spans the decorators too, §8.7) after the nodes
-//     of the parts evaluated there (decorators, defaults, bases, a
-//     comprehension's first iterable), which Uses the reads of those parts
+//     of the parts evaluated there (decorators, defaults, annotations,
+//     bases, a comprehension's first iterable), which Uses the reads of those parts
 //     and every enclosing variable read inside it (its captures), defines
 //     the created value, and may-defines (MayDef) every enclosing variable
 //     it assigns — through nonlocal, through global when the enclosing
@@ -209,8 +210,38 @@ var pythonLowering = Lowering{
 //     the created value is discarded.
 //   - print and exec statements, and every kind not named here, are plain
 //     nodes: one Stmt node spanning the statement with its reads, falling
-//     through. Annotations are not evaluated where they stand: a function's,
-//     a parameter's and an annotated assignment's type are read by no node.
+//     through.
+//
+// # Annotations
+//
+// Annotations are evaluated eagerly, as version 3.13 evaluates them:
+//
+//   - A function definition's parameter and return annotations are
+//     evaluated where it is created (§8.7): its creating node Uses their
+//     reads, beside its defaults', in every scope; a callable whose code
+//     holds the definition captures them.
+//   - An annotated assignment's annotation is evaluated in a class body or
+//     the module only (§7.2.2), after the value: `x: T = v` Uses T's reads
+//     on its node, and `x: T` there is a Stmt node spanning it that Uses
+//     them and binds nothing. In a function it is not evaluated. `t: T`
+//     with an attribute or subscript target evaluates the target's object
+//     and index in every scope (§7.2.2), at a Stmt node spanning it that
+//     binds nothing; with a name target in a function it makes no node.
+//   - `n[a]` in an annotation is a subscript and `t.n` an attribute (each
+//     may throw), and n in `t.n` is no read.
+//   - Under `from __future__ import annotations` (§7.11.1) no annotation of
+//     the module is evaluated, and none is a read.
+//   - Type parameters (`def f[T]`, `class C[T]`) and their bounds are
+//     evaluated lazily and are read by no node; a name among them that an
+//     annotation reads is resolved as the enclosing variable of that name,
+//     if one exists.
+//   - An assignment expression cannot stand in an annotation, so an
+//     annotation binds nothing and no binding-site scan reads one.
+//
+// Version 3.14 defers the evaluation of every annotation to its first
+// access: an annotation read here as an eager Use
+// over-approximates it, pairing the defining node with definitions that the
+// deferred evaluation would read later or never.
 //
 // # Uses
 //
@@ -347,6 +378,7 @@ func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scrat
 	j.start(l, b, fn, src, s)
 	defer j.finish()
 	k := j.k
+	j.lazy = j.deferred(fn)
 	id := fn.KindId()
 	j.module = id == k.module
 	j.pushFrame(fn)
@@ -385,6 +417,9 @@ type pyLower struct {
 	// module reports that the callable being lowered is the module, whose
 	// variables a nested callable's global declaration names.
 	module bool
+	// lazy reports that the module imports annotations from __future__, so
+	// no annotation of it is evaluated (see Annotations).
+	lazy bool
 	// shadow is non-zero while walking a nested callable for its captures.
 	shadow int
 	// walrusOnly is non-zero while a binding-site scan is inside a
@@ -1280,13 +1315,31 @@ func (j *pyLower) assign(n *ts.Node) {
 		r = r.ChildByFieldId(k.fRight)
 	}
 	targets := j.buf[base:]
+	// An annotated assignment has one target; its annotation is evaluated
+	// after the value, in a class body or the module only (§7.2.2).
+	ann := n.ChildByFieldId(k.fType)
+	if !j.eager() {
+		ann = nil
+	}
 	if r == nil {
-		// An annotation alone evaluates nothing.
+		// `t: T` evaluates a reference target's object and index and the
+		// annotation, when it is evaluated, and binds nothing.
+		m := len(j.reads)
+		t := j.l.unparen(&targets[0])
+		ref := t.KindId() == k.attribute || t.KindId() == k.subscript
+		if ref && j.reference(t) {
+			j.throws++
+		}
+		j.annotation(ann, true)
+		if ref || ann != nil {
+			j.node(flow.Stmt, n, m, len(j.reads))
+		}
 		j.done(base)
 		return
 	}
 	if len(targets) == 1 && j.single(&targets[0]) {
 		j.value(r)
+		j.annotation(ann, true)
 		j.bind(&targets[0], n, 0, len(j.reads))
 		j.done(base)
 		return
@@ -2129,8 +2182,8 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node, it int32) {
 // closure creates the node spanning at for nested callable n, after the
 // nodes of the parts evaluated where n is created: it Uses the reads from
 // reads[from:] on, which are those of the parts evaluated before it (a
-// decorated definition's decorators) and of its defaults, bases or first
-// iterable, and n's captures, all its own evaluation, and drops them from
+// decorated definition's decorators) and of its defaults, annotations, bases
+// or first iterable, and n's captures, all its own evaluation, and drops them from
 // reads. It defines dst, the created value (a def or class statement's
 // name, or the result variable of a lambda or comprehension), and
 // may-defines every enclosing variable n assigns.
@@ -2158,6 +2211,111 @@ func (j *pyLower) eval(x *ts.Node, lower bool) {
 	}
 }
 
+// deferred reports whether the module holding fn imports annotations from
+// __future__. A future statement may follow only the docstring (§7.11.1),
+// so only the module's leading statements are read.
+func (j *pyLower) deferred(fn *ts.Node) bool {
+	k := j.k
+	m := fn
+	for p := m.Parent(); p != nil; p = p.Parent() {
+		m = p
+	}
+	// The walk stops at the first statement that is neither, so a module's
+	// size never enters it.
+	for i, c := uint(0), m.NamedChild(0); c != nil; c = c.NextNamedSibling() {
+		if c.IsExtra() {
+			continue
+		}
+		switch c.KindId() {
+		case k.expressionStatement:
+			if x := firstNamed(c); i != 0 || x == nil || x.KindId() != k.stringLit {
+				return false
+			}
+		case k.futureImportStatement:
+			start, names := j.kids(c)
+			for x := range names {
+				nm := &names[x]
+				if nm.KindId() == k.aliasedImport {
+					nm = nm.ChildByFieldId(k.fName)
+				}
+				if string(j.text(nm)) == "annotations" {
+					j.done(start)
+					return true
+				}
+			}
+			j.done(start)
+		default:
+			return false
+		}
+		i++
+	}
+	return false
+}
+
+// eager reports whether an annotated assignment's annotation is evaluated
+// where it stands: in a class body or the module (§7.2.2), unless the
+// module defers annotations.
+func (j *pyLower) eager() bool { return !j.lazy && (j.module || j.frames[0].class) }
+
+// signature evaluates the parameter and return annotations of function
+// definition fn, which the enclosing function evaluates where fn is created
+// (§8.7), for their value (lower) or their captures.
+func (j *pyLower) signature(fn *ts.Node, lower bool) {
+	k := j.k
+	if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		start, list := j.kids(ps)
+		for i := range list {
+			if id := list[i].KindId(); id == k.typedParameter || id == k.typedDefaultParameter {
+				j.annotation(list[i].ChildByFieldId(k.fType), lower)
+			}
+		}
+		j.done(start)
+	}
+	j.annotation(fn.ChildByFieldId(k.fReturnType), lower)
+}
+
+// annotation evaluates annotation t for its value (lower) or collects its
+// captures, unless the module defers annotations. The grammar parses an
+// annotation's type forms apart from expressions: `n[a]` is a subscript,
+// `t.n` an attribute whose name is no read, `*n` an unpacking, `a | b` an
+// operator.
+func (j *pyLower) annotation(t *ts.Node, lower bool) {
+	if t == nil || j.lazy {
+		return
+	}
+	k := j.k
+	switch t.KindId() {
+	case k.typeKind, k.unionType, k.typeParameter, k.constrainedType:
+		start, list := j.kids(t)
+		for i := range list {
+			j.annotation(&list[i], lower)
+		}
+		j.done(start)
+	case k.genericType:
+		start, list := j.kids(t)
+		j.eval(&list[0], lower)
+		for i := 1; i < len(list); i++ {
+			j.annotation(&list[i], lower)
+		}
+		j.done(start)
+		if lower {
+			j.throws++
+		}
+	case k.memberType:
+		j.annotation(firstNamed(t), lower)
+		if lower {
+			j.throws++
+		}
+	case k.splatType:
+		j.eval(firstNamed(t), lower)
+		if lower {
+			j.throws++
+		}
+	default:
+		j.eval(t, lower)
+	}
+}
+
 // nested evaluates the parts of nested callable n evaluated where it is
 // created (lowered when lower, else captured), then collects the captures of
 // its own code in a frame of its own.
@@ -2167,13 +2325,17 @@ func (j *pyLower) nested(n *ts.Node, lower bool) {
 	switch id {
 	case k.functionDefinition, k.lambda:
 		j.defaults(n.ChildByFieldId(k.fParameters), lower)
+		j.signature(n, lower)
 	case k.classDefinition:
 		j.eval(n.ChildByFieldId(k.fSuperclasses), lower)
-		j.throws++
 	default:
 		start, list := j.kids(n)
 		j.firstIterable(list, func(r *ts.Node) { j.eval(r, lower) })
 		j.done(start)
+	}
+	// Creating a class or a comprehension may throw; one a nested callable
+	// creates throws when that callable runs, not at its creating node.
+	if lower && id != k.functionDefinition && id != k.lambda {
 		j.throws++
 	}
 	j.shadow++
@@ -2379,6 +2541,9 @@ func (j *pyLower) cap(n *ts.Node) {
 	case k.assignment:
 		j.capTarget(n.ChildByFieldId(k.fLeft))
 		j.cap(n.ChildByFieldId(k.fRight))
+		if j.frames[len(j.frames)-1].class {
+			j.annotation(n.ChildByFieldId(k.fType), false)
+		}
 	case k.namedExpression:
 		j.cap(n.ChildByFieldId(k.fValue))
 	case k.forStatement:
@@ -2477,12 +2642,13 @@ type pySyntax struct {
 	booleanOperator, comparisonOperator, conditionalExpression, typeKind, asPattern, asPatternTarget, patternList,
 	tuplePattern, listPattern, tuple, list, expressionList, parenthesizedExpression, listSplatPattern,
 	dictionarySplatPattern, typedParameter, defaultParameter, typedDefaultParameter, classPattern, keywordPattern,
-	splatPattern, dictPattern, unionPattern, genericType, trueLit uint16
+	splatPattern, dictPattern, unionPattern, genericType, trueLit, stringLit, unionType, memberType, splatType,
+	typeParameter, constrainedType uint16
 
 	withKw, comma, underscore, star, asKw uint16
 
 	fAlias, fAlternative, fArguments, fBody, fCondition, fConsequence, fDefinition, fFunction, fGuard, fLeft,
-	fModuleName, fName, fObject, fParameters, fRight, fSuperclasses, fValue uint16
+	fModuleName, fName, fObject, fParameters, fReturnType, fRight, fSuperclasses, fType, fValue uint16
 }
 
 var (
@@ -2531,6 +2697,8 @@ func pySyntaxOf() *pySyntax {
 		s.typedDefaultParameter, s.classPattern = kind("typed_default_parameter"), kind("class_pattern")
 		s.keywordPattern, s.splatPattern, s.dictPattern = kind("keyword_pattern"), kind("splat_pattern"), kind("dict_pattern")
 		s.unionPattern, s.genericType, s.trueLit = kind("union_pattern"), kind("generic_type"), kind("true")
+		s.stringLit, s.unionType, s.memberType = kind("string"), kind("union_type"), kind("member_type")
+		s.splatType, s.typeParameter, s.constrainedType = kind("splat_type"), kind("type_parameter"), kind("constrained_type")
 		s.withKw, s.comma, s.underscore = tok("with"), tok(","), tok("_")
 		// The `*` of `except*` is a token of its own that the grammar maps to
 		// the one public `*` kind.
@@ -2540,6 +2708,7 @@ func pySyntaxOf() *pySyntax {
 		s.fDefinition, s.fFunction, s.fGuard, s.fLeft = field("definition"), field("function"), field("guard"), field("left")
 		s.fModuleName, s.fName, s.fObject = field("module_name"), field("name"), field("object")
 		s.fParameters, s.fRight, s.fSuperclasses, s.fValue = field("parameters"), field("right"), field("superclasses"), field("value")
+		s.fReturnType, s.fType = field("return_type"), field("type")
 		pySyntaxTable = s
 	})
 	return pySyntaxTable
