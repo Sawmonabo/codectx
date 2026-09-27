@@ -58,7 +58,10 @@ func Grammar(name string) (*ts.Language, bool) {
 //     also its definition, and a field, element or pointer target only
 //     may-defines its base. The consumer Uses the result in both cases,
 //     never the target: in `(x := 1) + (x := 2)` it depends on both
-//     assignments;
+//     assignments. Rust is the one exception: its assignment evaluates to
+//     `()` (The Rust Reference, Assignment expressions), so its node
+//     defines no result and hands its consumer nothing, as its lowering
+//     states;
 //   - a callable's creation (a lambda, closure, local function, anonymous
 //     class, generator, comprehension, async block): the creating node,
 //     whose value is the created callable; it Uses the enclosing variables

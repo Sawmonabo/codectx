@@ -623,5 +623,827 @@ func TestRustLoweringGolden(t *testing.T) {
 				"a? + b?@73 -> let r: Option<i32> = try { a? + b? };@46",
 				"let r: Option<i32> = try { a? + b? };@46 -> r.unwrap_or(0)@84"},
 		},
+		{
+			// Expressions › `if` expressions (the condition is any
+			// expression, a parenthesized one included), and Expressions ›
+			// Grouped expressions: `(c)` is c. Nodes: c@5 (param), c@27 (the
+			// condition's Branch, spanning c without its parentheses), 1@32,
+			// 2@43. Succ: c@27→{1, 2}; 1→EXIT; 2→EXIT. IPDom: c@27 → EXIT.
+			name:     "a parenthesized condition's branch spans the condition without its parentheses",
+			protects: "an if, while or guard condition is spanned with every enclosing pair of parentheses stripped, as every lowering spans it",
+			mutation: "span the condition as written (the Branch renders (c)@26: every pair naming c@27 becomes one naming (c)@26)",
+			src:      "fn f(c: bool) -> i32 { if (c) { 1 } else { 2 } }",
+			cd:       []string{"c@27 -> 1@32", "c@27 -> 2@43"},
+			du:       []string{"c@5 -> c@27"},
+		},
+		{
+			// Expressions › Evaluation order of operands: `x + { … }` reads
+			// x before the block runs, and Expressions › Block expressions:
+			// the block's statements run whenever the let does. Nodes: x@9
+			// (param), x = 1@40 (takes the let's held read: Uses x, defines
+			// x and an owned variable holding the earlier x), x = 2@47
+			// (defines x; the read is no longer x's, so it takes nothing),
+			// 0@54 (the tail, defining the block's result), let y = …;@26
+			// (Uses the handed-on variable and the block's result, defines
+			// y), y + x@59. Straight line.
+			name:     "a read before a nested assignment pairs with the definition that reached it",
+			protects: "the let's read of x, made before the block's assignments, pairs with the parameter through the first assignment's hand-off, never with a later assignment",
+			mutation: "make no hand-off (the let's read of x stays on it and pairs with x = 2@47: loses x@9 -> x = 1@40 and x = 1@40 -> let y = x + { x = 1; x = 2; 0 };@26, gains x = 2@47 -> let y = x + { x = 1; x = 2; 0 };@26), or hand the read to every later assignment (gains x = 1@40 -> x = 2@47)",
+			src:      "fn f(mut x: i32) -> i32 { let y = x + { x = 1; x = 2; 0 }; y + x }",
+			du: []string{"x@9 -> x = 1@40", "x = 1@40 -> let y = x + { x = 1; x = 2; 0 };@26",
+				"0@54 -> let y = x + { x = 1; x = 2; 0 };@26", "let y = x + { x = 1; x = 2; 0 };@26 -> y + x@59",
+				"x = 2@47 -> y + x@59"},
+		},
+		{
+			// Expressions › Evaluation order of operands, and Expressions ›
+			// `if` expressions: the consequence runs only when c holds, so
+			// the assignment in it does not run whenever the let does and
+			// takes none of its reads (lower.go, the hand-off is made only
+			// when the assignment's node runs whenever the consumer does).
+			// Nodes: c@5, x@18, c@50 (Branch), x = 1@54, 0@61 and 0@72 (the
+			// arm tails, defining the if's result), let y = …;@35 (Uses x and
+			// the if's result), y + x@77. Succ: c@50→{x = 1, 0@72}; x = 1→0@61
+			// →let; 0@72→let; let→y + x. IPDom: c@50 → let.
+			name:     "an assignment in a conditional arm leaves an earlier read on its consumer",
+			protects: "a read held for the let stays on it when the redefining assignment sits in an if arm, so the let pairs with the parameter on the path that skips the assignment",
+			mutation: "hand off reads to an assignment in an if arm (the let then Uses a variable only the consequence defines: gains x@18 -> x = 1@54, loses x@18 -> let y = x + if c { x = 1; 0 } else { 0 };@35)",
+			src:      "fn f(c: bool, mut x: i32) -> i32 { let y = x + if c { x = 1; 0 } else { 0 }; y + x }",
+			cd:       []string{"c@50 -> x = 1@54", "c@50 -> 0@61", "c@50 -> 0@72"},
+			du: []string{"c@5 -> c@50", "x@18 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"x = 1@54 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"0@61 -> let y = x + if c { x = 1; 0 } else { 0 };@35", "0@72 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"let y = x + if c { x = 1; 0 } else { 0 };@35 -> y + x@77", "x@18 -> y + x@77", "x = 1@54 -> y + x@77"},
+		},
+		{
+			// Expressions › Grouped expressions: `(x)` is x, and lower.go's
+			// Spans: a node spanning an operand or tail strips its
+			// parentheses. Nodes: x@5 (param), x@23 (the tail, spanning x).
+			name:     "a parenthesized tail spans its expression without the parentheses",
+			protects: "a folded statement or tail given as a parenthesized expression renders and spans as the expression inside",
+			mutation: "drop the strip in into (the tail renders (x)@22: loses x@5 -> x@23, gains x@5 -> (x)@22)",
+			src:      "fn f(x: i32) -> i32 { (x) }",
+			du:       []string{"x@5 -> x@23"},
+		},
+		{
+			// Statements › Let statements: `let x;` declares x and assigns
+			// nothing, so it runs no code. Nodes: c@5, c@19 (Branch). The
+			// consequence makes no node, so both of c@19's edges reach EXIT.
+			name:     "a let without an initializer makes no node",
+			protects: "a declaration with no initializer is no statement node, so nothing depends on a condition through it",
+			mutation: "make a node for `let x;` (gains c@19 -> let x;@23)",
+			src:      "fn f(c: bool) { if c { let x; } }",
+			du:       []string{"c@5 -> c@19"},
+		},
+		{
+			// Items › Functions › Function parameters: a parameter's pattern
+			// is irrefutable and binds every name in it. Nodes: a@6, b@9 (one
+			// defining node per bound name), a - b@34.
+			name:     "a destructuring parameter binds each name at a node of its own",
+			protects: "every name a tuple parameter pattern binds is defined after Entry and reaches the body's reads",
+			mutation: "bind only a bare identifier parameter (loses a@6 -> a - b@34 and b@9 -> a - b@34)",
+			src:      "fn f((a, b): (i32, i32)) -> i32 { a - b }",
+			du:       []string{"a@6 -> a - b@34", "b@9 -> a - b@34"},
+		},
+		{
+			// Expressions › Closure expressions: an untyped closure parameter
+			// is a bare pattern, and binds (and shadows) in the closure body.
+			// Nodes: x@5, y@13, |x| x + y@38 (Uses y only), let g = …;@30
+			// (Uses the creating node's result), g(1) + x@49.
+			name:     "an untyped closure parameter shadows the enclosing variable of its name",
+			protects: "a closure parameter written without a type is still a binding, so its reads are no capture of the enclosing variable",
+			mutation: "bind closure parameters only through a typed parameter node (gains x@5 -> |x| x + y@38)",
+			src:      "fn f(x: i32, y: i32) -> i32 { let g = |x| x + y; g(1) + x }",
+			du: []string{"y@13 -> |x| x + y@38", "|x| x + y@38 -> let g = |x| x + y;@30",
+				"let g = |x| x + y;@30 -> g(1) + x@49", "x@5 -> g(1) + x@49"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions ›
+			// `continue` expressions: an unlabelled continue ends the
+			// current iteration of the innermost loop. Nodes: v@5, let mut n
+			// = 0;@25, v@49 (the iterated value), for@40 (head), x@44, *x <
+			// 0@56 (Branch), continue@65, n += x@77, n@87. Succ:
+			// let→v@49→for@40→{x@44, n@87}; x@44→*x < 0→{continue, n += x};
+			// continue→for@40; n += x→for@40. IPDom: for@40 → n@87; x@44 →
+			// *x < 0 → for@40; continue → for@40; n += x → for@40. Frontier
+			// walks: for@40 over x@44, *x < 0 and itself; *x < 0 over
+			// continue and n += x.
+			name:     "an unlabelled continue re-enters the innermost loop's head",
+			protects: "a continue without a label targets the innermost loop, so its head controls the rest of the body",
+			mutation: "resolve an unlabelled continue to no open frame (unresolved becomes 1 and continue@65 reaches EXIT: n += x@77 no longer carries control back to for@40)",
+			src:      "fn f(v: &[i32]) -> i32 { let mut n = 0; for x in v { if *x < 0 { continue; } n += x; } n }",
+			cd: []string{"for@40 -> x@44", "for@40 -> *x < 0@56", "for@40 -> for@40",
+				"*x < 0@56 -> continue@65", "*x < 0@56 -> n += x@77"},
+			du: []string{"v@5 -> v@49", "v@49 -> for@40", "v@49 -> x@44", "x@44 -> *x < 0@56", "x@44 -> n += x@77",
+				"let mut n = 0;@25 -> n += x@77", "n += x@77 -> n += x@77", "let mut n = 0;@25 -> n@87", "n += x@77 -> n@87"},
+		},
+		{
+			// Macros › Macro invocation: the expansion is not lowered, so a
+			// panicking macro is a plain node, as a call to a diverging
+			// function is. Nodes: c@5, x@14, c@34 (Branch), panic!("no")@38,
+			// x@54. Succ: c@34→{panic!, x@54}; panic!→x@54. IPDom: c@34 → x@54.
+			name:     "a panicking macro is a plain node that falls through",
+			protects: "a statement after an if whose arm ends in panic! is not control dependent on the if's condition",
+			mutation: "lower a panicking macro as a jump to Exit (gains c@34 -> x@54)",
+			src:      "fn f(c: bool, x: i32) -> i32 { if c { panic!(\"no\"); } x }",
+			cd:       []string{"c@34 -> panic!(\"no\")@38"},
+			du:       []string{"c@5 -> c@34", "x@14 -> x@54"},
+		},
+		{
+			// Expressions › `if` expressions: `else if` chains a second if as
+			// the else block, whose value is the outer if's. Nodes: a@5,
+			// b@14, a@43 (Branch), 1@47, b@59 (Branch), 2@63, 3@74, let y =
+			// …;@32 (Uses the if's result), y@79. Succ: a@43→{1, b@59};
+			// b@59→{2, 3}; 1, 2, 3→let. IPDom: a@43 → let; b@59 → let.
+			name:     "an else-if chain's arms each define the outer if's result",
+			protects: "every arm tail of an else-if chain hands its value to the let consuming the whole chain",
+			mutation: "lower the else-if with no result of its own consumer (loses 2@63 -> let y and 3@74 -> let y)",
+			src:      "fn f(a: bool, b: bool) -> i32 { let y = if a { 1 } else if b { 2 } else { 3 }; y }",
+			cd:       []string{"a@43 -> 1@47", "a@43 -> b@59", "b@59 -> 2@63", "b@59 -> 3@74"},
+			du: []string{"a@5 -> a@43", "b@14 -> b@59",
+				"1@47 -> let y = if a { 1 } else if b { 2 } else { 3 };@32",
+				"2@63 -> let y = if a { 1 } else if b { 2 } else { 3 };@32",
+				"3@74 -> let y = if a { 1 } else if b { 2 } else { 3 };@32",
+				"let y = if a { 1 } else if b { 2 } else { 3 };@32 -> y@79"},
+		},
+		{
+			// Expressions › Operator expressions › Lazy boolean operators:
+			// `a || b` evaluates b only when a is false, and its value is the
+			// deciding operand's. Nodes: a@5, b@14, a@41 (Branch, defining
+			// the result), b@46 (defining it again), let y = a || b;@33 (Uses
+			// the result), y@49. Succ: a@41→{b@46, let}; b@46→let.
+			name:     "a lazy operator consumed by a let hands each operand's value through its result",
+			protects: "the let consuming `a || b` reads the operator's result, defined by the left operand on its deciding edge and by the right operand",
+			mutation: "fold a consumed lazy operator into its consumer (a@41 and b@46 vanish and a@5 and b@14 pair with the let), or let the let re-read the operands (gains a@5 and b@14 -> let y = a || b;@33)",
+			src:      "fn f(a: bool, b: bool) -> bool { let y = a || b; y }",
+			cd:       []string{"a@41 -> b@46"},
+			du: []string{"a@5 -> a@41", "b@14 -> b@46", "a@41 -> let y = a || b;@33", "b@46 -> let y = a || b;@33",
+				"let y = a || b;@33 -> y@49"},
+		},
+		{
+			// Expressions › Operator expressions › Lazy boolean operators, in
+			// tail position: the operand nodes are all; no node spans the
+			// operator. Nodes: a@5, b@14, a@33 (Branch), b@38.
+			name:     "a lazy operator in tail position makes only its operand nodes",
+			protects: "a tail `a && b` makes no node spanning the operator, and its right operand depends on its left",
+			mutation: "make a node spanning the operator in tail position (a && b@33 appears, gaining a@33 -> a && b@33 and b@38 -> a && b@33)",
+			src:      "fn f(a: bool, b: bool) -> bool { a && b }",
+			cd:       []string{"a@33 -> b@38"},
+			du:       []string{"a@5 -> a@33", "b@14 -> b@38"},
+		},
+		{
+			// Expressions › Operator expressions › Borrow operators: `&x` is a
+			// shared borrow, through which the callee cannot write x (lower.go,
+			// Address-taking, Given up: interior mutability). Nodes: x@5,
+			// g(&x)@22 (Uses x), x@29.
+			name:     "a shared borrow is a use only",
+			protects: "passing `&x` to a call is no may-definition of x",
+			mutation: "treat a shared borrow as mutable (gains g(&x)@22 -> x@29)",
+			src:      "fn f(x: i32) -> i32 { g(&x); x }",
+			du:       []string{"x@5 -> g(&x)@22", "x@5 -> x@29"},
+		},
+		{
+			// Names › Scopes: a block is a scope, so the inner let's x ends
+			// with it. Nodes: x@5, let x = 1;@24 (a new variable), g(x)@35,
+			// x@43 (the parameter).
+			name:     "a block's let binding ends with the block",
+			protects: "a read after an inner block resolves to the variable in scope outside it, not the block's shadowing let",
+			mutation: "keep a block's bindings in scope after it (loses x@5 -> x@43, gains let x = 1;@24 -> x@43)",
+			src:      "fn f(x: i32) -> i32 { { let x = 1; g(x); } x }",
+			du:       []string{"let x = 1;@24 -> g(x)@35", "x@5 -> x@43"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Loop
+			// labels: a break naming a label no enclosing loop or block
+			// declares is an error (E0426) but parses. Nodes: loop@9 (head),
+			// break 'nope@16 (Jump; it defines nothing). The break's target
+			// names no frame, so it keeps no successor and augmentation sends
+			// it to EXIT.
+			name:       "a break naming no open label is unresolved",
+			protects:   "a jump whose label names no open frame is counted unresolved rather than bound to some other loop",
+			mutation:   "resolve an unknown label to the innermost loop (unresolved becomes 0)",
+			src:        "fn f() { loop { break 'nope; } }",
+			unresolved: 1,
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Loop
+			// labels: `break 'o` leaves the loop labelled 'o from inside an
+			// inner loop, and a valueless break defines nothing. Nodes: n@5,
+			// let mut i = 0;@22, loop@41 (outer head), loop@48 (inner head),
+			// i += 1@55, i > n@66 (Branch), break 'o@74, i@90. Succ:
+			// let→loop@41→loop@48→i += 1→i > n→{break, loop@48}; break→i@90.
+			// Neither loop has another exit. IPDom: loop@48 → i += 1 → i > n →
+			// break → i@90. Frontier walk from i > n→loop@48: loop@48, i +=
+			// 1, i > n.
+			name:     "a labelled break leaves the outer loop from an inner one",
+			protects: "`break 'o` lands after the loop its label names, not after the innermost loop, and defines no result",
+			mutation: "resolve a labelled break to the innermost loop (it lands on the outer loop's back edge, i@90 has no path from ENTRY: loses i += 1@55 -> i@90)",
+			src:      "fn f(n: i32) -> i32 { let mut i = 0; 'o: loop { loop { i += 1; if i > n { break 'o; } } } i }",
+			cd:       []string{"i > n@66 -> loop@48", "i > n@66 -> i += 1@55", "i > n@66 -> i > n@66"},
+			du: []string{"n@5 -> i > n@66", "let mut i = 0;@22 -> i += 1@55", "i += 1@55 -> i += 1@55",
+				"i += 1@55 -> i > n@66", "i += 1@55 -> i@90"},
+		},
+		{
+			// Statements › Expression statements: a trailing `if … else …`
+			// without `;` is the block's tail, so its value is the block's.
+			// Nodes: c@5, c@36 (Branch), 1@40, 2@51 (each defining the block's
+			// result), let y = …;@23 (Uses it), y@58. Succ: c@36→{1, 2}; 1,
+			// 2→let. IPDom: c@36 → let.
+			name:     "a trailing if in a consumed block is the block's tail",
+			protects: "the arms of a trailing if hand their values to the let consuming the enclosing block",
+			mutation: "take a trailing if expression statement as a statement, not the tail (loses 1@40 -> let y and 2@51 -> let y)",
+			src:      "fn f(c: bool) -> i32 { let y = { if c { 1 } else { 2 } }; y }",
+			cd:       []string{"c@36 -> 1@40", "c@36 -> 2@51"},
+			du: []string{"c@5 -> c@36", "1@40 -> let y = { if c { 1 } else { 2 } };@23",
+				"2@51 -> let y = { if c { 1 } else { 2 } };@23", "let y = { if c { 1 } else { 2 } };@23 -> y@58"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Iterator
+			// loops: the iterator is made once, so the body's write to n does
+			// not change the iteration. Nodes: n@9, 0..n@35 (the iterated
+			// value, defining the iteration variable), for@26 (head), i@30,
+			// n = i@42, n@51. Succ: n@9→0..n→for→{i, n@51}; i→n = i→for.
+			// IPDom: for → n@51; i → n = i → for.
+			name:     "a write in a for body to an iterated name never reaches the head",
+			protects: "the for head and binding read the value iterated before the loop, so `n = i` in the body pairs only with later reads of n",
+			mutation: "let the head re-read the iterated expression's names (gains n@9 -> for@26 and n = i@42 -> for@26)",
+			src:      "fn f(mut n: i32) -> i32 { for i in 0..n { n = i; } n }",
+			cd:       []string{"for@26 -> i@30", "for@26 -> n = i@42", "for@26 -> for@26"},
+			du: []string{"n@9 -> 0..n@35", "0..n@35 -> for@26", "0..n@35 -> i@30", "i@30 -> n = i@42",
+				"n@9 -> n@51", "n = i@42 -> n@51"},
+		},
+		{
+			// Expressions › Patterns › Identifier patterns: an identifier in
+			// a non-last arm may be a binding or a constant, so it is a Branch
+			// that also defines the name. Nodes: o@5, o@28 (scrutinee), n@32
+			// (Branch, Using the scrutinee's variable and defining n), n@37,
+			// 0@45. Succ: o@28→n@32→{n@37, 0}. IPDom: n@32 → EXIT.
+			name:     "an earlier arm's bare identifier is a branch that binds the name",
+			protects: "the arm's result reads the name its identifier pattern binds, and a later arm stays reachable on the pattern's false edge",
+			mutation: "define nothing at an earlier arm's bare identifier (loses n@32 -> n@37), or take it as irrefutable (loses n@32 -> 0@45)",
+			src:      "fn f(o: i32) -> i32 { match o { n => n, _ => 0 } }",
+			cd:       []string{"n@32 -> n@37", "n@32 -> 0@45"},
+			du:       []string{"o@5 -> o@28", "o@28 -> n@32", "n@32 -> n@37"},
+		},
+		{
+			// Expressions › Assignment expressions › Compound assignment
+			// expressions, and › Index expressions: `a[i] += 1` writes one
+			// element of a, a may-definition of a. Nodes: a@9, i@22, a[i] +=
+			// 1@41 (Uses a and i, may-defines a), a[0]@52.
+			name:     "an index write is a may-definition of its base",
+			protects: "a read of the array after `a[i] += 1` sees the write and the definition before it",
+			mutation: "record no may-definition of an index target's base (loses a[i] += 1@41 -> a[0]@52), or a killing one (loses a@9 -> a[0]@52)",
+			src:      "fn f(mut a: [i32; 2], i: usize) -> i32 { a[i] += 1; a[0] }",
+			du: []string{"a@9 -> a[i] += 1@41", "i@22 -> a[i] += 1@41", "a@9 -> a[0]@52",
+				"a[i] += 1@41 -> a[0]@52"},
+		},
+		{
+			// Expressions › Operator expressions › The dereference operator:
+			// `*p = 2` writes through p; lower.go, Address-taking: the write
+			// is a may-definition of the variable written through. Nodes:
+			// p@5, *p = 2@27 (Uses p, may-defines p), *p@35.
+			name:     "a write through a dereference is a may-definition of the variable written through",
+			protects: "a later read through p depends on the write through p",
+			mutation: "record no may-definition for a dereference target (loses *p = 2@27 -> *p@35)",
+			src:      "fn f(p: &mut i32) -> i32 { *p = 2; *p }",
+			du:       []string{"p@5 -> *p = 2@27", "p@5 -> *p@35", "*p = 2@27 -> *p@35"},
+		},
+		{
+			// Patterns › Or-patterns: every alternative binds the same names,
+			// so the first alternative's bindings stand for them. Nodes:
+			// o@5, o@41, Ok(x) | Err(x)@45 (Branch; the last arm is
+			// refutable by syntax, so it keeps its false edge), x@48, x@63.
+			// Succ: o@41→pattern→{x@48, EXIT}; x@48→x@63.
+			name:     "an or-pattern binds its first alternative's names",
+			protects: "an or-pattern's bound name is defined once, at the first alternative's name, and reaches the arm's result",
+			mutation: "bind every alternative's names (x@57 becomes a second binding node: loses x@48 -> x@63, gains x@57 -> x@63)",
+			src:      "fn f(o: Result<i32, i32>) -> i32 { match o { Ok(x) | Err(x) => x } }",
+			cd:       []string{"Ok(x) | Err(x)@45 -> x@48", "Ok(x) | Err(x)@45 -> x@63"},
+			du:       []string{"o@5 -> o@41", "o@41 -> Ok(x) | Err(x)@45", "o@41 -> x@48", "x@48 -> x@63"},
+		},
+		{
+			// Patterns › Identifier patterns: `x @ q` binds x to the matched
+			// value and q's names as q binds them. Nodes: o@5, o@36, x @
+			// Some(y)@40 (Branch), x@40, y@49, g(x, y)@55, 0@69. Succ:
+			// o@36→pattern→{x@40, 0}; x@40→y@49→g. IPDom: pattern → EXIT.
+			name:     "a bound pattern binds its name and the names of the pattern after @",
+			protects: "both x and y of `x @ Some(y)` are defined from the scrutinee's variable and read by the arm",
+			mutation: "bind only the name before @ (loses y@49 and y@49 -> g(x, y)@55), or only the pattern after it (loses x@40 and x@40 -> g(x, y)@55)",
+			src:      "fn f(o: Option<i32>) -> i32 { match o { x @ Some(y) => g(x, y), _ => 0 } }",
+			cd: []string{"x @ Some(y)@40 -> x@40", "x @ Some(y)@40 -> y@49", "x @ Some(y)@40 -> g(x, y)@55",
+				"x @ Some(y)@40 -> 0@69"},
+			du: []string{"o@5 -> o@36", "o@36 -> x @ Some(y)@40", "o@36 -> x@40", "o@36 -> y@49",
+				"x@40 -> g(x, y)@55", "y@49 -> g(x, y)@55"},
+		},
+		{
+			// The Rust Unstable Book, Language features › gen_blocks: a gen
+			// block's body runs only as its iterator is advanced, so it is
+			// its own function. Nodes: n@9, gen { n += 1; yield n; }@34 (Uses
+			// n, may-defines n), let g = …;@26 (Uses the creating node's
+			// result), drop(g)@60, n@69.
+			name:     "a gen block is its own function and its write is a may-definition where it is created",
+			protects: "a gen block's body is not inline code of the enclosing function: its write kills nothing there",
+			mutation: "lower a gen block's body inline (n += 1 kills the parameter's definition: loses n@9 -> n@69)",
+			src:      "fn f(mut n: i32) -> i32 { let g = gen { n += 1; yield n; }; drop(g); n }",
+			du: []string{"n@9 -> gen { n += 1; yield n; }@34",
+				"gen { n += 1; yield n; }@34 -> let g = gen { n += 1; yield n; };@26",
+				"let g = gen { n += 1; yield n; };@26 -> drop(g)@60", "n@9 -> n@69", "gen { n += 1; yield n; }@34 -> n@69"},
+		},
+		{
+			// Expressions › Await expressions: `a.await` is folded into the
+			// node consuming it. Nodes: a@11, b@17, let y = a.await + b;@34
+			// (Uses a and b), y@55.
+			name:     "an await expression is folded into its consumer",
+			protects: "the let consuming `a.await + b` reads a itself, with no node of the await's own",
+			mutation: "read nothing under an await expression (loses a@11 -> let y = a.await + b;@34)",
+			src:      "async fn f(a: F, b: i32) -> i32 { let y = a.await + b; y }",
+			du: []string{"a@11 -> let y = a.await + b;@34", "b@17 -> let y = a.await + b;@34",
+				"let y = a.await + b;@34 -> y@55"},
+		},
+		{
+			// Expressions › Index, Range, Array, Struct and Type cast
+			// expressions, and Paths › Expressions (a generic function path
+			// names an item): all are folded into the tail. Nodes: a@5, i@18,
+			// n@28, the tail@45 (Uses a, i and n; g names no local).
+			name:     "index, range, array, struct, cast and generic-call operands are folded into their consumer",
+			protects: "the reads inside a struct expression's fields, an index, a range, an array and a cast operand are the consuming node's own",
+			mutation: "read nothing inside a struct expression's body (loses a@5 and i@18 -> the tail), or inside a range or array (loses n@28 -> the tail)",
+			src:      "fn f(a: [i32; 2], i: usize, n: i32) -> i64 { g::<i32>(S { x: a[i] }, 0..n, [n]) as i64 }",
+			du: []string{"a@5 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45",
+				"i@18 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45",
+				"n@28 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45"},
+		},
+		{
+			// Expressions › Block expressions, `unsafe` blocks and `const`
+			// blocks: each consumed as a value yields its tail. Nodes: x@5,
+			// let z = x;@32, z + 1@43 (the tail, defining the block's
+			// result), let a = …;@22, a@69 (the unsafe block's tail), let b =
+			// …;@52, 2@86 (the const block's tail), b + const { 2 }@74.
+			// Straight line.
+			name:     "a block, an unsafe block and a const block consumed as a value hand over their tails",
+			protects: "each consumer of a block reads the block's result, defined by its tail node, never the names the block read",
+			mutation: "give a consumed block's tail no definition of its result (loses z + 1@43 -> let a, a@69 -> let b and 2@86 -> b + const { 2 }@74), or let a consumer re-read a block's names (gains x@5 -> let a)",
+			src:      "fn f(x: i32) -> i32 { let a = { let z = x; z + 1 }; let b = unsafe { a }; b + const { 2 } }",
+			du: []string{"x@5 -> let z = x;@32", "let z = x;@32 -> z + 1@43",
+				"z + 1@43 -> let a = { let z = x; z + 1 };@22", "let a = { let z = x; z + 1 };@22 -> a@69",
+				"a@69 -> let b = unsafe { a };@52", "let b = unsafe { a };@52 -> b + const { 2 }@74",
+				"2@86 -> b + const { 2 }@74"},
+		},
+		{
+			// Macros › Macro invocation, and The try propagation expression:
+			// the invocation a `?` can leave is a Branch whose value reaches
+			// its consumer through a result. Nodes: o@5, vec![o?]@46 (Branch
+			// Using o, defining the result), let v = vec![o?];@38 (Uses it),
+			// Some(v[0])@56. Succ: vec!→{EXIT, let}; let→Some. IPDom: vec! → EXIT.
+			name:     "a jumping macro's value reaches its consumer through a result",
+			protects: "the let consuming a macro whose tree holds `?` reads the invocation's result, never the tree's names, and depends on the invocation",
+			mutation: "let the consumer re-read the tree's reads (gains o@5 -> let v = vec![o?];@38, loses vec![o?]@46 -> let v = vec![o?];@38)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { let v = vec![o?]; Some(v[0]) }",
+			cd:       []string{"vec![o?]@46 -> let v = vec![o?];@38", "vec![o?]@46 -> Some(v[0])@56"},
+			du: []string{"o@5 -> vec![o?]@46", "vec![o?]@46 -> let v = vec![o?];@38",
+				"let v = vec![o?];@38 -> Some(v[0])@56"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › `break` and loop
+			// values: which tokens make the jumped value is known only to the
+			// expansion, so a break in a tree defines no result. Nodes: x@5,
+			// loop@30, m!(break x)@37 (Branch Using x; its break leaves the
+			// loop, its fall-through returns to the head), let r = …;@22, r@53.
+			// Succ: loop→m!→{let, loop}; let→r. IPDom: loop → m! → let.
+			name:     "a jump in a macro's token tree defines no result",
+			protects: "a break inside a token tree leaves the loop but hands the let no value of the loop",
+			mutation: "let a jump in a token tree define its loop's result (gains m!(break x)@37 -> let r = loop { m!(break x); };@22)",
+			src:      "fn f(x: i32) -> i32 { let r = loop { m!(break x); }; r }",
+			cd:       []string{"m!(break x)@37 -> loop@30", "m!(break x)@37 -> m!(break x)@37"},
+			du:       []string{"x@5 -> m!(break x)@37", "let r = loop { m!(break x); };@22 -> r@53"},
+		},
+		{
+			// Expressions › `if` expressions › Chains of conditions: a let
+			// chain's bindings are in scope for later members and the
+			// consequence only. Nodes: o@5, x@21, let Some(x) = o@41 (Branch),
+			// x@50, x > 0@60 (Branch), x@68, x@79 (the parameter). Succ:
+			// let→{x@50, x@79}; x@50→x > 0→{x@68, x@79}. IPDom: let → EXIT;
+			// x@50 → x > 0 → EXIT.
+			name:     "a let chain's binding is not in scope in the else",
+			protects: "the else of an if-let chain reads the enclosing variable, never the chain's binding of the same name",
+			mutation: "keep a let chain's bindings in scope in the else (loses x@21 -> x@79, gains x@50 -> x@79)",
+			src:      "fn f(o: Option<i32>, x: i32) -> i32 { if let Some(x) = o && x > 0 { x } else { x } }",
+			cd: []string{"let Some(x) = o@41 -> x@50", "let Some(x) = o@41 -> x > 0@60", "let Some(x) = o@41 -> x@79",
+				"x > 0@60 -> x@68", "x > 0@60 -> x@79"},
+			du: []string{"o@5 -> let Some(x) = o@41", "let Some(x) = o@41 -> x@50", "x@50 -> x > 0@60", "x@50 -> x@68",
+				"x@21 -> x@79"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Iterator
+			// loops, and The try propagation expression: `o?` is the
+			// iterated value, so its node is the iteration variable's
+			// definition. Nodes: o@5, let mut n = 0;@43, o?@67 (Branch to
+			// EXIT and on, defining the iteration variable), for@58, x@62, n
+			// += x@72, Some(n)@82. Succ: let→o?→{EXIT, for}; for→{x, Some};
+			// x→n += x→for. IPDom: o? → EXIT; for → Some; x → n += x → for.
+			name:     "a question mark as a for iterable is the iteration variable's node",
+			protects: "the for head and binding read the `?`'s Ok value, and the loop and what follows depend on the `?`",
+			mutation: "let the head Use the `?`'s operand instead of its value (gains o@5 -> for@58, loses o?@67 -> for@58)",
+			src:      "fn f(o: Option<Vec<i32>>) -> Option<i32> { let mut n = 0; for x in o? { n += x; } Some(n) }",
+			cd: []string{"o?@67 -> for@58", "o?@67 -> Some(n)@82", "for@58 -> x@62", "for@58 -> n += x@72",
+				"for@58 -> for@58"},
+			du: []string{"o@5 -> o?@67", "o?@67 -> for@58", "o?@67 -> x@62", "x@62 -> n += x@72",
+				"let mut n = 0;@43 -> n += x@72", "n += x@72 -> n += x@72", "let mut n = 0;@43 -> Some(n)@82",
+				"n += x@72 -> Some(n)@82"},
+		},
+		{
+			// Expressions › `match` expressions, and The try propagation
+			// expression: the scrutinee `g(s)?` is evaluated once, at the `?`'s
+			// Branch, whose Ok value the patterns test. Nodes: s@5, g(s)?@40,
+			// 0@48 (Branch), Ok(1)@53, Ok(0)@65. Succ: g(s)?→{EXIT, 0@48};
+			// 0@48→{Ok(1), Ok(0)}. IPDom: every node → EXIT.
+			name:     "a question mark as the match scrutinee is the scrutinee's node",
+			protects: "the arms test the `?`'s Ok value and depend on the `?`",
+			mutation: "let the patterns re-read the scrutinee's names (gains s@5 -> 0@48, loses g(s)?@40 -> 0@48)",
+			src:      "fn f(s: &str) -> Result<i32, E> { match g(s)? { 0 => Ok(1), _ => Ok(0) } }",
+			cd:       []string{"g(s)?@40 -> 0@48", "0@48 -> Ok(1)@53", "0@48 -> Ok(0)@65"},
+			du:       []string{"s@5 -> g(s)?@40", "g(s)?@40 -> 0@48"},
+		},
+		{
+			// Expressions › `match` expressions › Match guards: a `_` arm
+			// with a guard stays refutable, so a failed pattern reaches its
+			// guard. Nodes: o@5, c@21, o@45, Some(x)@49 (Branch), x@54, x@60,
+			// c@68 (the guard's Branch), 1@73, 0@81. Succ: Some(x)→{x@54,
+			// c@68}; x@54→x@60; c@68→{1, 0}. IPDom: every Branch → EXIT.
+			name:     "a failed pattern reaches a guarded wildcard arm's guard",
+			protects: "the arm after `_ if c` stays reachable, and the guard, not the wildcard's result, follows a failed pattern",
+			mutation: "treat a guarded `_` as irrefutable (the last arm lowers to nothing: loses c@68 -> 0@81)",
+			src:      "fn f(o: Option<i32>, c: bool) -> i32 { match o { Some(x) => x, _ if c => 1, _ => 0 } }",
+			cd: []string{"Some(x)@49 -> x@54", "Some(x)@49 -> x@60", "Some(x)@49 -> c@68", "c@68 -> 1@73",
+				"c@68 -> 0@81"},
+			du: []string{"o@5 -> o@45", "o@45 -> Some(x)@49", "o@45 -> x@54", "x@54 -> x@60", "c@21 -> c@68"},
+		},
+		{
+			// Expressions › `break` expressions: a match is no loop, so a
+			// break in an arm leaves the enclosing for. Nodes: v@5, let mut n
+			// = 0;@25, v@49, for@40, x@44, *x@59 (the scrutinee), 0@64
+			// (Branch), break@69, n += 1@81, n@92. Succ: for→{x, n@92};
+			// x→*x→0@64→{break, n += 1}; break→n@92; n += 1→for. IPDom: for →
+			// n@92; x → *x → 0@64 → n@92; break → n@92; n += 1 → for.
+			// Frontier walks: for over x, *x and 0@64; 0@64 over break, and
+			// over n += 1 and for.
+			name:     "a break in a match arm leaves the enclosing loop",
+			protects: "a match opens no jump frame, so an arm's break exits the loop around it",
+			mutation: "open a jump frame for a match (break@69 lands after the match and returns to for@40: ipdom(0@64) becomes for@40, so 0@64 loses for@40 as a dependent)",
+			src:      "fn f(v: &[i32]) -> i32 { let mut n = 0; for x in v { match *x { 0 => break, _ => n += 1 } } n }",
+			cd: []string{"for@40 -> x@44", "for@40 -> *x@59", "for@40 -> 0@64", "0@64 -> break@69",
+				"0@64 -> n += 1@81", "0@64 -> for@40"},
+			du: []string{"v@5 -> v@49", "v@49 -> for@40", "v@49 -> x@44", "x@44 -> *x@59", "*x@59 -> 0@64",
+				"let mut n = 0;@25 -> n += 1@81", "n += 1@81 -> n += 1@81", "let mut n = 0;@25 -> n@92",
+				"n += 1@81 -> n@92"},
+		},
+		{
+			// Patterns › Identifier patterns: a bare identifier in the last
+			// arm is irrefutable by syntax, so it is a Stmt defining the name.
+			// Nodes: o@5, o@36, Some(x)@40 (Branch), x@45, x@51, n@54 (Stmt,
+			// Using the scrutinee's variable, defining n), g(n)@59. Succ:
+			// Some(x)→{x@45, n@54}; x@45→x@51; n@54→g(n). IPDom: Some(x) → EXIT.
+			name:     "a last-arm bare identifier is a statement that binds the name",
+			protects: "the last arm's identifier makes no false edge out of the match and defines the name its result reads",
+			mutation: "make the last arm's bare identifier a Branch (n@54 gains a false edge to EXIT and controls g(n)@59)",
+			src:      "fn f(o: Option<i32>) -> i32 { match o { Some(x) => x, n => g(n) } }",
+			cd: []string{"Some(x)@40 -> x@45", "Some(x)@40 -> x@51", "Some(x)@40 -> n@54",
+				"Some(x)@40 -> g(n)@59"},
+			du: []string{"o@5 -> o@36", "o@36 -> Some(x)@40", "o@36 -> x@45", "o@36 -> n@54", "x@45 -> x@51",
+				"n@54 -> g(n)@59"},
+		},
+		{
+			// Expressions › Assignment expressions › Destructuring
+			// assignments: the elements of an array assignee and a named
+			// field's value are assignees; a rest `..` and the field name are
+			// not. Nodes: v@5, s@18, [a, .., b] = v@54 (defines an owned
+			// variable), a@55, b@62, S { f: c } = s@70 (likewise), c@77, a + b
+			// + c@86 (the `let a;` declarations make no node). Straight line.
+			name:     "an array assignee's elements and a named field's value are assigned, a rest never",
+			protects: "`[a, .., b] = v` defines a and b and `S { f: c } = s` defines c, each from the value evaluated once",
+			mutation: "take the rest `..` as an assignee (a node ..@58 appears), or take a named field's name instead of its value (loses c@77 -> a + b + c@86)",
+			src:      "fn f(v: [i32; 3], s: S) -> i32 { let a; let b; let c; [a, .., b] = v; S { f: c } = s; a + b + c }",
+			du: []string{"v@5 -> [a, .., b] = v@54", "[a, .., b] = v@54 -> a@55", "[a, .., b] = v@54 -> b@62",
+				"s@18 -> S { f: c } = s@70", "S { f: c } = s@70 -> c@77", "a@55 -> a + b + c@86",
+				"b@62 -> a + b + c@86", "c@77 -> a + b + c@86"},
+		},
+		{
+			// Expressions › Assignment expressions › Destructuring
+			// assignments: a place assignee is assigned its part, which may
+			// leave the rest of t in place. Nodes: t@9, v@24, (t.0, t.1) = (v,
+			// 1)@41 (Uses v, defines an owned variable), t.0@42 and t.1@47
+			// (each Uses that variable and t, may-defines t), t.0@62.
+			name:     "a place target of a destructuring assignment may-defines its base",
+			protects: "each field assignee Uses its own operands and is a may-definition of t, so a later read of t sees both writes' chain",
+			mutation: "give a place target no may-definition of its base (loses t.0@42 -> t.1@47 and t.1@47 -> t.0@62)",
+			src:      "fn f(mut t: (i32, i32), v: i32) -> i32 { (t.0, t.1) = (v, 1); t.0 }",
+			du: []string{"v@24 -> (t.0, t.1) = (v, 1)@41", "(t.0, t.1) = (v, 1)@41 -> t.0@42",
+				"(t.0, t.1) = (v, 1)@41 -> t.1@47", "t@9 -> t.0@42", "t@9 -> t.1@47", "t.0@42 -> t.1@47",
+				"t@9 -> t.0@62", "t.1@47 -> t.0@62"},
+		},
+		{
+			// Types › Closure types › Capture modes: a closure writing s.f and
+			// a[0] captures s and a by unique borrow. Nodes: s@9, a@19, the
+			// closure@53 (Uses s and a, may-defines both), let mut g = …;@41,
+			// g()@81, s.f + a[0]@86.
+			name:     "a callable's field and index writes are may-definitions of their bases where it is created",
+			protects: "a read after a closure that writes through a field or an index sees the closure's write",
+			mutation: "record no write for a callable's field or index target (loses || { s.f = 1; a[0] += 1; }@53 -> s.f + a[0]@86)",
+			src:      "fn f(mut s: S, mut a: [i32; 2]) -> i32 { let mut g = || { s.f = 1; a[0] += 1; }; g(); s.f + a[0] }",
+			du: []string{"s@9 -> || { s.f = 1; a[0] += 1; }@53", "a@19 -> || { s.f = 1; a[0] += 1; }@53", "|| { s.f = 1; a[0] += 1; }@53 -> let mut g = || { s.f = 1; a[0] += 1; };@41", "let mut g = || { s.f = 1; a[0] += 1; };@41 -> g()@81",
+				"s@9 -> s.f + a[0]@86", "a@19 -> s.f + a[0]@86", "|| { s.f = 1; a[0] += 1; }@53 -> s.f + a[0]@86"},
+		},
+		{
+			// Types › Closure types › Capture modes, and lower.go,
+			// Address-taking: a callable's `&mut n` of an enclosing local is
+			// one of its writes. Nodes: n@9, || h(&mut n)@38 (Uses n,
+			// may-defines n), let mut g = …;@26, g()@52, n@57.
+			name:     "a callable's mutable borrow of an enclosing local is a may-definition where it is created",
+			protects: "a read after a closure that lends n mutably sees what the borrow may have written",
+			mutation: "record a callable's `&mut` as a read only (loses || h(&mut n)@38 -> n@57)",
+			src:      "fn f(mut n: i32) -> i32 { let mut g = || h(&mut n); g(); n }",
+			du: []string{"n@9 -> || h(&mut n)@38", "|| h(&mut n)@38 -> let mut g = || h(&mut n);@26",
+				"let mut g = || h(&mut n);@26 -> g()@52", "n@9 -> n@57", "|| h(&mut n)@38 -> n@57"},
+		},
+		{
+			// Types › Closure types › Capture modes: a move closure owns its
+			// copies, including the ones the closures inside it write.
+			// Nodes: n@9, the move closure@34 (Uses n, may-defines nothing),
+			// let g = …;@26, g()@75, n@80.
+			name:     "a move closure drops the writes of the callables nested in it",
+			protects: "a write by a closure nested in a move closure never reaches a read of the outer variable",
+			mutation: "keep a nested callable's writes inside a move closure (gains move || { let mut h = || n += 1; h(); }@34 -> n@80)",
+			src:      "fn f(mut n: i32) -> i32 { let g = move || { let mut h = || n += 1; h(); }; g(); n }",
+			du:       []string{"n@9 -> move || { let mut h = || n += 1; h(); }@34", "move || { let mut h = || n += 1; h(); }@34 -> let g = move || { let mut h = || n += 1; h(); };@26", "let g = move || { let mut h = || n += 1; h(); };@26 -> g()@75", "n@9 -> n@80"},
+		},
+		{
+			// Expressions › Operator expressions › Borrow operators: `&mut
+			// x.0` and `&mut a[1]` borrow their base variables. Nodes: x@9,
+			// a@28, g(&mut x.0, &mut a[1])@50 (Uses x and a, may-defines both),
+			// x.1 + a[0]@74.
+			name:     "a mutable borrow of a field or element may-defines its base",
+			protects: "a read of x or a after a call receiving `&mut x.0` and `&mut a[1]` sees the call's possible writes",
+			mutation: "borrow only a bare name (loses g(&mut x.0, &mut a[1])@50 -> x.1 + a[0]@74)",
+			src:      "fn f(mut x: (i32, i32), mut a: [i32; 2]) -> i32 { g(&mut x.0, &mut a[1]); x.1 + a[0] }",
+			du: []string{"x@9 -> g(&mut x.0, &mut a[1])@50", "a@28 -> g(&mut x.0, &mut a[1])@50",
+				"x@9 -> x.1 + a[0]@74", "a@28 -> x.1 + a[0]@74", "g(&mut x.0, &mut a[1])@50 -> x.1 + a[0]@74"},
+		},
+		{
+			// lower.go, Address-taking: a pending borrow attaches to the node
+			// evaluating it, by position. Nodes: x@9, c@17, c@48 (Branch of
+			// the if operand, made after the borrow but not spanning it), 1@52,
+			// 2@63 (the if's result), g(&mut x, if c { 1 } else { 2 })@35
+			// (Uses x and the result, may-defines x), x@69. Succ: c@48→{1, 2};
+			// 1, 2→the call→x@69. IPDom: c@48 → the call.
+			name:     "a pending mutable borrow attaches by position, not to the next node made",
+			protects: "the call spanning `&mut x` carries its may-definition, never the if operand's Branch made before the call node",
+			mutation: "attach a pending borrow to the next node made (c@48 may-defines x: gains x@9 -> c@48 and c@48 -> x@69, loses g(&mut x, if c { 1 } else { 2 })@35 -> x@69)",
+			src:      "fn f(mut x: i32, c: bool) -> i32 { g(&mut x, if c { 1 } else { 2 }); x }",
+			cd:       []string{"c@48 -> 1@52", "c@48 -> 2@63"},
+			du: []string{"c@17 -> c@48", "x@9 -> g(&mut x, if c { 1 } else { 2 })@35",
+				"1@52 -> g(&mut x, if c { 1 } else { 2 })@35", "2@63 -> g(&mut x, if c { 1 } else { 2 })@35",
+				"x@9 -> x@69", "g(&mut x, if c { 1 } else { 2 })@35 -> x@69"},
+		},
+		{
+			// Statements › Declaration statements › Item declarations: items
+			// are not ordered, so a const or fn item names its item from the
+			// start of its block, shadowing the parameters n and g there.
+			// Nodes: n@5, g@13, let a = n + g();@40 (Uses nothing), a@95 (the
+			// block's tail), let b = …;@30, b + n + g@100 (the parameters).
+			name:     "an item names its item from the start of its block, shadowing a local",
+			protects: "a read before a block's const or fn item resolves to the item, never the enclosing local of that name",
+			mutation: "bind an item's name only from its declaration (gains n@5 and g@13 -> let a = n + g();@40)",
+			src:      "fn f(n: i32, g: i32) -> i32 { let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a }; b + n + g }",
+			du: []string{"let a = n + g();@40 -> a@95", "a@95 -> let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a };@30", "let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a };@30 -> b + n + g@100",
+				"n@5 -> b + n + g@100", "g@13 -> b + n + g@100"},
+		},
+		{
+			// Statements › Declaration statements › Item declarations: use
+			// and enum items run nothing. Nodes: c@5, x@14, c@34 (Branch),
+			// return x@65, 0@77. Succ: c@34→{return, 0}; return→EXIT.
+			name:     "use and enum items make no node",
+			protects: "a use declaration or an enum item in a block is no statement node",
+			mutation: "make a node for a use or enum item (c@34 gains use std::mem;@38 or enum E { A }@52 as a dependent)",
+			src:      "fn f(c: bool, x: i32) -> i32 { if c { use std::mem; enum E { A } return x; } 0 }",
+			cd:       []string{"c@34 -> return x@65", "c@34 -> 0@77"},
+			du:       []string{"c@5 -> c@34", "x@14 -> return x@65"},
+		},
+		{
+			// Names › Scopes › Pattern binding scopes: a match arm's, a
+			// while-let's and a for's bindings end with their construct.
+			// Nodes: o@61, Some(x)@65, x@70, g(x)@76, 0@87, the while-let
+			// head@98, x@107, g(x)@122, 0..2@139, for@130, x@134, g(x)@146,
+			// x@154 (the parameter). Succ: Some(x)→{x@70, 0@87}; x@70→g(x)→head;
+			// 0→head; head→{x@107, 0..2}; x@107→g(x)@122→head; 0..2→for→{x@134,
+			// x@154}; x@134→g(x)@146→for. IPDom: Some(x) → head → 0..2 → for →
+			// x@154.
+			name:     "match-arm, while-let and for bindings end with their construct",
+			protects: "a read after the three constructs resolves to the parameter, never to a binding of the same name",
+			mutation: "keep a construct's bindings in scope after it (x@154 pairs with x@134 instead: loses x@38 -> x@154)",
+			src:      "fn f(o: Option<i32>, mut v: Vec<i32>, x: i32) -> i32 { match o { Some(x) => g(x), _ => 0 }; while let Some(x) = v.pop() { g(x); } for x in 0..2 { g(x); } x }",
+			cd: []string{"Some(x)@65 -> x@70", "Some(x)@65 -> g(x)@76", "Some(x)@65 -> 0@87",
+				"let Some(x) = v.pop()@98 -> x@107", "let Some(x) = v.pop()@98 -> g(x)@122", "let Some(x) = v.pop()@98 -> let Some(x) = v.pop()@98",
+				"for@130 -> x@134", "for@130 -> g(x)@146", "for@130 -> for@130"},
+			du: []string{"o@5 -> o@61", "o@61 -> Some(x)@65", "o@61 -> x@70", "x@70 -> g(x)@76",
+				"v@25 -> let Some(x) = v.pop()@98", "let Some(x) = v.pop()@98 -> x@107", "x@107 -> g(x)@122",
+				"0..2@139 -> for@130", "0..2@139 -> x@134", "x@134 -> g(x)@146", "x@38 -> x@154"},
+		},
+		{
+			// Patterns › Identifier patterns, and Types › Closure types ›
+			// Capture modes: a `ref mut` binding in a closure borrows the
+			// matched enclosing o, one of the closure's writes. Nodes: o@9,
+			// the closure@54 (Uses o, may-defines o), let mut g = …;@42,
+			// g()@102, o@107.
+			name:     "a ref mut binding inside a callable is a may-definition of the matched place where it is created",
+			protects: "a read after a closure whose pattern mutably borrows o sees what the closure may write",
+			mutation: "record no write for a ref mut binding inside a callable (loses || { if let Some(ref mut v) = o { *v += 1; } }@54 -> o@107)",
+			src:      "fn f(mut o: Option<i32>) -> Option<i32> { let mut g = || { if let Some(ref mut v) = o { *v += 1; } }; g(); o }",
+			du:       []string{"o@9 -> || { if let Some(ref mut v) = o { *v += 1; } }@54", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42", "let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42 -> g()@102", "o@9 -> o@107", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> o@107"},
+		},
+		{
+			// The Rust Unstable Book, Language features › try_blocks: a `?`
+			// completes the innermost try block, whatever loops lie between.
+			// Nodes: v@5, let mut n = 0;@68, v@92, for@83, o@87, (*o)?@101
+			// (Branch; its break lands after the try block, defining its
+			// result), n += (*o)?@96, n@110 (the tail, defining the result),
+			// let r …;@41, r@115. Succ: for→{o, n@110}; o→(*o)?→{let r,
+			// n += …}; n += …→for; n@110→let r→r. IPDom: for → let r; o →
+			// (*o)? → let r; n += … → for; n@110 → let r.
+			name:     "a question mark in a loop inside a try block completes the block",
+			protects: "`?` breaks to the try block's end across an enclosing loop, defining the block's result, and never to the loop or the function's exit",
+			mutation: "send a `?` inside a loop to Exit (loses (*o)?@101 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41; (*o)?@101 then controls let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41 and r@115)",
+			src:      "fn f(v: &[Option<i32>]) -> Option<i32> { let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n }; r }",
+			cd: []string{"for@83 -> o@87", "for@83 -> (*o)?@101", "for@83 -> n@110", "(*o)?@101 -> n += (*o)?@96",
+				"(*o)?@101 -> for@83"},
+			du: []string{"v@5 -> v@92", "v@92 -> for@83", "v@92 -> o@87", "o@87 -> (*o)?@101",
+				"(*o)?@101 -> n += (*o)?@96", "(*o)?@101 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41", "let mut n = 0;@68 -> n += (*o)?@96",
+				"n += (*o)?@96 -> n += (*o)?@96", "let mut n = 0;@68 -> n@110", "n += (*o)?@96 -> n@110",
+				"n@110 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41", "let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41 -> r@115"},
+		},
+		{
+			// Patterns › Identifier patterns (`ref mut x @ q`) and Struct
+			// patterns (the shorthand `ref mut f`): each borrows the matched
+			// place. Nodes: o@9, s@29, let Some(ref mut x @ 1..=3) = o@47 (Branch), x@64 (Uses the owned
+			// variable, defines x, may-defines o), *x = 0@81, let S { ref mut f } = s;@91, f@107
+			// (likewise, may-defines s), *f = 1@116, g(o, s)@124. Succ:
+			// let Some(ref mut x @ 1..=3) = o@47→{x@64, let S { ref mut f } = s;@91}; x@64→*x = 0→let S { ref mut f } = s;@91→f→*f = 1→g. IPDom: let Some(ref mut x @ 1..=3) = o@47 → let S { ref mut f } = s;@91.
+			name:     "a bound ref mut pattern and a struct shorthand ref mut borrow the matched place",
+			protects: "`ref mut x @ q` and `S { ref mut f }` are may-definitions of o and s, reaching the later reads of both",
+			mutation: "bind `ref mut x @ q` or the shorthand `ref mut f` as a plain binding (loses o@9 -> x@64 and x@64 -> g(o, s)@124, or s@29 -> f@107 and f@107 -> g(o, s)@124)",
+			src:      "fn f(mut o: Option<i32>, mut s: S) -> i32 { if let Some(ref mut x @ 1..=3) = o { *x = 0; } let S { ref mut f } = s; *f = 1; g(o, s) }",
+			cd:       []string{"let Some(ref mut x @ 1..=3) = o@47 -> x@64", "let Some(ref mut x @ 1..=3) = o@47 -> *x = 0@81"},
+			du: []string{"o@9 -> let Some(ref mut x @ 1..=3) = o@47", "let Some(ref mut x @ 1..=3) = o@47 -> x@64", "o@9 -> x@64", "x@64 -> *x = 0@81", "s@29 -> let S { ref mut f } = s;@91", "let S { ref mut f } = s;@91 -> f@107",
+				"s@29 -> f@107", "f@107 -> *f = 1@116", "o@9 -> g(o, s)@124", "x@64 -> g(o, s)@124",
+				"s@29 -> g(o, s)@124", "f@107 -> g(o, s)@124"},
+		},
+		{
+			// Macros › Macro invocation: in a token tree, a name after a
+			// label's `'`, before `!` or before `:` is a label, a macro's
+			// name or a field name; `'a:` declares a label the tree's break
+			// uses, so it stays in the tree. Nodes: m!(…)@38 (a Stmt reading
+			// nothing), 0@…. No pair.
+			name:     "a name after a quote or before a bang or a colon in a token tree is not read",
+			protects: "a local named like a token-tree label, macro or field is not read by the invocation, and a break to a label the tree declares does not leave it",
+			mutation: "read a name after `'` or before `!` or `:` (gains a@5, g@13 or x@21 -> m!('a: loop { break 'a; } g!() S { x: 1 })@38)",
+			src:      "fn f(a: i32, g: i32, x: i32) -> i32 { m!('a: loop { break 'a; } g!() S { x: 1 }); 0 }",
+		},
+		{
+			// Macros › Macro invocation, and Borrow operators: in a token
+			// tree, `&&mut x`, `&mut s.f` and `&mut *p` each borrow their base
+			// variable. Nodes: x@9, s@21, p@27, m!(&&mut x, &mut s.f, &mut *p)@49 (Uses x, s and p,
+			// may-defines each), x + s.f + *p@81.
+			name:     "a token tree's double-ampersand, field and dereference borrows may-define their bases",
+			protects: "a read after the invocation sees the borrows `&&mut x`, `&mut s.f` and `&mut *p` may have written",
+			mutation: "borrow only after a single `&` and before a bare name (loses m!(&&mut x, &mut s.f, &mut *p)@49 -> x + s.f + *p@81)",
+			src:      "fn f(mut x: i32, mut s: S, p: &mut i32) -> i32 { m!(&&mut x, &mut s.f, &mut *p); x + s.f + *p }",
+			du: []string{"x@9 -> m!(&&mut x, &mut s.f, &mut *p)@49", "s@21 -> m!(&&mut x, &mut s.f, &mut *p)@49", "p@27 -> m!(&&mut x, &mut s.f, &mut *p)@49", "x@9 -> x + s.f + *p@81",
+				"s@21 -> x + s.f + *p@81", "p@27 -> x + s.f + *p@81", "m!(&&mut x, &mut s.f, &mut *p)@49 -> x + s.f + *p@81"},
+		},
+		{
+			// The std::fmt library documentation, Precision: `.p$` takes the
+			// precision from the variable p. Nodes: p@5, format!(…)@27.
+			name:     "a precision capture in a format string reads its variable",
+			protects: "`{:.p$}` reads p",
+			mutation: "read only width captures (loses p@5 -> format!(\"{:.p$}\", 1.5)@27)",
+			src:      "fn f(p: usize) -> String { format!(\"{:.p$}\", 1.5) }",
+			du:       []string{"p@5 -> format!(\"{:.p$}\", 1.5)@27"},
+		},
+		{
+			// The std::fmt library documentation: byte strings and C strings
+			// are no format strings. Nodes: m!(…)@22 (reads nothing), 0@….
+			name:     "byte and C string literals in a token tree are not format strings",
+			protects: "`b\"{x}\"` and `c\"{x}\"` capture nothing",
+			mutation: "read byte or C strings as format strings (gains x@5 -> m!(b\"{x}\", c\"{x}\")@22)",
+			src:      "fn f(x: i32) -> i32 { m!(b\"{x}\", c\"{x}\"); 0 }",
+		},
+		{
+			// The std::fmt library documentation: which macros format is not
+			// known here, so any macro's plain string literal is read as a
+			// format string. Nodes: x@5, m!(\"{x}\")@22.
+			name:     "a string literal in any macro is read as a format string",
+			protects: "a capture in a user macro's literal is a read, since the macro may format it",
+			mutation: "read format strings only in the standard formatting macros (loses x@5 -> m!(\"{x}\")@22)",
+			src:      "fn f(x: i32) -> i32 { m!(\"{x}\"); 0 }",
+			du:       []string{"x@5 -> m!(\"{x}\")@22"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › `break` and
+			// `continue` expressions: a break or continue in a tree with no
+			// loop of its own leaves the invocation to the source loop. Nodes:
+			// v@5, let mut n = 0;@27, v@51, for@42, x@46, m!(if x > 0 { continue } else { break })@55 (Branch Using x:
+			// to the head, past the loop and on), n += 1@97, n@107. Succ:
+			// for→{x, n@107}; x→m!(if x > 0 { continue } else { break })@55→{for, n@107, n += 1}; n += 1→for. IPDom:
+			// for → n@107; x → m!(if x > 0 { continue } else { break })@55 → n@107; n += 1 → for.
+			name:     "a break or continue in a token tree leaves to the enclosing source loop",
+			protects: "the invocation branches to the loop's head and past it, so the loop's rest depends on it",
+			mutation: "leave break and continue out of the token-tree jumps (m!(if x > 0 { continue } else { break })@55 is a Stmt: loses m!(if x > 0 { continue } else { break })@55 -> n += 1@97 and m!(if x > 0 { continue } else { break })@55 -> for@42)",
+			src:      "fn f(v: Vec<i32>) -> i32 { let mut n = 0; for x in v { m!(if x > 0 { continue } else { break }); n += 1; } n }",
+			cd:       []string{"for@42 -> x@46", "for@42 -> m!(if x > 0 { continue } else { break })@55", "m!(if x > 0 { continue } else { break })@55 -> for@42", "m!(if x > 0 { continue } else { break })@55 -> n += 1@97"},
+			du: []string{"v@5 -> v@51", "v@51 -> for@42", "v@51 -> x@46", "x@46 -> m!(if x > 0 { continue } else { break })@55",
+				"let mut n = 0;@27 -> n += 1@97", "n += 1@97 -> n += 1@97", "let mut n = 0;@27 -> n@107",
+				"n += 1@97 -> n@107"},
+		},
+		{
+			// The Rust Unstable Book, try_blocks, and Macros › Macro
+			// invocation: a `?` in a tree inside a source try block breaks to
+			// the block's end, defining no result. Nodes: a@5, m!(a?)@57
+			// (Branch), 1@65 (the tail, defining the block's result), let r: Option<i32> = try { m!(a?); 1 };@30,
+			// r.unwrap_or(0)@70. Succ: m!→{1, let r: Option<i32> = try { m!(a?); 1 };@30}; 1→let r: Option<i32> = try { m!(a?); 1 };@30→r.unwrap_or(0).
+			// IPDom: m! → let r: Option<i32> = try { m!(a?); 1 };@30.
+			name:     "a question mark in a token tree inside a try block breaks to the block's end",
+			protects: "what follows the try block does not depend on a `?` in a macro inside it",
+			mutation: "send a tree's `?` to Exit inside a try block (m!(a?)@57 then also controls let r: Option<i32> = try { m!(a?); 1 };@30 and r.unwrap_or(0)@70)",
+			src:      "fn f(a: Option<i32>) -> i32 { let r: Option<i32> = try { m!(a?); 1 }; r.unwrap_or(0) }",
+			cd:       []string{"m!(a?)@57 -> 1@65"},
+			du:       []string{"a@5 -> m!(a?)@57", "1@65 -> let r: Option<i32> = try { m!(a?); 1 };@30", "let r: Option<i32> = try { m!(a?); 1 };@30 -> r.unwrap_or(0)@70"},
+		},
+		{
+			// The Rust Reference, Trait and lifetime bounds: `?Sized` is a
+			// bound, not the try propagation operator, since its `?` follows
+			// no operand. Nodes: m!(T: ?Sized)@22 (a Stmt), x@37.
+			name:     "a question mark after a colon in a token tree is no jump",
+			protects: "a `?Sized` bound in a macro's arguments does not make the invocation a branch",
+			mutation: "take every `?` token as the operator (m!(T: ?Sized)@22 becomes a Branch controlling x@37)",
+			src:      "fn f(x: i32) -> i32 { m!(T: ?Sized); x }",
+			du:       []string{"x@5 -> x@37"},
+		},
+		{
+			// Macros › Macro invocation: the `{…}` after `fn`, and an async
+			// block, hold their own jumps. Nodes: o@5, m!(…)@38 (a Stmt Using
+			// o), Some(1)@76.
+			name:     "a fn body or async block in a token tree contains its jumps",
+			protects: "a return in a tree's fn item and a `?` in a tree's async block are no jumps of the enclosing function",
+			mutation: "let a tree's fn body or async block leave (m!(fn g() { return; }, async { o? })@38 becomes a Branch controlling Some(1)@76)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { m!(fn g() { return; }, async { o? }); Some(1) }",
+			du:       []string{"o@5 -> m!(fn g() { return; }, async { o? })@38"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Loop
+			// labels, and Macros › Macro invocation: a labelled jump leaves
+			// the tree unless the tree declares its label. Nodes: loop@13,
+			// m!(break 'o)@20 (Branch: past the loop and on), m!('i: …)@34 (a
+			// Stmt). Succ: loop→m!@20→{EXIT, m!@34}; m!@34→loop. IPDom: m!@20
+			// → EXIT; m!@34 → loop → m!@20.
+			name:     "a labelled jump in a token tree leaves unless the tree declares its label",
+			protects: "`break 'o` in a tree leaves to the source loop 'o, and `break 'i` stays in the tree declaring 'i",
+			mutation: "keep every labelled jump in its tree (m!(break 'o)@20 controls nothing), or let every one leave (break 'i names no open frame: unresolved becomes 1)",
+			src:      "fn f() { 'o: loop { m!(break 'o); m!('i: loop { break 'i; }); } }",
+			cd: []string{"m!(break 'o)@20 -> m!('i: loop { break 'i; })@34", "m!(break 'o)@20 -> loop@13",
+				"m!(break 'o)@20 -> m!(break 'o)@20"},
+		},
+		{
+			// The Rust Unstable Book, try_blocks, and Macros › Macro
+			// invocation: a `?` inside a try block written in the tree stays
+			// there. Nodes: o@5, m!(try { o? })@38 (a Stmt Using o), Some(1)@54.
+			name:     "a question mark inside a try block in a token tree stays in the tree",
+			protects: "the invocation holding `try { o? }` is no branch of the enclosing function",
+			mutation: "let a `?` in a tree's try block leave (m!(try { o? })@38 becomes a Branch controlling Some(1)@54)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { m!(try { o? }); Some(1) }",
+			du:       []string{"o@5 -> m!(try { o? })@38"},
+		},
+		{
+			// Macros › Macro invocation: a name a tree binds is not scoped,
+			// so a later token of that name still reads the enclosing
+			// variable (an over-approximation). Nodes: x@5, m!(let x = 1;
+			// x)@22 (Uses x: the x before `=` is a binding name, the later x
+			// the parameter), x@40.
+			name:     "a name a token tree binds is not scoped",
+			protects: "the tree's later read of x resolves to the enclosing x, never to nothing",
+			mutation: "scope a tree's let (the later x resolves to the tree's binding: loses x@5 -> m!(let x = 1; x)@22)",
+			src:      "fn f(x: i32) -> i32 { m!(let x = 1; x); x }",
+			du:       []string{"x@5 -> m!(let x = 1; x)@22", "x@5 -> x@40"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › Closure
+			// expressions: a macro inside a closure walked for its captures
+			// makes no jump of the enclosing function, and its reads are
+			// captures. Nodes: o@5, || { m!(o?); }@38 (Uses o), let c = …;@30,
+			// c()@54, 0@59.
+			name:     "a macro inside a callable walked for captures makes no jump and its reads are captures",
+			protects: "a `?` in a macro inside a closure is the closure's, and the tree's reads are the creating node's",
+			mutation: "let a macro inside a callable walked for captures make its jumps (a Branch m!(o?)@43 appears in f and controls c()@54 and 0@59)",
+			src:      "fn f(o: Option<i32>) -> i32 { let c = || { m!(o?); }; c(); 0 }",
+			du: []string{"o@5 -> || { m!(o?); }@38", "|| { m!(o?); }@38 -> let c = || { m!(o?); };@30",
+				"let c = || { m!(o?); };@30 -> c()@54"},
+		},
 	})
 }

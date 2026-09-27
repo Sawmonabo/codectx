@@ -57,7 +57,8 @@ const (
 //     initializer spanning it ([class.base.init]).
 //   - A statement is one node: an expression statement spans its
 //     expression (a comma expression at statement level is one statement
-//     per operand), an initialized declarator spans the init declarator,
+//     per operand; an empty statement `;`, labelled or not, makes none, so
+//     `L:;` is the label's node alone), an initialized declarator spans the init declarator,
 //     defines the name and comes after the nodes its initializer makes (a
 //     lambda's creating node included), return, co_return, throw, break,
 //     continue, goto and `__leave` span the statement (kind Jump). An
@@ -126,8 +127,9 @@ const (
 //     only by a jump into them.
 //   - A C++ range for ([stmt.ranged]) follows Iteration (see Lowering): the
 //     range expression's Stmt node, which defines the iteration variable;
-//     the Branch head, spanning from the declarator to the end of the range
-//     expression and Using only the iteration variable, never the names the
+//     the Branch head, spanning from the start of the declarator (a
+//     reference's `&` included: `auto &e : v` renders as `&e : v`) to the
+//     end of the range expression and Using only the iteration variable, never the names the
 //     range expression reads; then one defining node per bound name spanning
 //     the name, Using only the iteration variable too. A name bound by a
 //     reference to a non-const type (`auto &e : v`) is bound to an element
@@ -200,9 +202,12 @@ const (
 // an array type name are evaluated), and the controlling expression of a
 // generic selection (C17 §6.5.1.1p3) are not; the association a generic
 // selection picks depends on types, so every association's expression is
-// read. A node Uses what its own evaluation reads, and a value computed at
-// another node reaches it through a variable, as Lowering's Uses rule
-// states.
+// read. Both grammars parse the operand of alignof and offsetof as a type
+// descriptor (offsetof's second operand as a field name), so no identifier
+// of a variable ever stands there and no golden can show the rule: it holds
+// by the grammar. A node Uses what its own evaluation reads, and a value
+// computed at another node reaches it through a variable, as Lowering's Uses
+// rule states.
 //
 // A name that resolves to no variable (Lowering, Names that resolve to no
 // variable: here a file-scope or namespace name, a member named without its
@@ -258,7 +263,11 @@ const (
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
 // defines an owned variable that replaces the held read, so the folded read
-// pairs with the definition that reached it. The hand-off is made only when the
+// pairs with the definition that reached it. A definition through a name a
+// preprocessor conditional left bound to several variables defines each (see
+// Node granularity), so the defining node carries the held read of each one
+// (`g(x, x = 2)` after `#ifdef A int x = 1; #endif` hands on the read of the
+// arm's x and of the parameter). The hand-off is made only when the
 // defining node runs whenever the consumer does: a definition in the right
 // operand of `&&` or `||` or in an arm of `?:` leaves the read on the consumer.
 // So does a definition in a statement of a statement expression other than its
@@ -294,7 +303,9 @@ const (
 // `fill(buf)`; and binding a C++ reference to a non-const type to an
 // object, `T &r = x` (also `T &r{x}`, `T &r(x)`, `T &&r = …` and
 // `auto &[a, b] = s`), which may-defines its base variable at the
-// declarator's node ([dcl.init.ref]). A reference to a const type
+// declarator's node ([dcl.init.ref]). The base is seen through a call to
+// move, forward or move_if_noexcept, which yields its argument itself
+// ([utility.syn], [forward]): `T &&r = std::move(x)` may-defines x. A reference to a const type
 // (`const T &r = x`, [dcl.ref]/1) is a read-only view: its binding only
 // reads the object, as Lowering states. The may-definition
 // lands on that node even when a later operand makes a node first: the
@@ -343,7 +354,10 @@ const (
 // body, false to the next clause; the fringe that matches no clause ends in
 // Throw, and `catch (...)` ends the chain. A function-try-block covers the
 // member initializers and the body; for a constructor or destructor the end
-// of a handler rethrows ([except.handle]/15), otherwise it returns.
+// of a handler rethrows ([except.handle]/15), otherwise it returns. No
+// golden pins that difference: a function-try-block is the function's
+// outermost frame, so its rethrow and its return both end at EXIT and no
+// control-dependence or def-use pair tells them apart.
 //
 // Structured exceptions (both grammars; the anchor is the structured
 // exception handling extension's documented semantics of its try-finally
@@ -2462,13 +2476,18 @@ func (c *cLower) target(t *ts.Node) {
 }
 
 // baseIdent is the identifier a field, index or indirect target writes
-// through (x in `x.f`, `x->f`, `x[i]`, `*x`, `*(T *)x`), or nil.
+// through (x in `x.f`, `x->f`, `x[i]`, `*x`, `*(T *)x`, and in C++
+// `std::move(x)`), or nil.
 func (c *cLower) baseIdent(n *ts.Node) *ts.Node {
 	k := c.k
 	for n = c.l.unparen(n); n != nil; n = c.l.unparen(n) {
 		switch n.KindId() {
 		case k.identifier:
 			return n
+		case k.callExpression:
+			if n = c.castCallOperand(n); n == nil {
+				return nil
+			}
 		case k.fieldExpression, k.subscriptExpression:
 			n = n.ChildByFieldId(k.fArgument)
 		case k.pointerExpression:
@@ -2483,6 +2502,44 @@ func (c *cLower) baseIdent(n *ts.Node) *ts.Node {
 		}
 	}
 	return nil
+}
+
+// castCallOperand returns the one argument of a C++ call to move, forward
+// or move_if_noexcept, qualified or not (`std::move(x)`,
+// `std::forward<T>(x)`), or nil for any other call. Those functions are
+// casts ([utility.syn], [forward]): their result refers to the argument
+// itself, so a reference bound to it, or a write through it, reaches the
+// argument's object. A function of the program that takes one of those names
+// is read the same way, an over-approximation; a `static_cast` to a reference
+// type is not seen.
+func (c *cLower) castCallOperand(n *ts.Node) *ts.Node {
+	k := c.k
+	if !k.cpp {
+		return nil
+	}
+	f := n.ChildByFieldId(k.fFunction)
+	for f != nil && (f.KindId() == k.qualifiedIdentifier || f.KindId() == k.templateFunction) {
+		f = f.ChildByFieldId(k.fName)
+	}
+	if f == nil || f.KindId() != k.identifier {
+		return nil
+	}
+	switch string(c.text(f)) {
+	case "move", "forward", "move_if_noexcept":
+	default:
+		return nil
+	}
+	args := n.ChildByFieldId(k.fArguments)
+	if args == nil {
+		return nil
+	}
+	start, list := c.kids(args)
+	defer c.done(start)
+	if len(list) != 1 {
+		return nil
+	}
+	arg := list[0]
+	return &arg
 }
 
 // closure creates the node spanning n, a lambda or nested function: it Uses
@@ -2816,7 +2873,7 @@ type cSyntax struct {
 	lambdaExpression, lambdaCaptureInitializer, lambdaDefaultCapture, tryStatement, catchClause,
 	throwStatement, coReturnStatement, forRangeLoop, conditionClause, fieldInitializerList, newExpression,
 	referenceDeclarator, variadicDeclarator, structuredBindingDeclarator, qualifiedIdentifier, operatorCast,
-	argumentList, this, deleteExpression uint16
+	argumentList, this, deleteExpression, templateFunction uint16
 
 	and, or, assign, star, arrow, amp, ellipsis uint16
 	// C++ only: the alternative tokens `and` and `or` ([lex.digraph]).
@@ -2826,7 +2883,7 @@ type cSyntax struct {
 	fInitializer, fLabel, fLeft, fName, fOperator, fParameters, fRight, fSize, fType, fUpdate, fValue uint16
 
 	// C++ only.
-	fCaptures uint16
+	fArguments, fCaptures, fFunction uint16
 }
 
 var (
@@ -2892,10 +2949,10 @@ func resolveCSyntax(language string) *cSyntax {
 		s.referenceDeclarator, s.variadicDeclarator = kind("reference_declarator"), kind("variadic_declarator")
 		s.structuredBindingDeclarator, s.qualifiedIdentifier = kind("structured_binding_declarator"), kind("qualified_identifier")
 		s.operatorCast, s.argumentList, s.this = kind("operator_cast"), kind("argument_list"), kind("this")
-		s.deleteExpression = kind("delete_expression")
+		s.deleteExpression, s.templateFunction = kind("delete_expression"), kind("template_function")
 		s.altAnd, s.altOr = tok("and"), tok("or")
 		s.ellipsis = tok("...")
-		s.fCaptures = field("captures")
+		s.fArguments, s.fCaptures, s.fFunction = field("arguments"), field("captures"), field("function")
 		noNode = append(noNode, "class_specifier", "using_declaration", "alias_declaration", "namespace_definition",
 			"namespace_alias_definition", "static_assert_declaration", "template_declaration", "template_instantiation",
 			"concept_definition")

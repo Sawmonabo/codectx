@@ -39,7 +39,9 @@ const yieldLabel = " yield"
 //     identifier; a compact constructor's parameters are its record's
 //     components (JLS §8.10.4), spanning the identifiers in the record
 //     header. A method or constructor without a body lowers to Entry → Exit.
-//     A receiver parameter and an `_` name declare nothing.
+//     A receiver parameter and an `_` name declare nothing; neither is
+//     observable in any pair (a receiver has no name a body can read), so
+//     no golden case pins them.
 //   - A statement is one node: an expression statement spans its
 //     expression, a declarator with an initializer spans the declarator,
 //     return, throw, yield, break and continue span the statement (kind
@@ -47,7 +49,9 @@ const yieldLabel = " yield"
 //     record, enum or interface declaration spans the declaration. An
 //     expression statement that assigns or updates a local is its defining
 //     node. A declarator without an initializer makes no node: it executes
-//     nothing (JLS §14.4.2), and the variable is not definitely assigned.
+//     nothing (JLS §14.4.2), and the variable is not definitely assigned, so
+//     no use can read a definition made there (JLS §16) and no pair could
+//     show one; no golden case pins it.
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do, for. It is always made, after the nodes
 //     its own evaluation makes (an `&&` or `||` operand's nodes, an
@@ -167,7 +171,8 @@ const yieldLabel = " yield"
 //     spans it: that node holds the value.
 //
 // Statement kinds: every kind of the grammar's statement supertype is
-// handled above. An empty statement (`;`) makes no node; package, import
+// handled above. An empty statement (`;`), the body of an if, else or loop
+// included, makes no node; package, import
 // and module declarations do not occur in a callable; any kind the lowering
 // does not name (an error node included) is one Stmt node spanning it, with
 // its uses, falling through. Expression kinds other than the ones above
@@ -266,7 +271,11 @@ const yieldLabel = " yield"
 // cap test base's result before a MayDef or a writes entry. Every other
 // variable the builder or at receives is a fresh Var, a result, or a reads
 // or writes entry that passed those filters. The node the construct makes is
-// still made, with its other operands' reads.
+// still made, with its other operands' reads, and an embedded assignment or
+// update to such a name still defines its owned result, which its consumer
+// Uses: in `g(x = a)` for a field x, the node `x = a` Uses a, defines
+// neither x nor anything x names, and defines the result `g(…)` Uses (hand
+// defines it whatever the target resolves to).
 //
 // # Exceptions
 //
@@ -1005,6 +1014,12 @@ func (j *javaLower) stmt(n *ts.Node) {
 	labels := j.labels[from:]
 	j.labelAt = len(j.labels)
 	j.reset()
+	// The grammar's empty statement is the anonymous `;` token; a block's
+	// child list skips it, but the body of an if, else or loop is the token
+	// itself, and it executes nothing (JLS §14.6).
+	if !n.IsNamed() {
+		return
+	}
 	switch n.KindId() {
 	case k.expressionStmt:
 		if e := firstNamed(n); e != nil {

@@ -29,6 +29,14 @@ var goLowering = Lowering{
 //     short variable declaration, a var spec) with at most one variable
 //     target is one node spanning the statement (a var declaration of one
 //     spec spans the declaration). `x++` uses then defines x on that node.
+//     A variable target is a target identifier that names a variable of
+//     the function, or that `:=` declares; `_`, a name that resolves to no
+//     variable, and a field, index or indirect target are not variable
+//     targets, whatever the statement's syntactic target count: `n, y = y, n`
+//     with n resolving to no variable has one variable target, so it is one
+//     node spanning the statement, which Uses the reads of both paired
+//     values (y, the value paired with n; n itself reads nothing) and
+//     defines y.
 //   - A statement with k > 1 variable targets is k Stmt nodes, one per target,
 //     spanning the target identifier and defining it. Each carries the uses
 //     of its own value (its paired right-hand expression, or the whole right
@@ -1283,7 +1291,9 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool, held int3
 	g.buf, g.may = g.buf[:lo], g.may[:mlo]
 }
 
-// order emits one node per variable target, keeping the statement's
+// order emits one node per variable target (assign calls it only for more
+// than one; a target that is `_`, names no variable or writes through a base
+// is not among them), keeping the statement's
 // invariant: every target node reads the right-hand values as they were
 // before any target of the statement was written. It repeatedly takes the
 // first remaining target no other remaining target reads, so no node reads

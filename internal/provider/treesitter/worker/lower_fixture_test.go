@@ -16,18 +16,34 @@ import (
 // Functions preorder, from 0) of src, and the exact control-dependence and
 // def-use pairs and unresolved-jump count its lowering must produce. protects
 // names the failure mode the case guards; mutation names the code change that
-// would fail it.
+// would fail it. recovered marks a source that parses with a syntax error on
+// purpose, to pin how a lowering treats an error-recovered tree; every other
+// source must parse clean. callables, when nonzero, is the exact number of
+// callables Functions reports in src, which pins what is and is not a function
+// (a bodiless method, a signature) where no pair could show it.
 type goldenCase struct {
 	name, protects, mutation, src string
 	fn                            int
 	cd, du                        []string
 	unresolved                    int
+	recovered                     bool
+	callables                     int
 }
 
 // runGolden checks every case of language, one subtest per case. Every
 // golden table derives its cases by these rules, and states only what its
 // language adds:
 //
+//   - Grammars. A construct is covered for a grammar only by a case run
+//     through that grammar. Languages that share a lowering share cases: a
+//     c case whose source parses clean as C++ runs under cpp too, a
+//     javascript case under typescript and tsx, and a typescript case under
+//     tsx, each with the one expected set its table states. A case whose
+//     source does not parse clean in a sibling grammar runs only under its
+//     own, and the sibling's table holds its own case for the construct.
+//   - Parsing. Every source must parse with no ERROR or MISSING node in the
+//     grammar it runs under, so a pair set is never derived from a tree the
+//     parser recovered; a recovered case must hold one instead.
 //   - Rendering. A node renders as ENTRY, EXIT or "<source text of its span,
 //     whitespace collapsed>@<start byte>", every other node alike, a Handler
 //     included (a catch clause's Handler spans the clause's keyword, so it
@@ -82,18 +98,24 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				t.Fatal("the parser produced no tree")
 			}
 			defer tree.Close()
+			if got := tree.RootNode().HasError(); got != c.recovered {
+				t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, tree.RootNode().ToSexp())
+			}
 			var fn *ts.Node
 			i := 0
-			errFound := errors.New("found")
-			err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
+			if err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
 				if i == c.fn {
 					fn = n
-					return errFound
 				}
 				i++
 				return nil
-			})
-			if fn == nil || !errors.Is(err, errFound) {
+			}); err != nil {
+				t.Fatalf("functions: %v", err)
+			}
+			if c.callables != 0 && i != c.callables {
+				t.Errorf("callables = %d, want %d\nprotects: %s\nmutation: %s", i, c.callables, c.protects, c.mutation)
+			}
+			if fn == nil {
 				t.Fatalf("callable %d not found (%d callables)", c.fn, i)
 			}
 			var a flow.Arena
