@@ -8,7 +8,9 @@ import (
 // cShared are the C cases whose source parses clean as C++ too, so each runs
 // under both grammars with its one expected set. A call statement takes at
 // least two arguments: `g(x);` alone may read as a declaration of x in C++
-// ([stmt.ambig]). The cases that stay C-only use a construct C++ lacks.
+// ([stmt.ambig]). The cases that stay C-only use a construct C++ lacks, or a
+// statement the C++ grammar reads as a declaration or a cast; for the latter
+// the C++ table holds a case of its own.
 var cShared = []goldenCase{
 	{
 		// C17 §6.8.4.2: the labels are tested against the controlling
@@ -158,6 +160,13 @@ var cShared = []goldenCase{
 		protects: "a continue issued on the loop's continue path lands on the first node of the condition instead of panicking or re-entering the body",
 		mutation: "land the continue on the loop head (continue;@44 -> n--@18: n & 1@37 gains control of n--@18), call ContinueHere only once (CloseFrame panics), or let the condition re-read its last statement's names (n > 0@54 -> { … }@31 becomes n--@18 -> { … }@31)",
 		src:      "int f(int n) { do n--; while (({ if (n & 1) continue; n > 0; })); return n; }",
+		// Ill-formed on purpose: both compilers reject the continue ("continue
+		// statement not within a loop"), since they place a loop's condition
+		// outside its body. No valid program puts a continue there that binds
+		// to this loop, and the parsers accept the source, so the case pins
+		// that the lowering still gives the jump a defined landing rather
+		// than failing to close the loop's frame.
+		illFormed: true,
 		cd: []string{"n & 1@37 -> continue;@44", "n & 1@37 -> n & 1@37",
 			"{ if (n & 1) continue; n > 0; }@31 -> n--@18", "{ if (n & 1) continue; n > 0; }@31 -> n & 1@37",
 			"{ if (n & 1) continue; n > 0; }@31 -> n > 0@54",
@@ -326,6 +335,9 @@ var cShared = []goldenCase{
 		mutation:   "drop the unresolved count for a goto whose label is never defined (unresolved 0)",
 		src:        "void f(void) { goto M; }",
 		unresolved: 1,
+		// Ill-formed on purpose (C17 §6.8.6.1p1 is a constraint): the
+		// unresolved count exists only for such a source.
+		illFormed: true,
 	},
 	{
 		// C17 §6.8.4.1p2: the first substatement runs when the condition is
@@ -380,19 +392,6 @@ var cShared = []goldenCase{
 		cd:       []string{"x < y@38 -> g(0, x)@50", "x < y@38 -> x++@45", "x < y@38 -> x < y@38"},
 		du: []string{"y@17 -> x < y@38", "x = 0@31 -> x < y@38", "x++@45 -> x < y@38", "x = 0@31 -> g(0, x)@50",
 			"x++@45 -> g(0, x)@50", "x = 0@31 -> x++@45", "x++@45 -> x++@45", "x@10 -> return x;@59"},
-	},
-	{
-		// C17 §6.8.3p2: an expression statement is evaluated for its
-		// effect, and §6.5.13p4: && evaluates g(b) only when a is nonzero.
-		// Nodes: a@10, b@17, a@22 (Branch, defining the && result), g(b)@27
-		// (defining it again), return a;@33. The discarded result makes no
-		// further node. Succ: a@22→{g(b), return a}; g(b)→return a.
-		name:     "a discarded && statement is its operands' nodes alone",
-		protects: "an expression statement whose value nodes hand on a result nobody reads ends there, and the right operand still depends on the left",
-		mutation: "end the statement with a node Using the result (adds a && g(b)@22, with a@22 -> a && g(b)@22 and g(b)@27 -> a && g(b)@22)",
-		src:      "int f(int a, int b) { a && g(b); return a; }",
-		cd:       []string{"a@22 -> g(b)@27"},
-		du:       []string{"a@10 -> a@22", "b@17 -> g(b)@27", "a@10 -> return a;@33"},
 	},
 	{
 		// C17 §6.8.4.1p2 and §6.5.3.1p2 (the value of --x is x after the
@@ -529,17 +528,6 @@ var cShared = []goldenCase{
 		mutation: "take the outermost function declarator's parameters (its (int) names no parameter: loses x@12 -> return h(x);@23)",
 		src:      "int (*f(int x))(int) { return h(x); }",
 		du:       []string{"x@12 -> return h(x);@23"},
-	},
-	{
-		// C17 §6.7.6.2p5: a variable-length array's size is evaluated when
-		// the declaration is reached (a GNU extension in C++). Nodes: n@11,
-		// a[n]@20 (a Stmt node reading n, defining nothing), g(0, a)@26 (a
-		// decays: Uses and may-defines a, which no definition reaches).
-		name:     "a variable-length array declarator reads its size at its own node",
-		protects: "a declarator without an initializer still makes a node when it evaluates an array size, so the size's definitions reach it",
-		mutation: "make no node for a declarator without an initializer (loses n@11 -> a[n]@20)",
-		src:      "void f(int n) { int a[n]; g(0, a); }",
-		du:       []string{"n@11 -> a[n]@20"},
 	},
 	{
 		// C17 §6.2.4p3 and §6.7.9p10 ([stmt.dcl]/3 alike): a static local's
@@ -735,31 +723,6 @@ var cShared = []goldenCase{
 			"c@34 -> return g(x, c && (x = 1));@22"},
 	},
 	{
-		// C17 §6.5.3.4p2: sizeof of a variable-length array evaluates its
-		// operand, and so does sizeof of a VLA type name, whose size
-		// expression is read. g(0, a) may-define a (it decays), so the read
-		// in sizeof a shows. Nodes: n@10, a[n]@19 (reads n), g(0, a)@25
-		// (Uses and may-defines a), y = sizeof a@38 (Uses a), z =
-		// sizeof(int[n])@56 (Uses n), return y + z;@76.
-		name:     "sizeof of a variable-length array reads it and a VLA type name reads its size",
-		protects: "a VLA operand of sizeof is evaluated, unlike every other sizeof operand",
-		mutation: "treat every sizeof operand as unevaluated (loses g(0, a)@25 -> y = sizeof a@38 and n@10 -> z = sizeof(int[n])@56)",
-		src:      "int f(int n) { int a[n]; g(0, a); int y = sizeof a; int z = sizeof(int[n]); return y + z; }",
-		du: []string{"n@10 -> a[n]@19", "g(0, a)@25 -> y = sizeof a@38", "n@10 -> z = sizeof(int[n])@56",
-			"y = sizeof a@38 -> return y + z;@76", "z = sizeof(int[n])@56 -> return y + z;@76"},
-	},
-	{
-		// C17 §6.5.1.1p3: the controlling expression of a generic selection
-		// is not evaluated, and the lowering reads every association since
-		// the choice depends on types. Nodes: x@10, y@17, return
-		// _Generic(x, int: y, default: 0);@22 (Uses y only).
-		name:     "a generic selection reads its associations and not its controlling expression",
-		protects: "the controlling expression of _Generic is no read, while an association's expression is",
-		mutation: "read the controlling expression (adds x@10 -> return _Generic(x, int: y, default: 0);@22)",
-		src:      "int f(int x, int y) { return _Generic(x, int: y, default: 0); }",
-		du:       []string{"y@17 -> return _Generic(x, int: y, default: 0);@22"},
-	},
-	{
 		// C17 §6.2.1p4 and §6.7.6.3 ([basic.scope.block] alike): the block's
 		// `int x(int);` declares a function that hides the parameter until
 		// the block ends. Nodes: x@10, y@17, y = x(1)@36 (reads no
@@ -869,46 +832,43 @@ var cShared = []goldenCase{
 		du:       []string{"x = 1@31 -> a[x] = (x = 1)@23", "a@18 -> a[x] = (x = 1)@23", "x = 1@31 -> return x;@39"},
 	},
 	{
-		// C17 §6.7.6.1 and §6.7.6.2: in `char (*p)[4]` the declarator
-		// nearest p is the pointer, so p is a pointer to an array and does
-		// not decay. Nodes: (*p)[4] = 0@19 (defines p), g(0, p)@32 (Uses p,
-		// no may-definition), return p != 0;@41.
-		name:     "a pointer to an array is no array",
-		protects: "the declarator nearest the name decides its shape, so passing a pointer to an array is a plain read",
-		mutation: "take any array declarator on the chain as the shape (p decays: adds g(0, p)@32 -> return p != 0;@41)",
-		src:      "int f(void) { char (*p)[4] = 0; g(0, p); return p != 0; }",
-		du:       []string{"(*p)[4] = 0@19 -> g(0, p)@32", "(*p)[4] = 0@19 -> return p != 0;@41"},
-	},
-	{
 		// GNU C extension, Statements and Declarations in Expressions: a
 		// construct whose last statement is not an expression statement
-		// has no value. Nodes: x@10, g(0, ({ if (x) h(); }))@15 (the
-		// statement), x@26 (Branch), h()@30, return x;@40. Succ: x@26→
-		// {h(), g(0, …)}; h()→g(0, …)→return. IPDom: x@26 → g(0, …).
+		// has no value: it has void type, so it can only be discarded, here
+		// by a cast to void (C17 §6.5.4p2), folded into the statement's
+		// node. Nodes: x@10, x@28 (Branch), h()@31, (void)({ if (x) h();
+		// })@15 (the statement, reading nothing), return x;@40. Succ:
+		// x@28→{h(), (void)…}; h()→(void)…→return. IPDom: x@28 → (void)….
 		name:     "a statement expression ending in an if has no value",
 		protects: "a statement expression whose last statement is not an expression statement hands no result to its consumer",
-		mutation: "yield the last statement's condition as the value (adds x@26 -> g(0, ({ if (x) h(); }))@15)",
-		src:      "int f(int x) { g(0, ({ if (x) h(); })); return x; }",
-		cd:       []string{"x@26 -> h()@30"},
-		du:       []string{"x@10 -> x@26", "x@10 -> return x;@40"},
+		mutation: "yield the last statement's condition as the value (adds x@28 -> (void)({ if (x) h(); })@15)",
+		src:      "int f(int x) { (void)({ if (x) h(); }); return x; }",
+		cd:       []string{"x@28 -> h()@31"},
+		du:       []string{"x@10 -> x@28", "x@10 -> return x;@40"},
 	},
 	{
 		// GNU C extension, Statements and Declarations in Expressions, and
 		// C17 §6.8.6.2: a continue in a for loop's update goes to the end of
 		// the body, after which the update runs again from its first node,
 		// here the if's Branch. Nodes: x@10, y@17, x@29 (the condition),
-		// g()@61 (the body), y@38 (Branch), continue;@42, x--@52, return
-		// x;@66. Succ: x@29→{g(), return x}; g()→y@38→{continue, x--};
-		// continue→y@38; x--→x@29. IPDom: g(), continue → y@38 → x-- →
-		// x@29 → return x. Frontier walks: x@29→g() gives g(), y@38, x--,
-		// x@29; y@38→continue gives continue, y@38.
-		name:     "a continue in a for update's statement expression lands on the update's first node",
-		protects: "the continue path of a for loop begins at the update, so a continue issued inside it re-runs the update from its start",
-		mutation: "land the continue on the condition (loses y@38 -> y@38; x--@52 no longer post-dominates y@38)",
-		src:      "int f(int x, int y) { for (; x; ({ if (y) continue; x--; })) g(); return x; }",
-		cd: []string{"x@29 -> g()@61", "x@29 -> y@38", "x@29 -> x--@52", "x@29 -> x@29", "y@38 -> continue;@42",
-			"y@38 -> y@38"},
-		du: []string{"x@10 -> x@29", "x--@52 -> x@29", "y@17 -> y@38", "x@10 -> x--@52", "x--@52 -> x--@52",
+		// g()@61 (the body), y@39 (Branch), continue;@42, x--@52, return
+		// x;@66. Succ: x@29→{g(), return x}; g()→y@39→{continue, x--};
+		// continue→y@39; x--→x@29. IPDom: g(), continue → y@39 → x-- →
+		// x@29 → return x. Frontier walks: x@29→g() gives g(), y@39, x--,
+		// x@29; y@39→continue gives continue, y@39. Ill-formed on purpose:
+		// both compilers reject the continue ("continue statement not
+		// within a loop"), placing a for loop's update outside its body; no
+		// valid program puts a continue there that binds to this loop, and
+		// the parsers accept the source, so the case pins that the jump
+		// still gets a defined landing.
+		name:      "a continue in a for update's statement expression lands on the update's first node",
+		protects:  "the continue path of a for loop begins at the update, so a continue issued inside it re-runs the update from its start",
+		mutation:  "land the continue on the condition (loses y@39 -> y@39; x--@52 no longer post-dominates y@39)",
+		src:       "int f(int x, int y) { for (; x; ({ if (y) continue; x--; })) g(); return x; }",
+		illFormed: true,
+		cd: []string{"x@29 -> g()@61", "x@29 -> y@39", "x@29 -> x--@52", "x@29 -> x@29", "y@39 -> continue;@42",
+			"y@39 -> y@39"},
+		du: []string{"x@10 -> x@29", "x--@52 -> x@29", "y@17 -> y@39", "x@10 -> x--@52", "x--@52 -> x--@52",
 			"x@10 -> return x;@66", "x--@52 -> return x;@66"},
 	},
 	{
@@ -947,19 +907,19 @@ var cShared = []goldenCase{
 	{
 		// Structured exception handling, try-finally statement: the
 		// __finally block runs however the __try body is left, by break or
-		// by return, and each resumes after it. Nodes: x@10, x@21 (the loop
+		// by return, and each resumes after it. Nodes: x@10, x@22 (the loop
 		// head), x > 1@39 (Branch), break;@46, return 1;@53, g()@77 (the
-		// finally), return 0;@86. Succ: x@21→{x > 1, return 0}; x > 1→
+		// finally), return 0;@86. Succ: x@22→{x > 1, return 0}; x > 1→
 		// {break, return 1}; break, return 1→g(); g()→{return 0 (the
 		// break), EXIT (the return)}. No path completes the body, so the
-		// loop has no back edge. IPDom: x@21, g() → EXIT; x > 1 → g().
+		// loop has no back edge. IPDom: x@22, g() → EXIT; x > 1 → g().
 		name:     "a break and a return out of a __try body both run its __finally",
 		protects: "a break and a return leaving a __try pass through the __finally, which then resumes each at its own target",
 		mutation: "resolve the break straight to its target (g()@77 no longer controls return 0;@86)",
 		src:      "int f(int x) { while (x) { __try { if (x > 1) break; return 1; } __finally { g(); } } return 0; }",
-		cd: []string{"x@21 -> x > 1@39", "x@21 -> g()@77", "x@21 -> return 0;@86", "x > 1@39 -> break;@46",
+		cd: []string{"x@22 -> x > 1@39", "x@22 -> g()@77", "x@22 -> return 0;@86", "x > 1@39 -> break;@46",
 			"x > 1@39 -> return 1;@53", "g()@77 -> return 0;@86"},
-		du: []string{"x@10 -> x@21", "x@10 -> x > 1@39"},
+		du: []string{"x@10 -> x@22", "x@10 -> x > 1@39"},
 	},
 	{
 		// C17 §6.8.6.1 (goto), §6.8.1 (labels). Nodes: x@11, L@16 (the
@@ -1070,6 +1030,11 @@ var cShared = []goldenCase{
 		protects: "a break lowered in the update clause targets the loop whose update holds it and lands after the loop",
 		mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34), or end the discarded update with a node Using its result (adds ({ if (j > 5) break; j++; })@41, with j > 5@48 -> it and j++@62 -> it)",
 		src:      "int f(int n) { int j; for (j = 0; j < n; ({ if (j > 5) break; j++; })) g(0, j); return j; }",
+		// Ill-formed on purpose: both compilers reject the break ("break
+		// statement not within loop or switch"), placing a for loop's update
+		// outside its body; the parsers accept the source, so the case pins
+		// that the jump still gets a defined target.
+		illFormed: true,
 		cd: []string{"j < n@34 -> g(0, j)@71", "j < n@34 -> j > 5@48", "j > 5@48 -> break;@55", "j > 5@48 -> j++@62",
 			"j > 5@48 -> j < n@34"},
 		du: []string{"n@10 -> j < n@34", "j = 0@27 -> j < n@34", "j = 0@27 -> g(0, j)@71", "j = 0@27 -> j > 5@48",
@@ -1095,7 +1060,8 @@ var cShared = []goldenCase{
 	},
 	{
 		// C17 §6.2.1p4: g, declared outside any block, has file scope, so
-		// it is no variable of f. Nodes: y@18, g = y@23 (Uses y, defines
+		// it is no variable of f, which returns long so that `return g;`
+		// is valid. Nodes: y@18, g = y@23 (Uses y, defines
 		// nothing), g += y@30 (Uses y only), g++@38 (Uses nothing), g =
 		// y@48 (the embedded assignment: Uses y, defines the owned result),
 		// h(0, g = y)@43 (Uses that result), h(0, &g)@56 (Uses and may-defines
@@ -1104,7 +1070,7 @@ var cShared = []goldenCase{
 		name:     "a name with file scope is no variable in any position",
 		protects: "an assignment, compound assignment, update, embedded assignment, address-taking and read of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
 		mutation: "drop read's filter (Builder.Use panics on g's -1 at g += y@30), def's (Builder.Def panics at g = y@23), or mayDef's (Builder.MayDef panics at h(0, &g)@56), or fold the embedded assignment into its consumer (loses g = y@48 -> h(0, g = y)@43)",
-		src:      "int g; void f(int y) { g = y; g += y; g++; h(0, g = y); h(0, &g); return g; }",
+		src:      "int g; long f(int y) { g = y; g += y; g++; h(0, g = y); h(0, &g); return g; }",
 		du:       []string{"y@18 -> g = y@23", "y@18 -> g += y@30", "y@18 -> g = y@48", "g = y@48 -> h(0, g = y)@43"},
 	},
 	{
@@ -1241,15 +1207,82 @@ func TestCLoweringGolden(t *testing.T) {
 				"int g(void) { return x++; }@15 -> return x;@48"},
 		},
 		{
-			// Derived against an assumed recovery: the stray `]` is taken to
-			// become an ERROR node of its own inside the if's compound
-			// statement. No C statement kind the lowering does not name
-			// reaches its default branch, so an ERROR node is the only way
-			// to exercise it. Nodes: x@11, x@20 (Branch), ]@25 (a plain Stmt
+			// C17 §6.8.3p2: an expression statement is evaluated for its
+			// effect, and §6.5.13p4: && evaluates g(b) only when a is nonzero.
+			// Nodes: a@10, b@17, a@22 (Branch, defining the && result), g(b)@27
+			// (defining it again), return a;@33. The discarded result makes no
+			// further node. Succ: a@22→{g(b), return a}; g(b)→return a. C
+			// only: the C++ grammar reads `a && g(b);` as a declaration of g
+			// ([stmt.ambig]); the C++ table holds its own case.
+			name:     "a discarded && statement is its operands' nodes alone",
+			protects: "an expression statement whose value nodes hand on a result nobody reads ends there, and the right operand still depends on the left",
+			mutation: "end the statement with a node Using the result (adds a && g(b)@22, with a@22 -> a && g(b)@22 and g(b)@27 -> a && g(b)@22)",
+			src:      "int f(int a, int b) { a && g(b); return a; }",
+			cd:       []string{"a@22 -> g(b)@27"},
+			du:       []string{"a@10 -> a@22", "b@17 -> g(b)@27", "a@10 -> return a;@33"},
+		},
+		{
+			// C17 §6.7.6.2p5: a variable-length array's size is evaluated when
+			// the declaration is reached (C only: C++ has no variable-length
+			// array, [dcl.array]/1 requires a constant bound). Nodes: n@11,
+			// a[n]@20 (a Stmt node reading n, defining nothing), g(0, a)@26 (a
+			// decays: Uses and may-defines a, which no definition reaches).
+			name:     "a variable-length array declarator reads its size at its own node",
+			protects: "a declarator without an initializer still makes a node when it evaluates an array size, so the size's definitions reach it",
+			mutation: "make no node for a declarator without an initializer (loses n@11 -> a[n]@20)",
+			src:      "void f(int n) { int a[n]; g(0, a); }",
+			du:       []string{"n@11 -> a[n]@20"},
+		},
+		{
+			// C17 §6.5.3.4p2: sizeof of a variable-length array evaluates its
+			// operand, and so does sizeof of a VLA type name, whose size
+			// expression is read. g(0, a) may-define a (it decays), so the read
+			// in sizeof a shows. Nodes: n@10, a[n]@19 (reads n), g(0, a)@25
+			// (Uses and may-defines a), y = sizeof a@38 (Uses a), z =
+			// sizeof(int[n])@56 (Uses n), return y + z;@76. C only, as C++
+			// has no variable-length array.
+			name:     "sizeof of a variable-length array reads it and a VLA type name reads its size",
+			protects: "a VLA operand of sizeof is evaluated, unlike every other sizeof operand",
+			mutation: "treat every sizeof operand as unevaluated (loses g(0, a)@25 -> y = sizeof a@38 and n@10 -> z = sizeof(int[n])@56)",
+			src:      "int f(int n) { int a[n]; g(0, a); int y = sizeof a; int z = sizeof(int[n]); return y + z; }",
+			du: []string{"n@10 -> a[n]@19", "g(0, a)@25 -> y = sizeof a@38", "n@10 -> z = sizeof(int[n])@56",
+				"y = sizeof a@38 -> return y + z;@76", "z = sizeof(int[n])@56 -> return y + z;@76"},
+		},
+		{
+			// C17 §6.5.1.1p3: the controlling expression of a generic selection
+			// is not evaluated, and the lowering reads every association since
+			// the choice depends on types. Nodes: x@10, y@17, return
+			// _Generic(x, int: y, default: 0);@22 (Uses y only). C only: C++
+			// has no generic selection.
+			name:     "a generic selection reads its associations and not its controlling expression",
+			protects: "the controlling expression of _Generic is no read, while an association's expression is",
+			mutation: "read the controlling expression (adds x@10 -> return _Generic(x, int: y, default: 0);@22)",
+			src:      "int f(int x, int y) { return _Generic(x, int: y, default: 0); }",
+			du:       []string{"y@17 -> return _Generic(x, int: y, default: 0);@22"},
+		},
+		{
+			// C17 §6.7.6.1 and §6.7.6.2: in `char (*p)[4]` the declarator
+			// nearest p is the pointer, so p is a pointer to an array and does
+			// not decay. Nodes: (*p)[4] = 0@19 (defines p), g(0, p)@32 (Uses p,
+			// no may-definition), return p != 0;@41. C only: the C++ grammar
+			// reads `char (*p)[4] = 0;` as an assignment to a functional cast;
+			// the C++ table holds its own case.
+			name:     "a pointer to an array is no array",
+			protects: "the declarator nearest the name decides its shape, so passing a pointer to an array is a plain read",
+			mutation: "take any array declarator on the chain as the shape (p decays: adds g(0, p)@32 -> return p != 0;@41)",
+			src:      "int f(void) { char (*p)[4] = 0; g(0, p); return p != 0; }",
+			du:       []string{"(*p)[4] = 0@19 -> g(0, p)@32", "(*p)[4] = 0@19 -> return p != 0;@41"},
+		},
+		{
+			// Ill-formed on purpose, and recovered: the parser skips the stray
+			// `]`, wrapping it in an ERROR node it marks as an extra inside the
+			// if's compound statement. No C statement kind the lowering does
+			// not name reaches its default branch, so an ERROR node is the only
+			// way to exercise it. Nodes: x@11, x@20 (Branch), ]@25 (a plain Stmt
 			// node spanning the ERROR node), h()@29.
 			name:      "an unknown node kind is a plain statement",
 			protects:  "a node of a kind the lowering does not name, an error-recovered one included, still makes a Stmt node on its path",
-			mutation:  "make no node for an unnamed kind (loses x@20 -> ]@25)",
+			mutation:  "make no node for an unnamed kind, or drop an ERROR node the parser made an extra with the comments (either loses x@20 -> ]@25)",
 			src:       "void f(int x) { if (x) { ] } h(); }",
 			recovered: true,
 			cd:        []string{"x@20 -> ]@25"},

@@ -212,19 +212,19 @@ func TestCppLoweringGolden(t *testing.T) {
 			// object its initializer denotes, and std::move(x) is a cast to an
 			// rvalue referring to x itself ([utility.syn], [forward]), so each
 			// binding may-defines x (lower.go, Address-taking). The
-			// parenthesized form doubles its parentheses so `(x)` cannot read
-			// as a parameter declaration ([dcl.ambig.res]). Nodes: x@10,
-			// &&r = std::move(x)@19, &q{x}@43, &t((x))@54 (each Uses x,
-			// defines its reference and may-defines x), return x;@63. Succ: a
-			// straight line to EXIT. Each binding pairs with x@10, the killing
-			// definition behind the chain, and with the binding before it, its
-			// nearest may-definition; so does the return with the last.
-			name:     "a reference bound through std::move, braces or parentheses may-defines the local",
-			protects: "an rvalue reference bound to std::move(x), and a braced or parenthesized reference binding, reach the uses of x after them",
-			mutation: "stop baseIdent at a call (&&r = std::move(x)@19 makes no may-definition: loses &&r = std::move(x)@19 -> &q{x}@43), or read a braced or parenthesized reference initializer as a plain value (loses &q{x}@43 -> &t((x))@54 and &t((x))@54 -> return x;@63)",
-			src:      "int f(int x) { int &&r = std::move(x); int &q{x}; int &t((x)); return x; }",
-			du: []string{"x@10 -> &&r = std::move(x)@19", "x@10 -> &q{x}@43", "&&r = std::move(x)@19 -> &q{x}@43",
-				"x@10 -> &t((x))@54", "&q{x}@43 -> &t((x))@54", "x@10 -> return x;@63", "&t((x))@54 -> return x;@63"},
+			// comment inside the call's parentheses is no argument, so the call
+			// still has its one operand. Nodes: x@10, &&r = std::move(/* c */
+			// x)@19, &q{x}@51 (each Uses x, defines its reference and
+			// may-defines x), return x;@58. Succ: a straight line to EXIT.
+			// Each binding pairs with x@10, the killing definition behind the
+			// chain, and with the binding before it, its nearest
+			// may-definition; so does the return with the last.
+			name:     "a reference bound through std::move or braces may-defines the local",
+			protects: "an rvalue reference bound to std::move(x), a comment among its arguments included, and a braced reference binding reach the uses of x after them",
+			mutation: "stop baseIdent at a call, or count the comment as a second argument of std::move (either way &&r = std::move(/* c */ x)@19 makes no may-definition: loses &&r = std::move(/* c */ x)@19 -> &q{x}@51), or read a braced reference initializer as a plain value (loses &q{x}@51 -> return x;@58)",
+			src:      "int f(int x) { int &&r = std::move(/* c */ x); int &q{x}; return x; }",
+			du: []string{"x@10 -> &&r = std::move(/* c */ x)@19", "x@10 -> &q{x}@51",
+				"&&r = std::move(/* c */ x)@19 -> &q{x}@51", "x@10 -> return x;@58", "&q{x}@51 -> return x;@58"},
 		},
 		{
 			// [expr.prim.lambda.closure]: a lambda is a function of its own,
@@ -319,7 +319,7 @@ func TestCppLoweringGolden(t *testing.T) {
 		},
 		{
 			// [expr.new]: the allocation or the constructor may throw. Nodes:
-			// x@11, p = 0@21, p = new int(x)@34 (may throw), the Handler
+			// x@11, *p = 0@20, p = new int(x)@34 (may throw), the Handler
 			// catch@52, return 0;@66, return p;@78. Succ: p = new int(x)→
 			// {return p, catch}; catch→return 0. IPDom: p = new int(x) → EXIT.
 			name:     "a new expression may throw",
@@ -568,19 +568,24 @@ func TestCppLoweringGolden(t *testing.T) {
 			du:       []string{"x@11 -> x@26"},
 		},
 		{
-			// [stmt.ranged]/1: the range's begin call and each iterator step
-			// may throw. Nodes: v@8, s = 0@17, v@43 (the range, may throw),
-			// x : v@39 (the head, may throw), x@39, s += x@46, the Handler
-			// catch@56, return -1;@70, return s;@83. Succ: v@43→{head, catch};
-			// head→{x, return s, catch}; x→s += x→head; catch→return -1.
-			// IPDom: v@43, head → EXIT; catch → return -1.
-			name:     "a range for's range and iterator step may throw",
-			protects: "the range evaluation and each step of a range for in a try body reach its handler",
-			mutation: "count no throw for a range for (catch@56 is unreachable: loses v@43 -> catch@56 and x : v@39 -> catch@56)",
+			// [stmt.ranged]/1: the range is bound and begin and end are called
+			// once, each step compares and increments the iterator, and each
+			// element is bound from `*__begin`; on a class-type iterator each
+			// is a call, which may throw. Nodes: v@8, s = 0@17, v@43 (the
+			// range, may throw), x : v@39 (the head: the comparison and the
+			// increment, may throw), x@39 (the bound name: the dereference,
+			// may throw), s += x@46, the Handler catch@56, return -1;@70,
+			// return s;@83. Succ: v@43→{head, catch}; head→{x, return s,
+			// catch}; x→{s += x, catch}; s += x→head; catch→return -1. IPDom:
+			// v@43, head, x → EXIT; s += x → head; catch → return -1.
+			// Frontier walks: head→x gives x; x→s += x gives s += x, head.
+			name:     "a range for's range, iterator step and element binding may throw",
+			protects: "the range evaluation, each step and each element's dereference of a range for in a try body reach its handler",
+			mutation: "count no throw for a range for (catch@56 is unreachable: loses v@43 -> catch@56 and x : v@39 -> catch@56), or none for the element's dereference (x@39 -> catch@56 vanishes and the head controls s += x@46 again)",
 			src:      "int f(V v) { int s = 0; try { for (int x : v) s += x; } catch (...) { return -1; } return s; }",
 			cd: []string{"v@43 -> x : v@39", "v@43 -> catch@56", "v@43 -> return -1;@70", "x : v@39 -> x@39",
-				"x : v@39 -> s += x@46", "x : v@39 -> x : v@39", "x : v@39 -> return s;@83", "x : v@39 -> catch@56",
-				"x : v@39 -> return -1;@70"},
+				"x : v@39 -> return s;@83", "x : v@39 -> catch@56", "x : v@39 -> return -1;@70",
+				"x@39 -> s += x@46", "x@39 -> x : v@39", "x@39 -> catch@56", "x@39 -> return -1;@70"},
 			du: []string{"v@8 -> v@43", "v@43 -> x : v@39", "v@43 -> x@39", "x@39 -> s += x@46", "s = 0@17 -> s += x@46",
 				"s += x@46 -> s += x@46", "s = 0@17 -> return s;@83", "s += x@46 -> return s;@83"},
 		},
@@ -595,8 +600,45 @@ func TestCppLoweringGolden(t *testing.T) {
 			protects: "the structured-exception dereference rule reaches through a nested C++ try to its handler",
 			mutation: "give a dereference MayThrow only directly in a __try body (catch@51 is unreachable: loses r = *p@41 -> catch@51 and r = *p@41 -> r = 1@65)",
 			src:      "int f(int *p) { int r = 0; __try { try { r = *p; } catch (...) { r = 1; } } __finally { h(); } return r; }",
-			cd:       []string{"r = *p@41 -> catch@51", "r = *p@41 -> r = 1@65"},
-			du:       []string{"p@11 -> r = *p@41", "r = *p@41 -> return r;@95", "r = 1@65 -> return r;@95"},
+			// Ill-formed on purpose: the compilers that implement structured
+			// exceptions reject a C++ try and a __try in one function ("only
+			// one form of exception handling permitted per function"). The
+			// parser accepts it, so the case pins the defined lowering of such
+			// a tree: nothing reaches the __finally by a throw, since the
+			// catch-all takes every one, so it has no Handler node.
+			illFormed: true,
+			cd:        []string{"r = *p@41 -> catch@51", "r = *p@41 -> r = 1@65"},
+			du:        []string{"p@11 -> r = *p@41", "r = *p@41 -> return r;@95", "r = 1@65 -> return r;@95"},
+		},
+		{
+			// C17 §6.8.3p2 alike ([stmt.expr]): an expression statement is
+			// evaluated for its effect, and [expr.log.and]/1: the right operand
+			// is evaluated only when the left is true. The right operand is
+			// negated so the statement cannot read as a declaration of g
+			// ([stmt.ambig]), as `a && g(b);` does. Nodes: a@10, b@17, a@22
+			// (Branch, defining the && result), !g(b)@27 (defining it again),
+			// return a;@34. The discarded result makes no further node. Succ:
+			// a@22→{!g(b), return a}; !g(b)→return a.
+			name:     "a discarded && statement is its operands' nodes alone in C++",
+			protects: "an expression statement whose value nodes hand on a result nobody reads ends there, and the right operand still depends on the left",
+			mutation: "end the statement with a node Using the result (adds a && !g(b)@22, with a@22 -> a && !g(b)@22 and !g(b)@27 -> a && !g(b)@22)",
+			src:      "int f(int a, int b) { a && !g(b); return a; }",
+			cd:       []string{"a@22 -> !g(b)@27"},
+			du:       []string{"a@10 -> a@22", "b@17 -> !g(b)@27", "a@10 -> return a;@34"},
+		},
+		{
+			// [dcl.meaning] and [dcl.array]: in `char (*p)[4]` the declarator
+			// nearest p is the pointer, so p is a pointer to an array and does
+			// not decay. `static` makes the statement a declaration, which the
+			// grammar would otherwise read as an assignment to a functional
+			// cast; a static local's initializer is a defining node at its
+			// position (see the C table). Nodes: (*p)[4] = 0@26 (defines p),
+			// g(0, p)@39 (Uses p, no may-definition), return p != 0;@48.
+			name:     "a pointer to an array is no array in C++",
+			protects: "the declarator nearest the name decides its shape, so passing a pointer to an array is a plain read",
+			mutation: "take any array declarator on the chain as the shape (p decays: adds g(0, p)@39 -> return p != 0;@48)",
+			src:      "int f(void) { static char (*p)[4] = 0; g(0, p); return p != 0; }",
+			du:       []string{"(*p)[4] = 0@26 -> g(0, p)@39", "(*p)[4] = 0@26 -> return p != 0;@48"},
 		},
 	})
 }
