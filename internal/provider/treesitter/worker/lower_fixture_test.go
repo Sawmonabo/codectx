@@ -72,8 +72,10 @@ type goldenCase struct {
 //     the same rule, whether or not it reads the variable. A node may make
 //     several killing definitions.
 //     A Handler node carries the values on entry to each node that threw to
-//     it. A use that no definition reaches (a node with no path from ENTRY,
-//     a name no node defines) makes no pair.
+//     it. A use that no definition reaches (on entry to ENTRY or to a node
+//     with no predecessor, around a cycle no definition enters, or of a name
+//     no node defines) makes no pair; a region with no path from ENTRY
+//     still pairs its own definitions with its own uses.
 //   - Unresolved is the count of jumps (a break, continue or goto) whose
 //     target names no open frame or label. Only an ill-formed or recovered
 //     source can hold one.

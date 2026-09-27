@@ -246,6 +246,8 @@ type frame struct {
 	gen     int32
 	kind    frameKind
 	entered bool
+	// suspended hides the frame from Break and Continue (Suspend).
+	suspended bool
 }
 
 // item is one cell of a node list.
@@ -487,24 +489,54 @@ func (b *Builder) OpenBlock(labels ...string) Frame {
 // ContinueHere adds every continue pending on loop frame f to the current
 // fringe. Call it where the continue target begins, so the next node created
 // receives them. Every loop calls it where its continue target is. A continue
-// issued on f after that, by code on the loop's continue path itself (a for
-// loop's update clause holding a statement expression), is pending until a
-// later ContinueHere adds it where the language lands it; one still pending
-// at CloseFrame is a lowering defect CloseFrame reports.
+// issued on f after that is still pending at CloseFrame, a lowering defect
+// CloseFrame reports: code the language lowers after the continue target but
+// outside the body (a for loop's update) runs with f suspended.
 func (b *Builder) ContinueHere(f Frame) {
-	i, ok := slices.BinarySearchFunc(b.frames, int32(f), func(fr frame, g int32) int { return int(fr.gen - g) })
-	if !ok || b.frames[i].kind != loopFrame {
+	fr := b.frame(f)
+	if fr.kind != loopFrame {
 		panic("flow: Builder.ContinueHere on a frame that is not an open loop")
 	}
-	fr := &b.frames[i]
 	b.addList(fr.conts)
 	fr.conts = -1
+}
+
+// Suspend hides the open loop, switch or block frame f from Break and
+// Continue until Resume(f), so a jump in code the language places outside
+// f's body though it lowers it while f is open -- a loop's condition or
+// update holding a statement expression -- targets the frame enclosing f.
+func (b *Builder) Suspend(f Frame) { b.suspend(f, true) }
+
+// Resume makes the frame f that Suspend hid a jump target again.
+func (b *Builder) Resume(f Frame) { b.suspend(f, false) }
+
+func (b *Builder) suspend(f Frame, on bool) {
+	fr := b.frame(f)
+	if fr.kind == catchFrame || fr.kind == finallyFrame {
+		panic("flow: Builder.Suspend or Resume on a catch or finally frame")
+	}
+	if fr.suspended == on {
+		panic("flow: Builder.Suspend on a suspended frame, or Resume on one that is not")
+	}
+	fr.suspended = on
+}
+
+// frame returns the open frame f.
+func (b *Builder) frame(f Frame) *frame {
+	i, ok := slices.BinarySearchFunc(b.frames, int32(f), func(fr frame, g int32) int { return int(fr.gen - g) })
+	if !ok {
+		panic("flow: a Frame handle used after its frame was closed")
+	}
+	return &b.frames[i]
 }
 
 // CloseFrame adds every break pending on f to the current fringe and pops f,
 // which must be the innermost open frame.
 func (b *Builder) CloseFrame(f Frame) {
 	fr, i := b.innermost(f)
+	if fr.suspended {
+		panic("flow: Builder.CloseFrame on a suspended frame")
+	}
 	switch fr.kind {
 	case loopFrame:
 		if fr.conts != -1 {
@@ -520,11 +552,14 @@ func (b *Builder) CloseFrame(f Frame) {
 
 // Break moves the current fringe to the break target and empties it. label ""
 // is the innermost loop or switch; otherwise the innermost frame naming
-// label. No match increments Unresolved.
+// label. A suspended frame is passed over. No match increments Unresolved.
 func (b *Builder) Break(label string) {
 	t := toExit - 1
 	for i := int32(len(b.frames)) - 1; i >= 0; i-- {
 		fr := &b.frames[i]
+		if fr.suspended {
+			continue
+		}
 		if label == "" && (fr.kind == loopFrame || fr.kind == switchFrame) ||
 			label != "" && fr.kind != catchFrame && fr.kind != finallyFrame && b.named(fr, label) {
 			t = i
@@ -536,12 +571,12 @@ func (b *Builder) Break(label string) {
 
 // Continue moves the current fringe to a loop's continue target and empties
 // it. label "" is the innermost loop; otherwise the innermost loop naming
-// label. No match increments Unresolved.
+// label. A suspended frame is passed over. No match increments Unresolved.
 func (b *Builder) Continue(label string) {
 	t := toExit - 1
 	for i := int32(len(b.frames)) - 1; i >= 0; i-- {
 		fr := &b.frames[i]
-		if fr.kind == loopFrame && (label == "" || b.named(fr, label)) {
+		if fr.kind == loopFrame && !fr.suspended && (label == "" || b.named(fr, label)) {
 			t = i
 			break
 		}
