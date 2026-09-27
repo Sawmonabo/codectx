@@ -7,12 +7,28 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // Test hooks. They exist so a test can prove behaviour the production
 // constants make unreachable on a fixture -- a list that straddles a part
 // boundary needs either a repository-sized fixture or a smaller part.
+
+// WithDerivedReaders is opts with each reader pool the test left unsized sized
+// as the product sizes it on this machine under the shipped configuration
+// (config.ReadConnections, config.PostingConnections), because Open refuses a
+// store opened without both counts.
+func WithDerivedReaders(opts Options) Options {
+	cfg := config.Defaults()
+	if opts.ReadConnections == 0 {
+		opts.ReadConnections = config.ReadConnections(cfg)
+	}
+	if opts.PostingConnections == 0 {
+		opts.PostingConnections = config.PostingConnections(cfg)
+	}
+	return opts
+}
 
 // SetEdgePartBytes shrinks the edge-stream part size for one test and returns a
 // function that restores it. It is not a user setting: part size bounds a

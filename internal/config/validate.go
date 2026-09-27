@@ -17,9 +17,11 @@ import (
 // negative value is rejected. A RESERVATION (worker counts, batch sizes, queue
 // and memory budgets, connection counts, wire ceilings) is not a limit on the
 // repository at all -- it is how much machine the work is given, it must be
-// positive because a zero-sized batch or a zero-connection reader is a broken
-// reservation rather than an unbounded one, and it never refuses a repository:
-// it serialises and defers the work instead.
+// positive because a zero-sized batch is a broken reservation rather than an
+// unbounded one, and it never refuses a repository: it serialises and defers
+// the work instead. The two counts the machine sizes when they are unset,
+// index.workers and storage.read_connections, take 0 for that and refuse only
+// a negative value.
 func (c Config) validate() error {
 	if c.Version != SchemaVersion {
 		return configInvalid("version is %d; this build understands configuration version %d", c.Version, SchemaVersion)
@@ -41,7 +43,6 @@ func (c Config) validate() error {
 		{"resources.max_source_response_bytes", c.Resources.MaxSourceResponseBytes},
 		{"resources.max_query_text_bytes", int64(c.Resources.MaxQueryTextBytes)},
 		{"resources.max_page_items", int64(c.Resources.MaxPageItems)},
-		{"storage.read_connections", int64(c.Storage.ReadConnections)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
@@ -61,6 +62,9 @@ func (c Config) validate() error {
 	}
 	if c.Index.Workers < 0 {
 		return configInvalid("index.workers is %d; use 0 to choose from available CPUs and reservations", c.Index.Workers)
+	}
+	if c.Storage.ReadConnections < 0 {
+		return configInvalid("storage.read_connections is %d; use 0 to size each reader pool by the work that reads it", c.Storage.ReadConnections)
 	}
 	// Bounds: 0 (or "unlimited") means unlimited and is the default. Only a
 	// negative value is rejected; it is not a third meaning.

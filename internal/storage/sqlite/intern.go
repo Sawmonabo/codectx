@@ -269,8 +269,7 @@ func nextNativeKeyID(id int64) int64 {
 
 // lookupNativeKey walks one key's hash chain. It returns (id, true) for the id
 // whose stored key equals key, and (id, false) for the first free id on the
-// chain -- which is where a writer must place the key and which a reader reads
-// as "this key has never been interned".
+// chain -- which is where the writer must place the key.
 //
 // This is the collision handling ADR-0003 SS2.3 requires: two keys whose
 // digests agree are DETECTED by the string comparison and separated onto

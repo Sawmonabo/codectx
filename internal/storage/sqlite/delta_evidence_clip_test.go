@@ -20,7 +20,7 @@ func TestSealClipsEvidenceToTheConfiguredClip(t *testing.T) {
 	const clip = 3
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, store.Options{MaxEvidencePerFact: clip})
+	s, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{MaxEvidencePerFact: clip}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

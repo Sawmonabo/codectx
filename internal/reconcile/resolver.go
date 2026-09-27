@@ -23,7 +23,8 @@ import (
 
 // AliasStore is the one read the resolver performs: the distinct identities a
 // scoped native key is aliased to by sealed units, ordered by canonical key.
-// *sqlite.Store satisfies it.
+// *sqlite.AliasTable satisfies it: the dependencies' aliases, loaded once per
+// unit from the last commit by Store.DependencyAliases.
 type AliasStore interface {
 	LookupAliases(ctx context.Context, units []model.UnitID, scopeKey, nativeKey string, limit int) ([]sqlite.StoredAlias, error)
 }

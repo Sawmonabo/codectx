@@ -210,7 +210,8 @@ A producer's stream may itself read the store — the dependence applier's
 `Files` is a merge join against `Store.UnitInputs` — and `CarryOver` drains all
 three streams inside its own write transaction on the single writer
 connection. Such a stream therefore takes a reader-pool connection
-(`read_connections`, default 2) once per page of its own scan while the write
+(`read_connections`; by default one per unit built at once plus one per
+query slot) once per page of its own scan while the write
 transaction stays open. WAL readers never wait on the writer, so it cannot
 deadlock, but a saturated reader pool stalls the carry-over and the open write
 transaction blocks every other writer in the process for the length of the

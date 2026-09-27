@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
@@ -64,7 +65,10 @@ func New(t *testing.T, files map[string]string) *Harness {
 	}
 	// The store re-indexes carried lexical documents through the content
 	// store's range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	// The reader pools are sized as the product sizes them on this machine.
+	cfg := config.Defaults()
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{
+		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -170,6 +174,20 @@ type Unit struct {
 // the sorted dependency keys and the unit key over both plus ConfigHash.
 func (h *Harness) Plan(t *testing.T, p provider.Provider, scopeKey string, inputs []string, deps ...model.UnitID) Unit {
 	t.Helper()
+	// The resolver answers from the dependencies' aliases as of the last
+	// commit, exactly as the coordinator's does, so what the harness sealed so
+	// far is committed first.
+	if err := h.Store.Flush(h.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	aliases, err := h.Store.DependencyAliases(h.ctx, deps)
+	if err != nil {
+		t.Fatalf("DependencyAliases: %v", err)
+	}
+	resolver, err := reconcile.New(aliases, h.Repo, deps)
+	if err != nil {
+		t.Fatalf("reconcile.New: %v", err)
+	}
 	d := p.Descriptor()
 	run, err := h.Store.BeginProviderRun(h.ctx, h.Gen, d.ID, d.Version)
 	if err != nil {
@@ -184,10 +202,6 @@ func (h *Harness) Plan(t *testing.T, p provider.Provider, scopeKey string, input
 	spec := model.UnitSpec{ProviderID: d.ID, ProviderVersion: d.Version, ScopeKey: scopeKey, InputHash: hasher.Sum(), DependencyHash: model.DependencyHash(deps)}
 	spec.ID = model.NewUnitID(spec, ConfigHash)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: ConfigHash, OriginRunID: run, SourceBinding: model.SourceBindingVerified, Dependencies: deps}
-	resolver, err := reconcile.New(h.Store, h.Repo, deps)
-	if err != nil {
-		t.Fatalf("reconcile.New: %v", err)
-	}
 	req := provider.UnitRequest{
 		Binding:  model.Binding{RepositoryID: h.Repo, SnapshotID: h.Snapshot.ID, GenerationID: h.Gen},
 		Unit:     spec,
@@ -244,9 +258,14 @@ func (h *Harness) Run(t *testing.T, p provider.Provider, scopeKey string, inputs
 }
 
 // UnitState reports whether the unit exists and in what state; it is how a
-// test proves failed output was discarded rather than left building.
+// test proves failed output was discarded rather than left building. The store
+// answers from the last commit, so the harness commits what it has written
+// first.
 func (h *Harness) UnitState(t *testing.T, id model.UnitID) (model.UnitState, bool) {
 	t.Helper()
+	if err := h.Store.Flush(h.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	state, exists, err := h.Store.UnitState(h.ctx, id)
 	if err != nil {
 		t.Fatalf("UnitState: %v", err)

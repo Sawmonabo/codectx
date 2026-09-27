@@ -31,14 +31,22 @@ import (
 
 // Options are the storage settings of Section 20.1 `[storage]` plus the
 // `[index]` batch bounds the store enforces on unit writes. For the numeric
-// settings zero selects the documented default; no value means unlimited.
+// settings zero selects the documented default; no value means unlimited. The
+// two connection counts have no default: they are derived from the work that
+// reads each pool (config.ReadConnections, config.PostingConnections), which
+// only the caller can see, and Open refuses a store opened without them.
 type Options struct {
-	BusyTimeout     time.Duration // busy_timeout, default 5s
-	ReadConnections int           // read_connections, default 2
-	WriterCacheKiB  int           // writer_cache_kib, default 1 GiB; also the ingestion group bound
-	ReaderCacheKiB  int           // reader_cache_kib, default 4096
-	BatchRecords    int           // index.batch_records, default 1000
-	BatchBytes      int64         // index.batch_bytes, default 4 MiB
+	BusyTimeout time.Duration // busy_timeout, default 5s
+	// ReadConnections sizes the short-read pool: unit states, dependency
+	// aliases and every query's short reads.
+	ReadConnections int
+	// PostingConnections sizes the posting-stream pool, which only a query's
+	// candidate walk reads (OpenPostings).
+	PostingConnections int
+	WriterCacheKiB     int   // writer_cache_kib, default 1 GiB; also the ingestion group bound
+	ReaderCacheKiB     int   // reader_cache_kib, default 4096
+	BatchRecords       int   // index.batch_records, default 1000
+	BatchBytes         int64 // index.batch_bytes, default 4 MiB
 	// MaxJSONBytes bounds every stored JSON column that has no tighter model
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
@@ -153,9 +161,6 @@ func (o Options) withDefaults() Options {
 	if o.BusyTimeout <= 0 {
 		o.BusyTimeout = 5 * time.Second
 	}
-	if o.ReadConnections <= 0 {
-		o.ReadConnections = 2
-	}
 	if o.WriterCacheKiB <= 0 {
 		o.WriterCacheKiB = defaultWriterCacheKiB
 	}
@@ -180,8 +185,9 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// Store is one workspace database: a single writer connection, a small reader
-// pool and a private in-memory connection for query tokenization.
+// Store is one workspace database: a single writer connection, a short-read
+// pool, a posting-stream pool and a private in-memory connection for query
+// tokenization.
 type Store struct {
 	path      string
 	freeBytes func(dir string) (uint64, bool) // the disk measurement a refused write is settled against
@@ -240,6 +246,10 @@ func parseTime(s string) (time.Time, error) {
 func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if engineConfigErr != nil {
 		return nil, engineConfigErr
+	}
+	if opts.ReadConnections <= 0 || opts.PostingConnections <= 0 {
+		return nil, internal(fmt.Sprintf("the store was opened with %d short-read and %d posting-stream connections; the caller derives both (config.ReadConnections, config.PostingConnections)",
+			opts.ReadConnections, opts.PostingConnections))
 	}
 	opts = opts.withDefaults()
 	abs, err := filepath.Abs(path)
@@ -367,7 +377,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// starve the short reads (Match) the same query issues
 	// while the stream is open, which on the shared reader pool would be a
 	// deadlock as soon as two queries ran at once.
-	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections, opts.ReadOnly, immutable)
+	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.PostingConnections, opts.ReadOnly, immutable)
 	if err != nil {
 		s.closeOpened()
 		return nil, err

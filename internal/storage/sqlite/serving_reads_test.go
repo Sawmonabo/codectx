@@ -65,7 +65,7 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 		// A short busy timeout: a read that has to wait out the writer must
 		// fail this test quickly rather than hide inside the default five
 		// seconds.
-		reader, err := store.Open(ctx, path, store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond})
+		reader, err := store.Open(ctx, path, store.WithDerivedReaders(store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond}))
 		if err != nil {
 			t.Fatalf("the reader handle could not be opened beside the writer: %v", err)
 		}
