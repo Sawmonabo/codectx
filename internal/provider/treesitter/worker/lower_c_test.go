@@ -566,6 +566,127 @@ var cShared = []goldenCase{
 		cd:       []string{"1@43 -> h()@46"},
 		du:       []string{"x@11 -> x@24", "x@24 -> 1@43"},
 	},
+	{
+		// C17 §6.8.4.2p4 (a case label may sit anywhere in the switch body)
+		// and §6.10.1 (the group is kept or not at translation time). The
+		// case label inside the #ifdef is nested below another statement of
+		// the body, so its test jumps to its label node. Nodes: x@11, x@24
+		// (the controlling expression, defining the switch value), 1@44 and
+		// 2@65 (the tests in source order, Using it), A@36 (the directive's
+		// Branch, before the first top-level label: no predecessor),
+		// case@39 (the nested label's node), g()@47, h()@68. Succ:
+		// x@24→1→{case@39, 2}; 2→{h(), EXIT}; A→{case@39, h()};
+		// case@39→g()→h()→EXIT. IPDom: 1, 2 → EXIT; A → h(); case@39 →
+		// g() → h(). Frontier walks: 1→case@39 gives case@39, g(), h();
+		// 1→2 gives 2; 2→h() gives h(); A→case@39 gives case@39, g().
+		name:     "a case label inside a preprocessor conditional is reached from its test",
+		protects: "a case label a conditional wraps is still tested in source order and entered at its own label node, and the arm falls into the next case body",
+		mutation: "skip case labels nested in a preprocessor conditional (1@44 and case@39 vanish, and x@24 enters only 2@65)",
+		src:      "void f(int x) { switch (x) {\n#ifdef A\n case 1: g();\n#endif\n case 2: h(); } }",
+		cd: []string{"1@44 -> case@39", "1@44 -> g()@47", "1@44 -> h()@68", "1@44 -> 2@65", "2@65 -> h()@68",
+			"A@36 -> case@39", "A@36 -> g()@47"},
+		du: []string{"x@11 -> x@24", "x@24 -> 1@44", "x@24 -> 2@65"},
+	},
+	{
+		// C17 §6.8.4.2p5: with no matching case label control jumps to the
+		// default label, here inside a loop of the switch body. Nodes: x@11,
+		// n@18, x@31 (the controlling expression), 0@41 (the test), n--@51
+		// (the while condition: one Branch node defining n), default@58
+		// (the nested label's node), g()@67. Succ: x@31→0→{n--, default@58
+		// (the no-match path's jump)}; n--→{default@58, EXIT};
+		// default@58→g()→n--. IPDom: 0 → n--; default@58 → g() → n-- →
+		// EXIT. Frontier walks: 0→default@58 gives default@58, g();
+		// n--→default@58 gives default@58, g(), n--.
+		name:     "a nested default label takes the no-match path",
+		protects: "when the default label sits inside a loop of the switch body, a failed test jumps into the loop at the label",
+		mutation: "let the no-match path leave the switch (adds 0@41 -> n--@51, loses 0@41 -> default@58 and 0@41 -> g()@67)",
+		src:      "void f(int x, int n) { switch (x) { case 0: while (n--) { default: g(); } } }",
+		cd: []string{"0@41 -> default@58", "0@41 -> g()@67", "n--@51 -> default@58", "n--@51 -> g()@67",
+			"n--@51 -> n--@51"},
+		du: []string{"x@11 -> x@31", "x@31 -> 0@41", "n@18 -> n--@51", "n--@51 -> n--@51"},
+	},
+	{
+		// GNU C extension, Extended Asm: the input operands are read by the
+		// assembly statement. Nodes: x@10, asm("" : : "r"(x))@15 (a Stmt
+		// node Using x), return x;@35.
+		name:     "a plain assembly statement reads its input operands",
+		protects: "an asm statement without goto labels is one node whose input operand expressions are its reads",
+		mutation: "read no operand of an assembly statement (loses x@10 -> asm(\"\" : : \"r\"(x))@15)",
+		src:      "int f(int x) { asm(\"\" : : \"r\"(x)); return x; }",
+		du:       []string{"x@10 -> asm(\"\" : : \"r\"(x))@15", "x@10 -> return x;@35"},
+	},
+	{
+		// GNU C extension, Extended Asm, Output Operands: an output operand
+		// is written by the assembly, a write through its expression, so the
+		// node Uses and may-defines x. Nodes: x@10, asm("" : "=r"(x))@15,
+		// return x;@34, which pairs with the may-definition and with x@10
+		// behind it.
+		name:     "an assembly output operand may-defines its variable",
+		protects: "a variable an asm statement writes is may-defined there, so a later read sees the write",
+		mutation: "read an output operand as an input (loses asm(\"\" : \"=r\"(x))@15 -> return x;@34)",
+		src:      "int f(int x) { asm(\"\" : \"=r\"(x)); return x; }",
+		du: []string{"x@10 -> asm(\"\" : \"=r\"(x))@15", "x@10 -> return x;@34",
+			"asm(\"\" : \"=r\"(x))@15 -> return x;@34"},
+	},
+	{
+		// C17 §6.10.1: #if tests an expression, #elif tests another when the
+		// ones before failed, #ifndef tests a macro name; with no #else a
+		// build may keep no group. Nodes: x@10, A@19 (Branch), x = 1@23,
+		// B@36 (the #elif's Branch, on A's false path), x = 2@40, C@62 (the
+		// #ifndef's Branch spanning the name), x = 3@66, return x;@82. Succ:
+		// A→{x = 1, B}; B→{x = 2, C}; x = 1, x = 2→C; C→{x = 3, return x};
+		// x = 3→return x. IPDom: A, B → C → return x.
+		name:     "#if, #elif and #ifndef each branch on their condition",
+		protects: "an #elif is a decision on its predecessor's false path, and each conditional without #else keeps a path that runs none of its groups",
+		mutation: "lower #elif as an arm with no condition of its own (B@36 vanishes, A@19 controls x = 2@40, and loses x@10 -> return x;@82)",
+		src:      "int f(int x) {\n#if A\n  x = 1;\n#elif B\n  x = 2;\n#endif\n#ifndef C\n  x = 3;\n#endif\n  return x;\n}",
+		cd:       []string{"A@19 -> x = 1@23", "A@19 -> B@36", "B@36 -> x = 2@40", "C@62 -> x = 3@66"},
+		du: []string{"x@10 -> return x;@82", "x = 1@23 -> return x;@82", "x = 2@40 -> return x;@82",
+			"x = 3@66 -> return x;@82"},
+	},
+	{
+		// C17 §6.10.1p4: a directive's identifiers are macro names, not
+		// variables. Nodes: x@10, x@19 (the #if's Branch, reading nothing),
+		// g()@23, return x;@37.
+		name:     "a directive's condition reads no variable",
+		protects: "a name in an #if condition that matches a local is no read of the local",
+		mutation: "read the directive's condition as an expression (adds x@10 -> x@19)",
+		src:      "int f(int x) {\n#if x\n  g();\n#endif\n  return x;\n}",
+		cd:       []string{"x@19 -> g()@23"},
+		du:       []string{"x@10 -> return x;@37"},
+	},
+	{
+		// C17 §6.10.3: a #define is a translation-time directive and runs
+		// nothing. Nodes: x@10, x@19 (Branch), return 0;@39; the #define
+		// inside the if makes no node, so the Branch controls nothing.
+		name:     "a #define inside a body makes no node",
+		protects: "preprocessor lines other than conditionals are not statements",
+		mutation: "lower a #define as a plain Stmt node (adds x@19 -> #define Y 1@24)",
+		src:      "int f(int x) { if (x) {\n#define Y 1\n } return 0; }",
+		du:       []string{"x@10 -> x@19"},
+	},
+	{
+		// C17 §6.10.1p6 and §6.7.6.3: the #ifdef group declares x as a
+		// function, no variable; the empty group a build takes without A
+		// declares nothing, so after the directive x keeps the parameter's
+		// binding. Nodes: x@10, A@24 (Branch, both edges to the return),
+		// return x;@49.
+		name:     "a prototype only one arm declares leaves the earlier binding after the directive",
+		protects: "a name the arms bind only as no variable, and some build leaves unbound, still names the variable it named before the directive",
+		mutation: "make the name no variable after the directive when any arm binds it as none (loses x@10 -> return x;@49)",
+		src:      "int f(int x) { {\n#ifdef A\n  int x(int);\n#endif\n  return x; } }",
+		du:       []string{"x@10 -> return x;@49"},
+	},
+	{
+		// C17 §6.7.2.1 (a structure declaration) and §6.7.8 (typedef)
+		// declare types and run nothing; [class.pre] and [dcl.typedef]
+		// alike. Nodes: x@10, x@19 (Branch), return 0;@62.
+		name:     "a structure or typedef declaration in a body makes no node",
+		protects: "type declarations inside a function are not statements",
+		mutation: "lower a struct specifier or type definition as a plain Stmt node (adds x@19 -> struct T { int a; }@24 or x@19 -> typedef int U;@47)",
+		src:      "int f(int x) { if (x) { struct T { int a; }; typedef int U; } return 0; }",
+		du:       []string{"x@10 -> x@19"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
@@ -781,6 +902,46 @@ func TestCLoweringGolden(t *testing.T) {
 			cd:       []string{"a@30 -> b@35"},
 			du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
 				"r = a ?: b@26 -> return r;@38"},
+		},
+		{
+			// GNU C extension, Nested Functions: a nested function is its
+			// own function, and the enclosing one sees its definition as the
+			// node that creates it, which reads the variables it uses. Nodes:
+			// x@10, int g(void) { return x + 1; }@15 (the creating node,
+			// Using x), return g();@45.
+			name:     "a nested function's creating node reads its captures",
+			protects: "the enclosing function sees a nested definition as one node whose reads are the enclosing variables the body uses",
+			mutation: "give the creating node no reads (loses x@10 -> int g(void) { return x + 1; }@15)",
+			src:      "int f(int x) { int g(void) { return x + 1; } return g(); }",
+			du:       []string{"x@10 -> int g(void) { return x + 1; }@15"},
+		},
+		{
+			// GNU C extension, Nested Functions: the nested function reaches
+			// enclosing variables by reference, so its write to x may change
+			// the x f reads later; the may-definition sits on the creating
+			// node. Nodes: x@10, int g(void) { return x++; }@15 (Uses and
+			// may-defines x), g();@43, return x;@48.
+			name:     "a nested function's write is a may-definition on its creating node",
+			protects: "a read after a nested function that writes an enclosing variable sees the write the calls may make",
+			mutation: "treat the nested function's accesses as by copy (loses int g(void) { return x++; }@15 -> return x;@48)",
+			src:      "int f(int x) { int g(void) { return x++; } g(); return x; }",
+			du: []string{"x@10 -> int g(void) { return x++; }@15", "x@10 -> return x;@48",
+				"int g(void) { return x++; }@15 -> return x;@48"},
+		},
+		{
+			// Derived against an assumed recovery: the stray `]` is taken to
+			// become an ERROR node of its own inside the if's compound
+			// statement. No C statement kind the lowering does not name
+			// reaches its default branch, so an ERROR node is the only way
+			// to exercise it. Nodes: x@11, x@20 (Branch), ]@25 (a plain Stmt
+			// node spanning the ERROR node), h()@29.
+			name:      "an unknown node kind is a plain statement",
+			protects:  "a node of a kind the lowering does not name, an error-recovered one included, still makes a Stmt node on its path",
+			mutation:  "make no node for an unnamed kind (loses x@20 -> ]@25)",
+			src:       "void f(int x) { if (x) { ] } h(); }",
+			recovered: true,
+			cd:        []string{"x@20 -> ]@25"},
+			du:        []string{"x@11 -> x@20"},
 		},
 	}...))
 	runGolden(t, "cpp", cShared)
