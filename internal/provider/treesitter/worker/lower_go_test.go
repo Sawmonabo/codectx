@@ -433,5 +433,264 @@ func TestGoLoweringGolden(t *testing.T) {
 				"xs@24 -> xs@142", "xs@142 -> range@136", "xs@142 -> n@132", "n, y = y, n@68 -> y++@147",
 				"y++@147 -> y++@147", "n, y = y, n@68 -> return y + n@154", "y++@147 -> return y + n@154"},
 		},
+		{
+			// Go spec, Method declarations: the receiver is declared in the
+			// function block, as a parameter is. Nodes: s@16 (the receiver,
+			// before the parameters), v@24, s.n = v@33 (Uses s and v,
+			// may-defines s). Straight line.
+			name:     "a method's receiver is a node defining it",
+			protects: "a read of the receiver in a method body pairs with the receiver's own definition",
+			mutation: "lower no node for the receiver (loses s@16 -> s.n = v@33)",
+			src:      "package p\nfunc (s *S) f(v int) { s.n = v }",
+			du:       []string{"s@16 -> s.n = v@33", "v@24 -> s.n = v@33"},
+		},
+		{
+			// Go spec, Function declarations and Return statements: a named result
+			// is declared in the function block, and a return with no operands
+			// returns the results' current values. Nodes: c@17, r@26 (the named
+			// result), c@38 (condition), r = 1@42, return@51. Succ: c@38 →
+			// {r = 1, return}; r = 1 → return. IPDom: c@38, r = 1 → return.
+			name:     "a bare return uses every named result",
+			protects: "a bare return depends on each definition of a named result that reaches it, the result's own declaration included",
+			mutation: "lower no node for a named result (loses r@26 -> return@51), or give a bare return no uses (loses both pairs into return@51)",
+			src:      "package p\nfunc f(c bool) (r int) { if c { r = 1 }; return }",
+			cd:       []string{"c@38 -> r = 1@42"},
+			du:       []string{"c@17 -> c@38", "r@26 -> return@51", "r = 1@42 -> return@51"},
+		},
+		{
+			// Go spec, Variable declarations: a var declaration of one spec, and a
+			// parenthesized list of specs, each initialized in order. Nodes:
+			// a@17, var x = a@30 (the declaration, one spec), y = x@47 and
+			// z = y@54 (one node per spec of the list), return z@64. Straight
+			// line.
+			name:     "a var declaration of one spec spans the declaration, and a spec list makes a node per spec",
+			protects: "each var spec defines its own names at its own node, so a later spec reads an earlier one",
+			mutation: "span a one-spec declaration by its spec (renders x = a@34), or lower a spec list as one node (y = x@47 and z = y@54 merge)",
+			src:      "package p\nfunc f(a int) int { var x = a; var ( y = x; z = y; ); return z }",
+			du: []string{"a@17 -> var x = a@30", "var x = a@30 -> y = x@47", "y = x@47 -> z = y@54",
+				"z = y@54 -> return z@64"},
+		},
+		{
+			// Go spec, Send statements: both the channel and the value are
+			// evaluated before communication begins. Nodes: c@17, x@29,
+			// c <- x@38 (one simple-statement node).
+			name:     "a send statement outside a select is one node reading channel and value",
+			protects: "a send depends on the channel and the value it sends",
+			mutation: "lower a send statement with no uses (loses both pairs)",
+			src:      "package p\nfunc f(c chan int, x int) { c <- x }",
+			du:       []string{"c@17 -> c <- x@38", "x@29 -> c <- x@38"},
+		},
+		{
+			// Go spec, Assignment statements: every operand is evaluated before any
+			// target is assigned. Targets: a (redeclared, reads nothing: 1) and b
+			// (new, reads a). b is read by no other target and goes first, so
+			// its node reads the old a. Nodes: a@17, b@33, a@30, return
+			// a + b@44.
+			name:     "an acyclic multi-assignment orders its target nodes so none reads an earlier one's write",
+			protects: "a target whose value reads another target's variable sees that variable's value from before the statement",
+			mutation: "emit the target nodes in source order (a@30 -> b@33 replaces a@17 -> b@33)",
+			src:      "package p\nfunc f(a int) int { a, b := 1, a; return a + b }",
+			du:       []string{"a@17 -> b@33", "a@30 -> return a + b@44", "b@33 -> return a + b@44"},
+		},
+		{
+			// Go spec, Assignment statements: a multi-valued call's results are
+			// assigned to the targets in order. Nodes: a@17, x@30 and y@33
+			// (each Uses the whole right side, g(a): a), return x + y@44.
+			name:     "a multi-value call is read by every target node",
+			protects: "each target of a multi-value call depends on the call's operands",
+			mutation: "give the call's reads to the first target node only (loses a@17 -> y@33)",
+			src:      "package p\nfunc f(a int) int { x, y := g(a); return x + y }",
+			du:       []string{"a@17 -> x@30", "a@17 -> y@33", "x@30 -> return x + y@44", "y@33 -> return x + y@44"},
+		},
+		{
+			// Go spec, Assignment statements: `_` and s.f are not variable
+			// targets. The values paired with them (c, and the old b) and the
+			// field target's operand s are read by the statement's first node,
+			// a@41; b@52 is the last node and may-defines s. Nodes: s@17,
+			// a@22, b@25, c@28, a@41, b@52, return a + b@68. Straight line.
+			name:     "a blank or field target's reads ride on the statement's first node",
+			protects: "the operands and values of targets that name no variable are read once, before any target is written",
+			mutation: "carry a non-variable target's operands and value on no node (loses c@28, s@17 and b@25 -> a@41), or its may-definition on the first node (loses s@17 -> b@52)",
+			src:      "package p\nfunc f(s S, a, b, c int) int { a, _, s.f, b = 1, c, b, 2; return a + b }",
+			du: []string{"c@28 -> a@41", "s@17 -> a@41", "b@25 -> a@41", "s@17 -> b@52",
+				"a@41 -> return a + b@68", "b@52 -> return a + b@68"},
+		},
+		{
+			// Go spec, Assignment statements: the field write s.f is done when the
+			// statement's last target is written. Nodes: s@17, a@22, b@25, a@41
+			// (the first node: Uses s, the field target's operand, and b, its
+			// own value), b@44 (the last node: defines b, may-defines s),
+			// return s@57.
+			name:     "a statement's write-through may-definition rides on its last node",
+			protects: "a use after a multi-assignment that writes a field sees the write at the node where every target is written",
+			mutation: "put the statement's write-through may-definitions on its first node (a@41 -> return s@57 replaces b@44 -> return s@57)",
+			src:      "package p\nfunc f(s S, a, b int) S { s.f, a, b = 1, b, 2; return s }",
+			du: []string{"s@17 -> a@41", "b@25 -> a@41", "s@17 -> b@44", "b@44 -> return s@57",
+				"s@17 -> return s@57"},
+		},
+		{
+			// Go spec, Address operators and Assignment statements: *p = 2 writes
+			// through p. Nodes: x@17, p := &x@30 (Uses x, defines p,
+			// may-defines x), *p = 2@39 (Uses p, may-defines p, not x),
+			// g(p)@47, return x@53. The write to x through p is given up.
+			name:     "an indirect write may-defines the pointer, not what it points to",
+			protects: "a write through a pointer reaches later reads of the pointer and no read of the pointee",
+			mutation: "may-define the pointee's variable too (adds *p = 2@39 -> return x@53), or not the pointer (loses *p = 2@39 -> g(p)@47)",
+			src:      "package p\nfunc f(x int) int { p := &x; *p = 2; g(p); return x }",
+			du: []string{"x@17 -> p := &x@30", "p := &x@30 -> *p = 2@39", "p := &x@30 -> g(p)@47",
+				"*p = 2@39 -> g(p)@47", "x@17 -> return x@53", "p := &x@30 -> return x@53"},
+		},
+		{
+			// Go spec, IncDec statements: s.f++ is s.f += 1, a write through s.
+			// Nodes: s@17, s.f++@26 (Uses s, may-defines s), return s@33.
+			name:     "a field increment may-defines its base",
+			protects: "a use after x.f++ sees the increment and the base's earlier definition",
+			mutation: "make x.f++ define its base killing (loses s@17 -> return s@33), or define nothing (loses s.f++@26 -> return s@33)",
+			src:      "package p\nfunc f(s S) S { s.f++; return s }",
+			du:       []string{"s@17 -> s.f++@26", "s.f++@26 -> return s@33", "s@17 -> return s@33"},
+		},
+		{
+			// lower.go, May-definitions: a use pairs with the killing definition
+			// behind a chain of may-definitions and with the nearest one only.
+			// Nodes: s@17, s.f = 1@26, s.g = 2@35 (each Uses s, may-defines
+			// s), return s@44. s.g = 2 follows s.f = 1 on the only path, so
+			// s.f = 1 does not pair with the return.
+			name:     "a use pairs with the nearest may-definition and the killing one behind the chain",
+			protects: "a chain of field writes yields only the nearest write and the base's definition at a later use",
+			mutation: "pair a use with every may-definition reaching it (adds s.f = 1@26 -> return s@44)",
+			src:      "package p\nfunc f(s S) S { s.f = 1; s.g = 2; return s }",
+			du: []string{"s@17 -> s.f = 1@26", "s@17 -> s.g = 2@35", "s.f = 1@26 -> s.g = 2@35",
+				"s.g = 2@35 -> return s@44", "s@17 -> return s@44"},
+		},
+		{
+			// Go spec, Address operators: &s.f and &a[0] take the address of part
+			// of s and a. Nodes: s@17, a@22, g(&s.f)@33 (Uses s, may-defines
+			// s), h(&a[0])@42 (Uses a, may-defines a), k(s, a)@52.
+			name:     "taking the address of a field or element may-defines its base",
+			protects: "a use after &x.f or &a[i] is passed on sees the write the callee may make",
+			mutation: "take the base of &x.f or &a[i] to be no variable (loses g(&s.f)@33 -> k(s, a)@52 or h(&a[0])@42 -> k(s, a)@52)",
+			src:      "package p\nfunc f(s S, a []int) { g(&s.f); h(&a[0]); k(s, a) }",
+			du: []string{"s@17 -> g(&s.f)@33", "a@22 -> h(&a[0])@42", "s@17 -> k(s, a)@52",
+				"g(&s.f)@33 -> k(s, a)@52", "a@22 -> k(s, a)@52", "h(&a[0])@42 -> k(s, a)@52"},
+		},
+		{
+			// Go spec, Short variable declarations: the unpaired right side g(&z)
+			// is evaluated once, before x and y are assigned. Nodes: z := 0@25,
+			// x@33 (the first node: Uses z, may-defines z, defines x), y@36
+			// (Uses z, which it reads after x@33's may-definition by position:
+			// the sound over-approximation of reading it once), return
+			// x + y + z@48.
+			name:     "an address taken in an unpaired right side lands on the first node",
+			protects: "the may-definition of an address taken by a multi-value call is attached to the statement's first node, never its last",
+			mutation: "put an unpaired right side's may-definitions on the last node (loses x@33 -> y@36)",
+			src:      "package p\nfunc f() int { z := 0; x, y := g(&z); return x + y + z }",
+			du: []string{"z := 0@25 -> x@33", "z := 0@25 -> y@36", "x@33 -> y@36", "x@33 -> return x + y + z@48",
+				"y@36 -> return x + y + z@48", "z := 0@25 -> return x + y + z@48"},
+		},
+		{
+			// Go spec, Constant declarations, Type declarations and Declarations and
+			// scope: const x and type y shadow the parameters in the inner block
+			// and make no node. Nodes: x@17, y@20, g(x, y)@60 (Uses nothing),
+			// return x + y@71.
+			name:     "a const or type declaration makes no node and shadows",
+			protects: "a name a const or type declaration rebinds is no variable read in its block",
+			mutation: "let a const or type declaration leave the enclosing binding visible (adds x@17 -> g(x, y)@60 and y@20 -> g(x, y)@60)",
+			src:      "package p\nfunc f(x, y int) int { { const x = 2; type y int; g(x, y) }; return x + y }",
+			du:       []string{"x@17 -> return x + y@71", "y@20 -> return x + y@71"},
+		},
+		{
+			// Go spec, Go statements and Defer statements: the function value and
+			// parameters are evaluated where the statement executes. Nodes:
+			// x@17, go g(x)@26, defer h(x)@35.
+			name:     "go and defer read their call's arguments",
+			protects: "a go or defer statement depends on the arguments it evaluates",
+			mutation: "give a go or defer statement no uses (loses x@17 -> go g(x)@26 or x@17 -> defer h(x)@35)",
+			src:      "package p\nfunc f(x int) { go g(x); defer h(x) }",
+			du:       []string{"x@17 -> go g(x)@26", "x@17 -> defer h(x)@35"},
+		},
+		{
+			// Go spec, Go statements, Defer statements and Function literals: the
+			// literal may run at any later point, so its writes are
+			// may-definitions of its statement's node. Nodes: x := 0@25,
+			// go func() { x = 1 }()@33 (may-defines x), defer func() { x++
+			// }()@56 (Uses x, may-defines x), return x@80.
+			name:     "a go or defer literal's writes are may-definitions of its node",
+			protects: "a use after a go or defer whose literal writes a variable sees the write and the definition before it",
+			mutation: "record a go or defer literal's writes as no definition (loses go func() { x = 1 }()@33 -> defer func() { x++ }()@56 and defer func() { x++ }()@56 -> return x@80), or as killing (loses x := 0@25 -> return x@80)",
+			src:      "package p\nfunc f() int { x := 0; go func() { x = 1 }(); defer func() { x++ }(); return x }",
+			du: []string{"x := 0@25 -> go func() { x = 1 }()@33", "go func() { x = 1 }()@33 -> defer func() { x++ }()@56",
+				"x := 0@25 -> defer func() { x++ }()@56", "defer func() { x++ }()@56 -> return x@80",
+				"x := 0@25 -> return x@80"},
+		},
+		{
+			// Go spec, Declarations and scope and Short variable declarations: the
+			// if body's := declares a new x after reading the parameter x.
+			// Nodes: x@17, true@33 (condition), x := x + 1@40, g(x)@52, return
+			// x@60. Succ: true → {x := x + 1, return x}; g(x) → return x.
+			name:     "an inner-block := shadows and reads the outer name first",
+			protects: "a short declaration in an inner block reads the enclosing variable and defines a new one no later outer use sees",
+			mutation: "declare a := target before reading its right side (loses x@17 -> x := x + 1@40), or bind it in the enclosing block (adds x := x + 1@40 -> return x@60)",
+			src:      "package p\nfunc f(x int) int { if true { x := x + 1; g(x) }; return x }",
+			cd:       []string{"true@33 -> x := x + 1@40", "true@33 -> g(x)@52"},
+			du:       []string{"x@17 -> x := x + 1@40", "x := x + 1@40 -> g(x)@52", "x@17 -> return x@60"},
+		},
+		{
+			// Go spec, Composite literals: a map key is an expression. Nodes:
+			// k@17, return map[int]int{k: 1}@38.
+			name:     "a composite-literal key naming a variable is a use",
+			protects: "a map literal depends on the variable its key names",
+			mutation: "skip keyed elements' keys in collect (loses k@17 -> return map[int]int{k: 1}@38)",
+			src:      "package p\nfunc f(k int) map[int]int { return map[int]int{k: 1} }",
+			du:       []string{"k@17 -> return map[int]int{k: 1}@38"},
+		},
+		{
+			// Go spec, Function literals and Declarations and scope: the literal's
+			// parameter x shadows f's. Nodes: x@17, h := func(x int) int {
+			// return x }@30 (Uses nothing, defines h), return h(1)@65.
+			name:     "a function literal's own parameters shadow enclosing names",
+			protects: "a literal reading its own parameter captures no enclosing variable of that name",
+			mutation: "resolve a literal's reads without its parameters shadowing (adds x@17 -> h := func(x int) int { return x }@30)",
+			src:      "package p\nfunc f(x int) int { h := func(x int) int { return x }; return h(1) }",
+			du:       []string{"h := func(x int) int { return x }@30 -> return h(1)@65"},
+		},
+		{
+			// Go spec, Function literals: a literal nested in a literal shares the
+			// enclosing function's variables. Nodes: y@17, h := func() func()
+			// int { return func() int { return y } }@30 (Uses y), return
+			// h()()@89.
+			name:     "a nested literal's captures reach the outer creating node",
+			protects: "the node creating a literal depends on every enclosing variable a literal nested in it reads",
+			mutation: "stop capture resolution at a nested literal (loses y@17 -> h := func() func() int { return func() int { return y } }@30)",
+			src:      "package p\nfunc f(y int) int { h := func() func() int { return func() int { return y } }; return h()() }",
+			du: []string{"y@17 -> h := func() func() int { return func() int { return y } }@30",
+				"h := func() func() int { return func() int { return y } }@30 -> return h()()@89"},
+		},
+		{
+			// Go spec, Function literals: the literal writes s through a field, i
+			// by ++ and a through &a[0]. Nodes: s@17, a@22, i := 0@37, h :=
+			// func() { s.f = 1; i++; g(&a[0]) }@45 (Uses s, i and a,
+			// may-defines each, defines h), h()@85, g(s)@90, g(a)@96, return
+			// i@102.
+			name:     "a literal's field, increment and address writes are may-definitions at its creation",
+			protects: "a use after a literal writing an enclosing variable by a field, ++ or & sees the creating node",
+			mutation: "record a literal's field write, ++ or element address as a use only (loses h := ...@45 -> g(s)@90, -> return i@102 or -> g(a)@96)",
+			src:      "package p\nfunc f(s S, a []int) int { i := 0; h := func() { s.f = 1; i++; g(&a[0]) }; h(); g(s); g(a); return i }",
+			du: []string{"s@17 -> h := func() { s.f = 1; i++; g(&a[0]) }@45", "a@22 -> h := func() { s.f = 1; i++; g(&a[0]) }@45",
+				"i := 0@37 -> h := func() { s.f = 1; i++; g(&a[0]) }@45", "h := func() { s.f = 1; i++; g(&a[0]) }@45 -> h()@85",
+				"h := func() { s.f = 1; i++; g(&a[0]) }@45 -> g(s)@90", "s@17 -> g(s)@90",
+				"h := func() { s.f = 1; i++; g(&a[0]) }@45 -> g(a)@96", "a@22 -> g(a)@96",
+				"h := func() { s.f = 1; i++; g(&a[0]) }@45 -> return i@102", "i := 0@37 -> return i@102"},
+		},
+		{
+			// Go spec, Function literals: the literal only writes n. Nodes:
+			// n := 0@25, h := func() { n = 1 }@33 (may-defines n, a χ that
+			// reads n's prior version), h()@56, return n@61.
+			name:     "a literal that only writes a variable still pairs at its creation",
+			protects: "the creating node of a write-only literal pairs with the definitions it may leave in place",
+			mutation: "pair a creating node only with the variables its literal reads (loses n := 0@25 -> h := func() { n = 1 }@33)",
+			src:      "package p\nfunc f() int { n := 0; h := func() { n = 1 }; h(); return n }",
+			du: []string{"n := 0@25 -> h := func() { n = 1 }@33", "h := func() { n = 1 }@33 -> h()@56",
+				"h := func() { n = 1 }@33 -> return n@61", "n := 0@25 -> return n@61"},
+		},
 	})
 }
