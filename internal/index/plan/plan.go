@@ -146,10 +146,13 @@ type Plan struct {
 	// heap (Section 6), exactly as a workspace unit's membership already is.
 	// A hand-built Plan may leave it nil, which is a plan that runs nothing.
 	//
-	// It is re-iterable, it must not be called after Plan.Close, and the
-	// order it answers is byte for byte the order the in-heap list answered:
-	// the sort key is (the provider's position in Selection.Active, arrival
-	// sequence), so every unit identity and every digest is unchanged.
+	// It is re-iterable and must not be called after Plan.Close. Each
+	// provider's units are one contiguous stretch, in Selection.Active order,
+	// and a file-invalidated provider's stretch runs largest file first by
+	// source bytes, the manifest walk's arrival breaking a tie: a parse
+	// provider's longest file then starts first rather than last, which is
+	// what bounds the stage's tail (ADR-0012 decision 5, "Scheduling"). Order
+	// is not identity: no unit identity or digest depends on it.
 	Units func(yield func(Unit) error) error
 	// Reuse maps Key(providerID, scopeKey) to the sealed unit of the previous
 	// generation whose identity the fresh plan reproduces exactly. Those
@@ -403,9 +406,8 @@ type builder struct {
 	// buffer and are merged once in emit; Plan.Units then streams the merged
 	// run, so the executor's peak is one batch of units and not the plan's.
 	allUnits *pagination.ExternalSort[fileUnitRecord]
-	// unitSeq is the arrival counter that, with the provider's position in
-	// Selection.Active, keys allUnits. Sorting by (position, arrival) is what
-	// reproduces the in-heap concatenation exactly.
+	// unitSeq is the arrival counter that breaks a tie in allUnits' key
+	// (compareUnit), so the merged order is deterministic.
 	unitSeq int64
 	// providerOrder is each active provider's position in Selection.Active,
 	// which is the dependency order Plan.Units answers in.
@@ -648,7 +650,7 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 			b.plan.Reuse[Key(fp.id, scopeKey)] = spec.ID
 			continue
 		}
-		rec := fileUnitRecord{Order: b.providerOrder[fp.id], Seq: b.unitSeq,
+		rec := fileUnitRecord{Order: b.providerOrder[fp.id], Bytes: fv.Size, Seq: b.unitSeq,
 			ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey,
 			FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}
 		if len(u.DependsOn) == 1 {
@@ -799,12 +801,11 @@ func (b *builder) emit(ctx context.Context) error {
 // unitSequence is Plan.Units: one pass that interleaves the merged file-unit
 // run with the semantic units held in heap, in Selection.Active order.
 //
-// It reproduces the concatenation it replaced byte for byte. A provider is
-// either file-invalidated or larger-scoped and never both (classifyProviders
-// branches on InvalidationScope), so each position in the order is served by
-// exactly one of the two sources: the run's records for that position, in
-// arrival order, or that provider's bounded semantic list. Peak is one unit,
-// plus the run's own read block.
+// A provider is either file-invalidated or larger-scoped and never both
+// (classifyProviders branches on InvalidationScope), so each position in the
+// order is served by exactly one of the two sources: the run's records for
+// that position, in compareUnit's order, or that provider's bounded semantic
+// list. Peak is one unit, plus the run's own read block.
 func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) func(yield func(Unit) error) error {
 	return func(yield func(Unit) error) error {
 		next := 0
@@ -1096,10 +1097,11 @@ func compareInput(a, b model.UnitInput) int { return compareID(a.FileID, b.FileI
 // and fail the plan outright. Semantic units are never spilled for exactly
 // that reason; their lists are bounded by the scope count and stay in heap.
 type fileUnitRecord struct {
-	// Order is the provider's position in Selection.Active and Seq its arrival
-	// in the manifest walk. Together they are the sort key, and sorting on them
-	// reproduces the order the in-heap per-provider lists were concatenated in.
+	// Order is the provider's position in Selection.Active, Bytes the file's
+	// source bytes and Seq its arrival in the manifest walk: the sort key
+	// (compareUnit).
 	Order int   `json:"o"`
+	Bytes int64 `json:"b"`
 	Seq   int64 `json:"q"`
 
 	ProviderID      string `json:"p"`
@@ -1156,14 +1158,21 @@ func sizeOfUnit(r fileUnitRecord) int64 {
 		len(r.FileID)+len(r.ContentHash)+len(r.DependsOn)) + overhead
 }
 
-// compareUnit orders the unit sort by (provider position, arrival), which is
-// the concatenation order Plan.Units answers in. Every pair differs in Seq --
-// it is a per-plan counter incremented once per record -- so no tie is
-// reachable and the merge needs no stable-sort guarantee to be deterministic.
+// compareUnit orders the unit sort by provider position, then source bytes
+// descending, then arrival: the order Plan.Units answers in. Position first
+// keeps each provider one contiguous stretch in dependency order; bytes
+// descending is largest-first within it. Every pair differs in Seq -- it is a
+// per-plan counter incremented once per record -- so no tie is reachable and
+// the merge needs no stable-sort guarantee to be deterministic.
 func compareUnit(a, b fileUnitRecord) int {
 	switch {
 	case a.Order != b.Order:
 		if a.Order < b.Order {
+			return -1
+		}
+		return 1
+	case a.Bytes != b.Bytes:
+		if a.Bytes > b.Bytes {
 			return -1
 		}
 		return 1
