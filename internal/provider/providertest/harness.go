@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -93,7 +95,9 @@ func New(t *testing.T, files map[string]string) *Harness {
 	slices.Sort(paths)
 	manifest := model.NewHasher("providertest-manifest")
 	var total uint64
+	var census tslang.Census
 	for _, p := range paths {
+		census.Add(p)
 		content := files[p]
 		abs := filepath.Join(repoDir, filepath.FromSlash(p))
 		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
@@ -119,7 +123,16 @@ func New(t *testing.T, files map[string]string) *Harness {
 	h.Snapshot = model.Snapshot{
 		ID: model.NewSnapshotID(h.Repo, "", policyHash, manifest.Sum()), RepositoryID: h.Repo,
 		CaptureConsistency: model.CaptureOperatorFrozen, SourcePolicyHash: policyHash,
-		FileCount: uint64(len(paths)), SourceBytes: total, ManifestHash: manifest.Sum(), CreatedAt: time.Now().UTC(),
+		FileCount: uint64(len(paths)), SourceBytes: total, CUnits: census.C, CPPUnits: census.CPP,
+		ManifestHash: manifest.Sum(), CreatedAt: time.Now().UTC(),
+	}
+	// Each row is tagged as the capture tags it: by its path, and a header by
+	// the snapshot's census.
+	tag := lang.For(h.Snapshot)
+	for _, p := range paths {
+		fv := h.files[p]
+		fv.Language = tag.Of(p)
+		h.files[p] = fv
 	}
 	err = store.PutSnapshot(ctx, h.Snapshot, func(yield func(model.FileVersion) error) error {
 		for _, p := range paths {
