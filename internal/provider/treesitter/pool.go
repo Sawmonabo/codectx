@@ -192,11 +192,15 @@ type pool struct {
 	// inFlight counts the parses holding an increment, and maxInFlight is the
 	// most that ever did at once.
 	inFlight, maxInFlight int
-	// workerCPUMS sums the processor time of every reaped worker;
-	// cpuUnsampled records that one of them was not measured, which makes
-	// the sum unavailable.
+	// workerCPUMS sums the processor time of every reaped worker, and
+	// cpuUnsampled counts the reaped workers that were not measured, any one
+	// of which makes the sum unavailable. It is a count so a stage can tell
+	// whether one of its own workers was unmeasured.
 	workerCPUMS  int64
-	cpuUnsampled bool
+	cpuUnsampled uint64
+	// windows are the open stages' measurement windows (see stageWindow),
+	// bounded by the stages open at once.
+	windows map[*stageWindow]struct{}
 	// unmeasured counts the files whose Done carried no need, and
 	// modelFailures the model reads and encodings that failed.
 	unmeasured, modelFailures uint64
@@ -390,7 +394,7 @@ func workerEnv() []string {
 func newPool(runner *process.Runner, admit *admission.Ledger, cmd WorkerCommand, dir string, max int,
 	rederive func(workerResidentBytes int64)) *pool {
 	p := &pool{runner: runner, admission: admit, cmd: cmd, dir: dir, max: max, rederive: rederive,
-		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{},
+		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{}, windows: map[*stageWindow]struct{}{},
 		overruns: map[overrunClass]*Overrun{}, models: map[needKey]*needModel{}}
 	p.cond = sync.NewCond(&p.mu)
 	// Idle workers, and workers held by callers waiting for an increment, are
@@ -839,7 +843,7 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
 		p.exited++
 		if w.result.CPUUnsampled {
-			p.cpuUnsampled = true
+			p.cpuUnsampled++
 		} else {
 			p.workerCPUMS += w.result.CPUUserMillis + w.result.CPUSysMillis
 		}
@@ -1185,7 +1189,53 @@ func (p *pool) reserveParse(ctx context.Context, need int64) (h *admission.Holdi
 	}
 	p.inFlight++
 	p.maxInFlight = max(p.maxInFlight, p.inFlight)
+	for w := range p.windows {
+		w.maxInFlight = max(w.maxInFlight, p.inFlight)
+	}
 	return h, false, nil
+}
+
+// stageWindow is one open stage's view of the pool's lifetime counters: their
+// values when the stage opened, and the most parses that held an increment
+// at once while it was open, which a lifetime maximum cannot answer. Its
+// fields are guarded by the pool lock.
+type stageWindow struct {
+	started, unsampled uint64
+	cpuMS              int64
+	// exclusive is whether no worker was alive when the stage opened. A
+	// worker alive then carries processor time spent before the stage, so
+	// its reap would add that time to the stage's sum.
+	exclusive   bool
+	maxInFlight int
+}
+
+// openWindow starts measuring one stage.
+func (p *pool) openWindow() *stageWindow {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w := &stageWindow{started: p.started, unsampled: p.cpuUnsampled, cpuMS: p.workerCPUMS,
+		exclusive: len(p.live) == 0, maxInFlight: p.inFlight}
+	p.windows[w] = struct{}{}
+	return w
+}
+
+// closeWindow ends one stage's measurement and answers what the pool did
+// while it was open. It is called after the stage's drain, when every worker
+// the stage alone used has been reaped and its processor time summed. The
+// sum is unavailable when a worker was alive at the open or is still alive
+// now -- another run's stage was open beside this one, or a probe's worker
+// outlived it -- or when a worker reaped meanwhile was not measured: each
+// would make the sum part of the stage's cost, or more than it.
+func (p *pool) closeWindow(w *stageWindow) model.StageFigures {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.windows, w)
+	f := model.StageFigures{WorkersStarted: int64(p.started - w.started), MaxInFlight: int64(w.maxInFlight)}
+	if w.exclusive && len(p.live) == 0 && p.cpuUnsampled == w.unsampled {
+		cpu := p.workerCPUMS - w.cpuMS
+		f.WorkerCPUMS = &cpu
+	}
+	return f
 }
 
 // endParse gives one file's increment back. Its caller has already adjusted
@@ -1485,7 +1535,7 @@ func (p *pool) stats() Stats {
 		WorkersStarted: p.started, WorkersExited: p.exited, Parses: p.parses, Retries: p.retries,
 		MaxParsesInFlight: p.maxInFlight, WorkerCPUMS: p.workerCPUMS, UnmeasuredFiles: p.unmeasured,
 		NeedModelFailures: p.modelFailures, ParentRSSBytes: -1}
-	if p.cpuUnsampled {
+	if p.cpuUnsampled > 0 {
 		s.WorkerCPUMS = -1
 	}
 	for _, o := range p.overruns {

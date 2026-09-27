@@ -1608,23 +1608,24 @@ type stagedProvider struct {
 	outside int
 }
 
-func (p *stagedProvider) OpenStage(ctx context.Context) func(context.Context) {
-	var inner func(context.Context)
-	if s, ok := any(p.Provider).(stageOpener); ok {
-		inner = s.OpenStage(ctx)
-	}
+// The structural provider satisfies the coordinator's stage seam. The
+// coordinator asserts it at run time, so a signature that drifted would open
+// no stage at all and record no stage figures, silently; this makes the drift
+// a compile error instead.
+var _ stageOpener = (*treesitter.Provider)(nil)
+
+func (p *stagedProvider) OpenStage(ctx context.Context) func(context.Context) model.StageFigures {
+	inner := p.Provider.OpenStage(ctx)
 	p.mu.Lock()
 	p.open++
 	p.opens++
 	p.mu.Unlock()
-	return func(ctx context.Context) {
+	return func(ctx context.Context) model.StageFigures {
 		p.mu.Lock()
 		p.open--
 		p.closes++
 		p.mu.Unlock()
-		if inner != nil {
-			inner(ctx)
-		}
+		return inner(ctx)
 	}
 }
 
@@ -1644,7 +1645,9 @@ func (p *stagedProvider) IndexUnit(ctx context.Context, req provider.UnitRequest
 // between two of them, which drains the parser pool and starts its workers
 // again for the next unit. Mutations that fail this: opening the stage per
 // unit (opens equals the unit count), closing it before the group drains (a
-// unit runs outside it), or never closing it.
+// unit runs outside it), or never closing it. The stage's figures must reach
+// the result as the provider's pass record, which is what a proof run reads;
+// dropping them at the close, or never recording the pass, fails it too.
 func TestAProviderStageStaysOpenForItsWholePass(t *testing.T) {
 	f := newFixture(t, scenarioFiles())
 	ps := f.providers(false)
@@ -1654,8 +1657,18 @@ func TestAProviderStageStaysOpenForItsWholePass(t *testing.T) {
 	}
 	staged := &stagedProvider{Provider: ts}
 	c := f.coordinator([]provider.Provider{ps[0], ps[1], staged})
-	if _, err := c.Index(f.ctx, model.IndexRequest{}); err != nil {
+	res, err := c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
 		t.Fatalf("index: %v", err)
+	}
+	var pass *model.ProviderPass
+	for i := range res.Passes {
+		if res.Passes[i].ProviderID == ts.Descriptor().ID {
+			pass = &res.Passes[i]
+		}
+	}
+	if pass == nil || pass.Stage == nil || pass.Stage.WorkersStarted == 0 {
+		t.Fatalf("the structural provider's pass record carries no stage figures: %+v", pass)
 	}
 	staged.mu.Lock()
 	defer staged.mu.Unlock()
@@ -1668,5 +1681,66 @@ func TestAProviderStageStaysOpenForItsWholePass(t *testing.T) {
 	}
 	if staged.outside != 0 {
 		t.Fatalf("%d of %d units ran with the stage closed", staged.outside, staged.units)
+	}
+}
+
+// TestProviderPassRatios pins the arithmetic of the three passing
+// measurements a proof run reads from the result. Failure mode: a proof
+// passes or fails a pass on a wrong figure -- operands swapped, an
+// unavailable processor time used as a number, or a zero denominator
+// reported as a ratio of 0, which reads as the best possible pass.
+// Mutations that fail it: swap wall and CPU (or started and in flight, or
+// busy and wall); drop the nil check on WorkerCPUMS; return 0 instead of
+// nil from a non-positive denominator.
+func TestProviderPassRatios(t *testing.T) {
+	ms := time.Millisecond
+	cpu := func(v int64) *int64 { return &v }
+	some := func(v float64) *float64 { return &v }
+	for _, tc := range []struct {
+		name                      string
+		wall, busy                time.Duration
+		stage                     *model.StageFigures
+		wallPerCPU, startsPerSlot *float64
+		busyShare                 *float64
+	}{
+		{name: "measured pass", wall: 1000 * ms, busy: 250 * ms,
+			stage:      &model.StageFigures{WorkersStarted: 6, MaxInFlight: 4, WorkerCPUMS: cpu(3200)},
+			wallPerCPU: some(1.25), startsPerSlot: some(1.5), busyShare: some(0.25)},
+		{name: "worker processor time unavailable", wall: 1000 * ms, busy: 900 * ms,
+			stage:         &model.StageFigures{WorkersStarted: 2, MaxInFlight: 2},
+			startsPerSlot: some(1), busyShare: some(0.9)},
+		{name: "no worker processor time", wall: 1000 * ms,
+			stage:         &model.StageFigures{WorkersStarted: 1, MaxInFlight: 1, WorkerCPUMS: cpu(0)},
+			startsPerSlot: some(1), busyShare: some(0)},
+		{name: "nothing held memory", wall: 1000 * ms, busy: 500 * ms,
+			stage:     &model.StageFigures{WorkersStarted: 1, WorkerCPUMS: cpu(40)},
+			busyShare: some(0.5)},
+		{name: "no wall", stage: &model.StageFigures{WorkersStarted: 1, MaxInFlight: 1, WorkerCPUMS: cpu(10)},
+			wallPerCPU: some(0), startsPerSlot: some(1)},
+		{name: "a provider without a stage", wall: 400 * ms, busy: 100 * ms, busyShare: some(0.25)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pass := providerPass("p", 3, tc.wall, tc.busy, tc.stage)
+			for _, got := range []struct {
+				name      string
+				got, want *float64
+			}{
+				{"wall per cpu", pass.WallPerCPU, tc.wallPerCPU},
+				{"starts per slot", pass.StartsPerSlot, tc.startsPerSlot},
+				{"writer busy share", pass.WriterBusyShare, tc.busyShare},
+			} {
+				switch {
+				case got.want == nil && got.got != nil:
+					t.Errorf("%s = %v, want it absent", got.name, *got.got)
+				case got.want != nil && got.got == nil:
+					t.Errorf("%s is absent, want %v", got.name, *got.want)
+				case got.want != nil && *got.got != *got.want:
+					t.Errorf("%s = %v, want %v", got.name, *got.got, *got.want)
+				}
+			}
+			if err := pass.Validate(); err != nil {
+				t.Errorf("the pass record is refused: %v", err)
+			}
+		})
 	}
 }
