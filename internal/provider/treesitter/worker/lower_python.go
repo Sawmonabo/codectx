@@ -1322,13 +1322,14 @@ func (j *pyLower) assign(n *ts.Node) {
 		ann = nil
 	}
 	if r == nil {
-		// `t: T` evaluates a reference target's object and index and the
-		// annotation, when it is evaluated, and binds nothing.
+		// `t: T` evaluates a reference target's object and index, but not
+		// the final attribute or item access (§7.2.2), and the annotation,
+		// when it is evaluated; it binds nothing.
 		m := len(j.reads)
 		t := j.l.unparen(&targets[0])
 		ref := t.KindId() == k.attribute || t.KindId() == k.subscript
-		if ref && j.reference(t) {
-			j.throws++
+		if ref {
+			j.reference(t)
 		}
 		j.annotation(ann, true)
 		if ref || ann != nil {
