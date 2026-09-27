@@ -351,7 +351,10 @@ const (
 // body, false to the next clause; the fringe that matches no clause ends in
 // Throw, and `catch (...)` ends the chain. A function-try-block covers the
 // member initializers and the body; for a constructor or destructor the end
-// of a handler rethrows ([except.handle]/15), otherwise it returns.
+// of a handler rethrows ([except.handle]/15), otherwise it returns. No
+// golden pins that difference: a function-try-block is the function's
+// outermost frame, so its rethrow and its return both end at EXIT and no
+// control-dependence or def-use pair tells them apart.
 //
 // Structured exceptions (both grammars; the anchor is the structured
 // exception handling extension's documented semantics of its try-finally
