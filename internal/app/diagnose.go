@@ -154,6 +154,28 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 	return runRecord(view)
 }
 
+// NeedClasses reads the repository's learned per-file need models, one page and
+// the count past it, as the model carries them. A workspace that has recorded
+// no run answers none.
+func (l runLedger) NeedClasses(ctx context.Context, repo model.RepositoryID) ([]model.NeedClass, int64, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, 0, err
+	}
+	defer reader.Close()
+	classes, omitted, err := reader.NeedClasses(ctx, string(repo))
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]model.NeedClass, 0, len(classes))
+	for _, c := range classes {
+		out = append(out, model.NeedClass{Language: c.Key.Language, Fingerprint: c.Key.Fingerprint,
+			SizeClass: c.Key.SizeClass, Observations: c.Observations, Overruns: c.Overruns,
+			MaxDriftBytes: c.MaxDriftBytes})
+	}
+	return out, omitted, nil
+}
+
 // Run is the run with this identifier, which is how a run that has just ended
 // reports on itself: it knows its own id, and the latest run of the repository
 // may be another live run of this same process.
