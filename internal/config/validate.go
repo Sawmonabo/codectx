@@ -17,9 +17,11 @@ import (
 // negative value is rejected. A RESERVATION (worker counts, batch sizes, queue
 // and memory budgets, connection counts, wire ceilings) is not a limit on the
 // repository at all -- it is how much machine the work is given, it must be
-// positive because a zero-sized batch or a zero-connection reader is a broken
-// reservation rather than an unbounded one, and it never refuses a repository:
-// it serialises and defers the work instead.
+// positive because a zero-sized batch is a broken reservation rather than an
+// unbounded one, and it never refuses a repository: it serialises and defers
+// the work instead. The two counts the machine sizes when they are unset,
+// index.workers and storage.read_connections, take 0 for that and refuse only
+// a negative value.
 func (c Config) validate() error {
 	if c.Version != SchemaVersion {
 		return configInvalid("version is %d; this build understands configuration version %d", c.Version, SchemaVersion)
