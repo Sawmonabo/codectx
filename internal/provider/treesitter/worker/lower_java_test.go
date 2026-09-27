@@ -667,5 +667,273 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"c@28 -> c@67", "d@39 -> b = d@73", "c@67 -> y = c && (b = d)@63", "b = d@73 -> y = c && (b = d)@63",
 				"y = c && (b = d)@63 -> return y;@81"},
 		},
+		{
+			// §8.4.3.1, §8.4.7. Callable 0 is the class body, 1 the abstract
+			// method, which has no body: Entry → Exit, no parameter node.
+			name:      "a method without a body is a callable that lowers to entry and exit",
+			protects:  "a bodiless method stays one callable of its own, with no node and no pair",
+			mutation:  "skip a bodiless method in Functions (callables becomes 1 and callable 1 does not exist)",
+			src:       "abstract class A { abstract int f(int x); }",
+			fn:        1,
+			callables: 2,
+		},
+		{
+			// §14.4.2, §14.9.2, §16. Nodes: c@24, c@40 (Branch), y = 1@43,
+			// y = 2@55, return y;@62. The declarator int y makes no node.
+			// Succ: c@40→{y = 1, y = 2}; both → return. IPDom: c@40, y = 1,
+			// y = 2 → return. Frontier walk: c@40 over y = 1 and y = 2.
+			name:     "an if with an else merges both branches",
+			protects: "each branch's definition reaches the statement after the if, and each branch depends on the condition",
+			mutation: "lower an if as if it had no else (y = 2@55 is not made: c@40 loses its control of it and y = 2@55 -> return y;@62 is lost), or let the then branch fall into the else (y = 1@43 -> return y;@62 is lost)",
+			src:      "class A { int f(boolean c) { int y; if (c) y = 1; else y = 2; return y; } }",
+			fn:       1,
+			cd:       []string{"c@40 -> y = 1@43", "c@40 -> y = 2@55"},
+			du:       []string{"c@24 -> c@40", "y = 1@43 -> return y;@62", "y = 2@55 -> return y;@62"},
+		},
+		{
+			// §15.27.1, §15.27.2, §15.25. Callable 2, the lambda: its
+			// inferred parameters a@68 and b@71, the condition a > b@77 (a
+			// Branch), the arms a + n@85 and b@93 (each defining the
+			// conditional's result), and the body's value node a > b ? a + n :
+			// b@77 (Uses the result). n is the enclosing method's parameter,
+			// no variable of the lambda, so a + n Uses a only.
+			name:      "a lambda is a callable of its own, with its parameters and its expression body",
+			protects:  "a lambda's inferred parameters are its own defining nodes and its expression body is lowered as one value, while the enclosing method's locals are no variables of it",
+			mutation:  "drop lambda_expression from the callables (callables becomes 2 and callable 2 does not exist), declare no inferred parameters (loses every pair from a@68 and b@71), or end an expression body at its last node (the value node a > b ? a + n : b@77 vanishes with its two pairs)",
+			src:       "class A { void f(int n) { java.util.function.IntBinaryOperator g = (a, b) -> a > b ? a + n : b; } }",
+			fn:        2,
+			callables: 3,
+			cd:        []string{"a > b@77 -> a + n@85", "a > b@77 -> b@93"},
+			du: []string{"a@68 -> a > b@77", "b@71 -> a > b@77", "a@68 -> a + n@85", "b@71 -> b@93",
+				"a + n@85 -> a > b ? a + n : b@77", "b@93 -> a > b ? a + n : b@77"},
+		},
+		{
+			// §14.12, §14.22. Nodes: x@20, true@32 (the head, a Stmt: no exit
+			// edge), x > 0@44, break;@51, x++@58, return x;@65. Succ:
+			// true→x > 0→{break, x++}; x++→true; break→return. IPDom: true →
+			// x > 0 → return; x++ → true; break → return. Frontier walks:
+			// x > 0 over break; and over x++, true and itself.
+			name:     "a while on the literal true has no exit edge and is left only by its break",
+			protects: "the statement after while (true) is reached only through a break, so the loop's decision is the break's condition, not the literal",
+			mutation: "lower the literal true as a Branch with an exit edge (gains true@32 -> x > 0@44)",
+			src:      "class A { int f(int x) { while (true) { if (x > 0) break; x++; } return x; } }",
+			fn:       1,
+			cd: []string{"x > 0@44 -> break;@51", "x > 0@44 -> x++@58", "x > 0@44 -> true@32",
+				"x > 0@44 -> x > 0@44"},
+			du: []string{"x@20 -> x > 0@44", "x++@58 -> x > 0@44", "x@20 -> x++@58", "x++@58 -> x++@58",
+				"x@20 -> return x;@65", "x++@58 -> return x;@65"},
+		},
+		{
+			// §14.16, §14.12. Nodes: x@20, x > 0@32 (head), x--@41, x ==
+			// 2@50, continue;@58, g(x)@68, return x;@76. Succ: x > 0→{x--,
+			// return}; x--→x == 2→{continue, g(x)}; continue, g(x) → x > 0.
+			// IPDom: x > 0 → return; x-- → x == 2 → x > 0; continue, g(x) →
+			// x > 0. Frontier walks: x > 0 over x--, x == 2 and itself; x == 2
+			// over continue; and g(x).
+			name:     "an unlabelled continue re-enters the innermost loop's condition",
+			protects: "a continue skips the rest of the body and evaluates the condition again, so the skipped statement depends on the test guarding the continue",
+			mutation: "resolve an unlabelled continue to no loop (unresolved becomes 1 and continue;@58 loses its edge to x > 0@32)",
+			src:      "class A { int f(int x) { while (x > 0) { x--; if (x == 2) continue; g(x); } return x; } }",
+			fn:       1,
+			cd: []string{"x > 0@32 -> x--@41", "x > 0@32 -> x == 2@50", "x > 0@32 -> x > 0@32",
+				"x == 2@50 -> continue;@58", "x == 2@50 -> g(x)@68"},
+			du: []string{"x@20 -> x > 0@32", "x--@41 -> x > 0@32", "x@20 -> x--@41", "x--@41 -> x--@41",
+				"x--@41 -> x == 2@50", "x--@41 -> g(x)@68", "x@20 -> return x;@76", "x--@41 -> return x;@76"},
+		},
+		{
+			// §15.20.2. Nodes: o@24, o instanceof String@33 (the condition, the
+			// test folded whole into it: Uses o), g()@54.
+			name:     "an instanceof without a pattern is folded into its condition",
+			protects: "a type test that binds nothing makes no node for its tested value, so the condition itself reads the tested local",
+			mutation: "evaluate a pattern-less instanceof's tested value at a node of its own (o@24 -> o@33 replaces o@24 -> o instanceof String@33)",
+			src:      "class A { void f(Object o) { if (o instanceof String) g(); } }",
+			fn:       1,
+			cd:       []string{"o instanceof String@33 -> g()@54"},
+			du:       []string{"o@24 -> o instanceof String@33"},
+		},
+		{
+			// §15.20.2, §14.4. Nodes: o@27, o@44 (the tested value: Uses o,
+			// defines an owned variable), s@64 (the pattern variable, Using
+			// it), b = o instanceof String s@40 (the deciding node, the
+			// statement holding the test: Uses the owned variable, defines
+			// b), return b;@67.
+			name:     "an instanceof pattern in a declarator is decided by the declarator's node",
+			protects: "outside a condition the node of the statement holding the test decides it and reads the tested value once through the owned variable",
+			mutation: "let the declarator read the tested expression's names (o@27 -> b = o instanceof String s@40 replaces o@44 -> b = o instanceof String s@40)",
+			src:      "class A { boolean f(Object o) { boolean b = o instanceof String s; return b; } }",
+			fn:       1,
+			du: []string{"o@27 -> o@44", "o@44 -> s@64", "o@44 -> b = o instanceof String s@40",
+				"b = o instanceof String s@40 -> return b;@67"},
+		},
+		{
+			// §14.11.1, §14.11.3 (colon form). Nodes: x@20, y = 0@29, x@44
+			// (selector), case 1@49, case 2@57 (both labels of one group), y =
+			// 1@65, break;@72, y = 2@88 (default), return y;@97. Succ: case
+			// 1→{y = 1, case 2}; case 2→{y = 1, y = 2}; y = 1→break→return;
+			// y = 2→return. IPDom: case 1, case 2 → return; y = 1 → break →
+			// return. Frontier walks: case 1 over y = 1, break; and case 2;
+			// case 2 over y = 1, break; and y = 2.
+			name:     "several labels of one colon-form group each enter its body",
+			protects: "a group listing several case labels is entered when any of them matches, each tested in order",
+			mutation: "enter a group only from its last label (case 1@49 loses its control of y = 1@65 and break;@72)",
+			src:      "class A { int f(int x) { int y = 0; switch (x) { case 1: case 2: y = 1; break; default: y = 2; } return y; } }",
+			fn:       1,
+			cd: []string{"case 1@49 -> y = 1@65", "case 1@49 -> break;@72", "case 1@49 -> case 2@57",
+				"case 2@57 -> y = 1@65", "case 2@57 -> break;@72", "case 2@57 -> y = 2@88"},
+			du: []string{"x@20 -> x@44", "x@44 -> case 1@49", "x@44 -> case 2@57",
+				"y = 1@65 -> return y;@97", "y = 2@88 -> return y;@97"},
+		},
+		{
+			// §14.11.3 (colon form). Nodes: x@20, y = 0@29, x@44 (selector),
+			// case 1@49, y = 1@57, y++@73 (the default group, not last),
+			// case 3@78, y += 3@86, return y;@96. Succ: case 1→{y = 1, case
+			// 3}; y = 1→y++ (fall through); case 3→{y += 3, y++} (no label
+			// matched: the default group); y++→y += 3 (fall through); y +=
+			// 3→return. IPDom: case 1, case 3, y++ → y += 3; y = 1 → y++.
+			// Frontier walks: case 1 over y = 1, y++ and case 3; case 3 over
+			// y++. y++ is reached with y = 1's definition by the fall-through
+			// and with y = 0's by the no-match edge.
+			name:     "a default group not last is entered by the no-match edge and by fall-through, and falls through itself",
+			protects: "the default group takes both the previous body's fall-through and the path on which no label matched, wherever it stands",
+			mutation: "enter the default group only by the no-match edge (loses y = 1@57 -> y++@73), or only by fall-through (loses y = 0@29 -> y++@73)",
+			src:      "class A { int f(int x) { int y = 0; switch (x) { case 1: y = 1; default: y++; case 3: y += 3; } return y; } }",
+			fn:       1,
+			cd: []string{"case 1@49 -> y = 1@57", "case 1@49 -> y++@73", "case 1@49 -> case 3@78",
+				"case 3@78 -> y++@73"},
+			du: []string{"x@20 -> x@44", "x@44 -> case 1@49", "x@44 -> case 3@78",
+				"y = 0@29 -> y++@73", "y = 1@57 -> y++@73", "y = 0@29 -> y += 3@86", "y++@73 -> y += 3@86",
+				"y += 3@86 -> return y;@96"},
+		},
+		{
+			// §14.11.1, §14.11.2 (a case null label makes the switch
+			// enhanced, so it is exhaustive), §14.11.3. Nodes: s@23, y =
+			// 0@32, s@47 (selector), case null@52, y = 1@65, case "a"@72, y =
+			// 2@84, return y;@93. Succ: case null→{y = 1, case "a"}; case
+			// "a"→{y = 2, EXIT} (no match: MatchException); y = 1, y = 2 →
+			// return. IPDom: case null, case "a" → EXIT; y = 1, y = 2 →
+			// return. Frontier walks: case null over y = 1, return and case
+			// "a"; case "a" over y = 2 and return.
+			name:     "a case null label makes a switch statement without default throw when no label matches",
+			protects: "a switch statement with a null label is enhanced, so its no-match path leaves by a throw and the definition before the switch never reaches the statement after it",
+			mutation: "take only a pattern label as making the switch enhanced (gains y = 0@32 -> return y;@93, and return y;@93 loses its control dependences)",
+			src:      "class A { int f(String s) { int y = 0; switch (s) { case null -> y = 1; case \"a\" -> y = 2; } return y; } }",
+			fn:       1,
+			cd: []string{"case null@52 -> y = 1@65", "case null@52 -> return y;@93", "case null@52 -> case \"a\"@72",
+				"case \"a\"@72 -> y = 2@84", "case \"a\"@72 -> return y;@93"},
+			du: []string{"s@23 -> s@47", "s@47 -> case null@52", "s@47 -> case \"a\"@72",
+				"y = 1@65 -> return y;@93", "y = 2@84 -> return y;@93"},
+		},
+		{
+			// §15.28.1, §15.28.2. S is a sealed interface permitting exactly
+			// P and Q, declared elsewhere. Nodes: o@18, y = 0@27, o@46
+			// (selector), case P p@51, p@58, 1@63 (arm result), case Q q@66,
+			// q@73, 2@78, y = switch (o) { … }@34 (Uses the result, defines
+			// y), return y;@84. Succ: case P→{p, case Q}; p→1→assignment;
+			// case Q→{q, EXIT} (no match: MatchException); q→2→assignment;
+			// assignment→return. IPDom: case P, case Q → EXIT; p → 1 →
+			// assignment → return. Frontier walks: case P over p, 1, the
+			// assignment, return and case Q; case Q over q, 2, the
+			// assignment and return.
+			name:     "a switch expression without default throws when no label matches",
+			protects: "an exhaustive switch expression's no-match path leaves by a throw, so its consumer depends on the labels and the definition before it is killed on every path",
+			mutation: "leave a switch expression without default through its no-match edge (case Q q@66 loses its control of the assignment and return y;@84)",
+			src:      "class A { int f(S o) { int y = 0; y = switch (o) { case P p -> 1; case Q q -> 2; }; return y; } }",
+			fn:       1,
+			cd: []string{"case P p@51 -> p@58", "case P p@51 -> 1@63",
+				"case P p@51 -> y = switch (o) { case P p -> 1; case Q q -> 2; }@34", "case P p@51 -> return y;@84",
+				"case P p@51 -> case Q q@66", "case Q q@66 -> q@73", "case Q q@66 -> 2@78",
+				"case Q q@66 -> y = switch (o) { case P p -> 1; case Q q -> 2; }@34", "case Q q@66 -> return y;@84"},
+			du: []string{"o@18 -> o@46", "o@46 -> case P p@51", "o@46 -> p@58", "o@46 -> case Q q@66", "o@46 -> q@73",
+				"1@63 -> y = switch (o) { case P p -> 1; case Q q -> 2; }@34", "2@78 -> y = switch (o) { case P p -> 1; case Q q -> 2; }@34",
+				"y = switch (o) { case P p -> 1; case Q q -> 2; }@34 -> return y;@84"},
+		},
+		{
+			// §15.28, §15.7.1. Nodes: x@20, y@27, x@51 (selector), case 1@56,
+			// 2@66 and 3@80 (arm results, defining the switch expression's
+			// result), return y + switch (x) { … };@32 (Uses y, read before
+			// the switch expression, and the result). Succ: case 1→{2, 3};
+			// both → return. IPDom: case 1 → return. Frontier walk: case 1
+			// over 2 and 3.
+			name:     "a switch expression inside a larger expression keeps the enclosing statement's earlier reads",
+			protects: "the reads the consuming node made before a nested switch expression survive the arms' statements, which reset the reads",
+			mutation: "drop the enclosing statement's saved reads around a nested switch expression (loses y@27 -> return y + switch (x) { … };@32)",
+			src:      "class A { int f(int x, int y) { return y + switch (x) { case 1 -> 2; default -> 3; }; } }",
+			fn:       1,
+			cd:       []string{"case 1@56 -> 2@66", "case 1@56 -> 3@80"},
+			du: []string{"x@20 -> x@51", "x@51 -> case 1@56", "y@27 -> return y + switch (x) { case 1 -> 2; default -> 3; };@32",
+				"2@66 -> return y + switch (x) { case 1 -> 2; default -> 3; };@32", "3@80 -> return y + switch (x) { case 1 -> 2; default -> 3; };@32"},
+		},
+		{
+			// §15.14.2, §15.7.1. Nodes: i@20, i++@39 (the embedded update: Uses
+			// i, defines i, the owned variable carrying the declarator's
+			// earlier read of i, and its own result), y = i + g(i++)@29 (Uses
+			// both owned variables, defines y), return y + i;@45. The earlier
+			// read's hand-off and the update's own read of i pair alike here
+			// (an update always reads its target), so the case pins the
+			// update's own node and its definition of i.
+			name:     "an embedded update is its own node, defining its local and handing its value on",
+			protects: "an update inside a larger expression defines the local where it runs, and its consumer depends on it through its result",
+			mutation: "fold an embedded update into its consumer (i++@39 vanishes, and i@20 -> y = i + g(i++)@29 and -> return y + i;@45 replace its pairs)",
+			src:      "class A { int f(int i) { int y = i + g(i++); return y + i; } }",
+			fn:       1,
+			du: []string{"i@20 -> i++@39", "i++@39 -> y = i + g(i++)@29", "y = i + g(i++)@29 -> return y + i;@45",
+				"i++@39 -> return y + i;@45"},
+		},
+		{
+			// §15.23, §15.7.1. Nodes: c@28, x@39, c@62 (the && deciding operand's
+			// Branch, defining the operator's result), x = true@68 (the right
+			// operand's assignment: defines x, its own result and the
+			// operator's), y = x == (c && (x = true))@52 (Uses x, read before
+			// the operator, and the operator's result), return y;@80. Succ:
+			// c@62→{x = true, the declarator}; x = true→the declarator. IPDom:
+			// c@62 → the declarator. Frontier walk: c@62 over x = true.
+			name:     "a read before an assignment in an && right operand stays on its consumer",
+			protects: "an earlier read is not handed to an assignment the short circuit may skip, so the parameter still reaches the consumer on the path where c is false",
+			mutation: "hand the earlier read to an assignment inside a right operand (loses x@39 -> y = x == (c && (x = true))@52, gains x@39 -> x = true@68)",
+			src:      "class A { boolean f(boolean c, boolean x) { boolean y = x == (c && (x = true)); return y; } }",
+			fn:       1,
+			cd:       []string{"c@62 -> x = true@68"},
+			du: []string{"c@28 -> c@62", "x@39 -> y = x == (c && (x = true))@52", "c@62 -> y = x == (c && (x = true))@52",
+				"x = true@68 -> y = x == (c && (x = true))@52", "y = x == (c && (x = true))@52 -> return y;@80"},
+		},
+		{
+			// §6.3, §14.14.1. y and z are fields of A. Nodes: n@30, y = 0@44
+			// (the for header's local), y < n@51, y++@58, z = 1@72 (the
+			// block's local), return y + z;@81. Succ: y < n→{y++ (empty body),
+			// z = 1}; y++→y < n. IPDom: y < n → z = 1; y++ → y < n. Frontier
+			// walk: y < n over y++ and itself. The header's y ends with the
+			// loop and the block's z with the block, so the return reads the
+			// fields: no pair.
+			name:     "a local's scope ends with its for header and with its block",
+			protects: "a use after a loop or block of a name its header or block declared resolves to what the name meant outside, not to the ended local",
+			mutation: "keep a for header's locals in scope after the loop (gains y = 0@44 and y++@58 -> return y + z;@81), or a block's (gains z = 1@72 -> return y + z;@81)",
+			src:      "class A { int y, z; int f(int n) { for (int y = 0; y < n; y++) {} { int z = 1; } return y + z; } }",
+			fn:       1,
+			cd:       []string{"y < n@51 -> y++@58", "y < n@51 -> y < n@51"},
+			du: []string{"n@30 -> y < n@51", "y = 0@44 -> y < n@51", "y++@58 -> y < n@51", "y = 0@44 -> y++@58",
+				"y++@58 -> y++@58"},
+		},
+		{
+			// §14.6, §14.9. Nodes: c@25, c@34 (Branch), g()@39. The then
+			// statement is the empty statement, which makes no node, so both
+			// of c's edges reach g(), which post-dominates it.
+			name:     "an empty statement as an if's body makes no node",
+			protects: "an empty then statement executes nothing, so nothing depends on the condition",
+			mutation: "lower the anonymous ; token as a statement (a node ;@37 appears and c@34 controls it)",
+			src:      "class A { void f(boolean c) { if (c) ; g(); } }",
+			fn:       1,
+			du:       []string{"c@25 -> c@34"},
+		},
+		{
+			// §15.8.5, §14.9. Nodes: c@25, c@36 (the condition, every pair of
+			// parentheses stripped), g()@41.
+			name:     "a condition spans its expression without any of its nested parentheses",
+			protects: "a Branch node spans the condition with every enclosing pair of parentheses removed, however deeply nested",
+			mutation: "strip only the if statement's own parentheses (the Branch renders as ((c))@34)",
+			src:      "class A { void f(boolean c) { if (((c))) g(); } }",
+			fn:       1,
+			cd:       []string{"c@36 -> g()@41"},
+			du:       []string{"c@25 -> c@36"},
+		},
 	})
 }
