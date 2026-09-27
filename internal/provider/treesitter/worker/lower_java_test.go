@@ -710,16 +710,16 @@ func TestJavaLoweringGolden(t *testing.T) {
 		{
 			// §14.12, §14.22. Nodes: x@20, true@32 (the head, a Stmt: no exit
 			// edge), x > 0@44, break;@51, x++@58, return x;@65. Succ:
-			// true→x > 0→{break, x++}; x++→true; break→return. IPDom: true →
-			// x > 0 → return; x++ → true; break → return. Frontier walks:
-			// x > 0 over break; and over x++, true and itself.
+			// true→x > 0→{break, x++}; x++→true; break→return. Every path
+			// from x > 0 to EXIT leaves through the break, so IPDom: true →
+			// x > 0 → break → return; x++ → true. Frontier walk: x > 0 over
+			// x++, true and itself; nothing controls the break.
 			name:     "a while on the literal true has no exit edge and is left only by its break",
-			protects: "the statement after while (true) is reached only through a break, so the loop's decision is the break's condition, not the literal",
-			mutation: "lower the literal true as a Branch with an exit edge (gains true@32 -> x > 0@44)",
+			protects: "the statement after while (true) is reached only through a break, so the break post-dominates the loop's decision and the literal controls nothing",
+			mutation: "lower the literal true as a Branch with an exit edge (gains true@32 -> x > 0@44 and x > 0@44 -> break;@51, and loses x > 0@44 -> x > 0@44)",
 			src:      "class A { int f(int x) { while (true) { if (x > 0) break; x++; } return x; } }",
 			fn:       1,
-			cd: []string{"x > 0@44 -> break;@51", "x > 0@44 -> x++@58", "x > 0@44 -> true@32",
-				"x > 0@44 -> x > 0@44"},
+			cd:       []string{"x > 0@44 -> x++@58", "x > 0@44 -> true@32", "x > 0@44 -> x > 0@44"},
 			du: []string{"x@20 -> x > 0@44", "x++@58 -> x > 0@44", "x@20 -> x++@58", "x++@58 -> x++@58",
 				"x@20 -> return x;@65", "x++@58 -> return x;@65"},
 		},
@@ -805,23 +805,25 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"y += 3@86 -> return y;@96"},
 		},
 		{
-			// §14.11.1, §14.11.2 (a case null label makes the switch
-			// enhanced, so it is exhaustive), §14.11.3. Nodes: s@23, y =
-			// 0@32, s@47 (selector), case null@52, y = 1@65, case "a"@72, y =
-			// 2@84, return y;@93. Succ: case null→{y = 1, case "a"}; case
-			// "a"→{y = 2, EXIT} (no match: MatchException); y = 1, y = 2 →
-			// return. IPDom: case null, case "a" → EXIT; y = 1, y = 2 →
-			// return. Frontier walks: case null over y = 1, return and case
-			// "a"; case "a" over y = 2 and return.
+			// §14.11.1, §14.11.1.1, §14.11.2 (a case null label makes the
+			// switch enhanced, so it must be exhaustive: E is an enum whose one
+			// constant P the labels cover), §14.11.3. Nodes: s@18, y = 0@27,
+			// s@42 (selector), case null@47, y = 1@60, case P@67 (P is a
+			// constant, no variable), y = 2@77, return y;@86. Succ: case
+			// null→{y = 1, case P}; case P→{y = 2, EXIT} (no match:
+			// MatchException); y = 1, y = 2 → return. IPDom: case null, case
+			// P → EXIT; y = 1, y = 2 → return. Frontier walks: case null over
+			// y = 1, return and case P; case P over y = 2 and return. The
+			// enum's body is callable 2.
 			name:     "a case null label makes a switch statement without default throw when no label matches",
 			protects: "a switch statement with a null label is enhanced, so its no-match path leaves by a throw and the definition before the switch never reaches the statement after it",
-			mutation: "take only a pattern label as making the switch enhanced (gains y = 0@32 -> return y;@93, and return y;@93 loses its control dependences)",
-			src:      "class A { int f(String s) { int y = 0; switch (s) { case null -> y = 1; case \"a\" -> y = 2; } return y; } }",
+			mutation: "take only a pattern label as making the switch enhanced (gains y = 0@27 -> return y;@86, and return y;@86 loses its control dependences)",
+			src:      "class A { int f(E s) { int y = 0; switch (s) { case null -> y = 1; case P -> y = 2; } return y; } enum E { P } }",
 			fn:       1,
-			cd: []string{"case null@52 -> y = 1@65", "case null@52 -> return y;@93", "case null@52 -> case \"a\"@72",
-				"case \"a\"@72 -> y = 2@84", "case \"a\"@72 -> return y;@93"},
-			du: []string{"s@23 -> s@47", "s@47 -> case null@52", "s@47 -> case \"a\"@72",
-				"y = 1@65 -> return y;@93", "y = 2@84 -> return y;@93"},
+			cd: []string{"case null@47 -> y = 1@60", "case null@47 -> return y;@86", "case null@47 -> case P@67",
+				"case P@67 -> y = 2@77", "case P@67 -> return y;@86"},
+			du: []string{"s@18 -> s@42", "s@42 -> case null@47", "s@42 -> case P@67",
+				"y = 1@60 -> return y;@86", "y = 2@77 -> return y;@86"},
 		},
 		{
 			// §15.28.1, §15.28.2. S is a sealed interface permitting exactly
@@ -925,6 +927,17 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du:       []string{"c@25 -> c@34"},
 		},
 		{
+			// §14.6, §14.7, §14.9. Nodes: c@25, c@34 (Branch), g()@42. The then
+			// statement is a labelled empty statement, which executes nothing
+			// and makes no node, so both of c's edges reach g().
+			name:     "a labelled empty statement makes no node",
+			protects: "a label on an empty statement adds no node, so nothing depends on the condition",
+			mutation: "lower a labelled statement without a statement child as one node (a node l: ;@37 appears and c@34 controls it)",
+			src:      "class A { void f(boolean c) { if (c) l: ; g(); } }",
+			fn:       1,
+			du:       []string{"c@25 -> c@34"},
+		},
+		{
 			// §15.8.5, §14.9. Nodes: c@25, c@36 (the condition, every pair of
 			// parentheses stripped), g()@41.
 			name:     "a condition spans its expression without any of its nested parentheses",
@@ -957,21 +970,23 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du:       []string{"x@16 -> this(x, 0);@21", "x@16 -> g(x)@33"},
 		},
 		{
-			// §14.7, §14.16. Nodes: n@21, i = 0@41, i < n@48 (head), i >
-			// 1@66, continue a;@73, g(i)@85, i++@55. Succ: i < n→{i > 1,
-			// EXIT}; i > 1→{continue a, g(i)}; continue a, g(i) → i++ → i <
-			// n. IPDom: i < n → EXIT; i > 1, continue a, g(i) → i++ → i < n.
-			// Frontier walks: i < n over i > 1, i++ and itself; i > 1 over
-			// continue a; and g(i).
+			// §14.7, §14.15 (a break's target may be any labelled statement;
+			// a continue naming a, which labels the labelled statement b: …,
+			// not the loop, is rejected by §14.16). Nodes: n@21, i = 0@41, i
+			// < n@48 (head), i > 1@66, break a;@73, g(i)@82, i++@55. Succ: i
+			// < n→{i > 1, EXIT}; i > 1→{break a, g(i)}; break a→EXIT (the
+			// loop's exit ends the method); g(i) → i++ → i < n. IPDom: i < n,
+			// i > 1, break a → EXIT; g(i) → i++ → i < n. Frontier walks: i <
+			// n over i > 1; i > 1 over break a;, and over g(i), i++ and i < n.
 			name:     "every label of a loop labelled twice names that loop",
-			protects: "a continue naming the outer of two labels on one loop continues that loop",
-			mutation: "hand a loop only its innermost label (continue a;@73 is unresolved: unresolved becomes 1)",
-			src:      "class A { void f(int n) { a: b: for (int i = 0; i < n; i++) { if (i > 1) continue a; g(i); } } }",
+			protects: "a break naming the outer of two labels on one loop leaves that loop",
+			mutation: "hand a loop only its innermost label (break a;@73 is unresolved: unresolved becomes 1)",
+			src:      "class A { void f(int n) { a: b: for (int i = 0; i < n; i++) { if (i > 1) break a; g(i); } } }",
 			fn:       1,
-			cd: []string{"i < n@48 -> i > 1@66", "i < n@48 -> i++@55", "i < n@48 -> i < n@48",
-				"i > 1@66 -> continue a;@73", "i > 1@66 -> g(i)@85"},
+			cd: []string{"i < n@48 -> i > 1@66", "i > 1@66 -> break a;@73", "i > 1@66 -> g(i)@82",
+				"i > 1@66 -> i++@55", "i > 1@66 -> i < n@48"},
 			du: []string{"n@21 -> i < n@48", "i = 0@41 -> i < n@48", "i++@55 -> i < n@48",
-				"i = 0@41 -> i > 1@66", "i++@55 -> i > 1@66", "i = 0@41 -> g(i)@85", "i++@55 -> g(i)@85",
+				"i = 0@41 -> i > 1@66", "i++@55 -> i > 1@66", "i = 0@41 -> g(i)@82", "i++@55 -> g(i)@82",
 				"i = 0@41 -> i++@55", "i++@55 -> i++@55"},
 		},
 		{
@@ -1073,31 +1088,53 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"a@22 -> return a[i];@53", "a[i]++@45 -> return a[i];@53", "i@29 -> return a[i];@53"},
 		},
 		{
-			// §14.11.1. The grammar has no `case null, default` label, so the
-			// source parses with an error. Derived against the recovery taken
-			// as most likely: one switch_label spanning case null, default,
-			// holding the null literal and an ERROR node over `, default`, so
-			// no default token is a direct child of the label. Nodes: o@23,
-			// o@36 (selector), case null, default@41 (the one label, a
-			// Branch), return 0;@65, return 1;@79. The switch holds an error
-			// node, so its no-match path leaves it rather than throwing: the
-			// label→{return 0, return 1}. IPDom: the label → EXIT. Frontier
-			// walks: the label over return 0 and return 1.
-			name:      "a switch holding an error node is left when no label matches",
-			protects:  "a recovery that may have dropped a default makes no exhaustive-switch throw, so the statement after the switch runs on the no-match path",
-			mutation:  "throw on the no-match path of a switch whose tree holds an error node, as for any enhanced switch (return 1;@79 is unreachable: the label loses its control of it)",
-			src:       "class A { int f(Object o) { switch (o) { case null, default -> { return 0; } } return 1; } }",
-			fn:        1,
-			recovered: true,
-			cd:        []string{"case null, default@41 -> return 0;@65", "case null, default@41 -> return 1;@79"},
-			du:        []string{"o@23 -> o@36", "o@36 -> case null, default@41"},
+			// §14.11.1, §14.11.3. `case null, default` matches every value, null
+			// included: it is the default label and makes no node. Nodes: o@23,
+			// y = 0@32, o@47 (selector), case String s@52, s@64 (the pattern
+			// variable), y = 1@69, y = 2@98, return y;@107. Succ: case String
+			// s→{s, y = 2} (no label matched: the default group); s→y = 1→return;
+			// y = 2→return. IPDom: case String s, y = 1, y = 2 → return; s → y
+			// = 1. Frontier walk: case String s over s, y = 1 and y = 2. y = 0
+			// is killed on every path.
+			name:     "a case null, default label is the default and makes no node",
+			protects: "the label matching null and every other value enters its group on the no-match path, so a pattern switch holding it never throws there and nothing tests it",
+			mutation: "lower case null, default as a case label (a Branch case null, default@76 appears, controlled by case String s@52 and using the selector's variable, and its no-match path throws: it gains control of y = 2@98 and return y;@107)",
+			src:      "class A { int f(Object o) { int y = 0; switch (o) { case String s -> y = 1; case null, default -> y = 2; } return y; } }",
+			fn:       1,
+			cd:       []string{"case String s@52 -> s@64", "case String s@52 -> y = 1@69", "case String s@52 -> y = 2@98"},
+			du: []string{"o@23 -> o@47", "o@47 -> case String s@52", "o@47 -> s@64",
+				"y = 1@69 -> return y;@107", "y = 2@98 -> return y;@107"},
 		},
 		{
-			// An unmatched `)` in a block. Derived against the recovery taken
-			// as most likely: an ERROR node over `)` among the block's
-			// statements. Nodes: x@20, y = x@29, the ERROR node )@36 (the
-			// unnamed kind: one Stmt node with its uses, none here, falling
-			// through), return y;@38.
+			// §14.11.1, §14.11.2. The arm's block lacks the `;` after y = 1, so
+			// the source parses with a syntax error; derived against the
+			// recovery the parser makes for a statement missing its last token
+			// before a `}`: the expression statement kept whole, holding a
+			// zero-width missing `;`. A pattern switch statement without default
+			// throws when no label matches, but a switch whose tree holds a
+			// syntax error may have lost its default, so this one is left.
+			// Nodes: o@23, y = 0@32, o@47 (selector), case String s@52, s@64,
+			// y = 1@71, return y;@81. Succ: case String s→{s, return} (the
+			// no-match path leaves the switch); s→y = 1→return. IPDom: every
+			// node → return. Frontier walk: case String s over s and y = 1.
+			name:      "a switch holding a syntax error is left when no label matches",
+			protects:  "a recovery that may have dropped a default makes no exhaustive-switch throw, so the statement after the switch runs on the no-match path with the definitions before the switch",
+			mutation:  "throw on the no-match path of a switch whose tree holds a syntax error, as for any enhanced switch (loses y = 0@32 -> return y;@81, and case String s@52 gains control of return y;@81)",
+			src:       "class A { int f(Object o) { int y = 0; switch (o) { case String s -> { y = 1 } } return y; } }",
+			fn:        1,
+			recovered: true,
+			cd:        []string{"case String s@52 -> s@64", "case String s@52 -> y = 1@71"},
+			du: []string{"o@23 -> o@47", "o@47 -> case String s@52", "o@47 -> s@64",
+				"y = 0@32 -> return y;@81", "y = 1@71 -> return y;@81"},
+		},
+		{
+			// An unmatched `)` in a block, ill-formed on purpose: the parser
+			// recovers with an error node over `)` among the block's
+			// statements, between two intact statements. Nodes: x@20, y =
+			// x@29, the error node )@36 (a kind the lowering does not name:
+			// one Stmt node with its uses, none here, falling through), return
+			// y;@38. The pairs hold whether or not the error node makes a node
+			// of its own, as long as both statements survive it.
 			name:      "an error node among a block's statements is one node that falls through",
 			protects:  "a statement the parser could not recover is lowered as one node and control continues past it with the definitions before it",
 			mutation:  "end the path at a kind the lowering does not name (loses y = x@29 -> return y;@38)",
@@ -1107,19 +1144,21 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du:        []string{"x@20 -> y = x@29", "y = x@29 -> return y;@38"},
 		},
 		{
-			// §14.18, §14.20.1. Nodes: x@20, x > 0@35, throw new E();@42 (a
-			// Throw, into the open catch), x = 1@57, the Handler catch@66,
-			// E@73, e@75, x = 2@80, return x;@89. Succ: x > 0→{throw, x =
-			// 1}; throw→catch→E→{e, EXIT (rethrown)}; e→x = 2→return; x =
-			// 1→return. IPDom: x > 0, E → EXIT; throw → catch → E; x = 1, x =
-			// 2 → return. Frontier walks: x > 0 over throw, catch and E, and
-			// over x = 1 and return; E over e, x = 2 and return.
+			// §14.18, §14.20.1, §15.9.4. Nodes: x@20, x > 0@35, throw new
+			// E();@42 (a Throw, whose Throw source enters the first clause
+			// test, and MayThrow, since the creation may throw first: an edge
+			// into the Handler), x = 1@57, the Handler catch@66, E@73, e@75, x
+			// = 2@80, return x;@89. Succ: x > 0→{throw, x = 1}; throw→{catch,
+			// E}; catch→E→{e, EXIT (rethrown)}; e→x = 2→return; x = 1→return.
+			// IPDom: x > 0, E → EXIT; throw, catch → E; x = 1, x = 2 → return.
+			// Frontier walks: x > 0 over throw and E, and over x = 1 and
+			// return; throw over catch; E over e, x = 2 and return.
 			name:     "a throw statement inside a try leaves for the catch chain",
-			protects: "the statement after a throw inside a try runs only when the throw is skipped, and the thrown path reaches the catch clause's body",
-			mutation: "give a throw statement's node no Throw (it falls through to x = 1@57 besides its MayThrow edge: gains throw new E();@42 -> x = 1@57)",
+			protects: "the statement after a throw inside a try runs only when the throw is skipped, the thrown path reaches the catch clause's body, and a throw whose operand may itself throw also reaches the Handler",
+			mutation: "give a throw statement's node no Throw (it falls through to x = 1@57 besides its MayThrow edge: gains throw new E();@42 -> x = 1@57), or no MayThrow (loses throw new E();@42 -> catch@66: the Handler vanishes)",
 			src:      "class A { int f(int x) { try { if (x > 0) throw new E(); x = 1; } catch (E e) { x = 2; } return x; } }",
 			fn:       1,
-			cd: []string{"x > 0@35 -> throw new E();@42", "x > 0@35 -> catch@66", "x > 0@35 -> E@73",
+			cd: []string{"x > 0@35 -> throw new E();@42", "throw new E();@42 -> catch@66", "x > 0@35 -> E@73",
 				"x > 0@35 -> x = 1@57", "x > 0@35 -> return x;@89",
 				"E@73 -> e@75", "E@73 -> x = 2@80", "E@73 -> return x;@89"},
 			du: []string{"x@20 -> x > 0@35", "x = 1@57 -> return x;@89", "x = 2@80 -> return x;@89"},
@@ -1232,28 +1271,25 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"a = new int[1]@28 -> return a;@92", "class L { void m() { a[0] = 1; } }@44 -> return a;@92"},
 		},
 		{
-			// §15.28, §14.20.1. Nodes: x@20, r = 0@29, x@60 (the selector: the
-			// g() evaluated before it is its pending throw), case 1@65, 2@75,
-			// 3@89, r = g() + switch (x) { … }@42 (the consumer: the throw
-			// saved across the switch expression stays pending, so it may
-			// throw too), the Handler catch@97, E@104, e@106, r = 1@111,
-			// return r;@120. Succ: x@60→{case 1, catch}; case 1→{2, 3}; 2, 3 →
-			// the assignment→{return, catch}; catch→E→{e, EXIT}; e→r =
-			// 1→return. IPDom: x@60, the assignment, E, return → EXIT; case 1,
-			// 2, 3 → the assignment; catch → E; e → r = 1 → return. Frontier
-			// walks: x@60 over case 1, the assignment, catch and E; case 1
-			// over 2 and 3; the assignment over return, catch and E; E over
+			// §15.28, §15.7.1, §14.20.1. Nodes: x@20, r = 0@29, x@60 (the
+			// selector, the first node made after g() is evaluated: g()'s
+			// throw is its own, so it may throw), case 1@65, 2@75, 3@89, r =
+			// g() + switch (x) { … }@42 (the consumer: nothing it evaluates
+			// after the switch expression throws), the Handler catch@97,
+			// E@104, e@106, r = 1@111, return r;@120. Succ: x@60→{case 1,
+			// catch}; case 1→{2, 3}; 2, 3 → the assignment→return;
+			// catch→E→{e, EXIT}; e→r = 1→return. IPDom: x@60, E, return →
+			// EXIT; case 1, 2, 3 → the assignment → return; catch → E; e → r
+			// = 1 → return. Frontier walks: x@60 over case 1, the assignment
+			// and return, and over catch and E; case 1 over 2 and 3; E over
 			// e, r = 1 and return.
-			name:     "a throw pending before a nested switch expression stays pending for its consumer",
-			protects: "the node consuming a switch expression still carries a throwing construct its statement evaluated before the switch",
-			mutation: "drop the pending throw when a nested switch expression ends (the assignment loses its MayThrow edge: loses its control of catch@97 and E@104)",
+			name:     "a throw evaluated before a nested switch expression is its selector's, not its consumer's",
+			protects: "a throwing construct the statement evaluated before a nested switch expression attaches once, to the selector's node, the first node after it, and the consumer carries only what it evaluates after the switch",
+			mutation: "restore the pending throw after a nested switch expression (the assignment gains a MayThrow edge: gains its control of return r;@120, catch@97 and E@104, and x@60 loses return r;@120)",
 			src:      "class A { int f(int x) { int r = 0; try { r = g() + switch (x) { case 1 -> 2; default -> 3; }; } catch (E e) { r = 1; } return r; } }",
 			fn:       1,
 			cd: []string{"x@60 -> case 1@65", "x@60 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42",
-				"x@60 -> catch@97", "x@60 -> E@104", "case 1@65 -> 2@75", "case 1@65 -> 3@89",
-				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> return r;@120",
-				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> catch@97",
-				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> E@104",
+				"x@60 -> return r;@120", "x@60 -> catch@97", "x@60 -> E@104", "case 1@65 -> 2@75", "case 1@65 -> 3@89",
 				"E@104 -> e@106", "E@104 -> r = 1@111", "E@104 -> return r;@120"},
 			du: []string{"x@20 -> x@60", "x@60 -> case 1@65",
 				"2@75 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42", "3@89 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42",
@@ -1317,17 +1353,22 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"new B(k) { int m() { return n; } }@42 -> return new B(k) { int m() { return n; } };@35"},
 		},
 		{
-			// §15.27.2 (the source assigns a captured local, which the
-			// language rejects; it parses, and pins the capture walk). Nodes:
-			// n@21, () -> { n = 1; }@39 (the lambda: a plain assignment writes
-			// n without reading it, so it Uses nothing), r = () -> { n = 1;
-			// }@35 (Uses the result).
-			name:     "the capture walk takes a plain assignment's local target as written, not read",
-			protects: "a lambda that only assigns an enclosing name does not read it",
-			mutation: "let the capture walk read a plain assignment's target (gains n@21 -> () -> { n = 1; }@39)",
-			src:      "class A { void f(int n) { Runnable r = () -> { n = 1; }; } }",
-			fn:       1,
-			du:       []string{"() -> { n = 1; }@39 -> r = () -> { n = 1; }@35"},
+			// §15.27.2. Ill-formed on purpose: javac rejects the source with
+			// "local variables referenced from a lambda expression must be
+			// final or effectively final". No valid program expresses the
+			// point, since nested code may neither assign nor compound-assign
+			// an enclosing local, yet the lowering meets such code in a
+			// working tree, and its capture walk must neither read a plain
+			// assignment's target nor record it as a write. Nodes: n@21, ()
+			// -> { n = 1; }@39 (the lambda: Uses nothing, may-defines
+			// nothing), r = () -> { n = 1; }@35 (Uses the result).
+			name:      "the capture walk takes a plain assignment's local target as written, not read",
+			protects:  "a lambda that only assigns an enclosing name does not read it",
+			mutation:  "let the capture walk read a plain assignment's target (gains n@21 -> () -> { n = 1; }@39)",
+			src:       "class A { void f(int n) { Runnable r = () -> { n = 1; }; } }",
+			fn:        1,
+			illFormed: true,
+			du:        []string{"() -> { n = 1; }@39 -> r = () -> { n = 1; }@35"},
 		},
 		{
 			// §15.11.1, §15.10.4, §15.16. Nodes: o@25, a@34, r = 0@43, r =
