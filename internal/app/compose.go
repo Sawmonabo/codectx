@@ -92,13 +92,10 @@ const spoolBudgetDivisor = 8
 const collectorBatchLimit = 200
 
 // smallestChildReservationBytes is the smallest memory reservation any child
-// of a runner presents. It exists only to turn the runner's byte budget into
-// the concurrency count process.Limits also wants: the most children that
-// could ever fit an allocation is that allocation divided by this, so the
-// derived count is the byte bound restated and can never be what refuses a
-// child. It is deliberately below every real reservation -- the smallest heap
-// cap a heavy analyzer is given -- so the division over-counts rather than
-// under-counts.
+// of a runner presents, below every real reservation -- the smallest heap cap a
+// heavy analyzer is given. It sizes the one runner composed outside the
+// admission ledger: the Git listing that tool selection runs alone, which
+// reserves nothing.
 const smallestChildReservationBytes int64 = 768 << 20
 
 // unobservedFreeDiskBytes is the disk allocation used where the platform
@@ -213,15 +210,6 @@ func tempDiskShares(total int64) (runner, spools int64) {
 	}
 	spools = max(total/spoolBudgetDivisor, 1)
 	return total - spools, spools
-}
-
-// childSlots is that division: how many children of the smallest possible size
-// fit the budget, never below one.
-func childSlots(budget int64) int {
-	if n := budget / smallestChildReservationBytes; n > 1 {
-		return int(n)
-	}
-	return 1
 }
 
 // openMode selects what the composition takes and what it may write.
@@ -782,34 +770,29 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
-	// The runner's share of resources.max_temp_bytes (tempDiskShares) is its
-	// disk budget, including the unlimited default of 0: the runner reads a
-	// non-positive disk budget as unlimited and admits every reservation, so
-	// the default never refuses a child at admission. Only a ceiling the
-	// operator set refuses one, and it says so with resources.max_temp_bytes
-	// named in the error.
+	// The admission ledger is the one memory gate for every child of this
+	// process, and nothing beneath it may bind below it. Every child that
+	// reserves memory -- a dependence unit, an external indexer's profile, a
+	// language server, a parser file -- is admitted on the ledger first, and the
+	// ledger's allocation is re-derived between parser files, upward as well as
+	// down. A runner budget taken from the composition-time allocation would be
+	// a second, stale gate: once the allocation rose, it would queue what the
+	// ledger had just admitted. So no runner holds a memory figure of its own:
+	// each budget is the whole int64 range, which no reservation exceeds and no
+	// sum of them reaches, and not a figure standing in for a machine. The
+	// concurrency count is the whole int range for the same reason: the ledger
+	// counts nothing, so any count derived here could bind below it. The one
+	// child the ledger does not admit -- Git plumbing on the shared runner,
+	// which reserves nothing -- runs as many at once as its callers do, each a
+	// bounded read on their behalf.
 	//
-	// The runner beneath the admission gate must never refuse what the gate
-	// admitted, in memory. The gate runs a child larger than the whole
-	// allocation ALONE rather than refusing it. A dependence unit's
-	// reservation is its heap cap -- itself bounded by the allocation -- plus
-	// the memory its family keeps outside the heap, so the largest child a
-	// unit can present is larger than the allocation; an external indexer's
-	// is its profile's fixed figure, which a small host's allocation can be
-	// below. A runner budgeted at the allocation would refuse precisely those
-	// children, with the resource-limit error memory admission exists to
-	// avoid. This is the same rule the language-server runner below
-	// states: the budget is wide enough for the largest child the gate above
-	// it can admit.
-	sharedBudget := maxInt64(childMemory, dependence.MaxChildReservationBytes(childMemory))
-	for _, k := range scip.Kinds {
-		if mem, _, ok := scip.ProfileReservation(scip.ProfileScope(string(k), "")); ok {
-			sharedBudget = maxInt64(sharedBudget, mem)
-		}
-	}
+	// The shared runner keeps one bound the ledger does not state: its share of
+	// resources.max_temp_bytes (tempDiskShares), a ceiling the operator set on
+	// purpose, including the unlimited default of 0. Only a set ceiling refuses
+	// a child, and it names the key in the error.
 	shared, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     childSlots(sharedBudget),
-		MemoryBudgetBytes: sharedBudget,
+		MaxConcurrent:     math.MaxInt,
+		MemoryBudgetBytes: math.MaxInt64,
 		DiskBudgetBytes:   runnerDisk,
 	})
 	if err != nil {
@@ -818,15 +801,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// Parser workers are CPU-bound, so how many run at once is counted by
 	// cores. They exchange everything with this process over pipes and
 	// reserve no disk, so the runner holds no share of the temporary ceiling.
-	//
-	// Their memory is admitted on the one ledger and nowhere else: a worker's
-	// observed base and each file's predicted need are reserved there, and the
-	// ledger grants a file whenever no parse is in flight, however large. The
-	// runner reserves nothing per worker, so its memory budget must never
-	// refuse: it is the whole int64 range, which no reservation exceeds and
-	// no sum of them reaches, and not a figure standing in for a machine --
-	// on a host whose allocation is zero a figure derived from it would
-	// refuse the runner itself.
+	// Their memory is the ledger's, as above: a worker's observed base and
+	// each file's predicted need are reserved there, and the ledger grants a
+	// file whenever no parse is in flight, however large.
 	parserWorkers := config.ParserWorkers()
 	parsers, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     parserWorkers,
@@ -835,23 +812,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
-	// Language servers are admitted against the same allocation as every other
-	// heavy child; the manager is the gate that decides which ones run, and it
-	// can stop an idle server to make room, which a runner cannot. The runner's
-	// own budget therefore only has to be wide enough never to refuse a server
-	// the manager admitted: the allocation, or one largest pinned definition
-	// where the allocation is smaller than that, since a server larger than the
-	// whole allocation runs alone rather than not at all.
-	var serverMemory, serverDisk int64
-	for _, def := range lsp.Definitions() {
-		serverMemory = maxInt64(serverMemory, def.MemoryBudgetBytes)
-		serverDisk = maxInt64(serverDisk, def.DiskBudgetBytes)
-	}
-	serverBudget := maxInt64(childMemory, serverMemory)
+	// Language servers are admitted on the ledger in both dimensions by the
+	// manager, which can also stop an idle server to make room, which a runner
+	// cannot. The runner therefore holds no budget of its own in either: disk
+	// is unlimited here because the ledger already admitted each server's disk
+	// against the free space measured under the data directory.
 	servers, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     childSlots(serverBudget),
-		MemoryBudgetBytes: serverBudget,
-		DiskBudgetBytes:   int64(childSlots(serverBudget)) * serverDisk,
+		MaxConcurrent:     math.MaxInt,
+		MemoryBudgetBytes: math.MaxInt64,
 	})
 	if err != nil {
 		return nil, err
