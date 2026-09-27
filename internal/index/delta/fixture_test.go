@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -57,7 +58,9 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("OpenCAS: %v", err)
 	}
 	dbPath := filepath.Join(dataDir, "codectx.db")
-	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{})
+	cfg := config.Defaults()
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{
+		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -126,6 +129,8 @@ func (f *fixture) snapshot(files map[string]string) *tree {
 	if err != nil {
 		f.t.Fatalf("PutSnapshot: %v", err)
 	}
+	// A view reads the last commit, as the index build's does after capture.
+	f.flush()
 	if tr.view, err = snapshot.OpenView(f.ctx, f.store, f.cas, tr.snap.ID); err != nil {
 		f.t.Fatalf("OpenView: %v", err)
 	}
@@ -192,7 +197,11 @@ func (f *fixture) request(p provider.Provider, b build) delta.Request {
 	spec := model.UnitSpec{ProviderID: d.ID, ProviderVersion: d.Version, ScopeKey: b.scopeKey,
 		InputHash: hasher.Sum(), DependencyHash: model.DependencyHash(nil)}
 	spec.ID = model.NewUnitID(spec, b.cfgHash)
-	resolver, err := reconcile.New(f.store, f.repo, nil)
+	aliases, err := f.store.DependencyAliases(f.ctx, nil)
+	if err != nil {
+		f.t.Fatalf("DependencyAliases: %v", err)
+	}
+	resolver, err := reconcile.New(aliases, f.repo, nil)
 	if err != nil {
 		f.t.Fatalf("reconcile.New: %v", err)
 	}

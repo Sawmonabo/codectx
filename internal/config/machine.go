@@ -8,31 +8,50 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
-// IdleFootprintBytes is what this process holds before it reserves anything:
-// the Go runtime, the resolved configuration, the open store and the bounded
-// buffers a command needs to answer at all. Everything else in the footprint
-// is a reservation the configuration states, which is why this is the only
-// part of it that has to be measured.
+// idleFootprintBytes is what this process holds before it reserves anything:
+// the Go runtime, the resolved configuration and the bounded buffers a command
+// needs to answer at all. Everything else in the footprint is a reservation
+// the configuration states, which is why this is the only part of it that has
+// to be observed.
 //
-// Measured, not declared: `codectx status` over a freshly indexed five-file,
-// 432-byte fixture peaked at 26,584 / 27,052 / 26,732 KiB of resident set over
-// three samples ("Maximum resident set size", /usr/bin/time -v), so 26.4 MiB
-// at the worst of the three, rounded up to the next binary step for run-to-run
-// variation. The method and the samples are recorded in
-// docs/adr/ADR-0010-engine-memory.md.
-const IdleFootprintBytes int64 = 32 * (1 << 20)
+// It is this process's own resident set, read once, at its first use, with
+// residency.Read. For a loaded configuration that first use is validation
+// at load, before the store is opened, so the reading is the idle process and
+// does not count again the page caches the reservations below declare. Where
+// the platform reports no resident set, UnobservedIdleFootprintBytes stands in
+// for the reading.
+var idleFootprintBytes = sync.OnceValue(func() int64 {
+	if resident := residency.Read().Resident; resident != nil {
+		return int64(*resident)
+	}
+	return UnobservedIdleFootprintBytes
+})
+
+// UnobservedIdleFootprintBytes stands in for the idle term where the platform
+// reports no resident set for this process. It is not an observation of this
+// process: it is the measurement of the idle process recorded in
+// docs/adr/ADR-0010-engine-memory.md -- `codectx status` over a freshly
+// indexed five-file, 432-byte fixture peaked at 26,584 / 27,052 / 26,732 KiB
+// of resident set over three samples ("Maximum resident set size",
+// /usr/bin/time -v), so 26.4 MiB at the worst of the three, rounded up to the
+// next binary step for run-to-run variation.
+const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 
 // BaseFootprint is what this process holds for itself on this machine under
-// configuration c: the idle overhead above, plus the reservations it makes up
-// front -- one query slot's memory per core, the parsed-graph cache, the
+// configuration c: its idle resident set above, plus the reservations it
+// makes up front -- one query slot's memory per core, the parsed-graph cache, the
 // indexing queue, and every page cache it opens: the store writer
 // connection's (storage.writer_cache_kib), every reader connection's
-// (storage.reader_cache_kib) in every reader pool the process opens
-// (storeReaderPools), one lexical staging database's per unit a generation
+// (storage.reader_cache_kib) in both reader pools of every store handle
+// (ReadConnections for the writer's handle, QueryReadConnections for the
+// query-only one, PostingConnections for each of storeHandles), one lexical
+// staging database's per unit a generation
 // builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
 // query tokenizer (TokenizerCacheKiB) and the run ledger's
 // (ledger.FootprintBytes).
@@ -60,10 +79,42 @@ func BaseFootprint(c Config) int64 {
 // others by one handle's pools, which only leaves their children less.
 const storeHandles = 2
 
-// storeReaderPools is how many reader pools of storage.read_connections
-// connections each this process can hold open at once: every store handle
-// opens two, the short-read pool and the posting-stream pool.
-const storeReaderPools = 2 * storeHandles
+// ReadConnections is how many connections a store handle's short-read pool
+// holds: storage.read_connections when it is set, and otherwise one for each
+// goroutine that can read the pool at once. Those are the units a generation
+// builds at once (BuildWorkers), each reading its unit state and its
+// dependencies' aliases there, and the tool calls that run at once
+// (QuerySlots), each issuing its short reads there. The coordinator holds the
+// unit count under the provider pool's ceiling on live sinks, which can only
+// lower it, so the pool is never smaller than the goroutines that read it.
+func ReadConnections(c Config) int {
+	if c.Storage.ReadConnections > 0 {
+		return c.Storage.ReadConnections
+	}
+	return BuildWorkers(c) + QuerySlots()
+}
+
+// PostingConnections is how many connections a store handle's posting-stream
+// pool holds: storage.read_connections when it is set, and otherwise one per
+// tool call that runs at once (QuerySlots). Only a query's candidate walk
+// holds a posting session, and it holds one for the whole walk, so no unit
+// build ever reads this pool.
+func PostingConnections(c Config) int { return perQuery(c) }
+
+// QueryReadConnections is how many connections the short-read pool of the
+// serving composition's query-only handle holds: storage.read_connections
+// when it is set, and otherwise one per tool call that runs at once
+// (QuerySlots). That handle builds no unit, so no build worker reads it.
+func QueryReadConnections(c Config) int { return perQuery(c) }
+
+// perQuery is a pool that only tool calls read: storage.read_connections when
+// it is set, and otherwise QuerySlots.
+func perQuery(c Config) int {
+	if c.Storage.ReadConnections > 0 {
+		return c.Storage.ReadConnections
+	}
+	return QuerySlots()
+}
 
 // LexicalStageCacheKiB is the page cache of one building unit's lexical
 // staging database, which the store opens per unit that publishes search
@@ -108,8 +159,13 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	readerConnections, err := mulNoOverflow("reader pools * storage.read_connections",
-		storeReaderPools, int64(c.Storage.ReadConnections))
+	postingConnections, err := mulNoOverflow("store handles * posting-stream connections",
+		storeHandles, int64(PostingConnections(c)))
+	if err != nil {
+		return 0, err
+	}
+	readerConnections, err := addNoOverflow("short-read + query short-read + posting-stream connections",
+		int64(ReadConnections(c)), int64(QueryReadConnections(c)), postingConnections)
 	if err != nil {
 		return 0, err
 	}
@@ -129,7 +185,7 @@ func baseFootprintFor(c Config) (int64, error) {
 		return 0, err
 	}
 	return addNoOverflow("base footprint of this process",
-		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
+		idleFootprintBytes(), concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
 		stageCaches, storeHandles*TokenizerCacheKiB<<10, ledger.FootprintBytes)
 }
 

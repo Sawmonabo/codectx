@@ -47,8 +47,15 @@ type Language struct {
 	// it. Where present the worker checks it too.
 	Metadata string
 	// Extensions are the file extensions the grammar declares in its
-	// tree-sitter.json; used only when the manifest row carries no language.
+	// tree-sitter.json, plus ".hh" for C++, a C++ header spelling its
+	// declaration omits. An extension two grammars declare (".h") is a header
+	// whose grammar the repository decides (see Census); every other one
+	// names its language on its own.
 	Extensions []string
+	// Headers are the extensions of Extensions that name headers rather than
+	// translation units. A header is never counted by the census, since it
+	// is what the census decides.
+	Headers []string
 	// Query is the compiled-per-worker structural query source.
 	Query string
 	// Separator joins qualified-name components.
@@ -76,8 +83,8 @@ func build() []Language {
 	c := read("c")
 	cpp := read("c", "cpp")
 	all := []Language{
-		{Name: "c", Module: "github.com/tree-sitter/tree-sitter-c@v0.24.2", ABI: 15, Metadata: "0.24.2", Extensions: []string{".c", ".h"}, Query: c, Separator: "::"},
-		{Name: "cpp", Module: "github.com/tree-sitter/tree-sitter-cpp@v0.23.4", ABI: 14, Extensions: []string{".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"}, Query: cpp, Separator: "::"},
+		{Name: "c", Module: "github.com/tree-sitter/tree-sitter-c@v0.24.2", ABI: 15, Metadata: "0.24.2", Extensions: []string{".c", ".h"}, Headers: []string{".h"}, Query: c, Separator: "::"},
+		{Name: "cpp", Module: "github.com/tree-sitter/tree-sitter-cpp@v0.23.4", ABI: 14, Extensions: []string{".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"}, Headers: []string{".h", ".hpp", ".hh", ".hxx"}, Query: cpp, Separator: "::"},
 		{Name: "go", Module: "github.com/tree-sitter/tree-sitter-go@v0.25.0", ABI: 15, Metadata: "0.25.0", Extensions: []string{".go"}, Query: read("go"), Separator: "."},
 		{Name: "java", Module: "github.com/tree-sitter/tree-sitter-java@v0.23.5", ABI: 14, Extensions: []string{".java"}, Query: read("java"), Separator: "."},
 		{Name: "javascript", Module: "github.com/tree-sitter/tree-sitter-javascript@v0.25.0", ABI: 15, Metadata: "0.25.0", Extensions: []string{".js", ".mjs", ".cjs", ".jsx"}, Query: js, Separator: "."},
@@ -102,8 +109,10 @@ func Lookup(name string) (Language, bool) {
 }
 
 // ByExtension classifies a path by the extension its grammar declares. It is
-// the fallback for a manifest row without a language tag; ".h" is C here
-// because the C grammar owns it in both grammars' declarations.
+// the fallback for a manifest row without a language tag. For ".h", which the
+// C and C++ grammars both declare, it answers the first in name order, C: that
+// is the extension's answer, and a header's language is the repository's
+// (Census.Header), which supersedes it wherever a census is known.
 func ByExtension(p string) (Language, bool) {
 	ext := strings.ToLower(path.Ext(p))
 	for _, l := range All {
@@ -113,6 +122,34 @@ func ByExtension(p string) (Language, bool) {
 	}
 	return Language{}, false
 }
+
+// SharedHeader reports whether more than one grammar declares the path's
+// extension: a header whose grammar is the repository's, decided by the
+// census (Census.Header), and never the file name's. It is the one answer to
+// that question for the planner, the provider and the manifest's tagger. Only
+// ".h" is one.
+func SharedHeader(p string) bool {
+	return shared[strings.ToLower(path.Ext(p))]
+}
+
+// shared is the set of extensions more than one grammar declares, derived
+// once from the registry so the question costs a map lookup on the search
+// filter's path.
+var shared = func() map[string]bool {
+	declared := map[string]int{}
+	for _, l := range All {
+		for _, ext := range l.Extensions {
+			declared[ext]++
+		}
+	}
+	out := map[string]bool{}
+	for ext, n := range declared {
+		if n > 1 {
+			out[ext] = true
+		}
+	}
+	return out
+}()
 
 // Fingerprint is the digest folded into the provider version: binding,
 // extraction version and, per language, module version, ABI, metadata and

@@ -50,7 +50,9 @@ CREATE TABLE runs (
     -- Events the bounded bus refused because the collector was behind. A run
     -- never waits on its own accounting, so the loss is counted rather than
     -- prevented, and a reader that sees this above zero knows the span rows
-    -- below are incomplete.
+    -- below are incomplete. A need observation the need_models table would
+    -- refuse is counted here too: it is an event this file does not hold, and
+    -- written it would have lost the rest of its batch.
     events_dropped INTEGER NOT NULL CHECK(events_dropped >= 0),
     -- Null where the platform does not expose the process's peak resident
     -- size. Unavailable is never zero.
@@ -115,6 +117,34 @@ CREATE TABLE scope_peaks (
     scope_key TEXT NOT NULL CHECK(length(scope_key) > 0),
     peak_rss_bytes INTEGER NOT NULL CHECK(peak_rss_bytes > 0),
     PRIMARY KEY (repository_id, scope_key)
+) WITHOUT ROWID;
+-- The learned need of one class of parsed file in one repository: the
+-- language, the grammar fingerprint the files were parsed under, the build of
+-- the worker that parsed them, and the file-size class. A new build learns
+-- afresh, since what a worker does with a file's tree changes with it. state is the model's own encoding, replaced by each
+-- observation's, which already folds in every earlier one; the counts beside it
+-- are what the model was learned from and how often its reservation fell short.
+-- It is keyed by neither run nor generation, because a measurement stays true
+-- whatever becomes of the generation it was taken under: no run delete, sweep,
+-- discard or peak retirement touches it. A row exists only once a file was
+-- observed, so a class never measured has no row, never a row of zero.
+--
+-- max_drift_bytes is the largest need minus reservation any observation showed.
+-- It is signed -- a file that used less than it was reserved drifts below zero
+-- -- and it is above zero exactly when some observation overran, which is what
+-- the last CHECK states.
+CREATE TABLE need_models (
+    repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
+    language TEXT NOT NULL CHECK(length(language) > 0),
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) > 0),
+    build TEXT NOT NULL CHECK(length(build) > 0),
+    size_class INTEGER NOT NULL CHECK(size_class >= 0),
+    state BLOB NOT NULL CHECK(length(state) > 0),
+    observations INTEGER NOT NULL CHECK(observations > 0),
+    overruns INTEGER NOT NULL CHECK(overruns >= 0 AND overruns <= observations),
+    max_drift_bytes INTEGER NOT NULL,
+    CHECK((overruns > 0) = (max_drift_bytes > 0)),
+    PRIMARY KEY (repository_id, language, fingerprint, build, size_class)
 ) WITHOUT ROWID;
 -- Unique so that a span's end, and a child's parent lookup, name exactly one
 -- row by (run_id, seq); it is also the order a reader pages the run in.

@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -64,7 +67,10 @@ func New(t *testing.T, files map[string]string) *Harness {
 	}
 	// The store re-indexes carried lexical documents through the content
 	// store's range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	// The reader pools are sized as the product sizes them on this machine.
+	cfg := config.Defaults()
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{
+		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -89,7 +95,9 @@ func New(t *testing.T, files map[string]string) *Harness {
 	slices.Sort(paths)
 	manifest := model.NewHasher("providertest-manifest")
 	var total uint64
+	var census tslang.Census
 	for _, p := range paths {
+		census.Add(p)
 		content := files[p]
 		abs := filepath.Join(repoDir, filepath.FromSlash(p))
 		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
@@ -115,7 +123,16 @@ func New(t *testing.T, files map[string]string) *Harness {
 	h.Snapshot = model.Snapshot{
 		ID: model.NewSnapshotID(h.Repo, "", policyHash, manifest.Sum()), RepositoryID: h.Repo,
 		CaptureConsistency: model.CaptureOperatorFrozen, SourcePolicyHash: policyHash,
-		FileCount: uint64(len(paths)), SourceBytes: total, ManifestHash: manifest.Sum(), CreatedAt: time.Now().UTC(),
+		FileCount: uint64(len(paths)), SourceBytes: total, CUnits: census.C, CPPUnits: census.CPP,
+		ManifestHash: manifest.Sum(), CreatedAt: time.Now().UTC(),
+	}
+	// Each row is tagged as the capture tags it: by its path, and a header by
+	// the snapshot's census.
+	tag := lang.For(h.Snapshot)
+	for _, p := range paths {
+		fv := h.files[p]
+		fv.Language = tag.Of(p)
+		h.files[p] = fv
 	}
 	err = store.PutSnapshot(ctx, h.Snapshot, func(yield func(model.FileVersion) error) error {
 		for _, p := range paths {
@@ -127,6 +144,10 @@ func New(t *testing.T, files map[string]string) *Harness {
 	})
 	if err != nil {
 		t.Fatalf("PutSnapshot: %v", err)
+	}
+	// A view reads the last commit, as the index build's does after capture.
+	if err := store.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
 	view, err := snapshot.OpenView(ctx, store, cas, h.Snapshot.ID)
 	if err != nil {
@@ -170,6 +191,20 @@ type Unit struct {
 // the sorted dependency keys and the unit key over both plus ConfigHash.
 func (h *Harness) Plan(t *testing.T, p provider.Provider, scopeKey string, inputs []string, deps ...model.UnitID) Unit {
 	t.Helper()
+	// The resolver answers from the dependencies' aliases as of the last
+	// commit, exactly as the coordinator's does, so what the harness sealed so
+	// far is committed first.
+	if err := h.Store.Flush(h.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	aliases, err := h.Store.DependencyAliases(h.ctx, deps)
+	if err != nil {
+		t.Fatalf("DependencyAliases: %v", err)
+	}
+	resolver, err := reconcile.New(aliases, h.Repo, deps)
+	if err != nil {
+		t.Fatalf("reconcile.New: %v", err)
+	}
 	d := p.Descriptor()
 	run, err := h.Store.BeginProviderRun(h.ctx, h.Gen, d.ID, d.Version)
 	if err != nil {
@@ -184,10 +219,6 @@ func (h *Harness) Plan(t *testing.T, p provider.Provider, scopeKey string, input
 	spec := model.UnitSpec{ProviderID: d.ID, ProviderVersion: d.Version, ScopeKey: scopeKey, InputHash: hasher.Sum(), DependencyHash: model.DependencyHash(deps)}
 	spec.ID = model.NewUnitID(spec, ConfigHash)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: ConfigHash, OriginRunID: run, SourceBinding: model.SourceBindingVerified, Dependencies: deps}
-	resolver, err := reconcile.New(h.Store, h.Repo, deps)
-	if err != nil {
-		t.Fatalf("reconcile.New: %v", err)
-	}
 	req := provider.UnitRequest{
 		Binding:  model.Binding{RepositoryID: h.Repo, SnapshotID: h.Snapshot.ID, GenerationID: h.Gen},
 		Unit:     spec,
@@ -244,9 +275,14 @@ func (h *Harness) Run(t *testing.T, p provider.Provider, scopeKey string, inputs
 }
 
 // UnitState reports whether the unit exists and in what state; it is how a
-// test proves failed output was discarded rather than left building.
+// test proves failed output was discarded rather than left building. The store
+// answers from the last commit, so the harness commits what it has written
+// first.
 func (h *Harness) UnitState(t *testing.T, id model.UnitID) (model.UnitState, bool) {
 	t.Helper()
+	if err := h.Store.Flush(h.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	state, exists, err := h.Store.UnitState(h.ctx, id)
 	if err != nil {
 		t.Fatalf("UnitState: %v", err)

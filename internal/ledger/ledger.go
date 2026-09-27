@@ -64,6 +64,9 @@ const (
 	// goroutine drains it, so everything published before this event has been
 	// written by the time the collector answers it.
 	eventFlush
+	// eventNeed is one parsed file's measured need, which belongs to the
+	// run's repository and to no span.
+	eventNeed
 )
 
 // An event is what crosses the bus. It is small and owns nothing the producing
@@ -86,6 +89,9 @@ type event struct {
 	measured Measured
 	endWall  time.Time
 	wallMS   int64
+	// need is an eventNeed's observation, a copy the producing goroutine no
+	// longer holds.
+	need *NeedObservation
 }
 
 // A Ledger is a process's stable handle on the run ledger. It is composed once
@@ -600,6 +606,13 @@ func (l *Ledger) Flush(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
+	return c.flushed(ctx)
+}
+
+// flushed is Flush's barrier on one collector: it returns once c has written
+// everything published to it before the call, or at once when c has stopped
+// and so has written everything it had.
+func (c *collector) flushed(ctx context.Context) error {
 	ack := make(chan error, 1)
 	select {
 	case c.bus <- event{kind: eventFlush, ack: ack}:

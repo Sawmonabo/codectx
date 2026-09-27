@@ -12,6 +12,12 @@ import (
 // because their callers already hold the workspace indexing lock (a capture in
 // progress) or a retention lease naming the snapshot (a source read), and
 // because a snapshot exists before any generation references it.
+//
+// Every read here but RecordedBlob runs on the reader pool against the last
+// commit, so a snapshot view never takes a job on the writer however many
+// units read through it. A capture commits its snapshot before it opens a view
+// over it. RecordedBlob is the capture's own check, which must see the blobs
+// the open ingestion group has already recorded.
 
 // ReasonNotFound is the Details["reason"] value that marks a lookup which
 // found no row, so a caller can tell an absent snapshot or file from a
@@ -29,13 +35,14 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 		return model.Snapshot{}, err
 	}
 	var snap model.Snapshot
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		var repo []byte
-		var count, bytes int64
+		var count, bytes, cUnits, cppUnits int64
 		var created string
 		err := tx.QueryRowContext(ctx, `SELECT repository_id, head_object_id, source_policy_hash, manifest_hash, file_count, source_bytes,
-			capture_consistency, created_at FROM snapshots WHERE id = ?`, raw).
-			Scan(&repo, &snap.HeadObjectID, &snap.SourcePolicyHash, &snap.ManifestHash, &count, &bytes, &snap.CaptureConsistency, &created)
+			c_units, cpp_units, capture_consistency, created_at FROM snapshots WHERE id = ?`, raw).
+			Scan(&repo, &snap.HeadObjectID, &snap.SourcePolicyHash, &snap.ManifestHash, &count, &bytes, &cUnits, &cppUnits,
+				&snap.CaptureConsistency, &created)
 		if isNoRows(err) {
 			return notFound("snapshot %s does not exist", id)
 		}
@@ -44,6 +51,7 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 		}
 		snap.ID, snap.RepositoryID = id, model.RepositoryID(idHex(repo))
 		snap.FileCount, snap.SourceBytes = uint64(count), uint64(bytes)
+		snap.CUnits, snap.CPPUnits = uint64(cUnits), uint64(cppUnits)
 		snap.CreatedAt, err = parseTime(created)
 		return err
 	})
@@ -64,7 +72,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 		return model.FileVersion{}, err
 	}
 	var fv model.FileVersion
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND sf.file_id = ?2 LIMIT 1`, snapRaw, fileRaw)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -97,7 +105,7 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 		return nil, invalid("after_path is %d bytes, limit %d", len(afterPath), model.MaxPathBytes)
 	}
 	var out []model.FileVersion
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND f.path > ?2 ORDER BY f.path LIMIT ?3`, snapRaw, afterPath, limit)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -120,8 +128,19 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 // blob that is absent, quarantined or in trash is CTX_SOURCE_INTEGRITY: no
 // caller may serve bytes it cannot verify against stored digests.
 func (s *Store) Blob(ctx context.Context, hash string) (model.BlobRecord, error) {
+	return s.blob(ctx, s.read, hash)
+}
+
+// RecordedBlob is Blob as the ingestion side sees it: through the open group,
+// so a capture asking whether it has already recorded a blob sees the ones it
+// recorded since the last commit.
+func (s *Store) RecordedBlob(ctx context.Context, hash string) (model.BlobRecord, error) {
+	return s.blob(ctx, s.readOwn, hash)
+}
+
+func (s *Store) blob(ctx context.Context, read func(context.Context, func(*sql.Tx) error) error, hash string) (model.BlobRecord, error) {
 	var rec model.BlobRecord
-	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+	err := read(ctx, func(tx *sql.Tx) error {
 		var err error
 		rec, err = blobRecord(ctx, tx, hash)
 		return err

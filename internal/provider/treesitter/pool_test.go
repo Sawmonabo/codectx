@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -82,10 +83,9 @@ func TestHangDetectorEndsOnlyAWorkerThatNeitherComputesNorAnswers(t *testing.T) 
 	}
 }
 
-// newOneWorkerPool is a pool of real parser workers over a ledger whose
-// allocation holds exactly one of them, so the second worker anyone asks for
-// queues on the ledger.
-func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, int64) {
+// newTestPool is a pool of at most max real parser workers over a ledger of
+// the given allocation.
+func newTestPool(t *testing.T, max int, allocation int64) (*pool, *admission.Ledger) {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -98,14 +98,32 @@ func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const memory = int64(64) << 20
-	room, err := admission.NewLedger(memory, 0)
+	room, err := admission.NewLedger(allocation, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := newPool(runner, room, WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, t.TempDir(), 2, memory)
+	p := newPool(runner, room, WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, t.TempDir(), max, func(int64) {})
 	t.Cleanup(p.close)
-	return p, room, memory
+	return p, room
+}
+
+// newOneWorkerPool is a pool of real parser workers whose first worker is
+// started and whose ledger's allocation is then set to that worker's base
+// holding -- what it reported, or the idle stand-in where it reported none --
+// so it holds exactly one of them and the second worker anyone asks for --
+// reserved at that same largest base -- queues on the ledger. It returns the
+// first worker, busy, and its holding, which is what a foreign reserver that
+// must not fit beside it reserves.
+func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, *worker, int64) {
+	t.Helper()
+	p, room := newTestPool(t, 2, 4<<30)
+	first, err := p.acquire(context.Background(), p.request(0))
+	if err != nil {
+		t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
+	}
+	held := first.held.Load()
+	room.SetAllocation(held)
+	return p, room, first, held
 }
 
 // awaitHead returns once an acquirer of p has been told by the ledger that it
@@ -178,7 +196,7 @@ type handout struct {
 func acquireAsync(p *pool) <-chan handout {
 	ch := make(chan handout, 1)
 	go func() {
-		w, err := p.acquire(context.Background())
+		w, err := p.acquire(context.Background(), p.request(0))
 		ch <- handout{w, err}
 	}()
 	return ch
@@ -229,13 +247,17 @@ func acquireAsync(p *pool) <-chan handout {
 // idle and the pool makes no further acquire or release -- a stage whose own
 // progress waits on the reserver. The reserver must still be admitted: the
 // ledger's head runs the pool's idle-release step, which stops the worker.
+//
+// "foreign head before a caller's increment": the pool's only worker is held
+// by a caller that then waits for its file's increment behind another
+// reserver at the ledger's head, which waits for that worker's room. The
+// caller must be asked to yield its worker, and the worker it hands back must
+// be stopped, so the head is admitted. Mutation: drop yieldParse from the
+// pool's idle-release step -> the caller's wait never ends and the subtest
+// hangs.
 func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	t.Run("pool head", func(t *testing.T) {
-		p, _, _ := newOneWorkerPool(t)
-		first, err := p.acquire(context.Background())
-		if err != nil {
-			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
-		}
+		p, _, first, _ := newOneWorkerPool(t)
 		second := acquireAsync(p)
 		awaitHead(p)
 		p.release(first, true)
@@ -265,11 +287,7 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	})
 
 	t.Run("foreign head", func(t *testing.T) {
-		p, room, memory := newOneWorkerPool(t)
-		first, err := p.acquire(context.Background())
-		if err != nil {
-			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
-		}
+		p, room, first, memory := newOneWorkerPool(t)
 		stuck := make(chan struct{}, 1)
 		foreign := make(chan func(), 1)
 		go func() {
@@ -307,11 +325,7 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	})
 
 	t.Run("foreign waiter behind an idle worker", func(t *testing.T) {
-		p, room, memory := newOneWorkerPool(t)
-		first, err := p.acquire(context.Background())
-		if err != nil {
-			t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
-		}
+		p, room, first, memory := newOneWorkerPool(t)
 		p.release(first, true) // nobody waits, so the worker goes idle
 		stuck := make(chan struct{}, 1)
 		foreign := make(chan func(), 1)
@@ -372,11 +386,7 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	})
 
 	t.Run("foreign reserver beside an idle, quiet pool", func(t *testing.T) {
-		p, room, memory := newOneWorkerPool(t)
-		w, err := p.acquire(context.Background())
-		if err != nil {
-			t.Fatalf("the acquirer was not admitted on an idle ledger: %v", err)
-		}
+		p, room, w, memory := newOneWorkerPool(t)
 		p.release(w, true) // nobody waits, so the worker goes idle
 		foreign := make(chan func(), 1)
 		go func() {
@@ -395,4 +405,68 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 			t.Fatalf("the foreign reserver was admitted while the pool still held %d idle worker(s)", idle)
 		}
 	})
+
+	t.Run("foreign head before a caller's increment", func(t *testing.T) {
+		p, room, w, memory := newOneWorkerPool(t)
+		stuck := make(chan struct{}, 1)
+		foreign := make(chan func(), 1)
+		go func() {
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, func() {
+				select {
+				case stuck <- struct{}{}:
+				default:
+				}
+			})
+			if err != nil {
+				t.Errorf("the foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			foreign <- release
+		}()
+		<-stuck // the foreign reserver is the ledger's head and waits for w's room
+		ph, yielded, err := p.reserveParse(context.Background(), increment{bytes: memory})
+		if !yielded || ph != nil || err == nil {
+			t.Fatalf("the caller waiting for its increment behind a foreign head was not asked to yield (granted %v, error %v)",
+				ph != nil, err)
+		}
+		p.release(w, true)
+		(<-foreign)()
+		p.mu.Lock()
+		idle := len(p.idle)
+		p.mu.Unlock()
+		if idle != 0 {
+			t.Fatalf("the yielded worker went idle while the foreign head waited (%d idle)", idle)
+		}
+	})
+}
+
+// TestANeedTheWorkerCouldNotMeasureTeachesNothing settles a file whose Done
+// carried no need, then one whose Done carried one.
+//
+// Failure mode: an unavailable need read as zero is folded into the model as
+// a file that needed nothing; enough of them drag the prediction toward zero
+// and every later file of the class is admitted short and overruns.
+//
+// Mutation: settle a nil need as an observation of 0 -> the model predicts
+// after the first file, and no file is counted unmeasured. Count an overrun
+// without a need -> the first file is disclosed as one.
+func TestANeedTheWorkerCouldNotMeasureTeachesNothing(t *testing.T) {
+	p, _ := newTestPool(t, 1, 4<<30)
+	f := &fileNeed{language: "go", size: 4096, reserved: increment{bytes: 1 << 20}, model: &needModel{loaded: true}, halfLife: 1,
+		key: needKey{NeedKey: ledger.NeedKey{Language: "go", Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(4096)}}}
+	p.settle(f, wire.Memory{})
+	if _, ok := f.model.h.Predict(4096); ok {
+		t.Fatal("a file with no measured need was learned from")
+	}
+	if s := p.stats(); s.UnmeasuredFiles != 1 || len(s.Overruns) != 0 {
+		t.Fatalf("after a file with no need: %d unmeasured, overruns %+v; want 1 and none", s.UnmeasuredFiles, s.Overruns)
+	}
+	need := uint64(2 << 20)
+	p.settle(f, wire.Memory{NeedBytes: &need})
+	if _, ok := f.model.h.Predict(4096); !ok {
+		t.Fatal("a file with a measured need was not learned from")
+	}
+	if s := p.stats(); s.UnmeasuredFiles != 1 || len(s.Overruns) != 1 || s.Overruns[0].LargestDriftBytes != 1<<20 {
+		t.Fatalf("after a measured overrun: %d unmeasured, overruns %+v; want 1 and one of 1 MiB drift", s.UnmeasuredFiles, s.Overruns)
+	}
 }

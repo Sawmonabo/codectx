@@ -29,10 +29,21 @@ var goLowering = Lowering{
 //     short variable declaration, a var spec) with at most one variable
 //     target is one node spanning the statement (a var declaration of one
 //     spec spans the declaration). `x++` uses then defines x on that node.
+//     A variable target is a target identifier that names a variable of
+//     the function, or that `:=` declares; `_`, a name that resolves to no
+//     variable, and a field, index or indirect target are not variable
+//     targets, whatever the statement's syntactic target count: `n, y = y, n`
+//     with n resolving to no variable has one variable target, so it is one
+//     node spanning the statement, which Uses the reads of both paired
+//     values (y, the value paired with n; n itself reads nothing) and
+//     defines y.
 //   - A statement with k > 1 variable targets is k Stmt nodes, one per target,
 //     spanning the target identifier and defining it. Each carries the uses
 //     of its own value (its paired right-hand expression, or the whole right
-//     side of a multi-value call) and, for `op=`, its target. Go evaluates
+//     side of a multi-value call, whose reads every target node carries) and,
+//     for `op=`, its target. The may-definitions of an unpaired right side
+//     ride on the first node only (see the address-taking bullet), since Go
+//     evaluates it once. Go evaluates
 //     every operand before writing any target, and a node's uses are read
 //     before its own definition only, so the nodes are ordered such that no
 //     node reads a variable an earlier node of the statement wrote. Only a
@@ -137,7 +148,9 @@ var goLowering = Lowering{
 //     statement. The head Uses the tag's reads and defines a variable the
 //     lowering owns, holding the tag's value. A type switch's head spans
 //     `x := v.(type)`, Uses v's reads, and defines the alias x, which holds
-//     the switched value (without an alias, an owned variable). A switch
+//     the switched value; without an alias it spans `v.(type)`, from the
+//     guard's value through the closing parenthesis, and defines an owned
+//     variable. A switch
 //     without a tag, which the specification makes equivalent to `true`,
 //     has no head: its first case condition is its first node, after its
 //     init statement's. The head has one successor, the first case
@@ -157,8 +170,9 @@ var goLowering = Lowering{
 //     goto cannot jump into a block ("Goto statements"), so no clause reaches
 //     another clause's uses, and each clause's uses see the head's
 //     definition as they would see their own clause's. A read in a clause
-//     resolves in the clause's scope, where a declaration of its own
-//     shadows the alias.
+//     resolves in the clause's scope; the clause's own block already
+//     declares the alias, so only a declaration in a block nested in the
+//     clause shadows it.
 //   - A select has a Branch head spanning the `select` keyword. Go evaluates
 //     every clause's channel operand and sent value exactly once, in source
 //     order, on entering the select ("Select statements"), so their `&&`/`||`
@@ -166,15 +180,31 @@ var goLowering = Lowering{
 //     carries the may-definitions of what is not hoisted (a hoisted
 //     operand's are on its own Branch node), and defines a variable the
 //     lowering owns, holding the evaluated operands. Each clause's send or
-//     receive is one node, which Uses that variable and none of the
+//     receive is one node spanning the send or receive statement (`c <- v`,
+//     `<-c`, `n = <-c`, `x := <-c`), which Uses that variable and none of the
 //     operands' names, and Uses and writes a receive's left-hand side, which
 //     Go evaluates and assigns only when the clause is chosen (a receive
-//     with two targets is two nodes, each Using the variable). `select {}`
+//     with two variable targets is two nodes, each spanning its target
+//     identifier and Using the variable). `select {}`
 //     blocks forever and is lowered as a self-loop.
 //   - return, break, continue, goto and fallthrough are Jump nodes spanning
 //     the statement; `panic(...)` as a statement is a Jump node followed by
 //     Throw. Every label is its own Stmt node spanning the label identifier,
-//     before the statement it labels, so a goto always lands on it.
+//     before the statement it labels, so a goto always lands on it. A break
+//     or continue label must be that of an enclosing for, switch or select
+//     ("Break statements", "Continue statements"), so a label names the
+//     frame of the statement it labels directly and no other: in `L: M:
+//     for`, only M names the loop, L is a goto target only, and a break or
+//     continue naming L is unresolved.
+//   - A statement of a kind the lowering does not name, an ERROR node the
+//     parser's recovery leaves among a block's statements included, is one
+//     Stmt node spanning it, after its hoisted `&&`/`||` operands, that Uses
+//     every variable read under it, so a garbled statement drops no read.
+//     What it spans is the parser's recovery, not a rule of the lowering:
+//     the node spans the ERROR node itself, never more, and every
+//     statement the recovery keeps whole beside it is lowered as that
+//     statement is: when the recovery of `g(x) y` keeps `g(x)` an
+//     expression statement, the ERROR node's node spans y alone.
 //
 // Declarations of constants and types create no node; they only shadow.
 //
@@ -339,7 +369,7 @@ type goLower struct {
 	// hs holds the case-condition fringes of the open switches.
 	hs []flow.Fringe
 	// lab is the stack of the labels of the labelled statements being
-	// lowered; a statement's labels are its top.
+	// lowered; the label of the statement being lowered is its top.
 	lab []string
 	// marking records the next node created in first.
 	marking bool
@@ -460,7 +490,7 @@ func (g *goLower) isShort(n *ts.Node) bool {
 // may-definitions, adds only its result variable; one hoist did not lower is
 // folded, its operands' reads and may-definitions collected as the node's
 // own, so no read is dropped whatever the caller. No source reaches the
-// fold today: every caller hoists the subtree it collects first, and hoist
+// fold: every caller hoists the subtree it collects first, and hoist
 // descends into every named child collect does except a function literal,
 // which collect resolves through scan rather than through this case.
 func (g *goLower) collect(n *ts.Node) {
@@ -668,7 +698,8 @@ func (g *goLower) label(s *ts.Node) string {
 	return ""
 }
 
-// stmt lowers statement s; labels are the labels naming it.
+// stmt lowers statement s; labels holds the label naming it directly, if
+// any, which a for, switch or select gives its frame.
 func (g *goLower) stmt(s *ts.Node, labels []string) {
 	b, k := g.b, g.k
 	switch s.KindId() {
@@ -747,7 +778,7 @@ func (g *goLower) stmt(s *ts.Node, labels []string) {
 		// The enclosing switch carries the fringe into the next clause.
 		g.node(flow.Jump, s)
 	case k.labeledStatement:
-		g.labeled(s, labels)
+		g.labeled(s)
 	case k.ifStatement:
 		g.ifStmt(s)
 	case k.forStatement:
@@ -775,19 +806,16 @@ func (g *goLower) isPanic(e *ts.Node) bool {
 	return f != nil && f.KindId() == g.k.identifier && string(g.text(f)) == "panic" && g.binds.find(g.text(f), 0) < 0
 }
 
-// labeled lowers a labelled statement. Go's break and continue name only an
-// enclosing for, switch or select, so the labels reach those frames; every
-// label is also its own node, the target of goto.
-func (g *goLower) labeled(s *ts.Node, labels []string) {
+// labeled lowers a labelled statement. Its label is its own node, the
+// target of goto. A break or continue label must be that of an enclosing
+// for, switch or select ("Break statements", "Continue statements"), so the
+// label reaches the frame of the statement it labels directly and no other:
+// in `L: M: for`, L labels the labelled statement `M: for …`, and a break or
+// continue naming L is unresolved, as the compiler rejects it.
+func (g *goLower) labeled(s *ts.Node) {
 	k := g.k
 	id := s.ChildByFieldId(k.fLabel)
 	name := view(g.text(id))
-	// labels, those of the labelled statements s is the body of, is the top
-	// of lab; name is pushed after them. The frame the labelled statement
-	// opens copies the names, so they are popped once it is lowered.
-	start := len(g.lab) - len(labels)
-	g.lab = append(g.lab, name)
-	labels = g.lab[start:]
 	g.b.Label(name, g.span(id))
 	var inner *ts.Node
 	for i := range s.NamedChildCount() {
@@ -797,9 +825,14 @@ func (g *goLower) labeled(s *ts.Node, labels []string) {
 		}
 	}
 	if inner != nil && inner.KindId() != k.emptyStatement {
-		g.stmt(inner, labels)
+		// The label is the top of lab, passed with its capacity cut so a
+		// labelled statement nested in inner pushes past it; the frame inner
+		// opens copies it, so it is popped once inner is lowered.
+		top := len(g.lab)
+		g.lab = append(g.lab, name)
+		g.stmt(inner, g.lab[top:top+1:top+1])
+		g.lab = g.lab[:top]
 	}
-	g.lab = g.lab[:start]
 }
 
 func (g *goLower) ifStmt(s *ts.Node) {
@@ -1173,8 +1206,11 @@ func (g *goLower) fill(n *ts.Node, field uint16) {
 // assign lowers a statement assigning right (an expression list, one
 // expression, or nil) to lefts; compound targets are also read, define
 // declares every target not declared in the innermost block. A field, index
-// or indirect target is read and may-defines its base variable on the
-// statement's last node, where every target has been written. A
+// or indirect target's operands are read on the statement's first node, with
+// the values paired with targets that name no variable, and it may-defines
+// its base variable on the statement's last node, where every target has
+// been written; a statement of at most one variable target is one node,
+// which carries both. A
 // may-definition an evaluation makes (an address taken, a function literal's
 // write) lands on the node that evaluates it: a paired value's on its
 // target's node, a non-variable target's operands' and an unpaired right
@@ -1283,7 +1319,9 @@ func (g *goLower) assign(whole, right *ts.Node, compound, define bool, held int3
 	g.buf, g.may = g.buf[:lo], g.may[:mlo]
 }
 
-// order emits one node per variable target, keeping the statement's
+// order emits one node per variable target (assign calls it only for more
+// than one; a target that is `_`, names no variable or writes through a base
+// is not among them), keeping the statement's
 // invariant: every target node reads the right-hand values as they were
 // before any target of the statement was written. It repeatedly takes the
 // first remaining target no other remaining target reads, so no node reads

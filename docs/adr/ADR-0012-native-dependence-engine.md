@@ -14,7 +14,6 @@ the worker, the wire protocol or a provider. Phase 0 is not yet claimable under 
 review on 2026-09-26 found these gaps:
 - most Go and JavaScript cases cite no reference anchor;
 - some C cases cite none, and the TypeScript cases cite a handbook, which is not a language reference;
-- Rust has no `?`-on-`Result` case;
 - several handled constructs have no case;
 - no table has had its blind second derivation.
 
@@ -183,13 +182,14 @@ Four findings follow, and each one changes a decision below.
    - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time
      (three workers of one end-to-end test run in the capped test pass of 2026-09-25, recorded in the research note's
      raw wall-time file) is a worker busy about 2% of the time. That much is measured.
-   - The serialization point was found by reading, not by profiling. Every per-unit store call takes one group mutex
-     (`internal/storage/sqlite/open.go:710`, `:830`), and a unit makes about ten such calls, plus one or two per
-     extracted record.
+   - The serialization point was found by reading, not by profiling. In the store measured, every per-unit store call
+     took one group mutex, and a unit made about ten such calls, plus one or two per extracted record. That is the
+     measured reason for the store changes of decision 5, which replace the mutex with one writer goroutine.
    - How the other 98% splits between waiting on the lock, SQL, worker re-execution and the provider barrier is not
      yet measured. It is the benchmark task's first measurement.
 4. **A C++ header is parsed as C.**
-   - `.h` belongs to the C grammar (`internal/provider/treesitter/lang/lang.go:79`).
+   - In the build measured, `.h` belonged to the C grammar alone. Decision 10 declares it in both grammars' rows
+     (`internal/provider/treesitter/lang/lang.go:86-87`) and lets the repository decide.
    - In the compiler-infrastructure corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files.
 
 The per-function design figure of decision 5 has a heavy tail but a small absolute size. The population is the
@@ -251,7 +251,7 @@ from the other four. That asymmetry is real and is why `calls` is ported last, b
 | Interprocedural framework | **none** — no IFDS, no IDE | realizable-path precision is unobservable at a surface that publishes unlabelled depth-8 reachability, and the exploded supergraph reinstates exactly the whole-program resident structure decision 5 forbids |
 | Incrementality | **no incremental dataflow algorithm**; a changed function is recomputed from scratch, and the invalidation boundary is the file's content hash | a function's CFG is tens to hundreds of nodes; the bookkeeping costs more than the recomputation. This is also the model the structural tier already runs |
 | In-flight adjacency | plain `int32` compressed sparse row, forward and reverse, no varint | it is built and discarded inside one worker — a different object from the published per-generation adjacency of [ADR-0005](ADR-0005-graph-traversal-layout.md), which is unchanged |
-| Tree access | each file's tree is **flattened once, in one native call**, into a Go-side node array (kind, field, flags, byte range, parent, first child, next sibling), after the structural queries have run on the native tree; the native tree is then closed, and the lowering and the callable walk read the array with **no native call per node**. Every kind and field is resolved to an id once per process | per-node native calls are the measured dominant cost inside lowering and the callable walk (the context section's profile). **Alternatives:** per-call accessors, which is the measured cost; resolving ids alone, measured at under 10%; reading the library's node structures directly through unsafe pointers, which breaks on any change of the library's layout. **Given up:** the flat array's own bytes beside the tree while flattening, and whether it is smaller than the tree after is unknown (the tree stores leaves inline in 8 bytes). **Confirming measurement:** lowering time per function on the Go corpus, and flat bytes per source byte beside tree bytes, per language |
+| Tree access | each file's tree is **flattened once, by a constant number of native calls (one to size the array, one to fill it, one to free the fill's field table once it is copied) and none per node**, into a Go-side node array (kind, the cursor's nearest field, flags, byte range, parent, first child, next sibling) and a sparse field table, at any point before the native tree is closed, since flattening only reads it: a header's parses are flattened to weigh their errors before the structural queries run on the kept one, with no field table, since nothing reads fields there. The field table gives the array the library's own child-by-field answers: inside the fill, for every internal node, the library's public `ts_node_child_by_field_id` is asked for each field id in the language's field registry (the fields the lowerings resolve, listed once in the grammar table, which refuses a lowering any other), and every answer that is not null is kept as a (field, node index) pair. The field map it reads says more than the cursor's nearest field can: a field inherited through a hidden or an aliased child, an outer field on a node that also has a nearer one, and no field on an ERROR node. Its cost is one C-side lookup per internal node per registered field, and no crossing per node; its bytes are the answers only, counted in the array's size. Once the queries have run, the native tree is closed, and the lowering and the callable walk read the array with **no native call per node**. Every kind and field is resolved to an id once per process | per-node native calls are the measured dominant cost inside lowering and the callable walk (the context section's profile). **Alternatives:** per-call accessors, which is the measured cost; resolving ids alone, measured at under 10%; reading the library's node structures directly through unsafe pointers, which breaks on any change of the library's layout. The native tree handle is read from the binding's tree wrapper, whose only field it is, under a size assertion and a root-node equality test, so a binding change fails the tests rather than reading wrong memory; a repository-owned binding over the library's public API is the alternative, and is not needed while that check holds. **Given up:** the flat array's own bytes beside the tree while flattening, and whether it is smaller than the tree after is unknown (the tree stores leaves inline in 8 bytes). **Confirming measurement:** lowering time per function on the Go corpus, and flat bytes per source byte beside tree bytes, per language |
 | Allocation | one **reset slab arena per worker**, pointer-free typed backing arrays, reused across a file's functions and **released at the file boundary** | the multiplier is on the order of 10⁶ functions, and what the arena saves is the collector's scan set. Today the arena releases at a 1 MiB threshold (`flow/arena.go`), a figure fitted to nothing and corrected here: it fired for 3 of about 351,000 functions while the arena kept 0.4–1.25 MB between them. **Given up:** manual lifetime discipline inside the worker |
 | The file boundary | after each file the worker closes the tree, drops the arena's backing, returns freed C heap pages to the kernel and resets its own peak reading; the parse loop runs on one OS thread with one C heap arena | a per-file need can only be observed if the memory of the previous file is returned (decision 5). Without the return, the C allocator reuses what it already holds and the reading is censored: the resident set does not move on about 95% of files. **Given up:** the refault cost of the next file, and the arena setting is specific to one C library; both are measured before the decision is closed |
 | `GOGC` / `GOMEMLIMIT` | **set neither** | the parse tree's C allocation can be counted, because the binding routes it through Go. But the memory a limit would govern in the worker is small, and the coordinator's retained records are already bounded by the sink pool. A limit would add only the thrashing risk the garbage collector's own guide describes |
@@ -318,15 +318,18 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 **Per file, need is observed, not assumed.**
 - **Measure.** At the file boundary of decision 2, the worker returns freed pages, reads its base and resets its peak
   (the kernel's `clear_refs` value 5, then `VmHWM`). After the file it reads the peak and reports three figures in the
-  file's `Done` frame: need (peak minus base), base, and anonymous resident set. The worker measures itself: the 250 ms
-  tree sampler misses nearly every parse, so it stays only as an envelope check.
+  file's `Done` frame: need (peak minus base), base, and anonymous resident set. The base the worker holds on the ledger
+  is its anonymous resident set, which is its own, not the executable pages every worker shares; where only the whole
+  resident set is reported, that is held instead. The worker measures itself: the 250 ms tree sampler misses nearly
+  every parse's peak, so for need it stays only as an envelope check.
 - **Where no resettable peak exists.** On a platform that offers no resettable per-process peak, need is reported as
   unavailable, never as zero: the file is reserved at its prediction and nothing is learned from it.
 - **Learn.** The coordinator keeps a decaying histogram of need per source byte in 5% buckets. It is keyed per
-  repository, language, grammar fingerprint and file-size class, and persisted with the generation. It reserves the
-  histogram's weighted p99, which is the sample maximum below 100 observations. The half-life is counted in that
-  repository's own files of that language, so the model adapts at the speed of the repository in front of it, whatever
-  its size.
+  repository, language, grammar fingerprint, the worker's build and file-size class, and persisted in the ledger's
+  observation store beside the scope peaks, since a measurement stays true whatever becomes of its generation. It
+  reserves the histogram's weighted p99, which is the sample maximum below 100 observations. The half-life is counted
+  in that repository's own files of that language, so the model adapts at the speed of the repository in front of it,
+  whatever its size.
 - **First file.** The first file of a language never seen in this repository is reserved at a **structural prior**:
   `worker base + source bytes × 107`.
   - The 107 is derived from the parse-tree runtime's own node layout, not measured on any repository. Per source byte
@@ -334,22 +337,27 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
     input copies and 1 for the worker's buffer.
   - It holds on all 3,827 matrix files of 64 KiB or more. It is exceeded by 9 of 74,059 files of 4 KiB or more; the
     worst is 302.8 bytes per source byte, a 10,479-byte C++ file.
-  - An exceeded prior is an overrun that runs and is disclosed, never a refusal. If the prior falls below observed need
-    on some class, the first file of a language runs alone.
+  - An exceeded prior is an overrun that runs and is disclosed, never a refusal. Once a file reserved at the prior needs
+    more than it in some class of a language, every later file of that language reserved at the prior runs alone among
+    the parses, for the life of the parser pool: it is granted only when no other parse holds an increment, and none is
+    granted beside it. The switch is disclosed, as a warning naming the language and in the parser's resource view with
+    the count of files run alone.
+  - A worker of a new build learns afresh: the build is part of the key, and the parent refuses a worker whose hello
+    states another build.
 
 **Per run:**
 
 > `R_run = B_process + Σ over workers in flight (base_w + predicted_need(file_w)) + A_link`
 
-- `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set at composition;
-  today it is the constant `IdleFootprintBytes`, corrected here.
+- `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set once, at load;
+  only a platform that reports no resident set falls back to the recorded idle measurement.
 - `predicted_need` is the learned p99 above, or the prior for a first file.
 - `A_link` is the package-scoped linker's working set (decision 9).
 - No term is a constant fitted to a repository.
 - The figure depends on the files in flight, not on how many files the repository has.
 
-**The ledger.** Each worker holds its observed base for its lifetime and reserves each file's predicted increment
-before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/admission`) gains three obligations:
+**The ledger.** Each worker holds its observed base -- its anonymous resident set -- for its lifetime and reserves each
+file's predicted increment before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/admission`) gains three obligations:
 - **Adjust.** `Done` adjusts a holding to what the file used, upward without waiting.
 - **Forward progress.** A per-file increment is granted whenever no parse is in flight. This is the runs-alone rule
   restated per file, so a file larger than the whole allocation still runs, whole.
@@ -361,15 +369,24 @@ changes. A class that misses the target reopens the percentile, never the refusa
 runs.
 
 A file whose need exceeds its prediction does not fail; the overrun is counted and disclosed with its reservation, its
-observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed in code: parser
-observations are folded into the model. Today they are not, because worker spans carry an empty scope key and the
-collector skips them (`internal/ledger/collector.go:500`).
+observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed through the per-file need
+observation: each file's `Done` carries its measured need, the coordinator folds it into its class's model at once,
+the next file of that class is reserved from the updated model, and the ledger's observation store persists the model
+with the observation it came from. The worker's process-tree spans play no part in it.
 
 **Coexistence, as a mechanism.**
 - **The allocation.** It is the smaller of two figures: available memory plus the product's own observed residency,
-  less the base footprint and margin; and half of that total. It is **re-derived from the kernel's figure between
-  files**. Today it is read once, at composition (`internal/app/compose.go:711-731`), and that is corrected here.
-  Counting the product's own residency means its own growth never throttles it.
+  less the base footprint and margin; and half of that total. It is **re-derived from the kernel's figure before every
+  admission** on the ledger, not read once at composition. Counting the product's own residency means its own growth
+  never throttles it.
+- **The residency added back.** It is the parent's resident set plus every ledger child's live anonymous resident set,
+  since a child admitted on the ledger has already taken from the kernel's figure what its reservation stands for.
+  Every child the runner starts with a memory reservation (a dependence unit, an external indexer, a language server)
+  is read from the runner's tree sample at each admission. The parser workers, whose room the pool holds itself, are
+  the sum of their tree samples, handed over as each file's increment is reserved; where any live worker has no
+  reading, they are counted instead at their base holdings plus the increments of the parses in flight. Any other
+  child with no reading is left out of the sum, never counted as zero or at its reservation, so a missing reading can
+  only narrow the allocation.
 - **Waiting.** A file whose reservation does not fit waits at the head of the line and is admitted the moment one
   returns. Available memory falling **is** the signal that the user's editor, browser or the agent driving the product
   is competing.
@@ -394,24 +411,26 @@ collector skips them (`internal/ledger/collector.go:500`).
 **Scheduling** dispatches files largest-first by source bytes, from one shared queue:
 - On one corpus's rows, the compiler checkout's, parse time ranks with source bytes at Spearman ρ 0.82–0.86 per
   language.
-- A replay of those rows reaches the makespan lower bound at 16 workers, where path order, today's, is 10% over it.
-- The same rank and replay over every matrix corpus is a measurement of the benchmark task, and largest-first is
-  confirmed per class on it.
+- A replay of those rows reaches the makespan lower bound at 16 workers, where path order is 10% over it.
+- Over all seven public matrix corpora, per language with at least 30 files, per-file worker wall (parse, lowering
+  and analysis) ranks with source bytes at Spearman ρ 0.82–0.99, and a replay of largest-first from one queue
+  reaches the makespan lower bound, the larger of the mean load and the largest file, within 0.1% at 4, 8, 16 and
+  32 workers on every corpus, where path order is up to 44% over it. Largest-first is confirmed on every class.
 - Work stealing is dropped: it solves contention between per-worker queues, which one central queue does not have.
 - The worker count is the smaller of the processor count and the allocation divided by observed need.
 - The classic longest-processing-time bound is 4/3 − 1/(3m) of optimal.
 - Per-function variance is handled by order, not by a finer grain, because a per-function dispatch unit would force a
   shared parse-tree lifetime across workers.
 
-**Wall time is taken out of the store first.** The structural stage is serialized on the store's group mutex today, so
-worker count buys nothing until four changes land, in this order:
+**Wall time is taken out of the store first.** The structural stage measured was serialized on the store's group
+mutex, so worker count buys nothing without four changes, in this order:
 1. **Batch the resolution.** Resolve a file's candidates in one batched read, not one or two reads per record.
 2. **Move the reads.** Run the read-only steps on the reader pool against the last commit, adding one commit at each
    provider boundary.
 3. **One writer.** Hand writes to a writer goroutine that owns the connection, a group-lifetime statement cache and the
    per-group seal checks.
-4. **Keep the stage open.** Keep the parse stage open across the whole unit. A mid-provider drain re-executes workers
-   today.
+4. **Keep the stage open.** Keep the parse stage open across the provider's whole pass over its units. A mid-provider
+   drain would re-execute workers.
 
 More concurrency is not the fix: the write-ahead log admits one writer. Passing measurements:
 - stage wall ≤ 2 × Σ worker CPU ÷ workers;
@@ -578,7 +597,7 @@ what it is, and the retirement gate's parity condition is what proves the label 
   disclosed with the function's byte range, so no construct in a user's code can take down a worker or lose the
   file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
-  (`internal/index/generation.go:1257-1260`).
+  (`internal/index/generation.go:1392-1394`).
 - **`calls`.** A new package-scoped linking provider publishes `calls`. It is keyed on per-file digests of each file's
   export table and call-site table, so an edit inside a function body does not trigger a relink. Unit inputs are files
   today (`internal/index/delta/delta.go:56-72`), so this is a model addition.
@@ -600,13 +619,14 @@ gates.
 
 ### 10. A header's language is decided by the repository, not by its extension
 
-`.h` is mapped to the C grammar today (`internal/provider/treesitter/lang/lang.go:79`). In the compiler-infrastructure
+In the build measured, `.h` was mapped to the C grammar alone. In the compiler-infrastructure
 corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files. The repository, not the file name, knows
 which language its headers are written in. The rule:
 1. **One-language repositories.** A repository with C translation units and no C++ ones parses `.h` as C, and one with
    C++ translation units and no C ones parses `.h` as C++.
 2. **Mixed repositories.** A repository with both parses `.h` with the C++ grammar first. It is the closer superset of
-   the two dialects that occur in headers.
+   the two dialects that occur in headers. A repository with neither parses `.h` with the C++ grammar first, for the
+   same reason; the fallback recovers a C header.
 3. **Fallback.** A header whose chosen parse has errors is parsed once with the other grammar. The parse with fewer
    error bytes is kept, and the choice is disclosed per file.
 
@@ -619,7 +639,8 @@ makes a file-local decision depend on a project-wide pass that runs before any h
 - two neighbouring headers can differ in language.
 
 **Measurement, per class:** on every C/C++ instance, the `.h` parse-error share is no greater than the larger of that
-instance's `.c` and `.cpp` shares. No C-only instance changes.
+instance's `.c` and `.cpp` shares. No C-only instance's clean `.h` parse changes: the fallback applies in every
+repository, so a C-only instance's `.h` parse with errors may be replaced by a C++ parse with fewer error bytes.
 
 ## Measurements
 
@@ -809,10 +830,10 @@ plausibly larger than the implementation, which for Rust and Java cannot be a di
 at all and must be authored from the language reference; and per-language lowering semantics, where
 every reference implementation surveyed is measurably wrong on something.
 
-Two obligations this record creates rather than discharges. The per-file observation, the learned model and
-the ledger's adjust and forward-progress rules of decision 5 are required work; until they exist the disclosure of
-[ADR-0010](ADR-0010-engine-memory.md) decision 4 is what makes drift visible. And the store changes of decision 5
-come before any worker-count gain, because the structural stage is serialized on the store's lock. And the plan still publishes no native throughput target, because none can be measured before something is
+Two obligations this record creates. The per-file observation, the learned model and the ledger's adjust and
+forward-progress rules of decision 5 are built, and the disclosure of [ADR-0010](ADR-0010-engine-memory.md) decision 4
+is what makes an overrun of the model visible. And the store changes of decision 5 come before any worker-count gain,
+because the structural stage measured was serialized on the store's lock; they are built. And the plan still publishes no native throughput target, because none can be measured before something is
 built — what it publishes instead is the instrument and the comparison: phase 2 closes on a lower wall
 *and* a lower tree-summed peak than the engine, on the same unit and the same 250 ms sampler.
 

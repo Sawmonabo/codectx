@@ -53,12 +53,20 @@ var fixtures = []struct {
 
 func newProvider(t *testing.T) *treesitter.Provider {
 	t.Helper()
+	p := newProviderOver(t, 2, newLedger(t, 4<<30))
+	t.Cleanup(p.Close)
+	return p
+}
+
+// newProviderOver is a provider of at most workers parser workers admitted on
+// room. The caller closes it.
+func newProviderOver(t *testing.T, workers int, room *admission.Ledger) *treesitter.Provider {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		t.Fatal(err)
 	}
 	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
@@ -66,22 +74,21 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
+		MaxWorkers: workers, Rederive: func(int64) {}, Admission: room,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(p.Close)
 	return p
 }
 
 // newLedger is the reservation ledger a test provider's workers are admitted
-// on: wide enough that admission never queues a test's handful of workers.
-func newLedger(t *testing.T) *admission.Ledger {
+// on, over the given memory allocation.
+func newLedger(t *testing.T, allocation int64) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(4<<30, 0)
+	l, err := admission.NewLedger(allocation, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +206,12 @@ type capture struct {
 	nodes    []model.NodeFact
 	aliases  []model.NativeAlias
 	evidence []model.Evidence
+	search   []model.SearchUnit
+}
+
+func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
+	c.search = append(c.search, docs...)
+	return c.UnitOutput.PutSearchUnits(ctx, docs)
 }
 
 func (c *capture) PutAliases(ctx context.Context, a []model.NativeAlias) error {
@@ -219,6 +232,91 @@ func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) 
 		c.evidence = append(c.evidence, f.Evidence...)
 	}
 	return c.UnitOutput.PutRelations(ctx, facts)
+}
+
+// TestOneIdentityOneNodeAndBlankNamesDeclareNothing pins the two rules that
+// keep a unit's facts storable when a file repeats an identity. A unit that
+// published one node per declaration published the repeated identity's
+// search document twice, the store refused the second under its unique
+// (unit, search key), and the unit failed with nothing of the file indexed.
+func TestOneIdentityOneNodeAndBlankNamesDeclareNothing(t *testing.T) {
+	p := newProvider(t)
+	run := func(t *testing.T, file, src string) *capture {
+		t.Helper()
+		files := map[string]string{file: src}
+		h := providertest.New(t, files)
+		u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+		cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
+		result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
+		if err != nil {
+			t.Fatalf("RunUnit(%s): %v", file, err)
+		}
+		if result.State != model.RunSucceeded {
+			t.Fatalf("run state for %s = %s, want succeeded", file, result.State)
+		}
+		return cap
+	}
+	count := func(cap *capture, name string) (nodes, search int) {
+		for _, n := range cap.nodes {
+			if n.Node.Name == name {
+				nodes++
+			}
+		}
+		for _, d := range cap.search {
+			if d.Name == name {
+				search++
+			}
+		}
+		return nodes, search
+	}
+	noBlank := func(t *testing.T, cap *capture) {
+		t.Helper()
+		if nodes, search := count(cap, "_"); nodes != 0 || search != 0 {
+			t.Fatalf("%d nodes and %d search documents are named _; nodes: %s", nodes, search, names(cap.nodes))
+		}
+		for _, a := range cap.aliases {
+			if a.NativeKey == "_" || strings.HasSuffix(a.NativeKey, "._") || strings.HasPrefix(a.NativeKey, "decl:_@") {
+				t.Fatalf("alias %+v names the blank identifier", a)
+			}
+		}
+	}
+
+	// Go's blank identifier declares nothing, and the three `_` of one spec
+	// share the spec's range, so they also repeat one identity. Mutation:
+	// drop Go's blank name from the extraction -> `_` nodes appear; and with
+	// one node per declaration as well, the unit fails on the store.
+	t.Run("go blank names", func(t *testing.T) {
+		cap := run(t, "blank.go", "package p\nvar _, _, x, _ = f()\nfunc f() (int, int, int, int) { return 0, 0, 0, 0 }\n")
+		noBlank(t, cap)
+		for _, name := range []string{"x", "f"} {
+			if nodes, search := count(cap, name); nodes != 1 || search != 1 {
+				t.Fatalf("%s is %d nodes and %d search documents, want one of each; nodes: %s", name, nodes, search, names(cap.nodes))
+			}
+		}
+	})
+
+	// C's `int x, x;` is two tentative definitions of one object: both
+	// declarators share the declaration's name, kind and range, so they
+	// resolve to one identity. Mutation: publish a node and a search
+	// document per declaration -> the unit fails on the store's unique
+	// search key, or two nodes named x appear.
+	t.Run("c repeated declarator", func(t *testing.T) {
+		cap := run(t, "twice.c", "int x, x;\n")
+		if nodes, search := count(cap, "x"); nodes != 1 || search != 1 {
+			t.Fatalf("x is %d nodes and %d search documents, want one of each; nodes: %s", nodes, search, names(cap.nodes))
+		}
+		for _, n := range cap.nodes {
+			if n.Node.Name == "x" && len(n.Evidence) != 2 {
+				t.Fatalf("x carries %d evidence rows, want one per declarator", len(n.Evidence))
+			}
+		}
+	})
+
+	// Rust's unnamed constant is not nameable. Mutation: drop Rust's blank
+	// name from the extraction -> two constants named _ appear.
+	t.Run("rust unnamed constants", func(t *testing.T) {
+		noBlank(t, run(t, "unnamed.rs", "const _: () = ();\nconst _: () = ();\n"))
+	})
 }
 
 func lineOf(src []byte, offset uint64) uint32 {
@@ -408,25 +506,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // in release and drop the drain from leaveStage -> "the parse stage ended with
 // 2 worker process(es) still alive".
 func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
-		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner: runner, WorkDir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newProviderOver(t, 2, newLedger(t, 4<<30))
 	defer p.Close()
 
 	if s := p.Stats(); s.Processes != 0 || s.WorkersStarted != 0 {
@@ -588,26 +668,7 @@ func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 // how many processes ran its files.
 func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
-		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner: runner, WorkDir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return newProviderOver(t, 1, newLedger(t, 4<<30))
 }
 
 // TestARecordAndASourceLongerThanOneFrameArriveWhole pins that the wire has no
@@ -646,5 +707,47 @@ func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
 	if probe.Imports != 1 || probe.Truncated {
 		t.Fatalf("the %d-name import arrived as %d imports (truncated %v), want exactly 1 and not truncated",
 			names, probe.Imports, probe.Truncated)
+	}
+}
+
+// TestAFileLargerThanTheAllocationRunsAlone parses two files concurrently on
+// a ledger whose allocation is zero -- a real reading, a host with nothing
+// left over the product's footprint -- so every worker base and every file's
+// increment is larger than the whole allocation.
+//
+// Failure mode: a file whose predicted need exceeds the allocation, admitted
+// only when nothing at all is held, never runs once a worker holds its base,
+// and the index waits forever for memory no release will return; admitted
+// beside another parse, it takes memory the host does not have.
+//
+// Mutation: take the file's increment without the Parse mark -> neither probe
+// returns. Grant a Parse reservation beside another -> MaxParsesInFlight is 2
+// whenever the two parses overlap.
+func TestAFileLargerThanTheAllocationRunsAlone(t *testing.T) {
+	p := newProviderOver(t, 2, newLedger(t, 0))
+	defer p.Close()
+	src, err := os.ReadFile(filepath.Join("testdata", "sample.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := p.ParseProbe(context.Background(), "sample.go", src)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a file larger than the allocation did not complete: %v", err)
+		}
+	}
+	if s := p.Stats(); s.Parses != 2 || s.MaxParsesInFlight != 1 {
+		t.Fatalf("%d parses with at most %d in flight; want 2, one at a time", s.Parses, s.MaxParsesInFlight)
 	}
 }

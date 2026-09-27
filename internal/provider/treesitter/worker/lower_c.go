@@ -57,7 +57,8 @@ const (
 //     initializer spanning it ([class.base.init]).
 //   - A statement is one node: an expression statement spans its
 //     expression (a comma expression at statement level is one statement
-//     per operand), an initialized declarator spans the init declarator,
+//     per operand; an empty statement `;`, labelled or not, makes none, so
+//     `L:;` is the label's node alone), an initialized declarator spans the init declarator,
 //     defines the name and comes after the nodes its initializer makes (a
 //     lambda's creating node included), return, co_return, throw, break,
 //     continue, goto and `__leave` span the statement (kind Jump). An
@@ -70,7 +71,8 @@ const (
 //     node. A declarator without an initializer makes no node (the object's
 //     value is indeterminate, C17 §6.7.9p10), unless a variable-length array
 //     size is evaluated there: then one Stmt node spans the declarator and
-//     reads the size. In C++ a declarator without an initializer whose
+//     reads the size, and still defines nothing, since the array's elements
+//     are as indeterminate as any uninitialized object's. In C++ a declarator without an initializer whose
 //     declaration type is not a fundamental or enumeration type specifier,
 //     outside an `extern` declaration, declares an object of class type,
 //     which its default constructor initializes ([dcl.init]/7): one Stmt
@@ -78,8 +80,9 @@ const (
 //     that aliases a scalar is counted too, an over-approximation. A
 //     structured binding ([dcl.struct.bind]) evaluates its initializer
 //     once: a Stmt node spanning the initializer defines an owned variable,
-//     then one defining node per name, spanning the name, Uses it. A
-//     `static`
+//     then one defining node per name, spanning the name, Uses it; for a
+//     reference binding (`auto &[a, b] = s`) the initializer's node, which
+//     carries the read of s, also carries its may-definition. A `static`
 //     local is a variable whose initializer is a defining node at its
 //     position; the value it keeps across calls is not modelled.
 //   - A condition is one Branch node, spanned as Spans (see Lowering)
@@ -113,7 +116,9 @@ const (
 //     values are constants), then the case
 //     bodies in source order, each entered from its label and falling into
 //     the next body unless it jumps (C17 §6.8.4.2). `default` is taken when
-//     no label matches, whatever its position. A case or default label
+//     no label matches, whatever its position: it makes no test node, and
+//     the last test's false edge goes to its body (to its label node when it
+//     is nested). A case or default label
 //     nested below another statement of the switch body (a label inside a
 //     loop of the body, or inside a preprocessor conditional) is reached
 //     through the builder's Label and Goto: its Branch node's true edge
@@ -123,11 +128,14 @@ const (
 //     label node is named by cCasePrefix and the label's start byte, a name
 //     built only for such nested labels, in a buffer the function's
 //     lowering reuses. Statements before the first case label are reachable
-//     only by a jump into them.
+//     only by a jump into them, a preprocessor conditional among them
+//     included: its Branch node has no predecessor, and a case label nested
+//     in one of its arms is entered only from that label's test.
 //   - A C++ range for ([stmt.ranged]) follows Iteration (see Lowering): the
 //     range expression's Stmt node, which defines the iteration variable;
-//     the Branch head, spanning from the declarator to the end of the range
-//     expression and Using only the iteration variable, never the names the
+//     the Branch head, spanning from the start of the declarator (a
+//     reference's `&` included: `auto &e : v` renders as `&e : v`) to the
+//     end of the range expression and Using only the iteration variable, never the names the
 //     range expression reads; then one defining node per bound name spanning
 //     the name, Using only the iteration variable too. A name bound by a
 //     reference to a non-const type (`auto &e : v`) is bound to an element
@@ -177,19 +185,26 @@ const (
 //     A name the arms bind only as no variable (a
 //     function prototype) is no variable after the directive when every arm
 //     binds it, and otherwise keeps the binding from before it. Inside an arm
-//     that redeclares the name, the name is the arms' variable alone.
+//     that redeclares the name, the name is the arms' variable alone; a link
+//     that an inner conditional of an earlier arm gave the name is suspended
+//     there and restored when the outermost conditional at that block level
+//     ends, so a read after it Uses both variables again.
 //   - A lambda or a nested function definition is its own function; in the
 //     enclosing function its creating expression is one Stmt node spanning
-//     it (see Captures).
+//     it (see Captures). A nested function's name is no variable, as a
+//     block-scope prototype's is not: a call `g()` of it Uses nothing.
 //
 // Kinds that make no node: type definitions and type specifiers
 // (struct, union, enum, class), preprocessor lines other than
 // conditionals, linkage specifications, and the C++ using, alias,
 // namespace, static_assert, template and concept declarations. A
-// `co_yield` statement is a plain Stmt node and `co_await` a plain operand
+// `co_yield` statement is a plain Stmt node spanning the statement with its
+// `;` and `co_await` a plain operand
 // ([expr.await], [expr.yield]); the suspension is not a CFG edge. Every kind
 // not named above is a plain Stmt node carrying its reads and falling
-// through.
+// through, an ERROR node of the parser's recovery included, whether it wraps
+// what the parser could not parse or a single token it skipped (which the
+// parser marks as an extra, as it marks a comment).
 //
 // # Uses
 //
@@ -200,9 +215,12 @@ const (
 // an array type name are evaluated), and the controlling expression of a
 // generic selection (C17 §6.5.1.1p3) are not; the association a generic
 // selection picks depends on types, so every association's expression is
-// read. A node Uses what its own evaluation reads, and a value computed at
-// another node reaches it through a variable, as Lowering's Uses rule
-// states.
+// read. Both grammars parse the operand of alignof and offsetof as a type
+// descriptor (offsetof's second operand as a field name), so no identifier
+// of a variable ever stands there and no golden can show the rule: it holds
+// by the grammar. A node Uses what its own evaluation reads, and a value
+// computed at another node reaches it through a variable, as Lowering's Uses
+// rule states.
 //
 // A name that resolves to no variable (Lowering, Names that resolve to no
 // variable: here a file-scope or namespace name, a member named without its
@@ -258,7 +276,11 @@ const (
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
 // defines an owned variable that replaces the held read, so the folded read
-// pairs with the definition that reached it. The hand-off is made only when the
+// pairs with the definition that reached it. A definition through a name a
+// preprocessor conditional left bound to several variables defines each (see
+// Node granularity), so the defining node carries the held read of each one
+// (`g(x, x = 2)` after `#ifdef A int x = 1; #endif` hands on the read of the
+// arm's x and of the parameter). The hand-off is made only when the
 // defining node runs whenever the consumer does: a definition in the right
 // operand of `&&` or `||` or in an arm of `?:` leaves the read on the consumer.
 // So does a definition in a statement of a statement expression other than its
@@ -294,7 +316,9 @@ const (
 // `fill(buf)`; and binding a C++ reference to a non-const type to an
 // object, `T &r = x` (also `T &r{x}`, `T &r(x)`, `T &&r = …` and
 // `auto &[a, b] = s`), which may-defines its base variable at the
-// declarator's node ([dcl.init.ref]). A reference to a const type
+// declarator's node ([dcl.init.ref]). The base is seen through a call to
+// move, forward or move_if_noexcept, which yields its argument itself
+// ([utility.syn], [forward]): `T &&r = std::move(x)` may-defines x. A reference to a const type
 // (`const T &r = x`, [dcl.ref]/1) is a read-only view: its binding only
 // reads the object, as Lowering states. The may-definition
 // lands on that node even when a later operand makes a node first: the
@@ -316,21 +340,31 @@ const (
 // or lambda spanning it, which defines it too, as Uses states; a comma
 // expression's left operand is a statement of its own and its right operand
 // the value); otherwise the construct has no value and no
-// result. Every other statement is a node of its own, whose reads no later
+// result. An expression statement that discards one with no value
+// (`(void)({ if (x) h(); });`) still ends with a Stmt node spanning its
+// expression, carrying the reads left to it (none there): the construct
+// hands on no result, so the rule that an expression lowered to nodes of
+// its own makes no further node does not apply. Every other statement is a node of its own, whose reads no later
 // node takes. The extension permits jumping out of a statement expression: a
-// `break` or `continue` in one binds to the innermost loop or switch open
-// where it stands, so one in a for loop's update clause or a do loop's
-// condition binds to that loop. Its break ends the loop. Its continue goes
-// where every continue of that loop goes, to the end of the loop body (C17
-// §6.8.6.2), after which the update or the condition runs again: it lands on
-// the first node of the update or the condition.
+// `break` or `continue` in one binds to the innermost loop or switch whose
+// body holds it. A loop's condition and a for loop's update lie outside its
+// body, as the compilers that implement the extension place them, so a jump
+// in a statement expression there binds to the loop or switch enclosing that
+// loop: the condition and the update are lowered with the loop's own frame
+// suspended (flow.Builder, Suspend), and with no enclosing frame the jump is
+// unresolved.
 //
 // # Exceptions
 //
 // C++ ([except]): inside a try block MayThrow is given to every node whose
 // own evaluation contains a call, a `new`, a `delete` (the destructor and
-// the deallocation function, [expr.delete]), a direct initialization, a
-// default-initialized object of class type or a range for's iterator step.
+// the deallocation function, [expr.delete]), a direct initialization (a
+// braced one, `V w{x}`, included, [dcl.init.general]/16), a
+// default-initialized object of class type, or a step of a range for: the
+// range's node (the range bound, begin and end called), the head (the
+// iterator compared and incremented) and the first bound name's node (the
+// element bound from `*__begin`), each a call on a class-type iterator
+// ([stmt.ranged]/1).
 // A throw statement's node is a Throw, and MayThrow only when its operand's
 // own evaluation holds one of those: `throw 1;` goes straight to the first
 // clause's test, and a try whose body has no MayThrow node has no Handler
@@ -339,11 +373,15 @@ const (
 // nothing and may throw. A
 // try statement's handlers are tested in order after the Handler node
 // spanning the first `catch` keyword: each typed clause is a Branch node
-// spanning its parameter list that defines the caught name, true into its
+// spanning its parameter list, parentheses included (`(int e)`), that
+// defines the caught name, true into its
 // body, false to the next clause; the fringe that matches no clause ends in
 // Throw, and `catch (...)` ends the chain. A function-try-block covers the
 // member initializers and the body; for a constructor or destructor the end
-// of a handler rethrows ([except.handle]/15), otherwise it returns.
+// of a handler rethrows ([except.handle]/15), otherwise it returns. No
+// golden pins that difference: a function-try-block is the function's
+// outermost frame, so its rethrow and its return both end at EXIT and no
+// control-dependence or def-use pair tells them apart.
 //
 // Structured exceptions (both grammars; the anchor is the structured
 // exception handling extension's documented semantics of its try-finally
@@ -353,7 +391,8 @@ const (
 // `__try/__except (filter)` is a catch: its Handler node spans the
 // `__except` keyword, and its filter is a Branch node spanning the filter
 // expression without its parentheses, true into the handler, false
-// rethrowing; resumption at the fault is not modelled. `__leave` breaks to
+// rethrowing, a constant filter (`__except (1)`) included, since the
+// filter's value is not folded; resumption at the fault is not modelled. `__leave` breaks to
 // the end of the `__try` body: its block frame is opened inside the
 // finally or catch frame, so the jump stays inside the try and reaches a
 // `__finally` as the body's normal completion, not as an intercepted jump
@@ -362,7 +401,10 @@ const (
 // such a goto through the `__finally` (flow.Builder, Goto). The builder
 // applies MayThrow only inside an open catch or finally frame, so outside
 // every try a call throws nowhere; a dereference inside a C++ try nested in
-// a `__try` is also given MayThrow, an over-approximation.
+// a `__try` is also given MayThrow, an over-approximation, and reaches the
+// C++ handlers first: a `__finally` gets a Handler node only when a throw
+// that no inner catch-all takes can reach it. (The compilers that implement
+// structured exceptions reject the two forms in one function.)
 //
 // # Scoping
 //
@@ -391,7 +433,10 @@ const (
 // of, binds a reference to, or evaluates as a decaying array is a
 // may-definition on the creating node; a by-copy capture never is. A
 // by-reference init-capture `&r = x` binds a reference to x, a
-// may-definition of x on the creating node. A nested function definition
+// may-definition of x on the creating node. Inside the lambda's own
+// lowering a captured name is no variable (it names the enclosing
+// function's state), so a by-copy capture makes no pair there. A nested
+// function definition
 // (a compiler extension to C) accesses every enclosing variable by
 // reference.
 func lowerC(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
@@ -539,8 +584,10 @@ func (c *cLower) reuse(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, k 
 	c.first, c.last, c.lastSpan = -1, -1, flow.Span{}
 }
 
-// kids pushes n's named, non-extra children onto buf and returns the stack
-// mark and the list; done(mark) pops them.
+// kids pushes n's named children onto buf and returns the stack mark and the
+// list; done(mark) pops them. An extra (a comment) is left out, except an
+// ERROR node the parser made an extra: a token it skipped to recover, which
+// is lowered as a node of an unnamed kind is (see Node granularity).
 func (c *cLower) kids(n *ts.Node) (int, []ts.Node) { return c.collect(n, true, 0, 0, 0) }
 
 // body is kids without the children in fields f1, f2 and f3 (0 matches no
@@ -560,7 +607,7 @@ func (c *cLower) collect(n *ts.Node, named bool, f1, f2, f3 uint16) (int, []ts.N
 		for {
 			x := cur.Node()
 			f := cur.FieldId()
-			if (x.IsNamed() || !named) && !x.IsExtra() && (f == 0 || f != f1 && f != f2 && f != f3) {
+			if (x.IsNamed() || !named) && (!x.IsExtra() || x.IsError()) && (f == 0 || f != f1 && f != f2 && f != f3) {
 				c.buf = append(c.buf, *x)
 			}
 			if !cur.GotoNextSibling() {
@@ -1521,18 +1568,9 @@ func (c *cLower) head(cond *ts.Node) bool {
 	return true
 }
 
-// loopEnd closes a loop whose back edge targets h. again is the first node
-// of the code on the loop's continue path lowered after ContinueHere (a for
-// loop's update, a do loop's condition), or -1: a continue that code issues
-// through a statement expression is pending after ContinueHere, and lands on
-// again, since the continue path runs that code anew (see Statement
-// expressions in lowerC).
-func (c *cLower) loopEnd(f flow.Frame, h, again int32, exits bool, exit flow.Fringe) {
+// loopEnd closes a loop whose back edge targets h.
+func (c *cLower) loopEnd(f flow.Frame, h int32, exits bool, exit flow.Fringe) {
 	c.b.Close(h)
-	if again >= 0 {
-		c.b.ContinueHere(f)
-		c.b.Close(again)
-	}
 	if exits {
 		c.b.Restore(exit)
 	}
@@ -1547,7 +1585,9 @@ func (c *cLower) whileStmt(n *ts.Node) {
 	s := c.open()
 	f := c.b.OpenLoop()
 	saved := c.mark()
+	c.b.Suspend(f)
 	exits := c.head(n.ChildByFieldId(k.fCondition))
+	c.b.Resume(f)
 	h := c.unmark(saved)
 	var exit flow.Fringe
 	if exits {
@@ -1555,7 +1595,7 @@ func (c *cLower) whileStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, -1, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 	c.close(s)
 }
 
@@ -1565,15 +1605,15 @@ func (c *cLower) doStmt(n *ts.Node) {
 	saved := c.mark()
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	cm := c.mark()
+	c.b.Suspend(f)
 	exits := c.head(n.ChildByFieldId(k.fCondition))
-	again := c.unmark(cm)
+	c.b.Resume(f)
 	h := c.unmark(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = c.b.Push()
 	}
-	c.loopEnd(f, h, again, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 }
 
 func (c *cLower) forStmt(n *ts.Node) {
@@ -1594,7 +1634,9 @@ func (c *cLower) forStmt(n *ts.Node) {
 		c.reset()
 		c.node(flow.Stmt, n.Child(0), c.base)
 	} else {
+		c.b.Suspend(f)
 		exits = c.head(cond)
+		c.b.Resume(f)
 	}
 	h := c.unmark(saved)
 	var exit flow.Fringe
@@ -1603,14 +1645,13 @@ func (c *cLower) forStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	again := int32(-1)
 	if upd := n.ChildByFieldId(k.fUpdate); upd != nil {
-		um := c.mark()
+		c.b.Suspend(f)
 		c.reset()
 		c.exprStmt(upd)
-		again = c.unmark(um)
+		c.b.Resume(f)
 	}
-	c.loopEnd(f, h, again, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 	c.close(s)
 }
 
@@ -1646,6 +1687,10 @@ func (c *cLower) forRange(n *ts.Node) {
 	c.b.Use(h, iter)
 	exit := c.b.Push()
 	c.reset()
+	// The element is bound from `*__begin`, a call on a class-type iterator
+	// ([stmt.ranged]/1), made once per iteration: the first bound name's node
+	// takes the throw.
+	c.throws++
 	if sb := c.binding(decl); sb != nil {
 		start, names := c.kids(sb)
 		for i := range names {
@@ -1657,7 +1702,7 @@ func (c *cLower) forRange(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, -1, true, exit)
+	c.loopEnd(f, h, true, exit)
 	c.close(s)
 }
 
@@ -2462,13 +2507,18 @@ func (c *cLower) target(t *ts.Node) {
 }
 
 // baseIdent is the identifier a field, index or indirect target writes
-// through (x in `x.f`, `x->f`, `x[i]`, `*x`, `*(T *)x`), or nil.
+// through (x in `x.f`, `x->f`, `x[i]`, `*x`, `*(T *)x`, and in C++
+// `std::move(x)`), or nil.
 func (c *cLower) baseIdent(n *ts.Node) *ts.Node {
 	k := c.k
 	for n = c.l.unparen(n); n != nil; n = c.l.unparen(n) {
 		switch n.KindId() {
 		case k.identifier:
 			return n
+		case k.callExpression:
+			if n = c.castCallOperand(n); n == nil {
+				return nil
+			}
 		case k.fieldExpression, k.subscriptExpression:
 			n = n.ChildByFieldId(k.fArgument)
 		case k.pointerExpression:
@@ -2483,6 +2533,44 @@ func (c *cLower) baseIdent(n *ts.Node) *ts.Node {
 		}
 	}
 	return nil
+}
+
+// castCallOperand returns the one argument of a C++ call to move, forward
+// or move_if_noexcept, qualified or not (`std::move(x)`,
+// `std::forward<T>(x)`), or nil for any other call. Those functions are
+// casts ([utility.syn], [forward]): their result refers to the argument
+// itself, so a reference bound to it, or a write through it, reaches the
+// argument's object. A function of the program that takes one of those names
+// is read the same way, an over-approximation; a `static_cast` to a reference
+// type is not seen.
+func (c *cLower) castCallOperand(n *ts.Node) *ts.Node {
+	k := c.k
+	if !k.cpp {
+		return nil
+	}
+	f := n.ChildByFieldId(k.fFunction)
+	for f != nil && (f.KindId() == k.qualifiedIdentifier || f.KindId() == k.templateFunction) {
+		f = f.ChildByFieldId(k.fName)
+	}
+	if f == nil || f.KindId() != k.identifier {
+		return nil
+	}
+	switch string(c.text(f)) {
+	case "move", "forward", "move_if_noexcept":
+	default:
+		return nil
+	}
+	args := n.ChildByFieldId(k.fArguments)
+	if args == nil {
+		return nil
+	}
+	start, list := c.kids(args)
+	defer c.done(start)
+	if len(list) != 1 {
+		return nil
+	}
+	arg := list[0]
+	return &arg
 }
 
 // closure creates the node spanning n, a lambda or nested function: it Uses
@@ -2816,7 +2904,7 @@ type cSyntax struct {
 	lambdaExpression, lambdaCaptureInitializer, lambdaDefaultCapture, tryStatement, catchClause,
 	throwStatement, coReturnStatement, forRangeLoop, conditionClause, fieldInitializerList, newExpression,
 	referenceDeclarator, variadicDeclarator, structuredBindingDeclarator, qualifiedIdentifier, operatorCast,
-	argumentList, this, deleteExpression uint16
+	argumentList, this, deleteExpression, templateFunction uint16
 
 	and, or, assign, star, arrow, amp, ellipsis uint16
 	// C++ only: the alternative tokens `and` and `or` ([lex.digraph]).
@@ -2826,7 +2914,7 @@ type cSyntax struct {
 	fInitializer, fLabel, fLeft, fName, fOperator, fParameters, fRight, fSize, fType, fUpdate, fValue uint16
 
 	// C++ only.
-	fCaptures uint16
+	fArguments, fCaptures, fFunction uint16
 }
 
 var (
@@ -2892,10 +2980,10 @@ func resolveCSyntax(language string) *cSyntax {
 		s.referenceDeclarator, s.variadicDeclarator = kind("reference_declarator"), kind("variadic_declarator")
 		s.structuredBindingDeclarator, s.qualifiedIdentifier = kind("structured_binding_declarator"), kind("qualified_identifier")
 		s.operatorCast, s.argumentList, s.this = kind("operator_cast"), kind("argument_list"), kind("this")
-		s.deleteExpression = kind("delete_expression")
+		s.deleteExpression, s.templateFunction = kind("delete_expression"), kind("template_function")
 		s.altAnd, s.altOr = tok("and"), tok("or")
 		s.ellipsis = tok("...")
-		s.fCaptures = field("captures")
+		s.fArguments, s.fCaptures, s.fFunction = field("arguments"), field("captures"), field("function")
 		noNode = append(noNode, "class_specifier", "using_declaration", "alias_declaration", "namespace_definition",
 			"namespace_alias_definition", "static_assert_declaration", "template_declaration", "template_instantiation",
 			"concept_definition")

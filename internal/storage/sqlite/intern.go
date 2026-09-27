@@ -18,10 +18,9 @@ import (
 // the dictionary row on first sight.
 //
 // It holds no *sql.DB and opens nothing; every method is handed the caller's
-// *sql.Tx. It is NOT safe for concurrent use and does not need to be: the store
-// opens its writer pool with exactly one connection (open.go:128), so at most
-// one write transaction -- and therefore at most one caller of this interner --
-// exists at a time.
+// *sql.Tx. It is NOT safe for concurrent use and does not need to be: every
+// write runs as a job on the store's one writer goroutine (open.go, runWriter),
+// so at most one caller of this interner runs at a time.
 //
 // Memory is a function of cache capacity, never of repository size. Three
 // bounded LRUs (node ids, relation ids, and one shared dictionary for the
@@ -50,11 +49,11 @@ type dbInterner struct {
 	hits   uint64
 	misses uint64
 
-	// stmts is the statement cache of the write transaction the writer is
-	// currently running (stmtcache.go). The interner's resolutions are issued
-	// once per fact and once per evidence row, so preparing their SQL per call
-	// re-parses the same handful of texts for every row. It is installed by
-	// UnitWriter.providerWrite for the life of one batch and is nil for every
+	// stmts is the statement cache of the open ingestion group
+	// (stmtcache.go). The interner's resolutions are issued once per fact and
+	// once per evidence row, so preparing their SQL per call re-parses the
+	// same handful of texts for every row. UnitWriter.providerWrite points it
+	// at the group's cache for the life of one batch, and it is nil for every
 	// other caller, which then prepares on the transaction it passes.
 	stmts *stmtCache
 }
@@ -270,8 +269,7 @@ func nextNativeKeyID(id int64) int64 {
 
 // lookupNativeKey walks one key's hash chain. It returns (id, true) for the id
 // whose stored key equals key, and (id, false) for the first free id on the
-// chain -- which is where a writer must place the key and which a reader reads
-// as "this key has never been interned".
+// chain -- which is where the writer must place the key.
 //
 // This is the collision handling ADR-0003 SS2.3 requires: two keys whose
 // digests agree are DETECTED by the string comparison and separated onto

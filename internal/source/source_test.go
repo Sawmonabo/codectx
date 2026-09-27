@@ -178,7 +178,7 @@ func TestIndexMatchesRecomputation(t *testing.T) {
 	// a cursor over the window that starts at one reports whole-file
 	// coordinates that agree with a cursor over the whole file.
 	cp := idx.CheckpointFor(uint64(len(data)) / 2)
-	window, err := NewCursorAt(data[cp.Byte:], cp.Byte, cp.Line)
+	window, err := NewCursorAt(nil, data[cp.Byte:], cp.Byte, cp.Line)
 	if err != nil {
 		t.Fatalf("NewCursorAt: %v", err)
 	}
@@ -204,11 +204,11 @@ func TestIndexMatchesRecomputation(t *testing.T) {
 // TestPlanChunkBoundaries protects the Section 16.2 chunking contract: a chunk
 // ends on a complete UTF-8 sequence and a complete line when it can, a line
 // longer than the budget still makes progress and is flagged partial, invalid
-// UTF-8 is carried losslessly as base64, and an offset into a continuation byte
-// is rejected.
+// UTF-8 is carried losslessly as base64, and an offset inside a well-formed
+// UTF-8 sequence is rejected.
 func TestPlanChunkBoundaries(t *testing.T) {
 	text := []byte("alpha\r\nbeta\r\ngamma")
-	chunk, err := PlanChunk(text[:9], 0, uint64(len(text)), 9)
+	chunk, err := PlanChunk(nil, text[:9], 0, uint64(len(text)), 9)
 	if err != nil {
 		t.Fatalf("PlanChunk: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestPlanChunkBoundaries(t *testing.T) {
 	}
 
 	long := []byte("éééé")
-	chunk, err = PlanChunk(long[:5], 0, uint64(len(long)), 5)
+	chunk, err = PlanChunk(nil, long[:5], 0, uint64(len(long)), 5)
 	if err != nil {
 		t.Fatalf("PlanChunk on a long line: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestPlanChunkBoundaries(t *testing.T) {
 	}
 
 	binary := []byte{0xff, 0xfe, 'a', '\n'}
-	chunk, err = PlanChunk(binary, 0, uint64(len(binary)), 4)
+	chunk, err = PlanChunk(nil, binary, 0, uint64(len(binary)), 4)
 	if err != nil {
 		t.Fatalf("PlanChunk on invalid UTF-8: %v", err)
 	}
@@ -237,12 +237,12 @@ func TestPlanChunkBoundaries(t *testing.T) {
 		t.Fatalf("chunk encoding = %s, want base64 for invalid UTF-8", chunk.Encoding)
 	}
 
-	if _, err := PlanChunk([]byte(sample)[2:], 2, uint64(len(sample)), 16); err == nil {
+	if _, err := PlanChunk([]byte(sample)[:2], []byte(sample)[2:], 2, uint64(len(sample)), 16); err == nil {
 		t.Fatal("PlanChunk accepted an offset inside a UTF-8 sequence")
 	}
 
 	tail := []byte("alpha\nbeta")
-	chunk, err = PlanChunk(tail, 0, uint64(len(tail)), 64)
+	chunk, err = PlanChunk(nil, tail, 0, uint64(len(tail)), 64)
 	if err != nil {
 		t.Fatalf("PlanChunk on a file without a trailing newline: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestPlanChunkBoundaries(t *testing.T) {
 	// The zero-length end-of-file receipt is valid on its own terms: refusing
 	// it for a budget that cannot carry a code point would make an empty file
 	// unreadable and unconfirmable.
-	eof, err := PlanChunk(nil, uint64(len(tail)), uint64(len(tail)), 1)
+	eof, err := PlanChunk(nil, nil, uint64(len(tail)), uint64(len(tail)), 1)
 	if err != nil {
 		t.Fatalf("PlanChunk on the end-of-file receipt: %v", err)
 	}
@@ -261,11 +261,95 @@ func TestPlanChunkBoundaries(t *testing.T) {
 		t.Fatalf("end-of-file chunk = %+v, want the zero-length receipt at %d", eof, len(tail))
 	}
 
-	empty, err := PlanChunk(nil, 0, 0, 64)
+	empty, err := PlanChunk(nil, nil, 0, 0, 64)
 	if err != nil {
 		t.Fatalf("PlanChunk on an empty file: %v", err)
 	}
 	if empty.Range.Start != 0 || empty.Range.End != 0 || empty.NextOffset != nil {
 		t.Fatalf("empty-file chunk = %+v, want the zero-length EOF chunk", empty)
+	}
+}
+
+// planAll chains PlanChunk from byte zero to the end of data, carrying each
+// start's lookbehind the way the streaming callers do, and fails unless the
+// chunks tile the file exactly: a chain that stops early leaves every byte
+// past the stop unservable and fails the unit that indexes it.
+func planAll(t *testing.T, data []byte, maxBytes uint32) []Chunk {
+	t.Helper()
+	var (
+		chunks []Chunk
+		before Lookbehind
+		start  uint64
+	)
+	for {
+		end := min(start+uint64(maxBytes), uint64(len(data)))
+		chunk, err := PlanChunk(before.Bytes(), data[start:end], start, uint64(len(data)), maxBytes)
+		if err != nil {
+			t.Fatalf("PlanChunk at %d of %x: %v", start, data, err)
+		}
+		if chunk.Range.Start != start {
+			t.Fatalf("chunk %+v does not start where the previous one ended, at %d", chunk, start)
+		}
+		chunks = append(chunks, chunk)
+		if chunk.NextOffset == nil {
+			if chunk.Range.End != uint64(len(data)) {
+				t.Fatalf("the chain stops at %d of %d bytes", chunk.Range.End, len(data))
+			}
+			return chunks
+		}
+		before.Push(data[start:chunk.Range.End])
+		start = *chunk.NextOffset
+	}
+}
+
+// TestBoundaryAtStrayContinuationByte protects the Section 16.2 boundary rule:
+// an offset is illegal only inside a well-formed UTF-8 sequence, so a stray
+// continuation byte is a legal start and every byte of every file can be
+// served. The mutation that fails each case is named on it.
+func TestBoundaryAtStrayContinuationByte(t *testing.T) {
+	// A line end chosen just before a stray 0x9b: the next start is the stray
+	// byte. Mutation: a start guard that rejects every continuation byte.
+	stray := append([]byte("text\n"), 0x9b, 0x02)
+	stray = append(stray, "more bytes than one budget"...)
+	planAll(t, stray, 8)
+
+	// A complete three-byte rune ending exactly at the budget, then 0x9b: the
+	// edge is a boundary and the next start is accepted. Mutation: an edge
+	// trim that gives the complete rune back, or the start guard above.
+	edge := append([]byte("a\u4e2d"), 0x9b, 'z', 'z')
+	if chunks := planAll(t, edge, 4); chunks[0].Range.End != 4 {
+		t.Fatalf("first chunk %+v; want it to end at the complete rune's end, 4", chunks[0])
+	}
+
+	// A run of continuation bytes longer than the budget after a line: every
+	// chunk of the run is base64 and the run is covered without a gap or an
+	// overlap. Mutation: a trim that walks back over continuation bytes, or a
+	// start guard that rejects them.
+	run := append([]byte("a\n"), bytes.Repeat([]byte{0x80}, 40)...)
+	for _, c := range planAll(t, run, 16)[1:] {
+		if c.Encoding != model.EncodingBase64 {
+			t.Fatalf("run chunk %+v is %s; bytes that are not UTF-8 travel as base64", c, c.Encoding)
+		}
+	}
+
+	// A start after a line break followed by a stray byte, as a chunk's
+	// overlap produces, is accepted. Mutation: the same start guard.
+	overlapStart := []byte("ab\n\x9bcd\n")
+	if _, err := PlanChunk(overlapStart[:3], overlapStart[3:], 3, uint64(len(overlapStart)), 16); err != nil {
+		t.Fatalf("PlanChunk at a stray byte after a line break: %v", err)
+	}
+
+	// An offset inside a well-formed two-, three- and four-byte sequence is
+	// still refused, with the bytes before it supplied. Mutation: a guard
+	// that ignores the lookbehind, or a rule that accepts every continuation
+	// byte.
+	seq := []byte("\u00e9\u4e2d\U0001f600\n")
+	for _, offset := range []int{1, 3, 4, 6, 7, 8} {
+		_, err := PlanChunk(seq[max(0, offset-BoundaryContext):offset], seq[offset:], uint64(offset), uint64(len(seq)), 16)
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeArgumentInvalid {
+			t.Fatalf("PlanChunk at byte %d, inside a well-formed sequence, returned %v; want %s",
+				offset, err, model.CodeArgumentInvalid)
+		}
 	}
 }

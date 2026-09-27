@@ -126,7 +126,7 @@ func TestParserResourcePlateau(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerMemoryBytes: 256 << 20, Admission: benchAdmission(),
+		MaxWorkers: 1, Rederive: func(int64) {}, Admission: benchAdmission(),
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
@@ -250,7 +250,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestIncrementalReuse(t *testing.T) {
 	// workers and the coordinator's heavy units reserve on the same one.
 	admit := benchAdmission()
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerMemoryBytes: 256 << 20, Admission: admit,
+		Rederive: func(int64) {}, Admission: admit,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		t.Fatal(err)

@@ -65,7 +65,10 @@ type builder struct {
 	rels     map[model.RelationID]*model.RelationFact
 	relOrder []model.RelationID
 	aliases  []model.NativeAlias
-	search   []model.SearchUnit
+	// aliasSeen holds every alias already in aliases, so a declaration that
+	// repeats an identity does not publish the same alias row twice.
+	aliasSeen map[model.NativeAlias]bool
+	search    []model.SearchUnit
 	// dropped counts what this file's bounds kept out of the facts: calls
 	// past the callee-reference bound, and declaration or call-site keys
 	// over MaxNativeKeyBytes. Occurrences cut by the per-fact evidence clip
@@ -151,6 +154,7 @@ func (b *builder) build() error {
 	}
 	b.rels = map[model.RelationID]*model.RelationFact{}
 	b.nodeAt = map[model.NodeID]int{}
+	b.aliasSeen = map[model.NativeAlias]bool{}
 	b.byName = map[string][]int{}
 	var err error
 	if b.fileRng, err = b.rangeOf(0, uint32(len(b.src))); err != nil {
@@ -271,12 +275,23 @@ func (b *builder) resolveModule() error {
 		meta["package"] = bound(b.ex.done.Package, model.MaxNameBytes)
 	}
 	b.putNode(res, b.fileRng, b.modKey, meta)
-	b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: b.modKey, NodeID: res.Node.ID})
+	b.putAlias(b.scope, b.modKey, res.Node.ID)
 	return nil
 }
 
 // resolveDecls resolves every declaration, publishes its node, containment,
 // export, aliases and search document.
+//
+// One identity is one node per unit. A declaration that resolves to a node
+// this builder already published -- a minted identity that repeats name,
+// kind, qualified name and range (C's `int x, x;`, whose declarators share
+// the declaration's span), or an alias hit that resolves two declarations to
+// one dependency's node -- is another occurrence of that node, as a repeated
+// relation is: it adds an evidence row to the node, and publishes no second
+// node and no second search document, whose identity is the file and the
+// node. Its containment, export and ambiguity relations merge into the ones
+// already published, and its aliases are published once each; an alias it
+// claims that no earlier occurrence did is still its own claim.
 func (b *builder) resolveDecls() error {
 	for i := range b.decls {
 		d := &b.decls[i]
@@ -308,7 +323,7 @@ func (b *builder) resolveDecls() error {
 			// long they were. Distinct from result truncation by name.
 			meta["truncated_fields"] = d.truncated
 		}
-		b.putNode(res, d.rng, d.Qualified, meta)
+		first := b.putNode(res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
 
 		parent := b.module.Node.ID
@@ -321,7 +336,7 @@ func (b *builder) resolveDecls() error {
 			b.putRelation(b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
 		}
 		if _, cut := d.truncated["qualified_name"]; !cut {
-			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+			b.putAlias(b.scope, d.Qualified, res.Node.ID)
 		} else {
 			// The qualified name was cut to its storage ceiling, so it is no
 			// longer an identity: publishing it as an alias would claim that
@@ -331,7 +346,7 @@ func (b *builder) resolveDecls() error {
 			b.dropped++
 		}
 		if key := b.declKey(d); key != "" {
-			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: res.Node.ID})
+			b.putAlias(b.scope, key, res.Node.ID)
 		} else {
 			// The cross-provider key did not fit and was omitted rather than
 			// truncated. That is a record this file should have published and
@@ -345,7 +360,7 @@ func (b *builder) resolveDecls() error {
 			pkg, over := b.packageScope()
 			switch {
 			case pkg != "" && d.truncated["qualified_name"] == 0:
-				b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
+				b.putAlias(pkg, d.Qualified, res.Node.ID)
 			case over:
 				// The package alias scope did not fit and was omitted rather
 				// than truncated, for the same reason declKey omits an
@@ -355,7 +370,9 @@ func (b *builder) resolveDecls() error {
 				b.dropped++
 			}
 		}
-		b.search = append(b.search, b.searchUnit(d))
+		if first {
+			b.search = append(b.search, b.searchUnit(d))
+		}
 	}
 	return nil
 }
@@ -599,7 +616,7 @@ func (b *builder) refs() error {
 			}
 		}
 		if key := b.callsiteKey(r.NameStart, r.NameEnd); key != "" {
-			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: callee})
+			b.putAlias(b.scope, key, callee)
 		} else {
 			// The key did not fit and was omitted rather than truncated: a
 			// truncated key is a different, possibly colliding identity
@@ -664,11 +681,14 @@ func (b *builder) callsiteKey(start, end uint32) string {
 // functions, tests or macros; a type reference names type-like declarations.
 // Definitions are preferred over prototypes when both exist. A qualifier that
 // is an imported name makes the target cross-file, so nothing here.
+// Declarations that are occurrences of one node are one target, so a
+// repeated identity is neither a second candidate nor an ambiguity.
 func (b *builder) targets(r wire.Ref) []int {
 	if r.QualifierIsImport {
 		return nil
 	}
 	var out, protos []int
+	var seen map[model.NodeID]bool
 	for _, i := range b.byName[r.Name] {
 		d := &b.decls[i]
 		ok := false
@@ -685,6 +705,13 @@ func (b *builder) targets(r wire.Ref) []int {
 		if !ok {
 			continue
 		}
+		if seen == nil {
+			seen = map[model.NodeID]bool{}
+		}
+		if seen[d.res.Node.ID] {
+			continue
+		}
+		seen[d.res.Node.ID] = true
 		if d.Prototype {
 			protos = append(protos, i)
 		} else {
@@ -715,7 +742,15 @@ func (b *builder) evidence(node model.NodeID, rel model.RelationID, rng *model.S
 	return e
 }
 
-func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKey string, meta map[string]any) {
+// putNode publishes res's node with this occurrence as its evidence and
+// reports true, or, when this builder already published a node with that
+// identity, adds the occurrence to it and reports false: a unit publishes one
+// node per identity, and the first occurrence's metadata stands.
+func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKey string, meta map[string]any) bool {
+	if _, ok := b.nodeAt[res.Node.ID]; ok {
+		b.addEvidence(res.Node.ID, rng, nativeKey)
+		return false
+	}
 	node := res.Node
 	if len(meta) > 0 {
 		if raw, err := json.Marshal(meta); err == nil && len(raw) <= model.MaxMetadataBytes {
@@ -728,6 +763,16 @@ func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKe
 	// it a file whose every call is unresolved rescans the published facts per
 	// occurrence, which is quadratic in the file's references.
 	b.nodeAt[node.ID] = len(b.nodes) - 1
+	return true
+}
+
+// putAlias publishes one alias, once per unit.
+func (b *builder) putAlias(scope, key string, node model.NodeID) {
+	a := model.NativeAlias{ScopeKey: scope, NativeKey: key, NodeID: node}
+	if !b.aliasSeen[a] {
+		b.aliasSeen[a] = true
+		b.aliases = append(b.aliases, a)
+	}
 }
 
 // addEvidence records another occurrence of a node this builder published.
@@ -819,7 +864,7 @@ func (b *builder) emit(sink provider.Sink) (uint64, error) {
 	records := uint64(len(b.nodes) + len(rels) + len(b.aliases) + len(b.search))
 
 	nodes, aliases, search := b.nodes, b.aliases, b.search
-	b.nodes, b.nodeAt, b.aliases, b.search = nil, nil, nil, nil
+	b.nodes, b.nodeAt, b.aliases, b.aliasSeen, b.search = nil, nil, nil, nil, nil
 	if err := putChunked(b.ctx, nodes, sink.PutNodes); err != nil {
 		return 0, err
 	}

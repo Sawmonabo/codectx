@@ -144,8 +144,14 @@ func (u *UnitInputHasher) Add(in UnitInput) error {
 func (u *UnitInputHasher) Sum() string { return u.h.Sum() }
 
 // DependencyHash is UnitSpec.DependencyHash: the digest of the canonically
-// sorted dependency unit keys. An empty list has a well-defined digest.
-func DependencyHash(deps []UnitID) string {
+// sorted dependency unit keys, then of the sorted synthetic keys. A synthetic
+// key is an input the unit's output depends on that is no unit of its own --
+// a header's grammar, which the repository's census decides -- so it changes
+// the unit's identity without being a dependency the unit is reconciled
+// against. The synthetic keys follow a marker that no unit key can equal,
+// and without any the digest is exactly the dependency list's. An empty list
+// has a well-defined digest.
+func DependencyHash(deps []UnitID, synthetic ...string) string {
 	keys := make([]string, 0, len(deps))
 	for _, d := range deps {
 		keys = append(keys, string(d))
@@ -155,8 +161,21 @@ func DependencyHash(deps []UnitID) string {
 	for _, k := range keys {
 		h.AddString(k)
 	}
+	if len(synthetic) > 0 {
+		h.AddString(syntheticDependencyMarker)
+		sorted := append([]string(nil), synthetic...)
+		sort.Strings(sorted)
+		for _, k := range sorted {
+			h.AddString(k)
+		}
+	}
 	return h.Sum()
 }
+
+// syntheticDependencyMarker separates a unit's dependency keys from its
+// synthetic keys in DependencyHash. A unit key is lowercase hex, so no
+// dependency can be read as the marker.
+const syntheticDependencyMarker = "synthetic:"
 
 // UnitBuild is everything the store needs to open one immutable unit: the
 // spec, the analysis configuration digest that completes its identity, the run
@@ -168,6 +187,10 @@ type UnitBuild struct {
 	OriginRunID        ProviderRunID `json:"origin_run_id"`
 	SourceBinding      SourceBinding `json:"source_binding"`
 	Dependencies       []UnitID      `json:"dependencies,omitempty"`
+	// DependencyKeys are the synthetic keys the spec's DependencyHash folds
+	// beside Dependencies (see DependencyHash). They are identity only: the
+	// store records no row for them and nothing is reconciled against them.
+	DependencyKeys []string `json:"dependency_keys,omitempty"`
 }
 
 // Validate enforces the units table constraints and recomputes identity: the
@@ -207,7 +230,17 @@ func (b UnitBuild) Validate() error {
 		}
 		seen[d] = true
 	}
-	if want := DependencyHash(b.Dependencies); b.Spec.DependencyHash != want {
+	keys := make(map[string]bool, len(b.DependencyKeys))
+	for i, k := range b.DependencyKeys {
+		if err := requireField(indexed("unit_build.dependency_keys", i), k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if keys[k] {
+			return invalid("unit_build.dependency_keys repeats %q", truncateForMessage(k))
+		}
+		keys[k] = true
+	}
+	if want := DependencyHash(b.Dependencies, b.DependencyKeys...); b.Spec.DependencyHash != want {
 		return invalid("unit_spec.dependency_hash %q does not match the declared dependencies (%q)", b.Spec.DependencyHash, want)
 	}
 	if want := NewUnitID(b.Spec, b.AnalysisConfigHash); b.Spec.ID != want {

@@ -1767,7 +1767,7 @@ Read validates actor/session/TTL, manifest membership, offset/bounds and content
 
 The default raw source chunk is 64 KiB; configured raw maximum is 1 MiB. Source responses have a separately accounted wire budget allowing encoding/envelope expansion, with a 7-MiB hard ceiling. Generic tools remain under the much smaller metadata response limit. For a lower requested wire budget, reduce raw chunk size before emitting and never silently exceed it.
 
-Prefer complete UTF-8 sequences and complete line endings when they fit. A line larger than the chunk limit is split at a valid boundary with `partial_line=true`; never return zero progress waiting for a newline. Reject an offset into a UTF-8 continuation byte. Preserve CRLF and a final line without newline. Invalid UTF-8 is returned losslessly as base64 with byte-based ranges, not coerced into replacement characters. Enforce a nonempty request size sufficient for a UTF-8 code point, except valid EOF/empty-file responses.
+Prefer complete UTF-8 sequences and complete line endings when they fit. A line larger than the chunk limit is split at a valid boundary with `partial_line=true`; never return zero progress waiting for a newline. Reject an offset inside a well-formed UTF-8 sequence, one whose byte continues a well-formed sequence beginning at most three bytes before it; a continuation byte that belongs to no well-formed sequence is a legal boundary, served as base64, so every byte of every file can be served. Preserve CRLF and a final line without newline. Invalid UTF-8 is returned losslessly as base64 with byte-based ranges, not coerced into replacement characters. Enforce a nonempty request size sufficient for a UTF-8 code point, except valid EOF/empty-file responses.
 
 <a id="163-interval-merging-empty-files-and-readiness"></a>
 ### 16.3 Interval Merging, Empty Files, and Readiness
@@ -2037,7 +2037,7 @@ max_provider_record_bytes = 0  # 0 = unlimited; when set, must fit index.batch_b
 [storage]
 data_dir = ""
 busy_timeout = "5s"
-read_connections = 2
+read_connections = 0            # 0 = each reader pool sized by the goroutines that read it
 writer_cache_kib = 1048576
 reader_cache_kib = 4096
 closed_session_retention = "7d"

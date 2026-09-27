@@ -563,11 +563,14 @@ func (h *hydrator) positionAt(ctx context.Context, rec model.BlobRecord, idx sou
 		}
 		w = fresh
 	}
+	// The bytes from the offset that decide whether it is inside a
+	// well-formed UTF-8 sequence: source.BoundaryContext of them, fewer only
+	// at the end of the file. The walker holds the bytes before it.
+	ahead := min(offset+source.BoundaryContext, uint64(rec.Size))
 	for w.At() < offset {
-		// The window stops one byte PAST the offset where the file has one:
-		// that byte is what rejects an offset inside a UTF-8 sequence, and
-		// reading it here costs no extra call.
-		end := min(min(w.At()+maxRangeWindowBytes, offset+1), uint64(rec.Size))
+		// The window runs PAST the offset to ahead where it can: reading the
+		// deciding bytes here costs no extra call.
+		end := min(w.At()+maxRangeWindowBytes, ahead)
 		window, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: w.At(), End: end})
 		if err != nil {
 			return model.Position{}, nil, err
@@ -584,30 +587,37 @@ func (h *hydrator) positionAt(ctx context.Context, rec model.BlobRecord, idx sou
 		}
 		if consumed := offset - w.At(); consumed < uint64(len(window)) {
 			w.Advance(window[:consumed])
-			pos, err := w.PositionAt(window[consumed:])
-			return pos, w, err
+			if end == ahead {
+				pos, err := w.PositionAt(window[consumed:])
+				return pos, w, err
+			}
+			// The window ends between the offset and ahead: the deciding
+			// bytes are read below.
+			break
 		}
 		w.Advance(window)
 	}
-	// The walk landed exactly on the offset -- a checkpoint at it, or a
-	// previous endpoint -- so the byte at it has not been read yet.
+	// The walk is exactly on the offset -- a checkpoint at it, a previous
+	// endpoint, or a window that ended short of ahead -- so the bytes that
+	// decide it have not all been read yet.
 	var next []byte
-	if offset < uint64(rec.Size) {
-		read, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: offset, End: offset + 1})
+	if offset < ahead {
+		read, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: offset, End: ahead})
 		if err != nil {
 			return model.Position{}, nil, err
 		}
 		// Length-checked for the same reason the window read above is, and on
 		// the COMMON path: this branch is taken whenever the walk landed
 		// exactly on the offset, which is every hit at a checkpointed line
-		// start. A short read here would hand PositionAt an empty lookahead,
-		// silently skipping the UTF-8 continuation-byte rejection instead of
-		// faulting the store that no longer holds the blob it recorded.
-		if len(read) != 1 {
+		// start. A short read here would hand PositionAt a truncated
+		// lookahead, silently skipping the rejection of an offset inside a
+		// UTF-8 sequence instead of faulting the store that no longer holds
+		// the blob it recorded.
+		if uint64(len(read)) != ahead-offset {
 			return model.Position{}, nil, &model.Error{Code: model.CodeSourceIntegrity,
 				Message: "search: the content store returned " + strconv.Itoa(len(read)) +
-					" of the 1 byte at offset " + strconv.FormatUint(offset, 10) +
-					" of a " + strconv.FormatInt(rec.Size, 10) + "-byte blob",
+					" of the " + strconv.FormatUint(ahead-offset, 10) + " bytes at offset " +
+					strconv.FormatUint(offset, 10) + " of a " + strconv.FormatInt(rec.Size, 10) + "-byte blob",
 				Remediation: "run `codectx doctor --deep` to verify the content store"}
 		}
 		next = read
@@ -635,8 +645,9 @@ func (h *hydrator) blob(ctx context.Context, file model.FileID) (model.BlobRecor
 
 // checkpointIndex adapts a blob's sparse line checkpoints to the one
 // implementation of "the nearest point a range read can start scanning from".
-// A checkpoint's LineStartByte, not its ByteOffset, is the window start:
-// source.NewCursorAt rejects a window that does not begin on a line boundary.
+// A checkpoint's LineStartByte, not its ByteOffset, is the walk's start:
+// source.NewWalker counts lines from a line start, which also needs no bytes
+// before it to be a boundary.
 func checkpointIndex(rec model.BlobRecord) source.Index {
 	idx := source.Index{Size: uint64(rec.Size), ContentHash: rec.Hash, Blocks: rec.BlockDigests}
 	for _, cp := range rec.LineCheckpoints {

@@ -124,11 +124,6 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			user: "[workspace]\nmax_files = 2000000\n",
 		},
 		{
-			name:     "zero is not unlimited",
-			user:     "[storage]\nread_connections = 0\n",
-			wantCode: model.CodeConfigInvalid,
-		},
-		{
 			// The toolchain decides which binaries this build executes, so a
 			// repository that could set any of it would choose them.
 			name:     "project sets a tools key",

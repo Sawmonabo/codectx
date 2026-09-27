@@ -174,7 +174,12 @@ func (p *Provider) structure(ctx context.Context, e *Emitter, cls Classification
 	if cls.Format != "" {
 		meta["format"] = cls.Format
 	}
-	file, err := e.Node(ctx, PathCandidate(ID, model.NodeFile, fv.Path), Attrs{Precision: model.PrecisionSyntax, Located: true,
+	// The file node's language is its manifest row's, which the capture
+	// tagged within the snapshot: a header's is the grammar the snapshot's
+	// census parses headers with, and the plan keys a header's unit by it.
+	candidate := PathCandidate(ID, model.NodeFile, fv.Path)
+	candidate.Language = fv.Language
+	file, err := e.Node(ctx, candidate, Attrs{Precision: model.PrecisionSyntax, Located: true,
 		Detail: Detail("size", strconv.FormatInt(fv.Size, 10)), Metadata: Metadata(meta)})
 	if err != nil {
 		return model.Node{}, err

@@ -143,11 +143,26 @@ func TestSearchCoversEveryByte(t *testing.T) {
 		copy(raw[filesystem.ChunkBytes-1:], at)
 		return string(raw)
 	}
+	// Three files whose chunk boundaries land on a stray continuation byte,
+	// one that belongs to no well-formed sequence and is therefore a legal
+	// boundary. Each used to fail the unit with "offset N is inside a UTF-8
+	// sequence"; the mutation that fails them is a start guard that rejects
+	// every continuation byte rather than only one inside a well-formed
+	// sequence. A text head keeps each out of the binary sniff.
 	files := map[string]string{
 		"policy.htm":       doc.String(),
 		"minified.txt":     strings.Repeat("x", 5<<20),
 		"rune.min.js":      straddle([]byte("\u20ac")),
 		"contbytes.min.js": straddle([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}),
+		// The window's last line end is the "\n" just before 0x9b 0x02, so
+		// the next chunk starts at the stray byte.
+		"stray.txt": strings.Repeat("abc\n", 100) + "\x9b\x02" + strings.Repeat("x", 40<<10),
+		// A run of continuation bytes longer than a chunk: every cut inside it
+		// is a boundary, and the run is covered without a gap.
+		"contrun.txt": strings.Repeat("text line\n", 1000) + strings.Repeat("\x80", 2*filesystem.ChunkBytes) + "\n",
+		// The first chunk ends after "ov2\n" and its two-line overlap starts
+		// at the stray 0x9b after a line break.
+		"overlap.txt": strings.Repeat("filler line\n", 2700) + "\x9bov\nov2\n" + strings.Repeat("y", filesystem.ChunkBytes) + "\n",
 	}
 	for _, tc := range []struct {
 		path      string
@@ -157,6 +172,9 @@ func TestSearchCoversEveryByte(t *testing.T) {
 		{"minified.txt", false},
 		{"rune.min.js", true},
 		{"contbytes.min.js", true},
+		{"stray.txt", true},
+		{"contrun.txt", true},
+		{"overlap.txt", true},
 	} {
 		docs, state := index(t, files, tc.path)
 		if state.State != model.CapabilityFresh {

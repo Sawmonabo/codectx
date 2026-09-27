@@ -152,9 +152,10 @@ func (s *Store) PutSnapshot(ctx context.Context, snap model.Snapshot, files func
 			}
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO snapshots(id, repository_id, head_object_id, source_policy_hash, manifest_hash,
-			file_count, source_bytes, capture_consistency, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			file_count, source_bytes, c_units, cpp_units, capture_consistency, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			snapID, repo, snap.HeadObjectID, snap.SourcePolicyHash, snap.ManifestHash,
-			int64(snap.FileCount), int64(snap.SourceBytes), string(snap.CaptureConsistency), formatTime(snap.CreatedAt))
+			int64(snap.FileCount), int64(snap.SourceBytes), int64(snap.CUnits), int64(snap.CPPUnits),
+			string(snap.CaptureConsistency), formatTime(snap.CreatedAt))
 		return wrap("snapshots", err)
 	})
 	if err != nil || complete {

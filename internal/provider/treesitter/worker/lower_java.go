@@ -39,15 +39,20 @@ const yieldLabel = " yield"
 //     identifier; a compact constructor's parameters are its record's
 //     components (JLS §8.10.4), spanning the identifiers in the record
 //     header. A method or constructor without a body lowers to Entry → Exit.
-//     A receiver parameter and an `_` name declare nothing.
+//     A receiver parameter and an `_` name declare nothing; neither is
+//     observable in any pair (a receiver has no name a body can read), so
+//     no golden case pins them.
 //   - A statement is one node: an expression statement spans its
 //     expression, a declarator with an initializer spans the declarator,
 //     return, throw, yield, break and continue span the statement (kind
-//     Jump), an explicit constructor invocation spans itself, a local class,
+//     Jump), an explicit constructor invocation spans itself, its `;`
+//     included, as the grammar holds it, a local class,
 //     record, enum or interface declaration spans the declaration. An
 //     expression statement that assigns or updates a local is its defining
 //     node. A declarator without an initializer makes no node: it executes
-//     nothing (JLS §14.4.2), and the variable is not definitely assigned.
+//     nothing (JLS §14.4.2), and the variable is not definitely assigned, so
+//     no use can read a definition made there (JLS §16) and no pair could
+//     show one; no golden case pins it.
 //   - A condition is one Branch node spanning the condition without its
 //     parentheses: if, while, do, for. It is always made, after the nodes
 //     its own evaluation makes (an `&&` or `||` operand's nodes, an
@@ -68,21 +73,25 @@ const yieldLabel = " yield"
 //   - A switch (JLS §14.11 statement, §15.28 expression) is a Stmt node for
 //     its selector, evaluated once, which defines an owned variable (see
 //     Uses), then one Branch node per `case` label in source order,
-//     spanning the label, its guard included, as the grammar holds the guard
-//     in the label, each tested only when the previous failed; a label
+//     spanning the grammar's label, which begins at its `case` keyword
+//     (`case null`, `case String s`) and holds its guard and neither the
+//     `:` nor the `->` after it, each tested only when the previous failed; a label
 //     listing several constants (`case 2, 3`) is one label and one test
 //     (JLS §14.11.1). A label's node Uses the selector's variable, since it
 //     compares against the selector, and its constants' reads. A pattern
 //     label is followed on its match path by one defining node per pattern
 //     variable, spanning the variable's identifier and using the selector's
 //     variable, then, for a guard, a Branch node spanning the
-//     guard expression whose false edge joins the next label's test.
+//     guard expression whose false edge joins the label's own no-match
+//     path: the next label's test, or, after the last label, the default
+//     group or the switch's no-match exit.
 //     Several labels of one group all enter its body. `default` makes no
 //     node: the last label's false edge, the path on which no label
 //     matched, enters the group holding it, together with a colon-form
-//     fall-through into that group. The grammar has no `case null,
-//     default` label, so that source parses with an error node and is
-//     lowered as the labels the recovered tree holds. In the colon
+//     fall-through into that group. `case null, default` (JLS §14.11.1)
+//     matches every value, null included, so it is a `default` label and
+//     makes no node either; the grammar holds it as a `case` label whose
+//     last expression is the identifier `default` (see isDefault). In the colon
 //     form a body's end falls through into the next body; in the arrow form
 //     it leaves the switch. A switch expression without `default` is
 //     exhaustive, and its no-match path throws (JLS §15.28.2); so does that
@@ -91,8 +100,8 @@ const yieldLabel = " yield"
 //     §14.11.2, §14.11.3: MatchException); each such throw is a Throw from the
 //     last label's false edge, with no node of its own. Any other switch
 //     statement without `default` is left when no label matches, and so is every
-//     switch whose tree holds an error node, whose recovery may have dropped
-//     its `default`. An arrow arm's expression is a Stmt node spanning it, and
+//     switch whose tree holds a syntax error (an error or missing node), whose
+//     recovery may have dropped its `default`. An arrow arm's expression is a Stmt node spanning it, and
 //     the yield of its value; `yield e;` is a Jump node spanning the
 //     statement. Every yield breaks to the switch expression's frame (see
 //     yieldLabel). The arm result nodes and the yields define the switch
@@ -137,9 +146,12 @@ const yieldLabel = " yield"
 //     nothing, so the close's own MayThrow edges into the Handler of the
 //     resource acquired before it, while every throw its finally re-issues
 //     from the close (CloseFinally re-issues each intercepted MayThrow as a
-//     throw) is a Throw source that outer finally intercepts: an edge from
-//     the close into the outer finally body, which coincides with normal
-//     completion, never a second edge into its Handler. The null test
+//     throw) is a Throw source of the next frame out: the outer resource's
+//     finally, which intercepts it as an edge from the close into its body
+//     that coincides with normal completion, never a second edge into its
+//     Handler; or, for the first resource of the extended form, the
+//     statement's catch, whose Throw sources enter its first clause test
+//     directly. The null test
 //     before close is not modelled.
 //   - `synchronized (e) { … }` (JLS §14.19) is a Stmt node spanning e, which
 //     may throw, then the block; the monitor exit is not a node.
@@ -162,15 +174,33 @@ const yieldLabel = " yield"
 //     must be able to complete normally (§8.6), so the unit's pairs are
 //     exactly each initializer's own, and the order between them adds only
 //     unconditional edges.
+//   - A lambda's expression body is lowered for its value: its nodes, then
+//     a Stmt node spanning the body that Uses what they hand on, by the rule
+//     below; a block body is lowered as a block.
 //   - An expression lowered for its value and ended by a node spanning it
 //     takes no second node when the last node its own lowering made already
 //     spans it: that node holds the value.
 //
 // Statement kinds: every kind of the grammar's statement supertype is
-// handled above. An empty statement (`;`) makes no node; package, import
+// handled above. An empty statement (`;`), the body of an if, else, loop or
+// label included, makes no node; package, import
 // and module declarations do not occur in a callable; any kind the lowering
-// does not name (an error node included) is one Stmt node spanning it, with
-// its uses, falling through. Expression kinds other than the ones above
+// does not name is one Stmt node spanning it, with its uses, falling
+// through. An ERROR node of the parser's recovery is such a kind wherever it
+// stands, whether the parser made it an extra or not: it is lowered for its
+// value as any unnamed kind is, so a construct inside it that makes a node
+// anywhere (an embedded assignment, a lambda) makes one there and defines
+// what it defines there, and the rest folds into the Stmt node spanning it,
+// which is not made when the construct's node already spans it. Every
+// lowering keeps an ERROR node, extra or not, and makes its nodes as this
+// rule does: a construct inside it that its language lowers to nodes of its
+// own makes them there (Python lowers each named child of a
+// statement-position ERROR as a statement, which a statement the recovery
+// kept needs), and the ERROR node is a Stmt node spanning it. Java,
+// JavaScript and Python leave that node out when a construct's node already
+// spans the ERROR node; C, Go and Rust always make it, which gives a second
+// node over that span only for an ERROR node no wider than its one
+// construct. Expression kinds other than the ones above
 // (method and constructor invocations, an object creation without a class
 // body, field and array access, casts, unary, arithmetic and comparison
 // operators, the instanceof test, method references, array creation, class
@@ -181,7 +211,9 @@ const yieldLabel = " yield"
 // # Uses
 //
 // Only an identifier resolving to a local variable or parameter declared in
-// this function is a Use; a field, `this.x` included, is not a variable.
+// this function is a Use; a field, `this.x` included, is not a variable. A
+// local constant variable (`final int k = 1`, JLS §4.12.4) is a local
+// variable like any other: a case label naming it Uses it.
 // Values travel through variables (see Lowering): a node Uses what its own
 // evaluation reads, each read resolved in the scope where it occurs, and a
 // nested construct lowered to nodes of its own hands its value to its
@@ -245,7 +277,9 @@ const yieldLabel = " yield"
 // class, or one of its fields). The walk that collects them treats a plain
 // assignment's local target as written, not read; a compound assignment and
 // an update read it too. A captured local is effectively final (JLS
-// §15.27.2, §8.1.3), so no nested code assigns it; a write through its
+// §15.27.2, §8.1.3), so no nested code of a valid program assigns it; in a
+// program the compiler rejects for doing so, a plain assignment there is
+// neither a Use nor a MayDef of the local. A write through its
 // field or array element inside (`arr[0] = 1`, `box.v = 2`) is the
 // through-a-target rule: a MayDef of the local on the creating node, since
 // when the nested code runs is unknown, and a Use of it there too, since the
@@ -266,7 +300,11 @@ const yieldLabel = " yield"
 // cap test base's result before a MayDef or a writes entry. Every other
 // variable the builder or at receives is a fresh Var, a result, or a reads
 // or writes entry that passed those filters. The node the construct makes is
-// still made, with its other operands' reads.
+// still made, with its other operands' reads, and an embedded assignment or
+// update to such a name still defines its owned result, which its consumer
+// Uses: in `g(x = a)` for a field x, the node `x = a` Uses a, defines
+// neither x nor anything x names, and defines the result `g(…)` Uses (hand
+// defines it whatever the target resolves to).
 //
 // # Exceptions
 //
@@ -276,9 +314,14 @@ const yieldLabel = " yield"
 // through a receiver other than `this` or `super`, a cast, an enhanced-for
 // iterator step (the head) or a resource close; a monitor expression may
 // throw. Division, unboxing and string conversion are not counted. A throw
-// statement's node is a Throw; a failed assertion, an unmatched catch chain
-// and an exhaustive switch's no-match path are a Throw with no node of its
-// own. The Builder applies MayThrow only inside an open catch or finally
+// statement's node is a Throw, and also MayThrow when its operand holds such
+// a construct (`throw new E()`: the creation may throw before the throw), so
+// inside a try with catch clauses it has an edge into the Handler, and its
+// Throw enters the first clause test directly. A construct evaluated before
+// a nested node (a switch expression's selector, an arm, an operand lowered
+// to nodes) is that node's, never again its consumer's. A failed
+// assertion, an unmatched catch chain and an exhaustive switch's no-match
+// path are a Throw with no node of its own. The Builder applies MayThrow only inside an open catch or finally
 // frame.
 //
 // # Scoping
@@ -466,7 +509,10 @@ type javaArm struct {
 
 // kids pushes n's named, non-extra children onto buf and returns the stack
 // mark and the list; done(mark) pops them. A list stays valid across nested
-// kids calls.
+// kids calls. An extra (a comment) is left out, except an ERROR node the
+// parser made an extra, which its recovery does when it wraps what it could
+// not parse or a token it skipped: it is lowered as a kind the lowering does
+// not name is (see Statement kinds).
 func (j *javaLower) kids(n *ts.Node) (int, []ts.Node) {
 	return j.fieldKids(n, 0)
 }
@@ -479,7 +525,7 @@ func (j *javaLower) fieldKids(n *ts.Node, f uint16) (int, []ts.Node) {
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); x.IsNamed() && !x.IsExtra() && (f == 0 || c.FieldId() == f) {
+			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) && (f == 0 || c.FieldId() == f) {
 				j.buf = append(j.buf, *x)
 			}
 			if !c.GotoNextSibling() {
@@ -1005,6 +1051,12 @@ func (j *javaLower) stmt(n *ts.Node) {
 	labels := j.labels[from:]
 	j.labelAt = len(j.labels)
 	j.reset()
+	// The grammar's empty statement is the anonymous `;` token; a block's
+	// child list skips it, but the body of an if, else or loop is the token
+	// itself, and it executes nothing (JLS §14.6).
+	if !n.IsNamed() {
+		return
+	}
 	switch n.KindId() {
 	case k.expressionStmt:
 		if e := firstNamed(n); e != nil {
@@ -1316,7 +1368,7 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 			if c.KindId() != k.switchLabel {
 				continue
 			}
-			if j.hasToken(c, k.defaultKw) {
+			if j.isDefault(c) {
 				dflt = g
 				continue
 			}
@@ -1409,6 +1461,18 @@ func (j *javaLower) switchBlock(n *ts.Node, labels []string, expr bool) {
 	j.done(start)
 	clear(j.caseBinds[cBase:])
 	j.arms, j.caseBinds, j.groupAt = j.arms[:aBase], j.caseBinds[:cBase], j.groupAt[:gBase]
+}
+
+// isDefault reports whether switch label c matches every value: `default`,
+// or `case null, default` (JLS §14.11.1), which the grammar holds as a
+// `case` label whose last expression is the identifier `default`, a reserved
+// word no variable can bear.
+func (j *javaLower) isDefault(c *ts.Node) bool {
+	if j.hasToken(c, j.k.defaultKw) {
+		return true
+	}
+	last := lastNamed(c)
+	return last != nil && last.KindId() == j.k.identifier && string(j.text(last)) == "default"
 }
 
 // caseLabel lowers one `case` label of group g: its test, its pattern
@@ -1644,13 +1708,18 @@ func (j *javaLower) resources(spec, body *ts.Node) {
 
 // labeled hands a loop or switch its labels, labels[from:] and its own; any
 // other statement is a block frame only a labelled break targets, and keeps
-// what it introduces unless a break leaves it (JLS §6.3.2.7).
+// what it introduces unless a break leaves it (JLS §6.3.2.7). A loop labelled
+// twice takes both labels for break and continue alike; a continue naming the
+// outer one is a compile-time error (JLS §14.16: its target must be the loop
+// itself, not a labelled statement), so resolving it to the loop affects no
+// valid program.
 func (j *javaLower) labeled(n *ts.Node, from int) {
 	k := j.k
 	start, list := j.kids(n)
 	if len(list) < 2 {
+		// The labelled statement is the empty statement, the anonymous `;`
+		// token, which executes nothing (JLS §14.6) and makes no node.
 		j.done(start)
-		j.valueNode(n)
 		return
 	}
 	top := len(j.labels)
@@ -1886,13 +1955,15 @@ func (j *javaLower) expr(n *ts.Node) int {
 // arms run statements, which reset the statement's reads, so the reads of
 // the enclosing statement are saved on stack around it and restored after
 // it, followed by the owned result variable its arm result nodes and yields
-// define, which the node consuming its value Uses (see Uses). A throw
-// pending before the switch expression stays pending, so the consuming node
-// also carries it.
+// define, which the node consuming its value Uses (see Uses). A throwing
+// construct the statement evaluated before the switch expression is carried
+// by the selector's node, the first node made after it (see Exceptions), so
+// none is pending after the switch and the consuming node carries only what
+// its statement evaluates after it.
 func (j *javaLower) switchValue(n *ts.Node) {
 	base := len(j.stack)
 	j.stack = append(j.stack, j.reads...)
-	throws, thrown := j.throws, j.thrown
+	throws := j.throws
 	res := j.b.Var()
 	j.results = append(j.results, res)
 	j.switchBlock(n, nil, true)
@@ -1903,7 +1974,7 @@ func (j *javaLower) switchValue(n *ts.Node) {
 	}
 	j.stack = j.stack[:base]
 	j.read(res)
-	j.throws, j.thrown = throws, thrown
+	j.throws, j.thrown = throws, throws
 }
 
 // closure makes node id, which creates a lambda, an anonymous class or a
@@ -2144,8 +2215,10 @@ func (j *javaLower) cap(n *ts.Node) {
 			j.cap(c)
 		}
 	case k.labeledStmt:
+		// The label is list[0]; a labelled empty statement has nothing after
+		// it.
 		start, list := j.kids(n)
-		if len(list) > 0 {
+		if len(list) > 1 {
 			body := &list[len(list)-1]
 			before := j.binds.mark()
 			j.cap(body)

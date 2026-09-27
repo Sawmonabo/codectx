@@ -638,9 +638,11 @@ func (d deadlineSessions) Session(ctx context.Context, id model.SessionID, actor
 // --- the fake source --------------------------------------------------------
 
 // fakeSource reproduces snapshot.View.Read: it rejects a range past the file
-// and a boundary inside a UTF-8 sequence, and it derives positions from the
-// nearest checkpoint through source.NewCursorAt rather than scanning from byte
-// zero, so a row that reads far into a file exercises the real position path.
+// and a start inside a well-formed UTF-8 sequence, it hands back the bytes
+// before the start that its prefix walk would have read, and it derives
+// positions from the nearest checkpoint through source.NewCursorAt rather than
+// scanning from byte zero, so a row that reads far into a file exercises the
+// real position path.
 type fakeSource struct{ files map[model.FileID]*fixtureFile }
 
 var _ Source = (*fakeSource)(nil)
@@ -659,7 +661,8 @@ func (s *fakeSource) Read(ctx context.Context, id model.FileID, r model.ByteRang
 			"byte range ends at %d, past the %d-byte file", r.End, len(f.data))
 	}
 	cp := f.checkpointFor(r.Start)
-	cursor, err := source.NewCursorAt(f.data[cp.Byte:r.End], cp.Byte, cp.Line)
+	// A checkpoint is a line start, so the window from it needs no lookbehind.
+	cursor, err := source.NewCursorAt(nil, f.data[cp.Byte:r.End], cp.Byte, cp.Line)
 	if err != nil {
 		return snapshot.Range{}, fv, err
 	}
@@ -677,7 +680,8 @@ func (s *fakeSource) Read(ctx context.Context, id model.FileID, r model.ByteRang
 	// row below. Do not "optimize" this into a shared slice.
 	out := make([]byte, r.End-r.Start)
 	copy(out, f.data[r.Start:r.End])
-	return snapshot.Range{Bytes: out, Start: start, End: end}, fv, nil
+	before := bytes.Clone(f.data[max(cp.Byte, r.Start-min(r.Start, source.BoundaryContext)):r.Start])
+	return snapshot.Range{Bytes: out, Before: before, Start: start, End: end}, fv, nil
 }
 
 // --- harness ----------------------------------------------------------------
@@ -1192,30 +1196,58 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// A read offset inside a UTF-8 sequence has no honest answer: the bytes
-	// from there are not a decodable prefix of anything, and serving them as
-	// base64 instead would hand the client a chunk it cannot place in the
-	// text. The request is refused so the client re-reads from a boundary.
+	// A read offset inside a well-formed UTF-8 sequence has no honest answer:
+	// the bytes from there are not a decodable prefix of anything, and
+	// serving them as base64 instead would hand the client a chunk it cannot
+	// place in the text. The request is refused so the client re-reads from a
+	// boundary. Mutation: a boundary rule that ignores the bytes before the
+	// offset, or accepts every continuation byte, serves these offsets.
 	//
-	// Where the teeth are: the rejection itself belongs to internal/source, raised twice there
-	// (PlanChunk's window[0] guard and Cursor.PositionAt's),
-	// and no mutation of internal/coverage makes this row red -- deleting
-	// either source guard alone leaves the other one catching it. What the row
-	// pins here is that Read PROPAGATES the refusal rather than rounding the
-	// offset down to a boundary or falling back to base64, which is the shape
-	// a future "be lenient about offsets" change would take.
-	{"read/an offset inside a UTF-8 sequence is refused", func(t *testing.T, h *harness) {
+	// The rejection itself belongs to internal/source, raised by the view's
+	// cursor and again by PlanChunk. What the row pins here is that Read
+	// PROPAGATES the refusal rather than rounding the offset down to a
+	// boundary or falling back to base64.
+	{"read/an offset inside a well-formed UTF-8 sequence is refused", func(t *testing.T, h *harness) {
 		f := h.file(model.FileID(hexID(0x24)))
-		// The file opens with "é": byte 1 is its continuation byte, and the
-		// checkpoint before it is byte 0, so the window still starts on a
-		// boundary and the offset is the only thing wrong with the request.
-		var typedErr *model.Error
-		_, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
-			SessionID: sessionA, ActorID: actorA, FileID: f.id, Offset: 1,
+		// The file repeats "é中\U0001f600\n": byte 1 continues the two-byte
+		// sequence, byte 3 the three-byte one and byte 6 the four-byte one.
+		for _, offset := range []uint64{1, 3, 4, 6, 7, 8} {
+			var typedErr *model.Error
+			_, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
+				SessionID: sessionA, ActorID: actorA, FileID: f.id, Offset: offset,
+			})
+			if !errors.As(err, &typedErr) || typedErr.Code != model.CodeArgumentInvalid {
+				t.Fatalf("read of %s at byte %d, inside a well-formed sequence, returned %v; want %s",
+					f.path, offset, err, model.CodeArgumentInvalid)
+			}
+		}
+	}},
+
+	// A continuation byte that belongs to no well-formed sequence is a stray
+	// byte of invalid UTF-8, and an offset at it is a legal boundary: refusing
+	// it leaves every byte past it unservable whenever a chunk ends there.
+	// Mutation: rejecting every continuation byte refuses this read.
+	{"read/an offset at a stray continuation byte is served", func(t *testing.T, h *harness) {
+		f := h.file(model.FileID(hexID(0x23)))
+		// Byte 4 of binary.bin is 0x80 after a NUL: no sequence covers it.
+		const offset = 4
+		resp, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id, Offset: offset,
 		})
-		if !errors.As(err, &typedErr) || typedErr.Code != model.CodeArgumentInvalid {
-			t.Fatalf("read of %s at the continuation byte 1 returned %v; want %s",
-				f.path, err, model.CodeArgumentInvalid)
+		if err != nil {
+			t.Fatalf("read of %s at the stray byte %d: %v", f.path, offset, err)
+		}
+		got, err := base64.StdEncoding.DecodeString(resp.Content)
+		if err != nil || resp.Encoding != model.EncodingBase64 {
+			t.Fatalf("read at the stray byte came back as %q (%v); want lossless base64", resp.Encoding, err)
+		}
+		if resp.ByteRange.Start != offset || !bytes.Equal(got, f.data[offset:resp.ByteRange.End]) {
+			t.Fatalf("read at the stray byte served %x over [%d,%d); %s holds %x from %d",
+				got, resp.ByteRange.Start, resp.ByteRange.End, f.path, f.data[offset:], offset)
+		}
+		if start := resp.LineRange.Start; start.Line != 1 || start.Column != offset {
+			t.Fatalf("read at the stray byte starts at line %d column %d; want line 1 column %d",
+				start.Line, start.Column, offset)
 		}
 	}},
 

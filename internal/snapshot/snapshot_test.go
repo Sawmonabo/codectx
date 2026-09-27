@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -72,7 +73,7 @@ func newFixture(t *testing.T, withGit bool) *fixture {
 		}
 		f.gitCmd("init", "-q", "-b", "main")
 	}
-	s, err := store.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), store.Options{})
+	s, err := store.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), store.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
@@ -143,6 +144,11 @@ func (f *fixture) build(b *Builder) (model.Snapshot, *View) {
 	snap, err := b.Build(f.ctx)
 	if err != nil {
 		f.t.Fatalf("Build: %v", err)
+	}
+	// A view reads against the last commit, so the capture is committed
+	// first, as the index build commits it.
+	if err := f.store.Flush(f.ctx); err != nil {
+		f.t.Fatalf("Flush: %v", err)
 	}
 	view, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
 	if err != nil {
@@ -679,6 +685,9 @@ func TestEveryBlobIsDurableBeforeTheSnapshotNamesIt(t *testing.T) {
 	}
 	// And the bytes are readable afterwards, so publication was real and not
 	// merely recorded.
+	if err := f.store.Flush(f.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	v, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
 	if err != nil {
 		t.Fatalf("OpenView: %v", err)

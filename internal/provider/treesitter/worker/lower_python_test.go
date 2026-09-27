@@ -748,5 +748,756 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"y = (g := 2)@50 -> return y, h, k@192", "h = lambda: g@64 -> return y, h, k@192",
 				"def k(): global g g = 3@163 -> return y, h, k@192"},
 		},
+		{
+			// §8.7: a default is evaluated when the definition runs. Lines at
+			// 0, 10, 23, 30. Nodes: a@6, def g(x=a): pass@11 (reads a, the
+			// default, and defines g), return g@31.
+			name:     "a parameter default is a read of the defining node",
+			protects: "a default value belongs to the enclosing function's creating node, not to the nested function's graph",
+			mutation: "evaluate defaults inside the nested function (a@6 -> def g(x=a): pass@11 disappears)",
+			src:      "def f(a):\n def g(x=a):\n  pass\n return g\n",
+			fn:       1,
+			du:       []string{"a@6 -> def g(x=a): pass@11", "def g(x=a): pass@11 -> return g@31"},
+		},
+		{
+			// §8.8: the base list is evaluated when the class statement runs.
+			// Lines at 0, 10, 23, 30. Nodes: B@6, class C(B): pass@11 (reads
+			// B, defines C), return C@31.
+			name:     "a class's bases are reads of the creating node",
+			protects: "a class's bases belong to the enclosing function's creating node, not to the class body's graph",
+			mutation: "evaluate the bases in the class body (B@6 -> class C(B): pass@11 disappears)",
+			src:      "def f(B):\n class C(B):\n  pass\n return C\n",
+			fn:       1,
+			du:       []string{"B@6 -> class C(B): pass@11", "class C(B): pass@11 -> return C@31"},
+		},
+		{
+			// §7.1. Lines at 0, 13. Nodes: a@6, b@9, a, b@14 (one node
+			// spanning the statement, reading both expressions).
+			name:     "a bare tuple statement is one node spanning the statement",
+			protects: "an expression statement of several comma-separated expressions evaluates each of them at one node",
+			mutation: "lower only the first expression (b@9 -> a, b@14 disappears), or span the first expression (the node renders a@14)",
+			src:      "def f(a, b):\n a, b\n",
+			fn:       1,
+			du:       []string{"a@6 -> a, b@14", "b@9 -> a, b@14"},
+		},
+		{
+			// §7.11. Lines at 0, 9, 21, 43. Nodes: a@17 (`import a.b` binds
+			// a, the first component), d@41 (the alias binds d, not c), return
+			// a, d@44.
+			name:     "an import binds the first component of a dotted name and an alias",
+			protects: "each import clause defines the local name it binds, and only that name",
+			mutation: "bind the imported name instead of its alias (d is no local and d@41 -> return a, d@44 disappears), or no name for a dotted import (a@17 -> return a, d@44 disappears)",
+			src:      "def f():\n import a.b\n from m import c as d\n return a, d\n",
+			fn:       1,
+			du:       []string{"a@17 -> return a, d@44", "d@41 -> return a, d@44"},
+		},
+		{
+			// §7.11, the module (callable 0): a wildcard import is legal at
+			// module level only, and it binds every public name of m. Lines at
+			// 0, 6, 22. Nodes: x = 1@0, from m import *@6 (a Stmt that
+			// may-defines x, a χ), g(x)@22.
+			name:     "a wildcard import may rebind every module variable and kills none",
+			protects: "`from m import *` is a node of its own that may-defines each module variable, so a later read pairs with it and with the definition before it",
+			mutation: "make it define nothing (x = 1@0 -> from m import *@6 and from m import *@6 -> g(x)@22 disappear), or a killing definition of each variable (x = 1@0 -> g(x)@22 disappears)",
+			src:      "x = 1\nfrom m import *\ng(x)\n",
+			du:       []string{"x = 1@0 -> from m import *@6", "x = 1@0 -> g(x)@22", "from m import *@6 -> g(x)@22"},
+		},
+		{
+			// §7.14. Lines at 0, 9, 23. Nodes: type T = int@10 (spans the
+			// statement, defines T), return T@24.
+			name:     "a type alias statement defines its name",
+			protects: "a type alias binds a local that later reads see",
+			mutation: "make the alias define nothing (type T = int@10 -> return T@24 disappears)",
+			src:      "def f():\n type T = int\n return T\n",
+			fn:       1,
+			du:       []string{"type T = int@10 -> return T@24"},
+		},
+		{
+			// §7.2: the right side is evaluated once and assigned to each
+			// target from left to right. Lines at 0, 10, 21. Nodes: e@6,
+			// e@19 (Uses e, defines a variable of the lowering's own),
+			// a@11 and b@15 (each Using that variable), return a, b@22.
+			name:     "a chained assignment evaluates its value once and binds each target from it",
+			protects: "every target of `a = b = e` is bound from the one evaluation of e, not from e's reads",
+			mutation: "bind each target from the right side's reads (e@6 -> a@11 and e@6 -> b@15 replace the pairs from e@19)",
+			src:      "def f(e):\n a = b = e\n return a, b\n",
+			fn:       1,
+			du: []string{"e@6 -> e@19", "e@19 -> a@11", "e@19 -> b@15",
+				"a@11 -> return a, b@22", "b@15 -> return a, b@22"},
+		},
+		{
+			// §7.2.2: an annotation without a value evaluates nothing. Lines
+			// at 0, 13, 20, 29. Nodes: c@6, x@9, c@17 (Branch), return x@30.
+			// The if's body makes no node, so c controls nothing.
+			name:     "an annotation without a value makes no node",
+			protects: "`x: int` is neither a node nor a definition, so x's parameter value reaches the return and nothing depends on the condition",
+			mutation: "make a node for the annotation (c@17 -> x: int@22 appears), or a definition of x (x: int@22 -> return x@30 appears)",
+			src:      "def f(c, x):\n if c:\n  x: int\n return x\n",
+			fn:       1,
+			du:       []string{"c@6 -> c@17", "x@9 -> return x@30"},
+		},
+		{
+			// §7.12. Lines at 0, 10, 17, 28. Nodes: c@6, c@14 (Branch),
+			// return 1@29. The global declaration in the if's body makes no
+			// node, so c controls nothing.
+			name:     "a global declaration makes no node",
+			protects: "a global or nonlocal statement is a declaration, not code on the path",
+			mutation: "make a node for the declaration (c@14 -> global g@19 appears)",
+			src:      "def f(c):\n if c:\n  global g\n return 1\n",
+			fn:       1,
+			du:       []string{"c@6 -> c@14"},
+		},
+		{
+			// §7.5. Lines at 0, 16, 31. Nodes: o@6, a@9, i@12, o.p@21 (the
+			// first of two targets, spanning itself: Uses o, may-defines o),
+			// a[i]@26 (Uses a and i, may-defines a), return o, a@32. Each χ
+			// leaves the parameter's definition in place.
+			name:     "deleting an attribute or subscript is a write through its base",
+			protects: "`del o.p, a[i]` reads the object and index and may-defines the base variables without killing them",
+			mutation: "kill the base (o@6 -> return o, a@32 and a@9 -> return o, a@32 disappear), or record no write (o.p@21 -> return o, a@32 and a[i]@26 -> return o, a@32 disappear)",
+			src:      "def f(o, a, i):\n del o.p, a[i]\n return o, a\n",
+			fn:       1,
+			du: []string{"o@6 -> o.p@21", "a@9 -> a[i]@26", "i@12 -> a[i]@26",
+				"o@6 -> return o, a@32", "o.p@21 -> return o, a@32", "a@9 -> return o, a@32", "a[i]@26 -> return o, a@32"},
+		},
+		{
+			// §8.1, lower.go (Spans). Lines at 0, 10, 19, 30. Nodes: a@6,
+			// a@15 (the Branch, spanning a without its parentheses), return
+			// 1@21, return 0@31. Succ: a@15→{return 1, return 0}.
+			name:     "a parenthesized condition spans the expression inside the parentheses",
+			protects: "an if condition's node spans its expression with the enclosing parentheses stripped",
+			mutation: "span the condition as written (the Branch renders (a)@14)",
+			src:      "def f(a):\n if (a):\n  return 1\n return 0\n",
+			fn:       1,
+			cd:       []string{"a@15 -> return 1@21", "a@15 -> return 0@31"},
+			du:       []string{"a@6 -> a@15"},
+		},
+		{
+			// §8.3. Lines at 0, 11, 28. Nodes: ps@6, ps@24 (the iterable,
+			// defining the iteration variable), a, b in ps@16 (head), a@16 and
+			// b@19 (one binding node per name, each Using the iteration
+			// variable), g(a, b)@30. Succ: ps@24→head→{a@16, EXIT};
+			// a@16→b@19→g(a, b)→head. IPDom: a@16 → b@19 → g(a, b) → head →
+			// EXIT.
+			name:     "a for loop's unpacking target makes one binding node per name",
+			protects: "each name an unpacking for target binds is defined on the body path from the iteration variable",
+			mutation: "bind the target as one node (a@16 and b@19 become one node a, b@16), or bind from the iterable's reads (ps@6 -> a@16 and ps@6 -> b@19 appear)",
+			src:      "def f(ps):\n for a, b in ps:\n  g(a, b)\n",
+			fn:       1,
+			cd: []string{"a, b in ps@16 -> a@16", "a, b in ps@16 -> b@19", "a, b in ps@16 -> g(a, b)@30",
+				"a, b in ps@16 -> a, b in ps@16"},
+			du: []string{"ps@6 -> ps@24", "ps@24 -> a, b in ps@16", "ps@24 -> a@16", "ps@24 -> b@19",
+				"a@16 -> g(a, b)@30", "b@19 -> g(a, b)@30"},
+		},
+		{
+			// §8.9.2: async for is lowered as for. Lines at 0, 17, 37. Nodes:
+			// xs@12, xs@33 (the iterable), x in xs@28 (head), x@28 (target),
+			// g(x)@39. Succ: xs@33→head→{x@28, EXIT}; x@28→g(x)→head.
+			name:     "an async for loop is lowered as a for loop",
+			protects: "async for evaluates its iterable once and binds its target on the body path, as for does",
+			mutation: "lower async for as a plain statement (the head, the target and the loop's control dependence disappear)",
+			src:      "async def f(xs):\n async for x in xs:\n  g(x)\n",
+			fn:       1,
+			cd:       []string{"x in xs@28 -> x@28", "x in xs@28 -> g(x)@39", "x in xs@28 -> x in xs@28"},
+			du:       []string{"xs@12 -> xs@33", "xs@33 -> x in xs@28", "xs@33 -> x@28", "x@28 -> g(x)@39"},
+		},
+		{
+			// §6.11, §8.1. Lines at 0, 13, 26. Nodes: a@6, b@9, a@17 (Branch:
+			// defines the result variable), b@23 (defines it again), a and
+			// b@17 (the condition's Branch, Using the result variable only),
+			// g()@28. Succ: a@17→{b@23, a and b}; b@23→a and b; a and
+			// b→{g(), EXIT}.
+			name:     "a condition over a short-circuit operator reads its result variable",
+			protects: "an if over `a and b` is a Branch of its own that reads the operator's result, not the operands' names",
+			mutation: "let the condition re-read the operands (a@6 -> a and b@17 and b@9 -> a and b@17 replace the pairs from a@17 and b@23)",
+			src:      "def f(a, b):\n if a and b:\n  g()\n",
+			fn:       1,
+			cd:       []string{"a@17 -> b@23", "a and b@17 -> g()@28"},
+			du:       []string{"a@6 -> a@17", "b@9 -> b@23", "a@17 -> a and b@17", "b@23 -> a and b@17"},
+		},
+		{
+			// §7.1, §6.11. Lines at 0, 10. Nodes: a@6, a@11 (Branch), g()@17.
+			// The statement is the operator's nodes alone.
+			name:     "an expression statement over a short-circuit operator is the operator's nodes alone",
+			protects: "a discarded `a and g()` makes the Branch and the operand's node, and no node consuming a result",
+			mutation: "make a node for the whole statement (a and g()@11 appears, after g()@17 and controlled by a@11)",
+			src:      "def f(a):\n a and g()\n",
+			fn:       1,
+			cd:       []string{"a@11 -> g()@17"},
+			du:       []string{"a@6 -> a@11"},
+		},
+		{
+			// §8.4.4. Lines at 0, 9, 15, 21, 31. Nodes: g()@17 (may throw,
+			// into the finally), finally@22 (the Handler), h()@33 (the
+			// finally's body, reached from g()'s normal end and the
+			// Handler, then re-raising and completing to EXIT). IPDom: g(),
+			// finally → h() → EXIT.
+			name:     "a finally that something may throw into has a Handler spanning finally",
+			protects: "an exception part-way through the try body enters the finally through its Handler",
+			mutation: "enter the finally from the normal end alone (finally@22 disappears and g()@17 controls nothing)",
+			src:      "def f():\n try:\n  g()\n finally:\n  h()\n",
+			fn:       1,
+			cd:       []string{"g()@17 -> finally@22"},
+		},
+		{
+			// §8.5, §7.9. Lines at 0, 13, 23, 33, 42. Nodes: m@6, a@9, a@20
+			// (while head), m@30 (enter), break@36 (intercepted by the
+			// with's finally), with m@25 (the exit, re-issuing the break),
+			// return a@43. No exception reaches the finally, so nothing falls
+			// through the exit to the loop head. Succ: a@20→{m@30, return a};
+			// m@30→break→with m→return a. IPDom: a@20, m@30, break, with m
+			// → return a.
+			name:     "a break inside with is re-issued from the exit to its loop",
+			protects: "a break leaving a with body runs the exit and then leaves the loop, never returning to the loop head",
+			mutation: "let the exit fall through after a break (with m@25 reaches a@20, and a@20 -> a@20 appears), or break straight past the exit (with m@25 loses its predecessor and a@20's control of it)",
+			src:      "def f(m, a):\n while a:\n  with m:\n   break\n return a\n",
+			fn:       1,
+			cd:       []string{"a@20 -> m@30", "a@20 -> break@36", "a@20 -> with m@25"},
+			du:       []string{"m@6 -> m@30", "m@30 -> with m@25", "a@9 -> a@20", "a@9 -> return a@43"},
+		},
+		{
+			// §8.9.3: async with is lowered as with. Lines at 0, 16, 36.
+			// Nodes: m@12, m as r@28 (enter: defines r and the manager),
+			// g(r)@38 (may throw into the item's finally), with@23 (the
+			// Handler), with m as r@23 (the exit). Succ: g(r)→{exit, with};
+			// with→exit→EXIT.
+			name:     "an async with statement is lowered as a with statement",
+			protects: "async with enters the manager, binds the target and runs the exit on every path, as with does",
+			mutation: "lower async with as a plain statement (the enter, the exit and the Handler disappear)",
+			src:      "async def f(m):\n async with m as r:\n  g(r)\n",
+			fn:       1,
+			cd:       []string{"g(r)@38 -> with@23"},
+			du:       []string{"m@12 -> m as r@28", "m as r@28 -> g(r)@38", "m as r@28 -> with m as r@23"},
+		},
+		{
+			// §8.6. Lines at 0, 13, 26, 41, 53. Nodes: a@6, b@9, a, b@20 (the
+			// subjects, one node from the first to the last: Uses a and b,
+			// defines the subject variable), (x, y)@33 (Branch), x@34 and
+			// y@37 (captures), return x@44, return 0@54. The case is
+			// refutable and the last, so its false edge falls out of the
+			// match. Succ: a, b→(x, y)→{x@34, return 0}; x@34→y@37→return x.
+			name:     "several match subjects are one node and a refutable last case falls out",
+			protects: "`match a, b` evaluates both subjects once at one node that every case and capture reads, and a failed last case continues after the match",
+			mutation: "make one node per subject (a@20 and b@23 replace a, b@20), or end the match at a refutable last case (return 0@54 becomes unreachable and (x, y)@33 no longer controls it)",
+			src:      "def f(a, b):\n match a, b:\n  case (x, y):\n   return x\n return 0\n",
+			fn:       1,
+			cd: []string{"(x, y)@33 -> x@34", "(x, y)@33 -> y@37", "(x, y)@33 -> return x@44",
+				"(x, y)@33 -> return 0@54"},
+			du: []string{"a@6 -> a, b@20", "b@9 -> a, b@20", "a, b@20 -> (x, y)@33", "a, b@20 -> x@34",
+				"a, b@20 -> y@37", "x@34 -> return x@44"},
+		},
+		{
+			// §8.6.3, §8.6.4.2, §8.6.4.4, §8.6.4.7. A bare capture case
+			// `case y:` cannot render apart from its capture: the case node
+			// spans the pattern and the capture node the captured name, the
+			// same bytes. So the capture sits inside a group and an
+			// as-pattern, each irrefutable exactly when what it wraps is,
+			// and the case node spans (y as z). Lines at 0, 10, 20, 30, 39,
+			// 56, 65. Nodes: s@6, s@17 (the subject), 1@27 (Branch), r =
+			// 1@33, (y as z)@46 (the case: a Stmt, no false edge), y@47 and
+			// z@52 (captures, Using the subject's variable), r = z@59, return
+			// r@66. Succ: 1@27→{r = 1, (y as z)}; (y as z)→y@47→z@52→r = z;
+			// both arms→return r. IPDom: 1@27 → return r.
+			name:     "a capture, a group of it and an as-pattern over it are irrefutable",
+			protects: "a case whose pattern always matches has no false edge, so its case node controls nothing and nothing falls out of the match after it",
+			mutation: "make a capture, a one-element group or an as-pattern refutable ((y as z)@46 becomes a Branch, and (y as z)@46 -> y@47, (y as z)@46 -> z@52 and (y as z)@46 -> r = z@59 appear)",
+			src:      "def f(s):\n match s:\n  case 1:\n   r = 1\n  case (y as z):\n   r = z\n return r\n",
+			fn:       1,
+			cd: []string{"1@27 -> r = 1@33", "1@27 -> (y as z)@46", "1@27 -> y@47", "1@27 -> z@52",
+				"1@27 -> r = z@59"},
+			du: []string{"s@6 -> s@17", "s@17 -> 1@27", "s@17 -> (y as z)@46", "s@17 -> y@47", "s@17 -> z@52",
+				"z@52 -> r = z@59", "r = 1@33 -> return r@66", "r = z@59 -> return r@66"},
+		},
+		{
+			// §8.6.4.2: an or-pattern with an irrefutable alternative is
+			// irrefutable. Lines at 0, 10, 20, 30, 39, 53, 62. Nodes: s@6,
+			// s@17, 1@27 (Branch), r = 1@33, 2 | _@46 (the case: a Stmt),
+			// r = 2@56, return r@63. Succ: 1@27→{r = 1, 2 | _}; 2 | _→r = 2;
+			// both arms→return r.
+			name:     "an or-pattern with a wildcard alternative is irrefutable",
+			protects: "`case 2 | _` always matches, so its case node has no false edge and controls nothing",
+			mutation: "make an or-pattern refutable whatever its alternatives (2 | _@46 becomes a Branch and 2 | _@46 -> r = 2@56 appears)",
+			src:      "def f(s):\n match s:\n  case 1:\n   r = 1\n  case 2 | _:\n   r = 2\n return r\n",
+			fn:       1,
+			cd:       []string{"1@27 -> r = 1@33", "1@27 -> 2 | _@46", "1@27 -> r = 2@56"},
+			du: []string{"s@6 -> s@17", "s@17 -> 1@27", "s@17 -> 2 | _@46",
+				"r = 1@33 -> return r@63", "r = 2@56 -> return r@63"},
+		},
+		{
+			// §7.3. Lines at 0, 10, 20. Nodes: a@6, a@18 (Branch; its false
+			// edge raises straight to EXIT), return a@21.
+			name:     "an assert without a message raises from the condition's false edge",
+			protects: "a failed message-less assert leaves the function from its condition, so the code after it depends on the condition",
+			mutation: "lower a message-less assert as a plain statement (a@18 controls nothing)",
+			src:      "def f(a):\n assert a\n return a\n",
+			fn:       1,
+			cd:       []string{"a@18 -> return a@21"},
+			du:       []string{"a@6 -> a@18", "a@6 -> return a@21"},
+		},
+		{
+			// §6.2.7, §6.2.4, the comprehension (callable 2). Lines at 0, 10.
+			// Nodes: d@36 (the first iterable's parameter-like node), for k,
+			// v in d@24 (head), k@28 and v@31 (the unpacking target's binding
+			// nodes), k: v@19 (the element, spanning the key: value pair).
+			// Succ: d@36→head→{k@28, EXIT}; k@28→v@31→k: v→head.
+			name:     "a dictionary comprehension's element is its key: value pair",
+			protects: "the element node spans and reads both the key and the value, and an unpacking clause target binds each name",
+			mutation: "span or read the key alone (v@31 -> k: v@19 disappears and the element renders k@19)",
+			src:      "def f(d):\n return {k: v for k, v in d}\n",
+			fn:       2,
+			cd: []string{"for k, v in d@24 -> k@28", "for k, v in d@24 -> v@31", "for k, v in d@24 -> k: v@19",
+				"for k, v in d@24 -> for k, v in d@24"},
+			du: []string{"d@36 -> for k, v in d@24", "d@36 -> k@28", "d@36 -> v@31", "k@28 -> k: v@19", "v@31 -> k: v@19"},
+		},
+		{
+			// §6.2.8: a generator expression is a callable of its own. Lines
+			// at 0, 14. Nodes: xs@6, k@10, (x + k for x in xs)@22 (the
+			// creating node: its first iterable and its capture k), return
+			// …@15 (Uses the result variable). Callables: the module, f and
+			// the generator.
+			name:      "a generator expression is its own callable",
+			protects:  "a generator expression's creation reads its first iterable and captures, and its body is not the enclosing function's code",
+			mutation:  "drop generator expressions from the callables (callables = 2, and the return reads xs and k itself)",
+			src:       "def f(xs, k):\n return (x + k for x in xs)\n",
+			fn:        1,
+			callables: 3,
+			du: []string{"xs@6 -> (x + k for x in xs)@22", "k@10 -> (x + k for x in xs)@22",
+				"(x + k for x in xs)@22 -> return (x + k for x in xs)@15"},
+		},
+		{
+			// §6.4, §6.2.9. Lines at 0, 16, 29. Nodes: a@12, x = await a@17
+			// (await folds into the assignment: Uses a, defines x), yield
+			// x@30 (one Stmt node reading x).
+			name:     "await and yield fold into their statement's node",
+			protects: "await and yield are plain expressions, evaluated by the node of the statement holding them",
+			mutation: "make await a node of its own (await a@21 appears and a@12 pairs with it instead of the assignment)",
+			src:      "async def f(a):\n x = await a\n yield x\n",
+			fn:       1,
+			du:       []string{"a@12 -> x = await a@17", "x = await a@17 -> yield x@30"},
+		},
+		{
+			// §6.3.1, §6.3.4. Lines at 0, 16. Nodes: o@6, p@9, a@12, return
+			// g(o.p, a=1)@17 (reads o only: the attribute name p and the
+			// keyword name a are not reads).
+			name:     "attribute names and keyword names are not reads",
+			protects: "an attribute's name and a keyword argument's name never read a variable that shares their spelling",
+			mutation: "read the attribute name (p@9 -> return g(o.p, a=1)@17 appears), or the keyword name (a@12 -> return g(o.p, a=1)@17 appears)",
+			src:      "def f(o, p, a):\n return g(o.p, a=1)\n",
+			fn:       1,
+			du:       []string{"o@6 -> return g(o.p, a=1)@17"},
+		},
+		{
+			// §7.2.1. Lines at 0, 16, 27. Nodes: a@6, i@9, v@12, a[i] +=
+			// v@17 (Uses a, i and v, may-defines a), return a@28.
+			name:     "an augmented subscript write reads its operands and may-defines the base",
+			protects: "`a[i] += v` reads the object, index and value and leaves a's earlier definition reaching later uses",
+			mutation: "kill the base (a@6 -> return a@28 disappears), or record no write (a[i] += v@17 -> return a@28 disappears)",
+			src:      "def f(a, i, v):\n a[i] += v\n return a\n",
+			fn:       1,
+			du: []string{"a@6 -> a[i] += v@17", "i@9 -> a[i] += v@17", "v@12 -> a[i] += v@17",
+				"a@6 -> return a@28", "a[i] += v@17 -> return a@28"},
+		},
+		{
+			// §6.3.1, §8.4. Lines at 0, 10, 16, 26, 37, 45. Nodes: o@6, y =
+			// o.p@18 (the attribute read may throw), except@27 (Handler), E@34,
+			// y = 0@39, return y@46. Succ: y = o.p→{return y, except};
+			// except→E→{y = 0, EXIT}; y = 0→return y. IPDom: y = o.p, E →
+			// EXIT; except → E.
+			name:     "an attribute read may throw",
+			protects: "a node reading an attribute inside a try reaches the handler",
+			mutation: "count no throw for an attribute read (except@27 disappears, E@34 loses its predecessor and y = o.p@18 controls nothing)",
+			src:      "def f(o):\n try:\n  y = o.p\n except E:\n  y = 0\n return y\n",
+			fn:       1,
+			cd: []string{"y = o.p@18 -> return y@46", "y = o.p@18 -> except@27", "y = o.p@18 -> E@34",
+				"E@34 -> y = 0@39", "E@34 -> return y@46"},
+			du: []string{"o@6 -> y = o.p@18", "y = o.p@18 -> return y@46", "y = 0@39 -> return y@46"},
+		},
+		{
+			// §7.2, §8.4. Lines at 0, 10, 16, 27, 38, 46. Nodes: e@6, e@25 (the
+			// right side, defining the unpacked value's variable), a@18 (the
+			// first target: unpacking may throw, before any binding), b@21,
+			// except@28 (Handler), E@35, a = 0@40, return a@47. Succ:
+			// e@25→a@18→{b@21, except}; b@21→return a; except→E→{a = 0,
+			// EXIT}. IPDom: e@25 → a@18 → EXIT; E → EXIT.
+			name:     "an unpacking assignment may throw",
+			protects: "unpacking a value inside a try reaches the handler",
+			mutation: "count no throw for unpacking (except@28 disappears and a@18 controls nothing)",
+			src:      "def f(e):\n try:\n  a, b = e\n except E:\n  a = 0\n return a\n",
+			fn:       1,
+			cd: []string{"a@18 -> b@21", "a@18 -> return a@47", "a@18 -> except@28", "a@18 -> E@35",
+				"E@35 -> a = 0@40", "E@35 -> return a@47"},
+			du: []string{"e@6 -> e@25", "e@25 -> a@18", "e@25 -> b@21", "a@18 -> return a@47", "a = 0@40 -> return a@47"},
+		},
+		{
+			// §7.11, §8.4. Lines at 0, 9, 15, 26, 37, 45. Nodes: m@24 (the
+			// import's binding node, which may throw), except@27 (Handler),
+			// E@34, m = 0@39, return m@46. Succ: m@24→{return m, except};
+			// except→E→{m = 0, EXIT}.
+			name:     "an import may throw",
+			protects: "an import inside a try reaches the handler",
+			mutation: "count no throw for an import (except@27 disappears and m@24 controls nothing)",
+			src:      "def f():\n try:\n  import m\n except E:\n  m = 0\n return m\n",
+			fn:       1,
+			cd: []string{"m@24 -> return m@46", "m@24 -> except@27", "m@24 -> E@34",
+				"E@34 -> m = 0@39", "E@34 -> return m@46"},
+			du: []string{"m@24 -> return m@46", "m = 0@39 -> return m@46"},
+		},
+		{
+			// §7.8. Lines at 0, 9, 15, 25, 36, 44. Nodes: raise E@17 (a Throw
+			// alone: its source holds no call, so it is not MayThrow and no
+			// Handler is made), E@33 (the test, reached from the raise),
+			// x = 1@38, return x@45. Succ: raise E→E@33→{x = 1, EXIT};
+			// x = 1→return x.
+			name:     "raise of a bare class is a Throw alone and makes no Handler",
+			protects: "`raise E` joins the clause chain as a Throw source, with no Handler node before the first test",
+			mutation: "make `raise E` MayThrow (except@26 appears between the raise and E@33, and raise E@17 -> except@26 with it)",
+			src:      "def f():\n try:\n  raise E\n except E:\n  x = 1\n return x\n",
+			fn:       1,
+			cd:       []string{"E@33 -> x = 1@38", "E@33 -> return x@45"},
+			du:       []string{"x = 1@38 -> return x@45"},
+		},
+		{
+			// §7.8. Lines at 0, 9, 15, 27, 38, 46. Nodes: raise E()@17 (a
+			// Throw and MayThrow: the call may throw), except@28 (the Handler,
+			// reached by the MayThrow), E@35 (reached from the Handler and
+			// the Throw), x = 1@40, return x@47. Succ: raise E()→{except,
+			// E}; except→E→{x = 1, EXIT}. IPDom: raise E() → E → EXIT.
+			name:     "raise of a call is a Throw that may throw",
+			protects: "`raise E()` evaluates a call, so it reaches the handler part-way as well as by its Throw",
+			mutation: "treat every raise as a Throw alone (except@28 disappears, and raise E()@17 -> except@28 with it)",
+			src:      "def f():\n try:\n  raise E()\n except E:\n  x = 1\n return x\n",
+			fn:       1,
+			cd:       []string{"raise E()@17 -> except@28", "E@35 -> x = 1@40", "E@35 -> return x@47"},
+			du:       []string{"x = 1@40 -> return x@47"},
+		},
+		{
+			// §6.7, §6.10, §8.4. Lines at 0, 13, 19, 35, 41, 52, 60. Nodes:
+			// a@6, b@9, y = a + b < a@21 (arithmetic and a comparison: not
+			// MayThrow), g()@37 (may throw), except@42 (Handler, from g()
+			// alone), E@49, y = 0@54, return y@61. Succ: y = …→g()→{return y,
+			// except}; except→E→{y = 0, EXIT}. IPDom: y = … → g() → EXIT.
+			name:     "arithmetic and comparisons do not throw",
+			protects: "an operator's node inside a try has no edge to the handler, so only the call before it is a controller",
+			mutation: "count an arithmetic operator or a comparison toward MayThrow (y = a + b < a@21 gains an edge to except@42 and controls g()@37)",
+			src:      "def f(a, b):\n try:\n  y = a + b < a\n  g()\n except E:\n  y = 0\n return y\n",
+			fn:       1,
+			cd: []string{"g()@37 -> return y@61", "g()@37 -> except@42", "g()@37 -> E@49",
+				"E@49 -> y = 0@54", "E@49 -> return y@61"},
+			du: []string{"a@6 -> y = a + b < a@21", "b@9 -> y = a + b < a@21",
+				"y = a + b < a@21 -> return y@61", "y = 0@54 -> return y@61"},
+		},
+		{
+			// §7.2.2, §8.7: a definition's annotations are evaluated where it
+			// is created, a function's annotated assignment's are not. Lines at
+			// 0, 13, 23, 42, 49. Nodes: T@6, a@9, y: T = a@14 (reads a only),
+			// def g(p: T) -> T: pass@24 (defines g, reads T through the
+			// parameter's and the return annotation), return y, g@50.
+			name:     "a nested definition's annotations are reads of its creating node",
+			protects: "a parameter's and a return annotation are evaluated when the definition runs, so the variables they name reach its node, while a function's annotated assignment reads its value alone",
+			mutation: "read no annotation of a definition (T@6 -> def g(p: T) -> T: pass@24 disappears), or evaluate a function's annotated assignment (T@6 -> y: T = a@14 appears)",
+			src:      "def f(T, a):\n y: T = a\n def g(p: T) -> T:\n  pass\n return y, g\n",
+			fn:       1,
+			du: []string{"a@9 -> y: T = a@14", "y: T = a@14 -> return y, g@50", "T@6 -> def g(p: T) -> T: pass@24",
+				"def g(p: T) -> T: pass@24 -> return y, g@50"},
+		},
+		{
+			// §7.11.1: under the future import no annotation is evaluated.
+			// Lines at 0, 35, 45, 64, 71. Nodes: T@41, def g(p: T) -> T:
+			// pass@46 (defines g, reads nothing), return g@72.
+			name:     "annotations under the annotations future import are read by no node",
+			protects: "a module that imports annotations from __future__ evaluates none of them, so a definition's annotations are no reads",
+			mutation: "ignore the future import (T@41 -> def g(p: T) -> T: pass@46 appears)",
+			src:      "from __future__ import annotations\ndef f(T):\n def g(p: T) -> T:\n  pass\n return g\n",
+			fn:       1,
+			du:       []string{"def g(p: T) -> T: pass@46 -> return g@72"},
+		},
+		{
+			// §7.2.2, the class body (callable 1): a class body evaluates its
+			// annotations. Lines at 0, 9, 18, 24. Nodes: T = int@10, x: T@19
+			// (a Stmt reading T, binding nothing), y: T = 1@25 (reads T after
+			// its value, defines y).
+			name:     "a class body's annotations are reads where they stand",
+			protects: "an annotated name in a class body evaluates its annotation, with or without a value, so the variable it names reaches that node",
+			mutation: "make no node for an annotation without a value in a class body (T = int@10 -> x: T@19 disappears), or read no annotation of an annotated assignment there (T = int@10 -> y: T = 1@25 disappears)",
+			src:      "class C:\n T = int\n x: T\n y: T = 1\n",
+			fn:       1,
+			du:       []string{"T = int@10 -> x: T@19", "T = int@10 -> y: T = 1@25"},
+		},
+		{
+			// §6.11, §6.12. Lines at 0, 10, 29. Nodes: a@6, a@15 (Branch:
+			// defines the result variable), x := 1@21 (defines x and the
+			// operator's result variable), y = a or (x := 1)@11 (Uses the
+			// result variable only), return y@30. y reads no x, so the pair
+			// from x := 1 exists only through the result.
+			name:     "an assignment expression as an operand defines the operator's result",
+			protects: "`x := 1` as the operand after `or`'s deciding one yields the operator's value through its result variable",
+			mutation: "let an assignment expression operand define only its own target (x := 1@21 -> y = a or (x := 1)@11 disappears)",
+			src:      "def f(a):\n y = a or (x := 1)\n return y\n",
+			fn:       1,
+			cd:       []string{"a@15 -> x := 1@21"},
+			du: []string{"a@6 -> a@15", "a@15 -> y = a or (x := 1)@11", "x := 1@21 -> y = a or (x := 1)@11",
+				"y = a or (x := 1)@11 -> return y@30"},
+		},
+		{
+			// §8.5: a pattern target is bound inside the item's finally.
+			// Lines at 0, 10, 29, 36. Nodes: m@6, m as (a, b)@16 (enter:
+			// defines the manager and the entered value's variable), a@22
+			// (the first binding: unpacking may throw, into the item's
+			// finally), b@25, with@11 (the Handler), with m as (a, b)@11 (the
+			// exit), return a@37. Succ: a@22→{b@25, with@11}; b@25, with@11 →
+			// exit→{EXIT (the re-raise), return a}. IPDom: a@22 → exit → EXIT.
+			name:     "a with item's pattern target is bound inside the item's finally from the entered value",
+			protects: "a failing unpacking into a with item's pattern target runs the exit, and each name is bound from the entered value, not from the context expression's reads",
+			mutation: "bind a pattern target before opening the item's finally (with@11 disappears and the exit controls nothing), or from the context expression's reads (m@6 -> a@22 and m@6 -> b@25 replace the pairs from m as (a, b)@16)",
+			src:      "def f(m):\n with m as (a, b):\n  pass\n return a\n",
+			fn:       1,
+			cd:       []string{"a@22 -> b@25", "a@22 -> with@11", "with m as (a, b)@11 -> return a@37"},
+			du: []string{"m@6 -> m as (a, b)@16", "m as (a, b)@16 -> a@22", "m as (a, b)@16 -> b@25",
+				"m as (a, b)@16 -> with m as (a, b)@11", "a@22 -> return a@37"},
+		},
+		{
+			// §8.5: the items nest. Lines at 0, 13, 35, 41. Nodes: a@6, b@9,
+			// a as x@19 (enter x), b as y@27 (enter y: may throw, into x's
+			// finally), g()@37 (may throw, into y's finally), ,@25 (y's
+			// finally's Handler, spanning the comma before the item), with a
+			// as x, b as y@14 (y's exit: may throw, into x's finally), with@14
+			// (x's finally's Handler), with a as x@14 (x's exit), return x@42.
+			// Succ: a as x→b as y→{g(), with@14}; g()→{y's exit, ,@25};
+			// ,@25→y's exit; y's exit→{x's exit, with@14}; with@14→x's exit;
+			// x's exit→{EXIT, return x}. IPDom: g(), ,@25 → y's exit; b as y,
+			// y's exit, with@14 → x's exit → EXIT.
+			name:     "a later with item's Handler spans the comma before it",
+			protects: "an exception in the body enters the innermost item's finally through a Handler of its own, spanning that item's comma",
+			mutation: "span every item's Handler at the with keyword (,@25 renders with@14, and g()@37 -> ,@25 becomes g()@37 -> with@14), or give the later item no finally Handler (,@25 disappears)",
+			src:      "def f(a, b):\n with a as x, b as y:\n  g()\n return x\n",
+			fn:       1,
+			cd: []string{"b as y@27 -> g()@37", "b as y@27 -> with a as x, b as y@14", "b as y@27 -> with@14",
+				"g()@37 -> ,@25", "with a as x, b as y@14 -> with@14", "with a as x@14 -> return x@42"},
+			du: []string{"a@6 -> a as x@19", "b@9 -> b as y@27", "a as x@19 -> with a as x@14",
+				"b as y@27 -> with a as x, b as y@14", "a as x@19 -> return x@42"},
+		},
+		{
+			// §8.6.4.6, §8.6.4.10. Lines at 0, 16, 26, 39, 51, 63, 75. Nodes:
+			// s@6, C@9, k@12, s@23 (the subject), C(x)@33 (Branch: Uses the
+			// subject's variable and C, the class it names), x@35 (capture),
+			// return x@42, k.V@58 (Branch: Uses the subject's variable and k,
+			// the dotted value's first name), return 1@66, return 0@76. Succ:
+			// s@23→C(x)→{x@35, k.V}; x@35→return x; k.V→{return 1, return 0}.
+			// IPDom: C(x), k.V → EXIT; x@35 → return x.
+			name:     "a case node reads the class and the dotted value its pattern names",
+			protects: "a class pattern's class and a value pattern's dotted name are reads of the case node, and a class pattern's argument is a capture",
+			mutation: "read nothing for a pattern's class or dotted value (C@9 -> C(x)@33 and k@12 -> k.V@58 disappear), or take the class name for a capture (C@9 -> C(x)@33 disappears and a node C@33 appears)",
+			src:      "def f(s, C, k):\n match s:\n  case C(x):\n   return x\n  case k.V:\n   return 1\n return 0\n",
+			fn:       1,
+			cd: []string{"C(x)@33 -> x@35", "C(x)@33 -> return x@42", "C(x)@33 -> k.V@58",
+				"k.V@58 -> return 1@66", "k.V@58 -> return 0@76"},
+			du: []string{"s@6 -> s@23", "s@23 -> C(x)@33", "C@9 -> C(x)@33", "s@23 -> x@35", "x@35 -> return x@42",
+				"s@23 -> k.V@58", "k@12 -> k.V@58"},
+		},
+		{
+			// Ill-formed on purpose: the compiler rejects the Python 2 print
+			// statement ("Missing parentheses in call to 'print'"), and no
+			// section of the 3.13 reference defines it. The pinned grammar
+			// parses it clean, as print_statement, so a repository holding
+			// Python 2 code yields such trees, and every Python 3 statement
+			// kind is one the lowering names: only this form can show that an
+			// unnamed kind is still one node with its reads. Lines at 0, 10.
+			// Nodes: a@6, print a@11 (a plain Stmt node reading a).
+			name:      "a print statement is a plain node",
+			protects:  "a kind the lowering does not name is still one node with its reads",
+			mutation:  "make no node for a kind the lowering does not name (a@6 -> print a@11 disappears)",
+			src:       "def f(a):\n print a\n",
+			fn:        1,
+			illFormed: true,
+			du:        []string{"a@6 -> print a@11"},
+		},
+		{
+			// §6.13, §6.12, lower.go (the hand-off). Lines at 0, 13, 45.
+			// Nodes: x@6, c@9, c@35 (Branch), x := 1@24 (the true arm: defines
+			// x and the result variable; it does not run whenever the
+			// consumer does, so the earlier read of x stays on the consumer),
+			// 2@42 (the false arm, defining the result variable), y = x + ((x
+			// := 1) if c else 2)@14 (Uses x and the result variable), return
+			// y@46. Succ: c→{x := 1, 2}→y = …→return y. x := 1 pairs with the
+			// consumer through x and the result: one pair.
+			name:     "an assignment expression in a conditional arm leaves an earlier read on its consumer",
+			protects: "when the arm holding `x := 1` is not chosen, the consumer's earlier read of x still pairs with the x before it",
+			mutation: "hand the earlier read off to an assignment expression in an arm (x@6 -> y = x + ((x := 1) if c else 2)@14 disappears and x@6 -> x := 1@24 appears)",
+			src:      "def f(x, c):\n y = x + ((x := 1) if c else 2)\n return y\n",
+			fn:       1,
+			cd:       []string{"c@35 -> x := 1@24", "c@35 -> 2@42"},
+			du: []string{"c@9 -> c@35", "x@6 -> y = x + ((x := 1) if c else 2)@14",
+				"x := 1@24 -> y = x + ((x := 1) if c else 2)@14", "2@42 -> y = x + ((x := 1) if c else 2)@14",
+				"y = x + ((x := 1) if c else 2)@14 -> return y@46"},
+		},
+		{
+			// §6.10, §6.12, lower.go (the hand-off). The assignment
+			// expression sits inside the last operand, so that operand's node
+			// and the assignment's render apart. Lines at 0, 16, 48. Nodes:
+			// x@6, a@9, b@12, a < b@26 (Branch: defines the result variable
+			// and holds b), x := 1@35 (defines x and its own result variable;
+			// it runs only when a < b holds, so the earlier read of x stays on
+			// the consumer), (x := 1) + 0@34 (the last operand: Uses that
+			// result and the held b, defines the chain's result), y = …@17
+			// (Uses x and the chain's result), return y@49. Succ: a < b→{x :=
+			// 1, y = …}; x := 1→(x := 1) + 0→y = …→return y.
+			name:     "an assignment expression in a later chain operand leaves an earlier read on its consumer",
+			protects: "when the chain fails before the operand holding `x := 1`, the consumer's earlier read of x still pairs with the x before it",
+			mutation: "hand the earlier read off to an assignment expression in a later chain operand (x@6 -> y = x + (a < b < (x := 1) + 0)@17 disappears and x@6 -> x := 1@35 appears)",
+			src:      "def f(x, a, b):\n y = x + (a < b < (x := 1) + 0)\n return y\n",
+			fn:       1,
+			cd:       []string{"a < b@26 -> x := 1@35", "a < b@26 -> (x := 1) + 0@34"},
+			du: []string{"a@9 -> a < b@26", "b@12 -> a < b@26", "a < b@26 -> (x := 1) + 0@34",
+				"x := 1@35 -> (x := 1) + 0@34", "a < b@26 -> y = x + (a < b < (x := 1) + 0)@17",
+				"(x := 1) + 0@34 -> y = x + (a < b < (x := 1) + 0)@17", "x@6 -> y = x + (a < b < (x := 1) + 0)@17",
+				"x := 1@35 -> y = x + (a < b < (x := 1) + 0)@17", "y = x + (a < b < (x := 1) + 0)@17 -> return y@49"},
+		},
+		{
+			// §6.2.5, §8.4. Lines at 0, 10, 16, 27, 38, 46. Nodes: a@6, y =
+			// [*a]@18 (the star unpacking may throw), except@28 (Handler),
+			// E@35, y = 0@40, return y@47. Succ: y = [*a]→{return y, except};
+			// except→E→{y = 0, EXIT}.
+			name:     "a star unpacking may throw",
+			protects: "a node unpacking a value with * inside a try reaches the handler",
+			mutation: "count no throw for a star unpacking (except@28 disappears and y = [*a]@18 controls nothing)",
+			src:      "def f(a):\n try:\n  y = [*a]\n except E:\n  y = 0\n return y\n",
+			fn:       1,
+			cd: []string{"y = [*a]@18 -> return y@47", "y = [*a]@18 -> except@28", "y = [*a]@18 -> E@35",
+				"E@35 -> y = 0@40", "E@35 -> return y@47"},
+			du: []string{"a@6 -> y = [*a]@18", "y = [*a]@18 -> return y@47", "y = 0@40 -> return y@47"},
+		},
+		{
+			// §8.3, §8.4. Lines at 0, 11, 17, 32, 40, 51, 59. Nodes: xs@6,
+			// xs@28 (the iterable: creating the iterator may throw), x in
+			// xs@23 (head: each step may throw), x@23 (target), except@41
+			// (Handler, from the iterable and the head), E@48, x = 0@53,
+			// return x@60. Succ: xs@28→{head, except}; head→{x@23, return x,
+			// except}; x@23→head; except→E→{x = 0, EXIT}. IPDom: xs@28, head,
+			// E → EXIT; x@23 → head; except → E.
+			name:     "a for loop's iterator creation and step may throw",
+			protects: "the iterable's node and the loop head inside a try each reach the handler",
+			mutation: "count no throw for iter() (xs@28 -> except@41 and xs@28 -> E@48 disappear), or for next() (x in xs@23 -> except@41 and x in xs@23 -> E@48 disappear)",
+			src:      "def f(xs):\n try:\n  for x in xs:\n   pass\n except E:\n  x = 0\n return x\n",
+			fn:       1,
+			cd: []string{"xs@28 -> x in xs@23", "xs@28 -> except@41", "xs@28 -> E@48",
+				"x in xs@23 -> x@23", "x in xs@23 -> x in xs@23", "x in xs@23 -> return x@60",
+				"x in xs@23 -> except@41", "x in xs@23 -> E@48", "E@48 -> x = 0@53", "E@48 -> return x@60"},
+			du: []string{"xs@6 -> xs@28", "xs@28 -> x in xs@23", "xs@28 -> x@23",
+				"x@23 -> return x@60", "x = 0@53 -> return x@60"},
+		},
+		{
+			// §8.8, §6.2.4, §8.4. Lines at 0, 11, 17, 28, 36, 58, 69, 77.
+			// Nodes: xs@6, class C: pass@19 (class creation may throw),
+			// [x for x in xs]@42 (the comprehension's creation may throw;
+			// reads xs, defines the result variable), y = [x for x in
+			// xs]@38 (Uses the result variable; throws nothing of its own),
+			// except@59 (Handler), E@66, y = 0@71, return y@78. Succ: class→
+			// {[…], except}; […]→{y = […], except}; y = […]→return y;
+			// except→E→{y = 0, EXIT}. IPDom: class, […], E → EXIT; y = […]
+			// → return y.
+			name:     "creating a class or a comprehension may throw",
+			protects: "a class statement's node and a comprehension's creating node inside a try each reach the handler",
+			mutation: "count no throw for a class creation (class C: pass@19 controls nothing), or for a comprehension's creation (the comprehension's node controls only y = [x for x in xs]@38 and return y@78 through it)",
+			src:      "def f(xs):\n try:\n  class C:\n   pass\n  y = [x for x in xs]\n except E:\n  y = 0\n return y\n",
+			fn:       1,
+			cd: []string{"class C: pass@19 -> [x for x in xs]@42", "class C: pass@19 -> except@59", "class C: pass@19 -> E@66",
+				"[x for x in xs]@42 -> y = [x for x in xs]@38", "[x for x in xs]@42 -> return y@78",
+				"[x for x in xs]@42 -> except@59", "[x for x in xs]@42 -> E@66",
+				"E@66 -> y = 0@71", "E@66 -> return y@78"},
+			du: []string{"xs@6 -> [x for x in xs]@42", "[x for x in xs]@42 -> y = [x for x in xs]@38",
+				"y = [x for x in xs]@38 -> return y@78", "y = 0@71 -> return y@78"},
+		},
+		{
+			// §6.14, §6.2.4, §8.4: a comprehension a lambda creates is created
+			// when the lambda runs. Lines at 0, 9, 15, 44, 50, 61, 69. Nodes:
+			// lambda: [x for x in y]@21 (the creating node: not MayThrow), g =
+			// lambda: [x for x in y]@17, h()@46 (may throw), except@51
+			// (Handler, from h() alone), E@58, g = 0@63, return g@70. Succ:
+			// lambda→g = …→h()→{return g, except}; except→E→{g = 0, EXIT};
+			// g = 0→return g. IPDom: h(), E → EXIT; except → E.
+			name:     "a creation inside a nested callable throws there, not at its creating node",
+			protects: "a class or comprehension a lambda's body creates may throw when the lambda runs, so the node creating the lambda has no edge to the handler",
+			mutation: "count the nested creation's throw at the creating node (lambda: [x for x in y]@21 gains an edge to except@51 and controls g = lambda: [x for x in y]@17 and h()@46)",
+			src:      "def f():\n try:\n  g = lambda: [x for x in y]\n  h()\n except E:\n  g = 0\n return g\n",
+			fn:       1,
+			cd: []string{"h()@46 -> return g@70", "h()@46 -> except@51", "h()@46 -> E@58",
+				"E@58 -> g = 0@63", "E@58 -> return g@70"},
+			du: []string{"lambda: [x for x in y]@21 -> g = lambda: [x for x in y]@17",
+				"g = lambda: [x for x in y]@17 -> return g@70", "g = 0@63 -> return g@70"},
+		},
+		{
+			// §8.6.4.8, §8.4. Lines at 0, 10, 16, 27, 40, 49, 60, 68. Nodes:
+			// s@6, s@24 (the subject), [x]@35 (Branch: a sequence pattern
+			// may throw), x@36 (capture), except@50 (Handler), E@57, x =
+			// 0@62, return x@69. Succ: s@24→[x]→{x@36, return x (no case
+			// matched), except}; x@36→return x; except→E→{x = 0, EXIT}.
+			// IPDom: [x], E → EXIT; x@36 → return x.
+			name:     "a sequence pattern may throw",
+			protects: "a case node testing a sequence pattern inside a try reaches the handler",
+			mutation: "count no throw for a sequence pattern (except@50 disappears and [x]@35 controls only x@36 and return x@69)",
+			src:      "def f(s):\n try:\n  match s:\n   case [x]:\n    pass\n except E:\n  x = 0\n return x\n",
+			fn:       1,
+			cd: []string{"[x]@35 -> x@36", "[x]@35 -> return x@69", "[x]@35 -> except@50", "[x]@35 -> E@57",
+				"E@57 -> x = 0@62", "E@57 -> return x@69"},
+			du: []string{"s@6 -> s@24", "s@24 -> [x]@35", "s@24 -> x@36", "x@36 -> return x@69", "x = 0@62 -> return x@69"},
+		},
+		{
+			// §6.2.4, §4.2.2. Lines at 0, 14, 35. Nodes: xs@6, x@10, [x for x
+			// in xs]@19 (the creating node: reads xs, its first iterable; its
+			// element's x is its own target, so it captures nothing), y =
+			// …@15, return y, x@36 (reads f's x, the parameter).
+			name:     "a comprehension's for target is its own variable",
+			protects: "a comprehension's target neither reads nor rebinds the enclosing function's variable of the same name",
+			mutation: "resolve the element's x in the enclosing function (x@10 -> [x for x in xs]@19 appears), or bind the target there (x@10 -> return y, x@36 is replaced by a pair from the comprehension's node)",
+			src:      "def f(xs, x):\n y = [x for x in xs]\n return y, x\n",
+			fn:       1,
+			du: []string{"xs@6 -> [x for x in xs]@19", "[x for x in xs]@19 -> y = [x for x in xs]@15",
+				"y = [x for x in xs]@15 -> return y, x@36", "x@10 -> return y, x@36"},
+		},
+		{
+			// §8.8, §4.2.2, the class body (callable 1). Lines at 0, 9, 16.
+			// Nodes: a = 1@10, b = a@17. The class body is its own callable
+			// and its names are visible to its own code.
+			name:     "a class body is its own callable and reads its own names",
+			protects: "a class body's statements are lowered as a function whose names resolve in the class scope",
+			mutation: "hide the class scope from the class body too (a = 1@10 -> b = a@17 disappears)",
+			src:      "class C:\n a = 1\n b = a\n",
+			fn:       1,
+			du:       []string{"a = 1@10 -> b = a@17"},
+		},
+		{
+			// §7.12, §4.2.2. Every name the statements bind is declared
+			// global, so each resolves to no variable. Lines at 0, 10, 29,
+			// 39, 49, 56, 70, 80, 92, 100. Nodes: s@6, a@37 (the import's
+			// node, defining nothing), def g(): pass@40 (defining nothing),
+			// type T = int@57 (defining nothing), s@77 (the subject), [c]@87
+			// (Branch), c@88 (the capture, defining nothing), return a, g, T,
+			// c@101 (reading nothing). The sequence pattern keeps the case
+			// and capture nodes apart. Succ: s@77→[c]→{c@88, return};
+			// c@88→return.
+			name:     "an unresolved import, def name, type alias or capture makes its node and defines nothing",
+			protects: "a name declared global is no variable in these binding positions either, and each construct still makes its node",
+			mutation: "drop def's v < 0 return (Builder.Def panics on -1), or bind these names as locals (a@37, def g(): pass@40, type T = int@57 and c@88 each pair with return a, g, T, c@101)",
+			src:      "def f(s):\n global a, g, T, c\n import a\n def g():\n  pass\n type T = int\n match s:\n  case [c]:\n   pass\n return a, g, T, c\n",
+			fn:       1,
+			cd:       []string{"[c]@87 -> c@88"},
+			du:       []string{"s@6 -> s@77", "s@77 -> [c]@87", "s@77 -> c@88"},
+		},
+		{
+			// Ill-formed on purpose, and recovered. Observed tree: block (expression_statement (assignment …))
+			// (expression_statement (call)) (ERROR (expression_statement (assignment left: (identifier) right:
+			// (integer)))) (return_statement (identifier)); the ERROR is an extra over [32,39) "y = 1 )", its
+			// expression_statement [32,37). The rule (the ERROR statement kind in lower_python.go, errorStmt):
+			// each named child is lowered as a statement, so y = 1@32 defines y, and the ERROR, wider than it,
+			// is a Stmt node of its own with no reads. Nodes: x@6, y = 0@14, g()@24, y = 1@32, y = 1 )@32,
+			// return y@44.
+			name:      "a statement the recovery kept inside an ERROR node the parser made an extra is lowered as a statement",
+			protects:  "a statement the parser wrapped in an extra ERROR node still makes its nodes, and the definition inside it reaches the read after it rather than becoming a read",
+			mutation:  "skip the extra ERROR node with the comments (y = 1@32 -> return y@44 is lost and y = 0@14 -> return y@44 appears); or lower the ERROR node as one plain node reading every name under it (y = 1@32 vanishes: y = 0@14 -> y = 1 )@32 and y = 0@14 -> return y@44 appear)",
+			src:       "def f(x):\n    y = 0\n    g()\n    y = 1 )\n    return y\n",
+			fn:        1,
+			recovered: true,
+			du:        []string{"y = 1@32 -> return y@44"},
+		},
 	})
 }

@@ -130,7 +130,7 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	f.cas = cas
 	// Carried lexical documents are re-indexed through the content store's
 	// range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{})
+	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -221,7 +221,7 @@ func (f *fixture) treesitter() provider.Provider {
 		f.t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes,
-		Admission: f.admission, WorkerMemoryBytes: 256 << 20,
+		Admission: f.admission, Rederive: func(int64) {},
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: workDir})
 	if err != nil {
 		f.t.Fatal(err)
@@ -1594,3 +1594,9 @@ func testAdmission(t testing.TB) *admission.Ledger {
 	}
 	return l
 }
+
+// The structural provider satisfies the coordinator's stage seam. The
+// coordinator asserts it at run time, so a signature that drifted would open
+// no stage at all and record no stage figures, silently; this makes the drift
+// a compile error instead.
+var _ stageOpener = (*treesitter.Provider)(nil)

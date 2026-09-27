@@ -217,6 +217,17 @@ itself, at `data.run` and `data.stages`, with `data.stages_omitted`. Because onl
 top-level stages are printed, a unit that ended `unavailable` is not in this
 block -- read it from `status --resources` or its JSON.
 
+After the run's rows, one `pass` line per provider pass gives the passing
+measurements of ADR-0012 decision 5: the pass's units and wall, the time the
+store's one writer was busy during it and that time's share of the wall, and,
+for a provider that keeps a parse stage, the workers it started, the most
+parses in flight, the workers' summed processor time, wall × in flight ÷
+worker CPU (passes at 2 or less) and workers started ÷ in flight (passes at 1
+or less). A figure the pass could not measure reads `unavailable`: the worker
+processor time is unavailable when a worker was not measured, or when another
+run's stage shared the workers. `--json` carries the same records at
+`data.passes`, with `data.passes_omitted`.
+
 **`codectx status --resources`** prints the whole tree of the latest run for
 this repository as a table, the run's own row first and the stages under it
 ordered by wall time, with each stage's reason on its own line beneath it:

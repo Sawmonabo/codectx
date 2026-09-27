@@ -17,9 +17,9 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
-	"strconv"
-	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 )
 
 // Subcommand is the hidden argv[1] under which the codectx binary runs as a
@@ -84,11 +84,45 @@ const (
 )
 
 // Hello is the worker's identity: the PID for accounting, the language
-// fingerprint the parent must match, and the languages it verified.
+// fingerprint and the build the parent must match, and the languages it
+// verified.
 type Hello struct {
 	PID         int      `json:"pid"`
 	Fingerprint string   `json:"fingerprint"`
+	Build       string   `json:"build"`
 	Languages   []string `json:"languages"`
+	// Memory is the worker's standing memory once it has started and before
+	// its first file: BaseBytes and AnonBytes, never NeedBytes.
+	Memory Memory `json:"memory"`
+}
+
+// Build is this binary's build identity as a worker states it in its hello
+// and the parent keys what it learns of a worker's files by: the version, the
+// commit and the toolchain it was built from. The parent refuses a worker of
+// another build, so a need model learned under one build is only ever applied
+// to workers of that build.
+func Build() string {
+	b := model.CurrentBuildInfo()
+	return b.Version + " " + b.Commit + " " + b.Toolchain
+}
+
+// Memory is one file-boundary reading the worker takes of itself. Every
+// field is absent (nil) when the platform cannot supply it, never zero.
+type Memory struct {
+	// NeedBytes is the file's need: the worker's resident peak over the file
+	// less the base it started the file from. It is absent where the platform
+	// offers no resettable per-process peak, and then nothing is learned from
+	// the file.
+	NeedBytes *uint64 `json:"need_bytes,omitempty"`
+	// BaseBytes is the worker's resident set once this file's memory has been
+	// returned and its peak reset: what the worker holds between files, and
+	// the base the next file's need is measured from.
+	BaseBytes *uint64 `json:"base_bytes,omitempty"`
+	// AnonBytes is the anonymous part of that resident set, the memory that
+	// is this worker's alone rather than pages of the executable it shares
+	// with every other worker. It is what the parent holds a worker's base at
+	// and counts as the product's own residency.
+	AnonBytes *uint64 `json:"anon_bytes,omitempty"`
 }
 
 // Request opens one parse. The source follows as one KindSource message of
@@ -97,6 +131,10 @@ type Request struct {
 	Language    string `json:"language"`
 	Path        string `json:"path"`
 	SourceBytes uint64 `json:"source_bytes"`
+	// Fallback is the grammar a header whose parse with Language has errors
+	// is parsed with once more, the parse with fewer error bytes being kept.
+	// It is empty for every file that is not a header.
+	Fallback string `json:"fallback,omitempty"`
 }
 
 // Decl is one declaration. Offsets are byte offsets into the source; Parent
@@ -170,9 +208,11 @@ type Done struct {
 	// Truncated reports that the query cursor exceeded its match limit, so
 	// the query did not see every match in the tree.
 	Truncated bool `json:"truncated,omitempty"`
-	// RSSBytes is the worker's resident set after this parse, or 0 when the
-	// platform cannot report it (recorded as unavailable, not zero, upstream).
-	RSSBytes uint64 `json:"rss_bytes,omitempty"`
+	// Header is a header's grammar choice: the grammar each parse used, which
+	// was kept and why. It is nil for a request that named no fallback.
+	Header *lang.HeaderChoice `json:"header,omitempty"`
+	// Memory is the worker's reading of itself at the end of this file.
+	Memory Memory `json:"memory"`
 }
 
 // Error is a per-request failure that leaves the worker healthy.
@@ -270,25 +310,4 @@ func readFrame(r io.Reader) (Kind, bool, []byte, error) {
 		return 0, false, nil, err
 	}
 	return Kind(hdr[4] &^ more), cont, payload, nil
-}
-
-// ResidentBytes reports this process's resident set size and false when the
-// platform cannot report it. Both sides measure the same way — the worker to
-// put its RSS in the Done frame, the parent for its own — so the aggregate
-// accounting of Section 22 sums one measurement, not two definitions. A
-// caller records an unmeasurable value as unavailable, never as zero.
-func ResidentBytes() (int64, bool) {
-	data, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0, false
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0, false
-	}
-	pages, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil || pages < 0 {
-		return 0, false
-	}
-	return pages * int64(os.Getpagesize()), true
 }

@@ -89,6 +89,22 @@ minted key basis, per node kind:
 | Import target | `module` | `provider.ScopeWorkspace` | `import:<lang>:<import path>` | no; qualified name = import path | `structural_key` (same import path from any file mints the same node) |
 | Callee reference | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | no | `unresolved`; metadata `{"resolution":…,"candidates":…,"callee":…}` |
 
+One identity is one node per unit. A second occurrence of an identity the
+unit already published (two declarators of C's `int x, x;` share the
+declaration's name, kind and range; two declarations can also resolve
+through a dependency's alias to one node; one import path can be imported
+twice) adds an evidence row to that node and publishes no second node and no
+second search document. Its relations merge into the ones already published,
+and each alias is published once.
+
+A name the language says declares nothing is not extracted: Go's blank
+identifier `_` in any position (the Go specification, Blank identifier: it
+"does not introduce a binding and thus is not declared") and Rust's unnamed
+constant `const _` (the Rust Reference, Constant items). Neither it nor any
+declaration nested inside it gets a node, search document, relation or
+alias; a declaration sharing its exact range, the `x` of `var _, x = f()`,
+is still extracted.
+
 A callee reference node is minted for every call this file cannot resolve to
 exactly one of its own declarations. Its metadata carries the Section 9.3
 attribute pair and no number that could be read as a confidence:
@@ -219,13 +235,23 @@ disagrees with the manifest (`CTX_SOURCE_INTEGRITY`).
 
 ### Language detection
 
-`FileVersion.Language` from the snapshot manifest wins when it names a pinned
-language; otherwise the extension decides (`.go .py .pyi .js .mjs .cjs .jsx
-.ts .mts .cts .tsx .java .rs .c .h .cc .cpp .cxx .hpp .hh .hxx`). `.h` is parsed as
-C: a C parse of a C++ header yields ERROR nodes and a `partial` state with
-`CTX_COVERAGE_INCOMPLETE`, which is an honest report and the expected outcome
-for a C++ header named `.h`; guessing C++ from a neighbouring `.cpp` would not
-be.
+A path two grammars declare, `.h`, is a header, and its grammar is the
+repository's (ADR-0012 decision 10). The snapshot counts its C and C++
+translation units at capture: a repository with C and no C++ parses headers as
+C, one with C++ and no C as C++, and one with both or neither as C++ first. A
+unit counts only under the extension exactly as its grammar declares it, so a
+C++ `main.C` is not counted as C. A header whose parse has errors is parsed once more with the other grammar, the
+parse with fewer error bytes is kept, and the file's capability row discloses
+the choice in its `header_first`, `header_kept` and `header_reason` details
+(with both parses' error bytes when the second parse ran). When
+`tree_sitter.languages` enables only one of `c` and `cpp`, every header is
+parsed with that one, once. The manifest tags a header with the census's first
+grammar, and a census change that moves it rebuilds every header's units.
+
+Every other path is parsed with `FileVersion.Language` from the snapshot
+manifest when it names a pinned language, and otherwise the extension decides
+(`.go .py .pyi .js .mjs .cjs .jsx .ts .mts .cts .tsx .java .rs .c .cc .cpp .cxx
+.hpp .hh .hxx`).
 
 ## Worker process
 
@@ -242,13 +268,31 @@ Stdin/Stdout            io.Pipe, no byte total on either
 MaxStderrBytes          16 KiB
 Grace                   2 seconds (no timeout)
 CPUProgress             the worker's processor time, read by the hang detector
-MemoryReservationBytes  Options.WorkerMemoryBytes (the composition passes 256 MiB)
+MemoryReservationBytes  none: the admission ledger holds the worker's memory
 ```
 
-Before it is started, each worker reserves `Options.WorkerMemoryBytes` on the
-process's one admission ledger (`Options.Admission`), so parser workers wait in
-the same queue, against the same allocation, as every other heavy child; the
-reservation is given back once the runner has reaped the worker. Every
+Before it is started, each worker holds a base on the process's one admission
+ledger (`Options.Admission`): the largest base any worker of the pool has
+reported. Until one has reported, only that one worker is started, and the
+others wait for its report and are reserved at it. The worker's `Hello` and
+every `Done` adjust that holding to the base the worker measured of itself --
+its anonymous resident set, or the whole resident set where only that is
+reported -- upward without waiting, and it is given back once the runner has
+reaped the worker.
+Each file then holds its predicted need increment from before it is
+dispatched until its `Done`, which the ledger grants whenever no other parse
+is in flight, however large. So parser workers wait in the same queue, against
+the same allocation, as every other heavy child.
+
+The allocation is re-derived before every admission on the ledger, and it adds
+the product's own residency back to the kernel's available figure. The pool's
+part is handed over through `Options.Rederive` just before each file's
+increment is reserved: the sum of every live worker's anonymous resident set as
+the runner's tree sampler last read it, which includes what each parse in
+flight has taken so far. Where any live worker has no reading -- a platform
+that samples no running tree, or a worker the first sweep has not found yet --
+it is instead the workers' base holdings plus the increments of the parses in
+flight, since increments are not attributed to workers. Every
 admission is first-in-first-out on the ledger, and a worker coming back from a
 parse while an acquirer of the pool is queued there follows that order:
 
@@ -287,9 +331,10 @@ queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
-`process.Limits.MaxConcurrent` equal to the worker count and a memory budget
-that holds every reservation the admission ledger can have granted the workers
-at once, so the runner never refuses a worker the ledger has admitted.
+`process.Limits.MaxConcurrent` equal to the worker count and no memory budget
+(an unset bound is no bound): the runner reserves nothing per worker and the
+ledger is the one memory gate, so the runner never refuses or queues a worker
+the ledger has admitted.
 
 Wiring in `cmd/codectx/main.go`:
 
@@ -307,7 +352,7 @@ ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-	WorkerMemoryBytes: parserWorkerReservationBytes,
+	Rederive:          allocation.parserResidency, // the ledger's re-derivation
 	Admission:         admissionLedger,
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 	Runner:            parserRunner,
@@ -383,8 +428,8 @@ function of the file's bytes.
   timer, because a timer would only choose how long a resting machine carries
   one worker per core to save the milliseconds a restart costs. Bounding callers
   instead would let a caller start a fresh worker while an expiring one still
-  held its runner slot and memory reservation, and the runner would then refuse
-  an admission the pool itself caused.
+  held its runner slot and its memory reservation, and the fresh worker would
+  then queue for a slot and for memory the pool itself was holding.
 - A healthy worker returns to the idle list, where the next parse of the
   stage reuses it; the drain that follows the last caller closes its stdin,
   the worker exits on EOF and the runner reaps it. An unhealthy worker is
@@ -421,8 +466,9 @@ function of the file's bytes.
   `BusyWorkers` (the rest: parsing, or on their way out), started and exited
   counts, parses, retries, the sum of the resident set each live worker last
   reported, the parent's own resident set and the live worker PIDs. Both sides
-  measure RSS with the same `wire.ResidentBytes` helper over
-  `/proc/self/statm`. A value that cannot be measured is -1, never 0.
+  read their resident set through the one `internal/residency` reader of the
+  kernel's per-process status file; a worker reports its own as the base in
+  each `Hello` and `Done`. A value that cannot be measured is -1, never 0.
 
 ### Native lifecycle in the worker
 

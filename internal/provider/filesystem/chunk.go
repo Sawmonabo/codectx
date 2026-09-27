@@ -44,6 +44,9 @@ type chunker struct {
 	start    uint64
 	eof      bool
 	consumed uint64
+	// before is the bytes preceding start, carried across every window move
+	// (the overlap's included): they decide whether start is a boundary.
+	before source.Lookbehind
 	// scratch holds the sanitized copy of a chunk that is not valid UTF-8.
 	// It is reused across chunks, so a file of such chunks costs one extra
 	// window, not one per chunk.
@@ -105,7 +108,7 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 			return lost, model.Canceled(err)
 		}
 		window := c.buf[:c.filled]
-		chunk, err := source.PlanChunk(window, c.start, c.size, uint32(ChunkBytes))
+		chunk, err := source.PlanChunk(c.before.Bytes(), window, c.start, c.size, uint32(ChunkBytes))
 		if err != nil {
 			return lost, err
 		}
@@ -141,6 +144,7 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 		}
 		next := chunk.Range.End - uint64(keep)
 		drop := int(next - c.start)
+		c.before.Push(c.buf[:drop])
 		c.filled = copy(c.buf, c.buf[drop:c.filled])
 		c.start = next
 		if err := c.fill(); err != nil {
@@ -151,7 +155,9 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 
 // overlap returns how many trailing bytes of a line-complete chunk the next
 // chunk repeats: up to MaxOverlapLines whole lines, provided together they
-// stay within MaxOverlapBytes and leave the next chunk making progress.
+// stay within MaxOverlapBytes and leave the next chunk making progress. The
+// next chunk then starts just after a line break, which is always a boundary
+// whatever byte follows it.
 func overlap(body []byte) int {
 	if len(body) == 0 || body[len(body)-1] != '\n' {
 		return 0

@@ -443,6 +443,59 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 	}
 }
 
+// TestReservedResidencyCountsOnlyRunningLedgerChildren protects the add-back
+// the memory allocation makes for the product's own children.
+//
+// Requirement: ReservedResidentBytes sums the live residency of running
+// children that state a memory reservation, and nothing else. A child that
+// states none (Git plumbing) holds no room on the ledger, so its memory lost
+// from the kernel's figure is real pressure, and a child whose run returned
+// holds nothing.
+//
+// Mutations that fail it: track every run whatever its reservation, or never
+// forget a tracked run. Either adds back memory nothing reserved, which widens
+// the allocation past what the host has: the freeze the ledger prevents.
+func TestReservedResidencyCountsOnlyRunningLedgerChildren(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	if !treeSampled {
+		t.Skip("this platform samples no running tree, so there is no residency to add back")
+	}
+	runner, dir := testRunner(t)
+	spec := func(reservation int64) Spec {
+		return Spec{Path: "/bin/sh", Args: []string{"-c", "sleep 30"}, Dir: dir,
+			MaxStdoutBytes: 4096, MaxStderrBytes: 4096, Grace: 200 * time.Millisecond,
+			MemoryReservationBytes: reservation}
+	}
+	unreserved, stopUnreserved := context.WithCancel(context.Background())
+	defer stopUnreserved()
+	unreservedDone := make(chan struct{})
+	go func() { defer close(unreservedDone); _, _ = runner.Run(unreserved, spec(0)) }()
+	for runner.LiveSubprocesses() < 1 {
+		select {
+		case <-unreservedDone:
+			t.Fatal("the child that states no reservation ended before it was seen running")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	reserved, stopReserved := context.WithCancel(context.Background())
+	reservedDone := make(chan struct{})
+	go func() { defer close(reservedDone); _, _ = runner.Run(reserved, spec(1<<20)) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for runner.ReservedResidentBytes() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a running child that states a reservation was never counted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopReserved()
+	<-reservedDone
+	if got := runner.ReservedResidentBytes(); got != 0 {
+		t.Fatalf("with only a child that states no reservation running, the runner adds back %d bytes, want 0", got)
+	}
+	stopUnreserved()
+	<-unreservedDone
+}
+
 // TestAdmissionWaitsForHeadroom protects the class-C rule for the runner's
 // byte budgets.
 //

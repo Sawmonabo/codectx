@@ -262,18 +262,18 @@ one object. Blobs are raw files: no compression, no mmap, no packing.
 - `Read` is `ReadRange` plus one-based line and zero-based byte-column
   positions for both ends, derived from the nearest stored checkpoint at or
   before the interval through `source.NewCursorAt`. The window from that
-  checkpoint to the interval's end is what is read and verified; nothing before
-  the checkpoint is touched. A boundary inside a UTF-8 sequence is rejected.
+  checkpoint to the interval's end is what is read and verified, the prefix in
+  spans of at most `model.MaxRawChunkBytes`; nothing before the checkpoint is
+  touched. A start inside a well-formed UTF-8 sequence is rejected; the last
+  three bytes of the prefix, returned as `Range.Before`, decide it.
 
 Reads never fall back to the live checkout or to Git. A missing, truncated,
 oversized or corrupt object is `CTX_SOURCE_INTEGRITY`.
 
-Known limitation: checkpoints are recorded at line starts only, so the position
-window for a byte inside a single line longer than the read ceiling exceeds
-that ceiling and `Read` returns `CTX_RESOURCE_LIMIT` (bytes are still available
-through `ReadRange`). A checkpoint whose `line_start_byte` precedes its
-`byte_offset`, which the schema already permits, would bound the window to one
-block; that is a change to the shared index builder.
+Checkpoints are recorded at line starts only, so the prefix before a byte
+inside a single line longer than the read ceiling exceeds that ceiling; walking
+it in spans keeps every byte of such a line readable, at a cost linear in its
+distance from the checkpoint.
 
 ### Repair
 

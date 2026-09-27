@@ -587,14 +587,9 @@ func TestDetachAndAttachAgainRecordsBothHolds(t *testing.T) {
 
 func runByID(t *testing.T, dir, id string) ledger.RunView {
 	t.Helper()
-	reader, open, err := ledger.OpenReader(context.Background(), dir)
-	if err != nil || !open {
-		t.Fatalf("open the reader: %v, present=%v", err, open)
-	}
-	defer reader.Close()
-	view, found, err := reader.Run(context.Background(), id)
-	if err != nil || !found {
-		t.Fatalf("read run %s: %v, found=%v", id, err, found)
+	view, found := runIfAny(t, dir, id)
+	if !found {
+		t.Fatalf("run %s is not in the file", id)
 	}
 	return view
 }
@@ -670,5 +665,101 @@ func TestALearnedPeakSurvivesRunRetention(t *testing.T) {
 			t.Fatalf("scope %s answers peak %d observed=%v, want %d observed=%v",
 				tc.scope, peak, observed, tc.want, tc.observed)
 		}
+	}
+}
+
+// runIfAny is runByID for a run that may no longer be in the file.
+func runIfAny(t *testing.T, dir, id string) (ledger.RunView, bool) {
+	t.Helper()
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err != nil || !open {
+		t.Fatalf("open the reader: %v, present=%v", err, open)
+	}
+	defer reader.Close()
+	view, found, err := reader.Run(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read run %s: %v", id, err)
+	}
+	return view, found
+}
+
+// needClass reads the one learned class of key in the fixture repository.
+func needClass(t *testing.T, dir string, key ledger.NeedKey) ledger.NeedClass {
+	t.Helper()
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err != nil || !open {
+		t.Fatalf("open the reader: %v, present=%v", err, open)
+	}
+	defer reader.Close()
+	classes, omitted, err := reader.NeedClasses(context.Background(), repositoryID)
+	if err != nil || omitted != 0 {
+		t.Fatalf("read the need classes: %v, omitted=%d", err, omitted)
+	}
+	for _, c := range classes {
+		if c.Key == key {
+			return c
+		}
+	}
+	t.Fatalf("no need class %+v among %+v", key, classes)
+	return ledger.NeedClass{}
+}
+
+// TestALearnedNeedSurvivesItsRunsDiscard protects the model every later file
+// of a class is reserved from. A file's measured need is true whatever becomes
+// of the run and the generation it was taken under; a model that left with its
+// run would send every class back to the structural prior on the next run --
+// an overrun or a held-back worker per file, for ever -- and would do so
+// silently.
+//
+// Mutation: key the row by run, or delete it in DiscardRun. The later run
+// reads no model, or the counts read one observation short of two.
+func TestALearnedNeedSurvivesItsRunsDiscard(t *testing.T) {
+	ctx := context.Background()
+	l, dir := openLedger(t)
+	defer func() {
+		if err := l.Stop(); err != nil {
+			t.Errorf("stop the ledger: %v", err)
+		}
+	}()
+	key := ledger.NeedKey{Language: "go", Fingerprint: "grammar-a", Build: "build-a", SizeClass: 12}
+	measuring, measuringCtx := newRun(t, l)
+	// A span gives the run a row, so the discard below deletes something.
+	_, span := ledger.Start(measuringCtx, "parse", "")
+	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	if measuring.RepositoryID() != repositoryID {
+		t.Fatalf("the run records repository %q, opened for %q", measuring.RepositoryID(), repositoryID)
+	}
+	measuring.ObserveNeed(ledger.NeedObservation{Key: key, ReservedBytes: 100, NeedBytes: 90, State: []byte("first")})
+	measuring.ObserveNeed(ledger.NeedObservation{Key: key, ReservedBytes: 100, NeedBytes: 80, State: []byte("second")})
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := l.DiscardRun(ctx, measuring); err != nil {
+		t.Fatalf("discard the measuring run: %v", err)
+	}
+	if view, found := runIfAny(t, dir, measuring.ID()); found {
+		t.Fatalf("the measuring run still reads back as %s; the test must discard it to mean anything", view.Run.RunID)
+	}
+	later, _ := newRun(t, l)
+	got, found, err := later.NeedModel(ctx, key)
+	if err != nil || !found || string(got) != "second" {
+		t.Fatalf("after its run was discarded the class reads %q found=%v (%v), want the last observation's state",
+			got, found, err)
+	}
+	if c := needClass(t, dir, key); c.Observations != 2 {
+		t.Fatalf("the class counts %d observations after its run was discarded, want 2", c.Observations)
+	}
+	other := key
+	other.SizeClass++
+	if _, found, err := later.NeedModel(ctx, other); err != nil || found {
+		t.Fatalf("a class nothing measured reads found=%v (%v), want no model and no failure", found, err)
+	}
+	// A worker of another build learns afresh (mutation: leave the build out
+	// of NeedModel's key, and the new build is reserved from the old one's
+	// model).
+	rebuilt := key
+	rebuilt.Build = "build-b"
+	if _, found, err := later.NeedModel(ctx, rebuilt); err != nil || found {
+		t.Fatalf("a class measured only under another build reads found=%v (%v), want no model", found, err)
 	}
 }

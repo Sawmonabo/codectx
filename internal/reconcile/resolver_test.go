@@ -64,7 +64,14 @@ func TestResolutionIsIndependentOfDependencyCompletionOrder(t *testing.T) {
 			}
 			deps = append(deps, unit)
 		}
-		r, err := reconcile.New(h.Store, h.Repo, deps)
+		if err := h.Store.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		aliases, err := h.Store.DependencyAliases(context.Background(), deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := reconcile.New(aliases, h.Repo, deps)
 		if err != nil {
 			t.Fatal(err)
 		}

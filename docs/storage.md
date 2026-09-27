@@ -210,7 +210,8 @@ A producer's stream may itself read the store — the dependence applier's
 `Files` is a merge join against `Store.UnitInputs` — and `CarryOver` drains all
 three streams inside its own write transaction on the single writer
 connection. Such a stream therefore takes a reader-pool connection
-(`read_connections`, default 2) once per page of its own scan while the write
+(`read_connections`; by default one per unit built at once plus one per
+query slot) once per page of its own scan while the write
 transaction stays open. WAL readers never wait on the writer, so it cannot
 deadlock, but a saturated reader pool stalls the carry-over and the open write
 transaction blocks every other writer in the process for the length of the
@@ -479,10 +480,15 @@ spill a dirty page to the log; when another writer needs the database (a
 session, a lease, a heartbeat, a retention sweep: each ends the group before
 it runs and never waits longer than one batch); at activation or abort; and
 when the store closes. Readers on the reader pool see a run's units at those
-commits and not before; the ingestion side reads its own writes (unit states,
-aliases of dependency units, the snapshot and blobs a capture recorded) on
-the group's own connection, so a run reasons about what it has stored without
-waiting for a commit.
+commits and not before. The index build commits three more times on purpose:
+after the capture, before the build, and at each provider boundary. So the
+reads a unit makes -- its dependencies' states and aliases, its inputs, and
+every manifest row and blob it reads through the snapshot view -- run on the
+reader pool against the last commit and never queue behind the writer. The
+ingestion side reads its own writes on the group's connection only where it
+reasons about what this run has stored since the last commit: the capture's
+check for a blob it already recorded, the selected and carried units, delta
+state, generation status and provider runs.
 
 The reason is what a commit costs. SQLite writes every page a transaction
 dirtied to the log in full, and the checkpoint copies each once more; a batch

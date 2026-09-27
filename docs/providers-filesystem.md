@@ -86,7 +86,10 @@ tag a provider selects files by cannot drift apart. Its table covers the source
 languages and the documentation, build and configuration extensions.
 `filesystem.Language(path)` is a thin call to it and stays the name the
 analyzer providers call; the tags for the bundled grammars match
-`tree_sitter.languages`.
+`tree_sitter.languages`. A `.h` header, which the C and C++ grammars both
+declare, is tagged within its snapshot (`lang.For`): the grammar the snapshot's
+C and C++ translation-unit census parses headers with first. The manifest row,
+the search language filter and the file node all carry that tag.
 
 Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
 description) are emitted by `filesystem`, not by `manifest`: classification is
@@ -112,7 +115,8 @@ Chunks are stored once, in the file's own unit, and are the only place a
 source body is copied into the index; symbol documents carry names only.
 Chunking uses the shared `source.PlanChunk`: a chunk is at most 32 KiB
 (`model.MaxSearchBodyBytes`), ends on a line boundary when one fits, and a
-line longer than a chunk is split at a UTF-8 boundary. Consecutive chunks
+line longer than a chunk is split at a legal boundary, never inside a
+well-formed UTF-8 sequence. Consecutive chunks
 overlap by at most two whole lines and at most 1 KiB, so a pathological line
 cannot make the overlap a second copy of the chunk; a chunk that ends inside
 a split line has no overlap. The window held in memory is one chunk.

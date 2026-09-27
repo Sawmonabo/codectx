@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
-	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -21,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
+	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -126,6 +126,12 @@ type generation struct {
 	// units past walked are exactly the ones nothing ever started.
 	walked   int64
 	walkDone bool
+
+	// passes is one measurement per provider pass, in the order the passes
+	// ran, and passesTotal counts every pass, as runs and runsTotal do.
+	// Written under mu.
+	passes      []model.ProviderPass
+	passesTotal int64
 }
 
 // unitFailure is the typed reason one unit did not seal: the diagnostic
@@ -219,7 +225,7 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 		// high-water mark read before them would silently leave them out. It
 		// is the kernel's mark for the whole process, so a freed byte cannot
 		// lower it and reading it before the reclaim loses nothing.
-		g.report(diagnostics.PeakParentRSSBytes())
+		g.report(residency.Read().Peak)
 		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 		c.attachRunLedger(ctx, &res, g.ledgerRun, err)
@@ -312,6 +318,13 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	g.snap = snap
 	span.AddOut(int64(snap.FileCount))
 	if g.prev, err = c.activeGeneration(ctx); err != nil {
+		return err
+	}
+	// The view reads the manifest and blobs on the reader pool against the
+	// last commit, so the snapshot is committed before planning and every
+	// unit read through it: no source read of the pass takes a job on the
+	// writer.
+	if err := c.opts.Store.Flush(ctx); err != nil {
 		return err
 	}
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap.ID)
@@ -486,6 +499,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
 		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(g.c.opts.Config),
+		Passes: g.passes, PassesOmitted: g.passesTotal - int64(len(g.passes)),
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
 }
 
@@ -754,13 +768,21 @@ func (g *generation) attachCarried(ctx context.Context) (err error) {
 // build runs every unit the plan did not reuse, provider by provider in
 // dependency order, and returns the deferred ones for the background tick. A
 // provider's units run concurrently; the next provider starts only when the
-// previous one's units are sealed, because storage refuses to open a unit
-// whose declared dependency is not yet sealed.
+// previous one's units are sealed and committed, because a unit resolves
+// against its declared dependencies as of the last commit and storage refuses
+// one whose dependency is not sealed there.
 func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	ctx, span := ledger.Start(ctx, stageBuild, "")
 	defer func() {
 		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &g.built}, err)
 	}()
+	// The units attached and carried before the build are committed first:
+	// a unit of the first provider that runs resolves its dependencies against
+	// the last commit, and a carried dependency sealed only in the open group
+	// would be refused there.
+	if err := g.c.opts.Store.Flush(ctx); err != nil {
+		return nil, err
+	}
 	var deferred []plan.Unit
 	var group *unitGroup
 	current := ""
@@ -780,6 +802,12 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 				err := group.wait()
 				group = nil
 				if err != nil {
+					return err
+				}
+				// The next provider's units read their dependencies from the
+				// last commit, so what this provider sealed is committed before
+				// the first of them runs: one commit per provider boundary.
+				if err := g.c.opts.Store.Flush(ctx); err != nil {
 					return err
 				}
 			}
@@ -803,7 +831,7 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			return nil
 		}
 		if group == nil {
-			group = g.newUnitGroup(ctx)
+			group = g.newUnitGroup(ctx, u.ProviderID)
 		}
 		return group.submit(u, unitSpan)
 	})
@@ -885,6 +913,12 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 // unitGroup runs one provider's units with bounded concurrency as the plan
 // hands them over: a live set of at most workers units, and the first fatal
 // failure cancels the rest.
+//
+// The group is also the provider's whole pass over this run's units. A
+// provider that keeps a stage has it open for exactly that pass, so what the
+// stage holds warm -- the parser workers -- outlives every unit of the pass and
+// is not given back, and started again, when two sequential units leave it
+// empty between them.
 type unitGroup struct {
 	g      *generation
 	ctx    context.Context
@@ -893,11 +927,35 @@ type unitGroup struct {
 	wg     sync.WaitGroup
 	once   sync.Once
 	fatal  error
+
+	provider   string
+	closeStage func() model.StageFigures
+	// started, writerBusy and units are the pass's measurement: its wall, the
+	// store writer's busy time when it began, and the units it admitted.
+	started    time.Time
+	writerBusy time.Duration
+	units      int64
 }
 
-func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
+// stageOpener is a provider that keeps a stage open across a pass over many
+// units, and whose close answers what the stage measured. It is asserted
+// structurally here, at the one call site, so the provider interface carries
+// nothing only one provider needs; a provider without it runs each unit as it
+// always has, and its pass has no stage figures.
+type stageOpener interface {
+	OpenStage(ctx context.Context) (closeStage func() model.StageFigures)
+}
+
+func (g *generation) newUnitGroup(ctx context.Context, providerID string) *unitGroup {
 	runCtx, cancel := context.WithCancel(ctx)
-	return &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers)}
+	u := &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers),
+		provider: providerID, started: time.Now(), writerBusy: g.c.opts.Store.WriterBusy()}
+	if p, ok := g.c.opts.Registry.Lookup(providerID); ok {
+		if s, ok := p.(stageOpener); ok {
+			u.closeStage = s.OpenStage(ctx)
+		}
+	}
+	return u
 }
 
 // submit admits one unit against the group's worker slots, blocking while they
@@ -917,6 +975,7 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 		span.End(ledger.OutcomeUnavailable, notAdmitted(model.CodeProviderUnavailable), nil)
 		return err
 	}
+	u.units++
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
@@ -929,11 +988,70 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 }
 
 // wait drains the group and reports its first fatal failure. It releases the
-// group's context whatever the outcome, so an abandoned group leaks nothing.
+// group's context whatever the outcome, so an abandoned group leaks nothing;
+// closes the provider's stage after the last unit has left it, on every path,
+// a cancelled pass included, since the stage leaves under the run it was
+// opened in and consults no context of the close's; and records the pass's measurement on the generation
+// after that close, so the wall covers the stage's drain and the stage's
+// figures are final.
 func (u *unitGroup) wait() error {
 	u.wg.Wait()
 	u.cancel()
+	var stage *model.StageFigures
+	if u.closeStage != nil {
+		figures := u.closeStage()
+		stage = &figures
+		u.closeStage = nil
+	}
+	u.g.recordPass(providerPass(u.provider, u.units, time.Since(u.started),
+		u.g.c.opts.Store.WriterBusy()-u.writerBusy, stage))
 	return u.fatal
+}
+
+// recordPass keeps one pass's measurement for the result, within the same
+// per-result page Runs is held to, and counts it either way.
+func (g *generation) recordPass(pass model.ProviderPass) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.passesTotal++
+	if len(g.passes) < model.MaxRecordsPerResult {
+		g.passes = append(g.passes, pass)
+	}
+}
+
+// providerPass assembles one pass's record and the three passing
+// measurements of ADR-0012 decision 5 from its figures. A ratio is left
+// absent when a figure it needs is unavailable or its denominator is zero:
+// a pass that measured nothing neither passes nor fails, and reporting it as
+// 0 would read as the best possible pass.
+//
+//   - WallPerCPU is wall × the most parses in flight ÷ Σ worker CPU, the
+//     measurement that passes at 2 or less;
+//   - StartsPerSlot is workers started ÷ the most parses in flight, which
+//     passes at 1 or less;
+//   - WriterBusyShare is writer busy ÷ wall, reported, with build order the
+//     next lever at 0.8 or more.
+func providerPass(providerID string, units int64, wall, writerBusy time.Duration,
+	stage *model.StageFigures) model.ProviderPass {
+	pass := model.ProviderPass{ProviderID: providerID, Units: units, WallMS: wall.Milliseconds(),
+		WriterBusyMS: writerBusy.Milliseconds(), Stage: stage}
+	pass.WriterBusyShare = passRatio(float64(pass.WriterBusyMS), pass.WallMS)
+	if stage != nil {
+		pass.StartsPerSlot = passRatio(float64(stage.WorkersStarted), stage.MaxInFlight)
+		if stage.WorkerCPUMS != nil && stage.MaxInFlight > 0 {
+			pass.WallPerCPU = passRatio(float64(pass.WallMS)*float64(stage.MaxInFlight), *stage.WorkerCPUMS)
+		}
+	}
+	return pass
+}
+
+// passRatio is num ÷ den, or absent when den is not positive.
+func passRatio(num float64, den int64) *float64 {
+	if den <= 0 {
+		return nil
+	}
+	r := num / float64(den)
+	return &r
 }
 
 // unit builds one unit. The returned error is nonnil only when the failure
@@ -1083,16 +1201,25 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 	if err != nil {
 		return outcome{}, err
 	}
+	// The unit's candidates resolve against its declared dependencies' aliases,
+	// read once here from the last commit rather than once per candidate. The
+	// read can refuse a dependency that is not committed sealed, so it runs
+	// before the provider run is opened: a refusal after it would leave a run
+	// row `running` that nothing completes.
+	aliases, err := c.opts.Store.DependencyAliases(ctx, u.DependsOn)
+	if err != nil {
+		return outcome{}, err
+	}
+	resolver, err := reconcile.New(aliases, c.repo, u.DependsOn)
+	if err != nil {
+		return outcome{}, err
+	}
 	runID, err := c.opts.Store.BeginProviderRun(ctx, g.gen, u.ProviderID, u.ProviderVersion)
 	if err != nil {
 		return outcome{}, err
 	}
-	resolver, err := reconcile.New(c.opts.Store, c.repo, u.DependsOn)
-	if err != nil {
-		return outcome{}, err
-	}
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: c.cfgHash, OriginRunID: runID,
-		SourceBinding: binding, Dependencies: u.DependsOn}
+		SourceBinding: binding, Dependencies: u.DependsOn, DependencyKeys: u.DependencyKeys}
 	ureq := provider.UnitRequest{
 		Binding: model.Binding{RepositoryID: c.repo, SnapshotID: g.snap.ID, GenerationID: g.gen},
 		Unit:    spec, Run: runID, Content: g.view, Resolver: resolver,

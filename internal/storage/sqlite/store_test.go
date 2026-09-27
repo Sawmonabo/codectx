@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,7 +66,7 @@ func newFixture(t *testing.T, dbPath string) *fixture {
 func newFixtureWithOptions(t *testing.T, dbPath string, opts store.Options) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, opts)
+	s, err := store.Open(ctx, dbPath, store.WithDerivedReaders(opts))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -80,18 +82,24 @@ func (f *fixture) file(path string, content string) fileFixture {
 	f.t.Helper()
 	sum := sha256.Sum256([]byte(content))
 	ff := fileFixture{path: path, id: model.NewFileID(f.repo, path), content: []byte(content), hash: hex.EncodeToString(sum[:])}
-	rec := model.BlobRecord{Hash: ff.hash, Size: int64(len(content))}
+	if err := f.s.PutBlob(f.ctx, blobRecord(content)); err != nil {
+		f.t.Fatalf("PutBlob(%s): %v", path, err)
+	}
+	f.files[path] = ff
+	return ff
+}
+
+// blobRecord is the blob row a capture records for content.
+func blobRecord(content string) model.BlobRecord {
+	sum := sha256.Sum256([]byte(content))
+	rec := model.BlobRecord{Hash: hex.EncodeToString(sum[:]), Size: int64(len(content))}
 	for off := 0; off < len(content); off += model.BlobBlockBytes {
 		end := min(off+model.BlobBlockBytes, len(content))
 		d := sha256.Sum256([]byte(content[off:end]))
 		rec.BlockDigests = append(rec.BlockDigests, hex.EncodeToString(d[:]))
 	}
 	rec.LineCheckpoints = []model.LineCheckpoint{{ByteOffset: 0, LineNumber: 1, LineStartByte: 0}}
-	if err := f.s.PutBlob(f.ctx, rec); err != nil {
-		f.t.Fatalf("PutBlob(%s): %v", path, err)
-	}
-	f.files[path] = ff
-	return ff
+	return rec
 }
 
 func (f *fixture) snapshot(tag string, files ...fileFixture) model.Snapshot {
@@ -1243,6 +1251,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	raw.Close()
 	f2 := newFixture(t, dbPath)
 	f2.file(c.path, string(c.content))
+	flushed(t, f2.s)
 	if _, err := f2.s.Blob(ctx, c.hash); err != nil {
 		t.Fatalf("restored blob is not servable: %v", err)
 	}
@@ -1269,7 +1278,7 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Close()
-	if _, err := store.Open(ctx, dbPath, store.Options{}); err == nil {
+	if _, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{})); err == nil {
 		t.Fatal("Open accepted a database with a foreign schema fingerprint")
 	} else {
 		wantCode(t, err, model.CodeSchemaMismatch)
@@ -1831,6 +1840,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		if err := w2.Fail(f.ctx); err != nil {
 			t.Fatalf("Fail: %v", err)
 		}
+		// UnitState answers from the last commit.
+		flushed(t, f.s)
 		if state, exists, err := f.s.UnitState(f.ctx, w2.UnitID()); err != nil || exists {
 			t.Errorf("failed delta unit is %s/exists=%v (err %v), want gone", state, exists, err)
 		}
@@ -1969,7 +1980,6 @@ func TestBlobGraceProtocol(t *testing.T) {
 	// directly because the store's own paths refuse it by design: PutSnapshot
 	// only accepts a blob that is already 'ready', which is exactly why the
 	// recheck below is the last line of defence rather than the first.
-	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -2028,5 +2038,101 @@ func TestBlobGraceProtocol(t *testing.T) {
 	}
 	if blocks, lines := blobRowCounts(t, raw, doomedRaw); blocks != 0 || lines != 0 {
 		t.Fatalf("deleting the blobs row left %d blocks and %d checkpoints behind", blocks, lines)
+	}
+}
+
+// TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter drives ingestion
+// callers and exclusive writers at the store's one writer goroutine at once.
+//
+// Failure modes it protects: an exclusive write that returns before its row is
+// committed where the reader pool sees it (a lease a query then cannot find),
+// and an ingestion batch lost to an exclusive write that ended the group it sat
+// in. Mutation that must fail it: in open.go's write, drop
+// the s.commitGroup() that runs before the exclusive transaction begins (the
+// transaction then waits on the one connection the open group holds until the
+// test's deadline, and the waiting callers are reported).
+func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
+	f := newFixture(t, filepath.Join(t.TempDir(), "writer.db"))
+	// Every caller runs under a deadline halfway to the test binary's own, so
+	// a writer that never serves them ends their waits with an error this test
+	// reports, rather than the binary's timeout ending the run. A run without
+	// a timeout has no deadline to derive one from, and waits as it asked to.
+	ctx := t.Context()
+	if deadline, ok := t.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Until(deadline)/2))
+		defer cancel()
+	}
+	snap := f.snapshot("leases", f.file("leases.go", "package leases\n"))
+
+	const ingesters, writers, perCaller = 4, 4, 16
+	errs := make(chan error, (ingesters+writers)*perCaller)
+	var hashes []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := range ingesters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range perCaller {
+				rec := blobRecord(fmt.Sprintf("ingested %d/%d\n", i, j))
+				if err := f.s.PutBlob(ctx, rec); err != nil {
+					errs <- fmt.Errorf("PutBlob: %w", err)
+					return
+				}
+				mu.Lock()
+				hashes = append(hashes, rec.Hash)
+				mu.Unlock()
+			}
+		}()
+	}
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range perCaller {
+				// A batch of this caller's own first, so the exclusive write
+				// behind it finds an ingestion group open.
+				rec := blobRecord(fmt.Sprintf("before lease %d/%d\n", i, j))
+				if err := f.s.PutBlob(ctx, rec); err != nil {
+					errs <- fmt.Errorf("PutBlob: %w", err)
+					return
+				}
+				mu.Lock()
+				hashes = append(hashes, rec.Hash)
+				mu.Unlock()
+				lease := model.Lease{ID: model.H("interleaved-lease", strconv.Itoa(i), strconv.Itoa(j)), SnapshotID: snap.ID,
+					OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+				if err := f.s.AcquireLease(ctx, lease, ""); err != nil {
+					errs <- fmt.Errorf("AcquireLease: %w", err)
+					return
+				}
+				// LeaseExpiry reads the reader pool, which sees commits only.
+				if _, err := f.s.LeaseExpiry(ctx, lease.ID); err != nil {
+					errs <- fmt.Errorf("the lease an exclusive write just returned from is not on the reader pool: %w", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	if ctx.Err() != nil {
+		t.Errorf("the writer left callers waiting until the test's deadline: an exclusive write waited on the connection the open ingestion group holds")
+	}
+	for err := range errs {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+	flushed(t, f.s)
+	known, err := f.s.KnownBlobs(ctx, hashes)
+	if err != nil {
+		t.Fatalf("KnownBlobs: %v", err)
+	}
+	if len(known) != len(hashes) {
+		t.Fatalf("%d of %d ingested blobs are in the database after the flush: an exclusive write lost the batches its group held",
+			len(known), len(hashes))
 	}
 }

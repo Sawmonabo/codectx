@@ -2,6 +2,7 @@ package worker
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,18 +17,38 @@ import (
 // Functions preorder, from 0) of src, and the exact control-dependence and
 // def-use pairs and unresolved-jump count its lowering must produce. protects
 // names the failure mode the case guards; mutation names the code change that
-// would fail it.
+// would fail it. recovered marks a source that parses with a syntax error on
+// purpose, to pin how a lowering treats an error-recovered tree; every other
+// source must parse clean. illFormed marks a source that parses clean but that
+// its language's compiler rejects on purpose, such as a jump to a label no
+// frame opens, to pin how a lowering treats a program no compiler accepts;
+// every other source is one its compiler accepts, names it leaves undeclared
+// aside. callables, when nonzero, is the exact number of callables Functions
+// reports in src, which pins what is and is not a function (a bodiless
+// method, a signature) where no pair could show it.
 type goldenCase struct {
 	name, protects, mutation, src string
 	fn                            int
 	cd, du                        []string
 	unresolved                    int
+	recovered, illFormed          bool
+	callables                     int
 }
 
 // runGolden checks every case of language, one subtest per case. Every
 // golden table derives its cases by these rules, and states only what its
 // language adds:
 //
+//   - Grammars. A construct is covered for a grammar only by a case run
+//     through that grammar. Languages that share a lowering share cases: a
+//     c case whose source parses clean as C++ runs under cpp too, a
+//     javascript case under typescript and tsx, and a typescript case under
+//     tsx, each with the one expected set its table states. A case whose
+//     source does not parse clean in a sibling grammar runs only under its
+//     own, and the sibling's table holds its own case for the construct.
+//   - Parsing. Every source must parse with no ERROR or MISSING node in the
+//     grammar it runs under, so a pair set is never derived from a tree the
+//     parser recovered; a recovered case must hold one instead.
 //   - Rendering. A node renders as ENTRY, EXIT or "<source text of its span,
 //     whitespace collapsed>@<start byte>", every other node alike, a Handler
 //     included (a catch clause's Handler spans the clause's keyword, so it
@@ -51,10 +72,13 @@ type goldenCase struct {
 //     the same rule, whether or not it reads the variable. A node may make
 //     several killing definitions.
 //     A Handler node carries the values on entry to each node that threw to
-//     it. A use that no definition reaches (a node with no path from ENTRY,
-//     a name no node defines) makes no pair.
+//     it. A use that no definition reaches (on entry to ENTRY or to a node
+//     with no predecessor, around a cycle no definition enters, or of a name
+//     no node defines) makes no pair; a region with no path from ENTRY
+//     still pairs its own definitions with its own uses.
 //   - Unresolved is the count of jumps (a break, continue or goto) whose
-//     target names no open frame or label.
+//     target names no open frame or label. Only an ill-formed or recovered
+//     source can hold one.
 func runGolden(t *testing.T, language string, cases []goldenCase) {
 	t.Helper()
 	tl, ok := Grammar(language)
@@ -69,63 +93,107 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 	// lowers, so a list a case leaves behind reaches the next one's lowering.
 	var s Scratch
 	defer s.Close()
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			src := []byte(c.src)
-			p := ts.NewParser()
-			defer p.Close()
-			if err := p.SetLanguage(tl); err != nil {
-				t.Fatalf("set language: %v", err)
-			}
-			tree := p.Parse(src, nil)
-			if tree == nil {
-				t.Fatal("the parser produced no tree")
-			}
-			defer tree.Close()
-			var fn *ts.Node
-			i := 0
-			errFound := errors.New("found")
-			err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
-				if i == c.fn {
-					fn = n
-					return errFound
+	// Each grammar is its own subtest, so a failure names the grammar that
+	// produced it even where two grammars share a case's name.
+	t.Run(language, func(t *testing.T) {
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				src := []byte(c.src)
+				p := ts.NewParser()
+				defer p.Close()
+				if err := p.SetLanguage(tl); err != nil {
+					t.Fatalf("set language: %v", err)
 				}
-				i++
-				return nil
+				tree := p.Parse(src, nil)
+				if tree == nil {
+					t.Fatal("the parser produced no tree")
+				}
+				defer tree.Close()
+				if got := tree.RootNode().HasError(); got != c.recovered {
+					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, tree.RootNode().ToSexp())
+				}
+				if c.unresolved != 0 && !c.illFormed && !c.recovered {
+					t.Errorf("unresolved = %d on a source not marked ill-formed: a jump whose target no frame opens is rejected by every compiler", c.unresolved)
+				}
+				var fn *ts.Node
+				i := 0
+				if err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
+					if i == c.fn {
+						fn = n
+					}
+					i++
+					return nil
+				}); err != nil {
+					t.Fatalf("functions: %v", err)
+				}
+				if c.callables != 0 && i != c.callables {
+					t.Errorf("callables = %d, want %d\nprotects: %s\nmutation: %s", i, c.callables, c.protects, c.mutation)
+				}
+				if fn == nil {
+					t.Fatalf("callable %d not found (%d callables)", c.fn, i)
+				}
+				var a flow.Arena
+				g := low.Lower(fn, src, &a, &s)
+				pd := flow.PostDominators(g, &a)
+				render := func(e flow.Edges) []string {
+					out := make([]string, 0, e.Len())
+					for j := range e.Len() {
+						from, to := e.At(j)
+						out = append(out, renderNode(g, src, from)+" -> "+renderNode(g, src, to))
+					}
+					slices.Sort(out)
+					return out
+				}
+				cd := render(flow.ControlDependence(g, pd, &a))
+				du := render(flow.DefUse(g, &a))
+				want := func(s []string) []string {
+					s = slices.Clone(s)
+					slices.Sort(s)
+					return s
+				}
+				mismatch := false
+				if w := want(c.cd); !slices.Equal(cd, w) {
+					mismatch = true
+					t.Errorf("control dependence\n got  %q\n want %q\nprotects: %s\nmutation: %s", cd, w, c.protects, c.mutation)
+				}
+				if w := want(c.du); !slices.Equal(du, w) {
+					mismatch = true
+					t.Errorf("def-use\n got  %q\n want %q\nprotects: %s\nmutation: %s", du, w, c.protects, c.mutation)
+				}
+				if got := g.Unresolved(); got != c.unresolved {
+					mismatch = true
+					t.Errorf("unresolved = %d, want %d\nprotects: %s\nmutation: %s", got, c.unresolved, c.protects, c.mutation)
+				}
+				if mismatch {
+					t.Logf("lowered graph:\n%s\ncd:\n  %s\ndu:\n  %s\ntree: %s",
+						dumpGraph(g, src), strings.Join(cd, "\n  "), strings.Join(du, "\n  "), fn.ToSexp())
+				}
 			})
-			if fn == nil || !errors.Is(err, errFound) {
-				t.Fatalf("callable %d not found (%d callables)", c.fn, i)
-			}
-			var a flow.Arena
-			g := low.Lower(fn, src, &a, &s)
-			pd := flow.PostDominators(g, &a)
-			render := func(e flow.Edges) []string {
-				out := make([]string, 0, e.Len())
-				for j := range e.Len() {
-					from, to := e.At(j)
-					out = append(out, renderNode(g, src, from)+" -> "+renderNode(g, src, to))
-				}
-				slices.Sort(out)
-				return out
-			}
-			cd := render(flow.ControlDependence(g, pd, &a))
-			du := render(flow.DefUse(g, &a))
-			want := func(s []string) []string {
-				s = slices.Clone(s)
-				slices.Sort(s)
-				return s
-			}
-			if w := want(c.cd); !slices.Equal(cd, w) {
-				t.Errorf("control dependence\n got  %q\n want %q\nprotects: %s\nmutation: %s", cd, w, c.protects, c.mutation)
-			}
-			if w := want(c.du); !slices.Equal(du, w) {
-				t.Errorf("def-use\n got  %q\n want %q\nprotects: %s\nmutation: %s", du, w, c.protects, c.mutation)
-			}
-			if got := g.Unresolved(); got != c.unresolved {
-				t.Errorf("unresolved = %d, want %d\nprotects: %s\nmutation: %s", got, c.unresolved, c.protects, c.mutation)
-			}
-		})
+		}
+	})
+}
+
+// kindNames renders a flow.Kind in a graph dump.
+var kindNames = [...]string{
+	flow.Entry:   "entry",
+	flow.Exit:    "exit",
+	flow.Stmt:    "stmt",
+	flow.Branch:  "branch",
+	flow.Jump:    "jump",
+	flow.Handler: "handler",
+}
+
+// dumpGraph renders every node of g, one per line: its id, kind and
+// rendering, its successors by id, and the variable ids it defines, may
+// define and uses. A failing golden case logs it, so a wrong pair can be
+// traced to the node or edge that made it.
+func dumpGraph(g *flow.Graph, src []byte) string {
+	var b strings.Builder
+	for n := range int32(g.Len()) {
+		fmt.Fprintf(&b, "  %d %s %s succ=%v def=%v may=%v use=%v\n",
+			n, kindNames[g.Kind(n)], renderNode(g, src, n), g.Succ(n), g.Defs(n), g.MayDefs(n), g.Uses(n))
 	}
+	return b.String()
 }
 
 // renderNode renders node n of g for golden comparison.

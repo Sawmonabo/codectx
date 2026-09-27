@@ -9,6 +9,18 @@
 // unit's resolver and emits facts through the sink. It never links the
 // grammars itself and never holds a repository-wide AST or source cache: the
 // unit of work is one file, and its bytes live only for that unit.
+//
+// Memory is taken from each file's observed need (ADR-0012 decision 5): a
+// worker holds its reported base on the process's reservation ledger, and
+// each file reserves its predicted increment before it is dispatched -- the
+// learned p99 of need per source byte for its repository, language, grammar
+// fingerprint and size class, or the structural prior for the first file of
+// that key. The need a worker measures covers the parse and the extraction
+// only, since the dependence lowering does not run in the worker, so the
+// model learns that and nothing more. The overrun target of at most 2% of
+// files per class after the first generation is not claimed: overruns are
+// counted per class and disclosed in Stats, and every file that overruns
+// still runs.
 package treesitter
 
 import (
@@ -18,8 +30,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
@@ -53,8 +67,8 @@ type WorkerCommand struct {
 // Options configure the provider. Nothing here has a default of its own: the
 // two config.Limit fields are unlimited at zero, as config's defaults are;
 // MaxEvidencePerFact selects the model's ceiling at zero; and the worker
-// count, the per-worker reservation, the ledger, the runner, the worker and
-// its directory come from the composition root and are required. There is no
+// count, the allocation's re-derivation, the ledger, the runner, the worker
+// and its directory come from the composition root and are required. There is no
 // parse timeout -- a worker is ended only by a progress-based hang detector
 // (see pool.go).
 type Options struct {
@@ -79,15 +93,17 @@ type Options struct {
 	// none. Zero selects the ceiling. Occurrences past it are counted and
 	// disclosed, never dropped in silence.
 	MaxEvidencePerFact int
-	// WorkerMemoryBytes is the memory each worker reserves on Admission, and
-	// the reservation the runner accounts it under. It is one figure for every
-	// worker and every file; it is required and positive.
-	WorkerMemoryBytes int64
-	// Admission is the process's one reservation ledger. Each worker reserves
-	// WorkerMemoryBytes on it before it is started and gives the reservation
-	// back once the runner has reaped it, so parser workers are admitted
-	// against the same allocation, in the same queue, as every other heavy
-	// child. It is required: a pool with a running total of its own beside
+	// Rederive is handed the parser workers' residency, their part of the
+	// product's own, just before each file's increment is reserved; the
+	// ledger's re-derivation, which runs before every admission, adds the
+	// last figure handed over back to the allocation it derives. It is
+	// required.
+	Rederive func(workerResidentBytes int64)
+	// Admission is the process's one reservation ledger. Each worker holds
+	// its base on it from before it is started until the runner has reaped
+	// it, and each file holds its predicted increment from before it is
+	// dispatched until its Done, so parser workers are admitted against the
+	// same allocation, in the same queue, as every other heavy child. It is required: a pool with a running total of its own beside
 	// the ledger is the oversubscription the ledger exists to prevent.
 	Admission *admission.Ledger
 	// Worker is the worker executable; Runner starts it; WorkDir is the
@@ -104,12 +120,16 @@ type Provider struct {
 	languages map[string]lang.Language
 	pool      *pool
 
-	// stage counts the parse callers in flight. The parser workers stay warm
-	// for exactly as long as that count is above zero: the last caller to
-	// leave drains the pool, so a run that has stopped parsing holds no worker
-	// process at all. See pool.drain for why this is not a timer.
-	stageMu sync.Mutex
-	stage   int
+	// stage counts the parse callers in flight and the stages opened by
+	// OpenStage. The parser workers stay warm for exactly as long as that
+	// count is above zero: the last caller to leave drains the pool, so a run
+	// that has stopped parsing holds no worker process at all. See pool.drain
+	// for why this is not a timer. stageOpened is when the count last left
+	// zero, and stageWall sums the stages that have closed.
+	stageMu     sync.Mutex
+	stage       int
+	stageOpened time.Time
+	stageWall   time.Duration
 }
 
 // enterStage registers one unit's parse work and leaveStage gives it back,
@@ -124,6 +144,9 @@ type Provider struct {
 // is running and its worker is released by that stage's drain, or by Close.
 func (p *Provider) enterStage(ctx context.Context) {
 	p.stageMu.Lock()
+	if p.stage == 0 {
+		p.stageOpened = time.Now()
+	}
 	p.stage++
 	p.stageMu.Unlock()
 	p.pool.enterStage(ctx)
@@ -133,6 +156,9 @@ func (p *Provider) leaveStage(ctx context.Context) {
 	p.stageMu.Lock()
 	last := p.stage == 1
 	p.stage--
+	if last {
+		p.stageWall += time.Since(p.stageOpened)
+	}
 	p.stageMu.Unlock()
 	if last {
 		p.pool.drain()
@@ -153,8 +179,8 @@ func New(o Options) (*Provider, error) {
 	if o.MaxWorkers <= 0 {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
 	}
-	if o.WorkerMemoryBytes <= 0 {
-		return nil, invalidOption(fmt.Sprintf("the parser provider was given a %d-byte worker reservation; it needs a positive one", o.WorkerMemoryBytes))
+	if o.Rederive == nil {
+		return nil, invalidOption("the treesitter provider needs the step it hands the parser workers' residency to")
 	}
 	if o.Admission == nil {
 		return nil, invalidOption("the treesitter provider needs the process reservation ledger its workers are admitted against")
@@ -182,7 +208,7 @@ func New(o Options) (*Provider, error) {
 		langs[l.Name] = l
 	}
 	return &Provider{opts: o, languages: langs,
-		pool: newPool(o.Runner, o.Admission, o.Worker, o.WorkDir, o.MaxWorkers, o.WorkerMemoryBytes)}, nil
+		pool: newPool(o.Runner, o.Admission, o.Worker, o.WorkDir, o.MaxWorkers, o.Rederive)}, nil
 }
 
 func invalidOption(msg string) *model.Error {
@@ -211,25 +237,133 @@ func (p *Provider) Detect(_ context.Context, _ workspace.Root, _ workspace.Polic
 	return provider.Detection{Available: true, Capabilities: []string{capabilityName}}, nil
 }
 
-// LanguageOf reports the pinned language for a manifest row: the snapshot's
-// language tag when it names one this provider supports, else the extension.
+// LanguageOf reports whether the provider parses a manifest row, and the
+// language it parses it with first in a repository with no C or C++
+// translation unit. Whether a row is parsed never depends on the repository,
+// so the answer is the planner's eligibility gate; a header's grammar does,
+// so every parse asks grammarOf with its snapshot's census instead.
 func (p *Provider) LanguageOf(fv model.FileVersion) (lang.Language, bool) {
-	if l, ok := p.languages[fv.Language]; ok {
-		return l, true
-	}
-	l, ok := lang.ByExtension(fv.Path)
-	if !ok {
-		return lang.Language{}, false
-	}
-	_, ok = p.languages[l.Name]
+	l, _, ok := p.grammarOf(lang.Census{}, fv)
 	return l, ok
 }
 
+// grammarOf is the grammar a manifest row is parsed with first and, for a
+// header, the grammar a parse of it with errors falls back to (empty for
+// every other row). A path two grammars declare is a header, whose grammar is
+// the repository's (lang.Census.Header, ADR-0012 decision 10) and never the
+// manifest's tag or the extension's answer; when the provider supports only
+// one of the two, the header is parsed with that one alone. Any other row is
+// parsed with its snapshot language tag when the provider supports it, else
+// its extension's grammar.
+func (p *Provider) grammarOf(census lang.Census, fv model.FileVersion) (lang.Language, string, bool) {
+	if lang.SharedHeader(fv.Path) {
+		first, fallback, ok := census.Header().Within(func(name string) bool { _, ok := p.languages[name]; return ok })
+		return p.languages[first], fallback, ok
+	}
+	if l, ok := p.languages[fv.Language]; ok {
+		return l, "", true
+	}
+	l, ok := lang.ByExtension(fv.Path)
+	if !ok {
+		return lang.Language{}, "", false
+	}
+	_, ok = p.languages[l.Name]
+	return l, "", ok
+}
+
+// censusOf is the C and C++ census of view's snapshot. A probe has no
+// snapshot and parses a header as a repository with neither language would.
+func censusOf(view model.SnapshotView) lang.Census {
+	if view == nil {
+		return lang.Census{}
+	}
+	h := view.Header()
+	return lang.Census{C: h.CUnits, CPP: h.CPPUnits}
+}
+
+// keptLanguage is the language a parse's facts are in: the request's, or for
+// a header the grammar its kept parse used. A choice the request did not ask
+// for, or one that does not describe the request's two grammars, is output no
+// worker of this protocol produces.
+func keptLanguage(req wire.Request, h *lang.HeaderChoice) (lang.Language, error) {
+	name := req.Language
+	switch {
+	case req.Fallback == "" && h == nil:
+	case req.Fallback == "" || h == nil:
+		return lang.Language{}, outputInvalid("a header choice that does not answer the request's fallback")
+	case h.First != req.Language || (h.Kept != req.Language && h.Kept != req.Fallback) ||
+		(h.Kept == req.Fallback) != (h.Reason == lang.HeaderFallbackKept) ||
+		(h.Reason != lang.HeaderClean && h.Reason != lang.HeaderFirstKept && h.Reason != lang.HeaderFallbackKept):
+		return lang.Language{}, outputInvalid("a header choice that names grammars or a reason the request does not")
+	default:
+		name = h.Kept
+	}
+	l, ok := lang.Lookup(name)
+	if !ok {
+		return lang.Language{}, outputInvalid("a parse in a language that is not pinned")
+	}
+	return l, nil
+}
+
+// The capability details a header's parse discloses (lang.HeaderChoice): the
+// grammar it was parsed with first, the one kept and why, and, when the
+// fallback ran, the error bytes of each parse.
+const (
+	detailHeaderFirst              = "header_first"
+	detailHeaderKept               = "header_kept"
+	detailHeaderReason             = "header_reason"
+	detailHeaderFirstErrorBytes    = "header_first_error_bytes"
+	detailHeaderFallbackErrorBytes = "header_fallback_error_bytes"
+)
+
+// discloseHeader adds a header's grammar choice to its file's capability row.
+func discloseHeader(state model.CapabilityState, h lang.HeaderChoice) model.CapabilityState {
+	state = state.WithDetail(detailHeaderFirst, h.First).WithDetail(detailHeaderKept, h.Kept).
+		WithDetail(detailHeaderReason, string(h.Reason))
+	if h.Reason != lang.HeaderClean {
+		state = state.WithDetail(detailHeaderFirstErrorBytes, strconv.FormatUint(h.FirstErr.Bytes, 10)).
+			WithDetail(detailHeaderFallbackErrorBytes, strconv.FormatUint(h.Fallback.Bytes, 10))
+	}
+	return state
+}
+
 // Stats is the aggregate parent-plus-worker resource view.
-func (p *Provider) Stats() Stats { return p.pool.stats() }
+func (p *Provider) Stats() Stats {
+	s := p.pool.stats()
+	p.stageMu.Lock()
+	wall := p.stageWall
+	if p.stage > 0 {
+		wall += time.Since(p.stageOpened)
+	}
+	p.stageMu.Unlock()
+	s.StageWallMS = wall.Milliseconds()
+	return s
+}
 
 // Close stops every worker and waits for the runner to reap each one.
 func (p *Provider) Close() { p.pool.close() }
+
+// OpenStage opens one parse stage that holds the pool across every unit
+// indexed before closeStage is called. IndexUnit keeps its own bracket, so a
+// caller that never opens a stage still has the pool held for each unit it
+// indexes, and drained when the last of them ends. closeStage
+// leaves the stage once, however often it is called, under the run the stage
+// was opened in, so no caller can close another run's total. It answers what the pool did while the stage was
+// open, measured after the leave so a drained worker's processor time is in
+// it, and every later call answers the same figures.
+func (p *Provider) OpenStage(ctx context.Context) (closeStage func() model.StageFigures) {
+	window := p.pool.openWindow()
+	p.enterStage(ctx)
+	var once sync.Once
+	var figures model.StageFigures
+	return func() model.StageFigures {
+		once.Do(func() {
+			p.leaveStage(ctx)
+			figures = p.pool.closeWindow(window)
+		})
+		return figures
+	}
+}
 
 // IndexUnit indexes the one file the unit's scope key names. The run always
 // reports succeeded when facts were produced or the file was honestly
@@ -238,7 +372,9 @@ func (p *Provider) Close() { p.pool.close() }
 // the builder disclosed) or unavailable (over max_parse_file_bytes, wider than
 // the parser can address, not UTF-8, or not a supported language); an
 // unhealthy worker is replaced and the parse retried once; anything else fails
-// the unit.
+// the unit. A header is parsed with the grammar its snapshot's census chooses
+// and falls back once to the other (grammarOf); its facts are in the grammar
+// of the parse the worker kept, and the choice is disclosed on its row.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 	p.enterStage(ctx)
 	defer p.leaveStage(ctx)
@@ -258,7 +394,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		result.Capabilities = []model.CapabilityState{state}
 		return result, nil
 	}
-	l, ok := p.LanguageOf(fv)
+	l, fallback, ok := p.grammarOf(censusOf(req.Content), fv)
 	if !ok {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
@@ -273,8 +409,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !utf8.Valid(src) {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src))}, src)
+	wreq := wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src)), Fallback: fallback}
+	ex, err := p.parse(ctx, req.Content, wreq, src)
 	if err != nil {
+		return model.ProviderResult{}, err
+	}
+	if l, err = keptLanguage(wreq, ex.done.Header); err != nil {
 		return model.ProviderResult{}, err
 	}
 	b := &builder{ctx: ctx, req: req, fv: fv, lang: l, src: src, cur: source.NewCursor(src), ex: ex,
@@ -287,6 +427,9 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	result.RecordsEmitted = records
+	if h := ex.done.Header; h != nil {
+		state = discloseHeader(state, *h)
+	}
 	state, bounded := b.bounds(state)
 	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {
 		return finish(model.CapabilityPartial, model.CodeCoverageIncomplete)
@@ -345,16 +488,41 @@ func (p *Provider) read(ctx context.Context, view model.SnapshotView, fv model.F
 
 // parse runs one request on a pooled worker, replacing an unhealthy worker
 // and retrying exactly once (Section 11.3). A cancellation, a per-file error
-// or a startup failure is never retried.
-func (p *Provider) parse(ctx context.Context, req wire.Request, src []byte) (*extraction, error) {
-	for attempt := 0; ; attempt++ {
-		w, err := p.pool.acquire(ctx)
+// or a startup failure is never retried. The file is admitted at its
+// predicted increment with the worker in hand and learned from on its Done
+// (see pool); view is the snapshot the file belongs to, and nil for a probe,
+// which learns nothing. A caller that gives its worker back while it waits for
+// the increment asks again; that is not an attempt.
+func (p *Provider) parse(ctx context.Context, view model.SnapshotView, req wire.Request, src []byte) (*extraction, error) {
+	census := censusOf(view)
+	languageOf := func(fv model.FileVersion) (string, bool) {
+		l, _, ok := p.grammarOf(census, fv)
+		return l.Name, ok
+	}
+	f, err := p.pool.plan(ctx, view, req.Language, int64(len(src)), languageOf)
+	if err != nil {
+		return nil, err
+	}
+	r := p.pool.request(int64(len(src)))
+	for attempt := 0; ; {
+		w, err := p.pool.acquire(ctx, r)
 		if err != nil {
 			return nil, err
 		}
+		increment, yielded, err := p.pool.reserveParse(ctx, f.reserved)
+		if yielded {
+			p.pool.release(w, true)
+			continue
+		}
+		if err != nil {
+			p.pool.release(w, true)
+			return nil, err
+		}
 		ex, err := p.pool.parse(ctx, w, req, src)
+		p.pool.endParse(increment)
 		if err == nil {
 			p.pool.count(ctx, w, ex)
+			p.pool.settle(f, ex.done.Memory)
 			p.pool.release(w, true)
 			return ex, nil
 		}
@@ -372,6 +540,7 @@ func (p *Provider) parse(ctx context.Context, req wire.Request, src []byte) (*ex
 			return nil, (&model.Error{Code: model.CodeProviderUnavailable, Message: "the parser worker failed twice on " + bound(req.Path, 256), Retryable: true}).
 				WithDetail("cause", bound(err.Error(), 256))
 		}
+		attempt++
 		p.pool.mu.Lock()
 		p.pool.retries++
 		p.pool.mu.Unlock()
@@ -395,7 +564,7 @@ type Probe struct {
 // framing, validation and retry as IndexUnit, with no unit or sink -- and, as
 // enterStage records, no stage of its own.
 func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (Probe, error) {
-	l, ok := p.LanguageOf(model.FileVersion{Path: relPath})
+	l, fallback, ok := p.grammarOf(censusOf(nil), model.FileVersion{Path: relPath})
 	if !ok {
 		return Probe{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "no pinned grammar for " + bound(relPath, 256)}
 	}
@@ -405,8 +574,12 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 	if int64(len(src)) > wire.MaxSourceOffset {
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file is longer than the parser's byte offsets can address"}
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint64(len(src))}, src)
+	wreq := wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint64(len(src)), Fallback: fallback}
+	ex, err := p.parse(ctx, nil, wreq, src)
 	if err != nil {
+		return Probe{}, err
+	}
+	if l, err = keptLanguage(wreq, ex.done.Header); err != nil {
 		return Probe{}, err
 	}
 	return Probe{Language: l.Name, Declarations: len(ex.decls), Imports: len(ex.imports), References: len(ex.refs),

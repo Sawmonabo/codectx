@@ -2,6 +2,7 @@ package worker
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"unicode"
@@ -39,7 +40,17 @@ type grammar struct {
 	// importNames derives the local names an import path introduces when the
 	// query captured none.
 	importNames func(path string) []string
+	// blank is the name that declares nothing in the language, or empty
+	// when every name it extracts binds one. A declaration of it is not
+	// extracted, and neither is any declaration nested inside it.
+	blank string
+	// flatFields are the names of the fields the lowerings resolve, the
+	// grammar's field registry, resolved on first use by fieldRegistry.
+	flatFields []string
 
+	// registryOnce resolves registry.
+	registryOnce sync.Once
+	registry     fieldRegistry
 	// fields are the field ids the extraction reads, resolved on first use
 	// by fieldIDs.
 	fieldsOnce sync.Once
@@ -72,6 +83,9 @@ type kindIDs struct {
 	arrowFunction, functionExpression uint16
 	// C and C++ macros and declarator chains.
 	preprocDef, preprocFunctionDef, functionDeclarator, qualifiedIdentifier uint16
+	// errorKind is the kind of an ERROR node, the library's one error symbol,
+	// which its name lookup answers for "ERROR" in every grammar.
+	errorKind uint16
 }
 
 // kindSet is a set of named node kinds, indexed by kind id.
@@ -121,6 +135,7 @@ func (g *grammar) kindIDs() *kindIDs {
 			preprocFunctionDef:   id("preproc_function_def"),
 			functionDeclarator:   id("function_declarator"),
 			qualifiedIdentifier:  id("qualified_identifier"),
+			errorKind:            id("ERROR"),
 		}
 	})
 	return &g.kinds
@@ -149,6 +164,66 @@ func (g *grammar) fieldIDs() *fieldIDs {
 	})
 	return &g.fields
 }
+
+// fieldRegistry is a grammar's field registry: the fields the flat array
+// records for every node (Flatten), which are exactly the fields a lowering
+// may resolve, since mustField panics on any other. A lowering reads a field
+// the registry lists from the array, and one it does not list nowhere.
+type fieldRegistry struct {
+	// ids are the registered field ids, ascending, each once.
+	ids []uint16
+	// known is indexed by field id and marks the registered ones.
+	known []bool
+}
+
+// fieldRegistry is the field registry of g, resolved once. A name the
+// grammar does not define is a registry defect and panics.
+func (g *grammar) fieldRegistry() *fieldRegistry {
+	g.registryOnce.Do(func() {
+		tl := g.tsLanguage()
+		g.registry.known = make([]bool, tl.FieldCount()+1)
+		for _, name := range g.flatFields {
+			v := tl.FieldIdForName(name)
+			if v == 0 {
+				panic("worker: a field registry names " + name + ", which its grammar does not define")
+			}
+			g.registry.known[v] = true
+		}
+		for id, ok := range g.registry.known {
+			if ok {
+				g.registry.ids = append(g.registry.ids, uint16(id))
+			}
+		}
+	})
+	return &g.registry
+}
+
+// noFields is the empty registry, for an array no field is read from.
+var noFields fieldRegistry
+
+// The field registries, one per lowering: the names each language's
+// lowering resolves with mustField, the import-clause table's included.
+var (
+	goFields = []string{"alias", "alternative", "body", "communication", "condition", "consequence", "function",
+		"initializer", "label", "left", "name", "operand", "operator", "parameters", "receiver", "result", "right",
+		"type", "update", "value"}
+	jsFields = []string{"alias", "alternative", "argument", "arguments", "body", "condition", "consequence",
+		"declaration", "finalizer", "function", "handler", "increment", "index", "initializer", "key", "kind",
+		"label", "left", "name", "object", "operator", "optional_chain", "parameter", "parameters", "pattern",
+		"property", "right", "value"}
+	pythonFields = []string{"alias", "alternative", "arguments", "body", "condition", "consequence", "definition",
+		"function", "guard", "left", "module_name", "name", "object", "parameters", "return_type", "right",
+		"superclasses", "type", "value"}
+	javaFields = []string{"alternative", "arguments", "array", "body", "condition", "consequence", "declarator",
+		"index", "init", "left", "name", "object", "operand", "operator", "parameters", "pattern", "resources",
+		"right", "update", "value"}
+	rustFields = []string{"alternative", "arguments", "body", "condition", "consequence", "function", "left",
+		"name", "operator", "parameters", "pattern", "right", "type", "value"}
+	cFields = []string{"alternative", "argument", "body", "condition", "consequence", "declarator", "filter",
+		"goto_labels", "initializer", "label", "left", "name", "operator", "parameters", "right", "size", "type",
+		"update", "value"}
+	cppFields = slices.Concat(cFields, []string{"arguments", "captures", "function"})
+)
 
 // importSyntax is the import-clause table of g, the ECMAScript grammar
 // registered as language, resolved once.
@@ -214,10 +289,16 @@ var grammars = map[string]*grammar{
 			return d.kind == "function" && strings.HasSuffix(path, "_test.go") && goTestName.MatchString(d.name)
 		},
 		importNames: func(p string) []string { return []string{lastSegment(p, "/")} },
+		// The Go specification, Blank identifier and Declarations and scope:
+		// the blank identifier "does not introduce a binding and thus is not
+		// declared", in a var, const, function, method, type or field
+		// position alike.
+		blank:      "_",
+		flatFields: goFields,
 	},
-	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine},
-	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine},
-	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine},
+	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
+	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
+	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
 	"python": {
 		language: tree_sitter_python.Language,
 		wrappers: []string{"decorated_definition"},
@@ -241,6 +322,7 @@ var grammars = map[string]*grammar{
 				d.kind == "class" && strings.HasPrefix(d.name, "Test")
 		},
 		importNames: func(p string) []string { return []string{firstSegment(p, ".")} },
+		flatFields:  pythonFields,
 	},
 	"java": {
 		language: tree_sitter_java.Language,
@@ -254,6 +336,7 @@ var grammars = map[string]*grammar{
 		},
 		isTest:      func(d *decl, _ string, _ []byte) bool { return d.test },
 		importNames: func(p string) []string { return []string{lastSegment(p, ".")} },
+		flatFields:  javaFields,
 	},
 	"rust": {
 		language: tree_sitter_rust.Language,
@@ -275,9 +358,14 @@ var grammars = map[string]*grammar{
 			return false
 		},
 		importNames: rustUseNames,
+		// The Rust Reference, Constant items: a free constant may be unnamed
+		// by writing an underscore for its name, and such a constant is not
+		// nameable. No other item the extraction reads may be named `_`.
+		blank:      "_",
+		flatFields: rustFields,
 	},
-	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine},
-	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }},
+	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, flatFields: cFields},
+	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
 }
 
 var jsWrappers = []string{"export_statement", "lexical_declaration", "variable_declaration"}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -39,10 +40,11 @@ const (
 
 // Store is the write side of storage the builder needs: it persists each
 // blob's metadata before the manifest that names it, and imports the streamed
-// manifest. Blob lets a capture skip re-persisting a blob the store already
-// holds. *sqlite.Store satisfies it.
+// manifest. RecordedBlob lets a capture skip re-persisting a blob the store
+// already holds, one this capture recorded since the last commit included.
+// *sqlite.Store satisfies it.
 type Store interface {
-	Blob(ctx context.Context, hash string) (model.BlobRecord, error)
+	RecordedBlob(ctx context.Context, hash string) (model.BlobRecord, error)
 	PutBlob(ctx context.Context, b model.BlobRecord) error
 	PutSnapshot(ctx context.Context, snap model.Snapshot, files func(yield func(model.FileVersion) error) error) error
 }
@@ -276,8 +278,9 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	if err := batch.Barrier(ctx); err != nil {
 		return model.Snapshot{}, typed(err)
 	}
+	tag := lang.For(snap)
 	err = b.Store.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
-		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r)) })
+		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r, tag)) })
 	})
 	if err != nil {
 		return model.Snapshot{}, typed(err)
@@ -321,8 +324,9 @@ func (b *Builder) logger() *slog.Logger {
 }
 
 // fileVersion is the manifest row for one staged entry. Language is derived
-// from the path here, deterministically, rather than stored.
-func (b *Builder) fileVersion(r row) model.FileVersion {
+// here, deterministically, from the path and, for a header, the snapshot's
+// census.
+func (b *Builder) fileVersion(r row, tag lang.Tagger) model.FileVersion {
 	return model.FileVersion{
 		ID:          model.NewFileID(b.Repository, r.path),
 		Path:        r.path,
@@ -330,7 +334,7 @@ func (b *Builder) fileVersion(r row) model.FileVersion {
 		Size:        r.size,
 		ContentHash: r.hash,
 		GitObjectID: r.oid,
-		Language:    lang.Of(r.path),
+		Language:    tag.Of(r.path),
 		Executable:  r.executable,
 	}
 }
@@ -522,7 +526,7 @@ func (c *capture) captureFile(ctx context.Context, f workspace.File, r row, stat
 	if post.Size() != rec.Size || post.ModTime().UnixNano() != f.ModTime {
 		*changes++
 	}
-	if _, err := b.Store.Blob(ctx, rec.Hash); err != nil {
+	if _, err := b.Store.RecordedBlob(ctx, rec.Hash); err != nil {
 		if err := b.Store.PutBlob(ctx, rec); err != nil {
 			return err
 		}
@@ -645,14 +649,22 @@ func (c *capture) inspect(rel string) (fs.FileInfo, bool, error) {
 // header folds the sorted manifest into its aggregate digest and builds the
 // snapshot header. The manifest is streamed from staging; PutSnapshot streams
 // it a second time and validates the counts against the rows it receives.
+//
+// The C and C++ census is counted here and nowhere earlier: a walk pass runs
+// once per recapture and the unseen sweep drops and tombstones rows after it,
+// so only this stream over the settled manifest sees each final row once.
 func (c *capture) header(ctx context.Context, head string) (model.Snapshot, error) {
 	b := c.b
 	h := model.NewHasher(domainManifest)
 	var count, total uint64
+	var census tslang.Census
 	b.notes.LFSPointers, b.notes.LFSPointerCount = nil, 0
 	err := c.st.eachManifest(ctx, func(r row) error {
 		if r.lfs {
 			b.notes.addLFS(r.path)
+		}
+		if r.status != model.FileDeleted {
+			census.Add(r.path)
 		}
 		h.AddString(r.path)
 		h.AddString(string(r.status))
@@ -679,6 +691,8 @@ func (c *capture) header(ctx context.Context, head string) (model.Snapshot, erro
 		SourcePolicyHash:   b.SourcePolicyHash,
 		FileCount:          count,
 		SourceBytes:        total,
+		CUnits:             census.C,
+		CPPUnits:           census.CPP,
 		ManifestHash:       manifest,
 		CreatedAt:          time.Now().UTC(),
 	}
