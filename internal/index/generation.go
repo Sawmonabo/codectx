@@ -754,8 +754,9 @@ func (g *generation) attachCarried(ctx context.Context) (err error) {
 // build runs every unit the plan did not reuse, provider by provider in
 // dependency order, and returns the deferred ones for the background tick. A
 // provider's units run concurrently; the next provider starts only when the
-// previous one's units are sealed, because storage refuses to open a unit
-// whose declared dependency is not yet sealed.
+// previous one's units are sealed and committed, because a unit resolves
+// against its declared dependencies as of the last commit and storage refuses
+// one whose dependency is not sealed there.
 func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	ctx, span := ledger.Start(ctx, stageBuild, "")
 	defer func() {
@@ -782,6 +783,12 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 				if err != nil {
 					return err
 				}
+				// The next provider's units read their dependencies from the
+				// last commit, so what this provider sealed is committed before
+				// the first of them runs: one commit per provider boundary.
+				if err := g.c.opts.Store.Flush(ctx); err != nil {
+					return err
+				}
 			}
 			current = u.ProviderID
 		}
@@ -803,7 +810,7 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			return nil
 		}
 		if group == nil {
-			group = g.newUnitGroup(ctx)
+			group = g.newUnitGroup(ctx, u.ProviderID)
 		}
 		return group.submit(u, unitSpan)
 	})
@@ -885,19 +892,49 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 // unitGroup runs one provider's units with bounded concurrency as the plan
 // hands them over: a live set of at most workers units, and the first fatal
 // failure cancels the rest.
+//
+// The group is also the provider's whole pass over this run's units. A
+// provider that keeps a stage has it open for exactly that pass, so what the
+// stage holds warm -- the parser workers -- outlives every unit of the pass and
+// is not given back, and started again, when two sequential units leave it
+// empty between them.
 type unitGroup struct {
 	g      *generation
+	parent context.Context
 	ctx    context.Context
 	cancel context.CancelFunc
 	sem    chan struct{}
 	wg     sync.WaitGroup
 	once   sync.Once
 	fatal  error
+
+	provider   string
+	closeStage func(context.Context)
+	// started, writerBusy and units are the pass's measurement: its wall, the
+	// store writer's busy time when it began, and the units it admitted.
+	started    time.Time
+	writerBusy time.Duration
+	units      int64
 }
 
-func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
+// stageOpener is a provider that keeps a stage open across a pass over many
+// units. It is asserted structurally here, at the one call site, so the
+// provider interface carries nothing only one provider needs; a provider
+// without it runs each unit as it always has.
+type stageOpener interface {
+	OpenStage(ctx context.Context) (closeStage func(ctx context.Context))
+}
+
+func (g *generation) newUnitGroup(ctx context.Context, providerID string) *unitGroup {
 	runCtx, cancel := context.WithCancel(ctx)
-	return &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers)}
+	u := &unitGroup{g: g, parent: ctx, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers),
+		provider: providerID, started: time.Now(), writerBusy: g.c.opts.Store.WriterBusy()}
+	if p, ok := g.c.opts.Registry.Lookup(providerID); ok {
+		if s, ok := p.(stageOpener); ok {
+			u.closeStage = s.OpenStage(ctx)
+		}
+	}
+	return u
 }
 
 // submit admits one unit against the group's worker slots, blocking while they
@@ -917,6 +954,7 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 		span.End(ledger.OutcomeUnavailable, notAdmitted(model.CodeProviderUnavailable), nil)
 		return err
 	}
+	u.units++
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
@@ -929,10 +967,23 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 }
 
 // wait drains the group and reports its first fatal failure. It releases the
-// group's context whatever the outcome, so an abandoned group leaks nothing.
+// group's context whatever the outcome, so an abandoned group leaks nothing;
+// closes the provider's stage after the last unit has left it, under a
+// context a cancelled pass does not end, so the stage's own accounting is
+// closed on every path; and reports the pass's wall beside the time the store
+// writer was busy during it, the ratio that says whether the pass waited on
+// the one writer the write-ahead log admits.
 func (u *unitGroup) wait() error {
 	u.wg.Wait()
 	u.cancel()
+	if u.closeStage != nil {
+		u.closeStage(context.WithoutCancel(u.parent))
+		u.closeStage = nil
+	}
+	u.g.c.log.Info("provider pass", "component", component, "run_id", u.g.ledgerRun.ID(),
+		"provider_id", u.provider, "units", u.units,
+		"wall_ms", time.Since(u.started).Milliseconds(),
+		"writer_busy_ms", (u.g.c.opts.Store.WriterBusy() - u.writerBusy).Milliseconds())
 	return u.fatal
 }
 
@@ -1083,11 +1134,20 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 	if err != nil {
 		return outcome{}, err
 	}
-	runID, err := c.opts.Store.BeginProviderRun(ctx, g.gen, u.ProviderID, u.ProviderVersion)
+	// The unit's candidates resolve against its declared dependencies' aliases,
+	// read once here from the last commit rather than once per candidate. The
+	// read can refuse a dependency that is not committed sealed, so it runs
+	// before the provider run is opened: a refusal after it would leave a run
+	// row `running` that nothing completes.
+	aliases, err := c.opts.Store.DependencyAliases(ctx, u.DependsOn)
 	if err != nil {
 		return outcome{}, err
 	}
-	resolver, err := reconcile.New(c.opts.Store, c.repo, u.DependsOn)
+	resolver, err := reconcile.New(aliases, c.repo, u.DependsOn)
+	if err != nil {
+		return outcome{}, err
+	}
+	runID, err := c.opts.Store.BeginProviderRun(ctx, g.gen, u.ProviderID, u.ProviderVersion)
 	if err != nil {
 		return outcome{}, err
 	}

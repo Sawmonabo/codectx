@@ -394,10 +394,10 @@ type UnitWriter struct {
 	// building unit that owns it.
 	lex *lexicalStage
 
-	// stmts holds the prepared statements of the write transaction currently
-	// running, so the dozen SQL texts the per-row helpers issue are parsed
-	// once per transaction instead of once per row (stmtcache.go). It is
-	// installed by inTx for the life of one transaction and nil outside one.
+	// stmts is the open ingestion group's statement cache, so the dozen SQL
+	// texts the per-row helpers issue are parsed once per group instead of
+	// once per row (stmtcache.go). providerWrite points it at the group's
+	// cache for the life of one batch; it is nil outside one.
 	stmts *stmtCache
 
 	// evidenceClipped records what SealUnit dropped to hold the evidence
@@ -671,7 +671,7 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 		return err
 	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(tx, func() error {
+		return w.providerWrite(func() error {
 			defer w.endBatch()
 			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
 			if err != nil {
@@ -780,7 +780,7 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 		return err
 	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(tx, func() error {
+		return w.providerWrite(func() error {
 			defer w.endBatch()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
 			if err != nil {
@@ -838,7 +838,7 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 		return err
 	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(tx, func() error {
+		return w.providerWrite(func() error {
 			defer w.endBatch()
 			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id) VALUES(?, ?, ?, ?)`)
 			if err != nil {
@@ -913,7 +913,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	docIDs := make([]int64, len(docs))
 	var inserted int64
 	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(tx, func() error {
+		return w.providerWrite(func() error {
 			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
@@ -976,31 +976,27 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	return nil
 }
 
-// providerWrite maps a constraint failure inside a provider batch to
-// CTX_PROVIDER_OUTPUT_INVALID: an unregistered endpoint, an input file the
-// unit did not declare or a duplicated fact is malformed provider output, not
-// a caller argument error.
-// providerWrite runs one provider batch inside tx and translates what the
-// batch reports.
+// providerWrite runs one provider batch and maps a constraint
+// failure it reports to CTX_PROVIDER_OUTPUT_INVALID: an unregistered
+// endpoint, an input file the unit did not declare or a duplicated fact is
+// malformed provider output, not a caller argument error.
 //
-// It also installs the transaction's statement cache for the duration of the
-// batch and finalises every statement that cache prepared on the way out, so
-// the dozen SQL texts the per-row helpers issue are parsed once per batch
-// rather than once per row. Every per-row helper reaches the cache through
-// w.stmts; outside a batch it is nil and those helpers prepare on the
-// transaction they are handed, which is what every non-writer caller of the
-// same code does.
-func (w *UnitWriter) providerWrite(tx *sql.Tx, fn func() error) error {
-	cache := newStmtCache(tx)
+// It also points the writer and its interner at the ingestion group's
+// statement cache for the duration of the batch, so the dozen SQL texts the
+// per-row helpers issue are parsed once per group rather than once per row.
+// The batch runs as a job on the writer goroutine, the only goroutine that
+// touches the group or its cache, so this is not a race. Every per-row helper
+// reaches the cache through w.stmts; outside a batch it is nil and those
+// helpers prepare on the transaction they are handed, which is what every
+// non-writer caller of the same code does.
+func (w *UnitWriter) providerWrite(fn func() error) error {
+	cache := w.s.groupStmts()
 	w.stmts = cache
 	if in, ok := w.ids.(*dbInterner); ok {
 		in.stmts = cache
 		defer func() { in.stmts = nil }()
 	}
-	defer func() {
-		w.stmts = nil
-		cache.close()
-	}()
+	defer func() { w.stmts = nil }()
 	err := fn()
 	if err == nil {
 		return nil
@@ -1354,6 +1350,32 @@ func (w *UnitWriter) closeStage() error {
 const closureCTE = `WITH RECURSIVE closure(id) AS (
 	SELECT ?1 UNION SELECT ud.dependency_id FROM unit_dependencies ud JOIN closure c ON ud.unit_id = c.id)`
 
+// sealChecks are the invariants SealUnit validates over one unit, each a
+// count that must be zero, keyed by the unit's row as ?1.
+var sealChecks = []struct {
+	what  string
+	query string
+}{
+	{"node facts without evidence", `SELECT count(*) FROM node_facts nf WHERE nf.unit_id = ?1
+		AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = nf.unit_id AND e.node_id = nf.node_id)`},
+	{"relation facts without evidence", `SELECT count(*) FROM relation_facts rf WHERE rf.unit_id = ?1
+		AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = rf.unit_id AND e.relation_id = rf.relation_id)`},
+	{"node ranges past the end of their source", `SELECT count(*) FROM node_facts nf JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
+		JOIN blobs b ON b.hash = ui.content_hash WHERE nf.unit_id = ?1 AND nf.end_byte > b.size_bytes`},
+	{"evidence ranges past the end of their source", `SELECT count(*) FROM evidence e JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id
+		JOIN blobs b ON b.hash = ui.content_hash WHERE e.unit_id = ?1 AND e.end_byte > b.size_bytes`},
+	{"search documents past the end of their source", `SELECT count(*) FROM search_units su JOIN unit_inputs ui ON ui.unit_id = su.unit_id AND ui.file_id = su.file_id
+		JOIN blobs b ON b.hash = ui.content_hash WHERE su.unit_id = ?1 AND su.end_byte > b.size_bytes`},
+	{"relation endpoints with no visible node fact", closureCTE + ` SELECT count(*) FROM relation_facts rf JOIN relation_ids ri ON ri.id = rf.relation_id
+		WHERE rf.unit_id = ?1 AND (
+			NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.from_node_id AND nf.unit_id IN (SELECT id FROM closure))
+		 OR NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.to_node_id AND nf.unit_id IN (SELECT id FROM closure)))`},
+	{"alias targets with no visible node fact", closureCTE + ` SELECT count(*) FROM native_aliases na WHERE na.unit_id = ?1
+		AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = na.node_id AND nf.unit_id IN (SELECT id FROM closure))`},
+	{"dependency cycles", `SELECT count(*) FROM unit_dependencies ud WHERE ud.dependency_id = ?1 AND ud.unit_id IN (` +
+		`WITH RECURSIVE closure(id) AS (SELECT ?1 UNION SELECT d.dependency_id FROM unit_dependencies d JOIN closure c ON d.unit_id = c.id) SELECT id FROM closure)`},
+}
+
 // SealUnit validates the whole unit and makes it immutable and a member of the
 // generation it was begun for (Section 12.2 invariants beyond DDL): evidence
 // behind every fact, ranges inside their source, relation endpoints and alias
@@ -1375,32 +1397,13 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		if err := w.clipEvidence(ctx, tx); err != nil {
 			return err
 		}
-		checks := []struct {
-			what  string
-			query string
-		}{
-			{"node facts without evidence", `SELECT count(*) FROM node_facts nf WHERE nf.unit_id = ?1
-				AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = nf.unit_id AND e.node_id = nf.node_id)`},
-			{"relation facts without evidence", `SELECT count(*) FROM relation_facts rf WHERE rf.unit_id = ?1
-				AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = rf.unit_id AND e.relation_id = rf.relation_id)`},
-			{"node ranges past the end of their source", `SELECT count(*) FROM node_facts nf JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-				JOIN blobs b ON b.hash = ui.content_hash WHERE nf.unit_id = ?1 AND nf.end_byte > b.size_bytes`},
-			{"evidence ranges past the end of their source", `SELECT count(*) FROM evidence e JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id
-				JOIN blobs b ON b.hash = ui.content_hash WHERE e.unit_id = ?1 AND e.end_byte > b.size_bytes`},
-			{"search documents past the end of their source", `SELECT count(*) FROM search_units su JOIN unit_inputs ui ON ui.unit_id = su.unit_id AND ui.file_id = su.file_id
-				JOIN blobs b ON b.hash = ui.content_hash WHERE su.unit_id = ?1 AND su.end_byte > b.size_bytes`},
-			{"relation endpoints with no visible node fact", closureCTE + ` SELECT count(*) FROM relation_facts rf JOIN relation_ids ri ON ri.id = rf.relation_id
-				WHERE rf.unit_id = ?1 AND (
-					NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.from_node_id AND nf.unit_id IN (SELECT id FROM closure))
-				 OR NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.to_node_id AND nf.unit_id IN (SELECT id FROM closure)))`},
-			{"alias targets with no visible node fact", closureCTE + ` SELECT count(*) FROM native_aliases na WHERE na.unit_id = ?1
-				AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = na.node_id AND nf.unit_id IN (SELECT id FROM closure))`},
-			{"dependency cycles", `SELECT count(*) FROM unit_dependencies ud WHERE ud.dependency_id = ?1 AND ud.unit_id IN (` +
-				`WITH RECURSIVE closure(id) AS (SELECT ?1 UNION SELECT d.dependency_id FROM unit_dependencies d JOIN closure c ON d.unit_id = c.id) SELECT id FROM closure)`},
-		}
-		for _, c := range checks {
+		// The checks and the document count run through the group's
+		// statement cache, so each text is prepared once per group rather
+		// than once per unit.
+		stmts := s.groupStmts()
+		for _, c := range sealChecks {
 			var n int64
-			if err := tx.QueryRowContext(ctx, c.query, w.rowID).Scan(&n); err != nil {
+			if err := stmts.queryRow(ctx, tx, c.query, w.rowID).Scan(&n); err != nil {
 				return wrap(c.what, err)
 			}
 			if n != 0 {
@@ -1409,7 +1412,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			}
 		}
 		var docs int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_units WHERE unit_id = ?`, w.rowID).Scan(&docs); err != nil {
+		if err := stmts.queryRow(ctx, tx, `SELECT count(*) FROM search_units WHERE unit_id = ?`, w.rowID).Scan(&docs); err != nil {
 			return wrap("search_units", err)
 		}
 		if docs != w.searchDocs {
