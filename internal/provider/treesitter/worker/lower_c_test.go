@@ -6,9 +6,9 @@ import (
 )
 
 // cShared are the C cases whose source parses clean as C++ too, so each runs
-// under both grammars with its one expected set. A C case that stays out of it
-// holds a single-argument call statement, `g(x);`, which C++ may also read as
-// a declaration of x ([stmt.ambig]) and so would lower differently.
+// under both grammars with its one expected set. A call statement takes at
+// least two arguments: `g(x);` alone may read as a declaration of x in C++
+// ([stmt.ambig]). The cases that stay C-only use a construct C++ lacks.
 var cShared = []goldenCase{
 	{
 		// C17 §6.8.4.2: the labels are tested against the controlling
@@ -961,6 +961,213 @@ var cShared = []goldenCase{
 			"x > 1@39 -> return 1;@53", "g()@77 -> return 0;@86"},
 		du: []string{"x@10 -> x@21", "x@10 -> x > 1@39"},
 	},
+	{
+		// C17 §6.8.6.1 (goto), §6.8.1 (labels). Nodes: x@11, L@16 (the
+		// label's own node), x++@19, x < 9@28, goto L;@35, goto E;@43,
+		// g()@51 (no predecessor), E@56, h(0, x)@59. Succ: L→x++→x < 9→
+		// {goto L, goto E}; goto L→L (backward); goto E→E (forward);
+		// g()→E→h(0, x)→EXIT. IPDom: x < 9 → goto E (every path leaves by
+		// it); goto L → L → x++ → x < 9. Frontier walk from x < 9 over
+		// goto L: goto L, L, x++, x < 9. The only definition reaching
+		// h(0, x) is x++: g() has no path from ENTRY.
+		name:     "goto backward to a label and forward over dead code",
+		protects: "a goto lands on its label's own node whether the label is before or after it, and code skipped by a goto is not on any path",
+		mutation: "resolve goto only to labels declared before it (goto E dangles, unresolved 1), or let a goto fall through to the next statement (g()@51 becomes reachable and x < 9 gains it)",
+		src:      "void f(int x) { L: x++; if (x < 9) goto L; goto E; g(); E: h(0, x); }",
+		cd:       []string{"x < 9@28 -> goto L;@35", "x < 9@28 -> L@16", "x < 9@28 -> x++@19", "x < 9@28 -> x < 9@28"},
+		du:       []string{"x@11 -> x++@19", "x++@19 -> x++@19", "x++@19 -> x < 9@28", "x++@19 -> h(0, x)@59"},
+	},
+	{
+		// Structured exception handling, try-finally statement (the
+		// extension's documented semantics): `__leave` ends the `__try` body, the `__finally` block runs on
+		// every exit, and a call inside the body may raise. Nodes: x@11,
+		// x@28, __leave;@31, g()@40, the Handler __finally@47 (g()
+		// raising), h(0, x)@59, k()@70. Succ: x@28→{__leave, g()};
+		// __leave→h(0, x); g()→{h(0, x), __finally}; __finally→h(0, x);
+		// h(0, x)→{k() (normal), EXIT (the re-raised exception)};
+		// k()→EXIT. IPDom: x@28, g(), __finally → h(0, x) → EXIT.
+		name:     "__try/__finally with __leave",
+		protects: "__leave reaches the __finally body, not the statement after it, and a raising call reaches the __finally through its Handler and leaves the function after it",
+		mutation: "lower __leave as a jump past the __finally (h(0, x)@59 loses its edge from __leave;@31 and x@28 gains control of h(0, x)), or count no throw for calls in a __try body (__finally@47 and h(0, x) -> k() vanish)",
+		src:      "void f(int x) { __try { if (x) __leave; g(); } __finally { h(0, x); } k(); }",
+		cd:       []string{"x@28 -> __leave;@31", "x@28 -> g()@40", "g()@40 -> __finally@47", "h(0, x)@59 -> k()@70"},
+		du:       []string{"x@11 -> x@28", "x@11 -> h(0, x)@59"},
+	},
+	{
+		// C17 §6.5.16p3: an assignment's value is the value stored. Nodes:
+		// c@10, c = g()@23 (the loop head's first node), (c = g()) !=
+		// 0@22, h(0, c)@38, return c;@47. Succ: c = g()→(c = g()) != 0→
+		// {h(0, c), return c}; h(0, c)→c = g(). IPDom: h(0, c) → c = g() →
+		// (c = g()) != 0 → return c. c = g() kills the parameter.
+		name:     "an assignment embedded in a loop condition flows into the condition",
+		protects: "the node evaluating an expression that embeds `c = e` reads the c it defined, and the back edge re-enters the assignment",
+		mutation: "drop the read-back of the variable an embedded assignment defined (loses c = g()@23 -> (c = g()) != 0@22)",
+		src:      "int f(int c) { while ((c = g()) != 0) h(0, c); return c; }",
+		cd: []string{"(c = g()) != 0@22 -> h(0, c)@38", "(c = g()) != 0@22 -> c = g()@23",
+			"(c = g()) != 0@22 -> (c = g()) != 0@22"},
+		du: []string{"c = g()@23 -> (c = g()) != 0@22", "c = g()@23 -> h(0, c)@38", "c = g()@23 -> return c;@47"},
+	},
+	{
+		// C17 §6.2.1p4: a block's declaration hides the outer one until
+		// the block ends. Nodes: x@10, x = 1@21, g(0, x)@28, return x;@39.
+		name:     "a block-scope declaration shadows a parameter only inside its block",
+		protects: "the inner x is a new variable whose scope ends with its block",
+		mutation: "keep the block's bindings after it closes (return x;@39 pairs with x = 1@21 instead of x@10)",
+		src:      "int f(int x) { { int x = 1; g(0, x); } return x; }",
+		du:       []string{"x = 1@21 -> g(0, x)@28", "x@10 -> return x;@39"},
+	},
+	{
+		// C17 §6.5.3.2p3: `&x` yields a pointer to x, through which the
+		// callee may write it. Nodes: x = 1@14 (defines x), g(0, &x)@21
+		// (Uses x, may-defines x), return x;@31. The return's x pairs
+		// with the nearest may-definition g(0, &x) and with the killing
+		// x = 1 that reaches it through it.
+		name:     "taking an address is a may-definition of the variable",
+		protects: "a use after a call that received a variable's address sees the write the call may make through it",
+		mutation: "lower `&x` as a plain read (g(0, &x)@21 -> return x;@31 vanishes), or make it a killing Def (x = 1@14 -> return x;@31 vanishes)",
+		src:      "int f() { int x = 1; g(0, &x); return x; }",
+		du:       []string{"x = 1@14 -> g(0, &x)@21", "x = 1@14 -> return x;@31", "g(0, &x)@21 -> return x;@31"},
+	},
+	{
+		// C17 §6.3.2.1p3: an array evaluated other than as the operand of
+		// sizeof or & is converted to a pointer to its first element, so
+		// fill may write buf through it; a subscript reads an element.
+		// Nodes: `char buf[8];` makes none, fill(0, buf)@24 (Uses buf,
+		// may-defines it), use(0, buf[0])@38 (Uses buf), g(0, buf)@54.
+		name:     "an array passed to a call decays to its address and is may-defined there",
+		protects: "a use of an array after a call that received it sees the write the call may make, while a subscript read writes nothing",
+		mutation: "read a decaying array without the may-definition (loses both pairs from fill(0, buf)@24), or let a subscript operand decay too (adds use(0, buf[0])@38 -> g(0, buf)@54)",
+		src:      "void f() { char buf[8]; fill(0, buf); use(0, buf[0]); g(0, buf); }",
+		du:       []string{"fill(0, buf)@24 -> use(0, buf[0])@38", "fill(0, buf)@24 -> g(0, buf)@54"},
+	},
+	{
+		// C17 §6.10.1p6: only one group of a conditional is kept, so a
+		// declaration in the #ifdef group does not exist in the #else
+		// group, whose x is the parameter. Nodes: x@10, A@24, x = 1@32,
+		// g(0, x)@41, #else@50, g(0, x)@58, return x;@76. After the directive x
+		// names the #ifdef group's variable in the build that keeps that
+		// group and the parameter in the build that keeps #else, which
+		// does not rebind x: return x Uses both.
+		name:     "a preprocessor arm does not see a sibling arm's declarations",
+		protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter, and after the directive x stands for every binding it has in some build",
+		mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(0, x)@58), or bind a name after the directive to the arms' variable alone (loses x@10 -> return x;@76)",
+		src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n  g(0, x);\n#else\n  g(0, x);\n#endif\n  return x; } }",
+		cd:       []string{"A@24 -> x = 1@32", "A@24 -> g(0, x)@41", "A@24 -> #else@50", "A@24 -> g(0, x)@58"},
+		du:       []string{"x@10 -> g(0, x)@58", "x = 1@32 -> g(0, x)@41", "x = 1@32 -> return x;@76", "x@10 -> return x;@76"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions:
+		// jumping out of a statement expression is permitted, so a break
+		// in a for loop's third expression ends that loop (C17 §6.8.5.3,
+		// §6.8.6.3). The update's value is discarded: its last statement's
+		// node j++ yields the statement expression's result, which no
+		// node reads, so the update makes no node of its own. Nodes:
+		// n@10, j = 0@27, j < n@34, g(0, j)@71, j > 5@48, break;@55,
+		// j++@62, return j;@80. Succ: j < n→{g(0, j), return j};
+		// g(0, j)→j > 5→{break, j++}; break→return j; j++→j < n. IPDom:
+		// j < n, j > 5 → return j; g(0, j) → j > 5; j++ → j < n.
+		name:     "a break in a for update's statement expression leaves that loop",
+		protects: "a break lowered in the update clause targets the loop whose update holds it and lands after the loop",
+		mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34), or end the discarded update with a node Using its result (adds ({ if (j > 5) break; j++; })@41, with j > 5@48 -> it and j++@62 -> it)",
+		src:      "int f(int n) { int j; for (j = 0; j < n; ({ if (j > 5) break; j++; })) g(0, j); return j; }",
+		cd: []string{"j < n@34 -> g(0, j)@71", "j < n@34 -> j > 5@48", "j > 5@48 -> break;@55", "j > 5@48 -> j++@62",
+			"j > 5@48 -> j < n@34"},
+		du: []string{"n@10 -> j < n@34", "j = 0@27 -> j < n@34", "j = 0@27 -> g(0, j)@71", "j = 0@27 -> j > 5@48",
+			"j = 0@27 -> j++@62", "j = 0@27 -> return j;@80",
+			"j++@62 -> j < n@34", "j++@62 -> g(0, j)@71", "j++@62 -> j > 5@48", "j++@62 -> j++@62",
+			"j++@62 -> return j;@80"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions: the
+		// last thing in the compound statement is an expression followed
+		// by a semicolon, whose value is the value of the construct; the
+		// statements before it are evaluated for their effect. Nodes:
+		// y@10, z@17, g(0, y)@33 (Uses y), y = z@42 (Uses z, defines y and
+		// the statement expression's result), x = ({ g(0, y);
+		// y = z; })@26 (Uses the result, defines x), return x;@53. Succ:
+		// a straight line to EXIT.
+		name:     "a statement expression's value comes from its last statement's node",
+		protects: "the node consuming a statement expression reaches its value through the last statement's node, and reads nothing an earlier statement read",
+		mutation: "let the declarator re-read the statement expression's names (adds y@10 -> x = ({ g(0, y); y = z; })@26 and z@17 -> x = ({ g(0, y); y = z; })@26), or lower the last statement for its effect only (loses y = z@42 -> x = ({ g(0, y); y = z; })@26)",
+		src:      "int f(int y, int z) { int x = ({ g(0, y); y = z; }); return x; }",
+		du: []string{"y@10 -> g(0, y)@33", "z@17 -> y = z@42", "y = z@42 -> x = ({ g(0, y); y = z; })@26",
+			"x = ({ g(0, y); y = z; })@26 -> return x;@53"},
+	},
+	{
+		// C17 §6.2.1p4: g, declared outside any block, has file scope, so
+		// it is no variable of f. Nodes: y@18, g = y@23 (Uses y, defines
+		// nothing), g += y@30 (Uses y only), g++@38 (Uses nothing), g =
+		// y@48 (the embedded assignment: Uses y, defines the owned result),
+		// h(0, g = y)@43 (Uses that result), h(0, &g)@56 (Uses and may-defines
+		// nothing), return g;@66 (Uses nothing). Succ: a straight line to
+		// EXIT.
+		name:     "a name with file scope is no variable in any position",
+		protects: "an assignment, compound assignment, update, embedded assignment, address-taking and read of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
+		mutation: "drop read's filter (Builder.Use panics on g's -1 at g += y@30), def's (Builder.Def panics at g = y@23), or mayDef's (Builder.MayDef panics at h(0, &g)@56), or fold the embedded assignment into its consumer (loses g = y@48 -> h(0, g = y)@43)",
+		src:      "int g; void f(int y) { g = y; g += y; g++; h(0, g = y); h(0, &g); return g; }",
+		du:       []string{"y@18 -> g = y@23", "y@18 -> g += y@30", "y@18 -> g = y@48", "g = y@48 -> h(0, g = y)@43"},
+	},
+	{
+		// C17 §6.10.1p6: a conditional without #else keeps no group when
+		// A is undefined, so after the directive x is the #ifdef group's
+		// variable in one build and the parameter in the other. Nodes:
+		// x@10, A@24 (Branch), x = 1@32, g(0, x)@48 (Uses both variables),
+		// x = 2@59 (a killing definition of both: whichever build is
+		// taken, x names one of them and the write replaces it), return
+		// x;@69 (after the block, the parameter, which x = 2 killed).
+		// Succ: A→{x = 1, g(0, x)}; x = 1→g(0, x)→x = 2→return x. IPDom: A →
+		// g(0, x).
+		name:     "a name only one arm declares stands for both bindings after the directive",
+		protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there kills both, so the enclosing variable's earlier value does not reach past it",
+		mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(0, x)@48 and x = 2@59 -> return x;@69, adds x@10 -> return x;@69), or let the write may-define the enclosing variable instead of killing it (adds x@10 -> x = 2@59 and x@10 -> return x;@69)",
+		src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(0, x);\n  x = 2;\n } return x; }",
+		cd:       []string{"A@24 -> x = 1@32"},
+		du:       []string{"x@10 -> g(0, x)@48", "x = 1@32 -> g(0, x)@48", "x = 2@59 -> return x;@69"},
+	},
+	{
+		// C17 §6.3.2.1p3 (an array evaluated as a call argument decays to
+		// its address), §6.10.1p6. x is an array in the build without A
+		// and an int in the build with it, so h(0, x) passes the array's
+		// address in one build. Nodes: A@33 (Branch), x = 1@41, h(0, x)@57
+		// (Uses both variables, may-defines both: the name is an array in
+		// some build), return x[0];@68 (after the block, the array; a
+		// subscript's operand does not decay). `int x[2];` makes no node.
+		// Succ: A→{x = 1, h(0, x)}; x = 1→h(0, x)→return. IPDom: A → h(0, x).
+		name:     "a name that is an array in some build decays to its address after the directive",
+		protects: "a call after a conditional that passes a name which is an array in one build may-defines that array, so a later read of the array depends on the call",
+		mutation: "test only the arms' variable for an array shape (h(0, x)@57 no longer may-defines the enclosing array: loses h(0, x)@57 -> return x[0];@68)",
+		src:      "int f(void) { int x[2]; {\n#ifdef A\n  int x = 1;\n#endif\n  h(0, x); } return x[0]; }",
+		cd:       []string{"A@33 -> x = 1@41"},
+		du:       []string{"x = 1@41 -> h(0, x)@57", "h(0, x)@57 -> return x[0];@68"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions:
+		// when the last statement is a comma expression, its left
+		// operand is a statement and its right operand the value. Nodes: x@10, y@17,
+		// g(0, x)@33, y@42 (defining the construct's result), z = ({ g(0, x),
+		// y; })@26 (Uses it), return z;@49.
+		name:     "a comma expression as a statement expression's last statement yields its right operand",
+		protects: "only the right operand of a last comma statement is the value, and the left operand is a statement of its own",
+		mutation: "yield the whole comma expression (one node g(0, x), y@33 Using x and y replaces g(0, x)@33 and y@42: loses y@17 -> y@42)",
+		src:      "int f(int x, int y) { int z = ({ g(0, x), y; }); return z; }",
+		du: []string{"x@10 -> g(0, x)@33", "y@17 -> y@42", "y@42 -> z = ({ g(0, x), y; })@26",
+			"z = ({ g(0, x), y; })@26 -> return z;@49"},
+	},
+	{
+		// GNU C extension, Conditionals with Omitted Operands: `a ?: b`
+		// is a when a is nonzero, evaluated once, else b. Nodes: a@10,
+		// b@17, a@30 (Branch, defining the result), b@35 (defining it on
+		// the path that evaluates it), r = a ?: b@26 (Uses the result),
+		// return r;@38. Succ: a@30→{b@35,
+		// r = a ?: b}; b@35→r = a ?: b.
+		name:     "a two-operand conditional yields its condition or its alternative",
+		protects: "in a ?: b only b is conditional, and the condition's node yields the value when it is nonzero",
+		mutation: "give the condition's node no definition of the result (loses a@30 -> r = a ?: b@26)",
+		src:      "int f(int a, int b) { int r = a ?: b; return r; }",
+		cd:       []string{"a@30 -> b@35"},
+		du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
+			"r = a ?: b@26 -> return r;@38"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
@@ -970,185 +1177,6 @@ var cShared = []goldenCase{
 // under the C and the C++ grammar; the others under C only.
 func TestCLoweringGolden(t *testing.T) {
 	runGolden(t, "c", append(slices.Clone(cShared), []goldenCase{
-		{
-			// C17 §6.8.6.1 (goto), §6.8.1 (labels). Nodes: x@11, L@16 (the
-			// label's own node), x++@19, x < 9@28, goto L;@35, goto E;@43,
-			// g()@51 (no predecessor), E@56, h(x)@59. Succ: L→x++→x < 9→
-			// {goto L, goto E}; goto L→L (backward); goto E→E (forward);
-			// g()→E→h(x)→EXIT. IPDom: x < 9 → goto E (every path leaves by
-			// it); goto L → L → x++ → x < 9. Frontier walk from x < 9 over
-			// goto L: goto L, L, x++, x < 9. The only definition reaching
-			// h(x) is x++: g() has no path from ENTRY.
-			name:     "goto backward to a label and forward over dead code",
-			protects: "a goto lands on its label's own node whether the label is before or after it, and code skipped by a goto is not on any path",
-			mutation: "resolve goto only to labels declared before it (goto E dangles, unresolved 1), or let a goto fall through to the next statement (g()@51 becomes reachable and x < 9 gains it)",
-			src:      "void f(int x) { L: x++; if (x < 9) goto L; goto E; g(); E: h(x); }",
-			cd:       []string{"x < 9@28 -> goto L;@35", "x < 9@28 -> L@16", "x < 9@28 -> x++@19", "x < 9@28 -> x < 9@28"},
-			du:       []string{"x@11 -> x++@19", "x++@19 -> x++@19", "x++@19 -> x < 9@28", "x++@19 -> h(x)@59"},
-		},
-		{
-			// Structured exception handling, try-finally statement (the
-			// extension's documented semantics): `__leave` ends the `__try` body, the `__finally` block runs on
-			// every exit, and a call inside the body may raise. Nodes: x@11,
-			// x@28, __leave;@31, g()@40, the Handler __finally@47 (g()
-			// raising), h(x)@59, k()@67. Succ: x@28→{__leave, g()};
-			// __leave→h(x); g()→{h(x), __finally}; __finally→h(x);
-			// h(x)→{k() (normal), EXIT (the re-raised exception)};
-			// k()→EXIT. IPDom: x@28, g(), __finally → h(x) → EXIT.
-			name:     "__try/__finally with __leave",
-			protects: "__leave reaches the __finally body, not the statement after it, and a raising call reaches the __finally through its Handler and leaves the function after it",
-			mutation: "lower __leave as a jump past the __finally (h(x)@59 loses its edge from __leave;@31 and x@28 gains control of h(x)), or count no throw for calls in a __try body (__finally@47 and h(x) -> k() vanish)",
-			src:      "void f(int x) { __try { if (x) __leave; g(); } __finally { h(x); } k(); }",
-			cd:       []string{"x@28 -> __leave;@31", "x@28 -> g()@40", "g()@40 -> __finally@47", "h(x)@59 -> k()@67"},
-			du:       []string{"x@11 -> x@28", "x@11 -> h(x)@59"},
-		},
-		{
-			// C17 §6.5.16p3: an assignment's value is the value stored. Nodes:
-			// c@10, c = g()@23 (the loop head's first node), (c = g()) !=
-			// 0@22, h(c)@38, return c;@44. Succ: c = g()→(c = g()) != 0→
-			// {h(c), return c}; h(c)→c = g(). IPDom: h(c) → c = g() →
-			// (c = g()) != 0 → return c. c = g() kills the parameter.
-			name:     "an assignment embedded in a loop condition flows into the condition",
-			protects: "the node evaluating an expression that embeds `c = e` reads the c it defined, and the back edge re-enters the assignment",
-			mutation: "drop the read-back of the variable an embedded assignment defined (loses c = g()@23 -> (c = g()) != 0@22)",
-			src:      "int f(int c) { while ((c = g()) != 0) h(c); return c; }",
-			cd: []string{"(c = g()) != 0@22 -> h(c)@38", "(c = g()) != 0@22 -> c = g()@23",
-				"(c = g()) != 0@22 -> (c = g()) != 0@22"},
-			du: []string{"c = g()@23 -> (c = g()) != 0@22", "c = g()@23 -> h(c)@38", "c = g()@23 -> return c;@44"},
-		},
-		{
-			// C17 §6.2.1p4: a block's declaration hides the outer one until
-			// the block ends. Nodes: x@10, x = 1@21, g(x)@28, return x;@36.
-			name:     "a block-scope declaration shadows a parameter only inside its block",
-			protects: "the inner x is a new variable whose scope ends with its block",
-			mutation: "keep the block's bindings after it closes (return x;@36 pairs with x = 1@21 instead of x@10)",
-			src:      "int f(int x) { { int x = 1; g(x); } return x; }",
-			du:       []string{"x = 1@21 -> g(x)@28", "x@10 -> return x;@36"},
-		},
-		{
-			// C17 §6.5.3.2p3: `&x` yields a pointer to x, through which the
-			// callee may write it. Nodes: x = 1@14 (defines x), g(&x)@21
-			// (Uses x, may-defines x), return x;@28. The return's x pairs
-			// with the nearest may-definition g(&x) and with the killing
-			// x = 1 that reaches it through it.
-			name:     "taking an address is a may-definition of the variable",
-			protects: "a use after a call that received a variable's address sees the write the call may make through it",
-			mutation: "lower `&x` as a plain read (g(&x)@21 -> return x;@28 vanishes), or make it a killing Def (x = 1@14 -> return x;@28 vanishes)",
-			src:      "int f() { int x = 1; g(&x); return x; }",
-			du:       []string{"x = 1@14 -> g(&x)@21", "x = 1@14 -> return x;@28", "g(&x)@21 -> return x;@28"},
-		},
-		{
-			// C17 §6.3.2.1p3: an array evaluated other than as the operand of
-			// sizeof or & is converted to a pointer to its first element, so
-			// fill may write buf through it; a subscript reads an element.
-			// Nodes: `char buf[8];` makes none, fill(buf)@24 (Uses buf,
-			// may-defines it), use(buf[0])@35 (Uses buf), g(buf)@48.
-			name:     "an array passed to a call decays to its address and is may-defined there",
-			protects: "a use of an array after a call that received it sees the write the call may make, while a subscript read writes nothing",
-			mutation: "read a decaying array without the may-definition (loses both pairs from fill(buf)@24), or let a subscript operand decay too (adds use(buf[0])@35 -> g(buf)@48)",
-			src:      "void f() { char buf[8]; fill(buf); use(buf[0]); g(buf); }",
-			du:       []string{"fill(buf)@24 -> use(buf[0])@35", "fill(buf)@24 -> g(buf)@48"},
-		},
-		{
-			// C17 §6.10.1p6: only one group of a conditional is kept, so a
-			// declaration in the #ifdef group does not exist in the #else
-			// group, whose x is the parameter. Nodes: x@10, A@24, x = 1@32,
-			// g(x)@41, #else@47, g(x)@55, return x;@70. After the directive x
-			// names the #ifdef group's variable in the build that keeps that
-			// group and the parameter in the build that keeps #else, which
-			// does not rebind x: return x Uses both.
-			name:     "a preprocessor arm does not see a sibling arm's declarations",
-			protects: "each arm of a conditional resolves names against the scope before the directive, so the #else arm's x is the parameter, and after the directive x stands for every binding it has in some build",
-			mutation: "keep the #ifdef arm's bindings while lowering the #else arm (loses x@10 -> g(x)@55), or bind a name after the directive to the arms' variable alone (loses x@10 -> return x;@70)",
-			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n  g(x);\n#else\n  g(x);\n#endif\n  return x; } }",
-			cd:       []string{"A@24 -> x = 1@32", "A@24 -> g(x)@41", "A@24 -> #else@47", "A@24 -> g(x)@55"},
-			du:       []string{"x@10 -> g(x)@55", "x = 1@32 -> g(x)@41", "x = 1@32 -> return x;@70", "x@10 -> return x;@70"},
-		},
-		{
-			// GNU C extension, Statements and Declarations in Expressions:
-			// jumping out of a statement expression is permitted, so a break
-			// in a for loop's third expression ends that loop (C17 §6.8.5.3,
-			// §6.8.6.3). The update's value is discarded: its last statement's
-			// node j++ yields the statement expression's result, which no
-			// node reads, so the update makes no node of its own. Nodes:
-			// n@10, j = 0@27, j < n@34, g(j)@71, j > 5@48, break;@55,
-			// j++@62, return j;@77. Succ: j < n→{g(j), return j};
-			// g(j)→j > 5→{break, j++}; break→return j; j++→j < n. IPDom:
-			// j < n, j > 5 → return j; g(j) → j > 5; j++ → j < n.
-			name:     "a break in a for update's statement expression leaves that loop",
-			protects: "a break lowered in the update clause targets the loop whose update holds it and lands after the loop",
-			mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34), or end the discarded update with a node Using its result (adds ({ if (j > 5) break; j++; })@41, with j > 5@48 -> it and j++@62 -> it)",
-			src:      "int f(int n) { int j; for (j = 0; j < n; ({ if (j > 5) break; j++; })) g(j); return j; }",
-			cd: []string{"j < n@34 -> g(j)@71", "j < n@34 -> j > 5@48", "j > 5@48 -> break;@55", "j > 5@48 -> j++@62",
-				"j > 5@48 -> j < n@34"},
-			du: []string{"n@10 -> j < n@34", "j = 0@27 -> j < n@34", "j = 0@27 -> g(j)@71", "j = 0@27 -> j > 5@48",
-				"j = 0@27 -> j++@62", "j = 0@27 -> return j;@77",
-				"j++@62 -> j < n@34", "j++@62 -> g(j)@71", "j++@62 -> j > 5@48", "j++@62 -> j++@62",
-				"j++@62 -> return j;@77"},
-		},
-		{
-			// GNU C extension, Statements and Declarations in Expressions: the
-			// last thing in the compound statement is an expression followed
-			// by a semicolon, whose value is the value of the construct; the
-			// statements before it are evaluated for their effect. Nodes:
-			// y@10, z@17, g(y)@33 (Uses y), y = z@39 (Uses z, defines y and
-			// the statement expression's result), x = ({ g(y);
-			// y = z; })@26 (Uses the result, defines x), return x;@50. Succ:
-			// a straight line to EXIT.
-			name:     "a statement expression's value comes from its last statement's node",
-			protects: "the node consuming a statement expression reaches its value through the last statement's node, and reads nothing an earlier statement read",
-			mutation: "let the declarator re-read the statement expression's names (adds y@10 -> x = ({ g(y); y = z; })@26 and z@17 -> x = ({ g(y); y = z; })@26), or lower the last statement for its effect only (loses y = z@39 -> x = ({ g(y); y = z; })@26)",
-			src:      "int f(int y, int z) { int x = ({ g(y); y = z; }); return x; }",
-			du: []string{"y@10 -> g(y)@33", "z@17 -> y = z@39", "y = z@39 -> x = ({ g(y); y = z; })@26",
-				"x = ({ g(y); y = z; })@26 -> return x;@50"},
-		},
-		{
-			// C17 §6.2.1p4: g, declared outside any block, has file scope, so
-			// it is no variable of f. Nodes: y@18, g = y@23 (Uses y, defines
-			// nothing), g += y@30 (Uses y only), g++@38 (Uses nothing), g =
-			// y@45 (the embedded assignment: Uses y, defines the owned result),
-			// h(g = y)@43 (Uses that result), h(&g)@53 (Uses and may-defines
-			// nothing), return g;@60 (Uses nothing). Succ: a straight line to
-			// EXIT.
-			name:     "a name with file scope is no variable in any position",
-			protects: "an assignment, compound assignment, update, embedded assignment, address-taking and read of a name that resolves to no variable make their nodes with their other operands' reads and never reach the builder as a variable",
-			mutation: "drop read's filter (Builder.Use panics on g's -1 at g += y@30), def's (Builder.Def panics at g = y@23), or mayDef's (Builder.MayDef panics at h(&g)@53), or fold the embedded assignment into its consumer (loses g = y@45 -> h(g = y)@43)",
-			src:      "int g; void f(int y) { g = y; g += y; g++; h(g = y); h(&g); return g; }",
-			du:       []string{"y@18 -> g = y@23", "y@18 -> g += y@30", "y@18 -> g = y@45", "g = y@45 -> h(g = y)@43"},
-		},
-		{
-			// C17 §6.10.1p6: a conditional without #else keeps no group when
-			// A is undefined, so after the directive x is the #ifdef group's
-			// variable in one build and the parameter in the other. Nodes:
-			// x@10, A@24 (Branch), x = 1@32, g(x)@48 (Uses both variables),
-			// x = 2@56 (a killing definition of both: whichever build is
-			// taken, x names one of them and the write replaces it), return
-			// x;@66 (after the block, the parameter, which x = 2 killed).
-			// Succ: A→{x = 1, g(x)}; x = 1→g(x)→x = 2→return x. IPDom: A →
-			// g(x).
-			name:     "a name only one arm declares stands for both bindings after the directive",
-			protects: "a read after a conditional whose other build keeps the enclosing binding sees both, and a write there kills both, so the enclosing variable's earlier value does not reach past it",
-			mutation: "count a group without #else as having no empty arm, or bind the name to the arms' variable alone (loses x@10 -> g(x)@48 and x = 2@56 -> return x;@66, adds x@10 -> return x;@66), or let the write may-define the enclosing variable instead of killing it (adds x@10 -> x = 2@56 and x@10 -> return x;@66)",
-			src:      "int f(int x) { {\n#ifdef A\n  int x = 1;\n#endif\n  g(x);\n  x = 2;\n } return x; }",
-			cd:       []string{"A@24 -> x = 1@32"},
-			du:       []string{"x@10 -> g(x)@48", "x = 1@32 -> g(x)@48", "x = 2@56 -> return x;@66"},
-		},
-		{
-			// C17 §6.3.2.1p3 (an array evaluated as a call argument decays to
-			// its address), §6.10.1p6. x is an array in the build without A
-			// and an int in the build with it, so h(x) passes the array's
-			// address in one build. Nodes: A@33 (Branch), x = 1@41, h(x)@57
-			// (Uses both variables, may-defines both: the name is an array in
-			// some build), return x[0];@65 (after the block, the array; a
-			// subscript's operand does not decay). `int x[2];` makes no node.
-			// Succ: A→{x = 1, h(x)}; x = 1→h(x)→return. IPDom: A → h(x).
-			name:     "a name that is an array in some build decays to its address after the directive",
-			protects: "a call after a conditional that passes a name which is an array in one build may-defines that array, so a later read of the array depends on the call",
-			mutation: "test only the arms' variable for an array shape (h(x)@57 no longer may-defines the enclosing array: loses h(x)@57 -> return x[0];@65)",
-			src:      "int f(void) { int x[2]; {\n#ifdef A\n  int x = 1;\n#endif\n  h(x); } return x[0]; }",
-			cd:       []string{"A@33 -> x = 1@41"},
-			du:       []string{"x = 1@41 -> h(x)@57", "h(x)@57 -> return x[0];@65"},
-		},
 		{
 			// C17 §6.9.1p6: in an old-style definition the identifier list
 			// names the parameters and the declaration list gives their
@@ -1162,22 +1190,6 @@ func TestCLoweringGolden(t *testing.T) {
 			du:       []string{"a@6 -> return a;@18"},
 		},
 		{
-			// GNU C extension, Conditionals with Omitted Operands: `a ?: b`
-			// is a when a is nonzero, evaluated once, else b. Kept to C: the
-			// omitted middle operand is not known to parse in the C++
-			// grammar. Nodes: a@10, b@17, a@30 (Branch, defining the result),
-			// b@35 (defining it on the path that evaluates it), r = a ?:
-			// b@26 (Uses the result), return r;@38. Succ: a@30→{b@35,
-			// r = a ?: b}; b@35→r = a ?: b.
-			name:     "a two-operand conditional yields its condition or its alternative",
-			protects: "in a ?: b only b is conditional, and the condition's node yields the value when it is nonzero",
-			mutation: "give the condition's node no definition of the result (loses a@30 -> r = a ?: b@26)",
-			src:      "int f(int a, int b) { int r = a ?: b; return r; }",
-			cd:       []string{"a@30 -> b@35"},
-			du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
-				"r = a ?: b@26 -> return r;@38"},
-		},
-		{
 			// C17 §6.5.3.2p3: &s.f and &a[0] are addresses into s and a, so
 			// the callee may write both (C only: in C++ `struct S s;` is also
 			// a default-initialization node). Nodes: g(&s.f, &a[0])@36 (Uses
@@ -1189,20 +1201,6 @@ func TestCLoweringGolden(t *testing.T) {
 			mutation: "take no base through &s.f (loses g(&s.f, &a[0])@36 -> h(0, s.f)@52) or through &a[i] (loses g(&s.f, &a[0])@36 -> return a[1];@63)",
 			src:      "int f(void) { struct S s; int a[2]; g(&s.f, &a[0]); h(0, s.f); return a[1]; }",
 			du:       []string{"g(&s.f, &a[0])@36 -> h(0, s.f)@52", "g(&s.f, &a[0])@36 -> return a[1];@63"},
-		},
-		{
-			// GNU C extension, Statements and Declarations in Expressions:
-			// when the last statement is a comma expression, its left
-			// operand is a statement and its right operand the value (C only:
-			// C++ may read `g(x), y;` as a declaration). Nodes: x@10, y@17,
-			// g(x)@33, y@39 (defining the construct's result), z = ({ g(x),
-			// y; })@26 (Uses it), return z;@46.
-			name:     "a comma expression as a statement expression's last statement yields its right operand",
-			protects: "only the right operand of a last comma statement is the value, and the left operand is a statement of its own",
-			mutation: "yield the whole comma expression (one node g(x), y@33 Using x and y replaces g(x)@33 and y@39: loses y@17 -> y@39)",
-			src:      "int f(int x, int y) { int z = ({ g(x), y; }); return z; }",
-			du: []string{"x@10 -> g(x)@33", "y@17 -> y@39", "y@39 -> z = ({ g(x), y; })@26",
-				"z = ({ g(x), y; })@26 -> return z;@46"},
 		},
 		{
 			// GNU C extension, Nested Functions: a nested function is its
