@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // A unit's candidates resolve against a table of its dependencies' aliases,
@@ -112,7 +111,7 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	// node-id order, and the building unit's alias of F is absent.
 	low, high := min(first.Node.ID, second.Node.ID), max(first.Node.ID, second.Node.ID)
 	for key, want := range map[string][]model.NodeID{"F": {low, high}, "G": {g.Node.ID}} {
-		got, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, key, store.MaxAliasLookup)
+		got, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, key)
 		if err != nil {
 			t.Fatalf("table LookupAliases(%s): %v", key, err)
 		}
@@ -124,7 +123,7 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 			t.Fatalf("%s: the table answers %v, want %v (the building unit's alias is %s)", key, ids, want, other.Node.ID)
 		}
 	}
-	tied, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, "F", store.MaxAliasLookup)
+	tied, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, "F")
 	if err != nil {
 		t.Fatalf("table LookupAliases(F): %v", err)
 	}

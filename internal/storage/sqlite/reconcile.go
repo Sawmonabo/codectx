@@ -52,11 +52,6 @@ type StoredAlias struct {
 	CanonicalKey string
 }
 
-// MaxAliasLookup is the limit the resolver passes with each alias lookup. It
-// caps nothing: an AliasTable already holds every alias row of the unit's
-// dependencies and answers a key with every identity it is aliased to.
-const MaxAliasLookup = model.MaxAmbiguousCandidates + 2
-
 // aliasUnitChunk bounds the `IN (...)` fan-out of ONE statement. A lookup over
 // more dependency units than this is split across statements and the pages are
 // merged, so a unit with many dependencies is slower, never refused: the SQL
@@ -205,10 +200,8 @@ func (t *AliasTable) load(ctx context.Context, tx *sql.Tx, keys [][]byte) error 
 // identities ordered by canonical key and then node id, which depends only on
 // the sealed units' alias rows and never on the order they were written. A
 // unit the table was not loaded for is refused as an internal fault, because
-// answering it would report aliases of rows this table never read. The limit
-// is accepted to satisfy the resolver's store interface and bounds nothing:
-// the table already holds every row.
-func (t *AliasTable) LookupAliases(_ context.Context, units []model.UnitID, scopeKey, nativeKey string, _ int) ([]StoredAlias, error) {
+// answering it would report aliases of rows this table never read.
+func (t *AliasTable) LookupAliases(_ context.Context, units []model.UnitID, scopeKey, nativeKey string) ([]StoredAlias, error) {
 	if len(units) == 0 {
 		return nil, nil
 	}
