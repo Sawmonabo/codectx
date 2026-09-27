@@ -64,6 +64,9 @@ const (
 	// goroutine drains it, so everything published before this event has been
 	// written by the time the collector answers it.
 	eventFlush
+	// eventNeed is one parsed file's measured need, which belongs to the
+	// run's repository and to no span.
+	eventNeed
 )
 
 // An event is what crosses the bus. It is small and owns nothing the producing
@@ -86,6 +89,9 @@ type event struct {
 	measured Measured
 	endWall  time.Time
 	wallMS   int64
+	// need is an eventNeed's observation, a copy the producing goroutine no
+	// longer holds.
+	need *NeedObservation
 }
 
 // A Ledger is a process's stable handle on the run ledger. It is composed once

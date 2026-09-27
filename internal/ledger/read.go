@@ -569,3 +569,60 @@ func (r *Reader) MarkedUnits(ctx context.Context, repositoryID string, generatio
 	}
 	return out, wrap("read the marked units", rows.Err())
 }
+
+// A NeedClass is one learned need model of a repository as a reader sees it:
+// how many files it was learned from, how many of them used more than they
+// were reserved, and the largest drift -- need minus reservation -- any of
+// them showed, which is below zero when every file fitted.
+type NeedClass struct {
+	Key           NeedKey
+	Observations  int64
+	Overruns      int64
+	MaxDriftBytes int64
+}
+
+// NeedClasses is one page of a repository's learned need models in key order,
+// the disclosure of how often each class's reservation fell short, and how
+// many classes past the page the repository holds. A repository nothing was
+// ever measured in answers none. The page is model.MaxRecordsPerResult wide
+// and is read, and a truncated one counted, exactly as a run's spans are.
+func (r *Reader) NeedClasses(ctx context.Context, repositoryID string) ([]NeedClass, int64, error) {
+	repo, err := model.DecodeID(repositoryID)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT language, fingerprint, size_class, observations, overruns, max_drift_bytes
+		FROM need_models WHERE repository_id = ? ORDER BY language, fingerprint, size_class LIMIT ?`,
+		repo, model.MaxRecordsPerResult+1)
+	if err != nil {
+		return nil, 0, wrap("read the need models", err)
+	}
+	defer rows.Close()
+	var out []NeedClass
+	truncated := false
+	for rows.Next() {
+		if len(out) == model.MaxRecordsPerResult {
+			truncated = true
+			break
+		}
+		var c NeedClass
+		if err := rows.Scan(&c.Key.Language, &c.Key.Fingerprint, &c.Key.SizeClass,
+			&c.Observations, &c.Overruns, &c.MaxDriftBytes); err != nil {
+			return nil, 0, wrap("read the need models", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, wrap("read the need models", err)
+	}
+	if !truncated {
+		return out, 0, nil
+	}
+	rows.Close()
+	var total int64
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM need_models WHERE repository_id = ?`,
+		repo).Scan(&total); err != nil {
+		return nil, 0, wrap("count the need models", err)
+	}
+	return out, max(total-int64(len(out)), 0), nil
+}
