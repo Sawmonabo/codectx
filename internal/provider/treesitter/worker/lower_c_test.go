@@ -818,6 +818,149 @@ var cShared = []goldenCase{
 		du: []string{"c@17 -> c@34", "x@10 -> return g(x, c ? (x = 1) : 0);@22",
 			"x = 1@39 -> return g(x, c ? (x = 1) : 0);@22", "0@48 -> return g(x, c ? (x = 1) : 0);@22"},
 	},
+	{
+		// C17 §6.10.1p6: inside the #ifdef A group, the inner #ifdef B leaves
+		// x standing for the group's variable and the parameter. The #else
+		// group redeclares x without an initializer; there x is the groups'
+		// variable alone, so its g(0, x) reads no parameter. After the outer
+		// directive the link holds again, since the build with A and not B
+		// keeps the parameter. Nodes: x@10, A@24, B@33 (Branches), x = 1@41,
+		// g(0, x)@57 (Uses both), #else@66, g(0, x)@83 (Uses the groups'
+		// variable, which nothing defines on that path), return x;@101 (Uses
+		// both). `int x;` makes no node. Succ: A→{B, #else}; B→{x = 1,
+		// g(0, x)@57}; x = 1→g(0, x)@57→return; #else→g(0, x)@83→return.
+		// IPDom: A → return; B → g(0, x)@57; #else → g(0, x)@83.
+		name:     "a name an arm redeclares is that arm's variable alone",
+		protects: "inside a sibling arm that redeclares a name an inner conditional joined to an enclosing variable, the name no longer stands for the enclosing one",
+		mutation: "keep the link while lowering the redeclaring arm (adds x@10 -> g(0, x)@83)",
+		src:      "int f(int x) { {\n#ifdef A\n#ifdef B\n  int x = 1;\n#endif\n  g(0, x);\n#else\n  int x;\n  g(0, x);\n#endif\n  return x; } }",
+		cd: []string{"A@24 -> B@33", "A@24 -> g(0, x)@57", "A@24 -> #else@66", "A@24 -> g(0, x)@83",
+			"B@33 -> x = 1@41"},
+		du: []string{"x@10 -> g(0, x)@57", "x = 1@41 -> g(0, x)@57", "x@10 -> return x;@101",
+			"x = 1@41 -> return x;@101"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions: the
+		// declaration is in the construct's own list with no label after
+		// it, so it runs on every path to the value and its embedded
+		// assignment takes the call's earlier read of x. Nodes: x@10,
+		// x = 1@39 (Uses the held x, defines x, the owned variable holding
+		// the read and its own result), t = (x = 1)@34 (Uses that result,
+		// defines t), t@47 (the last statement, defining the construct's
+		// result), return g(x, ({ … }));@15 (Uses the held value and the
+		// result). Succ: a straight line to EXIT.
+		name:     "a statement expression's declaration on every path hands the consumer's read off",
+		protects: "a declaration of a statement expression's own list carries the consumer's earlier read, as an expression statement does",
+		mutation: "treat a declaration as skippable (loses x@10 -> x = 1@39)",
+		src:      "int f(int x) { return g(x, ({ int t = (x = 1); t; })); }",
+		du: []string{"x@10 -> x = 1@39", "x = 1@39 -> t = (x = 1)@34", "t = (x = 1)@34 -> t@47",
+			"x = 1@39 -> return g(x, ({ int t = (x = 1); t; }));@15", "t@47 -> return g(x, ({ int t = (x = 1); t; }));@15"},
+	},
+	{
+		// C17 §6.5.16p3 leaves the order of the operands unsequenced; the
+		// lowering takes the right operand before the target's operands, so
+		// a[x] reads the x that x = 1 stored. Nodes: x@10, a@18, x = 1@31
+		// (defines x and its result), a[x] = (x = 1)@23 (Uses a, x and the
+		// result, may-defines a), return x;@39.
+		name:     "an assignment evaluates its right operand before its target's operands",
+		protects: "the subscript of a written element reads the value the right operand's assignment stored",
+		mutation: "evaluate the target's operands first (the subscript's read is handed off: adds x@10 -> x = 1@31)",
+		src:      "int f(int x, int *a) { a[x] = (x = 1); return x; }",
+		du:       []string{"x = 1@31 -> a[x] = (x = 1)@23", "a@18 -> a[x] = (x = 1)@23", "x = 1@31 -> return x;@39"},
+	},
+	{
+		// C17 §6.7.6.1 and §6.7.6.2: in `char (*p)[4]` the declarator
+		// nearest p is the pointer, so p is a pointer to an array and does
+		// not decay. Nodes: (*p)[4] = 0@19 (defines p), g(0, p)@32 (Uses p,
+		// no may-definition), return p != 0;@41.
+		name:     "a pointer to an array is no array",
+		protects: "the declarator nearest the name decides its shape, so passing a pointer to an array is a plain read",
+		mutation: "take any array declarator on the chain as the shape (p decays: adds g(0, p)@32 -> return p != 0;@41)",
+		src:      "int f(void) { char (*p)[4] = 0; g(0, p); return p != 0; }",
+		du:       []string{"(*p)[4] = 0@19 -> g(0, p)@32", "(*p)[4] = 0@19 -> return p != 0;@41"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions: a
+		// construct whose last statement is not an expression statement
+		// has no value. Nodes: x@10, g(0, ({ if (x) h(); }))@15 (the
+		// statement), x@26 (Branch), h()@30, return x;@40. Succ: x@26→
+		// {h(), g(0, …)}; h()→g(0, …)→return. IPDom: x@26 → g(0, …).
+		name:     "a statement expression ending in an if has no value",
+		protects: "a statement expression whose last statement is not an expression statement hands no result to its consumer",
+		mutation: "yield the last statement's condition as the value (adds x@26 -> g(0, ({ if (x) h(); }))@15)",
+		src:      "int f(int x) { g(0, ({ if (x) h(); })); return x; }",
+		cd:       []string{"x@26 -> h()@30"},
+		du:       []string{"x@10 -> x@26", "x@10 -> return x;@40"},
+	},
+	{
+		// GNU C extension, Statements and Declarations in Expressions, and
+		// C17 §6.8.6.2: a continue in a for loop's update goes to the end of
+		// the body, after which the update runs again from its first node,
+		// here the if's Branch. Nodes: x@10, y@17, x@29 (the condition),
+		// g()@61 (the body), y@38 (Branch), continue;@42, x--@52, return
+		// x;@66. Succ: x@29→{g(), return x}; g()→y@38→{continue, x--};
+		// continue→y@38; x--→x@29. IPDom: g(), continue → y@38 → x-- →
+		// x@29 → return x. Frontier walks: x@29→g() gives g(), y@38, x--,
+		// x@29; y@38→continue gives continue, y@38.
+		name:     "a continue in a for update's statement expression lands on the update's first node",
+		protects: "the continue path of a for loop begins at the update, so a continue issued inside it re-runs the update from its start",
+		mutation: "land the continue on the condition (loses y@38 -> y@38; x--@52 no longer post-dominates y@38)",
+		src:      "int f(int x, int y) { for (; x; ({ if (y) continue; x--; })) g(); return x; }",
+		cd: []string{"x@29 -> g()@61", "x@29 -> y@38", "x@29 -> x--@52", "x@29 -> x@29", "y@38 -> continue;@42",
+			"y@38 -> y@38"},
+		du: []string{"x@10 -> x@29", "x--@52 -> x@29", "y@17 -> y@38", "x@10 -> x--@52", "x--@52 -> x--@52",
+			"x@10 -> return x;@66", "x--@52 -> return x;@66"},
+	},
+	{
+		// Structured exception handling, try-except statement: `->` and `[]`
+		// dereference, so they may raise in a __try body. Nodes: p@16,
+		// a@24, r = 0@33, r = p->f + a[1]@48, the Handler __except@67, 1@77
+		// (the filter, a Branch), r = 1@82, return r;@91. Succ: r = p->f +
+		// a[1]→{return r, __except}; __except→1→{r = 1, EXIT}; r = 1→
+		// return r. IPDom: r = p->f + a[1], 1 → EXIT; __except → 1.
+		name:     "a field access through a pointer and a subscript may raise in a __try body",
+		protects: "-> and [] inside a __try reach its handler",
+		mutation: "count no throw for -> and [] (the __except path is unreachable: r = p->f + a[1]@48 controls nothing)",
+		src:      "int f(struct S *p, int *a) { int r = 0; __try { r = p->f + a[1]; } __except (1) { r = 1; } return r; }",
+		cd: []string{"r = p->f + a[1]@48 -> __except@67", "r = p->f + a[1]@48 -> 1@77", "r = p->f + a[1]@48 -> return r;@91",
+			"1@77 -> r = 1@82", "1@77 -> return r;@91"},
+		du: []string{"p@16 -> r = p->f + a[1]@48", "a@24 -> r = p->f + a[1]@48", "r = p->f + a[1]@48 -> return r;@91",
+			"r = 1@82 -> return r;@91"},
+	},
+	{
+		// Structured exception handling, try-except statement: `__leave`
+		// ends the __try body, a normal completion that skips the handler.
+		// Nodes: x@10, r = 0@19, x@38 (Branch), __leave;@41, r = g()@50 (may
+		// raise), the Handler __except@61, 1@71 (the filter), r = 1@76,
+		// return r;@85. Succ: x@38→{__leave, r = g()}; __leave→return r;
+		// r = g()→{return r, __except}; __except→1→{r = 1, EXIT}; r = 1→
+		// return r. IPDom: x@38, r = g(), 1 → EXIT; __leave, r = 1 →
+		// return r.
+		name:     "__leave in a __try/__except completes the body normally",
+		protects: "__leave reaches the statement after the try, not the handler, so the value from before the body reaches it",
+		mutation: "lower __leave as a plain statement falling into r = g() (loses r = 0@19 -> return r;@85)",
+		src:      "int f(int x) { int r = 0; __try { if (x) __leave; r = g(); } __except (1) { r = 1; } return r; }",
+		cd: []string{"x@38 -> __leave;@41", "x@38 -> return r;@85", "x@38 -> r = g()@50", "r = g()@50 -> return r;@85",
+			"r = g()@50 -> __except@61", "r = g()@50 -> 1@71", "1@71 -> r = 1@76", "1@71 -> return r;@85"},
+		du: []string{"x@10 -> x@38", "r = 0@19 -> return r;@85", "r = g()@50 -> return r;@85", "r = 1@76 -> return r;@85"},
+	},
+	{
+		// Structured exception handling, try-finally statement: the
+		// __finally block runs however the __try body is left, by break or
+		// by return, and each resumes after it. Nodes: x@10, x@21 (the loop
+		// head), x > 1@39 (Branch), break;@46, return 1;@53, g()@77 (the
+		// finally), return 0;@86. Succ: x@21→{x > 1, return 0}; x > 1→
+		// {break, return 1}; break, return 1→g(); g()→{return 0 (the
+		// break), EXIT (the return)}. No path completes the body, so the
+		// loop has no back edge. IPDom: x@21, g() → EXIT; x > 1 → g().
+		name:     "a break and a return out of a __try body both run its __finally",
+		protects: "a break and a return leaving a __try pass through the __finally, which then resumes each at its own target",
+		mutation: "resolve the break straight to its target (g()@77 no longer controls return 0;@86)",
+		src:      "int f(int x) { while (x) { __try { if (x > 1) break; return 1; } __finally { g(); } } return 0; }",
+		cd: []string{"x@21 -> x > 1@39", "x@21 -> g()@77", "x@21 -> return 0;@86", "x > 1@39 -> break;@46",
+			"x > 1@39 -> return 1;@53", "g()@77 -> return 0;@86"},
+		du: []string{"x@10 -> x@21", "x@10 -> x > 1@39"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
@@ -1033,6 +1176,33 @@ func TestCLoweringGolden(t *testing.T) {
 			cd:       []string{"a@30 -> b@35"},
 			du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
 				"r = a ?: b@26 -> return r;@38"},
+		},
+		{
+			// C17 §6.5.3.2p3: &s.f and &a[0] are addresses into s and a, so
+			// the callee may write both (C only: in C++ `struct S s;` is also
+			// a default-initialization node). Nodes: g(&s.f, &a[0])@36 (Uses
+			// and may-defines s and a), h(0, s.f)@52, return a[1];@63. No
+			// killing definition of s or a exists, so each read pairs with
+			// the call alone.
+			name:     "the address of a member or an element may-defines its base",
+			protects: "taking the address of a field or an element reaches later reads of the whole variable",
+			mutation: "take no base through &s.f (loses g(&s.f, &a[0])@36 -> h(0, s.f)@52) or through &a[i] (loses g(&s.f, &a[0])@36 -> return a[1];@63)",
+			src:      "int f(void) { struct S s; int a[2]; g(&s.f, &a[0]); h(0, s.f); return a[1]; }",
+			du:       []string{"g(&s.f, &a[0])@36 -> h(0, s.f)@52", "g(&s.f, &a[0])@36 -> return a[1];@63"},
+		},
+		{
+			// GNU C extension, Statements and Declarations in Expressions:
+			// when the last statement is a comma expression, its left
+			// operand is a statement and its right operand the value (C only:
+			// C++ may read `g(x), y;` as a declaration). Nodes: x@10, y@17,
+			// g(x)@33, y@39 (defining the construct's result), z = ({ g(x),
+			// y; })@26 (Uses it), return z;@46.
+			name:     "a comma expression as a statement expression's last statement yields its right operand",
+			protects: "only the right operand of a last comma statement is the value, and the left operand is a statement of its own",
+			mutation: "yield the whole comma expression (one node g(x), y@33 Using x and y replaces g(x)@33 and y@39: loses y@17 -> y@39)",
+			src:      "int f(int x, int y) { int z = ({ g(x), y; }); return z; }",
+			du: []string{"x@10 -> g(x)@33", "y@17 -> y@39", "y@39 -> z = ({ g(x), y; })@26",
+				"z = ({ g(x), y; })@26 -> return z;@46"},
 		},
 		{
 			// GNU C extension, Nested Functions: a nested function is its
