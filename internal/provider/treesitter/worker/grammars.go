@@ -40,6 +40,10 @@ type grammar struct {
 	// importNames derives the local names an import path introduces when the
 	// query captured none.
 	importNames func(path string) []string
+	// blank is the name that declares nothing in the language, or empty
+	// when every name it extracts binds one. A declaration of it is not
+	// extracted, and neither is any declaration nested inside it.
+	blank string
 	// flatFields are the names of the fields the lowerings resolve, the
 	// grammar's field registry, resolved on first use by fieldRegistry.
 	flatFields []string
@@ -285,7 +289,12 @@ var grammars = map[string]*grammar{
 			return d.kind == "function" && strings.HasSuffix(path, "_test.go") && goTestName.MatchString(d.name)
 		},
 		importNames: func(p string) []string { return []string{lastSegment(p, "/")} },
-		flatFields:  goFields,
+		// The Go specification, Blank identifier and Declarations and scope:
+		// the blank identifier "does not introduce a binding and thus is not
+		// declared", in a var, const, function, method, type or field
+		// position alike.
+		blank:      "_",
+		flatFields: goFields,
 	},
 	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
 	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
@@ -349,7 +358,11 @@ var grammars = map[string]*grammar{
 			return false
 		},
 		importNames: rustUseNames,
-		flatFields:  rustFields,
+		// The Rust Reference, Constant items: a free constant may be unnamed
+		// by writing an underscore for its name, and such a constant is not
+		// nameable. No other item the extraction reads may be named `_`.
+		blank:      "_",
+		flatFields: rustFields,
 	},
 	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, flatFields: cFields},
 	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},

@@ -405,6 +405,11 @@ func (e *extraction) emit(out *emitter) error {
 	nameSpans := make(map[span]bool, len(decls))
 	wireDecls := make([]wire.Decl, 0, len(decls))
 	scopeIdx := 0
+	// blank is the range of the last declaration of the grammar's blank
+	// name: a declaration strictly inside it is not extracted either (the
+	// fields of `type _ struct{...}` belong to nothing), while one sharing
+	// its exact range is a sibling (the x of `var _, x = f()`).
+	var blank span
 	for _, d := range decls {
 		if e.g.refine != nil {
 			e.g.refine(d, e.src)
@@ -413,6 +418,16 @@ func (e *extraction) emit(out *emitter) error {
 			continue
 		}
 		start, end := d.node.StartByte(), d.node.EndByte()
+		if r := (span{start, end}); blank.start <= start && end <= blank.end && r != blank {
+			continue
+		}
+		if e.g.blank != "" && d.name == e.g.blank {
+			// It declares nothing, but its name is still its own token, not
+			// a type reference.
+			blank = span{start, end}
+			nameSpans[span{d.nameStart, d.nameEnd}] = true
+			continue
+		}
 		for scopeIdx < len(e.scopes) && e.scopes[scopeIdx].start <= start {
 			s := e.scopes[scopeIdx]
 			stack = pop(stack, s.start)

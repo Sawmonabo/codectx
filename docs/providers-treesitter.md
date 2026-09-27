@@ -89,6 +89,22 @@ minted key basis, per node kind:
 | Import target | `module` | `provider.ScopeWorkspace` | `import:<lang>:<import path>` | no; qualified name = import path | `structural_key` (same import path from any file mints the same node) |
 | Callee reference | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | no | `unresolved`; metadata `{"resolution":…,"candidates":…,"callee":…}` |
 
+One identity is one node per unit. A second occurrence of an identity the
+unit already published (two declarators of C's `int x, x;` share the
+declaration's name, kind and range; two declarations can also resolve
+through a dependency's alias to one node; one import path can be imported
+twice) adds an evidence row to that node and publishes no second node and no
+second search document. Its relations merge into the ones already published,
+and each alias is published once.
+
+A name the language says declares nothing is not extracted: Go's blank
+identifier `_` in any position (the Go specification, Blank identifier: it
+"does not introduce a binding and thus is not declared") and Rust's unnamed
+constant `const _` (the Rust Reference, Constant items). Neither it nor any
+declaration nested inside it gets a node, search document, relation or
+alias; a declaration sharing its exact range, the `x` of `var _, x = f()`,
+is still extracted.
+
 A callee reference node is minted for every call this file cannot resolve to
 exactly one of its own declarations. Its metadata carries the Section 9.3
 attribute pair and no number that could be read as a confidence:

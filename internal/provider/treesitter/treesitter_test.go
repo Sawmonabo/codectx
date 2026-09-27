@@ -206,6 +206,12 @@ type capture struct {
 	nodes    []model.NodeFact
 	aliases  []model.NativeAlias
 	evidence []model.Evidence
+	search   []model.SearchUnit
+}
+
+func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
+	c.search = append(c.search, docs...)
+	return c.UnitOutput.PutSearchUnits(ctx, docs)
 }
 
 func (c *capture) PutAliases(ctx context.Context, a []model.NativeAlias) error {
@@ -226,6 +232,91 @@ func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) 
 		c.evidence = append(c.evidence, f.Evidence...)
 	}
 	return c.UnitOutput.PutRelations(ctx, facts)
+}
+
+// TestOneIdentityOneNodeAndBlankNamesDeclareNothing pins the two rules that
+// keep a unit's facts storable when a file repeats an identity. A unit that
+// published one node per declaration published the repeated identity's
+// search document twice, the store refused the second under its unique
+// (unit, search key), and the unit failed with nothing of the file indexed.
+func TestOneIdentityOneNodeAndBlankNamesDeclareNothing(t *testing.T) {
+	p := newProvider(t)
+	run := func(t *testing.T, file, src string) *capture {
+		t.Helper()
+		files := map[string]string{file: src}
+		h := providertest.New(t, files)
+		u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+		cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
+		result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
+		if err != nil {
+			t.Fatalf("RunUnit(%s): %v", file, err)
+		}
+		if result.State != model.RunSucceeded {
+			t.Fatalf("run state for %s = %s, want succeeded", file, result.State)
+		}
+		return cap
+	}
+	count := func(cap *capture, name string) (nodes, search int) {
+		for _, n := range cap.nodes {
+			if n.Node.Name == name {
+				nodes++
+			}
+		}
+		for _, d := range cap.search {
+			if d.Name == name {
+				search++
+			}
+		}
+		return nodes, search
+	}
+	noBlank := func(t *testing.T, cap *capture) {
+		t.Helper()
+		if nodes, search := count(cap, "_"); nodes != 0 || search != 0 {
+			t.Fatalf("%d nodes and %d search documents are named _; nodes: %s", nodes, search, names(cap.nodes))
+		}
+		for _, a := range cap.aliases {
+			if a.NativeKey == "_" || strings.HasSuffix(a.NativeKey, "._") || strings.HasPrefix(a.NativeKey, "decl:_@") {
+				t.Fatalf("alias %+v names the blank identifier", a)
+			}
+		}
+	}
+
+	// Go's blank identifier declares nothing, and the three `_` of one spec
+	// share the spec's range, so they also repeat one identity. Mutation:
+	// drop Go's blank name from the extraction -> `_` nodes appear; and with
+	// one node per declaration as well, the unit fails on the store.
+	t.Run("go blank names", func(t *testing.T) {
+		cap := run(t, "blank.go", "package p\nvar _, _, x, _ = f()\nfunc f() (int, int, int, int) { return 0, 0, 0, 0 }\n")
+		noBlank(t, cap)
+		for _, name := range []string{"x", "f"} {
+			if nodes, search := count(cap, name); nodes != 1 || search != 1 {
+				t.Fatalf("%s is %d nodes and %d search documents, want one of each; nodes: %s", name, nodes, search, names(cap.nodes))
+			}
+		}
+	})
+
+	// C's `int x, x;` is two tentative definitions of one object: both
+	// declarators share the declaration's name, kind and range, so they
+	// resolve to one identity. Mutation: publish a node and a search
+	// document per declaration -> the unit fails on the store's unique
+	// search key, or two nodes named x appear.
+	t.Run("c repeated declarator", func(t *testing.T) {
+		cap := run(t, "twice.c", "int x, x;\n")
+		if nodes, search := count(cap, "x"); nodes != 1 || search != 1 {
+			t.Fatalf("x is %d nodes and %d search documents, want one of each; nodes: %s", nodes, search, names(cap.nodes))
+		}
+		for _, n := range cap.nodes {
+			if n.Node.Name == "x" && len(n.Evidence) != 2 {
+				t.Fatalf("x carries %d evidence rows, want one per declarator", len(n.Evidence))
+			}
+		}
+	})
+
+	// Rust's unnamed constant is not nameable. Mutation: drop Rust's blank
+	// name from the extraction -> two constants named _ appear.
+	t.Run("rust unnamed constants", func(t *testing.T) {
+		noBlank(t, run(t, "unnamed.rs", "const _: () = ();\nconst _: () = ();\n"))
+	})
 }
 
 func lineOf(src []byte, offset uint64) uint32 {
