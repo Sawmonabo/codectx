@@ -391,7 +391,7 @@ func TestParseMemory(t *testing.T) {
 		}
 		row.HasError = tree.RootNode().HasError()
 		native.SetCounting(false)
-		flat, err := worker.Flatten(tree)
+		flat, err := worker.Flatten(tree, in.language.Name)
 		native.SetCounting(true)
 		if err != nil {
 			tree.Close()

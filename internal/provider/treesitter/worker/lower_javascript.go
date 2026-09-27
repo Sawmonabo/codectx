@@ -2660,13 +2660,13 @@ func resolveJSSyntax(language string) *jsSyntax {
 	s.constKw, s.eqTok, s.staticKw, s.usingKw, s.deleteKw = tok("const"), tok("="), tok("static"), tok("using"), tok("delete")
 	s.typeKw, s.optTok = tl.IdForNodeKind("type", false), tl.IdForNodeKind("?.", false)
 	s.extendsClause = opt("extends_clause")
-	s.fPattern = tl.FieldIdForName("pattern")
 	s.fAlternative, s.fArgument, s.fArguments = field("alternative"), field("argument"), field("arguments")
 	s.fBody, s.fCondition, s.fConsequence, s.fDeclaration = field("body"), field("condition"), field("consequence"), field("declaration")
 	s.fFinalizer, s.fFunction, s.fHandler, s.fIncrement = field("finalizer"), field("function"), field("handler"), field("increment")
 	s.fIndex, s.fInitializer, s.fKey, s.fKind, s.fLabel = field("index"), field("initializer"), field("key"), field("kind"), field("label")
 	s.fLeft, s.fName, s.fObject, s.fOperator = field("left"), field("name"), field("object"), field("operator")
 	s.fOptionalChain, s.fParameter, s.fParameters = field("optional_chain"), field("parameter"), field("parameters")
+	s.fPattern = field("pattern")
 	s.fProperty, s.fRight, s.fValue = field("property"), field("right"), field("value")
 	return s
 }

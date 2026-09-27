@@ -243,7 +243,7 @@ func (p parsed) parseErrors() (lang.ParseErrors, *wire.Error) {
 	if !p.tree.RootNode().HasError() {
 		return lang.ParseErrors{}, nil
 	}
-	f, err := Flatten(p.tree)
+	f, err := flatten(p.tree, &noFields)
 	if err != nil {
 		return lang.ParseErrors{}, &wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}
 	}

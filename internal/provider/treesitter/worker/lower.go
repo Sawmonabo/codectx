@@ -338,11 +338,18 @@ func mustKind(tl *ts.Language, language, name string, named bool) uint16 {
 	return v
 }
 
-// mustField is the id of the field name in tl, the grammar of language.
+// mustField is the id of the field name in tl, the grammar of language. A
+// field the grammar does not define, or that the language's field registry
+// (grammars.go) does not list, is a lowering defect and panics: the flat
+// array records only the registered fields, so a lowering resolving another
+// could never read it there.
 func mustField(tl *ts.Language, language, name string) uint16 {
 	v := tl.FieldIdForName(name)
 	if v == 0 {
 		panic("worker: the " + language + " grammar has no field " + name)
+	}
+	if !grammars[language].fieldRegistry().known[v] {
+		panic("worker: the " + language + " field registry does not list " + name)
 	}
 	return v
 }

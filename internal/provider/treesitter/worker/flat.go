@@ -1,6 +1,12 @@
 package worker
 
-import "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+import (
+	"cmp"
+	"slices"
+	"strconv"
+
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+)
 
 // Flat is one file's parse tree as a Go-side node array, filled by Flatten.
 // It holds no native pointer and no Go pointer, so it outlives the tree it
@@ -8,6 +14,12 @@ import "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 // after Flatten, so any number of readers may share it.
 type Flat struct {
 	nodes []flatNode
+	// fields is the field table: for each node, in preorder, the answer of
+	// the library's ts_node_child_by_field_id for every registered field
+	// that has one, as (field, node index) pairs, so it is sorted by node.
+	fields []flatField
+	// registered is the grammar's field registry, indexed by field id.
+	registered []bool
 }
 
 // Root is the tree's root node.
@@ -199,15 +211,25 @@ func (n Node) NamedChild(i uint) Node {
 	return Node{}
 }
 
-// ChildByFieldId is the node's first child under field id, or null; id 0
-// names no field.
+// ChildByFieldId is the node the library's ts_node_child_by_field_id
+// answers for the node and field id, or null, read from the field table:
+// the first child under the field, a node inside a hidden or an aliased
+// child for a field that child passes up, and null on an ERROR node. Id 0
+// names no field and answers null. An id the grammar's field registry does
+// not list is a lowering defect and panics: the array does not record it.
 func (n Node) ChildByFieldId(id uint16) Node {
+	_ = n.rec()
 	if id == 0 {
 		return Node{}
 	}
-	for c := n.first(); !c.IsNull(); c = c.next() {
-		if uint16(c.rec().field) == id {
-			return c
+	if int(id) >= len(n.f.registered) || !n.f.registered[id] {
+		panic("worker: field " + strconv.Itoa(int(id)) + " is not in the grammar's field registry")
+	}
+	fs := n.f.fields
+	k, _ := slices.BinarySearchFunc(fs, n.i, func(e flatField, i uint32) int { return cmp.Compare(uint32(e.node), i) })
+	for ; k < len(fs) && uint32(fs[k].node) == n.i; k++ {
+		if uint16(fs[k].field) == id {
+			return Node{f: n.f, i: uint32(fs[k].child)}
 		}
 	}
 	return Node{}
@@ -234,7 +256,8 @@ func (c *Cursor) Reset(n Node) { c.root, c.cur = n, n }
 func (c *Cursor) Node() Node { return c.cur }
 
 // FieldId is the field of the cursor's node under its parent, or 0 at the
-// cursor's root, as the native cursor reports it.
+// cursor's root, as the native cursor reports it: the nearest field, which
+// ChildByFieldId's answers can differ from (see Flatten).
 func (c *Cursor) FieldId() uint16 {
 	if c.cur == c.root {
 		return 0

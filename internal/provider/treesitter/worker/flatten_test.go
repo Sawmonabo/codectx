@@ -37,9 +37,12 @@ import (
 //     answered as the native node answers it -- NextSibling and
 //     NextNamedSibling skipping a zero-width sibling at the node's end, as
 //     the native calls do -- ChildByFieldId for every field id of the
-//     grammar, and the cursor stepped in lockstep with a native one from
-//     every node; every absent answer is the null handle, as the zero Node
-//     is.
+//     grammar's field registry, answered as the library's field map answers
+//     it (a field inherited through a hidden or an aliased child, an outer
+//     field on a node that also has a nearer one, none on an ERROR node),
+//     and the cursor stepped in lockstep with a native one from every node,
+//     its FieldId the nearest field; every absent answer is the null handle,
+//     as the zero Node is.
 //
 // Every mismatch is reported, not only the first, so one defect does not
 // hide another.
@@ -51,11 +54,13 @@ import (
 // the node itself instead of the null handle; drop the zero-width skip from
 // NextSibling, or apply it to the record's link or to Child; sum error bytes
 // over every node that contains an error instead of every ERROR node, or
-// count an ERROR node nested in another.
+// count an ERROR node nested in another; answer ChildByFieldId from the
+// children's nearest fields instead of the field table (an inherited field,
+// an outer field and an ERROR node fail); resolve an answer below an aliased
+// child to that child instead of the answer itself.
 func TestFlatMatchesNative(t *testing.T) {
 	srcs := flatSources(t)
 	for _, l := range lang.All {
-		tl := mustGrammar(l.Name)
 		p, err := NewParser(l.Name)
 		if err != nil {
 			t.Fatal(err)
@@ -67,14 +72,14 @@ func TestFlatMatchesNative(t *testing.T) {
 					t.Fatal("the parser produced no tree")
 				}
 				defer tree.Close()
-				f, err := Flatten(tree)
+				f, err := Flatten(tree, l.Name)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if got, want := f.parseErrors(grammars[l.Name].kindIDs().errorKind), nativeErrors(tree); got != want {
 					t.Errorf("flat error figures %+v, native %+v", got, want)
 				}
-				checkFlat(t, tl, tree, f)
+				checkFlat(t, grammars[l.Name].fieldRegistry(), tree, f)
 			})
 		}
 		p.Close()
@@ -209,7 +214,7 @@ func stringLit(t *testing.T, fset *token.FileSet, e ast.Expr) string {
 }
 
 // checkFlat compares f with tree; see TestFlatMatchesNative.
-func checkFlat(t *testing.T, tl *ts.Language, tree *ts.Tree, f *Flat) {
+func checkFlat(t *testing.T, reg *fieldRegistry, tree *ts.Tree, f *Flat) {
 	t.Helper()
 	// The native nodes in preorder, each with the field the cursor reports
 	// for it, and each native id's preorder index.
@@ -281,7 +286,6 @@ walked:
 		t.Fatalf("%d flat nodes, %d native", len(f.nodes), len(native))
 	}
 
-	fieldCount := uint16(tl.FieldCount())
 	nc, fc := root.Walk(), froot.Walk()
 	defer nc.Close()
 	defer fc.Close()
@@ -329,7 +333,7 @@ walked:
 		for j := range n.NamedChildCount() + 1 {
 			at("NamedChild("+strconv.Itoa(int(j))+")", flat(fn.NamedChild(j)), nat(n.NamedChild(j)))
 		}
-		for id := range fieldCount + 2 {
+		for _, id := range reg.ids {
 			at("ChildByFieldId("+strconv.Itoa(int(id))+")", flat(fn.ChildByFieldId(id)), nat(n.ChildByFieldId(id)))
 		}
 
