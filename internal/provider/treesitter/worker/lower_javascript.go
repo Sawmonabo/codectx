@@ -118,7 +118,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     expression Uses its reads and defines the iteration variable, then a
 //     Branch head spanning the head clause from the left side to the end of
 //     the iterated expression (whether another element is assigned) Uses
-//     only that variable and defines nothing. On the body path, after the
+//     only that variable and defines nothing; the left side is the
+//     grammar's left field, the bound pattern or target, so `const`, `let`,
+//     `var` and `await` lie before the span (`for (const x of xs)`'s head
+//     is `x of xs`). On the body path, after the
 //     head, the left side is assigned (§14.7.5.7 ForIn/OfBodyEvaluation):
 //     each name it binds is defined by the destructuring rule below (a bare
 //     identifier is one defining node spanning it), and a property target
@@ -155,7 +158,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     side's incoming value is the iteration variable, and a parameter's (the
 //     argument) or a catch parameter's (the thrown value) reads none. A
 //     default (`a = e` in a pattern or parameter) is a Branch node spanning
-//     the element that defines the name from the incoming value and Uses
+//     the element (for a property element `k: a = e`, its value `a = e`, the
+//     key outside it) that defines the name from the incoming value and Uses
 //     only that value, then a Stmt node spanning e that defines it from the
 //     default and Uses only e's reads, since e is evaluated after the test;
 //     for a nested pattern the two define an owned variable instead, the
@@ -211,6 +215,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     variable it names; it depends on the object's shape at run time, and
 //     `with` is excluded from strict code (§14.11.1), so modules and classes
 //     never contain it. A body name is the variable it names.
+//   - A default export of an expression is the node of that expression,
+//     spanning it and not the export statement (`export default x + 1;`
+//     makes x + 1).
 //   - `export { … }`, `export * from …` and `export { … } from …` evaluate
 //     nothing where they stand (they declare the module's export bindings),
 //     so they make no node, as an import statement makes none.
@@ -298,7 +305,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // MayThrow is given to every node whose own evaluation — the part of the
 // source evaluated since the previous node — contains a call, `new`,
 // `await`, `yield`, a spread, a property read or write, a destructuring
-// element, a for…of iterator step (including for await), or the creation of
+// element, a for…of iterator step (including for await) on the loop's head,
+// the iterator's creation on a for…of's iterated expression's node (GetIterator
+// calls the value's iterator method, ECMA-262 §7.4.3, and throws when there is
+// none), or the creation of
 // a class that evaluates an `extends` expression, a computed key, a static
 // field initializer, a static block or a decorator (ECMA-262 §15.7.14); a
 // throw statement's node is also a Throw. A property write throws when the
@@ -312,6 +322,14 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // MayThrow; a throw statement's node enters the clause's first node
 // directly. With neither, the clause's nodes are still made, with no
 // predecessor.
+// A for…in's iterated expression and head are no throw points: the keys are
+// enumerated without a call of the program's own code, a proxy's traps aside,
+// which are given up as an operator's ToPrimitive is. A per-iteration binding
+// of a bare identifier is none either: it initializes or assigns a variable,
+// and only a destructuring element reads a property. An enum's and a
+// namespace's own node is none: the emitted call invokes the function the
+// emit has just created, which is always callable, and the code its body runs
+// is the member initializers' and the body's own nodes.
 // An operator is not counted, arithmetic and comparison alike, although
 // either can throw through ToPrimitive (§7.1.1) when an operand is an
 // object whose valueOf or toString throws, and `in` and `instanceof` throw
@@ -327,9 +345,15 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // start (the strict-mode rule, which modules and classes impose); a catch
 // parameter is scoped to its clause and a `for (let …)` binding to its loop;
 // a switch body is one block. Parameter defaults see the parameters only.
-// A `using` declaration arises in the javascript grammar only: the typescript
-// and tsx grammars have no using declaration, so there the construct cannot
-// be written and has no case.
+// The typescript and tsx grammars parse a using declaration (ES2026, TS 5.2)
+// as an assignment carrying `using`, `using a = e, b = f` as a comma sequence
+// whose first element is one: each such statement is that declaration, its
+// names bound from the block's start and each declarator's node spanning it
+// from its name, as the javascript grammar's using declaration is. The
+// disposal a using declaration schedules for the block's exit (a call of the
+// value's dispose method, which may throw) makes no node and is no throw
+// point: the call is the value's own method, given up as an operator's
+// ToPrimitive is (see Exceptions).
 //
 // # TypeScript
 //
@@ -391,7 +415,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     of its path that Uses and defines that name, then the body as a block
 //     with its own var scope. A namespace the grammar places in an
 //     expression statement is that namespace, with no node of its own for
-//     the statement. A namespace named by a string is ambient.
+//     the statement. A namespace named by a string is ambient: only a
+//     declaration file writes one without `declare`, and nothing in it runs.
 //   - `import x = require(m)` is one Stmt node spanning x, where it stands
 //     (in the program too, never also an import binding after Entry), that
 //     defines it and may throw; `import x = A.B` is one spanning x that
@@ -1032,8 +1057,36 @@ func (j *jsLower) predeclare(n *ts.Node, mark int) {
 			if name := j.root(ns.ChildByFieldId(k.fName)); name != nil && name.KindId() == k.identifier && !j.boundSince(mark, name) {
 				j.declare(name)
 			}
+		} else if n.KindId() == k.expressionStatement {
+			if e := firstNamed(n); e != nil {
+				j.declareUsing(e, false)
+			}
 		}
 	}
+}
+
+// declareUsing binds the names of a using declaration as the typescript and
+// tsx grammars parse it: an assignment carrying `using` (`using a = e`), or a
+// comma sequence whose first element is one (`using a = e, b = f`), every
+// element after it being another declarator of the same declaration. using
+// reports whether an earlier element of the sequence carried `using`; the
+// result is whether e or an element of it did.
+func (j *jsLower) declareUsing(e *ts.Node, using bool) bool {
+	k := j.k
+	switch e.KindId() {
+	case k.sequenceExpression:
+		start, list := j.kids(e)
+		for i := range list {
+			using = j.declareUsing(&list[i], using)
+		}
+		j.done(start)
+	case k.assignmentExpression:
+		using = using || j.hasTok(e, k.usingKw)
+		if left := j.strip(e.ChildByFieldId(k.fLeft)); using && left.KindId() == k.identifier {
+			j.declare(left)
+		}
+	}
+	return using
 }
 
 // hoistFunction emits a function declaration's hoisted defining node, spanning
@@ -1808,7 +1861,14 @@ func (j *jsLower) assign(n *ts.Node) {
 	switch left.KindId() {
 	case k.identifier:
 		j.value(right, false)
-		j.carry(j.node(flow.Stmt, n, m, len(j.reads)), m, left)
+		// An assignment carrying `using` is a using declaration's
+		// declarator (see Scoping in lowerJavaScript), which spans from
+		// its name, as a declarator does.
+		span := spanOf(n)
+		if j.hasTok(n, k.usingKw) {
+			span.Start = uint32(left.StartByte())
+		}
+		j.carry(j.nodeAt(flow.Stmt, span, m, len(j.reads)), m, left)
 	case k.objectPattern, k.arrayPattern:
 		// The right side is evaluated once, at its own node, whose result
 		// is the incoming value of every element and the assignment's
@@ -2449,7 +2509,7 @@ type jsSyntax struct {
 	// imports is the import-clause table the extraction shares.
 	imports importSyntax
 
-	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, staticKw uint16
+	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, staticKw, usingKw uint16
 	// typeKw and optTok (the anonymous `?.` of a TypeScript optional call)
 	// are optional.
 	typeKw, optTok uint16
@@ -2520,7 +2580,7 @@ func resolveJSSyntax(language string) *jsSyntax {
 			s.erased[id] = true
 		}
 	}
-	s.constKw, s.eqTok, s.staticKw = tok("const"), tok("="), tok("static")
+	s.constKw, s.eqTok, s.staticKw, s.usingKw = tok("const"), tok("="), tok("static"), tok("using")
 	s.typeKw, s.optTok = tl.IdForNodeKind("type", false), tl.IdForNodeKind("?.", false)
 	s.extendsClause = opt("extends_clause")
 	s.fPattern = tl.FieldIdForName("pattern")

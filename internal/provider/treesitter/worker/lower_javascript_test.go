@@ -70,7 +70,10 @@ var javascriptShared = []goldenCase{
 	{
 		// ECMA-262 §8.3.2 ContainsUndefinedBreakTarget: the label names no
 		// statement, an early error the lowering does not reject; the jump is
-		// counted and augmented to Exit.
+		// counted and augmented to Exit. Ill-formed on purpose: every engine
+		// and compiler rejects the source (`Undefined label 'missing'`), and
+		// the case pins how the lowering treats a jump no frame resolves,
+		// which a parse-clean tree still carries.
 		name:       "break to a missing label",
 		protects:   "a jump to no label is counted, keeps no successor and is augmented to Exit",
 		mutation:   "wire an unresolved break to the innermost loop, or drop the count",
@@ -78,6 +81,7 @@ var javascriptShared = []goldenCase{
 		fn:         1,
 		cd:         []string{"g()@22 -> break missing;@29"},
 		unresolved: 1,
+		illFormed:  true,
 	},
 	{
 		// ECMA-262 §14.15.3 The try Statement, Runtime Semantics: Evaluation
@@ -402,24 +406,6 @@ var javascriptShared = []goldenCase{
 		},
 	},
 	{
-		// ECMA-262 Annex B.3.3 FunctionDeclarations in IfStatement Statement
-		// Clauses: the declaration behaves as if it were in a block of its own.
-		// Nodes: c@11, g = 0@20, the Branch c@31, the hoisted g@43 (defines
-		// the inner g), the declaration function g() { return c }@34 (Uses
-		// its capture c, may-defines the inner g, so it pairs with g@43),
-		// return g;@60, which reads the outer g.
-		name:     "a function declaration as an if body is scoped to that body",
-		protects: "the declaration binds and defines its own name in an implicit block, so it never may-defines an enclosing variable of the same name",
-		mutation: "lower an if body with stmt alone (the hoisted g@43 vanishes with g@43 -> function g() { return c }@34, and function g() { return c }@34 may-defines the outer g: g = 0@20 -> function g() { return c }@34 and function g() { return c }@34 -> return g;@60 appear)",
-		src:      "function f(c) { let g = 0; if (c) function g() { return c } return g; }",
-		fn:       1,
-		cd:       []string{"c@31 -> g@43", "c@31 -> function g() { return c }@34"},
-		du: []string{
-			"c@11 -> c@31", "c@11 -> function g() { return c }@34", "g@43 -> function g() { return c }@34",
-			"g = 0@20 -> return g;@60",
-		},
-	},
-	{
 		// ECMA-262 §14.12.3 CaseClauseIsSelected: each test compares the
 		// discriminant's value, evaluated once (§14.12.4), with the test's.
 		// Nodes: x@11, the discriminant x@24 (Uses x, defines its value),
@@ -607,19 +593,6 @@ var javascriptShared = []goldenCase{
 		du:       []string{"x = 1@24 -> return (x = 1) + (x = 2);@16", "x = 2@34 -> return (x = 1) + (x = 2);@16"},
 	},
 	{
-		// ECMA-262 §14.11.2 The with Statement, Runtime Semantics: Evaluation:
-		// the object is evaluated, then the body runs in an object
-		// environment. Nodes: o@11, x@14, the object o@25 (Uses o), g(x)@30
-		// (Uses the parameter x: a name's resolution to one of the object's
-		// properties is given up), return x;@38.
-		name:     "a with statement evaluates its object and its body reads the variables it names",
-		protects: "a with statement's object is a node of its own that reads it, and a name in the body is the variable it names",
-		mutation: "drop the with statement's object node (o@11 -> o@25 vanishes), or bind the body's names to nothing inside a with (x@14 -> g(x)@30 vanishes)",
-		src:      "function f(o, x) { with (o) { g(x); } return x; }",
-		fn:       1,
-		du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
-	},
-	{
 		// ECMA-262 §13.13 Binary Logical Operators (the right operand is
 		// evaluated only when c is truthy) and §13.15.4
 		// EvaluateStringOrNumericBinaryExpression (x is read before the right
@@ -644,8 +617,8 @@ var javascriptShared = []goldenCase{
 		// GetIdentifierReference: f declares no g, so every g resolves
 		// past f's environments to the global one (in sloppy code an
 		// assignment to an unresolvable reference creates a global
-		// property, §6.2.5.6 PutValue, and `delete g` is allowed,
-		// §13.5.1.1), never to a variable of f; h is free too. Nodes: a@11;
+		// property, §6.2.5.6 PutValue), never to a variable of f; h is free
+		// too. Nodes: a@11;
 		// g = a@16, g += a@23 and g++@31 (each Uses its reads, defines
 		// nothing); the Branch g@36 and the write g ??= a@36 (Uses a); the
 		// embedded g = a@47 (Uses a, defines its result) and h(g = a)@45
@@ -653,26 +626,27 @@ var javascriptShared = []goldenCase{
 		// right side a@74 (Uses a, defines the incoming value), the
 		// default's Branch g = a@65 (Uses it) and the default a@69 (Uses
 		// a); the iterated a@87 (Uses a, defines the iteration variable),
-		// the head g of a@82 and the binding g@82 (each Uses it), delete
-		// g@90 (Uses nothing); the arrow () => g += a@110 (Uses its
-		// capture a, may-defines nothing, defines its result), the
-		// declarator c = () => g += a@106 (Uses the result, defines c);
-		// return c;@124.
+		// the head g of a@82 and the binding g@82 (each Uses it), h(g)@90
+		// (Uses nothing); the arrow () => g += a@106 (Uses its capture a,
+		// may-defines nothing, defines its result), the declarator c = ()
+		// => g += a@102 (Uses the result, defines c); return c;@120. `delete
+		// g` is left out, being sloppy code only: its operand is a plain read,
+		// the path h(g)@90 already takes.
 		name:     "a name that resolves to no variable is read and written as nothing in every position",
-		protects: "an unresolved name as an assignment, compound, update, logical, embedded, property-base, destructuring-default, iteration, deletion or capture target defines and reads nothing, while its node keeps its other reads",
+		protects: "an unresolved name as an assignment, compound, update, logical, embedded, property-base, destructuring-default, iteration or capture target defines and reads nothing, while its node keeps its other reads",
 		mutation: "drop the v < 0 return in def (flow.Builder.Def panics on g's -1 at g = a@16), in read (seen[-1] panics at g += a@23), in mayDefBase (MayDef(-1) at g.p = a@55) or in capTarget (MayDef(-1) on the arrow's node)",
-		src:      "function f(a) { g = a; g += a; g++; g ??= a; h(g = a); g.p = a; [g = a] = a; for (g of a) delete g; const c = () => g += a; return c; }",
+		src:      "function f(a) { g = a; g += a; g++; g ??= a; h(g = a); g.p = a; [g = a] = a; for (g of a) h(g); const c = () => g += a; return c; }",
 		fn:       1,
 		cd: []string{
 			"g@36 -> g ??= a@36", "g = a@65 -> a@69",
-			"g of a@82 -> g of a@82", "g of a@82 -> g@82", "g of a@82 -> delete g@90",
+			"g of a@82 -> g of a@82", "g of a@82 -> g@82", "g of a@82 -> h(g)@90",
 		},
 		du: []string{
 			"a@11 -> g = a@16", "a@11 -> g += a@23", "a@11 -> g ??= a@36", "a@11 -> g = a@47",
 			"g = a@47 -> h(g = a)@45", "a@11 -> g.p = a@55", "a@11 -> a@74", "a@74 -> g = a@65",
 			"a@11 -> a@69", "a@11 -> a@87", "a@87 -> g of a@82", "a@87 -> g@82",
-			"a@11 -> () => g += a@110", "() => g += a@110 -> c = () => g += a@106",
-			"c = () => g += a@106 -> return c;@124",
+			"a@11 -> () => g += a@106", "() => g += a@106 -> c = () => g += a@102",
+			"c = () => g += a@102 -> return c;@120",
 		},
 	},
 	{
@@ -897,8 +871,9 @@ var javascriptShared = []goldenCase{
 		du:       []string{"a = 1@23 -> b = a@30", "b = a@30 -> return b;@37"},
 	},
 	{
-		// TC39 Decorators proposal (ClassDefinitionEvaluation applies the decorators, a call, where the class
-		// is created) and ECMA-262 §13.3.6. The class node @d class A {}@22 spans its decorator, reads d and
+		// ECMAScript decorators (the TC39 Decorators proposal, stage 3; TypeScript 5.0 without
+		// experimentalDecorators): ClassDefinitionEvaluation applies the decorators, a call, where the class
+		// is created, and ECMA-262 §13.3.6. The class node @d class A {}@22 spans its decorator, reads d and
 		// may throw, so it controls the Handler catch@38, e@45 and g()@50.
 		name:     "a decorated JavaScript class spans its decorators, reads them and may throw at its creation",
 		protects: "a decorator is part of the class declaration's node and its application is a throw point",
@@ -909,7 +884,8 @@ var javascriptShared = []goldenCase{
 		du:       []string{"d@11 -> @d class A {}@22"},
 	},
 	{
-		// TC39 Decorators proposal and ECMA-262 §16.2.3 Exports: decorators written before `export` belong to
+		// ECMAScript decorators (the TC39 Decorators proposal, stage 3; TypeScript 5.0) and ECMA-262 §16.2.3
+		// Exports: decorators written before `export` belong to
 		// the export statement; the class node class A {}@25 lies after them and reads them. Program nodes: d
 		// = g()@6, class A {}@25.
 		name:     "decorators written before export are read by the exported class's node",
@@ -1144,16 +1120,16 @@ var javascriptShared = []goldenCase{
 	},
 	{
 		// ECMA-262 §13.3.5.1 EvaluateNew and §13.2.4.1 ArrayAccumulation (a spread iterates): new and spread
-		// are throw points. Nodes: a@11, r = 0@20, r = new C()@33 and r = [...a]@46 (each may throw), the
-		// Handler catch@60, e@67, return r;@72, return r;@84. The Handler sees r = 0 from the first and r =
-		// new C() from the second.
+		// are throw points. Nodes: a@11, r = [0]@20, r = new C()@35 and r = [...a]@48 (each may throw), the
+		// Handler catch@62, e@69, return r;@74, return r;@86. The Handler sees r = [0] from the first and r =
+		// new C() from the second. r starts as an array, so a TypeScript compiler accepts both assignments.
 		name:     "new and spread are throw points",
 		protects: "a node whose evaluation contains new or a spread reaches the catch's Handler, with the values from before it",
-		mutation: "stop counting new as a throw (r = new C()@33 controls nothing and r = 0@20 -> return r;@72 vanishes), or spread (r = new C()@33 -> return r;@72 vanishes)",
-		src:      "function f(a) { let r = 0; try { r = new C(); r = [...a]; } catch (e) { return r; } return r; }",
+		mutation: "stop counting new as a throw (r = new C()@35 controls nothing and r = [0]@20 -> return r;@74 vanishes), or spread (r = new C()@35 -> return r;@74 vanishes)",
+		src:      "function f(a) { let r = [0]; try { r = new C(); r = [...a]; } catch (e) { return r; } return r; }",
 		fn:       1,
-		cd:       []string{"r = new C()@33 -> r = [...a]@46", "r = new C()@33 -> catch@60", "r = new C()@33 -> e@67", "r = new C()@33 -> return r;@72", "r = [...a]@46 -> return r;@84", "r = [...a]@46 -> catch@60", "r = [...a]@46 -> e@67", "r = [...a]@46 -> return r;@72"},
-		du:       []string{"a@11 -> r = [...a]@46", "r = 0@20 -> return r;@72", "r = new C()@33 -> return r;@72", "r = [...a]@46 -> return r;@84"},
+		cd:       []string{"r = new C()@35 -> r = [...a]@48", "r = new C()@35 -> catch@62", "r = new C()@35 -> e@69", "r = new C()@35 -> return r;@74", "r = [...a]@48 -> return r;@86", "r = [...a]@48 -> catch@62", "r = [...a]@48 -> e@69", "r = [...a]@48 -> return r;@74"},
+		du:       []string{"a@11 -> r = [...a]@48", "r = [0]@20 -> return r;@74", "r = new C()@35 -> return r;@74", "r = [...a]@48 -> return r;@86"},
 	},
 	{
 		// ECMA-262 §15.8 Async Function Definitions (Await may complete with a throw). Nodes: p@17, r = 0@26,
@@ -1239,34 +1215,36 @@ var javascriptShared = []goldenCase{
 	},
 	{
 		// ECMA-262 §14.15.3 The try Statement: nothing in the block throws, so the catch is entered by no path
-		// and has no Handler. Its nodes e, y = e and h(y) are made with no predecessor, so they pair with
-		// nothing; x = 1@22 reaches return x;@64. That the nodes are made is not visible in the pairs; the
-		// case pins that no Handler is made.
+		// and has no Handler. Its nodes e@38, y = e@49 and h(y)@56 are made, e@38 with no predecessor: no
+		// value of the try block reaches them, so x@11 does not reach return x;@64 through the catch, and
+		// x = 1@22 alone does. Inside the unreachable clause the definitions still reach their uses along its
+		// own edges (flow.DefUse: only the value on entry to a node with no predecessor is undefined), so e@38
+		// pairs with y = e@49 and y = e@49 with h(y)@56.
 		name:     "a catch that no throw reaches has no Handler",
-		protects: "without a throwing node the catch is unreachable and its nodes carry no pair",
-		mutation: "make a Handler for every catch clause (e@38 -> y = e@49 appears)",
+		protects: "without a throwing node the catch is entered by no path, so no value from before the try reaches the code after it through the catch",
+		mutation: "count an assignment to a local as a throw point (x = 1@22 reaches the Handler catch@31: x@11 -> return x;@64 appears and x = 1@22 controls catch@31, e@38, y = e@49 and h(y)@56)",
 		src:      "function f(x) { try { x = 1; } catch (e) { const y = e; h(y); } return x; }",
 		fn:       1,
-		du:       []string{"x = 1@22 -> return x;@64"},
+		du:       []string{"x = 1@22 -> return x;@64", "e@38 -> y = e@49", "y = e@49 -> h(y)@56"},
 	},
 	{
 		// ECMA-262 §7.1.1 ToPrimitive: an operator can throw through an operand's valueOf, which the lowering
 		// gives up, so r = a + b@36 is no throw point and the catch is unreachable. Nodes: a@11, b@14, r =
-		// 0@20, r = a + b@36, return r;@73.
+		// 0@23, r = a + b@36, return r;@73.
 		name:     "an operator is not a throw point",
 		protects: "arithmetic does not make a node reach a Handler",
-		mutation: "count binary operators as throws (r = a + b@36 controls the catch and r = 0@20 -> return r;@61 appears)",
+		mutation: "count binary operators as throws (r = a + b@36 controls the catch and r = 0@23 -> return r;@61 appears)",
 		src:      "function f(a, b) { let r = 0; try { r = a + b; } catch (e) { return r; } return r; }",
 		fn:       1,
 		du:       []string{"a@11 -> r = a + b@36", "b@14 -> r = a + b@36", "r = a + b@36 -> return r;@73"},
 	},
 	{
 		// ECMA-262 §14.15.3 (TryStatement : try Block Catch Finally): a throw from the block enters the catch,
-		// and the finally runs after either. Nodes: r = 0@20, r = g()@32 (may throw to the catch's Handler
+		// and the finally runs after either. Nodes: r = 0@19, r = g()@32 (may throw to the catch's Handler
 		// catch@43), e@50, r = 1@55, h(r)@74. Nothing in the catch throws, so the finally has no Handler.
 		name:     "a try with both catch and finally sends the block's throw to the catch, then both paths through the finally",
 		protects: "the catch frame is innermost for the block, and the finally is entered after the block and after the catch",
-		mutation: "send the block's throw to the finally (r = 0@20 -> h(r)@74 appears and r = g()@32 loses control of e@50)",
+		mutation: "send the block's throw to the finally (r = 0@19 -> h(r)@74 appears and r = g()@32 loses control of e@50)",
 		src:      "function f() { let r = 0; try { r = g(); } catch (e) { r = 1; } finally { h(r); } }",
 		fn:       1,
 		cd:       []string{"r = g()@32 -> catch@43", "r = g()@32 -> e@50", "r = g()@32 -> r = 1@55"},
@@ -1305,6 +1283,21 @@ var javascriptShared = []goldenCase{
 		fn:        2,
 		du:        []string{"x@12 -> return g(x);@17"},
 		callables: 3,
+	},
+	{
+		// ECMA-262 §14.3.1 Let, Const, and Using Declarations (Explicit
+		// Resource Management, ES2026; TypeScript 5.2): a using binding is
+		// block-scoped like const. The typescript and tsx grammars parse the
+		// declaration as an assignment carrying `using`, whose node spans the
+		// declarator from its name, so every grammar renders a = g()@24.
+		// Nodes: a@11, a = g()@24 (defines the block's a), h(a)@33 (Uses it),
+		// return a;@41 (Uses the parameter).
+		name:     "a using declaration is block-scoped",
+		protects: "using binds its names in its block from the block's start, as let and const do",
+		mutation: "leave using_declaration, or the using assignment of the typescript grammars, out of predeclare (a = g()@24 defines the parameter: a = g()@24 -> return a;@41 replaces a@11 -> return a;@41), or span the using assignment whole (using a = g()@18 replaces a = g()@24 under typescript and tsx)",
+		src:      "function f(a) { { using a = g(); h(a); } return a; }",
+		fn:       1,
+		du:       []string{"a = g()@24 -> h(a)@33", "a@11 -> return a;@41"},
 	},
 }
 
@@ -1354,19 +1347,44 @@ var javascriptJSX = []goldenCase{
 	},
 }
 
-// javascriptOnly holds the cases whose construct only the javascript grammar
-// parses: the typescript and tsx grammars have no using declaration.
+// javascriptOnly holds the cases whose source only sloppy JavaScript accepts:
+// the typescript and tsx grammars parse them clean, but a TypeScript compiler
+// rejects them, as strict code does.
 var javascriptOnly = []goldenCase{
 	{
-		// ECMA-262 §14.3.1 Let, Const, and Using Declarations (Explicit
-		// Resource Management): a using binding is block-scoped like const.
-		// Nodes: a@11, a = g()@24 (defines the block's a), h(a)@33 (Uses it),
-		// return a;@41 (Uses the parameter).
-		name:     "a using declaration is block-scoped",
-		protects: "using binds its names in its block from the block's start, as let and const do",
-		mutation: "leave using_declaration out of predeclare (a = g()@24 defines the parameter: a = g()@24 -> return a;@41 replaces a@11 -> return a;@41)",
-		src:      "function f(a) { { using a = g(); h(a); } return a; }",
+		// ECMA-262 Annex B.3.3 FunctionDeclarations in IfStatement Statement
+		// Clauses: the declaration behaves as if it were in a block of its own.
+		// Sloppy code only: strict code, and so a TypeScript compiler, which
+		// binds g in f's body (TS2451 against the let), rejects a function
+		// declaration as an if body; javascriptShared's braced block case holds
+		// the construct for every grammar.
+		// Nodes: c@11, g = 0@20, the Branch c@31, the hoisted g@43 (defines
+		// the inner g), the declaration function g() { return c }@34 (Uses
+		// its capture c, may-defines the inner g, so it pairs with g@43),
+		// return g;@60, which reads the outer g.
+		name:     "a function declaration as an if body is scoped to that body",
+		protects: "the declaration binds and defines its own name in an implicit block, so it never may-defines an enclosing variable of the same name",
+		mutation: "lower an if body with stmt alone (the hoisted g@43 vanishes with g@43 -> function g() { return c }@34, and function g() { return c }@34 may-defines the outer g: g = 0@20 -> function g() { return c }@34 and function g() { return c }@34 -> return g;@60 appear)",
+		src:      "function f(c) { let g = 0; if (c) function g() { return c } return g; }",
 		fn:       1,
-		du:       []string{"a = g()@24 -> h(a)@33", "a@11 -> return a;@41"},
+		cd:       []string{"c@31 -> g@43", "c@31 -> function g() { return c }@34"},
+		du: []string{
+			"c@11 -> c@31", "c@11 -> function g() { return c }@34", "g@43 -> function g() { return c }@34",
+			"g = 0@20 -> return g;@60",
+		},
+	},
+	{
+		// ECMA-262 §14.11.2 The with Statement, Runtime Semantics: Evaluation:
+		// the object is evaluated, then the body runs in an object
+		// environment. Sloppy code only: a TypeScript compiler rejects every
+		// with statement (TS2410), so no TypeScript case exists. Nodes: o@11, x@14, the object o@25 (Uses o), g(x)@30
+		// (Uses the parameter x: a name's resolution to one of the object's
+		// properties is given up), return x;@38.
+		name:     "a with statement evaluates its object and its body reads the variables it names",
+		protects: "a with statement's object is a node of its own that reads it, and a name in the body is the variable it names",
+		mutation: "drop the with statement's object node (o@11 -> o@25 vanishes), or bind the body's names to nothing inside a with (x@14 -> g(x)@30 vanishes)",
+		src:      "function f(o, x) { with (o) { g(x); } return x; }",
+		fn:       1,
+		du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
 	},
 }
