@@ -34,7 +34,7 @@ func TestWriterSynchronousFollowsOption(t *testing.T) {
 			}
 			defer s.Close()
 			var got string
-			if err := s.writer.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&got); err != nil {
+			if err := s.writerQueryRow(ctx, `PRAGMA synchronous`, &got); err != nil {
 				t.Fatalf("read back: %v", err)
 			}
 			if got != tc.want {

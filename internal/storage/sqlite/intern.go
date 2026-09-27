@@ -50,11 +50,11 @@ type dbInterner struct {
 	hits   uint64
 	misses uint64
 
-	// stmts is the statement cache of the write transaction the writer is
-	// currently running (stmtcache.go). The interner's resolutions are issued
-	// once per fact and once per evidence row, so preparing their SQL per call
-	// re-parses the same handful of texts for every row. It is installed by
-	// UnitWriter.providerWrite for the life of one batch and is nil for every
+	// stmts is the statement cache of the open ingestion group
+	// (stmtcache.go). The interner's resolutions are issued once per fact and
+	// once per evidence row, so preparing their SQL per call re-parses the
+	// same handful of texts for every row. UnitWriter.providerWrite points it
+	// at the group's cache for the life of one batch, and it is nil for every
 	// other caller, which then prepares on the transaction it passes.
 	stmts *stmtCache
 }
