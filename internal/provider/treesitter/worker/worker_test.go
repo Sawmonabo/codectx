@@ -26,6 +26,13 @@ func TestHeaderParseKeepsFewerErrorBytesAndDisclosesIt(t *testing.T) {
 	// C cannot absorb a template: the C grammar reads `class` as a type name
 	// and `public:` as a label, so a class body alone would parse clean.
 	const cppHeader = "template <typename T> struct S { T v; };\n"
+	// C++ cannot absorb an identifier-list function definition, whose
+	// parameters are declared between the declarator and the body (C17
+	// §6.9.1, the form C23 removed): C++ has no such form ([dcl.fct.def]),
+	// so its grammar recovers with errors where the C grammar parses clean.
+	// A C name that is a C++ keyword is no such source: the C++ grammar
+	// parses `int class = 1;` clean.
+	const cHeader = "int f(a) int a; { return a; }\n"
 	cases := []struct {
 		name     string
 		req      wire.Request
@@ -38,7 +45,7 @@ func TestHeaderParseKeepsFewerErrorBytesAndDisclosesIt(t *testing.T) {
 		{name: "a C++ header parsed as C first falls back", req: wire.Request{Language: "c", Fallback: "cpp", Path: "x.h"},
 			src: cppHeader, kept: "cpp", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "S"},
 		{name: "a C header parsed as C++ first falls back", req: wire.Request{Language: "cpp", Fallback: "c", Path: "x.h"},
-			src: "int class = 1;\n", kept: "c", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "class"},
+			src: cHeader, kept: "c", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "f"},
 		{name: "a clean first parse is kept without a second", req: wire.Request{Language: "c", Fallback: "cpp", Path: "x.h"},
 			src: "int f(void);\n", kept: "c", reason: lang.HeaderClean, parsers: 1},
 		{name: "a request with no fallback is parsed once", req: wire.Request{Language: "c", Path: "x.h"},
