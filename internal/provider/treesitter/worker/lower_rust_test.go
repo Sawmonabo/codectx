@@ -1111,5 +1111,141 @@ func TestRustLoweringGolden(t *testing.T) {
 			du: []string{"o@5 -> o@36", "o@36 -> Some(x)@40", "o@36 -> x@45", "o@36 -> n@54", "x@45 -> x@51",
 				"n@54 -> g(n)@59"},
 		},
+		{
+			// Expressions › Assignment expressions › Destructuring
+			// assignments: the elements of an array assignee and a named
+			// field's value are assignees; a rest `..` and the field name are
+			// not. Nodes: v@5, s@18, [a, .., b] = v@54 (defines an owned
+			// variable), a@55, b@62, S { f: c } = s@70 (likewise), c@77, a + b
+			// + c@86 (the `let a;` declarations make no node). Straight line.
+			name:     "an array assignee's elements and a named field's value are assigned, a rest never",
+			protects: "`[a, .., b] = v` defines a and b and `S { f: c } = s` defines c, each from the value evaluated once",
+			mutation: "take the rest `..` as an assignee (a node ..@58 appears), or take a named field's name instead of its value (loses c@77 -> a + b + c@86)",
+			src:      "fn f(v: [i32; 3], s: S) -> i32 { let a; let b; let c; [a, .., b] = v; S { f: c } = s; a + b + c }",
+			du: []string{"v@5 -> [a, .., b] = v@54", "[a, .., b] = v@54 -> a@55", "[a, .., b] = v@54 -> b@62",
+				"s@18 -> S { f: c } = s@70", "S { f: c } = s@70 -> c@77", "a@55 -> a + b + c@86",
+				"b@62 -> a + b + c@86", "c@77 -> a + b + c@86"},
+		},
+		{
+			// Expressions › Assignment expressions › Destructuring
+			// assignments: a place assignee is assigned its part, which may
+			// leave the rest of t in place. Nodes: t@9, v@24, (t.0, t.1) = (v,
+			// 1)@41 (Uses v, defines an owned variable), t.0@42 and t.1@47
+			// (each Uses that variable and t, may-defines t), t.0@62.
+			name:     "a place target of a destructuring assignment may-defines its base",
+			protects: "each field assignee Uses its own operands and is a may-definition of t, so a later read of t sees both writes' chain",
+			mutation: "give a place target no may-definition of its base (loses t.0@42 -> t.1@47 and t.1@47 -> t.0@62)",
+			src:      "fn f(mut t: (i32, i32), v: i32) -> i32 { (t.0, t.1) = (v, 1); t.0 }",
+			du: []string{"v@24 -> (t.0, t.1) = (v, 1)@41", "(t.0, t.1) = (v, 1)@41 -> t.0@42",
+				"(t.0, t.1) = (v, 1)@41 -> t.1@47", "t@9 -> t.0@42", "t@9 -> t.1@47", "t.0@42 -> t.1@47",
+				"t@9 -> t.0@62", "t.1@47 -> t.0@62"},
+		},
+		{
+			// Types › Closure types › Capture modes: a closure writing s.f and
+			// a[0] captures s and a by unique borrow. Nodes: s@9, a@19, the
+			// closure@53 (Uses s and a, may-defines both), let mut g = …;@41,
+			// g()@81, s.f + a[0]@86.
+			name:     "a callable's field and index writes are may-definitions of their bases where it is created",
+			protects: "a read after a closure that writes through a field or an index sees the closure's write",
+			mutation: "record no write for a callable's field or index target (loses || { s.f = 1; a[0] += 1; }@53 -> s.f + a[0]@86)",
+			src:      "fn f(mut s: S, mut a: [i32; 2]) -> i32 { let mut g = || { s.f = 1; a[0] += 1; }; g(); s.f + a[0] }",
+			du: []string{"s@9 -> || { s.f = 1; a[0] += 1; }@53", "a@19 -> || { s.f = 1; a[0] += 1; }@53", "|| { s.f = 1; a[0] += 1; }@53 -> let mut g = || { s.f = 1; a[0] += 1; };@41", "let mut g = || { s.f = 1; a[0] += 1; };@41 -> g()@81",
+				"s@9 -> s.f + a[0]@86", "a@19 -> s.f + a[0]@86", "|| { s.f = 1; a[0] += 1; }@53 -> s.f + a[0]@86"},
+		},
+		{
+			// Types › Closure types › Capture modes, and lower.go,
+			// Address-taking: a callable's `&mut n` of an enclosing local is
+			// one of its writes. Nodes: n@9, || h(&mut n)@38 (Uses n,
+			// may-defines n), let mut g = …;@26, g()@52, n@57.
+			name:     "a callable's mutable borrow of an enclosing local is a may-definition where it is created",
+			protects: "a read after a closure that lends n mutably sees what the borrow may have written",
+			mutation: "record a callable's `&mut` as a read only (loses || h(&mut n)@38 -> n@57)",
+			src:      "fn f(mut n: i32) -> i32 { let mut g = || h(&mut n); g(); n }",
+			du: []string{"n@9 -> || h(&mut n)@38", "|| h(&mut n)@38 -> let mut g = || h(&mut n);@26",
+				"let mut g = || h(&mut n);@26 -> g()@52", "n@9 -> n@57", "|| h(&mut n)@38 -> n@57"},
+		},
+		{
+			// Types › Closure types › Capture modes: a move closure owns its
+			// copies, including the ones the closures inside it write.
+			// Nodes: n@9, the move closure@34 (Uses n, may-defines nothing),
+			// let g = …;@26, g()@75, n@80.
+			name:     "a move closure drops the writes of the callables nested in it",
+			protects: "a write by a closure nested in a move closure never reaches a read of the outer variable",
+			mutation: "keep a nested callable's writes inside a move closure (gains move || { let mut h = || n += 1; h(); }@34 -> n@80)",
+			src:      "fn f(mut n: i32) -> i32 { let g = move || { let mut h = || n += 1; h(); }; g(); n }",
+			du:       []string{"n@9 -> move || { let mut h = || n += 1; h(); }@34", "move || { let mut h = || n += 1; h(); }@34 -> let g = move || { let mut h = || n += 1; h(); };@26", "let g = move || { let mut h = || n += 1; h(); };@26 -> g()@75", "n@9 -> n@80"},
+		},
+		{
+			// Expressions › Operator expressions › Borrow operators: `&mut
+			// x.0` and `&mut a[1]` borrow their base variables. Nodes: x@9,
+			// a@28, g(&mut x.0, &mut a[1])@50 (Uses x and a, may-defines both),
+			// x.1 + a[0]@74.
+			name:     "a mutable borrow of a field or element may-defines its base",
+			protects: "a read of x or a after a call receiving `&mut x.0` and `&mut a[1]` sees the call's possible writes",
+			mutation: "borrow only a bare name (loses g(&mut x.0, &mut a[1])@50 -> x.1 + a[0]@74)",
+			src:      "fn f(mut x: (i32, i32), mut a: [i32; 2]) -> i32 { g(&mut x.0, &mut a[1]); x.1 + a[0] }",
+			du: []string{"x@9 -> g(&mut x.0, &mut a[1])@50", "a@28 -> g(&mut x.0, &mut a[1])@50",
+				"x@9 -> x.1 + a[0]@74", "a@28 -> x.1 + a[0]@74", "g(&mut x.0, &mut a[1])@50 -> x.1 + a[0]@74"},
+		},
+		{
+			// lower.go, Address-taking: a pending borrow attaches to the node
+			// evaluating it, by position. Nodes: x@9, c@17, c@48 (Branch of
+			// the if operand, made after the borrow but not spanning it), 1@52,
+			// 2@63 (the if's result), g(&mut x, if c { 1 } else { 2 })@35
+			// (Uses x and the result, may-defines x), x@69. Succ: c@48→{1, 2};
+			// 1, 2→the call→x@69. IPDom: c@48 → the call.
+			name:     "a pending mutable borrow attaches by position, not to the next node made",
+			protects: "the call spanning `&mut x` carries its may-definition, never the if operand's Branch made before the call node",
+			mutation: "attach a pending borrow to the next node made (c@48 may-defines x: gains x@9 -> c@48 and c@48 -> x@69, loses g(&mut x, if c { 1 } else { 2 })@35 -> x@69)",
+			src:      "fn f(mut x: i32, c: bool) -> i32 { g(&mut x, if c { 1 } else { 2 }); x }",
+			cd:       []string{"c@48 -> 1@52", "c@48 -> 2@63"},
+			du: []string{"c@17 -> c@48", "x@9 -> g(&mut x, if c { 1 } else { 2 })@35",
+				"1@52 -> g(&mut x, if c { 1 } else { 2 })@35", "2@63 -> g(&mut x, if c { 1 } else { 2 })@35",
+				"x@9 -> x@69", "g(&mut x, if c { 1 } else { 2 })@35 -> x@69"},
+		},
+		{
+			// Statements › Declaration statements › Item declarations: items
+			// are not ordered, so a const or fn item names its item from the
+			// start of its block, shadowing the parameters n and g there.
+			// Nodes: n@5, g@13, let a = n + g();@40 (Uses nothing), a@95 (the
+			// block's tail), let b = …;@30, b + n + g@100 (the parameters).
+			name:     "an item names its item from the start of its block, shadowing a local",
+			protects: "a read before a block's const or fn item resolves to the item, never the enclosing local of that name",
+			mutation: "bind an item's name only from its declaration (gains n@5 and g@13 -> let a = n + g();@40)",
+			src:      "fn f(n: i32, g: i32) -> i32 { let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a }; b + n + g }",
+			du: []string{"let a = n + g();@40 -> a@95", "a@95 -> let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a };@30", "let b = { let a = n + g(); const n: i32 = 3; fn g() -> i32 { 1 } a };@30 -> b + n + g@100",
+				"n@5 -> b + n + g@100", "g@13 -> b + n + g@100"},
+		},
+		{
+			// Statements › Declaration statements › Item declarations: use
+			// and enum items run nothing. Nodes: c@5, x@14, c@34 (Branch),
+			// return x@65, 0@77. Succ: c@34→{return, 0}; return→EXIT.
+			name:     "use and enum items make no node",
+			protects: "a use declaration or an enum item in a block is no statement node",
+			mutation: "make a node for a use or enum item (c@34 gains use std::mem;@38 or enum E { A }@52 as a dependent)",
+			src:      "fn f(c: bool, x: i32) -> i32 { if c { use std::mem; enum E { A } return x; } 0 }",
+			cd:       []string{"c@34 -> return x@65", "c@34 -> 0@77"},
+			du:       []string{"c@5 -> c@34", "x@14 -> return x@65"},
+		},
+		{
+			// Names › Scopes › Pattern binding scopes: a match arm's, a
+			// while-let's and a for's bindings end with their construct.
+			// Nodes: o@61, Some(x)@65, x@70, g(x)@76, 0@87, the while-let
+			// head@98, x@107, g(x)@122, 0..2@139, for@130, x@134, g(x)@146,
+			// x@154 (the parameter). Succ: Some(x)→{x@70, 0@87}; x@70→g(x)→head;
+			// 0→head; head→{x@107, 0..2}; x@107→g(x)@122→head; 0..2→for→{x@134,
+			// x@154}; x@134→g(x)@146→for. IPDom: Some(x) → head → 0..2 → for →
+			// x@154.
+			name:     "match-arm, while-let and for bindings end with their construct",
+			protects: "a read after the three constructs resolves to the parameter, never to a binding of the same name",
+			mutation: "keep a construct's bindings in scope after it (x@154 pairs with x@134 instead: loses x@38 -> x@154)",
+			src:      "fn f(o: Option<i32>, mut v: Vec<i32>, x: i32) -> i32 { match o { Some(x) => g(x), _ => 0 }; while let Some(x) = v.pop() { g(x); } for x in 0..2 { g(x); } x }",
+			cd: []string{"Some(x)@65 -> x@70", "Some(x)@65 -> g(x)@76", "Some(x)@65 -> 0@87",
+				"let Some(x) = v.pop()@98 -> x@107", "let Some(x) = v.pop()@98 -> g(x)@122", "let Some(x) = v.pop()@98 -> let Some(x) = v.pop()@98",
+				"for@130 -> x@134", "for@130 -> g(x)@146", "for@130 -> for@130"},
+			du: []string{"o@5 -> o@61", "o@61 -> Some(x)@65", "o@61 -> x@70", "x@70 -> g(x)@76",
+				"v@25 -> let Some(x) = v.pop()@98", "let Some(x) = v.pop()@98 -> x@107", "x@107 -> g(x)@122",
+				"0..2@139 -> for@130", "0..2@139 -> x@134", "x@134 -> g(x)@146", "x@38 -> x@154"},
+		},
 	})
 }
