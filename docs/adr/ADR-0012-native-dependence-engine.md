@@ -397,8 +397,10 @@ with the observation it came from. The worker's process-tree spans play no part 
 - On one corpus's rows, the compiler checkout's, parse time ranks with source bytes at Spearman ρ 0.82–0.86 per
   language.
 - A replay of those rows reaches the makespan lower bound at 16 workers, where path order is 10% over it.
-- The same rank and replay over every matrix corpus is a measurement of the benchmark task, and largest-first is
-  confirmed per class on it.
+- Over all seven public matrix corpora, per language with at least 30 files, per-file worker wall (parse, lowering
+  and analysis) ranks with source bytes at Spearman ρ 0.82–0.99, and a replay of largest-first from one queue
+  reaches the makespan lower bound, the larger of the mean load and the largest file, within 0.1% at 4, 8, 16 and
+  32 workers on every corpus, where path order is up to 44% over it. Largest-first is confirmed on every class.
 - Work stealing is dropped: it solves contention between per-worker queues, which one central queue does not have.
 - The worker count is the smaller of the processor count and the allocation divided by observed need.
 - The classic longest-processing-time bound is 4/3 − 1/(3m) of optimal.
