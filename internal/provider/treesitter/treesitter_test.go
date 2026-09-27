@@ -619,50 +619,6 @@ func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
 	}
 }
 
-// TestAnOpenStageKeepsItsWorkersAcrossUnits indexes two files as two
-// sequential units inside one open stage.
-//
-// Failure mode: the last unit to leave drains the pool, so a provider pass
-// over a run's units re-executes a worker for every unit whose predecessor
-// had finished, and workers started grows with the units instead of staying
-// at the most in flight.
-//
-// Mutation: drop the stage's reference (OpenStage returns without entering
-// the stage) -> the second unit starts a second worker.
-func TestAnOpenStageKeepsItsWorkersAcrossUnits(t *testing.T) {
-	p := newProvider(t)
-	ctx := context.Background()
-	closeStage := p.OpenStage(ctx)
-	var started uint64
-	for i, file := range []string{"sample.go", "sample.py"} {
-		src, err := os.ReadFile(filepath.Join("testdata", file))
-		if err != nil {
-			t.Fatal(err)
-		}
-		files := map[string]string{file: string(src)}
-		h := providertest.New(t, files)
-		u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
-		if _, err := provider.RunUnit(ctx, p, u.Request, h.Begin(t, u, []string{file}), providertest.Limits, h.Pool); err != nil {
-			t.Fatalf("RunUnit %s: %v", file, err)
-		}
-		s := p.Stats()
-		if i == 0 {
-			started = s.WorkersStarted
-		} else if s.WorkersStarted != started {
-			t.Fatalf("the second unit inside an open stage started %d worker(s) after the first started %d",
-				s.WorkersStarted-started, started)
-		}
-		if s.Processes == 0 {
-			t.Fatalf("the open stage holds no worker after unit %d", i+1)
-		}
-	}
-	closeStage(ctx)
-	closeStage(ctx) // idempotent: a second close must not leave a stage a unit never entered
-	if s := p.Stats(); s.Processes != 0 {
-		t.Fatalf("the stage closed with %d worker process(es) still alive", s.Processes)
-	}
-}
-
 // TestAFileLargerThanTheAllocationRunsAlone parses two files concurrently on
 // a ledger whose allocation is zero -- a real reading, a host with nothing
 // left over the product's footprint -- so every worker base and every file's

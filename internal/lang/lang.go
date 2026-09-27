@@ -125,27 +125,8 @@ func For(s model.Snapshot) Tagger {
 // Of returns the language tag of a root-relative path in the tagger's
 // snapshot.
 func (t Tagger) Of(rel string) string {
-	if twoGrammar[strings.ToLower(path.Ext(rel))] {
+	if tslang.SharedHeader(rel) {
 		return t.header
 	}
 	return Of(rel)
 }
-
-// twoGrammar is the set of extensions more than one grammar declares, derived
-// once from the grammar registry (tslang.Candidates' answer, without its
-// per-path allocation on the search filter's path).
-var twoGrammar = func() map[string]bool {
-	declared := map[string]int{}
-	for _, l := range tslang.All {
-		for _, ext := range l.Extensions {
-			declared[ext]++
-		}
-	}
-	out := map[string]bool{}
-	for ext, n := range declared {
-		if n > 1 {
-			out[ext] = true
-		}
-	}
-	return out
-}()

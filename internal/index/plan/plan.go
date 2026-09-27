@@ -88,7 +88,7 @@ type Unit struct {
 	// DependencyKeys are the synthetic keys folded into the unit's
 	// DependencyHash beside DependsOn (model.DependencyHash): inputs its
 	// output depends on that are no unit. A header's file units carry one,
-	// the census-derived grammar the unit reads (headerKeys), so a census
+	// the census-derived grammar the unit reads (headerKeyOf), so a census
 	// change that moves it rebuilds the unit and one that keeps it does not.
 	// It is never a dependency: nothing is reconciled against it and it is
 	// not a row a dependency read could refuse.
@@ -317,7 +317,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.CarriedPage to the paged sqlite.Store.CarriedUnits listing")
 	}
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
-		headers: headerKeysOf(in.View.Header(), in.Config.Providers.TreeSitter.Languages),
+		headerKey: headerKeyOf(in.View.Header()),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
 			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
 		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{},
@@ -393,9 +393,9 @@ type builder struct {
 	in      Inputs
 	cfgHash string
 	plan    Plan
-	// headers are the synthetic dependency keys of the file units of a
+	// headerKey is the synthetic dependency key of the file units of a
 	// header path in this snapshot (Unit.DependencyKeys).
-	headers headerKeys
+	headerKey string
 
 	// fileProviders are the file-invalidated providers in dependency order,
 	// so the filesystem unit of a path is derived before the units that depend
@@ -620,10 +620,9 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 	// Without the filesystem provider there is no content-exact comparison, so
 	// no file is claimed unchanged and no semantic scope is carried.
 	changed = !b.fsActive
-	// A path two grammars declare is a header whose grammar the census
-	// decides, and every file unit of it carries the part of that decision
-	// its facts depend on (headerKeys.of).
-	header := len(tslang.Candidates(fv.Path)) > 1
+	// A header two grammars declare has the grammar the census decides, and
+	// every file unit of it carries that decision (headerKeyOf).
+	header := tslang.SharedHeader(fv.Path)
 	var fsUnit model.UnitID
 	for _, fp := range b.fileProviders {
 		if deleted || !fp.gate(fv) {
@@ -633,7 +632,7 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 			Inputs: staticInputs([]model.UnitInput{{FileID: fv.ID, ContentHash: fv.ContentHash,
 				Executable: fv.Executable}})}
 		if header {
-			u.DependencyKeys = []string{b.headers.of(fp.id)}
+			u.DependencyKeys = []string{b.headerKey}
 		}
 		if fp.dependsOnFile {
 			// The registry hands providers back in dependency order, so the
@@ -1044,43 +1043,21 @@ func foldVersion(descriptor, observed string) (string, error) {
 	return model.H(domainProviderVersion, descriptor, observed), nil
 }
 
-// headerKeys are the two census-derived inputs a header's file units read,
-// each a synthetic dependency key.
+// headerKeyOf is the one census-derived input a header's file units read,
+// as a synthetic dependency key: the census's first grammar, which is the
+// language the manifest row and so the filesystem unit's file node carry
+// (lang.For), and the grammar the structural provider parses the header with
+// first whenever it enables both. It is a grammar and not the census, so a
+// census change rebuilds a header's units exactly when it moves that grammar.
 //
-// tag is the census's first grammar, the language the manifest row and so the
-// filesystem unit's file node carry (lang.For). grammar is the grammar the
-// structural provider parses the header with first: the census's first
-// grammar, unless tree_sitter.languages enables only the other of the two,
-// which is then the one grammar every header is parsed with whatever the
-// census says. Each is a grammar and not the census or its basis, so exactly
-// the census changes that move what a unit reads rebuild it: with both
-// grammars enabled, those tslang.Census.ChangesHeaders reports, and for the
-// structural unit with one grammar enabled, none. The enabled set itself
-// reaches every unit's identity through the analysis configuration hash.
-type headerKeys struct {
-	tag, grammar string
-}
-
-func headerKeysOf(s model.Snapshot, languages []string) headerKeys {
-	enabled := func(name string) bool { return len(languages) == 0 || slices.Contains(languages, name) }
-	plan := tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header()
-	grammar, _, ok := plan.Within(enabled)
-	if !ok {
-		// No grammar of the two is enabled, so no structural unit of a header
-		// is planned; the key is then read by no unit.
-		grammar = plan.First
-	}
-	return headerKeys{tag: "header_tag=" + plan.First, grammar: "header_grammar=" + grammar}
-}
-
-// of is the key the given provider's unit of a header carries: the grammar
-// for the structural unit, which parses with it, and the tag for every other,
-// whose facts carry the manifest's language at most.
-func (k headerKeys) of(providerID string) string {
-	if providerID == tslang.ProviderID {
-		return k.grammar
-	}
-	return k.tag
+// With tree_sitter.languages enabling only one of the two, every header is
+// parsed with that one, yet the structural unit is still rebuilt when the
+// first grammar moves: it depends on the path's filesystem unit, whose file
+// node carries the tag. A key of its own would change nothing. The enabled set
+// itself reaches every unit's identity through the analysis configuration
+// hash.
+func headerKeyOf(s model.Snapshot) string {
+	return "header_tag=" + tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header().First
 }
 
 // domainProviderVersion separates this digest from every other digest in the

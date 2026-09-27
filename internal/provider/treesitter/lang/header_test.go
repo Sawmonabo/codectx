@@ -23,17 +23,21 @@ func TestHeaderGrammarFollowsTheRepositoryCensus(t *testing.T) {
 	}{
 		// Mutation: counting a header as a translation unit makes this
 		// C repository mixed, and its headers C++.
-		{"c only, headers of both spellings present", []string{"a.c", "B.C", "a.h", "x.hpp", "y.hh", "z.hxx", "m.go"},
-			HeaderPlan{First: "c", Fallback: "cpp", Basis: HeaderCOnly}},
+		{"c only, headers of both spellings present", []string{"a.c", "a.h", "x.hpp", "y.hh", "z.hxx", "m.go"},
+			HeaderPlan{First: "c", Fallback: "cpp"}},
 		// Mutation: a C++ extension missing from the count leaves this
 		// repository with no units.
-		{"cpp only", []string{"a.cc", "b.cpp", "c.CXX", "a.h"},
-			HeaderPlan{First: "cpp", Fallback: "c", Basis: HeaderCPPOnly}},
+		{"cpp only", []string{"a.cc", "b.cpp", "c.cxx", "a.h"},
+			HeaderPlan{First: "cpp", Fallback: "c"}},
+		// Mutation: folding the extension's case counts the C++ unit `.C`
+		// as C and parses this repository's headers as C.
+		{"an upper-case .C unit is not C", []string{"main.C", "a.h"},
+			HeaderPlan{First: "cpp", Fallback: "c"}},
 		// Mutation: letting the majority decide parses these headers as C.
 		{"mixed parses c++ first", []string{"a.c", "b.c", "c.c", "d.cpp"},
-			HeaderPlan{First: "cpp", Fallback: "c", Basis: HeaderMixed}},
+			HeaderPlan{First: "cpp", Fallback: "c"}},
 		{"no units parses c++ first", []string{"a.h", "b.hpp", "main.go"},
-			HeaderPlan{First: "cpp", Fallback: "c", Basis: HeaderNoUnits}},
+			HeaderPlan{First: "cpp", Fallback: "c"}},
 	} {
 		if got := census(tc.paths...).Header(); got != tc.want {
 			t.Errorf("%s: plan %+v, want %+v", tc.name, got, tc.want)
@@ -41,37 +45,10 @@ func TestHeaderGrammarFollowsTheRepositoryCensus(t *testing.T) {
 	}
 }
 
-// A census change that flips the header grammar must invalidate every
-// header's unit; one that does not must not reparse them all.
-func TestCensusChangeInvalidatesHeadersOnlyWhenTheirGrammarChanges(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		old, next Census
-		want      bool
-	}{
-		// Mutation: comparing only the basis, or only presence of C, misses
-		// the first C++ file of a C repository.
-		{"first c++ unit in a c repository", Census{C: 5}, Census{C: 5, CPP: 1}, true},
-		{"last c++ unit leaves a mixed repository", Census{C: 5, CPP: 1}, Census{C: 5}, true},
-		{"last c unit leaves a c repository", Census{C: 1}, Census{}, true},
-		// Mutation: comparing the counts reparses every header on every
-		// added source file.
-		{"another c unit", Census{C: 5}, Census{C: 6}, false},
-		// Mutation: comparing the whole plan reparses on a basis change that
-		// keeps the grammar.
-		{"c++ repository gains c", Census{CPP: 2}, Census{C: 1, CPP: 2}, false},
-		{"headers only gains c++", Census{}, Census{CPP: 1}, false},
-	} {
-		if got := tc.old.ChangesHeaders(tc.next); got != tc.want {
-			t.Errorf("%s: changes %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
 // Keeping the worse parse publishes facts from the tree with more errors;
 // running the fallback on a clean header doubles its parse for nothing.
 func TestHeaderFallbackKeepsTheParseWithFewerErrorBytes(t *testing.T) {
-	plan := HeaderPlan{First: "cpp", Fallback: "c", Basis: HeaderMixed}
+	plan := HeaderPlan{First: "cpp", Fallback: "c"}
 	for _, tc := range []struct {
 		name            string
 		first, fallback ParseErrors
@@ -110,27 +87,5 @@ func TestHeaderFallbackKeepsTheParseWithFewerErrorBytes(t *testing.T) {
 	boom := errors.New("worker lost")
 	if _, err := plan.Choose(ParseErrors{Any: true, Bytes: 1}, func() (ParseErrors, error) { return ParseErrors{}, boom }); !errors.Is(err, boom) {
 		t.Errorf("a failed fallback parse answered %v, want %v", err, boom)
-	}
-}
-
-// Moving ".h" into the C++ declaration must not move any other extension,
-// or ".h" out of the extension answer rows without a census rely on.
-func TestHeaderCandidatesLeaveEveryOtherExtensionAlone(t *testing.T) {
-	for _, l := range All {
-		for _, ext := range l.Extensions {
-			got, ok := ByExtension("x" + ext)
-			cands := Candidates("x" + ext)
-			if ext == ".h" {
-				// Mutation: dropping ".h" from either declaration.
-				if !ok || got.Name != "c" || len(cands) != 2 || cands[0].Name != "c" || cands[1].Name != "cpp" {
-					t.Errorf(".h: ByExtension %q, candidates %d; want c and [c cpp]", got.Name, len(cands))
-				}
-				continue
-			}
-			// Mutation: an extension declared by a second grammar.
-			if !ok || got.Name != l.Name || len(cands) != 1 || cands[0].Name != l.Name {
-				t.Errorf("%s: ByExtension %q, %d candidates; want %s alone", ext, got.Name, len(cands), l.Name)
-			}
-		}
 	}
 }

@@ -254,7 +254,7 @@ func (p *Provider) LanguageOf(fv model.FileVersion) (lang.Language, bool) {
 // parsed with its snapshot language tag when the provider supports it, else
 // its extension's grammar.
 func (p *Provider) grammarOf(census lang.Census, fv model.FileVersion) (lang.Language, string, bool) {
-	if len(lang.Candidates(fv.Path)) > 1 {
+	if lang.SharedHeader(fv.Path) {
 		first, fallback, ok := census.Header().Within(func(name string) bool { _, ok := p.languages[name]; return ok })
 		return p.languages[first], fallback, ok
 	}
@@ -343,7 +343,8 @@ func (p *Provider) Close() { p.pool.close() }
 
 // OpenStage opens one parse stage that holds the pool across every unit
 // indexed before closeStage is called. IndexUnit keeps its own bracket, so a
-// caller that never opens a stage is served exactly as before. closeStage
+// caller that never opens a stage still has the pool held for each unit it
+// indexes, and drained when the last of them ends. closeStage
 // leaves the stage once, however often it is called, under the run the stage
 // was opened in: the context it is given is not consulted, so a caller cannot
 // close another run's total. It answers what the pool did while the stage was
