@@ -220,8 +220,9 @@ func (d ProviderDescriptor) Validate() error {
 
 // UnitSpec names one immutable unit of provider work. InputHash and
 // DependencyHash are aggregate digests folded with Hasher over the canonical
-// inputs the unit read and the keys of its declared dependencies; a unit may be
-// reused only when both still match (Section 9.4).
+// inputs the unit read and the keys of its declared dependencies and its
+// synthetic keys (DependencyHash); a unit may be reused only when both still
+// match (Section 9.4).
 type UnitSpec struct {
 	ID              UnitID `json:"id"`
 	ProviderID      string `json:"provider_id"`

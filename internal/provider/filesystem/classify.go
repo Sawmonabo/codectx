@@ -8,8 +8,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// Classification is what a path alone says about a file: its language tag,
-// the format it is recognized as, and the semantic node kind the filesystem
+// Classification is what a path alone says about a file: the format it is
+// recognized as, and the semantic node kind the filesystem
 // provider emits for it in addition to the file node. Formats the manifest
 // provider parses (go.mod, package.json, ...) carry no Node here because the
 // node they define is only known after parsing; recognition-only formats
@@ -17,9 +17,8 @@ import (
 // no relations beyond `defines`, because inventing build or template
 // evaluation is not allowed (Section 11.2).
 type Classification struct {
-	Language string
-	Format   string
-	Node     model.NodeKind
+	Format string
+	Node   model.NodeKind
 }
 
 // Recognized formats. The manifest provider parses the first six and
@@ -37,7 +36,9 @@ const (
 // Language returns the language tag for a root-relative path, or "" when the
 // path says nothing. The table itself lives in internal/lang, which is the
 // one place a path becomes a language tag; the name is kept here
-// because it is what the analyzer providers call.
+// because it is what the analyzer providers call. It knows no census: a file
+// node takes its manifest row's language instead, which for a header is the
+// snapshot's.
 func Language(rel string) string { return lang.Of(rel) }
 
 // byBasename maps exact basenames to their format and node kind.
@@ -127,7 +128,6 @@ func Classify(rel string) Classification {
 		strings.HasPrefix(lower, "notice") || strings.HasPrefix(lower, "authors"):
 		c = Classification{Format: "text", Node: model.NodeDocument}
 	}
-	c.Language = Language(rel)
 	return c
 }
 
