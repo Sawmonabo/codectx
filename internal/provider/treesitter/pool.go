@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -64,58 +65,93 @@ var errWorkerGone = errors.New("treesitter: parser worker exited")
 // reservation, and the runner would refuse the admission the pool itself
 // caused.
 //
-// Every worker is admitted on the process's one reservation ledger before it
-// is started and gives its reservation back only once the runner has reaped
-// it, so parser workers and every other heavy child of this process are
+// Memory is taken on the process's one reservation ledger in two holdings,
+// and nothing else in this pool counts it (ADR-0012 decision 5, "The
+// ledger"):
+//
+//   - A worker's base holding is reserved before the worker is started, at the
+//     largest base any worker of this pool has reported (zero before the first
+//     report), and adjusted to the base the worker reports in its hello and
+//     after every file, upward without waiting. It is given back only once the
+//     runner has reaped the process.
+//   - Each file's increment is a Parse reservation of its predicted need,
+//     taken with the worker in hand, after the allocation is re-derived, and
+//     given back once the file's Done has adjusted the base. A Parse
+//     reservation is granted whenever no other parse holds one, so a file
+//     larger than the whole allocation still runs, alone among the parses.
+//
+// Parser workers and every other heavy child of this process are therefore
 // admitted against one allocation and one running total.
 //
 // Every admission is first-in-first-out on the ledger. A worker coming back
 // from a parse while an acquirer of this pool is queued there goes one of two
 // ways, both in the ledger's order:
 //
-//   - When that acquirer is the ledger's head, the worker and the reservation
-//     it holds are handed to it. The head is next in line for exactly that
+//   - When that acquirer is the ledger's head, the worker and the base holding
+//     it carries are handed to it. The head is next in line for exactly that
 //     room, so the handout is the grant the ledger would make, without
 //     stopping one process to start the same one again. The ledger tells an
 //     acquirer it is the head that does not fit through the make-room step;
 //     no other reserver can come before it from then on.
 //   - When the head is another reserver -- a unit, a language server, another
-//     pool -- the worker is stopped: its reservation returns to the ledger,
+//     pool -- the worker is stopped: its base holding returns to the ledger,
 //     which pumps, and that head is admitted in order. This pool's acquirer
 //     behind it waits its turn.
 //
-// No idle worker is held or reused while any reserver waits on the ledger,
-// this pool's or another:
+// No worker that is not parsing is held while a reserver other than this
+// pool's own parse waits at the ledger's head. A worker is not parsing when it
+// is idle, and also when its caller holds it while it waits for the file's
+// increment:
 //
 //   - A worker coming back while one waits and no acquirer of this pool is the
 //     head is stopped, never idled.
-//   - An acquirer that finds idle workers while the ledger reports a waiter
+//   - An acquirer that finds idle workers while such a reserver waits
 //     (admission.Ledger.Waiting) stops every one of them and then queues for a
 //     worker of its own behind that waiter.
 //   - The pool is registered on the ledger as a holder of idle room
 //     (admission.Ledger.Holder) for its whole life, so a reserver that reaches
 //     the head and does not fit has the pool stop its idle workers at once,
-//     whether or not this pool is acquiring or releasing anything. A stage
-//     whose own progress waits on that reserver -- a unit of the same tick
-//     reserving behind room idle workers hold -- therefore never waits on the
-//     stage's drain.
+//     whether or not this pool is acquiring or releasing anything, and has one
+//     caller waiting for an increment give its worker back (yieldParse). That
+//     caller returns the worker through release -- to this pool's acquirer at
+//     the head, or stopped -- and asks for a worker again. A stage whose own
+//     progress waits on that reserver -- a unit of the same tick reserving
+//     behind room these workers hold -- therefore never waits on the stage's
+//     drain, and a caller holding a worker never waits for an increment
+//     queued behind a head that waits for that worker's room.
+//   - When the head is one of this pool's own increments, the workers are left
+//     as they are: a Parse reservation at the head that does not fit waits
+//     only on parses in flight, whose Done returns their increments, and is
+//     granted outright once none is in flight. Stopping workers for it would
+//     make every file an exec.
 //
 // Stopped workers' room returns to the ledger and reaches the head in order.
 // With nobody waiting, a worker coming back goes idle and is held for the
 // stage like any room an admitted child holds. Room is returned by its holder
-// and never taken from it, only idle room is given back, and admission order
-// among the reservers queued on the ledger is kept throughout.
+// and never taken from it, only room that is not parsing is given back, and
+// admission order among the reservers queued on the ledger is kept
+// throughout.
 //
 // Kept idle while an acquirer of this pool is queued, a worker would hold the
 // room that acquirer waits for while nothing ever pumps the ledger, and the
 // acquirer, its unit and the stage it keeps from draining would wait forever.
+//
+// Callers waiting for a worker are served largest source bytes first, ties in
+// arrival order, from the one queue pending: only its first may take an idle
+// worker or queue on the ledger for a new one. There is no work stealing and
+// no second count of workers: max is the processor count, and the memory bound
+// on how many run is the ledger's sum. A caller already queued on the ledger
+// keeps its place there, so a larger file that arrives after it waits behind
+// it: the ledger's order is not reopened for size.
 type pool struct {
 	runner    *process.Runner
 	admission *admission.Ledger
 	cmd       WorkerCommand
 	dir       string
 	max       int
-	memory    int64
+	// rederive is Options.Rederive: it re-derives the ledger's allocation,
+	// given the parser workers' standing bases, before each file's increment.
+	rederive func(workerResidentBytes int64)
 
 	mu sync.Mutex
 	// cond wakes acquirers when a worker becomes idle, a process exits, a
@@ -132,7 +168,19 @@ type pool struct {
 	// stop. While one is waiting and not yet handed a worker, release never
 	// idles a worker, so idle is empty for as long as any acquirer is queued.
 	queued []*acquirer
-	wg     sync.WaitGroup
+	// pending are the callers waiting for a worker, served largest first (see
+	// next). A caller leaves it once it holds a worker or queues on the ledger
+	// for one, and rejoins it, with its place, when it must ask again.
+	pending []*request
+	seq     uint64
+	// parseWaits are the callers holding a worker while they wait on the
+	// ledger for their file's increment.
+	parseWaits []*parseWait
+	// largestBase is the largest base any worker of this pool has reported:
+	// what a new worker's base holding is reserved at before it reports its
+	// own.
+	largestBase int64
+	wg          sync.WaitGroup
 	// totals is the open structural-parse total of every run parsing through
 	// this pool, which is what a worker's span hangs off. It is keyed by the
 	// run and not held as one span because a deferred publication's tick runs
@@ -141,6 +189,25 @@ type pool struct {
 	totals map[*ledger.Run]*stageTotal
 
 	started, exited, parses, retries uint64
+	// inFlight counts the parses holding an increment, and maxInFlight is the
+	// most that ever did at once.
+	inFlight, maxInFlight int
+	// workerCPUMS sums the processor time of every reaped worker;
+	// cpuUnsampled records that one of them was not measured, which makes
+	// the sum unavailable.
+	workerCPUMS  int64
+	cpuUnsampled bool
+	// unmeasured counts the files whose Done carried no need, and
+	// modelFailures the model reads and encodings that failed.
+	unmeasured, modelFailures uint64
+	// overruns are the files whose need exceeded their increment, per class.
+	// The map is bounded by the pinned languages times the size classes.
+	overruns map[overrunClass]*Overrun
+	// models are the learned need models of the repositories being indexed,
+	// loaded from the run ledger on first use and dropped when the last stage
+	// of their repository ends. It is bounded by those repositories times the
+	// pinned languages times the size classes.
+	models map[needKey]*needModel
 	// unregister removes the pool's idle-release step from the ledger; close
 	// calls it before it stops the workers.
 	unregister func()
@@ -154,7 +221,7 @@ type acquirer struct {
 	// wait ends, since the queue only grows at its tail.
 	head bool
 	// handed is the worker release gave this acquirer at the head, with the
-	// reservation that worker holds; nil until then.
+	// base holding that worker carries; nil until then.
 	handed *worker
 	// cancel ends this acquirer's ledger wait once it has been handed a
 	// worker, so the wait does not also take a second reservation.
@@ -170,6 +237,83 @@ func (p *pool) waiting() bool {
 		}
 	}
 	return false
+}
+
+// request is one caller waiting for a worker: its file's source bytes, and
+// its arrival, which breaks ties.
+type request struct {
+	bytes int64
+	seq   uint64
+}
+
+// request registers nothing; it numbers one caller's arrival for pending.
+func (p *pool) request(sourceBytes int64) *request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seq++
+	return &request{bytes: sourceBytes, seq: p.seq}
+}
+
+// next is the pending caller served first: the largest file, the earliest
+// arrival among equals. The pool lock must be held.
+func (p *pool) next() *request {
+	var first *request
+	for _, r := range p.pending {
+		if first == nil || r.bytes > first.bytes || r.bytes == first.bytes && r.seq < first.seq {
+			first = r
+		}
+	}
+	return first
+}
+
+// dequeue takes r out of pending and wakes the callers behind it, one of
+// which is now first. The pool lock must be held.
+func (p *pool) dequeue(r *request) {
+	p.pending = slices.DeleteFunc(p.pending, func(x *request) bool { return x == r })
+	p.cond.Broadcast()
+}
+
+// parseWait is one caller holding a worker while it waits on the ledger for
+// its file's increment. Its fields are guarded by the pool lock.
+type parseWait struct {
+	// head is set once the ledger has asked this wait to make room: it is
+	// then the queue's head and does not fit.
+	head bool
+	// yielded is set when yieldParse asked this caller to give its worker
+	// back, and cancel is what ends the wait for it.
+	yielded bool
+	cancel  context.CancelFunc
+}
+
+// parseHead reports whether one of this pool's increments is the ledger's
+// head. The pool lock must be held.
+func (p *pool) parseHead() bool {
+	for _, pw := range p.parseWaits {
+		if pw.head {
+			return true
+		}
+	}
+	return false
+}
+
+// yieldParse asks the caller that most recently began waiting for an
+// increment to give its worker back, unless an increment of this pool is the
+// ledger's head (see pool). It is called once per stuck pump of the ledger's
+// head, so workers are given back one at a time for as long as the head does
+// not fit.
+func (p *pool) yieldParse() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.parseHead() {
+		return
+	}
+	for i := len(p.parseWaits) - 1; i >= 0; i-- {
+		if pw := p.parseWaits[i]; !pw.yielded {
+			pw.yielded = true
+			pw.cancel()
+			return
+		}
+	}
 }
 
 // worker is one parser subprocess owned by the pool.
@@ -194,10 +338,10 @@ type worker struct {
 	// process is started and ended in the run goroutine, which is where the
 	// child's measured cost first exists.
 	span *ledger.Span
-	// release gives the worker's reservation back to the admission ledger. The
-	// run goroutine calls it once the runner has reaped the process, never
+	// holding is the worker's base holding on the admission ledger. The run
+	// goroutine releases it once the runner has reaped the process, never
 	// before: until then the memory is still held.
-	release func()
+	holding *admission.Holding
 
 	// cpu and received are the hang detector's two progress signals: the
 	// worker's consumed processor time, sampled by the runner, and the bytes
@@ -205,11 +349,14 @@ type worker struct {
 	cpu      *process.CPUProgress
 	received atomic.Int64
 
-	// pid and rss are written by the goroutine driving the worker and read by
-	// stats from any goroutine, so both are atomic rather than guarded by the
-	// pool lock the writers do not hold.
-	pid atomic.Int64
-	rss atomic.Uint64
+	// pid, held and base are written by the goroutine driving the worker and
+	// read by stats from any goroutine, so they are atomic rather than guarded
+	// by the pool lock the writers do not hold. held is the base holding's
+	// figure; base is the base the worker last reported, and -1 while it has
+	// reported none.
+	pid  atomic.Int64
+	held atomic.Int64
+	base atomic.Int64
 }
 
 // countingReader counts every byte read through it into n.
@@ -240,16 +387,25 @@ func workerEnv() []string {
 	return nil
 }
 
-func newPool(runner *process.Runner, admit *admission.Ledger, cmd WorkerCommand, dir string, max int, memory int64) *pool {
-	p := &pool{runner: runner, admission: admit, cmd: cmd, dir: dir, max: max, memory: memory,
-		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{}}
+func newPool(runner *process.Runner, admit *admission.Ledger, cmd WorkerCommand, dir string, max int,
+	rederive func(workerResidentBytes int64)) *pool {
+	p := &pool{runner: runner, admission: admit, cmd: cmd, dir: dir, max: max, rederive: rederive,
+		live: map[*worker]bool{}, totals: map[*ledger.Run]*stageTotal{},
+		overruns: map[overrunClass]*Overrun{}, models: map[needKey]*needModel{}}
 	p.cond = sync.NewCond(&p.mu)
-	// Idle workers are room this pool keeps warm, so the ledger is told it may
-	// ask for it back: a head that does not fit has them stopped (see pool).
+	// Idle workers, and workers held by callers waiting for an increment, are
+	// room this pool keeps without parsing, so the ledger is told it may ask
+	// for it back: a head that does not fit has them given back, unless the
+	// head is this pool's own increment (see pool).
 	p.unregister = admit.Holder(func() {
-		if p.admission.Waiting() {
-			p.drain()
+		p.mu.Lock()
+		own := p.parseHead()
+		p.mu.Unlock()
+		if own || !p.admission.Waiting() {
+			return
 		}
+		p.drain()
+		p.yieldParse()
 	})
 	return p
 }
@@ -263,12 +419,13 @@ func (p *pool) enterStage(ctx context.Context) {
 	if run == nil {
 		return
 	}
+	repository := run.RepositoryID()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	t := p.totals[run]
 	if t == nil {
 		spanCtx, span := ledger.Start(run.Context(context.Background()), stageStructuralParse, "")
-		t = &stageTotal{ctx: spanCtx, span: span}
+		t = &stageTotal{ctx: spanCtx, span: span, repository: repository, files: map[model.SnapshotID]*languageFiles{}}
 		p.totals[run] = t
 	}
 	t.refs++
@@ -294,6 +451,7 @@ func (p *pool) leaveStage(ctx context.Context) {
 	last := t.refs == 0
 	if last {
 		delete(p.totals, run)
+		p.dropModels(t.repository)
 	}
 	p.mu.Unlock()
 	if last {
@@ -336,38 +494,52 @@ func newWorker(p *pool) *worker {
 	w := &worker{p: p, ctx: ctx, cancel: cancel, in: in, out: out, childIn: childIn, childOut: childOut,
 		done: make(chan struct{}), cpu: &process.CPUProgress{}}
 	w.recv = countingReader{r: out, n: &w.received}
+	w.base.Store(-1)
 	return w
 }
 
-// acquire returns a worker to parse with: an idle one when the pool has one
-// and no reserver waits on the ledger, otherwise a newly started process,
-// waiting when max processes are already alive or about to be. It returns
-// promptly on cancellation.
+// acquire returns a worker to parse r's file with: an idle one when the pool
+// has one and no reserver other than this pool's own increment waits on the
+// ledger, otherwise a newly started process, waiting when max processes are
+// already alive or about to be. Callers are served from pending, largest file
+// first. It returns promptly on cancellation.
 //
-// Idle workers found while a reserver waits are stopped rather than reused
-// (see pool): their room goes back to the ledger, and this caller then
+// Idle workers found while such a reserver waits are stopped rather than
+// reused (see pool): their room goes back to the ledger, and this caller then
 // reserves behind that waiter like any other. Waiting takes the ledger lock
 // under the pool lock; nothing takes the two the other way round, since the
 // ledger calls into this pool only through the make-room step and the pool's
-// idle-release step, both with no ledger lock held.
+// idle-release step, both with no ledger lock held, and the pool holds, adjusts
+// and releases holdings only with its own lock released.
 //
-// A new worker's memory is reserved on the ledger before the worker exists,
-// with the pool lock released: the wait is first-in-first-out behind every
-// other heavy child and can be long. No worker goes idle while the wait lasts
-// (see release). The wait ends in one of two ways: the ledger grants the room
-// and this caller starts a worker in it, or, once this caller is the ledger's
-// head, release hands it a worker together with that worker's reservation and
-// the wait is withdrawn. A grant that lands at the same moment as a handout is
-// given straight back, and so is one granted to a pool that closed meanwhile.
-func (p *pool) acquire(ctx context.Context) (*worker, error) {
+// A new worker's base holding is reserved on the ledger before the worker
+// exists, at the largest base this pool has seen, with the pool lock released:
+// the wait is first-in-first-out behind every other heavy child and can be
+// long. No worker goes idle while the wait lasts (see release). The wait ends
+// in one of two ways: the ledger grants the room and this caller starts a
+// worker in it, or, once this caller is the ledger's head, release hands it a
+// worker together with that worker's base holding and the wait is withdrawn.
+// A grant that lands at the same moment as a handout is given straight back,
+// and so is one granted to a pool that closed meanwhile.
+func (p *pool) acquire(ctx context.Context, r *request) (*worker, error) {
 	p.mu.Lock()
+	p.pending = append(p.pending, r)
 	for {
 		if p.closed {
+			p.dequeue(r)
 			p.mu.Unlock()
-			return nil, &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
+			return nil, closedError()
+		}
+		if p.next() != r {
+			if err := p.wait(ctx); err != nil {
+				p.dequeue(r)
+				p.mu.Unlock()
+				return nil, err
+			}
+			continue
 		}
 		if n := len(p.idle); n > 0 {
-			if p.admission.Waiting() {
+			if p.admission.Waiting() && !p.parseHead() {
 				p.mu.Unlock()
 				p.drain()
 				p.mu.Lock()
@@ -375,13 +547,18 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			}
 			w := p.idle[n-1]
 			p.idle = p.idle[:n-1]
+			p.dequeue(r)
 			p.mu.Unlock()
 			return w, nil
 		}
 		if len(p.live)+len(p.queued) < p.max {
+			// Queued on the ledger, this caller keeps its place there, so the
+			// next pending caller may queue for a worker of its own.
+			p.dequeue(r)
 			reserving, cancel := context.WithCancel(ctx)
 			a := &acquirer{cancel: cancel}
 			p.queued = append(p.queued, a)
+			base := p.largestBase
 			p.mu.Unlock()
 			// The make-room step frees nothing -- idle is empty while this
 			// acquirer is queued -- and only marks it the ledger's head, which
@@ -389,7 +566,7 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			// is called with no ledger lock held, so taking the pool lock here
 			// inverts no order: release cancels a wait under the pool lock, and
 			// the ledger's cancellation takes the ledger lock alone.
-			release, err := p.admission.ReserveWith(reserving, admission.Reservation{MemoryBytes: p.memory}, func() {
+			holding, err := p.admission.Hold(reserving, admission.Reservation{MemoryBytes: base}, func() {
 				p.mu.Lock()
 				a.head = true
 				p.mu.Unlock()
@@ -403,14 +580,14 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 					// Granted as it was handed a worker: the worker's room is
 					// this caller's, so the grant goes back to the ledger.
 					p.mu.Unlock()
-					release()
+					holding.Release()
 					p.mu.Lock()
 				}
 				if p.closed {
 					// close has already counted w among the busy workers it
 					// kills, so it is left to close.
 					p.mu.Unlock()
-					return nil, &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
+					return nil, closedError()
 				}
 				if !p.live[w] {
 					// The worker died after it was handed over: it is waited
@@ -418,6 +595,7 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 					p.mu.Unlock()
 					w.stop(false)
 					p.mu.Lock()
+					p.pending = append(p.pending, r)
 					continue
 				}
 				p.mu.Unlock()
@@ -429,17 +607,19 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			}
 			if p.closed {
 				p.mu.Unlock()
-				release()
+				holding.Release()
 				p.mu.Lock()
+				p.pending = append(p.pending, r)
 				continue
 			}
 			// The worker is fully constructed — pipes, context, cancel,
-			// reservation — and takes its place in live and in the wait group
+			// base holding — and takes its place in live and in the wait group
 			// under the same hold close waits behind, so neither a second
 			// acquirer nor a concurrent close can see a process about to start
 			// as absent or half-built.
 			w := newWorker(p)
-			w.release = release
+			w.holding = holding
+			w.held.Store(base)
 			p.live[w] = true
 			p.started++
 			p.wg.Add(1)
@@ -450,10 +630,15 @@ func (p *pool) acquire(ctx context.Context) (*worker, error) {
 			return w, nil
 		}
 		if err := p.wait(ctx); err != nil {
+			p.dequeue(r)
 			p.mu.Unlock()
 			return nil, err
 		}
 	}
+}
+
+func closedError() *model.Error {
+	return &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
 }
 
 // wait blocks until the pool changes or ctx ends, releasing and retaking p.mu
@@ -476,16 +661,18 @@ func (p *pool) wait(ctx context.Context) error {
 	return nil
 }
 
-// release returns a worker after a parse. An unhealthy worker is stopped. A
-// healthy one goes, with its reservation, to the acquirer of this pool that is
-// the ledger's head; while any other reserver waits -- an acquirer of this
-// pool queued behind another head, or another reserver of the ledger -- it is
-// stopped, its reservation goes back to the ledger once the runner has reaped
-// it, and the ledger's pump hands that room to the head in order (see pool).
-// With nobody waiting it goes idle, reusable by the next parse of this stage
-// and stopped by the drain that follows the last one. Its place in live is
-// given up only when the process has exited, which is what keeps live
-// processes bounded.
+// release returns a worker after a parse, or from a caller that yielded it
+// while waiting for an increment. An unhealthy worker is stopped. A healthy
+// one goes, with its base holding, to the acquirer of this pool that is the
+// ledger's head; while any other reserver waits -- an acquirer of this pool
+// queued behind another head, or another reserver of the ledger at a head that
+// is not this pool's increment -- it is stopped, its base holding goes back to
+// the ledger once the runner has reaped it, and the ledger's pump hands that
+// room to the head in order (see pool). Otherwise it goes idle, to the first
+// pending caller or, with none, for the next parse of this stage, and is
+// stopped by the drain that follows the last one. Its place in live is given
+// up only when the process has exited, which is what keeps live processes
+// bounded.
 func (p *pool) release(w *worker, healthy bool) {
 	if !healthy {
 		w.stop(true)
@@ -516,7 +703,7 @@ func (p *pool) release(w *worker, healthy bool) {
 			}
 		}
 	}
-	if p.closed || p.waiting() || p.admission.Waiting() {
+	if p.closed || p.waiting() || p.admission.Waiting() && !p.parseHead() {
 		p.mu.Unlock()
 		w.stop(false)
 		return
@@ -612,10 +799,14 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	// pooled worker makes no progress by design, so the hang detector runs
 	// only while a request is outstanding (watch), fed the processor time the
 	// runner publishes through CPUProgress.
+	//
+	// The runner reserves no memory for a worker: the ledger is the one gate,
+	// where the worker's base and each file's increment are held, and the
+	// runner's own budget never refuses what the ledger admitted.
 	spec := process.Spec{
 		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir, Env: workerEnv(),
 		Stdin: w.childIn, Stdout: w.childOut, MaxStderrBytes: workerStderrBytes,
-		Grace: workerGrace, CPUProgress: w.cpu, MemoryReservationBytes: p.memory,
+		Grace: workerGrace, CPUProgress: w.cpu,
 	}
 	w.span = p.openWorkerSpan(ctx)
 	go func() {
@@ -624,7 +815,7 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		// The runner has reaped the process, so its memory is free: this, and
 		// not the moment the worker was asked to stop, is when the reservation
 		// is given back.
-		w.release()
+		w.holding.Release()
 		// The worker's cost is known here and nowhere earlier: the run has
 		// returned, so the child has been reaped and its processor time, tree
 		// peak and transferred bytes are on the result. The span is ended
@@ -647,6 +838,11 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		// certain errWorkerGone the one retry a real parse failure needs.
 		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
 		p.exited++
+		if w.result.CPUUnsampled {
+			p.cpuUnsampled = true
+		} else {
+			p.workerCPUMS += w.result.CPUUserMillis + w.result.CPUSysMillis
+		}
 		p.cond.Broadcast()
 		p.mu.Unlock()
 		close(w.done)
@@ -686,7 +882,25 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 			WithDetail("worker_stderr", w.stderrLine())
 	}
 	w.pid.Store(int64(hello.PID))
+	p.adjust(w, hello.Memory)
 	return nil
+}
+
+// adjust sets w's base holding to the base the worker reported, upward
+// without waiting, and raises the largest base a new worker is reserved at. A
+// reading with no base leaves the holding as it is: an unavailable base is
+// not a base of zero.
+func (p *pool) adjust(w *worker, m wire.Memory) {
+	if m.BaseBytes == nil || *m.BaseBytes > math.MaxInt64 {
+		return
+	}
+	base := int64(*m.BaseBytes)
+	w.holding.Adjust(base)
+	w.held.Store(base)
+	w.base.Store(base)
+	p.mu.Lock()
+	p.largestBase = max(p.largestBase, base)
+	p.mu.Unlock()
 }
 
 // openWorkerSpan opens one worker's span under the total of the run that is
@@ -926,9 +1140,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
-			if base := ex.done.Memory.BaseBytes; base != nil {
-				w.rss.Store(*base)
-			}
+			p.adjust(w, ex.done.Memory)
 			return ex, nil
 		case wire.KindError:
 			var e wire.Error
@@ -943,6 +1155,275 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			return nil, fmt.Errorf("unexpected frame kind %d", kind)
 		}
 	}
+}
+
+// reserveParse takes one file's increment of need bytes, with the worker in
+// hand: it re-derives the allocation from the kernel's figure and the
+// workers' standing bases, then holds a Parse reservation, which is granted
+// whenever no other parse holds one. yielded reports that the wait was ended
+// by yieldParse and not granted: the caller then gives its worker back through
+// release and asks for one again (see pool). A grant that lands as the caller
+// is asked to yield is kept, since the room is then this file's.
+func (p *pool) reserveParse(ctx context.Context, need int64) (h *admission.Holding, yielded bool, err error) {
+	p.rederive(p.standingBases())
+	waiting, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pw := &parseWait{cancel: cancel}
+	p.mu.Lock()
+	p.parseWaits = append(p.parseWaits, pw)
+	p.mu.Unlock()
+	h, err = p.admission.Hold(waiting, admission.Reservation{MemoryBytes: need, Parse: true}, func() {
+		p.mu.Lock()
+		pw.head = true
+		p.mu.Unlock()
+	})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.parseWaits = slices.DeleteFunc(p.parseWaits, func(x *parseWait) bool { return x == pw })
+	if err != nil {
+		return nil, pw.yielded && ctx.Err() == nil, err
+	}
+	p.inFlight++
+	p.maxInFlight = max(p.maxInFlight, p.inFlight)
+	return h, false, nil
+}
+
+// endParse gives one file's increment back. Its caller has already adjusted
+// the worker's base to the file's Done, so the ledger never admits the next
+// file against memory the worker has not yet returned.
+func (p *pool) endParse(h *admission.Holding) {
+	h.Release()
+	p.mu.Lock()
+	p.inFlight--
+	p.mu.Unlock()
+}
+
+// standingBases sums every live worker's base holding: the parser workers'
+// part of the product's own residency.
+func (p *pool) standingBases() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var sum int64
+	for w := range p.live {
+		sum += w.held.Load()
+	}
+	return sum
+}
+
+// needKey names one learned need model: the repository and the key the run
+// ledger stores it under within that repository.
+type needKey struct {
+	repository string
+	ledger.NeedKey
+}
+
+// needModel is one key's decaying histogram, loaded from the run ledger on
+// first use. Its lock orders the observations folded into it and the states
+// recorded after them.
+type needModel struct {
+	mu     sync.Mutex
+	loaded bool
+	h      admission.NeedHistogram
+}
+
+// languageFiles is one snapshot's count of files per language, counted once
+// per stage: the half-life of every model learned from that snapshot.
+type languageFiles struct {
+	mu      sync.Mutex
+	counted bool
+	files   map[string]int64
+}
+
+// overrunClass is what overruns are counted per: a language and a size class.
+type overrunClass struct {
+	language  string
+	sizeClass int
+}
+
+// fileNeed is what one file is reserved at and learned under.
+type fileNeed struct {
+	language string
+	size     int64
+	// reserved is the file's increment: the model's prediction, or the
+	// structural prior for the first file of its key.
+	reserved int64
+	// model is nil where nothing is learned from the file: no run, no stage,
+	// no snapshot to count the half-life in, or a model that could not be
+	// read. run, key and halfLife are set with it.
+	model    *needModel
+	run      *ledger.Run
+	key      needKey
+	halfLife int64
+}
+
+// plan predicts one file's increment and prepares what it is learned under.
+// Learning needs a run, the run's parse stage and the snapshot the file
+// belongs to, whose files of the language are the half-life; a diagnostic
+// probe has no snapshot and is reserved at its prediction but teaches nothing.
+// A model the run ledger cannot read is counted and stands aside for this
+// file, which is reserved at the prior and learns nothing, and is read again
+// for the next.
+func (p *pool) plan(ctx context.Context, view model.SnapshotView, language string, size int64,
+	languageOf func(model.FileVersion) (string, bool)) (*fileNeed, error) {
+	f := &fileNeed{language: language, size: size, reserved: admission.PriorNeed(size)}
+	run := ledger.RunFromContext(ctx)
+	if run == nil || view == nil {
+		return f, nil
+	}
+	p.mu.Lock()
+	t := p.totals[run]
+	p.mu.Unlock()
+	if t == nil {
+		return f, nil
+	}
+	halfLife, err := p.filesOf(ctx, t, view, language, languageOf)
+	if err != nil {
+		return nil, err
+	}
+	key := needKey{repository: t.repository,
+		NeedKey: ledger.NeedKey{Language: language, Fingerprint: fingerprint, SizeClass: admission.SizeClassOf(size)}}
+	p.mu.Lock()
+	m := p.models[key]
+	if m == nil {
+		m = &needModel{}
+		p.models[key] = m
+	}
+	p.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loaded {
+		state, ok, err := run.NeedModel(ctx, key.NeedKey)
+		if err != nil {
+			p.failedModel()
+			return f, nil
+		}
+		if ok {
+			var h admission.NeedHistogram
+			if err := h.UnmarshalBinary(state); err != nil {
+				// A state that does not decode teaches nothing; the model
+				// starts empty and the next observation's state supersedes it.
+				p.failedModel()
+			} else {
+				m.h = h
+			}
+		}
+		m.loaded = true
+	}
+	if need, ok := m.h.Predict(size); ok {
+		f.reserved = need
+	}
+	f.model, f.run, f.key, f.halfLife = m, run, key, halfLife
+	return f, nil
+}
+
+// filesOf is the count of the snapshot's files of language, streamed through
+// the snapshot's manifest once per stage; only the per-language counts are
+// kept. A count that fails is not kept, and the next file counts again.
+func (p *pool) filesOf(ctx context.Context, t *stageTotal, view model.SnapshotView, language string,
+	languageOf func(model.FileVersion) (string, bool)) (int64, error) {
+	id := view.Header().ID
+	p.mu.Lock()
+	c := t.files[id]
+	if c == nil {
+		c = &languageFiles{}
+		t.files[id] = c
+	}
+	p.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.counted {
+		files := map[string]int64{}
+		err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+			if fv.Status == model.FileDeleted {
+				return nil
+			}
+			if name, ok := languageOf(fv); ok {
+				files[name]++
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+		c.files, c.counted = files, true
+	}
+	return c.files[language], nil
+}
+
+// dropModels forgets the models of repository once no stage of it is left.
+// The pool lock must be held. The run ledger holds every state they reached.
+func (p *pool) dropModels(repository string) {
+	for _, t := range p.totals {
+		if t.repository == repository {
+			return
+		}
+	}
+	for k := range p.models {
+		if k.repository == repository {
+			delete(p.models, k)
+		}
+	}
+}
+
+func (p *pool) failedModel() {
+	p.mu.Lock()
+	p.modelFailures++
+	p.mu.Unlock()
+}
+
+// settle takes in one file's Done reading. A file whose need is absent learns
+// nothing and is counted unmeasured: an unavailable need is never an
+// observation of zero. A need above the file's increment is an overrun,
+// counted per class and disclosed; the file has already succeeded. A measured
+// need is folded into the file's model, when it has one, and recorded on the
+// run ledger with the model's state after it.
+func (p *pool) settle(f *fileNeed, m wire.Memory) {
+	if m.NeedBytes == nil || *m.NeedBytes > math.MaxInt64 {
+		p.mu.Lock()
+		p.unmeasured++
+		p.mu.Unlock()
+		return
+	}
+	need := int64(*m.NeedBytes)
+	if need > f.reserved {
+		class := overrunClass{language: f.language, sizeClass: admission.SizeClassOf(f.size)}
+		p.mu.Lock()
+		o := p.overruns[class]
+		if o == nil {
+			o = &Overrun{Language: class.language, SizeClass: class.sizeClass}
+			p.overruns[class] = o
+		}
+		o.Files++
+		if drift := need - f.reserved; drift > o.LargestDriftBytes {
+			o.LargestDriftBytes, o.ReservedBytes, o.NeedBytes = drift, f.reserved, need
+		}
+		p.mu.Unlock()
+	}
+	if f.model == nil {
+		return
+	}
+	f.model.mu.Lock()
+	defer f.model.mu.Unlock()
+	f.model.h.Observe(need, f.size, f.halfLife)
+	state, err := f.model.h.MarshalBinary()
+	if err != nil {
+		p.failedModel()
+		return
+	}
+	f.run.ObserveNeed(ledger.NeedObservation{Key: f.key.NeedKey, ReservedBytes: f.reserved, NeedBytes: need, State: state})
+}
+
+// Overrun is one class's files whose observed need exceeded the increment
+// they were admitted with (ADR-0012 decision 5). Each such file ran and
+// succeeded; the drift is need minus reservation, and ReservedBytes and
+// NeedBytes are those of the file with the largest.
+type Overrun struct {
+	Language          string `json:"language"`
+	SizeClass         int    `json:"size_class"`
+	Files             uint64 `json:"files"`
+	LargestDriftBytes int64  `json:"largest_drift_bytes"`
+	ReservedBytes     int64  `json:"reserved_bytes"`
+	NeedBytes         int64  `json:"need_bytes"`
 }
 
 // Stats is the aggregate parent-plus-worker resource view of Section 22:
@@ -962,7 +1443,25 @@ type Stats struct {
 	WorkersExited  uint64 `json:"workers_exited"`
 	Parses         uint64 `json:"parses"`
 	Retries        uint64 `json:"retries"`
-	// WorkerRSSBytes sums the resident set each live worker last reported.
+	// MaxParsesInFlight is the most files that held an increment at once.
+	MaxParsesInFlight int `json:"max_parses_in_flight"`
+	// StageWallMS is the wall time the parse stage was open, from its first
+	// enter to its last leave, summed over every stage so far.
+	StageWallMS int64 `json:"stage_wall_ms"`
+	// WorkerCPUMS sums the processor time of every reaped worker, and is -1
+	// when any of them was not measured.
+	WorkerCPUMS int64 `json:"worker_cpu_ms"`
+	// UnmeasuredFiles are the files whose worker reported no need, from which
+	// nothing was learned, and NeedModelFailures the learned models that could
+	// not be read or encoded, whose files were reserved at the prior or not
+	// recorded.
+	UnmeasuredFiles   uint64 `json:"unmeasured_files"`
+	NeedModelFailures uint64 `json:"need_model_failures"`
+	// Overruns are the classes in which a file needed more than its
+	// increment, ordered by language and size class.
+	Overruns []Overrun `json:"overruns,omitempty"`
+	// WorkerRSSBytes sums the base each live worker last reported, and is -1
+	// when any live worker has reported none.
 	WorkerRSSBytes int64 `json:"worker_rss_bytes"`
 	// ParentRSSBytes is this process's resident set.
 	ParentRSSBytes int64 `json:"parent_rss_bytes"`
@@ -988,18 +1487,32 @@ func (p *pool) stats() Stats {
 		}
 	}
 	s := Stats{Processes: len(p.live), IdleWorkers: len(p.idle), BusyWorkers: len(p.live) - len(p.idle),
-		WorkersStarted: p.started, WorkersExited: p.exited, Parses: p.parses, Retries: p.retries, ParentRSSBytes: -1}
+		WorkersStarted: p.started, WorkersExited: p.exited, Parses: p.parses, Retries: p.retries,
+		MaxParsesInFlight: p.maxInFlight, WorkerCPUMS: p.workerCPUMS, UnmeasuredFiles: p.unmeasured,
+		NeedModelFailures: p.modelFailures, ParentRSSBytes: -1}
+	if p.cpuUnsampled {
+		s.WorkerCPUMS = -1
+	}
+	for _, o := range p.overruns {
+		s.Overruns = append(s.Overruns, *o)
+	}
+	slices.SortFunc(s.Overruns, func(a, b Overrun) int {
+		if c := strings.Compare(a.Language, b.Language); c != 0 {
+			return c
+		}
+		return a.SizeClass - b.SizeClass
+	})
 	if rss, ok := wire.ResidentBytes(); ok {
 		s.ParentRSSBytes = rss
 	}
 	for w := range p.live {
 		s.WorkerPIDs = append(s.WorkerPIDs, int(w.pid.Load()))
-		rss := w.rss.Load()
-		if rss == 0 || s.WorkerRSSBytes < 0 {
+		base := w.base.Load()
+		if base < 0 || s.WorkerRSSBytes < 0 {
 			s.WorkerRSSBytes = -1
 			continue
 		}
-		s.WorkerRSSBytes += int64(rss)
+		s.WorkerRSSBytes += base
 	}
 	return s
 }

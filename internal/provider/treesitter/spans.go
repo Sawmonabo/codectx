@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 )
 
@@ -24,10 +25,17 @@ const stageStructuralParse = "structural_parse"
 // refs is how many units are parsing under this run. The total is opened by
 // the first and ended by the last, which is the stage: exactly as long as
 // there is parse work in flight.
+//
+// repository is the run's repository, which the need models learned under the
+// stage are keyed by, and files the per-language file counts of each snapshot
+// the stage parses, which are the models' half-lives. Both end with the
+// stage.
 type stageTotal struct {
-	ctx  context.Context
-	span *ledger.Span
-	refs int
+	ctx        context.Context
+	span       *ledger.Span
+	refs       int
+	repository string
+	files      map[model.SnapshotID]*languageFiles
 }
 
 // measured turns one worker child's result into what the span that ran it
