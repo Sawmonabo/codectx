@@ -792,16 +792,15 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@17 -> return a, d@44", "d@41 -> return a, d@44"},
 		},
 		{
-			// §7.11. Lines at 0, 13, 20, 38. Nodes: c@6, x@9, c@17 (Branch),
-			// from m import *@22 (a Stmt that defines nothing), return x@39.
-			// Succ: c→{from m import *, return x}; from m import *→return x.
-			name:     "a wildcard import is one node that defines nothing",
-			protects: "`from m import *` is a node of its own on its path and kills no local",
-			mutation: "make no node for it (c@17 -> from m import *@22 disappears), or let it kill every local (x@9 -> return x@39 becomes from m import *@22 -> return x@39)",
-			src:      "def f(c, x):\n if c:\n  from m import *\n return x\n",
-			fn:       1,
-			cd:       []string{"c@17 -> from m import *@22"},
-			du:       []string{"c@6 -> c@17", "x@9 -> return x@39"},
+			// §7.11, the module (callable 0): a wildcard import is legal at
+			// module level only, and it binds every public name of m. Lines at
+			// 0, 6, 22. Nodes: x = 1@0, from m import *@6 (a Stmt that
+			// may-defines x, a χ), g(x)@22.
+			name:     "a wildcard import may rebind every module variable and kills none",
+			protects: "`from m import *` is a node of its own that may-defines each module variable, so a later read pairs with it and with the definition before it",
+			mutation: "make it define nothing (x = 1@0 -> from m import *@6 and from m import *@6 -> g(x)@22 disappear), or a killing definition of each variable (x = 1@0 -> g(x)@22 disappears)",
+			src:      "x = 1\nfrom m import *\ng(x)\n",
+			du:       []string{"x = 1@0 -> from m import *@6", "x = 1@0 -> g(x)@22", "from m import *@6 -> g(x)@22"},
 		},
 		{
 			// §7.14. Lines at 0, 9, 23. Nodes: type T = int@10 (spans the
@@ -1273,15 +1272,21 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"s@23 -> k.V@58", "k@12 -> k.V@58"},
 		},
 		{
-			// print_statement of the pinned grammar (the Python 2 form, which
-			// no section of the 3.13 reference defines). Lines at 0, 10.
+			// Ill-formed on purpose: the compiler rejects the Python 2 print
+			// statement ("Missing parentheses in call to 'print'"), and no
+			// section of the 3.13 reference defines it. The pinned grammar
+			// parses it clean, as print_statement, so a repository holding
+			// Python 2 code yields such trees, and every Python 3 statement
+			// kind is one the lowering names: only this form can show that an
+			// unnamed kind is still one node with its reads. Lines at 0, 10.
 			// Nodes: a@6, print a@11 (a plain Stmt node reading a).
-			name:     "a print statement is a plain node",
-			protects: "a kind the lowering does not name is still one node with its reads",
-			mutation: "make no node for a kind the lowering does not name (a@6 -> print a@11 disappears)",
-			src:      "def f(a):\n print a\n",
-			fn:       1,
-			du:       []string{"a@6 -> print a@11"},
+			name:      "a print statement is a plain node",
+			protects:  "a kind the lowering does not name is still one node with its reads",
+			mutation:  "make no node for a kind the lowering does not name (a@6 -> print a@11 disappears)",
+			src:       "def f(a):\n print a\n",
+			fn:        1,
+			illFormed: true,
+			du:        []string{"a@6 -> print a@11"},
 		},
 		{
 			// §6.13, §6.12, lower.go (the hand-off). Lines at 0, 13, 45.

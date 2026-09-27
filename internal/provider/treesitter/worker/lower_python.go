@@ -34,9 +34,14 @@ var pythonLowering = Lowering{
 //   - A statement is one node: an expression statement spans its expression
 //     (a bare tuple statement `a, b` spans the statement), return, raise,
 //     break and continue span the statement (kind Jump), an import makes one
-//     defining node per bound name, spanning the local name (`import a.b`
-//     binds a; `from m import *` is one Stmt node spanning the statement and
-//     defines nothing), a type alias spans the statement and defines its
+//     defining node per bound name, spanning the local name: an alias, or
+//     the first identifier of a dotted name (`import a.b` binds a and spans
+//     a alone). `from m import *`, legal at module level only (§7.11), is one
+//     Stmt node spanning the statement that may-defines (MayDef) every
+//     variable of the callable, the module: it binds every public name of m, so it may
+//     rebind any of them and leave the others in place. A name bound only
+//     by the wildcard is no variable (see Names that resolve to no
+//     variable). A type alias spans the statement and defines its
 //     name. An assignment or augmented assignment to one identifier, one
 //     attribute or one subscript is its own node spanning the statement;
 //     an unpacking or a chained assignment (`a, b = e`, `a = b = e`)
@@ -86,10 +91,12 @@ var pythonLowering = Lowering{
 //     (`except*` renders `except`). Each except or except* clause
 //     with a type is a Branch node spanning its type expression, in source
 //     order. Except clauses: the first that matches runs; an exception no
-//     clause matches is re-raised (Throw) from the last test's false edge,
-//     which goes to the enclosing try's Handler, through any enclosing
-//     finally, or, with none open, is an edge from that test to Exit;
-//     and a bare `except:` catches everything and ends the chain. Except*
+//     clause matches is re-raised (Throw) from the last test's false edge.
+//     That Throw source joins the enclosing try's clause chain directly,
+//     reaching its first test beside its Handler, never through it; an
+//     enclosing finally intercepts it into the finally's body first; with
+//     neither open, it is an edge from that test to Exit. A bare
+//     `except:` catches everything and ends the chain. Except*
 //     clauses (§8.4.2): every clause matching a part of the group runs, so
 //     each test is reached from the previous test's false edge and from the
 //     previous body's end, and after the last clause the statement both
@@ -117,7 +124,8 @@ var pythonLowering = Lowering{
 //     in every case defines another variable holding the manager. The
 //     rest of the statement is a finally: its Handler spans the token
 //     introducing the item (the `with` keyword for the first, the preceding
-//     comma for each later one), a pattern or reference target is bound
+//     comma for each later one; in async with too the `with` keyword, not
+//     `async`), a pattern or reference target is bound
 //     inside it by the unpacking rule (a failing assignment runs
 //     `__exit__`), each binding node spanning its target (`o.p` in `with m
 //     as o.p`) and Using the entered value's variable and the reads of the
@@ -130,7 +138,11 @@ var pythonLowering = Lowering{
 //     The statement after the with follows the exit when the body completed
 //     normally or an exception reached the finally, because `__exit__` may
 //     suppress it; a break, continue or return alone is re-issued from the
-//     exit and never falls through. Items close in reverse.
+//     exit and never falls through. Items close in reverse: an inner item's
+//     exit is MayThrow (`__exit__` is a call) into each outer item's finally,
+//     unentered while the inner one closes, so it reaches the outer item's
+//     Handler, and the throw the inner finally re-issues from its exit joins
+//     the outer finally as a Throw source.
 //   - match (§8.6): the subjects are evaluated once, at one Stmt node
 //     spanning them that defines a variable of the lowering's own holding
 //     the subject value. Each case is one node spanning its patterns as
@@ -143,7 +155,10 @@ var pythonLowering = Lowering{
 //     irrefutable (§8.6.3: a capture, the wildcard, or an irrefutable group,
 //     or-pattern or as-pattern) and there is no guard. Every capture is a
 //     defining node spanning the captured name, on the taken path, Using the
-//     subject's variable; a guard is a Branch node
+//     subject's variable, in source order (an as-pattern `y as z` makes the
+//     captures of the pattern it wraps, y, and then its own name, z). A
+//     pattern's throw is the case node's: a capture node is never MayThrow;
+//     a guard is a Branch node
 //     spanning its expression, whose false edge also reaches the next case
 //     (captures made before it stay bound). A case body ends the match: there
 //     is no fallthrough, and no case matching falls out of the statement.
@@ -187,7 +202,9 @@ var pythonLowering = Lowering{
 //     assert message are lowered by yield with no result variable: a
 //     construct lowered to nodes is its nodes alone (`a and f()` is the
 //     Branch a and the Stmt f()), any other expression one Stmt node
-//     spanning it without its parentheses. A lambda or comprehension
+//     spanning it without its parentheses. A generator expression's own
+//     parentheses are its syntax, not a parenthesized expression, so its
+//     node spans them. A lambda or comprehension
 //     there is its creating node alone, which defines no result variable:
 //     the created value is discarded.
 //   - print and exec statements, and every kind not named here, are plain
@@ -222,7 +239,10 @@ var pythonLowering = Lowering{
 //     result alone), and a lambda or comprehension (the creating node). A
 //     condition over one of them (`if a and b:`) is a Branch that Uses the
 //     result variable. `x := e` as an operand or arm of another construct
-//     defines that construct's result the same way.
+//     defines that construct's result the same way. Nested anywhere inside
+//     an expression a node folds (`(x := 1) + 0`, `g(x := 1)`), `x := e` is
+//     a node of its own, made before the folding node, which Uses its
+//     result.
 //   - A def or class statement's node defines its name, the variable the
 //     created value travels through.
 //   - A read the consumer folds that its statement makes before a node
@@ -264,7 +284,9 @@ var pythonLowering = Lowering{
 // MayThrow is given to every node whose own evaluation — the part of the
 // source evaluated since the previous node — contains a call, an attribute or
 // subscript read or write, `await`, `yield`, a star or double-star unpacking,
-// an unpacking assignment, an import, a for loop's iterator creation or step,
+// an unpacking assignment (its first binding node carries the throw: the
+// value is unpacked before any target is bound, and, for a with item's
+// pattern target, inside the item's finally), an import, a for loop's iterator creation or step,
 // a context manager's enter or exit, a class creation, a comprehension's
 // creation, or a class, mapping, sequence or dotted-value pattern; a raise
 // statement's node is also a Throw. A raise counts toward MayThrow only
@@ -1230,7 +1252,15 @@ func (j *pyLower) imports(n *ts.Node) {
 			continue
 		}
 		if c.KindId() == k.wildcardImport {
-			j.node(flow.Stmt, n, 0, 0)
+			// It may rebind any variable of the callable, the module (see
+			// Node granularity): each is a χ on its node. frames holds the
+			// callable's own frame alone while a statement is lowered.
+			id := j.node(flow.Stmt, n, 0, 0)
+			for x := j.frames[0].mark; x < j.binds.mark(); x++ {
+				if v := j.binds.at(x).v; v >= 0 {
+					j.b.MayDef(id, v)
+				}
+			}
 			continue
 		}
 		if nm := j.importName(c); nm != nil {
