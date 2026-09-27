@@ -1,122 +1,119 @@
 package worker
 
-import "unsafe"
-
 // Flat is one file's parse tree as a Go-side node array, filled by Flatten.
 // It holds no native pointer and no Go pointer, so it outlives the tree it
 // was flattened from and the collector never scans it. Nothing writes it
 // after Flatten, so any number of readers may share it.
 type Flat struct {
-	nodes []Node
+	nodes []flatNode
 }
 
 // Root is the tree's root node.
-func (f *Flat) Root() *Node { return &f.nodes[0] }
+func (f *Flat) Root() Node { return Node{f: f} }
 
-// Bytes is the array's size in bytes, the figure the parse benchmark reports
-// per source byte beside the tree's own.
-func (f *Flat) Bytes() int { return len(f.nodes) * int(unsafe.Sizeof(Node{})) }
-
-// Node is one node of a Flat. A *Node answers the methods the lowerings and
-// the callable walk call on a native node, with the same signatures and the
-// same answers, and with no native call (Walk returns a Cursor, which answers
-// the native cursor's methods the same way): it navigates by the distances its
-// record holds to its parent, first child and next sibling within the one
-// array. Every *Node points into that array, so a Node is never copied: a
-// copy is outside the array and navigates to memory that is not a node. go
-// vet reports every copy (noCopy); code keeps *Node, as it kept *ts.Node.
+// Node is a handle on one node of a Flat: the array and the node's index in
+// it. It is a value: a copy names the same node. The zero Node is null, the
+// answer where the native API answers nil. A Node answers the methods the
+// lowerings and the callable walk call on a native node, with the same
+// answers and no native call (Walk returns a Cursor, which answers the
+// native cursor's methods the same way). Calling any method but IsNull on a
+// null Node panics, as calling one on a nil native node does.
 type Node struct {
-	_ noCopy
-	n flatNode
+	f *Flat
+	i uint32
 }
 
-// noCopy makes go vet's copylocks check report a copied Node. It is zero
-// size and first, so Node keeps flat_node's layout.
-type noCopy struct{}
+// IsNull reports the null Node.
+func (n Node) IsNull() bool { return n.f == nil }
 
-func (*noCopy) Lock()   {}
-func (*noCopy) Unlock() {}
-
-// step is the node dist nodes after n (forward) or before it (back), or nil
-// for dist 0.
-func (n *Node) step(dist uint32, forward bool) *Node {
-	if dist == 0 {
-		return nil
-	}
-	off := int(dist) * int(unsafe.Sizeof(Node{}))
-	if !forward {
-		off = -off
-	}
-	return (*Node)(unsafe.Add(unsafe.Pointer(n), off))
-}
+// rec is n's record.
+func (n Node) rec() *flatNode { return &n.f.nodes[n.i] }
 
 // Id is unique among the nodes of one Flat, as the native node's id is
 // among the nodes of one tree.
-func (n *Node) Id() uintptr { return uintptr(unsafe.Pointer(n)) }
+func (n Node) Id() uintptr { return uintptr(n.i) }
 
 // KindId is the node's kind: the library's public symbol.
-func (n *Node) KindId() uint16 { return uint16(n.n.kind) }
+func (n Node) KindId() uint16 { return uint16(n.rec().kind) }
 
 // IsNamed reports a named node.
-func (n *Node) IsNamed() bool { return n.n.flags&flatNamed != 0 }
+func (n Node) IsNamed() bool { return n.rec().flags&flatNamed != 0 }
 
 // IsExtra reports an extra node (a comment).
-func (n *Node) IsExtra() bool { return n.n.flags&flatExtra != 0 }
+func (n Node) IsExtra() bool { return n.rec().flags&flatExtra != 0 }
 
 // HasError reports that the node is, or contains, an error or a missing node.
-func (n *Node) HasError() bool { return n.n.flags&flatError != 0 }
+func (n Node) HasError() bool { return n.rec().flags&flatError != 0 }
 
 // StartByte is the node's first byte offset.
-func (n *Node) StartByte() uint { return uint(n.n.start) }
+func (n Node) StartByte() uint { return uint(n.rec().start) }
 
 // EndByte is the node's end byte offset, exclusive.
-func (n *Node) EndByte() uint { return uint(n.n.end) }
+func (n Node) EndByte() uint { return uint(n.rec().end) }
 
-// Parent is the node's parent, or nil for the root.
-func (n *Node) Parent() *Node { return n.step(uint32(n.n.parent), false) }
-
-// first is the node's first child, or nil.
-func (n *Node) first() *Node { return n.step(uint32(n.n.first), true) }
-
-// NextSibling is the node's next sibling, named or not, or nil.
-func (n *Node) NextSibling() *Node { return n.step(uint32(n.n.next), true) }
-
-// PrevSibling is the node's previous sibling, named or not, or nil. It walks
-// the parent's children from the first, as the native call does.
-func (n *Node) PrevSibling() *Node {
-	p := n.Parent()
-	if p == nil {
-		return nil
+// Parent is the node's parent, or null for the root.
+func (n Node) Parent() Node {
+	d := uint32(n.rec().parent)
+	if d == 0 {
+		return Node{}
 	}
-	var prev *Node
+	return Node{f: n.f, i: n.i - d}
+}
+
+// first is the node's first child, or null.
+func (n Node) first() Node {
+	d := uint32(n.rec().first)
+	if d == 0 {
+		return Node{}
+	}
+	return Node{f: n.f, i: n.i + d}
+}
+
+// NextSibling is the node's next sibling, named or not, or null.
+func (n Node) NextSibling() Node {
+	d := uint32(n.rec().next)
+	if d == 0 {
+		return Node{}
+	}
+	return Node{f: n.f, i: n.i + d}
+}
+
+// PrevSibling is the node's previous sibling, named or not, or null. It
+// walks the parent's children from the first, as the native call does.
+func (n Node) PrevSibling() Node {
+	p := n.Parent()
+	if p.IsNull() {
+		return Node{}
+	}
+	var prev Node
 	for c := p.first(); c != n; c = c.NextSibling() {
 		prev = c
 	}
 	return prev
 }
 
-// NextNamedSibling is the node's next named sibling, or nil.
-func (n *Node) NextNamedSibling() *Node {
+// NextNamedSibling is the node's next named sibling, or null.
+func (n Node) NextNamedSibling() Node {
 	c := n.NextSibling()
-	for c != nil && !c.IsNamed() {
+	for !c.IsNull() && !c.IsNamed() {
 		c = c.NextSibling()
 	}
 	return c
 }
 
 // ChildCount is the number of the node's children, named or not.
-func (n *Node) ChildCount() uint {
+func (n Node) ChildCount() uint {
 	var k uint
-	for c := n.first(); c != nil; c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
 		k++
 	}
 	return k
 }
 
-// Child is the node's i-th child, named or not, or nil.
-func (n *Node) Child(i uint) *Node {
+// Child is the node's i-th child, named or not, or null.
+func (n Node) Child(i uint) Node {
 	c := n.first()
-	for ; c != nil && i > 0; i-- {
+	for ; !c.IsNull() && i > 0; i-- {
 		c = c.NextSibling()
 	}
 	return c
@@ -124,9 +121,9 @@ func (n *Node) Child(i uint) *Node {
 
 // NamedChildCount is the number of the node's named children, extras
 // included.
-func (n *Node) NamedChildCount() uint {
+func (n Node) NamedChildCount() uint {
 	var k uint
-	for c := n.first(); c != nil; c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
 		if c.IsNamed() {
 			k++
 		}
@@ -134,9 +131,9 @@ func (n *Node) NamedChildCount() uint {
 	return k
 }
 
-// NamedChild is the node's i-th named child, extras included, or nil.
-func (n *Node) NamedChild(i uint) *Node {
-	for c := n.first(); c != nil; c = c.NextSibling() {
+// NamedChild is the node's i-th named child, extras included, or null.
+func (n Node) NamedChild(i uint) Node {
+	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
 		if c.IsNamed() {
 			if i == 0 {
 				return c
@@ -144,38 +141,38 @@ func (n *Node) NamedChild(i uint) *Node {
 			i--
 		}
 	}
-	return nil
+	return Node{}
 }
 
-// ChildByFieldId is the node's first child under field id, or nil; id 0
+// ChildByFieldId is the node's first child under field id, or null; id 0
 // names no field.
-func (n *Node) ChildByFieldId(id uint16) *Node {
+func (n Node) ChildByFieldId(id uint16) Node {
 	if id == 0 {
-		return nil
+		return Node{}
 	}
-	for c := n.first(); c != nil; c = c.NextSibling() {
-		if uint16(c.n.field) == id {
+	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
+		if uint16(c.rec().field) == id {
 			return c
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // Walk is a cursor rooted at n.
-func (n *Node) Walk() *Cursor { return &Cursor{root: n, cur: n} }
+func (n Node) Walk() *Cursor { return &Cursor{root: n, cur: n} }
 
 // Cursor walks the nodes under its root, as a native tree cursor does: it
-// never moves above or beside the node it was created or reset at.
+// never moves above or beside the node it was created or reset at. It holds
+// two handles and no native state.
 type Cursor struct {
-	root, cur *Node
+	root, cur Node
 }
 
-// Reset roots c at n. It takes the node by pointer where the native cursor
-// takes it by value, since a Node is never copied.
-func (c *Cursor) Reset(n *Node) { c.root, c.cur = n, n }
+// Reset roots c at n.
+func (c *Cursor) Reset(n Node) { c.root, c.cur = n, n }
 
 // Node is the cursor's node.
-func (c *Cursor) Node() *Node { return c.cur }
+func (c *Cursor) Node() Node { return c.cur }
 
 // FieldId is the field of the cursor's node under its parent, or 0 at the
 // cursor's root, as the native cursor reports it.
@@ -183,13 +180,13 @@ func (c *Cursor) FieldId() uint16 {
 	if c.cur == c.root {
 		return 0
 	}
-	return uint16(c.cur.n.field)
+	return uint16(c.cur.rec().field)
 }
 
 // GotoFirstChild moves to the first child and reports whether there is one.
 func (c *Cursor) GotoFirstChild() bool {
 	f := c.cur.first()
-	if f == nil {
+	if f.IsNull() {
 		return false
 	}
 	c.cur = f
@@ -203,7 +200,7 @@ func (c *Cursor) GotoNextSibling() bool {
 		return false
 	}
 	s := c.cur.NextSibling()
-	if s == nil {
+	if s.IsNull() {
 		return false
 	}
 	c.cur = s

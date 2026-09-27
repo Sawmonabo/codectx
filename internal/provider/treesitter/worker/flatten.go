@@ -126,7 +126,7 @@ import (
 	ts "github.com/tree-sitter/go-tree-sitter"
 )
 
-// flatNode is the walk's flat_node, the record every Node holds.
+// flatNode is the walk's flat_node, one element of a Flat's array.
 type flatNode = C.flat_node
 
 // The record's flags, as the walk sets them.
@@ -146,9 +146,7 @@ const (
 //     checks that the pointer is that handle);
 //   - the node and tree-cursor wrappers are each exactly one native struct
 //     wide, so the declarations above, which the walk passes to and receives
-//     from the library by value, have the library's size;
-//   - Node is exactly one flat_node wide, so the array Flatten allocates is
-//     the array the walk fills.
+//     from the library by value, have the library's size.
 var (
 	_ = [1]struct{}{}[unsafe.Sizeof(ts.Tree{})-unsafe.Sizeof(unsafe.Pointer(nil))]
 	_ = [1]struct{}{}[unsafe.Sizeof(unsafe.Pointer(nil))-unsafe.Sizeof(ts.Tree{})]
@@ -156,14 +154,12 @@ var (
 	_ = [1]struct{}{}[C.sizeof_TSNode-unsafe.Sizeof(ts.Node{})]
 	_ = [1]struct{}{}[unsafe.Sizeof(ts.TreeCursor{})-C.sizeof_TSTreeCursor]
 	_ = [1]struct{}{}[C.sizeof_TSTreeCursor-unsafe.Sizeof(ts.TreeCursor{})]
-	_ = [1]struct{}{}[unsafe.Sizeof(Node{})-C.sizeof_flat_node]
-	_ = [1]struct{}{}[C.sizeof_flat_node-unsafe.Sizeof(Node{})]
 )
 
 // Flatten copies tree into a Go-side node array in preorder: every node's
 // kind, field, flags, byte range, parent, first child and next sibling. It
-// crosses into the library twice for the whole tree, once to size the array
-// and once to fill it, and never once per node; the walk runs in the library,
+// makes two native calls per tree, one to size the array and one to fill it,
+// and none per node; the walk runs in the library,
 // over its public tree-cursor API. It runs after the structural queries have
 // used tree, and the caller may close tree as soon as it returns: the array
 // holds no native pointer.
@@ -179,9 +175,16 @@ var (
 func Flatten(tree *ts.Tree) (*Flat, error) {
 	h := *(**C.TSTree)(unsafe.Pointer(tree))
 	n := C.flat_size(h)
-	nodes := make([]Node, n)
-	if visited := C.flat_fill(h, (*C.flat_node)(unsafe.Pointer(unsafe.SliceData(nodes))), n); uint64(visited) != uint64(n) {
+	if n == 0 {
+		return nil, fmt.Errorf("flatten: the tree counts no root node")
+	}
+	nodes := make([]flatNode, n)
+	if visited := C.flat_fill(h, &nodes[0], n); uint64(visited) != uint64(n) {
 		return nil, fmt.Errorf("flatten: the tree cursor visited %d nodes where the tree counts %d", uint64(visited), uint64(n))
 	}
 	return &Flat{nodes: nodes}, nil
 }
+
+// Bytes is the array's size in bytes, the figure the parse benchmark reports
+// per source byte beside the tree's own.
+func (f *Flat) Bytes() int { return len(f.nodes) * C.sizeof_flat_node }

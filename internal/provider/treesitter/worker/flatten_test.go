@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"unsafe"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
@@ -35,12 +34,14 @@ import (
 //   - the accessor: every method a lowering or the callable walk calls,
 //     answered as the native node answers it, ChildByFieldId for every field
 //     id of the grammar, and the cursor stepped in lockstep with a native one
-//     from every node.
+//     from every node; every absent answer is the null handle, as the zero
+//     Node is.
 //
 // Mutations that fail it: record the node's grammar symbol instead of its
 // public one; take the field from the parent's field instead of the cursor's;
 // drop an extra from the sibling chain; count NamedChild without extras;
-// let GotoNextSibling leave the cursor's root.
+// let GotoNextSibling leave the cursor's root; answer a zero distance with
+// the node itself instead of the null handle.
 func TestFlatMatchesNative(t *testing.T) {
 	srcs := flatSources(t)
 	for _, l := range lang.All {
@@ -206,14 +207,34 @@ walked:
 		}
 		return i
 	}
-	flat := func(n *Node) int {
-		if n == nil {
+	// flat is n's index, -1 for the null handle; a handle on another Flat
+	// fails.
+	flat := func(n Node) int {
+		if n.IsNull() {
 			return -1
 		}
-		return int((uintptr(unsafe.Pointer(n)) - uintptr(unsafe.Pointer(&f.nodes[0]))) / unsafe.Sizeof(Node{}))
+		if n.f != f {
+			t.Fatalf("a handle on another array")
+		}
+		return int(n.i)
+	}
+	// dist is the index a record's distance names, -1 for none.
+	dist := func(i int, d uint32, forward bool) int {
+		switch {
+		case d == 0:
+			return -1
+		case forward:
+			return i + int(d)
+		}
+		return i - int(d)
 	}
 
 	root, froot := tree.RootNode(), f.Root()
+	var null Node
+	if !null.IsNull() || froot.IsNull() || !froot.Parent().IsNull() || !froot.NextSibling().IsNull() ||
+		!froot.PrevSibling().IsNull() || !froot.ChildByFieldId(0).IsNull() || !froot.Child(froot.ChildCount()).IsNull() {
+		t.Fatal("the zero Node is not null, the root is, or an absent answer from the root is not null")
+	}
 	if froot.KindId() != root.KindId() || froot.StartByte() != root.StartByte() || froot.EndByte() != root.EndByte() ||
 		froot.ChildCount() != root.ChildCount() {
 		t.Fatalf("the handle's root is %d [%d,%d) with %d children, the binding's %d [%d,%d) with %d",
@@ -230,7 +251,7 @@ walked:
 	defer nc.Close()
 	defer fc.Close()
 	for i, n := range native {
-		fn := &f.nodes[i]
+		fn := Node{f: f, i: uint32(i)}
 		at := func(what string, got, want any) {
 			t.Helper()
 			if got != want {
@@ -238,7 +259,7 @@ walked:
 			}
 		}
 		// The record.
-		r := fn.n
+		r := f.nodes[i]
 		at("record kind", uint16(r.kind), n.KindId())
 		at("record field", uint16(r.field), fields[i])
 		at("record named", r.flags&flatNamed != 0, n.IsNamed())
@@ -247,9 +268,9 @@ walked:
 		at("record extra", r.flags&flatExtra != 0, n.IsExtra())
 		at("record start", uint(r.start), n.StartByte())
 		at("record end", uint(r.end), n.EndByte())
-		at("record parent", flat(fn.step(uint32(r.parent), false)), nat(n.Parent()))
-		at("record first child", flat(fn.step(uint32(r.first), true)), nat(n.Child(0)))
-		at("record next sibling", flat(fn.step(uint32(r.next), true)), nat(n.NextSibling()))
+		at("record parent", dist(i, uint32(r.parent), false), nat(n.Parent()))
+		at("record first child", dist(i, uint32(r.first), true), nat(n.Child(0)))
+		at("record next sibling", dist(i, uint32(r.next), true), nat(n.NextSibling()))
 
 		// One id per name: the library's name lookup matches any prefix of
 		// ERROR as ERROR, so a kind spelt so is resolved only when it is one.
@@ -297,7 +318,7 @@ walked:
 // lockstep walks c, a native cursor, and fc, a flat one, over the subtree of
 // their common root in preorder, reporting through at every answer of fc
 // that differs from c's.
-func lockstep(at func(what string, got, want any), c *ts.TreeCursor, fc *Cursor, nat func(*ts.Node) int, flat func(*Node) int) {
+func lockstep(at func(what string, got, want any), c *ts.TreeCursor, fc *Cursor, nat func(*ts.Node) int, flat func(Node) int) {
 	for step := 0; ; step++ {
 		where := "step " + strconv.Itoa(step) + " "
 		at(where+"Node", flat(fc.Node()), nat(c.Node()))
