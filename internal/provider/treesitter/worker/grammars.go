@@ -72,6 +72,9 @@ type kindIDs struct {
 	arrowFunction, functionExpression uint16
 	// C and C++ macros and declarator chains.
 	preprocDef, preprocFunctionDef, functionDeclarator, qualifiedIdentifier uint16
+	// errorKind is the kind of an ERROR node, the library's one error symbol,
+	// which its name lookup answers for "ERROR" in every grammar.
+	errorKind uint16
 }
 
 // kindSet is a set of named node kinds, indexed by kind id.
@@ -121,6 +124,7 @@ func (g *grammar) kindIDs() *kindIDs {
 			preprocFunctionDef:   id("preproc_function_def"),
 			functionDeclarator:   id("function_declarator"),
 			qualifiedIdentifier:  id("qualified_identifier"),
+			errorKind:            id("ERROR"),
 		}
 	})
 	return &g.kinds

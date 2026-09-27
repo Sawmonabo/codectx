@@ -168,32 +168,127 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	return wire.WriteJSON(out, wire.KindDone, done)
 }
 
-// parse parses one file and streams its facts, closing the tree on every
+// parse parses one file and streams its facts, closing every tree on every
 // path. It returns the file's Done, or the per-file failure to answer with,
 // or the write error that ends the loop.
+//
+// A request that names a fallback is a header's (ADR-0012 decision 10): a
+// parse with its language that has errors is followed by one parse with the
+// fallback, the parse with fewer error bytes is kept and the other closed
+// before extraction, and the choice is disclosed in Done. Every other file is
+// parsed once, whatever its errors.
 func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *wire.Error, error) {
-	l, ok := lang.Lookup(req.Language)
-	g := grammars[req.Language]
+	if req.Fallback != "" {
+		if _, ok := lang.Lookup(req.Fallback); !ok || grammars[req.Fallback] == nil || req.Fallback == req.Language {
+			return wire.Done{}, &wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unusable fallback language " + req.Fallback}, nil
+		}
+	}
+	kept, fail := w.parseAs(req.Language, src)
+	if fail != nil {
+		return wire.Done{}, fail, nil
+	}
+	var header *lang.HeaderChoice
+	if req.Fallback != "" {
+		choice, next, fail := w.header(req, src, kept)
+		if fail != nil {
+			return wire.Done{}, fail, nil
+		}
+		kept, header = next, &choice
+	}
+	root := kept.tree.RootNode()
+	em := &emitter{w: out}
+	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src}
+	err := ex.run(kept.query, root, em)
+	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header}
+	kept.tree.Close()
+	return done, nil, err
+}
+
+// parsed is one parse of a file: its tree and the grammar, language and
+// compiled query it was parsed with.
+type parsed struct {
+	tree  *ts.Tree
+	l     lang.Language
+	g     *grammar
+	query *ts.Query
+}
+
+// parseAs parses src with the named language's grammar. The caller closes the
+// tree.
+func (w *state) parseAs(name string, src []byte) (parsed, *wire.Error) {
+	l, ok := lang.Lookup(name)
+	g := grammars[name]
 	if !ok || g == nil {
-		return wire.Done{}, &wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + req.Language}, nil
+		return parsed{}, &wire.Error{Code: "CTX_ARGUMENT_INVALID", Message: "unsupported language " + name}
 	}
 	parser, query, err := w.tools(l, g)
 	if err != nil {
-		return wire.Done{}, &wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}, nil
+		return parsed{}, &wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}
 	}
 	tree := Parse(parser, src, nil)
 	if tree == nil {
 		parser.Reset()
-		return wire.Done{}, &wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}, nil
+		return parsed{}, &wire.Error{Code: "CTX_PROVIDER_OUTPUT_INVALID", Message: "the parser produced no tree"}
 	}
-	root := tree.RootNode()
-	em := &emitter{w: out}
-	ex := &extraction{g: g, l: l, path: req.Path, src: src}
-	err = ex.run(query, root, em)
-	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated}
-	tree.Close()
-	return done, nil, err
+	return parsed{tree: tree, l: l, g: g, query: query}, nil
 }
+
+// parseErrors is p's error figures. A tree with no error or missing node is
+// clean without being flattened; any other is flattened once, and its error
+// bytes are read from the array, never by a native call per node.
+func (p parsed) parseErrors() (lang.ParseErrors, *wire.Error) {
+	if !p.tree.RootNode().HasError() {
+		return lang.ParseErrors{}, nil
+	}
+	f, err := Flatten(p.tree)
+	if err != nil {
+		return lang.ParseErrors{}, &wire.Error{Code: "CTX_INTERNAL", Message: err.Error()}
+	}
+	return f.parseErrors(p.g.kindIDs().errorKind), nil
+}
+
+// header decides a header from first, its parse with the request's language:
+// a clean one is kept as it is, and one with errors is weighed against one
+// parse with the fallback (lang.HeaderPlan.Choose). It returns the choice and
+// the kept parse, having closed the other; on a failure it has closed both.
+// Both trees are alive while the fallback parses, which lands inside the
+// file's measured need.
+func (w *state) header(req wire.Request, src []byte, first parsed) (lang.HeaderChoice, parsed, *wire.Error) {
+	firstErr, fail := first.parseErrors()
+	if fail != nil {
+		first.tree.Close()
+		return lang.HeaderChoice{}, parsed{}, fail
+	}
+	var second parsed
+	choice, err := lang.HeaderPlan{First: req.Language, Fallback: req.Fallback}.Choose(firstErr, func() (lang.ParseErrors, error) {
+		if second, fail = w.parseAs(req.Fallback, src); fail != nil {
+			return lang.ParseErrors{}, errFallback
+		}
+		pe, perr := second.parseErrors()
+		if fail = perr; fail != nil {
+			second.tree.Close()
+			return lang.ParseErrors{}, errFallback
+		}
+		return pe, nil
+	})
+	if err != nil {
+		first.tree.Close()
+		return lang.HeaderChoice{}, parsed{}, fail
+	}
+	switch {
+	case choice.Reason == lang.HeaderClean:
+		return choice, first, nil
+	case choice.Kept == req.Fallback:
+		first.tree.Close()
+		return choice, second, nil
+	}
+	second.tree.Close()
+	return choice, first, nil
+}
+
+// errFallback reports to Choose that the fallback parse failed; the failure
+// itself is the per-file error header answers with.
+var errFallback = errors.New("the fallback parse failed")
 
 // tools returns the language's parser and compiled query, creating them once.
 func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error) {

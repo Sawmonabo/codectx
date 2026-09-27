@@ -607,7 +607,8 @@ which language its headers are written in. The rule:
 1. **One-language repositories.** A repository with C translation units and no C++ ones parses `.h` as C, and one with
    C++ translation units and no C ones parses `.h` as C++.
 2. **Mixed repositories.** A repository with both parses `.h` with the C++ grammar first. It is the closer superset of
-   the two dialects that occur in headers.
+   the two dialects that occur in headers. A repository with neither parses `.h` with the C++ grammar first, for the
+   same reason; the fallback recovers a C header.
 3. **Fallback.** A header whose chosen parse has errors is parsed once with the other grammar. The parse with fewer
    error bytes is kept, and the choice is disclosed per file.
 
