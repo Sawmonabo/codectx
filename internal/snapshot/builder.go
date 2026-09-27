@@ -277,8 +277,9 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	if err := batch.Barrier(ctx); err != nil {
 		return model.Snapshot{}, typed(err)
 	}
+	tag := lang.For(snap)
 	err = b.Store.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
-		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r)) })
+		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r, tag)) })
 	})
 	if err != nil {
 		return model.Snapshot{}, typed(err)
@@ -322,8 +323,9 @@ func (b *Builder) logger() *slog.Logger {
 }
 
 // fileVersion is the manifest row for one staged entry. Language is derived
-// from the path here, deterministically, rather than stored.
-func (b *Builder) fileVersion(r row) model.FileVersion {
+// here, deterministically, from the path and, for a header, the snapshot's
+// census.
+func (b *Builder) fileVersion(r row, tag lang.Tagger) model.FileVersion {
 	return model.FileVersion{
 		ID:          model.NewFileID(b.Repository, r.path),
 		Path:        r.path,
@@ -331,7 +333,7 @@ func (b *Builder) fileVersion(r row) model.FileVersion {
 		Size:        r.size,
 		ContentHash: r.hash,
 		GitObjectID: r.oid,
-		Language:    lang.Of(r.path),
+		Language:    tag.Of(r.path),
 		Executable:  r.executable,
 	}
 }
