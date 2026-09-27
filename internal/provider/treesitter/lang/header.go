@@ -78,6 +78,23 @@ func (c Census) Header() HeaderPlan {
 	}
 }
 
+// Within is the plan restricted to the grammars a parser enables: with both,
+// the plan as it stands; with one, that grammar alone and no fallback; with
+// neither, false. It is the one answer to which grammar a header is parsed
+// with first, read by the parse and by the header unit's identity alike, so
+// the two cannot disagree.
+func (p HeaderPlan) Within(enabled func(name string) bool) (first, fallback string, ok bool) {
+	switch f, b := enabled(p.First), enabled(p.Fallback); {
+	case f && b:
+		return p.First, p.Fallback, true
+	case f:
+		return p.First, "", true
+	case b:
+		return p.Fallback, "", true
+	}
+	return "", "", false
+}
+
 // ChangesHeaders reports whether moving from census c to next changes the
 // grammar a header is parsed with first. When it does, every header parsed
 // under c was parsed with the wrong grammar for next and must be parsed

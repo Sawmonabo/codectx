@@ -1206,7 +1206,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		return outcome{}, err
 	}
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: c.cfgHash, OriginRunID: runID,
-		SourceBinding: binding, Dependencies: u.DependsOn}
+		SourceBinding: binding, Dependencies: u.DependsOn, DependencyKeys: u.DependencyKeys}
 	ureq := provider.UnitRequest{
 		Binding: model.Binding{RepositoryID: c.repo, SnapshotID: g.snap.ID, GenerationID: g.gen},
 		Unit:    spec, Run: runID, Content: g.view, Resolver: resolver,

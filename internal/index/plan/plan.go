@@ -1064,9 +1064,11 @@ type headerKeys struct {
 func headerKeysOf(s model.Snapshot, languages []string) headerKeys {
 	enabled := func(name string) bool { return len(languages) == 0 || slices.Contains(languages, name) }
 	plan := tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header()
-	grammar := plan.First
-	if !enabled(grammar) && enabled(plan.Fallback) {
-		grammar = plan.Fallback
+	grammar, _, ok := plan.Within(enabled)
+	if !ok {
+		// No grammar of the two is enabled, so no structural unit of a header
+		// is planned; the key is then read by no unit.
+		grammar = plan.First
 	}
 	return headerKeys{tag: "header_tag=" + plan.First, grammar: "header_grammar=" + grammar}
 }

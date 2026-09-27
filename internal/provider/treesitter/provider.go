@@ -255,18 +255,8 @@ func (p *Provider) LanguageOf(fv model.FileVersion) (lang.Language, bool) {
 // its extension's grammar.
 func (p *Provider) grammarOf(census lang.Census, fv model.FileVersion) (lang.Language, string, bool) {
 	if len(lang.Candidates(fv.Path)) > 1 {
-		plan := census.Header()
-		first, firstOK := p.languages[plan.First]
-		fallback, fallbackOK := p.languages[plan.Fallback]
-		switch {
-		case firstOK && fallbackOK:
-			return first, fallback.Name, true
-		case firstOK:
-			return first, "", true
-		case fallbackOK:
-			return fallback, "", true
-		}
-		return lang.Language{}, "", false
+		first, fallback, ok := census.Header().Within(func(name string) bool { _, ok := p.languages[name]; return ok })
+		return p.languages[first], fallback, ok
 	}
 	if l, ok := p.languages[fv.Language]; ok {
 		return l, "", true
