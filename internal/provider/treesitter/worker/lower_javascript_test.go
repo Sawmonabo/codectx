@@ -1299,6 +1299,29 @@ var javascriptShared = []goldenCase{
 		fn:       1,
 		du:       []string{"a = g()@24 -> h(a)@33", "a@11 -> return a;@41"},
 	},
+	{
+		// ECMA-262 §13.5.1.2 The delete Operator: deleting a property removes it from the object the base
+		// holds, a write through a property, so the node evaluating the delete may-defines the base (a χ, see
+		// May-definitions in Lowering), and a delete through an optional chain deletes on its non-nullish
+		// path, so its may-definition still holds after the merge.
+		// Nodes: o@11, k@14, delete o.p@19 (Uses o, may-defines it); the Branch o@38 (Uses o, defines the
+		// chain's result), the chain o?.[k]@38 (Uses the result and k, defines the result), delete o?.[k]@31
+		// (Uses the result, may-defines o); return o;@46. Each may-definition pairs with o@11 behind it and
+		// with the nearest one before it.
+		name:     "a delete of a property may-defines its base",
+		protects: "delete o.p, delete o[k] and delete o?.[k] write through o, so a later read of o depends on the delete",
+		mutation: "fold delete as a plain unary operator (delete o.p@19 -> o@38, delete o.p@19 -> delete o?.[k]@31, o@11 -> delete o?.[k]@31 and delete o?.[k]@31 -> return o;@46 vanish), or recognize only a member operand (delete o?.[k]@31 no longer may-defines o: delete o?.[k]@31 -> return o;@46 becomes delete o.p@19 -> return o;@46)",
+		src:      "function f(o, k) { delete o.p; delete o?.[k]; return o; }",
+		fn:       1,
+		cd:       []string{"o@38 -> o?.[k]@38"},
+		du: []string{
+			"o@11 -> delete o.p@19", "o@11 -> o@38", "delete o.p@19 -> o@38",
+			"o@38 -> o?.[k]@38", "k@14 -> o?.[k]@38",
+			"o@38 -> delete o?.[k]@31", "o?.[k]@38 -> delete o?.[k]@31",
+			"o@11 -> delete o?.[k]@31", "delete o.p@19 -> delete o?.[k]@31",
+			"o@11 -> return o;@46", "delete o?.[k]@31 -> return o;@46",
+		},
+	},
 }
 
 // javascriptJSX holds the JSX cases, which run under the javascript and tsx

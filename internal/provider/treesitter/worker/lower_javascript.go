@@ -149,6 +149,16 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     property read, whose result carries the reference and the old value to
 //     the write node; the write node reads o only as its may-definition's
 //     prior version, so it pairs with o by the May-definitions rule.
+//   - A delete of a property (`delete o.p`, `delete o[k]`, `delete o?.p`)
+//     is folded into the node that evaluates it, as a unary operator is, and
+//     that node may-defines the property's base variable (o), as every write
+//     through a property does: the delete removes a property of the object o
+//     holds (ECMA-262 §13.5.1.2). The node is the one whose reads include the
+//     operand's, recorded by position, so a node an operand evaluated later
+//     makes never takes it. Inside a nested callable the delete is one of its
+//     writes, which its creating node may-defines. `delete x` of a name
+//     writes nothing: it is sloppy code only and removes no variable of the
+//     function.
 //   - Destructuring is one defining node per bound name, spanning the name
 //     alone, with the TypeScript wrappers around it stripped (`[g!] = x`
 //     makes g's node spanning g), so D ≤ N. The value destructured is evaluated once, at its own node:
@@ -433,7 +443,7 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *S
 	clear(j.lab[:cap(j.lab)])
 	*j = jsLower{l: l, b: b, src: src, k: k, cur: s.cursor(fn), buf: j.buf[:0], binds: &s.scope,
 		reads: j.reads[:0], seen: j.seen[:0], stmtNo: 1, writes: j.writes[:0], first: -1, last: -1,
-		opt: j.opt[:0], lab: j.lab[:0], match: j.match[:0], optR: -1}
+		opt: j.opt[:0], lab: j.lab[:0], match: j.match[:0], optR: -1, may: j.may[:0]}
 	switch fn.KindId() {
 	case k.program:
 		j.hoistVars(fn)
@@ -529,6 +539,11 @@ type jsLower struct {
 	throws, thrown int
 	// first is the first node created since the last open, or -1.
 	first int32
+	// may are the pending may-definitions a delete of a property makes of
+	// its base variable, each with the position in reads where the delete's
+	// operand began: the node whose reads include it, the one evaluating the
+	// delete, takes it (see nodeAt).
+	may []jsMay
 	// last is the node created last, or -1, and lastSpan its span.
 	last     int32
 	lastSpan flow.Span
@@ -615,9 +630,18 @@ type jsSeen struct {
 	stmt, at int
 }
 
-// reset starts a statement: nothing is read and no throw is pending.
+// jsMay is a pending may-definition of v made by an operand whose reads begin
+// at reads[at].
+type jsMay struct {
+	at int
+	v  int32
+}
+
+// reset starts a statement: nothing is read and no throw or may-definition
+// is pending.
 func (j *jsLower) reset() {
 	j.reads, j.throws, j.thrown, j.condFrom = j.reads[:0], 0, 0, 0
+	j.may = j.may[:0]
 	j.stmtNo++
 }
 
@@ -650,7 +674,8 @@ func (j *jsLower) give(id int32, m int) {
 	j.read(r)
 }
 
-// node creates a node spanning n that Uses reads[from:to], and MayThrow when
+// node creates a node spanning n that Uses reads[from:to], may-defines what
+// the pending may-definitions made within those reads name, and MayThrow when
 // a throwing construct was evaluated since the previous node: that throw
 // happens before this node's definitions, which is what the Handler sees.
 func (j *jsLower) node(kind flow.Kind, n *ts.Node, from, to int) int32 {
@@ -664,12 +689,33 @@ func (j *jsLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 		j.first = id
 	}
 	j.uses(id, from, to)
+	kept := 0
+	for _, m := range j.may {
+		if from <= m.at && m.at < to {
+			j.b.MayDef(id, m.v)
+			continue
+		}
+		j.may[kept] = m
+		kept++
+	}
+	j.may = j.may[:kept]
 	if j.throws > j.thrown {
 		j.b.MayThrow(id)
 	}
 	j.thrown = j.throws
 	j.last, j.lastSpan = id, s
 	return id
+}
+
+// pending reports whether a may-definition made at reads[from] or later
+// waits for a node.
+func (j *jsLower) pending(from int) bool {
+	for _, m := range j.may {
+		if m.at >= from {
+			return true
+		}
+	}
+	return false
 }
 
 // uses records reads[from:to] as Uses of node id.
@@ -744,7 +790,7 @@ func (j *jsLower) mark(v int32, at int) {
 func (j *jsLower) valueNode(n *ts.Node) (int32, int) {
 	m, last := len(j.reads), j.last
 	j.value(n, false)
-	if j.last != last && j.lastSpan == spanOf(j.strip(n)) && j.thrown == j.throws {
+	if j.last != last && j.lastSpan == spanOf(j.strip(n)) && j.thrown == j.throws && !j.pending(m) {
 		return j.last, m
 	}
 	return j.node(flow.Stmt, j.l.unparen(n), m, len(j.reads)), m
@@ -1745,6 +1791,15 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 	case k.newExpression, k.awaitExpression, k.yieldExpression, k.spreadElement:
 		j.children(n, true)
 		j.throws++
+	case k.unaryExpression:
+		// A delete of a property writes through its base variable: the
+		// node evaluating the delete, whose reads include the operand's,
+		// may-defines it.
+		m := len(j.reads)
+		j.children(n, true)
+		if v := j.deleted(n); v >= 0 {
+			j.may = append(j.may, jsMay{at: m, v: v})
+		}
 	case k.class:
 		m := len(j.reads)
 		j.give(j.closure(n), m)
@@ -1754,6 +1809,21 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 	default:
 		j.children(n, true)
 	}
+}
+
+// deleted is the base variable of the property a unary expression n deletes
+// (o in `delete o.p`, `delete o[k]`, `delete o?.p`), or -1 when n is no
+// delete of a property or its base is no variable.
+func (j *jsLower) deleted(n *ts.Node) int32 {
+	k := j.k
+	if n.ChildByFieldId(k.fOperator).KindId() != k.deleteKw {
+		return -1
+	}
+	switch t := j.strip(n.ChildByFieldId(k.fArgument)); t.KindId() {
+	case k.memberExpression, k.subscriptExpression:
+		return j.base(t)
+	}
+	return -1
 }
 
 // children walks n's named children, lowering them (lower) or collecting
@@ -2404,6 +2474,12 @@ func (j *jsLower) cap(n *ts.Node) {
 		if v := n.ChildByFieldId(k.fValue); v != nil {
 			j.cap(v)
 		}
+	case k.unaryExpression:
+		// A delete of a property is a write through its base variable.
+		j.children(n, false)
+		if v := j.deleted(n); v >= 0 {
+			j.writes = append(j.writes, v)
+		}
 	case k.jsxOpeningElement, k.jsxSelfClosingElement:
 		j.jsxElement(n, false)
 	case k.jsxClosingElement:
@@ -2493,7 +2569,7 @@ type jsSyntax struct {
 	withStatement, importStatement, exportStatement, hashBangLine, importClause,
 	identifier, shorthandPropertyIdentifier, shorthandPropertyIdentifierPattern, parenthesizedExpression,
 	sequenceExpression, assignmentExpression, augmentedAssignmentExpression, binaryExpression, ternaryExpression,
-	updateExpression, callExpression, newExpression, awaitExpression, yieldExpression, memberExpression,
+	updateExpression, unaryExpression, callExpression, newExpression, awaitExpression, yieldExpression, memberExpression,
 	subscriptExpression, spreadElement, functionExpression, generatorFunction, methodDefinition,
 	classBody, fieldDefinition, classStaticBlock, trueLit, objectPattern, arrayPattern, assignmentPattern, objectAssignmentPattern,
 	pairPattern, restPattern, computedPropertyName, jsxOpeningElement, jsxSelfClosingElement,
@@ -2509,7 +2585,7 @@ type jsSyntax struct {
 	// imports is the import-clause table the extraction shares.
 	imports importSyntax
 
-	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, staticKw, usingKw uint16
+	and, or, nullish, andAssign, orAssign, nullishAssign, varKw, ofKw, constKw, eqTok, staticKw, usingKw, deleteKw uint16
 	// typeKw and optTok (the anonymous `?.` of a TypeScript optional call)
 	// are optional.
 	typeKw, optTok uint16
@@ -2554,6 +2630,7 @@ func resolveJSSyntax(language string) *jsSyntax {
 	s.parenthesizedExpression, s.sequenceExpression = kind("parenthesized_expression"), kind("sequence_expression")
 	s.assignmentExpression, s.augmentedAssignmentExpression = kind("assignment_expression"), kind("augmented_assignment_expression")
 	s.binaryExpression, s.ternaryExpression, s.updateExpression = kind("binary_expression"), kind("ternary_expression"), kind("update_expression")
+	s.unaryExpression = kind("unary_expression")
 	s.callExpression, s.newExpression, s.awaitExpression = kind("call_expression"), kind("new_expression"), kind("await_expression")
 	s.yieldExpression, s.memberExpression, s.subscriptExpression = kind("yield_expression"), kind("member_expression"), kind("subscript_expression")
 	s.spreadElement, s.functionExpression, s.generatorFunction = kind("spread_element"), kind("function_expression"), kind("generator_function")
@@ -2580,7 +2657,7 @@ func resolveJSSyntax(language string) *jsSyntax {
 			s.erased[id] = true
 		}
 	}
-	s.constKw, s.eqTok, s.staticKw, s.usingKw = tok("const"), tok("="), tok("static"), tok("using")
+	s.constKw, s.eqTok, s.staticKw, s.usingKw, s.deleteKw = tok("const"), tok("="), tok("static"), tok("using"), tok("delete")
 	s.typeKw, s.optTok = tl.IdForNodeKind("type", false), tl.IdForNodeKind("?.", false)
 	s.extendsClause = opt("extends_clause")
 	s.fPattern = tl.FieldIdForName("pattern")
