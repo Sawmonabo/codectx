@@ -19,15 +19,19 @@ import (
 // names the failure mode the case guards; mutation names the code change that
 // would fail it. recovered marks a source that parses with a syntax error on
 // purpose, to pin how a lowering treats an error-recovered tree; every other
-// source must parse clean. callables, when nonzero, is the exact number of
-// callables Functions reports in src, which pins what is and is not a function
-// (a bodiless method, a signature) where no pair could show it.
+// source must parse clean. illFormed marks a source that parses clean but that
+// its language's compiler rejects on purpose, such as a jump to a label no
+// frame opens, to pin how a lowering treats a program no compiler accepts;
+// every other source is one its compiler accepts, names it leaves undeclared
+// aside. callables, when nonzero, is the exact number of callables Functions
+// reports in src, which pins what is and is not a function (a bodiless
+// method, a signature) where no pair could show it.
 type goldenCase struct {
 	name, protects, mutation, src string
 	fn                            int
 	cd, du                        []string
 	unresolved                    int
-	recovered                     bool
+	recovered, illFormed          bool
 	callables                     int
 }
 
@@ -71,7 +75,8 @@ type goldenCase struct {
 //     it. A use that no definition reaches (a node with no path from ENTRY,
 //     a name no node defines) makes no pair.
 //   - Unresolved is the count of jumps (a break, continue or goto) whose
-//     target names no open frame or label.
+//     target names no open frame or label. Only an ill-formed or recovered
+//     source can hold one.
 func runGolden(t *testing.T, language string, cases []goldenCase) {
 	t.Helper()
 	tl, ok := Grammar(language)
@@ -104,6 +109,9 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				defer tree.Close()
 				if got := tree.RootNode().HasError(); got != c.recovered {
 					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, tree.RootNode().ToSexp())
+				}
+				if c.unresolved != 0 && !c.illFormed && !c.recovered {
+					t.Errorf("unresolved = %d on a source not marked ill-formed: a jump whose target no frame opens is rejected by every compiler", c.unresolved)
 				}
 				var fn *ts.Node
 				i := 0
