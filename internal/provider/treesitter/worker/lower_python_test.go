@@ -792,16 +792,15 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"a@17 -> return a, d@44", "d@41 -> return a, d@44"},
 		},
 		{
-			// §7.11. Lines at 0, 13, 20, 38. Nodes: c@6, x@9, c@17 (Branch),
-			// from m import *@22 (a Stmt that defines nothing), return x@39.
-			// Succ: c→{from m import *, return x}; from m import *→return x.
-			name:     "a wildcard import is one node that defines nothing",
-			protects: "`from m import *` is a node of its own on its path and kills no local",
-			mutation: "make no node for it (c@17 -> from m import *@22 disappears), or let it kill every local (x@9 -> return x@39 becomes from m import *@22 -> return x@39)",
-			src:      "def f(c, x):\n if c:\n  from m import *\n return x\n",
-			fn:       1,
-			cd:       []string{"c@17 -> from m import *@22"},
-			du:       []string{"c@6 -> c@17", "x@9 -> return x@39"},
+			// §7.11, the module (callable 0): a wildcard import is legal at
+			// module level only, and it binds every public name of m. Lines at
+			// 0, 6, 22. Nodes: x = 1@0, from m import *@6 (a Stmt that
+			// may-defines x, a χ), g(x)@22.
+			name:     "a wildcard import may rebind every module variable and kills none",
+			protects: "`from m import *` is a node of its own that may-defines each module variable, so a later read pairs with it and with the definition before it",
+			mutation: "make it define nothing (x = 1@0 -> from m import *@6 and from m import *@6 -> g(x)@22 disappear), or a killing definition of each variable (x = 1@0 -> g(x)@22 disappears)",
+			src:      "x = 1\nfrom m import *\ng(x)\n",
+			du:       []string{"x = 1@0 -> from m import *@6", "x = 1@0 -> g(x)@22", "from m import *@6 -> g(x)@22"},
 		},
 		{
 			// §7.14. Lines at 0, 9, 23. Nodes: type T = int@10 (spans the
@@ -1188,33 +1187,56 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"y = a + b < a@21 -> return y@61", "y = 0@54 -> return y@61"},
 		},
 		{
-			// §7.2.2, §8.7: annotations are not evaluated where they stand.
-			// Lines at 0, 13, 23, 42, 49. Nodes: T@6, a@9, y: T = a@14 (reads
-			// a only), def g(p: T) -> T: pass@24 (defines g, reads nothing:
-			// neither the parameter's nor the return annotation), return y,
-			// g@50.
-			name:     "annotations are read by no node",
-			protects: "an annotated assignment's, a parameter's and a function's type are not reads of the variables they name",
-			mutation: "read an annotation (T@6 -> y: T = a@14 or T@6 -> def g(p: T) -> T: pass@24 appears)",
+			// §7.2.2, §8.7: a definition's annotations are evaluated where it
+			// is created, a function's annotated assignment's are not. Lines at
+			// 0, 13, 23, 42, 49. Nodes: T@6, a@9, y: T = a@14 (reads a only),
+			// def g(p: T) -> T: pass@24 (defines g, reads T through the
+			// parameter's and the return annotation), return y, g@50.
+			name:     "a nested definition's annotations are reads of its creating node",
+			protects: "a parameter's and a return annotation are evaluated when the definition runs, so the variables they name reach its node, while a function's annotated assignment reads its value alone",
+			mutation: "read no annotation of a definition (T@6 -> def g(p: T) -> T: pass@24 disappears), or evaluate a function's annotated assignment (T@6 -> y: T = a@14 appears)",
 			src:      "def f(T, a):\n y: T = a\n def g(p: T) -> T:\n  pass\n return y, g\n",
 			fn:       1,
-			du: []string{"a@9 -> y: T = a@14", "y: T = a@14 -> return y, g@50",
+			du: []string{"a@9 -> y: T = a@14", "y: T = a@14 -> return y, g@50", "T@6 -> def g(p: T) -> T: pass@24",
 				"def g(p: T) -> T: pass@24 -> return y, g@50"},
 		},
 		{
-			// §6.11, §6.12. Lines at 0, 10, 28. Nodes: a@6, a@15 (Branch:
-			// defines the result variable), x := 1@20 (defines x and the
+			// §7.11.1: under the future import no annotation is evaluated.
+			// Lines at 0, 35, 45, 64, 71. Nodes: T@41, def g(p: T) -> T:
+			// pass@46 (defines g, reads nothing), return g@72.
+			name:     "annotations under the annotations future import are read by no node",
+			protects: "a module that imports annotations from __future__ evaluates none of them, so a definition's annotations are no reads",
+			mutation: "ignore the future import (T@41 -> def g(p: T) -> T: pass@46 appears)",
+			src:      "from __future__ import annotations\ndef f(T):\n def g(p: T) -> T:\n  pass\n return g\n",
+			fn:       1,
+			du:       []string{"def g(p: T) -> T: pass@46 -> return g@72"},
+		},
+		{
+			// §7.2.2, the class body (callable 1): a class body evaluates its
+			// annotations. Lines at 0, 9, 18, 24. Nodes: T = int@10, x: T@19
+			// (a Stmt reading T, binding nothing), y: T = 1@25 (reads T after
+			// its value, defines y).
+			name:     "a class body's annotations are reads where they stand",
+			protects: "an annotated name in a class body evaluates its annotation, with or without a value, so the variable it names reaches that node",
+			mutation: "make no node for an annotation without a value in a class body (T = int@10 -> x: T@19 disappears), or read no annotation of an annotated assignment there (T = int@10 -> y: T = 1@25 disappears)",
+			src:      "class C:\n T = int\n x: T\n y: T = 1\n",
+			fn:       1,
+			du:       []string{"T = int@10 -> x: T@19", "T = int@10 -> y: T = 1@25"},
+		},
+		{
+			// §6.11, §6.12. Lines at 0, 10, 29. Nodes: a@6, a@15 (Branch:
+			// defines the result variable), x := 1@21 (defines x and the
 			// operator's result variable), y = a or (x := 1)@11 (Uses the
-			// result variable only), return y@29. y reads no x, so the pair
+			// result variable only), return y@30. y reads no x, so the pair
 			// from x := 1 exists only through the result.
 			name:     "an assignment expression as an operand defines the operator's result",
 			protects: "`x := 1` as the operand after `or`'s deciding one yields the operator's value through its result variable",
-			mutation: "let an assignment expression operand define only its own target (x := 1@20 -> y = a or (x := 1)@11 disappears)",
+			mutation: "let an assignment expression operand define only its own target (x := 1@21 -> y = a or (x := 1)@11 disappears)",
 			src:      "def f(a):\n y = a or (x := 1)\n return y\n",
 			fn:       1,
-			cd:       []string{"a@15 -> x := 1@20"},
-			du: []string{"a@6 -> a@15", "a@15 -> y = a or (x := 1)@11", "x := 1@20 -> y = a or (x := 1)@11",
-				"y = a or (x := 1)@11 -> return y@29"},
+			cd:       []string{"a@15 -> x := 1@21"},
+			du: []string{"a@6 -> a@15", "a@15 -> y = a or (x := 1)@11", "x := 1@21 -> y = a or (x := 1)@11",
+				"y = a or (x := 1)@11 -> return y@30"},
 		},
 		{
 			// §8.5: a pattern target is bound inside the item's finally.
@@ -1273,15 +1295,21 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"s@23 -> k.V@58", "k@12 -> k.V@58"},
 		},
 		{
-			// print_statement of the pinned grammar (the Python 2 form, which
-			// no section of the 3.13 reference defines). Lines at 0, 10.
+			// Ill-formed on purpose: the compiler rejects the Python 2 print
+			// statement ("Missing parentheses in call to 'print'"), and no
+			// section of the 3.13 reference defines it. The pinned grammar
+			// parses it clean, as print_statement, so a repository holding
+			// Python 2 code yields such trees, and every Python 3 statement
+			// kind is one the lowering names: only this form can show that an
+			// unnamed kind is still one node with its reads. Lines at 0, 10.
 			// Nodes: a@6, print a@11 (a plain Stmt node reading a).
-			name:     "a print statement is a plain node",
-			protects: "a kind the lowering does not name is still one node with its reads",
-			mutation: "make no node for a kind the lowering does not name (a@6 -> print a@11 disappears)",
-			src:      "def f(a):\n print a\n",
-			fn:       1,
-			du:       []string{"a@6 -> print a@11"},
+			name:      "a print statement is a plain node",
+			protects:  "a kind the lowering does not name is still one node with its reads",
+			mutation:  "make no node for a kind the lowering does not name (a@6 -> print a@11 disappears)",
+			src:       "def f(a):\n print a\n",
+			fn:        1,
+			illFormed: true,
+			du:        []string{"a@6 -> print a@11"},
 		},
 		{
 			// §6.13, §6.12, lower.go (the hand-off). Lines at 0, 13, 45.
@@ -1339,45 +1367,63 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du: []string{"a@6 -> y = [*a]@18", "y = [*a]@18 -> return y@47", "y = 0@40 -> return y@47"},
 		},
 		{
-			// §8.3, §8.4. Lines at 0, 11, 17, 32, 41, 52, 60. Nodes: xs@6,
+			// §8.3, §8.4. Lines at 0, 11, 17, 32, 40, 51, 59. Nodes: xs@6,
 			// xs@28 (the iterable: creating the iterator may throw), x in
-			// xs@23 (head: each step may throw), x@23 (target), except@42
-			// (Handler, from the iterable and the head), E@49, x = 0@54,
-			// return x@61. Succ: xs@28→{head, except}; head→{x@23, return x,
+			// xs@23 (head: each step may throw), x@23 (target), except@41
+			// (Handler, from the iterable and the head), E@48, x = 0@53,
+			// return x@60. Succ: xs@28→{head, except}; head→{x@23, return x,
 			// except}; x@23→head; except→E→{x = 0, EXIT}. IPDom: xs@28, head,
 			// E → EXIT; x@23 → head; except → E.
 			name:     "a for loop's iterator creation and step may throw",
 			protects: "the iterable's node and the loop head inside a try each reach the handler",
-			mutation: "count no throw for iter() (xs@28 -> except@42 and xs@28 -> E@49 disappear), or for next() (x in xs@23 -> except@42 and x in xs@23 -> E@49 disappear)",
+			mutation: "count no throw for iter() (xs@28 -> except@41 and xs@28 -> E@48 disappear), or for next() (x in xs@23 -> except@41 and x in xs@23 -> E@48 disappear)",
 			src:      "def f(xs):\n try:\n  for x in xs:\n   pass\n except E:\n  x = 0\n return x\n",
 			fn:       1,
-			cd: []string{"xs@28 -> x in xs@23", "xs@28 -> except@42", "xs@28 -> E@49",
-				"x in xs@23 -> x@23", "x in xs@23 -> x in xs@23", "x in xs@23 -> return x@61",
-				"x in xs@23 -> except@42", "x in xs@23 -> E@49", "E@49 -> x = 0@54", "E@49 -> return x@61"},
+			cd: []string{"xs@28 -> x in xs@23", "xs@28 -> except@41", "xs@28 -> E@48",
+				"x in xs@23 -> x@23", "x in xs@23 -> x in xs@23", "x in xs@23 -> return x@60",
+				"x in xs@23 -> except@41", "x in xs@23 -> E@48", "E@48 -> x = 0@53", "E@48 -> return x@60"},
 			du: []string{"xs@6 -> xs@28", "xs@28 -> x in xs@23", "xs@28 -> x@23",
-				"x@23 -> return x@61", "x = 0@54 -> return x@61"},
+				"x@23 -> return x@60", "x = 0@53 -> return x@60"},
 		},
 		{
-			// §8.8, §6.2.4, §8.4. Lines at 0, 11, 17, 28, 37, 59, 70, 78.
+			// §8.8, §6.2.4, §8.4. Lines at 0, 11, 17, 28, 36, 58, 69, 77.
 			// Nodes: xs@6, class C: pass@19 (class creation may throw),
-			// [x for x in xs]@43 (the comprehension's creation may throw;
+			// [x for x in xs]@42 (the comprehension's creation may throw;
 			// reads xs, defines the result variable), y = [x for x in
-			// xs]@39 (Uses the result variable; throws nothing of its own),
-			// except@60 (Handler), E@67, y = 0@72, return y@79. Succ: class→
+			// xs]@38 (Uses the result variable; throws nothing of its own),
+			// except@59 (Handler), E@66, y = 0@71, return y@78. Succ: class→
 			// {[…], except}; […]→{y = […], except}; y = […]→return y;
 			// except→E→{y = 0, EXIT}. IPDom: class, […], E → EXIT; y = […]
 			// → return y.
 			name:     "creating a class or a comprehension may throw",
 			protects: "a class statement's node and a comprehension's creating node inside a try each reach the handler",
-			mutation: "count no throw for a class creation (class C: pass@19 controls nothing), or for a comprehension's creation (the comprehension's node controls only y = [x for x in xs]@39 and return y@79 through it)",
+			mutation: "count no throw for a class creation (class C: pass@19 controls nothing), or for a comprehension's creation (the comprehension's node controls only y = [x for x in xs]@38 and return y@78 through it)",
 			src:      "def f(xs):\n try:\n  class C:\n   pass\n  y = [x for x in xs]\n except E:\n  y = 0\n return y\n",
 			fn:       1,
-			cd: []string{"class C: pass@19 -> [x for x in xs]@43", "class C: pass@19 -> except@60", "class C: pass@19 -> E@67",
-				"[x for x in xs]@43 -> y = [x for x in xs]@39", "[x for x in xs]@43 -> return y@79",
-				"[x for x in xs]@43 -> except@60", "[x for x in xs]@43 -> E@67",
-				"E@67 -> y = 0@72", "E@67 -> return y@79"},
-			du: []string{"xs@6 -> [x for x in xs]@43", "[x for x in xs]@43 -> y = [x for x in xs]@39",
-				"y = [x for x in xs]@39 -> return y@79", "y = 0@72 -> return y@79"},
+			cd: []string{"class C: pass@19 -> [x for x in xs]@42", "class C: pass@19 -> except@59", "class C: pass@19 -> E@66",
+				"[x for x in xs]@42 -> y = [x for x in xs]@38", "[x for x in xs]@42 -> return y@78",
+				"[x for x in xs]@42 -> except@59", "[x for x in xs]@42 -> E@66",
+				"E@66 -> y = 0@71", "E@66 -> return y@78"},
+			du: []string{"xs@6 -> [x for x in xs]@42", "[x for x in xs]@42 -> y = [x for x in xs]@38",
+				"y = [x for x in xs]@38 -> return y@78", "y = 0@71 -> return y@78"},
+		},
+		{
+			// §6.14, §6.2.4, §8.4: a comprehension a lambda creates is created
+			// when the lambda runs. Lines at 0, 9, 15, 44, 50, 61, 69. Nodes:
+			// lambda: [x for x in y]@21 (the creating node: not MayThrow), g =
+			// lambda: [x for x in y]@17, h()@46 (may throw), except@51
+			// (Handler, from h() alone), E@58, g = 0@63, return g@70. Succ:
+			// lambda→g = …→h()→{return g, except}; except→E→{g = 0, EXIT};
+			// g = 0→return g. IPDom: h(), E → EXIT; except → E.
+			name:     "a creation inside a nested callable throws there, not at its creating node",
+			protects: "a class or comprehension a lambda's body creates may throw when the lambda runs, so the node creating the lambda has no edge to the handler",
+			mutation: "count the nested creation's throw at the creating node (lambda: [x for x in y]@21 gains an edge to except@51 and controls g = lambda: [x for x in y]@17 and h()@46)",
+			src:      "def f():\n try:\n  g = lambda: [x for x in y]\n  h()\n except E:\n  g = 0\n return g\n",
+			fn:       1,
+			cd: []string{"h()@46 -> return g@70", "h()@46 -> except@51", "h()@46 -> E@58",
+				"E@58 -> g = 0@63", "E@58 -> return g@70"},
+			du: []string{"lambda: [x for x in y]@21 -> g = lambda: [x for x in y]@17",
+				"g = lambda: [x for x in y]@17 -> return g@70", "g = 0@63 -> return g@70"},
 		},
 		{
 			// §8.6.4.8, §8.4. Lines at 0, 10, 16, 27, 40, 49, 60, 68. Nodes:
@@ -1396,17 +1442,17 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du: []string{"s@6 -> s@24", "s@24 -> [x]@35", "s@24 -> x@36", "x@36 -> return x@69", "x = 0@62 -> return x@69"},
 		},
 		{
-			// §6.2.4, §4.2.2. Lines at 0, 14, 34. Nodes: xs@6, x@10, [x for x
+			// §6.2.4, §4.2.2. Lines at 0, 14, 35. Nodes: xs@6, x@10, [x for x
 			// in xs]@19 (the creating node: reads xs, its first iterable; its
 			// element's x is its own target, so it captures nothing), y =
-			// …@15, return y, x@35 (reads f's x, the parameter).
+			// …@15, return y, x@36 (reads f's x, the parameter).
 			name:     "a comprehension's for target is its own variable",
 			protects: "a comprehension's target neither reads nor rebinds the enclosing function's variable of the same name",
-			mutation: "resolve the element's x in the enclosing function (x@10 -> [x for x in xs]@19 appears), or bind the target there (x@10 -> return y, x@35 is replaced by a pair from the comprehension's node)",
+			mutation: "resolve the element's x in the enclosing function (x@10 -> [x for x in xs]@19 appears), or bind the target there (x@10 -> return y, x@36 is replaced by a pair from the comprehension's node)",
 			src:      "def f(xs, x):\n y = [x for x in xs]\n return y, x\n",
 			fn:       1,
 			du: []string{"xs@6 -> [x for x in xs]@19", "[x for x in xs]@19 -> y = [x for x in xs]@15",
-				"y = [x for x in xs]@15 -> return y, x@35", "x@10 -> return y, x@35"},
+				"y = [x for x in xs]@15 -> return y, x@36", "x@10 -> return y, x@36"},
 		},
 		{
 			// §8.8, §4.2.2, the class body (callable 1). Lines at 0, 9, 16.
@@ -1421,21 +1467,21 @@ func TestPythonLoweringGolden(t *testing.T) {
 		},
 		{
 			// §7.12, §4.2.2. Every name the statements bind is declared
-			// global, so each resolves to no variable. Lines at 0, 10, 28,
-			// 38, 48, 55, 69, 79, 91, 100. Nodes: s@6, a@36 (the import's
-			// node, defining nothing), def g(): pass@39 (defining nothing),
-			// type T = int@56 (defining nothing), s@76 (the subject), [c]@86
-			// (Branch), c@87 (the capture, defining nothing), return a, g, T,
+			// global, so each resolves to no variable. Lines at 0, 10, 29,
+			// 39, 49, 56, 70, 80, 92, 100. Nodes: s@6, a@37 (the import's
+			// node, defining nothing), def g(): pass@40 (defining nothing),
+			// type T = int@57 (defining nothing), s@77 (the subject), [c]@87
+			// (Branch), c@88 (the capture, defining nothing), return a, g, T,
 			// c@101 (reading nothing). The sequence pattern keeps the case
-			// and capture nodes apart. Succ: s@76→[c]→{c@87, return};
-			// c@87→return.
+			// and capture nodes apart. Succ: s@77→[c]→{c@88, return};
+			// c@88→return.
 			name:     "an unresolved import, def name, type alias or capture makes its node and defines nothing",
 			protects: "a name declared global is no variable in these binding positions either, and each construct still makes its node",
-			mutation: "drop def's v < 0 return (Builder.Def panics on -1), or bind these names as locals (a@36, def g(): pass@39, type T = int@56 and c@87 each pair with return a, g, T, c@101)",
+			mutation: "drop def's v < 0 return (Builder.Def panics on -1), or bind these names as locals (a@37, def g(): pass@40, type T = int@57 and c@88 each pair with return a, g, T, c@101)",
 			src:      "def f(s):\n global a, g, T, c\n import a\n def g():\n  pass\n type T = int\n match s:\n  case [c]:\n   pass\n return a, g, T, c\n",
 			fn:       1,
-			cd:       []string{"[c]@86 -> c@87"},
-			du:       []string{"s@6 -> s@76", "s@76 -> [c]@86", "s@76 -> c@87"},
+			cd:       []string{"[c]@87 -> c@88"},
+			du:       []string{"s@6 -> s@77", "s@77 -> [c]@87", "s@77 -> c@88"},
 		},
 	})
 }
