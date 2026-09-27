@@ -160,9 +160,11 @@ var (
 // kind, field, flags, byte range, parent, first child and next sibling. It
 // makes two native calls per tree, one to size the array and one to fill it,
 // and none per node; the walk runs in the library,
-// over its public tree-cursor API. It runs after the structural queries have
-// used tree, and the caller may close tree as soon as it returns: the array
-// holds no native pointer.
+// over its public tree-cursor API. It only reads tree, so it may run at any
+// point before tree is closed: a header's parse is flattened to weigh its
+// errors before the structural queries run on the parse that is kept. The
+// caller may close tree as soon as it returns and the queries are done with
+// it: the array holds no native pointer.
 //
 // A node's kind is the library's public symbol, the id KindId returns, which
 // the library already gives to every symbol of one name and one visibility

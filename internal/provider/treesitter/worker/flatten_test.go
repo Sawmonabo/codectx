@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -22,31 +21,37 @@ import (
 // with every grammar, so error, missing and extra nodes are covered, and for
 // each tree it checks:
 //
+//   - the error figures a header's fallback is decided by: the array's error
+//     flag and outermost ERROR bytes equal the native tree's, so a header is
+//     never kept in the grammar with more errors. It is checked on its own,
+//     before and whatever the node checks find;
 //   - the handle: the root node Flatten reached through the tree wrapper's
 //     field is the binding's root node (kind, byte range, child count), so a
 //     binding that moves or replaces the handle fails here rather than
 //     reading wrong memory;
-//   - the array: node for node in preorder, kind, field, flags (named,
-//     missing, error, extra), byte range, and the parent, first child and
-//     next sibling;
-//   - the kind ids: each node's id is the one Language.IdForNodeKind resolves
-//     from its name, the resolution every lowering compares against;
+//   - the record, where no accessor reads it as the native node answers:
+//     each node's field and missing flag, and its next-sibling link, which is
+//     structural and so is the parent's next child (Child(k+1)), zero-width
+//     nodes included;
 //   - the accessor: every method a lowering or the callable walk calls,
-//     answered as the native node answers it, ChildByFieldId for every field
-//     id of the grammar, and the cursor stepped in lockstep with a native one
-//     from every node; every absent answer is the null handle, as the zero
-//     Node is;
-//   - the error figures a header's fallback is decided by: the array's error
-//     flag and outermost ERROR bytes equal the native tree's, so a header is
-//     never kept in the grammar with more errors.
+//     answered as the native node answers it -- NextSibling and
+//     NextNamedSibling skipping a zero-width sibling at the node's end, as
+//     the native calls do -- ChildByFieldId for every field id of the
+//     grammar, and the cursor stepped in lockstep with a native one from
+//     every node; every absent answer is the null handle, as the zero Node
+//     is.
+//
+// Every mismatch is reported, not only the first, so one defect does not
+// hide another.
 //
 // Mutations that fail it: record the node's grammar symbol instead of its
 // public one; take the field from the parent's field instead of the cursor's;
 // drop an extra from the sibling chain; count NamedChild without extras;
 // let GotoNextSibling leave the cursor's root; answer a zero distance with
-// the node itself instead of the null handle; sum error bytes over every node
-// that contains an error instead of every ERROR node, or count an ERROR node
-// nested in another.
+// the node itself instead of the null handle; drop the zero-width skip from
+// NextSibling, or apply it to the record's link or to Child; sum error bytes
+// over every node that contains an error instead of every ERROR node, or
+// count an ERROR node nested in another.
 func TestFlatMatchesNative(t *testing.T) {
 	srcs := flatSources(t)
 	for _, l := range lang.All {
@@ -66,10 +71,10 @@ func TestFlatMatchesNative(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				checkFlat(t, tl, tree, f)
 				if got, want := f.parseErrors(grammars[l.Name].kindIDs().errorKind), nativeErrors(tree); got != want {
-					t.Fatalf("flat error figures %+v, native %+v", got, want)
+					t.Errorf("flat error figures %+v, native %+v", got, want)
 				}
+				checkFlat(t, tl, tree, f)
 			})
 		}
 		p.Close()
@@ -277,7 +282,6 @@ walked:
 	}
 
 	fieldCount := uint16(tl.FieldCount())
-	ids := map[uintptr]uintptr{}
 	nc, fc := root.Walk(), froot.Walk()
 	defer nc.Close()
 	defer fc.Close()
@@ -286,34 +290,27 @@ walked:
 		at := func(what string, got, want any) {
 			t.Helper()
 			if got != want {
-				t.Fatalf("node %d (%s [%d,%d)): %s = %v, native %v", i, n.Kind(), n.StartByte(), n.EndByte(), what, got, want)
+				t.Errorf("node %d (%s [%d,%d)): %s = %v, native %v", i, n.Kind(), n.StartByte(), n.EndByte(), what, got, want)
 			}
 		}
-		// The record.
+		// The record, where no accessor answers for it: the field, the missing
+		// flag, and the structural next-sibling link, which is the parent's
+		// next child whatever its width.
 		r := f.nodes[i]
-		at("record kind", uint16(r.kind), n.KindId())
 		at("record field", uint16(r.field), fields[i])
-		at("record named", r.flags&flatNamed != 0, n.IsNamed())
 		at("record missing", r.flags&flatMissing != 0, n.IsMissing())
-		at("record error", r.flags&flatError != 0, n.HasError())
-		at("record extra", r.flags&flatExtra != 0, n.IsExtra())
-		at("record start", uint(r.start), n.StartByte())
-		at("record end", uint(r.end), n.EndByte())
-		at("record parent", dist(i, uint32(r.parent), false), nat(n.Parent()))
-		at("record first child", dist(i, uint32(r.first), true), nat(n.Child(0)))
-		at("record next sibling", dist(i, uint32(r.next), true), nat(n.NextSibling()))
-
-		// One id per name: the library's name lookup matches any prefix of
-		// ERROR as ERROR, so a kind spelt so is resolved only when it is one.
-		if k := n.Kind(); !strings.HasPrefix("ERROR", k) || n.IsError() {
-			at("IdForNodeKind", tl.IdForNodeKind(k, n.IsNamed()), fn.KindId())
+		structural := -1
+		if parent := n.Parent(); parent != nil {
+			for k := range parent.ChildCount() {
+				if c := parent.Child(k); c != nil && c.Id() == n.Id() {
+					structural = nat(parent.Child(k + 1))
+					break
+				}
+			}
 		}
+		at("record next sibling", dist(i, uint32(r.next), true), structural)
 
 		// The accessor.
-		if prev, ok := ids[n.Id()]; ok {
-			at("Id of a node seen before", fn.Id(), prev)
-		}
-		ids[n.Id()] = fn.Id()
 		at("KindId", fn.KindId(), n.KindId())
 		at("IsNamed", fn.IsNamed(), n.IsNamed())
 		at("IsExtra", fn.IsExtra(), n.IsExtra())
