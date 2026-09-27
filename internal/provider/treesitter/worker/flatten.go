@@ -191,13 +191,11 @@ static uint32_t flat_find(const flat_node *out, const void *const *ids, uint32_t
 // of the nfields registered fields. It writes nothing past cap: a walk that
 // would visit more nodes reports flat_overrun, as does one that visits fewer.
 // Once the walk is done, every answer is resolved to its node's index,
-// which the preorder walk had not reached when it asked.
+// which the preorder walk had not reached when it asked. cap is at least 1,
+// the root, which the caller checks.
 static flat_result flat_fill(const TSTree *tree, flat_node *out, uint32_t cap, const uint16_t *fields,
 		uint32_t nfields) {
 	flat_result res = {.status = flat_overrun};
-	if (cap == 0) {
-		return res;
-	}
 	const void **ids = malloc((size_t)cap * sizeof *ids);
 	if (!ids) {
 		res.status = flat_no_memory;
