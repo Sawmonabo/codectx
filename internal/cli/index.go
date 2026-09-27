@@ -759,7 +759,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 // unavailable, never 0, since 0 is the best value every ratio can take.
 func writeIndexPasses(b *strings.Builder, passes []model.ProviderPass, omitted int64) {
 	for _, pass := range passes {
-		fmt.Fprintf(b, "pass        %s %d %s in %s, writer busy %s, busy ÷ wall %s",
+		fmt.Fprintf(b, "pass        %s %d %s in %s, writer busy %s, busy/wall %s",
 			pass.ProviderID, pass.Units, plural(int(pass.Units), "unit", "units"), millisMetric(pass.WallMS),
 			millisMetric(pass.WriterBusyMS), ratioMetric(pass.WriterBusyShare))
 		if stage := pass.Stage; stage != nil {
@@ -767,7 +767,7 @@ func writeIndexPasses(b *strings.Builder, passes []model.ProviderPass, omitted i
 			if stage.WorkerCPUMS != nil {
 				cpu = millisMetric(*stage.WorkerCPUMS)
 			}
-			fmt.Fprintf(b, ", %d workers started, %d most in flight, worker cpu %s, wall × in flight ÷ cpu %s, started ÷ in flight %s",
+			fmt.Fprintf(b, ", %d workers started, %d most in flight, worker cpu %s, wall*in-flight/cpu %s, started/in-flight %s",
 				stage.WorkersStarted, stage.MaxInFlight, cpu, ratioMetric(pass.WallPerCPU), ratioMetric(pass.StartsPerSlot))
 		}
 		b.WriteString("\n")

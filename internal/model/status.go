@@ -81,7 +81,7 @@ type IndexResult struct {
 	// read by a proof run from the result rather than from a log. It is a
 	// wire-sized page like Runs, and PassesOmitted is how many passes did not
 	// fit it.
-	Passes        []ProviderPass `json:"passes,omitempty"`
+	Passes        []ProviderPass `json:"passes"`
 	PassesOmitted int64          `json:"passes_omitted"`
 }
 
