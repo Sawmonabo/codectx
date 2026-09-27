@@ -53,12 +53,20 @@ var fixtures = []struct {
 
 func newProvider(t *testing.T) *treesitter.Provider {
 	t.Helper()
+	p := newProviderOver(t, 2, newLedger(t, 4<<30))
+	t.Cleanup(p.Close)
+	return p
+}
+
+// newProviderOver is a provider of at most workers parser workers admitted on
+// room. The caller closes it.
+func newProviderOver(t *testing.T, workers int, room *admission.Ledger) *treesitter.Provider {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		t.Fatal(err)
 	}
 	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
@@ -66,22 +74,21 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
+		MaxWorkers: workers, Rederive: func(int64) {}, Admission: room,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(p.Close)
 	return p
 }
 
 // newLedger is the reservation ledger a test provider's workers are admitted
-// on: wide enough that admission never queues a test's handful of workers.
-func newLedger(t *testing.T) *admission.Ledger {
+// on, over the given memory allocation.
+func newLedger(t *testing.T, allocation int64) *admission.Ledger {
 	t.Helper()
-	l, err := admission.NewLedger(4<<30, 0)
+	l, err := admission.NewLedger(allocation, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,25 +415,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // in release and drop the drain from leaveStage -> "the parse stage ended with
 // 2 worker process(es) still alive".
 func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
-		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner: runner, WorkDir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newProviderOver(t, 2, newLedger(t, 4<<30))
 	defer p.Close()
 
 	if s := p.Stats(); s.Processes != 0 || s.WorkersStarted != 0 {
@@ -588,26 +577,7 @@ func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 // how many processes ran its files.
 func newSingleWorkerProvider(t *testing.T) *treesitter.Provider {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
-		t.Fatal(err)
-	}
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerMemoryBytes: 64 << 20, Admission: newLedger(t),
-		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner: runner, WorkDir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return newProviderOver(t, 1, newLedger(t, 4<<30))
 }
 
 // TestARecordAndASourceLongerThanOneFrameArriveWhole pins that the wire has no
@@ -646,5 +616,91 @@ func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
 	if probe.Imports != 1 || probe.Truncated {
 		t.Fatalf("the %d-name import arrived as %d imports (truncated %v), want exactly 1 and not truncated",
 			names, probe.Imports, probe.Truncated)
+	}
+}
+
+// TestAnOpenStageKeepsItsWorkersAcrossUnits indexes two files as two
+// sequential units inside one open stage.
+//
+// Failure mode: the last unit to leave drains the pool, so a provider pass
+// over a run's units re-executes a worker for every unit whose predecessor
+// had finished, and workers started grows with the units instead of staying
+// at the most in flight.
+//
+// Mutation: drop the stage's reference (OpenStage returns without entering
+// the stage) -> the second unit starts a second worker.
+func TestAnOpenStageKeepsItsWorkersAcrossUnits(t *testing.T) {
+	p := newProvider(t)
+	ctx := context.Background()
+	closeStage := p.OpenStage(ctx)
+	var started uint64
+	for i, file := range []string{"sample.go", "sample.py"} {
+		src, err := os.ReadFile(filepath.Join("testdata", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := map[string]string{file: string(src)}
+		h := providertest.New(t, files)
+		u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+		if _, err := provider.RunUnit(ctx, p, u.Request, h.Begin(t, u, []string{file}), providertest.Limits, h.Pool); err != nil {
+			t.Fatalf("RunUnit %s: %v", file, err)
+		}
+		s := p.Stats()
+		if i == 0 {
+			started = s.WorkersStarted
+		} else if s.WorkersStarted != started {
+			t.Fatalf("the second unit inside an open stage started %d worker(s) after the first started %d",
+				s.WorkersStarted-started, started)
+		}
+		if s.Processes == 0 {
+			t.Fatalf("the open stage holds no worker after unit %d", i+1)
+		}
+	}
+	closeStage(ctx)
+	closeStage(ctx) // idempotent: a second close must not leave a stage a unit never entered
+	if s := p.Stats(); s.Processes != 0 {
+		t.Fatalf("the stage closed with %d worker process(es) still alive", s.Processes)
+	}
+}
+
+// TestAFileLargerThanTheAllocationRunsAlone parses two files concurrently on
+// a ledger whose allocation is zero -- a real reading, a host with nothing
+// left over the product's footprint -- so every worker base and every file's
+// increment is larger than the whole allocation.
+//
+// Failure mode: a file whose predicted need exceeds the allocation, admitted
+// only when nothing at all is held, never runs once a worker holds its base,
+// and the index waits forever for memory no release will return; admitted
+// beside another parse, it takes memory the host does not have.
+//
+// Mutation: take the file's increment without the Parse mark -> neither probe
+// returns. Grant a Parse reservation beside another -> MaxParsesInFlight is 2
+// whenever the two parses overlap.
+func TestAFileLargerThanTheAllocationRunsAlone(t *testing.T) {
+	p := newProviderOver(t, 2, newLedger(t, 0))
+	defer p.Close()
+	src, err := os.ReadFile(filepath.Join("testdata", "sample.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := p.ParseProbe(context.Background(), "sample.go", src)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a file larger than the allocation did not complete: %v", err)
+		}
+	}
+	if s := p.Stats(); s.Parses != 2 || s.MaxParsesInFlight != 1 {
+		t.Fatalf("%d parses with at most %d in flight; want 2, one at a time", s.Parses, s.MaxParsesInFlight)
 	}
 }

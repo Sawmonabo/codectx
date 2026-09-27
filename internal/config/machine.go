@@ -8,27 +8,44 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// IdleFootprintBytes is what this process holds before it reserves anything:
-// the Go runtime, the resolved configuration, the open store and the bounded
-// buffers a command needs to answer at all. Everything else in the footprint
-// is a reservation the configuration states, which is why this is the only
-// part of it that has to be measured.
+// idleFootprintBytes is what this process holds before it reserves anything:
+// the Go runtime, the resolved configuration and the bounded buffers a command
+// needs to answer at all. Everything else in the footprint is a reservation
+// the configuration states, which is why this is the only part of it that has
+// to be observed.
 //
-// Measured, not declared: `codectx status` over a freshly indexed five-file,
-// 432-byte fixture peaked at 26,584 / 27,052 / 26,732 KiB of resident set over
-// three samples ("Maximum resident set size", /usr/bin/time -v), so 26.4 MiB
-// at the worst of the three, rounded up to the next binary step for run-to-run
-// variation. The method and the samples are recorded in
-// docs/adr/ADR-0010-engine-memory.md.
-const IdleFootprintBytes int64 = 32 * (1 << 20)
+// It is this process's own resident set, read once, at its first use, with
+// wire.ResidentBytes. For a loaded configuration that first use is validation
+// at load, before the store is opened, so the reading is the idle process and
+// does not count again the page caches the reservations below declare. Where
+// the platform reports no resident set, UnobservedIdleFootprintBytes stands in
+// for the reading.
+var idleFootprintBytes = sync.OnceValue(func() int64 {
+	if resident, ok := wire.ResidentBytes(); ok {
+		return resident
+	}
+	return UnobservedIdleFootprintBytes
+})
+
+// UnobservedIdleFootprintBytes stands in for the idle term where the platform
+// reports no resident set for this process. It is not an observation of this
+// process: it is the measurement of the idle process recorded in
+// docs/adr/ADR-0010-engine-memory.md -- `codectx status` over a freshly
+// indexed five-file, 432-byte fixture peaked at 26,584 / 27,052 / 26,732 KiB
+// of resident set over three samples ("Maximum resident set size",
+// /usr/bin/time -v), so 26.4 MiB at the worst of the three, rounded up to the
+// next binary step for run-to-run variation.
+const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 
 // BaseFootprint is what this process holds for itself on this machine under
-// configuration c: the idle overhead above, plus the reservations it makes up
-// front -- one query slot's memory per core, the parsed-graph cache, the
+// configuration c: its idle resident set above, plus the reservations it
+// makes up front -- one query slot's memory per core, the parsed-graph cache, the
 // indexing queue, and every page cache it opens: the store writer
 // connection's (storage.writer_cache_kib), every reader connection's
 // (storage.reader_cache_kib) in every reader pool the process opens
@@ -129,7 +146,7 @@ func baseFootprintFor(c Config) (int64, error) {
 		return 0, err
 	}
 	return addNoOverflow("base footprint of this process",
-		IdleFootprintBytes, concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
+		idleFootprintBytes(), concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
 		stageCaches, storeHandles*TokenizerCacheKiB<<10, ledger.FootprintBytes)
 }
 

@@ -89,6 +89,26 @@ type Hello struct {
 	PID         int      `json:"pid"`
 	Fingerprint string   `json:"fingerprint"`
 	Languages   []string `json:"languages"`
+	// Memory is the worker's standing memory once it has started and before
+	// its first file: BaseBytes and AnonBytes, never NeedBytes.
+	Memory Memory `json:"memory"`
+}
+
+// Memory is one file-boundary reading the worker takes of itself. Every
+// field is absent (nil) when the platform cannot supply it, never zero.
+type Memory struct {
+	// NeedBytes is the file's need: the worker's resident peak over the file
+	// less the base it started the file from. It is absent where the platform
+	// offers no resettable per-process peak, and then nothing is learned from
+	// the file.
+	NeedBytes *uint64 `json:"need_bytes,omitempty"`
+	// BaseBytes is the worker's resident set once this file's memory has been
+	// returned and its peak reset: what the worker holds between files, and
+	// the base the next file's need is measured from.
+	BaseBytes *uint64 `json:"base_bytes,omitempty"`
+	// AnonBytes is the anonymous part of that resident set, the memory that
+	// is this worker's alone rather than pages of the executable it shares.
+	AnonBytes *uint64 `json:"anon_bytes,omitempty"`
 }
 
 // Request opens one parse. The source follows as one KindSource message of
@@ -170,9 +190,8 @@ type Done struct {
 	// Truncated reports that the query cursor exceeded its match limit, so
 	// the query did not see every match in the tree.
 	Truncated bool `json:"truncated,omitempty"`
-	// RSSBytes is the worker's resident set after this parse, or 0 when the
-	// platform cannot report it (recorded as unavailable, not zero, upstream).
-	RSSBytes uint64 `json:"rss_bytes,omitempty"`
+	// Memory is the worker's reading of itself at the end of this file.
+	Memory Memory `json:"memory"`
 }
 
 // Error is a per-request failure that leaves the worker healthy.
@@ -273,10 +292,11 @@ func readFrame(r io.Reader) (Kind, bool, []byte, error) {
 }
 
 // ResidentBytes reports this process's resident set size and false when the
-// platform cannot report it. Both sides measure the same way — the worker to
-// put its RSS in the Done frame, the parent for its own — so the aggregate
-// accounting of Section 22 sums one measurement, not two definitions. A
-// caller records an unmeasurable value as unavailable, never as zero.
+// platform cannot report it. It is the parent's reading of itself -- for the
+// provider's resource view, the base footprint's idle term and the product's
+// own residency in the re-derived allocation -- while a worker reports its own
+// memory in its Hello and Done frames (Memory). A caller records an
+// unmeasurable value as unavailable, never as zero.
 func ResidentBytes() (int64, bool) {
 	data, err := os.ReadFile("/proc/self/statm")
 	if err != nil {

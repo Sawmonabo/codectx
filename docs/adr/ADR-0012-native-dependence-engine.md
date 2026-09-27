@@ -323,7 +323,8 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 - **Where no resettable peak exists.** On a platform that offers no resettable per-process peak, need is reported as
   unavailable, never as zero: the file is reserved at its prediction and nothing is learned from it.
 - **Learn.** The coordinator keeps a decaying histogram of need per source byte in 5% buckets. It is keyed per
-  repository, language, grammar fingerprint and file-size class, and persisted with the generation. It reserves the
+  repository, language, grammar fingerprint and file-size class, and persisted in the ledger's observation store beside
+  the scope peaks, since a measurement stays true whatever becomes of its generation. It reserves the
   histogram's weighted p99, which is the sample maximum below 100 observations. The half-life is counted in that
   repository's own files of that language, so the model adapts at the speed of the repository in front of it, whatever
   its size.

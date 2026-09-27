@@ -221,7 +221,7 @@ func (f *fixture) treesitter() provider.Provider {
 		f.t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes,
-		Admission: f.admission, WorkerMemoryBytes: 256 << 20,
+		Admission: f.admission, Rederive: func(int64) {},
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: workDir})
 	if err != nil {
 		f.t.Fatal(err)
