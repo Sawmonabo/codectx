@@ -292,10 +292,11 @@ func readFrame(r io.Reader) (Kind, bool, []byte, error) {
 }
 
 // ResidentBytes reports this process's resident set size and false when the
-// platform cannot report it. Both sides measure the same way — the worker to
-// put its RSS in the Done frame, the parent for its own — so the aggregate
-// accounting of Section 22 sums one measurement, not two definitions. A
-// caller records an unmeasurable value as unavailable, never as zero.
+// platform cannot report it. It is the parent's reading of itself -- for the
+// provider's resource view, the base footprint's idle term and the product's
+// own residency in the re-derived allocation -- while a worker reports its own
+// memory in its Hello and Done frames (Memory). A caller records an
+// unmeasurable value as unavailable, never as zero.
 func ResidentBytes() (int64, bool) {
 	data, err := os.ReadFile("/proc/self/statm")
 	if err != nil {
