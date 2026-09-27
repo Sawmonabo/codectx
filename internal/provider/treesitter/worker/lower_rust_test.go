@@ -824,5 +824,115 @@ func TestRustLoweringGolden(t *testing.T) {
 			src:        "fn f() { loop { break 'nope; } }",
 			unresolved: 1,
 		},
+		{
+			// Expressions › Loops and other breakable expressions › Loop
+			// labels: `break 'o` leaves the loop labelled 'o from inside an
+			// inner loop, and a valueless break defines nothing. Nodes: n@5,
+			// let mut i = 0;@22, loop@41 (outer head), loop@48 (inner head),
+			// i += 1@55, i > n@66 (Branch), break 'o@74, i@90. Succ:
+			// let→loop@41→loop@48→i += 1→i > n→{break, loop@48}; break→i@90.
+			// Neither loop has another exit. IPDom: loop@48 → i += 1 → i > n →
+			// break → i@90. Frontier walk from i > n→loop@48: loop@48, i +=
+			// 1, i > n.
+			name:     "a labelled break leaves the outer loop from an inner one",
+			protects: "`break 'o` lands after the loop its label names, not after the innermost loop, and defines no result",
+			mutation: "resolve a labelled break to the innermost loop (it lands on the outer loop's back edge, i@90 has no path from ENTRY: loses i += 1@55 -> i@90)",
+			src:      "fn f(n: i32) -> i32 { let mut i = 0; 'o: loop { loop { i += 1; if i > n { break 'o; } } } i }",
+			cd:       []string{"i > n@66 -> loop@48", "i > n@66 -> i += 1@55", "i > n@66 -> i > n@66"},
+			du: []string{"n@5 -> i > n@66", "let mut i = 0;@22 -> i += 1@55", "i += 1@55 -> i += 1@55",
+				"i += 1@55 -> i > n@66", "i += 1@55 -> i@90"},
+		},
+		{
+			// Statements › Expression statements: a trailing `if … else …`
+			// without `;` is the block's tail, so its value is the block's.
+			// Nodes: c@5, c@36 (Branch), 1@40, 2@51 (each defining the block's
+			// result), let y = …;@23 (Uses it), y@58. Succ: c@36→{1, 2}; 1,
+			// 2→let. IPDom: c@36 → let.
+			name:     "a trailing if in a consumed block is the block's tail",
+			protects: "the arms of a trailing if hand their values to the let consuming the enclosing block",
+			mutation: "take a trailing if expression statement as a statement, not the tail (loses 1@40 -> let y and 2@51 -> let y)",
+			src:      "fn f(c: bool) -> i32 { let y = { if c { 1 } else { 2 } }; y }",
+			cd:       []string{"c@36 -> 1@40", "c@36 -> 2@51"},
+			du: []string{"c@5 -> c@36", "1@40 -> let y = { if c { 1 } else { 2 } };@23",
+				"2@51 -> let y = { if c { 1 } else { 2 } };@23", "let y = { if c { 1 } else { 2 } };@23 -> y@58"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Iterator
+			// loops: the iterator is made once, so the body's write to n does
+			// not change the iteration. Nodes: n@9, 0..n@35 (the iterated
+			// value, defining the iteration variable), for@26 (head), i@30,
+			// n = i@42, n@51. Succ: n@9→0..n→for→{i, n@51}; i→n = i→for.
+			// IPDom: for → n@51; i → n = i → for.
+			name:     "a write in a for body to an iterated name never reaches the head",
+			protects: "the for head and binding read the value iterated before the loop, so `n = i` in the body pairs only with later reads of n",
+			mutation: "let the head re-read the iterated expression's names (gains n@9 -> for@26 and n = i@42 -> for@26)",
+			src:      "fn f(mut n: i32) -> i32 { for i in 0..n { n = i; } n }",
+			cd:       []string{"for@26 -> i@30", "for@26 -> n = i@42", "for@26 -> for@26"},
+			du: []string{"n@9 -> 0..n@35", "0..n@35 -> for@26", "0..n@35 -> i@30", "i@30 -> n = i@42",
+				"n@9 -> n@51", "n = i@42 -> n@51"},
+		},
+		{
+			// Expressions › Patterns › Identifier patterns: an identifier in
+			// a non-last arm may be a binding or a constant, so it is a Branch
+			// that also defines the name. Nodes: o@5, o@28 (scrutinee), n@32
+			// (Branch, Using the scrutinee's variable and defining n), n@37,
+			// 0@45. Succ: o@28→n@32→{n@37, 0}. IPDom: n@32 → EXIT.
+			name:     "an earlier arm's bare identifier is a branch that binds the name",
+			protects: "the arm's result reads the name its identifier pattern binds, and a later arm stays reachable on the pattern's false edge",
+			mutation: "define nothing at an earlier arm's bare identifier (loses n@32 -> n@37), or take it as irrefutable (loses n@32 -> 0@45)",
+			src:      "fn f(o: i32) -> i32 { match o { n => n, _ => 0 } }",
+			cd:       []string{"n@32 -> n@37", "n@32 -> 0@45"},
+			du:       []string{"o@5 -> o@28", "o@28 -> n@32", "n@32 -> n@37"},
+		},
+		{
+			// Expressions › Assignment expressions › Compound assignment
+			// expressions, and › Index expressions: `a[i] += 1` writes one
+			// element of a, a may-definition of a. Nodes: a@9, i@22, a[i] +=
+			// 1@41 (Uses a and i, may-defines a), a[0]@52.
+			name:     "an index write is a may-definition of its base",
+			protects: "a read of the array after `a[i] += 1` sees the write and the definition before it",
+			mutation: "record no may-definition of an index target's base (loses a[i] += 1@41 -> a[0]@52), or a killing one (loses a@9 -> a[0]@52)",
+			src:      "fn f(mut a: [i32; 2], i: usize) -> i32 { a[i] += 1; a[0] }",
+			du: []string{"a@9 -> a[i] += 1@41", "i@22 -> a[i] += 1@41", "a@9 -> a[0]@52",
+				"a[i] += 1@41 -> a[0]@52"},
+		},
+		{
+			// Expressions › Operator expressions › The dereference operator:
+			// `*p = 2` writes through p; lower.go, Address-taking: the write
+			// is a may-definition of the variable written through. Nodes:
+			// p@5, *p = 2@27 (Uses p, may-defines p), *p@35.
+			name:     "a write through a dereference is a may-definition of the variable written through",
+			protects: "a later read through p depends on the write through p",
+			mutation: "record no may-definition for a dereference target (loses *p = 2@27 -> *p@35)",
+			src:      "fn f(p: &mut i32) -> i32 { *p = 2; *p }",
+			du:       []string{"p@5 -> *p = 2@27", "p@5 -> *p@35", "*p = 2@27 -> *p@35"},
+		},
+		{
+			// Patterns › Or-patterns: every alternative binds the same names,
+			// so the first alternative's bindings stand for them. Nodes:
+			// o@5, o@41, Ok(x) | Err(x)@45 (Branch; the last arm is
+			// refutable by syntax, so it keeps its false edge), x@48, x@63.
+			// Succ: o@41→pattern→{x@48, EXIT}; x@48→x@63.
+			name:     "an or-pattern binds its first alternative's names",
+			protects: "an or-pattern's bound name is defined once, at the first alternative's name, and reaches the arm's result",
+			mutation: "bind every alternative's names (x@57 becomes a second binding node: loses x@48 -> x@63, gains x@57 -> x@63)",
+			src:      "fn f(o: Result<i32, i32>) -> i32 { match o { Ok(x) | Err(x) => x } }",
+			cd:       []string{"Ok(x) | Err(x)@45 -> x@48", "Ok(x) | Err(x)@45 -> x@63"},
+			du:       []string{"o@5 -> o@41", "o@41 -> Ok(x) | Err(x)@45", "o@41 -> x@48", "x@48 -> x@63"},
+		},
+		{
+			// Patterns › Identifier patterns: `x @ q` binds x to the matched
+			// value and q's names as q binds them. Nodes: o@5, o@36, x @
+			// Some(y)@40 (Branch), x@40, y@49, g(x, y)@55, 0@69. Succ:
+			// o@36→pattern→{x@40, 0}; x@40→y@49→g. IPDom: pattern → EXIT.
+			name:     "a bound pattern binds its name and the names of the pattern after @",
+			protects: "both x and y of `x @ Some(y)` are defined from the scrutinee's variable and read by the arm",
+			mutation: "bind only the name before @ (loses y@49 and y@49 -> g(x, y)@55), or only the pattern after it (loses x@40 and x@40 -> g(x, y)@55)",
+			src:      "fn f(o: Option<i32>) -> i32 { match o { x @ Some(y) => g(x, y), _ => 0 } }",
+			cd: []string{"x @ Some(y)@40 -> x@40", "x @ Some(y)@40 -> y@49", "x @ Some(y)@40 -> g(x, y)@55",
+				"x @ Some(y)@40 -> 0@69"},
+			du: []string{"o@5 -> o@36", "o@36 -> x @ Some(y)@40", "o@36 -> x@40", "o@36 -> y@49",
+				"x@40 -> g(x, y)@55", "y@49 -> g(x, y)@55"},
+		},
 	})
 }
