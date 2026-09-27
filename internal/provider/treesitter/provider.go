@@ -269,11 +269,21 @@ func (p *Provider) Close() { p.pool.close() }
 // caller that never opens a stage is served exactly as before. closeStage
 // leaves the stage once, however often it is called, under the run the stage
 // was opened in: the context it is given is not consulted, so a caller cannot
-// close another run's total.
-func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.Context)) {
+// close another run's total. It answers what the pool did while the stage was
+// open, measured after the leave so a drained worker's processor time is in
+// it, and every later call answers the same figures.
+func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.Context) model.StageFigures) {
+	window := p.pool.openWindow()
 	p.enterStage(ctx)
 	var once sync.Once
-	return func(context.Context) { once.Do(func() { p.leaveStage(ctx) }) }
+	var figures model.StageFigures
+	return func(context.Context) model.StageFigures {
+		once.Do(func() {
+			p.leaveStage(ctx)
+			figures = p.pool.closeWindow(window)
+		})
+		return figures
+	}
 }
 
 // IndexUnit indexes the one file the unit's scope key names. The run always
