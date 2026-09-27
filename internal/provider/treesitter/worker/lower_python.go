@@ -297,6 +297,10 @@ var pythonLowering = Lowering{
 // name a plain assignment, `:=`, or a for, with, except, del or case
 // capture target binds, which only writes it; an augmented assignment
 // reads and writes it.
+// No golden case pins that a write-only target records no read, because no
+// fact can show it: such a write is always a may-definition at the creating
+// node, and a χ pairs the node with the variable's reaching definitions
+// exactly as a read would, so the pairs are the same either way.
 //
 // # Names that resolve to no variable
 //
