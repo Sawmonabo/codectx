@@ -1168,6 +1168,19 @@ var cShared = []goldenCase{
 		du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
 			"r = a ?: b@26 -> return r;@38"},
 	},
+	{
+		// C17 §6.7.9p10 ([dcl.init]/12 alike): a declarator without an
+		// initializer leaves the value indeterminate and defines nothing.
+		// Nodes: x@10, x@26 (Branch), y = 1@29, return y;@36; `int y;`
+		// makes no node, so on the path that skips y = 1 no definition of
+		// y reaches the return.
+		name:     "a declarator without an initializer defines nothing",
+		protects: "an uninitialized local has no definition for a later read to pair with",
+		mutation: "make `int y;` a defining node (adds y@19 -> return y;@36)",
+		src:      "int f(int x) { int y; if (x) y = 1; return y; }",
+		cd:       []string{"x@26 -> y = 1@29"},
+		du:       []string{"x@10 -> x@26", "y = 1@29 -> return y;@36"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use

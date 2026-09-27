@@ -465,5 +465,138 @@ func TestCppLoweringGolden(t *testing.T) {
 			mutation: "read a qualified name's last component (adds m@35 -> return this->m + S::m;@40)",
 			src:      "struct S { static int m; int f(int m) { return this->m + S::m; } };",
 		},
+		{
+			// [expr.unary.op]/3: &s.f and &a[0] are addresses into s and a.
+			// `S s;` default-initializes s, a node defining it ([dcl.init]/7).
+			// Nodes: s@12, g(&s.f, &a[0])@25 (Uses and may-defines s and a),
+			// h(0, s.f)@41, return a[1];@52.
+			name:     "the address of a member or an element may-defines its base in C++",
+			protects: "taking the address of a field or an element reaches later reads of the whole variable, behind the object's own definition",
+			mutation: "take no base through &s.f (loses g(&s.f, &a[0])@25 -> h(0, s.f)@41) or through &a[i] (loses g(&s.f, &a[0])@25 -> return a[1];@52)",
+			src:      "int f() { S s; int a[2]; g(&s.f, &a[0]); h(0, s.f); return a[1]; }",
+			du: []string{"s@12 -> g(&s.f, &a[0])@25", "s@12 -> h(0, s.f)@41", "g(&s.f, &a[0])@25 -> h(0, s.f)@41",
+				"g(&s.f, &a[0])@25 -> return a[1];@52"},
+		},
+		{
+			// [stmt.if]/3, [stmt.switch]/3 and [stmt.ranged]/1: an
+			// init-statement runs before the condition. Nodes: v@8, y =
+			// g()@21, y@30 (Branch), return y;@33, z = g()@55, z@64 (the
+			// switch value), 1@74, return z;@77, s = 0@93, w = v@107, w@122
+			// (the range), x : w@118 (the head), x@118, s += x@125, return
+			// s;@133. Succ: y@30→{return y, z = g()}; z = g()→z@64→1→{return
+			// z, s = 0}; s = 0→w = v→w@122→head→{x@118, return s};
+			// x@118→s += x→head. IPDom: y@30, 1 → EXIT; head → return s.
+			name:     "the init-statements of if, switch and range for run before their conditions",
+			protects: "each init-statement is lowered as a statement before its condition, so the condition and the body read what it defines",
+			mutation: "drop the initializer of a condition clause (loses y = g()@21 -> y@30, z = g()@55 -> z@64 and w = v@107 -> w@122)",
+			src:      "int f(V v) { if (int y = g(); y) return y; switch (int z = g(); z) { case 1: return z; } int s = 0; for (V w = v; int x : w) s += x; return s; }",
+			cd: []string{"y@30 -> return y;@33", "y@30 -> z = g()@55", "y@30 -> z@64", "y@30 -> 1@74",
+				"1@74 -> return z;@77", "1@74 -> s = 0@93", "1@74 -> w = v@107", "1@74 -> w@122", "1@74 -> x : w@118",
+				"1@74 -> return s;@133", "x : w@118 -> x@118", "x : w@118 -> s += x@125", "x : w@118 -> x : w@118"},
+			du: []string{"y = g()@21 -> y@30", "y = g()@21 -> return y;@33", "z = g()@55 -> z@64",
+				"z = g()@55 -> return z;@77", "z@64 -> 1@74", "v@8 -> w = v@107", "w = v@107 -> w@122",
+				"w@122 -> x : w@118", "w@122 -> x@118", "x@118 -> s += x@125", "s = 0@93 -> s += x@125",
+				"s += x@125 -> s += x@125", "s = 0@93 -> return s;@133", "s += x@125 -> return s;@133"},
+		},
+		{
+			// [stmt.ranged] and [dcl.init.ref]/5: `auto &e` binds each element
+			// of v, so each binding may-defines v. Nodes: v@8, v@28 (the
+			// range), &e : v@23 (the head, spanning from the declarator), e@24
+			// (Uses the iteration variable, may-defines v), e = 0@31, return
+			// g(0, v);@38. Each iteration's binding pairs with the one before
+			// it, its nearest may-definition of v.
+			name:     "a range for by non-const reference may-defines the range's base",
+			protects: "a write through a by-reference loop variable reaches the reads of the range after the loop",
+			mutation: "read a non-const reference binding as a copy (loses e@24 -> return g(0, v);@38, v@8 -> e@24 and e@24 -> e@24)",
+			src:      "int f(V v) { for (auto &e : v) e = 0; return g(0, v); }",
+			cd:       []string{"&e : v@23 -> e@24", "&e : v@23 -> e = 0@31", "&e : v@23 -> &e : v@23"},
+			du: []string{"v@8 -> v@28", "v@28 -> &e : v@23", "v@28 -> e@24", "v@8 -> e@24", "e@24 -> e@24",
+				"v@8 -> return g(0, v);@38", "e@24 -> return g(0, v);@38"},
+		},
+		{
+			// [dcl.ref]/1: `const auto &e` is a read-only view of each element.
+			// Nodes: v@8, s = 0@17, v@45 (the range), &e : v@40 (the head),
+			// e@41 (no may-definition), s += e@48, return g(s, v);@56.
+			name:     "a range for by const reference only reads the range",
+			protects: "a const reference loop variable adds no may-definition of the range's base",
+			mutation: "treat a const reference binding as non-const (adds v@8 -> e@41, e@41 -> e@41 and e@41 -> return g(s, v);@56)",
+			src:      "int f(V v) { int s = 0; for (const auto &e : v) s += e; return g(s, v); }",
+			cd:       []string{"&e : v@40 -> e@41", "&e : v@40 -> s += e@48", "&e : v@40 -> &e : v@40"},
+			du: []string{"v@8 -> v@45", "v@45 -> &e : v@40", "v@45 -> e@41", "e@41 -> s += e@48", "s = 0@17 -> s += e@48",
+				"s += e@48 -> s += e@48", "s = 0@17 -> return g(s, v);@56", "s += e@48 -> return g(s, v);@56",
+				"v@8 -> return g(s, v);@56"},
+		},
+		{
+			// [stmt.ranged] and [dcl.struct.bind]: each name of the binding is
+			// defined from the element. Nodes: m@8, s = 0@17, m@43 (the range),
+			// [k, x] : m@34 (the head), k@35, x@38 (each Using the iteration
+			// variable), s += x@46, return s;@54. Succ: head→{k, return s};
+			// k→x→s += x→head.
+			name:     "a range for with a structured binding defines each name from the element",
+			protects: "every name a structured binding in a range for binds is defined on the body path from the iteration variable",
+			mutation: "bind only the first name of a structured binding (loses m@43 -> x@38 and x@38 -> s += x@46)",
+			src:      "int f(M m) { int s = 0; for (auto [k, x] : m) s += x; return s; }",
+			cd: []string{"[k, x] : m@34 -> k@35", "[k, x] : m@34 -> x@38", "[k, x] : m@34 -> s += x@46",
+				"[k, x] : m@34 -> [k, x] : m@34"},
+			du: []string{"m@8 -> m@43", "m@43 -> [k, x] : m@34", "m@43 -> k@35", "m@43 -> x@38", "x@38 -> s += x@46",
+				"s = 0@17 -> s += x@46", "s += x@46 -> s += x@46", "s = 0@17 -> return s;@54", "s += x@46 -> return s;@54"},
+		},
+		{
+			// [expr.yield] and [expr.await]: co_yield and co_await suspend the
+			// coroutine and resume it where it stopped, so neither is a CFG
+			// edge. Nodes: x@8, co_yield x;@13 (a plain Stmt node), y =
+			// co_await g(x)@29, co_return y;@48.
+			name:     "co_yield and co_await fall through",
+			protects: "a suspension point is an ordinary statement or operand, so the code after it stays on the path",
+			mutation: "lower co_yield as a return (y = co_await g(x)@29 becomes unreachable: loses its pairs)",
+			src:      "G f(int x) { co_yield x; int y = co_await g(x); co_return y; }",
+			du: []string{"x@8 -> co_yield x;@13", "x@8 -> y = co_await g(x)@29",
+				"y = co_await g(x)@29 -> co_return y;@48"},
+		},
+		{
+			// [except.throw]: evaluating the operand g() may itself throw, so
+			// the throw is MayThrow as well as a Throw, and the try gets a
+			// Handler, which a throw of a constant does not make. Nodes: x@11,
+			// x@26 (Branch), throw g();@29, the Handler catch@42, h()@56,
+			// k()@63. Succ: x@26→{throw, k()}; throw→{catch (MayThrow), h()
+			// (the Throw)}; catch→h()→k(). IPDom: x@26 → k(); throw → h().
+			name:     "a throw whose operand calls may throw before it throws",
+			protects: "a call in a throw's operand reaches the handler through the Handler node, as any call in a try body does",
+			mutation: "give a throw no MayThrow whatever its operand (the Handler vanishes: loses throw g();@29 -> catch@42)",
+			src:      "void f(int x) { try { if (x) throw g(); } catch (...) { h(); } k(); }",
+			cd:       []string{"x@26 -> throw g();@29", "x@26 -> h()@56", "throw g();@29 -> catch@42"},
+			du:       []string{"x@11 -> x@26"},
+		},
+		{
+			// [stmt.ranged]/1: the range's begin call and each iterator step
+			// may throw. Nodes: v@8, s = 0@17, v@43 (the range, may throw),
+			// x : v@39 (the head, may throw), x@39, s += x@46, the Handler
+			// catch@56, return -1;@70, return s;@83. Succ: v@43→{head, catch};
+			// head→{x, return s, catch}; x→s += x→head; catch→return -1.
+			// IPDom: v@43, head → EXIT; catch → return -1.
+			name:     "a range for's range and iterator step may throw",
+			protects: "the range evaluation and each step of a range for in a try body reach its handler",
+			mutation: "count no throw for a range for (catch@56 is unreachable: loses v@43 -> catch@56 and x : v@39 -> catch@56)",
+			src:      "int f(V v) { int s = 0; try { for (int x : v) s += x; } catch (...) { return -1; } return s; }",
+			cd: []string{"v@43 -> x : v@39", "v@43 -> catch@56", "v@43 -> return -1;@70", "x : v@39 -> x@39",
+				"x : v@39 -> s += x@46", "x : v@39 -> x : v@39", "x : v@39 -> return s;@83", "x : v@39 -> catch@56",
+				"x : v@39 -> return -1;@70"},
+			du: []string{"v@8 -> v@43", "v@43 -> x : v@39", "v@43 -> x@39", "x@39 -> s += x@46", "s = 0@17 -> s += x@46",
+				"s += x@46 -> s += x@46", "s = 0@17 -> return s;@83", "s += x@46 -> return s;@83"},
+		},
+		{
+			// [except] with structured exception handling: inside a __try, a
+			// dereference in a nested C++ try is also given MayThrow, so it
+			// reaches the C++ handler. Nodes: p@11, r = 0@20, r = *p@41, the
+			// Handler catch@51, r = 1@65, h()@88 (the __finally), return
+			// r;@95. Succ: r = *p→{h(), catch}; catch→r = 1→h()→return r.
+			// IPDom: r = *p → h().
+			name:     "a dereference in a C++ try inside a __try may throw",
+			protects: "the structured-exception dereference rule reaches through a nested C++ try to its handler",
+			mutation: "give a dereference MayThrow only directly in a __try body (catch@51 is unreachable: loses r = *p@41 -> catch@51 and r = *p@41 -> r = 1@65)",
+			src:      "int f(int *p) { int r = 0; __try { try { r = *p; } catch (...) { r = 1; } } __finally { h(); } return r; }",
+			cd:       []string{"r = *p@41 -> catch@51", "r = *p@41 -> r = 1@65"},
+			du:       []string{"p@11 -> r = *p@41", "r = *p@41 -> return r;@95", "r = 1@65 -> return r;@95"},
+		},
 	})
 }
