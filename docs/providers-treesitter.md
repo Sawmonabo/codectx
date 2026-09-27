@@ -427,8 +427,9 @@ function of the file's bytes.
   `BusyWorkers` (the rest: parsing, or on their way out), started and exited
   counts, parses, retries, the sum of the resident set each live worker last
   reported, the parent's own resident set and the live worker PIDs. Both sides
-  measure RSS with the same `wire.ResidentBytes` helper over
-  `/proc/self/statm`. A value that cannot be measured is -1, never 0.
+  read their resident set through the one `internal/residency` reader of the
+  kernel's per-process status file; a worker reports its own as the base in
+  each `Hello` and `Done`. A value that cannot be measured is -1, never 0.
 
 ### Native lifecycle in the worker
 
