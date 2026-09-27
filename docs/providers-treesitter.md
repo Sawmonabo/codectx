@@ -219,13 +219,22 @@ disagrees with the manifest (`CTX_SOURCE_INTEGRITY`).
 
 ### Language detection
 
-`FileVersion.Language` from the snapshot manifest wins when it names a pinned
-language; otherwise the extension decides (`.go .py .pyi .js .mjs .cjs .jsx
-.ts .mts .cts .tsx .java .rs .c .h .cc .cpp .cxx .hpp .hh .hxx`). `.h` is parsed as
-C: a C parse of a C++ header yields ERROR nodes and a `partial` state with
-`CTX_COVERAGE_INCOMPLETE`, which is an honest report and the expected outcome
-for a C++ header named `.h`; guessing C++ from a neighbouring `.cpp` would not
-be.
+A path two grammars declare, `.h`, is a header, and its grammar is the
+repository's (ADR-0012 decision 10). The snapshot counts its C and C++
+translation units at capture: a repository with C and no C++ parses headers as
+C, one with C++ and no C as C++, and one with both or neither as C++ first. A
+header whose parse has errors is parsed once more with the other grammar, the
+parse with fewer error bytes is kept, and the file's capability row discloses
+the choice in its `header_first`, `header_kept` and `header_reason` details
+(with both parses' error bytes when the second parse ran). When
+`tree_sitter.languages` enables only one of `c` and `cpp`, every header is
+parsed with that one, once. The manifest tags a header with the census's first
+grammar, and a census change that moves it rebuilds every header's units.
+
+Every other path is parsed with `FileVersion.Language` from the snapshot
+manifest when it names a pinned language, and otherwise the extension decides
+(`.go .py .pyi .js .mjs .cjs .jsx .ts .mts .cts .tsx .java .rs .c .cc .cpp .cxx
+.hpp .hh .hxx`).
 
 ## Worker process
 
