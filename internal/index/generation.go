@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
-	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -21,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
+	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -219,7 +219,7 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 		// high-water mark read before them would silently leave them out. It
 		// is the kernel's mark for the whole process, so a freed byte cannot
 		// lower it and reading it before the reclaim loses nothing.
-		g.report(diagnostics.PeakParentRSSBytes())
+		g.report(residency.Read().Peak)
 		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 		c.attachRunLedger(ctx, &res, g.ledgerRun, err)

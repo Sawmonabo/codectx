@@ -36,6 +36,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -173,8 +174,8 @@ func memoryAllocation(m dependence.Machine, baseFootprintBytes, workerResidentBy
 		return m.SchedulingAllocation(baseFootprintBytes)
 	}
 	held := workerResidentBytes
-	if parent, ok := wire.ResidentBytes(); ok {
-		held += parent
+	if parent := residency.Read().Resident; parent != nil {
+		held += int64(*parent)
 	}
 	return dependence.Machine{AvailableBytes: m.AvailableBytes + held, Observed: true}.
 		SchedulingAllocation(baseFootprintBytes)

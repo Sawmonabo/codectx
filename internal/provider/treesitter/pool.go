@@ -19,6 +19,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
 // A worker has no wall-clock bound of any kind: no lifetime, no per-parse
@@ -1497,8 +1498,8 @@ func (p *pool) stats() Stats {
 		}
 		return a.SizeClass - b.SizeClass
 	})
-	if rss, ok := wire.ResidentBytes(); ok {
-		s.ParentRSSBytes = rss
+	if rss := residency.Read().Resident; rss != nil {
+		s.ParentRSSBytes = int64(*rss)
 	}
 	for w := range p.live {
 		s.WorkerPIDs = append(s.WorkerPIDs, int(w.pid.Load()))

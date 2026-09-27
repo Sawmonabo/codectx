@@ -13,8 +13,8 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
-	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
 // This file measures the per-function dependence core in this process: the
@@ -107,10 +107,11 @@ func emit(t *testing.T, row any) {
 // resident is this process's resident set, nil when the platform cannot
 // report it.
 func resident() *int64 {
-	v, ok := wire.ResidentBytes()
-	if !ok {
+	r := residency.Read().Resident
+	if r == nil {
 		return nil
 	}
+	v := int64(*r)
 	return &v
 }
 

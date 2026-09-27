@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
 // ProcessCounter reports how many children a process runner currently has
@@ -74,11 +75,9 @@ type HostSampler struct {
 	// unmeasurable path is provable on a host that can measure. Otherwise the
 	// invariant that guards darwin and windows could only be tested there.
 
-	// parentRSS reads this process's resident set size, or nil where the host
-	// exposes no such figure.
-	parentRSS func() *uint64
-	// peakParentRSS reads this process's high-water resident set size.
-	peakParentRSS func() *uint64
+	// self reads this process's resident set and its high-water mark, each
+	// nil where the host exposes no such figure.
+	self func() residency.Reading
 	// treeRSS sums this process's descendants in one sweep, split into the
 	// base parser workers (this same executable re-executed under its worker
 	// subcommand) and every other child. Both are nil on a host with no
@@ -91,11 +90,10 @@ type HostSampler struct {
 // NewHostSampler builds the sampler over the real host readers.
 func NewHostSampler(opts HostSamplerOptions) *HostSampler {
 	return &HostSampler{
-		opts:          opts,
-		parentRSS:     parentRSSBytes,
-		peakParentRSS: PeakParentRSSBytes,
-		treeRSS:       descendantRSSBytes,
-		dirBytes:      directoryBytes,
+		opts:     opts,
+		self:     residency.Read,
+		treeRSS:  descendantRSSBytes,
+		dirBytes: directoryBytes,
 	}
 }
 
@@ -119,9 +117,10 @@ func (h *HostSampler) Sample(_ context.Context) (model.ResourceReport, error) {
 	goManaged := ms.Sys
 
 	base, native := h.treeRSS()
+	self := h.self()
 	report := model.ResourceReport{
-		ParentRSSBytes:     h.parentRSS(),
-		PeakParentRSSBytes: h.peakParentRSS(),
+		ParentRSSBytes:     self.Resident,
+		PeakParentRSSBytes: self.Peak,
 		GoManagedBytes:     &goManaged,
 		BaseWorkerRSSBytes: base,
 		NativeWorkerBytes:  native,
@@ -222,65 +221,6 @@ func directoryBytes(dir string) *uint64 {
 // returned to a caller: it turns the figure into the disclosed floor
 // maxWalkedEntries describes.
 var errWalkBound = errors.New("directory traversal reached its bound")
-
-// parentRSSBytes reads this process's resident set size from /proc/self/statm,
-// whose second field is the resident page count. A host without that file --
-// every non-Linux platform, and a Linux host with /proc unmounted -- has no
-// portable equivalent, so the figure is absent rather than zero.
-func parentRSSBytes() *uint64 {
-	raw, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return nil
-	}
-	fields := strings.Fields(string(raw))
-	const residentIndex = 1
-	if len(fields) <= residentIndex {
-		return nil
-	}
-	pages, err := strconv.ParseUint(fields[residentIndex], 10, 64)
-	if err != nil {
-		return nil
-	}
-	bytes := pages * uint64(os.Getpagesize())
-	return &bytes
-}
-
-// PeakParentRSSBytes reads this process's high-water resident set size from the
-// VmHWM line of /proc/self/status, in kibibytes. It is the kernel's own peak,
-// not a figure this application sampled, so it covers the whole life of the
-// process including work that finished before any sampler started -- and so,
-// in a long-lived server, work of earlier runs than the one asking.
-//
-// It is exported because it is the ONE reader of that file in the product: a
-// run reports its own process peak through it at its end, and a second reader
-// would be a second answer to the same question.
-//
-// It returns nil, and never zero, where the file cannot be read or does not
-// carry the line: a platform that does not account for this has no peak, which
-// is not a peak of nothing.
-func PeakParentRSSBytes() *uint64 {
-	raw, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		return nil
-	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		rest, ok := strings.CutPrefix(line, "VmHWM:")
-		if !ok {
-			continue
-		}
-		fields := strings.Fields(rest)
-		if len(fields) == 0 {
-			return nil
-		}
-		kib, err := strconv.ParseUint(fields[0], 10, 64)
-		if err != nil {
-			return nil
-		}
-		bytes := kib * 1024
-		return &bytes
-	}
-	return nil
-}
 
 // descendantRSSBytes sums the resident set size of every descendant of this
 // process in ONE sweep of /proc, split by what the child is.
