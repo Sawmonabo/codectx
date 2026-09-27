@@ -123,19 +123,33 @@ func ByExtension(p string) (Language, bool) {
 	return Language{}, false
 }
 
-// Candidates is every grammar that declares the path's extension, in name
-// order: the repository-independent answer. One language for every extension
-// but ".h", whose two are C and C++; none for a path no grammar declares.
-func Candidates(p string) []Language {
-	ext := strings.ToLower(path.Ext(p))
-	var out []Language
+// SharedHeader reports whether more than one grammar declares the path's
+// extension: a header whose grammar is the repository's, decided by the
+// census (Census.Header), and never the file name's. It is the one answer to
+// that question for the planner, the provider and the manifest's tagger. Only
+// ".h" is one.
+func SharedHeader(p string) bool {
+	return shared[strings.ToLower(path.Ext(p))]
+}
+
+// shared is the set of extensions more than one grammar declares, derived
+// once from the registry so the question costs a map lookup on the search
+// filter's path.
+var shared = func() map[string]bool {
+	declared := map[string]int{}
 	for _, l := range All {
-		if slices.Contains(l.Extensions, ext) {
-			out = append(out, l)
+		for _, ext := range l.Extensions {
+			declared[ext]++
+		}
+	}
+	out := map[string]bool{}
+	for ext, n := range declared {
+		if n > 1 {
+			out[ext] = true
 		}
 	}
 	return out
-}
+}()
 
 // Fingerprint is the digest folded into the provider version: binding,
 // extraction version and, per language, module version, ABI, metadata and

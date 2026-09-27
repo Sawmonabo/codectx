@@ -14,7 +14,6 @@ the worker, the wire protocol or a provider. Phase 0 is not yet claimable under 
 review on 2026-09-26 found these gaps:
 - most Go and JavaScript cases cite no reference anchor;
 - some C cases cite none, and the TypeScript cases cite a handbook, which is not a language reference;
-- Rust has no `?`-on-`Result` case;
 - several handled constructs have no case;
 - no table has had its blind second derivation.
 
@@ -183,13 +182,14 @@ Four findings follow, and each one changes a decision below.
    - A parser worker's span is its process lifetime. Its measured 6.2 s of wall against 0.13 s of processor time
      (three workers of one end-to-end test run in the capped test pass of 2026-09-25, recorded in the research note's
      raw wall-time file) is a worker busy about 2% of the time. That much is measured.
-   - The serialization point was found by reading, not by profiling. Every per-unit store call takes one group mutex
-     (`internal/storage/sqlite/open.go:710`, `:830`), and a unit makes about ten such calls, plus one or two per
-     extracted record.
+   - The serialization point was found by reading, not by profiling. In the store measured, every per-unit store call
+     took one group mutex, and a unit made about ten such calls, plus one or two per extracted record. That is the
+     measured reason for the store changes of decision 5, which replace the mutex with one writer goroutine.
    - How the other 98% splits between waiting on the lock, SQL, worker re-execution and the provider barrier is not
      yet measured. It is the benchmark task's first measurement.
 4. **A C++ header is parsed as C.**
-   - `.h` belongs to the C grammar (`internal/provider/treesitter/lang/lang.go:79`).
+   - In the build measured, `.h` belonged to the C grammar alone. Decision 10 declares it in both grammars' rows
+     (`internal/provider/treesitter/lang/lang.go:86-87`) and lets the repository decide.
    - In the compiler-infrastructure corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files.
 
 The per-function design figure of decision 5 has a heavy tail but a small absolute size. The population is the
@@ -342,7 +342,7 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 
 > `R_run = B_process + Σ over workers in flight (base_w + predicted_need(file_w)) + A_link`
 
-- `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set at composition;
+- `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set once, at load;
   only a platform that reports no resident set falls back to the recorded idle measurement.
 - `predicted_need` is the learned p99 above, or the prior for a first file.
 - `A_link` is the package-scoped linker's working set (decision 9).
@@ -396,7 +396,7 @@ with the observation it came from. The worker's process-tree spans play no part 
 **Scheduling** dispatches files largest-first by source bytes, from one shared queue:
 - On one corpus's rows, the compiler checkout's, parse time ranks with source bytes at Spearman ρ 0.82–0.86 per
   language.
-- A replay of those rows reaches the makespan lower bound at 16 workers, where path order, today's, is 10% over it.
+- A replay of those rows reaches the makespan lower bound at 16 workers, where path order is 10% over it.
 - The same rank and replay over every matrix corpus is a measurement of the benchmark task, and largest-first is
   confirmed per class on it.
 - Work stealing is dropped: it solves contention between per-worker queues, which one central queue does not have.
@@ -405,15 +405,15 @@ with the observation it came from. The worker's process-tree spans play no part 
 - Per-function variance is handled by order, not by a finer grain, because a per-function dispatch unit would force a
   shared parse-tree lifetime across workers.
 
-**Wall time is taken out of the store first.** The structural stage is serialized on the store's group mutex today, so
-worker count buys nothing until four changes land, in this order:
+**Wall time is taken out of the store first.** The structural stage measured was serialized on the store's group
+mutex, so worker count buys nothing without four changes, in this order:
 1. **Batch the resolution.** Resolve a file's candidates in one batched read, not one or two reads per record.
 2. **Move the reads.** Run the read-only steps on the reader pool against the last commit, adding one commit at each
    provider boundary.
 3. **One writer.** Hand writes to a writer goroutine that owns the connection, a group-lifetime statement cache and the
    per-group seal checks.
-4. **Keep the stage open.** Keep the parse stage open across the whole unit. A mid-provider drain re-executes workers
-   today.
+4. **Keep the stage open.** Keep the parse stage open across the provider's whole pass over its units. A mid-provider
+   drain would re-execute workers.
 
 More concurrency is not the fix: the write-ahead log admits one writer. Passing measurements:
 - stage wall ≤ 2 × Σ worker CPU ÷ workers;
@@ -580,7 +580,7 @@ what it is, and the retirement gate's parity condition is what proves the label 
   disclosed with the function's byte range, so no construct in a user's code can take down a worker or lose the
   file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
-  (`internal/index/generation.go:1257-1260`).
+  (`internal/index/generation.go:1392-1394`).
 - **`calls`.** A new package-scoped linking provider publishes `calls`. It is keyed on per-file digests of each file's
   export table and call-site table, so an edit inside a function body does not trigger a relink. Unit inputs are files
   today (`internal/index/delta/delta.go:56-72`), so this is a model addition.
@@ -602,7 +602,7 @@ gates.
 
 ### 10. A header's language is decided by the repository, not by its extension
 
-`.h` is mapped to the C grammar today (`internal/provider/treesitter/lang/lang.go:79`). In the compiler-infrastructure
+In the build measured, `.h` was mapped to the C grammar alone. In the compiler-infrastructure
 corpus, 74.7% of `.h` files parse with errors, against 22.8% of `.c` files. The repository, not the file name, knows
 which language its headers are written in. The rule:
 1. **One-language repositories.** A repository with C translation units and no C++ ones parses `.h` as C, and one with
@@ -622,7 +622,8 @@ makes a file-local decision depend on a project-wide pass that runs before any h
 - two neighbouring headers can differ in language.
 
 **Measurement, per class:** on every C/C++ instance, the `.h` parse-error share is no greater than the larger of that
-instance's `.c` and `.cpp` shares. No C-only instance changes.
+instance's `.c` and `.cpp` shares. No C-only instance's clean `.h` parse changes: the fallback applies in every
+repository, so a C-only instance's `.h` parse with errors may be replaced by a C++ parse with fewer error bytes.
 
 ## Measurements
 
@@ -812,10 +813,10 @@ plausibly larger than the implementation, which for Rust and Java cannot be a di
 at all and must be authored from the language reference; and per-language lowering semantics, where
 every reference implementation surveyed is measurably wrong on something.
 
-Two obligations this record creates rather than discharges. The per-file observation, the learned model and
-the ledger's adjust and forward-progress rules of decision 5 are required work; until they exist the disclosure of
-[ADR-0010](ADR-0010-engine-memory.md) decision 4 is what makes drift visible. And the store changes of decision 5
-come before any worker-count gain, because the structural stage is serialized on the store's lock. And the plan still publishes no native throughput target, because none can be measured before something is
+Two obligations this record creates. The per-file observation, the learned model and the ledger's adjust and
+forward-progress rules of decision 5 are built, and the disclosure of [ADR-0010](ADR-0010-engine-memory.md) decision 4
+is what makes an overrun of the model visible. And the store changes of decision 5 come before any worker-count gain,
+because the structural stage measured was serialized on the store's lock; they are built. And the plan still publishes no native throughput target, because none can be measured before something is
 built — what it publishes instead is the instrument and the comparison: phase 2 closes on a lower wall
 *and* a lower tree-summed peak than the engine, on the same unit and the same 250 ms sampler.
 

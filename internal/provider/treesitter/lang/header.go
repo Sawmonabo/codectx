@@ -3,7 +3,6 @@ package lang
 import (
 	"path"
 	"slices"
-	"strings"
 )
 
 // The two grammars a header can be parsed with.
@@ -18,14 +17,17 @@ const (
 // the file name, knows which language its headers are written in. The zero
 // value is the census of a repository with neither.
 type Census struct {
-	C   uint64 `json:"c"`
-	CPP uint64 `json:"cpp"`
+	C   uint64
+	CPP uint64
 }
 
 // Add counts one repository path. A header, and a path of any other
-// language, counts nothing.
+// language, counts nothing. The extension is matched exactly as a grammar
+// declares it: by the compilers' convention `.C` is C++, so folding case
+// would count it as C, and a unit the registry does not spell is counted as
+// neither.
 func (c *Census) Add(p string) {
-	ext := strings.ToLower(path.Ext(p))
+	ext := path.Ext(p)
 	for _, l := range All {
 		if !slices.Contains(l.Extensions, ext) || slices.Contains(l.Headers, ext) {
 			continue
@@ -39,43 +41,22 @@ func (c *Census) Add(p string) {
 	}
 }
 
-// HeaderBasis names which census rule chose a repository's header grammar.
-type HeaderBasis string
-
-const (
-	// HeaderCOnly: C translation units and no C++ ones; headers are C.
-	HeaderCOnly HeaderBasis = "c_only"
-	// HeaderCPPOnly: C++ translation units and no C ones; headers are C++.
-	HeaderCPPOnly HeaderBasis = "cpp_only"
-	// HeaderMixed: both; headers are parsed as C++ first, the closer superset
-	// of the two dialects that occur in headers.
-	HeaderMixed HeaderBasis = "mixed"
-	// HeaderNoUnits: neither, so nothing in the repository singles out one
-	// dialect and headers are parsed as C++ first, for the reason the mixed
-	// rule gives.
-	HeaderNoUnits HeaderBasis = "no_units"
-)
-
 // HeaderPlan is the repository's decision for every header: the grammar each
 // is parsed with first, and the one a parse with errors falls back to.
 type HeaderPlan struct {
-	First    string      `json:"first"`
-	Fallback string      `json:"fallback"`
-	Basis    HeaderBasis `json:"basis"`
+	First    string
+	Fallback string
 }
 
-// Header applies the census rule.
+// Header applies the census rule. C translation units and no C++ ones make
+// headers C. C++ ones and no C ones make them C++. Both, or neither, parse
+// headers as C++ first: the closer superset of the two dialects that occur
+// in headers, where nothing in the repository singles out C.
 func (c Census) Header() HeaderPlan {
-	switch {
-	case c.C > 0 && c.CPP == 0:
-		return HeaderPlan{First: nameC, Fallback: nameCPP, Basis: HeaderCOnly}
-	case c.CPP > 0 && c.C == 0:
-		return HeaderPlan{First: nameCPP, Fallback: nameC, Basis: HeaderCPPOnly}
-	case c.C > 0:
-		return HeaderPlan{First: nameCPP, Fallback: nameC, Basis: HeaderMixed}
-	default:
-		return HeaderPlan{First: nameCPP, Fallback: nameC, Basis: HeaderNoUnits}
+	if c.C > 0 && c.CPP == 0 {
+		return HeaderPlan{First: nameC, Fallback: nameCPP}
 	}
+	return HeaderPlan{First: nameCPP, Fallback: nameC}
 }
 
 // Within is the plan restricted to the grammars a parser enables: with both,
@@ -93,17 +74,6 @@ func (p HeaderPlan) Within(enabled func(name string) bool) (first, fallback stri
 		return p.Fallback, "", true
 	}
 	return "", "", false
-}
-
-// ChangesHeaders reports whether moving from census c to next changes the
-// grammar a header is parsed with first. When it does, every header parsed
-// under c was parsed with the wrong grammar for next and must be parsed
-// again; a change of basis alone (one-language C++ to mixed) keeps the
-// grammar and every header's facts. What a header's parse kept follows from
-// its first grammar and its bytes, so that grammar is the one input the
-// census adds to a header's identity.
-func (c Census) ChangesHeaders(next Census) bool {
-	return c.Header().First != next.Header().First
 }
 
 // ParseErrors is what one parse of a header reports about its errors.

@@ -40,10 +40,11 @@ const (
 
 // Store is the write side of storage the builder needs: it persists each
 // blob's metadata before the manifest that names it, and imports the streamed
-// manifest. Blob lets a capture skip re-persisting a blob the store already
-// holds. *sqlite.Store satisfies it.
+// manifest. RecordedBlob lets a capture skip re-persisting a blob the store
+// already holds, one this capture recorded since the last commit included.
+// *sqlite.Store satisfies it.
 type Store interface {
-	Blob(ctx context.Context, hash string) (model.BlobRecord, error)
+	RecordedBlob(ctx context.Context, hash string) (model.BlobRecord, error)
 	PutBlob(ctx context.Context, b model.BlobRecord) error
 	PutSnapshot(ctx context.Context, snap model.Snapshot, files func(yield func(model.FileVersion) error) error) error
 }
@@ -525,7 +526,7 @@ func (c *capture) captureFile(ctx context.Context, f workspace.File, r row, stat
 	if post.Size() != rec.Size || post.ModTime().UnixNano() != f.ModTime {
 		*changes++
 	}
-	if _, err := b.Store.Blob(ctx, rec.Hash); err != nil {
+	if _, err := b.Store.RecordedBlob(ctx, rec.Hash); err != nil {
 		if err := b.Store.PutBlob(ctx, rec); err != nil {
 			return err
 		}

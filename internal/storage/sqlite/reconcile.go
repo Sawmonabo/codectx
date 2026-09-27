@@ -71,7 +71,7 @@ type aliasKey struct{ scope, native string }
 // file's path chain, the file and its classified node, so the table is sized
 // by one path's depth, never by the repository.
 type AliasTable struct {
-	units   map[model.UnitID]bool
+	units   []model.UnitID // the loaded dependencies, sorted and distinct
 	aliases map[aliasKey][]StoredAlias
 }
 
@@ -86,19 +86,14 @@ type AliasTable struct {
 // answer would mint an identity other than the one the committed dependency
 // names, and the run would still succeed.
 func (s *Store) DependencyAliases(ctx context.Context, units []model.UnitID) (*AliasTable, error) {
-	t := &AliasTable{units: make(map[model.UnitID]bool, len(units)), aliases: map[aliasKey][]StoredAlias{}}
-	ids := make([]model.UnitID, 0, len(units))
-	keys := make([][]byte, 0, len(units))
-	for _, u := range units {
-		if t.units[u] {
-			continue
-		}
+	ids := distinctUnits(units)
+	t := &AliasTable{units: ids, aliases: map[aliasKey][]StoredAlias{}}
+	keys := make([][]byte, 0, len(ids))
+	for _, u := range ids {
 		key, err := idBlob("unit_id", string(u))
 		if err != nil {
 			return nil, err
 		}
-		t.units[u] = true
-		ids = append(ids, u)
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
@@ -198,9 +193,13 @@ func (t *AliasTable) load(ctx context.Context, tx *sql.Tx, keys [][]byte) error 
 // LookupAliases returns every distinct identity that (scopeKey, nativeKey) is
 // aliased to by the given units, from the loaded table: a copy of the key's
 // identities ordered by canonical key and then node id, which depends only on
-// the sealed units' alias rows and never on the order they were written. A
-// unit the table was not loaded for is refused as an internal fault, because
-// answering it would report aliases of rows this table never read.
+// the sealed units' alias rows and never on the order they were written.
+//
+// The table holds one merged list per key, so it can answer only the whole
+// set it was loaded for. A unit set that differs from it, by a unit the table
+// never read or by one it read and the caller left out, is refused as an
+// internal fault: the answer would carry aliases of rows the caller did not
+// name, or miss aliases of rows it did.
 func (t *AliasTable) LookupAliases(_ context.Context, units []model.UnitID, scopeKey, nativeKey string) ([]StoredAlias, error) {
 	if len(units) == 0 {
 		return nil, nil
@@ -208,12 +207,19 @@ func (t *AliasTable) LookupAliases(_ context.Context, units []model.UnitID, scop
 	if scopeKey == "" || len(scopeKey) > model.MaxScopeKeyBytes || nativeKey == "" || len(nativeKey) > model.MaxNativeKeyBytes {
 		return nil, invalid("alias lookup needs a bounded, non-empty scope key and native key")
 	}
-	for _, u := range units {
-		if !t.units[u] {
-			return nil, internal("alias lookup names unit " + string(u) + ", which is not a dependency this table was loaded for")
-		}
+	// The resolver passes its dependencies sorted and distinct, which is the
+	// table's own order, so the common case compares without allocating.
+	if !slices.Equal(units, t.units) && !slices.Equal(distinctUnits(units), t.units) {
+		return nil, internal("alias lookup names a unit set other than the dependencies this table was loaded for")
 	}
 	return slices.Clone(t.aliases[aliasKey{scope: scopeKey, native: nativeKey}]), nil
+}
+
+// distinctUnits is units sorted, without repeats, in a new slice.
+func distinctUnits(units []model.UnitID) []model.UnitID {
+	sorted := slices.Clone(units)
+	slices.Sort(sorted)
+	return slices.Compact(sorted)
 }
 
 // sortAliases puts identities in the resolver's order: canonical key, then

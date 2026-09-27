@@ -93,10 +93,13 @@ bounded by the writer's page cache; nothing commits per batch.
    returns (sessions, leases, heartbeats, retention, the planner's statistics, generation pins)
    keeps its own transaction. It announces itself, the next ingestion call commits the group, and
    it runs; it waits at most one batch.
-7. **Own-writes reads.** The ingestion side's reads (unit states, aliases of dependency units,
-   selected and carried units, delta state, unit inputs, the snapshot and blobs a capture recorded,
-   generation status, provider runs) run on the group's connection while a group is open, so a run
-   sees what it has stored. Query paths read the reader pool and see a run's units at its commits.
+7. **Own-writes reads.** The ingestion side's reads of what the run stored since the last commit
+   (the capture's check for a blob it recorded, selected and carried units, delta state,
+   generation status, provider runs) run on the group's connection while a group is open. A unit's
+   own reads (its dependencies' states and aliases, its inputs, the snapshot view's manifest rows
+   and blobs) run on the reader pool against the last commit, which the index build advances after
+   the capture, before the build and at each provider boundary. Query paths read the reader pool
+   and see a run's units at its commits.
 8. **Requirements, as tests.** The store's ingestion test asserts that the bytes the engine writes
    and the bytes sent to disk are each at most four times the bytes stored; a second test gives
    the writer a 2 MiB cache and asserts the log never exceeds twice the cache; a third writes

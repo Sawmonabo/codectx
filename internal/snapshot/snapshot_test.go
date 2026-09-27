@@ -145,6 +145,11 @@ func (f *fixture) build(b *Builder) (model.Snapshot, *View) {
 	if err != nil {
 		f.t.Fatalf("Build: %v", err)
 	}
+	// A view reads against the last commit, so the capture is committed
+	// first, as the index build commits it.
+	if err := f.store.Flush(f.ctx); err != nil {
+		f.t.Fatalf("Flush: %v", err)
+	}
 	view, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
 	if err != nil {
 		f.t.Fatalf("OpenView: %v", err)
@@ -680,6 +685,9 @@ func TestEveryBlobIsDurableBeforeTheSnapshotNamesIt(t *testing.T) {
 	}
 	// And the bytes are readable afterwards, so publication was real and not
 	// merely recorded.
+	if err := f.store.Flush(f.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	v, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
 	if err != nil {
 		t.Fatalf("OpenView: %v", err)

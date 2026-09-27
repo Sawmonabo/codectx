@@ -668,7 +668,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// exactly that reason, and writes nothing on any other.
 		if s.queryStore, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
 			BusyTimeout:        cfg.Storage.BusyTimeout.Std(),
-			ReadConnections:    config.ReadConnections(cfg),
+			ReadConnections:    config.QueryReadConnections(cfg),
 			PostingConnections: config.PostingConnections(cfg),
 			ReaderCacheKiB:     cfg.Storage.ReaderCacheKiB,
 			MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
