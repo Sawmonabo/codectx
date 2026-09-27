@@ -412,26 +412,32 @@ func ledgerLike(peaks map[string]int64) func(ctx context.Context, scopeKey, fami
 	}
 }
 
-// A header's grammar is decided by the snapshot's census, so a header's
-// structural and filesystem units must be keyed by it: a census change that
-// flips the first grammar must rebuild every header, and one that keeps it
-// must reuse every header, with every other file untouched either way. The
-// identity is taken after the unit's spill round trip, which is the form the
-// executor derives it from. It fails if the key is omitted from fileUnits,
-// Spec or the spilled record (a flip keeps the header's identity), or if it
-// is taken from the census's basis rather than its first grammar (the
-// non-flipping change moves the header's identity).
-func TestAHeaderUnitIsKeyedByItsCensusFirstGrammarAndNothingElse(t *testing.T) {
-	identity := func(census model.Snapshot, path string) model.UnitID {
+// A header's grammar is decided by the snapshot's census, so a header's file
+// units must be keyed by the census-derived grammar each reads: the
+// structural unit by the grammar it is parsed with first, the filesystem unit
+// by the manifest's tag, the census's first grammar. A census change that
+// moves that grammar must rebuild the unit, and one that keeps it must reuse
+// it, with every other file untouched either way. With only one of the two
+// grammars enabled every header is parsed with that one, so no census change
+// moves the structural unit, while the tag still moves the filesystem unit.
+// The identity is taken after the unit's spill round trip, which is the form
+// the executor derives it from. It fails if the key is omitted from
+// fileUnits, Spec or the spilled record (a flip keeps the identity), if it is
+// taken from the census's basis rather than a grammar (the non-flipping
+// change moves it), if the structural key ignores the enabled grammars (the
+// one-grammar flip moves it), or if the filesystem unit takes the structural
+// key (the one-grammar flip keeps the stale tag's unit).
+func TestAHeaderUnitIsKeyedByTheGrammarItReads(t *testing.T) {
+	identity := func(providerID string, census model.Snapshot, path string, languages ...string) model.UnitID {
 		t.Helper()
 		sorter, err := pagination.NewExternalSort(t.TempDir(), 0, encodeUnit, decodeUnit, compareUnit)
 		if err != nil {
 			t.Fatalf("NewExternalSort: %v", err)
 		}
 		defer func() { _ = sorter.Close() }()
-		b := &builder{headerKey: headerKey(census), allUnits: sorter, providerOrder: map[string]int{},
+		b := &builder{headers: headerKeysOf(census, languages), allUnits: sorter, providerOrder: map[string]int{},
 			plan:          Plan{Reuse: map[string]model.UnitID{}, Unplanned: map[string]int{}},
-			fileProviders: []fileProvider{{id: "treesitter", version: "1", gate: func(model.FileVersion) bool { return true }}}}
+			fileProviders: []fileProvider{{id: providerID, version: "1", gate: func(model.FileVersion) bool { return true }}}}
 		fv := model.FileVersion{ID: model.NewFileID("repo", path), Path: path,
 			ContentHash: string(model.NewFileID("content", path))}
 		if _, _, err := b.fileUnits(context.Background(), fv, false); err != nil {
@@ -452,21 +458,32 @@ func TestAHeaderUnitIsKeyedByItsCensusFirstGrammarAndNothingElse(t *testing.T) {
 		}
 		return id
 	}
+	const structural, files = "treesitter", "filesystem"
 	cOnly := model.Snapshot{FileCount: 1, CUnits: 1}
 	cppOnly := model.Snapshot{FileCount: 1, CPPUnits: 1}
 	mixed := model.Snapshot{FileCount: 2, CUnits: 1, CPPUnits: 1}
 	none := model.Snapshot{}
-	if identity(cOnly, "inc/a.h") == identity(cppOnly, "inc/a.h") {
-		t.Fatal("a census that flips the header grammar from C to C++ kept the header unit's identity: " +
-			"it would be reused with facts parsed under the wrong grammar")
-	}
-	if identity(mixed, "inc/a.h") != identity(none, "inc/a.h") {
-		t.Fatal("a census change that keeps C++ first moved the header unit's identity: " +
-			"every header would be rebuilt for nothing")
-	}
-	for _, path := range []string{"src/a.c", "inc/a.hpp"} {
-		if identity(cOnly, path) != identity(cppOnly, path) {
-			t.Fatalf("%s is no two-grammar header, yet the census moved its unit's identity", path)
+	for _, p := range []string{structural, files} {
+		if identity(p, cOnly, "inc/a.h") == identity(p, cppOnly, "inc/a.h") {
+			t.Fatalf("a census that flips the header grammar from C to C++ kept the %s unit's identity: "+
+				"it would be reused with facts made under the wrong grammar", p)
 		}
+		if identity(p, mixed, "inc/a.h") != identity(p, none, "inc/a.h") {
+			t.Fatalf("a census change that keeps C++ first moved the %s unit's identity: "+
+				"every header would be rebuilt for nothing", p)
+		}
+		for _, path := range []string{"src/a.c", "inc/a.hpp"} {
+			if identity(p, cOnly, path) != identity(p, cppOnly, path) {
+				t.Fatalf("%s is no two-grammar header, yet the census moved its %s unit's identity", path, p)
+			}
+		}
+	}
+	if identity(structural, cOnly, "inc/a.h", "cpp") != identity(structural, cppOnly, "inc/a.h", "cpp") {
+		t.Fatal("with only the C++ grammar enabled a census flip moved the structural unit's identity, " +
+			"though every header is parsed with C++ either way")
+	}
+	if identity(files, cOnly, "inc/a.h", "cpp") == identity(files, cppOnly, "inc/a.h", "cpp") {
+		t.Fatal("with only the C++ grammar enabled a census flip kept the filesystem unit's identity, " +
+			"though the manifest's tag for the header moved from c to cpp")
 	}
 }
