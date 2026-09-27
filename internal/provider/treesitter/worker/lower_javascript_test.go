@@ -629,8 +629,9 @@ var javascriptShared = []goldenCase{
 		// the head g of a@82 and the binding g@82 (each Uses it), h(g)@90
 		// (Uses nothing); the arrow () => g += a@106 (Uses its capture a,
 		// may-defines nothing, defines its result), the declarator c = ()
-		// => g += a@102 (Uses the result, defines c); return c;@120. The
-		// deletion position is javascriptOnly's: `delete g` is sloppy code.
+		// => g += a@102 (Uses the result, defines c); return c;@120. `delete
+		// g` is left out, being sloppy code only: its operand is a plain read,
+		// the path h(g)@90 already takes.
 		name:     "a name that resolves to no variable is read and written as nothing in every position",
 		protects: "an unresolved name as an assignment, compound, update, logical, embedded, property-base, destructuring-default, iteration or capture target defines and reads nothing, while its node keeps its other reads",
 		mutation: "drop the v < 0 return in def (flow.Builder.Def panics on g's -1 at g = a@16), in read (seen[-1] panics at g += a@23), in mayDefBase (MayDef(-1) at g.p = a@55) or in capTarget (MayDef(-1) on the arrow's node)",
@@ -1385,17 +1386,5 @@ var javascriptOnly = []goldenCase{
 		src:      "function f(o, x) { with (o) { g(x); } return x; }",
 		fn:       1,
 		du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
-	},
-	{
-		// ECMA-262 §13.5.1.2 The delete Operator: in sloppy code `delete g` of an unresolvable name
-		// evaluates to true and deletes nothing of f (§13.5.1.1 forbids it in strict code, and a TypeScript
-		// compiler rejects it, TS2703). g resolves to no variable of f. Nodes: a@11, delete g@16 (Uses
-		// nothing), return a;@26.
-		name:     "a deletion of a name that resolves to no variable reads nothing",
-		protects: "an unresolved name as a delete operand is state the facts do not track, so its node reads and writes nothing",
-		mutation: "drop the v < 0 return in read (seen[-1] panics at delete g@16)",
-		src:      "function f(a) { delete g; return a; }",
-		fn:       1,
-		du:       []string{"a@11 -> return a;@26"},
 	},
 }
