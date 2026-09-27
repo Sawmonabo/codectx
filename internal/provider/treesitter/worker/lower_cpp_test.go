@@ -198,50 +198,6 @@ func TestCppLoweringGolden(t *testing.T) {
 				"b@22 -> return a + b;@30"},
 		},
 		{
-			// [expr.ass]: an assignment's result is its left operand, and
-			// [expr.call]: the arguments are indeterminately sequenced, each
-			// evaluated completely before the call. Nodes: x@10, x = 1@25
-			// (defines x and its own result), x = 2@34 (defines x, killing
-			// x = 1, and its own result), return g((x = 1),
-			// (x = 2));@15 (Uses both results). Succ: a straight line to EXIT.
-			name:     "each embedded assignment to a local hands its own value to the consumer",
-			protects: "the consumer of two assignments to one local depends on both, since it Uses each assignment's result and not the local the second one overwrites",
-			mutation: "let the consumer Use the assigned local instead of each result (loses x = 1@25 -> return g((x = 1), (x = 2));@15)",
-			src:      "int f(int x) { return g((x = 1), (x = 2)); }",
-			du:       []string{"x = 1@25 -> return g((x = 1), (x = 2));@15", "x = 2@34 -> return g((x = 1), (x = 2));@15"},
-		},
-		{
-			// [expr.call]: the arguments are indeterminately sequenced; the
-			// lowering takes source order, so the read of x in the first
-			// argument precedes x = 1. Nodes: x@10, x = 1@27 (Uses the x the
-			// call already read, defines x, an owned variable carrying that
-			// earlier value, and its own result), return g(x, x
-			// = 1);@15 (Uses the carried value and the result). Succ: a
-			// straight line to EXIT.
-			name:     "a read made before an embedded assignment of the same local keeps the earlier value",
-			protects: "the call's first argument reaches the parameter's value through the assignment's node, not the value the assignment stores",
-			mutation: "let the held read of x pair with the definition after it (loses x@10 -> x = 1@27)",
-			src:      "int f(int x) { return g(x, x = 1); }",
-			du:       []string{"x@10 -> x = 1@27", "x = 1@27 -> return g(x, x = 1);@15"},
-		},
-		{
-			// [expr.log.and]/1: the right operand is evaluated only when the
-			// left is true; [expr.call]: the arguments are indeterminately
-			// sequenced, taken in source order. Nodes: x@10, c@17, c@34
-			// (Branch, Uses c, defines the && result), x = 1@40 (defines x,
-			// its own result and the && result; it runs only when c
-			// is true, so it takes no read held before it), return g(x, c &&
-			// (x = 1));@22 (Uses the held x and the && result). Succ: c@34→
-			// {x = 1, return}; x = 1→return. IPDom: c@34 → return.
-			name:     "a read held before a conditionally evaluated assignment stays on the consumer",
-			protects: "on the path that skips an assignment in a && operand the consumer still sees the local's earlier definition, and on the other path the assignment",
-			mutation: "hand the held read off to the assignment unconditionally (adds x@10 -> x = 1@40, loses x@10 -> return g(x, c && (x = 1));@22)",
-			src:      "int f(int x, int c) { return g(x, c && (x = 1)); }",
-			cd:       []string{"c@34 -> x = 1@40"},
-			du: []string{"c@17 -> c@34", "x@10 -> return g(x, c && (x = 1));@22", "x = 1@40 -> return g(x, c && (x = 1));@22",
-				"c@34 -> return g(x, c && (x = 1));@22"},
-		},
-		{
 			// [class.mfct.non.static]/2: a member named without `this->` in a
 			// member function is `(*this).m`, a member, no variable of f.
 			// Nodes: y@42, m = y@47 (Uses y, defines nothing), m += y@54

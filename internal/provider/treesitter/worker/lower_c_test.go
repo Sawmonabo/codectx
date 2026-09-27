@@ -687,6 +687,137 @@ var cShared = []goldenCase{
 		src:      "int f(int x) { if (x) { struct T { int a; }; typedef int U; } return 0; }",
 		du:       []string{"x@10 -> x@19"},
 	},
+	{
+		// C17 §6.5.2.2p10 and §6.5.16p3 in C, and in C++
+		// [expr.ass]: an assignment's result is its left operand, and
+		// [expr.call]: the arguments are indeterminately sequenced, each
+		// evaluated completely before the call. Nodes: x@10, x = 1@25
+		// (defines x and its own result), x = 2@34 (defines x, killing
+		// x = 1, and its own result), return g((x = 1),
+		// (x = 2));@15 (Uses both results). Succ: a straight line to EXIT.
+		name:     "each embedded assignment to a local hands its own value to the consumer",
+		protects: "the consumer of two assignments to one local depends on both, since it Uses each assignment's result and not the local the second one overwrites",
+		mutation: "let the consumer Use the assigned local instead of each result (loses x = 1@25 -> return g((x = 1), (x = 2));@15)",
+		src:      "int f(int x) { return g((x = 1), (x = 2)); }",
+		du:       []string{"x = 1@25 -> return g((x = 1), (x = 2));@15", "x = 2@34 -> return g((x = 1), (x = 2));@15"},
+	},
+	{
+		// C17 §6.5.2.2p10 and §6.5.16p3 in C, and in C++
+		// [expr.call]: the arguments are indeterminately sequenced; the
+		// lowering takes source order, so the read of x in the first
+		// argument precedes x = 1. Nodes: x@10, x = 1@27 (Uses the x the
+		// call already read, defines x, an owned variable carrying that
+		// earlier value, and its own result), return g(x, x
+		// = 1);@15 (Uses the carried value and the result). Succ: a
+		// straight line to EXIT.
+		name:     "a read made before an embedded assignment of the same local keeps the earlier value",
+		protects: "the call's first argument reaches the parameter's value through the assignment's node, not the value the assignment stores",
+		mutation: "let the held read of x pair with the definition after it (loses x@10 -> x = 1@27)",
+		src:      "int f(int x) { return g(x, x = 1); }",
+		du:       []string{"x@10 -> x = 1@27", "x = 1@27 -> return g(x, x = 1);@15"},
+	},
+	{
+		// C17 §6.5.2.2p10 and §6.5.16p3 in C, and in C++
+		// [expr.log.and]/1: the right operand is evaluated only when the
+		// left is true; [expr.call]: the arguments are indeterminately
+		// sequenced, taken in source order. Nodes: x@10, c@17, c@34
+		// (Branch, Uses c, defines the && result), x = 1@40 (defines x,
+		// its own result and the && result; it runs only when c
+		// is true, so it takes no read held before it), return g(x, c &&
+		// (x = 1));@22 (Uses the held x and the && result). Succ: c@34→
+		// {x = 1, return}; x = 1→return. IPDom: c@34 → return.
+		name:     "a read held before a conditionally evaluated assignment stays on the consumer",
+		protects: "on the path that skips an assignment in a && operand the consumer still sees the local's earlier definition, and on the other path the assignment",
+		mutation: "hand the held read off to the assignment unconditionally (adds x@10 -> x = 1@40, loses x@10 -> return g(x, c && (x = 1));@22)",
+		src:      "int f(int x, int c) { return g(x, c && (x = 1)); }",
+		cd:       []string{"c@34 -> x = 1@40"},
+		du: []string{"c@17 -> c@34", "x@10 -> return g(x, c && (x = 1));@22", "x = 1@40 -> return g(x, c && (x = 1));@22",
+			"c@34 -> return g(x, c && (x = 1));@22"},
+	},
+	{
+		// C17 §6.5.3.4p2: sizeof of a variable-length array evaluates its
+		// operand, and so does sizeof of a VLA type name, whose size
+		// expression is read. g(0, a) may-define a (it decays), so the read
+		// in sizeof a shows. Nodes: n@10, a[n]@19 (reads n), g(0, a)@25
+		// (Uses and may-defines a), y = sizeof a@38 (Uses a), z =
+		// sizeof(int[n])@56 (Uses n), return y + z;@76.
+		name:     "sizeof of a variable-length array reads it and a VLA type name reads its size",
+		protects: "a VLA operand of sizeof is evaluated, unlike every other sizeof operand",
+		mutation: "treat every sizeof operand as unevaluated (loses g(0, a)@25 -> y = sizeof a@38 and n@10 -> z = sizeof(int[n])@56)",
+		src:      "int f(int n) { int a[n]; g(0, a); int y = sizeof a; int z = sizeof(int[n]); return y + z; }",
+		du: []string{"n@10 -> a[n]@19", "g(0, a)@25 -> y = sizeof a@38", "n@10 -> z = sizeof(int[n])@56",
+			"y = sizeof a@38 -> return y + z;@76", "z = sizeof(int[n])@56 -> return y + z;@76"},
+	},
+	{
+		// C17 §6.5.1.1p3: the controlling expression of a generic selection
+		// is not evaluated, and the lowering reads every association since
+		// the choice depends on types. Nodes: x@10, y@17, return
+		// _Generic(x, int: y, default: 0);@22 (Uses y only).
+		name:     "a generic selection reads its associations and not its controlling expression",
+		protects: "the controlling expression of _Generic is no read, while an association's expression is",
+		mutation: "read the controlling expression (adds x@10 -> return _Generic(x, int: y, default: 0);@22)",
+		src:      "int f(int x, int y) { return _Generic(x, int: y, default: 0); }",
+		du:       []string{"y@17 -> return _Generic(x, int: y, default: 0);@22"},
+	},
+	{
+		// C17 §6.2.1p4 and §6.7.6.3 ([basic.scope.block] alike): the block's
+		// `int x(int);` declares a function that hides the parameter until
+		// the block ends. Nodes: x@10, y@17, y = x(1)@36 (reads no
+		// variable), return x + y;@48.
+		name:     "a block-scope prototype hides a parameter with no variable",
+		protects: "a name a block declares as a function is no variable there, and the enclosing variable is visible again after the block",
+		mutation: "leave the parameter visible under the prototype (adds x@10 -> y = x(1)@36)",
+		src:      "int f(int x, int y) { { int x(int); y = x(1); } return x + y; }",
+		du:       []string{"x@10 -> return x + y;@48", "y = x(1)@36 -> return x + y;@48"},
+	},
+	{
+		// C17 §6.5.17p2: the comma operator evaluates both operands and
+		// yields the right one; in value position it is folded into the
+		// node that evaluates it. Nodes: x@10, y@17, y = (g(), x)@22 (Uses
+		// x, defines y), return y;@36.
+		name:     "a comma operator in value position is folded into its consumer",
+		protects: "the reads of a value-position comma expression are its consumer's own",
+		mutation: "drop a comma expression's operand reads in value position (loses x@10 -> y = (g(), x)@22)",
+		src:      "int f(int x, int y) { y = (g(), x); return y; }",
+		du:       []string{"x@10 -> y = (g(), x)@22", "y = (g(), x)@22 -> return y;@36"},
+	},
+	{
+		// C17 §6.5.4 and §6.5.3.2p4: `*(int *)p` designates the object p
+		// points to, so the store is a write through p. Nodes: p@13, v@20,
+		// *(int *)p = v@25 (Uses p and v, may-defines p), g(0, p)@40.
+		name:     "a write through a cast pointer may-defines the pointer",
+		protects: "the base of a write is found through a cast, so a later read of the pointer sees the store",
+		mutation: "stop baseIdent at a cast (loses *(int *)p = v@25 -> g(0, p)@40)",
+		src:      "void f(void *p, int v) { *(int *)p = v; g(0, p); }",
+		du: []string{"p@13 -> *(int *)p = v@25", "v@20 -> *(int *)p = v@25", "p@13 -> g(0, p)@40",
+			"*(int *)p = v@25 -> g(0, p)@40"},
+	},
+	{
+		// C17 §6.7.9p7: a designator names a member, not a variable; the
+		// initializer list is folded into the declarator's node. Nodes:
+		// x@10, a = 0@19, s = { .a = x }@35 (Uses x only, defines s),
+		// return s.a;@51.
+		name:     "a designated initializer reads only its value",
+		protects: "the member a designator names is no read of a local of the same name",
+		mutation: "read the designator as a name (adds a = 0@19 -> s = { .a = x }@35)",
+		src:      "int f(int x) { int a = 0; struct S s = { .a = x }; return s.a; }",
+		du:       []string{"x@10 -> s = { .a = x }@35", "s = { .a = x }@35 -> return s.a;@51"},
+	},
+	{
+		// C17 §6.5.15p4: only the chosen arm of ?: is evaluated, so an
+		// assignment in an arm does not run on every path to the call and
+		// takes none of its earlier reads. Nodes: x@10, c@17, c@34
+		// (Branch), x = 1@39 (defines x and the ?: result), 0@48 (defines
+		// the result), return g(x, c ? (x = 1) : 0);@22 (Uses x and the
+		// result). Succ: c@34→{x = 1, 0}→return. IPDom: c@34 → return.
+		name:     "an assignment in a conditional arm takes none of the consumer's earlier reads",
+		protects: "on the path through the other arm the consumer still sees the local's earlier definition",
+		mutation: "hand the held read off to an assignment in a ?: arm (adds x@10 -> x = 1@39, loses x@10 -> return g(x, c ? (x = 1) : 0);@22)",
+		src:      "int f(int x, int c) { return g(x, c ? (x = 1) : 0); }",
+		cd:       []string{"c@34 -> x = 1@39", "c@34 -> 0@48"},
+		du: []string{"c@17 -> c@34", "x@10 -> return g(x, c ? (x = 1) : 0);@22",
+			"x = 1@39 -> return g(x, c ? (x = 1) : 0);@22", "0@48 -> return g(x, c ? (x = 1) : 0);@22"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
