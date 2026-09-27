@@ -1297,15 +1297,10 @@ func (p *pool) plan(ctx context.Context, view model.SnapshotView, language strin
 			p.failedModel()
 			return f, nil
 		}
-		if ok {
-			var h admission.NeedHistogram
-			if err := h.UnmarshalBinary(state); err != nil {
-				// A state that does not decode teaches nothing; the model
-				// starts empty and the next observation's state supersedes it.
-				p.failedModel()
-			} else {
-				m.h = h
-			}
+		// A state that does not decode teaches nothing: UnmarshalBinary leaves
+		// the model empty, and the next observation's state supersedes it.
+		if ok && m.h.UnmarshalBinary(state) != nil {
+			p.failedModel()
 		}
 		m.loaded = true
 	}
