@@ -265,10 +265,10 @@ func (s *signals) tracked(root workspace.Root, maxFiles int64) error {
 	if err != nil {
 		return err
 	}
-	// One listing runs at a time and reserves nothing, so the runner is sized
-	// at the package's smallest child reservation: this command starts no
-	// other child and has no allocation to divide between them.
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: smallestChildReservationBytes})
+	// The one listing this command runs reserves nothing and starts beside no
+	// other child, so its runner states no bound: there is no allocation to
+	// divide and no ledger to stand beneath.
+	runner, err := process.NewRunner(process.Limits{})
 	if err != nil {
 		return err
 	}
