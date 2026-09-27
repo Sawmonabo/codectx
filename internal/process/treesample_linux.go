@@ -43,6 +43,13 @@ type treeSampler struct {
 	// then cpu holds no measurement, and a reader is told so instead of being
 	// handed a zero it would read as "consumed nothing".
 	cpuSeen atomic.Bool
+	// anon is the tree's summed anonymous resident set as of the last sweep
+	// that found the tree, and anonSeen whether that sweep read it for every
+	// member it found. Like cpu it is read while the run is going, by the
+	// allocation's add-back of the product's own residency (Runner.
+	// ReservedResidentBytes, CPUProgress.AnonResidentBytes).
+	anon     atomic.Int64
+	anonSeen atomic.Bool
 }
 
 // startTreeSampler begins sampling the process group pgid every interval. The
@@ -79,6 +86,11 @@ func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
 				// a live reader as a measurement.
 				s.cpu.Store(sums.ticks)
 				s.cpuSeen.Store(true)
+				// A sweep that could not read some member's pages has no
+				// figure for the tree, so the reading becomes unavailable
+				// rather than the partial sum.
+				s.anon.Store(sums.anon)
+				s.anonSeen.Store(sums.anonRead)
 			}
 			select {
 			case <-s.stop:
@@ -113,6 +125,16 @@ func (s *treeSampler) cpuTicks() (int64, bool) {
 	return s.cpu.Load(), true
 }
 
+// anonBytes reports the tree's summed anonymous resident set as of the last
+// sweep that found it. ok is false until a sweep has read it for every member
+// it found, and after a sweep that could not: no measurement, not zero.
+func (s *treeSampler) anonBytes() (int64, bool) {
+	if s == nil || !s.anonSeen.Load() {
+		return 0, false
+	}
+	return s.anon.Load(), true
+}
+
 // groupSums is one sweep's totals over a process group.
 type groupSums struct {
 	rss   int64
@@ -127,6 +149,10 @@ type groupSums struct {
 	// sweep that found the tree is distinguishable from one that found nothing
 	// and from one whose members all denied their counters.
 	ioSeen bool
+	// anon is the summed anonymous resident set, and anonRead reports that it
+	// was read for every member the sweep found.
+	anon     int64
+	anonRead bool
 }
 
 // sumGroup adds the resident set size, the consumed CPU ticks and the
@@ -145,6 +171,7 @@ func sumGroup(pgid int) groupSums {
 		return sums
 	}
 	pageSize := int64(os.Getpagesize())
+	sums.anonRead = true
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
@@ -157,6 +184,11 @@ func sumGroup(pgid int) groupSums {
 		sums.found = true
 		sums.rss += pages * pageSize
 		sums.ticks += cpu
+		if anon, ok := anonPages(pid); ok {
+			sums.anon += anon * pageSize
+		} else {
+			sums.anonRead = false
+		}
 		// Only a member of the group is opened a second time, so the extra
 		// read costs the size of the tree and not the size of /proc.
 		if read, write, ok := ioBytes(pid); ok {
@@ -205,6 +237,31 @@ func ioBytes(pid int) (read, write int64, ok bool) {
 	// Both counters or neither: a half-read file is an unreadable one, so a
 	// missing figure is never summed in as a zero.
 	return read, write, found == 2
+}
+
+// anonPages reads one process's anonymous resident pages from
+// /proc/<pid>/statm: the resident set less its file-backed and shared pages.
+// Those pages -- the executable and libraries every child of one binary maps
+// -- stay in the kernel's available figure while they can be reclaimed, so
+// only the anonymous part is memory the process holds of its own.
+func anonPages(pid int) (int64, bool) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/statm")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) < 3 {
+		return 0, false
+	}
+	resident, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || resident < 0 {
+		return 0, false
+	}
+	shared, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || shared < 0 || shared > resident {
+		return 0, false
+	}
+	return resident - shared, true
 }
 
 // statGroup reads one process's group ID, resident pages and consumed CPU

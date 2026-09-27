@@ -257,13 +257,26 @@ MemoryReservationBytes  none: the admission ledger holds the worker's memory
 
 Before it is started, each worker holds a base on the process's one admission
 ledger (`Options.Admission`): the largest base any worker of the pool has
-reported, zero before the first one reports. The worker's `Hello` and every
-`Done` adjust that holding to the base the worker measured of itself, upward
-without waiting, and it is given back once the runner has reaped the worker.
+reported. Until one has reported, only that one worker is started, and the
+others wait for its report and are reserved at it. The worker's `Hello` and
+every `Done` adjust that holding to the base the worker measured of itself --
+its anonymous resident set, or the whole resident set where only that is
+reported -- upward without waiting, and it is given back once the runner has
+reaped the worker.
 Each file then holds its predicted need increment from before it is
 dispatched until its `Done`, which the ledger grants whenever no other parse
 is in flight, however large. So parser workers wait in the same queue, against
-the same allocation, as every other heavy child. Every
+the same allocation, as every other heavy child.
+
+The allocation is re-derived before every admission on the ledger, and it adds
+the product's own residency back to the kernel's available figure. The pool's
+part is handed over through `Options.Rederive` just before each file's
+increment is reserved: the sum of every live worker's anonymous resident set as
+the runner's tree sampler last read it, which includes what each parse in
+flight has taken so far. Where any live worker has no reading -- a platform
+that samples no running tree, or a worker the first sweep has not found yet --
+it is instead the workers' base holdings plus the increments of the parses in
+flight, since increments are not attributed to workers. Every
 admission is first-in-first-out on the ledger, and a worker coming back from a
 parse while an acquirer of the pool is queued there follows that order:
 
@@ -323,7 +336,7 @@ ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-	Rederive:          rederiveAllocation(admissionLedger, baseFootprint),
+	Rederive:          allocation.parserResidency, // the ledger's re-derivation
 	Admission:         admissionLedger,
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 	Runner:            parserRunner,

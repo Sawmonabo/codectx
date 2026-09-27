@@ -149,21 +149,24 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // footprint and the safety margin, and half of that total
 // (dependence.Machine.SchedulingAllocation over the augmented reading).
 // Counting the product's own residency -- this process's resident set and
-// workerResidentBytes, what its parser workers hold -- means its own growth
+// childResidentBytes, what its ledger children hold -- means its own growth
 // never throttles it: memory the product already holds is not memory another
-// process could have been given.
+// process could have been given, and a child admitted on the ledger has
+// already taken from the kernel's figure the memory its reservation stands
+// for.
 //
 // It is the one derivation of the allocation, at composition (before any
-// parser worker has started, so workerResidentBytes is zero) and before every
-// admission on the ledger (ledgerAllocation.rederive). Where this process's resident set is not
-// reported, it is left out of the sum rather than counted as zero, and the
-// allocation is the smaller figure available memory alone leaves. An
-// unobserved reading is the stand-in allocation, not observed.
-func memoryAllocation(m dependence.Machine, baseFootprintBytes, workerResidentBytes int64) (int64, bool) {
+// child has started, so childResidentBytes is zero) and before every
+// admission on the ledger (ledgerAllocation.rederive). Where this process's
+// resident set is not reported, it is left out of the sum rather than
+// counted as zero, and the allocation is the smaller figure available memory
+// alone leaves. An unobserved reading is the stand-in allocation, not
+// observed.
+func memoryAllocation(m dependence.Machine, baseFootprintBytes, childResidentBytes int64) (int64, bool) {
 	if !m.Observed {
 		return m.SchedulingAllocation(baseFootprintBytes)
 	}
-	held := workerResidentBytes
+	held := childResidentBytes
 	if parent := residency.Read().Resident; parent != nil {
 		held += int64(*parent)
 	}
@@ -181,19 +184,26 @@ func memoryAllocation(m dependence.Machine, baseFootprintBytes, workerResidentBy
 // a host that never reported one -- stays. Nothing already admitted is taken
 // back (admission.Ledger.SetAllocation).
 //
-// workers is the parser workers' part of the product's own residency --
-// their bases and the increments of the parses in flight -- as the parser
-// provider last reported it through its Rederive step (parserResidency),
-// which it calls just before it reserves each file's increment, so that
-// reservation's re-derivation counts it.
+// The ledger children's residency it adds back has two parts:
+//   - runners' children that state a memory reservation -- dependence units,
+//     external indexers, language servers -- at each one's live anonymous
+//     resident set (process.Runner.ReservedResidentBytes), read at this
+//     admission. A child with no reading is left out, never counted as zero
+//     or at its reservation;
+//   - the parser workers, which hold their room on the ledger themselves and
+//     state none to the runner, at the figure the parser provider last handed
+//     over (parserResidency), just before it reserved its latest file's
+//     increment: their live readings, or, where one is missing, their base
+//     holdings and the increments of the parses in flight.
 type ledgerAllocation struct {
 	l                  *admission.Ledger
 	baseFootprintBytes int64
+	runners            []*process.Runner
 	workers            atomic.Int64
 }
 
 // parserResidency is the parser provider's Rederive step: it records the
-// workers' residency for the re-derivation the file's reservation runs next.
+// workers' residency for the re-derivations that follow it.
 func (a *ledgerAllocation) parserResidency(workerResidentBytes int64) {
 	a.workers.Store(workerResidentBytes)
 }
@@ -203,7 +213,11 @@ func (a *ledgerAllocation) rederive() {
 	if !m.Observed {
 		return
 	}
-	allocation, _ := memoryAllocation(m, a.baseFootprintBytes, a.workers.Load())
+	children := a.workers.Load()
+	for _, r := range a.runners {
+		children += r.ReservedResidentBytes()
+	}
+	allocation, _ := memoryAllocation(m, a.baseFootprintBytes, children)
 	a.l.SetAllocation(allocation)
 }
 
@@ -783,8 +797,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.admission, err = admission.NewLedger(childMemory, childDisk); err != nil {
 		return nil, err
 	}
-	derived := &ledgerAllocation{l: s.admission, baseFootprintBytes: baseFootprint}
-	s.admission.RederiveBeforeEachAdmission(derived.rederive)
 	// The admission ledger is the one memory gate for every child of this
 	// process, and nothing beneath it may bind below it. Every child that
 	// reserves memory -- a dependence unit, an external indexer's profile, a
@@ -833,6 +845,12 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// so the resource report sums all three: naming one would describe part of
 	// the process budget as the whole of it.
 	s.runners = []diagnostics.ProcessCounter{shared, parsers, servers}
+	// Installed once every runner exists and before any reserver is composed,
+	// so the first admission on the ledger already counts every ledger
+	// child's residency (ledgerAllocation).
+	derived := &ledgerAllocation{l: s.admission, baseFootprintBytes: baseFootprint,
+		runners: []*process.Runner{shared, parsers, servers}}
+	s.admission.RederiveBeforeEachAdmission(derived.rederive)
 
 	if root.HasGit {
 		// A Git workspace is never captured without its membership and ignore
