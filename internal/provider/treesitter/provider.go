@@ -93,9 +93,11 @@ type Options struct {
 	// none. Zero selects the ceiling. Occurrences past it are counted and
 	// disclosed, never dropped in silence.
 	MaxEvidencePerFact int
-	// Rederive re-derives the admission allocation from the kernel's figure
-	// and the product's own residency, of which workerResidentBytes is the
-	// parser workers' part; the pool calls it between files. It is required.
+	// Rederive is handed the parser workers' residency, their part of the
+	// product's own, just before each file's increment is reserved; the
+	// ledger's re-derivation, which runs before every admission, adds the
+	// last figure handed over back to the allocation it derives. It is
+	// required.
 	Rederive func(workerResidentBytes int64)
 	// Admission is the process's one reservation ledger. Each worker holds
 	// its base on it from before it is started until the runner has reaped
@@ -178,7 +180,7 @@ func New(o Options) (*Provider, error) {
 		return nil, invalidOption(fmt.Sprintf("the parser provider was given %d workers; it needs at least one", o.MaxWorkers))
 	}
 	if o.Rederive == nil {
-		return nil, invalidOption("the treesitter provider needs the step that re-derives the allocation between files")
+		return nil, invalidOption("the treesitter provider needs the step it hands the parser workers' residency to")
 	}
 	if o.Admission == nil {
 		return nil, invalidOption("the treesitter provider needs the process reservation ledger its workers are admitted against")

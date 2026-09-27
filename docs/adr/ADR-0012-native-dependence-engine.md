@@ -318,8 +318,10 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 **Per file, need is observed, not assumed.**
 - **Measure.** At the file boundary of decision 2, the worker returns freed pages, reads its base and resets its peak
   (the kernel's `clear_refs` value 5, then `VmHWM`). After the file it reads the peak and reports three figures in the
-  file's `Done` frame: need (peak minus base), base, and anonymous resident set. The worker measures itself: the 250 ms
-  tree sampler misses nearly every parse, so it stays only as an envelope check.
+  file's `Done` frame: need (peak minus base), base, and anonymous resident set. The base the worker holds on the ledger
+  is its anonymous resident set, which is its own, not the executable pages every worker shares; where only the whole
+  resident set is reported, that is held instead. The worker measures itself: the 250 ms tree sampler misses nearly
+  every parse's peak, so for need it stays only as an envelope check.
 - **Where no resettable peak exists.** On a platform that offers no resettable per-process peak, need is reported as
   unavailable, never as zero: the file is reserved at its prediction and nothing is learned from it.
 - **Learn.** The coordinator keeps a decaying histogram of need per source byte in 5% buckets. It is keyed per
@@ -354,8 +356,8 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 - No term is a constant fitted to a repository.
 - The figure depends on the files in flight, not on how many files the repository has.
 
-**The ledger.** Each worker holds its observed base for its lifetime and reserves each file's predicted increment
-before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/admission`) gains three obligations:
+**The ledger.** Each worker holds its observed base -- its anonymous resident set -- for its lifetime and reserves each
+file's predicted increment before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/admission`) gains three obligations:
 - **Adjust.** `Done` adjusts a holding to what the file used, upward without waiting.
 - **Forward progress.** A per-file increment is granted whenever no parse is in flight. This is the runs-alone rule
   restated per file, so a file larger than the whole allocation still runs, whole.
@@ -374,9 +376,17 @@ with the observation it came from. The worker's process-tree spans play no part 
 
 **Coexistence, as a mechanism.**
 - **The allocation.** It is the smaller of two figures: available memory plus the product's own observed residency,
-  less the base footprint and margin; and half of that total. It is **re-derived from the kernel's figure between
-  files**, not read once at composition. Counting the product's own residency means its own growth never throttles
-  it.
+  less the base footprint and margin; and half of that total. It is **re-derived from the kernel's figure before every
+  admission** on the ledger, not read once at composition. Counting the product's own residency means its own growth
+  never throttles it.
+- **The residency added back.** It is the parent's resident set plus every ledger child's live anonymous resident set,
+  since a child admitted on the ledger has already taken from the kernel's figure what its reservation stands for.
+  Every child the runner starts with a memory reservation (a dependence unit, an external indexer, a language server)
+  is read from the runner's tree sample at each admission. The parser workers, whose room the pool holds itself, are
+  the sum of their tree samples, handed over as each file's increment is reserved; where any live worker has no
+  reading, they are counted instead at their base holdings plus the increments of the parses in flight. Any other
+  child with no reading is left out of the sum, never counted as zero or at its reservation, so a missing reading can
+  only narrow the allocation.
 - **Waiting.** A file whose reservation does not fit waits at the head of the line and is admitted the moment one
   returns. Available memory falling **is** the signal that the user's editor, browser or the agent driving the product
   is competing.

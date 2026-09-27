@@ -2,8 +2,8 @@ package process
 
 import "sync/atomic"
 
-// CPUProgress carries a running child's consumed processor time out to the
-// caller that started it.
+// CPUProgress carries a running child's consumed processor time, and its
+// anonymous resident set, out to the caller that started it.
 //
 // It exists so a caller that runs its own hang detector over a protocol this
 // package cannot see inside -- a framed request/response stream, where a
@@ -35,6 +35,19 @@ func (p *CPUProgress) Ticks() (int64, bool) {
 		return 0, false
 	}
 	return p.sampler.Load().cpuTicks()
+}
+
+// AnonResidentBytes reports the child tree's summed anonymous resident set --
+// what it holds of its own, not the executable pages it shares -- as of the
+// last sweep that found the tree. ok is false where there is no measurement:
+// no sampler is bound yet, this platform has none, or the last sweep that
+// found the tree could not read it for every member. A caller that adds it to
+// a sum leaves an unavailable figure out, never counts it as zero.
+func (p *CPUProgress) AnonResidentBytes() (int64, bool) {
+	if p == nil {
+		return 0, false
+	}
+	return p.sampler.Load().anonBytes()
 }
 
 // bind publishes the run's tree sampler. A nil handle is the ordinary case --

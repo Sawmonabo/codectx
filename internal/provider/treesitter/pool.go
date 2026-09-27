@@ -165,8 +165,9 @@ type pool struct {
 	dir       string
 	max       int
 	// rederive is Options.Rederive: it is handed the parser workers' part of
-	// the product's residency (residentBytes) before each file's increment,
-	// which the allocation that increment is admitted against counts.
+	// the product's residency (residentBytes) before each file's increment is
+	// reserved, and the ledger's re-derivation before every admission adds
+	// the last figure it was handed back to the allocation.
 	rederive func(workerResidentBytes int64)
 
 	mu sync.Mutex
@@ -1330,22 +1331,35 @@ func (p *pool) endParse(ph *parseHolding) {
 	p.mu.Unlock()
 }
 
-// residentBytes is the parser workers' part of the product's own residency:
-// every live worker's base holding and every parse's increment in flight.
-// The memory a parse in flight has already taken is gone from the kernel's
-// available figure, so leaving its increment out would have the product's
-// own parses narrow the room for the next file. The parent reads no live
-// figure of a worker mid-parse, so the increment stands in for what the
-// parse holds: a parse that has not yet reached its increment is counted at
-// it.
+// residentBytes is the parser workers' part of the product's own residency.
+// Where every live worker has a live reading of its anonymous resident set
+// (process.CPUProgress.AnonResidentBytes), it is the sum of those readings,
+// which include what each parse in flight has taken so far. Otherwise it is
+// what the pool holds for them: every live worker's base holding and every
+// parse's increment in flight, since the memory a parse in flight has taken
+// is already gone from the kernel's available figure, and leaving it out
+// would have the product's own parses narrow the room for the next file. A
+// parse that has not yet reached its increment is then counted at it. The
+// increments are not attributed to workers, so one worker without a reading
+// -- a platform that samples no running tree, or a worker the first sweep has
+// not yet found -- puts the whole pool on the holdings.
 func (p *pool) residentBytes() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	sum := p.inFlightBytes
+	held, read := p.inFlightBytes, int64(0)
+	complete := true
 	for w := range p.live {
-		sum += w.held.Load()
+		held += w.held.Load()
+		if b, ok := w.cpu.AnonResidentBytes(); ok {
+			read += b
+		} else {
+			complete = false
+		}
 	}
-	return sum
+	if complete {
+		return read
+	}
+	return held
 }
 
 // needKey names one learned need model: the repository and the key the run

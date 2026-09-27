@@ -24,3 +24,7 @@ func (s *treeSampler) stopSampling() treeSample { return treeSample{} }
 // signal, so the stall watchdog is left with the pipes and the named output
 // files, and a CPUProgress reader with its own fallback.
 func (s *treeSampler) cpuTicks() (int64, bool) { return 0, false }
+
+// anonBytes never has a measurement here, so the allocation leaves a child's
+// residency out of its add-back rather than counting it as zero.
+func (s *treeSampler) anonBytes() (int64, bool) { return 0, false }

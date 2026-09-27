@@ -113,7 +113,9 @@ type Spec struct {
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
 	// native child can temporarily exceed a reservation, and only an OS control
-	// can prevent that.
+	// can prevent that. A run that states a memory reservation is a child
+	// admitted on the process's reservation ledger, and its live residency is
+	// summed by ReservedResidentBytes while it runs.
 	MemoryReservationBytes int64
 	DiskReservationBytes   int64
 }
@@ -266,6 +268,48 @@ type Runner struct {
 	// (it could not be killed), which the run reports as an error and which
 	// this counter, like the admission, stops holding.
 	live int64
+	// reserved are the samplers of the running children that state a memory
+	// reservation (Spec.MemoryReservationBytes), which ReservedResidentBytes
+	// sums. An entry is added once the child's sampler exists and removed
+	// before its run returns, so it is bounded by the live children.
+	reserved map[*treeSampler]struct{}
+}
+
+// ReservedResidentBytes is the summed live anonymous resident set of this
+// runner's running children that state a memory reservation: the children
+// admitted on the process's reservation ledger, whose memory the kernel's
+// available figure has already lost. It is the last sweep's figure for each
+// child. A child with no reading -- a platform that samples no running tree,
+// a sweep that has not yet found it, or one that could not read a member --
+// is left out of the sum, never counted as zero and never at its
+// reservation, so an unavailable reading can only make the allocation that
+// adds this figure back smaller.
+func (r *Runner) ReservedResidentBytes() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var sum int64
+	for s := range r.reserved {
+		if b, ok := s.anonBytes(); ok {
+			sum += b
+		}
+	}
+	return sum
+}
+
+// trackReserved records a running child that states a memory reservation and
+// returns the function that forgets it.
+func (r *Runner) trackReserved(s *treeSampler) func() {
+	r.mu.Lock()
+	if r.reserved == nil {
+		r.reserved = map[*treeSampler]struct{}{}
+	}
+	r.reserved[s] = struct{}{}
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		delete(r.reserved, s)
+		r.mu.Unlock()
+	}
 }
 
 // LiveSubprocesses reports how many children this runner has started whose run
@@ -563,6 +607,12 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// tree exits, and a caller that sees it stop moving is reading a child
 	// that has stopped.
 	spec.CPUProgress.bind(sampler)
+	// A child admitted on the ledger has its live residency added back to
+	// the allocation while it runs (ReservedResidentBytes). On a platform with
+	// no sampler there is nothing to read, and nothing is tracked.
+	if spec.MemoryReservationBytes > 0 && sampler != nil {
+		defer r.trackReserved(sampler)()
+	}
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.
 	outPipe.closeWriter()
