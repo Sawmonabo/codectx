@@ -368,7 +368,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // of a name its block already binds (an enum or namespace before it, or the
 // class or function a namespace merges with) declares no second variable and
 // assigns the same one. `import x = …` is emitted as a `var`, so its name is
-// function-scoped and hoisted like var:
+// function-scoped and hoisted like var; no pair can show the hoisting, since
+// a var of the same name before it is the same variable either way and a use
+// before it meets no definition, so that rule has no golden case:
 //
 //   - An enum is one Stmt node spanning its name that Uses and defines the
 //     name (the emitted `E || (E = {})`), then one Stmt node per member

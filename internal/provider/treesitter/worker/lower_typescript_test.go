@@ -9,8 +9,8 @@ import (
 // of hand-derived TypeScript and TSX callables. The JavaScript lowering's
 // shared cases (javascriptShared) run under both grammars, and its JSX cases
 // (javascriptJSX) under tsx; the TypeScript cases in shared run under both
-// grammars, since TSX is TypeScript with JSX; the TSX case runs under tsx
-// only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
+// grammars, since TSX is TypeScript with JSX; typescriptOnly runs under
+// typescript only and the TSX case under tsx only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
 // granularity lowerJavaScript documents under "TypeScript". A TypeScript-only
 // construct is anchored in the compiler's documented emit, the JavaScript it
 // compiles to, and that JavaScript's runtime semantics in ECMA-262; each case
@@ -285,7 +285,202 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 		},
 	)
-	runGolden(t, "typescript", slices.Concat(javascriptShared, shared))
+	shared = append(shared, []goldenCase{
+		{
+			// The compiler's emit: an overload signature emits no code, so it is no callable. Functions preorder:
+			// the program 0, the implementation 1. Nodes: a@40, g(a)@50.
+			name:      "an overload signature is not a callable",
+			protects:  "callable indexes skip a function signature without a body",
+			mutation:  "count function_signature as a callable (callables becomes 3 and callable 1 is the signature, with no pairs)",
+			src:       "function h(a: string): void; function h(a: any) { g(a); }",
+			fn:        1,
+			du:        []string{"a@40 -> g(a)@50"},
+			callables: 2,
+		},
+		{
+			// The compiler's emit erases an index signature, so the class node class A { [k: string]: any }@21
+			// reads nothing, its k being the signature's own parameter name; it defines A, which return A;@50
+			// reads.
+			name:     "an index signature is erased and reads nothing",
+			protects: "an index signature's bracketed name is no computed key and no read",
+			mutation: "walk an index signature as a computed key (k@11 -> class A { [k: string]: any }@21 appears)",
+			src:      "function f(k: any) { class A { [k: string]: any } return A; }",
+			fn:       1,
+			du:       []string{"class A { [k: string]: any }@21 -> return A;@50"},
+		},
+		{
+			// The compiler's emit elides `import type` and a `type` import specifier. Program nodes: v@45 (the one
+			// binding), g(T, U, v)@59, which reads v only.
+			name:     "type-only imports bind nothing",
+			protects: "import type and a type specifier make no node and no variable",
+			mutation: "bind type-only imports (T and U gain nodes pairing with g(T, U, v)@59)",
+			src:      "import type { T } from \"m\"; import { type U, v } from \"m\"; g(T, U, v);",
+			fn:       0,
+			du:       []string{"v@45 -> g(T, U, v)@59"},
+		},
+		{
+			// The compiler's emit inlines a const enum's members and emits no declaration, so the if's then block
+			// makes no node and nothing depends on the Branch c@25.
+			name:     "a const enum is erased",
+			protects: "a const enum makes no node, even inside a branch",
+			mutation: "lower a const enum as an enum (E@49 and its member node appear, control dependent on c@25)",
+			src:      "function f(c: any) { if (c) { const enum E { a = 1 } } return c; }",
+			fn:       1,
+			du:       []string{"c@11 -> c@25", "c@11 -> return c;@55"},
+		},
+		{
+			// The compiler's emit of `x satisfies T` is x. The Branch spans the condition as written, x satisfies
+			// number@25, and reads x; it controls g()@45.
+			name:     "satisfies evaluates to its operand",
+			protects: "a satisfies expression is read through to its operand and a Branch spans it as written",
+			mutation: "treat satisfies as opaque (x@11 -> x satisfies number@25 vanishes)",
+			src:      "function f(x: any) { if (x satisfies number) g(); return x; }",
+			fn:       1,
+			cd:       []string{"x satisfies number@25 -> g()@45"},
+			du:       []string{"x@11 -> x satisfies number@25", "x@11 -> return x;@50"},
+		},
+		{
+			// The compiler's emit of `h<T>` is h. Nodes: h@11, k = h<number>@27 (Uses h), return k;@42.
+			name:     "an instantiation expression evaluates to its operand",
+			protects: "type arguments on a value are erased and the operand is read",
+			mutation: "treat an instantiation expression as opaque (h@11 -> k = h<number>@27 vanishes)",
+			src:      "function f(h: any) { const k = h<number>; return k; }",
+			fn:       1,
+			du:       []string{"h@11 -> k = h<number>@27", "k = h<number>@27 -> return k;@42"},
+		},
+		{
+			// The compiler's emit of `o?.p!` is `o?.p`: the chain's node o?.p@21 stands for the wrapper, and the
+			// statement makes no second node. Nodes: o@11, the Branch o@21, the chain o?.p@21.
+			name:     "the node an operand's lowering made stands for a transparent wrapper",
+			protects: "a statement ending in a wrapped chain takes no second node spanning the wrapper",
+			mutation: "end the statement with its own node when a wrapper encloses the chain (o?.p!@21 appears, Using the chain's result)",
+			src:      "function f(o: any) { o?.p!; }",
+			fn:       1,
+			cd:       []string{"o@21 -> o?.p@21"},
+			du:       []string{"o@11 -> o@21", "o@21 -> o?.p@21"},
+		},
+		{
+			// The compiler's emit applies parameter decorators where the class is defined (`__decorate([__param(0,
+			// d)], …)`, a call). The class node class A { m(@d p: any) {} }@27 reads d and may throw, so it
+			// controls the Handler catch@57, e@64 and g()@69.
+			name:     "a parameter decorator is read and may throw at the class's creation",
+			protects: "a method parameter's decorators are the class's, not the method's",
+			mutation: "leave parameter decorators to the method (d@11 -> the class node vanishes and it controls nothing)",
+			src:      "function f(d: any) { try { class A { m(@d p: any) {} } } catch (e) { g(); } }",
+			fn:       1,
+			cd:       []string{"class A { m(@d p: any) {} }@27 -> catch@57", "class A { m(@d p: any) {} }@27 -> e@64", "class A { m(@d p: any) {} }@27 -> g()@69"},
+			du:       []string{"d@11 -> class A { m(@d p: any) {} }@27"},
+		},
+		{
+			// The compiler's emit applies a member decorator where the class is defined (`__decorate([d],
+			// A.prototype, "m")`, a call). The class node class A { @d m() {} }@27 reads d and may throw, so it
+			// controls the Handler catch@51, e@58 and g()@63.
+			name:     "a member decorator is read and may throw at the class's creation",
+			protects: "a method's decorators are evaluated by the class node",
+			mutation: "count only class-level decorators (the class node controls nothing and d@11 -> class A { @d m() {} }@27 vanishes)",
+			src:      "function f(d: any) { try { class A { @d m() {} } } catch (e) { g(); } }",
+			fn:       1,
+			cd:       []string{"class A { @d m() {} }@27 -> catch@51", "class A { @d m() {} }@27 -> e@58", "class A { @d m() {} }@27 -> g()@63"},
+			du:       []string{"d@11 -> class A { @d m() {} }@27"},
+		},
+		{
+			// The compiler's emit drops `abstract`, so an abstract class is a class: its node abstract class A { x
+			// = a; }@21 captures its field initializer's a and defines A, which return A;@49 reads.
+			name:     "an abstract class is lowered as a class",
+			protects: "abstract_class_declaration creates and captures as a class declaration does",
+			mutation: "treat an abstract class as erased (both pairs vanish)",
+			src:      "function f(a: any) { abstract class A { x = a; } return A; }",
+			fn:       1,
+			du:       []string{"a@11 -> abstract class A { x = a; }@21", "abstract class A { x = a; }@21 -> return A;@49"},
+		},
+		{
+			// The compiler's emit of two enums of one name is one variable, `E || (E = {})` twice. Nodes: E@20
+			// (Uses and defines E), a = 1@24, E@37 (Uses the first definition, defines E again), b = 2@41, return
+			// E;@49.
+			name:     "a second enum of a name merges into the first's variable",
+			protects: "an enum whose name its block already binds declares no second variable",
+			mutation: "declare a new variable for each enum (E@20 -> E@37 vanishes)",
+			src:      "function f() { enum E { a = 1 } enum E { b = 2 } return E; }",
+			fn:       1,
+			du:       []string{"E@20 -> E@37", "E@37 -> return E;@49"},
+		},
+		{
+			// The compiler's emit merges a namespace into the class of its name (`(function (C) { … })(C || (C =
+			// {}))`). Nodes: class C {}@15 (defines C), the namespace's C@36 (Uses and defines C), g()@40, return
+			// C;@47.
+			name:     "a namespace merges into the class of its name",
+			protects: "a namespace whose name a class in its block binds reads and assigns that variable",
+			mutation: "declare a new variable for a namespace that merges (class C {}@15 -> C@36 vanishes)",
+			src:      "function f() { class C {} namespace C { g(); } return C; }",
+			fn:       1,
+			du:       []string{"class C {}@15 -> C@36", "C@36 -> return C;@47"},
+		},
+		{
+			// The compiler's emit of `namespace A.B` is nested functions invoked on A. Program nodes: A@10 (the
+			// path's leftmost name, Uses and defines A), g()@16, h(A)@23.
+			name:     "a dotted namespace defines its leftmost name",
+			protects: "the namespace node spans and defines the leftmost name of its path",
+			mutation: "span and define the whole path (A.B@10 appears in A@10's place and defines no variable, so A@10 -> h(A)@23 vanishes)",
+			src:      "namespace A.B { g(); } h(A);",
+			fn:       0,
+			du:       []string{"A@10 -> h(A)@23"},
+		},
+		{
+			// The compiler's emit of a namespace body is a function, so its var is its own. Program nodes: x =
+			// 1@4, N@21, x = 2@29 (the namespace's x), g(x)@38, which reads the program's x.
+			name:     "a namespace body has its own var scope",
+			protects: "a var inside a namespace does not merge into the enclosing variable of its name",
+			mutation: "hoist a namespace's vars into the enclosing function (x = 2@29 -> g(x)@38 replaces x = 1@4 -> g(x)@38)",
+			src:      "var x = 1; namespace N { var x = 2; } g(x);",
+			fn:       0,
+			du:       []string{"x = 1@4 -> g(x)@38"},
+		},
+		{
+			// The compiler's emit: a module named by a string is an ambient declaration and emits nothing. Program
+			// nodes: x = 1@4, g(x)@33.
+			name:     "a string-named module is ambient",
+			protects: "nothing inside a string-named module declaration is lowered",
+			mutation: "lower a string-named module as a namespace (x = 2 kills x = 1: x = 2@24 -> g(x)@33 replaces x = 1@4 -> g(x)@33)",
+			src:      "let x = 1; module \"m\" { x = 2; } g(x);",
+			fn:       0,
+			du:       []string{"x = 1@4 -> g(x)@33"},
+		},
+		{
+			// The compiler's emit of `import m = require("m")` is `var m = require("m")`, a call (ECMA-262
+			// §13.3.6). Nodes: N@31, m@42 (may throw), the Handler catch@64, e@71, g()@76.
+			name:     "a require import-equals may throw",
+			protects: "the import-equals node of the require form is a throw point",
+			mutation: "stop counting the require form as a throw (m@42 controls nothing)",
+			src:      "function f() { try { namespace N { import m = require(\"m\"); } } catch (e) { g(); } }",
+			fn:       1,
+			cd:       []string{"m@42 -> catch@64", "m@42 -> e@71", "m@42 -> g()@76"},
+		},
+		{
+			// The compiler's emit of `export = e` is `module.exports = e`: e is evaluated like a default export.
+			// Program nodes: x = 1@4, x@20.
+			name:     "export = evaluates its expression",
+			protects: "an export assignment is a value node reading its expression",
+			mutation: "make an export assignment no node (x = 1@4 -> x@20 vanishes)",
+			src:      "let x = 1; export = x;",
+			fn:       0,
+			du:       []string{"x = 1@4 -> x@20"},
+		},
+	}...)
+	// typescriptOnly holds the cases whose source only the typescript grammar
+	// parses: the tsx grammar has no type assertion.
+	typescriptOnly := []goldenCase{
+		{
+			// The compiler's emit of `<T>e` is e. Nodes: x@11, y = <number>x@27 (Uses x), return y;@42. The tsx
+			// grammar has no type assertion, so this case runs under typescript only.
+			name:     "a type assertion evaluates to its operand",
+			protects: "an angle-bracket assertion is read through to its operand",
+			mutation: "treat a type assertion as opaque (x@11 -> y = <number>x@27 vanishes)",
+			src:      "function f(x: any) { const y = <number>x; return y; }",
+			fn:       1,
+			du:       []string{"x@11 -> y = <number>x@27", "y = <number>x@27 -> return y;@42"},
+		},
+	}
+	runGolden(t, "typescript", slices.Concat(javascriptShared, shared, typescriptOnly))
 	runGolden(t, "tsx", slices.Concat(javascriptShared, javascriptJSX, shared, []goldenCase{{
 		// The compiler's JSX emit: an element is a call whose first
 		// argument is its tag, `<B />` becoming `createElement(B, null)`,
