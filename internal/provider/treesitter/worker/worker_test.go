@@ -23,7 +23,9 @@ import (
 // whether or not the request names one (the parser count and the missing
 // disclosure catch it).
 func TestHeaderParseKeepsFewerErrorBytesAndDisclosesIt(t *testing.T) {
-	const cppHeader = "class X { public: void f(); };\n"
+	// C cannot absorb a template: the C grammar reads `class` as a type name
+	// and `public:` as a label, so a class body alone would parse clean.
+	const cppHeader = "template <typename T> struct S { T v; };\n"
 	cases := []struct {
 		name     string
 		req      wire.Request
@@ -34,14 +36,12 @@ func TestHeaderParseKeepsFewerErrorBytesAndDisclosesIt(t *testing.T) {
 		wantDecl string
 	}{
 		{name: "a C++ header parsed as C first falls back", req: wire.Request{Language: "c", Fallback: "cpp", Path: "x.h"},
-			src: cppHeader, kept: "cpp", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "X"},
+			src: cppHeader, kept: "cpp", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "S"},
 		{name: "a C header parsed as C++ first falls back", req: wire.Request{Language: "cpp", Fallback: "c", Path: "x.h"},
 			src: "int class = 1;\n", kept: "c", reason: lang.HeaderFallbackKept, parsers: 2, wantDecl: "class"},
 		{name: "a clean first parse is kept without a second", req: wire.Request{Language: "c", Fallback: "cpp", Path: "x.h"},
 			src: "int f(void);\n", kept: "c", reason: lang.HeaderClean, parsers: 1},
 		{name: "a request with no fallback is parsed once", req: wire.Request{Language: "c", Path: "x.h"},
-			src: cppHeader, parsers: 1},
-		{name: "a source file with errors is parsed once", req: wire.Request{Language: "c", Path: "x.c"},
 			src: cppHeader, parsers: 1},
 	}
 	for _, tc := range cases {

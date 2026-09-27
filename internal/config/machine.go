@@ -49,7 +49,9 @@ const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 // indexing queue, and every page cache it opens: the store writer
 // connection's (storage.writer_cache_kib), every reader connection's
 // (storage.reader_cache_kib) in both reader pools of every store handle
-// (ReadConnections, PostingConnections, storeHandles), one lexical staging database's per unit a generation
+// (ReadConnections for the writer's handle, QueryReadConnections for the
+// query-only one, PostingConnections for each of storeHandles), one lexical
+// staging database's per unit a generation
 // builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
 // query tokenizer (TokenizerCacheKiB) and the run ledger's
 // (ledger.FootprintBytes).
@@ -97,7 +99,17 @@ func ReadConnections(c Config) int {
 // tool call that runs at once (QuerySlots). Only a query's candidate walk
 // holds a posting session, and it holds one for the whole walk, so no unit
 // build ever reads this pool.
-func PostingConnections(c Config) int {
+func PostingConnections(c Config) int { return perQuery(c) }
+
+// QueryReadConnections is how many connections the short-read pool of the
+// serving composition's query-only handle holds: storage.read_connections
+// when it is set, and otherwise one per tool call that runs at once
+// (QuerySlots). That handle builds no unit, so no build worker reads it.
+func QueryReadConnections(c Config) int { return perQuery(c) }
+
+// perQuery is a pool that only tool calls read: storage.read_connections when
+// it is set, and otherwise QuerySlots.
+func perQuery(c Config) int {
 	if c.Storage.ReadConnections > 0 {
 		return c.Storage.ReadConnections
 	}
@@ -147,13 +159,13 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	handleConnections, err := addNoOverflow("short-read + posting-stream connections",
-		int64(ReadConnections(c)), int64(PostingConnections(c)))
+	postingConnections, err := mulNoOverflow("store handles * posting-stream connections",
+		storeHandles, int64(PostingConnections(c)))
 	if err != nil {
 		return 0, err
 	}
-	readerConnections, err := mulNoOverflow("store handles * reader connections",
-		storeHandles, handleConnections)
+	readerConnections, err := addNoOverflow("short-read + query short-read + posting-stream connections",
+		int64(ReadConnections(c)), int64(QueryReadConnections(c)), postingConnections)
 	if err != nil {
 		return 0, err
 	}

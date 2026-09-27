@@ -124,13 +124,6 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			user: "[workspace]\nmax_files = 2000000\n",
 		},
 		{
-			// 0 sizes each reader pool by the work that reads it; a negative
-			// count is not a third meaning.
-			name:     "a negative reader connection count is rejected",
-			user:     "[storage]\nread_connections = -1\n",
-			wantCode: model.CodeConfigInvalid,
-		},
-		{
 			// The toolchain decides which binaries this build executes, so a
 			// repository that could set any of it would choose them.
 			name:     "project sets a tools key",

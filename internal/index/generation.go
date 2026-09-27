@@ -921,7 +921,6 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 // empty between them.
 type unitGroup struct {
 	g      *generation
-	parent context.Context
 	ctx    context.Context
 	cancel context.CancelFunc
 	sem    chan struct{}
@@ -930,7 +929,7 @@ type unitGroup struct {
 	fatal  error
 
 	provider   string
-	closeStage func(context.Context) model.StageFigures
+	closeStage func() model.StageFigures
 	// started, writerBusy and units are the pass's measurement: its wall, the
 	// store writer's busy time when it began, and the units it admitted.
 	started    time.Time
@@ -944,12 +943,12 @@ type unitGroup struct {
 // nothing only one provider needs; a provider without it runs each unit as it
 // always has, and its pass has no stage figures.
 type stageOpener interface {
-	OpenStage(ctx context.Context) (closeStage func(ctx context.Context) model.StageFigures)
+	OpenStage(ctx context.Context) (closeStage func() model.StageFigures)
 }
 
 func (g *generation) newUnitGroup(ctx context.Context, providerID string) *unitGroup {
 	runCtx, cancel := context.WithCancel(ctx)
-	u := &unitGroup{g: g, parent: ctx, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers),
+	u := &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers),
 		provider: providerID, started: time.Now(), writerBusy: g.c.opts.Store.WriterBusy()}
 	if p, ok := g.c.opts.Registry.Lookup(providerID); ok {
 		if s, ok := p.(stageOpener); ok {
@@ -990,9 +989,9 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 
 // wait drains the group and reports its first fatal failure. It releases the
 // group's context whatever the outcome, so an abandoned group leaks nothing;
-// closes the provider's stage after the last unit has left it, under a
-// context a cancelled pass does not end, so the stage's own accounting is
-// closed on every path; and records the pass's measurement on the generation
+// closes the provider's stage after the last unit has left it, on every path,
+// a cancelled pass included, since the stage leaves under the run it was
+// opened in and consults no context of the close's; and records the pass's measurement on the generation
 // after that close, so the wall covers the stage's drain and the stage's
 // figures are final.
 func (u *unitGroup) wait() error {
@@ -1000,7 +999,7 @@ func (u *unitGroup) wait() error {
 	u.cancel()
 	var stage *model.StageFigures
 	if u.closeStage != nil {
-		figures := u.closeStage(context.WithoutCancel(u.parent))
+		figures := u.closeStage()
 		stage = &figures
 		u.closeStage = nil
 	}
