@@ -826,8 +826,12 @@ func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) 
 		err := s.ingestGroup(ctx, true, fn)
 		// The run is over: the writer's page cache, which the run filled with
 		// its groups, goes back to the process so a long-lived server does not
-		// keep a run's working set resident.
-		_, _ = s.writer.ExecContext(context.WithoutCancel(ctx), `PRAGMA shrink_memory`)
+		// keep a run's working set resident. A group still open -- one whose
+		// savepoint could not be taken -- holds the one pooled connection, and
+		// a statement on the pool would wait on it forever.
+		if s.group == nil {
+			_, _ = s.writer.ExecContext(context.WithoutCancel(ctx), `PRAGMA shrink_memory`)
+		}
 		return err
 	}, false))
 }
