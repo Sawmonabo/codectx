@@ -233,8 +233,13 @@ type Snapshot struct {
 	SourcePolicyHash   string             `json:"source_policy_hash"`
 	FileCount          uint64             `json:"file_count"`
 	SourceBytes        uint64             `json:"source_bytes"`
-	ManifestHash       string             `json:"manifest_hash"`
-	CreatedAt          time.Time          `json:"created_at"`
+	// CUnits and CPPUnits are the repository's C and C++ translation units,
+	// counted on the capture's own walk over its paths: the census a header's
+	// grammar is decided from. A header is neither.
+	CUnits       uint64    `json:"c_units"`
+	CPPUnits     uint64    `json:"cpp_units"`
+	ManifestHash string    `json:"manifest_hash"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Validate enforces the snapshots table constraints.
