@@ -1247,5 +1247,203 @@ func TestRustLoweringGolden(t *testing.T) {
 				"v@25 -> let Some(x) = v.pop()@98", "let Some(x) = v.pop()@98 -> x@107", "x@107 -> g(x)@122",
 				"0..2@139 -> for@130", "0..2@139 -> x@134", "x@134 -> g(x)@146", "x@38 -> x@154"},
 		},
+		{
+			// Patterns › Identifier patterns, and Types › Closure types ›
+			// Capture modes: a `ref mut` binding in a closure borrows the
+			// matched enclosing o, one of the closure's writes. Nodes: o@9,
+			// the closure@54 (Uses o, may-defines o), let mut g = …;@42,
+			// g()@102, o@107.
+			name:     "a ref mut binding inside a callable is a may-definition of the matched place where it is created",
+			protects: "a read after a closure whose pattern mutably borrows o sees what the closure may write",
+			mutation: "record no write for a ref mut binding inside a callable (loses || { if let Some(ref mut v) = o { *v += 1; } }@54 -> o@107)",
+			src:      "fn f(mut o: Option<i32>) -> Option<i32> { let mut g = || { if let Some(ref mut v) = o { *v += 1; } }; g(); o }",
+			du:       []string{"o@9 -> || { if let Some(ref mut v) = o { *v += 1; } }@54", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42", "let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42 -> g()@102", "o@9 -> o@107", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> o@107"},
+		},
+		{
+			// The Rust Unstable Book, Language features › try_blocks: a `?`
+			// completes the innermost try block, whatever loops lie between.
+			// Nodes: v@5, let mut n = 0;@68, v@92, for@83, o@87, (*o)?@101
+			// (Branch; its break lands after the try block, defining its
+			// result), n += (*o)?@96, n@110 (the tail, defining the result),
+			// let r …;@41, r@115. Succ: for→{o, n@110}; o→(*o)?→{let r,
+			// n += …}; n += …→for; n@110→let r→r. IPDom: for → let r; o →
+			// (*o)? → let r; n += … → for; n@110 → let r.
+			name:     "a question mark in a loop inside a try block completes the block",
+			protects: "`?` breaks to the try block's end across an enclosing loop, defining the block's result, and never to the loop or the function's exit",
+			mutation: "send a `?` inside a loop to Exit (loses (*o)?@101 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41; (*o)?@101 then controls let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41 and r@115)",
+			src:      "fn f(v: &[Option<i32>]) -> Option<i32> { let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n }; r }",
+			cd: []string{"for@83 -> o@87", "for@83 -> (*o)?@101", "for@83 -> n@110", "(*o)?@101 -> n += (*o)?@96",
+				"(*o)?@101 -> for@83"},
+			du: []string{"v@5 -> v@92", "v@92 -> for@83", "v@92 -> o@87", "o@87 -> (*o)?@101",
+				"(*o)?@101 -> n += (*o)?@96", "(*o)?@101 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41", "let mut n = 0;@68 -> n += (*o)?@96",
+				"n += (*o)?@96 -> n += (*o)?@96", "let mut n = 0;@68 -> n@110", "n += (*o)?@96 -> n@110",
+				"n@110 -> let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41", "let r: Option<i32> = try { let mut n = 0; for o in v { n += (*o)?; } n };@41 -> r@115"},
+		},
+		{
+			// Patterns › Identifier patterns (`ref mut x @ q`) and Struct
+			// patterns (the shorthand `ref mut f`): each borrows the matched
+			// place. Nodes: o@9, s@29, let Some(ref mut x @ 1..=3) = o@47 (Branch), x@64 (Uses the owned
+			// variable, defines x, may-defines o), *x = 0@81, let S { ref mut f } = s;@91, f@107
+			// (likewise, may-defines s), *f = 1@116, g(o, s)@124. Succ:
+			// let Some(ref mut x @ 1..=3) = o@47→{x@64, let S { ref mut f } = s;@91}; x@64→*x = 0→let S { ref mut f } = s;@91→f→*f = 1→g. IPDom: let Some(ref mut x @ 1..=3) = o@47 → let S { ref mut f } = s;@91.
+			name:     "a bound ref mut pattern and a struct shorthand ref mut borrow the matched place",
+			protects: "`ref mut x @ q` and `S { ref mut f }` are may-definitions of o and s, reaching the later reads of both",
+			mutation: "bind `ref mut x @ q` or the shorthand `ref mut f` as a plain binding (loses o@9 -> x@64 and x@64 -> g(o, s)@124, or s@29 -> f@107 and f@107 -> g(o, s)@124)",
+			src:      "fn f(mut o: Option<i32>, mut s: S) -> i32 { if let Some(ref mut x @ 1..=3) = o { *x = 0; } let S { ref mut f } = s; *f = 1; g(o, s) }",
+			cd:       []string{"let Some(ref mut x @ 1..=3) = o@47 -> x@64", "let Some(ref mut x @ 1..=3) = o@47 -> *x = 0@81"},
+			du: []string{"o@9 -> let Some(ref mut x @ 1..=3) = o@47", "let Some(ref mut x @ 1..=3) = o@47 -> x@64", "o@9 -> x@64", "x@64 -> *x = 0@81", "s@29 -> let S { ref mut f } = s;@91", "let S { ref mut f } = s;@91 -> f@107",
+				"s@29 -> f@107", "f@107 -> *f = 1@116", "o@9 -> g(o, s)@124", "x@64 -> g(o, s)@124",
+				"s@29 -> g(o, s)@124", "f@107 -> g(o, s)@124"},
+		},
+		{
+			// Macros › Macro invocation: in a token tree, a name after a
+			// label's `'`, before `!` or before `:` is a label, a macro's
+			// name or a field name; `'a:` declares a label the tree's break
+			// uses, so it stays in the tree. Nodes: m!(…)@38 (a Stmt reading
+			// nothing), 0@…. No pair.
+			name:     "a name after a quote or before a bang or a colon in a token tree is not read",
+			protects: "a local named like a token-tree label, macro or field is not read by the invocation, and a break to a label the tree declares does not leave it",
+			mutation: "read a name after `'` or before `!` or `:` (gains a@5, g@13 or x@21 -> m!('a: loop { break 'a; } g!() S { x: 1 })@38)",
+			src:      "fn f(a: i32, g: i32, x: i32) -> i32 { m!('a: loop { break 'a; } g!() S { x: 1 }); 0 }",
+		},
+		{
+			// Macros › Macro invocation, and Borrow operators: in a token
+			// tree, `&&mut x`, `&mut s.f` and `&mut *p` each borrow their base
+			// variable. Nodes: x@9, s@21, p@27, m!(&&mut x, &mut s.f, &mut *p)@49 (Uses x, s and p,
+			// may-defines each), x + s.f + *p@81.
+			name:     "a token tree's double-ampersand, field and dereference borrows may-define their bases",
+			protects: "a read after the invocation sees the borrows `&&mut x`, `&mut s.f` and `&mut *p` may have written",
+			mutation: "borrow only after a single `&` and before a bare name (loses m!(&&mut x, &mut s.f, &mut *p)@49 -> x + s.f + *p@81)",
+			src:      "fn f(mut x: i32, mut s: S, p: &mut i32) -> i32 { m!(&&mut x, &mut s.f, &mut *p); x + s.f + *p }",
+			du: []string{"x@9 -> m!(&&mut x, &mut s.f, &mut *p)@49", "s@21 -> m!(&&mut x, &mut s.f, &mut *p)@49", "p@27 -> m!(&&mut x, &mut s.f, &mut *p)@49", "x@9 -> x + s.f + *p@81",
+				"s@21 -> x + s.f + *p@81", "p@27 -> x + s.f + *p@81", "m!(&&mut x, &mut s.f, &mut *p)@49 -> x + s.f + *p@81"},
+		},
+		{
+			// The std::fmt library documentation, Precision: `.p$` takes the
+			// precision from the variable p. Nodes: p@5, format!(…)@27.
+			name:     "a precision capture in a format string reads its variable",
+			protects: "`{:.p$}` reads p",
+			mutation: "read only width captures (loses p@5 -> format!(\"{:.p$}\", 1.5)@27)",
+			src:      "fn f(p: usize) -> String { format!(\"{:.p$}\", 1.5) }",
+			du:       []string{"p@5 -> format!(\"{:.p$}\", 1.5)@27"},
+		},
+		{
+			// The std::fmt library documentation: byte strings and C strings
+			// are no format strings. Nodes: m!(…)@22 (reads nothing), 0@….
+			name:     "byte and C string literals in a token tree are not format strings",
+			protects: "`b\"{x}\"` and `c\"{x}\"` capture nothing",
+			mutation: "read byte or C strings as format strings (gains x@5 -> m!(b\"{x}\", c\"{x}\")@22)",
+			src:      "fn f(x: i32) -> i32 { m!(b\"{x}\", c\"{x}\"); 0 }",
+		},
+		{
+			// The std::fmt library documentation: which macros format is not
+			// known here, so any macro's plain string literal is read as a
+			// format string. Nodes: x@5, m!(\"{x}\")@22.
+			name:     "a string literal in any macro is read as a format string",
+			protects: "a capture in a user macro's literal is a read, since the macro may format it",
+			mutation: "read format strings only in the standard formatting macros (loses x@5 -> m!(\"{x}\")@22)",
+			src:      "fn f(x: i32) -> i32 { m!(\"{x}\"); 0 }",
+			du:       []string{"x@5 -> m!(\"{x}\")@22"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › `break` and
+			// `continue` expressions: a break or continue in a tree with no
+			// loop of its own leaves the invocation to the source loop. Nodes:
+			// v@5, let mut n = 0;@27, v@51, for@42, x@46, m!(if x > 0 { continue } else { break })@55 (Branch Using x:
+			// to the head, past the loop and on), n += 1@97, n@107. Succ:
+			// for→{x, n@107}; x→m!(if x > 0 { continue } else { break })@55→{for, n@107, n += 1}; n += 1→for. IPDom:
+			// for → n@107; x → m!(if x > 0 { continue } else { break })@55 → n@107; n += 1 → for.
+			name:     "a break or continue in a token tree leaves to the enclosing source loop",
+			protects: "the invocation branches to the loop's head and past it, so the loop's rest depends on it",
+			mutation: "leave break and continue out of the token-tree jumps (m!(if x > 0 { continue } else { break })@55 is a Stmt: loses m!(if x > 0 { continue } else { break })@55 -> n += 1@97 and m!(if x > 0 { continue } else { break })@55 -> for@42)",
+			src:      "fn f(v: Vec<i32>) -> i32 { let mut n = 0; for x in v { m!(if x > 0 { continue } else { break }); n += 1; } n }",
+			cd:       []string{"for@42 -> x@46", "for@42 -> m!(if x > 0 { continue } else { break })@55", "m!(if x > 0 { continue } else { break })@55 -> for@42", "m!(if x > 0 { continue } else { break })@55 -> n += 1@97"},
+			du: []string{"v@5 -> v@51", "v@51 -> for@42", "v@51 -> x@46", "x@46 -> m!(if x > 0 { continue } else { break })@55",
+				"let mut n = 0;@27 -> n += 1@97", "n += 1@97 -> n += 1@97", "let mut n = 0;@27 -> n@107",
+				"n += 1@97 -> n@107"},
+		},
+		{
+			// The Rust Unstable Book, try_blocks, and Macros › Macro
+			// invocation: a `?` in a tree inside a source try block breaks to
+			// the block's end, defining no result. Nodes: a@5, m!(a?)@57
+			// (Branch), 1@65 (the tail, defining the block's result), let r: Option<i32> = try { m!(a?); 1 };@30,
+			// r.unwrap_or(0)@70. Succ: m!→{1, let r: Option<i32> = try { m!(a?); 1 };@30}; 1→let r: Option<i32> = try { m!(a?); 1 };@30→r.unwrap_or(0).
+			// IPDom: m! → let r: Option<i32> = try { m!(a?); 1 };@30.
+			name:     "a question mark in a token tree inside a try block breaks to the block's end",
+			protects: "what follows the try block does not depend on a `?` in a macro inside it",
+			mutation: "send a tree's `?` to Exit inside a try block (m!(a?)@57 then also controls let r: Option<i32> = try { m!(a?); 1 };@30 and r.unwrap_or(0)@70)",
+			src:      "fn f(a: Option<i32>) -> i32 { let r: Option<i32> = try { m!(a?); 1 }; r.unwrap_or(0) }",
+			cd:       []string{"m!(a?)@57 -> 1@65"},
+			du:       []string{"a@5 -> m!(a?)@57", "1@65 -> let r: Option<i32> = try { m!(a?); 1 };@30", "let r: Option<i32> = try { m!(a?); 1 };@30 -> r.unwrap_or(0)@70"},
+		},
+		{
+			// The Rust Reference, Trait and lifetime bounds: `?Sized` is a
+			// bound, not the try propagation operator, since its `?` follows
+			// no operand. Nodes: m!(T: ?Sized)@22 (a Stmt), x@37.
+			name:     "a question mark after a colon in a token tree is no jump",
+			protects: "a `?Sized` bound in a macro's arguments does not make the invocation a branch",
+			mutation: "take every `?` token as the operator (m!(T: ?Sized)@22 becomes a Branch controlling x@37)",
+			src:      "fn f(x: i32) -> i32 { m!(T: ?Sized); x }",
+			du:       []string{"x@5 -> x@37"},
+		},
+		{
+			// Macros › Macro invocation: the `{…}` after `fn`, and an async
+			// block, hold their own jumps. Nodes: o@5, m!(…)@38 (a Stmt Using
+			// o), Some(1)@76.
+			name:     "a fn body or async block in a token tree contains its jumps",
+			protects: "a return in a tree's fn item and a `?` in a tree's async block are no jumps of the enclosing function",
+			mutation: "let a tree's fn body or async block leave (m!(fn g() { return; }, async { o? })@38 becomes a Branch controlling Some(1)@76)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { m!(fn g() { return; }, async { o? }); Some(1) }",
+			du:       []string{"o@5 -> m!(fn g() { return; }, async { o? })@38"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Loop
+			// labels, and Macros › Macro invocation: a labelled jump leaves
+			// the tree unless the tree declares its label. Nodes: loop@13,
+			// m!(break 'o)@20 (Branch: past the loop and on), m!('i: …)@34 (a
+			// Stmt). Succ: loop→m!@20→{EXIT, m!@34}; m!@34→loop. IPDom: m!@20
+			// → EXIT; m!@34 → loop → m!@20.
+			name:     "a labelled jump in a token tree leaves unless the tree declares its label",
+			protects: "`break 'o` in a tree leaves to the source loop 'o, and `break 'i` stays in the tree declaring 'i",
+			mutation: "keep every labelled jump in its tree (m!(break 'o)@20 controls nothing), or let every one leave (break 'i names no open frame: unresolved becomes 1)",
+			src:      "fn f() { 'o: loop { m!(break 'o); m!('i: loop { break 'i; }); } }",
+			cd: []string{"m!(break 'o)@20 -> m!('i: loop { break 'i; })@34", "m!(break 'o)@20 -> loop@13",
+				"m!(break 'o)@20 -> m!(break 'o)@20"},
+		},
+		{
+			// The Rust Unstable Book, try_blocks, and Macros › Macro
+			// invocation: a `?` inside a try block written in the tree stays
+			// there. Nodes: o@5, m!(try { o? })@38 (a Stmt Using o), Some(1)@54.
+			name:     "a question mark inside a try block in a token tree stays in the tree",
+			protects: "the invocation holding `try { o? }` is no branch of the enclosing function",
+			mutation: "let a `?` in a tree's try block leave (m!(try { o? })@38 becomes a Branch controlling Some(1)@54)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { m!(try { o? }); Some(1) }",
+			du:       []string{"o@5 -> m!(try { o? })@38"},
+		},
+		{
+			// Macros › Macro invocation: a name a tree binds is not scoped,
+			// so a later token of that name still reads the enclosing
+			// variable (an over-approximation). Nodes: x@5, m!(let x = 1;
+			// x)@22 (Uses x: the x before `=` is a binding name, the later x
+			// the parameter), x@40.
+			name:     "a name a token tree binds is not scoped",
+			protects: "the tree's later read of x resolves to the enclosing x, never to nothing",
+			mutation: "scope a tree's let (the later x resolves to the tree's binding: loses x@5 -> m!(let x = 1; x)@22)",
+			src:      "fn f(x: i32) -> i32 { m!(let x = 1; x); x }",
+			du:       []string{"x@5 -> m!(let x = 1; x)@22", "x@5 -> x@40"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › Closure
+			// expressions: a macro inside a closure walked for its captures
+			// makes no jump of the enclosing function, and its reads are
+			// captures. Nodes: o@5, || { m!(o?); }@38 (Uses o), let c = …;@30,
+			// c()@54, 0@59.
+			name:     "a macro inside a callable walked for captures makes no jump and its reads are captures",
+			protects: "a `?` in a macro inside a closure is the closure's, and the tree's reads are the creating node's",
+			mutation: "let a macro inside a callable walked for captures make its jumps (a Branch m!(o?)@43 appears in f and controls c()@54 and 0@59)",
+			src:      "fn f(o: Option<i32>) -> i32 { let c = || { m!(o?); }; c(); 0 }",
+			du: []string{"o@5 -> || { m!(o?); }@38", "|| { m!(o?); }@38 -> let c = || { m!(o?); };@30",
+				"let c = || { m!(o?); };@30 -> c()@54"},
+		},
 	})
 }
