@@ -33,8 +33,9 @@ was the measurement for this family at this size.
 2. **The allocation leaves the host half of what was available when the run began.** The allocation
    the scheduler sums reservations against is the smaller of available memory minus the base
    footprint and safety margin, and half of available memory. The base footprint is itself derived
-   from the machine and the configuration — this build's measured idle overhead plus the query,
-   cache and queue reservations, the query slots coming from the cores — so a larger host reserves
+   from the machine and the configuration — this process's own resident set, read once at load
+   (32 MiB stands in for it where the platform reports none), plus the query, cache and queue
+   reservations, the query slots coming from the cores — so a larger host reserves
    more for this process and offers its children less, and no core count can make the shipped
    defaults unresolvable. The share is a constant with its reason in the code, not a setting. A unit whose reservation exceeds even that runs whole at the allocation,
    as [ADR-0001](ADR-0001-scale-posture.md) and the empirical research require; it is never split for
@@ -161,9 +162,10 @@ The ceiling changes cost, never facts. Peak parse RSS 1.11 GB at 768 MiB, 1.17 a
 This process's own idle overhead, the part of the base footprint that is not a stated reservation:
 `codectx status` over a freshly indexed five-file, 432-byte fixture, peak resident set of the
 command process ("Maximum resident set size", `/usr/bin/time -v`), three samples: **26,584 /
-27,052 / 26,732 KiB**, i.e. 26.4 MiB at the worst of the three. The shipped constant is 32 MiB, the
-worst sample rounded up to the next binary step. The 1 GiB that preceded it was never measured; it
-is 38× the measurement, and every byte of that over-statement was taken from the children.
+27,052 / 26,732 KiB**, i.e. 26.4 MiB at the worst of the three. The process reads its own resident
+set at load; only where the platform reports none does a constant stand in for it, 32 MiB, the
+worst sample rounded up to the next binary step. A figure of 1 GiB would be 38× the measurement,
+and every byte of that over-statement would be taken from the children.
 
 Soft ceiling: an 8 GiB hard ceiling with a 1 GiB soft ceiling peaked at 3.82 GB (3.65 without
 the soft ceiling; 1.17 with a real 1 GiB hard ceiling); a periodic collection interval did not

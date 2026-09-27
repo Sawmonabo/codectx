@@ -34,9 +34,11 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
 
   - **Reservations** — worker counts, batch and queue sizes, memory budgets,
     connection counts. These size the machine the work is given, not the
-    repository. A zero-sized batch or a zero-connection reader is a broken
-    reservation, not an unbounded one, so `0` is rejected. They never refuse a
-    repository either: they serialise and defer work instead.
+    repository. A zero-sized batch is a broken reservation, not an unbounded
+    one, so `0` is rejected. Two counts take `0` as "derive": `index.workers`
+    chooses one per core, and `storage.read_connections` sizes each reader pool
+    by the work that reads it. They never refuse a repository either: they
+    serialise and defer work instead.
   - **Caller budgets** — `context.default_max_bytes`, `default_estimated_tokens`,
     `default_max_files` and `max_slices`. This is the **one family of non-zero
     defaults deliberately kept**. They are not scale refusals: a context plan
@@ -218,7 +220,7 @@ All **user** trust.
 |---|---|---|
 | `data_dir` | `""` | Absolute path for all cache and state. Empty resolves to a user-private per-workspace directory (below). |
 | `busy_timeout` | `"5s"` | SQLite busy timeout. |
-| `read_connections` | `0` | Connections in each of a store handle's two reader pools. `0` sizes each by the goroutines that read it: the short-read pool, which every unit being built and every tool call reads, holds one connection per unit a generation builds at once (`index.workers`, or one per core) plus one per concurrent tool call (one per core); the posting-stream pool, which only a search's candidate walk holds, one per concurrent tool call. A set value sizes both pools. Each connection may cache up to `reader_cache_kib`, and the process's base footprint counts every one. |
+| `read_connections` | `0` | Connections in each of a store handle's two reader pools. `0` sizes each by the goroutines that read it: the short-read pool, which every unit being built and every tool call reads, holds one connection per unit a generation builds at once (`index.workers`, or one per core) plus one per concurrent tool call (one per core); the posting-stream pool, which only a search's candidate walk holds, one per concurrent tool call. The serving composition's query-only handle builds nothing, so its short-read pool holds one connection per concurrent tool call alone. A set value sizes every pool. Each connection may cache up to `reader_cache_kib`, and the process's base footprint counts every one. |
 | `writer_cache_kib` | `1048576` | Writer page cache. An index run commits in groups this size: the group commits the moment the cache would spill (see [storage](storage.md#how-an-index-run-commits)), so this is also the memory an index run holds for its writes and the largest log it leaves behind. |
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
@@ -563,7 +565,8 @@ relationships that must hold:
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.
 - The base footprint this process keeps for itself is **derived**, not bounded:
-  this process's own resident set, read once at load + (query slots on this
+  this process's own resident set, read once at load (32 MiB stands in for it
+  where the platform reports no resident set) + (query slots on this
   machine) × `query_memory_bytes` + `cache_bytes` + `queue_bytes` + every page
   cache the process opens (the store's writer and reader pools, lexical staging
   for each unit built at once, the tokenizer and the run ledger). How many queries run at

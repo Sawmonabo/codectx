@@ -223,7 +223,8 @@ A path two grammars declare, `.h`, is a header, and its grammar is the
 repository's (ADR-0012 decision 10). The snapshot counts its C and C++
 translation units at capture: a repository with C and no C++ parses headers as
 C, one with C++ and no C as C++, and one with both or neither as C++ first. A
-header whose parse has errors is parsed once more with the other grammar, the
+unit counts only under the extension exactly as its grammar declares it, so a
+C++ `main.C` is not counted as C. A header whose parse has errors is parsed once more with the other grammar, the
 parse with fewer error bytes is kept, and the file's capability row discloses
 the choice in its `header_first`, `header_kept` and `header_reason` details
 (with both parses' error bytes when the second parse ran). When
@@ -398,8 +399,8 @@ function of the file's bytes.
   timer, because a timer would only choose how long a resting machine carries
   one worker per core to save the milliseconds a restart costs. Bounding callers
   instead would let a caller start a fresh worker while an expiring one still
-  held its runner slot and memory reservation, and the runner would then refuse
-  an admission the pool itself caused.
+  held its runner slot and its memory reservation, and the fresh worker would
+  then queue for a slot and for memory the pool itself was holding.
 - A healthy worker returns to the idle list, where the next parse of the
   stage reuses it; the drain that follows the last caller closes its stdin,
   the worker exits on EOF and the runner reaps it. An unhealthy worker is
