@@ -692,5 +692,280 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"n := 0@25 -> h := func() { n = 1 }@33", "h := func() { n = 1 }@33 -> h()@56",
 				"h := func() { n = 1 }@33 -> return n@61", "n := 0@25 -> return n@61"},
 		},
+		{
+			// Go spec, Expression switches: a case with several values matches if
+			// any equals the tag. Nodes: x@17, x@37 (tag head), 1, 2@46 (the case
+			// condition, spanning the list), return 1@52, return 0@64. Succ:
+			// x@37 → 1, 2 → {return 1, return 0}. IPDom: 1, 2 → EXIT.
+			name:     "a case list of several values spans the list",
+			protects: "a multi-value case is one condition naming every value it compares",
+			mutation: "span only the first value of a case list (1, 2@46 renders as 1@46)",
+			src:      "package p\nfunc f(x int) int { switch x { case 1, 2: return 1 }; return 0 }",
+			cd:       []string{"1, 2@46 -> return 1@52", "1, 2@46 -> return 0@64"},
+			du:       []string{"x@17 -> x@37", "x@37 -> 1, 2@46"},
+		},
+		{
+			// Go spec, Logical operators and Operator precedence: in (a || b) && c,
+			// a true skips b and reaches c; a false evaluates b; c is evaluated
+			// only when a || b holds. Only the three non-short-circuit operands
+			// are nodes: a@37, b@42, c@48, then the condition (a || b) &&
+			// c@36 and g()@52. Succ: a → {c, b}; b → {c, condition}; c →
+			// condition; condition → {g(), EXIT}. IPDom: a, b, c → condition →
+			// EXIT. Frontier walks: a over b and c; b over c. Every path from a
+			// passes b or c, which redefine the result, so a's definition
+			// reaches no use.
+			name:     "a nested || inside && is wired by short-circuit",
+			protects: "the left operand of || reaches the operand after the || when true and the right operand when false",
+			mutation: "wire || like && (loses a@37 -> c@48), or make the parenthesized || a node of its own",
+			src:      "package p\nfunc f(a, b, c bool) { if (a || b) && c { g() } }",
+			cd:       []string{"a@37 -> b@42", "a@37 -> c@48", "b@42 -> c@48", "(a || b) && c@36 -> g()@52"},
+			du: []string{"a@17 -> a@37", "b@20 -> b@42", "c@23 -> c@48", "b@42 -> (a || b) && c@36",
+				"c@48 -> (a || b) && c@36"},
+		},
+		{
+			// Go spec, For statements with single condition: the condition is
+			// evaluated before each iteration. The condition's first hoisted
+			// operand a@34 is the loop head and the back-edge target. Nodes:
+			// a@17, b@20, a@34, b@39, a && b@34 (condition), g()@43. Succ:
+			// a@34 → {b@39, condition}; b@39 → condition; condition → {g(),
+			// EXIT}; g() → a@34. IPDom: g() → a@34 → condition → EXIT; b@39 →
+			// condition. Frontier walks: a@34 over b@39; the condition over
+			// g(), a@34 and itself.
+			name:     "a loop whose condition is hoisted && heads at its first operand",
+			protects: "each iteration re-evaluates the short-circuit condition from its first operand",
+			mutation: "make the condition node the back-edge target (loses a && b@34 -> a@34; g()@43 reaches the condition directly)",
+			src:      "package p\nfunc f(a, b bool) { for a && b { g() } }",
+			cd: []string{"a@34 -> b@39", "a && b@34 -> g()@43", "a && b@34 -> a@34",
+				"a && b@34 -> a && b@34"},
+			du: []string{"a@17 -> a@34", "b@20 -> b@39", "a@34 -> a && b@34", "b@39 -> a && b@34"},
+		},
+		{
+			// Go spec, Type switches: a clause listing several types matches any
+			// of them; with no alias the guard's value is held by a variable the
+			// lowering owns. Nodes: v@17, v.(type)@37 (head, Uses v), int,
+			// string@53 (type case, Uses the owned variable), return 1@66,
+			// return 0@78. IPDom: int, string → EXIT.
+			name:     "an aliasless type switch holds its guard in an owned variable, and a type list spans the list",
+			protects: "a type case with no alias still tests the value the head evaluated, over every type it lists",
+			mutation: "give an aliasless type switch no tag variable (loses v.(type)@37 -> int, string@53), or span a type list by its first type (renders int@53)",
+			src:      "package p\nfunc f(v any) int { switch v.(type) { case int, string: return 1 }; return 0 }",
+			cd:       []string{"int, string@53 -> return 1@66", "int, string@53 -> return 0@78"},
+			du:       []string{"v@17 -> v.(type)@37", "v.(type)@37 -> int, string@53"},
+		},
+		{
+			// Go spec, Expression switches: a missing switch expression is
+			// equivalent to true, so there is no head and each case condition
+			// reads its own operands. Nodes: x@17, x > 0@44, return 1@51, return
+			// 0@63.
+			name:     "a tagless switch has no head and its case reads its own operands",
+			protects: "a tagless switch's case condition depends on the variables it names",
+			mutation: "lower case conditions of a tagless switch without their own reads (loses x@17 -> x > 0@44)",
+			src:      "package p\nfunc f(x int) int { switch { case x > 0: return 1 }; return 0 }",
+			cd:       []string{"x > 0@44 -> return 1@51", "x > 0@44 -> return 0@63"},
+			du:       []string{"x@17 -> x > 0@44"},
+		},
+		{
+			// Go spec, Expression switches: the cases are tested top to bottom, and
+			// default runs only when none matches, wherever it stands. Nodes:
+			// x@17, y := 0@30, x@45 (head), 1@54, 2@85 (conditions, in source
+			// order, default skipped), y = 1@57, y = 3@73, y = 2@88, return
+			// y@97. Succ: 1 → {y = 1, 2}; 2 → {y = 2, y = 3}. IPDom: 1, 2 →
+			// return y. Frontier walks: 1 over y = 1 and 2; 2 over y = 3 and
+			// y = 2. Every path writes y, so y := 0 reaches nothing.
+			name:     "a default in the middle is tested last",
+			protects: "a default clause is entered from the last case condition's false edge, not from the case before it in the source",
+			mutation: "enter default from the condition before it in the source (1@54 -> y = 3@73 replaces 2@85 -> y = 3@73)",
+			src:      "package p\nfunc f(x int) int { y := 0; switch x { case 1: y = 1; default: y = 3; case 2: y = 2 }; return y }",
+			cd:       []string{"1@54 -> y = 1@57", "1@54 -> 2@85", "2@85 -> y = 3@73", "2@85 -> y = 2@88"},
+			du: []string{"x@17 -> x@45", "x@45 -> 1@54", "x@45 -> 2@85", "y = 1@57 -> return y@97",
+				"y = 3@73 -> return y@97", "y = 2@88 -> return y@97"},
+		},
+		{
+			// Go spec, Expression switches: with no case, default always runs.
+			// Nodes: x@17, y := 0@30, x@45 (head), y = 1@58 (entered from the
+			// head), return y@67. Straight line: y = 1 kills y := 0.
+			name:     "a switch with only default enters it from the head",
+			protects: "a default-only switch always runs its default body",
+			mutation: "let a switch with no case also leave by its head's fringe (adds y := 0@30 -> return y@67)",
+			src:      "package p\nfunc f(x int) int { y := 0; switch x { default: y = 1 }; return y }",
+			du:       []string{"x@17 -> x@45", "y = 1@58 -> return y@67"},
+		},
+		{
+			// Go spec, If statements: the init statement runs before the condition,
+			// in the if's implicit block. Nodes: a@17, x := g(a)@33, x > 0@44,
+			// return x@52, return a@64. IPDom: x > 0 → EXIT.
+			name:     "an if init statement is its own node",
+			protects: "the condition reads the variable the init statement declares, not the init's operands",
+			mutation: "fold the init statement into the condition (x := g(a)@33 vanishes and the condition reads a)",
+			src:      "package p\nfunc f(a int) int { if x := g(a); x > 0 { return x }; return a }",
+			cd:       []string{"x > 0@44 -> return x@52", "x > 0@44 -> return a@64"},
+			du: []string{"a@17 -> x := g(a)@33", "x := g(a)@33 -> x > 0@44", "x := g(a)@33 -> return x@52",
+				"a@17 -> return a@64"},
+		},
+		{
+			// Go spec, Switch statements: the init statement runs before the tag
+			// is evaluated. Nodes: a@17, x := g(a)@37, x@48 (tag head), 1@57,
+			// return x@60, return a@72. IPDom: 1 → EXIT.
+			name:     "a switch init statement is its own node and the tag reads only what it names",
+			protects: "the tag head depends on the init's variable, not on the init's operands",
+			mutation: "let the tag head Use the init statement's reads (adds a@17 -> x@48)",
+			src:      "package p\nfunc f(a int) int { switch x := g(a); x { case 1: return x }; return a }",
+			cd:       []string{"1@57 -> return x@60", "1@57 -> return a@72"},
+			du: []string{"a@17 -> x := g(a)@37", "x := g(a)@37 -> x@48", "x@48 -> 1@57",
+				"x := g(a)@37 -> return x@60", "a@17 -> return a@72"},
+		},
+		{
+			// Go spec, Handling panics: panic stops the function's normal
+			// execution. Nodes: x@17, x < 0@33, panic(x)@41 (a Jump, then
+			// Throw: no catch exists, so to EXIT), return x@53. IPDom: x < 0 →
+			// EXIT.
+			name:     "a panic statement leaves the function",
+			protects: "the statements after a conditional panic depend on the condition that avoids it",
+			mutation: "lower panic as an ordinary call statement (panic(x)@41 falls through to return x@53, and x < 0@33 no longer controls return x@53)",
+			src:      "package p\nfunc f(x int) int { if x < 0 { panic(x) }; return x }",
+			cd:       []string{"x < 0@33 -> panic(x)@41", "x < 0@33 -> return x@53"},
+			du:       []string{"x@17 -> x < 0@33", "x@17 -> panic(x)@41", "x@17 -> return x@53"},
+		},
+		{
+			// Go spec, Break statements and Continue statements: an unlabelled
+			// continue begins the innermost loop's next iteration at its post
+			// statement, and break ends it. Nodes: n@17, i := 0@30, i < n@38
+			// (head), i == 2@54, continue@63, i == 5@78, break@87, g(i)@96,
+			// i++@45. Succ: i < n → {i == 2, EXIT}; i == 2 → {continue,
+			// i == 5}; continue → i++; i == 5 → {break, g(i)}; break → EXIT;
+			// g(i) → i++ → i < n. IPDom: i == 2, i == 5, break, i < n → EXIT;
+			// continue, g(i) → i++ → i < n. Frontier walks: i < n over i == 2;
+			// i == 2 over continue, i++, i < n and i == 5; i == 5 over break,
+			// g(i), i++ and i < n.
+			name:     "unlabelled break and continue target the innermost loop",
+			protects: "continue reaches the post statement and break the loop's exit",
+			mutation: "resolve an unlabelled continue to the loop's exit (loses i == 2@54 -> i++@45 and i == 2@54 -> i < n@38)",
+			src:      "package p\nfunc f(n int) { for i := 0; i < n; i++ { if i == 2 { continue }; if i == 5 { break }; g(i) } }",
+			cd: []string{"i < n@38 -> i == 2@54", "i == 2@54 -> continue@63", "i == 2@54 -> i++@45",
+				"i == 2@54 -> i < n@38", "i == 2@54 -> i == 5@78", "i == 5@78 -> break@87", "i == 5@78 -> g(i)@96",
+				"i == 5@78 -> i++@45", "i == 5@78 -> i < n@38"},
+			du: []string{"n@17 -> i < n@38", "i := 0@30 -> i < n@38", "i++@45 -> i < n@38",
+				"i := 0@30 -> i == 2@54", "i++@45 -> i == 2@54", "i := 0@30 -> i == 5@78", "i++@45 -> i == 5@78",
+				"i := 0@30 -> g(i)@96", "i++@45 -> g(i)@96", "i := 0@30 -> i++@45", "i++@45 -> i++@45"},
+		},
+		{
+			// Go spec, Break statements: break M names no enclosing statement
+			// labelled M, so the program is invalid; the jump is lowered
+			// unresolved, with no successor. Nodes: for@21 (head), break M@27.
+			// Augmentation adds break M → EXIT.
+			name:       "a break naming no open frame is unresolved",
+			protects:   "a labelled break with no matching frame is counted, never resolved to the innermost loop",
+			mutation:   "resolve a labelled break naming no frame to the innermost loop (unresolved becomes 0)",
+			src:        "package p\nfunc f() { for { break M } }",
+			unresolved: 1,
+		},
+		{
+			// Go spec, Select statements: a select with no cases blocks forever.
+			// Nodes: select@21, whose one successor is itself; the sink
+			// component cannot reach EXIT, so augmentation adds select → EXIT.
+			// Frontier walk: select over itself.
+			name:     "an empty select is a self-loop",
+			protects: "select {} never completes, so nothing after it is reached from it",
+			mutation: "lower an empty select as falling through (loses select@21 -> select@21)",
+			src:      "package p\nfunc f() { select {} }",
+			cd:       []string{"select@21 -> select@21"},
+		},
+		{
+			// Go spec, Select statements and Declarations and scope: n is declared
+			// in no block of f. Nodes: c@17, select@31 (head, Uses c), n =
+			// <-c@45 (Uses the variable the head defines, defines nothing),
+			// g()@57.
+			name:     "a select receive into a name that resolves to no variable defines nothing",
+			protects: "an unresolved receive target keeps the clause node and never reaches the builder as -1",
+			mutation: "drop the variable >= 0 test on a receive target (the clause Defs -1 and panics), or drop the clause node (loses select@31 -> n = <-c@45)",
+			src:      "package p\nfunc f(c chan int) { select { case n = <-c: }; g() }",
+			du:       []string{"c@17 -> select@31", "select@31 -> n = <-c@45"},
+		},
+		{
+			// Go spec, Select statements: v, ok := <-c assigns both on the chosen
+			// clause. Nodes: c@17, select@35, v@49 and ok@52 (each Uses the
+			// variable the head defines), ok@66 (condition), return v@71, return
+			// 0@85. IPDom: ok@66 → EXIT.
+			name:     "a two-target receive is a node per target, each reading the head's value",
+			protects: "both targets of a receive depend on the channel the head evaluated",
+			mutation: "give the head's variable to the receive's first node only (loses select@35 -> ok@52)",
+			src:      "package p\nfunc f(c chan int) int { select { case v, ok := <-c: if ok { return v } }; return 0 }",
+			cd:       []string{"ok@66 -> return v@71", "ok@66 -> return 0@85"},
+			du: []string{"c@17 -> select@35", "select@35 -> v@49", "select@35 -> ok@52", "ok@52 -> ok@66",
+				"v@49 -> return v@71"},
+		},
+		{
+			// Go spec, Select statements: the default clause runs when no
+			// communication can proceed; it evaluates nothing on entry. Nodes:
+			// c@17, x := 0@35, select@43, x = <-c@57, x = 1@75, return x@84.
+			// Succ: select → {x = <-c, x = 1} → return x. IPDom: select →
+			// return x. Both clauses write x, so x := 0 reaches nothing.
+			name:     "a select's default clause is entered from the head",
+			protects: "a select default clause's body depends on the head choosing it",
+			mutation: "enter a select's default clause from after the other clauses (loses select@43 -> x = 1@75)",
+			src:      "package p\nfunc f(c chan int) int { x := 0; select { case x = <-c: default: x = 1 }; return x }",
+			cd:       []string{"select@43 -> x = <-c@57", "select@43 -> x = 1@75"},
+			du: []string{"c@17 -> select@43", "select@43 -> x = <-c@57", "x = <-c@57 -> return x@84",
+				"x = 1@75 -> return x@84"},
+		},
+		{
+			// Go spec, For statements with for clause: an absent condition is
+			// equivalent to true. Nodes: n@17, i := 0@30, for@26 (head, one
+			// successor), i > n@49, break@57, i++@40. Succ: for → i > n →
+			// {break, i++}; i++ → for; break → EXIT. IPDom: i++ → for → i > n
+			// → EXIT. Frontier walk: i > n over break, i++, for and itself.
+			name:     "a for clause with no condition has a head with no exit edge",
+			protects: "a for clause without a condition leaves only by its break",
+			mutation: "give the head an exit edge (for@26 -> EXIT: i > n@49 no longer controls for@26)",
+			src:      "package p\nfunc f(n int) { for i := 0; ; i++ { if i > n { break } } }",
+			cd:       []string{"i > n@49 -> break@57", "i > n@49 -> i++@40", "i > n@49 -> for@26", "i > n@49 -> i > n@49"},
+			du: []string{"n@17 -> i > n@49", "i := 0@30 -> i > n@49", "i++@40 -> i > n@49", "i := 0@30 -> i++@40",
+				"i++@40 -> i++@40"},
+		},
+		{
+			// Go spec, For statements with range clause: an identifier target
+			// assigned by = is written each iteration. Nodes: xs@17, k := 0@33,
+			// xs@55 (range expression), range@49 (head), k@45 (defines k, Uses
+			// the iteration variable), return k@63. Succ: range → {k, return
+			// k}; k → range.
+			name:     "a range target assigned by = defines it",
+			protects: "a use after a range loop with an = target sees the loop's writes and the value before it",
+			mutation: "let a range target assigned by = define nothing (loses k@45 -> return k@63)",
+			src:      "package p\nfunc f(xs []int) int { k := 0; for k = range xs { }; return k }",
+			cd:       []string{"range@49 -> k@45", "range@49 -> range@49"},
+			du: []string{"xs@17 -> xs@55", "xs@55 -> range@49", "xs@55 -> k@45", "k := 0@33 -> return k@63",
+				"k@45 -> return k@63"},
+		},
+		{
+			// Go spec, For statements with range clause: := declares both key and
+			// value. Nodes: m@17, s := 0@38, m@64, range@58, k@50, v@53 (each
+			// Uses the iteration variable), s += k + v@68, return s@82. Succ:
+			// range → {k, return s}; k → v → s += k + v → range.
+			name:     "a range with := key and value makes a node per target",
+			protects: "both the key and the value depend on the range expression as evaluated before the loop",
+			mutation: "give the iteration variable to the key node only (loses m@64 -> v@53)",
+			src:      "package p\nfunc f(m map[int]int) int { s := 0; for k, v := range m { s += k + v }; return s }",
+			cd: []string{"range@58 -> k@50", "range@58 -> v@53", "range@58 -> s += k + v@68",
+				"range@58 -> range@58"},
+			du: []string{"m@17 -> m@64", "m@64 -> range@58", "m@64 -> k@50", "m@64 -> v@53",
+				"k@50 -> s += k + v@68", "v@53 -> s += k + v@68", "s := 0@38 -> s += k + v@68",
+				"s += k + v@68 -> s += k + v@68", "s := 0@38 -> return s@82", "s += k + v@68 -> return s@82"},
+		},
+		{
+			// Go spec, For statements with range clause: the range expression is
+			// evaluated once, so the body's xs = nil changes no iteration.
+			// Nodes: xs@17, s := 0@33, xs@59, range@53, v@48, s += v@64,
+			// xs = nil@72, return s@84. Succ: range → {v, return s}; v →
+			// s += v → xs = nil → range. xs = nil reaches no use.
+			name:     "a body write to the iterated variable does not reach the head",
+			protects: "the loop head depends on the range expression as evaluated, never on a body's write to its variables",
+			mutation: "let the head read the range expression's names (adds xs = nil@72 -> range@53)",
+			src:      "package p\nfunc f(xs []int) int { s := 0; for _, v := range xs { s += v; xs = nil }; return s }",
+			cd: []string{"range@53 -> v@48", "range@53 -> s += v@64", "range@53 -> xs = nil@72",
+				"range@53 -> range@53"},
+			du: []string{"xs@17 -> xs@59", "xs@59 -> range@53", "xs@59 -> v@48", "v@48 -> s += v@64",
+				"s := 0@33 -> s += v@64", "s += v@64 -> s += v@64", "s := 0@33 -> return s@84",
+				"s += v@64 -> return s@84"},
+		},
 	})
 }
