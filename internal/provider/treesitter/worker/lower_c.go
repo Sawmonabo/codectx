@@ -342,16 +342,13 @@ const (
 // the value); otherwise the construct has no value and no
 // result. Every other statement is a node of its own, whose reads no later
 // node takes. The extension permits jumping out of a statement expression: a
-// `break` or `continue` in one binds to the innermost loop or switch open
-// where it stands, so one in a for loop's update clause or a do loop's
-// condition binds to that loop. Its break ends the loop. Its continue goes
-// where every continue of that loop goes, to the end of the loop body (C17
-// §6.8.6.2), after which the update or the condition runs again: it lands on
-// the first node of the update or the condition. The compilers that implement
-// the extension place a loop's condition and update outside its body: they
-// reject such a jump when no loop encloses the one holding it, and bind it
-// to the enclosing loop when one does, where this lowering binds it to the
-// loop holding it.
+// `break` or `continue` in one binds to the innermost loop or switch whose
+// body holds it. A loop's condition and a for loop's update lie outside its
+// body, as the compilers that implement the extension place them, so a jump
+// in a statement expression there binds to the loop or switch enclosing that
+// loop: the condition and the update are lowered with the loop's own frame
+// suspended (flow.Builder, Suspend), and with no enclosing frame the jump is
+// unresolved.
 //
 // # Exceptions
 //
@@ -1567,18 +1564,9 @@ func (c *cLower) head(cond *ts.Node) bool {
 	return true
 }
 
-// loopEnd closes a loop whose back edge targets h. again is the first node
-// of the code on the loop's continue path lowered after ContinueHere (a for
-// loop's update, a do loop's condition), or -1: a continue that code issues
-// through a statement expression is pending after ContinueHere, and lands on
-// again, since the continue path runs that code anew (see Statement
-// expressions in lowerC).
-func (c *cLower) loopEnd(f flow.Frame, h, again int32, exits bool, exit flow.Fringe) {
+// loopEnd closes a loop whose back edge targets h.
+func (c *cLower) loopEnd(f flow.Frame, h int32, exits bool, exit flow.Fringe) {
 	c.b.Close(h)
-	if again >= 0 {
-		c.b.ContinueHere(f)
-		c.b.Close(again)
-	}
 	if exits {
 		c.b.Restore(exit)
 	}
@@ -1593,7 +1581,9 @@ func (c *cLower) whileStmt(n *ts.Node) {
 	s := c.open()
 	f := c.b.OpenLoop()
 	saved := c.mark()
+	c.b.Suspend(f)
 	exits := c.head(n.ChildByFieldId(k.fCondition))
+	c.b.Resume(f)
 	h := c.unmark(saved)
 	var exit flow.Fringe
 	if exits {
@@ -1601,7 +1591,7 @@ func (c *cLower) whileStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, -1, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 	c.close(s)
 }
 
@@ -1611,15 +1601,15 @@ func (c *cLower) doStmt(n *ts.Node) {
 	saved := c.mark()
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	cm := c.mark()
+	c.b.Suspend(f)
 	exits := c.head(n.ChildByFieldId(k.fCondition))
-	again := c.unmark(cm)
+	c.b.Resume(f)
 	h := c.unmark(saved)
 	var exit flow.Fringe
 	if exits {
 		exit = c.b.Push()
 	}
-	c.loopEnd(f, h, again, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 }
 
 func (c *cLower) forStmt(n *ts.Node) {
@@ -1640,7 +1630,9 @@ func (c *cLower) forStmt(n *ts.Node) {
 		c.reset()
 		c.node(flow.Stmt, n.Child(0), c.base)
 	} else {
+		c.b.Suspend(f)
 		exits = c.head(cond)
+		c.b.Resume(f)
 	}
 	h := c.unmark(saved)
 	var exit flow.Fringe
@@ -1649,14 +1641,13 @@ func (c *cLower) forStmt(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	again := int32(-1)
 	if upd := n.ChildByFieldId(k.fUpdate); upd != nil {
-		um := c.mark()
+		c.b.Suspend(f)
 		c.reset()
 		c.exprStmt(upd)
-		again = c.unmark(um)
+		c.b.Resume(f)
 	}
-	c.loopEnd(f, h, again, exits, exit)
+	c.loopEnd(f, h, exits, exit)
 	c.close(s)
 }
 
@@ -1707,7 +1698,7 @@ func (c *cLower) forRange(n *ts.Node) {
 	}
 	c.sub(n.ChildByFieldId(k.fBody))
 	c.b.ContinueHere(f)
-	c.loopEnd(f, h, -1, true, exit)
+	c.loopEnd(f, h, true, exit)
 	c.close(s)
 }
 
