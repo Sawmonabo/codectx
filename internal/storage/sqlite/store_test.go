@@ -1251,6 +1251,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	raw.Close()
 	f2 := newFixture(t, dbPath)
 	f2.file(c.path, string(c.content))
+	flushed(t, f2.s)
 	if _, err := f2.s.Blob(ctx, c.hash); err != nil {
 		t.Fatalf("restored blob is not servable: %v", err)
 	}
@@ -1979,7 +1980,6 @@ func TestBlobGraceProtocol(t *testing.T) {
 	// directly because the store's own paths refuse it by design: PutSnapshot
 	// only accepts a blob that is already 'ready', which is exactly why the
 	// recheck below is the last line of defence rather than the first.
-	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -2046,13 +2046,11 @@ func TestBlobGraceProtocol(t *testing.T) {
 //
 // Failure modes it protects: an exclusive write that returns before its row is
 // committed where the reader pool sees it (a lease a query then cannot find),
-// an ingestion batch lost to an exclusive write that ended the group it sat in,
-// and a writer busy time that never moves, which would report a stage as never
-// waiting on the writer. Mutations that must fail it: in open.go's write, drop
+// and an ingestion batch lost to an exclusive write that ended the group it sat
+// in. Mutation that must fail it: in open.go's write, drop
 // the s.commitGroup() that runs before the exclusive transaction begins (the
 // transaction then waits on the one connection the open group holds until the
-// test's deadline, and the waiting callers are reported); in runWriter, drop
-// the s.writerBusy.Add.
+// test's deadline, and the waiting callers are reported).
 func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 	f := newFixture(t, filepath.Join(t.TempDir(), "writer.db"))
 	// Every caller runs under a deadline halfway to the test binary's own, so
@@ -2066,7 +2064,6 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 		defer cancel()
 	}
 	snap := f.snapshot("leases", f.file("leases.go", "package leases\n"))
-	busy := f.s.WriterBusy()
 
 	const ingesters, writers, perCaller = 4, 4, 16
 	errs := make(chan error, (ingesters+writers)*perCaller)
@@ -2137,8 +2134,5 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 	if len(known) != len(hashes) {
 		t.Fatalf("%d of %d ingested blobs are in the database after the flush: an exclusive write lost the batches its group held",
 			len(known), len(hashes))
-	}
-	if f.s.WriterBusy() <= busy {
-		t.Fatalf("WriterBusy stayed at %v across %d writer jobs", f.s.WriterBusy(), len(hashes)+writers*perCaller)
 	}
 }

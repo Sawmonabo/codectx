@@ -27,7 +27,8 @@ import (
 //     row order is the reverse of the canonical order and the mutation shows.
 //
 // The table must also answer every key with exactly the identities the sealed
-// dependency aliased it to.
+// dependency aliased it to, and refuse a lookup over a unit set it was not
+// loaded for.
 //
 // The group is assumed to stay open across the seal: the fixture writes a few
 // rows, far below what spills the writer's cache, and no exclusive writer
@@ -56,7 +57,7 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	}
 	g := f.nodeFact(wa, run, a.path, "G", &a)
 	for _, fact := range []model.NodeFact{first, second, g} {
-		if err := wa.PutKeyedNodes(ctx, []model.NodeFact{fact}, [][]string{keyList()}); err != nil {
+		if err := wa.PutKeyedNodes(ctx, []model.NodeFact{fact}, [][]string{keyList(fact.Node.Name)}); err != nil {
 			t.Fatalf("PutKeyedNodes(%s %s): %v", fact.Node.Kind, fact.Node.Name, err)
 		}
 	}
@@ -84,7 +85,7 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	// A second unit aliases F to its own identity and is committed building.
 	wb := f.begin(gen, run, b)
 	other := f.nodeFact(wb, run, b.path, "F", &b)
-	if err := wb.PutKeyedNodes(ctx, []model.NodeFact{other}, [][]string{keyList()}); err != nil {
+	if err := wb.PutKeyedNodes(ctx, []model.NodeFact{other}, [][]string{keyList("b")}); err != nil {
 		t.Fatalf("PutKeyedNodes(unsealed): %v", err)
 	}
 	if err := wb.PutAliases(ctx, []model.NativeAlias{{ScopeKey: a.path, NativeKey: "F", NodeID: other.Node.ID}}); err != nil {
@@ -129,6 +130,14 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	}
 	if len(tied) != 2 || tied[0].CanonicalKey != tied[1].CanonicalKey || tied[0].NodeID >= tied[1].NodeID {
 		t.Fatalf("F answers %v, want the two identities tied on one canonical key in node-id order", tied)
+	}
+	// A lookup naming a unit the table never read would be answered with the
+	// loaded units' aliases alone. Mutation: drop the unit-set check in
+	// LookupAliases.
+	if got, err := table.LookupAliases(ctx, []model.UnitID{sealed, building}, a.path, "F"); err == nil {
+		t.Fatalf("the table answered %v for a unit set it was not loaded for", got)
+	} else {
+		wantCode(t, err, model.CodeInternal)
 	}
 }
 

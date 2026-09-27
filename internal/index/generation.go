@@ -320,6 +320,13 @@ func (g *generation) capture(ctx context.Context) (err error) {
 	if g.prev, err = c.activeGeneration(ctx); err != nil {
 		return err
 	}
+	// The view reads the manifest and blobs on the reader pool against the
+	// last commit, so the snapshot is committed before planning and every
+	// unit read through it: no source read of the pass takes a job on the
+	// writer.
+	if err := c.opts.Store.Flush(ctx); err != nil {
+		return err
+	}
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap.ID)
 	if err != nil {
 		return err
@@ -769,6 +776,13 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	defer func() {
 		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &g.built}, err)
 	}()
+	// The units attached and carried before the build are committed first:
+	// a unit of the first provider that runs resolves its dependencies against
+	// the last commit, and a carried dependency sealed only in the open group
+	// would be refused there.
+	if err := g.c.opts.Store.Flush(ctx); err != nil {
+		return nil, err
+	}
 	var deferred []plan.Unit
 	var group *unitGroup
 	current := ""

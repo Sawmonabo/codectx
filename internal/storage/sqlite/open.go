@@ -966,14 +966,15 @@ func (s *Store) Flush(ctx context.Context) error {
 
 // readOwn runs fn where it sees the ingestion group's own writes: on the
 // group's transaction while one is open, and on the reader pool otherwise.
-// It is the read path of the ingestion side -- unit states, aliases of
-// dependency units, the snapshot and blobs a capture just recorded -- whose
-// callers reason about what this run has already stored. Query paths read
-// through read and never see a group in progress. Only the group branch is a
-// job: with no group open, the read runs on the reader pool in the caller's
-// goroutine and never delays the writer. It is never called from inside a
-// job: a producer stream an ingestion call drains reads through the pool
-// instead (UnitInputs), and sees the last commit.
+// It is the read path of the ingestion side whose callers reason about what
+// this run has already stored -- a capture asking whether it has recorded a
+// blob, a unit's own rows -- and every call is a job on the writer, if only
+// to learn that no group is open. Unit states, dependency aliases and every
+// snapshot view read through read instead, against the last commit, which the
+// index build advances at each provider boundary; query paths do the same and
+// never see a group in progress. It is never called from inside a job: a
+// producer stream an ingestion call drains reads through the pool instead
+// (UnitInputs), and sees the last commit.
 func (s *Store) readOwn(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	if s.opts.ReadOnly {
 		return s.read(ctx, fn)
