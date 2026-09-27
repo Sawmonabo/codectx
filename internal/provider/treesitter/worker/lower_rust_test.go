@@ -238,7 +238,8 @@ func TestRustLoweringGolden(t *testing.T) {
 		{
 			// The Rust Unstable Book, Language features › try_blocks (The
 			// Rust Reference does not define try blocks: a `?` in one
-			// completes the block rather than the function), and
+			// completes the block rather than the function; valid on nightly
+			// behind `#![feature(try_blocks)]`), and
 			// Expressions › Operator expressions › The try propagation
 			// expression. Nodes: a@5, a?@57 (Branch Using a; it defines its
 			// Ok value and, completing the block, the block's result, both
@@ -566,39 +567,44 @@ func TestRustLoweringGolden(t *testing.T) {
 			// f, so predeclare binds it to no variable; Macros By Example ›
 			// Hygiene: `make!(m)` may declare m at the invocation's site, but
 			// the expansion is not lowered, so m resolves to nothing; H, g and
-			// k are named by no declaration in scope. Nodes: v@5, make!(m)@66,
+			// k are named by no declaration in scope. G is written only as a
+			// place (a reference to a `static mut` is refused by the 2024
+			// edition's static_mut_refs lint), and the borrowed and ref-mut
+			// matched places are H. Nodes: v@5, make!(m)@66,
 			// G = (v, 0)@83 (Uses v, defines nothing), m += v@95 (Uses v
 			// only), m = v@112 (the embedded assignment, Uses v), let e = (m =
 			// v);@103 (defines e, Uses nothing), (m, G.1, w) = (v, 1, 2)@120
 			// (Uses v, defines an owned variable), m@121, G.1@124 and w@129
 			// (each Uses it; only w@129 defines, and G.1 may-defines nothing),
-			// G.0 = v@145 (Uses v), g(&mut G)@154 and the println!@165
-			// (token-tree reads of H and m, a `&mut m` borrow and a `{G:?}`
-			// capture: nothing), || { m += v; H = 1; }@203 (Uses the captured
-			// v, may-defines nothing), let c = …;@195, c()@226, H@240 (the
-			// iterated value, defining the iteration variable), for@231,
-			// i@235, let (ref mut y, z) = G;@245 (Uses nothing, defines an
-			// owned variable), y@258 (a `ref mut` binding of an unresolved
-			// place: no may-definition), z@261, k(e, w, y, z)@269. Succ:
-			// straight line to for@231→{i@235, let (ref mut y, z) = G;@245};
-			// i@235→for@231. IPDom: for@231 → let (ref mut y, z) = G;@245.
+			// G.0 = v@145 (Uses v), g(&mut H)@154 and the println!@165
+			// (a token-tree read of m, a `&mut m` borrow and a `{H:?}`
+			// capture, each of `{H:?} {:?}`'s arguments used: nothing),
+			// || { m += v; H = 1; }@205 (Uses the captured v, may-defines
+			// nothing), let c = …;@197, c()@228, H@242 (the iterated value,
+			// defining the iteration variable), for@233, i@237, let (ref mut
+			// y, z) = H;@247 (Uses nothing, defines an owned variable), y@260
+			// (a `ref mut` binding of an unresolved place: no
+			// may-definition), z@263, k(e, w, y, z)@271. Succ: straight line
+			// to for@233→{i@237, let (ref mut y, z) = H;@247}; i@237→for@233.
+			// IPDom: for@233 → let (ref mut y, z) = H;@247.
 			name:     "a name that resolves to no local defines, may-defines and uses nothing in every position",
 			protects: "a static item, a name a macro declares and an undeclared name, as an assignment, compound, embedded or destructuring target, a place's base, a borrowed or ref-mut-matched place, a captured read or write, a token-tree read, borrow or format capture, and an iterated value, never reach flow.Builder as -1 and pair with nothing",
 			mutation: "remove any one -1 filter (read's or def's; the baseVar >= 0 check of assign, targets or compound; value's or tokenBorrow's borrow check; bindName's matched check; capWrite's) and flow.Builder panics on G, m or H; or let predeclare bind an item's name to a variable (gains G = (v, 0)@83 -> G.1@124 and -> G.0 = v@145, among others)",
-			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut G); println!(\"{G:?}\", &mut m, H); let c = || { m += v; H = 1; }; c(); for i in H {} let (ref mut y, z) = G; k(e, w, y, z) } }",
-			cd:       []string{"for@231 -> i@235", "for@231 -> for@231"},
+			src:      "fn f(v: i32) -> i32 { static mut G: (i32, i32) = (0, 0); unsafe { make!(m); let w; G = (v, 0); m += v; let e = (m = v); (m, G.1, w) = (v, 1, 2); G.0 = v; g(&mut H); println!(\"{H:?} {:?}\", &mut m); let c = || { m += v; H = 1; }; c(); for i in H {} let (ref mut y, z) = H; k(e, w, y, z) } }",
+			cd:       []string{"for@233 -> i@237", "for@233 -> for@233"},
 			du: []string{"v@5 -> G = (v, 0)@83", "v@5 -> m += v@95", "v@5 -> m = v@112",
-				"v@5 -> (m, G.1, w) = (v, 1, 2)@120", "v@5 -> G.0 = v@145", "v@5 -> || { m += v; H = 1; }@203",
+				"v@5 -> (m, G.1, w) = (v, 1, 2)@120", "v@5 -> G.0 = v@145", "v@5 -> || { m += v; H = 1; }@205",
 				"(m, G.1, w) = (v, 1, 2)@120 -> m@121", "(m, G.1, w) = (v, 1, 2)@120 -> G.1@124",
 				"(m, G.1, w) = (v, 1, 2)@120 -> w@129",
-				"|| { m += v; H = 1; }@203 -> let c = || { m += v; H = 1; };@195",
-				"let c = || { m += v; H = 1; };@195 -> c()@226", "H@240 -> for@231", "H@240 -> i@235",
-				"let (ref mut y, z) = G;@245 -> y@258", "let (ref mut y, z) = G;@245 -> z@261",
-				"let e = (m = v);@103 -> k(e, w, y, z)@269", "w@129 -> k(e, w, y, z)@269",
-				"y@258 -> k(e, w, y, z)@269", "z@261 -> k(e, w, y, z)@269"},
+				"|| { m += v; H = 1; }@205 -> let c = || { m += v; H = 1; };@197",
+				"let c = || { m += v; H = 1; };@197 -> c()@228", "H@242 -> for@233", "H@242 -> i@237",
+				"let (ref mut y, z) = H;@247 -> y@260", "let (ref mut y, z) = H;@247 -> z@263",
+				"let e = (m = v);@103 -> k(e, w, y, z)@271", "w@129 -> k(e, w, y, z)@271",
+				"y@260 -> k(e, w, y, z)@271", "z@263 -> k(e, w, y, z)@271"},
 		},
 		{
-			// The Rust Unstable Book, Language features › try_blocks, and
+			// The Rust Unstable Book, Language features › try_blocks (valid
+			// on nightly behind `#![feature(try_blocks)]`), and
 			// Expressions › Operator expressions › The try propagation
 			// expression: the operands of `a? + b?` are evaluated left to
 			// right, and whichever `?` meets an error first completes the
@@ -685,13 +691,13 @@ func TestRustLoweringGolden(t *testing.T) {
 			du:       []string{"x@5 -> x@23"},
 		},
 		{
-			// Statements › Let statements: `let x;` declares x and assigns
-			// nothing, so it runs no code. Nodes: c@5, c@19 (Branch). The
+			// Statements › Let statements: `let x: i32;` declares x and
+			// assigns nothing, so it runs no code. Nodes: c@5, c@19 (Branch). The
 			// consequence makes no node, so both of c@19's edges reach EXIT.
 			name:     "a let without an initializer makes no node",
 			protects: "a declaration with no initializer is no statement node, so nothing depends on a condition through it",
-			mutation: "make a node for `let x;` (gains c@19 -> let x;@23)",
-			src:      "fn f(c: bool) { if c { let x; } }",
+			mutation: "make a node for `let x: i32;` (gains c@19 -> let x: i32;@23)",
+			src:      "fn f(c: bool) { if c { let x: i32; } }",
 			du:       []string{"c@5 -> c@19"},
 		},
 		{
@@ -814,7 +820,9 @@ func TestRustLoweringGolden(t *testing.T) {
 		{
 			// Expressions › Loops and other breakable expressions › Loop
 			// labels: a break naming a label no enclosing loop or block
-			// declares is an error (E0426) but parses. Nodes: loop@9 (head),
+			// declares is an error (E0426) but parses: ill-formed on purpose,
+			// since how a lowering counts a jump no frame opens is only
+			// observable on a program no compiler accepts. Nodes: loop@9 (head),
 			// break 'nope@16 (Jump; it defines nothing). The break's target
 			// names no frame, so it keeps no successor and augmentation sends
 			// it to EXIT.
@@ -823,6 +831,7 @@ func TestRustLoweringGolden(t *testing.T) {
 			mutation:   "resolve an unknown label to the innermost loop (unresolved becomes 0)",
 			src:        "fn f() { loop { break 'nope; } }",
 			unresolved: 1,
+			illFormed:  true,
 		},
 		{
 			// Expressions › Loops and other breakable expressions › Loop
@@ -935,7 +944,8 @@ func TestRustLoweringGolden(t *testing.T) {
 				"x@40 -> g(x, y)@55", "y@49 -> g(x, y)@55"},
 		},
 		{
-			// The Rust Unstable Book, Language features › gen_blocks: a gen
+			// The Rust Unstable Book, Language features › gen_blocks (valid
+			// on nightly behind `#![feature(gen_blocks)]`): a gen
 			// block's body runs only as its iterator is advanced, so it is
 			// its own function. Nodes: n@9, gen { n += 1; yield n; }@34 (Uses
 			// n, may-defines n), let g = …;@26 (Uses the creating node's
@@ -1166,14 +1176,15 @@ func TestRustLoweringGolden(t *testing.T) {
 		},
 		{
 			// Types › Closure types › Capture modes: a move closure owns its
-			// copies, including the ones the closures inside it write.
-			// Nodes: n@9, the move closure@34 (Uses n, may-defines nothing),
-			// let g = …;@26, g()@75, n@80.
+			// copies, including the ones the closures inside it write, so
+			// it mutates its own state and is called through `let mut g`.
+			// Nodes: n@9, the move closure@38 (Uses n, may-defines nothing),
+			// let mut g = …;@26, g()@79, n@84.
 			name:     "a move closure drops the writes of the callables nested in it",
 			protects: "a write by a closure nested in a move closure never reaches a read of the outer variable",
-			mutation: "keep a nested callable's writes inside a move closure (gains move || { let mut h = || n += 1; h(); }@34 -> n@80)",
-			src:      "fn f(mut n: i32) -> i32 { let g = move || { let mut h = || n += 1; h(); }; g(); n }",
-			du:       []string{"n@9 -> move || { let mut h = || n += 1; h(); }@34", "move || { let mut h = || n += 1; h(); }@34 -> let g = move || { let mut h = || n += 1; h(); };@26", "let g = move || { let mut h = || n += 1; h(); };@26 -> g()@75", "n@9 -> n@80"},
+			mutation: "keep a nested callable's writes inside a move closure (gains move || { let mut h = || n += 1; h(); }@38 -> n@84)",
+			src:      "fn f(mut n: i32) -> i32 { let mut g = move || { let mut h = || n += 1; h(); }; g(); n }",
+			du:       []string{"n@9 -> move || { let mut h = || n += 1; h(); }@38", "move || { let mut h = || n += 1; h(); }@38 -> let mut g = move || { let mut h = || n += 1; h(); };@26", "let mut g = move || { let mut h = || n += 1; h(); };@26 -> g()@79", "n@9 -> n@84"},
 		},
 		{
 			// Expressions › Operator expressions › Borrow operators: `&mut
@@ -1260,7 +1271,8 @@ func TestRustLoweringGolden(t *testing.T) {
 			du:       []string{"o@9 -> || { if let Some(ref mut v) = o { *v += 1; } }@54", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42", "let mut g = || { if let Some(ref mut v) = o { *v += 1; } };@42 -> g()@102", "o@9 -> o@107", "|| { if let Some(ref mut v) = o { *v += 1; } }@54 -> o@107"},
 		},
 		{
-			// The Rust Unstable Book, Language features › try_blocks: a `?`
+			// The Rust Unstable Book, Language features › try_blocks (valid
+			// on nightly behind `#![feature(try_blocks)]`): a `?`
 			// completes the innermost try block, whatever loops lie between.
 			// Nodes: v@5, let mut n = 0;@68, v@92, for@83, o@87, (*o)?@101
 			// (Branch; its break lands after the try block, defining its
@@ -1284,7 +1296,9 @@ func TestRustLoweringGolden(t *testing.T) {
 			// patterns (the shorthand `ref mut f`): each borrows the matched
 			// place. Nodes: o@9, s@29, let Some(ref mut x @ 1..=3) = o@47 (Branch), x@64 (Uses the owned
 			// variable, defines x, may-defines o), *x = 0@81, let S { ref mut f } = s;@91, f@107
-			// (likewise, may-defines s), *f = 1@116, g(o, s)@124. Succ:
+			// (likewise, may-defines s), *f = 1@116, g(o, s)@124 (it pairs with
+			// o@9 and s@29, the killing definitions reaching it through the
+			// chis x@64 and f@107, and with those chis). Succ:
 			// let Some(ref mut x @ 1..=3) = o@47→{x@64, let S { ref mut f } = s;@91}; x@64→*x = 0→let S { ref mut f } = s;@91→f→*f = 1→g. IPDom: let Some(ref mut x @ 1..=3) = o@47 → let S { ref mut f } = s;@91.
 			name:     "a bound ref mut pattern and a struct shorthand ref mut borrow the matched place",
 			protects: "`ref mut x @ q` and `S { ref mut f }` are may-definitions of o and s, reaching the later reads of both",
@@ -1363,7 +1377,8 @@ func TestRustLoweringGolden(t *testing.T) {
 				"n += 1@97 -> n@107"},
 		},
 		{
-			// The Rust Unstable Book, try_blocks, and Macros › Macro
+			// The Rust Unstable Book, try_blocks (valid on nightly behind
+			// `#![feature(try_blocks)]`), and Macros › Macro
 			// invocation: a `?` in a tree inside a source try block breaks to
 			// the block's end, defining no result. Nodes: a@5, m!(a?)@57
 			// (Branch), 1@65 (the tail, defining the block's result), let r: Option<i32> = try { m!(a?); 1 };@30,
@@ -1444,6 +1459,66 @@ func TestRustLoweringGolden(t *testing.T) {
 			src:      "fn f(o: Option<i32>) -> i32 { let c = || { m!(o?); }; c(); 0 }",
 			du: []string{"o@5 -> || { m!(o?); }@38", "|| { m!(o?); }@38 -> let c = || { m!(o?); };@30",
 				"let c = || { m!(o?); };@30 -> c()@54"},
+		},
+		{
+			// Expressions › `if` expressions › Chains of conditions: a later
+			// member of a let chain runs only when the members before it
+			// hold, and Expressions › Evaluation order of operands: the let
+			// reads x before the if runs. Nodes: o@5, x@25, let Some(_) =
+			// o@57 (Branch, the first member), x = 2@78 (defines x; it runs
+			// only when o is Some, so it takes none of the let's reads), true@85
+			// (the block's tail, defining its result), { x = 2; true }@76 (the
+			// second member's Branch, Using that result), 1@94 and 0@105 (the
+			// arm tails, defining the if's result), let y = …;@42 (Uses x and
+			// the if's result), y + x@110. Succ: let Some(_) = o→{x = 2, 0};
+			// x = 2→true→{ x = 2; true }→{1, 0}; 1, 0→let y→y + x. IPDom: both
+			// Branches → let y; x = 2 → true → { x = 2; true }.
+			name:     "an assignment in a later let-chain member leaves an earlier read on its consumer",
+			protects: "the let's read of x pairs with the parameter on the path where the first member fails and the second never runs",
+			mutation: "lower a later let-chain member in no region (x = 2@78 takes the let's read: gains x@25 -> x = 2@78, loses x@25 -> let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42)",
+			src:      "fn f(o: Option<i32>, mut x: i32) -> i32 { let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 }; y + x }",
+			cd: []string{"let Some(_) = o@57 -> x = 2@78", "let Some(_) = o@57 -> true@85",
+				"let Some(_) = o@57 -> { x = 2; true }@76", "let Some(_) = o@57 -> 0@105",
+				"{ x = 2; true }@76 -> 1@94", "{ x = 2; true }@76 -> 0@105"},
+			du: []string{"o@5 -> let Some(_) = o@57", "true@85 -> { x = 2; true }@76",
+				"x@25 -> let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42", "x = 2@78 -> let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42", "1@94 -> let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42", "0@105 -> let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42",
+				"let y = x + if let Some(_) = o && { x = 2; true } { 1 } else { 0 };@42 -> y + x@110", "x@25 -> y + x@110", "x = 2@78 -> y + x@110"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Infinite
+			// loops: a `loop` is left only by a break, so the statements of
+			// its body before the first break run whenever the let consuming
+			// its value does. Nodes: x@9, loop@38 (head), x = 1@45 (takes the
+			// let's held read: Uses x, defines x and an owned variable holding
+			// the earlier x), break 0@52 (defines the loop's result), let y =
+			// …;@26 (Uses the handed-on variable and the loop's result), y +
+			// x@63. The break leaves nothing on the back edge: straight line.
+			name:     "a loop body's statements before its first break take the consumer's earlier read",
+			protects: "the let's read of x, made before the loop, pairs with the parameter through the hand-off of the assignment that precedes every break",
+			mutation: "open the loop's region at its body's start (x = 1@45 takes nothing: loses x@9 -> x = 1@45, and the let pairs with x = 1@45 as if it read the assignment's x)",
+			src:      "fn f(mut x: i32) -> i32 { let y = x + loop { x = 1; break 0 }; y + x }",
+			du: []string{"x@9 -> x = 1@45", "x = 1@45 -> let y = x + loop { x = 1; break 0 };@26", "break 0@52 -> let y = x + loop { x = 1; break 0 };@26", "let y = x + loop { x = 1; break 0 };@26 -> y + x@63",
+				"x = 1@45 -> y + x@63"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Labeled
+			// block expressions: `break 'a` leaves the block, skipping its
+			// later statements. Nodes: c@5, x@18, z@30, x = 1@69 (before any
+			// break: takes the let's held read of x), c@79 (Branch), break 'a
+			// 0@83 (defines the block's result), z = 2@97 (after the break,
+			// which reaches the let past it, so it takes nothing, although the
+			// if holding the break has ended), 1@104 (the tail, defining the
+			// block's result), let y = …;@47 (Uses the handed-on variable, z
+			// and the block's result), y + x + z@109. Succ: c@79→{break,
+			// z = 2}; break→let y; z = 2→1→let y. IPDom: c@79 → let y.
+			name:     "a labelled block is a region from its first break to its end",
+			protects: "an assignment before the block's first break takes the consumer's earlier read, and one after it leaves the read on the consumer, which pairs with the parameter on the break's path",
+			mutation: "open the region at the block's start (loses x@18 -> x = 1@69), or let it end with the if holding the break (z = 2@97 takes the read: gains z@30 -> z = 2@97, loses z@30 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47)",
+			src:      "fn f(c: bool, mut x: i32, mut z: i32) -> i32 { let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 }; y + x + z }",
+			cd:       []string{"c@79 -> break 'a 0@83", "c@79 -> z = 2@97", "c@79 -> 1@104"},
+			du: []string{"c@5 -> c@79", "x@18 -> x = 1@69", "x = 1@69 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "z@30 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "z = 2@97 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47",
+				"break 'a 0@83 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "1@104 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47 -> y + x + z@109", "x = 1@69 -> y + x + z@109",
+				"z@30 -> y + x + z@109", "z = 2@97 -> y + x + z@109"},
 		},
 	})
 }
