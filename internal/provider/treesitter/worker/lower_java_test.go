@@ -1190,5 +1190,365 @@ func TestJavaLoweringGolden(t *testing.T) {
 			du: []string{"o@23 -> o@34", "o@34 -> s@54", "o@34 -> !(o instanceof String s)@32",
 				"s@54 -> return s.length();@73"},
 		},
+		{
+			// §8.9.1, §12.4.2. Callable 0, the enum body: the enum constant
+			// P's argument c() ? 1 : 2 lowers to c()@11 (Branch), 1@17 and
+			// 2@21 (each defining the conditional's result), then P(c() ? 1 :
+			// 2)@9 (a Stmt node Using the result), then Q@25. The
+			// constructors and c are callables of their own.
+			name:     "an enum body's unit lowers each enum constant as a node after its arguments",
+			protects: "the decision inside an enum constant's arguments is lowered in the enum body's unit, and the constant's node consumes its arguments' value",
+			mutation: "skip enum constants in the unit (loses every pair and c()@11's control dependences)",
+			src:      "enum E { P(c() ? 1 : 2), Q; E() {} E(int x) {} static boolean c() { return true; } }",
+			fn:       0,
+			cd:       []string{"c()@11 -> 1@17", "c()@11 -> 2@21"},
+			du:       []string{"1@17 -> P(c() ? 1 : 2)@9", "2@21 -> P(c() ? 1 : 2)@9"},
+		},
+		{
+			// §9.3. Callable 0, the interface body: the constant X's
+			// initializer lowers to I.c()@22 (Branch; I is no variable),
+			// 1@30 and 2@34 (the arms), then X = I.c() ? 1 : 2@18.
+			name:     "an interface body's unit lowers its constant declarators",
+			protects: "an interface constant's initializer is lowered in the interface body's unit",
+			mutation: "drop interface_body from the callables (callable 0 becomes the method c: no pair), or skip constant declarations in the unit (loses every pair)",
+			src:      "interface I { int X = I.c() ? 1 : 2; static boolean c() { return true; } }",
+			fn:       0,
+			cd:       []string{"I.c()@22 -> 1@30", "I.c()@22 -> 2@34"},
+			du:       []string{"1@30 -> X = I.c() ? 1 : 2@18", "2@34 -> X = I.c() ? 1 : 2@18"},
+		},
+		{
+			// §8.1.3, §15.26.1. Nodes: a = new int[1]@28, class L { … }@44 (the
+			// local class declaration: Uses its capture a and may-defines it,
+			// since its method writes an element of a), new L().m()@79,
+			// return a;@92. The declaration is a χ of a, so the return pairs
+			// with it, the nearest may-definition, and with the killing
+			// definition before it.
+			name:     "a local class writing through a captured array may-defines it where it is declared",
+			protects: "a use of a captured array after a local class declaration sees the element write its methods may perform",
+			mutation: "record no write through a captured local in a local class (loses class L { void m() { a[0] = 1; } }@44 -> return a;@92)",
+			src:      "class A { int[] f() { int[] a = new int[1]; class L { void m() { a[0] = 1; } } new L().m(); return a; } }",
+			fn:       1,
+			du: []string{"a = new int[1]@28 -> class L { void m() { a[0] = 1; } }@44",
+				"a = new int[1]@28 -> return a;@92", "class L { void m() { a[0] = 1; } }@44 -> return a;@92"},
+		},
+		{
+			// §15.28, §14.20.1. Nodes: x@20, r = 0@29, x@60 (the selector: the
+			// g() evaluated before it is its pending throw), case 1@65, 2@75,
+			// 3@89, r = g() + switch (x) { … }@42 (the consumer: the throw
+			// saved across the switch expression stays pending, so it may
+			// throw too), the Handler catch@97, E@104, e@106, r = 1@111,
+			// return r;@120. Succ: x@60→{case 1, catch}; case 1→{2, 3}; 2, 3 →
+			// the assignment→{return, catch}; catch→E→{e, EXIT}; e→r =
+			// 1→return. IPDom: x@60, the assignment, E, return → EXIT; case 1,
+			// 2, 3 → the assignment; catch → E; e → r = 1 → return. Frontier
+			// walks: x@60 over case 1, the assignment, catch and E; case 1
+			// over 2 and 3; the assignment over return, catch and E; E over
+			// e, r = 1 and return.
+			name:     "a throw pending before a nested switch expression stays pending for its consumer",
+			protects: "the node consuming a switch expression still carries a throwing construct its statement evaluated before the switch",
+			mutation: "drop the pending throw when a nested switch expression ends (the assignment loses its MayThrow edge: loses its control of catch@97 and E@104)",
+			src:      "class A { int f(int x) { int r = 0; try { r = g() + switch (x) { case 1 -> 2; default -> 3; }; } catch (E e) { r = 1; } return r; } }",
+			fn:       1,
+			cd: []string{"x@60 -> case 1@65", "x@60 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42",
+				"x@60 -> catch@97", "x@60 -> E@104", "case 1@65 -> 2@75", "case 1@65 -> 3@89",
+				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> return r;@120",
+				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> catch@97",
+				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> E@104",
+				"E@104 -> e@106", "E@104 -> r = 1@111", "E@104 -> return r;@120"},
+			du: []string{"x@20 -> x@60", "x@60 -> case 1@65",
+				"2@75 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42", "3@89 -> r = g() + switch (x) { case 1 -> 2; default -> 3; }@42",
+				"r = g() + switch (x) { case 1 -> 2; default -> 3; }@42 -> return r;@120", "r = 1@111 -> return r;@120"},
+		},
+		{
+			// §14.20.2. Nodes: r = 0@24, r = g()@37 (throws into the finally),
+			// the Handler finally@48, h(r)@58 (the finally body, entered by
+			// normal completion and by the Handler), return r;@66. Succ: r =
+			// g()→{h(r), finally}; finally→h(r); h(r)→{return, EXIT (the
+			// re-issued throw)}. IPDom: r = g(), finally → h(r) → EXIT.
+			// Frontier walks: r = g() over finally; h(r) over return. The
+			// Handler carries r = g()'s entry value r = 0.
+			name:     "a finally without a catch has a Handler at finally when its block may throw",
+			protects: "an exception from a try block without catch clauses runs the finally with the values before the throwing node, then leaves",
+			mutation: "open no Handler for a finally frame's MayThrow sources (loses r = 0@24 -> h(r)@58 and -> return r;@66, and r = g()@37 loses its control of finally@48)",
+			src:      "class A { int f() { int r = 0; try { r = g(); } finally { h(r); } return r; } }",
+			fn:       1,
+			cd:       []string{"r = g()@37 -> finally@48", "h(r)@58 -> return r;@66"},
+			du: []string{"r = 0@24 -> h(r)@58", "r = g()@37 -> h(r)@58",
+				"r = 0@24 -> return r;@66", "r = g()@37 -> return r;@66"},
+		},
+		{
+			// §14.20.3.2. Nodes: r = 0@24, a = open()@38 (the acquisition: its
+			// call throws to the statement's catch), r = a.u()@52 (throws to
+			// the resource's finally), the resource's Handler )@48, R a =
+			// open()@36 (the close: Uses a, throws to the catch, and re-issues
+			// the intercepted throw there), the Handler catch@65, E@72, e@74,
+			// r = 1@79, h(r)@98 (the statement's finally, entered by normal
+			// completion, the catch body and E's rethrow), return r;@106.
+			// Succ: a = open()→{r = a.u(), catch}; r = a.u()→{R a, )@48};
+			// )@48→R a; R a→{h(r), catch, E}; catch→E→{e, h(r)}; e→r =
+			// 1→h(r); h(r)→{return, EXIT}. IPDom: a = open(), R a, E → h(r)
+			// → EXIT; r = a.u(), )@48 → R a; catch → E. Frontier walks: a =
+			// open() over r = a.u(), R a, catch and E; r = a.u() over )@48;
+			// R a over catch and E; E over e and r = 1; h(r) over return.
+			// Each Handler carries its sources' entry values, so r = 0 reaches
+			// the finally along every exceptional path.
+			name:     "an extended try-with-resources closes its resources inside its own catch and finally",
+			protects: "the statement's catch clauses catch what the acquisition, the block and the close throw, and its finally follows every path",
+			mutation: "close the resources outside the statement's catch clauses (R a = open()@36 throws past the catch: loses R a = open()@36 -> catch@65 and -> E@72)",
+			src:      "class A { int f() { int r = 0; try (R a = open()) { r = a.u(); } catch (E e) { r = 1; } finally { h(r); } return r; } }",
+			fn:       1,
+			cd: []string{"a = open()@38 -> r = a.u()@52", "a = open()@38 -> R a = open()@36", "a = open()@38 -> catch@65",
+				"a = open()@38 -> E@72", "r = a.u()@52 -> )@48", "R a = open()@36 -> catch@65", "R a = open()@36 -> E@72",
+				"E@72 -> e@74", "E@72 -> r = 1@79", "h(r)@98 -> return r;@106"},
+			du: []string{"a = open()@38 -> r = a.u()@52", "a = open()@38 -> R a = open()@36",
+				"r = 0@24 -> h(r)@98", "r = a.u()@52 -> h(r)@98", "r = 1@79 -> h(r)@98",
+				"r = 0@24 -> return r;@106", "r = a.u()@52 -> return r;@106", "r = 1@79 -> return r;@106"},
+		},
+		{
+			// §15.9.4, §15.9.5. Nodes: k@23, n@30, new B(k) { … }@42 (the
+			// creation: Uses its argument's read of k and its capture n,
+			// defines the owned result), return …@35 (Uses the result).
+			name:     "an anonymous class creation reads its arguments as well as its captures",
+			protects: "the creating node carries the constructor arguments' reads, evaluated where the object is created",
+			mutation: "let the creation node Use only its captures (loses k@23 -> new B(k) { int m() { return n; } }@42)",
+			src:      "class A { Object f(int k, int n) { return new B(k) { int m() { return n; } }; } }",
+			fn:       1,
+			du: []string{"k@23 -> new B(k) { int m() { return n; } }@42", "n@30 -> new B(k) { int m() { return n; } }@42",
+				"new B(k) { int m() { return n; } }@42 -> return new B(k) { int m() { return n; } };@35"},
+		},
+		{
+			// §15.27.2 (the source assigns a captured local, which the
+			// language rejects; it parses, and pins the capture walk). Nodes:
+			// n@21, () -> { n = 1; }@39 (the lambda: a plain assignment writes
+			// n without reading it, so it Uses nothing), r = () -> { n = 1;
+			// }@35 (Uses the result).
+			name:     "the capture walk takes a plain assignment's local target as written, not read",
+			protects: "a lambda that only assigns an enclosing name does not read it",
+			mutation: "let the capture walk read a plain assignment's target (gains n@21 -> () -> { n = 1; }@39)",
+			src:      "class A { void f(int n) { Runnable r = () -> { n = 1; }; } }",
+			fn:       1,
+			du:       []string{"() -> { n = 1; }@39 -> r = () -> { n = 1; }@35"},
+		},
+		{
+			// §15.11.1, §15.10.4, §15.16. Nodes: o@25, a@34, r = 0@43, r =
+			// this.v@56 (no throw: the receiver is this), r = o.f@68, r =
+			// a[0]@77, r = (int) (Object) r@87 (each may throw), the Handler
+			// catch@111, E@118, e@120, r = 1@125, return r;@134. Succ: r =
+			// this.v→r = o.f→{r = a[0], catch}; r = a[0]→{the cast, catch};
+			// the cast→{return, catch}; catch→E→{e, EXIT}; e→r = 1→return.
+			// IPDom: r = o.f, r = a[0], the cast, E, return → EXIT; catch → E.
+			// Frontier walks: each throwing node over its next node, catch and
+			// E; E over e, r = 1 and return.
+			name:     "a field access through a receiver, an array access and a cast may throw, and a field of this does not",
+			protects: "only the constructs that can throw give a node an exceptional edge into the catch",
+			mutation: "count a field access through this as throwing (gains r = this.v@56 -> r = o.f@68, -> catch@111 and -> E@118)",
+			src:      "class A { int v; int f(P o, int[] a) { int r = 0; try { r = this.v; r = o.f; r = a[0]; r = (int) (Object) r; } catch (E e) { r = 1; } return r; } }",
+			fn:       1,
+			cd: []string{"r = o.f@68 -> r = a[0]@77", "r = o.f@68 -> catch@111", "r = o.f@68 -> E@118",
+				"r = a[0]@77 -> r = (int) (Object) r@87", "r = a[0]@77 -> catch@111", "r = a[0]@77 -> E@118",
+				"r = (int) (Object) r@87 -> return r;@134", "r = (int) (Object) r@87 -> catch@111", "r = (int) (Object) r@87 -> E@118",
+				"E@118 -> e@120", "E@118 -> r = 1@125", "E@118 -> return r;@134"},
+			du: []string{"o@25 -> r = o.f@68", "a@34 -> r = a[0]@77", "r = a[0]@77 -> r = (int) (Object) r@87",
+				"r = (int) (Object) r@87 -> return r;@134", "r = 1@125 -> return r;@134"},
+		},
+		{
+			// §14.14.2, §14.20.1. Nodes: xs@40, s = 0@50, xs@76 (the iterated
+			// expression), int x : xs@68 (the head: its iterator step may
+			// throw), x@72, s += x@80, the Handler catch@90, E@97, e@99, s =
+			// -1@104, return s;@114. Succ: xs@76→head→{x, return, catch};
+			// x→s += x→head; catch→E→{e, EXIT}; e→s = -1→return. IPDom: head,
+			// E, return → EXIT; x → s += x → head; catch → E. Frontier walks:
+			// the head over x, s += x, itself, return, catch and E; E over e,
+			// s = -1 and return.
+			name:     "an enhanced for's head may throw",
+			protects: "the iterator step of an enhanced for inside a try reaches the catch",
+			mutation: "give the enhanced-for head no MayThrow (loses int x : xs@68 -> catch@90 and -> E@97)",
+			src:      "class A { int f(java.util.List<Integer> xs) { int s = 0; try { for (int x : xs) s += x; } catch (E e) { s = -1; } return s; } }",
+			fn:       1,
+			cd: []string{"int x : xs@68 -> x@72", "int x : xs@68 -> s += x@80", "int x : xs@68 -> int x : xs@68",
+				"int x : xs@68 -> return s;@114", "int x : xs@68 -> catch@90", "int x : xs@68 -> E@97",
+				"E@97 -> e@99", "E@97 -> s = -1@104", "E@97 -> return s;@114"},
+			du: []string{"xs@40 -> xs@76", "xs@76 -> int x : xs@68", "xs@76 -> x@72", "x@72 -> s += x@80",
+				"s = 0@50 -> s += x@80", "s += x@80 -> s += x@80", "s = 0@50 -> return s;@114", "s += x@80 -> return s;@114",
+				"s = -1@104 -> return s;@114"},
+		},
+		{
+			// §14.19, §14.20.1. Nodes: o@23, r = 0@32, o@59 (the monitor
+			// expression: may throw), r = 1@64, the Handler catch@75, E@82,
+			// e@84, r = 2@89, return r;@98. Succ: o@59→{r = 1, catch}; r =
+			// 1→return; catch→E→{e, EXIT}; e→r = 2→return. IPDom: o@59, E,
+			// return → EXIT; r = 1 → return; catch → E. Frontier walks: o@59
+			// over r = 1, return, catch and E; E over e, r = 2 and return.
+			name:     "a monitor expression may throw",
+			protects: "a synchronized statement inside a try can fail at its monitor and reach the catch",
+			mutation: "give a monitor expression no MayThrow (loses o@59 -> catch@75 and -> E@82)",
+			src:      "class A { int f(Object o) { int r = 0; try { synchronized (o) { r = 1; } } catch (E e) { r = 2; } return r; } }",
+			fn:       1,
+			cd: []string{"o@59 -> r = 1@64", "o@59 -> return r;@98", "o@59 -> catch@75", "o@59 -> E@82",
+				"E@82 -> e@84", "E@82 -> r = 2@89", "E@82 -> return r;@98"},
+			du: []string{"o@23 -> o@59", "r = 1@64 -> return r;@98", "r = 2@89 -> return r;@98"},
+		},
+		{
+			// §15.17.2, §14.20.2. Nodes: a@20, b@27, r = 0@36, r = a / b@49,
+			// h(r)@72 (the finally), return r;@80. Division is not counted as
+			// throwing, so nothing reaches the finally by MayThrow: no Handler,
+			// and a straight line. A deliberate give-up: an ArithmeticException
+			// path is not modelled.
+			name:     "division is not counted as throwing",
+			protects: "a try whose only possible exception is a division by zero has no exceptional edge",
+			mutation: "count division as throwing (a Handler finally@62 appears, and gains r = 0@36 -> h(r)@72 and -> return r;@80)",
+			src:      "class A { int f(int a, int b) { int r = 0; try { r = a / b; } finally { h(r); } return r; } }",
+			fn:       1,
+			du: []string{"a@20 -> r = a / b@49", "b@27 -> r = a / b@49", "r = a / b@49 -> h(r)@72",
+				"r = a / b@49 -> return r;@80"},
+		},
+		{
+			// §6.3.4, §14.11.1. Nodes: o@23, o@43 (selector), case Object x
+			// when x instanceof String s@48 (the label), x@60 (the pattern
+			// variable), x@67 (the guard's tested value, reading x), s@87,
+			// x instanceof String s@67 (the guard's Branch), s.length()@92
+			// (the arm), 0@115 (default), return …@28. Succ: the label→{x@60,
+			// 0}; x@60→x@67→s→the guard→{s.length(), 0}; both → return.
+			// IPDom: the label, the guard → return; x@60 → x@67 → s → the
+			// guard. Frontier walks: the label over x@60, x@67, s, the guard
+			// and 0; the guard over s.length() and 0. The guard's when-true s
+			// is in scope in the rule.
+			name:     "a guard's when-true pattern variable is in scope in its rule",
+			protects: "an arm reads the pattern variable its guard's test defines",
+			mutation: "keep a guard's when-true set out of its rule (loses s@87 -> s.length()@92)",
+			src:      "class A { int f(Object o) { return switch (o) { case Object x when x instanceof String s -> s.length(); default -> 0; }; } }",
+			fn:       1,
+			cd: []string{"case Object x when x instanceof String s@48 -> x@60", "case Object x when x instanceof String s@48 -> x@67",
+				"case Object x when x instanceof String s@48 -> s@87", "case Object x when x instanceof String s@48 -> x instanceof String s@67",
+				"case Object x when x instanceof String s@48 -> 0@115",
+				"x instanceof String s@67 -> s.length()@92", "x instanceof String s@67 -> 0@115"},
+			du: []string{"o@23 -> o@43", "o@43 -> case Object x when x instanceof String s@48", "o@43 -> x@60",
+				"x@60 -> x@67", "x@67 -> s@87", "x@67 -> x instanceof String s@67", "s@87 -> s.length()@92",
+				"s.length()@92 -> return switch (o) { case Object x when x instanceof String s -> s.length(); default -> 0; };@28",
+				"0@115 -> return switch (o) { case Object x when x instanceof String s -> s.length(); default -> 0; };@28"},
+		},
+		{
+			// §6.3.1.2, §6.3.2.2. Nodes: o@27, o@38 (tested value), s@58, !(o
+			// instanceof String s)@36 (the || deciding operand's Branch,
+			// defining the operator's result), s.isEmpty()@64 (the right
+			// operand: s, the left's when-false set, is in scope), the
+			// condition @36 (Uses the result), return false;@77, return
+			// s.length() > 1;@91. Succ: the left→{the condition, s.isEmpty()};
+			// s.isEmpty()→the condition→{return false, the last return}.
+			// IPDom: the left → the condition → EXIT. The || introduces its
+			// when-false set {s} and the then statement cannot complete
+			// normally, so s is in scope after the if.
+			name:     "a || left operand's when-false pattern variable is in scope in its right operand and after the if",
+			protects: "the right operand of || and the code after an if that exits when || is true read the pattern variable of the negated test",
+			mutation: "put a || left operand's when-true set in scope in its right operand (loses s@58 -> s.isEmpty()@64), or introduce nothing after the if (loses s@58 -> return s.length() > 1;@91)",
+			src:      "class A { boolean f(Object o) { if (!(o instanceof String s) || s.isEmpty()) return false; return s.length() > 1; } }",
+			fn:       1,
+			cd: []string{"!(o instanceof String s)@36 -> s.isEmpty()@64",
+				"!(o instanceof String s) || s.isEmpty()@36 -> return false;@77",
+				"!(o instanceof String s) || s.isEmpty()@36 -> return s.length() > 1;@91"},
+			du: []string{"o@27 -> o@38", "o@38 -> s@58", "o@38 -> !(o instanceof String s)@36", "s@58 -> s.isEmpty()@64",
+				"!(o instanceof String s)@36 -> !(o instanceof String s) || s.isEmpty()@36",
+				"s.isEmpty()@64 -> !(o instanceof String s) || s.isEmpty()@36", "s@58 -> return s.length() > 1;@91"},
+		},
+		{
+			// §6.3.2.2. Nodes: o@23, o@32 (tested value), s@52, o instanceof
+			// String s@32 (the condition), return 0;@63, return s.length();@73.
+			// The then statement completes normally and the else does not, so
+			// the when-true s is in scope after the if.
+			name:     "an if whose else alone cannot complete introduces its when-true pattern variable after it",
+			protects: "a use after an if that leaves only through its else resolves to the pattern variable of the test",
+			mutation: "introduce only a when-false set after an if (loses s@52 -> return s.length();@73)",
+			src:      "class A { int f(Object o) { if (o instanceof String s) {} else return 0; return s.length(); } }",
+			fn:       1,
+			cd:       []string{"o instanceof String s@32 -> return 0;@63", "o instanceof String s@32 -> return s.length();@73"},
+			du: []string{"o@23 -> o@32", "o@32 -> s@52", "o@32 -> o instanceof String s@32",
+				"s@52 -> return s.length();@73"},
+		},
+		{
+			// §6.3.2.5, §14.14.1.2. Nodes: o@24, o@36 (tested value, the head's
+			// first node), s@56, o instanceof String s@36 (the condition),
+			// g(s)@81, o = s.substring(1)@59 (the update). Succ: o@36→s→the
+			// condition→{g(s), EXIT}; g(s)→the update→o@36. IPDom: o@36 → s
+			// → the condition → EXIT; g(s) → the update → o@36. Frontier walk:
+			// the condition over g(s), the update, o@36, s and itself.
+			name:     "a basic for's when-true pattern variable is in scope in its update clause",
+			protects: "the update clause reads the pattern variable the condition defines on each iteration",
+			mutation: "scope the condition's when-true set to the body only (loses s@56 -> o = s.substring(1)@59)",
+			src:      "class A { void f(Object o) { for (; o instanceof String s; o = s.substring(1)) { g(s); } } }",
+			fn:       1,
+			cd: []string{"o instanceof String s@36 -> g(s)@81", "o instanceof String s@36 -> o = s.substring(1)@59",
+				"o instanceof String s@36 -> o@36", "o instanceof String s@36 -> s@56",
+				"o instanceof String s@36 -> o instanceof String s@36"},
+			du: []string{"o@24 -> o@36", "o = s.substring(1)@59 -> o@36", "o@36 -> s@56", "o@36 -> o instanceof String s@36",
+				"s@56 -> g(s)@81", "s@56 -> o = s.substring(1)@59"},
+		},
+		{
+			// §6.3.2.3, §14.15. s is also a field. Nodes: o@33, o@47 (tested
+			// value), s@67, !(o instanceof String s)@45 (the condition), o ==
+			// null@77, break;@88, o = g()@95, return s.length();@106. Succ:
+			// o@47→s→the condition→{o == null, return}; o == null→{break, o =
+			// g()}; break→return; o = g()→o@47. IPDom: the condition, o ==
+			// null, break → return; o@47 → s → the condition; o = g() → o@47.
+			// Frontier walks: the condition over o == null; o == null over
+			// break, and over o = g(), o@47, s and the condition. A break
+			// leaves the body, so the loop introduces nothing: the return
+			// reads the field.
+			name:     "a break that leaves a loop body blocks the loop's pattern variable after it",
+			protects: "a use after a loop a break may leave resolves to what the name meant before the loop, not to the condition's pattern variable",
+			mutation: "introduce the when-false set after a loop a break leaves (gains s@67 -> return s.length();@106)",
+			src:      "class A { String s; int f(Object o) { while (!(o instanceof String s)) { if (o == null) break; o = g(); } return s.length(); } }",
+			fn:       1,
+			cd: []string{"!(o instanceof String s)@45 -> o == null@77", "o == null@77 -> break;@88",
+				"o == null@77 -> o = g()@95", "o == null@77 -> o@47", "o == null@77 -> s@67",
+				"o == null@77 -> !(o instanceof String s)@45"},
+			du: []string{"o@33 -> o@47", "o = g()@95 -> o@47", "o@47 -> s@67", "o@47 -> !(o instanceof String s)@45",
+				"o@33 -> o == null@77", "o = g()@95 -> o == null@77"},
+		},
+		{
+			// §6.3.2.7, §14.7. s is also a field. Nodes: o@33, o@47 (tested
+			// value), s@67, !(o instanceof String s)@45 (the condition), return
+			// 0;@71, return s.length();@81. The labelled if holds no break
+			// naming its label, so it introduces what the if does: s.
+			name:     "a labelled statement introduces its statement's pattern variables when no break leaves it",
+			protects: "a label does not hide the pattern variable its if introduces",
+			mutation: "introduce nothing after a labelled statement (loses s@67 -> return s.length();@81)",
+			src:      "class A { String s; int f(Object o) { l: if (!(o instanceof String s)) return 0; return s.length(); } }",
+			fn:       1,
+			cd:       []string{"!(o instanceof String s)@45 -> return 0;@71", "!(o instanceof String s)@45 -> return s.length();@81"},
+			du: []string{"o@33 -> o@47", "o@47 -> s@67", "o@47 -> !(o instanceof String s)@45",
+				"s@67 -> return s.length();@81"},
+		},
+		{
+			// §6.3.2.7, §14.15. s is also a field. Nodes: o@33, o@47, s@67, the
+			// condition @45, break l;@71 (leaves the labelled if for its end),
+			// return s.length();@80. A break leaves the labelled statement,
+			// so it introduces nothing: the return reads the field.
+			name:     "a labelled statement a break leaves introduces nothing",
+			protects: "a use after a labelled statement its break may leave resolves to what the name meant before it",
+			mutation: "let a labelled statement introduce its statement's set though a break leaves it (gains s@67 -> return s.length();@80)",
+			src:      "class A { String s; int f(Object o) { l: if (!(o instanceof String s)) break l; return s.length(); } }",
+			fn:       1,
+			cd:       []string{"!(o instanceof String s)@45 -> break l;@71"},
+			du:       []string{"o@33 -> o@47", "o@47 -> s@67", "o@47 -> !(o instanceof String s)@45"},
+		},
+		{
+			// §14.22, §14.20.2, §6.3.2.2. Nodes: o@23, o@34, s@54, the
+			// condition @32, return 0;@66 (intercepted by the finally), g()@88
+			// (the finally, which re-issues the return), return s.length();@97.
+			// A try whose block cannot complete normally cannot either, though
+			// its finally can, so the then block cannot and the if introduces
+			// s. Succ: the condition→{return 0, return s.length()}; return
+			// 0→g()→EXIT. IPDom: the condition → EXIT. Frontier walks: the
+			// condition over return 0, g() and return s.length().
+			name:     "a then block ending in a try whose block returns cannot complete normally",
+			protects: "normal completion follows the language's rules for try with finally, so the pattern variable is in scope after the if",
+			mutation: "take every try as completing normally (loses s@54 -> return s.length();@97)",
+			src:      "class A { int f(Object o) { if (!(o instanceof String s)) { try { return 0; } finally { g(); } } return s.length(); } }",
+			fn:       1,
+			cd: []string{"!(o instanceof String s)@32 -> return 0;@66", "!(o instanceof String s)@32 -> g()@88",
+				"!(o instanceof String s)@32 -> return s.length();@97"},
+			du: []string{"o@23 -> o@34", "o@34 -> s@54", "o@34 -> !(o instanceof String s)@32",
+				"s@54 -> return s.length();@97"},
+		},
 	})
 }
