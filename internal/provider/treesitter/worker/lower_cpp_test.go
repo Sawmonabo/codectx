@@ -240,5 +240,244 @@ func TestCppLoweringGolden(t *testing.T) {
 			du: []string{"x@10 -> &&r = std::move(x)@19", "x@10 -> &q{x}@43", "&&r = std::move(x)@19 -> &q{x}@43",
 				"x@10 -> &t((x))@54", "&q{x}@43 -> &t((x))@54", "x@10 -> return x;@63", "&t((x))@54 -> return x;@63"},
 		},
+		{
+			// [expr.prim.lambda.closure]: a lambda is a function of its own,
+			// fn 1 in preorder. Its parameter x is a node after Entry; the
+			// captured a is no variable of the lambda's own function. Nodes:
+			// x@32, return x + a;@37.
+			name:      "a lambda is lowered as its own function with its parameters",
+			protects:  "the lambda's body is a callable whose parameters are defined at its entry",
+			mutation:  "lower a lambda without its parameters (loses x@32 -> return x + a;@37)",
+			src:       "int f(int a) { auto l = [a](int x) { return x + a; }; return l(1); }",
+			fn:        1,
+			callables: 2,
+			du:        []string{"x@32 -> return x + a;@37"},
+		},
+		{
+			// [dcl.fct.default]: a default argument is evaluated by the caller,
+			// so the callee sees only its parameter. Nodes: x@10, return x;@21.
+			name:     "a default argument makes no node",
+			protects: "the parameter's entry node is its only definition, whatever the default",
+			mutation: "lower the default as a node defining the parameter (adds g()@14 -> return x;@21, loses x@10 -> return x;@21)",
+			src:      "int f(int x = g()) { return x; }",
+			du:       []string{"x@10 -> return x;@21"},
+		},
+		{
+			// [dcl.init]/7: an object of class type without an initializer is
+			// default-initialized by its constructor, which may throw. Nodes:
+			// w@18 (defines w, may throw), return w.n;@21, the Handler
+			// catch@35, return 0;@49. Succ: w→{return w.n, catch};
+			// catch→return 0. IPDom: w → EXIT.
+			name:     "a class-type declarator without an initializer is a throwing definition",
+			protects: "a default-constructed local is defined at its declarator and its constructor reaches the handler",
+			mutation: "make no node for a declarator without an initializer (every pair vanishes)",
+			src:      "int f() { try { V w; return w.n; } catch (...) { return 0; } }",
+			cd:       []string{"w@18 -> return w.n;@21", "w@18 -> catch@35", "w@18 -> return 0;@49"},
+			du:       []string{"w@18 -> return w.n;@21"},
+		},
+		{
+			// [dcl.stc]/5: an extern block-scope declaration refers to an
+			// object defined elsewhere and constructs nothing. Nodes: x@10,
+			// x@19 (Branch), return 0;@38; `extern V e;` makes no node.
+			name:     "an extern declaration makes no node",
+			protects: "an extern declaration of a class-type object is not a default initialization",
+			mutation: "drop the extern check in classType (adds x@19 -> e@33)",
+			src:      "int f(int x) { if (x) { extern V e; } return 0; }",
+			du:       []string{"x@10 -> x@19"},
+		},
+		{
+			// [dcl.struct.bind]/1 and [dcl.init.ref]/5: `auto &[a, b] = p`
+			// binds a reference to p, so the initializer's node may-defines p.
+			// Nodes: p@8, p@28 (the initializer: Uses and may-defines p,
+			// defines the owned variable), a@20, b@23, a = 1@31, return g(0,
+			// p);@38.
+			name:     "a structured binding by reference may-defines its initializer's base",
+			protects: "a write through a name bound by `auto &[a, b] = p` is accounted as a possible write of p",
+			mutation: "read a by-reference structured binding's initializer as a plain value (loses p@28 -> return g(0, p);@38)",
+			src:      "int f(P p) { auto &[a, b] = p; a = 1; return g(0, p); }",
+			du: []string{"p@8 -> p@28", "p@28 -> a@20", "p@28 -> b@23", "p@8 -> return g(0, p);@38",
+				"p@28 -> return g(0, p);@38"},
+		},
+		{
+			// [stmt.switch] and [stmt.pre]: a switch condition that declares y
+			// initializes y once; the case tests compare against it. Nodes:
+			// int y = g()@18 (defines y), 1@38 (the test, Using y), return
+			// y;@41, return 0;@53.
+			name:     "a switch condition declaration defines the name its tests use",
+			protects: "the case tests of a declaring switch condition Use the declared name, which the body also reads",
+			mutation: "give the declaring condition no definition of y (loses int y = g()@18 -> 1@38 and int y = g()@18 -> return y;@41)",
+			src:      "int f() { switch (int y = g()) { case 1: return y; } return 0; }",
+			cd:       []string{"1@38 -> return y;@41", "1@38 -> return 0;@53"},
+			du:       []string{"int y = g()@18 -> 1@38", "int y = g()@18 -> return y;@41"},
+		},
+		{
+			// [dcl.ref]/1: in `const int *&r` the reference refers to a
+			// non-const pointer (the const qualifies the pointee), so binding
+			// it may-defines p. Nodes: p@17, *&r = p@32 (Uses p, defines r,
+			// may-defines p), g(0, r)@41, return p != 0;@50.
+			name:     "a reference to a pointer to const may-define the pointer",
+			protects: "the const nearest the reference decides whether its binding may write, not a const further out",
+			mutation: "take the declaration's const as the reference's (loses *&r = p@32 -> return p != 0;@50)",
+			src:      "int f(const int *p) { const int *&r = p; g(0, r); return p != 0; }",
+			du: []string{"p@17 -> *&r = p@32", "*&r = p@32 -> g(0, r)@41", "p@17 -> return p != 0;@50",
+				"*&r = p@32 -> return p != 0;@50"},
+		},
+		{
+			// [expr.delete]: delete p destroys the object p points to and
+			// reads p. Nodes: p@12, delete p@17 (Uses p), g(0, p)@27.
+			name:     "delete of a local pointer only reads it",
+			protects: "deleting through a local is no write of the local",
+			mutation: "treat delete's operand as written (adds delete p@17 -> g(0, p)@27)",
+			src:      "void f(int *p) { delete p; g(0, p); }",
+			du:       []string{"p@12 -> delete p@17", "p@12 -> g(0, p)@27"},
+		},
+		{
+			// [expr.new]: the allocation or the constructor may throw. Nodes:
+			// x@11, p = 0@21, p = new int(x)@34 (may throw), the Handler
+			// catch@52, return 0;@66, return p;@78. Succ: p = new int(x)→
+			// {return p, catch}; catch→return 0. IPDom: p = new int(x) → EXIT.
+			name:     "a new expression may throw",
+			protects: "an allocation in a try body reaches its handler",
+			mutation: "count no throw for new (p = new int(x)@34 controls nothing)",
+			src:      "int *f(int x) { int *p = 0; try { p = new int(x); } catch (...) { return 0; } return p; }",
+			cd: []string{"p = new int(x)@34 -> catch@52", "p = new int(x)@34 -> return 0;@66",
+				"p = new int(x)@34 -> return p;@78"},
+			du: []string{"x@11 -> p = new int(x)@34", "p = new int(x)@34 -> return p;@78"},
+		},
+		{
+			// [expr.delete]: the destructor and the deallocation function may
+			// throw. Nodes: p@9, delete p@20 (may throw), the Handler catch@32,
+			// return 1;@46, return 0;@58.
+			name:     "a delete expression may throw",
+			protects: "a deletion in a try body reaches its handler",
+			mutation: "count no throw for delete (delete p@20 controls nothing)",
+			src:      "int f(S *p) { try { delete p; } catch (...) { return 1; } return 0; }",
+			cd:       []string{"delete p@20 -> catch@32", "delete p@20 -> return 1;@46", "delete p@20 -> return 0;@58"},
+			du:       []string{"p@9 -> delete p@20"},
+		},
+		{
+			// [dcl.init]/16: a parenthesized or braced initializer calls a
+			// constructor, which may throw. Two arguments keep `V u(x, 1)` from
+			// reading as a function declaration ([dcl.ambig.res]). Nodes: x@10,
+			// u(x, 1)@23, w{x}@34 (each may throw), the Handler catch@42,
+			// return 1;@56, return 0;@68. Succ: u→{w, catch}; w→{return 0,
+			// catch}; catch→return 1. IPDom: u, w → EXIT; catch → return 1.
+			name:     "direct initialization may throw",
+			protects: "a constructor call written as a parenthesized or braced initializer reaches the handler",
+			mutation: "count no throw for an argument-list or braced initializer (u(x, 1)@23 and w{x}@34 control nothing)",
+			src:      "int f(int x) { try { V u(x, 1); V w{x}; } catch (...) { return 1; } return 0; }",
+			cd: []string{"u(x, 1)@23 -> w{x}@34", "u(x, 1)@23 -> catch@42", "u(x, 1)@23 -> return 1;@56",
+				"w{x}@34 -> return 0;@68", "w{x}@34 -> catch@42", "w{x}@34 -> return 1;@56"},
+			du: []string{"x@10 -> u(x, 1)@23", "x@10 -> w{x}@34"},
+		},
+		{
+			// [except.pre]/4: a function-try-block of an ordinary function
+			// covers its body; the end of its handler returns. Nodes: x@10,
+			// return g(x);@19 (may throw), the Handler catch@34, return x;@48.
+			// Succ: return g(x)→{EXIT, catch}; catch→return x.
+			name:     "a function-try-block of an ordinary function is lowered",
+			protects: "a definition whose body is a try statement lowers the try with its handlers",
+			mutation: "lower only a compound body (the handlers vanish: loses return g(x);@19 -> catch@34 and x@10 -> return x;@48)",
+			src:      "int f(int x) try { return g(x); } catch (...) { return x; }",
+			cd:       []string{"return g(x);@19 -> catch@34", "return g(x);@19 -> return x;@48"},
+			du:       []string{"x@10 -> return g(x);@19", "x@10 -> return x;@48"},
+		},
+		{
+			// [basic.scope.block]/2: a handler's parameter is scoped to the
+			// handler. Nodes: e@10, g()@21 (may throw), the Handler catch@28,
+			// (int e)@34 (the test, defining the caught e), h(0, e)@44, return
+			// e;@55. Succ: g()→{return e, catch}; catch→(int e)→{h(0, e),
+			// EXIT}; h(0, e)→return e. IPDom: g(), (int e) → EXIT; catch →
+			// (int e).
+			name:     "a catch parameter is scoped to its handler",
+			protects: "the caught name shadows the parameter inside the handler only",
+			mutation: "keep the catch parameter's binding after the handler (return e;@55 pairs with (int e)@34 instead of e@10)",
+			src:      "int f(int e) { try { g(); } catch (int e) { h(0, e); } return e; }",
+			cd: []string{"g()@21 -> catch@28", "g()@21 -> (int e)@34", "g()@21 -> return e;@55",
+				"(int e)@34 -> h(0, e)@44", "(int e)@34 -> return e;@55"},
+			du: []string{"(int e)@34 -> h(0, e)@44", "e@10 -> return e;@55"},
+		},
+		{
+			// [stmt.pre]/5: a name a condition declares is scoped to the
+			// statement. Nodes: x@10, int x = g()@19 (Branch, defining the
+			// inner x), h(0, x)@32, return x;@41.
+			name:     "a condition declaration is scoped to its statement",
+			protects: "the x an if condition declares shadows the parameter inside the if only",
+			mutation: "keep the condition's binding after the if (return x;@41 pairs with int x = g()@19 instead of x@10)",
+			src:      "int f(int x) { if (int x = g()) h(0, x); return x; }",
+			cd:       []string{"int x = g()@19 -> h(0, x)@32"},
+			du:       []string{"int x = g()@19 -> h(0, x)@32", "x@10 -> return x;@41"},
+		},
+		{
+			// [stmt.ranged]/1: the for-range-declaration is scoped to the loop.
+			// Nodes: v@8, x@15, v@33 (the range, defining the iteration
+			// variable), x : v@29 (the head), x@29 (the bound name), h(0,
+			// x)@36, return x;@45. Succ: v@33→head→{x@29, return x};
+			// x@29→h(0, x)→head.
+			name:     "a range for's name is scoped to the loop",
+			protects: "the bound name shadows the parameter inside the loop only",
+			mutation: "keep the bound name after the loop (return x;@45 pairs with x@29 instead of x@15)",
+			src:      "int f(V v, int x) { for (int x : v) h(0, x); return x; }",
+			cd:       []string{"x : v@29 -> x@29", "x : v@29 -> h(0, x)@36", "x : v@29 -> x : v@29"},
+			du: []string{"v@8 -> v@33", "v@33 -> x : v@29", "v@33 -> x@29", "x@29 -> h(0, x)@36",
+				"x@15 -> return x;@45"},
+		},
+		{
+			// [expr.prim.lambda.capture]/7: a name the lambda body declares is
+			// its own, so nothing is captured. Nodes: a@10, the lambda @24
+			// (Uses nothing, defines its result), l = …@20, l()@51, return
+			// a;@56.
+			name:     "a name a lambda declares shadows the enclosing one",
+			protects: "a write to a lambda's own local is no capture and no may-definition of the enclosing variable",
+			mutation: "resolve the lambda body's names in the enclosing scope (adds a@10 -> [&] { int a = 0; a = 1; }@24 and [&] { int a = 0; a = 1; }@24 -> return a;@56)",
+			src:      "int f(int a) { auto l = [&] { int a = 0; a = 1; }; l(); return a; }",
+			du: []string{"[&] { int a = 0; a = 1; }@24 -> l = [&] { int a = 0; a = 1; }@20",
+				"l = [&] { int a = 0; a = 1; }@20 -> l()@51", "a@10 -> return a;@56"},
+		},
+		{
+			// [expr.prim.lambda.capture]/12: a by-reference capture whose
+			// address the body takes may be written through it. Nodes: a@10,
+			// the lambda @24 (Uses and may-defines a), l = …@20, l()@43,
+			// return a;@48.
+			name:     "a by-reference capture whose address is taken is a may-definition",
+			protects: "taking the address of a variable captured by reference reaches the reads after the lambda",
+			mutation: "count only direct writes as by-reference writes (loses [&] { g(0, &a); }@24 -> return a;@48)",
+			src:      "int f(int a) { auto l = [&] { g(0, &a); }; l(); return a; }",
+			du: []string{"a@10 -> [&] { g(0, &a); }@24", "[&] { g(0, &a); }@24 -> l = [&] { g(0, &a); }@20",
+				"l = [&] { g(0, &a); }@20 -> l()@43", "a@10 -> return a;@48", "[&] { g(0, &a); }@24 -> return a;@48"},
+		},
+		{
+			// [expr.prim.lambda.capture]/6: `&r = x` declares a reference bound
+			// to x, `y = x` a copy. Nodes: x@10, the lambda @24 (Uses x for
+			// both init-captures, may-defines x for &r), l = …@20, l()@69,
+			// return x;@74.
+			name:     "a by-reference init-capture may-defines what it binds",
+			protects: "a reference init-capture reaches the reads of its bound variable after the lambda, a copy init-capture does not",
+			mutation: "treat `&r = x` as a copy (loses [&r = x, y = x]() mutable { r = 1; y = 2; }@24 -> return x;@74)",
+			src:      "int f(int x) { auto l = [&r = x, y = x]() mutable { r = 1; y = 2; }; l(); return x; }",
+			du: []string{"x@10 -> [&r = x, y = x]() mutable { r = 1; y = 2; }@24",
+				"[&r = x, y = x]() mutable { r = 1; y = 2; }@24 -> l = [&r = x, y = x]() mutable { r = 1; y = 2; }@20",
+				"l = [&r = x, y = x]() mutable { r = 1; y = 2; }@20 -> l()@69", "x@10 -> return x;@74",
+				"[&r = x, y = x]() mutable { r = 1; y = 2; }@24 -> return x;@74"},
+		},
+		{
+			// [dcl.typedef], [namespace.alias] and [dcl.pre]/10: an alias, a
+			// namespace alias and a static assertion run nothing. Nodes: x@10,
+			// x@19 (Branch), return 0;@76.
+			name:     "C++ declarations that run nothing make no node",
+			protects: "using, namespace alias and static_assert inside a body are not statements",
+			mutation: "lower an alias declaration as a plain Stmt node (adds x@19 -> using T = int;@24)",
+			src:      "int f(int x) { if (x) { using T = int; namespace N = M; static_assert(1); } return 0; }",
+			du:       []string{"x@10 -> x@19"},
+		},
+		{
+			// [expr.prim.id.qual] and [expr.prim.this]: S::m names the static
+			// member and this->m the object's member, neither the parameter m.
+			// Nodes: m@35, return this->m + S::m;@40, which reads no variable.
+			name:     "a qualified name and a member through this are no reads of a local",
+			protects: "a qualified identifier and a this-> member access do not resolve to a parameter of the same name",
+			mutation: "read a qualified name's last component (adds m@35 -> return this->m + S::m;@40)",
+			src:      "struct S { static int m; int f(int m) { return this->m + S::m; } };",
+		},
 	})
 }
