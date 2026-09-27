@@ -381,6 +381,134 @@ var cShared = []goldenCase{
 		du: []string{"y@17 -> x < y@38", "x = 0@31 -> x < y@38", "x++@45 -> x < y@38", "x = 0@31 -> g(0, x)@50",
 			"x++@45 -> g(0, x)@50", "x = 0@31 -> x++@45", "x++@45 -> x++@45", "x@10 -> return x;@59"},
 	},
+	{
+		// C17 §6.8.3p2: an expression statement is evaluated for its
+		// effect, and §6.5.13p4: && evaluates g(b) only when a is nonzero.
+		// Nodes: a@10, b@17, a@22 (Branch, defining the && result), g(b)@27
+		// (defining it again), return a;@33. The discarded result makes no
+		// further node. Succ: a@22→{g(b), return a}; g(b)→return a.
+		name:     "a discarded && statement is its operands' nodes alone",
+		protects: "an expression statement whose value nodes hand on a result nobody reads ends there, and the right operand still depends on the left",
+		mutation: "end the statement with a node Using the result (adds a && g(b)@22, with a@22 -> a && g(b)@22 and g(b)@27 -> a && g(b)@22)",
+		src:      "int f(int a, int b) { a && g(b); return a; }",
+		cd:       []string{"a@22 -> g(b)@27"},
+		du:       []string{"a@10 -> a@22", "b@17 -> g(b)@27", "a@10 -> return a;@33"},
+	},
+	{
+		// C17 §6.8.4.1p2 and §6.5.3.1p2 (the value of --x is x after the
+		// decrement). Nodes: x@10, --x@19 (the condition: one Branch node
+		// that reads and defines x), return x;@24, return 0;@34. IPDom:
+		// --x → EXIT.
+		name:     "an update that is the whole condition is the decision node",
+		protects: "a condition that is only an increment or decrement makes one Branch node defining its operand",
+		mutation: "lower the update as a node of its own before a Branch spanning the same text (adds --x@19 -> --x@19)",
+		src:      "int f(int x) { if (--x) return x; return 0; }",
+		cd:       []string{"--x@19 -> return x;@24", "--x@19 -> return 0;@34"},
+		du:       []string{"x@10 -> --x@19", "--x@19 -> return x;@24"},
+	},
+	{
+		// C17 §6.5.3.2p3, §6.10.1p6: after the directive x is the #ifdef
+		// group's variable in one build and the outer x in the other, so
+		// &x may-defines both. Nodes: x = 0@18, A@34 (Branch), x = 1@42,
+		// g(0, &x)@58 (Uses and may-defines both), return x;@70 (the outer
+		// x). Succ: x = 0→A→{x = 1, g(0, &x)}; x = 1→g(0, &x)→return x.
+		// IPDom: A → g(0, &x).
+		name:     "taking the address of a name a conditional left standing for two bindings may-defines both",
+		protects: "an address taken through a joined name reaches later reads of every variable the name may denote",
+		mutation: "may-define only the arms' variable (loses g(0, &x)@58 -> return x;@70)",
+		src:      "int f(void) { int x = 0; {\n#ifdef A\n  int x = 1;\n#endif\n  g(0, &x); } return x; }",
+		cd:       []string{"A@34 -> x = 1@42"},
+		du: []string{"x = 0@18 -> g(0, &x)@58", "x = 1@42 -> g(0, &x)@58", "x = 0@18 -> return x;@70",
+			"g(0, &x)@58 -> return x;@70"},
+	},
+	{
+		// C17 §6.5.2.3p3: a member name designates a member of the
+		// structure, not an ordinary identifier (§6.2.3: members have a name
+		// space of their own). Nodes: s@15, m = 1@24, return s.m;@31. The
+		// local m is never read.
+		name:     "a field name is no read of a local of the same name",
+		protects: "the member identifier in s.m does not resolve to a local variable named m",
+		mutation: "resolve field identifiers as names (adds m = 1@24 -> return s.m;@31)",
+		src:      "int f(struct S s) { int m = 1; return s.m; }",
+		du:       []string{"s@15 -> return s.m;@31"},
+	},
+	{
+		// C17 §6.8.5.3p2: an omitted condition is replaced by a nonzero
+		// constant, so the loop leaves only by break. Nodes: x@11, for@16
+		// (the head, a Stmt node spanning the keyword with no exit edge),
+		// x@31 (Branch), break;@34, g()@41, h()@48. Succ: for→x@31→{break,
+		// g()}; break→h(); g()→for. IPDom: x@31 → break; g() → for → x@31.
+		name:     "a for with no condition leaves only by break",
+		protects: "for (;;) has no exit edge, so the break's condition controls the loop and nothing depends on the head",
+		mutation: "give a condition-less for an exit edge (for@16 becomes a Branch controlling x@31, break;@34 and g()@41)",
+		src:      "void f(int x) { for (;;) { if (x) break; g(); } h(); }",
+		cd:       []string{"x@31 -> g()@41", "x@31 -> for@16", "x@31 -> x@31"},
+		du:       []string{"x@11 -> x@31"},
+	},
+	{
+		// C17 §6.8.6.2p2: continue jumps to the end of the loop body, and a
+		// loop on 1 re-enters at its head. Nodes: x@11, 1@23 (the head, a
+		// Stmt node with no exit edge), x@32 (Branch), continue;@35, g()@45.
+		// Succ: 1→x@32→{continue, g()}; continue→1; g()→1. Nothing reaches
+		// EXIT, so the exit augmentation adds 1→EXIT (1 is the sink
+		// component's first node in reverse post-order). IPDom: x@32,
+		// continue, g() → 1 → EXIT. Frontier walks: 1→x@32 gives x@32, 1;
+		// x@32→continue gives continue; x@32→g() gives g().
+		name:     "a continue in a loop with no exit lands on the head",
+		protects: "a continue in a loop that never exits re-enters at the head's node, so the body's test still controls the statement after it",
+		mutation: "land the continue on the body's first node x@32 (every path from x@32 then passes g()@45: loses x@32 -> g()@45)",
+		src:      "void f(int x) { while (1) { if (x) continue; g(); } }",
+		cd:       []string{"1@23 -> x@32", "1@23 -> 1@23", "x@32 -> continue;@35", "x@32 -> g()@45"},
+		du:       []string{"x@11 -> x@32"},
+	},
+	{
+		// C17 §6.8.6.2p2 and §6.8.5.3p1: a continue in a for loop goes to
+		// the end of the body, after which the update runs. Nodes: n@10,
+		// s = 0@19, i = 0@35, i < n@42 (Branch), i == 1@60 (Branch),
+		// continue;@68, s += i@78, i++@49 (the update), return s;@88. Succ:
+		// i = 0→i < n→{i == 1, return s}; i == 1→{continue, s += i};
+		// continue→i++; s += i→i++; i++→i < n. IPDom: i == 1, continue,
+		// s += i → i++ → i < n → return s.
+		name:     "a continue in a for loop lands on the update",
+		protects: "a continue in a for body runs the update before the condition, so the update post-dominates the body's test",
+		mutation: "land the continue on the condition (i++@49 no longer post-dominates i == 1@60: adds i == 1@60 -> i++@49)",
+		src:      "int f(int n) { int s = 0; for (int i = 0; i < n; i++) { if (i == 1) continue; s += i; } return s; }",
+		cd: []string{"i < n@42 -> i == 1@60", "i < n@42 -> i++@49", "i < n@42 -> i < n@42",
+			"i == 1@60 -> continue;@68", "i == 1@60 -> s += i@78"},
+		du: []string{"n@10 -> i < n@42", "i = 0@35 -> i < n@42", "i = 0@35 -> i == 1@60", "i = 0@35 -> s += i@78",
+			"i = 0@35 -> i++@49", "i++@49 -> i < n@42", "i++@49 -> i == 1@60", "i++@49 -> s += i@78", "i++@49 -> i++@49",
+			"s = 0@19 -> s += i@78", "s = 0@19 -> return s;@88", "s += i@78 -> s += i@78", "s += i@78 -> return s;@88"},
+	},
+	{
+		// C17 §6.8.6.2p2 and §6.8.5.1: a continue in a while body goes to
+		// the end of the body, after which the condition is evaluated
+		// again. Nodes: x@10, y@17, x@29 (Branch head), y@38 (Branch),
+		// continue;@41, x--@51, return x;@58. Succ: x@29→{y@38, return x};
+		// y@38→{continue, x--}; continue→x@29; x--→x@29. IPDom: y@38,
+		// continue, x-- → x@29 → return x.
+		name:     "a continue in a while body lands on the condition",
+		protects: "a continue in a while body re-evaluates the condition, so the body's test does not control the loop head",
+		mutation: "lower the continue as a break (y@38 gains control of x@29, and loses the loop's back edge from continue;@41)",
+		src:      "int f(int x, int y) { while (x) { if (y) continue; x--; } return x; }",
+		cd:       []string{"x@29 -> y@38", "x@29 -> x@29", "y@38 -> continue;@41", "y@38 -> x--@51"},
+		du: []string{"x@10 -> x@29", "x--@51 -> x@29", "y@17 -> y@38", "x@10 -> x--@51", "x--@51 -> x--@51",
+			"x@10 -> return x;@58", "x--@51 -> return x;@58"},
+	},
+	{
+		// C17 §6.5.13p4 and §6.8.4.1: a && condition evaluates g(b) only
+		// when a is nonzero, and the if branches on the && value. Nodes:
+		// a@10, b@17, a@26 (Branch, defining the && result), g(b)@31
+		// (defining it again), a && g(b)@26 (the condition's Branch, Using
+		// the result), return 1;@37, return 0;@47. Succ: a@26→{g(b),
+		// a && g(b)}; g(b)→a && g(b)→{return 1, return 0}. IPDom: a@26,
+		// g(b) → a && g(b) → EXIT.
+		name:     "a && that is the whole condition branches on its result",
+		protects: "the condition's decision node reaches the operands' values through the result, not by re-reading their names",
+		mutation: "let the condition re-read the operands' names (a@10 and b@17 pair with a && g(b)@26, and a@26 -> a && g(b)@26 and g(b)@31 -> a && g(b)@26 vanish)",
+		src:      "int f(int a, int b) { if (a && g(b)) return 1; return 0; }",
+		cd:       []string{"a@26 -> g(b)@31", "a && g(b)@26 -> return 1;@37", "a && g(b)@26 -> return 0;@47"},
+		du:       []string{"a@10 -> a@26", "b@17 -> g(b)@31", "a@26 -> a && g(b)@26", "g(b)@31 -> a && g(b)@26"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
