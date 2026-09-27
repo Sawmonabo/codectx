@@ -1353,7 +1353,7 @@ func TestJavaLoweringGolden(t *testing.T) {
 				"new B(k) { int m() { return n; } }@42 -> return new B(k) { int m() { return n; } };@35"},
 		},
 		{
-			// §15.27.2. Ill-formed on purpose: javac rejects the source with
+			// §15.27.2. Ill-formed on purpose: a compiler rejects the source with
 			// "local variables referenced from a lambda expression must be
 			// final or effectively final". No valid program expresses the
 			// point, since nested code may neither assign nor compound-assign
