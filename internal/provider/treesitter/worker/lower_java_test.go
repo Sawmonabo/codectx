@@ -935,5 +935,260 @@ func TestJavaLoweringGolden(t *testing.T) {
 			cd:       []string{"c@36 -> g()@41"},
 			du:       []string{"c@25 -> c@36"},
 		},
+		{
+			// §8.4.1. Nodes: xs@23 (the variable arity parameter), return
+			// xs.length;@29 (Uses xs).
+			name:     "a variable arity parameter is a defining node",
+			protects: "a use of a varargs parameter pairs with the parameter's definition",
+			mutation: "declare no variable for a spread parameter (loses xs@23 -> return xs.length;@29)",
+			src:      "class A { int f(int... xs) { return xs.length; } }",
+			fn:       1,
+			du:       []string{"xs@23 -> return xs.length;@29"},
+		},
+		{
+			// §8.8.7.1. Callable 1 is the first constructor. Nodes: x@16, this(x,
+			// 0);@21 (the explicit constructor invocation, one node spanning
+			// itself: Uses x), g(x)@33.
+			name:     "an explicit constructor invocation is one node that reads its arguments",
+			protects: "the arguments of this(…) are read at the invocation's own node",
+			mutation: "make no node for an explicit constructor invocation (loses x@16 -> this(x, 0);@21)",
+			src:      "class A { A(int x) { this(x, 0); g(x); } A(int x, int y) {} }",
+			fn:       1,
+			du:       []string{"x@16 -> this(x, 0);@21", "x@16 -> g(x)@33"},
+		},
+		{
+			// §14.7, §14.16. Nodes: n@21, i = 0@41, i < n@48 (head), i >
+			// 1@66, continue a;@73, g(i)@85, i++@55. Succ: i < n→{i > 1,
+			// EXIT}; i > 1→{continue a, g(i)}; continue a, g(i) → i++ → i <
+			// n. IPDom: i < n → EXIT; i > 1, continue a, g(i) → i++ → i < n.
+			// Frontier walks: i < n over i > 1, i++ and itself; i > 1 over
+			// continue a; and g(i).
+			name:     "every label of a loop labelled twice names that loop",
+			protects: "a continue naming the outer of two labels on one loop continues that loop",
+			mutation: "hand a loop only its innermost label (continue a;@73 is unresolved: unresolved becomes 1)",
+			src:      "class A { void f(int n) { a: b: for (int i = 0; i < n; i++) { if (i > 1) continue a; g(i); } } }",
+			fn:       1,
+			cd: []string{"i < n@48 -> i > 1@66", "i < n@48 -> i++@55", "i < n@48 -> i < n@48",
+				"i > 1@66 -> continue a;@73", "i > 1@66 -> g(i)@85"},
+			du: []string{"n@21 -> i < n@48", "i = 0@41 -> i < n@48", "i++@55 -> i < n@48",
+				"i = 0@41 -> i > 1@66", "i++@55 -> i > 1@66", "i = 0@41 -> g(i)@85", "i++@55 -> g(i)@85",
+				"i = 0@41 -> i++@55", "i++@55 -> i++@55"},
+		},
+		{
+			// §14.11.1, §15.29. Nodes: x@20, k = 1@35, x@50 (selector), case
+			// k@55 (Uses the selector's variable and its constant's read of
+			// k), x = 0@65, x = 1@83 (default), return x;@92. Succ: case
+			// k→{x = 0, x = 1}; both → return. IPDom: case k → return.
+			name:     "a case label reads the constant variables it names",
+			protects: "a label naming a constant variable depends on that variable's definition as well as on the selector's value",
+			mutation: "let a label Use only the selector's variable (loses k = 1@35 -> case k@55)",
+			src:      "class A { int f(int x) { final int k = 1; switch (x) { case k -> x = 0; default -> x = 1; } return x; } }",
+			fn:       1,
+			cd:       []string{"case k@55 -> x = 0@65", "case k@55 -> x = 1@83"},
+			du: []string{"x@20 -> x@50", "x@50 -> case k@55", "k = 1@35 -> case k@55",
+				"x = 0@65 -> return x;@92", "x = 1@83 -> return x;@92"},
+		},
+		{
+			// §14.30.1, §15.20.2. Nodes: o@23, o@32 (the tested value: Uses o,
+			// defines an owned variable), the pattern variables a@51 and b@58
+			// (each Using it), o instanceof P(int a, int b)@32
+			// (the condition, the test folded into it), return a + b;@62,
+			// return 0;@76.
+			name:     "a record pattern defines each component variable from the tested value",
+			protects: "the component variables of a record pattern are defined on the match path from the value tested once, and are in scope in the then statement",
+			mutation: "bind no variables in a record pattern's components (loses a@51 and b@58 -> return a + b;@62)",
+			src:      "class A { int f(Object o) { if (o instanceof P(int a, int b)) return a + b; return 0; } }",
+			fn:       1,
+			cd:       []string{"o instanceof P(int a, int b)@32 -> return a + b;@62", "o instanceof P(int a, int b)@32 -> return 0;@76"},
+			du: []string{"o@23 -> o@32", "o@32 -> a@51", "o@32 -> b@58", "o@32 -> o instanceof P(int a, int b)@32",
+				"a@51 -> return a + b;@62", "b@58 -> return a + b;@62"},
+		},
+		{
+			// §11.1.1, §14.20.1. Nodes: r = 0@24, r = g()@37 (throws), the
+			// Handler catch@48, Throwable@55 (a Stmt: it catches everything),
+			// t@65, r = 1@70, return r;@79. Succ: r = g()→{return, catch};
+			// catch→Throwable→t→r = 1→return; no rethrow. IPDom: every node →
+			// return. Frontier walk: r = g() over catch, Throwable, t and r =
+			// 1.
+			name:     "a clause catching Throwable ends the catch chain",
+			protects: "an exception that reaches a Throwable clause is always caught, so the statement after the try depends on nothing in the chain",
+			mutation: "test a Throwable clause like any other (Throwable@55 becomes a Branch with a rethrow edge: it gains control of t@65, r = 1@70 and return r;@79, and r = g()@37 gains return r;@79)",
+			src:      "class A { int f() { int r = 0; try { r = g(); } catch (Throwable t) { r = 1; } return r; } }",
+			fn:       1,
+			cd: []string{"r = g()@37 -> catch@48", "r = g()@37 -> Throwable@55", "r = g()@37 -> t@65",
+				"r = g()@37 -> r = 1@70"},
+			du: []string{"r = g()@37 -> return r;@79", "r = 1@70 -> return r;@79"},
+		},
+		{
+			// §14.20.3. Nodes: a@19, use(a)@34 (throws to the resource's
+			// finally), the Handler )@30, a@29 (the close, Using the
+			// expression's read of a). The resource names an existing
+			// variable, so it acquires nothing. Succ: use(a)→{a@29, )@30};
+			// )@30→a@29. IPDom: use(a), )@30 → a@29. Frontier walk: use(a)
+			// over )@30.
+			name:     "a resource naming an existing variable acquires nothing and its close reads the variable",
+			protects: "try (a) makes no acquiring node and closes a on every exit, reading the variable at the close",
+			mutation: "close it Using nothing (loses a@19 -> a@29)",
+			src:      "class A { void f(R a) { try (a) { use(a); } } }",
+			fn:       1,
+			cd:       []string{"use(a)@34 -> )@30"},
+			du:       []string{"a@19 -> use(a)@34", "a@19 -> a@29"},
+		},
+		{
+			// §14.10. Nodes: x@21, assert@26, x > 0@33, g(x)@40. Succ:
+			// assert→{x > 0, g(x)}; x > 0→{g(x), EXIT} (the failed assertion
+			// throws from the false edge: no message node). IPDom: assert,
+			// x > 0 → EXIT. Frontier walks: assert over x > 0 and g(x); x >
+			// 0 over g(x).
+			name:     "an assertion without a message throws from its condition's false edge",
+			protects: "a failed assertion without a message leaves at once, so the statement after it depends on the assertion",
+			mutation: "let the false edge of a message-less assertion fall through (x > 0@33 controls nothing)",
+			src:      "class A { void f(int x) { assert x > 0; g(x); } }",
+			fn:       1,
+			cd:       []string{"assert@26 -> x > 0@33", "assert@26 -> g(x)@40", "x > 0@33 -> g(x)@40"},
+			du:       []string{"x@21 -> x > 0@33", "x@21 -> g(x)@40"},
+		},
+		{
+			// §15.13.3. Nodes: a@23, return a::g;@28 (the method reference is
+			// folded, with its receiver's read of a).
+			name:     "a method reference is folded with its receiver's reads",
+			protects: "the receiver of a method reference is evaluated where the reference is, by the consuming node",
+			mutation: "fold a method reference without its receiver's reads (loses a@23 -> return a::g;@28)",
+			src:      "class A { Runnable f(A a) { return a::g; } }",
+			fn:       1,
+			du:       []string{"a@23 -> return a::g;@28"},
+		},
+		{
+			// §15.26.2, §15.14.2. Nodes: a@22, i@29, a[i] += 1@34 (Uses a and
+			// i, may-defines a), a[i]++@45 (the same), return a[i];@53. Each
+			// write is a χ of a: a use of a after it pairs with it, the
+			// nearest may-definition, and with the parameter.
+			name:     "a compound element assignment and an element update may-define the array local",
+			protects: "a[i] += v and a[i]++ read their base and may-define it without killing the earlier definition",
+			mutation: "record no may-definition for a compound element assignment (loses a[i] += 1@34 -> a[i]++@45) or for an element update (loses a[i]++@45 -> return a[i];@53)",
+			src:      "class A { int f(int[] a, int i) { a[i] += 1; a[i]++; return a[i]; } }",
+			fn:       1,
+			du: []string{"a@22 -> a[i] += 1@34", "i@29 -> a[i] += 1@34",
+				"a@22 -> a[i]++@45", "a[i] += 1@34 -> a[i]++@45", "i@29 -> a[i]++@45",
+				"a@22 -> return a[i];@53", "a[i]++@45 -> return a[i];@53", "i@29 -> return a[i];@53"},
+		},
+		{
+			// §14.11.1. The grammar has no `case null, default` label, so the
+			// source parses with an error. Derived against the recovery taken
+			// as most likely: one switch_label spanning case null, default,
+			// holding the null literal and an ERROR node over `, default`, so
+			// no default token is a direct child of the label. Nodes: o@23,
+			// o@36 (selector), case null, default@41 (the one label, a
+			// Branch), return 0;@65, return 1;@79. The switch holds an error
+			// node, so its no-match path leaves it rather than throwing: the
+			// label→{return 0, return 1}. IPDom: the label → EXIT. Frontier
+			// walks: the label over return 0 and return 1.
+			name:      "a switch holding an error node is left when no label matches",
+			protects:  "a recovery that may have dropped a default makes no exhaustive-switch throw, so the statement after the switch runs on the no-match path",
+			mutation:  "throw on the no-match path of a switch whose tree holds an error node, as for any enhanced switch (return 1;@79 is unreachable: the label loses its control of it)",
+			src:       "class A { int f(Object o) { switch (o) { case null, default -> { return 0; } } return 1; } }",
+			fn:        1,
+			recovered: true,
+			cd:        []string{"case null, default@41 -> return 0;@65", "case null, default@41 -> return 1;@79"},
+			du:        []string{"o@23 -> o@36", "o@36 -> case null, default@41"},
+		},
+		{
+			// An unmatched `)` in a block. Derived against the recovery taken
+			// as most likely: an ERROR node over `)` among the block's
+			// statements. Nodes: x@20, y = x@29, the ERROR node )@36 (the
+			// unnamed kind: one Stmt node with its uses, none here, falling
+			// through), return y;@38.
+			name:      "an error node among a block's statements is one node that falls through",
+			protects:  "a statement the parser could not recover is lowered as one node and control continues past it with the definitions before it",
+			mutation:  "end the path at a kind the lowering does not name (loses y = x@29 -> return y;@38)",
+			src:       "class A { int f(int x) { int y = x; ) return y; } }",
+			fn:        1,
+			recovered: true,
+			du:        []string{"x@20 -> y = x@29", "y = x@29 -> return y;@38"},
+		},
+		{
+			// §14.18, §14.20.1. Nodes: x@20, x > 0@35, throw new E();@42 (a
+			// Throw, into the open catch), x = 1@57, the Handler catch@66,
+			// E@73, e@75, x = 2@80, return x;@89. Succ: x > 0→{throw, x =
+			// 1}; throw→catch→E→{e, EXIT (rethrown)}; e→x = 2→return; x =
+			// 1→return. IPDom: x > 0, E → EXIT; throw → catch → E; x = 1, x =
+			// 2 → return. Frontier walks: x > 0 over throw, catch and E, and
+			// over x = 1 and return; E over e, x = 2 and return.
+			name:     "a throw statement inside a try leaves for the catch chain",
+			protects: "the statement after a throw inside a try runs only when the throw is skipped, and the thrown path reaches the catch clause's body",
+			mutation: "give a throw statement's node no Throw (it falls through to x = 1@57 besides its MayThrow edge: gains throw new E();@42 -> x = 1@57)",
+			src:      "class A { int f(int x) { try { if (x > 0) throw new E(); x = 1; } catch (E e) { x = 2; } return x; } }",
+			fn:       1,
+			cd: []string{"x > 0@35 -> throw new E();@42", "x > 0@35 -> catch@66", "x > 0@35 -> E@73",
+				"x > 0@35 -> x = 1@57", "x > 0@35 -> return x;@89",
+				"E@73 -> e@75", "E@73 -> x = 2@80", "E@73 -> return x;@89"},
+			du: []string{"x@20 -> x > 0@35", "x = 1@57 -> return x;@89", "x = 2@80 -> return x;@89"},
+		},
+		{
+			// §14.12, §6.3.2.3. Nodes: o@23, o@37 (the tested value, the
+			// head's first node), s@57, !(o instanceof String s)@35 (the
+			// condition), o = g()@63, return s.length();@74. Succ: o@37→s→the
+			// condition→{o = g(), return}; o = g()→o@37 (the back edge).
+			// IPDom: o@37 → s → the condition → return; o = g() → o@37.
+			// Frontier walk: the condition over o = g(), o@37, s and itself.
+			// No break leaves the body, so the when-false s is in scope after
+			// the loop.
+			name:     "a while's back edge re-enters the first node of its condition",
+			protects: "each iteration evaluates the whole condition again, its tested value included, and the body's definition reaches it",
+			mutation: "send the back edge to the condition's Branch (loses o = g()@63 -> o@37, and the condition no longer controls o@37 and s@57)",
+			src:      "class A { int f(Object o) { while (!(o instanceof String s)) { o = g(); } return s.length(); } }",
+			fn:       1,
+			cd: []string{"!(o instanceof String s)@35 -> o = g()@63", "!(o instanceof String s)@35 -> o@37",
+				"!(o instanceof String s)@35 -> s@57", "!(o instanceof String s)@35 -> !(o instanceof String s)@35"},
+			du: []string{"o@23 -> o@37", "o = g()@63 -> o@37", "o@37 -> s@57", "o@37 -> !(o instanceof String s)@35",
+				"s@57 -> return s.length();@74"},
+		},
+		{
+			// §14.13, §6.3.2.4. Nodes: o@23, o = g()@33 (the body, first),
+			// o@53 (tested value), s@73, !(o instanceof String s)@51 (the
+			// condition), return s.length();@78. Succ: o = g()→o@53→s→the
+			// condition→{o = g(), return}. IPDom: each → the next, the
+			// condition → return. Frontier walk: the condition over o = g(),
+			// o@53, s and itself. The body holds no break, so the when-false
+			// s is in scope after the loop.
+			name:     "a do statement's when-false pattern variable is in scope after it",
+			protects: "a use after a do loop resolves to the pattern variable its negated condition defines",
+			mutation: "introduce nothing after a do (loses s@73 -> return s.length();@78)",
+			src:      "class A { int f(Object o) { do { o = g(); } while (!(o instanceof String s)); return s.length(); } }",
+			fn:       1,
+			cd: []string{"!(o instanceof String s)@51 -> o = g()@33", "!(o instanceof String s)@51 -> o@53",
+				"!(o instanceof String s)@51 -> s@73", "!(o instanceof String s)@51 -> !(o instanceof String s)@51"},
+			du: []string{"o = g()@33 -> o@53", "o@53 -> s@73", "o@53 -> !(o instanceof String s)@51",
+				"s@73 -> return s.length();@78"},
+		},
+		{
+			// §6.3.1.4, §15.25. Nodes: o@23, o@35 (tested value), s@55, o
+			// instanceof String s@35 (the condition's Branch), s.length()@59
+			// and 0@72 (the arms, defining the conditional's result), return
+			// …@28 (Uses the result). The condition's when-true s is in scope
+			// in the second operand.
+			name:     "a conditional's when-true pattern variable is in scope in its second operand",
+			protects: "the arm after ? reads the pattern variable its condition defines",
+			mutation: "keep the condition's sets out of the arms (loses s@55 -> s.length()@59)",
+			src:      "class A { int f(Object o) { return o instanceof String s ? s.length() : 0; } }",
+			fn:       1,
+			cd:       []string{"o instanceof String s@35 -> s.length()@59", "o instanceof String s@35 -> 0@72"},
+			du: []string{"o@23 -> o@35", "o@35 -> s@55", "o@35 -> o instanceof String s@35", "s@55 -> s.length()@59",
+				"s.length()@59 -> return o instanceof String s ? s.length() : 0;@28", "0@72 -> return o instanceof String s ? s.length() : 0;@28"},
+		},
+		{
+			// §6.3.2.2. Nodes: o@23, o@34 (tested value), s@54, !(o
+			// instanceof String s)@32 (the condition), return 0;@58, return
+			// s.length();@73. The negated test's when-false set, {s}, is in
+			// scope in the else statement.
+			name:     "an if's when-false pattern variable is in scope in its else statement",
+			protects: "the else statement of a negated instanceof reads the pattern variable the test defines",
+			mutation: "scope no set in the else statement (loses s@54 -> return s.length();@73)",
+			src:      "class A { int f(Object o) { if (!(o instanceof String s)) return 0; else return s.length(); } }",
+			fn:       1,
+			cd:       []string{"!(o instanceof String s)@32 -> return 0;@58", "!(o instanceof String s)@32 -> return s.length();@73"},
+			du: []string{"o@23 -> o@34", "o@34 -> s@54", "o@34 -> !(o instanceof String s)@32",
+				"s@54 -> return s.length();@73"},
+		},
 	})
 }
