@@ -563,10 +563,10 @@ relationships that must hold:
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.
 - The base footprint this process keeps for itself is **derived**, not bounded:
-  this build's measured idle overhead + (query slots on this machine) ×
-  `query_memory_bytes` + `cache_bytes` + `queue_bytes` + every page cache the
-  process opens (the store's writer and reader pools, lexical staging for each
-  unit built at once, the tokenizer and the run ledger). How many queries run at
+  this process's own resident set, read once at load + (query slots on this
+  machine) × `query_memory_bytes` + `cache_bytes` + `queue_bytes` + every page
+  cache the process opens (the store's writer and reader pools, lexical staging
+  for each unit built at once, the tokenizer and the run ledger). How many queries run at
   once comes from the cores, so a host with more cores has a larger base
   footprint and leaves the analyzers and language servers it starts a smaller
   allocation. There is no figure here for you to exceed and no core count that

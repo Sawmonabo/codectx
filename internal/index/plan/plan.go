@@ -282,14 +282,14 @@ type Inputs struct {
 	// supplier's to report, and it answers no observation: an accounting file
 	// must not refuse a plan.
 	RecordedPeak func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool)
-	// Machine is the composition root's one observation of the host, the
-	// reading the admission allocation was derived from. Every heavy unit's
-	// reservation, heap caps included, is sized against it, so the figure a
-	// unit is admitted at and the cap its children run under come from the
-	// same reading. The planner never observes the machine itself: a second
-	// reading taken while memory is momentarily free would size caps the
-	// allocation never admitted. The zero value is a host that exposes no
-	// available memory.
+	// Machine is the composition root's reading of the host, the one the
+	// admission allocation starts from before the ledger re-derives it
+	// between parser files. Every heavy unit's reservation, heap caps
+	// included, is sized against it, so every unit of one plan is sized from
+	// one reading. The planner never observes the machine itself: a reading
+	// of its own, taken while memory is momentarily free, would size caps
+	// from a moment the composition never saw. The zero value is a host that
+	// exposes no available memory.
 	Machine dependence.Machine
 	Config  config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot

@@ -242,13 +242,18 @@ Stdin/Stdout            io.Pipe, no byte total on either
 MaxStderrBytes          16 KiB
 Grace                   2 seconds (no timeout)
 CPUProgress             the worker's processor time, read by the hang detector
-MemoryReservationBytes  Options.WorkerMemoryBytes (the composition passes 256 MiB)
+MemoryReservationBytes  none: the admission ledger holds the worker's memory
 ```
 
-Before it is started, each worker reserves `Options.WorkerMemoryBytes` on the
-process's one admission ledger (`Options.Admission`), so parser workers wait in
-the same queue, against the same allocation, as every other heavy child; the
-reservation is given back once the runner has reaped the worker. Every
+Before it is started, each worker holds a base on the process's one admission
+ledger (`Options.Admission`): the largest base any worker of the pool has
+reported, zero before the first one reports. The worker's `Hello` and every
+`Done` adjust that holding to the base the worker measured of itself, upward
+without waiting, and it is given back once the runner has reaped the worker.
+Each file then holds its predicted need increment from before it is
+dispatched until its `Done`, which the ledger grants whenever no other parse
+is in flight, however large. So parser workers wait in the same queue, against
+the same allocation, as every other heavy child. Every
 admission is first-in-first-out on the ledger, and a worker coming back from a
 parse while an acquirer of the pool is queued there follows that order:
 
@@ -288,8 +293,9 @@ queued on the ledger is kept throughout.
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
 `process.Limits.MaxConcurrent` equal to the worker count and a memory budget
-that holds every reservation the admission ledger can have granted the workers
-at once, so the runner never refuses a worker the ledger has admitted.
+of the whole int64 range: the runner reserves nothing per worker and the
+ledger is the one memory gate, so the runner never refuses or queues a worker
+the ledger has admitted.
 
 Wiring in `cmd/codectx/main.go`:
 
@@ -307,7 +313,7 @@ ts, err := treesitter.New(treesitter.Options{
 	Languages:         cfg.Providers.TreeSitter.Languages,
 	MaxWorkers:        config.ParserWorkers(),
 	MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-	WorkerMemoryBytes: parserWorkerReservationBytes,
+	Rederive:          rederiveAllocation(admissionLedger, baseFootprint),
 	Admission:         admissionLedger,
 	Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 	Runner:            parserRunner,
