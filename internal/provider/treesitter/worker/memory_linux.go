@@ -13,20 +13,21 @@ static int trimHeap(void) { return 0; }
 */
 import "C"
 
-import "os"
+import (
+	"os"
+
+	"github.com/Sawmonabo/codectx/internal/residency"
+)
 
 // nativeHost holds the C heap to one arena, so that every tree allocation of
 // the parse thread lands in the heap the boundary returns, and supplies the
-// kernel's status file and resettable peak. A C library without the arena
+// kernel's resident figures and resettable peak. A C library without the arena
 // setting or the trim call reports the heap as not returned, so no need is
 // measured from a heap that kept the previous file's pages.
 func nativeHost() host {
 	held := C.holdOneArena() == 1
 	return host{
-		status: func() (string, bool) {
-			raw, err := os.ReadFile("/proc/self/status")
-			return string(raw), err == nil
-		},
+		read:       residency.Read,
 		returnHeap: func() bool { return held && C.trimHeap() == 1 },
 		resetPeak: func() bool {
 			// Writing 5 to clear_refs resets the resident peak (VmHWM) to the

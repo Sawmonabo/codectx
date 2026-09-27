@@ -343,7 +343,7 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 > `R_run = B_process + Σ over workers in flight (base_w + predicted_need(file_w)) + A_link`
 
 - `B_process` is `config.BaseFootprint`. Its idle term is read from the parent's own resident set at composition;
-  today it is the constant `IdleFootprintBytes`, corrected here.
+  only a platform that reports no resident set falls back to the recorded idle measurement.
 - `predicted_need` is the learned p99 above, or the prior for a first file.
 - `A_link` is the package-scoped linker's working set (decision 9).
 - No term is a constant fitted to a repository.
@@ -362,15 +362,16 @@ changes. A class that misses the target reopens the percentile, never the refusa
 runs.
 
 A file whose need exceeds its prediction does not fail; the overrun is counted and disclosed with its reservation, its
-observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed in code: parser
-observations are folded into the model. Today they are not, because worker spans carry an empty scope key and the
-collector skips them (`internal/ledger/collector.go:500`).
+observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed through the per-file need
+observation: each file's `Done` carries its measured need, the coordinator folds it into its class's model at once,
+the next file of that class is reserved from the updated model, and the ledger's observation store persists the model
+with the observation it came from. The worker's process-tree spans play no part in it.
 
 **Coexistence, as a mechanism.**
 - **The allocation.** It is the smaller of two figures: available memory plus the product's own observed residency,
   less the base footprint and margin; and half of that total. It is **re-derived from the kernel's figure between
-  files**. Today it is read once, at composition (`internal/app/compose.go:711-731`), and that is corrected here.
-  Counting the product's own residency means its own growth never throttles it.
+  files**, not read once at composition. Counting the product's own residency means its own growth never throttles
+  it.
 - **Waiting.** A file whose reservation does not fit waits at the head of the line and is admitted the moment one
   returns. Available memory falling **is** the signal that the user's editor, browser or the agent driving the product
   is competing.

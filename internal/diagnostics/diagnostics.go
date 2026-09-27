@@ -126,8 +126,13 @@ type WorkspaceProber interface {
 // and the composition root adapts the one to the other. A nil run is the honest
 // answer for a workspace that has recorded no run, which is what a reader of a
 // cache built before anything was instrumented sees.
+//
+// NeedClasses is the same ledger's page of learned per-file need models for
+// the repository, in key order, and how many classes lie past the page. A
+// repository nothing was ever measured in answers none.
 type RunLedger interface {
 	LatestRun(ctx context.Context, repo model.RepositoryID, generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error)
+	NeedClasses(ctx context.Context, repo model.RepositoryID) ([]model.NeedClass, int64, error)
 }
 
 // Options are the dependencies of a Service. Every field is required except

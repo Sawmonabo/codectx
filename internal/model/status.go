@@ -461,6 +461,16 @@ type ResourceReport struct {
 	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
 	UnitsReused          *int64 `json:"units_reused,omitempty"`
 	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
+	// NeedClasses is one page of this repository's learned per-file need
+	// models, in key order: for each class, how many parsed files it learned
+	// from, how many of them used more than they were reserved, and the
+	// largest drift any of them showed. It is how an operator checks the
+	// overrun target per class, and it is read from the run ledger's
+	// observation store, so it covers every run this repository recorded.
+	// NeedClassesOmitted counts the classes past the page. A repository in
+	// which nothing was ever measured carries none.
+	NeedClasses        []NeedClass `json:"need_classes,omitempty"`
+	NeedClassesOmitted int64       `json:"need_classes_omitted"`
 	// Run is the latest recorded run for this repository -- the live one if a
 	// run is going, otherwise the one that produced the active generation --
 	// and Stages is one page of its stages. Run is carried beside Stages
@@ -479,6 +489,20 @@ type ResourceReport struct {
 	// which of the two they are looking at. Each carries the remediation of
 	// the typed error it came from.
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// A NeedClass is one learned per-file need model: its key (language, grammar
+// fingerprint and file-size class), how many files it learned from, how many of
+// them overran their reservation, and the largest drift -- need minus
+// reservation -- any of them showed. The drift is below zero when every file
+// fitted, which is a real reading, not an absence.
+type NeedClass struct {
+	Language      string `json:"language"`
+	Fingerprint   string `json:"fingerprint"`
+	SizeClass     int    `json:"size_class"`
+	Observations  int64  `json:"observations"`
+	Overruns      int64  `json:"overruns"`
+	MaxDriftBytes int64  `json:"max_drift_bytes"`
 }
 
 // An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
@@ -594,8 +618,45 @@ func (r ResourceReport) Validate() error {
 			}
 		}
 	}
+	if err := validateNeedClasses(r.NeedClasses, r.NeedClassesOmitted); err != nil {
+		return err
+	}
 	if err := validateRunLedger("resources", r.Run, r.Stages, r.StagesOmitted); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateNeedClasses bounds the need-class page like every record list of a
+// response and refuses a class whose counts cannot be true: a negative count,
+// or more overruns than observations. The drift is signed and unbounded below.
+func validateNeedClasses(classes []NeedClass, omitted int64) error {
+	if len(classes) > MaxRecordsPerResult {
+		return invalid("resources.need_classes holds %d rows, more than the %d a bounded response carries",
+			len(classes), MaxRecordsPerResult)
+	}
+	if err := requireNonNegative("resources.need_classes_omitted", omitted); err != nil {
+		return err
+	}
+	for _, c := range classes {
+		if err := requireField("resources.need_classes.language", c.Language, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireField("resources.need_classes.fingerprint", c.Fingerprint, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.size_class", int64(c.SizeClass)); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.observations", c.Observations); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.overruns", c.Overruns); err != nil {
+			return err
+		}
+		if c.Overruns > c.Observations {
+			return invalid("resources.need_classes reports %d overruns of %d observations", c.Overruns, c.Observations)
+		}
 	}
 	return nil
 }

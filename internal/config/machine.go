@@ -11,7 +11,7 @@ import (
 	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
-	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
 // idleFootprintBytes is what this process holds before it reserves anything:
@@ -21,14 +21,14 @@ import (
 // to be observed.
 //
 // It is this process's own resident set, read once, at its first use, with
-// wire.ResidentBytes. For a loaded configuration that first use is validation
+// residency.Read. For a loaded configuration that first use is validation
 // at load, before the store is opened, so the reading is the idle process and
 // does not count again the page caches the reservations below declare. Where
 // the platform reports no resident set, UnobservedIdleFootprintBytes stands in
 // for the reading.
 var idleFootprintBytes = sync.OnceValue(func() int64 {
-	if resident, ok := wire.ResidentBytes(); ok {
-		return resident
+	if resident := residency.Read().Resident; resident != nil {
+		return int64(*resident)
 	}
 	return UnobservedIdleFootprintBytes
 })

@@ -281,6 +281,11 @@ func errOrder(at int, got, want string) error {
 // provider -- and storage refuses a unit whose declared dependency is not yet
 // sealed. The streamed file units and the in-heap semantic units come from two
 // different places, so their interleave is where that can go wrong.
+//
+// Within a file provider's stretch the units run largest file first, arrival
+// breaking a tie, so a parse stage's longest file starts first instead of
+// becoming its tail. Mutations that fail it: the bytes term dropped from
+// compareUnit, sorted ascending, or ranked above the provider position.
 func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.T) {
 	sorter, err := pagination.NewExternalSort(t.TempDir(), 8,
 		encodeUnit, decodeUnit, compareUnit)
@@ -291,9 +296,10 @@ func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.
 	// Positions 0 and 2 are file-invalidated providers, 1 and 3 semantic. The
 	// records are added out of position order, so only the sort key can put
 	// them back.
-	for _, order := range []int{2, 0, 2, 0, 2} {
+	sizes := []int64{10, 5, 30, 5, 10}
+	for i, order := range []int{2, 0, 2, 0, 2} {
 		rec := unitAt(len(t.Name()) + order)
-		rec.Order, rec.Seq = order, int64(sorter.Len())
+		rec.Order, rec.Bytes, rec.Seq = order, sizes[i], int64(sorter.Len())
 		rec.ScopeKey = "file:p" + itoa(order) + "/n" + itoa(int(rec.Seq)) + ".go"
 		if err := sorter.Add(rec); err != nil {
 			t.Fatalf("Add: %v", err)
@@ -315,10 +321,10 @@ func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.
 		t.Fatalf("walking the sequence: %v", err)
 	}
 	want := []string{"file:p0/n1.go", "file:p0/n3.go", "pkg:a", "pkg:b",
-		"file:p2/n0.go", "file:p2/n2.go", "file:p2/n4.go", "proj:r"}
+		"file:p2/n2.go", "file:p2/n0.go", "file:p2/n4.go", "proj:r"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("the plan streamed %v, want %v: each provider's units must be one contiguous "+
-			"stretch, in Selection.Active order", got, want)
+			"stretch, in Selection.Active order, largest file first within it", got, want)
 	}
 }
 

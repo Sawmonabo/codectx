@@ -1035,6 +1035,18 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
 	}
+	// One line per learned need class: what the reservation it predicts was
+	// measured against. Overruns over observations is the per-class figure
+	// the overrun target is stated in, and the drift says by how much the
+	// worst file missed -- below zero when every file fitted.
+	for _, c := range r.NeedClasses {
+		fmt.Fprintf(tw, "    need %s %s size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
+			c.Language, shortDigest(c.Fingerprint), c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
+	}
+	if r.NeedClassesOmitted > 0 {
+		fmt.Fprintf(tw, "    need %d more %s\t\n", r.NeedClassesOmitted,
+			plural(int(r.NeedClassesOmitted), "class", "classes"))
+	}
 	// What this block could not read, and why. A figure that is simply absent
 	// looks the same as one nothing ever recorded, so the reason is printed
 	// under the figures rather than left to the JSON.

@@ -82,6 +82,7 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
 	s.runLedger(ctx, &report)
+	s.needClasses(ctx, &report)
 	if err := report.Validate(); err != nil {
 		return model.ResourceReport{}, err
 	}
@@ -152,6 +153,23 @@ func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 		return cmp.Compare(a.Seq, b.Seq)
 	})
 	report.Run, report.Stages, report.StagesOmitted = run, stages, omitted
+}
+
+// needClasses fills the page of learned per-file need models and the count
+// past it. It reads the observation store beside the run rows, and a ledger
+// that cannot be read leaves the rows absent with the reason in the block's
+// warnings, for the reason runLedger does: an unreadable accounting file is
+// not a repository in which nothing was measured.
+func (s *Service) needClasses(ctx context.Context, report *model.ResourceReport) {
+	if s.opts.Ledger == nil {
+		return
+	}
+	classes, omitted, err := s.opts.Ledger.NeedClasses(ctx, s.opts.Repo)
+	if err != nil {
+		report.Warnings = append(report.Warnings, "the learned need models could not be read: "+warningText(err))
+		return
+	}
+	report.NeedClasses, report.NeedClassesOmitted = classes, omitted
 }
 
 // scratchBytes discloses the disk the store's scratch pools hold, which is

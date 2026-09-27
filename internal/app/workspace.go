@@ -172,9 +172,10 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// it, beside the language servers the manager admits against the same
 		// handle.
 		Admission: s.admission,
-		// The one observation of the host the admission allocation was
-		// derived from, so the planner sizes every heavy unit against the
-		// reading it is admitted against.
+		// The composition's reading of the host. The planner sizes every
+		// heavy unit's heap caps against it; the admission allocation starts
+		// from the same reading and is then re-derived between parser files,
+		// counting the product's own residency.
 		Machine: s.machine,
 		// The read-only side of the same file, so a finished run states in its
 		// result what it did. It opens the ledger per call and never writes.
