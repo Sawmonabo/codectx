@@ -201,14 +201,14 @@ Resolution order (Section 9.4):
 1. **Strong key, then native key, against persisted aliases.** The resolver
    looks up `(ScopeKey, StrongKey)` and then `(ScopeKey, NativeKey)` in the
    `native_aliases` of the unit's **sealed declared dependencies only**
-   (`Store.LookupAliases`, bounded at `MaxAliasLookup`, read-only, one short
-   transaction). A hit is basis `native_key`. The identity with the smallest
-   canonical key is primary; the rest, in the same order, form the bounded
-   `Ambiguous` list the provider records as `may_refer_to` edges. The lookup
-   fetches one row more than a `Resolution` can hold; more equally supported
-   identities than `MaxAmbiguousCandidates` is `CTX_PROVIDER_OUTPUT_INVALID`
-   with `Details["limit"]`, never a silent truncation. An alias match adopts
-   the stored kind, because the identity already exists.
+   (an `AliasTable`: every alias row of those dependencies, loaded once per
+   unit by `Store.DependencyAliases` in one read transaction against the last
+   commit, which refuses a dependency not sealed there). A hit is basis
+   `native_key`. The identity with the smallest canonical key is primary; the
+   rest, in the same order, form the `Ambiguous` list the provider records as
+   `may_refer_to` edges. Every alternative is retained: a key aliased to many
+   identities is a fact about the repository, neither truncated nor refused.
+   An alias match adopts the stored kind, because the identity already exists.
 2. **Minted identity** by `reconcile.CanonicalKey(candidate)`, the single
    implementation of Section 9.1's `canonical_entity_key`:
    - file and range present → `source_location`: key over the file's path

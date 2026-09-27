@@ -212,8 +212,7 @@ func TestInternerRejectsMalformedInput(t *testing.T) {
 // A real SHA-256 collision is not constructible, so the test constructs the
 // state one would produce: a row squatting on the id the key's digest names,
 // holding a different key. The interner must probe past it, give the key its
-// own id, and leave the squatter's key intact -- and the reader-side resolution
-// (internedPair) must agree with the writer.
+// own id, and leave the squatter's key intact.
 //
 // Mutation: delete the `stored == key` comparison in lookupNativeKey so any
 // occupied slot counts as a hit. Both keys then resolve to one id and the
@@ -249,20 +248,6 @@ func TestNativeKeyHashCollisionIsDetected(t *testing.T) {
 	if stored != key || squatted != squatter {
 		t.Fatalf("the chain lost a key: id %d = %q (want %q), id %d = %q (want %q)",
 			ref, stored, key, collided, squatted, squatter)
-	}
-
-	// The reader resolves by walking the same chain, so it must land on the
-	// same id -- a reader that stopped at the first occupied slot would read
-	// the squatter's aliases for this key.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO scope_keys(key) VALUES(?)`, "scope"); err != nil {
-		t.Fatalf("seeding the scope key: %v", err)
-	}
-	_, native, err := internedPair(ctx, tx, "scope", key)
-	if err != nil {
-		t.Fatalf("internedPair: %v", err)
-	}
-	if native != int64(ref) {
-		t.Fatalf("the reader resolved %q to %d, the writer to %d", key, native, ref)
 	}
 
 	// Re-resolving through a flushed cache must converge on the same id.

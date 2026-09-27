@@ -427,8 +427,8 @@ func (r Resolution) Validate() error {
 	// equally supported identities than MaxAmbiguousCandidates is a property of
 	// the repository, not an invalid resolution, and refusing it here made the
 	// resolver refuse the provider's whole output instead. The list is bounded
-	// in the only place a bound belongs -- the alias lookup's own page size in
-	// storage -- so nothing unbounded reaches this validator.
+	// by what the unit's sealed dependencies published: the resolver reads it
+	// from their alias table, which holds those rows and nothing else.
 	for i, id := range r.Ambiguous {
 		if err := requireID(indexed("resolution.ambiguous", i), string(id)); err != nil {
 			return err
