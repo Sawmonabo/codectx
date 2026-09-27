@@ -1,11 +1,16 @@
 package worker
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // TestTypeScriptLoweringGolden pins the control-dependence and def-use pairs
-// of hand-derived TypeScript and TSX callables. The shared cases run under
-// both grammars, since TSX is TypeScript with JSX; the JSX case runs under
-// tsx only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
+// of hand-derived TypeScript and TSX callables. The JavaScript lowering's
+// shared cases (javascriptShared) run under both grammars, and its JSX cases
+// (javascriptJSX) under tsx; the TypeScript cases in shared run under both
+// grammars, since TSX is TypeScript with JSX; the TSX case runs under tsx
+// only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
 // granularity lowerJavaScript documents under "TypeScript". A TypeScript-only
 // construct is anchored in the compiler's documented emit, the JavaScript it
 // compiles to, and that JavaScript's runtime semantics in ECMA-262; each case
@@ -246,54 +251,6 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			fn:       1,
 		},
 	)
-	// The JavaScript switch, compound-write and class-creation rules hold on
-	// both grammars; the sources carry no type syntax, so the offsets are
-	// JavaScript's.
-	shared = append(shared,
-		goldenCase{
-			// ECMA-262 §14.12.3 CaseClauseIsSelected; derivation as in the
-			// JavaScript case of the same name.
-			name:     "every case test reads the discriminant",
-			protects: "a case test's decision reads the discriminant's value through the node that evaluated it once",
-			mutation: "give each case test the discriminant's reads instead of its value (x@11 -> 1@34 and x@11 -> 2@54 appear, x@24 -> 1@34 and x@24 -> 2@54 vanish)",
-			src:      "function f(x) { switch (x) { case 1: g(); break; case 2: h(); } }",
-			fn:       1,
-			cd:       []string{"1@34 -> g()@37", "1@34 -> break;@42", "1@34 -> 2@54", "2@54 -> h()@57"},
-			du:       []string{"x@11 -> x@24", "x@24 -> 1@34", "x@24 -> 2@54"},
-		},
-		goldenCase{
-			// ECMA-262 §13.15.2; derivation as in the JavaScript case of
-			// the same name.
-			name:     "a compound property assignment reads the property before its right side",
-			protects: "the read of a compound property assignment throws before the right side is evaluated, and the store after it, each on its own node, the store reading the old value through the read's result",
-			mutation: "count the read's throw with the store, after the right side (o.p@25 vanishes with its five control dependences and o@11 -> o.p@25), or give the write the reads of o and of the condition instead of the two results (c@14 -> o.p += c ? 1 : 2@25 appears)",
-			src:      "function f(o, c) { try { o.p += c ? 1 : 2 } catch (e) { h() } }",
-			fn:       1,
-			cd: []string{
-				"o.p@25 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25",
-				"o.p@25 -> catch@44", "o.p@25 -> e@51", "o.p@25 -> h()@56",
-				"c@32 -> 1@36", "c@32 -> 2@40",
-				"o.p += c ? 1 : 2@25 -> catch@44", "o.p += c ? 1 : 2@25 -> e@51", "o.p += c ? 1 : 2@25 -> h()@56",
-			},
-			du: []string{
-				"o@11 -> o.p@25", "c@14 -> c@32", "o.p@25 -> o.p += c ? 1 : 2@25",
-				"1@36 -> o.p += c ? 1 : 2@25", "2@40 -> o.p += c ? 1 : 2@25", "o@11 -> o.p += c ? 1 : 2@25",
-			},
-		},
-		goldenCase{
-			// ECMA-262 §15.7.14; derivation as in the JavaScript case of the
-			// same name, here through public_field_definition.
-			name:     "a class whose static initializer runs at its creation may throw there",
-			protects: "a static field initializer, a static block or a computed key is a throw point of the class's creation",
-			mutation: "count only a heritage and a decorator as a class-level throw (the class node controls nothing and the catch is unreachable)",
-			src:      "function f() { try { class A { static x = g(); } } catch (e) { h(); } }",
-			fn:       1,
-			cd: []string{
-				"class A { static x = g(); }@21 -> catch@51", "class A { static x = g(); }@21 -> e@58",
-				"class A { static x = g(); }@21 -> h()@63",
-			},
-		},
-	)
 	shared = append(shared,
 		goldenCase{
 			// The compiler's emit: a `declare` declaration emits no code, so
@@ -328,8 +285,8 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			},
 		},
 	)
-	runGolden(t, "typescript", shared)
-	runGolden(t, "tsx", append(shared, goldenCase{
+	runGolden(t, "typescript", slices.Concat(javascriptShared, shared))
+	runGolden(t, "tsx", slices.Concat(javascriptShared, javascriptJSX, shared, []goldenCase{{
 		// The compiler's JSX emit: an element is a call whose first
 		// argument is its tag, `<B />` becoming `createElement(B, null)`,
 		// so a capitalized tag name is a read of B. && is ECMA-262 §13.13
@@ -346,5 +303,5 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			"a@11 -> a@40", "B@23 -> <B />@45",
 			"a@40 -> return a && <B />;@33", "<B />@45 -> return a && <B />;@33",
 		},
-	}))
+	}}))
 }
