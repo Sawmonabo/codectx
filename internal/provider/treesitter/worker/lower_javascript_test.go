@@ -13,7 +13,7 @@ import (
 // outer` that leaves past a loop head can take the head's control of itself
 // from it.
 func TestJavaScriptLoweringGolden(t *testing.T) {
-	runGolden(t, "javascript", slices.Concat(javascriptShared, javascriptJSX))
+	runGolden(t, "javascript", slices.Concat(javascriptShared, javascriptJSX, javascriptOnly))
 }
 
 // javascriptShared holds the JavaScript cases whose sources parse clean in the
@@ -876,6 +876,436 @@ var javascriptShared = []goldenCase{
 			"i++@39 -> i < 2@32", "i++@39 -> g(i)@44", "i++@39 -> i++@39", "i@11 -> return i;@50",
 		},
 	},
+	{
+		// ECMA-262 §13.15.2 Assignment Operators: PutValue replaces the binding's value. Nodes: x@11, x = 1@16
+		// (kills x), return x;@23.
+		name:     "a plain assignment kills the variable's earlier definition",
+		protects: "an identifier assignment is a killing definition, so the definition before it no longer reaches later uses",
+		mutation: "record an identifier assignment as a may-definition (x@11 -> return x;@23 appears)",
+		src:      "function f(x) { x = 1; return x; }",
+		fn:       1,
+		du:       []string{"x = 1@16 -> return x;@23"},
+	},
+	{
+		// ECMA-262 §13.16 Comma Operator: at statement level each element is its own statement. Nodes: a@11,
+		// b@20 (let b), a = 1@23, b = a@30 (Uses a), return b;@37.
+		name:     "a statement-level comma sequence is one statement per element",
+		protects: "each element of a statement-level sequence is its own node, so a later element reads an earlier one's definition",
+		mutation: "lower a statement-level sequence as one node (a = 1@23 and b = a@30 merge into one node spanning the sequence)",
+		src:      "function f(a) { let b; a = 1, b = a; return b; }",
+		fn:       1,
+		du:       []string{"a = 1@23 -> b = a@30", "b = a@30 -> return b;@37"},
+	},
+	{
+		// TC39 Decorators proposal (ClassDefinitionEvaluation applies the decorators, a call, where the class
+		// is created) and ECMA-262 §13.3.6. The class node @d class A {}@22 spans its decorator, reads d and
+		// may throw, so it controls the Handler catch@38, e@45 and g()@50.
+		name:     "a decorated JavaScript class spans its decorators, reads them and may throw at its creation",
+		protects: "a decorator is part of the class declaration's node and its application is a throw point",
+		mutation: "stop counting a decorator as a throwing call (the class node controls nothing), or span the class without its decorators (it renders as class A {}@25)",
+		src:      "function f(d) { try { @d class A {} } catch (e) { g(); } }",
+		fn:       1,
+		cd:       []string{"@d class A {}@22 -> catch@38", "@d class A {}@22 -> e@45", "@d class A {}@22 -> g()@50"},
+		du:       []string{"d@11 -> @d class A {}@22"},
+	},
+	{
+		// TC39 Decorators proposal and ECMA-262 §16.2.3 Exports: decorators written before `export` belong to
+		// the export statement; the class node class A {}@25 lies after them and reads them. Program nodes: d
+		// = g()@6, class A {}@25.
+		name:     "decorators written before export are read by the exported class's node",
+		protects: "an exported class's node reads the decorators the export statement carries, and spans the class only",
+		mutation: "skip the export statement's decorators (d = g()@6 -> class A {}@25 vanishes)",
+		src:      "const d = g(); @d export class A {}",
+		fn:       0,
+		du:       []string{"d = g()@6 -> class A {}@25"},
+	},
+	{
+		// ECMA-262 §14.7.2 The do-while Statement (DoWhileLoopEvaluation) and §14.8 The continue Statement.
+		// Nodes: a@11, the Branch g()@25 (the body's first node, the back edge's target), continue;@30, a =
+		// h(a)@40, the condition's Branch a@59, return a;@63. The continue enters the condition; the
+		// condition's true edge re-enters g(), so it controls g() and itself.
+		name:     "a do-while's back edge enters the body and its continue enters the condition",
+		protects: "the body runs before the first test, a continue skips the rest of the body to the condition, and the condition loops back to the body's first node",
+		mutation: "send a do-while's continue to the body's first node (a@11 -> a@59 vanishes, a@59 loses its control of g()), or make the back edge enter the condition (a@59 loses its self-dependence)",
+		src:      "function f(a) { do { if (g()) continue; a = h(a); } while (a); return a; }",
+		fn:       1,
+		cd:       []string{"a@59 -> a@59", "a@59 -> g()@25", "g()@25 -> continue;@30", "g()@25 -> a = h(a)@40"},
+		du:       []string{"a@11 -> a = h(a)@40", "a@11 -> a@59", "a@11 -> return a;@63", "a = h(a)@40 -> a = h(a)@40", "a = h(a)@40 -> a@59", "a = h(a)@40 -> return a;@63"},
+	},
+	{
+		// ECMA-262 §14.7.4.2 ForBodyEvaluation: a continue completes the body, then the increment runs. Nodes:
+		// n@11, i = 0@25, the Branch i < n@32, the Branch g(i)@50, continue;@56, h(i)@66, the update i++@39,
+		// whose back edge enters the condition. Both body paths meet at i++, so the condition controls it and
+		// itself.
+		name:     "a for loop's continue enters the update",
+		protects: "continue in a for loop runs the update before the next test, so the update post-dominates the body",
+		mutation: "send a for loop's continue to the condition (i++@39 is skipped on that path: g(i)@50 gains control of i++@39)",
+		src:      "function f(n) { for (let i = 0; i < n; i++) { if (g(i)) continue; h(i); } }",
+		fn:       1,
+		cd:       []string{"i < n@32 -> i < n@32", "i < n@32 -> g(i)@50", "i < n@32 -> i++@39", "g(i)@50 -> continue;@56", "g(i)@50 -> h(i)@66"},
+		du:       []string{"n@11 -> i < n@32", "i = 0@25 -> i < n@32", "i = 0@25 -> g(i)@50", "i = 0@25 -> h(i)@66", "i = 0@25 -> i++@39", "i++@39 -> i < n@32", "i++@39 -> g(i)@50", "i++@39 -> h(i)@66", "i++@39 -> i++@39"},
+	},
+	{
+		// ECMA-262 §14.12.4 CaseBlockEvaluation: a case body without a break falls into the next. Nodes: x@11,
+		// r = 0@20, the discriminant x@35, the Branch 1@45, r = 1@48, the Branch 2@60, r = r + 2@63, return
+		// r;@76. r = 1 flows into r = r + 2, which both tests' true edges reach.
+		name:     "a case body that does not break falls through into the next body",
+		protects: "the end of a case body flows into the next case's body, so its definitions reach that body",
+		mutation: "send a case body's end to the switch exit (r = 1@48 -> r = r + 2@63 vanishes and r = 1@48 -> return r;@76 appears)",
+		src:      "function f(x) { let r = 0; switch (x) { case 1: r = 1; case 2: r = r + 2; } return r; }",
+		fn:       1,
+		cd:       []string{"1@45 -> r = 1@48", "1@45 -> r = r + 2@63", "1@45 -> 2@60", "2@60 -> r = r + 2@63"},
+		du:       []string{"x@11 -> x@35", "x@35 -> 1@45", "x@35 -> 2@60", "r = 0@20 -> r = r + 2@63", "r = 0@20 -> return r;@76", "r = 1@48 -> r = r + 2@63", "r = r + 2@63 -> return r;@76"},
+	},
+	{
+		// ECMA-262 §14.12.2 CaseBlockEvaluation: with no test matching, the default's body runs wherever it
+		// stands, and falls through. Nodes: x@11, the discriminant x@24, the Branch 1@34, g()@37, h()@51
+		// (default), the Branch 2@61, k()@64. 2@61's false edge enters h(), which falls into k().
+		name:     "the last test's false edge enters a default that is not last",
+		protects: "default makes no node, the last case test's false edge enters the default's body where it stands, and that body falls through",
+		mutation: "send the last test's false edge to the switch exit when a default exists (2@61 loses control of h()@51)",
+		src:      "function f(x) { switch (x) { case 1: g(); default: h(); case 2: k(); } }",
+		fn:       1,
+		cd:       []string{"1@34 -> g()@37", "1@34 -> h()@51", "1@34 -> 2@61", "2@61 -> h()@51"},
+		du:       []string{"x@11 -> x@24", "x@24 -> 1@34", "x@24 -> 2@61"},
+	},
+	{
+		// ECMA-262 §14.7.5.7 ForIn/OfBodyEvaluation: a destructuring left side is bound from the next value on
+		// the body path. Nodes: ps@11, ps@38 (defines the iteration variable), the head [a, b] of ps@28 (Uses
+		// it), a@29 and b@32 (each Uses it, defines its name), g(a, b)@42.
+		name:     "a destructuring for…of left side is bound on the body path from the iteration variable",
+		protects: "each name of a destructuring left side is a node on the body path Using the iteration variable, never the iterated expression's names",
+		mutation: "give the element nodes the iterated expression's reads (ps@11 -> a@29 and ps@11 -> b@32 appear), or bind the left side on the head (the head defines a and b)",
+		src:      "function f(ps) { for (const [a, b] of ps) g(a, b); }",
+		fn:       1,
+		cd:       []string{"[a, b] of ps@28 -> [a, b] of ps@28", "[a, b] of ps@28 -> a@29", "[a, b] of ps@28 -> b@32", "[a, b] of ps@28 -> g(a, b)@42"},
+		du:       []string{"ps@11 -> ps@38", "ps@38 -> [a, b] of ps@28", "ps@38 -> a@29", "ps@38 -> b@32", "a@29 -> g(a, b)@42", "b@32 -> g(a, b)@42"},
+	},
+	{
+		// ECMA-262 §14.7.5.6 ForIn/OfHeadEvaluation (async iteration): for await…of follows the iteration
+		// model. Nodes: xs@17, xs@45 (defines the iteration variable), the head x of xs@40, x@40, g(x)@49.
+		name:     "a for await…of loop follows the iteration model",
+		protects: "for await…of evaluates its iterable once and binds the left side on the body path",
+		mutation: "lower for await…of apart from for…of (its head or binding pairs change: xs@17 -> x of xs@40 appears when the head reads the iterated names)",
+		src:      "async function f(xs) { for await (const x of xs) g(x); }",
+		fn:       1,
+		cd:       []string{"x of xs@40 -> x of xs@40", "x of xs@40 -> x@40", "x of xs@40 -> g(x)@49"},
+		du:       []string{"xs@17 -> xs@45", "xs@45 -> x of xs@40", "xs@45 -> x@40", "x@40 -> g(x)@49"},
+	},
+	{
+		// ECMA-262 §13.13 Binary Logical Operators and §14.6 The if Statement: a short-circuit in a condition
+		// is lowered to its nodes, and the if's Branch reads its result. Nodes: a@11, b@14, the Branch a@23
+		// (defines the result), g(b)@28 (defines it), the if's Branch a || g(b)@23 (Uses it), h()@34.
+		name:     "a short-circuit in a condition decides through its own Branch and the condition reads its result",
+		protects: "|| in condition position has its deciding Branch and operand node, and the condition's Branch Uses the result both define",
+		mutation: "fold a short-circuit in a condition into the condition's Branch (a@23 and g(b)@28 vanish; a@11 and b@14 pair with the condition)",
+		src:      "function f(a, b) { if (a || g(b)) h(); }",
+		fn:       1,
+		cd:       []string{"a@23 -> g(b)@28", "a || g(b)@23 -> h()@34"},
+		du:       []string{"a@11 -> a@23", "b@14 -> g(b)@28", "a@23 -> a || g(b)@23", "g(b)@28 -> a || g(b)@23"},
+	},
+	{
+		// ECMA-262 §13.15.2 (LogicalAssignment): `x ??= y` assigns only when x is nullish, and its value is
+		// x's or y's. Nodes: x@11, y@14, the Branch x@30 (Uses x, defines the result), the write x ??= y@30
+		// (Uses y, defines x and the result), the declarator z = (x ??= y)@25 (Uses the result), return x +
+		// z;@40, reached by x@11 on the path that skips the write.
+		name:     "a logical assignment to a local conditionally defines it and yields a result from both exits",
+		protects: "the write of a logical assignment is conditional on its Branch, and both define the result the consumer reads",
+		mutation: "define x unconditionally at the Branch (x@11 -> return x + z;@40 vanishes), or define the result only at the write (x@30 -> z = (x ??= y)@25 vanishes)",
+		src:      "function f(x, y) { const z = (x ??= y); return x + z; }",
+		fn:       1,
+		cd:       []string{"x@30 -> x ??= y@30"},
+		du:       []string{"x@11 -> x@30", "y@14 -> x ??= y@30", "x@30 -> z = (x ??= y)@25", "x ??= y@30 -> z = (x ??= y)@25", "x@11 -> return x + z;@40", "x ??= y@30 -> return x + z;@40", "z = (x ??= y)@25 -> return x + z;@40"},
+	},
+	{
+		// ECMA-262 §13.3.9.1 OptionalChain Evaluation: each `?.` may end the chain. Nodes: a@11, the Branch
+		// a@23 before the first ?. (Uses a, defines the chain's result), the Branch a?.b@23 before the second
+		// (Uses it, defines it again), the chain a?.b?.c@23 (Uses it, defines it), return a?.b?.c;@16, which
+		// all three reach.
+		name:     "each ?. of a chain has its own Branch",
+		protects: "a chain with several ?. makes a Branch before each, each defining the result on its nullish exit",
+		mutation: "make one Branch for a whole chain (a?.b@23 vanishes with its pairs)",
+		src:      "function f(a) { return a?.b?.c; }",
+		fn:       1,
+		cd:       []string{"a@23 -> a?.b@23", "a?.b@23 -> a?.b?.c@23"},
+		du:       []string{"a@11 -> a@23", "a@23 -> a?.b@23", "a?.b@23 -> a?.b?.c@23", "a@23 -> return a?.b?.c;@16", "a?.b@23 -> return a?.b?.c;@16", "a?.b?.c@23 -> return a?.b?.c;@16"},
+	},
+	{
+		// ECMA-262 §13.3.9 Optional Chains: nothing right of `?.` runs when g is nullish. Nodes: g@11, x =
+		// 0@20, the Branch g@27, x = 1@31 and the chain g?.(x = 1)@27 on the non-nullish path, return x;@39.
+		name:     "a chain's node Uses the result of an assignment lowered after its ?.",
+		protects: "an optional call's arguments are conditional and the chain node reads their results",
+		mutation: "give the chain node the callee's reads (g@11 -> g?.(x = 1)@27 appears), or drop the chain's Use of the argument's result (x = 1@31 -> g?.(x = 1)@27 vanishes)",
+		src:      "function f(g) { let x = 0; g?.(x = 1); return x; }",
+		fn:       1,
+		cd:       []string{"g@27 -> x = 1@31", "g@27 -> g?.(x = 1)@27"},
+		du:       []string{"g@11 -> g@27", "g@27 -> g?.(x = 1)@27", "x = 1@31 -> g?.(x = 1)@27", "x = 0@20 -> return x;@39", "x = 1@31 -> return x;@39"},
+	},
+	{
+		// ECMA-262 §14.3.3.3 KeyedBindingInitialization: a nested pattern's default is evaluated when the
+		// property is undefined. Nodes: o@11, p@14, the initializer o@44 (defines the incoming value), the
+		// Branch { x } = p@30 (Uses it, defines the nested value), the default p@38 (Uses p, defines it), x@32
+		// (Uses the nested value), return x;@47.
+		name:     "a nested pattern with a default destructures an owned value both paths define",
+		protects: "the Branch and the default node define an owned nested value, which the nested elements Use",
+		mutation: "bind the nested elements from the enclosing incoming value (o@44 -> x@32 appears, p@38 -> x@32 vanishes)",
+		src:      "function f(o, p) { const { a: { x } = p } = o; return x; }",
+		fn:       1,
+		cd:       []string{"{ x } = p@30 -> p@38"},
+		du:       []string{"o@11 -> o@44", "o@44 -> { x } = p@30", "p@14 -> p@38", "{ x } = p@30 -> x@32", "p@38 -> x@32", "x@32 -> return x;@47"},
+	},
+	{
+		// ECMA-262 §14.3.3 Destructuring Binding Patterns: a nested pattern without a default is folded into
+		// its elements. Nodes: o@11, the initializer o@38, x@28 and y@31 (each Uses the incoming value),
+		// return x + y;@41.
+		name:     "a nested pattern without a default is folded into its element nodes",
+		protects: "nested elements read the enclosing incoming value directly, with no node for the nested pattern",
+		mutation: "make a node for a nested pattern without a default (a node spanning [x, y] appears between o@38 and the elements)",
+		src:      "function f(o) { const { a: [x, y] } = o; return x + y; }",
+		fn:       1,
+		du:       []string{"o@11 -> o@38", "o@38 -> x@28", "o@38 -> y@31", "x@28 -> return x + y;@41", "y@31 -> return x + y;@41"},
+	},
+	{
+		// ECMA-262 §10.2.11 FunctionDeclarationInstantiation steps 27-28: with parameter expressions, the
+		// body's vars live in a separate environment the defaults do not see. The arrow's default x is f's x,
+		// so the creating node (a = x) => { var x = 1; return a; }@26 captures it; the declarator h = …@22
+		// Uses its result; return h;@63.
+		name:     "a parameter default sees the parameters only, never the body's vars",
+		protects: "capture collection and binding resolve a default's names before the body's var declarations",
+		mutation: "hoist the body's vars before walking the defaults (the arrow's var x shadows the default's x: x@11 -> (a = x) => { var x = 1; return a; }@26 vanishes)",
+		src:      "function f(x) { const h = (a = x) => { var x = 1; return a; }; return h; }",
+		fn:       1,
+		du:       []string{"x@11 -> (a = x) => { var x = 1; return a; }@26", "(a = x) => { var x = 1; return a; }@26 -> h = (a = x) => { var x = 1; return a; }@22", "h = (a = x) => { var x = 1; return a; }@22 -> return h;@63"},
+	},
+	{
+		// ECMA-262 §15.3 Arrow Function Definitions and §13.15.2: a closure's property write may-defines the
+		// base where the closure is created. Nodes: o@11, the arrow () => { o.p = 1; }@26 (Uses o, may-defines
+		// it), the declarator g = …@22, return o;@46.
+		name:     "a closure's property write may-defines its base at the creating node",
+		protects: "the creation node reads the written property's base and may-defines it, so a later use pairs with both",
+		mutation: "drop the base of a property a closure writes from its may-definitions (() => { o.p = 1; }@26 -> return o;@46 vanishes)",
+		src:      "function f(o) { const g = () => { o.p = 1; }; return o; }",
+		fn:       1,
+		du:       []string{"o@11 -> () => { o.p = 1; }@26", "() => { o.p = 1; }@26 -> g = () => { o.p = 1; }@22", "o@11 -> return o;@46", "() => { o.p = 1; }@26 -> return o;@46"},
+	},
+	{
+		// ECMA-262 §15.7.14 ClassDefinitionEvaluation: the class's field initializers and static blocks are
+		// its body's unit, and the class node in the enclosing function captures them. Nodes: a@11, b@14, the
+		// class node class A { x = a; static { g(b); } }@19 (Uses a and b, defines A), return A;@55.
+		name:     "a class node captures its field initializers and static blocks",
+		protects: "the enclosing function's class node Uses the variables its field initializers and static blocks read",
+		mutation: "leave field initializers out of the class's captures (a@11 -> the class node vanishes), or static blocks (b@14 -> the class node vanishes)",
+		src:      "function f(a, b) { class A { x = a; static { g(b); } } return A; }",
+		fn:       1,
+		du:       []string{"a@11 -> class A { x = a; static { g(b); } }@19", "b@14 -> class A { x = a; static { g(b); } }@19", "class A { x = a; static { g(b); } }@19 -> return A;@55"},
+	},
+	{
+		// ECMA-262 §16.2.3.7 Evaluation: `export { x }` and `export * from` evaluate nothing. Program nodes: x
+		// = 1@4, g(x)@44.
+		name:     "export lists make no node",
+		protects: "an export clause is a declaration of the module's bindings, not a read",
+		mutation: "lower an export clause as an expression (a node spanning x in export { x } pairs with x = 1@4)",
+		src:      "let x = 1; export { x }; export * from \"m\"; g(x);",
+		fn:       0,
+		du:       []string{"x = 1@4 -> g(x)@44"},
+	},
+	{
+		// ECMA-262 §16.2.3.7 Evaluation (ExportDeclaration : export default AssignmentExpression): the value
+		// is evaluated where it stands. Program nodes: x = 1@4, x + 1@26.
+		name:     "a default export is a value node",
+		protects: "a default export's expression is one node reading its variables",
+		mutation: "make a default export no node (x = 1@4 -> x + 1@26 vanishes)",
+		src:      "let x = 1; export default x + 1;",
+		fn:       0,
+		du:       []string{"x = 1@4 -> x + 1@26"},
+	},
+	{
+		// ECMA-262 §14.9 The break Statement and §14.7.4.2 ForBodyEvaluation (no test: only a break leaves).
+		// Nodes: the head for@15, the Branch g()@30, break;@35, h()@44. Every path from g() to Exit passes the
+		// break, so g()'s false edge controls the head and g() itself.
+		name:     "only a break leaves a loop with no exit edge",
+		protects: "a for (;;) has no exit edge, so the code after it is reached through the break alone",
+		mutation: "give for (;;) an exit edge (the head gains control dependents and g()@30 loses its control of for@15)",
+		src:      "function f() { for (;;) { if (g()) break; } h(); }",
+		fn:       1,
+		cd:       []string{"g()@30 -> for@15", "g()@30 -> g()@30"},
+	},
+	{
+		// ECMA-262 §13.14 Conditional Operator and §13.15.2: an assignment standing for an arm defines both
+		// the local and the result. Nodes: c@11, x@14, the Branch c@29, x = 1@34 (defines x and the result),
+		// 2@43 (defines the result), the declarator y = c ? (x = 1) : 2@25, return y + x;@46.
+		name:     "an assignment as a conditional arm defines both the variable and the result",
+		protects: "the assignment's node is the arm's yielding node and also kills its target",
+		mutation: "give an assignment arm a second node (a node spanning (x = 1) appears), or skip the result definition on it (x = 1@34 -> y = c ? (x = 1) : 2@25 vanishes)",
+		src:      "function f(c, x) { const y = c ? (x = 1) : 2; return y + x; }",
+		fn:       1,
+		cd:       []string{"c@29 -> x = 1@34", "c@29 -> 2@43"},
+		du:       []string{"c@11 -> c@29", "x = 1@34 -> y = c ? (x = 1) : 2@25", "2@43 -> y = c ? (x = 1) : 2@25", "y = c ? (x = 1) : 2@25 -> return y + x;@46", "x = 1@34 -> return y + x;@46", "x@14 -> return y + x;@46"},
+	},
+	{
+		// ECMA-262 §13.3.5.1 EvaluateNew and §13.2.4.1 ArrayAccumulation (a spread iterates): new and spread
+		// are throw points. Nodes: a@11, r = 0@20, r = new C()@33 and r = [...a]@46 (each may throw), the
+		// Handler catch@60, e@67, return r;@72, return r;@84. The Handler sees r = 0 from the first and r =
+		// new C() from the second.
+		name:     "new and spread are throw points",
+		protects: "a node whose evaluation contains new or a spread reaches the catch's Handler, with the values from before it",
+		mutation: "stop counting new as a throw (r = new C()@33 controls nothing and r = 0@20 -> return r;@72 vanishes), or spread (r = new C()@33 -> return r;@72 vanishes)",
+		src:      "function f(a) { let r = 0; try { r = new C(); r = [...a]; } catch (e) { return r; } return r; }",
+		fn:       1,
+		cd:       []string{"r = new C()@33 -> r = [...a]@46", "r = new C()@33 -> catch@60", "r = new C()@33 -> e@67", "r = new C()@33 -> return r;@72", "r = [...a]@46 -> return r;@84", "r = [...a]@46 -> catch@60", "r = [...a]@46 -> e@67", "r = [...a]@46 -> return r;@72"},
+		du:       []string{"a@11 -> r = [...a]@46", "r = 0@20 -> return r;@72", "r = new C()@33 -> return r;@72", "r = [...a]@46 -> return r;@84"},
+	},
+	{
+		// ECMA-262 §15.8 Async Function Definitions (Await may complete with a throw). Nodes: p@17, r = 0@26,
+		// r = await p@39 (may throw), the Handler catch@54, e@61, return r;@66.
+		name:     "await is a throw point",
+		protects: "a node evaluating await reaches the catch's Handler",
+		mutation: "stop counting await as a throw (r = await p@39 controls nothing and r = 0@26 -> return r;@66 vanishes)",
+		src:      "async function f(p) { let r = 0; try { r = await p; } catch (e) { return r; } }",
+		fn:       1,
+		cd:       []string{"r = await p@39 -> catch@54", "r = await p@39 -> e@61", "r = await p@39 -> return r;@66"},
+		du:       []string{"p@17 -> r = await p@39", "r = 0@26 -> return r;@66"},
+	},
+	{
+		// ECMA-262 §15.5 Generator Function Definitions (yield may resume with a throw). Nodes: a@12, r =
+		// 0@21, r = yield a@34 (may throw), the Handler catch@49, e@56, return r;@61.
+		name:     "yield is a throw point",
+		protects: "a node evaluating yield reaches the catch's Handler",
+		mutation: "stop counting yield as a throw (r = yield a@34 controls nothing and r = 0@21 -> return r;@61 vanishes)",
+		src:      "function* f(a) { let r = 0; try { r = yield a; } catch (e) { return r; } }",
+		fn:       1,
+		cd:       []string{"r = yield a@34 -> catch@49", "r = yield a@34 -> e@56", "r = yield a@34 -> return r;@61"},
+		du:       []string{"a@12 -> r = yield a@34", "r = 0@21 -> return r;@61"},
+	},
+	{
+		// ECMA-262 §13.15.5.2 DestructuringAssignmentEvaluation: each element's property read may throw.
+		// Nodes: o@11, a = 0@20, the right side o@42 (defines the incoming value), the element a@36 (may
+		// throw, defines a), the Handler catch@48, e@55, return a;@60, return a;@72.
+		name:     "a destructuring element is a throw point",
+		protects: "each element node reaches the catch's Handler, which sees the value from before the element",
+		mutation: "stop counting a destructuring element as a throw (a@36 controls nothing and a = 0@20 -> return a;@60 vanishes)",
+		src:      "function f(o) { let a = 0; try { ({ a } = o); } catch (e) { return a; } return a; }",
+		fn:       1,
+		cd:       []string{"a@36 -> return a;@72", "a@36 -> catch@48", "a@36 -> e@55", "a@36 -> return a;@60"},
+		du:       []string{"o@11 -> o@42", "o@42 -> a@36", "a = 0@20 -> return a;@60", "a@36 -> return a;@72"},
+	},
+	{
+		// ECMA-262 §7.4.8 IteratorStep and §14.7.5.7: getting the iterator and each step may throw. Nodes:
+		// xs@11, r = 0@21, the iterated xs@50 (may throw), the head x of xs@45 (may throw), x@45, r = x@54,
+		// the Handler catch@63, e@70, return r;@75, return r;@87. The head throws on every iteration, so the
+		// Handler sees r = 0 and r = x.
+		name:     "a for…of iterator step is a throw point",
+		protects: "the iterated expression's node and the head reach the catch's Handler, the head once per iteration",
+		mutation: "stop counting a for…of step as a throw (the head controls none of the catch's nodes and r = x@54 -> return r;@75 vanishes)",
+		src:      "function f(xs) { let r = 0; try { for (const x of xs) r = x; } catch (e) { return r; } return r; }",
+		fn:       1,
+		cd:       []string{"xs@50 -> x of xs@45", "xs@50 -> catch@63", "xs@50 -> e@70", "xs@50 -> return r;@75", "x of xs@45 -> x of xs@45", "x of xs@45 -> x@45", "x of xs@45 -> r = x@54", "x of xs@45 -> return r;@87", "x of xs@45 -> catch@63", "x of xs@45 -> e@70", "x of xs@45 -> return r;@75"},
+		du:       []string{"xs@11 -> xs@50", "xs@50 -> x of xs@45", "xs@50 -> x@45", "x@45 -> r = x@54", "r = 0@21 -> return r;@75", "r = x@54 -> return r;@75", "r = 0@21 -> return r;@87", "r = x@54 -> return r;@87"},
+	},
+	{
+		// ECMA-262 §15.7.14 ClassDefinitionEvaluation (ClassHeritage is evaluated and may throw). The class
+		// node class A extends B {}@22 reads B and may throw, so it controls the Handler catch@45, e@52 and
+		// g()@57.
+		name:     "a class's extends expression is read and may throw at its creation",
+		protects: "the heritage is evaluated by the class node, which is a throw point",
+		mutation: "stop counting a heritage as a throw (the class node controls nothing), or leave it out of the captures (B@11 -> class A extends B {}@22 vanishes)",
+		src:      "function f(B) { try { class A extends B {} } catch (e) { g(); } }",
+		fn:       1,
+		cd:       []string{"class A extends B {}@22 -> catch@45", "class A extends B {}@22 -> e@52", "class A extends B {}@22 -> g()@57"},
+		du:       []string{"B@11 -> class A extends B {}@22"},
+	},
+	{
+		// ECMA-262 §15.7.14 ClassDefinitionEvaluation: a computed method name is evaluated where the class is
+		// created and may throw. The class node class A { [k]() {} }@22 reads k and controls the Handler
+		// catch@45, e@52 and g()@57.
+		name:     "a computed method key is read and may throw at the class's creation",
+		protects: "a computed key is part of the class node's evaluation, never the method's",
+		mutation: "stop counting a computed key as a throw (the class node controls nothing), or leave it to the method (k@11 -> class A { [k]() {} }@22 vanishes)",
+		src:      "function f(k) { try { class A { [k]() {} } } catch (e) { g(); } }",
+		fn:       1,
+		cd:       []string{"class A { [k]() {} }@22 -> catch@45", "class A { [k]() {} }@22 -> e@52", "class A { [k]() {} }@22 -> g()@57"},
+		du:       []string{"k@11 -> class A { [k]() {} }@22"},
+	},
+	{
+		// ECMA-262 §15.7.14 and §15.7.11 ClassStaticBlockDefinitionEvaluation: a static block runs at the
+		// class's creation. The class node class A { static { g(); } }@21 may throw, so it controls the
+		// Handler catch@51, e@58 and h()@63.
+		name:     "a static block is a throw point of the class's creation",
+		protects: "a class whose static block calls makes its node a throw point",
+		mutation: "stop counting a static block as a throw (the class node controls nothing)",
+		src:      "function f() { try { class A { static { g(); } } } catch (e) { h(); } }",
+		fn:       1,
+		cd:       []string{"class A { static { g(); } }@21 -> catch@51", "class A { static { g(); } }@21 -> e@58", "class A { static { g(); } }@21 -> h()@63"},
+	},
+	{
+		// ECMA-262 §14.15.3 The try Statement: nothing in the block throws, so the catch is entered by no path
+		// and has no Handler. Its nodes e, y = e and h(y) are made with no predecessor, so they pair with
+		// nothing; x = 1@22 reaches return x;@64. That the nodes are made is not visible in the pairs; the
+		// case pins that no Handler is made.
+		name:     "a catch that no throw reaches has no Handler",
+		protects: "without a throwing node the catch is unreachable and its nodes carry no pair",
+		mutation: "make a Handler for every catch clause (e@38 -> y = e@49 appears)",
+		src:      "function f(x) { try { x = 1; } catch (e) { const y = e; h(y); } return x; }",
+		fn:       1,
+		du:       []string{"x = 1@22 -> return x;@64"},
+	},
+	{
+		// ECMA-262 §7.1.1 ToPrimitive: an operator can throw through an operand's valueOf, which the lowering
+		// gives up, so r = a + b@36 is no throw point and the catch is unreachable. Nodes: a@11, b@14, r =
+		// 0@20, r = a + b@36, return r;@73.
+		name:     "an operator is not a throw point",
+		protects: "arithmetic does not make a node reach a Handler",
+		mutation: "count binary operators as throws (r = a + b@36 controls the catch and r = 0@20 -> return r;@61 appears)",
+		src:      "function f(a, b) { let r = 0; try { r = a + b; } catch (e) { return r; } return r; }",
+		fn:       1,
+		du:       []string{"a@11 -> r = a + b@36", "b@14 -> r = a + b@36", "r = a + b@36 -> return r;@73"},
+	},
+	{
+		// ECMA-262 §14.15.3 (TryStatement : try Block Catch Finally): a throw from the block enters the catch,
+		// and the finally runs after either. Nodes: r = 0@20, r = g()@32 (may throw to the catch's Handler
+		// catch@43), e@50, r = 1@55, h(r)@74. Nothing in the catch throws, so the finally has no Handler.
+		name:     "a try with both catch and finally sends the block's throw to the catch, then both paths through the finally",
+		protects: "the catch frame is innermost for the block, and the finally is entered after the block and after the catch",
+		mutation: "send the block's throw to the finally (r = 0@20 -> h(r)@74 appears and r = g()@32 loses control of e@50)",
+		src:      "function f() { let r = 0; try { r = g(); } catch (e) { r = 1; } finally { h(r); } }",
+		fn:       1,
+		cd:       []string{"r = g()@32 -> catch@43", "r = g()@32 -> e@50", "r = g()@32 -> r = 1@55"},
+		du:       []string{"r = g()@32 -> h(r)@74", "r = 1@55 -> h(r)@74"},
+	},
+	{
+		// ECMA-262 §14.12.4 (CaseBlock BlockDeclarationInstantiation): the switch's case block is one scope.
+		// Nodes: x@11, the discriminant x@24, the Branch 1@34, y = 1@41, the Branch 2@53, g(y)@56, which reads
+		// the y the first case declares.
+		name:     "a switch body is one block",
+		protects: "a declaration in one case is visible in the next",
+		mutation: "scope each case body on its own (y in g(y) names no variable: y = 1@41 -> g(y)@56 vanishes)",
+		src:      "function f(x) { switch (x) { case 1: let y = 1; case 2: g(y); } }",
+		fn:       1,
+		cd:       []string{"1@34 -> y = 1@41", "1@34 -> g(y)@56", "1@34 -> 2@53", "2@53 -> g(y)@56"},
+		du:       []string{"x@11 -> x@24", "x@24 -> 1@34", "x@24 -> 2@53", "y = 1@41 -> g(y)@56"},
+	},
+	{
+		// ECMA-262 §14.13.4 LabelledEvaluation and §14.9: a labelled break leaves the labelled block. Nodes:
+		// a@11, the Branch a@25, break b;@28, g()@37, h()@44; both paths meet at h().
+		name:     "a labelled non-loop statement is a block frame a labelled break leaves",
+		protects: "break b jumps to the end of the labelled block",
+		mutation: "open no frame for a labelled block (break b; names no frame: unresolved becomes 1)",
+		src:      "function f(a) { b: { if (a) break b; g(); } h(); }",
+		fn:       1,
+		cd:       []string{"a@25 -> break b;@28", "a@25 -> g()@37"},
+		du:       []string{"a@11 -> a@25"},
+	},
+	{
+		// ECMA-262 §15.4 Method Definitions: a method is a callable. Functions preorder: the program 0, the
+		// class body 1, the method 2. Nodes: x@12, return g(x);@17.
+		name:      "a method definition is a callable of its own",
+		protects:  "Functions reports a method as a function and its parameters bind in it",
+		mutation:  "drop method_definition from the callables (callables becomes 2 and callable 2 is missing)",
+		src:       "class A { m(x) { return g(x); } }",
+		fn:        2,
+		du:        []string{"x@12 -> return g(x);@17"},
+		callables: 3,
+	},
 }
 
 // javascriptJSX holds the JSX cases, which run under the javascript and tsx
@@ -921,5 +1351,22 @@ var javascriptJSX = []goldenCase{
 			"M@11 -> return <M.C p={a}>{b}</M.C>;@22", "a@14 -> return <M.C p={a}>{b}</M.C>;@22",
 			"b@17 -> return <M.C p={a}>{b}</M.C>;@22",
 		},
+	},
+}
+
+// javascriptOnly holds the cases whose construct only the javascript grammar
+// parses: the typescript and tsx grammars have no using declaration.
+var javascriptOnly = []goldenCase{
+	{
+		// ECMA-262 §14.3.1 Let, Const, and Using Declarations (Explicit
+		// Resource Management): a using binding is block-scoped like const.
+		// Nodes: a@11, a = g()@24 (defines the block's a), h(a)@33 (Uses it),
+		// return a;@41 (Uses the parameter).
+		name:     "a using declaration is block-scoped",
+		protects: "using binds its names in its block from the block's start, as let and const do",
+		mutation: "leave using_declaration out of predeclare (a = g()@24 defines the parameter: a = g()@24 -> return a;@41 replaces a@11 -> return a;@41)",
+		src:      "function f(a) { { using a = g(); h(a); } return a; }",
+		fn:       1,
+		du:       []string{"a = g()@24 -> h(a)@33", "a@11 -> return a;@41"},
 	},
 }

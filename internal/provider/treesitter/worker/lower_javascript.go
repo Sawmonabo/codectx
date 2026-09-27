@@ -327,6 +327,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // start (the strict-mode rule, which modules and classes impose); a catch
 // parameter is scoped to its clause and a `for (let …)` binding to its loop;
 // a switch body is one block. Parameter defaults see the parameters only.
+// A `using` declaration arises in the javascript grammar only: the typescript
+// and tsx grammars have no using declaration, so there the construct cannot
+// be written and has no case.
 //
 // # TypeScript
 //
