@@ -357,6 +357,8 @@ type ResourceReport struct {
 	// evidence against one. It is absent where this process ran no heavy unit
 	// at all, and zero where it ran them and none overran.
 	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
+	UnitsReused          *int64 `json:"units_reused,omitempty"`
+	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
 	// NeedClasses is one page of this repository's learned per-file need
 	// models, in key order: for each class, how many parsed files it learned
 	// from, how many of them used more than they were reserved, and the
@@ -367,8 +369,6 @@ type ResourceReport struct {
 	// which nothing was ever measured carries none.
 	NeedClasses        []NeedClass `json:"need_classes,omitempty"`
 	NeedClassesOmitted int64       `json:"need_classes_omitted"`
-	UnitsReused          *int64 `json:"units_reused,omitempty"`
-	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
 	// Run is the latest recorded run for this repository -- the live one if a
 	// run is going, otherwise the one that produced the active generation --
 	// and Stages is one page of its stages. Run is carried beside Stages
