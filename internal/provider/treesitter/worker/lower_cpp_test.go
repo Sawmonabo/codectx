@@ -265,5 +265,24 @@ func TestCppLoweringGolden(t *testing.T) {
 				"[&] { m = 1; }@99 -> l = [&] { m = 1; }@95", "v@130 -> &e : v@125", "v@130 -> e@126",
 				"e@126 -> g(0, e)@133"},
 		},
+		{
+			// [dcl.init.ref]/5: a reference to a non-const type binds to the
+			// object its initializer denotes, and std::move(x) is a cast to an
+			// rvalue referring to x itself ([utility.syn], [forward]), so each
+			// binding may-defines x (lower.go, Address-taking). The
+			// parenthesized form doubles its parentheses so `(x)` cannot read
+			// as a parameter declaration ([dcl.ambig.res]). Nodes: x@10,
+			// &&r = std::move(x)@19, &q{x}@43, &t((x))@54 (each Uses x,
+			// defines its reference and may-defines x), return x;@63. Succ: a
+			// straight line to EXIT. Each binding pairs with x@10, the killing
+			// definition behind the chain, and with the binding before it, its
+			// nearest may-definition; so does the return with the last.
+			name:     "a reference bound through std::move, braces or parentheses may-defines the local",
+			protects: "an rvalue reference bound to std::move(x), and a braced or parenthesized reference binding, reach the uses of x after them",
+			mutation: "stop baseIdent at a call (&&r = std::move(x)@19 makes no may-definition: loses &&r = std::move(x)@19 -> &q{x}@43), or read a braced or parenthesized reference initializer as a plain value (loses &q{x}@43 -> &t((x))@54 and &t((x))@54 -> return x;@63)",
+			src:      "int f(int x) { int &&r = std::move(x); int &q{x}; int &t((x)); return x; }",
+			du: []string{"x@10 -> &&r = std::move(x)@19", "x@10 -> &q{x}@43", "&&r = std::move(x)@19 -> &q{x}@43",
+				"x@10 -> &t((x))@54", "&q{x}@43 -> &t((x))@54", "x@10 -> return x;@63", "&t((x))@54 -> return x;@63"},
+		},
 	})
 }
