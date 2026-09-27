@@ -64,7 +64,7 @@ func TestReadOnlyStoreReadsWhileAnotherHoldsTheWriteTransaction(t *testing.T) {
 	// the five-second default; it is also what makes "answers at once" a claim
 	// this test can make.
 	opts := store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond}
-	reader, err := store.Open(ctx, dbPath, opts)
+	reader, err := store.Open(ctx, dbPath, store.WithDerivedReaders(opts))
 	if err != nil {
 		t.Fatalf("a read-only open was refused while the writer held its group: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestReadOnlyPinHoldsASupersededGenerationAndNamesItsCollection(t *testing.T
 	}
 	f.activate(gen2, gen)
 
-	reader, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond})
+	reader, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond}))
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) 
 			"test would not bound the close that copies them", coldGen)
 	}
 
-	reader, err := store.Open(ctx, dst, store.Options{ReadOnly: true})
+	reader, err := store.Open(ctx, dst, store.WithDerivedReaders(store.Options{ReadOnly: true}))
 	if err != nil {
 		t.Fatalf("a read-only open of a store with a live log was refused: %v", err)
 	}
@@ -403,7 +403,7 @@ func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	stale, err := store.Open(ctx, dst, store.Options{ReadOnly: true})
+	stale, err := store.Open(ctx, dst, store.WithDerivedReaders(store.Options{ReadOnly: true}))
 	if err == nil {
 		stale.Close()
 		t.Fatal("a read-only open of an unwritable directory whose log holds the newest generation succeeded " +
@@ -421,7 +421,7 @@ func TestAReadOnlyOpenLeavesTheDatabaseItsLogAndItsIndexUntouched(t *testing.T) 
 // without its log.
 func activeGeneration(t *testing.T, ctx context.Context, path string, repo model.RepositoryID) model.GenerationID {
 	t.Helper()
-	s, err := store.Open(ctx, path, store.Options{ReadOnly: true})
+	s, err := store.Open(ctx, path, store.WithDerivedReaders(store.Options{ReadOnly: true}))
 	if err != nil {
 		t.Fatalf("a read-only open of %s: %v", filepath.Base(path), err)
 	}

@@ -986,10 +986,15 @@ func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 const testDiskAllocationBytes int64 = 64 << 30
 
 // testBaseFootprintBytes stands in for what the composition derives from the
-// machine and the configuration (config.BaseFootprint). It is the shipped
-// defaults on a 16-core host -- 32 MiB idle + 16 query slots x 32 MiB + 32 MiB
-// cache + 16 MiB queue -- stated here rather than imported so this package's
-// tests do not resolve a configuration to size a reservation.
+// machine and the configuration (config.BaseFootprint). It is a fixed figure,
+// not that derivation: the unobserved idle footprint (32 MiB), 16 query slots
+// of the default 32 MiB, the default 32 MiB cache and a 16 MiB queue. It leaves
+// out the page caches the derivation also counts (the writer's, every reader
+// connection's, the lexical staging and tokenizer caches) and the run ledger's,
+// which these tests do not depend on: each needs only a positive base far
+// below the machine it is subtracted from. It is stated here rather than
+// derived so the tests neither resolve a configuration nor vary with the
+// host's cores.
 const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
 
 // TestAllocationSubtractsTheDerivedBaseFootprint protects the rule that the
@@ -1053,53 +1058,4 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 			"a larger footprint must leave a smaller allocation",
 			testBaseFootprintBytes, bigger, base128, smaller)
 	}
-}
-
-// TestLargestChildFitsTheRunnerBeneathTheGate protects the rule that nothing
-// below the admission gate refuses what the gate admitted.
-//
-// Failure mode it guards: the gate runs a unit larger than the whole
-// allocation ALONE rather than refusing it, but a unit's reservation is its
-// heap cap -- already bounded by the allocation -- PLUS the memory its family
-// keeps outside the heap, so the largest reservation always exceeds the
-// allocation. A process runner budgeted at the allocation therefore refuses
-// exactly the unit the gate just admitted, and the unit fails with a resource
-// limit instead of running. That is "refusing work for memory", which this
-// package's own rule says the product never does. It is invisible on a host
-// roomy enough that no unit's estimate reaches the allocation, which is why it
-// is asserted here rather than left to a run to discover.
-func TestLargestChildFitsTheRunnerBeneathTheGate(t *testing.T) {
-	for _, available := range []int64{8 << 30, 16 << 30, 64 << 30} {
-		m := dependence.Machine{AvailableBytes: available, Observed: true}
-		allocation, _ := m.SchedulingAllocation(testBaseFootprintBytes)
-		budget := dependence.MaxChildReservationBytes(allocation)
-		g := dependence.NewGovernor(0, testBaseFootprintBytes)
-
-		// A unit far too large for any host: its estimate clamps to the
-		// allocation, which is the case that produces the largest reservation.
-		for _, f := range []dependence.Family{
-			dependence.FamilyC, dependence.FamilyGo, dependence.FamilyJava,
-			dependence.FamilyJavaScript, dependence.FamilyPython, dependence.FamilyRust,
-		} {
-			r := g.Reserve(f, 1<<40, m)
-			if r.Bytes() > budget {
-				t.Errorf("on a %d-byte machine a %s unit reserves %d, over the %d-byte runner budget: "+
-					"the runner beneath the gate would refuse a unit the gate admitted",
-					available, f, r.Bytes(), budget)
-			}
-			// The cap itself never exceeds the allocation the unit is admitted
-			// against, or it is sized against one figure and admitted against
-			// another.
-			if r.HeapCapBytes > allocation {
-				t.Errorf("on a %d-byte machine a %s unit is capped at %d, over the %d-byte allocation "+
-					"it is admitted against", available, f, r.HeapCapBytes, allocation)
-			}
-		}
-	}
-	// The unobservable host is deliberately NOT covered here: sizing invents no
-	// bound there (a ceiling for an unreadable machine is what synthesis
-	// Section 8 forbids) while admission stands one in, so a unit is sized
-	// without a bound and admitted against the stand-in. Which side of that
-	// asymmetry is right is a design question, and a test here would only
-	// freeze one answer to it.
 }

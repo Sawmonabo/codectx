@@ -25,7 +25,7 @@ import (
 func TestPackedContainerSlotFollowsTheFilesContainer(t *testing.T) {
 	ctx := context.Background()
 	repo := model.RepositoryID("00000000000000000000000000000000000000000000000000000000000000c1")
-	s, err := store.Open(ctx, t.TempDir()+"/codectx.db", store.Options{})
+	s, err := store.Open(ctx, t.TempDir()+"/codectx.db", store.WithDerivedReaders(store.Options{}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

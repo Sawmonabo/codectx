@@ -227,13 +227,14 @@ type treeSample struct {
 // watchdog reads is never staler than one of its own polls.
 const treeSampleInterval = 250 * time.Millisecond
 
-// Limits are the runner-wide admission bounds. Concurrency and memory are
-// required and positive. The disk budget is the one bound that may be zero,
-// because it is the only one that carries a user-set ceiling rather than a
-// derived reservation; what keeps a run from filling the device is not this
-// figure but the process's reservation ledger above, which admits a child's
-// temporary bytes against the free space actually measured under the data
-// directory.
+// Limits are the runner-wide admission bounds, one rule for all three: zero is
+// no bound, a positive value is one, and a negative value is refused. A runner
+// beneath the process's reservation ledger states no memory figure and no count
+// of its own, because the ledger admits every child that reserves memory or
+// disk and counts nothing, so any figure here could only bind below it. What
+// is left to a runner is what the ledger does not state: how many parser
+// workers the cores run at once, and the operator's resources.max_temp_bytes
+// share, which a set value enforces and names in its refusal.
 type Limits struct {
 	MaxConcurrent     int
 	MemoryBudgetBytes int64
@@ -248,7 +249,8 @@ type Runner struct {
 	mu         sync.Mutex
 	memoryUsed int64
 	diskUsed   int64
-	// running counts the admissions in flight, against MaxConcurrent.
+	// running counts the admissions in flight, against MaxConcurrent when it
+	// is set.
 	running int
 	// queue holds the runs waiting for headroom, in arrival order. A run that
 	// does not fit the remaining budget waits in it rather than being refused;
@@ -296,30 +298,9 @@ func (r *Runner) startedChild() func() {
 
 // NewRunner returns a runner bound by limits.
 func NewRunner(limits Limits) (*Runner, error) {
-	if limits.MaxConcurrent <= 0 || limits.MemoryBudgetBytes <= 0 {
-		return nil, resourceLimit("runner limits are concurrency %d and memory %d; both reservations must be positive",
-			limits.MaxConcurrent, limits.MemoryBudgetBytes)
-	}
-	// DiskBudgetBytes is a BOUND and not a reservation: it carries
-	// resources.max_temp_bytes, whose default is unlimited, so a non-positive
-	// value admits every run's disk reservation rather than refusing the
-	// runner outright. Concurrency and memory stay reservations -- they size
-	// the machine the children are given, and a zero-sized one is broken
-	// rather than unbounded.
-	//
-	// It is deliberately NOT sized to pass through whatever the reservation
-	// ledger above admits, as the memory budget is. The memory budget bounds
-	// the same bytes the gate above admits, so a narrower one would refuse
-	// precisely what the gate had just admitted. This budget is a different
-	// quantity: the ledger admits a child's temporary bytes against the host's
-	// real free space less resources.min_free_disk_bytes, while this is the
-	// runner's share of the ceiling an operator put on temporary bytes on
-	// purpose. A default install never
-	// refuses here -- the key is unlimited -- and an operator who set it asked
-	// for the refusal, which names the key. Widening it to whatever the gate
-	// admits would delete the only place that key is enforced.
-	if limits.DiskBudgetBytes < 0 {
-		return nil, resourceLimit("runner disk budget is %d; use 0 for unlimited", limits.DiskBudgetBytes)
+	if limits.MaxConcurrent < 0 || limits.MemoryBudgetBytes < 0 || limits.DiskBudgetBytes < 0 {
+		return nil, resourceLimit("runner limits are concurrency %d, memory %d and disk %d; none may be negative, and 0 is no bound",
+			limits.MaxConcurrent, limits.MemoryBudgetBytes, limits.DiskBudgetBytes)
 	}
 	return &Runner{limits: limits}, nil
 }
@@ -405,7 +386,7 @@ type admission struct {
 // run that does not fit the remaining headroom WAITS for it -- the budgets are
 // memory admission, which schedules work rather than rejecting it. The only
 // refusal left is the one no amount of waiting can clear: a reservation larger
-// than the whole user-set budget, which is reported with both numbers.
+// than a whole budget that is set, which is reported with both numbers.
 //
 // Why there is no deadlock. Concurrency and bytes are taken together under one
 // lock, so a run never holds a slot while waiting for memory -- the shape that
@@ -423,7 +404,7 @@ type admission struct {
 // The trade-off this accepts: head-of-line admission can leave headroom idle
 // while a large reservation waits. That is the cost of never starving one.
 func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
-	if spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes {
+	if r.limits.MemoryBudgetBytes > 0 && spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes {
 		return nil, resourceLimit("the run reserves %d bytes of memory, over the runner budget of %d",
 			spec.MemoryReservationBytes, r.limits.MemoryBudgetBytes)
 	}
@@ -470,8 +451,8 @@ func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 func (r *Runner) promote() {
 	for e := r.queue.Front(); e != nil; {
 		w := e.Value.(*admission)
-		if r.running >= r.limits.MaxConcurrent ||
-			r.memoryUsed+w.mem > r.limits.MemoryBudgetBytes ||
+		if (r.limits.MaxConcurrent > 0 && r.running >= r.limits.MaxConcurrent) ||
+			(r.limits.MemoryBudgetBytes > 0 && r.memoryUsed+w.mem > r.limits.MemoryBudgetBytes) ||
 			(r.limits.DiskBudgetBytes > 0 && r.diskUsed+w.disk > r.limits.DiskBudgetBytes) {
 			return
 		}

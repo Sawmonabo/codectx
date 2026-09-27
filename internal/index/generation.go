@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
-	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -21,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
+	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -126,6 +126,12 @@ type generation struct {
 	// units past walked are exactly the ones nothing ever started.
 	walked   int64
 	walkDone bool
+
+	// passes is one measurement per provider pass, in the order the passes
+	// ran, and passesTotal counts every pass, as runs and runsTotal do.
+	// Written under mu.
+	passes      []model.ProviderPass
+	passesTotal int64
 }
 
 // unitFailure is the typed reason one unit did not seal: the diagnostic
@@ -219,7 +225,7 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 		// high-water mark read before them would silently leave them out. It
 		// is the kernel's mark for the whole process, so a freed byte cannot
 		// lower it and reading it before the reclaim loses nothing.
-		g.report(diagnostics.PeakParentRSSBytes())
+		g.report(residency.Read().Peak)
 		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 		c.attachRunLedger(ctx, &res, g.ledgerRun, err)
@@ -486,6 +492,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
 		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(g.c.opts.Config),
+		Passes: g.passes, PassesOmitted: g.passesTotal - int64(len(g.passes)),
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
 }
 
@@ -909,7 +916,7 @@ type unitGroup struct {
 	fatal  error
 
 	provider   string
-	closeStage func(context.Context)
+	closeStage func(context.Context) model.StageFigures
 	// started, writerBusy and units are the pass's measurement: its wall, the
 	// store writer's busy time when it began, and the units it admitted.
 	started    time.Time
@@ -918,11 +925,12 @@ type unitGroup struct {
 }
 
 // stageOpener is a provider that keeps a stage open across a pass over many
-// units. It is asserted structurally here, at the one call site, so the
-// provider interface carries nothing only one provider needs; a provider
-// without it runs each unit as it always has.
+// units, and whose close answers what the stage measured. It is asserted
+// structurally here, at the one call site, so the provider interface carries
+// nothing only one provider needs; a provider without it runs each unit as it
+// always has, and its pass has no stage figures.
 type stageOpener interface {
-	OpenStage(ctx context.Context) (closeStage func(ctx context.Context))
+	OpenStage(ctx context.Context) (closeStage func(ctx context.Context) model.StageFigures)
 }
 
 func (g *generation) newUnitGroup(ctx context.Context, providerID string) *unitGroup {
@@ -970,21 +978,67 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 // group's context whatever the outcome, so an abandoned group leaks nothing;
 // closes the provider's stage after the last unit has left it, under a
 // context a cancelled pass does not end, so the stage's own accounting is
-// closed on every path; and reports the pass's wall beside the time the store
-// writer was busy during it, the ratio that says whether the pass waited on
-// the one writer the write-ahead log admits.
+// closed on every path; and records the pass's measurement on the generation
+// after that close, so the wall covers the stage's drain and the stage's
+// figures are final.
 func (u *unitGroup) wait() error {
 	u.wg.Wait()
 	u.cancel()
+	var stage *model.StageFigures
 	if u.closeStage != nil {
-		u.closeStage(context.WithoutCancel(u.parent))
+		figures := u.closeStage(context.WithoutCancel(u.parent))
+		stage = &figures
 		u.closeStage = nil
 	}
-	u.g.c.log.Info("provider pass", "component", component, "run_id", u.g.ledgerRun.ID(),
-		"provider_id", u.provider, "units", u.units,
-		"wall_ms", time.Since(u.started).Milliseconds(),
-		"writer_busy_ms", (u.g.c.opts.Store.WriterBusy() - u.writerBusy).Milliseconds())
+	u.g.recordPass(providerPass(u.provider, u.units, time.Since(u.started),
+		u.g.c.opts.Store.WriterBusy()-u.writerBusy, stage))
 	return u.fatal
+}
+
+// recordPass keeps one pass's measurement for the result, within the same
+// per-result page Runs is held to, and counts it either way.
+func (g *generation) recordPass(pass model.ProviderPass) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.passesTotal++
+	if len(g.passes) < model.MaxRecordsPerResult {
+		g.passes = append(g.passes, pass)
+	}
+}
+
+// providerPass assembles one pass's record and the three passing
+// measurements of ADR-0012 decision 5 from its figures. A ratio is left
+// absent when a figure it needs is unavailable or its denominator is zero:
+// a pass that measured nothing neither passes nor fails, and reporting it as
+// 0 would read as the best possible pass.
+//
+//   - WallPerCPU is wall × the most parses in flight ÷ Σ worker CPU, the
+//     measurement that passes at 2 or less;
+//   - StartsPerSlot is workers started ÷ the most parses in flight, which
+//     passes at 1 or less;
+//   - WriterBusyShare is writer busy ÷ wall, reported, with build order the
+//     next lever at 0.8 or more.
+func providerPass(providerID string, units int64, wall, writerBusy time.Duration,
+	stage *model.StageFigures) model.ProviderPass {
+	pass := model.ProviderPass{ProviderID: providerID, Units: units, WallMS: wall.Milliseconds(),
+		WriterBusyMS: writerBusy.Milliseconds(), Stage: stage}
+	pass.WriterBusyShare = passRatio(float64(pass.WriterBusyMS), pass.WallMS)
+	if stage != nil {
+		pass.StartsPerSlot = passRatio(float64(stage.WorkersStarted), stage.MaxInFlight)
+		if stage.WorkerCPUMS != nil && stage.MaxInFlight > 0 {
+			pass.WallPerCPU = passRatio(float64(pass.WallMS)*float64(stage.MaxInFlight), *stage.WorkerCPUMS)
+		}
+	}
+	return pass
+}
+
+// passRatio is num ÷ den, or absent when den is not positive.
+func passRatio(num float64, den int64) *float64 {
+	if den <= 0 {
+		return nil
+	}
+	r := num / float64(den)
+	return &r
 }
 
 // unit builds one unit. The returned error is nonnil only when the failure
@@ -1152,7 +1206,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		return outcome{}, err
 	}
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: c.cfgHash, OriginRunID: runID,
-		SourceBinding: binding, Dependencies: u.DependsOn}
+		SourceBinding: binding, Dependencies: u.DependsOn, DependencyKeys: u.DependencyKeys}
 	ureq := provider.UnitRequest{
 		Binding: model.Binding{RepositoryID: c.repo, SnapshotID: g.snap.ID, GenerationID: g.gen},
 		Unit:    spec, Run: runID, Content: g.view, Resolver: resolver,

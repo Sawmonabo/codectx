@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // A unit's candidates resolve against a table of its dependencies' aliases,
@@ -27,8 +26,8 @@ import (
 //     sortAliases. The identity with the larger node id is interned first, so
 //     row order is the reverse of the canonical order and the mutation shows.
 //
-// The table must also answer every key exactly as the per-key store read does
-// over the same committed rows.
+// The table must also answer every key with exactly the identities the sealed
+// dependency aliased it to.
 //
 // The group is assumed to stay open across the seal: the fixture writes a few
 // rows, far below what spills the writer's cache, and no exclusive writer
@@ -107,25 +106,24 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DependencyAliases after the commit: %v", err)
 	}
-	for _, key := range []string{"F", "G"} {
-		got, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, key, store.MaxAliasLookup)
+	// Each key answers exactly the identities the sealed dependency aliased it
+	// to, in canonical order: F's two tie on the canonical key and so come in
+	// node-id order, and the building unit's alias of F is absent.
+	low, high := min(first.Node.ID, second.Node.ID), max(first.Node.ID, second.Node.ID)
+	for key, want := range map[string][]model.NodeID{"F": {low, high}, "G": {g.Node.ID}} {
+		got, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, key)
 		if err != nil {
 			t.Fatalf("table LookupAliases(%s): %v", key, err)
 		}
-		want, err := f.s.LookupAliases(ctx, []model.UnitID{sealed, building}, a.path, key, store.MaxAliasLookup)
-		if err != nil {
-			t.Fatalf("store LookupAliases(%s): %v", key, err)
-		}
-		if !slices.Equal(got, want) {
-			t.Fatalf("%s: the table answers %v, the store answers %v", key, got, want)
-		}
+		ids := make([]model.NodeID, 0, len(got))
 		for _, alias := range got {
-			if alias.NodeID == other.Node.ID {
-				t.Fatalf("%s: the answer holds %s, an alias of the unsealed unit", key, alias.NodeID)
-			}
+			ids = append(ids, alias.NodeID)
+		}
+		if !slices.Equal(ids, want) {
+			t.Fatalf("%s: the table answers %v, want %v (the building unit's alias is %s)", key, ids, want, other.Node.ID)
 		}
 	}
-	tied, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, "F", store.MaxAliasLookup)
+	tied, err := table.LookupAliases(ctx, []model.UnitID{sealed}, a.path, "F")
 	if err != nil {
 		t.Fatalf("table LookupAliases(F): %v", err)
 	}

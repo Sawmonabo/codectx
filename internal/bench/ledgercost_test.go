@@ -377,7 +377,7 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	if err != nil {
 		return ledgerArmResult{}, err
 	}
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		return ledgerArmResult{}, err
 	}

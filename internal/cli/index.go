@@ -749,7 +749,41 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	writeProvidersDisabled(&b, result.ProvidersDisabled)
 	writeCapabilities(&b, result.Completeness)
 	writeIndexRunLedger(&b, result.Run, result.Stages, result.StagesOmitted)
+	writeIndexPasses(&b, result.Passes, result.PassesOmitted)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
+}
+
+// writeIndexPasses appends one line per provider pass: its units, wall and
+// store writer time, and for a provider with a stage its worker figures and
+// the passing measurements. A figure the pass could not measure reads
+// unavailable, never 0, since 0 is the best value every ratio can take.
+func writeIndexPasses(b *strings.Builder, passes []model.ProviderPass, omitted int64) {
+	for _, pass := range passes {
+		fmt.Fprintf(b, "pass        %s %d %s in %s, writer busy %s, busy/wall %s",
+			pass.ProviderID, pass.Units, plural(int(pass.Units), "unit", "units"), millisMetric(pass.WallMS),
+			millisMetric(pass.WriterBusyMS), ratioMetric(pass.WriterBusyShare))
+		if stage := pass.Stage; stage != nil {
+			cpu := metricUnavailable
+			if stage.WorkerCPUMS != nil {
+				cpu = millisMetric(*stage.WorkerCPUMS)
+			}
+			fmt.Fprintf(b, ", %d workers started, %d most in flight, worker cpu %s, wall*in-flight/cpu %s, started/in-flight %s",
+				stage.WorkersStarted, stage.MaxInFlight, cpu, ratioMetric(pass.WallPerCPU), ratioMetric(pass.StartsPerSlot))
+		}
+		b.WriteString("\n")
+	}
+	if omitted > 0 {
+		fmt.Fprintf(b, "omitted     %d further %s beyond this result's page\n",
+			omitted, plural(int(omitted), "pass was measured", "passes were measured"))
+	}
+}
+
+// ratioMetric renders a measured ratio, or says it is unavailable.
+func ratioMetric(r *float64) string {
+	if r == nil {
+		return metricUnavailable
+	}
+	return fmt.Sprintf("%.2f", *r)
 }
 
 // writeIndexRunLedger appends what the run cost and which of its stages that
@@ -1000,6 +1034,18 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s%s\n",
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
+	}
+	// One line per learned need class: what the reservation it predicts was
+	// measured against. Overruns over observations is the per-class figure
+	// the overrun target is stated in, and the drift says by how much the
+	// worst file missed -- below zero when every file fitted.
+	for _, c := range r.NeedClasses {
+		fmt.Fprintf(tw, "    need %s %s size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
+			c.Language, shortDigest(c.Fingerprint), c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
+	}
+	if r.NeedClassesOmitted > 0 {
+		fmt.Fprintf(tw, "    need %d more %s\t\n", r.NeedClassesOmitted,
+			plural(int(r.NeedClassesOmitted), "class", "classes"))
 	}
 	// What this block could not read, and why. A figure that is simply absent
 	// looks the same as one nothing ever recorded, so the reason is printed

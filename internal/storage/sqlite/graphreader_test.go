@@ -56,7 +56,7 @@ func graphFixtureStoreFull(t *testing.T) (*store.Store, model.RepositoryID, stri
 	ctx := context.Background()
 	repo := graphtest.FixtureRepository
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
-	s, err := store.Open(ctx, dbPath, store.Options{})
+	s, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -108,7 +109,7 @@ var scenarios = []scenario{
 		name: "unmeasurable metric is absent, not zero",
 		run: func(t *testing.T) {
 			blind := NewHostSampler(HostSamplerOptions{})
-			blind.parentRSS = func() *uint64 { return nil }
+			blind.self = func() residency.Reading { return residency.Reading{} }
 			got, err := blind.Sample(context.Background())
 			if err != nil {
 				t.Fatalf("Sample on a host that cannot read its own RSS: %v", err)
@@ -128,7 +129,7 @@ var scenarios = []scenario{
 				t.Fatalf("Sample on this host: %v", err)
 			}
 			if runtime.GOOS == "linux" && (real.ParentRSSBytes == nil || *real.ParentRSSBytes == 0) {
-				t.Fatal("this host exposes /proc/self/statm, so parent RSS must be a real figure")
+				t.Fatal("this host exposes /proc/self/status, so parent RSS must be a real figure")
 			}
 		},
 	},

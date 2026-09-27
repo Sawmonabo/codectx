@@ -66,7 +66,7 @@ func newFixture(t *testing.T, dbPath string) *fixture {
 func newFixtureWithOptions(t *testing.T, dbPath string, opts store.Options) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, opts)
+	s, err := store.Open(ctx, dbPath, store.WithDerivedReaders(opts))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1277,7 +1277,7 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Close()
-	if _, err := store.Open(ctx, dbPath, store.Options{}); err == nil {
+	if _, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{})); err == nil {
 		t.Fatal("Open accepted a database with a foreign schema fingerprint")
 	} else {
 		wantCode(t, err, model.CodeSchemaMismatch)
@@ -2050,11 +2050,21 @@ func TestBlobGraceProtocol(t *testing.T) {
 // and a writer busy time that never moves, which would report a stage as never
 // waiting on the writer. Mutations that must fail it: in open.go's write, drop
 // the s.commitGroup() that runs before the exclusive transaction begins (the
-// transaction then waits on the one connection the open group holds, and the
-// test never finishes); in runWriter, drop the s.writerBusy.Add.
+// transaction then waits on the one connection the open group holds until the
+// test's deadline, and the waiting callers are reported); in runWriter, drop
+// the s.writerBusy.Add.
 func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 	f := newFixture(t, filepath.Join(t.TempDir(), "writer.db"))
-	ctx := f.ctx
+	// Every caller runs under a deadline halfway to the test binary's own, so
+	// a writer that never serves them ends their waits with an error this test
+	// reports, rather than the binary's timeout ending the run. A run without
+	// a timeout has no deadline to derive one from, and waits as it asked to.
+	ctx := t.Context()
+	if deadline, ok := t.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Until(deadline)/2))
+		defer cancel()
+	}
 	snap := f.snapshot("leases", f.file("leases.go", "package leases\n"))
 	busy := f.s.WriterBusy()
 
@@ -2110,6 +2120,9 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 	}
 	wg.Wait()
 	close(errs)
+	if ctx.Err() != nil {
+		t.Errorf("the writer left callers waiting until the test's deadline: an exclusive write waited on the connection the open ingestion group holds")
+	}
 	for err := range errs {
 		t.Error(err)
 	}

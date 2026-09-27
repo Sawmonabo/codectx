@@ -2037,7 +2037,7 @@ max_provider_record_bytes = 0  # 0 = unlimited; when set, must fit index.batch_b
 [storage]
 data_dir = ""
 busy_timeout = "5s"
-read_connections = 2
+read_connections = 0            # 0 = each reader pool sized by the goroutines that read it
 writer_cache_kib = 1048576
 reader_cache_kib = 4096
 closed_session_retention = "7d"

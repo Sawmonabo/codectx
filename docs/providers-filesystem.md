@@ -86,7 +86,10 @@ tag a provider selects files by cannot drift apart. Its table covers the source
 languages and the documentation, build and configuration extensions.
 `filesystem.Language(path)` is a thin call to it and stays the name the
 analyzer providers call; the tags for the bundled grammars match
-`tree_sitter.languages`.
+`tree_sitter.languages`. A `.h` header, which the C and C++ grammars both
+declare, is tagged within its snapshot (`lang.For`): the grammar the snapshot's
+C and C++ translation-unit census parses headers with first. The manifest row,
+the search language filter and the file node all carry that tag.
 
 Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
 description) are emitted by `filesystem`, not by `manifest`: classification is

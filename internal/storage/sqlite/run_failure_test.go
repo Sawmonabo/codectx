@@ -131,7 +131,7 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 
 	// A second handle on the same file, with no coordinator behind it: this is
 	// the process that did none of the work and holds none of its state.
-	reader, err := store.Open(f.ctx, path, store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond})
+	reader, err := store.Open(f.ctx, path, store.WithDerivedReaders(store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond}))
 	if err != nil {
 		t.Fatalf("the second handle could not be opened: %v", err)
 	}

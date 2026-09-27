@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -234,18 +235,94 @@ func (p *Provider) Detect(_ context.Context, _ workspace.Root, _ workspace.Polic
 	return provider.Detection{Available: true, Capabilities: []string{capabilityName}}, nil
 }
 
-// LanguageOf reports the pinned language for a manifest row: the snapshot's
-// language tag when it names one this provider supports, else the extension.
+// LanguageOf reports whether the provider parses a manifest row, and the
+// language it parses it with first in a repository with no C or C++
+// translation unit. Whether a row is parsed never depends on the repository,
+// so the answer is the planner's eligibility gate; a header's grammar does,
+// so every parse asks grammarOf with its snapshot's census instead.
 func (p *Provider) LanguageOf(fv model.FileVersion) (lang.Language, bool) {
+	l, _, ok := p.grammarOf(lang.Census{}, fv)
+	return l, ok
+}
+
+// grammarOf is the grammar a manifest row is parsed with first and, for a
+// header, the grammar a parse of it with errors falls back to (empty for
+// every other row). A path two grammars declare is a header, whose grammar is
+// the repository's (lang.Census.Header, ADR-0012 decision 10) and never the
+// manifest's tag or the extension's answer; when the provider supports only
+// one of the two, the header is parsed with that one alone. Any other row is
+// parsed with its snapshot language tag when the provider supports it, else
+// its extension's grammar.
+func (p *Provider) grammarOf(census lang.Census, fv model.FileVersion) (lang.Language, string, bool) {
+	if len(lang.Candidates(fv.Path)) > 1 {
+		first, fallback, ok := census.Header().Within(func(name string) bool { _, ok := p.languages[name]; return ok })
+		return p.languages[first], fallback, ok
+	}
 	if l, ok := p.languages[fv.Language]; ok {
-		return l, true
+		return l, "", true
 	}
 	l, ok := lang.ByExtension(fv.Path)
 	if !ok {
-		return lang.Language{}, false
+		return lang.Language{}, "", false
 	}
 	_, ok = p.languages[l.Name]
-	return l, ok
+	return l, "", ok
+}
+
+// censusOf is the C and C++ census of view's snapshot. A probe has no
+// snapshot and parses a header as a repository with neither language would.
+func censusOf(view model.SnapshotView) lang.Census {
+	if view == nil {
+		return lang.Census{}
+	}
+	h := view.Header()
+	return lang.Census{C: h.CUnits, CPP: h.CPPUnits}
+}
+
+// keptLanguage is the language a parse's facts are in: the request's, or for
+// a header the grammar its kept parse used. A choice the request did not ask
+// for, or one that does not describe the request's two grammars, is output no
+// worker of this protocol produces.
+func keptLanguage(req wire.Request, h *lang.HeaderChoice) (lang.Language, error) {
+	name := req.Language
+	switch {
+	case req.Fallback == "" && h == nil:
+	case req.Fallback == "" || h == nil:
+		return lang.Language{}, outputInvalid("a header choice that does not answer the request's fallback")
+	case h.First != req.Language || (h.Kept != req.Language && h.Kept != req.Fallback) ||
+		(h.Kept == req.Fallback) != (h.Reason == lang.HeaderFallbackKept) ||
+		(h.Reason != lang.HeaderClean && h.Reason != lang.HeaderFirstKept && h.Reason != lang.HeaderFallbackKept):
+		return lang.Language{}, outputInvalid("a header choice that names grammars or a reason the request does not")
+	default:
+		name = h.Kept
+	}
+	l, ok := lang.Lookup(name)
+	if !ok {
+		return lang.Language{}, outputInvalid("a parse in a language that is not pinned")
+	}
+	return l, nil
+}
+
+// The capability details a header's parse discloses (lang.HeaderChoice): the
+// grammar it was parsed with first, the one kept and why, and, when the
+// fallback ran, the error bytes of each parse.
+const (
+	detailHeaderFirst              = "header_first"
+	detailHeaderKept               = "header_kept"
+	detailHeaderReason             = "header_reason"
+	detailHeaderFirstErrorBytes    = "header_first_error_bytes"
+	detailHeaderFallbackErrorBytes = "header_fallback_error_bytes"
+)
+
+// discloseHeader adds a header's grammar choice to its file's capability row.
+func discloseHeader(state model.CapabilityState, h lang.HeaderChoice) model.CapabilityState {
+	state = state.WithDetail(detailHeaderFirst, h.First).WithDetail(detailHeaderKept, h.Kept).
+		WithDetail(detailHeaderReason, string(h.Reason))
+	if h.Reason != lang.HeaderClean {
+		state = state.WithDetail(detailHeaderFirstErrorBytes, strconv.FormatUint(h.FirstErr.Bytes, 10)).
+			WithDetail(detailHeaderFallbackErrorBytes, strconv.FormatUint(h.Fallback.Bytes, 10))
+	}
+	return state
 }
 
 // Stats is the aggregate parent-plus-worker resource view.
@@ -269,11 +346,21 @@ func (p *Provider) Close() { p.pool.close() }
 // caller that never opens a stage is served exactly as before. closeStage
 // leaves the stage once, however often it is called, under the run the stage
 // was opened in: the context it is given is not consulted, so a caller cannot
-// close another run's total.
-func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.Context)) {
+// close another run's total. It answers what the pool did while the stage was
+// open, measured after the leave so a drained worker's processor time is in
+// it, and every later call answers the same figures.
+func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.Context) model.StageFigures) {
+	window := p.pool.openWindow()
 	p.enterStage(ctx)
 	var once sync.Once
-	return func(context.Context) { once.Do(func() { p.leaveStage(ctx) }) }
+	var figures model.StageFigures
+	return func(context.Context) model.StageFigures {
+		once.Do(func() {
+			p.leaveStage(ctx)
+			figures = p.pool.closeWindow(window)
+		})
+		return figures
+	}
 }
 
 // IndexUnit indexes the one file the unit's scope key names. The run always
@@ -283,7 +370,9 @@ func (p *Provider) OpenStage(ctx context.Context) (closeStage func(ctx context.C
 // the builder disclosed) or unavailable (over max_parse_file_bytes, wider than
 // the parser can address, not UTF-8, or not a supported language); an
 // unhealthy worker is replaced and the parse retried once; anything else fails
-// the unit.
+// the unit. A header is parsed with the grammar its snapshot's census chooses
+// and falls back once to the other (grammarOf); its facts are in the grammar
+// of the parse the worker kept, and the choice is disclosed on its row.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 	p.enterStage(ctx)
 	defer p.leaveStage(ctx)
@@ -303,7 +392,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		result.Capabilities = []model.CapabilityState{state}
 		return result, nil
 	}
-	l, ok := p.LanguageOf(fv)
+	l, fallback, ok := p.grammarOf(censusOf(req.Content), fv)
 	if !ok {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
@@ -318,8 +407,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !utf8.Valid(src) {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	ex, err := p.parse(ctx, req.Content, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src))}, src)
+	wreq := wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src)), Fallback: fallback}
+	ex, err := p.parse(ctx, req.Content, wreq, src)
 	if err != nil {
+		return model.ProviderResult{}, err
+	}
+	if l, err = keptLanguage(wreq, ex.done.Header); err != nil {
 		return model.ProviderResult{}, err
 	}
 	b := &builder{ctx: ctx, req: req, fv: fv, lang: l, src: src, cur: source.NewCursor(src), ex: ex,
@@ -332,6 +425,9 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	result.RecordsEmitted = records
+	if h := ex.done.Header; h != nil {
+		state = discloseHeader(state, *h)
+	}
 	state, bounded := b.bounds(state)
 	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {
 		return finish(model.CapabilityPartial, model.CodeCoverageIncomplete)
@@ -396,7 +492,12 @@ func (p *Provider) read(ctx context.Context, view model.SnapshotView, fv model.F
 // which learns nothing. A caller that gives its worker back while it waits for
 // the increment asks again; that is not an attempt.
 func (p *Provider) parse(ctx context.Context, view model.SnapshotView, req wire.Request, src []byte) (*extraction, error) {
-	f, err := p.pool.plan(ctx, view, req.Language, int64(len(src)), p.languageName)
+	census := censusOf(view)
+	languageOf := func(fv model.FileVersion) (string, bool) {
+		l, _, ok := p.grammarOf(census, fv)
+		return l.Name, ok
+	}
+	f, err := p.pool.plan(ctx, view, req.Language, int64(len(src)), languageOf)
 	if err != nil {
 		return nil, err
 	}
@@ -444,12 +545,6 @@ func (p *Provider) parse(ctx context.Context, view model.SnapshotView, req wire.
 	}
 }
 
-// languageName is LanguageOf as the pool counts a snapshot's files by it.
-func (p *Provider) languageName(fv model.FileVersion) (string, bool) {
-	l, ok := p.LanguageOf(fv)
-	return l.Name, ok
-}
-
 // Probe is the outcome of a diagnostic parse: what the worker extracted,
 // without storage, identities or the resolver.
 type Probe struct {
@@ -467,7 +562,7 @@ type Probe struct {
 // framing, validation and retry as IndexUnit, with no unit or sink -- and, as
 // enterStage records, no stage of its own.
 func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (Probe, error) {
-	l, ok := p.LanguageOf(model.FileVersion{Path: relPath})
+	l, fallback, ok := p.grammarOf(censusOf(nil), model.FileVersion{Path: relPath})
 	if !ok {
 		return Probe{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "no pinned grammar for " + bound(relPath, 256)}
 	}
@@ -477,8 +572,12 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 	if int64(len(src)) > wire.MaxSourceOffset {
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file is longer than the parser's byte offsets can address"}
 	}
-	ex, err := p.parse(ctx, nil, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint64(len(src))}, src)
+	wreq := wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint64(len(src)), Fallback: fallback}
+	ex, err := p.parse(ctx, nil, wreq, src)
 	if err != nil {
+		return Probe{}, err
+	}
+	if l, err = keptLanguage(wreq, ex.done.Header); err != nil {
 		return Probe{}, err
 	}
 	return Probe{Language: l.Name, Declarations: len(ex.decls), Imports: len(ex.imports), References: len(ex.refs),

@@ -17,9 +17,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
-	"strconv"
-	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 )
 
 // Subcommand is the hidden argv[1] under which the codectx binary runs as a
@@ -117,6 +116,10 @@ type Request struct {
 	Language    string `json:"language"`
 	Path        string `json:"path"`
 	SourceBytes uint64 `json:"source_bytes"`
+	// Fallback is the grammar a header whose parse with Language has errors
+	// is parsed with once more, the parse with fewer error bytes being kept.
+	// It is empty for every file that is not a header.
+	Fallback string `json:"fallback,omitempty"`
 }
 
 // Decl is one declaration. Offsets are byte offsets into the source; Parent
@@ -190,6 +193,9 @@ type Done struct {
 	// Truncated reports that the query cursor exceeded its match limit, so
 	// the query did not see every match in the tree.
 	Truncated bool `json:"truncated,omitempty"`
+	// Header is a header's grammar choice: the grammar each parse used, which
+	// was kept and why. It is nil for a request that named no fallback.
+	Header *lang.HeaderChoice `json:"header,omitempty"`
 	// Memory is the worker's reading of itself at the end of this file.
 	Memory Memory `json:"memory"`
 }
@@ -289,26 +295,4 @@ func readFrame(r io.Reader) (Kind, bool, []byte, error) {
 		return 0, false, nil, err
 	}
 	return Kind(hdr[4] &^ more), cont, payload, nil
-}
-
-// ResidentBytes reports this process's resident set size and false when the
-// platform cannot report it. It is the parent's reading of itself -- for the
-// provider's resource view, the base footprint's idle term and the product's
-// own residency in the re-derived allocation -- while a worker reports its own
-// memory in its Hello and Done frames (Memory). A caller records an
-// unmeasurable value as unavailable, never as zero.
-func ResidentBytes() (int64, bool) {
-	data, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0, false
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0, false
-	}
-	pages, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil || pages < 0 {
-		return 0, false
-	}
-	return pages * int64(os.Getpagesize()), true
 }

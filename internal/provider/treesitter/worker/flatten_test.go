@@ -35,13 +35,18 @@ import (
 //     answered as the native node answers it, ChildByFieldId for every field
 //     id of the grammar, and the cursor stepped in lockstep with a native one
 //     from every node; every absent answer is the null handle, as the zero
-//     Node is.
+//     Node is;
+//   - the error figures a header's fallback is decided by: the array's error
+//     flag and outermost ERROR bytes equal the native tree's, so a header is
+//     never kept in the grammar with more errors.
 //
 // Mutations that fail it: record the node's grammar symbol instead of its
 // public one; take the field from the parent's field instead of the cursor's;
 // drop an extra from the sibling chain; count NamedChild without extras;
 // let GotoNextSibling leave the cursor's root; answer a zero distance with
-// the node itself instead of the null handle.
+// the node itself instead of the null handle; sum error bytes over every node
+// that contains an error instead of every ERROR node, or count an ERROR node
+// nested in another.
 func TestFlatMatchesNative(t *testing.T) {
 	srcs := flatSources(t)
 	for _, l := range lang.All {
@@ -62,9 +67,35 @@ func TestFlatMatchesNative(t *testing.T) {
 					t.Fatal(err)
 				}
 				checkFlat(t, tl, tree, f)
+				if got, want := f.parseErrors(grammars[l.Name].kindIDs().errorKind), nativeErrors(tree); got != want {
+					t.Fatalf("flat error figures %+v, native %+v", got, want)
+				}
 			})
 		}
 		p.Close()
+	}
+}
+
+// nativeErrors is tree's error figures read node by node from the native
+// tree: its error flag, and the bytes of every ERROR node no ERROR node
+// encloses.
+func nativeErrors(tree *ts.Tree) lang.ParseErrors {
+	root := tree.RootNode()
+	pe := lang.ParseErrors{Any: root.HasError()}
+	c := tree.Walk()
+	defer c.Close()
+	for {
+		n := c.Node()
+		if n.IsError() {
+			pe.Bytes += uint64(n.EndByte() - n.StartByte())
+		} else if c.GotoFirstChild() {
+			continue
+		}
+		for !c.GotoNextSibling() {
+			if !c.GotoParent() {
+				return pe
+			}
+		}
 	}
 }
 

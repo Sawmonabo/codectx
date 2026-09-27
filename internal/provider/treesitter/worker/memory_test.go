@@ -3,26 +3,9 @@ package worker
 import (
 	"fmt"
 	"testing"
-)
 
-// TestParseStatusReadsKibibytesAndMissingIsUnavailable protects the reading
-// every per-file need and worker base is taken from. A field read in the
-// wrong unit, or a missing field read as zero, reaches the parent's need model
-// and ledger as a figure the worker never had. Mutations that fail it:
-// dropping the ×1024, or returning a pointer to 0 for an absent field.
-func TestParseStatusReadsKibibytesAndMissingIsUnavailable(t *testing.T) {
-	const text = "Name:\tcodectx\nVmPeak:\t  900000 kB\nVmHWM:\t   81920 kB\nVmRSS:\t   40960 kB\nRssFile:\t   30000 kB\nThreads:\t8\n"
-	s := parseStatus(text)
-	if s.peak == nil || *s.peak != 81920*1024 {
-		t.Fatalf("VmHWM = %v, want %d", s.peak, 81920*1024)
-	}
-	if s.resident == nil || *s.resident != 40960*1024 {
-		t.Fatalf("VmRSS = %v, want %d", s.resident, 40960*1024)
-	}
-	if s.anon != nil {
-		t.Fatalf("RssAnon is absent from the text but read as %d, not unavailable", *s.anon)
-	}
-}
+	"github.com/Sawmonabo/codectx/internal/residency"
+)
 
 // fakeHost is a platform whose peak, resident set and heap return the test
 // sets between boundaries.
@@ -33,8 +16,9 @@ type fakeHost struct {
 
 func (f *fakeHost) host() host {
 	return host{
-		status: func() (string, bool) {
-			return fmt.Sprintf("VmHWM:\t%d kB\nVmRSS:\t%d kB\nRssAnon:\t%d kB\n", f.peakKiB, f.rssKiB, f.rssKiB/2), true
+		read: func() residency.Reading {
+			return residency.Parse(fmt.Sprintf("VmHWM:\t%d kB\nVmRSS:\t%d kB\nRssAnon:\t%d kB\n",
+				f.peakKiB, f.rssKiB, f.rssKiB/2))
 		},
 		returnHeap: func() bool { return f.returns },
 		resetPeak:  func() bool { return f.resets },

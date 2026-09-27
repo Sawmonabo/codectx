@@ -31,11 +31,12 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 	var snap model.Snapshot
 	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		var repo []byte
-		var count, bytes int64
+		var count, bytes, cUnits, cppUnits int64
 		var created string
 		err := tx.QueryRowContext(ctx, `SELECT repository_id, head_object_id, source_policy_hash, manifest_hash, file_count, source_bytes,
-			capture_consistency, created_at FROM snapshots WHERE id = ?`, raw).
-			Scan(&repo, &snap.HeadObjectID, &snap.SourcePolicyHash, &snap.ManifestHash, &count, &bytes, &snap.CaptureConsistency, &created)
+			c_units, cpp_units, capture_consistency, created_at FROM snapshots WHERE id = ?`, raw).
+			Scan(&repo, &snap.HeadObjectID, &snap.SourcePolicyHash, &snap.ManifestHash, &count, &bytes, &cUnits, &cppUnits,
+				&snap.CaptureConsistency, &created)
 		if isNoRows(err) {
 			return notFound("snapshot %s does not exist", id)
 		}
@@ -44,6 +45,7 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 		}
 		snap.ID, snap.RepositoryID = id, model.RepositoryID(idHex(repo))
 		snap.FileCount, snap.SourceBytes = uint64(count), uint64(bytes)
+		snap.CUnits, snap.CPPUnits = uint64(cUnits), uint64(cppUnits)
 		snap.CreatedAt, err = parseTime(created)
 		return err
 	})

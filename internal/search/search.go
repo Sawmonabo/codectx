@@ -236,6 +236,11 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 	} else {
+		// A continuation serves hits already filtered; only a first page
+		// filters, so only it reads the snapshot's tagger.
+		if err := filter.pin(ctx, s.store, binding.SnapshotID); err != nil {
+			return empty, err
+		}
 		var run *pagination.SortedRun[scored]
 		searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
 		run, truncated, reason, err = s.rank(searchCtx, reader, req, filter)
@@ -895,12 +900,28 @@ func spoolBudgetFullReason(dropped int) string {
 // actually asked for.
 //
 // Paths are root-relative path PREFIXES: a hit is kept when its file path
-// equals a listed prefix or lies under it. Languages are matched by
-// lang.Of(path), the one place a repository path becomes a language name, so a
-// filter cannot disagree with the language the index recorded.
+// equals a listed prefix or lies under it. Languages are matched by the pinned
+// snapshot's lang.Tagger, the one place a repository path becomes a language
+// name, so a filter cannot disagree with the language the manifest recorded,
+// a header's included.
 type hitFilter struct {
 	prefixes  []string
 	languages map[string]bool
+	tag       lang.Tagger
+}
+
+// pin binds the language filter to the pinned snapshot's tagger. The snapshot
+// header is read only when a language filter is set, since only it tags.
+func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, id model.SnapshotID) error {
+	if f.languages == nil {
+		return nil
+	}
+	snap, err := store.Snapshot(ctx, id)
+	if err != nil {
+		return err
+	}
+	f.tag = lang.For(snap)
+	return nil
 }
 
 // newHitFilter normalizes the request's filters once. A path that is not
@@ -928,7 +949,7 @@ func newHitFilter(req model.SearchRequest) (hitFilter, error) {
 
 // keep reports whether a hit at this repository path survives the filters.
 func (f hitFilter) keep(p string) bool {
-	if f.languages != nil && !f.languages[lang.Of(p)] {
+	if f.languages != nil && !f.languages[f.tag.Of(p)] {
 		return false
 	}
 	if len(f.prefixes) == 0 {

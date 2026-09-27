@@ -13,8 +13,8 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
-	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/residency"
 )
 
 // This file measures the per-function dependence core in this process: the
@@ -107,10 +107,11 @@ func emit(t *testing.T, row any) {
 // resident is this process's resident set, nil when the platform cannot
 // report it.
 func resident() *int64 {
-	v, ok := wire.ResidentBytes()
-	if !ok {
+	r := residency.Read().Resident
+	if r == nil {
 		return nil
 	}
+	v := int64(*r)
 	return &v
 }
 
@@ -331,7 +332,12 @@ type parseRow struct {
 	// tree still open; negative if the parse released retained state.
 	NativeAfterBytes int64 `json:"native_after_bytes"`
 	// TreeBytes is what closing the tree released: the tree itself.
-	TreeBytes       int64  `json:"tree_bytes"`
+	TreeBytes int64 `json:"tree_bytes"`
+	// FlatBytes is the flattened node array the lowering reads in place of
+	// the tree (worker.Flatten), in the Go heap. It is taken from the open
+	// tree with native counting paused, since the tree cursor the flattening
+	// walks with allocates natively and frees before it returns.
+	FlatBytes       int64  `json:"flat_bytes"`
 	NativeBaseBytes uint64 `json:"native_base_bytes"`
 	// InputCopyBytes is the binding's uncounted C-string copies of the
 	// source, live until the parse ends.
@@ -384,6 +390,15 @@ func TestParseMemory(t *testing.T) {
 			return
 		}
 		row.HasError = tree.RootNode().HasError()
+		native.SetCounting(false)
+		flat, err := worker.Flatten(tree)
+		native.SetCounting(true)
+		if err != nil {
+			tree.Close()
+			t.Errorf("%s: %v", in.path, err)
+			return
+		}
+		row.FlatBytes = int64(flat.Bytes())
 		tree.Close()
 		row.NativeBaseBytes = base
 		row.NativeAfterBytes = int64(after) - int64(base)

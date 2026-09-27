@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -394,7 +395,8 @@ func TestAnAbandonedDeferredUnitReadsFailedInAnotherProcess(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	second, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadOnly: true})
+	second, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadOnly: true,
+		ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("a second, read-only store handle: %v", err)
 	}

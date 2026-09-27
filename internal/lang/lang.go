@@ -6,11 +6,20 @@
 // The table covers source languages and the documentation, build and
 // configuration extensions the filesystem provider classifies. Classification is by extension and basename only: no file is opened
 // to guess, and a path with no entry honestly has no language.
+//
+// One extension, ".h", names a header the C and C++ grammars both declare,
+// whose language is the repository's and not the file name's. A reader that
+// holds the snapshot tags through For, which answers the grammar the
+// snapshot's census parses its headers with first; Of is the answer without a
+// census, which only a reader indifferent to C against C++ may use.
 package lang
 
 import (
 	"path"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 )
 
 // byExtension maps a lowercased extension to its language tag. The tags for
@@ -88,7 +97,9 @@ var byBasename = map[string]string{
 
 // Of returns the language tag for a root-relative path, or "" when the path
 // says nothing. The basename is consulted first, so CMakeLists.txt is cmake
-// rather than text.
+// rather than text. It knows no census, so a ".h" header answers the table's
+// "c" whatever the repository is written in; Tagger.Of is the answer within a
+// snapshot.
 func Of(rel string) string {
 	base := path.Base(rel)
 	if l, ok := byBasename[base]; ok {
@@ -96,3 +107,45 @@ func Of(rel string) string {
 	}
 	return byExtension[strings.ToLower(path.Ext(base))]
 }
+
+// Tagger tags the paths of one snapshot.
+type Tagger struct {
+	header string
+}
+
+// For is the tagger of one snapshot: a header two grammars declare takes the
+// grammar the snapshot's census parses headers with first
+// (tslang.Census.Header), and every other path its Of tag. It is the grammar
+// a header's parse starts from, not the one its kept parse used: the manifest
+// row is written at capture, before any parse.
+func For(s model.Snapshot) Tagger {
+	return Tagger{header: tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header().First}
+}
+
+// Of returns the language tag of a root-relative path in the tagger's
+// snapshot.
+func (t Tagger) Of(rel string) string {
+	if twoGrammar[strings.ToLower(path.Ext(rel))] {
+		return t.header
+	}
+	return Of(rel)
+}
+
+// twoGrammar is the set of extensions more than one grammar declares, derived
+// once from the grammar registry (tslang.Candidates' answer, without its
+// per-path allocation on the search filter's path).
+var twoGrammar = func() map[string]bool {
+	declared := map[string]int{}
+	for _, l := range tslang.All {
+		for _, ext := range l.Extensions {
+			declared[ext]++
+		}
+	}
+	out := map[string]bool{}
+	for ext, n := range declared {
+		if n > 1 {
+			out[ext] = true
+		}
+	}
+	return out
+}()

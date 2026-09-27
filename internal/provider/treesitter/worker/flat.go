@@ -1,5 +1,7 @@
 package worker
 
+import "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+
 // Flat is one file's parse tree as a Go-side node array, filled by Flatten.
 // It holds no native pointer and no Go pointer, so it outlives the tree it
 // was flattened from and the collector never scans it. Nothing writes it
@@ -10,6 +12,33 @@ type Flat struct {
 
 // Root is the tree's root node.
 func (f *Flat) Root() Node { return Node{f: f} }
+
+// parseErrors is what the tree f was flattened from reports about its errors:
+// whether it has an error or a missing node, and the bytes its outermost
+// ERROR nodes (errorKind) cover, so a byte inside nested error nodes counts
+// once. It reads the array alone and descends only into nodes that contain an
+// error.
+func (f *Flat) parseErrors(errorKind uint16) lang.ParseErrors {
+	root := f.Root()
+	pe := lang.ParseErrors{Any: root.HasError()}
+	if !pe.Any {
+		return pe
+	}
+	c := root.Walk()
+	for {
+		n := c.Node()
+		if n.KindId() == errorKind {
+			pe.Bytes += uint64(n.EndByte() - n.StartByte())
+		} else if n.HasError() && c.GotoFirstChild() {
+			continue
+		}
+		for !c.GotoNextSibling() {
+			if !c.GotoParent() {
+				return pe
+			}
+		}
+	}
+}
 
 // Node is a handle on one node of a Flat: the array and the node's index in
 // it. It is a value: a copy names the same node. The zero Node is null, the

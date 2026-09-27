@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // Index, status and doctor contracts. The spec does not enumerate the fields of
 // these records; each doc comment below states the minimal set the named
@@ -73,6 +76,96 @@ type IndexResult struct {
 	// would read as the complete cost of the run -- the one thing a bounded
 	// response must never do.
 	StagesOmitted int64 `json:"stages_omitted"`
+	// Passes is one record per provider pass this generation ran, in the
+	// order the passes ran: the passing measurements of ADR-0012 decision 5,
+	// read by a proof run from the result rather than from a log. It is a
+	// wire-sized page like Runs, and PassesOmitted is how many passes did not
+	// fit it.
+	Passes        []ProviderPass `json:"passes"`
+	PassesOmitted int64          `json:"passes_omitted"`
+}
+
+// ProviderPass is one provider's pass over a run's units: from the moment its
+// first unit is admitted, which is when a provider that keeps a stage opens
+// it, to the moment the last one has drained and that stage has closed. For
+// such a provider the pass wall is the stage wall.
+//
+// Stage is what the provider's stage measured over the pass, and is absent
+// for a provider without one: a provider that starts no workers has no worker
+// figures, which is not the same as figures of zero. Each ratio is absent when
+// a figure it is computed from is unavailable or its denominator is zero.
+type ProviderPass struct {
+	ProviderID string `json:"provider_id"`
+	Units      int64  `json:"units"`
+	WallMS     int64  `json:"wall_ms"`
+	// WriterBusyMS is the time the store's one writer was busy during the
+	// pass.
+	WriterBusyMS int64         `json:"writer_busy_ms"`
+	Stage        *StageFigures `json:"stage,omitempty"`
+	// WallPerCPU is wall × the most parses in flight ÷ Σ worker CPU; the pass
+	// passes at 2 or less.
+	WallPerCPU *float64 `json:"wall_per_cpu,omitempty"`
+	// StartsPerSlot is workers started ÷ the most parses in flight; the pass
+	// passes at 1 or less.
+	StartsPerSlot *float64 `json:"starts_per_slot,omitempty"`
+	// WriterBusyShare is writer busy ÷ wall. It is reported, and build order
+	// is the next lever at 0.8 or more.
+	WriterBusyShare *float64 `json:"writer_busy_share,omitempty"`
+}
+
+// StageFigures is what one provider stage measured between its open and its
+// close: the workers it started, the most parses that held memory at once,
+// and the processor time of the workers reaped by then. WorkerCPUMS is absent
+// when a worker reaped in the stage was not measured, or when any worker was
+// alive at the stage's open or still alive at its close, as when another
+// run's stage was open beside it: a partial sum, or one carrying another
+// stage's time, is never reported as the stage's.
+type StageFigures struct {
+	WorkersStarted int64  `json:"workers_started"`
+	MaxInFlight    int64  `json:"max_in_flight"`
+	WorkerCPUMS    *int64 `json:"worker_cpu_ms,omitempty"`
+}
+
+// Validate enforces the pass record's shape: counts are non-negative and a
+// ratio, when present, is a finite non-negative number.
+func (p ProviderPass) Validate() error {
+	if err := requireField("provider_pass.provider_id", p.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	type count struct {
+		field string
+		value int64
+	}
+	counts := []count{
+		{"provider_pass.units", p.Units},
+		{"provider_pass.wall_ms", p.WallMS},
+		{"provider_pass.writer_busy_ms", p.WriterBusyMS},
+	}
+	if p.Stage != nil {
+		counts = append(counts, count{"provider_pass.stage.workers_started", p.Stage.WorkersStarted},
+			count{"provider_pass.stage.max_in_flight", p.Stage.MaxInFlight})
+		if p.Stage.WorkerCPUMS != nil {
+			counts = append(counts, count{"provider_pass.stage.worker_cpu_ms", *p.Stage.WorkerCPUMS})
+		}
+	}
+	for _, c := range counts {
+		if err := requireNonNegative(c.field, c.value); err != nil {
+			return err
+		}
+	}
+	for _, ratio := range []struct {
+		field string
+		value *float64
+	}{
+		{"provider_pass.wall_per_cpu", p.WallPerCPU},
+		{"provider_pass.starts_per_slot", p.StartsPerSlot},
+		{"provider_pass.writer_busy_share", p.WriterBusyShare},
+	} {
+		if ratio.value != nil && (math.IsNaN(*ratio.value) || math.IsInf(*ratio.value, 0) || *ratio.value < 0) {
+			return invalid("%s must be a finite non-negative ratio, got %v", ratio.field, *ratio.value)
+		}
+	}
+	return nil
 }
 
 // Validate enforces the result shape.
@@ -98,6 +191,7 @@ func (r IndexResult) Validate() error {
 		{"index_result.files_parsed", r.FilesParsed},
 		{"index_result.files_captured", r.FilesCaptured},
 		{"index_result.runs_omitted", r.RunsOmitted},
+		{"index_result.passes_omitted", r.PassesOmitted},
 	} {
 		if err := requireNonNegative(count.field, count.value); err != nil {
 			return err
@@ -108,6 +202,14 @@ func (r IndexResult) Validate() error {
 	}
 	for _, run := range r.Runs {
 		if err := run.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := boundPage("index_result.passes", len(r.Passes)); err != nil {
+		return err
+	}
+	for _, pass := range r.Passes {
+		if err := pass.Validate(); err != nil {
 			return err
 		}
 	}
@@ -359,6 +461,16 @@ type ResourceReport struct {
 	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
 	UnitsReused          *int64 `json:"units_reused,omitempty"`
 	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
+	// NeedClasses is one page of this repository's learned per-file need
+	// models, in key order: for each class, how many parsed files it learned
+	// from, how many of them used more than they were reserved, and the
+	// largest drift any of them showed. It is how an operator checks the
+	// overrun target per class, and it is read from the run ledger's
+	// observation store, so it covers every run this repository recorded.
+	// NeedClassesOmitted counts the classes past the page. A repository in
+	// which nothing was ever measured carries none.
+	NeedClasses        []NeedClass `json:"need_classes,omitempty"`
+	NeedClassesOmitted int64       `json:"need_classes_omitted"`
 	// Run is the latest recorded run for this repository -- the live one if a
 	// run is going, otherwise the one that produced the active generation --
 	// and Stages is one page of its stages. Run is carried beside Stages
@@ -377,6 +489,20 @@ type ResourceReport struct {
 	// which of the two they are looking at. Each carries the remediation of
 	// the typed error it came from.
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// A NeedClass is one learned per-file need model: its key (language, grammar
+// fingerprint and file-size class), how many files it learned from, how many of
+// them overran their reservation, and the largest drift -- need minus
+// reservation -- any of them showed. The drift is below zero when every file
+// fitted, which is a real reading, not an absence.
+type NeedClass struct {
+	Language      string `json:"language"`
+	Fingerprint   string `json:"fingerprint"`
+	SizeClass     int    `json:"size_class"`
+	Observations  int64  `json:"observations"`
+	Overruns      int64  `json:"overruns"`
+	MaxDriftBytes int64  `json:"max_drift_bytes"`
 }
 
 // An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
@@ -492,8 +618,45 @@ func (r ResourceReport) Validate() error {
 			}
 		}
 	}
+	if err := validateNeedClasses(r.NeedClasses, r.NeedClassesOmitted); err != nil {
+		return err
+	}
 	if err := validateRunLedger("resources", r.Run, r.Stages, r.StagesOmitted); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateNeedClasses bounds the need-class page like every record list of a
+// response and refuses a class whose counts cannot be true: a negative count,
+// or more overruns than observations. The drift is signed and unbounded below.
+func validateNeedClasses(classes []NeedClass, omitted int64) error {
+	if len(classes) > MaxRecordsPerResult {
+		return invalid("resources.need_classes holds %d rows, more than the %d a bounded response carries",
+			len(classes), MaxRecordsPerResult)
+	}
+	if err := requireNonNegative("resources.need_classes_omitted", omitted); err != nil {
+		return err
+	}
+	for _, c := range classes {
+		if err := requireField("resources.need_classes.language", c.Language, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireField("resources.need_classes.fingerprint", c.Fingerprint, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.size_class", int64(c.SizeClass)); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.observations", c.Observations); err != nil {
+			return err
+		}
+		if err := requireNonNegative("resources.need_classes.overruns", c.Overruns); err != nil {
+			return err
+		}
+		if c.Overruns > c.Observations {
+			return invalid("resources.need_classes reports %d overruns of %d observations", c.Overruns, c.Observations)
+		}
 	}
 	return nil
 }

@@ -79,7 +79,7 @@ const deltaStatePart = 1 << 20
 // merge join against Store.UnitInputs — and it is drained from inside
 // CarryOver's ingestion call, on the single writer connection. Such a stream
 // sees the store as of the last commit: it takes a connection from the reader
-// pool (read_connections, default 2) once per page of its own scan, and the
+// pool (Options.ReadConnections) once per page of its own scan, and the
 // ingestion group stays open across every one of those round-trips. What a
 // stream reads is the predecessor unit, sealed and committed before this run
 // began, so the last commit is the state it needs; a stream must never call a

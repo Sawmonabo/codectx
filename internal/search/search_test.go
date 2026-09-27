@@ -87,7 +87,7 @@ func newFixture(t *testing.T) *fixture {
 	ctx := context.Background()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "codectx.db")
-	st, err := sqlite.Open(ctx, dbPath, sqlite.Options{})
+	st, err := sqlite.Open(ctx, dbPath, sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1438,7 +1438,8 @@ func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
 // spools.Create, leaving w.spool nil -- and the continuation the first page
 // hands back names nothing, so page two fails instead of serving the tail.
 func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
-	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true,
+		ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
 	}
@@ -2050,7 +2051,7 @@ func newTwoOffsetFixture(t *testing.T, loserStart, winnerStart uint64) *twoOffse
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{})
+	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -2292,7 +2293,8 @@ func (f *fixture) unitOf(d doc) model.UnitID {
 // Mutation: drop the reader.Continuable() branch in keysetNext so the lease is
 // always acquired. The leg then fails with the read-only store's refusal.
 func legWriterlessSymbolPagesInFull(t *testing.T, f *fixture) {
-	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true,
+		ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
 	}
