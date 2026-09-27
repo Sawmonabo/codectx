@@ -64,8 +64,10 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // The goldens render nodes by source text, so the granularity is exact:
 //
 //   - Every parameter bound name is one defining node after Entry, spanning
-//     its identifier; in the program, every binding of an ES import
-//     statement is one, spanning the local name. A TypeScript import-equals
+//     its identifier, in parameter order and before any node of the body,
+//     the hoisted nodes of the body's function declarations included; in the
+//     program, every binding of an ES import statement is one, spanning the
+//     local name, before the program's hoisted nodes. A TypeScript import-equals
 //     declaration has no such node: it is one node where it stands (see
 //     TypeScript below).
 //   - A statement is one node: an expression statement spans its expression
@@ -86,7 +88,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     the element nodes), not a second node. `var x;` is a hoisted
 //     declaration and no node; `let x;` defines x.
 //   - A function declaration is hoisted: one node at the start of its block,
-//     spanning its name, defines the name. At the declaration's own position
+//     after the parameter nodes when the block is the function's body and
+//     before every other node of the block, spanning its name, defines the
+//     name. At the declaration's own position
 //     a Stmt node spanning the declaration creates the function (see nested
 //     callables below) and may-defines the name, so a use after the
 //     declaration sees the captures read there.
@@ -142,8 +146,9 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     property read, whose result carries the reference and the old value to
 //     the write node; the write node reads o only as its may-definition's
 //     prior version, so it pairs with o by the May-definitions rule.
-//   - Destructuring is one defining node per bound name, spanning the name,
-//     so D ≤ N. The value destructured is evaluated once, at its own node:
+//   - Destructuring is one defining node per bound name, spanning the name
+//     alone, with the TypeScript wrappers around it stripped (`[g!] = x`
+//     makes g's node spanning g), so D ≤ N. The value destructured is evaluated once, at its own node:
 //     a declarator's initializer or an assignment's right side is a Stmt node
 //     spanning it (unless its own lowering made one) that defines an owned
 //     variable, the incoming value every element Uses; a for…in/for…of left
@@ -191,7 +196,15 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //   - A statement that stands alone as the body of an if, else, loop, with
 //     or label is scoped to an implicit block of its own, as a braced body
 //     is: a function declaration there is hoisted within it and binds its
-//     name there, never an enclosing variable of the same name.
+//     name there, never an enclosing variable of the same name. This is the
+//     strict rule (see Scoping) and holds in sloppy code too: the second,
+//     function-scoped `var` binding ECMA-262 Annex B.3.2.1 gives a block's
+//     function declaration in sloppy code, when no early error or enclosing
+//     lexical name of the same name forbids it, is given up, since whether
+//     code is sloppy depends on the file being a script rather than a module
+//     and on directives the lowering does not track. So after the block the
+//     name is the enclosing variable of that name, or resolves to no
+//     variable when there is none, and never pairs with the declaration.
 //   - A with statement (ECMA-262 §14.11) is a Stmt node spanning its object,
 //     which is evaluated and read, then its body. Given up: that a name in
 //     the body resolves to one of the object's properties, not to the
@@ -329,7 +342,8 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 // callable or class, too, walks only the operand, never the type): a node
 // the enclosing construct
 // makes for the whole expression (a condition's Branch, a statement's node)
-// spans the expression as written, wrapper included, and a node the
+// spans the expression as written, wrapper included, a destructuring
+// element's node, which spans the bound name, excepted, and a node the
 // operand's own lowering made (an optional chain, a nested callable, an
 // assignment) stands for the wrapper. An assignment target is read through
 // the wrappers, so `x! = e` defines x.
