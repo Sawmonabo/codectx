@@ -967,5 +967,203 @@ func TestGoLoweringGolden(t *testing.T) {
 				"s := 0@33 -> s += v@64", "s += v@64 -> s += v@64", "s := 0@33 -> return s@84",
 				"s += v@64 -> return s@84"},
 		},
+		{
+			// Go spec, Function literals and Short variable declarations: the
+			// literal paired with x is created when x's value is evaluated.
+			// Nodes: z := 0@25, x@33 (defines x, may-defines z by the literal's
+			// write), y@36, x()@62, return y + z@67. Straight line.
+			name:     "a literal's write in a multi-target statement lands on its target's node",
+			protects: "the may-definition a paired function literal makes is attached to the node of the target it is paired with",
+			mutation: "attach the literal's may-definition to the statement's last node (loses x@33 -> return y + z@67, adds z := 0@25 -> y@36)",
+			src:      "package p\nfunc f() int { z := 0; x, y := func() { z = 1 }, 2; x(); return y + z }",
+			du: []string{"z := 0@25 -> x@33", "x@33 -> x()@62", "x@33 -> return y + z@67", "z := 0@25 -> return y + z@67",
+				"y@36 -> return y + z@67"},
+		},
+		{
+			// Go spec, Assignment statements: x is assigned after g(&x) runs, so
+			// what g writes through &x is overwritten. Targets: x reads y, y's
+			// value g(&x) reads x: a cycle, broken at x, whose node x@38 also
+			// uses its own old value; y@41's read of x resolves through x@38,
+			// and y@41's may-definition of x is dropped, since x@38 already
+			// assigned x. Nodes: y@17, x := 0@30, x@38, y@41, return x@55.
+			name:     "a may-definition on a node after the one assigning the variable is dropped",
+			protects: "an address taken in a later target's value never overrides the statement's own assignment of the variable",
+			mutation: "keep the may-definition of a variable an earlier node of the statement assigned (adds y@41 -> return x@55)",
+			src:      "package p\nfunc f(y int) int { x := 0; x, y = y, g(&x); return x }",
+			du:       []string{"y@17 -> x@38", "x := 0@30 -> x@38", "x@38 -> y@41", "x@38 -> return x@55"},
+		},
+		{
+			// Go spec, For statements with range clause: an index target's
+			// operands are evaluated on every iteration, as in an assignment.
+			// Nodes: a@17, xs@20, i@30, xs@56 (range expression), range@50
+			// (head), a[i]@43 (Uses a, i and the iteration variable,
+			// may-defines a), i++@61. Succ: range → {a[i], EXIT}; a[i] → i++
+			// → range.
+			name:     "an index range target reads its operands each iteration and may-defines its base",
+			protects: "an index target of a range sees the body's writes to its index and leaves its base's earlier value in place",
+			mutation: "evaluate the target's operands once before the loop (loses i++@61 -> a[i]@43), or make it define nothing (loses a[i]@43 -> a[i]@43)",
+			src:      "package p\nfunc f(a, xs []int, i int) { for a[i] = range xs { i++ } }",
+			cd:       []string{"range@50 -> a[i]@43", "range@50 -> i++@61", "range@50 -> range@50"},
+			du: []string{"xs@20 -> xs@56", "xs@56 -> range@50", "xs@56 -> a[i]@43", "a@17 -> a[i]@43",
+				"a[i]@43 -> a[i]@43", "i@30 -> a[i]@43", "i++@61 -> a[i]@43", "i@30 -> i++@61", "i++@61 -> i++@61"},
+		},
+		{
+			// Go spec, For statements with range clause: range over an integer n
+			// evaluates n once; the values run from 0 to n-1. Nodes: n@17,
+			// s := 0@30, n@53, range@47, i@42, s += i@57, return s@67.
+			name:     "a range over an integer follows the iteration model",
+			protects: "the head and the value of an integer range depend on the integer as evaluated before the loop",
+			mutation: "let the head read the range expression's names (adds n@17 -> range@47)",
+			src:      "package p\nfunc f(n int) int { s := 0; for i := range n { s += i }; return s }",
+			cd:       []string{"range@47 -> i@42", "range@47 -> s += i@57", "range@47 -> range@47"},
+			du: []string{"n@17 -> n@53", "n@53 -> range@47", "n@53 -> i@42", "i@42 -> s += i@57",
+				"s := 0@30 -> s += i@57", "s += i@57 -> s += i@57", "s := 0@30 -> return s@67",
+				"s += i@57 -> return s@67"},
+		},
+		{
+			// Go spec, For statements with range clause: range over a channel
+			// evaluates the channel once and receives until it is closed. Nodes:
+			// c@17, s := 0@35, c@58, range@52, v@47, s += v@62, return s@72.
+			name:     "a range over a channel follows the iteration model",
+			protects: "the head and the value of a channel range depend on the channel as evaluated before the loop",
+			mutation: "let the head read the range expression's names (adds c@17 -> range@52)",
+			src:      "package p\nfunc f(c chan int) int { s := 0; for v := range c { s += v }; return s }",
+			cd:       []string{"range@52 -> v@47", "range@52 -> s += v@62", "range@52 -> range@52"},
+			du: []string{"c@17 -> c@58", "c@58 -> range@52", "c@58 -> v@47", "v@47 -> s += v@62",
+				"s := 0@35 -> s += v@62", "s += v@62 -> s += v@62", "s := 0@35 -> return s@72",
+				"s += v@62 -> return s@72"},
+		},
+		{
+			// Go spec, For statements with range clause (range over function): the
+			// function literal written as x is created once, at x's node, which
+			// Uses n (the literal's n++ reads it) and may-defines n. Nodes: n@17,
+			// func(y func(int) bool) { n++ }@41, range@35, k@30, g(k, n)@74.
+			// Succ: x's node → range → {k, EXIT}; k → g(k, n) → range.
+			name:     "a function literal ranged over is created at the range expression's node",
+			protects: "a use in the body sees the range function's captured write, made where the function is created",
+			mutation: "lower a function literal written as x with no captures (loses n@17 -> func(y func(int) bool) { n++ }@41 and func(y func(int) bool) { n++ }@41 -> g(k, n)@74)",
+			src:      "package p\nfunc f(n int) { for k := range func(y func(int) bool) { n++ } { g(k, n) } }",
+			cd:       []string{"range@35 -> k@30", "range@35 -> g(k, n)@74", "range@35 -> range@35"},
+			du: []string{"n@17 -> func(y func(int) bool) { n++ }@41", "func(y func(int) bool) { n++ }@41 -> range@35",
+				"func(y func(int) bool) { n++ }@41 -> k@30", "k@30 -> g(k, n)@74",
+				"func(y func(int) bool) { n++ }@41 -> g(k, n)@74", "n@17 -> g(k, n)@74"},
+		},
+		{
+			// Go spec, For statements with range clause and Length and capacity:
+			// len(a) of an array a is constant, and with no iteration variable
+			// the specification does not evaluate it; the lowering does not
+			// apply that exception, so x's node Uses a. Nodes: var a
+			// [3]int@25, n := 0@39, len(a)@57, range@51, n++@66, return n@73.
+			// Succ: len(a) → range → {n++, return n}; n++ → range.
+			name:     "the constant-range exception is not applied",
+			protects: "a range expression is always read at its own node, so no read is dropped on a guess about its type",
+			mutation: "apply the constant-range exception (loses var a [3]int@25 -> len(a)@57)",
+			src:      "package p\nfunc f() int { var a [3]int; n := 0; for range len(a) { n++ }; return n }",
+			cd:       []string{"range@51 -> n++@66", "range@51 -> range@51"},
+			du: []string{"var a [3]int@25 -> len(a)@57", "len(a)@57 -> range@51", "n := 0@39 -> n++@66",
+				"n++@66 -> n++@66", "n := 0@39 -> return n@73", "n++@66 -> return n@73"},
+		},
+		{
+			// Go spec, Type switches: the alias is declared in each clause, and a
+			// clause's own declaration shadows it. Nodes: v@17, x :=
+			// v.(type)@37 (head, defines the alias), int@58 and string@78 (type
+			// cases, each Using the alias), return x@63, x := 0@86, return
+			// x@94, return 0@106. Succ: int → {return x@63, string}; string →
+			// {x := 0, return 0}. IPDom: int, string → EXIT. Frontier walks:
+			// int over return x@63 and string; string over x := 0, return x@94
+			// and return 0.
+			name:     "a type switch's alias serves every clause and a clause's declaration shadows it",
+			protects: "every clause reads the head's alias, and a clause's own := shadows it for that clause's later reads",
+			mutation: "resolve a clause's read to the alias past its own declaration (x := v.(type)@37 -> return x@94 replaces x := 0@86 -> return x@94), or give a type case after the first no use of the alias (loses x := v.(type)@37 -> string@78)",
+			src:      "package p\nfunc f(v any) int { switch x := v.(type) { case int: return x; case string: x := 0; return x }; return 0 }",
+			cd: []string{"int@58 -> return x@63", "int@58 -> string@78", "string@78 -> x := 0@86",
+				"string@78 -> return x@94", "string@78 -> return 0@106"},
+			du: []string{"v@17 -> x := v.(type)@37", "x := v.(type)@37 -> int@58", "x := v.(type)@37 -> string@78",
+				"x := v.(type)@37 -> return x@63", "x := 0@86 -> return x@94"},
+		},
+		{
+			// Go spec, Break statements and Continue statements: an unlabelled
+			// break in a switch ends the switch, continue passes it to the
+			// loop, and break L ends the select labelled L. Nodes: n@17, c@24,
+			// i := 0@42, i < n@50, i@70 (tag head), 1@79, 2@94, break@82,
+			// continue@97, L@109, select@112, <-c@126, break L@131, g(i)@142,
+			// i++@57. Succ: i < n → {i@70, EXIT}; i@70 → 1 → {break, 2}; 2 →
+			// {continue, L}; break → L; continue → i++; L → select → <-c →
+			// break L → g(i) → i++ → i < n. IPDom: i@70 → 1; 1, 2, continue,
+			// g(i) → i++ → i < n → EXIT; break → L → select → <-c → break L
+			// → g(i). Frontier walks: i < n over i@70, 1, i++ and itself; 1
+			// over break, L, select, <-c, break L, g(i) and 2; 2 over
+			// continue, L, select, <-c, break L and g(i).
+			name:     "a break in a switch ends the switch, and a labelled break ends its select",
+			protects: "an unlabelled break inside a switch in a loop and a labelled select break both continue after their statement, inside the loop",
+			mutation: "let an unlabelled break target the innermost loop, skipping the switch (break@82 reaches EXIT: 1@79 loses L@109 and the nodes after it)",
+			src:      "package p\nfunc f(n int, c chan int) { for i := 0; i < n; i++ { switch i { case 1: break; case 2: continue }; L: select { case <-c: break L }; g(i) } }",
+			cd: []string{"i < n@50 -> i@70", "i < n@50 -> 1@79", "i < n@50 -> i++@57", "i < n@50 -> i < n@50",
+				"1@79 -> break@82", "1@79 -> 2@94", "1@79 -> L@109", "1@79 -> select@112", "1@79 -> <-c@126",
+				"1@79 -> break L@131", "1@79 -> g(i)@142", "2@94 -> continue@97", "2@94 -> L@109",
+				"2@94 -> select@112", "2@94 -> <-c@126", "2@94 -> break L@131", "2@94 -> g(i)@142"},
+			du: []string{"n@17 -> i < n@50", "i := 0@42 -> i < n@50", "i++@57 -> i < n@50", "i := 0@42 -> i@70",
+				"i++@57 -> i@70", "i@70 -> 1@79", "i@70 -> 2@94", "c@24 -> select@112", "select@112 -> <-c@126",
+				"i := 0@42 -> g(i)@142", "i++@57 -> g(i)@142", "i := 0@42 -> i++@57", "i++@57 -> i++@57"},
+		},
+		{
+			// Go spec, Short variable declarations: := may redeclare a variable of
+			// the same block, which it then assigns. Nodes: x := 0@21, L@29,
+			// g(x)@32, x@38 (assigns the existing x), y@41, g(y)@52, goto
+			// L@58. Succ: straight line to goto L → L. {L, …, goto L} cannot
+			// reach EXIT; L is its first RPO member, so augmentation adds L →
+			// EXIT. Frontier walk: L over every member and itself.
+			name:     "a := redeclaration assigns the existing variable",
+			protects: "a redeclared name in := is the same variable, so its new value reaches reads of the old one around a loop",
+			mutation: "declare every := target anew (loses x@38 -> g(x)@32)",
+			src:      "package p\nfunc f() { x := 0; L: g(x); x, y := 1, 2; g(y); goto L }",
+			cd: []string{"L@29 -> g(x)@32", "L@29 -> x@38", "L@29 -> y@41", "L@29 -> g(y)@52",
+				"L@29 -> goto L@58", "L@29 -> L@29"},
+			du: []string{"x := 0@21 -> g(x)@32", "x@38 -> g(x)@32", "y@41 -> g(y)@52"},
+		},
+		{
+			// Go spec, Labeled statements and Continue statements: L and M both
+			// label the for, so continue L targets it. Nodes: n@17, L@26,
+			// M@29, i := 0@36, i < n@44, i > 1@60, continue L@68, break M@82,
+			// i++@51. Succ: i < n → {i > 1, EXIT}; i > 1 → {continue L,
+			// break M}; continue L → i++ → i < n; break M → EXIT. IPDom:
+			// i > 1 → EXIT; continue L → i++ → i < n → EXIT.
+			name:     "stacked labels all name the labelled loop",
+			protects: "a jump naming the outer of two stacked labels reaches the loop they both label",
+			mutation: "let only the innermost label reach the frame (continue L is unresolved: unresolved 1)",
+			src:      "package p\nfunc f(n int) { L: M: for i := 0; i < n; i++ { if i > 1 { continue L }; break M } }",
+			cd: []string{"i < n@44 -> i > 1@60", "i > 1@60 -> continue L@68", "i > 1@60 -> i++@51",
+				"i > 1@60 -> i < n@44", "i > 1@60 -> break M@82"},
+			du: []string{"n@17 -> i < n@44", "i := 0@36 -> i < n@44", "i++@51 -> i < n@44", "i := 0@36 -> i > 1@60",
+				"i++@51 -> i > 1@60", "i := 0@36 -> i++@51", "i++@51 -> i++@51"},
+		},
+		{
+			// Go spec, Logical operators and Operator precedence: a && b || c is
+			// (a && b) || c in value position. Only the operands are nodes:
+			// a@45, b@50, c@55, then return a && b || c@38. Succ: a → {b, c};
+			// b → {return, c}; c → return. IPDom: a, b, c → return. Frontier
+			// walks: a over b and c; b over c. a's definition of the result is
+			// redefined by b or c on every path, so it reaches no use.
+			name:     "a mixed short-circuit chain in value position makes a node per operand",
+			protects: "a false left operand of && skips to the || operand, and the owning node Uses the result the deciding operands define",
+			mutation: "make the && sub-expression a node of its own, or send a false a to the owning node (loses a@45 -> c@55)",
+			src:      "package p\nfunc f(a, b, c bool) bool { return a && b || c }",
+			cd:       []string{"a@45 -> b@50", "a@45 -> c@55", "b@50 -> c@55"},
+			du: []string{"a@17 -> a@45", "b@20 -> b@50", "c@23 -> c@55", "b@50 -> return a && b || c@38",
+				"c@55 -> return a && b || c@38"},
+		},
+		{
+			// A statement the parser cannot recognise: `x )` is taken to recover
+			// as one ERROR node in the statement list (an assumed recovery,
+			// settled by the harness's parse). The lowering's default branch
+			// makes it one Stmt node carrying its reads. Nodes: x@17, g(x)@26,
+			// x )@32, h(x)@37. Straight line.
+			name:      "an unrecognised statement keeps its reads",
+			protects:  "a syntax error inside a body drops no read of the statement it garbles",
+			mutation:  "let the default branch make no node or collect nothing (loses x@17 -> x )@32)",
+			src:       "package p\nfunc f(x int) { g(x); x ); h(x) }",
+			recovered: true,
+			du:        []string{"x@17 -> g(x)@26", "x@17 -> x )@32", "x@17 -> h(x)@37"},
+		},
 	})
 }
