@@ -170,7 +170,7 @@ func (l runLedger) NeedClasses(ctx context.Context, repo model.RepositoryID) ([]
 	out := make([]model.NeedClass, 0, len(classes))
 	for _, c := range classes {
 		out = append(out, model.NeedClass{Language: c.Key.Language, Fingerprint: c.Key.Fingerprint,
-			SizeClass: c.Key.SizeClass, Observations: c.Observations, Overruns: c.Overruns,
+			Build: c.Key.Build, SizeClass: c.Key.SizeClass, Observations: c.Observations, Overruns: c.Overruns,
 			MaxDriftBytes: c.MaxDriftBytes})
 	}
 	return out, omitted, nil

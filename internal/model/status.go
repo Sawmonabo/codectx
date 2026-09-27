@@ -492,13 +492,14 @@ type ResourceReport struct {
 }
 
 // A NeedClass is one learned per-file need model: its key (language, grammar
-// fingerprint and file-size class), how many files it learned from, how many of
+// fingerprint, the parser worker's build identity and file-size class), how many files it learned from, how many of
 // them overran their reservation, and the largest drift -- need minus
 // reservation -- any of them showed. The drift is below zero when every file
 // fitted, which is a real reading, not an absence.
 type NeedClass struct {
 	Language      string `json:"language"`
 	Fingerprint   string `json:"fingerprint"`
+	Build         string `json:"build"`
 	SizeClass     int    `json:"size_class"`
 	Observations  int64  `json:"observations"`
 	Overruns      int64  `json:"overruns"`
@@ -643,6 +644,9 @@ func validateNeedClasses(classes []NeedClass, omitted int64) error {
 			return err
 		}
 		if err := requireField("resources.need_classes.fingerprint", c.Fingerprint, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireField("resources.need_classes.build", c.Build, MaxIdentifierBytes); err != nil {
 			return err
 		}
 		if err := requireNonNegative("resources.need_classes.size_class", int64(c.SizeClass)); err != nil {

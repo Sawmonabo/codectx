@@ -1035,13 +1035,15 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
 	}
-	// One line per learned need class: what the reservation it predicts was
+	// One line per learned need class, keyed as the model is -- the worker's
+	// build included, so two builds' models of one class are two lines and
+	// never read as duplicates: what the reservation it predicts was
 	// measured against. Overruns over observations is the per-class figure
 	// the overrun target is stated in, and the drift says by how much the
 	// worst file missed -- below zero when every file fitted.
 	for _, c := range r.NeedClasses {
-		fmt.Fprintf(tw, "    need %s %s size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
-			c.Language, shortDigest(c.Fingerprint), c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
+		fmt.Fprintf(tw, "    need %s %s build %q size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
+			c.Language, shortDigest(c.Fingerprint), c.Build, c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
 	}
 	if r.NeedClassesOmitted > 0 {
 		fmt.Fprintf(tw, "    need %d more %s\t\n", r.NeedClassesOmitted,
