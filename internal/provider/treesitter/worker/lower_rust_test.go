@@ -934,5 +934,182 @@ func TestRustLoweringGolden(t *testing.T) {
 			du: []string{"o@5 -> o@36", "o@36 -> x @ Some(y)@40", "o@36 -> x@40", "o@36 -> y@49",
 				"x@40 -> g(x, y)@55", "y@49 -> g(x, y)@55"},
 		},
+		{
+			// The Rust Unstable Book, Language features › gen_blocks: a gen
+			// block's body runs only as its iterator is advanced, so it is
+			// its own function. Nodes: n@9, gen { n += 1; yield n; }@34 (Uses
+			// n, may-defines n), let g = …;@26 (Uses the creating node's
+			// result), drop(g)@60, n@69.
+			name:     "a gen block is its own function and its write is a may-definition where it is created",
+			protects: "a gen block's body is not inline code of the enclosing function: its write kills nothing there",
+			mutation: "lower a gen block's body inline (n += 1 kills the parameter's definition: loses n@9 -> n@69)",
+			src:      "fn f(mut n: i32) -> i32 { let g = gen { n += 1; yield n; }; drop(g); n }",
+			du: []string{"n@9 -> gen { n += 1; yield n; }@34",
+				"gen { n += 1; yield n; }@34 -> let g = gen { n += 1; yield n; };@26",
+				"let g = gen { n += 1; yield n; };@26 -> drop(g)@60", "n@9 -> n@69", "gen { n += 1; yield n; }@34 -> n@69"},
+		},
+		{
+			// Expressions › Await expressions: `a.await` is folded into the
+			// node consuming it. Nodes: a@11, b@17, let y = a.await + b;@34
+			// (Uses a and b), y@55.
+			name:     "an await expression is folded into its consumer",
+			protects: "the let consuming `a.await + b` reads a itself, with no node of the await's own",
+			mutation: "read nothing under an await expression (loses a@11 -> let y = a.await + b;@34)",
+			src:      "async fn f(a: F, b: i32) -> i32 { let y = a.await + b; y }",
+			du: []string{"a@11 -> let y = a.await + b;@34", "b@17 -> let y = a.await + b;@34",
+				"let y = a.await + b;@34 -> y@55"},
+		},
+		{
+			// Expressions › Index, Range, Array, Struct and Type cast
+			// expressions, and Paths › Expressions (a generic function path
+			// names an item): all are folded into the tail. Nodes: a@5, i@18,
+			// n@28, the tail@45 (Uses a, i and n; g names no local).
+			name:     "index, range, array, struct, cast and generic-call operands are folded into their consumer",
+			protects: "the reads inside a struct expression's fields, an index, a range, an array and a cast operand are the consuming node's own",
+			mutation: "read nothing inside a struct expression's body (loses a@5 and i@18 -> the tail), or inside a range or array (loses n@28 -> the tail)",
+			src:      "fn f(a: [i32; 2], i: usize, n: i32) -> i64 { g::<i32>(S { x: a[i] }, 0..n, [n]) as i64 }",
+			du: []string{"a@5 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45",
+				"i@18 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45",
+				"n@28 -> g::<i32>(S { x: a[i] }, 0..n, [n]) as i64@45"},
+		},
+		{
+			// Expressions › Block expressions, `unsafe` blocks and `const`
+			// blocks: each consumed as a value yields its tail. Nodes: x@5,
+			// let z = x;@32, z + 1@43 (the tail, defining the block's
+			// result), let a = …;@22, a@69 (the unsafe block's tail), let b =
+			// …;@52, 2@86 (the const block's tail), b + const { 2 }@74.
+			// Straight line.
+			name:     "a block, an unsafe block and a const block consumed as a value hand over their tails",
+			protects: "each consumer of a block reads the block's result, defined by its tail node, never the names the block read",
+			mutation: "give a consumed block's tail no definition of its result (loses z + 1@43 -> let a, a@69 -> let b and 2@86 -> b + const { 2 }@74), or let a consumer re-read a block's names (gains x@5 -> let a)",
+			src:      "fn f(x: i32) -> i32 { let a = { let z = x; z + 1 }; let b = unsafe { a }; b + const { 2 } }",
+			du: []string{"x@5 -> let z = x;@32", "let z = x;@32 -> z + 1@43",
+				"z + 1@43 -> let a = { let z = x; z + 1 };@22", "let a = { let z = x; z + 1 };@22 -> a@69",
+				"a@69 -> let b = unsafe { a };@52", "let b = unsafe { a };@52 -> b + const { 2 }@74",
+				"2@86 -> b + const { 2 }@74"},
+		},
+		{
+			// Macros › Macro invocation, and The try propagation expression:
+			// the invocation a `?` can leave is a Branch whose value reaches
+			// its consumer through a result. Nodes: o@5, vec![o?]@46 (Branch
+			// Using o, defining the result), let v = vec![o?];@38 (Uses it),
+			// Some(v[0])@56. Succ: vec!→{EXIT, let}; let→Some. IPDom: vec! → EXIT.
+			name:     "a jumping macro's value reaches its consumer through a result",
+			protects: "the let consuming a macro whose tree holds `?` reads the invocation's result, never the tree's names, and depends on the invocation",
+			mutation: "let the consumer re-read the tree's reads (gains o@5 -> let v = vec![o?];@38, loses vec![o?]@46 -> let v = vec![o?];@38)",
+			src:      "fn f(o: Option<i32>) -> Option<i32> { let v = vec![o?]; Some(v[0]) }",
+			cd:       []string{"vec![o?]@46 -> let v = vec![o?];@38", "vec![o?]@46 -> Some(v[0])@56"},
+			du: []string{"o@5 -> vec![o?]@46", "vec![o?]@46 -> let v = vec![o?];@38",
+				"let v = vec![o?];@38 -> Some(v[0])@56"},
+		},
+		{
+			// Macros › Macro invocation, and Expressions › `break` and loop
+			// values: which tokens make the jumped value is known only to the
+			// expansion, so a break in a tree defines no result. Nodes: x@5,
+			// loop@30, m!(break x)@37 (Branch Using x; its break leaves the
+			// loop, its fall-through returns to the head), let r = …;@22, r@53.
+			// Succ: loop→m!→{let, loop}; let→r. IPDom: loop → m! → let.
+			name:     "a jump in a macro's token tree defines no result",
+			protects: "a break inside a token tree leaves the loop but hands the let no value of the loop",
+			mutation: "let a jump in a token tree define its loop's result (gains m!(break x)@37 -> let r = loop { m!(break x); };@22)",
+			src:      "fn f(x: i32) -> i32 { let r = loop { m!(break x); }; r }",
+			cd:       []string{"m!(break x)@37 -> loop@30", "m!(break x)@37 -> m!(break x)@37"},
+			du:       []string{"x@5 -> m!(break x)@37", "let r = loop { m!(break x); };@22 -> r@53"},
+		},
+		{
+			// Expressions › `if` expressions › Chains of conditions: a let
+			// chain's bindings are in scope for later members and the
+			// consequence only. Nodes: o@5, x@21, let Some(x) = o@41 (Branch),
+			// x@50, x > 0@60 (Branch), x@68, x@79 (the parameter). Succ:
+			// let→{x@50, x@79}; x@50→x > 0→{x@68, x@79}. IPDom: let → EXIT;
+			// x@50 → x > 0 → EXIT.
+			name:     "a let chain's binding is not in scope in the else",
+			protects: "the else of an if-let chain reads the enclosing variable, never the chain's binding of the same name",
+			mutation: "keep a let chain's bindings in scope in the else (loses x@21 -> x@79, gains x@50 -> x@79)",
+			src:      "fn f(o: Option<i32>, x: i32) -> i32 { if let Some(x) = o && x > 0 { x } else { x } }",
+			cd: []string{"let Some(x) = o@41 -> x@50", "let Some(x) = o@41 -> x > 0@60", "let Some(x) = o@41 -> x@79",
+				"x > 0@60 -> x@68", "x > 0@60 -> x@79"},
+			du: []string{"o@5 -> let Some(x) = o@41", "let Some(x) = o@41 -> x@50", "x@50 -> x > 0@60", "x@50 -> x@68",
+				"x@21 -> x@79"},
+		},
+		{
+			// Expressions › Loops and other breakable expressions › Iterator
+			// loops, and The try propagation expression: `o?` is the
+			// iterated value, so its node is the iteration variable's
+			// definition. Nodes: o@5, let mut n = 0;@43, o?@67 (Branch to
+			// EXIT and on, defining the iteration variable), for@58, x@62, n
+			// += x@72, Some(n)@82. Succ: let→o?→{EXIT, for}; for→{x, Some};
+			// x→n += x→for. IPDom: o? → EXIT; for → Some; x → n += x → for.
+			name:     "a question mark as a for iterable is the iteration variable's node",
+			protects: "the for head and binding read the `?`'s Ok value, and the loop and what follows depend on the `?`",
+			mutation: "let the head Use the `?`'s operand instead of its value (gains o@5 -> for@58, loses o?@67 -> for@58)",
+			src:      "fn f(o: Option<Vec<i32>>) -> Option<i32> { let mut n = 0; for x in o? { n += x; } Some(n) }",
+			cd: []string{"o?@67 -> for@58", "o?@67 -> Some(n)@82", "for@58 -> x@62", "for@58 -> n += x@72",
+				"for@58 -> for@58"},
+			du: []string{"o@5 -> o?@67", "o?@67 -> for@58", "o?@67 -> x@62", "x@62 -> n += x@72",
+				"let mut n = 0;@43 -> n += x@72", "n += x@72 -> n += x@72", "let mut n = 0;@43 -> Some(n)@82",
+				"n += x@72 -> Some(n)@82"},
+		},
+		{
+			// Expressions › `match` expressions, and The try propagation
+			// expression: the scrutinee `g(s)?` is evaluated once, at the `?`'s
+			// Branch, whose Ok value the patterns test. Nodes: s@5, g(s)?@40,
+			// 0@48 (Branch), Ok(1)@53, Ok(0)@65. Succ: g(s)?→{EXIT, 0@48};
+			// 0@48→{Ok(1), Ok(0)}. IPDom: every node → EXIT.
+			name:     "a question mark as the match scrutinee is the scrutinee's node",
+			protects: "the arms test the `?`'s Ok value and depend on the `?`",
+			mutation: "let the patterns re-read the scrutinee's names (gains s@5 -> 0@48, loses g(s)?@40 -> 0@48)",
+			src:      "fn f(s: &str) -> Result<i32, E> { match g(s)? { 0 => Ok(1), _ => Ok(0) } }",
+			cd:       []string{"g(s)?@40 -> 0@48", "0@48 -> Ok(1)@53", "0@48 -> Ok(0)@65"},
+			du:       []string{"s@5 -> g(s)?@40", "g(s)?@40 -> 0@48"},
+		},
+		{
+			// Expressions › `match` expressions › Match guards: a `_` arm
+			// with a guard stays refutable, so a failed pattern reaches its
+			// guard. Nodes: o@5, c@21, o@45, Some(x)@49 (Branch), x@54, x@60,
+			// c@68 (the guard's Branch), 1@73, 0@81. Succ: Some(x)→{x@54,
+			// c@68}; x@54→x@60; c@68→{1, 0}. IPDom: every Branch → EXIT.
+			name:     "a failed pattern reaches a guarded wildcard arm's guard",
+			protects: "the arm after `_ if c` stays reachable, and the guard, not the wildcard's result, follows a failed pattern",
+			mutation: "treat a guarded `_` as irrefutable (the last arm lowers to nothing: loses c@68 -> 0@81)",
+			src:      "fn f(o: Option<i32>, c: bool) -> i32 { match o { Some(x) => x, _ if c => 1, _ => 0 } }",
+			cd: []string{"Some(x)@49 -> x@54", "Some(x)@49 -> x@60", "Some(x)@49 -> c@68", "c@68 -> 1@73",
+				"c@68 -> 0@81"},
+			du: []string{"o@5 -> o@45", "o@45 -> Some(x)@49", "o@45 -> x@54", "x@54 -> x@60", "c@21 -> c@68"},
+		},
+		{
+			// Expressions › `break` expressions: a match is no loop, so a
+			// break in an arm leaves the enclosing for. Nodes: v@5, let mut n
+			// = 0;@25, v@49, for@40, x@44, *x@59 (the scrutinee), 0@64
+			// (Branch), break@69, n += 1@81, n@92. Succ: for→{x, n@92};
+			// x→*x→0@64→{break, n += 1}; break→n@92; n += 1→for. IPDom: for →
+			// n@92; x → *x → 0@64 → n@92; break → n@92; n += 1 → for.
+			// Frontier walks: for over x, *x and 0@64; 0@64 over break, and
+			// over n += 1 and for.
+			name:     "a break in a match arm leaves the enclosing loop",
+			protects: "a match opens no jump frame, so an arm's break exits the loop around it",
+			mutation: "open a jump frame for a match (break@69 lands after the match and returns to for@40: ipdom(0@64) becomes for@40, so 0@64 loses for@40 as a dependent)",
+			src:      "fn f(v: &[i32]) -> i32 { let mut n = 0; for x in v { match *x { 0 => break, _ => n += 1 } } n }",
+			cd: []string{"for@40 -> x@44", "for@40 -> *x@59", "for@40 -> 0@64", "0@64 -> break@69",
+				"0@64 -> n += 1@81", "0@64 -> for@40"},
+			du: []string{"v@5 -> v@49", "v@49 -> for@40", "v@49 -> x@44", "x@44 -> *x@59", "*x@59 -> 0@64",
+				"let mut n = 0;@25 -> n += 1@81", "n += 1@81 -> n += 1@81", "let mut n = 0;@25 -> n@92",
+				"n += 1@81 -> n@92"},
+		},
+		{
+			// Patterns › Identifier patterns: a bare identifier in the last
+			// arm is irrefutable by syntax, so it is a Stmt defining the name.
+			// Nodes: o@5, o@36, Some(x)@40 (Branch), x@45, x@51, n@54 (Stmt,
+			// Using the scrutinee's variable, defining n), g(n)@59. Succ:
+			// Some(x)→{x@45, n@54}; x@45→x@51; n@54→g(n). IPDom: Some(x) → EXIT.
+			name:     "a last-arm bare identifier is a statement that binds the name",
+			protects: "the last arm's identifier makes no false edge out of the match and defines the name its result reads",
+			mutation: "make the last arm's bare identifier a Branch (n@54 gains a false edge to EXIT and controls g(n)@59)",
+			src:      "fn f(o: Option<i32>) -> i32 { match o { Some(x) => x, n => g(n) } }",
+			cd: []string{"Some(x)@40 -> x@45", "Some(x)@40 -> x@51", "Some(x)@40 -> n@54",
+				"Some(x)@40 -> g(n)@59"},
+			du: []string{"o@5 -> o@36", "o@36 -> Some(x)@40", "o@36 -> x@45", "o@36 -> n@54", "x@45 -> x@51",
+				"n@54 -> g(n)@59"},
+		},
 	})
 }
