@@ -988,20 +988,41 @@ func TestPythonLoweringGolden(t *testing.T) {
 				"a, b@20 -> y@37", "x@34 -> return x@44"},
 		},
 		{
-			// §8.6.3, §8.6.4.4. Lines at 0, 10, 20, 30, 39, 49, 58. Nodes: s@6,
-			// s@17 (the subject), 1@27 (Branch), r = 1@33, y@46 (the case, a
-			// Stmt: a capture is irrefutable), y@46 (the capture, spanning the
-			// same name), r = y@52, return r@59. Both y@46 nodes render alike,
-			// so their pairs appear twice. Succ: 1@27→{r = 1, y case};
-			// y case→y capture→r = y; both arms→return r.
-			name:     "a capture case is irrefutable and has no false edge",
-			protects: "a bare capture pattern always matches, so its case node controls nothing and nothing falls out of the match after it",
-			mutation: "make a capture case a Branch (y@46 -> y@46 and y@46 -> r = y@52 appear)",
-			src:      "def f(s):\n match s:\n  case 1:\n   r = 1\n  case y:\n   r = y\n return r\n",
+			// §8.6.3, §8.6.4.2, §8.6.4.4, §8.6.4.7. A bare capture case
+			// `case y:` cannot render apart from its capture: the case node
+			// spans the pattern and the capture node the captured name, the
+			// same bytes. So the capture sits inside a group and an
+			// as-pattern, each irrefutable exactly when what it wraps is,
+			// and the case node spans (y as z). Lines at 0, 10, 20, 30, 39,
+			// 56, 65. Nodes: s@6, s@17 (the subject), 1@27 (Branch), r =
+			// 1@33, (y as z)@46 (the case: a Stmt, no false edge), y@47 and
+			// z@52 (captures, Using the subject's variable), r = z@59, return
+			// r@66. Succ: 1@27→{r = 1, (y as z)}; (y as z)→y@47→z@52→r = z;
+			// both arms→return r. IPDom: 1@27 → return r.
+			name:     "a capture, a group of it and an as-pattern over it are irrefutable",
+			protects: "a case whose pattern always matches has no false edge, so its case node controls nothing and nothing falls out of the match after it",
+			mutation: "make a capture, a one-element group or an as-pattern refutable ((y as z)@46 becomes a Branch, and (y as z)@46 -> y@47, (y as z)@46 -> z@52 and (y as z)@46 -> r = z@59 appear)",
+			src:      "def f(s):\n match s:\n  case 1:\n   r = 1\n  case (y as z):\n   r = z\n return r\n",
 			fn:       1,
-			cd:       []string{"1@27 -> r = 1@33", "1@27 -> y@46", "1@27 -> y@46", "1@27 -> r = y@52"},
-			du: []string{"s@6 -> s@17", "s@17 -> 1@27", "s@17 -> y@46", "s@17 -> y@46", "y@46 -> r = y@52",
-				"r = 1@33 -> return r@59", "r = y@52 -> return r@59"},
+			cd: []string{"1@27 -> r = 1@33", "1@27 -> (y as z)@46", "1@27 -> y@47", "1@27 -> z@52",
+				"1@27 -> r = z@59"},
+			du: []string{"s@6 -> s@17", "s@17 -> 1@27", "s@17 -> (y as z)@46", "s@17 -> y@47", "s@17 -> z@52",
+				"z@52 -> r = z@59", "r = 1@33 -> return r@66", "r = z@59 -> return r@66"},
+		},
+		{
+			// §8.6.4.2: an or-pattern with an irrefutable alternative is
+			// irrefutable. Lines at 0, 10, 20, 30, 39, 53, 62. Nodes: s@6,
+			// s@17, 1@27 (Branch), r = 1@33, 2 | _@46 (the case: a Stmt),
+			// r = 2@56, return r@63. Succ: 1@27→{r = 1, 2 | _}; 2 | _→r = 2;
+			// both arms→return r.
+			name:     "an or-pattern with a wildcard alternative is irrefutable",
+			protects: "`case 2 | _` always matches, so its case node has no false edge and controls nothing",
+			mutation: "make an or-pattern refutable whatever its alternatives (2 | _@46 becomes a Branch and 2 | _@46 -> r = 2@56 appears)",
+			src:      "def f(s):\n match s:\n  case 1:\n   r = 1\n  case 2 | _:\n   r = 2\n return r\n",
+			fn:       1,
+			cd:       []string{"1@27 -> r = 1@33", "1@27 -> 2 | _@46", "1@27 -> r = 2@56"},
+			du: []string{"s@6 -> s@17", "s@17 -> 1@27", "s@17 -> 2 | _@46",
+				"r = 1@33 -> return r@63", "r = 2@56 -> return r@63"},
 		},
 		{
 			// §7.3. Lines at 0, 10, 20. Nodes: a@6, a@18 (Branch; its false
