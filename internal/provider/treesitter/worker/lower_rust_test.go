@@ -1523,22 +1523,18 @@ func TestRustLoweringGolden(t *testing.T) {
 				"z@30 -> y + x + z@109", "z = 2@97 -> y + x + z@109"},
 		},
 		{
-			// Ill-formed on purpose, and recovered: y=1 is followed by return with no `;` (The Rust
-			// Reference, Statements: an expression statement that is not a block ends with `;`); the
-			// parser recovers by wrapping the reduced assignment y=1 in an ERROR node it marks as an extra
-			// among the block's statements (one tree of 3 bytes costs the recovery less than a missing
-			// terminator does), and the return statement after it parses whole. The rule (children and into in lower_rust.go): an ERROR node the
-			// parser made an extra is kept and lowered as a kind not named, for its value, so the
-			// assignment inside it is the node y=1@45 defining y, and the ERROR node makes no second node
-			// over the same span. Nodes: x@5, let mut y = 0;@23, the Branch x@41, y=1@45, return y@49,
-			// the tail y@60.
+			// Ill-formed on purpose, and recovered. Observed tree: block (let_declaration …) (ERROR
+			// (assignment_expression left: (identifier) right: (integer_literal))) (identifier); the ERROR is
+			// an extra over [38,47) "y = 1 ) (", its assignment [38,43). The rule (children and the kinds not
+			// named in lower_rust.go): the ERROR is kept and lowered as a kind not named, a Stmt node spanning
+			// it with its reads, none here, after its assignment's defining node y = 1@38. Nodes: x@5, let mut
+			// y = 0;@23, y = 1@38, y = 1 ) (@38, the tail y@48.
 			name:      "an assignment inside an ERROR node the parser made an extra defines its target",
-			protects:  "a statement the parser wrapped in an extra ERROR node still makes its one node, and the definition inside it reaches the read after it",
-			mutation:  "drop the extra ERROR node's content with the comments (y=1@45 vanishes: x@41 -> y=1@45 and y=1@45 -> return y@49 are lost, and let mut y = 0;@23 -> return y@49 appears); or give the ERROR node a Stmt node of its own beside the assignment's (a second y=1@45 appears, controlled by x@41)",
-			src:       "fn f(x: bool) -> i32 { let mut y = 0; if x { y=1 return y } y }",
+			protects:  "a statement the parser wrapped in an extra ERROR node still makes its nodes, and the definition inside it reaches the read after it",
+			mutation:  "skip the extra ERROR node with the comments (y = 1@38 and y = 1 ) (@38 vanish: y = 1@38 -> y@48 is lost and let mut y = 0;@23 -> y@48 appears)",
+			src:       "fn f(x: bool) -> i32 { let mut y = 0; y = 1 ) ( y }",
 			recovered: true,
-			cd:        []string{"x@41 -> y=1@45", "x@41 -> return y@49"},
-			du:        []string{"x@5 -> x@41", "y=1@45 -> return y@49", "let mut y = 0;@23 -> y@60"},
+			du:        []string{"y = 1@38 -> y@48"},
 		},
 	})
 }

@@ -211,6 +211,13 @@ var pythonLowering = Lowering{
 //   - print and exec statements, and every kind not named here, are plain
 //     nodes: one Stmt node spanning the statement with its reads, falling
 //     through.
+//   - An ERROR node of the parser's recovery in a statement position,
+//     whether the parser made it an extra or not, lowers each named child
+//     as a statement (a child of no statement kind is a plain node, as
+//     above), so a statement the recovery kept makes its nodes and defines
+//     what it defines (`y = 1` in `y = 1 )` defines y); then it is one Stmt
+//     node spanning the ERROR node, with none of the children's reads, not
+//     made when the last node its children made already spans it.
 //
 // # Annotations
 //
@@ -455,6 +462,9 @@ type pyLower struct {
 	throws, thrown int
 	// first is the first node created since the last open, or -1.
 	first int32
+	// last is the last node nodeAt created, or -1, and lastSpan its span.
+	last     int32
+	lastSpan flow.Span
 	// hold is a stack of saved fringes that a construct merges at its end:
 	// the arm ends of an if chain, the case ends of a match, the handler ends
 	// of a try, the false exits of a chained comparison.
@@ -472,7 +482,7 @@ func (j *pyLower) start(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s
 	*j = pyLower{
 		l: l, b: b, src: src, k: pySyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
 		buf: j.buf[:0], frames: j.frames[:0], reads: j.reads[:0], seen: j.seen, stmtNo: j.stmtNo + 1,
-		writes: j.writes[:0], first: -1, hold: j.hold[:0], fins: j.fins[:0], mgrs: j.mgrs[:0],
+		writes: j.writes[:0], first: -1, last: -1, hold: j.hold[:0], fins: j.fins[:0], mgrs: j.mgrs[:0],
 	}
 }
 
@@ -500,7 +510,7 @@ type pyFrame struct {
 // mark and the list; done(mark) pops them. A list stays valid across nested
 // kids calls: later pushes never overwrite it. An ERROR node the parser made
 // an extra, which its recovery does when it wraps what it could not parse or
-// a token it skipped, is kept: it is lowered as a kind not named here is.
+// a token it skipped, is kept: stmt lowers it (see errorStmt).
 func (j *pyLower) kids(n *ts.Node) (int, []ts.Node) {
 	start := len(j.buf)
 	c := j.cur
@@ -1079,6 +1089,7 @@ func (j *pyLower) nodeAt(kind flow.Kind, s flow.Span, from, to int) int32 {
 	if j.first < 0 {
 		j.first = id
 	}
+	j.last, j.lastSpan = id, s
 	for _, v := range j.reads[from:to] {
 		j.b.Use(id, v)
 	}
@@ -1199,6 +1210,10 @@ func (j *pyLower) block(n *ts.Node) {
 func (j *pyLower) stmt(n *ts.Node) {
 	k := j.k
 	j.reset()
+	if n.IsError() {
+		j.errorStmt(n)
+		return
+	}
 	switch n.KindId() {
 	case k.expressionStatement:
 		start, list := j.kids(n)
@@ -1265,6 +1280,23 @@ func (j *pyLower) stmt(n *ts.Node) {
 		j.closure(d, n, from, j.lookup(d.ChildByFieldId(k.fName)))
 	default:
 		j.yield(n, -1)
+	}
+}
+
+// errorStmt lowers an ERROR node of the parser's recovery in a statement
+// position (see the statement kinds in lowerPython): each named child as a
+// statement, through stmt, then a Stmt node spanning the ERROR node, unless
+// the last node its children made already spans it.
+func (j *pyLower) errorStmt(n *ts.Node) {
+	last := j.last
+	start, list := j.kids(n)
+	for i := range list {
+		j.stmt(&list[i])
+	}
+	j.done(start)
+	j.reset()
+	if j.last == last || j.lastSpan != spanOf(n) {
+		j.node(flow.Stmt, n, 0, 0)
 	}
 }
 

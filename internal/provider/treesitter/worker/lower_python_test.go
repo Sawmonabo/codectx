@@ -1484,23 +1484,20 @@ func TestPythonLoweringGolden(t *testing.T) {
 			du:       []string{"s@6 -> s@77", "s@77 -> [c]@87", "s@77 -> c@88"},
 		},
 		{
-			// Ill-formed on purpose, and recovered: y=1 and return share a line, so the first simple
-			// statement lacks its newline (Language Reference §7); the
-			// parser recovers by wrapping the reduced assignment y=1 in an ERROR node it marks as an extra
-			// among the block's statements (one tree of 3 bytes costs the recovery less than a missing
-			// terminator does), and the return statement after it parses whole. The rule
-			// (kids and the unnamed kinds in lower_python.go): an ERROR node the parser made an extra is
-			// kept and is a plain node, one Stmt node spanning it with its reads, and every name under it is
-			// read, the assignment's target included, so y=1@38 Uses y and defines nothing. Nodes: x@6,
-			// y = 0@14, the Branch x@27, y=1@38, return y@42, return y@55.
-			name:      "an ERROR node the parser made an extra is one plain node with every read under it",
-			protects:  "a statement the parser wrapped in an extra ERROR node still makes its node on its path, carrying the reads under it",
-			mutation:  "drop the extra ERROR node's content with the comments (y=1@38 vanishes: x@27 -> y=1@38 and y = 0@14 -> y=1@38 are lost)",
-			src:       "def f(x):\n    y = 0\n    if x:\n        y=1 return y\n    return y\n",
+			// Ill-formed on purpose, and recovered. Observed tree: block (expression_statement (assignment …))
+			// (expression_statement (call)) (ERROR (expression_statement (assignment left: (identifier) right:
+			// (integer)))) (return_statement (identifier)); the ERROR is an extra over [32,39) "y = 1 )", its
+			// expression_statement [32,37). The rule (the ERROR statement kind in lower_python.go, errorStmt):
+			// each named child is lowered as a statement, so y = 1@32 defines y, and the ERROR, wider than it,
+			// is a Stmt node of its own with no reads. Nodes: x@6, y = 0@14, g()@24, y = 1@32, y = 1 )@32,
+			// return y@44.
+			name:      "a statement the recovery kept inside an ERROR node the parser made an extra is lowered as a statement",
+			protects:  "a statement the parser wrapped in an extra ERROR node still makes its nodes, and the definition inside it reaches the read after it rather than becoming a read",
+			mutation:  "skip the extra ERROR node with the comments (y = 1@32 -> return y@44 is lost and y = 0@14 -> return y@44 appears); or lower the ERROR node as one plain node reading every name under it (y = 1@32 vanishes: y = 0@14 -> y = 1 )@32 and y = 0@14 -> return y@44 appear)",
+			src:       "def f(x):\n    y = 0\n    g()\n    y = 1 )\n    return y\n",
 			fn:        1,
 			recovered: true,
-			cd:        []string{"x@27 -> y=1@38", "x@27 -> return y@42"},
-			du:        []string{"x@6 -> x@27", "y = 0@14 -> y=1@38", "y = 0@14 -> return y@42", "y = 0@14 -> return y@55"},
+			du:        []string{"y = 1@32 -> return y@44"},
 		},
 	})
 }

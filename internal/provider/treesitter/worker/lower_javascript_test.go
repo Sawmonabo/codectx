@@ -1411,21 +1411,19 @@ var javascriptOnly = []goldenCase{
 		du:       []string{"o@11 -> o@25", "x@14 -> g(x)@30", "x@14 -> return x;@38"},
 	},
 	{
-		// Ill-formed on purpose, and recovered: no line break parts y=1 from return, so no semicolon is
-		// inserted (ECMA-262 §12.10.1) and the statement lacks its terminator; the
-		// parser recovers by wrapping the reduced assignment y=1 in an ERROR node it marks as an extra
-		// among the block's statements (one tree of 3 bytes costs the recovery less than a missing
-		// terminator does), and the return statement after it parses whole. The rule (kids in
-		// lower_javascript.go): an ERROR node the parser made an extra is kept and lowered as a kind the
-		// lowering does not name, for its value, so the assignment inside it is the node y=1@36 defining y.
-		// Nodes: x@11, y = 0@20, the Branch x@31, y=1@36, return y@40, return y;@51.
+		// Ill-formed on purpose, and recovered. Observed tree: statement_block (lexical_declaration …) (ERROR
+		// (assignment_expression left: (identifier) right: (number))) (return_statement (identifier)); the ERROR
+		// is an extra over [27,34) "y = 1 )", its assignment [27,32). The rule (kids and Statement kinds in
+		// lower_javascript.go, with the ERROR rule stated in lower_java.go): the ERROR is kept and lowered for
+		// its value, so its assignment is the node y = 1@27 defining y and an owned result, and the ERROR,
+		// wider than it, is a Stmt node of its own that Uses that result. Nodes: x@11, y = 0@20, y = 1@27,
+		// y = 1 )@27, return y;@35.
 		name:      "an assignment inside an ERROR node the parser made an extra defines its target",
-		protects:  "a statement the parser wrapped in an extra ERROR node still makes its node, and the definition inside it reaches the read after it",
-		mutation:  "drop the extra ERROR node's content with the comments (y=1@36 vanishes: x@31 -> y=1@36 and y=1@36 -> return y@40 are lost, and y = 0@20 -> return y@40 appears)",
-		src:       "function f(x) { let y = 0; if (x) { y=1 return y } return y; }",
+		protects:  "a statement the parser wrapped in an extra ERROR node still makes its nodes, and the definition inside it reaches the read after it",
+		mutation:  "skip the extra ERROR node with the comments (y = 1@27 and y = 1 )@27 vanish: y = 1@27 -> y = 1 )@27 and y = 1@27 -> return y;@35 are lost, and y = 0@20 -> return y;@35 appears)",
+		src:       "function f(x) { let y = 0; y = 1 ) return y; }",
 		fn:        1,
 		recovered: true,
-		cd:        []string{"x@31 -> y=1@36", "x@31 -> return y@40"},
-		du:        []string{"x@11 -> x@31", "y=1@36 -> return y@40", "y = 0@20 -> return y;@51"},
+		du:        []string{"y = 1@27 -> y = 1 )@27", "y = 1@27 -> return y;@35"},
 	},
 }

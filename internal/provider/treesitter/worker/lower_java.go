@@ -192,8 +192,15 @@ const yieldLabel = " yield"
 // anywhere (an embedded assignment, a lambda) makes one there and defines
 // what it defines there, and the rest folds into the Stmt node spanning it,
 // which is not made when the construct's node already spans it. Every
-// lowering applies this rule: an ERROR node is its language's kind the
-// lowering does not name. Expression kinds other than the ones above
+// lowering keeps an ERROR node, extra or not, and makes its nodes as this
+// rule does: a construct inside it that its language lowers to nodes of its
+// own makes them there (Python lowers each named child of a
+// statement-position ERROR as a statement, which a statement the recovery
+// kept needs), and the ERROR node is a Stmt node spanning it. Java,
+// JavaScript and Python leave that node out when a construct's node already
+// spans the ERROR node; C, Go and Rust always make it, which gives a second
+// node over that span only for an ERROR node no wider than its one
+// construct. Expression kinds other than the ones above
 // (method and constructor invocations, an object creation without a class
 // body, field and array access, casts, unary, arithmetic and comparison
 // operators, the instanceof test, method references, array creation, class
