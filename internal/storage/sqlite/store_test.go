@@ -66,7 +66,7 @@ func newFixture(t *testing.T, dbPath string) *fixture {
 func newFixtureWithOptions(t *testing.T, dbPath string, opts store.Options) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, opts)
+	s, err := store.Open(ctx, dbPath, store.WithDerivedReaders(opts))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1277,7 +1277,7 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Close()
-	if _, err := store.Open(ctx, dbPath, store.Options{}); err == nil {
+	if _, err := store.Open(ctx, dbPath, store.WithDerivedReaders(store.Options{})); err == nil {
 		t.Fatal("Open accepted a database with a foreign schema fingerprint")
 	} else {
 		wantCode(t, err, model.CodeSchemaMismatch)

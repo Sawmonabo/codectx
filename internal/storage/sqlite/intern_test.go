@@ -31,7 +31,7 @@ func decodeForTest(t *testing.T, id string) []byte {
 func internFixture(t *testing.T) (context.Context, *Store, *sql.Tx) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "intern.db"), Options{})
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "intern.db"), WithDerivedReaders(Options{}))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

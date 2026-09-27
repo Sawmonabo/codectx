@@ -28,7 +28,7 @@ import (
 // Mutation that fails it: remove the `scratch.For` registration from Open.
 func TestOpenRegistersTheDatabaseDirectoryForPacedRemoval(t *testing.T) {
 	dir := t.TempDir()
-	s, err := store.Open(context.Background(), filepath.Join(dir, "codectx.db"), store.Options{})
+	s, err := store.Open(context.Background(), filepath.Join(dir, "codectx.db"), store.WithDerivedReaders(store.Options{}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

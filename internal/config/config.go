@@ -228,8 +228,11 @@ type Storage struct {
 	// the user-private directory DefaultDataDir returns, so no consumer derives
 	// it a second time. Load does not create it; the storage owner creates it
 	// with user-private permissions.
-	DataDir                string   `toml:"data_dir"`
-	BusyTimeout            Duration `toml:"busy_timeout"`
+	DataDir     string   `toml:"data_dir"`
+	BusyTimeout Duration `toml:"busy_timeout"`
+	// ReadConnections sizes both reader pools of every store handle when it is
+	// set. 0, the default, sizes each pool by the goroutines that read it
+	// (ReadConnections and PostingConnections in machine.go).
 	ReadConnections        int      `toml:"read_connections"`
 	WriterCacheKiB         int      `toml:"writer_cache_kib"`
 	ReaderCacheKiB         int      `toml:"reader_cache_kib"`
@@ -652,7 +655,7 @@ func Defaults() Config {
 		Storage: Storage{
 			DataDir:                "",
 			BusyTimeout:            Duration(5 * time.Second),
-			ReadConnections:        2,
+			ReadConnections:        0,
 			WriterCacheKiB:         1048576,
 			ReaderCacheKiB:         4096,
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),

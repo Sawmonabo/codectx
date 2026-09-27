@@ -48,8 +48,8 @@ const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 // makes up front -- one query slot's memory per core, the parsed-graph cache, the
 // indexing queue, and every page cache it opens: the store writer
 // connection's (storage.writer_cache_kib), every reader connection's
-// (storage.reader_cache_kib) in every reader pool the process opens
-// (storeReaderPools), one lexical staging database's per unit a generation
+// (storage.reader_cache_kib) in both reader pools of every store handle
+// (ReadConnections, PostingConnections, storeHandles), one lexical staging database's per unit a generation
 // builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
 // query tokenizer (TokenizerCacheKiB) and the run ledger's
 // (ledger.FootprintBytes).
@@ -77,10 +77,32 @@ func BaseFootprint(c Config) int64 {
 // others by one handle's pools, which only leaves their children less.
 const storeHandles = 2
 
-// storeReaderPools is how many reader pools of storage.read_connections
-// connections each this process can hold open at once: every store handle
-// opens two, the short-read pool and the posting-stream pool.
-const storeReaderPools = 2 * storeHandles
+// ReadConnections is how many connections a store handle's short-read pool
+// holds: storage.read_connections when it is set, and otherwise one for each
+// goroutine that can read the pool at once. Those are the units a generation
+// builds at once (BuildWorkers), each reading its unit state and its
+// dependencies' aliases there, and the tool calls that run at once
+// (QuerySlots), each issuing its short reads there. The coordinator holds the
+// unit count under the provider pool's ceiling on live sinks, which can only
+// lower it, so the pool is never smaller than the goroutines that read it.
+func ReadConnections(c Config) int {
+	if c.Storage.ReadConnections > 0 {
+		return c.Storage.ReadConnections
+	}
+	return BuildWorkers(c) + QuerySlots()
+}
+
+// PostingConnections is how many connections a store handle's posting-stream
+// pool holds: storage.read_connections when it is set, and otherwise one per
+// tool call that runs at once (QuerySlots). Only a query's candidate walk
+// holds a posting session, and it holds one for the whole walk, so no unit
+// build ever reads this pool.
+func PostingConnections(c Config) int {
+	if c.Storage.ReadConnections > 0 {
+		return c.Storage.ReadConnections
+	}
+	return QuerySlots()
+}
 
 // LexicalStageCacheKiB is the page cache of one building unit's lexical
 // staging database, which the store opens per unit that publishes search
@@ -125,8 +147,13 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	readerConnections, err := mulNoOverflow("reader pools * storage.read_connections",
-		storeReaderPools, int64(c.Storage.ReadConnections))
+	handleConnections, err := addNoOverflow("short-read + posting-stream connections",
+		int64(ReadConnections(c)), int64(PostingConnections(c)))
+	if err != nil {
+		return 0, err
+	}
+	readerConnections, err := mulNoOverflow("store handles * reader connections",
+		storeHandles, handleConnections)
 	if err != nil {
 		return 0, err
 	}

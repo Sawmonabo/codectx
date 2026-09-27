@@ -28,7 +28,7 @@ func TestWriterSynchronousFollowsOption(t *testing.T) {
 	} {
 		t.Run("mode="+tc.mode, func(t *testing.T) {
 			ctx := context.Background()
-			s, err := Open(ctx, filepath.Join(t.TempDir(), "codectx.db"), Options{Synchronous: tc.mode})
+			s, err := Open(ctx, filepath.Join(t.TempDir(), "codectx.db"), WithDerivedReaders(Options{Synchronous: tc.mode}))
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
@@ -65,7 +65,7 @@ func TestWriterSynchronousFollowsOption(t *testing.T) {
 
 // An unrecognized mode fails Open rather than silently choosing one.
 func TestOpenRejectsUnknownSynchronous(t *testing.T) {
-	_, err := Open(context.Background(), filepath.Join(t.TempDir(), "codectx.db"), Options{Synchronous: "off"})
+	_, err := Open(context.Background(), filepath.Join(t.TempDir(), "codectx.db"), WithDerivedReaders(Options{Synchronous: "off"}))
 	var typed *model.Error
 	if err == nil || !errors.As(err, &typed) || typed.Code != model.CodeArgumentInvalid {
 		t.Fatalf("open with synchronous=off: got %v, want CTX_ARGUMENT_INVALID", err)

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
@@ -64,7 +65,10 @@ func New(t *testing.T, files map[string]string) *Harness {
 	}
 	// The store re-indexes carried lexical documents through the content
 	// store's range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	// The reader pools are sized as the product sizes them on this machine.
+	cfg := config.Defaults()
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{
+		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

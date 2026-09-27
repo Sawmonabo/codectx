@@ -38,12 +38,12 @@ func TestLazyWriterOpenDoesNotWaitOnAWriteTransaction(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "codectx.db")
-	opts := store.Options{BusyTimeout: contendedBusyTimeout, ReadConnections: 2}
+	opts := store.Options{BusyTimeout: contendedBusyTimeout}
 
 	// The cache exists and holds a schema, which is every cache a run can be
 	// writing to. (An empty one is the case adoptSchema creates, and no run
 	// can be holding a transaction on a cache no writing open has finished.)
-	first, err := store.Open(ctx, path, opts)
+	first, err := store.Open(ctx, path, store.WithDerivedReaders(opts))
 	if err != nil {
 		t.Fatalf("create the cache: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestLazyWriterOpenDoesNotWaitOnAWriteTransaction(t *testing.T) {
 
 	lazy := opts
 	lazy.LazyWriter = true
-	serving, err := store.Open(ctx, path, lazy)
+	serving, err := store.Open(ctx, path, store.WithDerivedReaders(lazy))
 	if err != nil {
 		t.Fatalf("a writer-deferred open was refused while another connection held the write transaction: %v -- "+
 			"the open still writes, so a server cannot come up beside a running index", err)
@@ -78,7 +78,7 @@ func TestLazyWriterOpenDoesNotWaitOnAWriteTransaction(t *testing.T) {
 		t.Fatalf("close the writer-deferred store: %v", err)
 	}
 
-	blocked, err := store.Open(ctx, path, opts)
+	blocked, err := store.Open(ctx, path, store.WithDerivedReaders(opts))
 	if err == nil {
 		blocked.Close()
 		t.Fatal("an ordinary writing open succeeded with a write transaction held: " +
