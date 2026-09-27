@@ -145,6 +145,10 @@ func New(t *testing.T, files map[string]string) *Harness {
 	if err != nil {
 		t.Fatalf("PutSnapshot: %v", err)
 	}
+	// A view reads the last commit, as the index build's does after capture.
+	if err := store.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	view, err := snapshot.OpenView(ctx, store, cas, h.Snapshot.ID)
 	if err != nil {
 		t.Fatalf("OpenView: %v", err)

@@ -129,6 +129,8 @@ func (f *fixture) snapshot(files map[string]string) *tree {
 	if err != nil {
 		f.t.Fatalf("PutSnapshot: %v", err)
 	}
+	// A view reads the last commit, as the index build's does after capture.
+	f.flush()
 	if tr.view, err = snapshot.OpenView(f.ctx, f.store, f.cas, tr.snap.ID); err != nil {
 		f.t.Fatalf("OpenView: %v", err)
 	}
