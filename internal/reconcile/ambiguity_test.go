@@ -10,13 +10,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// aliasesFor returns n distinct stored aliases in canonical-key order.
+// fixedAliases answers every lookup with its stored aliases, in canonical-key
+// order.
 type fixedAliases []sqlite.StoredAlias
 
-func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ string, limit int) ([]sqlite.StoredAlias, error) {
-	if limit < len(f) {
-		return f[:limit], nil
-	}
+func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ string) ([]sqlite.StoredAlias, error) {
 	return f, nil
 }
 
@@ -26,14 +24,11 @@ func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ st
 // Mutation that fails it: return CTX_PROVIDER_OUTPUT_INVALID for a native key
 // aliased to more identities than model.MaxAmbiguousCandidates. One heavily
 // overloaded symbol name then refuses the whole dependency output — the unit
-// produces nothing, not even the facts that had no ambiguity at all. The
-// alias lookup's own page size is the only bound; the resolver keeps every
-// alternative it returned so no may_refer_to edge is silently lost.
+// produces nothing, not even the facts that had no ambiguity at all. What the
+// dependencies published is the only bound; the resolver keeps every
+// alternative the lookup returned so no may_refer_to edge is silently lost.
 func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing.T) {
-	const n = sqlite.MaxAliasLookup // more than MaxAmbiguousCandidates+1
-	if n <= model.MaxAmbiguousCandidates+1 {
-		t.Fatalf("fixture is not over the ambiguity threshold: %d", n)
-	}
+	const n = model.MaxAmbiguousCandidates + 2 // over the ambiguity threshold
 	var store fixedAliases
 	for i := 0; i < n; i++ {
 		id := model.NodeID(fmt.Sprintf("%064x", i+1))

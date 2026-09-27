@@ -26,7 +26,7 @@ import (
 // *sqlite.AliasTable satisfies it: the dependencies' aliases, loaded once per
 // unit from the last commit by Store.DependencyAliases.
 type AliasStore interface {
-	LookupAliases(ctx context.Context, units []model.UnitID, scopeKey, nativeKey string, limit int) ([]sqlite.StoredAlias, error)
+	LookupAliases(ctx context.Context, units []model.UnitID, scopeKey, nativeKey string) ([]sqlite.StoredAlias, error)
 }
 
 // Resolver resolves candidates for one unit against that unit's completed
@@ -77,7 +77,7 @@ func (r *Resolver) Resolve(ctx context.Context, c model.NodeCandidate) (model.Re
 		if key == "" || len(r.deps) == 0 {
 			continue
 		}
-		hits, err := r.store.LookupAliases(ctx, r.deps, c.ScopeKey, key, sqlite.MaxAliasLookup)
+		hits, err := r.store.LookupAliases(ctx, r.deps, c.ScopeKey, key)
 		if err != nil {
 			return model.Resolution{}, err
 		}

@@ -986,10 +986,15 @@ func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
 const testDiskAllocationBytes int64 = 64 << 30
 
 // testBaseFootprintBytes stands in for what the composition derives from the
-// machine and the configuration (config.BaseFootprint). It is the shipped
-// defaults on a 16-core host -- 32 MiB idle + 16 query slots x 32 MiB + 32 MiB
-// cache + 16 MiB queue -- stated here rather than imported so this package's
-// tests do not resolve a configuration to size a reservation.
+// machine and the configuration (config.BaseFootprint). It is a fixed figure,
+// not that derivation: the unobserved idle footprint (32 MiB), 16 query slots
+// of the default 32 MiB, the default 32 MiB cache and a 16 MiB queue. It leaves
+// out the page caches the derivation also counts (the writer's, every reader
+// connection's, the lexical staging and tokenizer caches) and the run ledger's,
+// which these tests do not depend on: each needs only a positive base far
+// below the machine it is subtracted from. It is stated here rather than
+// derived so the tests neither resolve a configuration nor vary with the
+// host's cores.
 const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
 
 // TestAllocationSubtractsTheDerivedBaseFootprint protects the rule that the
