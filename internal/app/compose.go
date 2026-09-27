@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,13 +89,6 @@ const spoolBudgetDivisor = 8
 // this composition chooses, and it is stated because agreeing with the store's
 // batch is a decision, not a default.
 const collectorBatchLimit = 200
-
-// smallestChildReservationBytes is the smallest memory reservation any child
-// of a runner presents, below every real reservation -- the smallest heap cap a
-// heavy analyzer is given. It sizes the one runner composed outside the
-// admission ledger: the Git listing that tool selection runs alone, which
-// reserves nothing.
-const smallestChildReservationBytes int64 = 768 << 20
 
 // unobservedFreeDiskBytes is the disk allocation used where the platform
 // reports no free-space figure for the data directory. It is not a
@@ -779,11 +771,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// ledger's allocation is re-derived between parser files, upward as well as
 	// down. A runner budget taken from the composition-time allocation would be
 	// a second, stale gate: once the allocation rose, it would queue what the
-	// ledger had just admitted. So no runner holds a memory figure of its own:
-	// each budget is the whole int64 range, which no reservation exceeds and no
-	// sum of them reaches, and not a figure standing in for a machine. The
-	// concurrency count is the whole int range for the same reason: the ledger
-	// counts nothing, so any count derived here could bind below it. The one
+	// ledger had just admitted. So no runner states a memory figure of its own
+	// (process.Limits reads an unset bound as no bound), and none states a
+	// count either: the ledger counts nothing, so any count derived here could
+	// bind below it. The one
 	// child the ledger does not admit -- Git plumbing on the shared runner,
 	// which reserves nothing -- runs as many at once as its callers do, each a
 	// bounded read on their behalf.
@@ -792,11 +783,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// resources.max_temp_bytes (tempDiskShares), a ceiling the operator set on
 	// purpose, including the unlimited default of 0. Only a set ceiling refuses
 	// a child, and it names the key in the error.
-	shared, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     math.MaxInt,
-		MemoryBudgetBytes: math.MaxInt64,
-		DiskBudgetBytes:   runnerDisk,
-	})
+	shared, err := process.NewRunner(process.Limits{DiskBudgetBytes: runnerDisk})
 	if err != nil {
 		return nil, err
 	}
@@ -807,22 +794,16 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// each file's predicted need are reserved there, and the ledger grants a
 	// file whenever no parse is in flight, however large.
 	parserWorkers := config.ParserWorkers()
-	parsers, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     parserWorkers,
-		MemoryBudgetBytes: math.MaxInt64,
-	})
+	parsers, err := process.NewRunner(process.Limits{MaxConcurrent: parserWorkers})
 	if err != nil {
 		return nil, err
 	}
 	// Language servers are admitted on the ledger in both dimensions by the
 	// manager, which can also stop an idle server to make room, which a runner
-	// cannot. The runner therefore holds no budget of its own in either: disk
-	// is unlimited here because the ledger already admitted each server's disk
-	// against the free space measured under the data directory.
-	servers, err := process.NewRunner(process.Limits{
-		MaxConcurrent:     math.MaxInt,
-		MemoryBudgetBytes: math.MaxInt64,
-	})
+	// cannot. The runner therefore states no bound of its own in any
+	// dimension: the ledger already admitted each server's disk against the
+	// free space measured under the data directory.
+	servers, err := process.NewRunner(process.Limits{})
 	if err != nil {
 		return nil, err
 	}

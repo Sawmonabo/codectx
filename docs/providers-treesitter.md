@@ -301,8 +301,8 @@ queued on the ledger is kept throughout.
 
 The runner holds one concurrency slot per live worker for the worker's whole
 life. The composition gives the workers a runner of their own, with
-`process.Limits.MaxConcurrent` equal to the worker count and a memory budget
-of the whole int64 range: the runner reserves nothing per worker and the
+`process.Limits.MaxConcurrent` equal to the worker count and no memory budget
+(an unset bound is no bound): the runner reserves nothing per worker and the
 ledger is the one memory gate, so the runner never refuses or queues a worker
 the ledger has admitted.
 
