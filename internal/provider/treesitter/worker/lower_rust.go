@@ -1336,11 +1336,13 @@ func (r *rsLower) cond(c *ts.Node) int {
 	return mark
 }
 
-// condPart lowers one condition or let-chain member as a Branch node and
-// saves its false edge in hs. A let condition's Branch evaluates its value
-// once and defines an owned variable its bindings Use.
+// condPart lowers one condition or let-chain member as a Branch node spanning
+// it with its parentheses stripped (lower.go, Spans), and saves its false edge
+// in hs. A let condition's Branch evaluates its value once and defines an
+// owned variable its bindings Use.
 func (r *rsLower) condPart(c *ts.Node) {
 	k := r.k
+	c = r.l.unparen(c)
 	m, last := len(r.reads), r.last
 	if c.KindId() == k.letCondition {
 		val := c.ChildByFieldId(k.fValue)

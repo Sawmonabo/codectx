@@ -623,5 +623,18 @@ func TestRustLoweringGolden(t *testing.T) {
 				"a? + b?@73 -> let r: Option<i32> = try { a? + b? };@46",
 				"let r: Option<i32> = try { a? + b? };@46 -> r.unwrap_or(0)@84"},
 		},
+		{
+			// Expressions › `if` expressions (the condition is any
+			// expression, a parenthesized one included), and Expressions ›
+			// Grouped expressions: `(c)` is c. Nodes: c@5 (param), c@27 (the
+			// condition's Branch, spanning c without its parentheses), 1@32,
+			// 2@43. Succ: c@27→{1, 2}; 1→EXIT; 2→EXIT. IPDom: c@27 → EXIT.
+			name:     "a parenthesized condition's branch spans the condition without its parentheses",
+			protects: "an if, while or guard condition is spanned with every enclosing pair of parentheses stripped, as every lowering spans it",
+			mutation: "span the condition as written (the Branch renders (c)@26: every pair naming c@27 becomes one naming (c)@26)",
+			src:      "fn f(c: bool) -> i32 { if (c) { 1 } else { 2 } }",
+			cd:       []string{"c@27 -> 1@32", "c@27 -> 2@43"},
+			du:       []string{"c@5 -> c@27"},
+		},
 	})
 }
