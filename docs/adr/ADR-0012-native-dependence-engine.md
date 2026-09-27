@@ -323,11 +323,11 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 - **Where no resettable peak exists.** On a platform that offers no resettable per-process peak, need is reported as
   unavailable, never as zero: the file is reserved at its prediction and nothing is learned from it.
 - **Learn.** The coordinator keeps a decaying histogram of need per source byte in 5% buckets. It is keyed per
-  repository, language, grammar fingerprint and file-size class, and persisted in the ledger's observation store beside
-  the scope peaks, since a measurement stays true whatever becomes of its generation. It reserves the
-  histogram's weighted p99, which is the sample maximum below 100 observations. The half-life is counted in that
-  repository's own files of that language, so the model adapts at the speed of the repository in front of it, whatever
-  its size.
+  repository, language, grammar fingerprint, the worker's build and file-size class, and persisted in the ledger's
+  observation store beside the scope peaks, since a measurement stays true whatever becomes of its generation. It
+  reserves the histogram's weighted p99, which is the sample maximum below 100 observations. The half-life is counted
+  in that repository's own files of that language, so the model adapts at the speed of the repository in front of it,
+  whatever its size.
 - **First file.** The first file of a language never seen in this repository is reserved at a **structural prior**:
   `worker base + source bytes × 107`.
   - The 107 is derived from the parse-tree runtime's own node layout, not measured on any repository. Per source byte
@@ -335,8 +335,13 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
     input copies and 1 for the worker's buffer.
   - It holds on all 3,827 matrix files of 64 KiB or more. It is exceeded by 9 of 74,059 files of 4 KiB or more; the
     worst is 302.8 bytes per source byte, a 10,479-byte C++ file.
-  - An exceeded prior is an overrun that runs and is disclosed, never a refusal. If the prior falls below observed need
-    on some class, the first file of a language runs alone.
+  - An exceeded prior is an overrun that runs and is disclosed, never a refusal. Once a file reserved at the prior needs
+    more than it in some class of a language, every later file of that language reserved at the prior runs alone among
+    the parses, for the life of the parser pool: it is granted only when no other parse holds an increment, and none is
+    granted beside it. The switch is disclosed, as a warning naming the language and in the parser's resource view with
+    the count of files run alone.
+  - A worker of a new build learns afresh: the build is part of the key, and the parent refuses a worker whose hello
+    states another build.
 
 **Per run:**
 

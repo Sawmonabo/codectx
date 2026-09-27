@@ -119,8 +119,9 @@ CREATE TABLE scope_peaks (
     PRIMARY KEY (repository_id, scope_key)
 ) WITHOUT ROWID;
 -- The learned need of one class of parsed file in one repository: the
--- language, the grammar fingerprint the files were parsed under and the
--- file-size class. state is the model's own encoding, replaced by each
+-- language, the grammar fingerprint the files were parsed under, the build of
+-- the worker that parsed them, and the file-size class. A new build learns
+-- afresh, since what a worker does with a file's tree changes with it. state is the model's own encoding, replaced by each
 -- observation's, which already folds in every earlier one; the counts beside it
 -- are what the model was learned from and how often its reservation fell short.
 -- It is keyed by neither run nor generation, because a measurement stays true
@@ -136,13 +137,14 @@ CREATE TABLE need_models (
     repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
     language TEXT NOT NULL CHECK(length(language) > 0),
     fingerprint TEXT NOT NULL CHECK(length(fingerprint) > 0),
+    build TEXT NOT NULL CHECK(length(build) > 0),
     size_class INTEGER NOT NULL CHECK(size_class >= 0),
     state BLOB NOT NULL CHECK(length(state) > 0),
     observations INTEGER NOT NULL CHECK(observations > 0),
     overruns INTEGER NOT NULL CHECK(overruns >= 0 AND overruns <= observations),
     max_drift_bytes INTEGER NOT NULL,
     CHECK((overruns > 0) = (max_drift_bytes > 0)),
-    PRIMARY KEY (repository_id, language, fingerprint, size_class)
+    PRIMARY KEY (repository_id, language, fingerprint, build, size_class)
 ) WITHOUT ROWID;
 -- Unique so that a span's end, and a child's parent lookup, name exactly one
 -- row by (run_id, seq); it is also the order a reader pages the run in.

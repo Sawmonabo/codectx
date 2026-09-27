@@ -14,9 +14,9 @@
 // machine's memory and freeze the host, which is the failure this package
 // exists to make impossible. Nothing here observes the machine or derives the
 // allocations: the composition root derives both and hands the figures over,
-// and re-derives the memory figure from the kernel's between parsed files
-// (SetAllocation), so there is exactly one place a second total could ever be
-// introduced.
+// and re-derives the memory figure from the kernel's before every admission
+// (RederiveBeforeEachAdmission, SetAllocation), so there is exactly one place
+// a second total could ever be introduced.
 //
 // A holding's memory can move while it is held (Holding.Adjust): a parser
 // worker holds the base it reports for its lifetime, and a reported figure
@@ -81,8 +81,10 @@ type Ledger struct {
 	diskAllocation int64
 	admitted       int
 	// parses counts the admitted Parse reservations: the forward-progress
-	// rule grants a Parse head whenever it is zero.
+	// rule grants a Parse head whenever it is zero. alone counts the admitted
+	// ones that run alone: while it is above zero no Parse head is granted.
 	parses   int
+	alone    int
 	used     int64
 	diskUsed int64
 	queue    []*waiter
@@ -90,6 +92,9 @@ type Ledger struct {
 	// registration so each one is removed exactly once. The map is bounded by
 	// the holders this process composes, one per room-keeping pool.
 	holders map[*func()]struct{}
+	// rederive is the composition root's re-derivation of the memory
+	// allocation (RederiveBeforeEachAdmission), or nil.
+	rederive func()
 }
 
 // waiter is one reservation, queued and then held. bytes, granted, released
@@ -100,6 +105,7 @@ type waiter struct {
 	bytes     int64
 	diskBytes int64
 	parse     bool
+	alone     bool
 	granted   bool
 	released  bool
 	ready     chan struct{}
@@ -176,6 +182,13 @@ type Reservation struct {
 	// than the whole allocation still runs, alone among the parses. The rule
 	// waives the memory sum only, never the disk one.
 	Parse bool
+	// Alone marks a Parse reservation that runs alone among the parses: at
+	// the head it is granted only once no other Parse reservation is held, and
+	// while it is held no other Parse reservation is granted, whatever the
+	// sum. It is the reservation of a file whose increment rests on a
+	// prediction that has already fallen short of what a file needed, so no
+	// other parse's room is staked on it. It requires Parse.
+	Alone bool
 }
 
 // ReserveWith is Reserve in both dimensions: it blocks until this child's
@@ -211,6 +224,19 @@ func (l *Ledger) DiskSnapshot() (allocation, reserved int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.diskAllocation, l.diskUsed
+}
+
+// RederiveBeforeEachAdmission installs the step that re-derives the memory
+// allocation from the kernel's figure. Hold runs it, with no ledger lock held,
+// before every reservation queues, so each child -- a unit, a language server,
+// a parser worker or file -- is admitted against a reading of the machine
+// taken as it asks, and not against the one the last parser file took. The
+// step sets the figure through SetAllocation and may leave it as it is when
+// the kernel withholds a reading.
+func (l *Ledger) RederiveBeforeEachAdmission(step func()) {
+	l.mu.Lock()
+	l.rederive = step
+	l.mu.Unlock()
 }
 
 // Holder registers an idle-release step: a holder of room it keeps warm for
@@ -289,7 +315,14 @@ func (l *Ledger) pump() {
 		// never hold while a pool is up, and a file larger than the allocation
 		// would never run. The rule waives memory only: a Parse head that
 		// requested disk still waits for the disk to fit.
+		//
+		// A Parse head is never granted beside a Parse reservation that runs
+		// alone, and one that runs alone is never granted beside another
+		// Parse reservation, whatever the sum.
 		memoryFits := head.bytes == 0 || l.used+head.bytes <= l.allocation || head.parse && l.parses == 0
+		if head.parse && (l.alone > 0 || head.alone && l.parses > 0) {
+			memoryFits = false
+		}
 		diskFits := head.diskBytes == 0 || l.diskUsed+head.diskBytes <= l.diskAllocation
 		if l.admitted > 0 && !(memoryFits && diskFits) {
 			select {
@@ -306,6 +339,9 @@ func (l *Ledger) pump() {
 		l.admitted++
 		if head.parse {
 			l.parses++
+		}
+		if head.alone {
+			l.alone++
 		}
 		l.used += head.bytes
 		l.diskUsed += head.diskBytes
@@ -347,6 +383,9 @@ func (l *Ledger) release(w *waiter) {
 	if w.parse {
 		l.parses--
 	}
+	if w.alone {
+		l.alone--
+	}
 	l.used -= w.bytes
 	l.diskUsed -= w.diskBytes
 	l.pump()
@@ -364,19 +403,32 @@ type Holding struct {
 // adjusts, and everything they document -- the runs-alone rule, the makeRoom
 // step, the idle-release steps, the cancellation that leaks nothing -- is this
 // call's. A Parse reservation is also admitted under the forward-progress rule
-// (Reservation.Parse). A reservation of negative bytes in either dimension is
+// (Reservation.Parse), and one that runs alone is held apart from every other
+// (Reservation.Alone). A reservation of negative bytes in either dimension is
 // refused with CTX_ARGUMENT_INVALID: a holding's figures are never negative.
+// So is one that runs alone without being a Parse reservation, since only
+// parses are kept apart from each other.
 func (l *Ledger) Hold(ctx context.Context, r Reservation, makeRoom func()) (*Holding, error) {
 	if r.MemoryBytes < 0 || r.DiskBytes < 0 {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "a reservation on the ledger needs memory and disk figures that are not negative"}
 	}
+	if r.Alone && !r.Parse {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "only a parser file's reservation can run alone among the parses"}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
 	}
-	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, parse: r.Parse, ready: make(chan struct{}),
+	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, parse: r.Parse, alone: r.Alone, ready: make(chan struct{}),
 		stuck: make(chan struct{}, 1)}
 	h := &Holding{l: l, w: w}
+	l.mu.Lock()
+	rederive := l.rederive
+	l.mu.Unlock()
+	if rederive != nil {
+		rederive()
+	}
 	l.mu.Lock()
 	l.queue = append(l.queue, w)
 	l.pump()

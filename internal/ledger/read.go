@@ -591,8 +591,8 @@ func (r *Reader) NeedClasses(ctx context.Context, repositoryID string) ([]NeedCl
 	if err != nil {
 		return nil, 0, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT language, fingerprint, size_class, observations, overruns, max_drift_bytes
-		FROM need_models WHERE repository_id = ? ORDER BY language, fingerprint, size_class LIMIT ?`,
+	rows, err := r.db.QueryContext(ctx, `SELECT language, fingerprint, build, size_class, observations, overruns, max_drift_bytes
+		FROM need_models WHERE repository_id = ? ORDER BY language, fingerprint, build, size_class LIMIT ?`,
 		repo, model.MaxRecordsPerResult+1)
 	if err != nil {
 		return nil, 0, wrap("read the need models", err)
@@ -606,7 +606,7 @@ func (r *Reader) NeedClasses(ctx context.Context, repositoryID string) ([]NeedCl
 			break
 		}
 		var c NeedClass
-		if err := rows.Scan(&c.Key.Language, &c.Key.Fingerprint, &c.Key.SizeClass,
+		if err := rows.Scan(&c.Key.Language, &c.Key.Fingerprint, &c.Key.Build, &c.Key.SizeClass,
 			&c.Observations, &c.Overruns, &c.MaxDriftBytes); err != nil {
 			return nil, 0, wrap("read the need models", err)
 		}

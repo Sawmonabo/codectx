@@ -18,6 +18,7 @@ import (
 	"io"
 	"math"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 )
 
@@ -83,14 +84,26 @@ const (
 )
 
 // Hello is the worker's identity: the PID for accounting, the language
-// fingerprint the parent must match, and the languages it verified.
+// fingerprint and the build the parent must match, and the languages it
+// verified.
 type Hello struct {
 	PID         int      `json:"pid"`
 	Fingerprint string   `json:"fingerprint"`
+	Build       string   `json:"build"`
 	Languages   []string `json:"languages"`
 	// Memory is the worker's standing memory once it has started and before
 	// its first file: BaseBytes and AnonBytes, never NeedBytes.
 	Memory Memory `json:"memory"`
+}
+
+// Build is this binary's build identity as a worker states it in its hello
+// and the parent keys what it learns of a worker's files by: the version, the
+// commit and the toolchain it was built from. The parent refuses a worker of
+// another build, so a need model learned under one build is only ever applied
+// to workers of that build.
+func Build() string {
+	b := model.CurrentBuildInfo()
+	return b.Version + " " + b.Commit + " " + b.Toolchain
 }
 
 // Memory is one file-boundary reading the worker takes of itself. Every
@@ -106,7 +119,9 @@ type Memory struct {
 	// the base the next file's need is measured from.
 	BaseBytes *uint64 `json:"base_bytes,omitempty"`
 	// AnonBytes is the anonymous part of that resident set, the memory that
-	// is this worker's alone rather than pages of the executable it shares.
+	// is this worker's alone rather than pages of the executable it shares
+	// with every other worker. It is what the parent holds a worker's base at
+	// and counts as the product's own residency.
 	AnonBytes *uint64 `json:"anon_bytes,omitempty"`
 }
 

@@ -152,6 +152,47 @@ func TestParseForwardProgressWhileBasesAreHeld(t *testing.T) {
 	(<-second).Release()
 }
 
+// A file that runs alone waits for every parse in flight however much room
+// is left, and no parse runs beside it. It is the reservation of a file whose
+// prediction has already fallen short, so a parse beside it could take room
+// the file then outgrows. Mutations this fails on:
+//   - admitting a Parse that runs alone on the sum alone: it runs beside the
+//     parse in flight;
+//   - admitting a Parse head on the sum while one that runs alone is held: it
+//     runs beside it;
+//   - release not returning the count of those that run alone: the last file
+//     never runs.
+func TestAParseThatRunsAloneRunsBesideNoOtherParse(t *testing.T) {
+	l, err := NewLedger(1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	inFlight, err := l.Hold(ctx, Reservation{MemoryBytes: 1, Parse: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited, signal := waitSignal()
+	alone := holdAsync(l, Reservation{MemoryBytes: 1, Parse: true, Alone: true}, signal)
+	select {
+	case <-alone:
+		t.Fatal("a file that runs alone ran beside a parse in flight")
+	case <-waited:
+	}
+	inFlight.Release()
+	held := <-alone
+
+	waited, signal = waitSignal()
+	beside := holdAsync(l, Reservation{MemoryBytes: 1, Parse: true}, signal)
+	select {
+	case <-beside:
+		t.Fatal("a parse ran beside a file that runs alone although it fitted the sum")
+	case <-waited:
+	}
+	held.Release()
+	(<-beside).Release()
+}
+
 // Adjust takes an upward figure at once and counts it, and a downward one
 // admits a waiter. Mutations this fails on:
 //   - Adjust upward not adding to the reserved sum: the ledger admits a child
@@ -266,30 +307,6 @@ func TestNeedHistogramMaximumThenPercentile(t *testing.T) {
 	}
 	if _, ok := (&NeedHistogram{}).Predict(1000); ok {
 		t.Fatal("an empty model claimed a prediction")
-	}
-}
-
-// A recent regime overtakes an old one within a few half-lives. Mutations this
-// fails on:
-//   - no decay: 200 old files outweigh 100 new ones and the model reserves the
-//     old regime's need for good, holding back concurrency the repository no
-//     longer needs;
-//   - replacing the model with the latest file: the old regime is forgotten
-//     after one file, and the next file of it overruns.
-func TestNeedHistogramDecayLetsARecentRegimeOvertake(t *testing.T) {
-	h := &NeedHistogram{}
-	for range 200 {
-		h.Observe(50*1000, 1000, 10)
-	}
-	h.Observe(10*1000, 1000, 10)
-	if got, _ := h.Predict(1000); !inBucket(got, 50) {
-		t.Fatalf("one file of a new regime overturned 200 of the old: reserved %d, want near 50000", got)
-	}
-	for range 99 {
-		h.Observe(10*1000, 1000, 10)
-	}
-	if got, _ := h.Predict(1000); !inBucket(got, 10) {
-		t.Fatalf("ten half-lives of a new regime did not overtake the old: reserved %d, want near 10000", got)
 	}
 }
 

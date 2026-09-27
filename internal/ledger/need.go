@@ -9,10 +9,15 @@ import (
 )
 
 // NeedKey names one learned need model within a repository: the language, the
-// grammar fingerprint the files were parsed under, and the file-size class.
+// grammar fingerprint the files were parsed under, the build identity of the
+// worker that parsed them, and the file-size class. A worker of a new build
+// learns afresh: what it holds of a file's tree beside the parse -- the
+// flattened array, the lowering's structures -- changes with the build, and a
+// model learned under another would reserve for work the file no longer does.
 type NeedKey struct {
 	Language    string
 	Fingerprint string
+	Build       string
 	SizeClass   int
 }
 
@@ -46,7 +51,7 @@ func (r *Run) RepositoryID() string {
 // state is copied, so the caller may reuse its buffer at once.
 //
 // An observation the store would refuse -- no language, no fingerprint, no
-// state, a negative class, or a negative figure, which no measurement is -- is
+// build, no state, a negative class, or a negative figure, which no measurement is -- is
 // counted as dropped too rather than published: written, it would fail the
 // transaction it shares with every other event of the batch and lose them all.
 // A nil or stopped run records nothing.
@@ -54,7 +59,7 @@ func (r *Run) ObserveNeed(o NeedObservation) {
 	if r == nil {
 		return
 	}
-	if o.Key.Language == "" || o.Key.Fingerprint == "" || o.Key.SizeClass < 0 || len(o.State) == 0 ||
+	if o.Key.Language == "" || o.Key.Fingerprint == "" || o.Key.Build == "" || o.Key.SizeClass < 0 || len(o.State) == 0 ||
 		o.NeedBytes < 0 || o.ReservedBytes < 0 {
 		if !r.stopped.Load() {
 			r.dropped.Add(1)
@@ -71,18 +76,23 @@ func (r *Run) ObserveNeed(o NeedObservation) {
 // detached read nothing and answer false, not an error, exactly as they record
 // nothing: the store is read through the run's own attachment.
 //
-// It reads what has been written, so an observation still on the bus is not in
-// the answer; the caller that published it holds the newer state already. It
-// reads through the collector's one connection, so it is never called from a
-// subscriber, which runs while a flush holds that connection.
+// It first waits for the collector to write everything published before the
+// call, so an observation still on the bus -- one a model dropped at the end
+// of a stage published, or one a failed run left behind -- is in the answer,
+// and a model loaded again never forgets it. It waits on the collector and
+// reads through its one connection, so it is never called from a subscriber,
+// which runs while a flush holds that connection.
 func (r *Run) NeedModel(ctx context.Context, key NeedKey) ([]byte, bool, error) {
 	if r == nil || r.detached() {
 		return nil, false, nil
 	}
+	if err := r.c.flushed(ctx); err != nil {
+		return nil, false, err
+	}
 	var state []byte
 	err := r.c.db.QueryRowContext(ctx, `SELECT state FROM need_models
-		WHERE repository_id = ? AND language = ? AND fingerprint = ? AND size_class = ?`,
-		r.repo, key.Language, key.Fingerprint, key.SizeClass).Scan(&state)
+		WHERE repository_id = ? AND language = ? AND fingerprint = ? AND build = ? AND size_class = ?`,
+		r.repo, key.Language, key.Fingerprint, key.Build, key.SizeClass).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}

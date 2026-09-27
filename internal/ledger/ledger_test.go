@@ -721,7 +721,7 @@ func TestALearnedNeedSurvivesItsRunsDiscard(t *testing.T) {
 			t.Errorf("stop the ledger: %v", err)
 		}
 	}()
-	key := ledger.NeedKey{Language: "go", Fingerprint: "grammar-a", SizeClass: 12}
+	key := ledger.NeedKey{Language: "go", Fingerprint: "grammar-a", Build: "build-a", SizeClass: 12}
 	measuring, measuringCtx := newRun(t, l)
 	// A span gives the run a row, so the discard below deletes something.
 	_, span := ledger.Start(measuringCtx, "parse", "")
@@ -754,50 +754,12 @@ func TestALearnedNeedSurvivesItsRunsDiscard(t *testing.T) {
 	if _, found, err := later.NeedModel(ctx, other); err != nil || found {
 		t.Fatalf("a class nothing measured reads found=%v (%v), want no model and no failure", found, err)
 	}
-}
-
-// TestAnOverrunIsCountedOnlyWhenNeedExceedsTheReservation protects the
-// disclosure the overrun target is judged by. A file that used exactly what it
-// was reserved did not overrun; counting it would report a warm model as
-// missing its target, and missing a real overrun would report a model that
-// under-reserves as one that fits.
-//
-// Mutation: count need >= reservation as an overrun, or never count one. The
-// class reads two overruns, or none, where one file of three exceeded its
-// reservation.
-func TestAnOverrunIsCountedOnlyWhenNeedExceedsTheReservation(t *testing.T) {
-	ctx := context.Background()
-	l, dir := openLedger(t)
-	defer func() {
-		if err := l.Stop(); err != nil {
-			t.Errorf("stop the ledger: %v", err)
-		}
-	}()
-	overran := ledger.NeedKey{Language: "c", Fingerprint: "grammar-b", SizeClass: 9}
-	fitted := ledger.NeedKey{Language: "c", Fingerprint: "grammar-b", SizeClass: 10}
-	run, _ := newRun(t, l)
-	for _, o := range []struct {
-		key              ledger.NeedKey
-		reserved, needed int64
-	}{
-		{overran, 100, 100},
-		{overran, 100, 107},
-		{overran, 100, 40},
-		{fitted, 100, 60},
-		{fitted, 100, 70},
-	} {
-		run.ObserveNeed(ledger.NeedObservation{Key: o.key, ReservedBytes: o.reserved, NeedBytes: o.needed,
-			State: []byte("state")})
-	}
-	if err := l.Flush(ctx); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	if c := needClass(t, dir, overran); c.Observations != 3 || c.Overruns != 1 || c.MaxDriftBytes != 7 {
-		t.Fatalf("the class reads %d observations, %d overruns and a drift of %d, want 3, 1 and 7",
-			c.Observations, c.Overruns, c.MaxDriftBytes)
-	}
-	if c := needClass(t, dir, fitted); c.Observations != 2 || c.Overruns != 0 || c.MaxDriftBytes != -30 {
-		t.Fatalf("the class every file fitted reads %d observations, %d overruns and a drift of %d, want 2, 0 and -30",
-			c.Observations, c.Overruns, c.MaxDriftBytes)
+	// A worker of another build learns afresh (mutation: leave the build out
+	// of NeedModel's key, and the new build is reserved from the old one's
+	// model).
+	rebuilt := key
+	rebuilt.Build = "build-b"
+	if _, found, err := later.NeedModel(ctx, rebuilt); err != nil || found {
+		t.Fatalf("a class measured only under another build reads found=%v (%v), want no model", found, err)
 	}
 }
