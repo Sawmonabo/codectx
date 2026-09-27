@@ -1594,3 +1594,79 @@ func testAdmission(t testing.TB) *admission.Ledger {
 	}
 	return l
 }
+
+// stagedProvider is the structural provider with a stage the coordinator must
+// keep open across its whole pass. It counts how often the stage opens and
+// closes, and every unit records whether it ran inside an open stage.
+type stagedProvider struct {
+	*treesitter.Provider
+	mu      sync.Mutex
+	open    int
+	opens   int
+	closes  int
+	units   int
+	outside int
+}
+
+func (p *stagedProvider) OpenStage(ctx context.Context) func(context.Context) {
+	var inner func(context.Context)
+	if s, ok := any(p.Provider).(stageOpener); ok {
+		inner = s.OpenStage(ctx)
+	}
+	p.mu.Lock()
+	p.open++
+	p.opens++
+	p.mu.Unlock()
+	return func(ctx context.Context) {
+		p.mu.Lock()
+		p.open--
+		p.closes++
+		p.mu.Unlock()
+		if inner != nil {
+			inner(ctx)
+		}
+	}
+}
+
+func (p *stagedProvider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	p.mu.Lock()
+	p.units++
+	if p.open == 0 {
+		p.outside++
+	}
+	p.mu.Unlock()
+	return p.Provider.IndexUnit(ctx, req, sink)
+}
+
+// A provider that keeps a stage has it open once for its whole pass over the
+// run's units and closed once after the last of them. Bracketing each unit
+// instead lets a pass whose units run one after another empty the stage
+// between two of them, which drains the parser pool and starts its workers
+// again for the next unit. Mutations that fail this: opening the stage per
+// unit (opens equals the unit count), closing it before the group drains (a
+// unit runs outside it), or never closing it.
+func TestAProviderStageStaysOpenForItsWholePass(t *testing.T) {
+	f := newFixture(t, scenarioFiles())
+	ps := f.providers(false)
+	ts, ok := ps[2].(*treesitter.Provider)
+	if !ok {
+		t.Fatal("the structural provider is not *treesitter.Provider")
+	}
+	staged := &stagedProvider{Provider: ts}
+	c := f.coordinator([]provider.Provider{ps[0], ps[1], staged})
+	if _, err := c.Index(f.ctx, model.IndexRequest{}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	staged.mu.Lock()
+	defer staged.mu.Unlock()
+	if staged.units < 2 {
+		t.Fatalf("the structural provider ran %d units; the pass needs several to show the stage outlives one", staged.units)
+	}
+	if staged.opens != 1 || staged.closes != 1 {
+		t.Fatalf("the stage opened %d and closed %d times over %d units; want once each for the whole pass",
+			staged.opens, staged.closes, staged.units)
+	}
+	if staged.outside != 0 {
+		t.Fatalf("%d of %d units ran with the stage closed", staged.outside, staged.units)
+	}
+}

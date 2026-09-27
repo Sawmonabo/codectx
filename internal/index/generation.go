@@ -810,7 +810,7 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			return nil
 		}
 		if group == nil {
-			group = g.newUnitGroup(ctx)
+			group = g.newUnitGroup(ctx, u.ProviderID)
 		}
 		return group.submit(u, unitSpan)
 	})
@@ -892,19 +892,49 @@ func (g *generation) accountUnwalkedUnits(ctx context.Context) {
 // unitGroup runs one provider's units with bounded concurrency as the plan
 // hands them over: a live set of at most workers units, and the first fatal
 // failure cancels the rest.
+//
+// The group is also the provider's whole pass over this run's units. A
+// provider that keeps a stage has it open for exactly that pass, so what the
+// stage holds warm -- the parser workers -- outlives every unit of the pass and
+// is not given back, and started again, when two sequential units leave it
+// empty between them.
 type unitGroup struct {
 	g      *generation
+	parent context.Context
 	ctx    context.Context
 	cancel context.CancelFunc
 	sem    chan struct{}
 	wg     sync.WaitGroup
 	once   sync.Once
 	fatal  error
+
+	provider   string
+	closeStage func(context.Context)
+	// started, writerBusy and units are the pass's measurement: its wall, the
+	// store writer's busy time when it began, and the units it admitted.
+	started    time.Time
+	writerBusy time.Duration
+	units      int64
 }
 
-func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
+// stageOpener is a provider that keeps a stage open across a pass over many
+// units. It is asserted structurally here, at the one call site, so the
+// provider interface carries nothing only one provider needs; a provider
+// without it runs each unit as it always has.
+type stageOpener interface {
+	OpenStage(ctx context.Context) (closeStage func(ctx context.Context))
+}
+
+func (g *generation) newUnitGroup(ctx context.Context, providerID string) *unitGroup {
 	runCtx, cancel := context.WithCancel(ctx)
-	return &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers)}
+	u := &unitGroup{g: g, parent: ctx, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers),
+		provider: providerID, started: time.Now(), writerBusy: g.c.opts.Store.WriterBusy()}
+	if p, ok := g.c.opts.Registry.Lookup(providerID); ok {
+		if s, ok := p.(stageOpener); ok {
+			u.closeStage = s.OpenStage(ctx)
+		}
+	}
+	return u
 }
 
 // submit admits one unit against the group's worker slots, blocking while they
@@ -924,6 +954,7 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 		span.End(ledger.OutcomeUnavailable, notAdmitted(model.CodeProviderUnavailable), nil)
 		return err
 	}
+	u.units++
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
@@ -936,10 +967,23 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 }
 
 // wait drains the group and reports its first fatal failure. It releases the
-// group's context whatever the outcome, so an abandoned group leaks nothing.
+// group's context whatever the outcome, so an abandoned group leaks nothing;
+// closes the provider's stage after the last unit has left it, under a
+// context a cancelled pass does not end, so the stage's own accounting is
+// closed on every path; and reports the pass's wall beside the time the store
+// writer was busy during it, the ratio that says whether the pass waited on
+// the one writer the write-ahead log admits.
 func (u *unitGroup) wait() error {
 	u.wg.Wait()
 	u.cancel()
+	if u.closeStage != nil {
+		u.closeStage(context.WithoutCancel(u.parent))
+		u.closeStage = nil
+	}
+	u.g.c.log.Info("provider pass", "component", component, "run_id", u.g.ledgerRun.ID(),
+		"provider_id", u.provider, "units", u.units,
+		"wall_ms", time.Since(u.started).Milliseconds(),
+		"writer_busy_ms", (u.g.c.opts.Store.WriterBusy() - u.writerBusy).Milliseconds())
 	return u.fatal
 }
 
