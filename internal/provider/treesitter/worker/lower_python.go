@@ -44,7 +44,11 @@ var pythonLowering = Lowering{
 //     variable of the lowering's own, then makes one defining node per
 //     target, spanning the target, in source order, each Using that
 //     variable. An annotation without a value (`x: int`) evaluates
-//     nothing and makes no node. pass, global and nonlocal make no node.
+//     nothing and makes no node. pass, global and nonlocal make no node,
+//     and a global or nonlocal declaration is neither a read nor a write of
+//     the name: a nested callable whose only mention of an enclosing n is
+//     `nonlocal n` gives its creating node no Use and no may-definition of
+//     n (see Scoping for what does).
 //   - `del t` (§7.5): with one target, one node spanning the statement (so
 //     does `del(x)`: parentheses around a target are transparent); with
 //     several, one node per target spanning it, parentheses included; the
@@ -83,6 +87,8 @@ var pythonLowering = Lowering{
 //     with a type is a Branch node spanning its type expression, in source
 //     order. Except clauses: the first that matches runs; an exception no
 //     clause matches is re-raised (Throw) from the last test's false edge,
+//     which goes to the enclosing try's Handler, through any enclosing
+//     finally, or, with none open, is an edge from that test to Exit;
 //     and a bare `except:` catches everything and ends the chain. Except*
 //     clauses (§8.4.2): every clause matching a part of the group runs, so
 //     each test is reached from the previous test's false edge and from the
@@ -97,7 +103,11 @@ var pythonLowering = Lowering{
 //     Handler spans the `as` keyword. The else body runs from the try
 //     body's normal end, with the handlers closed, then joins the handler
 //     exits; finally is the builder's finally, its Handler spanning the
-//     `finally` keyword.
+//     `finally` keyword. Every Handler named here and under with (the
+//     except's, the finally's, the `as` clause's and each with item's) is
+//     made only when a node inside its frame is MayThrow (see Exceptions);
+//     with none, the frame is entered from its Throw and jump sources and
+//     its normal end alone, and no Handler node exists.
 //   - with (§8.5), per item in order: the context expression's nodes, then
 //     one acquiring Stmt node spanning the item (entering the manager), which
 //     Uses the context expression's reads alone, defines the `as` target
@@ -177,7 +187,9 @@ var pythonLowering = Lowering{
 //     assert message are lowered by yield with no result variable: a
 //     construct lowered to nodes is its nodes alone (`a and f()` is the
 //     Branch a and the Stmt f()), any other expression one Stmt node
-//     spanning it without its parentheses.
+//     spanning it without its parentheses. A lambda or comprehension
+//     there is its creating node alone, which defines no result variable:
+//     the created value is discarded.
 //   - print and exec statements, and every kind not named here, are plain
 //     nodes: one Stmt node spanning the statement with its reads, falling
 //     through. Annotations are not evaluated where they stand: a function's,
