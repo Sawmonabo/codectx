@@ -155,7 +155,11 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     through a property does: the delete removes a property of the object o
 //     holds (ECMA-262 §13.5.1.2). The node is the one whose reads include the
 //     operand's, recorded by position, so a node an operand evaluated later
-//     makes never takes it. Inside a nested callable the delete is one of its
+//     makes never takes it. Through an optional chain (`delete o?.[k]`),
+//     whose receiver and chain are nodes of their own, it is still the node
+//     evaluating the delete (the statement's, `delete o?.[k]`), which the
+//     nullish and the non-nullish paths both reach, never the receiver's
+//     Branch or the chain's node. Inside a nested callable the delete is one of its
 //     writes, which its creating node may-defines. `delete x` of a name
 //     writes nothing: it is sloppy code only and removes no variable of the
 //     function.

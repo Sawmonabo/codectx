@@ -73,7 +73,8 @@ const yieldLabel = " yield"
 //   - A switch (JLS §14.11 statement, §15.28 expression) is a Stmt node for
 //     its selector, evaluated once, which defines an owned variable (see
 //     Uses), then one Branch node per `case` label in source order,
-//     spanning the grammar's label, which holds its guard and neither the
+//     spanning the grammar's label, which begins at its `case` keyword
+//     (`case null`, `case String s`) and holds its guard and neither the
 //     `:` nor the `->` after it, each tested only when the previous failed; a label
 //     listing several constants (`case 2, 3`) is one label and one test
 //     (JLS §14.11.1). A label's node Uses the selector's variable, since it

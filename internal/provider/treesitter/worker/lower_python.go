@@ -317,7 +317,9 @@ var pythonLowering = Lowering{
 // subscript read or write, `await`, `yield`, a star or double-star unpacking,
 // an unpacking assignment (its first binding node carries the throw: the
 // value is unpacked before any target is bound, and, for a with item's
-// pattern target, inside the item's finally), an import, a for loop's iterator creation or step,
+// pattern target, inside the item's finally), an import, a for loop's
+// iterator creation (at the iterable's Stmt node, which defines the
+// iteration variable; see Iteration in Lowering) or step (at the loop head),
 // a context manager's enter or exit, a class creation, a comprehension's
 // creation, or a class, mapping, sequence or dotted-value pattern; a raise
 // statement's node is also a Throw. A raise counts toward MayThrow only
@@ -370,7 +372,9 @@ var pythonLowering = Lowering{
 // nested callable's writes are recorded (site, scan) only for variables of
 // this function, so its creating node may-defines no -1. Every construct
 // still makes its nodes: `x := e` with x unresolved defines the result
-// variable alone, and `except E as n` with n global keeps its finally and
+// variable alone, a match capture of an unresolved name is its node on the
+// taken path, defining nothing and Using the subject's variable as every
+// capture does, and `except E as n` with n global keeps its finally and
 // its deleting node, which defines nothing. So reads, seen and the Builder
 // never see -1.
 func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {

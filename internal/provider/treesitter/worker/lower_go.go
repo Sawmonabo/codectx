@@ -200,7 +200,11 @@ var goLowering = Lowering{
 //     parser's recovery leaves among a block's statements included, is one
 //     Stmt node spanning it, after its hoisted `&&`/`||` operands, that Uses
 //     every variable read under it, so a garbled statement drops no read.
-//     What it spans is the parser's recovery, not a rule of the lowering.
+//     What it spans is the parser's recovery, not a rule of the lowering:
+//     the node spans the ERROR node itself, never more, and every
+//     statement the recovery keeps whole beside it is lowered as that
+//     statement is: when the recovery of `g(x) y` keeps `g(x)` an
+//     expression statement, the ERROR node's node spans y alone.
 //
 // Declarations of constants and types create no node; they only shadow.
 //

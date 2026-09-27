@@ -61,8 +61,13 @@ const rsTryLabel = " try"
 //     closure, async or gen block (its creating node, whose value is the
 //     created callable), and a macro invocation a jump can leave (its
 //     node). An if, match, loop, while, for or block makes no node spanning
-//     itself, in any position: its conditions, heads, statements and arm
-//     results are its nodes. A while or for loop, an assignment, a compound
+//     itself, in any position but one: its conditions, heads, statements
+//     and arm results are its nodes. The one is a block that is itself a
+//     condition or a let-chain member (`if let Some(_) = o && { x = 2; true
+//     }`): every condition and member is a Branch node spanning it, so the
+//     block's statements and tail are its nodes, its tail defines the
+//     block's result, and the Branch spanning the block Uses that result,
+//     as a GNU C condition `({ …; e; })` does. A while or for loop, an assignment, a compound
 //     assignment and a jump yield `()` or `!`, so they hand over nothing.
 //     That departs from Lowering's embedded-assignment rule on purpose: a
 //     Rust assignment used as a value evaluates to `()`, which carries no

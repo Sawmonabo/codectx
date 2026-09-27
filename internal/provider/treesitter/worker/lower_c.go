@@ -340,7 +340,11 @@ const (
 // or lambda spanning it, which defines it too, as Uses states; a comma
 // expression's left operand is a statement of its own and its right operand
 // the value); otherwise the construct has no value and no
-// result. Every other statement is a node of its own, whose reads no later
+// result. An expression statement that discards one with no value
+// (`(void)({ if (x) h(); });`) still ends with a Stmt node spanning its
+// expression, carrying the reads left to it (none there): the construct
+// hands on no result, so the rule that an expression lowered to nodes of
+// its own makes no further node does not apply. Every other statement is a node of its own, whose reads no later
 // node takes. The extension permits jumping out of a statement expression: a
 // `break` or `continue` in one binds to the innermost loop or switch whose
 // body holds it. A loop's condition and a for loop's update lie outside its
