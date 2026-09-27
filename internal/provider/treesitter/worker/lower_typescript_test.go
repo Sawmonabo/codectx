@@ -10,7 +10,7 @@ import (
 // shared cases (javascriptShared) run under both grammars, and its JSX cases
 // (javascriptJSX) under tsx; the TypeScript cases in shared run under both
 // grammars, since TSX is TypeScript with JSX; typescriptOnly runs under
-// typescript only and the TSX case under tsx only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
+// typescript only. Pairs are derived as in TestJavaScriptLoweringGolden, from the
 // granularity lowerJavaScript documents under "TypeScript". A TypeScript-only
 // construct is anchored in the compiler's documented emit, the JavaScript it
 // compiles to, and that JavaScript's runtime semantics in ECMA-262; each case
@@ -309,21 +309,31 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			du:       []string{"class A { [k: string]: any }@21 -> return A;@50"},
 		},
 		{
-			// The compiler's emit elides `import type` and a `type` import specifier. Program nodes: v@45 (the one
-			// binding), g(T, U, v)@59, which reads v only.
-			name:     "type-only imports bind nothing",
-			protects: "import type and a type specifier make no node and no variable",
-			mutation: "bind type-only imports (T and U gain nodes pairing with g(T, U, v)@59)",
-			src:      "import type { T } from \"m\"; import { type U, v } from \"m\"; g(T, U, v);",
+			// The compiler's emit elides `import type`, and a default export of a name that has no value
+			// meaning (the compiler accepts one naming a type-only import and emits nothing for it). Program
+			// nodes: the default export's T@43, which reads nothing.
+			name:     "an import type declaration binds nothing",
+			protects: "import type makes no node and no variable, so a later read of its name pairs with nothing",
+			mutation: "bind the names of an import type declaration (T@14 -> T@43 appears)",
+			src:      "import type { T } from \"m\"; export default T;",
 			fn:       0,
-			du:       []string{"v@45 -> g(T, U, v)@59"},
+		},
+		{
+			// The compiler's emit elides a `type` import specifier and keeps the others. Program nodes: v@17
+			// (the one binding), g(v)@31, the default export's U@52, which reads nothing.
+			name:     "a type import specifier binds nothing",
+			protects: "a type specifier makes no node and no variable, while the value specifiers beside it bind",
+			mutation: "bind type specifiers (U@14 -> U@52 appears), or skip the whole clause (v@17 -> g(v)@31 vanishes)",
+			src:      "import { type U, v } from \"m\"; g(v); export default U;",
+			fn:       0,
+			du:       []string{"v@17 -> g(v)@31"},
 		},
 		{
 			// The compiler's emit inlines a const enum's members and emits no declaration, so the if's then block
 			// makes no node and nothing depends on the Branch c@25.
 			name:     "a const enum is erased",
 			protects: "a const enum makes no node, even inside a branch",
-			mutation: "lower a const enum as an enum (E@49 and its member node appear, control dependent on c@25)",
+			mutation: "lower a const enum as an enum (E@41 and its member node appear, control dependent on c@25)",
 			src:      "function f(c: any) { if (c) { const enum E { a = 1 } } return c; }",
 			fn:       1,
 			du:       []string{"c@11 -> c@25", "c@11 -> return c;@55"},
@@ -340,13 +350,14 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			du:       []string{"x@11 -> x satisfies number@25", "x@11 -> return x;@50"},
 		},
 		{
-			// The compiler's emit of `h<T>` is h. Nodes: h@11, k = h<number>@27 (Uses h), return k;@42.
+			// The compiler's emit of `h<T>` (TS 4.7) is h; h is generic, so the compiler accepts the type
+			// arguments. Nodes: h@11, k = h<number>@38 (Uses h), return k;@53.
 			name:     "an instantiation expression evaluates to its operand",
 			protects: "type arguments on a value are erased and the operand is read",
-			mutation: "treat an instantiation expression as opaque (h@11 -> k = h<number>@27 vanishes)",
-			src:      "function f(h: any) { const k = h<number>; return k; }",
+			mutation: "treat an instantiation expression as opaque (h@11 -> k = h<number>@38 vanishes)",
+			src:      "function f(h: <T>(x: T) => T) { const k = h<number>; return k; }",
 			fn:       1,
-			du:       []string{"h@11 -> k = h<number>@27", "k = h<number>@27 -> return k;@42"},
+			du:       []string{"h@11 -> k = h<number>@38", "k = h<number>@38 -> return k;@53"},
 		},
 		{
 			// The compiler's emit of `o?.p!` is `o?.p`: the chain's node o?.p@21 stands for the wrapper, and the
@@ -360,8 +371,9 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 			du:       []string{"o@11 -> o@21", "o@21 -> o?.p@21"},
 		},
 		{
-			// The compiler's emit applies parameter decorators where the class is defined (`__decorate([__param(0,
-			// d)], …)`, a call). The class node class A { m(@d p: any) {} }@27 reads d and may throw, so it
+			// Parameter decorators exist only under the compiler's experimentalDecorators (the legacy
+			// decorators; ECMAScript decorators have none), whose emit applies them where the class is defined
+			// (`__decorate([__param(0, d)], …)`, a call). The class node class A { m(@d p: any) {} }@27 reads d and may throw, so it
 			// controls the Handler catch@57, e@64 and g()@69.
 			name:     "a parameter decorator is read and may throw at the class's creation",
 			protects: "a method parameter's decorators are the class's, not the method's",
@@ -406,14 +418,14 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			// The compiler's emit merges a namespace into the class of its name (`(function (C) { … })(C || (C =
-			// {}))`). Nodes: class C {}@15 (defines C), the namespace's C@36 (Uses and defines C), g()@40, return
-			// C;@47.
+			// {}))`); a namespace stands only at a file's or a namespace's top level. Program nodes: class C
+			// {}@0 (defines C), the namespace's C@21 (Uses and defines C), g()@25, h(C)@32.
 			name:     "a namespace merges into the class of its name",
 			protects: "a namespace whose name a class in its block binds reads and assigns that variable",
-			mutation: "declare a new variable for a namespace that merges (class C {}@15 -> C@36 vanishes)",
-			src:      "function f() { class C {} namespace C { g(); } return C; }",
-			fn:       1,
-			du:       []string{"class C {}@15 -> C@36", "C@36 -> return C;@47"},
+			mutation: "declare a new variable for a namespace that merges (class C {}@0 -> C@21 vanishes)",
+			src:      "class C {} namespace C { g(); } h(C);",
+			fn:       0,
+			du:       []string{"class C {}@0 -> C@21", "C@21 -> h(C)@32"},
 		},
 		{
 			// The compiler's emit of `namespace A.B` is nested functions invoked on A. Program nodes: A@10 (the
@@ -437,23 +449,31 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 		},
 		{
 			// The compiler's emit: a module named by a string is an ambient declaration and emits nothing. Program
-			// nodes: x = 1@4, g(x)@33.
-			name:     "a string-named module is ambient",
-			protects: "nothing inside a string-named module declaration is lowered",
-			mutation: "lower a string-named module as a namespace (x = 2 kills x = 1: x = 2@24 -> g(x)@33 replaces x = 1@4 -> g(x)@33)",
-			src:      "let x = 1; module \"m\" { x = 2; } g(x);",
-			fn:       0,
-			du:       []string{"x = 1@4 -> g(x)@33"},
+			// nodes: x = 1@4, g(x)@33. Ill-formed on purpose: the compiler rejects a quoted name outside an ambient
+			// context (TS1035), and in a declaration file, the one place written without `declare`, a module holds
+			// no statement a pair could show. The case pins that the lowering never runs such a body, which the
+			// grammar parses as the namespace kind.
+			name:      "a string-named module is ambient",
+			protects:  "nothing inside a string-named module declaration is lowered",
+			mutation:  "lower a string-named module as a namespace (x = 2 kills x = 1: x = 2@24 -> g(x)@33 replaces x = 1@4 -> g(x)@33)",
+			src:       "let x = 1; module \"m\" { x = 2; } g(x);",
+			fn:        0,
+			du:        []string{"x = 1@4 -> g(x)@33"},
+			illFormed: true,
 		},
 		{
 			// The compiler's emit of `import m = require("m")` is `var m = require("m")`, a call (ECMA-262
-			// §13.3.6). Nodes: N@31, m@42 (may throw), the Handler catch@64, e@71, g()@76.
-			name:     "a require import-equals may throw",
-			protects: "the import-equals node of the require form is a throw point",
-			mutation: "stop counting the require form as a throw (m@42 controls nothing)",
-			src:      "function f() { try { namespace N { import m = require(\"m\"); } } catch (e) { g(); } }",
-			fn:       1,
-			cd:       []string{"m@42 -> catch@64", "m@42 -> e@71", "m@42 -> g()@76"},
+			// §13.3.6). Nodes: N@31, m@42 (may throw), the Handler catch@64, e@71, g()@76. Ill-formed on purpose:
+			// the compiler admits an import-equals only at a file's or a namespace's top level (TS1235) and a
+			// require form only at a file's (TS1147), so no try frame can enclose one and no valid program shows
+			// its throw; the case pins that the form is a call, as its emit is.
+			name:      "a require import-equals may throw",
+			protects:  "the import-equals node of the require form is a throw point",
+			mutation:  "stop counting the require form as a throw (m@42 controls nothing)",
+			src:       "function f() { try { namespace N { import m = require(\"m\"); } } catch (e) { g(); } }",
+			fn:        1,
+			cd:        []string{"m@42 -> catch@64", "m@42 -> e@71", "m@42 -> g()@76"},
+			illFormed: true,
 		},
 		{
 			// The compiler's emit of `export = e` is `module.exports = e`: e is evaluated like a default export.
@@ -481,22 +501,5 @@ func TestTypeScriptLoweringGolden(t *testing.T) {
 		},
 	}
 	runGolden(t, "typescript", slices.Concat(javascriptShared, shared, typescriptOnly))
-	runGolden(t, "tsx", slices.Concat(javascriptShared, javascriptJSX, shared, []goldenCase{{
-		// The compiler's JSX emit: an element is a call whose first
-		// argument is its tag, `<B />` becoming `createElement(B, null)`,
-		// so a capitalized tag name is a read of B. && is ECMA-262 §13.13
-		// Binary Logical Operators, and either operand can be its value:
-		// the Branch a@40 (Uses a) and the right operand <B />@45 (Uses B)
-		// each define the operator's result, which the return@33 Uses.
-		name:     "a JSX element in TSX reads its component",
-		protects: "TSX resolves the JSX kinds its grammar has, so a component tag is a read and a conditional operand",
-		mutation: "resolve the JSX kinds against the typescript grammar for tsx (<B /> reads nothing: B@23 -> <B />@45 vanishes), or give the return the operands' reads instead of the result (a@11 -> return a && <B />;@33 appears)",
-		src:      "function f(a: boolean, B: any) { return a && <B />; }",
-		fn:       1,
-		cd:       []string{"a@40 -> <B />@45"},
-		du: []string{
-			"a@11 -> a@40", "B@23 -> <B />@45",
-			"a@40 -> return a && <B />;@33", "<B />@45 -> return a && <B />;@33",
-		},
-	}}))
+	runGolden(t, "tsx", slices.Concat(javascriptShared, javascriptJSX, shared))
 }
