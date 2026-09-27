@@ -32,6 +32,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -84,6 +85,14 @@ type Unit struct {
 	// a workspace or package unit, whose dependency would be the repository's
 	// whole file-unit list and would exceed model.MaxDependenciesPerUnit.
 	DependsOn []model.UnitID
+	// DependencyKeys are the synthetic keys folded into the unit's
+	// DependencyHash beside DependsOn (model.DependencyHash): inputs its
+	// output depends on that are no unit. A header's file units carry one,
+	// the grammar the snapshot's census parses headers with first, so a
+	// census change that flips it rebuilds every header and one that keeps
+	// it rebuilds none. It is never a dependency: nothing is reconciled
+	// against it and it is not a row a dependency read could refuse.
+	DependencyKeys []string
 	// Heavy marks a unit that must pass the Scheduler before it runs, and
 	// Admission is what it is admitted against in both dimensions: for a
 	// dependence unit the memory its Reservation weighs, for an external
@@ -112,7 +121,7 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 		}
 	}
 	spec := model.UnitSpec{ProviderID: u.ProviderID, ProviderVersion: u.ProviderVersion,
-		ScopeKey: u.ScopeKey, InputHash: h.Sum(), DependencyHash: model.DependencyHash(u.DependsOn)}
+		ScopeKey: u.ScopeKey, InputHash: h.Sum(), DependencyHash: model.DependencyHash(u.DependsOn, u.DependencyKeys...)}
 	spec.ID = model.NewUnitID(spec, analysisConfigHash)
 	return spec, nil
 }
@@ -304,7 +313,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if in.PrevGen != 0 && in.CarriedPage == nil {
 		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.CarriedPage to the paged sqlite.Store.CarriedUnits listing")
 	}
-	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
+	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(), headerKey: headerKey(in.View.Header()),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
 			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
 		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{},
@@ -380,6 +389,9 @@ type builder struct {
 	in      Inputs
 	cfgHash string
 	plan    Plan
+	// headerKey is the synthetic dependency key of every file unit of a
+	// header path in this snapshot (Unit.DependencyKeys).
+	headerKey string
 
 	// fileProviders are the file-invalidated providers in dependency order,
 	// so the filesystem unit of a path is derived before the units that depend
@@ -605,6 +617,15 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 	// Without the filesystem provider there is no content-exact comparison, so
 	// no file is claimed unchanged and no semantic scope is carried.
 	changed = !b.fsActive
+	// A path two grammars declare is a header whose grammar the census
+	// decides. Both units that read that decision carry it: the structural
+	// unit parses with it and the filesystem unit tags the file node with the
+	// manifest's language, which follows it. A header path is refused by
+	// every other file provider's gate.
+	var keys []string
+	if len(tslang.Candidates(fv.Path)) > 1 {
+		keys = []string{b.headerKey}
+	}
 	var fsUnit model.UnitID
 	for _, fp := range b.fileProviders {
 		if deleted || !fp.gate(fv) {
@@ -612,7 +633,7 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 		}
 		u := Unit{ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey, InputCount: 1,
 			Inputs: staticInputs([]model.UnitInput{{FileID: fv.ID, ContentHash: fv.ContentHash,
-				Executable: fv.Executable}})}
+				Executable: fv.Executable}}), DependencyKeys: keys}
 		if fp.dependsOnFile {
 			// The registry hands providers back in dependency order, so the
 			// filesystem unit of this path is already derived. If it is not,
@@ -653,6 +674,9 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 			FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}
 		if len(u.DependsOn) == 1 {
 			rec.DependsOn = u.DependsOn[0]
+		}
+		if len(u.DependencyKeys) == 1 {
+			rec.DependencyKey = u.DependencyKeys[0]
 		}
 		b.unitSeq++
 		if err := b.allUnits.Add(rec); err != nil {
@@ -1020,6 +1044,14 @@ func foldVersion(descriptor, observed string) (string, error) {
 	return model.H(domainProviderVersion, descriptor, observed), nil
 }
 
+// headerKey is the synthetic dependency key of a header's file units in one
+// snapshot: the grammar its census parses headers with first. It is that
+// grammar and not the census or its basis, so exactly the census changes
+// tslang.Census.ChangesHeaders reports rebuild the headers.
+func headerKey(s model.Snapshot) string {
+	return "header_grammar=" + tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header().First
+}
+
 // domainProviderVersion separates this digest from every other digest in the
 // product, so one can never be presented as another.
 const domainProviderVersion = "unit-provider-version-v1"
@@ -1114,16 +1146,24 @@ type fileUnitRecord struct {
 	// that does not depend on it. A file unit never has more than one
 	// dependency (fileUnits sets exactly the filesystem unit or none).
 	DependsOn model.UnitID `json:"d,omitempty"`
+	// DependencyKey is the unit's one synthetic dependency key, the header
+	// grammar of a header path, empty for every other file (fileUnits sets
+	// at most one).
+	DependencyKey string `json:"k,omitempty"`
 }
 
 // unit rehydrates the record into the Unit the executor runs. Its identity is
-// unchanged: Spec folds the same single input and the same dependency list.
+// unchanged: Spec folds the same single input, the same dependency list and
+// the same synthetic key.
 func (r fileUnitRecord) unit() Unit {
 	u := Unit{ProviderID: r.ProviderID, ProviderVersion: r.ProviderVersion, ScopeKey: r.ScopeKey,
 		InputCount: 1, Inputs: staticInputs([]model.UnitInput{{FileID: r.FileID,
 			ContentHash: r.ContentHash, Executable: r.Executable}})}
 	if r.DependsOn != "" {
 		u.DependsOn = []model.UnitID{r.DependsOn}
+	}
+	if r.DependencyKey != "" {
+		u.DependencyKeys = []string{r.DependencyKey}
 	}
 	return u
 }
@@ -1148,12 +1188,12 @@ func decodeUnit(b []byte) (fileUnitRecord, error) {
 }
 
 // sizeOfUnit charges one buffered unit record against the run's byte budget:
-// its five variable strings plus the struct's fixed fields and their headers.
+// its six variable strings plus the struct's fixed fields and their headers.
 // It is the retained heap of one record, not its encoded length.
 func sizeOfUnit(r fileUnitRecord) int64 {
 	const overhead = 128
 	return int64(len(r.ProviderID)+len(r.ProviderVersion)+len(r.ScopeKey)+
-		len(r.FileID)+len(r.ContentHash)+len(r.DependsOn)) + overhead
+		len(r.FileID)+len(r.ContentHash)+len(r.DependsOn)+len(r.DependencyKey)) + overhead
 }
 
 // compareUnit orders the unit sort by (provider position, arrival), which is

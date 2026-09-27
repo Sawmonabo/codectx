@@ -411,3 +411,62 @@ func ledgerLike(peaks map[string]int64) func(ctx context.Context, scopeKey, fami
 		return largest, observed
 	}
 }
+
+// A header's grammar is decided by the snapshot's census, so a header's
+// structural and filesystem units must be keyed by it: a census change that
+// flips the first grammar must rebuild every header, and one that keeps it
+// must reuse every header, with every other file untouched either way. The
+// identity is taken after the unit's spill round trip, which is the form the
+// executor derives it from. It fails if the key is omitted from fileUnits,
+// Spec or the spilled record (a flip keeps the header's identity), or if it
+// is taken from the census's basis rather than its first grammar (the
+// non-flipping change moves the header's identity).
+func TestAHeaderUnitIsKeyedByItsCensusFirstGrammarAndNothingElse(t *testing.T) {
+	identity := func(census model.Snapshot, path string) model.UnitID {
+		t.Helper()
+		sorter, err := pagination.NewExternalSort(t.TempDir(), 0, encodeUnit, decodeUnit, compareUnit)
+		if err != nil {
+			t.Fatalf("NewExternalSort: %v", err)
+		}
+		defer func() { _ = sorter.Close() }()
+		b := &builder{headerKey: headerKey(census), allUnits: sorter, providerOrder: map[string]int{},
+			plan:          Plan{Reuse: map[string]model.UnitID{}, Unplanned: map[string]int{}},
+			fileProviders: []fileProvider{{id: "treesitter", version: "1", gate: func(model.FileVersion) bool { return true }}}}
+		fv := model.FileVersion{ID: model.NewFileID("repo", path), Path: path,
+			ContentHash: string(model.NewFileID("content", path))}
+		if _, _, err := b.fileUnits(context.Background(), fv, false); err != nil {
+			t.Fatalf("fileUnits(%s): %v", path, err)
+		}
+		run, err := sorter.Sorted()
+		if err != nil {
+			t.Fatalf("Sorted: %v", err)
+		}
+		defer func() { _ = run.Close() }()
+		var id model.UnitID
+		if err := run.Each(func(rec fileUnitRecord) error {
+			spec, err := rec.unit().Spec("config")
+			id = spec.ID
+			return err
+		}); err != nil {
+			t.Fatalf("deriving the unit of %s: %v", path, err)
+		}
+		return id
+	}
+	cOnly := model.Snapshot{FileCount: 1, CUnits: 1}
+	cppOnly := model.Snapshot{FileCount: 1, CPPUnits: 1}
+	mixed := model.Snapshot{FileCount: 2, CUnits: 1, CPPUnits: 1}
+	none := model.Snapshot{}
+	if identity(cOnly, "inc/a.h") == identity(cppOnly, "inc/a.h") {
+		t.Fatal("a census that flips the header grammar from C to C++ kept the header unit's identity: " +
+			"it would be reused with facts parsed under the wrong grammar")
+	}
+	if identity(mixed, "inc/a.h") != identity(none, "inc/a.h") {
+		t.Fatal("a census change that keeps C++ first moved the header unit's identity: " +
+			"every header would be rebuilt for nothing")
+	}
+	for _, path := range []string{"src/a.c", "inc/a.hpp"} {
+		if identity(cOnly, path) != identity(cppOnly, path) {
+			t.Fatalf("%s is no two-grammar header, yet the census moved its unit's identity", path)
+		}
+	}
+}
