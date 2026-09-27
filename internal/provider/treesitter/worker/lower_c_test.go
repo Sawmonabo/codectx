@@ -145,34 +145,30 @@ var cShared = []goldenCase{
 		du:       []string{"x@10 -> x@38", "r = 0@19 -> return r;@80", "r = 1@49 -> return r;@80"},
 	},
 	{
-		// C17 §6.8.6.2p2: a continue jumps to the end of the loop body,
-		// after which a do loop evaluates its condition again; GNU C
-		// extension, Statements and Declarations in Expressions: the jump
-		// out of the condition is permitted. The condition strips the do's
-		// parentheses and the statement expression's own. Nodes: n@10,
-		// n--@18, n & 1@37, continue;@44, n > 0@54, the condition
-		// { … }@31 (a Branch Using the statement expression's result,
-		// which n > 0@54, the last statement's node, defines), return
-		// n;@66. Succ: n--→n & 1→{continue, n > 0}; continue→
-		// n & 1; n > 0→{ … }→{n--, return n}. IPDom: n & 1 → n > 0;
-		// { … } → return n.
-		name:     "a continue in a do loop's condition re-evaluates the condition",
-		protects: "a continue issued on the loop's continue path lands on the first node of the condition instead of panicking or re-entering the body",
-		mutation: "land the continue on the loop head (continue;@44 -> n--@18: n & 1@37 gains control of n--@18), call ContinueHere only once (CloseFrame panics), or let the condition re-read its last statement's names (n > 0@54 -> { … }@31 becomes n--@18 -> { … }@31)",
-		src:      "int f(int n) { do n--; while (({ if (n & 1) continue; n > 0; })); return n; }",
-		// Ill-formed on purpose: both compilers reject the continue ("continue
-		// statement not within a loop"), since they place a loop's condition
-		// outside its body. No valid program puts a continue there that binds
-		// to this loop, and the parsers accept the source, so the case pins
-		// that the lowering still gives the jump a defined landing rather
-		// than failing to close the loop's frame.
-		illFormed: true,
-		cd: []string{"n & 1@37 -> continue;@44", "n & 1@37 -> n & 1@37",
-			"{ if (n & 1) continue; n > 0; }@31 -> n--@18", "{ if (n & 1) continue; n > 0; }@31 -> n & 1@37",
-			"{ if (n & 1) continue; n > 0; }@31 -> n > 0@54",
-			"{ if (n & 1) continue; n > 0; }@31 -> { if (n & 1) continue; n > 0; }@31"},
-		du: []string{"n@10 -> n--@18", "n--@18 -> n--@18", "n--@18 -> n & 1@37", "n--@18 -> n > 0@54",
-			"n > 0@54 -> { if (n & 1) continue; n > 0; }@31", "n--@18 -> return n;@66"},
+		// C17 §6.8.5.2 (do) and §6.8.6.2 (continue); GNU C extension,
+		// Statements and Declarations in Expressions: a jump out of the
+		// construct is permitted. A loop's condition lies outside its body,
+		// so the continue in the do loop's condition binds to the enclosing
+		// while and goes to its condition, as the compilers bind it. The
+		// condition strips the do's parentheses and the statement
+		// expression's own. Nodes: n@10, n@22 (the while's Branch), n--@30,
+		// n & 1@49 (Branch), continue;@56, n > 0@66 (defining the statement
+		// expression's result), the do's condition { … }@43 (a Branch Using
+		// it), return n;@80. Succ: n@22→{n--, return n}; n--→n & 1→
+		// {continue, n > 0}; continue→n@22; n > 0→{ … }→{n-- (the do's back
+		// edge), n@22}. IPDom: n@22 → return n; n-- → n & 1 → n@22; n > 0 →
+		// { … } → n@22. Frontier walks: n@22→n-- gives n--, n & 1, n@22;
+		// n & 1→n > 0 gives n > 0, { … }; { … }→n-- gives n--, n & 1.
+		name:     "a continue in a do loop's condition binds to the enclosing loop",
+		protects: "a jump in a statement expression in a loop's condition binds to the loop enclosing that loop, so the continue re-evaluates the outer condition",
+		mutation: "lower the do loop's condition with its own frame open (the continue stays pending on the do loop and CloseFrame panics), or bind the continue to nothing (unresolved 1)",
+		src:      "int f(int n) { while (n) { do n--; while (({ if (n & 1) continue; n > 0; })); } return n; }",
+		cd: []string{"n@22 -> n--@30", "n@22 -> n & 1@49", "n@22 -> n@22", "n & 1@49 -> continue;@56",
+			"n & 1@49 -> n > 0@66", "n & 1@49 -> { if (n & 1) continue; n > 0; }@43",
+			"{ if (n & 1) continue; n > 0; }@43 -> n--@30", "{ if (n & 1) continue; n > 0; }@43 -> n & 1@49"},
+		du: []string{"n@10 -> n@22", "n@10 -> n--@30", "n--@30 -> n--@30", "n--@30 -> n & 1@49", "n--@30 -> n > 0@66",
+			"n--@30 -> n@22", "n--@30 -> return n;@80", "n > 0@66 -> { if (n & 1) continue; n > 0; }@43",
+			"n@10 -> return n;@80"},
 	},
 	{
 		// C17 §6.5.13p4 (&& evaluates its right operand only when the left
@@ -847,29 +843,27 @@ var cShared = []goldenCase{
 		du:       []string{"x@10 -> x@28", "x@10 -> return x;@40"},
 	},
 	{
-		// GNU C extension, Statements and Declarations in Expressions, and
-		// C17 §6.8.6.2: a continue in a for loop's update goes to the end of
-		// the body, after which the update runs again from its first node,
-		// here the if's Branch. Nodes: x@10, y@17, x@29 (the condition),
-		// g()@61 (the body), y@39 (Branch), continue;@42, x--@52, return
-		// x;@66. Succ: x@29→{g(), return x}; g()→y@39→{continue, x--};
-		// continue→y@39; x--→x@29. IPDom: g(), continue → y@39 → x-- →
-		// x@29 → return x. Frontier walks: x@29→g() gives g(), y@39, x--,
-		// x@29; y@39→continue gives continue, y@39. Ill-formed on purpose:
-		// both compilers reject the continue ("continue statement not
-		// within a loop"), placing a for loop's update outside its body; no
-		// valid program puts a continue there that binds to this loop, and
-		// the parsers accept the source, so the case pins that the jump
-		// still gets a defined landing.
-		name:      "a continue in a for update's statement expression lands on the update's first node",
-		protects:  "the continue path of a for loop begins at the update, so a continue issued inside it re-runs the update from its start",
-		mutation:  "land the continue on the condition (loses y@39 -> y@39; x--@52 no longer post-dominates y@39)",
-		src:       "int f(int x, int y) { for (; x; ({ if (y) continue; x--; })) g(); return x; }",
-		illFormed: true,
-		cd: []string{"x@29 -> g()@61", "x@29 -> y@39", "x@29 -> x--@52", "x@29 -> x@29", "y@39 -> continue;@42",
-			"y@39 -> y@39"},
-		du: []string{"x@10 -> x@29", "x--@52 -> x@29", "y@17 -> y@39", "x@10 -> x--@52", "x--@52 -> x--@52",
-			"x@10 -> return x;@66", "x--@52 -> return x;@66"},
+		// C17 §6.8.5.3 (for) and §6.8.6.2 (continue); GNU C extension,
+		// Statements and Declarations in Expressions. A for loop's update
+		// lies outside its body, so the continue in it binds to the
+		// enclosing while and goes to its condition, as the compilers bind
+		// it. The update's value is discarded, so it makes no node of its
+		// own. Nodes: x@10, y@17, y@29 (the while's Branch), x@41 (the for's
+		// Branch), g()@73, y@51 (the update's Branch), continue;@54,
+		// x--@64, return x;@80. Succ: y@29→{x@41, return x}; x@41→{g(),
+		// y@29 (the for ends the while's body)}; g()→y@51→{continue, x--};
+		// continue→y@29; x--→x@41. IPDom: y@29 → return x; x@41, y@51,
+		// continue → y@29; g() → y@51; x-- → x@41. Frontier walks:
+		// y@29→x@41 gives x@41, y@29; x@41→g() gives g(), y@51;
+		// y@51→continue gives continue; y@51→x-- gives x--, x@41.
+		name:     "a continue in a for update's statement expression binds to the enclosing loop",
+		protects: "a jump in a statement expression in a for loop's update binds to the loop enclosing that loop, so the continue re-evaluates the outer condition rather than re-running the update",
+		mutation: "lower the update with the for loop's frame open (the continue stays pending on the for loop and CloseFrame panics), or bind the continue to nothing (unresolved 1)",
+		src:      "int f(int x, int y) { while (y) { for (; x; ({ if (y) continue; x--; })) g(); } return x; }",
+		cd: []string{"y@29 -> x@41", "y@29 -> y@29", "x@41 -> g()@73", "x@41 -> y@51", "y@51 -> continue;@54",
+			"y@51 -> x--@64", "y@51 -> x@41"},
+		du: []string{"x@10 -> x@41", "x@10 -> x--@64", "x@10 -> return x;@80", "x--@64 -> x@41", "x--@64 -> x--@64",
+			"x--@64 -> return x;@80", "y@17 -> y@29", "y@17 -> y@51"},
 	},
 	{
 		// Structured exception handling, try-except statement: `->` and `[]`
@@ -1016,31 +1010,30 @@ var cShared = []goldenCase{
 		du:       []string{"x@10 -> g(0, x)@58", "x = 1@32 -> g(0, x)@41", "x = 1@32 -> return x;@76", "x@10 -> return x;@76"},
 	},
 	{
-		// GNU C extension, Statements and Declarations in Expressions:
-		// jumping out of a statement expression is permitted, so a break
-		// in a for loop's third expression ends that loop (C17 §6.8.5.3,
-		// §6.8.6.3). The update's value is discarded: its last statement's
-		// node j++ yields the statement expression's result, which no
-		// node reads, so the update makes no node of its own. Nodes:
-		// n@10, j = 0@27, j < n@34, g(0, j)@71, j > 5@48, break;@55,
-		// j++@62, return j;@80. Succ: j < n→{g(0, j), return j};
-		// g(0, j)→j > 5→{break, j++}; break→return j; j++→j < n. IPDom:
-		// j < n, j > 5 → return j; g(0, j) → j > 5; j++ → j < n.
-		name:     "a break in a for update's statement expression leaves that loop",
-		protects: "a break lowered in the update clause targets the loop whose update holds it and lands after the loop",
-		mutation: "send the update's break to the loop head instead of past the loop (j > 5@48 loses control of j < n@34), or end the discarded update with a node Using its result (adds ({ if (j > 5) break; j++; })@41, with j > 5@48 -> it and j++@62 -> it)",
-		src:      "int f(int n) { int j; for (j = 0; j < n; ({ if (j > 5) break; j++; })) g(0, j); return j; }",
-		// Ill-formed on purpose: both compilers reject the break ("break
-		// statement not within loop or switch"), placing a for loop's update
-		// outside its body; the parsers accept the source, so the case pins
-		// that the jump still gets a defined target.
-		illFormed: true,
-		cd: []string{"j < n@34 -> g(0, j)@71", "j < n@34 -> j > 5@48", "j > 5@48 -> break;@55", "j > 5@48 -> j++@62",
-			"j > 5@48 -> j < n@34"},
-		du: []string{"n@10 -> j < n@34", "j = 0@27 -> j < n@34", "j = 0@27 -> g(0, j)@71", "j = 0@27 -> j > 5@48",
-			"j = 0@27 -> j++@62", "j = 0@27 -> return j;@80",
-			"j++@62 -> j < n@34", "j++@62 -> g(0, j)@71", "j++@62 -> j > 5@48", "j++@62 -> j++@62",
-			"j++@62 -> return j;@80"},
+		// C17 §6.8.5.3 (for) and §6.8.6.3 (break); GNU C extension,
+		// Statements and Declarations in Expressions. A for loop's update
+		// lies outside its body, so the break in it binds to the enclosing
+		// while and ends it, as the compilers bind it. The update's value is
+		// discarded: its last statement's node j++ yields the statement
+		// expression's result, which no node reads, so the update makes no
+		// node of its own. Nodes: n@10, j = 0@19, n@33 (the while's Branch),
+		// j < n@45 (the for's Branch), g(0, j)@82, j > 5@59, break;@66,
+		// j++@73, return j;@93. Succ: j = 0→n@33→{j < n, return j};
+		// j < n→{g(0, j), n@33}; g(0, j)→j > 5→{break, j++}; break→return j;
+		// j++→j < n. IPDom: n@33, j < n, j > 5, break → return j; g(0, j) →
+		// j > 5; j++ → j < n. Frontier walks: n@33→j < n gives j < n;
+		// j < n→g(0, j) gives g(0, j), j > 5; j < n→n@33 gives n@33;
+		// j > 5→break gives break; j > 5→j++ gives j++, j < n.
+		name:     "a break in a for update's statement expression leaves the enclosing loop",
+		protects: "a break in a statement expression in a for loop's update binds to the loop enclosing that loop and lands after it",
+		mutation: "lower the update with the for loop's frame open (break;@66 ends the for loop only and reaches n@33: loses j < n@45 -> n@33), or end the discarded update with a node Using its result (adds { if (j > 5) break; j++; }@53, controlled by j > 5@59 and pairing with j++@73)",
+		src:      "int f(int n) { int j = 0; while (n) { for (; j < n; ({ if (j > 5) break; j++; })) g(0, j); } return j; }",
+		cd: []string{"n@33 -> j < n@45", "j < n@45 -> g(0, j)@82", "j < n@45 -> j > 5@59", "j < n@45 -> n@33",
+			"j > 5@59 -> break;@66", "j > 5@59 -> j++@73", "j > 5@59 -> j < n@45"},
+		du: []string{"n@10 -> n@33", "n@10 -> j < n@45", "j = 0@19 -> j < n@45", "j = 0@19 -> g(0, j)@82",
+			"j = 0@19 -> j > 5@59", "j = 0@19 -> j++@73", "j = 0@19 -> return j;@93",
+			"j++@73 -> j < n@45", "j++@73 -> g(0, j)@82", "j++@73 -> j > 5@59", "j++@73 -> j++@73",
+			"j++@73 -> return j;@93"},
 	},
 	{
 		// GNU C extension, Statements and Declarations in Expressions: the
