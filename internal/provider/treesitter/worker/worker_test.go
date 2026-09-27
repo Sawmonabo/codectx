@@ -41,6 +41,8 @@ func TestHeaderParseKeepsFewerErrorBytesAndDisclosesIt(t *testing.T) {
 			src: "int f(void);\n", kept: "c", reason: lang.HeaderClean, parsers: 1},
 		{name: "a request with no fallback is parsed once", req: wire.Request{Language: "c", Path: "x.h"},
 			src: cppHeader, parsers: 1},
+		{name: "a source file with errors is parsed once", req: wire.Request{Language: "c", Path: "x.c"},
+			src: cppHeader, parsers: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
