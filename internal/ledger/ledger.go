@@ -606,6 +606,13 @@ func (l *Ledger) Flush(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
+	return c.flushed(ctx)
+}
+
+// flushed is Flush's barrier on one collector: it returns once c has written
+// everything published to it before the call, or at once when c has stopped
+// and so has written everything it had.
+func (c *collector) flushed(ctx context.Context) error {
 	ack := make(chan error, 1)
 	select {
 	case c.bus <- event{kind: eventFlush, ack: ack}:

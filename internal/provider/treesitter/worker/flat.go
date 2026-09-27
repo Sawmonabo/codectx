@@ -59,8 +59,12 @@ func (n Node) IsNull() bool { return n.f == nil }
 func (n Node) rec() *flatNode { return &n.f.nodes[n.i] }
 
 // Id is unique among the nodes of one Flat, as the native node's id is
-// among the nodes of one tree.
-func (n Node) Id() uintptr { return uintptr(n.i) }
+// among the nodes of one tree. The record is read first so a null Node
+// panics here, as every other method does, rather than answer the root's id.
+func (n Node) Id() uintptr {
+	_ = n.rec()
+	return uintptr(n.i)
+}
 
 // KindId is the node's kind: the library's public symbol.
 func (n Node) KindId() uint16 { return uint16(n.rec().kind) }
@@ -98,8 +102,10 @@ func (n Node) first() Node {
 	return Node{f: n.f, i: n.i + d}
 }
 
-// NextSibling is the node's next sibling, named or not, or null.
-func (n Node) NextSibling() Node {
+// next is the node's structural next sibling, named or not, or null: the
+// record's link, the sibling a tree cursor and Child(k+1) reach, zero-width
+// nodes included.
+func (n Node) next() Node {
 	d := uint32(n.rec().next)
 	if d == 0 {
 		return Node{}
@@ -107,25 +113,45 @@ func (n Node) NextSibling() Node {
 	return Node{f: n.f, i: n.i + d}
 }
 
+// NextSibling is the node's next sibling, named or not, or null, as the
+// native call answers it: the first later sibling that ends after this node
+// ends. The native call skips every sibling ending at or before this node's
+// end, which a sibling after it does only when it is zero-width and starts
+// where this node ends -- a MISSING token after a node, as the `)` after
+// `f(a` -- so such a sibling is skipped here too, although the record, the
+// cursor and Child link it.
+func (n Node) NextSibling() Node {
+	end := n.rec().end
+	c := n.next()
+	for !c.IsNull() && c.rec().end <= end {
+		c = c.next()
+	}
+	return c
+}
+
 // PrevSibling is the node's previous sibling, named or not, or null. It
-// walks the parent's children from the first, as the native call does.
+// walks the parent's children from the first, as the native call does, and
+// like it answers a zero-width sibling.
 func (n Node) PrevSibling() Node {
 	p := n.Parent()
 	if p.IsNull() {
 		return Node{}
 	}
 	var prev Node
-	for c := p.first(); c != n; c = c.NextSibling() {
+	for c := p.first(); c != n; c = c.next() {
 		prev = c
 	}
 	return prev
 }
 
-// NextNamedSibling is the node's next named sibling, or null.
+// NextNamedSibling is the node's next named sibling, or null, with the
+// native call's skip of every sibling that ends at or before this node's end
+// (see NextSibling).
 func (n Node) NextNamedSibling() Node {
-	c := n.NextSibling()
-	for !c.IsNull() && !c.IsNamed() {
-		c = c.NextSibling()
+	end := n.rec().end
+	c := n.next()
+	for !c.IsNull() && (c.rec().end <= end || !c.IsNamed()) {
+		c = c.next()
 	}
 	return c
 }
@@ -133,7 +159,7 @@ func (n Node) NextNamedSibling() Node {
 // ChildCount is the number of the node's children, named or not.
 func (n Node) ChildCount() uint {
 	var k uint
-	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.next() {
 		k++
 	}
 	return k
@@ -143,7 +169,7 @@ func (n Node) ChildCount() uint {
 func (n Node) Child(i uint) Node {
 	c := n.first()
 	for ; !c.IsNull() && i > 0; i-- {
-		c = c.NextSibling()
+		c = c.next()
 	}
 	return c
 }
@@ -152,7 +178,7 @@ func (n Node) Child(i uint) Node {
 // included.
 func (n Node) NamedChildCount() uint {
 	var k uint
-	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.next() {
 		if c.IsNamed() {
 			k++
 		}
@@ -162,7 +188,7 @@ func (n Node) NamedChildCount() uint {
 
 // NamedChild is the node's i-th named child, extras included, or null.
 func (n Node) NamedChild(i uint) Node {
-	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.next() {
 		if c.IsNamed() {
 			if i == 0 {
 				return c
@@ -179,7 +205,7 @@ func (n Node) ChildByFieldId(id uint16) Node {
 	if id == 0 {
 		return Node{}
 	}
-	for c := n.first(); !c.IsNull(); c = c.NextSibling() {
+	for c := n.first(); !c.IsNull(); c = c.next() {
 		if uint16(c.rec().field) == id {
 			return c
 		}
@@ -187,8 +213,12 @@ func (n Node) ChildByFieldId(id uint16) Node {
 	return Node{}
 }
 
-// Walk is a cursor rooted at n.
-func (n Node) Walk() *Cursor { return &Cursor{root: n, cur: n} }
+// Walk is a cursor rooted at n. The record is read first so a null Node
+// panics here, as every other method does.
+func (n Node) Walk() *Cursor {
+	_ = n.rec()
+	return &Cursor{root: n, cur: n}
+}
 
 // Cursor walks the nodes under its root, as a native tree cursor does: it
 // never moves above or beside the node it was created or reset at. It holds
@@ -228,7 +258,7 @@ func (c *Cursor) GotoNextSibling() bool {
 	if c.cur == c.root {
 		return false
 	}
-	s := c.cur.NextSibling()
+	s := c.cur.next()
 	if s.IsNull() {
 		return false
 	}

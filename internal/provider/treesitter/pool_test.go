@@ -108,11 +108,12 @@ func newTestPool(t *testing.T, max int, allocation int64) (*pool, *admission.Led
 }
 
 // newOneWorkerPool is a pool of real parser workers whose first worker is
-// started and whose ledger's allocation is then set to that worker's
-// reported base, so it holds exactly one of them and the second worker
-// anyone asks for -- reserved at that same largest base -- queues on the
-// ledger. It returns the first worker, busy, and its base, which is what a
-// foreign reserver that must not fit beside it reserves.
+// started and whose ledger's allocation is then set to that worker's base
+// holding -- what it reported, or the idle stand-in where it reported none --
+// so it holds exactly one of them and the second worker anyone asks for --
+// reserved at that same largest base -- queues on the ledger. It returns the
+// first worker, busy, and its holding, which is what a foreign reserver that
+// must not fit beside it reserves.
 func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, *worker, int64) {
 	t.Helper()
 	p, room := newTestPool(t, 2, 4<<30)
@@ -120,13 +121,9 @@ func newOneWorkerPool(t *testing.T) (*pool, *admission.Ledger, *worker, int64) {
 	if err != nil {
 		t.Fatalf("the first acquirer was not admitted on an idle ledger: %v", err)
 	}
-	base := first.base.Load()
-	if base <= 0 {
-		p.release(first, true)
-		t.Skip("this platform reports no worker base, so no allocation holds exactly one worker")
-	}
-	room.SetAllocation(base)
-	return p, room, first, base
+	held := first.held.Load()
+	room.SetAllocation(held)
+	return p, room, first, held
 }
 
 // awaitHead returns once an acquirer of p has been told by the ledger that it
@@ -250,6 +247,14 @@ func acquireAsync(p *pool) <-chan handout {
 // idle and the pool makes no further acquire or release -- a stage whose own
 // progress waits on the reserver. The reserver must still be admitted: the
 // ledger's head runs the pool's idle-release step, which stops the worker.
+//
+// "foreign head before a caller's increment": the pool's only worker is held
+// by a caller that then waits for its file's increment behind another
+// reserver at the ledger's head, which waits for that worker's room. The
+// caller must be asked to yield its worker, and the worker it hands back must
+// be stopped, so the head is admitted. Mutation: drop yieldParse from the
+// pool's idle-release step -> the caller's wait never ends and the subtest
+// hangs.
 func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 	t.Run("pool head", func(t *testing.T) {
 		p, _, first, _ := newOneWorkerPool(t)
@@ -400,66 +405,39 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 			t.Fatalf("the foreign reserver was admitted while the pool still held %d idle worker(s)", idle)
 		}
 	})
-}
 
-// awaitPending returns once n callers of p are waiting for a worker in
-// pending.
-func awaitPending(p *pool, n int) {
-	for {
-		p.mu.Lock()
-		pending := len(p.pending) == n
-		p.mu.Unlock()
-		if pending {
-			return
-		}
-		runtime.Gosched()
-	}
-}
-
-// TestTheLargestWaitingFileIsServedFirst runs one real parser worker, busy,
-// with a small file's caller and then a larger file's caller waiting for it.
-//
-// Failure mode: callers served in arrival order leave the largest file of a
-// run for last, and its parse alone then sets the stage's wall time, which is
-// what largest-first dispatch exists to bound.
-//
-// Mutation: order next by arrival alone -> the small file, which arrived
-// first, is handed the worker.
-func TestTheLargestWaitingFileIsServedFirst(t *testing.T) {
-	p, _ := newTestPool(t, 1, 4<<30)
-	first, err := p.acquire(context.Background(), p.request(0))
-	if err != nil {
-		t.Fatalf("the first acquirer was not admitted: %v", err)
-	}
-	acquire := func(bytes int64) <-chan handout {
-		ch := make(chan handout, 1)
-		r := p.request(bytes)
+	t.Run("foreign head before a caller's increment", func(t *testing.T) {
+		p, room, w, memory := newOneWorkerPool(t)
+		stuck := make(chan struct{}, 1)
+		foreign := make(chan func(), 1)
 		go func() {
-			w, err := p.acquire(context.Background(), r)
-			ch <- handout{w, err}
+			release, err := room.ReserveWith(context.Background(), admission.Reservation{MemoryBytes: memory}, func() {
+				select {
+				case stuck <- struct{}{}:
+				default:
+				}
+			})
+			if err != nil {
+				t.Errorf("the foreign reserver was refused: %v", err)
+				release = func() {}
+			}
+			foreign <- release
 		}()
-		return ch
-	}
-	small := acquire(10)
-	awaitPending(p, 1)
-	large := acquire(10 << 20)
-	awaitPending(p, 2)
-	p.release(first, true)
-	got := <-large
-	if got.err != nil || got.w != first {
-		t.Fatalf("the larger file was not handed the worker coming back (error %v)", got.err)
-	}
-	select {
-	case late := <-small:
-		t.Fatalf("the smaller file was handed a worker (error %v) while the larger held the only one", late.err)
-	default:
-	}
-	p.release(got.w, true)
-	if late := <-small; late.err != nil {
-		t.Fatalf("the smaller file was refused: %v", late.err)
-	} else {
-		p.release(late.w, true)
-	}
+		<-stuck // the foreign reserver is the ledger's head and waits for w's room
+		ph, yielded, err := p.reserveParse(context.Background(), increment{bytes: memory})
+		if !yielded || ph != nil || err == nil {
+			t.Fatalf("the caller waiting for its increment behind a foreign head was not asked to yield (granted %v, error %v)",
+				ph != nil, err)
+		}
+		p.release(w, true)
+		(<-foreign)()
+		p.mu.Lock()
+		idle := len(p.idle)
+		p.mu.Unlock()
+		if idle != 0 {
+			t.Fatalf("the yielded worker went idle while the foreign head waited (%d idle)", idle)
+		}
+	})
 }
 
 // TestANeedTheWorkerCouldNotMeasureTeachesNothing settles a file whose Done
@@ -474,8 +452,8 @@ func TestTheLargestWaitingFileIsServedFirst(t *testing.T) {
 // without a need -> the first file is disclosed as one.
 func TestANeedTheWorkerCouldNotMeasureTeachesNothing(t *testing.T) {
 	p, _ := newTestPool(t, 1, 4<<30)
-	f := &fileNeed{language: "go", size: 4096, reserved: 1 << 20, model: &needModel{loaded: true}, halfLife: 1,
-		key: needKey{NeedKey: ledger.NeedKey{Language: "go", Fingerprint: fingerprint, SizeClass: admission.SizeClassOf(4096)}}}
+	f := &fileNeed{language: "go", size: 4096, reserved: increment{bytes: 1 << 20}, model: &needModel{loaded: true}, halfLife: 1,
+		key: needKey{NeedKey: ledger.NeedKey{Language: "go", Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(4096)}}}
 	p.settle(f, wire.Memory{})
 	if _, ok := f.model.h.Predict(4096); ok {
 		t.Fatal("a file with no measured need was learned from")

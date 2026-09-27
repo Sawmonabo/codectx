@@ -529,11 +529,11 @@ func foldNeed(ctx context.Context, tx *sql.Tx, repo []byte, o *NeedObservation) 
 		overrun = 1
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO need_models(
-		repository_id, language, fingerprint, size_class, state, observations, overruns, max_drift_bytes)
-		VALUES(?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(repository_id, language, fingerprint, size_class)
+		repository_id, language, fingerprint, build, size_class, state, observations, overruns, max_drift_bytes)
+		VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(repository_id, language, fingerprint, build, size_class)
 		DO UPDATE SET state = excluded.state, observations = observations + 1,
 			overruns = overruns + excluded.overruns, max_drift_bytes = max(max_drift_bytes, excluded.max_drift_bytes)`,
-		repo, o.Key.Language, o.Key.Fingerprint, o.Key.SizeClass, o.State, overrun, o.NeedBytes-o.ReservedBytes)
+		repo, o.Key.Language, o.Key.Fingerprint, o.Key.Build, o.Key.SizeClass, o.State, overrun, o.NeedBytes-o.ReservedBytes)
 	return wrap("record the file's need", err)
 }
 

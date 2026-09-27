@@ -51,7 +51,8 @@ const (
 // before any native object exists, so every parse allocates from the one heap
 // the file boundary returns. Before hello the worker takes that boundary once
 // and reports its standing memory; after every file it takes it again before
-// answering (serve).
+// answering, and before a file whose grammars' parser and query it builds
+// first, so their cost lands in its base and not in that file's need (serve).
 func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -68,7 +69,8 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 		names = append(names, l.Name)
 	}
 	// The first boundary has no file before it, so it carries no need.
-	hello := wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Languages: names, Memory: w.meter.boundary()}
+	hello := wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Build: wire.Build(), Languages: names,
+		Memory: w.meter.boundary()}
 	if err := wire.WriteJSON(out, wire.KindHello, hello); err != nil {
 		return exitBadInput
 	}
@@ -156,6 +158,7 @@ func (w *state) verify() error {
 // frame carries no reading, but its boundary is still taken so the next file
 // is measured from a fresh base.
 func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
+	w.prepare(req)
 	done, fail, err := w.parse(out, req, src)
 	mem := w.meter.boundary()
 	switch {
@@ -289,6 +292,33 @@ func (w *state) header(req wire.Request, src []byte, first parsed) (lang.HeaderC
 // errFallback reports to Choose that the fallback parse failed; the failure
 // itself is the per-file error header answers with.
 var errFallback = errors.New("the fallback parse failed")
+
+// prepare builds the parser and query of the request's language, and of its
+// fallback, that this worker has not built yet, and then takes a file
+// boundary, whose reading it discards: the tools are held for the worker's
+// life, so they belong to its base, and a file measured from a base taken
+// before them would learn their construction as its own need. A grammar this
+// worker cannot build tools for is left to the parse, which answers the
+// failure as the file's.
+func (w *state) prepare(req wire.Request) {
+	built := false
+	for _, name := range []string{req.Language, req.Fallback} {
+		l, ok := lang.Lookup(name)
+		g := grammars[name]
+		if name == "" || !ok || g == nil {
+			continue
+		}
+		if _, ok := w.queries[l.Name]; ok {
+			continue
+		}
+		if _, _, err := w.tools(l, g); err == nil {
+			built = true
+		}
+	}
+	if built {
+		w.meter.boundary()
+	}
+}
 
 // tools returns the language's parser and compiled query, creating them once.
 func (w *state) tools(l lang.Language, g *grammar) (*ts.Parser, *ts.Query, error) {
