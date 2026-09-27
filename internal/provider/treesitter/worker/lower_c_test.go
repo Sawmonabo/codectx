@@ -509,6 +509,63 @@ var cShared = []goldenCase{
 		cd:       []string{"a@26 -> g(b)@31", "a && g(b)@26 -> return 1;@37", "a && g(b)@26 -> return 0;@47"},
 		du:       []string{"a@10 -> a@26", "b@17 -> g(b)@31", "a@26 -> a && g(b)@26", "g(b)@31 -> a && g(b)@26"},
 	},
+	{
+		// C17 §6.7.6.3p8: a parameter declared as a function returning int
+		// is adjusted to a pointer to one ([dcl.fct]/5 alike), and is still
+		// a parameter. Nodes: g@10, x@22, return g(x);@27 (Uses g and x).
+		name:     "a parameter declared as a function is a parameter node",
+		protects: "a parameter whose declarator is a function declarator is declared and defined like any other parameter",
+		mutation: "skip a parameter whose declarator is a function declarator (loses g@10 -> return g(x);@27)",
+		src:      "int f(int g(int), int x) { return g(x); }",
+		du:       []string{"g@10 -> return g(x);@27", "x@22 -> return g(x);@27"},
+	},
+	{
+		// C17 §6.7.6.3 ([dcl.fct] alike): in `int (*f(int x))(int)` the
+		// declarator nearest f takes (int x), and the outer (int) is the
+		// parameter list of the returned pointer's type. Nodes: x@12,
+		// return h(x);@23.
+		name:     "a function returning a function pointer takes its parameters from the innermost declarator",
+		protects: "the parameters of a definition are those of the function declarator nearest its name",
+		mutation: "take the outermost function declarator's parameters (its (int) names no parameter: loses x@12 -> return h(x);@23)",
+		src:      "int (*f(int x))(int) { return h(x); }",
+		du:       []string{"x@12 -> return h(x);@23"},
+	},
+	{
+		// C17 §6.7.6.2p5: a variable-length array's size is evaluated when
+		// the declaration is reached (a GNU extension in C++). Nodes: n@11,
+		// a[n]@20 (a Stmt node reading n, defining nothing), g(0, a)@26 (a
+		// decays: Uses and may-defines a, which no definition reaches).
+		name:     "a variable-length array declarator reads its size at its own node",
+		protects: "a declarator without an initializer still makes a node when it evaluates an array size, so the size's definitions reach it",
+		mutation: "make no node for a declarator without an initializer (loses n@11 -> a[n]@20)",
+		src:      "void f(int n) { int a[n]; g(0, a); }",
+		du:       []string{"n@11 -> a[n]@20"},
+	},
+	{
+		// C17 §6.2.4p3 and §6.7.9p10 ([stmt.dcl]/3 alike): a static local's
+		// initializer takes effect once, before its first use; the lowering
+		// makes it a defining node at its position. Nodes: x@10, s = 1@26,
+		// s += x@33, return s;@41.
+		name:     "a static local's initializer is a defining node at its position",
+		protects: "a static local is a variable of the function whose initializer defines it where it is written",
+		mutation: "treat a static local as no variable (every pair of s vanishes: loses s = 1@26 -> s += x@33 and s += x@33 -> return s;@41)",
+		src:      "int f(int x) { static int s = 1; s += x; return s; }",
+		du:       []string{"x@10 -> s += x@33", "s = 1@26 -> s += x@33", "s += x@33 -> return s;@41"},
+	},
+	{
+		// C17 §6.8.4.2p7 ([stmt.switch] alike): control enters the body only
+		// at a matching label, so a statement before the first one is
+		// reached by no path from the switch. Nodes: x@11, x@24 (the
+		// controlling expression, defining the switch value), g(0, x)@29 (no
+		// predecessor), 1@43 (the test, Using the switch value), h()@46.
+		// Succ: x@24→1→{h(), EXIT}; g(0, x)→h(). IPDom: 1 → EXIT.
+		name:     "a statement before the first case label is reached by no path",
+		protects: "the switch head jumps to its tests, never falling into the statements before the first label, so their reads pair with nothing",
+		mutation: "enter the body at its first statement (adds x@11 -> g(0, x)@29)",
+		src:      "void f(int x) { switch (x) { g(0, x); case 1: h(); } }",
+		cd:       []string{"1@43 -> h()@46"},
+		du:       []string{"x@11 -> x@24", "x@24 -> 1@43"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
@@ -696,6 +753,34 @@ func TestCLoweringGolden(t *testing.T) {
 			src:      "int f(void) { int x[2]; {\n#ifdef A\n  int x = 1;\n#endif\n  h(x); } return x[0]; }",
 			cd:       []string{"A@33 -> x = 1@41"},
 			du:       []string{"x = 1@41 -> h(x)@57", "h(x)@57 -> return x[0];@65"},
+		},
+		{
+			// C17 §6.9.1p6: in an old-style definition the identifier list
+			// names the parameters and the declaration list gives their
+			// types (C only; C++ has no identifier list). Nodes: a@6 (the
+			// parameter's node, spanning its identifier in the list),
+			// return a;@18. The declaration `int a;` makes no node.
+			name:     "an old-style definition's identifier list names its parameters",
+			protects: "a parameter named in an identifier list is defined at entry, and the declaration list does not redeclare it as a local",
+			mutation: "skip identifier-list parameters (loses a@6 -> return a;@18)",
+			src:      "int f(a) int a; { return a; }",
+			du:       []string{"a@6 -> return a;@18"},
+		},
+		{
+			// GNU C extension, Conditionals with Omitted Operands: `a ?: b`
+			// is a when a is nonzero, evaluated once, else b. Kept to C: the
+			// omitted middle operand is not known to parse in the C++
+			// grammar. Nodes: a@10, b@17, a@30 (Branch, defining the result),
+			// b@35 (defining it on the path that evaluates it), r = a ?:
+			// b@26 (Uses the result), return r;@38. Succ: a@30→{b@35,
+			// r = a ?: b}; b@35→r = a ?: b.
+			name:     "a two-operand conditional yields its condition or its alternative",
+			protects: "in a ?: b only b is conditional, and the condition's node yields the value when it is nonzero",
+			mutation: "give the condition's node no definition of the result (loses a@30 -> r = a ?: b@26)",
+			src:      "int f(int a, int b) { int r = a ?: b; return r; }",
+			cd:       []string{"a@30 -> b@35"},
+			du: []string{"a@10 -> a@30", "b@17 -> b@35", "a@30 -> r = a ?: b@26", "b@35 -> r = a ?: b@26",
+				"r = a ?: b@26 -> return r;@38"},
 		},
 	}...))
 	runGolden(t, "cpp", cShared)
