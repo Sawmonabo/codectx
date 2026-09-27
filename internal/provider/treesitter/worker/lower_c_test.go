@@ -317,6 +317,70 @@ var cShared = []goldenCase{
 		du: []string{"x@10 -> x = 2@53", "x = 1@32 -> x = 2@53", "x = 2@53 -> g(x, x = 2)@48",
 			"x = 2@53 -> return x;@64"},
 	},
+	{
+		// C17 §6.8.6.1p1: a goto's identifier names a label in the
+		// enclosing function; M names none. Nodes: goto M;@15 (a Jump with
+		// no target, so it keeps no successor and gains the edge to EXIT).
+		name:       "a goto to a label the function does not define is an unresolved jump",
+		protects:   "a goto whose label names nothing is counted as unresolved rather than landing anywhere",
+		mutation:   "drop the unresolved count for a goto whose label is never defined (unresolved 0)",
+		src:        "void f(void) { goto M; }",
+		unresolved: 1,
+	},
+	{
+		// C17 §6.8.4.1p2: the first substatement runs when the condition is
+		// nonzero, the else substatement otherwise. Nodes: x@10, x@26
+		// (Branch), y = 1@29, y = 2@41, return y;@48 (`int y;` makes no
+		// node). Succ: x@26→{y = 1, y = 2}; both → return y. IPDom: x@26 →
+		// return y.
+		name:     "an if with an else runs one arm and merges after it",
+		protects: "each arm of an if-else is a path from its condition, and both arms' definitions reach the statement after it",
+		mutation: "let the then arm fall into the else arm (y = 2@41 kills y = 1@29: loses y = 1@29 -> return y;@48 and x@26 -> y = 2@41)",
+		src:      "int f(int x) { int y; if (x) y = 1; else y = 2; return y; }",
+		cd:       []string{"x@26 -> y = 1@29", "x@26 -> y = 2@41"},
+		du:       []string{"x@10 -> x@26", "y = 1@29 -> return y;@48", "y = 2@41 -> return y;@48"},
+	},
+	{
+		// C17 §6.5.14p4: || evaluates its right operand only when the left
+		// compares equal to 0. Nodes: a@10, b@17, a@30 (Branch, Uses a,
+		// defines the || result), g(b)@35 (Uses b, defines the result on
+		// the path that evaluates it), r = a || g(b)@26 (Uses the result,
+		// defines r), return r;@41. Succ: a@30→{g(b), r = a || g(b)};
+		// g(b)→r = a || g(b). IPDom: a@30 → r = a || g(b).
+		name:     "|| decides on its left operand and yields through a result",
+		protects: "the right operand of || depends on the left, and the consumer reaches the value through the result both operands define",
+		mutation: "match only the && token (a@30 and its control of g(b)@35 vanish, and a@10 and b@17 pair with r = a || g(b)@26)",
+		src:      "int f(int a, int b) { int r = a || g(b); return r; }",
+		cd:       []string{"a@30 -> g(b)@35"},
+		du: []string{"a@10 -> a@30", "b@17 -> g(b)@35", "a@30 -> r = a || g(b)@26", "g(b)@35 -> r = a || g(b)@26",
+			"r = a || g(b)@26 -> return r;@41"},
+	},
+	{
+		// C17 §6.5.3.4p2: the operand of sizeof is not evaluated unless its
+		// type is a variable-length array; [expr.sizeof]/1 alike. Nodes:
+		// x@10, y = sizeof x@19 (reads nothing), return y;@33.
+		name:     "the operand of sizeof is not read",
+		protects: "sizeof of an ordinary variable makes no use of it",
+		mutation: "read sizeof's operand (adds x@10 -> y = sizeof x@19)",
+		src:      "int f(int x) { int y = sizeof x; return y; }",
+		du:       []string{"y = sizeof x@19 -> return y;@33"},
+	},
+	{
+		// C17 §6.8.5p5 and [stmt.for]: a for statement is a block, so the
+		// x its clause-1 declares ends with the loop. The call takes two
+		// arguments so the body cannot read as a declaration in C++
+		// ([stmt.ambig]). Nodes: x@10, y@17, x = 0@31, x < y@38 (Branch),
+		// g(0, x)@50, x++@45 (the update), return x;@59. Succ: x = 0→
+		// x < y→{g(0, x), return x}; g(0, x)→x++→x < y. IPDom: x < y →
+		// return x; g(0, x) → x++ → x < y.
+		name:     "a for-init declaration is scoped to its loop",
+		protects: "the variable a for clause declares shadows the parameter inside the loop only, so the read after the loop sees the parameter",
+		mutation: "keep the for-init binding after the loop (return x;@59 pairs with x = 0@31 and x++@45 instead of x@10)",
+		src:      "int f(int x, int y) { for (int x = 0; x < y; x++) g(0, x); return x; }",
+		cd:       []string{"x < y@38 -> g(0, x)@50", "x < y@38 -> x++@45", "x < y@38 -> x < y@38"},
+		du: []string{"y@17 -> x < y@38", "x = 0@31 -> x < y@38", "x++@45 -> x < y@38", "x = 0@31 -> g(0, x)@50",
+			"x++@45 -> g(0, x)@50", "x = 0@31 -> x++@45", "x++@45 -> x++@45", "x@10 -> return x;@59"},
+	},
 }
 
 // TestCLoweringGolden pins the C lowering's control-dependence and def-use
