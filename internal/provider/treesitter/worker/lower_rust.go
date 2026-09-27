@@ -36,8 +36,10 @@ const rsTryLabel = " try"
 //     even when it reads nothing, as a literal `2` is. A let declaration
 //     spans the declaration. An assignment or compound assignment is its own
 //     defining node, spanning it; return, break and continue are Jump nodes
-//     spanning the expression. A macro invocation is one node spanning it,
-//     read as Macro invocations states: a Stmt node, or a Branch when a jump
+//     spanning the expression. A macro invocation is one node spanning the
+//     invocation, without the `;` of its expression statement (`make!(m);`
+//     renders as make!(m), as any expression statement does), read as Macro
+//     invocations states: a Stmt node, or a Branch when a jump
 //     in its token tree can leave it. Its expansion is not lowered, so a
 //     panicking macro (panic!, unreachable!, todo!, assert!) is a plain node
 //     that falls through, as a call does.
@@ -59,7 +61,12 @@ const rsTryLabel = " try"
 //     node). An if, match, loop, while, for or block makes no node spanning
 //     itself, in any position: its conditions, heads, statements and arm
 //     results are its nodes. A while or for loop, an assignment, a compound
-//     assignment and a jump yield `()` or `!`, so they hand over nothing. A
+//     assignment and a jump yield `()` or `!`, so they hand over nothing.
+//     That departs from Lowering's embedded-assignment rule on purpose: a
+//     Rust assignment used as a value evaluates to `()`, which carries no
+//     variable's value, so its node defines no owned result and its consumer
+//     Uses none: `let e = (m = v);` defines e and Uses nothing of the
+//     assignment. A
 //     yielding node that also defines a variable of its own (the `?`
 //     completing a try block, which defines its own Ok value) defines the
 //     result too, each definition killing (see Lowering). Several `?` on one
@@ -103,7 +110,9 @@ const rsTryLabel = " try"
 //     nothing else; then one defining node per name the pattern binds, each
 //     Using that variable and nothing else, so the head and the names depend
 //     on the iterated value as it was before the loop, never on a write to
-//     its variables in the body.
+//     its variables in the body. An iterated value naming no variable (`for
+//     i in H {}`) still makes its node, which Uses nothing and defines the
+//     iteration variable the head and the bindings Use.
 //   - A match evaluates its scrutinee once, at a node of its own (a Stmt node
 //     spanning it, or the node yielding its value when that spans it) that
 //     defines an owned variable; then its arms in source order: a Branch node
@@ -143,7 +152,10 @@ const rsTryLabel = " try"
 //     value, followed by one defining node per bound name Using it. `let x;`
 //     declares x and makes no node. A destructuring assignment is likewise a
 //     node for the assignment, defining an owned variable, then one node per
-//     target, each Using it (a place target also Uses its own operands); its
+//     target, each Using it (a place target also Uses its own operands); a
+//     target naming no variable (an item, an undeclared name, or a place
+//     whose base is one) still makes its node, which Uses the owned variable
+//     and defines and may-defines nothing; its
 //     assignees are those of the Reference's "Destructuring assignments": the
 //     elements of a tuple `(a, b) = e` or array `[a, b] = e`, the arguments
 //     of a tuple struct `P(a, b) = e`, and the fields of a struct `S { x, f:
@@ -216,6 +228,29 @@ const rsTryLabel = " try"
 // target nodes Use the assignment's owned variable, never the a and b the
 // assignment read.
 //
+// # Hand-off
+//
+// Lowering's hand-off rule applies, with the operands of an expression
+// evaluated left to right (The Rust Reference, Expressions › Evaluation order
+// of operands). A read the consumer folds that an assignment, compound
+// assignment or destructuring target's node later redefines (`let y = x + {
+// x = 1; 0 };`, `f(x, x += 1)`) is carried by that node: it Uses the earlier
+// value and defines an owned variable holding it, which replaces the held
+// read (handOff), so the consumer pairs with the definition that reached it
+// and a later definition in the same expression neither re-reads nor
+// receives it. Only a killing definition of a named variable hands off; a
+// may-definition (a place write, a borrow, a callable's write) does not. The
+// hand-off is made only when that node runs whenever the consumer does. A
+// definition inside a region some path to the consumer skips leaves the
+// read on the consumer: the right operand of `&&` or `||`, an if's
+// consequence and alternative (its condition runs on every path), a match's
+// arms, patterns and guards (its scrutinee runs on every path), a loop body,
+// a whole while loop, a for body (its iterated value runs on every path), a
+// labelled block, whose break can skip its later statements, a try block,
+// whose `?` can, and a let-else's else block. A `?` opens no such region:
+// when the consumer runs, the `?` did not leave, so what follows it ran. A
+// target naming no variable hands off nothing, since read never records -1.
+//
 // # Names that resolve to no variable
 //
 // Lowering's section of that name applies. Here lookup returns -1 for a
@@ -241,7 +276,9 @@ const rsTryLabel = " try"
 // # Exceptions
 //
 // Rust has no try/catch: a panic unwinds out of the function and is not
-// modelled, as the seed does outside a try, so no node is MayThrow.
+// modelled, as the seed does outside a try, so no node is MayThrow. No golden
+// case can observe that: a MayThrow with no catch or finally frame open adds
+// no edge and no pair, and a Rust callable never opens one.
 //
 // # Scoping
 //
@@ -322,6 +359,11 @@ type rsLower struct {
 	// yet carried by a node, in evaluation order; a node Uses a window of
 	// them and the window is dropped once the node is made.
 	reads []int32
+	// sure is where the reads held for a consumer that runs whenever the
+	// node being lowered does begin: reads[sure:] precede that node on every
+	// path reaching the consumer, and a read before sure belongs to a
+	// consumer the node may be skipped for (see Hand-off).
+	sure int
 	// frames are the open loops, labelled blocks and try blocks, innermost
 	// last, each with the result variable its valued breaks define.
 	frames []rsFrame
@@ -359,7 +401,7 @@ func (r *rsLower) reset(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s
 	r.l, r.b, r.src, r.k, r.cur, r.binds = l, b, src, rsSyntaxOf(), s.cursor(fn), &s.scope
 	r.buf, r.reads, r.writes, r.borrows = r.buf[:0], r.reads[:0], r.writes[:0], r.borrows[:0]
 	r.hs, r.ends, r.frames = r.hs[:0], r.ends[:0], r.frames[:0]
-	r.shadow, r.tries = 0, 0
+	r.shadow, r.tries, r.sure = 0, 0, 0
 	r.first, r.last, r.lastSpan, r.lastDef, r.lastVar, r.matched = -1, -1, flow.Span{}, false, -1, -1
 }
 
@@ -504,6 +546,40 @@ func (r *rsLower) def(n, v int32) {
 	if n == r.last && !r.lastDef {
 		r.lastDef, r.lastVar = true, v
 	}
+}
+
+// handOff hands on the reads of v in reads[sure:end], held for a consumer
+// that runs whenever node n does and made before n redefines v (`x + { x =
+// 1; 0 }`): n Uses that earlier value and defines an owned variable holding
+// it, which replaces those reads, so the consumer pairs with the definition
+// that reached it rather than with n (see Hand-off).
+func (r *rsLower) handOff(n, v int32, end int) {
+	if v < 0 {
+		return
+	}
+	t := int32(-1)
+	for i := r.sure; i < end; i++ {
+		if r.reads[i] != v {
+			continue
+		}
+		if t < 0 {
+			t = r.b.Var()
+		}
+		r.reads[i] = t
+	}
+	if t >= 0 {
+		r.b.Use(n, v)
+		r.b.Def(n, t)
+	}
+}
+
+// maybe opens a region that some path reaching the consumers of the reads
+// held so far skips, so no definition in it takes them, and returns the mark
+// the caller restores sure to when the region ends.
+func (r *rsLower) maybe() int {
+	s := r.sure
+	r.sure = len(r.reads)
+	return s
 }
 
 // open starts tracking the first node created; close returns it (-1 if none)
@@ -735,9 +811,11 @@ func (r *rsLower) block(n *ts.Node, dst int32) {
 		r.predeclare(&list[i])
 	}
 	var f flow.Frame
+	sure := r.sure
 	if lab != "" {
 		f = r.b.OpenBlock(lab)
 		r.openFrame(r.labelNode(n), false, dst)
+		r.maybe()
 	}
 	for i := range list {
 		if c := &list[i]; c.KindId() != k.label {
@@ -752,6 +830,7 @@ func (r *rsLower) block(n *ts.Node, dst int32) {
 		r.closeFrame()
 		r.b.CloseFrame(f)
 	}
+	r.sure = sure
 	r.done(start)
 	r.binds.truncate(mark)
 }
@@ -829,7 +908,9 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 		f := r.b.OpenBlock(rsTryLabel)
 		r.openFrame(nil, false, dst)
 		r.tries++
+		sure := r.maybe()
 		r.block(r.firstKid(u), dst)
+		r.sure = sure
 		r.tries--
 		r.closeFrame()
 		r.b.CloseFrame(f)
@@ -984,8 +1065,9 @@ func (r *rsLower) lazy(n *ts.Node, dst int32) {
 	}
 	r.reads = r.reads[:m]
 	r.def(id, dst)
-	p := r.b.Push()
+	p, sure := r.b.Push(), r.maybe()
 	r.into(right, dst)
+	r.sure = sure
 	r.b.Merge(p)
 	r.b.Pop(p)
 }
@@ -1392,6 +1474,7 @@ func (r *rsLower) ifExpr(n *ts.Node, dst int32) {
 	k := r.k
 	mark := r.binds.mark()
 	fm := r.cond(n.ChildByFieldId(k.fCondition))
+	sure := r.maybe()
 	r.block(n.ChildByFieldId(k.fConsequence), dst)
 	r.binds.truncate(mark)
 	t := r.b.Push()
@@ -1401,6 +1484,7 @@ func (r *rsLower) ifExpr(n *ts.Node, dst int32) {
 			r.into(s, dst)
 		}
 	}
+	r.sure = sure
 	r.b.Merge(t)
 	r.release(fm)
 }
@@ -1417,7 +1501,9 @@ func (r *rsLower) loopExpr(n *ts.Node, dst int32) {
 	f := r.openLoop(n)
 	r.openFrame(r.labelNode(n), true, dst)
 	h := r.node(flow.Stmt, spanOf(r.token(n, r.k.loopKw)), 0, 0)
+	sure := r.maybe()
 	r.block(n.ChildByFieldId(r.k.fBody), -1)
+	r.sure = sure
 	r.closeFrame()
 	r.b.ContinueHere(f)
 	r.b.Close(h)
@@ -1428,11 +1514,12 @@ func (r *rsLower) whileExpr(n *ts.Node) {
 	k := r.k
 	f := r.openLoop(n)
 	r.openFrame(r.labelNode(n), true, -1)
-	mark := r.binds.mark()
+	mark, sure := r.binds.mark(), r.maybe()
 	saved := r.open()
 	fm := r.cond(n.ChildByFieldId(k.fCondition))
 	h := r.close(saved)
 	r.block(n.ChildByFieldId(k.fBody), -1)
+	r.sure = sure
 	r.binds.truncate(mark)
 	r.closeFrame()
 	r.b.ContinueHere(f)
@@ -1450,9 +1537,10 @@ func (r *rsLower) forExpr(n *ts.Node) {
 	h := r.node(flow.Branch, spanOf(r.token(n, k.forKw)), 0, 0)
 	r.b.Use(h, iter)
 	exit := r.b.Push()
-	mark := r.binds.mark()
+	mark, sure := r.binds.mark(), r.maybe()
 	r.bindFrom(n.ChildByFieldId(k.fPattern), iter, -1)
 	r.block(n.ChildByFieldId(k.fBody), -1)
+	r.sure = sure
 	r.binds.truncate(mark)
 	r.closeFrame()
 	r.b.ContinueHere(f)
@@ -1484,7 +1572,7 @@ func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
 	sm := len(r.reads)
 	r.reads = append(r.reads, s)
 	se := sm + 1
-	anchor := r.b.Push()
+	anchor, sure := r.b.Push(), r.maybe()
 	base, eb := len(r.hs), len(r.ends)
 	live := true
 	start, arms := r.kids(n.ChildByFieldId(k.fBody))
@@ -1529,6 +1617,7 @@ func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
 		r.b.Merge(e)
 	}
 	r.b.Pop(anchor)
+	r.sure = sure
 	r.hs, r.ends, r.reads = r.hs[:base], r.ends[:eb], r.reads[:sm]
 }
 
@@ -1550,8 +1639,9 @@ func (r *rsLower) let(n *ts.Node) {
 		r.reads = r.reads[:m]
 		s := r.b.Var()
 		r.def(id, s)
-		p := r.b.Push()
+		p, sure := r.b.Push(), r.maybe()
 		r.block(alt, -1)
+		r.sure = sure
 		// The language requires the else block to diverge; a block ending
 		// in a plain panicking-macro node still has a fringe, which returns.
 		r.b.Return()
@@ -1581,7 +1671,9 @@ func (r *rsLower) assign(n *ts.Node) {
 	switch left.KindId() {
 	case k.identifier:
 		r.value(right)
-		r.def(r.node(flow.Stmt, spanOf(n), m, len(r.reads)), r.lookup(left))
+		id, v := r.node(flow.Stmt, spanOf(n), m, len(r.reads)), r.lookup(left)
+		r.def(id, v)
+		r.handOff(id, v, m)
 	case k.tupleExpression, k.arrayExpression, k.callExpression, k.structExpression:
 		r.value(right)
 		id := r.node(flow.Stmt, spanOf(n), m, len(r.reads))
@@ -1672,7 +1764,9 @@ func (r *rsLower) targets(t *ts.Node, s int32) {
 	m := len(r.reads)
 	r.read(s)
 	if t.KindId() == k.identifier {
-		r.def(r.node(flow.Stmt, spanOf(t), m, len(r.reads)), r.lookup(t))
+		id, v := r.node(flow.Stmt, spanOf(t), m, len(r.reads)), r.lookup(t)
+		r.def(id, v)
+		r.handOff(id, v, m)
 	} else {
 		r.value(t)
 		id := r.node(flow.Stmt, spanOf(t), m, len(r.reads))
@@ -1693,7 +1787,9 @@ func (r *rsLower) compound(n *ts.Node) {
 		v := r.lookup(left)
 		r.read(v)
 		r.value(right)
-		r.def(r.node(flow.Stmt, spanOf(n), m, len(r.reads)), v)
+		id := r.node(flow.Stmt, spanOf(n), m, len(r.reads))
+		r.def(id, v)
+		r.handOff(id, v, m)
 	} else {
 		r.value(left)
 		r.value(right)

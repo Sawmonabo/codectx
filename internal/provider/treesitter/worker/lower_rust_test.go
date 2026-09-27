@@ -636,5 +636,43 @@ func TestRustLoweringGolden(t *testing.T) {
 			cd:       []string{"c@27 -> 1@32", "c@27 -> 2@43"},
 			du:       []string{"c@5 -> c@27"},
 		},
+		{
+			// Expressions › Evaluation order of operands: `x + { … }` reads
+			// x before the block runs, and Expressions › Block expressions:
+			// the block's statements run whenever the let does. Nodes: x@9
+			// (param), x = 1@40 (takes the let's held read: Uses x, defines
+			// x and an owned variable holding the earlier x), x = 2@47
+			// (defines x; the read is no longer x's, so it takes nothing),
+			// 0@54 (the tail, defining the block's result), let y = …;@26
+			// (Uses the handed-on variable and the block's result, defines
+			// y), y + x@59. Straight line.
+			name:     "a read before a nested assignment pairs with the definition that reached it",
+			protects: "the let's read of x, made before the block's assignments, pairs with the parameter through the first assignment's hand-off, never with a later assignment",
+			mutation: "make no hand-off (the let's read of x stays on it and pairs with x = 2@47: loses x@9 -> x = 1@40 and x = 1@40 -> let y = x + { x = 1; x = 2; 0 };@26, gains x = 2@47 -> let y = x + { x = 1; x = 2; 0 };@26), or hand the read to every later assignment (gains x = 1@40 -> x = 2@47)",
+			src:      "fn f(mut x: i32) -> i32 { let y = x + { x = 1; x = 2; 0 }; y + x }",
+			du: []string{"x@9 -> x = 1@40", "x = 1@40 -> let y = x + { x = 1; x = 2; 0 };@26",
+				"0@54 -> let y = x + { x = 1; x = 2; 0 };@26", "let y = x + { x = 1; x = 2; 0 };@26 -> y + x@59",
+				"x = 2@47 -> y + x@59"},
+		},
+		{
+			// Expressions › Evaluation order of operands, and Expressions ›
+			// `if` expressions: the consequence runs only when c holds, so
+			// the assignment in it does not run whenever the let does and
+			// takes none of its reads (lower.go, the hand-off is made only
+			// when the assignment's node runs whenever the consumer does).
+			// Nodes: c@5, x@18, c@50 (Branch), x = 1@54, 0@61 and 0@72 (the
+			// arm tails, defining the if's result), let y = …;@35 (Uses x and
+			// the if's result), y + x@77. Succ: c@50→{x = 1, 0@72}; x = 1→0@61
+			// →let; 0@72→let; let→y + x. IPDom: c@50 → let.
+			name:     "an assignment in a conditional arm leaves an earlier read on its consumer",
+			protects: "a read held for the let stays on it when the redefining assignment sits in an if arm, so the let pairs with the parameter on the path that skips the assignment",
+			mutation: "hand off reads to an assignment in an if arm (the let then Uses a variable only the consequence defines: gains x@18 -> x = 1@54, loses x@18 -> let y = x + if c { x = 1; 0 } else { 0 };@35)",
+			src:      "fn f(c: bool, mut x: i32) -> i32 { let y = x + if c { x = 1; 0 } else { 0 }; y + x }",
+			cd:       []string{"c@50 -> x = 1@54", "c@50 -> 0@61", "c@50 -> 0@72"},
+			du: []string{"c@5 -> c@50", "x@18 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"x = 1@54 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"0@61 -> let y = x + if c { x = 1; 0 } else { 0 };@35", "0@72 -> let y = x + if c { x = 1; 0 } else { 0 };@35",
+				"let y = x + if c { x = 1; 0 } else { 0 };@35 -> y + x@77", "x@18 -> y + x@77", "x = 1@54 -> y + x@77"},
+		},
 	})
 }
