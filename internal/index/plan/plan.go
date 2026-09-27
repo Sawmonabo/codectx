@@ -618,10 +618,9 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 	// no file is claimed unchanged and no semantic scope is carried.
 	changed = !b.fsActive
 	// A path two grammars declare is a header whose grammar the census
-	// decides. Both units that read that decision carry it: the structural
-	// unit parses with it and the filesystem unit tags the file node with the
-	// manifest's language, which follows it. A header path is refused by
-	// every other file provider's gate.
+	// decides, and every file unit of it carries that decision: the
+	// structural unit parses with it, and the filesystem unit tags the file
+	// node with the manifest's language, which follows it.
 	var keys []string
 	if len(tslang.Candidates(fv.Path)) > 1 {
 		keys = []string{b.headerKey}
