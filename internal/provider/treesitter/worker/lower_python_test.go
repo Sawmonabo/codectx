@@ -1483,5 +1483,24 @@ func TestPythonLoweringGolden(t *testing.T) {
 			cd:       []string{"[c]@87 -> c@88"},
 			du:       []string{"s@6 -> s@77", "s@77 -> [c]@87", "s@77 -> c@88"},
 		},
+		{
+			// Ill-formed on purpose, and recovered: y=1 and return share a line, so the first simple
+			// statement lacks its newline (Language Reference §7); the
+			// parser recovers by wrapping the reduced assignment y=1 in an ERROR node it marks as an extra
+			// among the block's statements (one tree of 3 bytes costs the recovery less than a missing
+			// terminator does), and the return statement after it parses whole. The rule
+			// (kids and the unnamed kinds in lower_python.go): an ERROR node the parser made an extra is
+			// kept and is a plain node, one Stmt node spanning it with its reads, and every name under it is
+			// read, the assignment's target included, so y=1@38 Uses y and defines nothing. Nodes: x@6,
+			// y = 0@14, the Branch x@27, y=1@38, return y@42, return y@55.
+			name:      "an ERROR node the parser made an extra is one plain node with every read under it",
+			protects:  "a statement the parser wrapped in an extra ERROR node still makes its node on its path, carrying the reads under it",
+			mutation:  "drop the extra ERROR node's content with the comments (y=1@38 vanishes: x@27 -> y=1@38 and y = 0@14 -> y=1@38 are lost)",
+			src:       "def f(x):\n    y = 0\n    if x:\n        y=1 return y\n    return y\n",
+			fn:        1,
+			recovered: true,
+			cd:        []string{"x@27 -> y=1@38", "x@27 -> return y@42"},
+			du:        []string{"x@6 -> x@27", "y = 0@14 -> y=1@38", "y = 0@14 -> return y@42", "y = 0@14 -> return y@55"},
+		},
 	})
 }

@@ -938,7 +938,10 @@ func (r *rsLower) stmt(n *ts.Node, dst int32) {
 // the value is not consumed): a construct lowered to nodes passes dst to its
 // yields, and a folded expression is one Stmt node spanning it, Using its
 // reads, that defines dst. A while or for loop, an assignment and a jump
-// yield no value.
+// yield no value. A folded expression whose value nobody consumes, and whose
+// own lowering already made a node spanning it with no read left over (an
+// ERROR node of the parser's recovery wrapping just `y = 1`), makes no
+// second node: a statement is one node.
 func (r *rsLower) into(e *ts.Node, dst int32) {
 	if e == nil {
 		return
@@ -999,8 +1002,11 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 		}
 		fallthrough
 	default:
-		m := len(r.reads)
+		m, last := len(r.reads), r.last
 		r.value(u)
+		if dst < 0 && len(r.reads) == m && r.spans(last, u) {
+			return
+		}
 		r.def(r.node(flow.Stmt, spanOf(u), m, len(r.reads)), dst)
 		r.reads = r.reads[:m]
 	}

@@ -1522,5 +1522,23 @@ func TestRustLoweringGolden(t *testing.T) {
 				"break 'a 0@83 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "1@104 -> let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47", "let y = x + z + 'a: { x = 1; if c { break 'a 0; } z = 2; 1 };@47 -> y + x + z@109", "x = 1@69 -> y + x + z@109",
 				"z@30 -> y + x + z@109", "z = 2@97 -> y + x + z@109"},
 		},
+		{
+			// Ill-formed on purpose, and recovered: y=1 is followed by return with no `;` (The Rust
+			// Reference, Statements: an expression statement that is not a block ends with `;`); the
+			// parser recovers by wrapping the reduced assignment y=1 in an ERROR node it marks as an extra
+			// among the block's statements (one tree of 3 bytes costs the recovery less than a missing
+			// terminator does), and the return statement after it parses whole. The rule (children and into in lower_rust.go): an ERROR node the
+			// parser made an extra is kept and lowered as a kind not named, for its value, so the
+			// assignment inside it is the node y=1@45 defining y, and the ERROR node makes no second node
+			// over the same span. Nodes: x@5, let mut y = 0;@23, the Branch x@41, y=1@45, return y@49,
+			// the tail y@60.
+			name:      "an assignment inside an ERROR node the parser made an extra defines its target",
+			protects:  "a statement the parser wrapped in an extra ERROR node still makes its one node, and the definition inside it reaches the read after it",
+			mutation:  "drop the extra ERROR node's content with the comments (y=1@45 vanishes: x@41 -> y=1@45 and y=1@45 -> return y@49 are lost, and let mut y = 0;@23 -> return y@49 appears); or give the ERROR node a Stmt node of its own beside the assignment's (a second y=1@45 appears, controlled by x@41)",
+			src:       "fn f(x: bool) -> i32 { let mut y = 0; if x { y=1 return y } y }",
+			recovered: true,
+			cd:        []string{"x@41 -> y=1@45", "x@41 -> return y@49"},
+			du:        []string{"x@5 -> x@41", "y=1@45 -> return y@49", "let mut y = 0;@23 -> y@60"},
+		},
 	})
 }
