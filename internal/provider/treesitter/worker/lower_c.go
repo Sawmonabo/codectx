@@ -57,7 +57,8 @@ const (
 //     initializer spanning it ([class.base.init]).
 //   - A statement is one node: an expression statement spans its
 //     expression (a comma expression at statement level is one statement
-//     per operand), an initialized declarator spans the init declarator,
+//     per operand; an empty statement `;`, labelled or not, makes none, so
+//     `L:;` is the label's node alone), an initialized declarator spans the init declarator,
 //     defines the name and comes after the nodes its initializer makes (a
 //     lambda's creating node included), return, co_return, throw, break,
 //     continue, goto and `__leave` span the statement (kind Jump). An
@@ -126,8 +127,9 @@ const (
 //     only by a jump into them.
 //   - A C++ range for ([stmt.ranged]) follows Iteration (see Lowering): the
 //     range expression's Stmt node, which defines the iteration variable;
-//     the Branch head, spanning from the declarator to the end of the range
-//     expression and Using only the iteration variable, never the names the
+//     the Branch head, spanning from the start of the declarator (a
+//     reference's `&` included: `auto &e : v` renders as `&e : v`) to the
+//     end of the range expression and Using only the iteration variable, never the names the
 //     range expression reads; then one defining node per bound name spanning
 //     the name, Using only the iteration variable too. A name bound by a
 //     reference to a non-const type (`auto &e : v`) is bound to an element
@@ -258,7 +260,11 @@ const (
 // definition of the same local follows (`f(x, x = 1)`) is carried by the
 // defining node, as Lowering states: the node Uses the earlier value and
 // defines an owned variable that replaces the held read, so the folded read
-// pairs with the definition that reached it. The hand-off is made only when the
+// pairs with the definition that reached it. A definition through a name a
+// preprocessor conditional left bound to several variables defines each (see
+// Node granularity), so the defining node carries the held read of each one
+// (`g(x, x = 2)` after `#ifdef A int x = 1; #endif` hands on the read of the
+// arm's x and of the parameter). The hand-off is made only when the
 // defining node runs whenever the consumer does: a definition in the right
 // operand of `&&` or `||` or in an arm of `?:` leaves the read on the consumer.
 // So does a definition in a statement of a statement expression other than its
