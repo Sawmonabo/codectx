@@ -293,7 +293,7 @@ type Inputs struct {
 	RecordedPeak func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool)
 	// Machine is the composition root's reading of the host, the one the
 	// admission allocation starts from before the ledger re-derives it
-	// between parser files. Every heavy unit's reservation, heap caps
+	// before every admission. Every heavy unit's reservation, heap caps
 	// included, is sized against it, so every unit of one plan is sized from
 	// one reading. The planner never observes the machine itself: a reading
 	// of its own, taken while memory is momentarily free, would size caps
