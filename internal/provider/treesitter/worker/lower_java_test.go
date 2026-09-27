@@ -1107,10 +1107,12 @@ func TestJavaLoweringGolden(t *testing.T) {
 		},
 		{
 			// §14.11.1, §14.11.2. The arm's block lacks the `;` after y = 1, so
-			// the source parses with a syntax error; derived against the
-			// recovery the parser makes for a statement missing its last token
-			// before a `}`: the expression statement kept whole, holding a
-			// zero-width missing `;`. A pattern switch statement without default
+			// the source parses with a syntax error; the parser recovers with
+			// an ERROR node it marks as an extra, spanning y = 1 and holding
+			// the assignment. An ERROR node is lowered as a kind the lowering
+			// does not name, for its value, so the assignment inside it is the
+			// node y = 1@71 defining y, as it would be in an expression
+			// statement holding a missing `;`. A pattern switch statement without default
 			// throws when no label matches, but a switch whose tree holds a
 			// syntax error may have lost its default, so this one is left.
 			// Nodes: o@23, y = 0@32, o@47 (selector), case String s@52, s@64,
@@ -1119,7 +1121,7 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// node → return. Frontier walk: case String s over s and y = 1.
 			name:      "a switch holding a syntax error is left when no label matches",
 			protects:  "a recovery that may have dropped a default makes no exhaustive-switch throw, so the statement after the switch runs on the no-match path with the definitions before the switch",
-			mutation:  "throw on the no-match path of a switch whose tree holds a syntax error, as for any enhanced switch (loses y = 0@32 -> return y;@81, and case String s@52 gains control of return y;@81)",
+			mutation:  "throw on the no-match path of a switch whose tree holds a syntax error, as for any enhanced switch (loses y = 0@32 -> return y;@81, and case String s@52 gains control of return y;@81); or leave an ERROR node the parser made an extra out of the block's statement list, with the comments (loses case String s@52 -> y = 1@71 and y = 1@71 -> return y;@81)",
 			src:       "class A { int f(Object o) { int y = 0; switch (o) { case String s -> { y = 1 } } return y; } }",
 			fn:        1,
 			recovered: true,
@@ -1133,8 +1135,8 @@ func TestJavaLoweringGolden(t *testing.T) {
 			// statements, between two intact statements. Nodes: x@20, y =
 			// x@29, the error node )@36 (a kind the lowering does not name:
 			// one Stmt node with its uses, none here, falling through), return
-			// y;@38. The pairs hold whether or not the error node makes a node
-			// of its own, as long as both statements survive it.
+			// y;@38. The error node makes a node of its own, extra or not; the
+			// pairs hold as long as both statements survive it.
 			name:      "an error node among a block's statements is one node that falls through",
 			protects:  "a statement the parser could not recover is lowered as one node and control continues past it with the definitions before it",
 			mutation:  "end the path at a kind the lowering does not name (loses y = x@29 -> return y;@38)",

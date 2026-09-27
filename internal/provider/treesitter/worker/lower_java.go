@@ -184,8 +184,15 @@ const yieldLabel = " yield"
 // handled above. An empty statement (`;`), the body of an if, else, loop or
 // label included, makes no node; package, import
 // and module declarations do not occur in a callable; any kind the lowering
-// does not name (an error node included) is one Stmt node spanning it, with
-// its uses, falling through. Expression kinds other than the ones above
+// does not name is one Stmt node spanning it, with its uses, falling
+// through. An ERROR node of the parser's recovery is such a kind wherever it
+// stands, whether the parser made it an extra or not: it is lowered for its
+// value as any unnamed kind is, so a construct inside it that makes a node
+// anywhere (an embedded assignment, a lambda) makes one there and defines
+// what it defines there, and the rest folds into the Stmt node spanning it,
+// which is not made when the construct's node already spans it. Every
+// lowering applies this rule: an ERROR node is its language's kind the
+// lowering does not name. Expression kinds other than the ones above
 // (method and constructor invocations, an object creation without a class
 // body, field and array access, casts, unary, arithmetic and comparison
 // operators, the instanceof test, method references, array creation, class
@@ -494,7 +501,10 @@ type javaArm struct {
 
 // kids pushes n's named, non-extra children onto buf and returns the stack
 // mark and the list; done(mark) pops them. A list stays valid across nested
-// kids calls.
+// kids calls. An extra (a comment) is left out, except an ERROR node the
+// parser made an extra, which its recovery does when it wraps what it could
+// not parse or a token it skipped: it is lowered as a kind the lowering does
+// not name is (see Statement kinds).
 func (j *javaLower) kids(n *ts.Node) (int, []ts.Node) {
 	return j.fieldKids(n, 0)
 }
@@ -507,7 +517,7 @@ func (j *javaLower) fieldKids(n *ts.Node, f uint16) (int, []ts.Node) {
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); x.IsNamed() && !x.IsExtra() && (f == 0 || c.FieldId() == f) {
+			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) && (f == 0 || c.FieldId() == f) {
 				j.buf = append(j.buf, *x)
 			}
 			if !c.GotoNextSibling() {

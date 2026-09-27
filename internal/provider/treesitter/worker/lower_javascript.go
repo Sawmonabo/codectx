@@ -571,14 +571,17 @@ type jsLower struct {
 
 // kids pushes n's named, non-extra children (comments are extras) onto buf
 // and returns the stack mark and the list; done(mark) pops them. A list stays
-// valid across nested kids calls: later pushes never overwrite it.
+// valid across nested kids calls: later pushes never overwrite it. An ERROR
+// node the parser made an extra, which its recovery does when it wraps what
+// it could not parse or a token it skipped, is kept: it is lowered as a kind
+// the lowering does not name is.
 func (j *jsLower) kids(n *ts.Node) (int, []ts.Node) {
 	start := len(j.buf)
 	c := j.cur
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); x.IsNamed() && !x.IsExtra() {
+			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) {
 				j.buf = append(j.buf, *x)
 			}
 			if !c.GotoNextSibling() {

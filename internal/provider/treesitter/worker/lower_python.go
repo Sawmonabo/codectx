@@ -494,14 +494,16 @@ type pyFrame struct {
 
 // kids pushes n's named, non-extra children onto buf and returns the stack
 // mark and the list; done(mark) pops them. A list stays valid across nested
-// kids calls: later pushes never overwrite it.
+// kids calls: later pushes never overwrite it. An ERROR node the parser made
+// an extra, which its recovery does when it wraps what it could not parse or
+// a token it skipped, is kept: it is lowered as a kind not named here is.
 func (j *pyLower) kids(n *ts.Node) (int, []ts.Node) {
 	start := len(j.buf)
 	c := j.cur
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); x.IsNamed() && !x.IsExtra() {
+			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) {
 				j.buf = append(j.buf, *x)
 			}
 			if !c.GotoNextSibling() {

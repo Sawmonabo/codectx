@@ -434,14 +434,17 @@ func (r *rsLower) kids(n *ts.Node) (int, []ts.Node) { return r.children(n, true)
 func (r *rsLower) toks(n *ts.Node) (int, []ts.Node) { return r.children(n, false) }
 
 // children pushes n's non-extra children onto buf, only the named ones when
-// named is set, and returns the stack mark and the list.
+// named is set, and returns the stack mark and the list. An ERROR node the
+// parser made an extra, which its recovery does when it wraps what it could
+// not parse or a token it skipped, is kept: it is lowered as a kind not named
+// here is, an error node included.
 func (r *rsLower) children(n *ts.Node, named bool) (int, []ts.Node) {
 	start := len(r.buf)
 	c := r.cur
 	c.Reset(*n)
 	if c.GotoFirstChild() {
 		for {
-			if x := c.Node(); (x.IsNamed() || !named) && !x.IsExtra() {
+			if x := c.Node(); (x.IsNamed() || !named) && (!x.IsExtra() || x.IsError()) {
 				r.buf = append(r.buf, *x)
 			}
 			if !c.GotoNextSibling() {
