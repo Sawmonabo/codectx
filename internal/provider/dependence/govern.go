@@ -350,30 +350,5 @@ func (g Governor) RetryCap(r Reservation, peakBytes int64) int64 {
 	return cap
 }
 
-// MaxChildReservationBytes is the largest reservation Reserve can produce for
-// any family on a machine whose scheduling allocation is allocationBytes. It
-// is the figure a process runner beneath the admission gate must be able to
-// admit: the gate runs a child larger than the whole allocation alone rather
-// than refusing it, so a runner budgeted at the allocation would refuse
-// exactly the unit the gate just admitted, and "refusing work for memory" is
-// not a thing this product does.
-//
-// It is derived from the shipped constants rather than stated: the cap is
-// bounded by the allocation, and the most any family adds on top of it is the
-// largest non-heap residency plus the largest helper allowance. The export
-// step's allowance is included in the same maximum because a unit reserves the
-// peak of its two steps, not their sum.
-func MaxChildReservationBytes(allocationBytes int64) int64 {
-	var above int64 = exportResident
-	for _, v := range residentAboveHeap {
-		above = max(above, v)
-	}
-	var helper int64
-	for _, v := range helperAllowance {
-		helper = max(helper, v)
-	}
-	return allocationBytes + above + helper
-}
-
 // itoa renders a byte figure for a bounded error detail.
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
