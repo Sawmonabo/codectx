@@ -130,7 +130,7 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	f.cas = cas
 	// Carried lexical documents are re-indexed through the content store's
 	// range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{})
+	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

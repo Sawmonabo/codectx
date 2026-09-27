@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -72,7 +73,7 @@ func newFixture(t *testing.T, withGit bool) *fixture {
 		}
 		f.gitCmd("init", "-q", "-b", "main")
 	}
-	s, err := store.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), store.Options{})
+	s, err := store.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), store.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
