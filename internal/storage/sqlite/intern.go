@@ -18,10 +18,9 @@ import (
 // the dictionary row on first sight.
 //
 // It holds no *sql.DB and opens nothing; every method is handed the caller's
-// *sql.Tx. It is NOT safe for concurrent use and does not need to be: the store
-// opens its writer pool with exactly one connection (open.go:128), so at most
-// one write transaction -- and therefore at most one caller of this interner --
-// exists at a time.
+// *sql.Tx. It is NOT safe for concurrent use and does not need to be: every
+// write runs as a job on the store's one writer goroutine (open.go, runWriter),
+// so at most one caller of this interner runs at a time.
 //
 // Memory is a function of cache capacity, never of repository size. Three
 // bounded LRUs (node ids, relation ids, and one shared dictionary for the
