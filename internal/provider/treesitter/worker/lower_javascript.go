@@ -239,6 +239,19 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     condition, has no exit edge: only a break leaves it. Its head is a Stmt
 //     node spanning `true`, or the `for` keyword.
 //
+// Statement kinds: any statement kind the lowering does not name above is
+// lowered for its value, as an expression statement is: the nodes its own
+// evaluation makes, then one Stmt node spanning it that Uses its reads, not
+// made when the last of those nodes already spans it; control falls through.
+// An expression kind it does not name makes no node of its own: its named
+// children are lowered for their values in source order. An ERROR node of the
+// parser's recovery is kept, extra or not, by the rule every lowering keeps
+// (see Statement kinds in the Java lowering): where it stands as a statement
+// it is a statement kind the lowering does not name, so a construct inside it
+// that makes a node makes it there and the Stmt node spanning the ERROR node
+// is left out when that construct's node already spans it; inside an
+// expression it is an expression kind the lowering does not name.
+//
 // # Uses
 //
 // Only an identifier resolving to a variable declared in this function is a
