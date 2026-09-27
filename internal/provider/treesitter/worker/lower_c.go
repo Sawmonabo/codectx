@@ -202,9 +202,12 @@ const (
 // an array type name are evaluated), and the controlling expression of a
 // generic selection (C17 §6.5.1.1p3) are not; the association a generic
 // selection picks depends on types, so every association's expression is
-// read. A node Uses what its own evaluation reads, and a value computed at
-// another node reaches it through a variable, as Lowering's Uses rule
-// states.
+// read. Both grammars parse the operand of alignof and offsetof as a type
+// descriptor (offsetof's second operand as a field name), so no identifier
+// of a variable ever stands there and no golden can show the rule: it holds
+// by the grammar. A node Uses what its own evaluation reads, and a value
+// computed at another node reaches it through a variable, as Lowering's Uses
+// rule states.
 //
 // A name that resolves to no variable (Lowering, Names that resolve to no
 // variable: here a file-scope or namespace name, a member named without its
