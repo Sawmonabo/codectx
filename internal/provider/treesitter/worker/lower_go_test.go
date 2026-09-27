@@ -47,6 +47,8 @@ func TestGoLoweringGolden(t *testing.T) {
 			// Go spec, Goto statements: a goto transfers control to the statement with
 			// the corresponding label in the same function; with no label M the
 			// program is invalid, and the goto is lowered unresolved.
+			// Ill-formed on purpose: the compiler rejects it with "label M not
+			// declared"; the case pins how a jump no label resolves is lowered.
 			// Nodes: x@17, x > 0@29, goto M@37 (no label M: no successor),
 			// x++@47. Augmentation adds goto M→EXIT.
 			name:       "dangling goto",
@@ -56,6 +58,7 @@ func TestGoLoweringGolden(t *testing.T) {
 			cd:         []string{"x > 0@29 -> goto M@37", "x > 0@29 -> x++@47"},
 			du:         []string{"x@17 -> x > 0@29", "x@17 -> x++@47"},
 			unresolved: 1,
+			illFormed:  true,
 		},
 		{
 			// Go spec, Break statements and Continue statements: break L terminates
@@ -590,13 +593,13 @@ func TestGoLoweringGolden(t *testing.T) {
 		{
 			// Go spec, Constant declarations, Type declarations and Declarations and
 			// scope: const x and type y shadow the parameters in the inner block
-			// and make no node. Nodes: x@17, y@20, g(x, y)@60 (Uses nothing),
-			// return x + y@71.
+			// and make no node; y(0) is a conversion to the type y. Nodes:
+			// x@17, y@20, g(x, y(0))@60 (Uses nothing), return x + y@74.
 			name:     "a const or type declaration makes no node and shadows",
 			protects: "a name a const or type declaration rebinds is no variable read in its block",
-			mutation: "let a const or type declaration leave the enclosing binding visible (adds x@17 -> g(x, y)@60 and y@20 -> g(x, y)@60)",
-			src:      "package p\nfunc f(x, y int) int { { const x = 2; type y int; g(x, y) }; return x + y }",
-			du:       []string{"x@17 -> return x + y@71", "y@20 -> return x + y@71"},
+			mutation: "let a const or type declaration leave the enclosing binding visible (adds x@17 -> g(x, y(0))@60 and y@20 -> g(x, y(0))@60)",
+			src:      "package p\nfunc f(x, y int) int { { const x = 2; type y int; g(x, y(0)) }; return x + y }",
+			du:       []string{"x@17 -> return x + y@74", "y@20 -> return x + y@74"},
 		},
 		{
 			// Go spec, Go statements and Defer statements: the function value and
@@ -851,13 +854,16 @@ func TestGoLoweringGolden(t *testing.T) {
 		{
 			// Go spec, Break statements: break M names no enclosing statement
 			// labelled M, so the program is invalid; the jump is lowered
-			// unresolved, with no successor. Nodes: for@21 (head), break M@27.
+			// unresolved, with no successor. Ill-formed on purpose: the compiler
+			// rejects it with "invalid break label M"; the case pins how a jump
+			// no frame resolves is lowered. Nodes: for@21 (head), break M@27.
 			// Augmentation adds break M → EXIT.
 			name:       "a break naming no open frame is unresolved",
 			protects:   "a labelled break with no matching frame is counted, never resolved to the innermost loop",
 			mutation:   "resolve a labelled break naming no frame to the innermost loop (unresolved becomes 0)",
 			src:        "package p\nfunc f() { for { break M } }",
 			unresolved: 1,
+			illFormed:  true,
 		},
 		{
 			// Go spec, Select statements: a select with no cases blocks forever.
@@ -912,13 +918,17 @@ func TestGoLoweringGolden(t *testing.T) {
 			// Go spec, For statements with for clause: an absent condition is
 			// equivalent to true. Nodes: n@17, i := 0@30, for@26 (head, one
 			// successor), i > n@49, break@57, i++@40. Succ: for → i > n →
-			// {break, i++}; i++ → for; break → EXIT. IPDom: i++ → for → i > n
-			// → EXIT. Frontier walk: i > n over break, i++, for and itself.
+			// {break, i++}; i++ → for; break → EXIT. Every path from i > n to
+			// EXIT passes break, so IPDom: i++ → for → i > n → break → EXIT,
+			// and break depends on nothing. Frontier walk: i > n over i++, for
+			// and itself. With an exit edge on the head, IPDom(for) and
+			// IPDom(i > n) become EXIT: for controls i > n, i > n controls
+			// break, and i > n no longer controls itself.
 			name:     "a for clause with no condition has a head with no exit edge",
 			protects: "a for clause without a condition leaves only by its break",
-			mutation: "give the head an exit edge (for@26 -> EXIT: i > n@49 no longer controls for@26)",
+			mutation: "give the head an exit edge (for@26 -> EXIT: adds for@26 -> i > n@49 and i > n@49 -> break@57, loses i > n@49 -> i > n@49)",
 			src:      "package p\nfunc f(n int) { for i := 0; ; i++ { if i > n { break } } }",
-			cd:       []string{"i > n@49 -> break@57", "i > n@49 -> i++@40", "i > n@49 -> for@26", "i > n@49 -> i > n@49"},
+			cd:       []string{"i > n@49 -> i++@40", "i > n@49 -> for@26", "i > n@49 -> i > n@49"},
 			du: []string{"n@17 -> i > n@49", "i := 0@30 -> i > n@49", "i++@40 -> i > n@49", "i := 0@30 -> i++@40",
 				"i++@40 -> i++@40"},
 		},
@@ -1064,22 +1074,24 @@ func TestGoLoweringGolden(t *testing.T) {
 				"n++@66 -> n++@66", "n := 0@39 -> return n@73", "n++@66 -> return n@73"},
 		},
 		{
-			// Go spec, Type switches: the alias is declared in each clause, and a
-			// clause's own declaration shadows it. Nodes: v@17, x :=
+			// Go spec, Type switches: the alias is declared in the implicit block
+			// of each clause, and a declaration in a block nested in the clause
+			// shadows it (a `:=` of the alias in the clause's own block declares
+			// no new variable, which the compiler rejects). Nodes: v@17, x :=
 			// v.(type)@37 (head, defines the alias), int@58 and string@78 (type
-			// cases, each Using the alias), return x@63, x := 0@86, return
-			// x@94, return 0@106. Succ: int → {return x@63, string}; string →
+			// cases, each Using the alias), return x@63, x := 0@88, return
+			// x@96, return 0@110. Succ: int → {return x@63, string}; string →
 			// {x := 0, return 0}. IPDom: int, string → EXIT. Frontier walks:
-			// int over return x@63 and string; string over x := 0, return x@94
+			// int over return x@63 and string; string over x := 0, return x@96
 			// and return 0.
 			name:     "a type switch's alias serves every clause and a clause's declaration shadows it",
-			protects: "every clause reads the head's alias, and a clause's own := shadows it for that clause's later reads",
-			mutation: "resolve a clause's read to the alias past its own declaration (x := v.(type)@37 -> return x@94 replaces x := 0@86 -> return x@94), or give a type case after the first no use of the alias (loses x := v.(type)@37 -> string@78)",
-			src:      "package p\nfunc f(v any) int { switch x := v.(type) { case int: return x; case string: x := 0; return x }; return 0 }",
-			cd: []string{"int@58 -> return x@63", "int@58 -> string@78", "string@78 -> x := 0@86",
-				"string@78 -> return x@94", "string@78 -> return 0@106"},
+			protects: "every clause reads the head's alias, and a := in a block nested in a clause shadows it for that block's later reads",
+			mutation: "resolve a clause's read to the alias past a nested declaration (x := v.(type)@37 -> return x@96 replaces x := 0@88 -> return x@96), or give a type case after the first no use of the alias (loses x := v.(type)@37 -> string@78)",
+			src:      "package p\nfunc f(v any) int { switch x := v.(type) { case int: return x; case string: { x := 0; return x } }; return 0 }",
+			cd: []string{"int@58 -> return x@63", "int@58 -> string@78", "string@78 -> x := 0@88",
+				"string@78 -> return x@96", "string@78 -> return 0@110"},
 			du: []string{"v@17 -> x := v.(type)@37", "x := v.(type)@37 -> int@58", "x := v.(type)@37 -> string@78",
-				"x := v.(type)@37 -> return x@63", "x := 0@86 -> return x@94"},
+				"x := v.(type)@37 -> return x@63", "x := 0@88 -> return x@96"},
 		},
 		{
 			// Go spec, Break statements and Continue statements: an unlabelled
@@ -1122,20 +1134,29 @@ func TestGoLoweringGolden(t *testing.T) {
 			du: []string{"x := 0@21 -> g(x)@32", "x@38 -> g(x)@32", "y@41 -> g(y)@52"},
 		},
 		{
-			// Go spec, Labeled statements and Continue statements: L and M both
-			// label the for, so continue L targets it. Nodes: n@17, L@26,
-			// M@29, i := 0@36, i < n@44, i > 1@60, continue L@68, break M@82,
-			// i++@51. Succ: i < n → {i > 1, EXIT}; i > 1 → {continue L,
-			// break M}; continue L → i++ → i < n; break M → EXIT. IPDom:
-			// i > 1 → EXIT; continue L → i++ → i < n → EXIT.
-			name:     "stacked labels all name the labelled loop",
-			protects: "a jump naming the outer of two stacked labels reaches the loop they both label",
-			mutation: "let only the innermost label reach the frame (continue L is unresolved: unresolved 1)",
+			// Go spec, Labeled statements, Break statements and Continue
+			// statements: a break or continue label must be that of an
+			// enclosing for, switch or select. M labels the for; L labels the
+			// labelled statement `M: for …`, so continue L names no frame.
+			// Ill-formed on purpose: the compiler rejects it with "invalid
+			// continue label L"; the case pins that an outer stacked label is
+			// a goto target only. Nodes: n@17, L@26, M@29, i := 0@36, i <
+			// n@44, i > 1@60, continue L@68 (unresolved: no successor), break
+			// M@82, i++@51 (no predecessor: no continue reaches it and the
+			// body always leaves by a jump). Succ: i < n → {i > 1, EXIT};
+			// i > 1 → {continue L, break M}; break M → EXIT; i++ → i < n.
+			// Augmentation adds continue L → EXIT. IPDom: i++ → i < n; every
+			// other node → EXIT. i < n merges i := 0 and i++, whose own use
+			// of i no definition reaches.
+			name:     "an outer stacked label names no loop",
+			protects: "a break or continue naming a label on a labelled statement, not on the loop, is unresolved, never resolved to the loop",
+			mutation: "let every stacked label reach the loop's frame (continue L resolves to i++: unresolved 0, adds i > 1@60 -> i++@51, i > 1@60 -> i < n@44 and i := 0@36 -> i++@51)",
 			src:      "package p\nfunc f(n int) { L: M: for i := 0; i < n; i++ { if i > 1 { continue L }; break M } }",
-			cd: []string{"i < n@44 -> i > 1@60", "i > 1@60 -> continue L@68", "i > 1@60 -> i++@51",
-				"i > 1@60 -> i < n@44", "i > 1@60 -> break M@82"},
+			cd:       []string{"i < n@44 -> i > 1@60", "i > 1@60 -> continue L@68", "i > 1@60 -> break M@82"},
 			du: []string{"n@17 -> i < n@44", "i := 0@36 -> i < n@44", "i++@51 -> i < n@44", "i := 0@36 -> i > 1@60",
-				"i++@51 -> i > 1@60", "i := 0@36 -> i++@51", "i++@51 -> i++@51"},
+				"i++@51 -> i > 1@60"},
+			unresolved: 1,
+			illFormed:  true,
 		},
 		{
 			// Go spec, Logical operators and Operator precedence: a && b || c is
@@ -1153,17 +1174,20 @@ func TestGoLoweringGolden(t *testing.T) {
 				"c@55 -> return a && b || c@38"},
 		},
 		{
-			// A statement the parser cannot recognise: `x )` is taken to recover
-			// as one ERROR node in the statement list (an assumed recovery,
-			// settled by the harness's parse). The lowering's default branch
-			// makes it one Stmt node carrying its reads. Nodes: x@17, g(x)@26,
-			// x )@32, h(x)@37. Straight line.
+			// A statement the parser cannot recognise. Derived against an
+			// assumed recovery: the complete statement g(x) is reduced, and
+			// the identifier y, which no terminator separates from it, is
+			// skipped into an ERROR node of its own among the block's
+			// statements (a stray token that cannot continue the statement,
+			// as a stray `)` is). The lowering's default branch makes that
+			// ERROR node one Stmt node carrying its reads. Nodes: x@17, y@20,
+			// g(x)@29, y@34 (the ERROR node), h(x)@37. Straight line.
 			name:      "an unrecognised statement keeps its reads",
 			protects:  "a syntax error inside a body drops no read of the statement it garbles",
-			mutation:  "let the default branch make no node or collect nothing (loses x@17 -> x )@32)",
-			src:       "package p\nfunc f(x int) { g(x); x ); h(x) }",
+			mutation:  "let the default branch make no node or collect nothing (loses y@20 -> y@34)",
+			src:       "package p\nfunc f(x, y int) { g(x) y; h(x) }",
 			recovered: true,
-			du:        []string{"x@17 -> g(x)@26", "x@17 -> x )@32", "x@17 -> h(x)@37"},
+			du:        []string{"x@17 -> g(x)@29", "y@20 -> y@34", "x@17 -> h(x)@37"},
 		},
 	})
 }
