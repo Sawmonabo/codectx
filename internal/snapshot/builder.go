@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -645,14 +646,22 @@ func (c *capture) inspect(rel string) (fs.FileInfo, bool, error) {
 // header folds the sorted manifest into its aggregate digest and builds the
 // snapshot header. The manifest is streamed from staging; PutSnapshot streams
 // it a second time and validates the counts against the rows it receives.
+//
+// The C and C++ census is counted here and nowhere earlier: a walk pass runs
+// once per recapture and the unseen sweep drops and tombstones rows after it,
+// so only this stream over the settled manifest sees each final row once.
 func (c *capture) header(ctx context.Context, head string) (model.Snapshot, error) {
 	b := c.b
 	h := model.NewHasher(domainManifest)
 	var count, total uint64
+	var census tslang.Census
 	b.notes.LFSPointers, b.notes.LFSPointerCount = nil, 0
 	err := c.st.eachManifest(ctx, func(r row) error {
 		if r.lfs {
 			b.notes.addLFS(r.path)
+		}
+		if r.status != model.FileDeleted {
+			census.Add(r.path)
 		}
 		h.AddString(r.path)
 		h.AddString(string(r.status))
@@ -679,6 +688,8 @@ func (c *capture) header(ctx context.Context, head string) (model.Snapshot, erro
 		SourcePolicyHash:   b.SourcePolicyHash,
 		FileCount:          count,
 		SourceBytes:        total,
+		CUnits:             census.C,
+		CPPUnits:           census.CPP,
 		ManifestHash:       manifest,
 		CreatedAt:          time.Now().UTC(),
 	}

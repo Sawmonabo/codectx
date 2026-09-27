@@ -234,8 +234,9 @@ type Snapshot struct {
 	FileCount          uint64             `json:"file_count"`
 	SourceBytes        uint64             `json:"source_bytes"`
 	// CUnits and CPPUnits are the repository's C and C++ translation units,
-	// counted on the capture's own walk over its paths: the census a header's
-	// grammar is decided from. A header is neither.
+	// counted over the capture's settled manifest: the census a header's
+	// grammar is decided from. A header is neither, and a deleted row is not
+	// a unit, so unlike FileCount they never count a tombstone.
 	CUnits       uint64    `json:"c_units"`
 	CPPUnits     uint64    `json:"cpp_units"`
 	ManifestHash string    `json:"manifest_hash"`
@@ -265,6 +266,16 @@ func (s Snapshot) Validate() error {
 	}
 	if err := boundSigned64("snapshot.source_bytes", s.SourceBytes); err != nil {
 		return err
+	}
+	if err := boundSigned64("snapshot.c_units", s.CUnits); err != nil {
+		return err
+	}
+	if err := boundSigned64("snapshot.cpp_units", s.CPPUnits); err != nil {
+		return err
+	}
+	if s.CUnits > s.FileCount || s.CPPUnits > s.FileCount-s.CUnits {
+		return invalid("snapshot census counts %d C and %d C++ translation units, more than its %d files",
+			s.CUnits, s.CPPUnits, s.FileCount)
 	}
 	if err := boundField("snapshot.head_object_id", s.HeadObjectID, MaxIdentifierBytes); err != nil {
 		return err

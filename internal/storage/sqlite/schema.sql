@@ -46,6 +46,8 @@ CREATE TABLE snapshots (
     manifest_hash TEXT NOT NULL,
     file_count INTEGER NOT NULL CHECK(file_count >= 0),
     source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    c_units INTEGER NOT NULL CHECK(c_units >= 0),
+    cpp_units INTEGER NOT NULL CHECK(cpp_units >= 0),
     capture_consistency TEXT NOT NULL CHECK(capture_consistency IN ('validated_capture','operator_frozen')),
     created_at TEXT NOT NULL,
     UNIQUE(repository_id, id)
