@@ -115,7 +115,8 @@ Chunks are stored once, in the file's own unit, and are the only place a
 source body is copied into the index; symbol documents carry names only.
 Chunking uses the shared `source.PlanChunk`: a chunk is at most 32 KiB
 (`model.MaxSearchBodyBytes`), ends on a line boundary when one fits, and a
-line longer than a chunk is split at a UTF-8 boundary. Consecutive chunks
+line longer than a chunk is split at a legal boundary, never inside a
+well-formed UTF-8 sequence. Consecutive chunks
 overlap by at most two whole lines and at most 1 KiB, so a pathological line
 cannot make the overlap a second copy of the chunk; a chunk that ends inside
 a split line has no overlap. The window held in memory is one chunk.

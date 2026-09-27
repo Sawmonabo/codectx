@@ -62,8 +62,11 @@ func NewCursor(data []byte) *Cursor {
 }
 
 // NewCursorAt returns a cursor over a window of a file: data holds the bytes
-// beginning at startByte, which must be the first byte of the one-based line
-// startLine.
+// beginning at startByte, which is on the one-based line startLine, and before
+// holds the BoundaryContext bytes preceding startByte, fewer only when they
+// begin at a line start or the start of the file. A position on startLine
+// reports its column from startByte, so a window that begins mid-line is the
+// caller's to correct.
 //
 // This is what makes the sparse checkpoints of an Index usable. Serving a range
 // from the middle of a large file would otherwise have to rescan the file from
@@ -71,13 +74,17 @@ func NewCursor(data []byte) *Cursor {
 // that counts lines its own way and disagrees with this one at the first CRLF.
 // Both coordinates are reported in whole-file terms.
 //
-// A window that does not start on a line boundary is rejected: every line and
-// column the cursor then reports would be wrong by a whole line.
-func NewCursorAt(data []byte, startByte uint64, startLine uint32) (*Cursor, error) {
+// A window that starts inside a UTF-8 sequence is rejected. Every later
+// offset of an accepted window is then judged from the window alone: a
+// well-formed sequence covering a later byte cannot begin before a legal
+// start. The window's own end is taken as the file's, so a caller that asks
+// for a position in its last BoundaryContext bytes either holds the window to
+// the end of the file or asks at a boundary PlanChunk already chose.
+func NewCursorAt(before, data []byte, startByte uint64, startLine uint32) (*Cursor, error) {
 	if startLine == 0 {
 		return nil, invalid("line numbers are one-based; a window cannot start at line 0")
 	}
-	if len(data) > 0 && !utf8.RuneStart(data[0]) {
+	if !boundary(before, data) {
 		return nil, invalid("the window starts at byte %d, inside a UTF-8 sequence", startByte)
 	}
 	return &Cursor{data: data, base: startByte, baseLine: startLine, line: startLine, lineStart: 0}, nil
@@ -136,8 +143,9 @@ func (c *Cursor) SourceRange(startLine, startColumn, endLine, endColumn uint32, 
 }
 
 // PositionAt reports the line and UTF-8 byte column of one byte offset. The
-// offset must be a rune boundary: Section 16.2 rejects an offset into a
-// continuation byte rather than serving from the middle of a character.
+// offset must be a boundary: Section 16.2 rejects an offset inside a
+// well-formed UTF-8 sequence rather than serving from the middle of a
+// character.
 func (c *Cursor) PositionAt(offset uint64) (model.Position, error) {
 	if offset < c.base {
 		return model.Position{}, invalid("byte offset %d is before the window, which starts at %d", offset, c.base)
@@ -146,7 +154,7 @@ func (c *Cursor) PositionAt(offset uint64) (model.Position, error) {
 		return model.Position{}, invalid("byte offset %d is past the %d bytes at offset %d", offset, len(c.data), c.base)
 	}
 	idx := int(offset - c.base)
-	if idx < len(c.data) && !utf8.RuneStart(c.data[idx]) {
+	if !boundary(c.data[max(0, idx-BoundaryContext):idx], c.data[idx:]) {
 		return model.Position{}, invalid("byte offset %d is inside a UTF-8 sequence", offset)
 	}
 	// Counting from the start is correct regardless of the cache, and the cache
@@ -220,7 +228,9 @@ func columnOffset(content []byte, column uint32, enc ColumnEncoding) (int, error
 		if int(column) > len(content) {
 			return 0, fmt.Errorf("column is past the %d-byte line", len(content))
 		}
-		if int(column) < len(content) && !utf8.RuneStart(content[column]) {
+		// content begins at a legal line start and ends at a line break or the
+		// end of the file, neither of which a sequence crosses.
+		if !boundary(content[max(0, int(column)-BoundaryContext):column], content[column:]) {
 			return 0, fmt.Errorf("column is inside a UTF-8 sequence")
 		}
 		return int(column), nil
@@ -250,6 +260,68 @@ func columnOffset(content []byte, column uint32, enc ColumnEncoding) (int, error
 	return 0, fmt.Errorf("column is past the end of the line, which holds %d %s units", units, enc)
 }
 
+// BoundaryContext is how many bytes on each side of an offset decide whether
+// it is a boundary: a UTF-8 sequence is at most utf8.UTFMax bytes long.
+const BoundaryContext = utf8.UTFMax - 1
+
+// boundary reports whether the offset between before and after is a legal
+// boundary (Section 16.2). It is illegal only when it is inside a well-formed
+// UTF-8 sequence: when the byte at it continues a sequence that begins at most
+// BoundaryContext bytes earlier and decodes well-formed past it. A
+// continuation byte that belongs to no well-formed sequence is a legal
+// boundary -- a stray byte of invalid UTF-8, served as base64 -- so every byte
+// of every file can be served; rejecting every continuation byte instead would
+// leave a long enough run of them with no legal boundary at all.
+//
+// before holds the bytes preceding the offset, of which only the last
+// BoundaryContext matter; fewer are enough when they begin at a line start or
+// the start of the file, since no sequence crosses a line break. after holds the bytes from the offset to the end of the file, or at
+// least BoundaryContext of them: a sequence cut short by the end of after is
+// judged as if the file ended there.
+func boundary(before, after []byte) bool {
+	if len(after) == 0 || utf8.RuneStart(after[0]) {
+		return true
+	}
+	// Only the nearest byte that is not a continuation byte can begin a
+	// sequence covering the offset: an earlier one's sequence would have to
+	// run through it.
+	for k := 1; k <= BoundaryContext && k <= len(before); k++ {
+		if lead := before[len(before)-k]; utf8.RuneStart(lead) {
+			var seq [utf8.UTFMax]byte
+			n := copy(seq[:], before[len(before)-k:])
+			n += copy(seq[n:], after)
+			// An invalid encoding decodes with size 1, so size > k holds
+			// exactly for a well-formed sequence that runs past the offset.
+			_, size := utf8.DecodeRune(seq[:n])
+			return size <= k
+		}
+	}
+	return true
+}
+
+// Lookbehind keeps the last BoundaryContext bytes of a stream consumed in
+// pieces of any length: the bytes before the stream's current offset that
+// boundary needs. Its zero value is a stream at a line start or the start of
+// the file, where none are needed.
+type Lookbehind struct {
+	b [BoundaryContext]byte
+	n int
+}
+
+// Push records p as the next bytes consumed.
+func (l *Lookbehind) Push(p []byte) {
+	if len(p) >= BoundaryContext {
+		l.n = copy(l.b[:], p[len(p)-BoundaryContext:])
+		return
+	}
+	kept := min(l.n, BoundaryContext-len(p))
+	copy(l.b[:], l.b[l.n-kept:l.n])
+	l.n = kept + copy(l.b[kept:], p)
+}
+
+// Bytes returns the kept bytes, valid until the next Push.
+func (l *Lookbehind) Bytes() []byte { return l.b[:l.n] }
+
 func invalid(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
 }
@@ -278,6 +350,9 @@ type Walker struct {
 	// that line's first byte.
 	line      uint32
 	lineStart uint64
+	// tail is the bytes consumed before at, which decide whether at is a
+	// boundary. A walk starts at a line start, which needs none.
+	tail Lookbehind
 }
 
 // NewWalker starts a walk at a checkpoint, whose Byte must be the first byte of
@@ -300,14 +375,17 @@ func (w *Walker) Advance(chunk []byte) {
 		w.lineStart = w.at + uint64(last) + 1
 	}
 	w.at += uint64(len(chunk))
+	w.tail.Push(chunk)
 }
 
 // PositionAt reports the position of the offset the walk has reached. next
-// holds the file's bytes from that offset -- one byte is enough, and it is
-// empty at end of file -- so the offset is rejected inside a UTF-8 sequence
-// rather than served from the middle of a character, as Cursor.PositionAt does.
+// holds the file's bytes from that offset -- BoundaryContext of them, fewer
+// only at the end of the file -- so the offset is rejected inside a
+// well-formed UTF-8 sequence rather than served from the middle of a
+// character, as Cursor.PositionAt does. The bytes before it are the ones the
+// walk consumed.
 func (w *Walker) PositionAt(next []byte) (model.Position, error) {
-	if len(next) > 0 && !utf8.RuneStart(next[0]) {
+	if !boundary(w.tail.Bytes(), next) {
 		return model.Position{}, invalid("byte offset %d is inside a UTF-8 sequence", w.at)
 	}
 	return model.Position{Byte: w.at, Line: w.line, Column: uint32(w.at - w.lineStart)}, nil

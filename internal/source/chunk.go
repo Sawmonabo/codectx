@@ -21,18 +21,23 @@ type Chunk struct {
 //
 // window must hold exactly the bytes [windowStart, min(windowStart+maxBytes,
 // fileSize)) of the file: the plan only ever shrinks the window, so no
-// lookahead beyond it is needed.
+// lookahead beyond it is needed. before holds the BoundaryContext bytes
+// preceding windowStart, fewer only when they begin at a line start or the
+// start of the file; they decide whether windowStart is a boundary.
 //
-// The rules are Section 16.2's, in order: reject an offset inside a UTF-8
-// sequence; prefer a complete UTF-8 sequence and a complete line when they fit;
+// The rules are Section 16.2's, in order: reject an offset inside a
+// well-formed UTF-8 sequence; prefer a complete UTF-8 sequence and a complete line when they fit;
 // split a line longer than the budget at a valid boundary and report
 // partial_line rather than returning no progress; carry invalid UTF-8
 // losslessly as base64 with byte-based ranges instead of coercing it into
 // replacement characters; and treat the zero-length position at end of file as
 // a valid response.
-func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Chunk, error) {
+func PlanChunk(before, window []byte, windowStart, fileSize uint64, maxBytes uint32) (Chunk, error) {
 	if windowStart > fileSize {
 		return Chunk{}, invalid("offset %d is past the %d-byte file", windowStart, fileSize)
+	}
+	if uint64(len(before)) > windowStart {
+		return Chunk{}, invalid("%d bytes precede offset %d, but %d were handed in as its lookbehind", windowStart, windowStart, len(before))
 	}
 	available := fileSize - windowStart
 	if uint64(len(window)) > available {
@@ -56,7 +61,7 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 	if maxBytes < utf8.UTFMax {
 		return Chunk{}, invalid("a chunk budget of %d bytes cannot carry one UTF-8 code point", maxBytes)
 	}
-	if !utf8.RuneStart(window[0]) {
+	if !boundary(before, window) {
 		return Chunk{}, invalid("offset %d is inside a UTF-8 sequence", windowStart)
 	}
 
@@ -69,14 +74,15 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 
 	partial := false
 	if !atEOF {
-		// Back off to a rune boundary, whatever the window holds. The trim is
-		// not about decodability -- it is what keeps the next chunk's start
-		// legal: a boundary in the middle of a UTF-8 sequence is rejected by
-		// the guard above, so a chunk cut mid-sequence would fail the very
-		// next call and with it the whole unit. Bytes that are not text at
-		// all cost nothing here: the trim only ever moves the boundary, it
-		// never drops a byte, and the next chunk carries what it gave back.
-		if trimmed := trimToRuneBoundary(body); trimmed != len(body) {
+		// Back off to a boundary, whatever the window holds. The trim is not
+		// about decodability -- it is what keeps the next chunk's start
+		// legal: a boundary inside a well-formed UTF-8 sequence is rejected
+		// by the guard above, so a chunk cut there would fail the very next
+		// call and with it the whole unit. The trim only ever moves the
+		// boundary, it never drops a byte, and the next chunk carries what it
+		// gave back. A cut just after a line break is always legal, since no
+		// sequence runs through one.
+		if trimmed := trimToBoundary(body); trimmed != len(body) {
 			end = trimmed
 			body = window[:end]
 		}
@@ -111,37 +117,24 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 	return chunk, nil
 }
 
-// trimToRuneBoundary returns the length of the longest prefix of body that
-// ends on a rune boundary, so the next chunk starts on a byte utf8.RuneStart
-// accepts. It walks back over a run of continuation bytes of any length, not
-// just the at most three a well-formed sequence can have: a file may hold an
-// arbitrarily long run of them, and stopping the walk early would hand the
-// next chunk an illegal start offset and fail the unit.
+// trimToBoundary returns the length of the longest prefix of body whose
+// end is a boundary, judged without the bytes past body. The end can be
+// inside a well-formed sequence only if a sequence begins in the last
+// BoundaryContext bytes and is still incomplete at the edge -- a valid prefix
+// the next bytes might complete -- so exactly that sequence's first byte is
+// given back to the next chunk. Every other end is a boundary whatever
+// follows it: a complete rune, a line break, or a stray continuation byte
+// whose sequence is already not well-formed.
 //
-// It never returns zero. When body holds no rune boundary after its first
-// byte, every cut but the full window would leave the chunk making no
-// progress, so the window is kept whole -- trailing bytes and all. If the byte
-// after that window is itself a continuation byte, the next PlanChunk refuses
-// it: a request whose offset is inside a UTF-8 sequence is CTX_INVALID_INPUT,
-// and a file that holds such a run is unreadable past it rather than served in
-// pieces that do not decode.
-func trimToRuneBoundary(body []byte) int {
-	last := -1
-	for i := len(body) - 1; i >= 0; i-- {
-		if utf8.RuneStart(body[i]) {
-			last = i
-			break
+// It never returns zero: body holds maxBytes >= utf8.UTFMax bytes whenever
+// it is trimmed, so the sequence it gives back begins after its first byte.
+func trimToBoundary(body []byte) int {
+	for k := 1; k <= BoundaryContext && k < len(body); k++ {
+		// FullRune is false exactly for a valid prefix cut short: an
+		// invalid encoding counts as a full, one-byte rune.
+		if lead := len(body) - k; !utf8.FullRune(body[lead:]) {
+			return lead
 		}
 	}
-	if last <= 0 {
-		return len(body)
-	}
-	// A complete sequence ending exactly at the window edge is already on a
-	// boundary. Anything else -- a sequence cut short by the edge, an invalid
-	// start byte, or stray continuation bytes after a complete rune -- is
-	// given back to the next chunk, which then starts at last.
-	if r, size := utf8.DecodeRune(body[last:]); (r != utf8.RuneError || size > 1) && last+size == len(body) {
-		return len(body)
-	}
-	return last
+	return len(body)
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
+	"github.com/Sawmonabo/codectx/internal/source"
 )
 
 // TestHydrateRefusesAnInvertedSpan pins the guard at the top of hydrate. A span
@@ -54,14 +55,14 @@ func TestHydrateRefusesAnInvertedSpan(t *testing.T) {
 	}
 }
 
-// shortTailCAS serves every read faithfully except the one-byte lookahead the
-// walk takes when it lands exactly on the offset, which it truncates to
-// nothing -- the shape a store that no longer holds the blob it recorded
-// presents on that path.
+// shortTailCAS serves every read faithfully except the lookahead of at most
+// source.BoundaryContext bytes the walk takes when it lands exactly on the
+// offset, which it truncates to nothing -- the shape a store that no longer
+// holds the blob it recorded presents on that path.
 type shortTailCAS struct{ cas *snapshot.CAS }
 
 func (s shortTailCAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
-	if r.End-r.Start == 1 {
+	if r.End-r.Start <= source.BoundaryContext {
 		return nil, nil
 	}
 	return s.cas.ReadRange(ctx, rec, r)
@@ -69,9 +70,9 @@ func (s shortTailCAS) ReadRange(ctx context.Context, rec model.BlobRecord, r mod
 
 // TestHydrateFaultsAShortTailRead pins the length check on the COMMON path: the
 // lookahead read is taken whenever the walk landed exactly on the offset, which
-// is every hit at a checkpointed line start. Unchecked, a short read handed
-// PositionAt an empty lookahead and the UTF-8 continuation-byte rejection was
-// silently skipped instead of the store being faulted.
+// is every hit at a checkpointed line start. Unchecked, a short read hands
+// PositionAt a truncated lookahead and the rejection of an offset inside a
+// UTF-8 sequence is silently skipped instead of the store being faulted.
 func TestHydrateFaultsAShortTailRead(t *testing.T) {
 	ctx := context.Background()
 	cas, err := snapshot.OpenCAS(t.TempDir())

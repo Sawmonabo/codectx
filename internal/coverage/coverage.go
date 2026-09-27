@@ -100,9 +100,10 @@ type Sessions interface {
 // Source is the per-snapshot verified read surface. *snapshot.View satisfies
 // it. Read verifies exactly the CAS blocks it touches, walking back to the
 // nearest stored line checkpoint for the line and column context, and returns
-// exactly the requested bytes, rejecting a boundary inside a UTF-8 sequence and
-// a range past the file. The walk back is the view's own cost and does not
-// bound the chunk: it reads that prefix in spans of its own.
+// exactly the requested bytes with the bytes before them that decide whether
+// the start is a boundary, rejecting a start inside a well-formed UTF-8
+// sequence and a range past the file. The walk back is the view's own cost and
+// does not bound the chunk: it reads that prefix in spans of its own.
 //
 // Range.Bytes aliases the buffer the view read, so a caller that retains the
 // slice must copy it first.

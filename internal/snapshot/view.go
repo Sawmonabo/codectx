@@ -159,8 +159,13 @@ func (v *View) ReadRange(ctx context.Context, id model.FileID, r model.ByteRange
 // Range is one verified range read with its whole-file line/column context.
 type Range struct {
 	Bytes []byte
-	Start model.Position
-	End   model.Position
+	// Before holds the source.BoundaryContext bytes preceding Start, fewer
+	// only when a line begins closer: the lookbehind that
+	// decides whether Start is a boundary, for source.PlanChunk to judge it
+	// with. It is a copy and does not alias Bytes.
+	Before []byte
+	Start  model.Position
+	End    model.Position
 }
 
 // Read is ReadRange plus positions: the start and end of the interval in
@@ -178,8 +183,9 @@ type Range struct {
 // make every byte of such a file past that ceiling permanently unreadable, and
 // a required_full file that can never be served can never reach full_served.
 //
-// A boundary inside a UTF-8 sequence is rejected, as Section 16.2 requires of
-// served offsets.
+// A start inside a well-formed UTF-8 sequence is rejected, as Section 16.2
+// requires of served offsets; the prefix walk supplies the bytes before it
+// that decide it.
 func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Range, model.FileVersion, error) {
 	fv, rec, err := v.file(ctx, id)
 	if err != nil {
@@ -192,7 +198,7 @@ func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Ra
 		return Range{}, fv, invalid("byte range ends at %d, past the %d-byte file", r.End, rec.Size)
 	}
 	cp := indexOf(rec).CheckpointFor(r.Start)
-	line, lineStart, err := v.scanTo(ctx, rec, cp, r.Start)
+	line, lineStart, before, err := v.scanTo(ctx, rec, cp, r.Start)
 	if err != nil {
 		return Range{}, fv, err
 	}
@@ -208,7 +214,7 @@ func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Ra
 	// it. A position it reports on the window's first line carries a column
 	// measured from the window rather than from the line, which is the one
 	// thing the prefix walk already knows and is corrected below.
-	cursor, err := source.NewCursorAt(window, r.Start, line)
+	cursor, err := source.NewCursorAt(before, window, r.Start, line)
 	if err != nil {
 		return Range{}, fv, err
 	}
@@ -222,28 +228,33 @@ func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Ra
 		}
 	}
 	start := model.Position{Byte: r.Start, Line: line, Column: startColumn}
-	return Range{Bytes: window, Start: start, End: end}, fv, nil
+	return Range{Bytes: window, Before: before, Start: start, End: end}, fv, nil
 }
 
 // scanTo reads and verifies [cp.Byte, offset) in successive spans no larger
 // than model.MaxRawChunkBytes, the ceiling CAS.ReadRange enforces, and reports
 // the one-based line that holds offset together with the byte at which that
-// line starts. It reads nothing before the checkpoint and retains no span.
-func (v *View) scanTo(ctx context.Context, rec model.BlobRecord, cp source.Checkpoint, offset uint64) (uint32, uint64, error) {
+// line starts, and the last source.BoundaryContext bytes before offset. A
+// checkpoint is a line start, so the fewer bytes a walk shorter than that
+// yields are all the lookbehind offset needs. It reads nothing before the
+// checkpoint and retains no span.
+func (v *View) scanTo(ctx context.Context, rec model.BlobRecord, cp source.Checkpoint, offset uint64) (uint32, uint64, []byte, error) {
 	line, lineStart := cp.Line, cp.Byte
+	var before source.Lookbehind
 	for at := cp.Byte; at < offset; {
 		end := min(at+model.MaxRawChunkBytes, offset)
 		span, err := v.cas.ReadRange(ctx, rec, model.ByteRange{Start: at, End: end})
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		if n := bytes.Count(span, newline); n > 0 {
 			line += uint32(n)
 			lineStart = at + uint64(bytes.LastIndexByte(span, '\n')) + 1
 		}
+		before.Push(span)
 		at = end
 	}
-	return line, lineStart, nil
+	return line, lineStart, bytes.Clone(before.Bytes()), nil
 }
 
 var newline = []byte{'\n'}

@@ -132,10 +132,12 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
 			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-req.Offset, req.Offset, end)}
 	}
-	// PlanChunk owns every boundary rule -- the rune boundary, the complete
-	// line, the over-budget split, the base64 fallback and the zero-length end
-	// of file -- and needs exactly [offset, min(offset+raw, size)).
-	chunk, err := source.PlanChunk(window.Bytes, req.Offset, size, raw)
+	// PlanChunk owns every boundary rule -- the start inside a well-formed
+	// UTF-8 sequence, the complete line, the over-budget split, the base64
+	// fallback and the zero-length end of file -- and needs exactly [offset,
+	// min(offset+raw, size)) plus the bytes before offset the view's prefix
+	// walk read, which decide whether offset is a boundary.
+	chunk, err := source.PlanChunk(window.Before, window.Bytes, req.Offset, size, raw)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
@@ -144,7 +146,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	start := window.Start
 	stop := window.End
 	if chunk.Range.End != end {
-		cursor, err := source.NewCursorAt(window.Bytes, req.Offset, window.Start.Line)
+		cursor, err := source.NewCursorAt(window.Before, window.Bytes, req.Offset, window.Start.Line)
 		if err != nil {
 			return model.ReadChunkResponse{}, err
 		}
