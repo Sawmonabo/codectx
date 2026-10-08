@@ -141,6 +141,9 @@ func (x *goLink) list(n Node) []Node {
 	return l
 }
 
+// is reports a node of kind id; a null node is of no kind.
+func (x *goLink) is(n Node, id uint16) bool { return !n.IsNull() && n.KindId() == id }
+
 // unparen strips the parentheses around an expression or a type.
 func (x *goLink) unparen(n Node) Node {
 	for !n.IsNull() && (n.KindId() == x.k.parenExpression || n.KindId() == x.k.parenType) {
@@ -543,7 +546,7 @@ func (x *goLink) enter(n Node) {
 		left := x.list(n.ChildByFieldId(k.fLeft))
 		x.values(n.ChildByFieldId(k.fRight), func(i int) string {
 			if i < len(left) {
-				if t := x.unparen(left[i]); t.KindId() == k.selectorExpression {
+				if t := x.unparen(left[i]); x.is(t, k.selectorExpression) {
 					if f := goChild(t, k.fField); !f.IsNull() {
 						return x.copied(f)
 					}
@@ -561,16 +564,21 @@ func (x *goLink) enter(n Node) {
 			case k.keyedElement:
 				key, val := goChild(e, k.fKey), goChild(e, k.fValue)
 				field := ""
-				if id := firstNamed(key); !id.IsNull() && (id.KindId() == k.identifier || id.KindId() == k.fieldIdentifier) {
-					field = x.copied(id)
+				if !key.IsNull() {
+					if id := firstNamed(key); x.is(id, k.identifier) || x.is(id, k.fieldIdentifier) {
+						field = x.copied(id)
+					}
 				}
-				x.value(firstNamed(val), field)
+				if !val.IsNull() {
+					x.value(firstNamed(val), field)
+				}
 			case k.literalElement:
 				x.value(firstNamed(e), "")
 			}
 		})
 	case k.callExpression:
 		x.site(n)
+		x.passed(n)
 	}
 }
 
@@ -653,7 +661,7 @@ func (x *goLink) declare(names, values, spec Node) {
 			v = x.typeVar(declared)
 		case len(vals) == len(ids):
 			v = x.valueVar(vals[i])
-			if spec.IsNull() && x.unparen(vals[i]).KindId() == k.funcLiteral {
+			if spec.IsNull() && x.is(x.unparen(vals[i]), k.funcLiteral) {
 				v.bound = true
 			}
 		case len(vals) == 1 && i == 0:
@@ -692,6 +700,11 @@ func (x *goLink) valueVar(e Node) goVar {
 		}
 		if f, ok := x.funcs[x.text(e)]; ok {
 			return f
+		}
+	}
+	if e.KindId() == x.k.selectorExpression {
+		if fn := x.selected(e); fn != "" {
+			return goVar{typ: wire.Type{Kind: wire.TypeFunction, Name: fn}}
 		}
 	}
 	return goVar{typ: x.exprType(e)}
@@ -798,9 +811,9 @@ func (x *goLink) exprType(e Node) wire.Type {
 			return wire.Type{Kind: wire.TypeNamed, Name: name}
 		}
 	case k.callExpression:
-		if f := x.unparen(e.ChildByFieldId(k.fFunction)); f.KindId() == k.identifier && x.text(f) == "new" && !x.local("new") {
-			if arg := firstNamed(goChild(e, k.fArguments)); !arg.IsNull() {
-				if name := x.baseName(arg); name != "" {
+		if f := x.unparen(e.ChildByFieldId(k.fFunction)); x.is(f, k.identifier) && x.text(f) == "new" && !x.local("new") {
+			if args := goChild(e, k.fArguments); !args.IsNull() {
+				if name := x.baseName(firstNamed(args)); name != "" {
 					return wire.Type{Kind: wire.TypeNamed, Name: name}
 				}
 			}
@@ -843,13 +856,13 @@ func goCopiedType(t wire.Type) wire.Type {
 
 // isImport reports an operand that names an import no local shadows.
 func (x *goLink) isImport(o Node) bool {
-	return o.KindId() == x.k.identifier && x.imports[x.text(o)] && !x.local(x.text(o))
+	return x.is(o, x.k.identifier) && x.imports[x.text(o)] && !x.local(x.text(o))
 }
 
 // isType reports an operand that names a type the file declares and no
 // local shadows: the operand of a method expression `T.M`.
 func (x *goLink) isType(o Node) bool {
-	if o.KindId() != x.k.identifier || x.local(x.text(o)) {
+	if !x.is(o, x.k.identifier) || x.local(x.text(o)) {
 		return false
 	}
 	if _, ok := x.tops[x.text(o)]; ok {
@@ -880,7 +893,8 @@ func (x *goLink) callee(call Node) Node {
 	return Node{}
 }
 
-// site appends a call expression's site and the values its arguments pass.
+// site appends a call expression's site, when its callee is a call
+// reference.
 func (x *goLink) site(call Node) {
 	k := x.k
 	name := x.callee(call)
@@ -910,17 +924,22 @@ func (x *goLink) site(call Node) {
 			s.Receiver = goCopiedType(t)
 		}
 	}
-	args := goChild(call, k.fArguments)
-	isNew := f.KindId() == k.identifier && (x.text(f) == "new" || x.text(f) == "make") && !x.local(x.text(f))
-	if !args.IsNull() {
-		goNamed(args, func(a Node) {
-			s.Args = append(s.Args, goCopiedType(x.exprType(a)))
-			if !isNew {
-				x.value(a, "")
-			}
-		})
+	if args := goChild(call, k.fArguments); !args.IsNull() {
+		goNamed(args, func(a Node) { s.Args = append(s.Args, goCopiedType(x.exprType(a))) })
 	}
 	x.out.Sites = append(x.out.Sites, s)
+}
+
+// passed sends the values a call's arguments pass, whatever its callee; the
+// arguments of new and make are types.
+func (x *goLink) passed(call Node) {
+	f := call.ChildByFieldId(x.k.fFunction)
+	if !f.IsNull() && f.KindId() == x.k.identifier && (x.text(f) == "new" || x.text(f) == "make") && !x.local(x.text(f)) {
+		return
+	}
+	if args := goChild(call, x.k.fArguments); !args.IsNull() {
+		goNamed(args, func(a Node) { x.value(a, "") })
+	}
 }
 
 // values sends a value for every function in a list of values, each written
@@ -958,26 +977,33 @@ func (x *goLink) value(e Node, field string) {
 		}
 		fn = name
 	case k.selectorExpression:
-		o, f := x.unparen(e.ChildByFieldId(k.fOperand)), goChild(e, k.fField)
-		if f.IsNull() {
-			break
-		}
-		switch {
-		case x.isImport(o) || x.isType(o):
-			fn = x.text(o) + "." + x.text(f)
-		default:
-			if t := x.exprType(o); t.Kind == wire.TypeNamed {
-				if _, isField := x.types[t.Name][x.text(f)]; !isField {
-					fn = t.Name + "." + x.text(f)
-				}
-			}
-		}
+		fn = x.selected(e)
 	}
 	if fn == "" {
 		return
 	}
 	x.out.Values = append(x.out.Values, wire.Value{At: goSpan(e), Field: field,
 		Type: wire.Type{Kind: wire.TypeFunction, Name: strings.Clone(fn)}})
+}
+
+// selected is the function a selector takes as a value: "pkg.F" through an
+// import, "T.M" for a method expression on a file type, and "T.M" for a
+// method value whose receiver's type T is recovered and declares no field M;
+// empty for any other selector.
+func (x *goLink) selected(e Node) string {
+	o, f := x.unparen(e.ChildByFieldId(x.k.fOperand)), goChild(e, x.k.fField)
+	switch {
+	case f.IsNull():
+		return ""
+	case x.isImport(o) || x.isType(o):
+		return x.text(o) + "." + x.text(f)
+	}
+	if t := x.exprType(o); t.Kind == wire.TypeNamed {
+		if _, isField := x.types[t.Name][x.text(f)]; !isField {
+			return t.Name + "." + x.text(f)
+		}
+	}
+	return ""
 }
 
 // goPredeclared are the predeclared identifiers that are values but never
@@ -1040,7 +1066,7 @@ func (x *goLink) boundFunctions(n Node) {
 // goLinkSyntax holds the kind and field ids the Go linker matches, resolved
 // once by name against the pinned grammar. Fields the registry does not
 // list (field, path, key, arguments) are read from each child's own record
-// (child), never through ChildByFieldId.
+// (goChild), never through ChildByFieldId.
 type goLinkSyntax struct {
 	identifier, fieldIdentifier, typeIdentifier, packageIdentifier, sourceFile, block, expressionList,
 	parenExpression, parenType, callExpression, selectorExpression, unaryExpression, compositeLiteral,
