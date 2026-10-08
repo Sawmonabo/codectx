@@ -364,8 +364,8 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.declared), cap(b.declared))*int(unsafe.Sizeof(Span{}))
 }
 
-// release drops every scratch list's backing array. Arena.Begin calls it,
-// before reset, when the release rule fires.
+// release drops every scratch list's backing array. Arena.Release calls
+// it.
 func (b *Builder) release() {
 	*b = Builder{}
 }
