@@ -211,49 +211,14 @@ func TestImport(t *testing.T) {
 		export string
 		check  func(t *testing.T, rep graphcsv.Report, c counts)
 	}{{
-		// Failure mode: a frontend's write lowering is not understood and the
-		// unit publishes no reads/writes at all, silently losing the only
-		// honest source of write facts (no SCIP indexer sets a write role).
-		name: "c reads and writes", src: "src/c", export: "c",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
-			// `s->f = 3` writes the member the base type declares, and the
-			// `<global> g` closure binding makes the flow a capture.
-			if c.node[model.NodeField] == 0 {
-				t.Errorf("no field declaration published; indirect field writes did not resolve")
-			}
-			if c.detail["reaching_def capture"] == 0 {
-				t.Errorf("no capture detail published; a flow through a global was labelled intraprocedural")
-			}
-			// Failure mode: a method taken as a value never anchors, so every
-			// fact that would name the method the value carries -- and with it
-			// any call made through that value -- is silently dropped. The
-			// export's METHOD_REF for `run` is the only node here whose REF
-			// edge names a method rather than a declaration.
-			if !c.has(model.RelDataFlowsTo, "function:<global>", "function:run") {
-				t.Errorf("the method the reference names is not an endpoint of the flow that reaches it; "+
-					"the method reference did not anchor (edges = %d)", len(c.edges))
-			}
-		},
+		name: "c", src: "src/c", export: "c",
 	}, {
-		name: "go reads and writes", src: "src/golang", export: "golang",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
-		},
+		name: "go", src: "src/golang", export: "golang",
 	}, {
-		name: "java reads and writes", src: "src/javasrc", export: "javasrc",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
-		},
+		name: "java", src: "src/javasrc", export: "javasrc",
 	}, {
-		name: "javascript reads and writes", src: "src/jssrc", export: "jssrc",
+		name: "javascript invented callee", src: "src/jssrc", export: "jssrc",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo, model.RelMayReferTo)
-			// Failure mode: a destructuring or computed target is published as
-			// a precise write against a guessed declaration.
-			if rep.UnresolvedWrites == 0 {
-				t.Errorf("no unresolved write shape reported; a guessed target would be published as a precise write")
-			}
 			// Failure mode: the export marks a callee it invented -- a method
 			// it emitted with no definition anywhere in the graph, so that an
 			// unresolved site still has a target -- and the import drops the
@@ -270,17 +235,13 @@ func TestImport(t *testing.T) {
 			}
 		},
 	}, {
-		name: "python reads and writes", src: "src/pythonsrc", export: "pythonsrc",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo, model.RelMayReferTo)
-		},
+		name: "python", src: "src/pythonsrc", export: "pythonsrc",
 	}, {
 		// Failure mode: an export label this import does not map is emitted as
 		// a fact instead of being counted. The Rust export's CONFIG_FILE row
 		// (its Cargo.toml) is the real unmapped label.
-		name: "rust reads and writes, unknown label counted", src: "src/rust", export: "rust",
+		name: "rust unknown label counted", src: "src/rust", export: "rust",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelWrites, model.RelReads, model.RelDataFlowsTo)
 			if rep.UnknownLabels["CONFIG_FILE"] != 1 {
 				t.Errorf("unknown labels = %v; the export's CONFIG_FILE row must be counted, not emitted", rep.UnknownLabels)
 			}
@@ -289,30 +250,26 @@ func TestImport(t *testing.T) {
 			}
 		},
 	}, {
-		// Failure mode: control dependence or calls silently publish nothing,
-		// so a declared capability is empty. Also the forward-id case: every
-		// edges_* file sorts before every nodes_* file, so every relation here
-		// was staged before its endpoints' rows were read.
-		name: "calls and control dependence", src: "src/gofix", export: "gofix",
+		// Failure mode: calls silently publish nothing, so the one declared
+		// capability is empty while the export holds control dependence, data
+		// flow and assignments the import must leave to the structural
+		// provider (the loop below asserts none of them reached the sink).
+		// Also the forward-id case: every edges_* file sorts before every
+		// nodes_* file, so every relation here was staged before its
+		// endpoints' rows were read.
+		name: "calls", src: "src/gofix", export: "gofix",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelCalls, model.RelControlDependsOn, model.RelDataFlowsTo,
-				model.RelReads, model.RelWrites)
-			if c.detail["cdg"] == 0 || c.detail["call"] == 0 {
-				t.Errorf("evidence details = %v; want cdg and call", c.detail)
+			wantRelations(t, c, model.RelCalls)
+			if c.detail["call"] == 0 {
+				t.Errorf("evidence details = %v; want call", c.detail)
 			}
 		},
 	}, {
-		// Failure mode: a method reached through a variable (`const f =
-		// helper; f(i)`) leaves no fact at all, because the method reference
-		// the export binds to the method never anchors. What the export does
-		// NOT carry is the call: `f(i)` is bound to an invented callee named
-		// `f`, never to `helper`, so the dependence on `helper` exists only as
-		// the flow of the method value into the name that is called.
+		// A method reached through a variable (`const f = helper; f(i)`): the
+		// export binds `f(i)` to an invented callee named `f`, never to
+		// `helper`, and the call edge must say exactly that.
 		name: "javascript method reached through a value", src: "src/jsvalue", export: "jsvalue",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
-				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
-			}
 			if !c.has(model.RelCalls, "function:run", "function:f") || c.names(model.RelCalls, "function:helper") {
 				t.Errorf("the call through the value resolved to something other than the export's invented callee")
 			}
@@ -342,12 +299,9 @@ func TestImport(t *testing.T) {
 		},
 	}, {
 		// Same shape in Python, where the export binds the call site to
-		// nothing at all rather than to an invented callee.
+		// nothing at all: no call may be fabricated for it.
 		name: "python method reached through a value", src: "src/pyvalue", export: "pyvalue",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
-				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
-			}
 			if c.rel[model.RelCalls] != 0 {
 				t.Errorf("calls = %d; the export binds this call site to no callee at all", c.rel[model.RelCalls])
 			}
@@ -381,7 +335,22 @@ func TestImport(t *testing.T) {
 				t.Errorf("full import reported %d/%d changed and %d removed; every key is new against the absent set",
 					rep.Changed, rep.Keys.Count(), rep.Removed)
 			}
-			tc.check(t, rep, c)
+			// Failure mode: the import still publishes a family the structural
+			// provider now owns, so storage holds two producers' facts for one
+			// relation and every consumer double-counts it. The language
+			// fixtures' exports carry the CDG, REACHING_DEF and assignment rows
+			// those families were derived from, so each language is a case.
+			// Mutation that fails it: restore the control_depends_on INSERT in
+			// scratch.project -- the gofix case then publishes that kind.
+			for _, kind := range []model.RelationKind{model.RelControlDependsOn, model.RelDataFlowsTo,
+				model.RelReads, model.RelWrites} {
+				if c.rel[kind] != 0 {
+					t.Errorf("%d %s relations put to the sink; that family is the structural provider's", c.rel[kind], kind)
+				}
+			}
+			if tc.check != nil {
+				tc.check(t, rep, c)
+			}
 		})
 	}
 }
@@ -421,7 +390,7 @@ func TestImportRefusesMalformedExport(t *testing.T) {
 		if rep.DroppedMethods == 0 {
 			t.Fatalf("no entity was dropped although no exported path is in the snapshot")
 		}
-		if n := c.node[model.NodeFunction] + c.node[model.NodeVariable] + c.node[model.NodeField]; n != 0 {
+		if n := c.node[model.NodeFunction]; n != 0 {
 			t.Fatalf("%d nodes published from an export whose paths are not in the snapshot", n)
 		}
 	})
@@ -534,7 +503,7 @@ func TestImportDelta(t *testing.T) {
 // capabilities are the relation kinds this package publishes.
 func descriptor() model.ProviderDescriptor {
 	return model.ProviderDescriptor{ID: graphcsv.ProviderID, Version: "test-1",
-		Capabilities:      []string{"control_depends_on", "data_flows_to", "reads", "writes", "calls"},
+		Capabilities:      []string{"calls"},
 		InvalidationScope: model.InvalidationPackage}
 }
 
@@ -1003,20 +972,21 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 // or a projection query carrying a `LIMIT bound+1` that truncated it, would be
 // a refusal or a silent cut on a count that belongs to the analysed source. The
 // equality assertions below are what catch a truncation: a LIMIT under a bound
-// of 1 leaves two occurrences and every published relation behind it.
+// of 1 leaves the JavaScript fixture's other call occurrences and every
+// published relation behind them.
 func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
-	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
-	whole, _, _, err := run(t, src, export, graphcsv.Options{Language: "go"})
+	src, export := filepath.Join("testdata", "src", "jssrc"), filepath.Join("testdata", "jssrc")
+	whole, _, _, err := run(t, src, export, graphcsv.Options{Language: "javascript"})
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if whole.DerivedRows == 0 {
-		t.Fatalf("the import derived no occurrences, so the bound below proves nothing")
+	if whole.DerivedRows < 2 {
+		t.Fatalf("the import derived %d occurrences, so the bound of 1 below proves nothing", whole.DerivedRows)
 	}
 	if whole.OverDerivedRows {
 		t.Fatalf("an import with no max_derived_rows reported crossing one")
 	}
-	bounded, _, state, err := run(t, src, export, graphcsv.Options{Language: "go", MaxDerivedRows: 1})
+	bounded, _, state, err := run(t, src, export, graphcsv.Options{Language: "javascript", MaxDerivedRows: 1})
 	if err != nil {
 		t.Fatalf("an import over max_derived_rows must not fail the unit: %v", err)
 	}

@@ -313,12 +313,10 @@ func importCSVFile(ctx context.Context, sc *scratch, path, label string, edge bo
 		}
 		n.name, n.fullName, n.signature = cols.get(rec, "NAME"), cols.get(rec, "FULL_NAME"), cols.get(rec, "SIGNATURE")
 		n.canonicalName, n.filename, n.code = cols.get(rec, "CANONICAL_NAME"), cols.get(rec, "FILENAME"), cols.get(rec, "CODE")
-		n.methodFullName, n.typeFullName = cols.get(rec, "METHOD_FULL_NAME"), cols.get(rec, "TYPE_FULL_NAME")
-		n.closureBinding = cols.get(rec, "CLOSURE_BINDING_ID")
+		n.methodFullName = cols.get(rec, "METHOD_FULL_NAME")
 		n.line = optInt(cols.get(rec, "LINE_NUMBER"))
 		n.lineEnd = optInt(cols.get(rec, "LINE_NUMBER_END"))
 		n.col = optInt(cols.get(rec, "COLUMN_NUMBER"))
-		n.argIndex = optInt(cols.get(rec, "ARGUMENT_INDEX"))
 		n.isExternal = strings.EqualFold(strings.TrimSpace(cols.get(rec, "IS_EXTERNAL")), "true")
 		n.astParent = cols.get(rec, "AST_PARENT_FULL_NAME")
 		if err := sc.putNode(ctx, n); err != nil {

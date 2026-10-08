@@ -32,7 +32,6 @@ type emitter struct {
 	external                  int // declarations the export marked external
 	dropped                   int // entities refused: unmatched path or oversized attribute
 	noRange                   int // located facts whose coordinates did not verify
-	unresolved                int // assignment targets published as may_refer_to
 	clipped                   int // evidence rows over the effective per-fact clip
 	// truncatedFields counts, by field name, the descriptive storage values
 	// this import cut to their model ceiling before writing them to the sink.
@@ -183,7 +182,7 @@ func (e *emitter) locateItem(ctx context.Context, it located, f *sourceFile) err
 		// The path is not in the pinned snapshot. A published entity there
 		// cannot be bound to source and is refused; an occurrence site keeps
 		// its relation but carries no source binding.
-		if _, isEnt := entityLabels[it.label]; isEnt {
+		if it.label == labelMethod {
 			ok = 0
 			e.dropped++
 		} else {
@@ -200,11 +199,6 @@ func (e *emitter) locateItem(ctx context.Context, it located, f *sourceFile) err
 		return err
 	}
 	return e.sc.staged(ctx)
-}
-
-// entityLabels are the labels a published entity can carry.
-var entityLabels = map[string]struct{}{
-	labelMethod: {}, labelLocal: {}, labelParamIn: {}, labelMember: {},
 }
 
 // openSource maps a root-relative path to the snapshot file it names and
@@ -423,14 +417,13 @@ func nativeMethodKey(fullName string) string { return ProviderID + ":method:" + 
 // entity is one published graph entity being identified.
 type entity struct {
 	id                               int64
-	kind, label                      string
 	name, canonical, fullName        string
 	signature                        string
 	ownerFullName                    string
 	fileID, hash, lang, rng, relPath string
 	code                             string
 	file                             sql.NullInt64
-	line, lineEnd, col               sql.NullInt64
+	line, lineEnd                    sql.NullInt64
 	external, speculated             bool
 }
 
@@ -458,8 +451,8 @@ func (e *emitter) identify(ctx context.Context) error {
 	}
 	after := int64(math.MinInt64)
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.id, t.kind, n.label, n.name, n.canonical_name, n.full_name, n.signature,
-			n.line, n.line_end, n.col, t.external, iv.id IS NOT NULL, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.id, n.name, n.canonical_name, n.full_name, n.signature,
+			n.line, n.line_end, t.external, iv.id IS NOT NULL, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
 			l.range_text, COALESCE(f.path, ''), COALESCE(o.full_name, ''),
 			COALESCE((SELECT c.code FROM code c WHERE c.id = t.id ORDER BY c.seq LIMIT 1), '')
 			FROM ents t JOIN nodes n ON n.id = t.id JOIN loc l ON l.node = t.id
@@ -473,7 +466,7 @@ func (e *emitter) identify(ctx context.Context) error {
 		for rows.Next() {
 			var it entity
 			var ext, spec int64
-			if err := rows.Scan(&it.id, &it.kind, &it.label, &it.name, &it.canonical, &it.fullName, &it.signature, &it.line, &it.lineEnd, &it.col,
+			if err := rows.Scan(&it.id, &it.name, &it.canonical, &it.fullName, &it.signature, &it.line, &it.lineEnd,
 				&ext, &spec, &it.file, &it.fileID, &it.hash, &it.lang, &it.rng, &it.relPath, &it.ownerFullName, &it.code); err != nil {
 				rows.Close()
 				return internalErr("import identify: %v", err)
@@ -511,16 +504,7 @@ func (e *emitter) identify(ctx context.Context) error {
 }
 
 func (e *emitter) identifyOne(ctx context.Context, it entity) error {
-	name, kind := it.name, model.NodeFunction
-	switch it.label {
-	case labelMember:
-		kind = model.NodeField
-	case labelLocal, labelParamIn:
-		kind = model.NodeVariable
-	}
-	if it.kind == kindUnresolved {
-		kind = model.NodeVariable
-	}
+	name := it.name
 	if name == "" {
 		name = it.canonical
 	}
@@ -528,21 +512,15 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		name = e.cut("name", it.code, model.MaxNameBytes)
 	}
 	qualified := it.fullName
-	if qualified == "" && it.ownerFullName != "" && name != "" && it.kind != kindUnresolved {
+	if qualified == "" && it.ownerFullName != "" && name != "" {
 		qualified = it.ownerFullName + "." + name
 	}
 	if name == "" {
 		name = qualified
 	}
 	native := nativeMethodKey(qualified)
-	switch it.kind {
-	case kindDecl:
-		native = ProviderID + ":decl:" + qualified + "@" + nullStr(it.line) + ":" + nullStr(it.col)
-	case kindUnresolved:
-		native = ProviderID + ":unresolved:" + it.ownerFullName + "#" + name
-	}
 	scope := e.opts.UnitScopeKey
-	if it.relPath != "" && it.kind != kindUnresolved {
+	if it.relPath != "" {
 		scope = "file:" + it.relPath
 	}
 	// Only the identity half still refuses the entity. native and scope are
@@ -560,13 +538,13 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	// nothing. The local name and qualified name stay whole below, because
 	// they are read there as key material — the fact key and the evidence
 	// native key — which a cut would silently re-mint.
-	cand := model.NodeCandidate{ProviderID: ProviderID, ScopeKey: scope, NativeKey: native, Kind: kind,
+	cand := model.NodeCandidate{ProviderID: ProviderID, ScopeKey: scope, NativeKey: native, Kind: model.NodeFunction,
 		Name:      e.cut("name", name, model.MaxNameBytes),
 		Signature: e.cut("signature", it.signature, model.MaxSignatureBytes),
 		Language:  e.language}
 	cand.QualifiedName = e.cut("qualified_name", qualified, model.MaxQualifiedNameBytes)
 	evFile, evHash := model.FileID(it.fileID), it.hash
-	if it.relPath != "" && it.kind != kindUnresolved {
+	if it.relPath != "" {
 		// A located declaration keys on its exact declaration range, which is
 		// how a structural provider and this import mint one identity.
 		cand.Language = it.lang
@@ -584,24 +562,14 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 				cand.StrongKey = key
 			}
 		}
-	} else if it.kind == kindUnresolved {
-		// A target shape the export did not bind is a provider-local
-		// unresolved entity: no qualified name, no location, no merge with
-		// another entity by short name (Section 9.4).
-		cand.QualifiedName = ""
-		qualified = ""
 	}
 	res, err := e.res.Resolve(ctx, cand)
 	if err != nil {
 		return err
 	}
 	node := res.Node
-	if meta := resolutionMetadata(res, it.external, it.kind == kindUnresolved, it.speculated); meta != nil {
+	if meta := resolutionMetadata(res, it.external, it.speculated); meta != nil {
 		node.Metadata = meta
-	}
-	detail := detailCall
-	if it.kind != kindMethod {
-		detail = detailAssignment
 	}
 	// The fact is stored as the node plus the fields its one evidence row is
 	// rebuilt from at emission; the evidence itself repeats the unit, run and
@@ -611,7 +579,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		return internalErr("import identify: %v", err)
 	}
 	aliasList := []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: cand.NativeKey, NodeID: node.ID}}
-	if it.kind == kindMethod && qualified != "" && cand.ScopeKey != provider.ScopeWorkspace {
+	if qualified != "" && cand.ScopeKey != provider.ScopeWorkspace {
 		// The full-name alias is unit independent: it is how a stub in
 		// another unit binds to this declaration.
 		aliasList = append(aliasList, model.NativeAlias{ScopeKey: provider.ScopeWorkspace, NativeKey: native, NodeID: node.ID})
@@ -620,16 +588,15 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	if err != nil {
 		return internalErr("import identify: %v", err)
 	}
-	label := "node:" + it.kind
 	keyOwner := e.keyOwner(it.fullName, it.ownerFullName)
 	positional := e.positional(it.fullName, it.ownerFullName, it.rng, it.name, it.signature)
-	key := FactKey(label, keyOwner, it.relPath, "", name, positional, "")
+	key := FactKey(factNodeMethod, keyOwner, it.relPath, "", name, positional, "")
 	if err := e.sc.exec(ctx, `INSERT INTO ident(ent, node_id, key, alias_json) VALUES(?,?,?,?)`,
 		it.id, string(node.ID), key, string(aliasJSON)); err != nil {
 		return err
 	}
 	if err := e.sc.exec(ctx, `INSERT INTO facts(ent, node_json, canonical_key, file, range_text, native_key, detail) VALUES(?,?,?,?,?,?,?)`,
-		it.id, string(nodeJSON), res.CanonicalKey, it.file, it.rng, e.boundedNativeKey(qualified), e.cut("detail", detail, model.MaxDetailBytes)); err != nil {
+		it.id, string(nodeJSON), res.CanonicalKey, it.file, it.rng, e.boundedNativeKey(qualified), e.cut("detail", detailCall, model.MaxDetailBytes)); err != nil {
 		return err
 	}
 	if err := e.sc.staged(ctx); err != nil {
@@ -651,12 +618,8 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	return nil
 }
 
-// Entity kinds staged in the scratch.
-const (
-	kindMethod     = "method"
-	kindDecl       = "decl"
-	kindUnresolved = "unres"
-)
+// factNodeMethod is the fact-key label of a published method.
+const factNodeMethod = "node:method"
 
 // formatRange is the staged form of a verified range: its six coordinates
 // in decimal, which is a fifth of the JSON form and is parsed without one.
@@ -717,13 +680,14 @@ func rangeDigest(ranges ...string) string {
 }
 
 // resolutionMetadata is the node metadata that tells a consumer of the graph
-// answers what kind of identity this is: one the export could not bind, one it
-// bound several ways, one it invented, or one that lives outside the unit.
-// Nothing else carries that distinction to a caller, because a traversal
-// answers with nodes and relations and never with the evidence behind them.
-func resolutionMetadata(res model.Resolution, external, unresolved, speculated bool) json.RawMessage {
+// answers what kind of identity this is: one the resolver could not bind, one
+// it bound several ways, one the export invented, or one that lives outside
+// the unit. Nothing else carries that distinction to a caller, because a
+// traversal answers with nodes and relations and never with the evidence
+// behind them.
+func resolutionMetadata(res model.Resolution, external, speculated bool) json.RawMessage {
 	switch {
-	case unresolved || res.Basis == model.MatchUnresolved:
+	case res.Basis == model.MatchUnresolved:
 		return json.RawMessage(`{"resolution":"unresolved","candidates":0}`)
 	case len(res.Ambiguous) > 0:
 		return json.RawMessage(`{"resolution":"ambiguous","candidates":` + strconv.Itoa(len(res.Ambiguous)+1) + `}`)
@@ -771,11 +735,10 @@ func (e *emitter) evidence(node model.NodeID, rel model.RelationID, file model.F
 // The projection is read in (kind, from entity, to entity, site) order, so
 // the occurrences of one edge arrive together and are appended in that
 // order to the in-order stream, which the emission then reads front to back
-// with no sort at all. Two cases cannot be grouped that way and go to a
-// second, sorted stream: an edge whose endpoint is an identity several
-// entities resolved to, because its occurrences come from several entity
-// pairs; and may_refer_to, whose target an ambiguous resolution names
-// directly rather than through an entity.
+// with no sort at all. An edge whose endpoint is an identity several entities
+// resolved to cannot be grouped that way, because its occurrences come from
+// several entity pairs, and goes to the second, sorted stream, beside the
+// may_refer_to edges identify staged there for ambiguous resolutions.
 //
 // Occurrences with identical evidence identity collapse to the first staged;
 // distinct ranges stay distinct.
@@ -787,7 +750,6 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 	type key struct {
 		kind           string
 		from, to, site int64
-		op, target     string
 	}
 	after := key{from: math.MinInt64, to: math.MinInt64, site: math.MinInt64}
 	type group struct {
@@ -797,7 +759,7 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 	var open group
 	seen := map[model.EvidenceID]bool{}
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name, p.detail,
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT p.kind, p.from_e, p.to_e, p.site, p.detail,
 			f.node_id, t.node_id, s.file, COALESCE(fl.file_id, ''), COALESCE(fl.content_hash, ''), s.range_text, COALESCE(fl.path, ''),
 			COALESCE(o.full_name, ''), COALESCE((SELECT c.code FROM code c WHERE c.id = p.site ORDER BY c.seq LIMIT 1), ''),
 			COALESCE(cn.name, ''),
@@ -805,9 +767,9 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 			FROM projs p JOIN ident f ON f.ent = p.from_e JOIN ident t ON t.ent = p.to_e JOIN loc s ON s.node = p.site
 			LEFT JOIN files fl ON fl.id = s.file LEFT JOIN attr a ON a.id = p.site LEFT JOIN nodes o ON o.id = a.owner
 			LEFT JOIN nodes cn ON cn.id = p.site
-			WHERE (p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name) > (?,?,?,?,?,?)
-			ORDER BY p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name LIMIT ?`,
-			after.kind, after.from, after.to, after.site, after.op, after.target, pageSize)
+			WHERE (p.kind, p.from_e, p.to_e, p.site) > (?,?,?,?)
+			ORDER BY p.kind, p.from_e, p.to_e, p.site LIMIT ?`,
+			after.kind, after.from, after.to, after.site, pageSize)
 		if err != nil {
 			return internalErr("import relations: %v", err)
 		}
@@ -820,7 +782,7 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 		var page []occ
 		for rows.Next() {
 			var o occ
-			if err := rows.Scan(&o.kind, &o.key.from, &o.key.to, &o.site, &o.op, &o.key.target, &o.detail,
+			if err := rows.Scan(&o.kind, &o.key.from, &o.key.to, &o.site, &o.detail,
 				&o.from, &o.to, &o.file, &o.fileID, &o.hash, &o.rng, &o.relPath, &o.owner, &o.code, &o.siteName, &o.apart); err != nil {
 				rows.Close()
 				return internalErr("import relations: %v", err)
@@ -835,13 +797,13 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 			break
 		}
 		for _, o := range page {
-			kind, ok := relationKinds[o.kind]
-			if !ok {
+			kind := model.RelationKind(o.kind)
+			if kind != model.RelCalls {
 				return internalErr("import relations: unknown projection %q", o.kind)
 			}
-			factKey := FactKey("rel:"+o.kind, o.owner, o.relPath, o.op, o.key.target,
-				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target), o.from+keySep+o.to)
-			if o.apart || kind == model.RelMayReferTo {
+			factKey := FactKey("rel:"+o.kind, o.owner, o.relPath, "", "",
+				e.positional("", o.owner, o.rng, o.code, o.siteName, ""), o.from+keySep+o.to)
+			if o.apart {
 				if err := e.stageRelation(ctx, model.NodeID(o.from), kind, model.NodeID(o.to), o.file, model.FileID(o.fileID),
 					o.hash, o.rng, o.owner, o.detail, factKey); err != nil {
 					return err
@@ -885,16 +847,6 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// relationKinds maps a projection kind to its published relation.
-var relationKinds = map[string]model.RelationKind{
-	"calls":              model.RelCalls,
-	"control_depends_on": model.RelControlDependsOn,
-	"data_flows_to":      model.RelDataFlowsTo,
-	"reads":              model.RelReads,
-	"writes":             model.RelWrites,
-	"may_refer_to":       model.RelMayReferTo,
 }
 
 // stageRelation appends one occurrence to the sorted stream, with the
@@ -1279,23 +1231,4 @@ func (e *emitter) emitSorted(ctx context.Context, b *relationBatch) error {
 			}
 		}
 	}
-}
-
-func nullStr(n sql.NullInt64) string {
-	if !n.Valid {
-		return ""
-	}
-	return strconv.FormatInt(n.Int64, 10)
-}
-
-// truncate cuts s to at most limit bytes on a rune boundary.
-func truncate(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
 }

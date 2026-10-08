@@ -565,8 +565,9 @@ with `CTX_RESOURCE_LIMIT`. The first definition of a symbol is the one
 references bind to; a later definition keeps its own located identity.
 
 The occurrence roles `ReadAccess` and `WriteAccess` are deliberately not
-mapped. `reads` and `writes` are the `dependence` provider's facts, derived
-from the graph's assignment operators (Section 11.6), and two providers
+mapped. `reads` and `writes` are the structural provider's facts, derived
+from each callable's def-use analysis (`docs/providers-treesitter.md`,
+Dependence facts), and two providers
 publishing one relation kind from different precisions is the parallel
 implementation policy forbids. A read or write occurrence is a `references`
 edge here, like any other non-definition, non-import occurrence. No indexer
