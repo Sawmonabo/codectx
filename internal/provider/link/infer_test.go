@@ -148,6 +148,29 @@ export function fire(h) { h.click(); }`,
 		want:     []Binding{b(0, 0, 0, 0, DetailField)},
 		mutation: "a member site that watches only its receiver, not the field it calls, leaves `h.click()` unbound",
 	}, {
+		name: "an imported function written to a field",
+		source: `// src/a.js
+import { onSave as save } from './h.js';
+const actions = {};
+actions.save = save;
+export function run(x) { x.save(); }
+// src/h.js
+export function onSave() {}
+export function save() {}`,
+		tables: []*Table{
+			js("src/a.js",
+				[]Decl{decl(model.NodeConstant, "actions", -1), exported(decl(model.NodeFunction, "run", -1))},
+				[]Site{{Caller: 1, Callee: "save", Shape: wire.ShapeMember, Receiver: param(0)}},
+				[]Value{{Caller: -1, Field: "save", Type: wire.Type{Kind: wire.TypeModule, Name: "./h.js#onSave"}}}),
+			js("src/h.js",
+				[]Decl{exported(decl(model.NodeFunction, "onSave", -1)), exported(decl(model.NodeFunction, "save", -1))},
+				nil, nil),
+		},
+		// The value is the declaration h.js exports as onSave; the local
+		// name `save` an import renamed it to names nothing in h.js.
+		want:     []Binding{b(0, 0, 1, 0, DetailField)},
+		mutation: "evaluating `./h.js#onSave` as a module path leaves `x.save()` unbound; looking up the local name binds h.js save",
+	}, {
 		name: "class-hierarchy analysis and super",
 		source: `class Shape {
   area() { return 0; }
