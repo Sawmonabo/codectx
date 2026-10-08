@@ -3,8 +3,6 @@ package worker
 import (
 	"sync"
 
-	ts "github.com/tree-sitter/go-tree-sitter"
-
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 )
 
@@ -304,8 +302,10 @@ const rsTryLabel = " try"
 //
 // A block is a scope; `let` declares a new variable for each name its
 // pattern binds after its initializer is read, so a shadowing `let` is a new
-// variable; a match arm, an if-let consequence, a while-let body and a for
-// body scope the names their pattern binds. A nested function item cannot
+// variable; every parameter and local is declared over its identifier's
+// span (flow.Builder.Named, through declare), and every other variable is
+// one the lowering owns; a match arm, an if-let consequence, a while-let
+// body and a for body scope the names their pattern binds. A nested function item cannot
 // capture locals: it creates no node in the enclosing function and its name
 // shadows as a non-variable. Every identifier in a pattern binds, except the
 // path of a tuple-struct or struct pattern.
@@ -345,14 +345,14 @@ const rsTryLabel = " try"
 //   - A name the tree binds (a closure parameter, a `let` or other pattern in
 //     it) is not scoped: a later token of that name still resolves to the
 //     enclosing variable, which over-approximates the tree's reads.
-func lowerRust(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+func lowerRust(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	r := &s.rs
 	r.reset(l, b, fn, src, s)
 	defer r.detach()
 	k := r.k
 	switch fn.KindId() {
 	case k.functionItem, k.closureExpression:
-		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 			r.params(ps)
 		}
 		r.body(fn.ChildByFieldId(k.fBody))
@@ -368,9 +368,11 @@ type rsLower struct {
 	b   *flow.Builder
 	src []byte
 	k   *rsSyntax
-	cur *ts.TreeCursor
-	// buf is a stack of child lists; kids pushes one and done pops it.
-	buf []ts.Node
+	cur *Cursor
+	// buf is a stack of child lists; kids pushes one and done pops it. bufTop
+	// is the most entries it has held while lowering the current callable.
+	buf    []Node
+	bufTop int
 	// binds is the scope chain, innermost last.
 	binds *scope
 	// shadow is non-zero while walking a nested callable for its captures:
@@ -415,68 +417,74 @@ type rsLower struct {
 }
 
 // reset readies r, the worker's Rust state, to lower fn: every scalar is set
-// anew and every list truncated in place, keeping its capacity. The lists
-// hold no pointer into the Go heap (a parse-tree node refers to the tree's
-// own memory), so truncation leaves nothing reachable from the file.
-func (r *rsLower) reset(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+// anew and every list truncated in place, keeping its capacity. buf is the
+// one list that holds nodes, each a handle on the file's flat array; detach
+// zeroes every entry it held, so the Scratch keeps no file's array reachable.
+func (r *rsLower) reset(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	r.l, r.b, r.src, r.k, r.cur, r.binds = l, b, src, rsSyntaxOf(), s.cursor(fn), &s.scope
 	r.buf, r.reads, r.writes, r.borrows = r.buf[:0], r.reads[:0], r.writes[:0], r.borrows[:0]
 	r.hs, r.ends, r.frames = r.hs[:0], r.ends[:0], r.frames[:0]
-	r.shadow, r.tries, r.sure = 0, 0, 0
+	r.shadow, r.tries, r.sure, r.bufTop = 0, 0, 0, 0
 	r.first, r.last, r.lastSpan, r.lastDef, r.lastVar, r.matched = -1, -1, flow.Span{}, false, -1, -1
 }
 
 // detach drops r's references to the function just lowered, so the
-// Scratch holds neither its source nor its builder until the next one.
-func (r *rsLower) detach() { r.l, r.b, r.src, r.cur, r.binds = nil, nil, nil, nil, nil }
+// Scratch holds neither its source, its builder nor its flat array until the
+// next one: it zeroes buf's entries up to the most it held, which done's
+// truncation leaves in the backing store.
+func (r *rsLower) detach() {
+	clear(r.buf[:r.bufTop])
+	r.l, r.b, r.src, r.cur, r.binds = nil, nil, nil, nil, nil
+}
 
 // kids pushes n's named, non-extra children (comments are extras) onto buf
 // and returns the stack mark and the list; done(mark) pops them. A list stays
 // valid across nested kids calls: later pushes never overwrite it.
-func (r *rsLower) kids(n *ts.Node) (int, []ts.Node) { return r.children(n, true) }
+func (r *rsLower) kids(n Node) (int, []Node) { return r.children(n, true) }
 
 // toks is kids for every child, named or not: the tokens of a token tree.
-func (r *rsLower) toks(n *ts.Node) (int, []ts.Node) { return r.children(n, false) }
+func (r *rsLower) toks(n Node) (int, []Node) { return r.children(n, false) }
 
 // children pushes n's non-extra children onto buf, only the named ones when
 // named is set, and returns the stack mark and the list. An ERROR node the
 // parser made an extra, which its recovery does when it wraps what it could
 // not parse or a token it skipped, is kept: it is lowered as a kind not named
 // here is, an error node included.
-func (r *rsLower) children(n *ts.Node, named bool) (int, []ts.Node) {
+func (r *rsLower) children(n Node, named bool) (int, []Node) {
 	start := len(r.buf)
 	c := r.cur
-	c.Reset(*n)
+	c.Reset(n)
 	if c.GotoFirstChild() {
 		for {
 			if x := c.Node(); (x.IsNamed() || !named) && (!x.IsExtra() || x.IsError()) {
-				r.buf = append(r.buf, *x)
+				r.buf = append(r.buf, x)
 			}
 			if !c.GotoNextSibling() {
 				break
 			}
 		}
 	}
+	r.bufTop = max(r.bufTop, len(r.buf))
 	return start, r.buf[start:]
 }
 
 func (r *rsLower) done(mark int) { r.buf = r.buf[:mark] }
 
-func (r *rsLower) text(n *ts.Node) []byte { return textOf(r.src, n) }
+func (r *rsLower) text(n Node) []byte { return textOf(r.src, n) }
 
-// declare binds name in the innermost scope: a new variable, or -1 inside a
-// nested callable.
-func (r *rsLower) declare(name *ts.Node) int32 {
+// declare binds name, the declaring identifier (or `self`), in the innermost
+// scope: a new variable named by name's span, or -1 inside a nested callable.
+func (r *rsLower) declare(name Node) int32 {
 	v := int32(-1)
 	if r.shadow == 0 {
-		v = r.b.Var()
+		v = r.b.Named(spanOf(name))
 	}
 	r.binds.push(r.text(name), v)
 	return v
 }
 
 // lookup resolves name through the scope chain: its variable, or -1.
-func (r *rsLower) lookup(name *ts.Node) int32 { return r.binds.lookup(r.text(name)) }
+func (r *rsLower) lookup(name Node) int32 { return r.binds.lookup(r.text(name)) }
 
 // read records a read of v, unless v is -1.
 func (r *rsLower) read(v int32) {
@@ -503,10 +511,10 @@ type rsFrame struct {
 }
 
 // openFrame opens the frame of a loop (loop set) or block named by label
-// node lab, which is nil when it has none, whose valued breaks define dst.
-func (r *rsLower) openFrame(lab *ts.Node, loop bool, dst int32) {
+// node lab, which is null when it has none, whose valued breaks define dst.
+func (r *rsLower) openFrame(lab Node, loop bool, dst int32) {
 	f := rsFrame{loop: loop, dst: dst, mark: len(r.reads)}
-	if lab != nil {
+	if !lab.IsNull() {
 		f.from, f.to = uint32(lab.StartByte()), uint32(lab.EndByte())
 	}
 	r.frames = append(r.frames, f)
@@ -662,62 +670,62 @@ func (r *rsLower) close(saved int32) int32 {
 }
 
 // spans reports whether the last node, made after node last, spans n.
-func (r *rsLower) spans(last int32, n *ts.Node) bool {
+func (r *rsLower) spans(last int32, n Node) bool {
 	return r.last != last && r.lastSpan == spanOf(r.l.unparen(n))
 }
 
 // labelOf is the label of a loop, block, break or continue, or "".
-func (r *rsLower) labelOf(n *ts.Node) string {
-	if c := r.labelNode(n); c != nil {
+func (r *rsLower) labelOf(n Node) string {
+	if c := r.labelNode(n); !c.IsNull() {
 		return view(r.text(c))
 	}
 	return ""
 }
 
-// labelNode is the label node of a loop, block, break or continue, or nil.
-func (r *rsLower) labelNode(n *ts.Node) *ts.Node {
-	if c := r.firstKid(n); c != nil && c.KindId() == r.k.label {
+// labelNode is the label node of a loop, block, break or continue, or null.
+func (r *rsLower) labelNode(n Node) Node {
+	if c := r.firstKid(n); !c.IsNull() && c.KindId() == r.k.label {
 		return c
 	}
-	return nil
+	return Node{}
 }
 
-// token is n's child of kind id, named or not, or nil, found in one walk of
+// token is n's child of kind id, named or not, or null, found in one walk of
 // the reused cursor.
-func (r *rsLower) token(n *ts.Node, id uint16) *ts.Node {
+func (r *rsLower) token(n Node, id uint16) Node {
 	c := r.cur
-	c.Reset(*n)
+	c.Reset(n)
 	for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
 		if x := c.Node(); x.KindId() == id {
 			return x
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // firstKid is n's first named child that is not an extra (a comment), or
-// nil, found in one walk of the reused cursor.
-func (r *rsLower) firstKid(n *ts.Node) *ts.Node {
+// null, found in one walk of the reused cursor.
+func (r *rsLower) firstKid(n Node) Node {
 	c := r.cur
-	c.Reset(*n)
+	c.Reset(n)
 	for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
 		if x := c.Node(); x.IsNamed() && !x.IsExtra() {
 			return x
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // params defines every name a parameter list binds, in declaration order.
-func (r *rsLower) params(ps *ts.Node) {
+func (r *rsLower) params(ps Node) {
 	k := r.k
 	start, list := r.kids(ps)
 	for i := range list {
-		switch p := &list[i]; p.KindId() {
+		switch p := list[i]; p.KindId() {
 		case k.parameter:
 			r.pattern(p.ChildByFieldId(k.fPattern), 0, 0, true)
 		case k.selfParameter:
-			if s := r.token(p, k.self); s != nil {
+			if s := r.token(p, k.self); !s.IsNull() {
 				r.pattern(s, 0, 0, true)
 			}
 		case k.attributeItem, k.variadicParameter:
@@ -734,9 +742,9 @@ func (r *rsLower) params(ps *ts.Node) {
 }
 
 // body lowers a callable's body: a block, or a closure's expression.
-func (r *rsLower) body(n *ts.Node) {
+func (r *rsLower) body(n Node) {
 	switch {
-	case n == nil || !n.IsNamed():
+	case n.IsNull() || !n.IsNamed():
 	case n.KindId() == r.k.block:
 		r.block(n, -1)
 	default:
@@ -749,8 +757,8 @@ func (r *rsLower) body(n *ts.Node) {
 // defines it and Uses reads[from:to]. An or-pattern binds the names of its
 // first alternative, since every alternative binds the same ones, in the
 // same binding modes.
-func (r *rsLower) pattern(p *ts.Node, from, to int, nodes bool) {
-	if p == nil {
+func (r *rsLower) pattern(p Node, from, to int, nodes bool) {
+	if p.IsNull() {
 		return
 	}
 	k := r.k
@@ -758,19 +766,19 @@ func (r *rsLower) pattern(p *ts.Node, from, to int, nodes bool) {
 	case k.identifier, k.shorthandFieldIdentifier, k.self:
 		r.bindName(p, from, to, nodes, false)
 	case k.fieldPattern:
-		if q := p.ChildByFieldId(k.fPattern); q != nil {
+		if q := p.ChildByFieldId(k.fPattern); !q.IsNull() {
 			r.pattern(q, from, to, nodes)
-		} else if name := p.ChildByFieldId(k.fName); name != nil {
+		} else if name := p.ChildByFieldId(k.fName); !name.IsNull() {
 			// The shorthand `ref mut x` of a struct pattern.
-			borrow := r.token(p, k.refKw) != nil && r.token(p, k.mutableSpecifier) != nil
+			borrow := !r.token(p, k.refKw).IsNull() && !r.token(p, k.mutableSpecifier).IsNull()
 			r.bindName(name, from, to, nodes, borrow)
 		}
 	case k.orPattern:
-		if q := r.firstKid(p); q != nil {
+		if q := r.firstKid(p); !q.IsNull() {
 			r.pattern(q, from, to, nodes)
 		}
 	case k.refPattern:
-		if q := r.firstKid(p); q != nil && q.KindId() == k.mutPattern {
+		if q := r.firstKid(p); !q.IsNull() && q.KindId() == k.mutPattern {
 			r.refMut(q, from, to, nodes)
 		} else {
 			r.pattern(q, from, to, nodes)
@@ -780,8 +788,8 @@ func (r *rsLower) pattern(p *ts.Node, from, to int, nodes bool) {
 		typ := p.ChildByFieldId(k.fType)
 		start, list := r.kids(p)
 		for i := range list {
-			if typ == nil || list[i].Id() != typ.Id() {
-				r.pattern(&list[i], from, to, nodes)
+			if typ.IsNull() || list[i].Id() != typ.Id() {
+				r.pattern(list[i], from, to, nodes)
 			}
 		}
 		r.done(start)
@@ -793,7 +801,7 @@ func (r *rsLower) pattern(p *ts.Node, from, to int, nodes bool) {
 // address-taking rule of Lowering, its node may-defines that place's base
 // variable, matched; inside a nested callable that variable is one of the
 // callable's writes.
-func (r *rsLower) bindName(n *ts.Node, from, to int, nodes, borrow bool) {
+func (r *rsLower) bindName(n Node, from, to int, nodes, borrow bool) {
 	v := r.declare(n)
 	borrow = borrow && r.matched >= 0
 	switch {
@@ -813,11 +821,11 @@ func (r *rsLower) bindName(n *ts.Node, from, to int, nodes, borrow bool) {
 // refMut binds mp, the `mut x` or `mut x @ q` of a `ref mut` identifier
 // pattern (Reference "Identifier patterns"): x is the `ref mut` binding, and
 // q's names bind as q says.
-func (r *rsLower) refMut(mp *ts.Node, from, to int, nodes bool) {
+func (r *rsLower) refMut(mp Node, from, to int, nodes bool) {
 	k := r.k
 	start, list := r.kids(mp)
 	for i := range list {
-		switch c := &list[i]; c.KindId() {
+		switch c := list[i]; c.KindId() {
 		case k.mutableSpecifier:
 		case k.identifier:
 			r.bindName(c, from, to, nodes, true)
@@ -825,9 +833,9 @@ func (r *rsLower) refMut(mp *ts.Node, from, to int, nodes bool) {
 			cs, sub := r.kids(c)
 			for j := range sub {
 				if j == 0 && sub[j].KindId() == k.identifier {
-					r.bindName(&sub[j], from, to, nodes, true)
+					r.bindName(sub[j], from, to, nodes, true)
 				} else {
-					r.pattern(&sub[j], from, to, nodes)
+					r.pattern(sub[j], from, to, nodes)
 				}
 			}
 			r.done(cs)
@@ -842,7 +850,7 @@ func (r *rsLower) refMut(mp *ts.Node, from, to int, nodes bool) {
 // variable is place, or a value when place is -1: the variable p's `ref mut`
 // bindings borrow. The caller resolves place before p binds anything, so a
 // name p rebinds still names the matched variable.
-func (r *rsLower) patternOf(p *ts.Node, from, to int, nodes bool, place int32) {
+func (r *rsLower) patternOf(p Node, from, to int, nodes bool, place int32) {
 	saved := r.matched
 	r.matched = place
 	r.pattern(p, from, to, nodes)
@@ -850,11 +858,11 @@ func (r *rsLower) patternOf(p *ts.Node, from, to int, nodes bool, place int32) {
 }
 
 // predeclare binds the value name an item declares, from its block's start.
-func (r *rsLower) predeclare(n *ts.Node) {
+func (r *rsLower) predeclare(n Node) {
 	k := r.k
 	switch n.KindId() {
 	case k.functionItem, k.constItem, k.staticItem, k.structItem:
-		if name := n.ChildByFieldId(k.fName); name != nil {
+		if name := n.ChildByFieldId(k.fName); !name.IsNull() {
 			r.binds.push(r.text(name), -1)
 		}
 	}
@@ -862,8 +870,8 @@ func (r *rsLower) predeclare(n *ts.Node) {
 
 // block lowers a block in its own scope, its tail defining dst; a labelled
 // block is a block frame whose valued breaks define dst too.
-func (r *rsLower) block(n *ts.Node, dst int32) {
-	if n == nil {
+func (r *rsLower) block(n Node, dst int32) {
+	if n.IsNull() {
 		return
 	}
 	k := r.k
@@ -871,7 +879,7 @@ func (r *rsLower) block(n *ts.Node, dst int32) {
 	lab := r.labelOf(n)
 	start, list := r.kids(n)
 	for i := range list {
-		r.predeclare(&list[i])
+		r.predeclare(list[i])
 	}
 	var f flow.Frame
 	sure := r.sure
@@ -880,7 +888,7 @@ func (r *rsLower) block(n *ts.Node, dst int32) {
 		r.openFrame(r.labelNode(n), false, dst)
 	}
 	for i := range list {
-		if c := &list[i]; c.KindId() != k.label {
+		if c := list[i]; c.KindId() != k.label {
 			d := int32(-1)
 			if i == len(list)-1 && r.yields(c) {
 				d = dst
@@ -901,13 +909,13 @@ func (r *rsLower) block(n *ts.Node, dst int32) {
 // tail, whose value is the block's: an expression, or an expression
 // statement without its `;` (the grammar makes a trailing `if c { a } else
 // { b }` one).
-func (r *rsLower) yields(c *ts.Node) bool {
+func (r *rsLower) yields(c Node) bool {
 	k := r.k
 	switch id := c.KindId(); {
 	case id == k.letDeclaration:
 		return false
 	case id == k.expressionStatement:
-		return r.token(c, k.semi) == nil
+		return r.token(c, k.semi).IsNull()
 	case int(id) < len(k.item) && k.item[id]:
 		return false
 	}
@@ -916,7 +924,7 @@ func (r *rsLower) yields(c *ts.Node) bool {
 
 // stmt lowers one statement of a block, or its tail expression, whose value
 // defines dst.
-func (r *rsLower) stmt(n *ts.Node, dst int32) {
+func (r *rsLower) stmt(n Node, dst int32) {
 	k := r.k
 	id := n.KindId()
 	if int(id) < len(k.item) && k.item[id] {
@@ -939,8 +947,8 @@ func (r *rsLower) stmt(n *ts.Node, dst int32) {
 // yields, and a folded expression is one Stmt node spanning it, Using its
 // reads, that defines dst. A while or for loop, an assignment and a jump
 // yield no value.
-func (r *rsLower) into(e *ts.Node, dst int32) {
-	if e == nil {
+func (r *rsLower) into(e Node, dst int32) {
+	if e.IsNull() {
 		return
 	}
 	k := r.k
@@ -968,7 +976,7 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 		r.block(u.ChildByFieldId(k.fBody), dst)
 	case k.tryBlock:
 		f := r.b.OpenBlock(rsTryLabel)
-		r.openFrame(nil, false, dst)
+		r.openFrame(Node{}, false, dst)
 		r.tries++
 		sure := r.sure
 		r.block(r.firstKid(u), dst)
@@ -1010,7 +1018,7 @@ func (r *rsLower) into(e *ts.Node, dst int32) {
 // node of its own that defines an owned variable, and returns it: the node
 // that yields n's value when it spans n (a `?`, a closure), otherwise a Stmt
 // node spanning n that Uses n's reads.
-func (r *rsLower) valueVar(n *ts.Node) int32 {
+func (r *rsLower) valueVar(n Node) int32 {
 	m, last := len(r.reads), r.last
 	r.value(n)
 	if len(r.reads) == m+1 && r.spans(last, n) && r.lastDef && r.lastVar == r.reads[m] {
@@ -1029,8 +1037,8 @@ func (r *rsLower) valueVar(n *ts.Node) int32 {
 // are recorded for the node consuming it; a construct lowered to nodes of its
 // own hands its value over through a result variable the lowering owns,
 // which its yields define and which is recorded as the consumer's read.
-func (r *rsLower) value(n *ts.Node) {
-	if n == nil {
+func (r *rsLower) value(n Node) {
+	if n.IsNull() {
 		return
 	}
 	k := r.k
@@ -1075,7 +1083,7 @@ func (r *rsLower) value(n *ts.Node) {
 	case k.referenceExpression:
 		v := n.ChildByFieldId(k.fValue)
 		r.value(v)
-		if r.token(n, k.mutableSpecifier) != nil {
+		if !r.token(n, k.mutableSpecifier).IsNull() {
 			if b := r.baseVar(v); b >= 0 {
 				r.borrows = append(r.borrows, rsBorrow{v: b, at: uint32(n.StartByte())})
 			}
@@ -1084,7 +1092,7 @@ func (r *rsLower) value(n *ts.Node) {
 	default:
 		start, list := r.kids(n)
 		for i := range list {
-			r.value(&list[i])
+			r.value(list[i])
 		}
 		r.done(start)
 	}
@@ -1094,9 +1102,9 @@ func (r *rsLower) value(n *ts.Node) {
 // reads and defining dst, the Ok value; its successors are Exit (inside a
 // try block: the end of that block, whose result it defines too) and the
 // rest of the enclosing expression.
-func (r *rsLower) try(n *ts.Node, dst int32) {
+func (r *rsLower) try(n Node, dst int32) {
 	m := len(r.reads)
-	if e := r.firstKid(n); e != nil {
+	if e := r.firstKid(n); !e.IsNull() {
 		r.value(e)
 	}
 	id := r.node(flow.Branch, spanOf(n), m, len(r.reads))
@@ -1118,7 +1126,7 @@ func (r *rsLower) try(n *ts.Node, dst int32) {
 // operand is a Branch node spanning it (or the node its own lowering made
 // that spans it), which defines dst on the path where it decides the value;
 // the right operand, evaluated only on the other path, defines dst again.
-func (r *rsLower) lazy(n *ts.Node, dst int32) {
+func (r *rsLower) lazy(n Node, dst int32) {
 	left, right := n.ChildByFieldId(r.k.fLeft), n.ChildByFieldId(r.k.fRight)
 	m, last := len(r.reads), r.last
 	r.value(left)
@@ -1151,9 +1159,9 @@ const (
 // such jump from it, leaves the fringe on its fall-through, and returns the
 // node. Inside a nested callable being walked for its captures nothing
 // jumps: the jumps are the callable's own.
-func (r *rsLower) macro(n *ts.Node) int32 {
+func (r *rsLower) macro(n Node) int32 {
 	t := r.token(n, r.k.tokenTree)
-	if t == nil {
+	if t.IsNull() {
 		return -1
 	}
 	esc := rsEscAll
@@ -1177,7 +1185,7 @@ func (r *rsLower) macro(n *ts.Node) int32 {
 // invocation, and reports whether one of them does. Without emit it records
 // the tree's reads, mutable borrows and format captures; with emit it records
 // nothing and issues each jump that leaves from the saved fringe from.
-func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool {
+func (r *rsLower) tokens(t Node, esc int, emit bool, from flow.Fringe) bool {
 	k := r.k
 	jumps, lits := false, false
 	// own is what this level's tokens may make leave: esc, or nothing within
@@ -1189,14 +1197,14 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 	params, closure := false, false
 	start, list := r.toks(t)
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		id := c.KindId()
-		var prev, after *ts.Node
+		var prev, after Node
 		if i > 0 {
-			prev = &list[i-1]
+			prev = list[i-1]
 		}
 		if i+1 < len(list) {
-			after = &list[i+1]
+			after = list[i+1]
 		}
 		switch {
 		case params:
@@ -1207,12 +1215,12 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 			if r.src[c.StartByte()] == '{' {
 				sub = own & next
 				switch {
-				case prev != nil && (prev.KindId() == k.asyncKw || prev.KindId() == k.genKw):
+				case !prev.IsNull() && (prev.KindId() == k.asyncKw || prev.KindId() == k.genKw):
 					sub = 0
-				case prev != nil && prev.KindId() == k.identifier && r.word(prev, "move") && i > 1 &&
+				case !prev.IsNull() && prev.KindId() == k.identifier && r.word(prev, "move") && i > 1 &&
 					(list[i-2].KindId() == k.asyncKw || list[i-2].KindId() == k.genKw):
 					sub = 0
-				case prev != nil && prev.KindId() == k.identifier && r.word(prev, "try"):
+				case !prev.IsNull() && prev.KindId() == k.identifier && r.word(prev, "try"):
 					sub &^= rsEscTry
 				}
 				next = own
@@ -1227,7 +1235,7 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 			}
 			r.binds.truncate(m)
 		case id == k.pipe || id == k.or:
-			if prev == nil || !r.operand(prev) {
+			if prev.IsNull() || !r.operand(prev) {
 				closure, params, own, next = true, id == k.pipe, 0, 0
 			}
 		case id == k.comma || id == k.semi:
@@ -1240,7 +1248,7 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 		case id == k.fnKw:
 			next = 0
 		case id == k.quote:
-			if after != nil && after.KindId() == k.identifier && i+2 < len(list) && list[i+2].KindId() == k.colon {
+			if !after.IsNull() && after.KindId() == k.identifier && i+2 < len(list) && list[i+2].KindId() == k.colon {
 				label = r.src[c.StartByte():after.EndByte()]
 			}
 		case id == k.question || id == k.returnKw || id == k.breakKw || id == k.continueKw:
@@ -1275,7 +1283,7 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 				r.read(r.lookup(c))
 			}
 		case id == k.mutableSpecifier:
-			if prev != nil && (prev.KindId() == k.amp || prev.KindId() == k.and) {
+			if !prev.IsNull() && (prev.KindId() == k.amp || prev.KindId() == k.and) {
 				r.tokenBorrow(list[i+1:], prev)
 			}
 		case id == k.stringLiteral || id == k.rawStringLiteral:
@@ -1294,11 +1302,11 @@ func (r *rsLower) tokens(t *ts.Node, esc int, emit bool, from flow.Fringe) bool 
 // returns the label a break or continue names, or nil. A `?` is the operator
 // only after an operand (a bound `?Sized` follows `:` or `+`); a labelled
 // jump stays in the tree when the tree declares its label.
-func (r *rsLower) leaves(list []ts.Node, i int, own int) ([]byte, bool) {
+func (r *rsLower) leaves(list []Node, i int, own int) ([]byte, bool) {
 	k := r.k
 	switch list[i].KindId() {
 	case k.question:
-		return nil, own&rsEscTry != 0 && i > 0 && r.operand(&list[i-1])
+		return nil, own&rsEscTry != 0 && i > 0 && r.operand(list[i-1])
 	case k.returnKw:
 		return nil, own&rsEscReturn != 0
 	}
@@ -1311,7 +1319,7 @@ func (r *rsLower) leaves(list []ts.Node, i int, own int) ([]byte, bool) {
 
 // operand reports whether token c ends an operand, so that a `?` after it is
 // the question mark operator and a `|` or `||` after it is binary.
-func (r *rsLower) operand(c *ts.Node) bool {
+func (r *rsLower) operand(c Node) bool {
 	k := r.k
 	switch id := c.KindId(); {
 	case id == k.question || id == k.awaitKw:
@@ -1325,21 +1333,21 @@ func (r *rsLower) operand(c *ts.Node) bool {
 }
 
 // word reports whether token c's text is w.
-func (r *rsLower) word(c *ts.Node, w string) bool { return string(r.text(c)) == w }
+func (r *rsLower) word(c Node, w string) bool { return string(r.text(c)) == w }
 
 // named reports whether the name between tokens prev and after is a name
 // rather than a read: a field or method name after `.`, a path segment after
 // or before `::`, a label after `'`, a macro's name before `!`, a field or
 // binding name before `:`, or a named argument or assignment target before a
 // single `=`.
-func (r *rsLower) named(prev, after *ts.Node) bool {
+func (r *rsLower) named(prev, after Node) bool {
 	k := r.k
-	if prev != nil {
+	if !prev.IsNull() {
 		if id := prev.KindId(); id == k.dot || id == k.pathSep || id == k.quote {
 			return true
 		}
 	}
-	if after != nil {
+	if !after.IsNull() {
 		if id := after.KindId(); id == k.pathSep || id == k.bang || id == k.colon || id == k.eq {
 			return true
 		}
@@ -1351,7 +1359,7 @@ func (r *rsLower) named(prev, after *ts.Node) bool {
 // makes of the base variable of the tokens rest after it (x in `&mut x`,
 // `&mut x.f`, `&mut *x`): a pending may-definition at amp's position, or,
 // inside a nested callable, one of its writes.
-func (r *rsLower) tokenBorrow(rest []ts.Node, amp *ts.Node) {
+func (r *rsLower) tokenBorrow(rest []Node, amp Node) {
 	k := r.k
 	j := 0
 	for j < len(rest) && rest[j].KindId() == k.deref {
@@ -1361,7 +1369,7 @@ func (r *rsLower) tokenBorrow(rest []ts.Node, amp *ts.Node) {
 		j+1 < len(rest) && rest[j+1].KindId() == k.pathSep {
 		return
 	}
-	v := r.lookup(&rest[j])
+	v := r.lookup(rest[j])
 	switch {
 	case v < 0:
 	case r.shadow > 0:
@@ -1374,16 +1382,16 @@ func (r *rsLower) tokenBorrow(rest []ts.Node, amp *ts.Node) {
 // formats reads the variables the format strings of one token-tree level
 // capture: every string literal that is not a byte or C string. A name the
 // level passes as a named argument (`x = …`) is that argument, not a capture.
-func (r *rsLower) formats(list []ts.Node) {
+func (r *rsLower) formats(list []Node) {
 	k := r.k
 	m := r.binds.mark()
 	for i := range list {
 		if list[i].KindId() == k.identifier && i+1 < len(list) && list[i+1].KindId() == k.eq {
-			r.binds.push(r.text(&list[i]), -1)
+			r.binds.push(r.text(list[i]), -1)
 		}
 	}
 	for i := range list {
-		lit := &list[i]
+		lit := list[i]
 		if id := lit.KindId(); id != k.stringLiteral && id != k.rawStringLiteral {
 			continue
 		}
@@ -1393,7 +1401,7 @@ func (r *rsLower) formats(list []ts.Node) {
 		start, parts := r.kids(lit)
 		for j := range parts {
 			if parts[j].KindId() == k.stringContent {
-				r.captures(r.text(&parts[j]))
+				r.captures(r.text(parts[j]))
 			}
 		}
 		r.done(start)
@@ -1451,7 +1459,7 @@ func rsNameByte(b byte) bool {
 // captures and may-defines every enclosing variable n assigns. Its value, the
 // created callable, reaches a consumer through the result variable the
 // caller makes it define.
-func (r *rsLower) closure(n *ts.Node) int32 {
+func (r *rsLower) closure(n Node) int32 {
 	m, w := len(r.reads), len(r.writes)
 	r.capFunction(n)
 	id := r.node(flow.Stmt, spanOf(n), m, len(r.reads))
@@ -1464,9 +1472,9 @@ func (r *rsLower) closure(n *ts.Node) int32 {
 
 // cond lowers an if or while condition or a match guard, leaving the fringe
 // on the taken path, and returns the index in hs where its false edges begin.
-func (r *rsLower) cond(c *ts.Node) int {
+func (r *rsLower) cond(c Node) int {
 	mark := len(r.hs)
-	if c == nil {
+	if c.IsNull() {
 		// An error-recovered tree without a condition: both edges leave.
 		r.hs = append(r.hs, r.b.Push())
 		return mark
@@ -1480,7 +1488,7 @@ func (r *rsLower) cond(c *ts.Node) int {
 			if i > 0 {
 				r.maybe()
 			}
-			r.condPart(&list[i])
+			r.condPart(list[i])
 		}
 		r.restore(sure)
 		r.done(start)
@@ -1494,7 +1502,7 @@ func (r *rsLower) cond(c *ts.Node) int {
 // it with its parentheses stripped (lower.go, Spans), and saves its false edge
 // in hs. A let condition's Branch evaluates its value once and defines an
 // owned variable its bindings Use.
-func (r *rsLower) condPart(c *ts.Node) {
+func (r *rsLower) condPart(c Node) {
 	k := r.k
 	c = r.l.unparen(c)
 	m, last := len(r.reads), r.last
@@ -1521,7 +1529,7 @@ func (r *rsLower) condPart(c *ts.Node) {
 // bindFrom binds pattern p, which matches the value in variable s (a place
 // whose base variable is place, or -1): one defining node per name, each
 // Using s.
-func (r *rsLower) bindFrom(p *ts.Node, s, place int32) {
+func (r *rsLower) bindFrom(p Node, s, place int32) {
 	m := len(r.reads)
 	r.reads = append(r.reads, s)
 	r.patternOf(p, m, m+1, true, place)
@@ -1542,7 +1550,7 @@ func (r *rsLower) release(mark int) {
 	r.hs = r.hs[:mark]
 }
 
-func (r *rsLower) ifExpr(n *ts.Node, dst int32) {
+func (r *rsLower) ifExpr(n Node, dst int32) {
 	k := r.k
 	mark := r.binds.mark()
 	fm := r.cond(n.ChildByFieldId(k.fCondition))
@@ -1551,8 +1559,8 @@ func (r *rsLower) ifExpr(n *ts.Node, dst int32) {
 	r.binds.truncate(mark)
 	t := r.b.Push()
 	r.falses(fm)
-	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
-		if s := r.firstKid(alt); s != nil {
+	if alt := n.ChildByFieldId(k.fAlternative); !alt.IsNull() {
+		if s := r.firstKid(alt); !s.IsNull() {
 			r.into(s, dst)
 		}
 	}
@@ -1562,14 +1570,14 @@ func (r *rsLower) ifExpr(n *ts.Node, dst int32) {
 }
 
 // openLoop opens the loop frame of n, named by its label if it has one.
-func (r *rsLower) openLoop(n *ts.Node) flow.Frame {
+func (r *rsLower) openLoop(n Node) flow.Frame {
 	if lab := r.labelOf(n); lab != "" {
 		return r.b.OpenLoop(lab)
 	}
 	return r.b.OpenLoop()
 }
 
-func (r *rsLower) loopExpr(n *ts.Node, dst int32) {
+func (r *rsLower) loopExpr(n Node, dst int32) {
 	f := r.openLoop(n)
 	r.openFrame(r.labelNode(n), true, dst)
 	h := r.node(flow.Stmt, spanOf(r.token(n, r.k.loopKw)), 0, 0)
@@ -1582,7 +1590,7 @@ func (r *rsLower) loopExpr(n *ts.Node, dst int32) {
 	r.b.CloseFrame(f)
 }
 
-func (r *rsLower) whileExpr(n *ts.Node) {
+func (r *rsLower) whileExpr(n Node) {
 	k := r.k
 	f := r.openLoop(n)
 	r.openFrame(r.labelNode(n), true, -1)
@@ -1601,7 +1609,7 @@ func (r *rsLower) whileExpr(n *ts.Node) {
 	r.release(fm)
 }
 
-func (r *rsLower) forExpr(n *ts.Node) {
+func (r *rsLower) forExpr(n Node) {
 	k := r.k
 	iter := r.valueVar(n.ChildByFieldId(k.fValue))
 	f := r.openLoop(n)
@@ -1622,13 +1630,13 @@ func (r *rsLower) forExpr(n *ts.Node) {
 	r.b.Pop(exit)
 }
 
-// armPattern splits a match arm's pattern into its pattern (nil for the
-// wildcard `_`, an anonymous token) and its guard (nil if none). The pattern
+// armPattern splits a match arm's pattern into its pattern (null for the
+// wildcard `_`, an anonymous token) and its guard (null if none). The pattern
 // precedes the guard, so a named first child that is not the guard is it.
-func (r *rsLower) armPattern(mp *ts.Node) (pat, guard *ts.Node) {
+func (r *rsLower) armPattern(mp Node) (pat, guard Node) {
 	guard = mp.ChildByFieldId(r.k.fCondition)
-	if pat = r.firstKid(mp); pat != nil && guard != nil && pat.Id() == guard.Id() {
-		pat = nil
+	if pat = r.firstKid(mp); !pat.IsNull() && !guard.IsNull() && pat.Id() == guard.Id() {
+		pat = Node{}
 	}
 	return pat, guard
 }
@@ -1636,7 +1644,7 @@ func (r *rsLower) armPattern(mp *ts.Node) (pat, guard *ts.Node) {
 // matchExpr lowers a match whose arms' results define dst. The scrutinee
 // is evaluated once, at its own node defining an owned variable, which every
 // arm's pattern node and binding Use.
-func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
+func (r *rsLower) matchExpr(n Node, dst int32) {
 	k := r.k
 	val := n.ChildByFieldId(k.fValue)
 	s := r.valueVar(val)
@@ -1649,14 +1657,14 @@ func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
 	live := true
 	start, arms := r.kids(n.ChildByFieldId(k.fBody))
 	for i := range arms {
-		arm := &arms[i]
+		arm := arms[i]
 		if arm.KindId() != k.matchArm {
 			continue
 		}
 		pat, guard := r.armPattern(arm.ChildByFieldId(k.fPattern))
 		mark := r.binds.mark()
 		switch {
-		case pat == nil:
+		case pat.IsNull():
 		case pat.KindId() == k.identifier && i == len(arms)-1:
 			r.pattern(pat, sm, se, true)
 		case pat.KindId() == k.identifier:
@@ -1668,7 +1676,7 @@ func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
 			r.hs = append(r.hs, r.b.Push())
 			r.patternOf(pat, sm, se, true, place)
 		}
-		if guard != nil {
+		if !guard.IsNull() {
 			r.cond(guard)
 		}
 		r.into(arm.ChildByFieldId(k.fValue), dst)
@@ -1696,17 +1704,17 @@ func (r *rsLower) matchExpr(n *ts.Node, dst int32) {
 // let lowers a let declaration. A pattern other than a bare identifier
 // matches the value its node evaluates once, through an owned variable that
 // node defines and every binding Uses.
-func (r *rsLower) let(n *ts.Node) {
+func (r *rsLower) let(n Node) {
 	k := r.k
 	pat, val := n.ChildByFieldId(k.fPattern), n.ChildByFieldId(k.fValue)
-	if val == nil {
+	if val.IsNull() {
 		r.pattern(pat, 0, 0, false)
 		return
 	}
 	m := len(r.reads)
 	r.value(val)
 	place := r.baseVar(val)
-	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
+	if alt := n.ChildByFieldId(k.fAlternative); !alt.IsNull() {
 		id := r.node(flow.Branch, spanOf(n), m, len(r.reads))
 		r.reads = r.reads[:m]
 		s := r.b.Var()
@@ -1736,7 +1744,7 @@ func (r *rsLower) let(n *ts.Node) {
 // assign lowers `left = right`. Its value is `()`, so it yields none. A
 // destructuring assignment's node evaluates the value once and defines an
 // owned variable every target Uses.
-func (r *rsLower) assign(n *ts.Node) {
+func (r *rsLower) assign(n Node) {
 	k := r.k
 	left, right := r.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(r.reads)
@@ -1773,7 +1781,7 @@ func (r *rsLower) assign(n *ts.Node) {
 // the shorthand field's name and the named field's value, never the field
 // name. The callee path and struct name are no assignees, and neither is a
 // rest `..` nor an attribute.
-func (r *rsLower) assignees(t *ts.Node) (mark int, list []ts.Node, ok bool) {
+func (r *rsLower) assignees(t Node) (mark int, list []Node, ok bool) {
 	k := r.k
 	holder := t
 	switch t.KindId() {
@@ -1785,7 +1793,7 @@ func (r *rsLower) assignees(t *ts.Node) (mark int, list []ts.Node, ok bool) {
 	default:
 		return 0, nil, false
 	}
-	if holder == nil {
+	if holder.IsNull() {
 		return len(r.buf), nil, true
 	}
 	start, kids := r.kids(holder)
@@ -1802,16 +1810,16 @@ func (r *rsLower) assignees(t *ts.Node) (mark int, list []ts.Node, ok bool) {
 		case k.shorthandFieldInitializer:
 			// Its name follows any attributes.
 			name := c.NamedChild(c.NamedChildCount() - 1)
-			if name == nil {
+			if name.IsNull() {
 				continue
 			}
-			c = *name
+			c = name
 		case k.fieldInitializer:
 			v := c.ChildByFieldId(k.fValue)
-			if v == nil {
+			if v.IsNull() {
 				continue
 			}
-			c = *v
+			c = v
 		}
 		r.buf[n] = c
 		n++
@@ -1823,12 +1831,12 @@ func (r *rsLower) assignees(t *ts.Node) (mark int, list []ts.Node, ok bool) {
 // targets lowers the targets of a destructuring assignment whose value is in
 // variable s: one node per target, in source order, each Using s; a place
 // target also Uses its own operands and may-defines its base variable.
-func (r *rsLower) targets(t *ts.Node, s int32) {
+func (r *rsLower) targets(t Node, s int32) {
 	k := r.k
 	t = r.l.unparen(t)
 	if start, list, ok := r.assignees(t); ok {
 		for i := range list {
-			r.targets(&list[i], s)
+			r.targets(list[i], s)
 		}
 		r.done(start)
 		return
@@ -1851,7 +1859,7 @@ func (r *rsLower) targets(t *ts.Node, s int32) {
 
 // compound lowers `left op= right`: the target is read, then written. Its
 // value is `()`, so it yields none.
-func (r *rsLower) compound(n *ts.Node) {
+func (r *rsLower) compound(n Node) {
 	k := r.k
 	left, right := r.l.unparen(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(r.reads)
@@ -1877,13 +1885,13 @@ func (r *rsLower) compound(n *ts.Node) {
 // reads, then the transfer. A valued break's node defines the result
 // variable of the loop or labelled block it leaves; the jump itself is of
 // type `!` and yields nothing. The label, a kid value skips, is no read.
-func (r *rsLower) jump(n *ts.Node) {
+func (r *rsLower) jump(n Node) {
 	k := r.k
 	m := len(r.reads)
 	label := r.labelOf(n)
 	start, list := r.kids(n)
 	for i := range list {
-		r.value(&list[i])
+		r.value(list[i])
 	}
 	r.done(start)
 	id := r.node(flow.Jump, spanOf(n), m, len(r.reads))
@@ -1906,9 +1914,9 @@ func (r *rsLower) jump(n *ts.Node) {
 // through (x in `x.f`, `x[i].f`, `*x`, `(*x).f`), or -1. Only `*` of the
 // unary operators yields a place: `-x` and `!x` are values, so `&mut !b`
 // borrows a temporary, never b.
-func (r *rsLower) baseVar(t *ts.Node) int32 {
+func (r *rsLower) baseVar(t Node) int32 {
 	k := r.k
-	for t = r.l.unparen(t); t != nil; t = r.l.unparen(t) {
+	for t = r.l.unparen(t); !t.IsNull(); t = r.l.unparen(t) {
 		switch t.KindId() {
 		case k.identifier, k.self:
 			return r.lookup(t)
@@ -1917,7 +1925,7 @@ func (r *rsLower) baseVar(t *ts.Node) int32 {
 		case k.indexExpression:
 			t = r.firstKid(t)
 		case k.unaryExpression:
-			if r.token(t, k.deref) == nil {
+			if r.token(t, k.deref).IsNull() {
 				return -1
 			}
 			t = r.firstKid(t)
@@ -1933,32 +1941,32 @@ func (r *rsLower) baseVar(t *ts.Node) int32 {
 // A `move` closure, async block or gen block captures by value, so it writes
 // its own copies: its reads are kept and its writes, its nested callables'
 // included, are dropped (Reference "Closure expressions", "Async blocks").
-func (r *rsLower) capFunction(fn *ts.Node) {
+func (r *rsLower) capFunction(fn Node) {
 	k := r.k
 	w := len(r.writes)
 	r.shadow++
 	mark := r.binds.mark()
 	if fn.KindId() == k.closureExpression {
-		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 			r.params(ps)
 		}
-		if body := fn.ChildByFieldId(k.fBody); body != nil && body.IsNamed() {
+		if body := fn.ChildByFieldId(k.fBody); !body.IsNull() && body.IsNamed() {
 			r.cap(body)
 		}
-	} else if body := r.firstKid(fn); body != nil {
+	} else if body := r.firstKid(fn); !body.IsNull() {
 		r.cap(body)
 	}
 	r.binds.truncate(mark)
 	r.shadow--
-	if r.token(fn, k.moveKw) != nil {
+	if !r.token(fn, k.moveKw).IsNull() {
 		r.writes = r.writes[:w]
 	}
 }
 
 // cap collects the references n makes to variables of the function being
 // lowered, honouring every scope n opens.
-func (r *rsLower) cap(n *ts.Node) {
-	if n == nil {
+func (r *rsLower) cap(n Node) {
+	if n.IsNull() {
 		return
 	}
 	k := r.k
@@ -1985,19 +1993,19 @@ func (r *rsLower) cap(n *ts.Node) {
 		mark := r.binds.mark()
 		start, list := r.kids(n)
 		for i := range list {
-			r.predeclare(&list[i])
+			r.predeclare(list[i])
 		}
 		for i := range list {
-			r.cap(&list[i])
+			r.cap(list[i])
 		}
 		r.done(start)
 		r.binds.truncate(mark)
 	case k.letDeclaration:
 		v := n.ChildByFieldId(k.fValue)
-		if v != nil {
+		if !v.IsNull() {
 			r.cap(v)
 		}
-		if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
+		if alt := n.ChildByFieldId(k.fAlternative); !alt.IsNull() {
 			r.cap(alt)
 		}
 		r.patternOf(n.ChildByFieldId(k.fPattern), 0, 0, false, r.baseVar(v))
@@ -2008,14 +2016,14 @@ func (r *rsLower) cap(n *ts.Node) {
 	case k.ifExpression, k.whileExpression:
 		mark := r.binds.mark()
 		r.cap(n.ChildByFieldId(k.fCondition))
-		if c := n.ChildByFieldId(k.fConsequence); c != nil {
+		if c := n.ChildByFieldId(k.fConsequence); !c.IsNull() {
 			r.cap(c)
 		}
-		if body := n.ChildByFieldId(k.fBody); body != nil {
+		if body := n.ChildByFieldId(k.fBody); !body.IsNull() {
 			r.cap(body)
 		}
 		r.binds.truncate(mark)
-		if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
+		if alt := n.ChildByFieldId(k.fAlternative); !alt.IsNull() {
 			r.cap(alt)
 		}
 	case k.forExpression:
@@ -2028,22 +2036,22 @@ func (r *rsLower) cap(n *ts.Node) {
 		v := n.ChildByFieldId(k.fValue)
 		r.cap(v)
 		body := n.ChildByFieldId(k.fBody)
-		if body == nil {
+		if body.IsNull() {
 			return
 		}
 		place := r.baseVar(v)
 		start, arms := r.kids(body)
 		for i := range arms {
-			arm := &arms[i]
+			arm := arms[i]
 			if arm.KindId() != k.matchArm {
 				continue
 			}
 			mark := r.binds.mark()
 			pat, guard := r.armPattern(arm.ChildByFieldId(k.fPattern))
-			if pat != nil {
+			if !pat.IsNull() {
 				r.patternOf(pat, 0, 0, false, place)
 			}
-			if guard != nil {
+			if !guard.IsNull() {
 				r.cap(guard)
 			}
 			r.cap(arm.ChildByFieldId(k.fValue))
@@ -2059,7 +2067,7 @@ func (r *rsLower) cap(n *ts.Node) {
 	case k.referenceExpression:
 		v := n.ChildByFieldId(k.fValue)
 		r.cap(v)
-		if r.token(n, k.mutableSpecifier) != nil {
+		if !r.token(n, k.mutableSpecifier).IsNull() {
 			if b := r.baseVar(v); b >= 0 {
 				r.writes = append(r.writes, b)
 			}
@@ -2068,7 +2076,7 @@ func (r *rsLower) cap(n *ts.Node) {
 	default:
 		start, list := r.kids(n)
 		for i := range list {
-			r.cap(&list[i])
+			r.cap(list[i])
 		}
 		r.done(start)
 	}
@@ -2078,7 +2086,7 @@ func (r *rsLower) cap(n *ts.Node) {
 // inside a nested callable binds: an identifier (read too when read is set),
 // every target of a destructuring assignment, or the base of a field, index
 // or dereference target, whose operands are read.
-func (r *rsLower) capWrite(t *ts.Node, read bool) {
+func (r *rsLower) capWrite(t Node, read bool) {
 	k := r.k
 	t = r.l.unparen(t)
 	if t.KindId() == k.identifier {
@@ -2092,7 +2100,7 @@ func (r *rsLower) capWrite(t *ts.Node, read bool) {
 	}
 	if start, list, ok := r.assignees(t); ok {
 		for i := range list {
-			r.capWrite(&list[i], false)
+			r.capWrite(list[i], false)
 		}
 		r.done(start)
 		return
