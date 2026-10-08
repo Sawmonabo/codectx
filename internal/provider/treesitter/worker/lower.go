@@ -380,9 +380,9 @@ func (l *Lowering) unparen(n Node) Node {
 }
 
 // Functions calls visit with every callable under root, root included, in
-// preorder, nested callables included, in one cursor walk of the flat
-// array. It stops at
-// and returns the first error visit returns. A unit with no code of its own
+// preorder, nested callables included, in one cursor walk of the flat array.
+// It stops at and returns the first error visit returns. A unit with no code
+// of its own
 // (a class body without initializers or static blocks) is still visited and
 // lowers to Entry -> Exit, so a count of callables counts it. The subtree of
 // an ambient kind is not walked.
@@ -409,9 +409,9 @@ func (l *Lowering) Functions(root Node, visit func(fn Node) error) error {
 
 // Lower builds fn's graph in a: Begin over fn's byte range, the language's
 // lowering, Finish. fn must be a node Functions visited, and src the source
-// its flat array was flattened from, unchanged while fn is lowered. The graph is valid
-// until the next a.Begin. s is the worker's lowering scratch; one Scratch
-// serves every language and every function a worker lowers.
+// its flat array was flattened from, unchanged while fn is lowered. The graph
+// is valid until the next a.Begin. s is the worker's lowering scratch; one
+// Scratch serves every language and every function a worker lowers.
 func (l *Lowering) Lower(fn Node, src []byte, a *flow.Arena, s *Scratch) *flow.Graph {
 	b := a.Begin(spanOf(fn))
 	s.scope.truncate(0)
@@ -423,9 +423,9 @@ func (l *Lowering) Lower(fn Node, src []byte, a *flow.Arena, s *Scratch) *flow.G
 // Scratch is one worker's reusable lowering state, the pointer-bearing
 // counterpart of flow.Arena: the flat cursor every lowering walks with, the
 // scope chain every lowering resolves names through, and each language's
-// lowering state, whose lists keep their capacity from one
-// function to the next. The zero value is ready to use; Close drops all of
-// it at the file boundary. It is not safe for concurrent use: one Scratch per worker, beside
+// lowering state, whose lists keep their capacity from one function to the
+// next. The zero value is ready to use; Close drops all of it at the file
+// boundary. It is not safe for concurrent use: one Scratch per worker, beside
 // its Arena.
 //
 // Each language's state is created on first use and, at the start of every

@@ -5,13 +5,14 @@
 // precision syntax, and, from the same worker walk, the file-local
 // dependence families control_depends_on, data_flows_to, reads and writes
 // between the file's parameters and locals at precision static_analysis
-// (docs/providers-treesitter.md, Dependence facts). Parsing runs in isolated worker subprocesses (package
-// worker) started through the shared process runner; this package is the
-// parent side, which streams pinned bytes to a worker, validates every framed
-// fact it answers with against those bytes, resolves identities through the
-// unit's resolver and emits facts through the sink. It never links the
-// grammars itself and never holds a repository-wide AST or source cache: the
-// unit of work is one file, and its bytes live only for that unit.
+// (docs/providers-treesitter.md, Dependence facts). Parsing runs in isolated
+// worker subprocesses (package worker) started through the shared process
+// runner; this package is the parent side, which streams pinned bytes to a
+// worker, validates every framed fact it answers with against those bytes,
+// resolves identities through the unit's resolver and emits facts through the
+// sink. It never links the grammars itself and never holds a repository-wide
+// AST or source cache: the unit of work is one file, and its bytes live only
+// for that unit.
 //
 // Memory is taken from each file's observed need (ADR-0012 decision 5): a
 // worker holds its reported base on the process's reservation ledger, and
@@ -21,10 +22,9 @@
 // that key. The need a worker measures covers the parse, the extraction and
 // the dependence lowering and analysis of every callable, which all run in
 // the worker's one walk over the file, so the model learns all three. The
-// overrun target of at most 2% of
-// files per class after the first generation is not claimed: overruns are
-// counted per class and disclosed in Stats, and every file that overruns
-// still runs.
+// overrun target of at most 2% of files per class after the first generation
+// is not claimed: overruns are counted per class and disclosed in Stats, and
+// every file that overruns still runs.
 package treesitter
 
 import (

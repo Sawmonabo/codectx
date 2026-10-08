@@ -1535,9 +1535,9 @@ func (j *javaLower) caseLabel(c Node, g int, sv int32) bool {
 }
 
 // bindPattern adds every variable pattern p binds to pats, a new variable
-// declared over its identifier's span or, in a capture walk, -1, and outside a capture walk defines each on one
-// node spanning its identifier that Uses reads[from:to]. None is in scope
-// until scopePats binds it.
+// declared over its identifier's span or, in a capture walk, -1, and outside
+// a capture walk defines each on one node spanning its identifier that Uses
+// reads[from:to]. None is in scope until scopePats binds it.
 func (j *javaLower) bindPattern(p Node, from, to int) {
 	k := j.k
 	switch p.KindId() {

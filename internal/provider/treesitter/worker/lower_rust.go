@@ -305,9 +305,9 @@ const rsTryLabel = " try"
 // variable; every parameter and local is declared over its identifier's
 // span (flow.Builder.Named, through declare), and every other variable is
 // one the lowering owns; a match arm, an if-let consequence, a while-let
-// body and a for body scope the names their pattern binds. A nested function item cannot
-// capture locals: it creates no node in the enclosing function and its name
-// shadows as a non-variable. Every identifier in a pattern binds, except the
+// body and a for body scope the names their pattern binds. A nested function
+// item cannot capture locals: it creates no node in the enclosing function
+// and its name shadows as a non-variable. Every identifier in a pattern binds, except the
 // path of a tuple-struct or struct pattern.
 //
 // # Macro invocations
