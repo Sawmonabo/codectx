@@ -528,7 +528,10 @@ func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
 	if i < 0 {
 		return nil, internalErr("the linking provider is planned without the structural provider whose tables it reads")
 	}
-	keys := []string{"structural_version=" + b.fileProviders[i].version}
+	// The folded version alone, which foldVersion already bounds to
+	// model.MaxIdentifierBytes: a prefix could push it past the bound
+	// UnitBuild.Validate holds every dependency key to.
+	keys := []string{b.fileProviders[i].version}
 	if family == dependence.FamilyC {
 		keys = append(keys, b.headerKey)
 	}

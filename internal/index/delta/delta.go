@@ -154,8 +154,10 @@ type Result struct {
 	// import runs. That is deliberate — the replaced-set decisions keyed on
 	// it (Replaced.IndexLevel, and the dependence applier's re-iterability
 	// refusal) must be sound against what this build chose, not against a
-	// report from the producer they are guarding. A delta whose
-	// Filtered is false re-imported everything and inherited nothing, even
+	// report from the producer they are guarding. The link applier sets it
+	// when it hands Link the predecessor's resolution, from that hand-off
+	// alone. A delta whose Filtered is false re-imported everything and
+	// inherited nothing, even
 	// though the predecessor was present and usable — for the dependence
 	// applier that is every refresh that changed or removed a declared file.
 	// Result.Carried being all zero does not distinguish that from a

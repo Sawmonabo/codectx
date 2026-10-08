@@ -38,6 +38,10 @@ func TestMain(m *testing.M) {
 // resolve nothing, and what it republishes must be exactly what the first
 // build published.
 //
+// The edit (`* 2` to `* 3`) keeps the file's length, so every range, and with
+// it every structural identity, is unchanged; that is what lets the rebuilt
+// unit's facts be compared row for row with the first build's.
+//
 // Mutation that fails it: hand Link no previous state when every digest
 // matches (drop `opts.Previous = f` in link.go): Filtered is then false.
 func TestLinkBodyEditRelinksNothing(t *testing.T) {
