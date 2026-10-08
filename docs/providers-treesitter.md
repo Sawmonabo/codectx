@@ -4,7 +4,10 @@ The bundled structural provider (implementation plan Section 11.3). It parses
 each supported source file with a pinned tree-sitter grammar in an isolated
 worker subprocess and publishes declarations, containing scopes, signatures,
 imports and exports, syntax references and call sites, test declarations and
-attached documentation at precision `syntax`. It is required, file-scoped and
+attached documentation at precision `syntax`. From the same walk it publishes
+the four file-local dependence families, `control_depends_on`,
+`data_flows_to`, `reads` and `writes`, at precision `static_analysis` (see
+Dependence facts); it is their only publisher. It is required, file-scoped and
 depends on the `filesystem` provider by ID.
 
 Packages:
@@ -13,7 +16,8 @@ Packages:
 |---|---|
 | `internal/provider/treesitter` | Parent side: worker pool, fact validation, resolution, emission. Never links a grammar. |
 | `internal/provider/treesitter/worker` | Child side: `Main(ctx, stdin, stdout, stderr) int`. Owns every native object. |
-| `internal/provider/treesitter/wire` | Length-prefixed JSON framing shared by both. |
+| `internal/provider/treesitter/wire` | Length-prefixed framing shared by both: JSON records, and the binary function message (`wire.Function`). |
+| `internal/provider/treesitter/flow` | The flow core the worker runs per callable: CFG, post-dominators, control dependence, SSA def-use. |
 | `internal/provider/treesitter/lang` | Pin table (grammar module, ABI, version), embedded query packs, fingerprint. |
 | `internal/bench` | `TestParserResourcePlateau` (skipped under `-short`). |
 
@@ -22,7 +26,7 @@ Packages:
 ```
 ID                treesitter
 Version           1.<extraction-version>-<fingerprint[:24]>
-Capabilities      structure
+Capabilities      structure, control_depends_on, data_flows_to, reads, writes
 DependsOn         filesystem
 InvalidationScope file
 Required          true
@@ -216,7 +220,9 @@ duplicated (Section 11.2 stores source once, in the filesystem unit).
 ### Capability state per file
 
 The run always reports `succeeded` (so the unit seals and coverage is
-recorded) with one `structure` capability state at the file's scope:
+recorded) with one `structure` capability state at the file's scope, and one
+row for each of the four dependence capabilities beside it, whose states are
+given under Dependence facts, Capabilities. The `structure` row's states:
 
 | State | DiagnosticCode | Meaning |
 |---|---|---|
@@ -491,7 +497,8 @@ parent → worker   Request{language, path, source_bytes}
 parent → worker   Source<raw bytes>                            exactly source_bytes
 worker → parent   Decl* Import* Ref*                           facts, one record each
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
-worker → parent   Done{package, syntax_errors, truncated, rss_bytes}
+worker → parent   Function*                                    KindFunction, one per callable, binary
+worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
@@ -504,6 +511,19 @@ name within `wire.MaxQualifierBytes` and empty when the receiver is a larger
 expression — a chained `a.b(x).c(y).Scan(&v)` has a receiver hundreds of bytes
 long, which is a callee this file cannot name, not a string to truncate.
 `qualifier_is_import` is decided from the receiver's full text either way.
+
+A `Function` message (`KindFunction`, `wire.AppendFunction` and
+`wire.DecodeFunction`) is the one message that is not JSON: big-endian
+integers and length-prefixed lists carrying the callable's span, its named
+variables as declaring-identifier ranges, its evidence node ranges, and its
+control, flow, read and write facts as indices into those two lists, or, for
+a function whose analysis panicked, its span and the recovered text. The
+decoder checks every list length against the bytes that remain before it
+allocates and refuses an index past the list it names
+(`wire.ErrMalformedFunction`). `Done.DependenceFailure` is set when the
+file's dependence pass failed outside every function, so no function message
+was sent; it never touches the file's structural facts. What the parent
+publishes from these is stated under Dependence facts.
 
 Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
@@ -673,6 +693,15 @@ All MIT:
   bytes publishes identical keys naming identical identities, and the call to
   the builtin `len` publishes both its alias and a callee node with
   `resolution=unresolved`, `candidates=0`.
+- `internal/provider/treesitter/worker` `Test<Language>LoweringGolden`, one
+  per lowering (`lower_c_test.go`, `lower_cpp_test.go`, `lower_go_test.go`,
+  `lower_java_test.go`, `lower_javascript_test.go`, `lower_python_test.go`,
+  `lower_rust_test.go`, `lower_typescript_test.go`): each authored golden
+  table, derived twice from the source text and the language reference, runs
+  on the flat array through the shared harness in `lower_fixture_test.go` and
+  must reproduce every case's control dependence and def-use exactly and emit
+  nothing outside them. They are the gate the four dependence families are
+  published under (ADR-0012, Status).
 - `internal/bench` `TestParserResourcePlateau` (skipped under `-short`): 600
   parses of 64×-repeated fixtures through the real worker path on one
   long-lived worker; worker RSS after warm-up must stay within 8 MiB of its

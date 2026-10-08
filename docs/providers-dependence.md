@@ -1,10 +1,19 @@
 # The `dependence` provider
 
-`internal/provider/dependence` supplies control dependence, data dependence
-through captures and globals, reads, writes and fallback call facts for the
-nine supported languages. It is the Section 11.6 provider: extraction-lazy,
-cached, governed per unit, and honest about every way an analysis can come
-back incomplete.
+`internal/provider/dependence` supplies fallback call facts for the nine
+supported languages. It is the Section 11.6 provider: extraction-lazy, cached,
+governed per unit, and honest about every way an analysis can come back
+incomplete. It publishes `calls` only, and only until the package-scoped
+linking provider of ADR-0012 decision 9 publishes them; the provider and its
+engine are then deleted.
+
+The four file-local dependence families, `control_depends_on`,
+`data_flows_to`, `reads` and `writes`, are not published here. The structural
+provider computes them in process for every language and publishes them per
+file, at `static_analysis` (docs/providers-treesitter.md, Dependence facts).
+The importer drops them for every language: it derives no control dependence,
+no def-use walk and no assignment reads or writes from the export, and so
+publishes no `may_refer_to` for an assignment target it could not resolve.
 
 The analysis engine behind it is identified by its tool lock entry and its
 licence record. Everywhere the provider speaks — the provider id, capability
@@ -15,26 +24,13 @@ document — it is "the engine".
 
 | Capability | Relation | Evidence detail |
 |---|---|---|
-| `control_depends_on` | `control_depends_on` | `cdg` |
-| `data_flows_to` | `data_flows_to` | `reaching_def`, `reaching_def capture` |
-| `reads` | `reads` | `assignment` |
-| `writes` | `writes` | `assignment` |
 | `calls` | `calls` | `call`, `call speculated` |
 
-Every fact is `static_analysis` precision with exact byte ranges. A dependence
-edge does not claim a proven end-to-end source-to-sink flow; data dependence
-that crosses a method boundary through a closure or a global carries the
-`reaching_def capture` detail rather than borrowing the intraprocedural label;
-the export gives a global no marker of its own, so globals and captures share
-that detail.
-
-Precision names the origin of a fact, not a proof of soundness, and one
-language carries a known gap: the Rust frontend lowers the try operator (`?`)
-to a plain call with no control structure, so every statement after a `?` is
-recorded as unconditionally reachable when it is control-dependent on the `?`
-succeeding, and labeled `break`/`continue` bind to the innermost loop. The
-control-dependence and data-dependence facts for Rust are therefore complete
-over the graph the frontend emits, not over the language's semantics.
+Every fact is `static_analysis` precision with exact byte ranges. The
+descriptor, detection and every unit's capability rows name `calls` alone
+(`dependence.Capabilities` in `internal/provider/dependence/failure.go`). An
+entity whose resolution is ambiguous still publishes its equally supported
+alternatives as `may_refer_to` edges from the chosen identity.
 
 Where a call site names a callee the engine could not find, the engine invents
 one: a method with no definition anywhere in the graph, emitted so the site has
@@ -63,67 +59,24 @@ A graph answer
 the evidence behind them, which is why the node itself has to say it: without
 that, an invented callee reads as a real dependency of the source.
 
-A method taken as a value — assigned to a variable, passed as an argument,
-bound by a `def` or `function` statement — is bound by the export to the method
-it names, and the import anchors it there, so every fact derived through such a
-reference names the method the value carries. That flow is how a dependence on
-a function reached through a variable is published at all, and it is all that
-is published: the call through the value is **not** a `calls` edge to the
-referenced method. The engine binds such a call site to an invented callee
-named after the variable (JavaScript) or to no callee at all (Python), never to
-the method the value holds, so a `calls` edge naming it would be this product's
-inference from reachability rather than a fact the analysis produced. It is
-published as the data dependence it is, and a consumer of `codectx_callees`
-follows `data_flows_to` to find the function a variable was called through.
+A call through a method taken as a value — assigned to a variable, passed as
+an argument — is **not** a `calls` edge to the referenced method. The engine
+binds such a call site to an invented callee named after the variable
+(JavaScript) or to no callee at all (Python), never to the method the value
+holds, so a `calls` edge naming it would be this product's inference rather
+than a fact the analysis produced.
 
-`control_depends_on` is a single-hop join, not a walk: the engine's control
-dependence edge is published wherever both of its endpoints anchor to a
-published entity, and nothing is followed from there. `data_flows_to` is the
-other shape — a def-use walk, bounded at eight hops, from one anchored node
-through the lowering nodes between it and the next one — so a control
-dependence answer is exactly as deep as the graph the engine emitted, while a
-data flow answer is as deep as that bound allows. Because both endpoints must
-anchor, a control dependence whose controlling node is the `if`, `while`,
-`switch` or `try` node itself is not published at all: what survives is a
-dependence between two resolved call sites or declarations.
-
-Every language with a `try` statement — C++, Java, JavaScript, TypeScript, TSX,
-and Python's `try`/`except`/`else` — carries a second known gap, in that
-control dependence. The engine's control-flow graph models the exceptional exit
-of a whole `try` body as one edge from the body's **last** statement into each
-handler, and wires an explicit `throw` (Python `raise`) to the method's exit
-rather than to a handler. So a call in a handler is published as
-`control_depends_on` the last call of the `try` body, which is the wrong
-controlling statement whenever an earlier call is the one that could have
-thrown, and an explicit throw inside a `try` creates no control dependence on
-the handler that catches it. The product publishes the control-flow graph the
-engine emits and has no pass of its own that could thread a throw destination
-through it, so it cannot correct this.
-
-For a consumer of `codectx_impact` and `codectx_dependency_path` the
-consequence is a plausible-looking wrong controller rather than a missing
-fact: inside a `try`, the dependence on the handler is real and both endpoints
-are real calls, but the statement named as the controller is not the one that
-throws. C and Go have no exception construct and are unaffected; Rust's `?` is
-the separate caveat above.
-
-`reads` and `writes` come from this provider alone: no SCIP indexer sets a
-write role, and syntax cannot resolve the target of an assignment.
-
-Each published capability carries its own state at the unit's scope, and a
-state that is not `fresh` carries the machine-readable particulars of why in
-bounded `details` pairs: `skipped_methods` (the exact count) and
-`skipped_method_names` (a sample, whole names only) on a `partial`
-`data_flows_to`, `subdivided` and `backend_failure` on every capability of a
-subdivided unit, and `unanalysed_files` on every capability of a unit with a
-source file the frontend was handed and did not read (see the default path
-exclusions below). Export rows the importer recognised but does not map are
-reported once, under the `unsupported_labels` pseudo-capability, `unavailable`,
-with a label-to-count map ordered by count and an `untracked_labels` count for
-whatever did not fit. The particulars are never encoded into extra capability
-rows whose *name* is the detail text: that grows a bounded list with the size
-of the repository and claims a capability identity for something that is not a
-capability.
+The `calls` capability carries its state at the unit's scope, and a state that
+is not `fresh` carries the machine-readable particulars of why in bounded
+`details` pairs: `subdivided` and `backend_failure` on a subdivided unit, and
+`unanalysed_files` on a unit with a source file the frontend was handed and did
+not read (see the default path exclusions below). Export rows the importer
+recognised but does not map are reported once, under the `unsupported_labels`
+pseudo-capability, `unavailable`, with a label-to-count map ordered by count
+and an `untracked_labels` count for whatever did not fit. The particulars are
+never encoded into extra capability rows whose *name* is the detail text: that
+grows a bounded list with the size of the repository and claims a capability
+identity for something that is not a capability.
 
 ## The engine
 
@@ -148,8 +101,7 @@ as CSV into a private export directory.
   were equal (`docs/research/10-engine-empirical.md` §9a). It is part of the
   cache key and there is no second parse at a higher limit.
 * The single export of every representation carries every edge family the
-  importer reads (calls, control dependence, reaching definitions and
-  containment). The narrower dependence-only representations are not
+  importer reads (calls and containment). The narrower dependence-only representations are not
   implemented for CSV or GraphML in this release; there is no GraphML path.
 * The engine's argument parser rejects a repeated option, so the
   semantics-neutral option allowlist must never restate a pinned one.
@@ -318,13 +270,10 @@ unit with source and the export carried no method. Without that, every lookup wo
 again and hold it at the most-recently-used end of the budget for as long as
 the unit is refreshed.
 
-A graph whose parse skipped methods at the definition cap is **not** cached.
-What was skipped exists only on that parse's standard error, and a reused graph
-carries no trace of it, so a cache hit would republish `data_flows_to` as
-`fresh` for a unit whose data dependence is missing whole method bodies. A
-reused graph never publishes a capability fresher than the run that produced
-it; the cost is that such a unit reparses every generation, which the pinned
-definition cap makes rare.
+A graph whose parse skipped methods at the definition cap is cached like any
+other: the skip removes only a method's data dependence, which this provider
+does not publish, so a reused graph publishes exactly what the run that
+produced it did.
 
 ## Memory
 
@@ -440,7 +389,7 @@ Every one of these was reproduced against the real engine.
 | `empty_export` | both steps exited 0 and the export carries no method for a unit that has source | `CTX_PROVIDER_OUTPUT_INVALID` with `family` and `source_files`, the count of the unit's own source files the materialization handed the frontend. Not worded as a crash, because none happened, and not worded as itself either: the frontend is given every file of the unit, so three causes remain and the failure names all three — source holding no definition this family's frontend parses, a frontend whose own fixed rules drop every file of the unit (see the default path exclusions below), and a frontend that failed without reporting it. A unit whose every file is dropped fails here, before any import, so it carries no `unanalysed_files`; a unit whose files are only partly dropped seals and discloses them under that detail. |
 | `engine` (no part survived subdivision) | a subdivided unit no part of which produced a method | same code, with `source_files`, `parts`, `parts_failed` and `parts_without_method`. The reason is that tally — never "no part produced an honest result", which restates the class. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
-| definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
+| definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals. The skip removes only a method's data dependence, which this provider does not publish, so no capability row carries it. |
 
 ### The frontends' default path exclusions, and how they are disclosed
 
