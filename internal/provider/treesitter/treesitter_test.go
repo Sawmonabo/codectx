@@ -35,20 +35,35 @@ func TestMain(m *testing.M) {
 // declaration and a non-ASCII string before a declaration, so a byte range
 // that was computed in characters, or a line/column that was trusted from
 // the child instead of derived from the bytes, misses its source.
+//
+// Each also carries one small dependence source: a function f with a
+// parameter p, a local x assigned from it, and a condition on x guarding a
+// write of the local y (checkDependence).
 var fixtures = []struct {
 	file   string
 	nested string // a declaration nested in another
 	outer  string // the declaration it is nested in
+	// depFile and dep are the dependence source and the path it is indexed at.
+	depFile, dep string
 }{
-	{"sample.go", "inner", "Start"},
-	{"sample.py", "inner", "start"},
-	{"sample.js", "inner", "start"},
-	{"sample.ts", "inner", "serve"},
-	{"sample.tsx", "label", "View"},
-	{"Sample.java", "run", "start"},
-	{"sample.rs", "inner", "start"},
-	{"sample.c", "local", "start"},
-	{"sample.cpp", "Config", "Server"},
+	{"sample.go", "inner", "Start",
+		"dep.go", "package p\n\nfunc f(p int) int {\n\tx := p\n\ty := 0\n\tif x > 0 {\n\t\ty = x\n\t}\n\treturn y\n}\n"},
+	{"sample.py", "inner", "start",
+		"dep.py", "def f(p):\n    x = p\n    y = 0\n    if x > 0:\n        y = x\n    return y\n"},
+	{"sample.js", "inner", "start",
+		"dep.js", "function f(p) {\n  let x = p;\n  let y = 0;\n  if (x > 0) {\n    y = x;\n  }\n  return y;\n}\n"},
+	{"sample.ts", "inner", "serve",
+		"dep.ts", "function f(p: number): number {\n  let x = p;\n  let y = 0;\n  if (x > 0) {\n    y = x;\n  }\n  return y;\n}\n"},
+	{"sample.tsx", "label", "View",
+		"dep.tsx", "function f(p: number): number {\n  let x = p;\n  let y = 0;\n  if (x > 0) {\n    y = x;\n  }\n  return y;\n}\n"},
+	{"Sample.java", "run", "start",
+		"Dep.java", "class Dep {\n  int f(int p) {\n    int x = p;\n    int y = 0;\n    if (x > 0) {\n      y = x;\n    }\n    return y;\n  }\n}\n"},
+	{"sample.rs", "inner", "start",
+		"dep.rs", "fn f(p: i32) -> i32 {\n    let x = p;\n    let mut y = 0;\n    if x > 0 {\n        y = x;\n    }\n    y\n}\n"},
+	{"sample.c", "local", "start",
+		"dep.c", "int f(int p) {\n  int x = p;\n  int y = 0;\n  if (x > 0) {\n    y = x;\n  }\n  return y;\n}\n"},
+	{"sample.cpp", "Config", "Server",
+		"dep.cpp", "int f(int p) {\n  int x = p;\n  int y = 0;\n  if (x > 0) {\n    y = x;\n  }\n  return y;\n}\n"},
 }
 
 func newProvider(t *testing.T) *treesitter.Provider {
@@ -132,9 +147,7 @@ func TestLanguageFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RunUnit: %v", err)
 			}
-			if len(result.Capabilities) != 1 || result.Capabilities[0].State != model.CapabilityFresh {
-				t.Fatalf("capability state = %+v, want one fresh structure state", result.Capabilities)
-			}
+			wantFresh(t, result.Capabilities)
 			fv := h.File(t, fx.file)
 			var nested *model.Node
 			var outers []*model.Node
@@ -188,6 +201,7 @@ func TestLanguageFixtures(t *testing.T) {
 				}
 			}
 			checkCallsites(t, p, files, fx.file, src, cap)
+			checkDependence(t, p, fx.depFile, fx.dep)
 			if p.Stats().Processes > 2 {
 				t.Fatalf("worker processes = %d, over the pool bound", p.Stats().Processes)
 			}
@@ -199,11 +213,103 @@ func TestLanguageFixtures(t *testing.T) {
 	}
 }
 
+// wantFresh asserts a parsed, clean file's capability rows: one per
+// descriptor capability, the structure and the four dependence families,
+// each fresh.
+func wantFresh(t *testing.T, rows []model.CapabilityState) {
+	t.Helper()
+	want := []string{"structure", string(model.RelControlDependsOn), string(model.RelDataFlowsTo), string(model.RelReads), string(model.RelWrites)}
+	if len(rows) != len(want) {
+		t.Fatalf("capability rows = %+v, want one per capability %v", rows, want)
+	}
+	for i, row := range rows {
+		if row.Capability != want[i] || row.State != model.CapabilityFresh {
+			t.Fatalf("capability row %d = %+v, want %s fresh", i, row, want[i])
+		}
+	}
+}
+
+// checkDependence indexes one language's dependence source through the
+// provider harness and asserts that the four families arrive between the
+// expected variable entities, at precision static_analysis, with every
+// capability row fresh.
+//
+// Failure modes: a parent that drops or misdecodes the worker's function
+// messages publishes none of the four families, so every consumer of them
+// answers empty for that language; one that mints variables under another
+// identity than the declaration key splits a variable from every other
+// producer's; one that labels the facts syntax under-reports what produced
+// them.
+//
+// Mutation: skip wire.KindFunction in the exchange's frame switch -> the
+// worker's frame is an unexpected kind and the unit fails; decode it but
+// publish nothing -> no data_flows_to p to x. Publish the four families at
+// the builder's structure family -> the precision check fails.
+func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
+	t.Helper()
+	files := map[string]string{file: src}
+	h := providertest.New(t, files)
+	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
+	result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
+	if err != nil {
+		t.Fatalf("RunUnit(%s): %v", file, err)
+	}
+	wantFresh(t, result.Capabilities)
+	vars := map[string]model.NodeID{}
+	var owner model.NodeID
+	for _, n := range cap.nodes {
+		switch {
+		case n.Node.Kind == model.NodeVariable && n.Evidence[0].Precision == model.PrecisionStaticAnalysis:
+			vars[n.Node.Name] = n.Node.ID
+			key := "decl:" + n.Node.Name + "@" + file + ":"
+			if !slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool {
+				return a.NodeID == n.Node.ID && a.ScopeKey == treesitter.ScopePrefix+file && strings.HasPrefix(a.NativeKey, key)
+			}) {
+				t.Fatalf("%s: variable %s carries no declaration-key alias %s...", file, n.Node.Name, key)
+			}
+		case n.Node.Name == "f" && (n.Node.Kind == model.NodeFunction || n.Node.Kind == model.NodeMethod):
+			owner = n.Node.ID
+		}
+	}
+	for _, name := range []string{"p", "x", "y"} {
+		if vars[name] == "" {
+			t.Fatalf("%s: no static_analysis variable %s; nodes: %s", file, name, names(cap.nodes))
+		}
+	}
+	if owner == "" {
+		t.Fatalf("%s: no declaration f owns the variables; nodes: %s", file, names(cap.nodes))
+	}
+	want := []struct {
+		kind     model.RelationKind
+		from, to model.NodeID
+	}{
+		{model.RelDataFlowsTo, vars["p"], vars["x"]},
+		{model.RelControlDependsOn, vars["y"], vars["x"]},
+		{model.RelReads, owner, vars["x"]},
+		{model.RelWrites, owner, vars["y"]},
+	}
+	for _, w := range want {
+		i := slices.IndexFunc(cap.rels, func(r model.RelationFact) bool {
+			return r.Relation.Kind == w.kind && r.Relation.From == w.from && r.Relation.To == w.to
+		})
+		if i < 0 {
+			t.Fatalf("%s: no %s relation between the expected variables", file, w.kind)
+		}
+		for _, e := range cap.rels[i].Evidence {
+			if e.Precision != model.PrecisionStaticAnalysis {
+				t.Fatalf("%s: %s evidence at precision %s, want %s", file, w.kind, e.Precision, model.PrecisionStaticAnalysis)
+			}
+		}
+	}
+}
+
 // capture records the facts a unit persisted so the test can read the
 // ranges back rather than trust the provider's own view of them.
 type capture struct {
 	provider.UnitOutput
 	nodes    []model.NodeFact
+	rels     []model.RelationFact
 	aliases  []model.NativeAlias
 	evidence []model.Evidence
 	search   []model.SearchUnit
@@ -228,6 +334,7 @@ func (c *capture) PutNodes(ctx context.Context, facts []model.NodeFact) error {
 }
 
 func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) error {
+	c.rels = append(c.rels, facts...)
 	for _, f := range facts {
 		c.evidence = append(c.evidence, f.Evidence...)
 	}
