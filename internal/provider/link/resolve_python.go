@@ -1,7 +1,6 @@
 package link
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"path"
@@ -139,13 +138,6 @@ func comparePyHit(a, b pyHit) int {
 		}
 	}
 	return 0
-}
-
-func compareRef(a, b Ref) int {
-	if c := cmp.Compare(a.File, b.File); c != 0 {
-		return c
-	}
-	return cmp.Compare(a.Index, b.Index)
 }
 
 func cmpBool(a, b bool) int {

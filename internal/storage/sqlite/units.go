@@ -505,7 +505,9 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 }
 
 // streamInputs writes unit_inputs in bounded batches, checking each row against
-// the generation's snapshot and folding the canonical input digest.
+// the generation's snapshot and folding the canonical input digest. An input's
+// Digest is stored beside it and is not folded: it is outside the unit's
+// identity (model.UnitInput).
 func (w *UnitWriter) streamInputs(ctx context.Context, snapshot []byte, inputs func(yield func(model.UnitInput) error) error) error {
 	hasher := model.NewUnitInputHasher()
 	batch := make([]model.UnitInput, 0, w.s.opts.BatchRecords)
@@ -519,7 +521,7 @@ func (w *UnitWriter) streamInputs(ctx context.Context, snapshot []byte, inputs f
 				return wrap("snapshot_files", err)
 			}
 			defer check.Close()
-			ins, err := tx.PrepareContext(ctx, `INSERT INTO unit_inputs(unit_id, file_id, content_hash, executable) VALUES(?, ?, ?, ?)`)
+			ins, err := tx.PrepareContext(ctx, `INSERT INTO unit_inputs(unit_id, file_id, content_hash, executable, digest) VALUES(?, ?, ?, ?, ?)`)
 			if err != nil {
 				return wrap("unit_inputs", err)
 			}
@@ -535,7 +537,11 @@ func (w *UnitWriter) streamInputs(ctx context.Context, snapshot []byte, inputs f
 					}
 					return wrap("snapshot_files", err)
 				}
-				if _, err := ins.ExecContext(ctx, w.rowID, fileRaw, hashRaw, boolInt(in.Executable)); err != nil {
+				digest, err := optionalBlob("unit_input.digest", in.Digest)
+				if err != nil {
+					return err
+				}
+				if _, err := ins.ExecContext(ctx, w.rowID, fileRaw, hashRaw, boolInt(in.Executable), digest); err != nil {
 					return wrap("unit_inputs", err)
 				}
 			}

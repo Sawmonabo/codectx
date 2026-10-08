@@ -47,10 +47,6 @@ func compareTargetSite(a, b Binding) int {
 	return cmp.Or(compareRef(a.Target, b.Target), compareRef(a.Site, b.Site))
 }
 
-func compareRef(a, b Ref) int {
-	return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Index, b.Index))
-}
-
 // encodeBinding is a binding's record in a sorted run and in the stored state.
 func encodeBinding(b Binding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)

@@ -1,6 +1,7 @@
 package link
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"strings"
@@ -43,6 +44,11 @@ func (u *unit) Files(ctx context.Context, yield func(file int32, fv model.FileVe
 // Sites, by context.
 type Ref struct {
 	File, Index int32
+}
+
+// compareRef orders refs by file, then index.
+func compareRef(a, b Ref) int {
+	return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Index, b.Index))
 }
 
 // Binding is one declaration a resolver found a site may call.

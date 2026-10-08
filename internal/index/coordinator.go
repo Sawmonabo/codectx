@@ -10,9 +10,9 @@
 //  3. open a staging generation over the snapshot and the ref it was built
 //     from;
 //  4. attach the units the plan proved reusable, carry the stale predecessor
-//     of every refreshing deferred scope, and build the rest -- SCIP and
-//     dependence through their delta appliers (internal/index/delta), every
-//     other provider through provider.RunUnit;
+//     of every refreshing deferred scope, and build the rest -- SCIP,
+//     dependence and linking through their delta appliers
+//     (internal/index/delta), every other provider through provider.RunUnit;
 //  5. validate and activate with a compare-and-swap on the active pointer;
 //  6. retain by ref.
 //
@@ -49,6 +49,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -339,9 +340,9 @@ const (
 	stageAbandonment = "abandonment"
 )
 
-// buildAppliers binds the delta appliers of the two providers that can
-// describe what changed since their last run. A provider the registry does not
-// hold simply has no applier: its units are then never planned either.
+// buildAppliers binds the delta appliers of the providers that can describe
+// what changed since their last run. A provider the registry does not hold
+// simply has no applier: its units are then never planned either.
 //
 // A registered provider of an unexpected concrete type is a composition error
 // and fails construction. Falling back to a full run would be a silent
@@ -362,6 +363,13 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 			return nil, internalErr("the registered " + dependence.ProviderID + " provider cannot apply its own deltas")
 		}
 		out[dependence.ProviderID] = delta.NewDependence(c.opts.Store, dp, c.limits, c.opts.Pool)
+	}
+	if p, ok := c.opts.Registry.Lookup(link.ProviderID); ok {
+		lp, ok := p.(*link.Provider)
+		if !ok {
+			return nil, internalErr("the registered " + link.ProviderID + " provider cannot apply its own deltas")
+		}
+		out[link.ProviderID] = delta.NewLink(c.opts.Store, lp, link.StoreTables(c.opts.Store), c.limits, c.opts.Pool)
 	}
 	return out, nil
 }
@@ -785,8 +793,10 @@ func (c *Coordinator) carriedPage(gen model.GenerationID) func(context.Context, 
 
 // enablement is what Registry.Select asks about each provider. A provider the
 // configuration does not name is enabled, which is what a required base
-// provider is. The LSP overlay is not a registry provider -- it answers live
-// queries rather than sealing units -- so it has no row here.
+// provider is. The linking provider has no key of its own: it reads only what
+// the structural provider stores, so it runs exactly when that provider is
+// enabled and is off with it. The LSP overlay is not a registry provider -- it
+// answers live queries rather than sealing units -- so it has no row here.
 func (c *Coordinator) enablement(providerID string) config.Enablement {
 	p := c.opts.Config.Providers
 	switch providerID {
@@ -794,7 +804,7 @@ func (c *Coordinator) enablement(providerID string) config.Enablement {
 		return p.SCIP.Enabled
 	case dependence.ProviderID:
 		return p.Dependence.Enabled
-	case tslang.ProviderID:
+	case tslang.ProviderID, link.ProviderID:
 		if !p.TreeSitter.Enabled {
 			return config.Disabled
 		}
@@ -827,7 +837,9 @@ func disabledProviders(cfg config.Config) []string {
 	p := cfg.Providers
 	var out []string
 	if !p.TreeSitter.Enabled {
-		out = append(out, tslang.ProviderID)
+		// The linking provider is off with the structural provider whose
+		// tables it reads (enablement), and is said to be.
+		out = append(out, tslang.ProviderID, link.ProviderID)
 	}
 	if p.SCIP.Enabled == config.Disabled {
 		out = append(out, scip.ID)

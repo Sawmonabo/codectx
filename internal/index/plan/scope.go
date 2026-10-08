@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -137,6 +138,24 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			unplanned[unplannedProjects+string(f)] = n
 		}
 		return out, unplanned, nil
+	case link.ProviderID:
+		// The linking provider's units are the dependence planner's projects,
+		// reused rather than re-derived, with the same membership: a project's
+		// member files are what its calls resolve across. A project that
+		// planner refused as a unit of its own is linked with the unit that
+		// encloses it, which loses no call, so nothing is unplanned here; the
+		// refusal is the dependence provider's to count, and counting it again
+		// under the same key would double it. It runs no heavy child.
+		dp, err := dependence.PlanUnits(ctx, view)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := make([]semantic, 0, len(dp.Units))
+		for _, u := range dp.Units {
+			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, family: u.Family,
+				contains: func(fv model.FileVersion) bool { return u.OwnsInput(fv.Path) }})
+		}
+		return out, nil, nil
 	}
 	return nil, nil, internalErr("the planner does not know which unit scopes provider " + d.ID + " builds")
 }
@@ -161,6 +180,9 @@ type semantic struct {
 	bytes    int64
 	version  string
 	contains func(model.FileVersion) bool
+	// dependencyKeys are the unit's synthetic dependency keys
+	// (Unit.DependencyKeys).
+	dependencyKeys []string
 
 	inputs []model.UnitInput
 	// changed counts the member files whose content differs from the previous

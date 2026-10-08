@@ -14,6 +14,12 @@
 //     one, hand storage the replaced set and carry the rest over;
 //  4. store the fresh delta state and seal.
 //
+// The linking provider's applier (link.go) is the third, and its delta is the
+// coarsest: one digest per member file's link tables. When every member keeps
+// its predecessor's digest it hands Link the predecessor's resolution instead
+// of resolving; either way Link republishes every fact, so it carries nothing
+// over.
+//
 // A predecessor that is absent, stored no state, or stored state this build
 // cannot read is not an error: the unit is built in full and Result.Full and
 // Result.FullReason say so. That degradation covers provider-written state
@@ -42,7 +48,8 @@ import (
 )
 
 // Stats counts one delta in the applier's own granularity: SCIP documents for
-// the SCIP applier, fact keys for the dependence applier.
+// the SCIP applier, fact keys for the dependence applier, member inputs by
+// their table digest for the link applier.
 type Stats struct{ Changed, Unchanged, Removed int64 }
 
 // Request is one unit to build. It is what the coordinator has already
@@ -147,8 +154,10 @@ type Result struct {
 	// import runs. That is deliberate — the replaced-set decisions keyed on
 	// it (Replaced.IndexLevel, and the dependence applier's re-iterability
 	// refusal) must be sound against what this build chose, not against a
-	// report from the producer they are guarding. A delta whose
-	// Filtered is false re-imported everything and inherited nothing, even
+	// report from the producer they are guarding. The link applier sets it
+	// when it hands Link the predecessor's resolution, from that hand-off
+	// alone. A delta whose Filtered is false re-imported everything and
+	// inherited nothing, even
 	// though the predecessor was present and usable — for the dependence
 	// applier that is every refresh that changed or removed a declared file.
 	// Result.Carried being all zero does not distinguish that from a
