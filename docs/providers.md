@@ -25,8 +25,12 @@ Each relation family has one publisher. The four file-local dependence
 families, `control_depends_on`, `data_flows_to`, `reads` and `writes`, are the
 structural `treesitter` provider's, published per file at `static_analysis`
 from the same worker walk that extracts the file
-(`docs/providers-treesitter.md`, Dependence facts). The `dependence` provider
-publishes `calls` only (`docs/providers-dependence.md`).
+(`docs/providers-treesitter.md`, Dependence facts). Cross-file `calls` are the
+package-scoped `link` provider's, at `static_analysis`, from the link tables
+the structural provider stores with each file's unit
+(`docs/providers-link.md`); the structural provider's own `calls` stay the
+in-file syntax tier. The `dependence` provider publishes no relation
+(`docs/providers-dependence.md`).
 
 ```go
 type Provider interface {
