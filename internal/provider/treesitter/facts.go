@@ -43,6 +43,30 @@ var declKinds = map[string]model.NodeKind{
 	"test": model.NodeTest, "module": model.NodeModule, "namespace": model.NodeNamespace,
 }
 
+// family is a group of facts reported under its own capability rows, with
+// its own evidence precision and its own bound accounting.
+type family int
+
+const (
+	// structure is every structural fact: declarations, containment,
+	// imports, references and call sites, at precision syntax.
+	structure family = iota
+	// dependence is the four file-local dependence families and the
+	// variable entities they connect, at precision static_analysis: a
+	// control-flow graph, post-dominators and def-use chains are static
+	// analysis whichever parser built the tree they came from.
+	dependence
+	families
+)
+
+// precision is the origin every evidence row of the family names.
+func (f family) precision() model.Precision {
+	if f == dependence {
+		return model.PrecisionStaticAnalysis
+	}
+	return model.PrecisionSyntax
+}
+
 // builder turns one file's validated extraction into facts. Every byte range
 // it publishes is derived from the pinned bytes with source.Cursor; nothing
 // the worker said is copied without being checked against them.
@@ -69,17 +93,20 @@ type builder struct {
 	// repeats an identity does not publish the same alias row twice.
 	aliasSeen map[model.NativeAlias]bool
 	search    []model.SearchUnit
-	// dropped counts what this file's bounds kept out of the facts: calls
-	// past the callee-reference bound, and declaration or call-site keys
-	// over MaxNativeKeyBytes. Occurrences cut by the per-fact evidence clip
-	// are counted in clipped instead, so the operator can attribute them.
-	// Any of it makes the file's coverage partial.
-	dropped int
-	// clipped counts the evidence occurrences the per-fact clip kept out.
-	// It is disclosed on the file's capability as `evidence_clipped`, the
-	// same detail key the filesystem provider uses for the same bound, so a
-	// clip is attributable instead of folded into the generic dropped count.
-	clipped int
+	// dropped counts, per fact family, what this file's bounds kept out of
+	// the facts: calls past the callee-reference bound, declaration,
+	// call-site and variable keys over MaxNativeKeyBytes, and the facts of a
+	// dropped variable. Occurrences cut by the per-fact evidence clip are
+	// counted in clipped instead, so the operator can attribute them. Any of
+	// it makes the file's coverage of that family partial, and a family's
+	// count never reaches another family's capability row.
+	dropped [families]int
+	// clipped counts, per fact family, the evidence occurrences the per-fact
+	// clip kept out. It is disclosed on the family's capability rows as
+	// `evidence_clipped`, the same detail key the filesystem provider uses
+	// for the same bound, so a clip is attributable instead of folded into
+	// the generic dropped count.
+	clipped [families]int
 	// evidenceClip is the effective per-fact evidence bound (Options
 	// MaxEvidencePerFact); 0 means the model's record ceiling.
 	evidenceClip int
@@ -101,11 +128,8 @@ type declFact struct {
 	sig  string
 	doc  string
 	res  model.Resolution
-	// truncated names the fields this declaration's storage ceilings cut,
-	// with the original byte length of each. It is index-time truncation of
-	// a stored value and is published as its own attribute, never merged
-	// with a result page's transient truncation flag.
-	truncated map[string]int
+	// truncated names the fields this declaration's storage ceilings cut.
+	truncated truncations
 
 	// body is the search document's text: the attached documentation and the
 	// signature, composed and bounded once at extraction so a cut is recorded
@@ -113,14 +137,20 @@ type declFact struct {
 	body string
 }
 
-// truncate bounds one of this declaration's fields and records the cut.
-func (d *declFact) truncate(field, value string, max int) string {
+// truncations names the fields a fact's storage ceilings cut, with the
+// original byte length of each. It is index-time truncation of a stored
+// value and is published as the node's truncated_fields attribute, never
+// merged with a result page's transient truncation flag.
+type truncations map[string]int
+
+// cut bounds one field to max bytes and records the cut.
+func (t *truncations) cut(field, value string, max int) string {
 	bounded, original := model.TruncateField(value, max)
 	if original > len(bounded) {
-		if d.truncated == nil {
-			d.truncated = map[string]int{}
+		if *t == nil {
+			*t = truncations{}
 		}
-		d.truncated[field] = original
+		(*t)[field] = original
 	}
 	return bounded
 }
@@ -148,8 +178,10 @@ func (b *builder) build() error {
 	// no container for a declaration and no scope for an alias, so the file
 	// publishes nothing and reports its structural coverage partial /
 	// CTX_COVERAGE_INCOMPLETE, exactly as an over-long declaration key does.
+	// Every function's dependence facts are lost with it, and counted.
 	if len(b.scope) > model.MaxScopeKeyBytes || len(b.modKey) > model.MaxNativeKeyBytes {
-		b.dropped++
+		b.dropped[structure]++
+		b.dropped[dependence] += len(b.ex.functions)
 		return nil
 	}
 	b.rels = map[model.RelationID]*model.RelationFact{}
@@ -172,7 +204,10 @@ func (b *builder) build() error {
 	if err := b.imports(); err != nil {
 		return err
 	}
-	return b.refs()
+	if err := b.refs(); err != nil {
+		return err
+	}
+	return b.functions()
 }
 
 // rangeOf derives a located range from two byte offsets the worker reported.
@@ -236,22 +271,22 @@ func (b *builder) validateDecls() error {
 			return err
 		}
 		f := declFact{Decl: d, kind: kind, rng: rng}
-		f.sig = f.truncate("signature", collapse(string(b.src[d.Start:d.SigEnd])), model.MaxSignatureBytes)
-		f.Name = f.truncate("name", d.Name, model.MaxNameBytes)
-		f.Qualified = f.truncate("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
-		f.Impl = f.truncate("receiver", d.Impl, model.MaxNameBytes)
+		f.sig = f.truncated.cut("signature", collapse(string(b.src[d.Start:d.SigEnd])), model.MaxSignatureBytes)
+		f.Name = f.truncated.cut("name", d.Name, model.MaxNameBytes)
+		f.Qualified = f.truncated.cut("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
+		f.Impl = f.truncated.cut("receiver", d.Impl, model.MaxNameBytes)
 		if d.DocEnd > 0 {
 			if _, err := b.rangeOf(d.DocStart, d.DocEnd); err != nil {
 				return err
 			}
-			f.doc = f.truncate("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
+			f.doc = f.truncated.cut("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
 		}
 		// The search body is composed and bounded here, not in searchUnit,
 		// because the node's metadata is built before searchUnit runs: a cut
 		// made later would never reach truncated_fields. A doc and a
 		// signature each at their own ceiling compose to more than one body
 		// holds, so this bound really does cut and must disclose it.
-		f.body = f.truncate("body", searchBody(f.doc, f.sig), maxDocBytes)
+		f.body = f.truncated.cut("body", searchBody(f.doc, f.sig), maxDocBytes)
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
 	}
@@ -274,7 +309,7 @@ func (b *builder) resolveModule() error {
 	if b.ex.done.Package != "" {
 		meta["package"] = bound(b.ex.done.Package, model.MaxNameBytes)
 	}
-	b.putNode(res, b.fileRng, b.modKey, meta)
+	b.putNode(structure, res, b.fileRng, b.modKey, meta)
 	b.putAlias(b.scope, b.modKey, res.Node.ID)
 	return nil
 }
@@ -323,7 +358,7 @@ func (b *builder) resolveDecls() error {
 			// long they were. Distinct from result truncation by name.
 			meta["truncated_fields"] = d.truncated
 		}
-		first := b.putNode(res, d.rng, d.Qualified, meta)
+		first := b.putNode(structure, res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
 
 		parent := b.module.Node.ID
@@ -331,9 +366,9 @@ func (b *builder) resolveDecls() error {
 		if d.Parent >= 0 {
 			parent, kind = b.decls[d.Parent].res.Node.ID, model.RelContains
 		}
-		b.putRelation(parent, kind, res.Node.ID, d.rng, d.Qualified, "")
+		b.putRelation(structure, parent, kind, res.Node.ID, d.rng, d.Qualified, "")
 		if d.Exported && d.Parent < 0 {
-			b.putRelation(b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
+			b.putRelation(structure, b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
 		}
 		if _, cut := d.truncated["qualified_name"]; !cut {
 			b.putAlias(b.scope, d.Qualified, res.Node.ID)
@@ -343,9 +378,9 @@ func (b *builder) resolveDecls() error {
 			// every declaration sharing the first MaxQualifiedNameBytes is
 			// the same symbol. It is omitted and counted, exactly as declKey
 			// omits an over-long key.
-			b.dropped++
+			b.dropped[structure]++
 		}
-		if key := b.declKey(d); key != "" {
+		if key := b.declKey(d.Name, d.Start, d.End, d.rng); key != "" {
 			b.putAlias(b.scope, key, res.Node.ID)
 		} else {
 			// The cross-provider key did not fit and was omitted rather than
@@ -354,7 +389,7 @@ func (b *builder) resolveDecls() error {
 			// same function resolves to a second identity. It is counted, so
 			// the file reports partial / CTX_COVERAGE_INCOMPLETE instead of
 			// claiming structural coverage it does not have.
-			b.dropped++
+			b.dropped[structure]++
 		}
 		if d.Parent < 0 {
 			pkg, over := b.packageScope()
@@ -367,7 +402,7 @@ func (b *builder) resolveDecls() error {
 				// over-long key. This declaration will not merge with the one
 				// another file of the same package publishes, so the file's
 				// structural coverage is genuinely incomplete and says so.
-				b.dropped++
+				b.dropped[structure]++
 			}
 		}
 		if first {
@@ -388,14 +423,16 @@ func (b *builder) identityKey(d *declFact) string {
 	if _, cut := d.truncated["qualified_name"]; !cut {
 		return d.Qualified
 	}
-	if key := b.declKey(d); key != "" {
+	if key := b.declKey(d.Name, d.Start, d.End, d.rng); key != "" {
 		return key
 	}
 	return d.Qualified
 }
 
-// declKey is the cross-provider declaration key: the one string a semantic
-// provider and this one both compute for the same declaration:
+// declKey is the cross-provider declaration key of the declaration named name
+// that spans the pinned bytes [start, end), located at rng: the one string a
+// semantic provider and this one both compute for the same declaration, and
+// the native key of every variable entity, over its declaring identifier:
 //
 //	scope  "file:" + path
 //	key    "decl:" + <identifier token as written> + "@" + path + ":" + <first line> + "-" + <last line>
@@ -416,14 +453,14 @@ func (b *builder) identityKey(d *declFact) string {
 // whose cross-provider key is missing will not merge with the semantic
 // provider's node for the same function: the file's structural coverage is
 // genuinely incomplete and says so.
-func (b *builder) declKey(d *declFact) string {
-	endLine := d.rng.End.Line
-	if d.End > d.Start && b.src[d.End-1] == '\n' {
+func (b *builder) declKey(name string, start, end uint32, rng *model.SourceRange) string {
+	endLine := rng.End.Line
+	if end > start && b.src[end-1] == '\n' {
 		// The half-open end sits at the start of the next line; the
 		// declaration's last line is the one before it.
 		endLine--
 	}
-	key := "decl:" + d.Name + "@" + b.fv.Path + ":" + strconv.FormatUint(uint64(d.rng.Start.Line), 10) + "-" + strconv.FormatUint(uint64(endLine), 10)
+	key := "decl:" + name + "@" + b.fv.Path + ":" + strconv.FormatUint(uint64(rng.Start.Line), 10) + "-" + strconv.FormatUint(uint64(endLine), 10)
 	if len(key) > model.MaxNativeKeyBytes {
 		return ""
 	}
@@ -477,7 +514,7 @@ func (b *builder) imports() error {
 		// different identity and never allowed to fail the unit.
 		key := "import:" + b.lang.Name + ":" + imp.Path
 		if len(key) > model.MaxNativeKeyBytes {
-			b.dropped++
+			b.dropped[structure]++
 			continue
 		}
 		name := lastPathSegment(imp.Path)
@@ -488,8 +525,8 @@ func (b *builder) imports() error {
 		if err != nil {
 			return err
 		}
-		b.putNode(res, rng, "import:"+imp.Path, map[string]any{"import_path": imp.Path})
-		b.putRelation(b.module.Node.ID, model.RelImports, res.Node.ID, rng, imp.Path, "")
+		b.putNode(structure, res, rng, "import:"+imp.Path, map[string]any{"import_path": imp.Path})
+		b.putRelation(structure, b.module.Node.ID, model.RelImports, res.Node.ID, rng, imp.Path, "")
 	}
 	return nil
 }
@@ -550,7 +587,7 @@ func (b *builder) refs() error {
 			// A type reference to a name this file does not declare is left to a
 			// provider that can see the other file; no placeholder is minted.
 			for _, t := range targets {
-				b.putRelation(from, model.RelReferences, b.decls[t].res.Node.ID, rng, r.Name, "")
+				b.putRelation(structure, from, model.RelReferences, b.decls[t].res.Node.ID, rng, r.Name, "")
 			}
 			continue
 		}
@@ -562,7 +599,7 @@ func (b *builder) refs() error {
 			// structurally rather than as an attribute on a node that also
 			// describes the declaration itself.
 			callee = b.decls[targets[0]].res.Node.ID
-			b.putRelation(from, model.RelCalls, callee, rng, r.Name, "")
+			b.putRelation(structure, from, model.RelCalls, callee, rng, r.Name, "")
 		} else {
 			// Nothing in this file is the single callee: the name is declared
 			// several times here, is qualified by an imported name, or is not
@@ -588,7 +625,7 @@ func (b *builder) refs() error {
 					// with more distinct cross-file callees than this is
 					// reported partial rather than allowed to publish an
 					// unbounded number of placeholder nodes and relations.
-					b.dropped++
+					b.dropped[structure]++
 					continue
 				}
 				if res, err = b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
@@ -596,12 +633,12 @@ func (b *builder) refs() error {
 					return err
 				}
 				callees[key] = res
-				b.putNode(res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
+				b.putNode(structure, res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
 			} else {
-				b.addEvidence(res.Node.ID, rng, key)
+				b.addEvidence(structure, res.Node.ID, rng, key)
 			}
 			callee = res.Node.ID
-			b.putRelation(from, model.RelCalls, callee, rng, key, resolution)
+			b.putRelation(structure, from, model.RelCalls, callee, rng, key, resolution)
 			kept := min(len(targets), model.MaxAmbiguousCandidates)
 			if kept < len(targets) {
 				// The candidate list is cut to the model's ambiguity bound.
@@ -609,10 +646,10 @@ func (b *builder) refs() error {
 				// should have published and did not, so it is counted like
 				// every other loss and the file reports partial rather than
 				// claiming complete structural coverage.
-				b.dropped += len(targets) - kept
+				b.dropped[structure] += len(targets) - kept
 			}
 			for _, t := range targets[:kept] {
-				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
+				b.putRelation(structure, from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
 		}
 		if key := b.callsiteKey(r.NameStart, r.NameEnd); key != "" {
@@ -623,7 +660,7 @@ func (b *builder) refs() error {
 			// claim. Without it this call site does not join the SCIP
 			// occurrence at the same bytes, so the file's structural
 			// coverage is genuinely incomplete and reports partial.
-			b.dropped++
+			b.dropped[structure]++
 		}
 	}
 	return nil
@@ -733,22 +770,22 @@ func (b *builder) resolve(c model.NodeCandidate) (model.Resolution, error) {
 	return res, nil
 }
 
-// evidence builds one evidence row for this unit and run.
-func (b *builder) evidence(node model.NodeID, rel model.RelationID, rng *model.SourceRange, nativeKey, detail string) model.Evidence {
+// evidence builds one evidence row of fam for this unit and run.
+func (b *builder) evidence(fam family, node model.NodeID, rel model.RelationID, rng *model.SourceRange, nativeKey, detail string) model.Evidence {
 	e := model.Evidence{UnitID: b.req.Unit.ID, ProviderID: b.req.Unit.ProviderID, ProviderVersion: b.req.Unit.ProviderVersion,
-		OriginRunID: b.req.Run, NodeID: node, RelationID: rel, Precision: model.PrecisionSyntax,
+		OriginRunID: b.req.Run, NodeID: node, RelationID: rel, Precision: fam.precision(),
 		FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: rng, NativeKey: bound(nativeKey, model.MaxNativeKeyBytes), Detail: detail}
 	e.ID = model.NewEvidenceID(e)
 	return e
 }
 
-// putNode publishes res's node with this occurrence as its evidence and
-// reports true, or, when this builder already published a node with that
+// putNode publishes res's node with this occurrence as its evidence of fam
+// and reports true, or, when this builder already published a node with that
 // identity, adds the occurrence to it and reports false: a unit publishes one
 // node per identity, and the first occurrence's metadata stands.
-func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKey string, meta map[string]any) bool {
+func (b *builder) putNode(fam family, res model.Resolution, rng *model.SourceRange, nativeKey string, meta map[string]any) bool {
 	if _, ok := b.nodeAt[res.Node.ID]; ok {
-		b.addEvidence(res.Node.ID, rng, nativeKey)
+		b.addEvidence(fam, res.Node.ID, rng, nativeKey)
 		return false
 	}
 	node := res.Node
@@ -758,7 +795,7 @@ func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKe
 		}
 	}
 	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey,
-		Evidence: []model.Evidence{b.evidence(node.ID, "", rng, nativeKey, "")}})
+		Evidence: []model.Evidence{b.evidence(fam, node.ID, "", rng, nativeKey, "")}})
 	// The index makes a repeat occurrence of an identity a map lookup. Without
 	// it a file whose every call is unresolved rescans the published facts per
 	// occurrence, which is quadratic in the file's references.
@@ -775,30 +812,31 @@ func (b *builder) putAlias(scope, key string, node model.NodeID) {
 	}
 }
 
-// addEvidence records another occurrence of a node this builder published.
-func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey string) {
+// addEvidence records another occurrence of fam of a node this builder
+// published; an occurrence past the clip is counted against fam.
+func (b *builder) addEvidence(fam family, id model.NodeID, rng *model.SourceRange, nativeKey string) {
 	i, ok := b.nodeAt[id]
 	if !ok {
 		return
 	}
 	if b.evidenceFull(len(b.nodes[i].Evidence)) {
-		b.clipped++
+		b.clipped[fam]++
 		return
 	}
-	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(b.nodes[i].Node.ID, "", rng, nativeKey, ""))
+	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(fam, b.nodes[i].Node.ID, "", rng, nativeKey, ""))
 }
 
-// bounds folds this file's bound accounting into the capability state it is
-// reported on. The evidence clip is attributed under
+// bounds folds fam's bound accounting for this file into the capability
+// state it is reported on. The evidence clip is attributed under
 // model.DetailEvidenceClipped instead of the generic dropped count, so an operator can tell a clip they
 // configured from any other bound; the bool reports whether any bound -- clip
-// or otherwise -- made this file's coverage partial, so attributing the clip
-// never costs the partial signal.
-func (b *builder) bounds(state model.CapabilityState) (model.CapabilityState, bool) {
-	if b.clipped > 0 {
-		state = state.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(b.clipped))
+// or otherwise -- made this file's coverage of fam partial, so attributing the
+// clip never costs the partial signal.
+func (b *builder) bounds(fam family, state model.CapabilityState) (model.CapabilityState, bool) {
+	if b.clipped[fam] > 0 {
+		state = state.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(b.clipped[fam]))
 	}
-	return state, b.dropped > 0 || b.clipped > 0
+	return state, b.dropped[fam] > 0 || b.clipped[fam] > 0
 }
 
 // evidenceFull reports whether a fact already carries every occurrence this
@@ -817,13 +855,14 @@ func (b *builder) evidenceFull(n int) bool {
 // as may_refer_to edges instead of silently picking the first.
 func (b *builder) ambiguous(res model.Resolution, rng *model.SourceRange) {
 	for _, alt := range res.Ambiguous {
-		b.putRelation(res.Node.ID, model.RelMayReferTo, alt, rng, res.CanonicalKey, "ambiguous alias match")
+		b.putRelation(structure, res.Node.ID, model.RelMayReferTo, alt, rng, res.CanonicalKey, "ambiguous alias match")
 	}
 }
 
-// putRelation adds one occurrence of a canonical edge; several occurrences
-// share the relation and each carries its own range-bearing evidence.
-func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to model.NodeID, rng *model.SourceRange, nativeKey, detail string) {
+// putRelation adds one occurrence of fam of a canonical edge; several
+// occurrences share the relation and each carries its own range-bearing
+// evidence, and an occurrence past the clip is counted against fam.
+func (b *builder) putRelation(fam family, from model.NodeID, kind model.RelationKind, to model.NodeID, rng *model.SourceRange, nativeKey, detail string) {
 	id := model.NewRelationID(b.req.Binding.RepositoryID, from, kind, to)
 	f, ok := b.rels[id]
 	if !ok {
@@ -832,10 +871,10 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 		b.relOrder = append(b.relOrder, id)
 	}
 	if b.evidenceFull(len(f.Evidence)) {
-		b.clipped++
+		b.clipped[fam]++
 		return
 	}
-	f.Evidence = append(f.Evidence, b.evidence("", id, rng, nativeKey, detail))
+	f.Evidence = append(f.Evidence, b.evidence(fam, "", id, rng, nativeKey, detail))
 }
 
 // searchUnit is the declaration's lexical document: names, signature and its
@@ -897,7 +936,7 @@ func putChunked[T any](ctx context.Context, items []T, put func(context.Context,
 
 // collapse trims s, folds runs of whitespace into one space and bounds it.
 // collapse folds a declaration's signature bytes onto one line. It does not
-// bound the result: the caller truncates through declFact.truncate, so a cut
+// bound the result: the caller truncates through truncations.cut, so a cut
 // signature is flagged in truncated_fields rather than shortened in silence.
 func collapse(s string) string {
 	return strings.Join(strings.Fields(s), " ")
@@ -928,7 +967,7 @@ func cleanDoc(s string) string {
 	for len(out) > 0 && out[len(out)-1] == "" {
 		out = out[:len(out)-1]
 	}
-	// Unbounded: the caller truncates through declFact.truncate so the cut is
+	// Unbounded: the caller truncates through truncations.cut so the cut is
 	// counted. Bounding here is what made an over-long docstring vanish
 	// silently.
 	return strings.Join(out, "\n")
@@ -965,7 +1004,7 @@ func lastPathSegment(p string) string {
 
 // searchBody composes a declaration's search text: its attached documentation
 // above its signature, or the signature alone when it has none. The caller
-// bounds the result through declFact.truncate so a cut is flagged.
+// bounds the result through truncations.cut so a cut is flagged.
 func searchBody(doc, sig string) string {
 	if doc == "" {
 		return sig
