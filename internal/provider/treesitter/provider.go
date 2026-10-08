@@ -378,7 +378,18 @@ func (p *Provider) OpenStage(ctx context.Context) (closeStage func() model.Stage
 // the unit. A header is parsed with the grammar its snapshot's census chooses
 // and falls back once to the other (grammarOf); its facts are in the grammar
 // of the parse the worker kept, and the choice is disclosed on its row.
+//
+// The file's link table (linkTable) is stored with the unit under
+// link.TableKind for the linking provider to read, so the sink must be a
+// provider.StateSink: on any other the unit is refused before anything is
+// parsed, rather than sealed without the table. A file whose link pass failed
+// stores none and discloses the failure on its structure row.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	states, ok := sink.(provider.StateSink)
+	if !ok {
+		return model.ProviderResult{}, &model.Error{Code: model.CodeInternal,
+			Message: "the structural provider stores each file's link table with its unit and was given a sink that holds no state"}
+	}
 	p.enterStage(ctx)
 	defer p.leaveStage(ctx)
 	relPath, ok := strings.CutPrefix(req.Unit.ScopeKey, lang.ScopePrefix)
@@ -432,10 +443,16 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
+	if err := b.storeTable(states); err != nil {
+		return model.ProviderResult{}, err
+	}
 	result.RecordsEmitted = records
 	state := model.CapabilityState{ProviderID: lang.ProviderID, Capability: capabilityName, Scope: req.Unit.ScopeKey, State: model.CapabilityFresh}
 	if h := ex.done.Header; h != nil {
 		state = discloseHeader(state, *h)
+	}
+	if ex.done.LinkFailure != "" {
+		state = state.WithDetail(detailLinkFailure, ex.done.LinkFailure)
 	}
 	state, bounded := b.bounds(structure, state)
 	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {
