@@ -27,9 +27,10 @@ No relation. The import still stages, projects and keys the export's call
 edges, so its key set and delta are the export's, but none reaches the sink.
 It publishes the unit's method nodes, at `static_analysis` with exact byte
 ranges, and their aliases. The descriptor, detection and every unit's
-capability rows still name `calls`
-(`dependence.Capabilities` in `internal/provider/dependence/failure.go`), which
-the provider no longer publishes.
+capability rows name no capability (`dependence.Capabilities` in
+`internal/provider/dependence/failure.go` is empty), so nothing reads `calls`
+as fresh from this provider; a unit reports only the `unsupported_labels`
+pseudo-capability.
 
 The rest of this section describes the call edges the import projects and keys.
 
@@ -67,11 +68,7 @@ binds such a call site to an invented callee named after the variable
 holds, so a `calls` edge naming it would be this product's inference rather
 than a fact the analysis produced.
 
-The `calls` capability carries its state at the unit's scope, and a state that
-is not `fresh` carries the machine-readable particulars of why in bounded
-`details` pairs: `subdivided` and `backend_failure` on a subdivided unit, and
-`unanalysed_files` on a unit with a source file the frontend was handed and did
-not read (see the default path exclusions below). Export rows the importer
+Export rows the importer
 recognised but does not map are reported once, under the `unsupported_labels`
 pseudo-capability, `unavailable`, with a label-to-count map ordered by count
 and an `untracked_labels` count for whatever did not fit. The particulars are

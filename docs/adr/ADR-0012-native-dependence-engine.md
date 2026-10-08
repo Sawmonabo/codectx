@@ -537,7 +537,9 @@ output or the first table.
 | **5 — type recovery, the two frontends that have it** (withdrawn) | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
 
-**The retirement gate — all five at once.**
+**The retirement gate — all five at once.** **Amended 2026-10-08.** Conditions 1 and 3 are not gates of the
+deletion: condition 1's engine band is withdrawn with the band itself (decision 7), and the targets of condition 3 are
+measured in the proofs after the engine's deletion, against the same denominator and by the same sample method.
 
 1. **Parity.** For each of the nine advertised languages and each of the five published families, the native key set
    is within the per-family band measured from two engine runs on that language's pinned units, on every instance of

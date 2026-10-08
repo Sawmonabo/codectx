@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // TestChildProjectsKeepsEveryPart pins the one invariant of the subdivision
@@ -31,50 +29,5 @@ func TestChildProjectsKeepsEveryPart(t *testing.T) {
 	}
 	if len(children) != parts {
 		t.Fatalf("childProjects returned %d of %d parts: a subdivided unit may not drop source", len(children), parts)
-	}
-}
-
-// TestAClippedFactIsDisclosedOnEveryCapability protects the contract
-// index.max_evidence_per_fact carries in internal/config/config.go: "the cut is
-// reported on the unit's capability detail, never silent".
-//
-// The failure mode: the import removes occurrences from facts it then publishes
-// whole-looking. A consumer that counts occurrences — a reviewer asking how
-// many call sites reach a sink — reads a number the clip decided, and with
-// every capability left fresh there is nothing on the generation that says so.
-// A log line is not that disclosure: it reaches no reader of the index.
-//
-// The unanalysed row protects the same posture for a source file the engine
-// was handed and did not read: every capability lacks its facts, so every row
-// must say so. Mutation that fails it: leave the rows fresh when
-// UnanalysedFiles is set.
-func TestAClippedFactIsDisclosedOnEveryCapability(t *testing.T) {
-	for _, c := range []struct {
-		name    string
-		pub     publication
-		want    model.CapabilityStateValue
-		key     string
-		wantDet string
-	}{
-		{name: "clipped", pub: publication{ClippedEvidence: 7}, want: model.CapabilityPartial,
-			key: model.DetailEvidenceClipped, wantDet: "7"},
-		{name: "not clipped", pub: publication{}, want: model.CapabilityFresh, key: model.DetailEvidenceClipped},
-		{name: "unanalysed", pub: publication{UnanalysedFiles: 3, UnanalysedFirst: "test/a.js"},
-			want: model.CapabilityPartial, key: detailUnanalysedFiles, wantDet: "3 test/a.js"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			rows := c.pub.capabilities("scope")
-			if len(rows) != len(Capabilities) {
-				t.Fatalf("got %d capability rows, want %d", len(rows), len(Capabilities))
-			}
-			for _, row := range rows {
-				if row.State != c.want {
-					t.Errorf("%s = %q, want %q", row.Capability, row.State, c.want)
-				}
-				if got := row.Details[c.key]; got != c.wantDet {
-					t.Errorf("%s detail %s = %q, want %q", row.Capability, c.key, got, c.wantDet)
-				}
-			}
-		})
 	}
 }
