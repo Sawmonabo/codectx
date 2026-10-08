@@ -550,9 +550,17 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			in.types++
 		}
 		if d.Parent == -1 && (f.python || d.Exported) && (isType(d.Kind) || isCallable(d.Kind)) {
+			// An ECMAScript default export is also the module's `default`,
+			// which a default import names (`spec#default`).
+			names := []string{d.Name}
+			if d.Default {
+				names = append(names, "default")
+			}
 			for _, b := range bases {
-				if err := exports.Add(export{Base: b, Name: d.Name, Decl: ref, Type: isType(d.Kind)}); err != nil {
-					return err
+				for _, name := range names {
+					if err := exports.Add(export{Base: b, Name: name, Decl: ref, Type: isType(d.Kind)}); err != nil {
+						return err
+					}
 				}
 			}
 		}
