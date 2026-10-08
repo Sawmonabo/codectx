@@ -23,8 +23,10 @@ const detailLinkFailure = "link_failure"
 // An Export joins the declaration whose name token it names, a Site the call
 // reference whose callee token it names. Every call reference is a site, with
 // the reference's caller, range, callee and in-file candidates (targets). A
-// joined site takes the worker's shape, qualifier, signature and types; one
-// no Site joins takes its shape from the reference (a qualified call is a
+// joined site takes the worker's shape, signature and types, and the
+// worker's qualifier where it names one (a static site's), else the
+// reference's, so QualifierIsImport always describes the qualifier stored;
+// one no Site joins takes its shape from the reference (a qualified call is a
 // member call, any other a bare one), keeps the reference's qualifier and
 // carries no recovered type. A
 // TypeResult names a worker site and is remapped to that site's index in
@@ -86,7 +88,7 @@ func (b *builder) linkTable() error {
 			// The first reference at a callee token claims the worker's site;
 			// a second reference at the same token keeps its own shape.
 			w, siteAt[i] = i, int32(len(t.Sites))
-			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, wl.Sites[i].Qualifier, wl.Sites[i].Signature
+			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
 		}
 		joined = append(joined, w)
 		t.Sites = append(t.Sites, s)
