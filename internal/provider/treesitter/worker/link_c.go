@@ -34,9 +34,10 @@ import (
 //     argument or a receiver is the result of has the lower index.
 //   - Values: every function taken as a value: `&f` and `&C::m`, and a name
 //     in a position that stores or passes its value (an argument, an
-//     initializer, the right side of `=`, a return value) that no local,
-//     member, object, constant or type of the file declares, with the field
-//     it is written to by `x.f = g`, `x->f = g` or `{ .f = g }`.
+//     initializer, a member's default value, the right side of `=`, a
+//     return value) that no local, member, object, constant or type of the
+//     file declares, with the field it is written to by `x.f = g`,
+//     `x->f = g`, `{ .f = g }` or a member declared `= g`.
 //
 // Spelling. A type name in a Receiver, Supertype, Qualifier or TypeNamed is
 // the name as written with every template argument list dropped (`V<T>` is
@@ -595,9 +596,9 @@ func (k *cLinker) value(n, name Node) {
 }
 
 // position reports whether n's value is stored or passed: an argument, an
-// initializer, the right side of `=`, a return value, an arm of a
-// conditional in such a position, through any parentheses and casts. field
-// is the field it is written to, when it is.
+// initializer, a member's default value, the right side of `=`, a return
+// value, an arm of a conditional in such a position, through any
+// parentheses and casts. field is the field it is written to, when it is.
 func (k *cLinker) position(n Node) (field string, ok bool) {
 	s, x := k.s, k.x
 	p := n.Parent()
@@ -642,6 +643,20 @@ func (k *cLinker) position(n Node) (field string, ok bool) {
 		if p.ChildByFieldId(s.fConsequence) == n || p.ChildByFieldId(s.fAlternative) == n {
 			return k.position(p)
 		}
+	case x.fieldDeclaration:
+		// A member's default value (`void (*cb)(int) = h;`): an expression
+		// child of a field declaration is one, since its declarators are no
+		// expression, written to the declarator before it.
+		c := p.Walk()
+		defer c.Close()
+		for ok := c.GotoFirstChild(); ok && c.Node() != n; ok = c.GotoNextSibling() {
+			if c.FieldId() == s.fDeclarator {
+				if name := k.chain(c.Node()).name; !name.IsNull() {
+					field = string(textOf(k.src, name))
+				}
+			}
+		}
+		return field, field != ""
 	}
 	return "", false
 }
