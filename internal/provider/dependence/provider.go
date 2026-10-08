@@ -666,7 +666,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 		return p.recoverBySubdivision(ctx, req, unit, adm, run, source, sink, g.outcome, g.decision, files)
 	}
 
-	_, crash, err := p.export(ctx, req, unit, adm, run, g.path, files)
+	crash, err := p.export(ctx, req, unit, adm, run, g.path, files)
 	if crash.Class == FailureEngine || crash.Class == FailureEmptyExport {
 		// The export proved this graph produces nothing, and would produce
 		// nothing again: the engine died writing it out twice on its own
@@ -886,28 +886,29 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // crash of research Section 6: the exit code is a lie there, and the only
 // honest signal is the empty result.
 //
-// The second return is the verdict on the graph itself: a reproducible engine
+// The first return is the verdict on the graph itself: a reproducible engine
 // crash the caller must subdivide on, exactly as graphFor returns one for the
 // parse, or the empty export below. Both say the graph produces nothing, which
-// is what makes them the two the caller must not keep a cache entry for. An export that dies on
-// the engine's own exception is not a property of the unit's memory or of its
-// deadline -- those keep their own failure paths here -- and it is not a
-// verdict on the unit's source either: the children of a project whose whole
-// export dies export cleanly. Confirming it costs one more export of a graph
-// already on disk; the engine exposes no neutral option for this step, so the
-// confirmation is the same argv a second time and what it yields is a second
-// observation of the same class, which is what subdivision rests on.
+// is what makes them the two the caller must not keep a cache entry for. An
+// export that dies on the engine's own exception is not a property of the
+// unit's memory or of its deadline -- those keep their own failure paths here
+// -- and it is not a verdict on the unit's source either: the children of a
+// project whose whole export dies export cleanly. Confirming it costs one
+// more export of a graph already on disk; the engine exposes no neutral
+// option for this step, so the confirmation is the same argv a second time
+// and what it yields is a second observation of the same class, which is what
+// subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
-	run *runDir, graph string, files int64) (ExportOutcome, Outcome, error) {
+	run *runDir, graph string, files int64) (Outcome, error) {
 
 	out, err := p.runExport(ctx, req, unit, adm, unit.ScopeKey, graph, run.path("export"))
 	if err != nil {
-		return ExportOutcome{}, Outcome{}, err
+		return Outcome{}, err
 	}
 	if out.Class == FailureEngine && out.Exception != "" {
 		confirm, err := p.runExport(ctx, req, unit, adm, unit.ScopeKey, graph, run.path("export"))
 		if err != nil {
-			return ExportOutcome{}, Outcome{}, err
+			return Outcome{}, err
 		}
 		switch {
 		case confirm.Class == FailureEngine && confirm.Exception != "":
@@ -917,14 +918,14 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 			if err := paced.RemoveAllFor(paced.AnalyzerOutput, run.path("export")); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				slog.Error("a failed dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
 			}
-			return ExportOutcome{}, confirm.Outcome, nil
+			return confirm.Outcome, nil
 		case confirm.Class != FailureNone:
-			return ExportOutcome{}, Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm.Outcome, adm.res)
+			return Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm.Outcome, adm.res)
 		}
 		out = confirm
 	}
 	if out.Class != FailureNone {
-		return ExportOutcome{}, Outcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, adm.res)
+		return Outcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, adm.res)
 	}
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
@@ -932,9 +933,9 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		// worded as itself either: the failure names the three causes that
 		// remain and how much source the frontend was handed.
 		out.Outcome.Class = FailureEmptyExport
-		return ExportOutcome{}, out.Outcome, emptyExport(unit, out.Outcome, adm.res, files)
+		return out.Outcome, emptyExport(unit, out.Outcome, adm.res, files)
 	}
-	return out, Outcome{}, nil
+	return Outcome{}, nil
 }
 
 // runExport is one export step: the engine run, its log line and its observed

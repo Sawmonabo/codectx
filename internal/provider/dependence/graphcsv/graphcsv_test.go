@@ -211,6 +211,11 @@ func TestImport(t *testing.T) {
 		export string
 		check  func(t *testing.T, rep graphcsv.Report, c counts)
 	}{{
+		// The c, go, java and python sources hold assignments and call no
+		// function they declare: their exports carry the CDG, REACHING_DEF and
+		// assignment rows the four families could be derived from. Their
+		// assertions are the shared ones after the table: the unit seals,
+		// every key is new, and none of the four families reaches the sink.
 		name: "c", src: "src/c", export: "c",
 	}, {
 		name: "go", src: "src/golang", export: "golang",
@@ -335,13 +340,15 @@ func TestImport(t *testing.T) {
 				t.Errorf("full import reported %d/%d changed and %d removed; every key is new against the absent set",
 					rep.Changed, rep.Keys.Count(), rep.Removed)
 			}
-			// Failure mode: the import still publishes a family the structural
-			// provider now owns, so storage holds two producers' facts for one
+			// Failure mode: the import publishes a family the structural
+			// provider owns, so storage holds two producers' facts for one
 			// relation and every consumer double-counts it. The language
 			// fixtures' exports carry the CDG, REACHING_DEF and assignment rows
-			// those families were derived from, so each language is a case.
-			// Mutation that fails it: restore the control_depends_on INSERT in
-			// scratch.project -- the gofix case then publishes that kind.
+			// those families could be derived from, so each language is a case.
+			// Mutation that fails it: stage a non-calls projection in
+			// scratch.project -> Import refuses it as an unknown projection and
+			// the case fails; admit that kind in the emit's projection check as
+			// well -> its count here is non-zero.
 			for _, kind := range []model.RelationKind{model.RelControlDependsOn, model.RelDataFlowsTo,
 				model.RelReads, model.RelWrites} {
 				if c.rel[kind] != 0 {
