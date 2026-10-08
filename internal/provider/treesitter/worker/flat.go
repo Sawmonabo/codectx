@@ -2,6 +2,7 @@ package worker
 
 import (
 	"cmp"
+	"math"
 	"slices"
 	"strconv"
 
@@ -86,6 +87,13 @@ func (n Node) IsNamed() bool { return n.rec().flags&flatNamed != 0 }
 
 // IsExtra reports an extra node (a comment).
 func (n Node) IsExtra() bool { return n.rec().flags&flatExtra != 0 }
+
+// IsError reports an ERROR node: the library's one error symbol, which
+// ts_node_is_error compares the node's symbol against.
+func (n Node) IsError() bool { return n.rec().kind == errorSymbol }
+
+// errorSymbol is the library's ts_builtin_sym_error, (TSSymbol)-1.
+const errorSymbol = math.MaxUint16
 
 // HasError reports that the node is, or contains, an error or a missing node.
 func (n Node) HasError() bool { return n.rec().flags&flatError != 0 }

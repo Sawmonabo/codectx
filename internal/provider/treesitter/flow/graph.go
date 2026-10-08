@@ -63,6 +63,7 @@ type Graph struct {
 	mayOff, mayDefs  []int32
 	succOff, succ    []int32
 	predOff, pred    []int32
+	declared         []Span
 	vars, unresolved int
 }
 
@@ -101,6 +102,14 @@ func (g *Graph) Pred(n int32) []int32 { return window(g.pred, g.predOff, n) }
 
 // Vars is the variable count; variable ids are dense in [0, Vars()).
 func (g *Graph) Vars() int { return g.vars }
+
+// Declared is the span of the identifier that declares variable v and true
+// for a variable bound to a name (Builder.Named), or false for one the
+// lowering owns (Builder.Var).
+func (g *Graph) Declared(v int32) (Span, bool) {
+	s := g.declared[v]
+	return s, s.End > s.Start
+}
 
 // DefCount is the killing-definition count D, the (node, variable) pairs
 // Defs lists over every node. May-definitions are not counted. D is bounded

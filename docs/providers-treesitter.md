@@ -253,6 +253,105 @@ manifest when it names a pinned language, and otherwise the extension decides
 (`.go .py .pyi .js .mjs .cjs .jsx .ts .mts .cts .tsx .java .rs .c .cc .cpp .cxx
 .hpp .hh .hxx`).
 
+## Dependence facts
+
+The provider publishes the four file-local dependence families, `control_depends_on`, `data_flows_to`, `reads` and
+`writes`, from the same worker walk that extracts the file (ADR-0012 decisions 1 and 9). This section is the contract
+the worker, the wire and the parent share.
+
+### The worker's walk
+
+For each file the worker extracts the structural facts from the native tree, flattens the tree (`worker.Flatten`),
+closes the native tree, and then visits every callable of the flat array in the lowering's preorder
+(`Lowering.Functions`). For each callable it lowers the function (`Lowering.Lower`), computes post-dominators, control
+dependence and SSA def-use (package `flow`), projects them as below, and sends one `KindFunction` message. A panic in
+one function's lowering or analysis is recovered, and that function's message carries `Failed`, its span and the
+recovered value's text instead of facts. The file's memory is released at the file boundary before `KindDone`.
+
+A failure of the pass outside every function, such as a tree that does not flatten, sends no function message and
+sets `Done.DependenceFailure`. Neither kind of failure touches the file's structural facts.
+
+### Projection
+
+Inside one function, a variable is **named** when the lowering declared it with `flow.Builder.Named`: a parameter or
+a local, identified by its declaring identifier's byte range (`flow.Graph.Declared`). A variable the lowering owns
+(`flow.Builder.Var`: a result, an iteration value, a selector) is never published; facts pass through it.
+
+For a node `n`:
+- `W(n)` is the named variables `n` defines or may define;
+- `R(n)` is the named variables `n` uses;
+- `Src(n)` is the named variables whose value reaches `n`: for every def-use pair `(p, n)`, each variable `p` defines
+  or may define that `n` uses (or, for a may-definition at `n`, reads as its prior version) contributes itself when
+  it is named, and `Src(p)` when it is owned. `Src` is the least fixed point of these equations over the function's
+  def-use pairs, so a cycle of owned variables (a result defined and consumed inside a loop) adds nothing twice and
+  ends; it has no depth bound;
+- `A(n)` is `W(n) ∪ Src(n)`.
+
+The function message carries:
+- **control**: for every control-dependence pair (controller `c`, dependent `d`), each `x` in `A(d)` and each `y` in
+  `Src(c)` with `x ≠ y` gives `x control_depends_on y`, evidenced at `d`. A condition built from operators is anchored
+  at every variable it reads;
+- **flows**: for every node `u`, each `y` in `W(u)` and each `x` in `Src(u)` with `x ≠ y` gives `x data_flows_to y`,
+  evidenced at `u`;
+- **reads**: each `v` in `R(n)`, evidenced at `n`;
+- **writes**: each `v` in `W(n)`, evidenced at `n`, marked as a may-definition when it is one.
+
+A repeated fact at one node is sent once. Nothing is capped.
+
+### Published shape
+
+The parent validates every range against the pinned bytes, as it does for every structural record, and publishes:
+
+| fact | from | to | evidence range | evidence detail |
+|---|---|---|---|---|
+| `control_depends_on` | variable of the dependent node | variable the controlling node reads | the dependent node | `cdg` |
+| `data_flows_to` | variable whose value flows | variable the reached node defines | the reached node | `reaching_def` |
+| `reads` | the owning declaration | variable | the reading node | `use` |
+| `writes` | the owning declaration | variable | the defining node | `definition` or `may_definition` |
+
+- **Variable entity.** Each named variable becomes one `variable` node. Its name is the declaring identifier's text,
+  its range is that identifier's range, and its qualified name is the owning declaration's qualified name, the
+  language's separator, and the name (the name alone when the owner is the file's module). Its native key, under the
+  file's scope `file:<path>`, is the cross-provider declaration key
+  `decl:<name>@<path>:<first line>-<last line>` over the identifier's lines, which the provider also publishes as an
+  alias, so any other producer of the same declaration resolves to the same identity (ADR-0012 decision 4). A key over
+  the model's native-key bound is omitted, never truncated: the variable and its facts are dropped and counted.
+- **Owning declaration.** The owner of a function's `reads` and `writes`, and of its variables, is the innermost
+  structural declaration of the same file whose range contains the callable's range; a callable no declaration
+  contains is owned by the file's module node. A lambda or closure is therefore owned by the declaration that
+  contains it.
+- **Endpoints.** Every endpoint of `control_depends_on` and `data_flows_to` is a variable entity. A call site is not
+  an endpoint, which is narrower than the previous publisher of these families, which anchored a call site to the
+  method it invokes: the callee is resolved by the linking provider that publishes `calls`, and a fact that reaches
+  only a call, a return or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no variable are not
+  tracked (see the shared contract in `internal/provider/treesitter/worker/lower.go`).
+- **Relation evidence.** Each occurrence is one evidence row: the node's range, the owning declaration's qualified
+  name as its native key, and the detail above. The existing per-fact evidence clip applies.
+- **Precision.** Every evidence row of the four families, and of a variable node, is `static_analysis`
+  (ADR-0012 decision 8). Every other fact of the provider stays `syntax`.
+
+### Capabilities
+
+The descriptor lists `structure`, `control_depends_on`, `data_flows_to`, `reads` and `writes`. Every parsed file
+reports one row per capability under its own scope:
+- the four rows follow the structure row's state for a file that was not parsed (unavailable) or that has syntax
+  errors (partial, `CTX_COVERAGE_INCOMPLETE`);
+- a failed function makes the four rows `partial` with `CTX_COVERAGE_INCOMPLETE`, and discloses
+  `failed_functions` (the count, a space, and the first failed function's byte range `start-end`) and
+  `failure_cause` (that function's recovered text, bounded to the detail bound);
+- an unresolved jump makes them `partial` and discloses `unresolved_jumps`;
+- a fact a bound kept out (an omitted key, the evidence clip) makes them `partial`, disclosed as the structure row
+  discloses its own;
+- `Done.DependenceFailure` makes them `failed` with `CTX_INTERNAL` and the reason under `failure_cause`.
+
+None of these fails the unit or changes the structure row.
+
+### Reuse
+
+The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
+them with its structural facts, and an edited file recomputes all of them. The extraction version
+(`internal/provider/treesitter/lang/lang.go`) changes with the facts the worker emits.
+
 ## Worker process
 
 ### Launch

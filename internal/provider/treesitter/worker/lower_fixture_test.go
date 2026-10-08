@@ -108,16 +108,23 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				if tree == nil {
 					t.Fatal("the parser produced no tree")
 				}
-				defer tree.Close()
-				if got := tree.RootNode().HasError(); got != c.recovered {
-					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, tree.RootNode().ToSexp())
+				// The production path: the tree is flattened, closed, and every
+				// callable is found and lowered from the flat array alone.
+				sexp := tree.RootNode().ToSexp()
+				flat, err := Flatten(tree, language)
+				tree.Close()
+				if err != nil {
+					t.Fatalf("flatten: %v", err)
+				}
+				if got := flat.Root().HasError(); got != c.recovered {
+					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, sexp)
 				}
 				if c.unresolved != 0 && !c.illFormed && !c.recovered {
 					t.Errorf("unresolved = %d on a source not marked ill-formed: a jump whose target no frame opens is rejected by every compiler", c.unresolved)
 				}
-				var fn *ts.Node
+				var fn Node
 				i := 0
-				if err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
+				if err := low.Functions(flat.Root(), func(n Node) error {
 					if i == c.fn {
 						fn = n
 					}
@@ -129,7 +136,7 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				if c.callables != 0 && i != c.callables {
 					t.Errorf("callables = %d, want %d\nprotects: %s\nmutation: %s", i, c.callables, c.protects, c.mutation)
 				}
-				if fn == nil {
+				if fn.IsNull() {
 					t.Fatalf("callable %d not found (%d callables)", c.fn, i)
 				}
 				var a flow.Arena
@@ -166,7 +173,7 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				}
 				if mismatch {
 					t.Logf("lowered graph:\n%s\ncd:\n  %s\ndu:\n  %s\ntree: %s",
-						dumpGraph(g, src), strings.Join(cd, "\n  "), strings.Join(du, "\n  "), fn.ToSexp())
+						dumpGraph(g, src), strings.Join(cd, "\n  "), strings.Join(du, "\n  "), sexp)
 				}
 			})
 		}
@@ -249,17 +256,22 @@ func TestMayDefinitionChainIsLinear(t *testing.T) {
 			if tree == nil {
 				t.Fatal("the parser produced no tree")
 			}
-			defer tree.Close()
-			var fn *ts.Node
+			flat, err := Flatten(tree, c.language)
+			tree.Close()
+			if err != nil {
+				t.Fatalf("flatten: %v", err)
+			}
+			declaration := tl.IdForNodeKind("function_declaration", true)
+			var fn Node
 			found := errors.New("found")
-			_ = low.Functions(tree.RootNode(), func(m *ts.Node) error {
-				if m.Kind() == "function_declaration" {
+			_ = low.Functions(flat.Root(), func(m Node) error {
+				if m.KindId() == declaration {
 					fn = m
 					return found
 				}
 				return nil
 			})
-			if fn == nil {
+			if fn.IsNull() {
 				t.Fatal("no function declaration")
 			}
 			var s Scratch
