@@ -437,8 +437,8 @@ func TestImportDelta(t *testing.T) {
 	}
 }
 
-// descriptor is the provider identity the import is driven under. The
-// capabilities are the relation kinds this package publishes.
+// descriptor is the provider identity the import is driven under, with the
+// dependence provider's declared capability.
 func descriptor() model.ProviderDescriptor {
 	return model.ProviderDescriptor{ID: graphcsv.ProviderID, Version: "test-1",
 		Capabilities:      []string{"calls"},
