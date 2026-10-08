@@ -109,7 +109,7 @@ export function run(task) { task.exec(); }`,
 			js("src/a.js",
 				[]Decl{decl(model.NodeClass, "Job", -1), method("exec", 0, "Job"), exported(decl(model.NodeFunction, "main", -1))},
 				[]Site{
-					{Caller: 2, Callee: "run", Shape: wire.ShapeStatic, Qualifier: "b", QualifierIsImport: true,
+					{Caller: 2, Callee: "run", Shape: wire.ShapeMember,
 						Receiver: wire.Type{Kind: wire.TypeModule, Name: "./b.js"}, Args: []wire.Type{result(1)}},
 					{Caller: 2, Callee: "Job", Shape: wire.ShapeConstructor, Candidates: []int32{0}},
 				}, nil),

@@ -184,13 +184,10 @@ type fact struct {
 // edge says that To holds every value From holds.
 type edge struct{ From, To variable }
 
-// call is the site a value or a binding belongs to. Implicit reports that
-// the call passes its receiver implicitly (a member call, a construction),
-// which shifts a Python method's parameters by its `self`.
+// call is the site a value or a binding belongs to.
 type call struct {
-	Site     Ref
-	Callee   string
-	Implicit bool
+	Site   Ref
+	Callee string
 }
 
 // The roles a value plays at a site.
@@ -232,7 +229,6 @@ type binding struct {
 	Site, Target Ref
 	Rank         byte
 	Flow         bool
-	Implicit     bool
 }
 
 // lookup asks for the method Name the type Class declares, or else inherits
@@ -276,13 +272,9 @@ type construct struct {
 	Call  call
 }
 
-// declRec is one value a callable returns, and whether the callable takes
-// an implicit receiver as its first declared parameter. A callable that
-// returns nothing known has one record with Has false.
+// declRec is one value a callable returns.
 type declRec struct {
 	Decl Ref
-	Self bool
-	Has  bool
 	Ret  operand
 }
 
@@ -291,13 +283,6 @@ type argRec struct {
 	Site Ref
 	Arg  int32
 	Op   operand
-}
-
-// argReq connects the arguments of Site to the parameters of Target, the
-// first argument to parameter Off.
-type argReq struct {
-	Site, Target Ref
-	Off          int32
 }
 
 // ---- the inference ----
@@ -567,19 +552,11 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 				return err
 			}
 		}
-		self := f.python && d.Receiver != "" && !d.Static
-		n := 0
 		err := f.eval(ctx, int32(i), d.Returns, func(op operand) error {
-			n++
-			return decls.Add(declRec{Decl: ref, Self: self, Has: true, Ret: op})
+			return decls.Add(declRec{Decl: ref, Ret: op})
 		})
 		if err != nil {
 			return err
-		}
-		if n == 0 {
-			if err := decls.Add(declRec{Decl: ref, Self: self}); err != nil {
-				return err
-			}
 		}
 	}
 	for _, st := range t.Supertypes {
@@ -625,7 +602,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 	t, in := f.t, f.in
 	s := &t.Sites[i]
 	ref := Ref{File: f.file, Index: i}
-	c := call{Site: ref, Callee: s.Callee, Implicit: s.Shape == wire.ShapeMember || s.Shape == wire.ShapeConstructor}
+	c := call{Site: ref, Callee: s.Callee}
 	for j, a := range s.Args {
 		err := f.eval(ctx, s.Caller, a, func(op operand) error { return args.Add(argRec{Site: ref, Arg: int32(j), Op: op}) })
 		if err != nil {
@@ -645,10 +622,14 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 	switch s.Shape {
 	case wire.ShapeBare:
 		// A bare call of an imported name carries the module it was
-		// imported from as its receiver.
+		// imported from and the name the module declares it by, which the
+		// local name an import may rename it to is not.
 		if s.Receiver.Kind == wire.TypeModule {
-			if err := route(roleReceiver); err != nil {
-				return err
+			spec, name, ok := importedName(s.Receiver.Name, f.python)
+			if base, found := moduleBase(t.Path, spec, f.python); ok && found {
+				if err := r.exportReqs.Add(exportReq{Base: base, Name: name, Call: c}); err != nil {
+					return err
+				}
 			}
 		}
 		for _, k := range s.Candidates {
@@ -659,9 +640,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			target := Ref{File: f.file, Index: k}
 			switch {
 			case isType(d.Kind):
-				cc := c
-				cc.Implicit = true
-				if err := in.receive(ctx, r, recv{Call: cc, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}}); err != nil {
+				if err := in.receive(ctx, r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}}); err != nil {
 					return err
 				}
 			case isCallable(d.Kind):
@@ -779,7 +758,7 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 				return err
 			}
 			return in.h.dispatch(ctx, v.X.Ref, c.Callee, func(m Ref) error {
-				return r.bindings.Add(binding{Site: c.Site, Target: m, Rank: rankHierarchy, Flow: true, Implicit: c.Implicit})
+				return r.bindings.Add(binding{Site: c.Site, Target: m, Rank: rankHierarchy, Flow: true})
 			})
 		case valExact:
 			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankDirect})
@@ -822,9 +801,7 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 		func(q exportReq, es []export) error {
 			for _, e := range es {
 				if e.Type {
-					cc := q.Call
-					cc.Implicit = true
-					if err := in.receive(ctx, r, recv{Call: cc, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Decl}}); err != nil {
+					if err := in.receive(ctx, r, recv{Call: q.Call, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Decl}}); err != nil {
 						return err
 					}
 					continue
@@ -851,7 +828,7 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 				return r.bindings.Add(binding{Site: c.Call.Site, Target: c.Class, Rank: rankDirect})
 			}
 			for _, m := range ms {
-				if err := r.bindings.Add(binding{Site: c.Call.Site, Target: m.Method, Rank: rankDirect, Flow: true, Implicit: c.Call.Implicit}); err != nil {
+				if err := r.bindings.Add(binding{Site: c.Call.Site, Target: m.Method, Rank: rankDirect, Flow: true}); err != nil {
 					return err
 				}
 			}
@@ -891,7 +868,7 @@ func (in *inference) resolveLookups(r *round) error {
 					return missing.Add(l)
 				}
 				for _, m := range ms {
-					if err := r.bindings.Add(binding{Site: l.Call.Site, Target: m.Method, Rank: l.Rank, Flow: true, Implicit: l.Call.Implicit}); err != nil {
+					if err := r.bindings.Add(binding{Site: l.Call.Site, Target: m.Method, Rank: l.Rank, Flow: true}); err != nil {
 						return err
 					}
 				}
@@ -968,9 +945,10 @@ func (in *inference) mergeBindings(r *round) (*pagination.SortedRun[binding], er
 }
 
 // flow connects each new binding's site to its target: the target's
-// returns to the site's result, and each argument to the parameter it
-// binds, shifted past a Python method's `self` when the call passes the
-// receiver implicitly.
+// returns to the site's result, and argument i to parameter i. Every
+// lowering counts parameters from the first one after an implicit receiver
+// (`this`, Python's `self` and `cls`), so a call's arguments and its
+// target's parameters line up for every shape.
 func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error {
 	byTarget, err := newSort(in, codec[binding]{put: bindingCodec.put, get: bindingCodec.get,
 		cmp: func(a, b binding) int { return cmp.Or(cmpRef(a.Target, b.Target), cmpRef(a.Site, b.Site)) }})
@@ -990,41 +968,27 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 	if err != nil {
 		return err
 	}
-	reqs, err := newSort(in, argReqCodec)
-	if err != nil {
-		return err
-	}
 	err = join(targets, in.decls, func(b binding, d declRec) int { return cmpRef(b.Target, d.Decl) },
 		func(b binding, ds []declRec) error {
-			if len(ds) == 0 {
-				return nil
-			}
 			result := variable{Kind: varResult, File: b.Site.File, Index: b.Site.Index}
 			for _, d := range ds {
-				if !d.Has {
-					continue
-				}
 				if err := r.into(result, d.Ret); err != nil {
 					return err
 				}
 			}
-			var off int32
-			if ds[0].Self && b.Implicit {
-				off = 1
-			}
-			return reqs.Add(argReq{Site: b.Site, Target: b.Target, Off: off})
+			return nil
 		})
 	if err != nil {
 		return err
 	}
-	bySite, err := sorted(in, reqs)
-	if err != nil {
-		return err
-	}
-	return join(bySite, in.args, func(q argReq, a argRec) int { return cmpRef(q.Site, a.Site) },
-		func(q argReq, as []argRec) error {
+	// fresh is sorted by site, the order the arguments are.
+	return join(fresh, in.args, func(b binding, a argRec) int { return cmpRef(b.Site, a.Site) },
+		func(b binding, as []argRec) error {
+			if !b.Flow {
+				return nil
+			}
 			for _, a := range as {
-				p := variable{Kind: varParam, File: q.Target.File, Decl: q.Target.Index, Index: a.Arg + q.Off}
+				p := variable{Kind: varParam, File: b.Target.File, Decl: b.Target.Index, Index: a.Arg}
 				if err := r.into(p, a.Op); err != nil {
 					return err
 				}
@@ -1170,6 +1134,28 @@ func moduleBase(p, spec string, python bool) (string, bool) {
 		return "", false
 	}
 	return stripExtension(path.Join(dir, spec)), true
+}
+
+// importedName splits the module receiver of a bare call of an imported
+// name into the module as written and the name the module declares: an
+// ECMAScript `spec#name` (`import {name as local} from "spec"`), a Python
+// `module.name` split at its last dot (`from module import name as local`,
+// a relative module keeping its dots).
+func importedName(written string, python bool) (spec, name string, ok bool) {
+	sep := "#"
+	if python {
+		sep = "."
+	}
+	i := strings.LastIndex(written, sep)
+	if i < 0 || i == len(written)-1 {
+		return "", "", false
+	}
+	spec, name = written[:i], written[i+1:]
+	if python && strings.Trim(spec, ".") == "" {
+		// `from . import name`: the module is the package the dots name.
+		spec = written[:i+1]
+	}
+	return spec, name, spec != ""
 }
 
 func stripExtension(p string) string {
@@ -1403,7 +1389,7 @@ func (w *wbuf) operand(o operand) {
 		w.value(o.X)
 	}
 }
-func (w *wbuf) call(c call) { w.ref(c.Site); w.str(c.Callee); w.flag(c.Implicit) }
+func (w *wbuf) call(c call) { w.ref(c.Site); w.str(c.Callee) }
 
 type rbuf struct {
 	b   []byte
@@ -1450,7 +1436,7 @@ func (r *rbuf) operand() operand {
 	}
 	return operand{X: r.value()}
 }
-func (r *rbuf) call() call { return call{Site: r.ref(), Callee: r.str(), Implicit: r.flag()} }
+func (r *rbuf) call() call { return call{Site: r.ref(), Callee: r.str()} }
 
 func cmpRef(a, b Ref) int { return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Index, b.Index)) }
 
@@ -1477,17 +1463,7 @@ func cmpOperand(a, b operand) int {
 }
 
 func cmpCall(a, b call) int {
-	return cmp.Or(cmpRef(a.Site, b.Site), cmp.Compare(a.Callee, b.Callee), cmpFlag(a.Implicit, b.Implicit))
-}
-
-func cmpFlag(a, b bool) int {
-	switch {
-	case a == b:
-		return 0
-	case a:
-		return 1
-	}
-	return -1
+	return cmp.Or(cmpRef(a.Site, b.Site), cmp.Compare(a.Callee, b.Callee))
 }
 
 var factCodec = codec[fact]{
@@ -1524,10 +1500,9 @@ var bindingCodec = codec[binding]{
 		w.ref(b.Target)
 		w.u8(b.Rank)
 		w.flag(b.Flow)
-		w.flag(b.Implicit)
 	},
 	get: func(r *rbuf) binding {
-		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag(), Implicit: r.flag()}
+		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag()}
 	},
 	cmp: func(a, b binding) int { return cmp.Or(cmpRef(a.Site, b.Site), cmpRef(a.Target, b.Target)) },
 }
@@ -1582,12 +1557,12 @@ var constructCodec = codec[construct]{
 }
 
 var declRecCodec = codec[declRec]{
-	put: func(w *wbuf, d declRec) { w.ref(d.Decl); w.flag(d.Self); w.flag(d.Has); w.operand(d.Ret) },
+	put: func(w *wbuf, d declRec) { w.ref(d.Decl); w.operand(d.Ret) },
 	get: func(r *rbuf) declRec {
-		return declRec{Decl: r.ref(), Self: r.flag(), Has: r.flag(), Ret: r.operand()}
+		return declRec{Decl: r.ref(), Ret: r.operand()}
 	},
 	cmp: func(a, b declRec) int {
-		return cmp.Or(cmpRef(a.Decl, b.Decl), cmpFlag(a.Has, b.Has), cmpOperand(a.Ret, b.Ret))
+		return cmp.Or(cmpRef(a.Decl, b.Decl), cmpOperand(a.Ret, b.Ret))
 	},
 }
 
@@ -1596,13 +1571,5 @@ var argRecCodec = codec[argRec]{
 	get: func(r *rbuf) argRec { return argRec{Site: r.ref(), Arg: r.i32(), Op: r.operand()} },
 	cmp: func(a, b argRec) int {
 		return cmp.Or(cmpRef(a.Site, b.Site), cmp.Compare(a.Arg, b.Arg), cmpOperand(a.Op, b.Op))
-	},
-}
-
-var argReqCodec = codec[argReq]{
-	put: func(w *wbuf, q argReq) { w.ref(q.Site); w.ref(q.Target); w.i32(q.Off) },
-	get: func(r *rbuf) argReq { return argReq{Site: r.ref(), Target: r.ref(), Off: r.i32()} },
-	cmp: func(a, b argReq) int {
-		return cmp.Or(cmpRef(a.Site, b.Site), cmpRef(a.Target, b.Target), cmp.Compare(a.Off, b.Off))
 	},
 }
