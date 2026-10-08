@@ -133,17 +133,10 @@ func (b *builder) declsByStart() []int {
 // owner's node, the native key its facts' evidence carries (its qualified
 // name) and the qualified name its variables are named under, which is empty
 // for the module, whose variables are named by their name alone.
-//
-// Of the declarations starting at or before the span, the one with the
-// greatest start that contains it is the innermost; among equal starts the
-// later declaration is nested in the earlier one.
 func (b *builder) owner(byStart []int, s wire.Span) (model.NodeID, string, string) {
-	n, _ := slices.BinarySearchFunc(byStart, s.Start+1, func(i int, start uint32) int { return cmp.Compare(b.decls[i].Start, start) })
-	for k := n - 1; k >= 0; k-- {
-		d := &b.decls[byStart[k]]
-		if d.End >= s.End {
-			return d.res.Node.ID, d.Qualified, d.Qualified
-		}
+	if i := b.enclosing(byStart, s); i >= 0 {
+		d := &b.decls[i]
+		return d.res.Node.ID, d.Qualified, d.Qualified
 	}
 	return b.module.Node.ID, b.fv.Path, ""
 }

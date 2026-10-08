@@ -157,7 +157,9 @@ func (b *builder) linkTable() error {
 }
 
 // enclosing is the index of the innermost declaration whose range contains
-// s, -1 for the module, by the search owner makes over the same order.
+// s, -1 for the module. Of the declarations starting at or before s, the one
+// with the greatest start that contains it is the innermost; among equal
+// starts the later declaration is nested in the earlier one.
 func (b *builder) enclosing(byStart []int, s wire.Span) int32 {
 	n, _ := slices.BinarySearchFunc(byStart, s.Start+1, func(i int, start uint32) int { return cmp.Compare(b.decls[i].Start, start) })
 	for k := n - 1; k >= 0; k-- {
