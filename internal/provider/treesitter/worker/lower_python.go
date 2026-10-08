@@ -1855,7 +1855,7 @@ func (j *pyLower) withStmt(n Node) {
 			clause = x
 		}
 	}
-	start, items := j.kids(&clause)
+	start, items := j.kids(clause)
 	base := len(j.fins)
 	for i := range items {
 		j.reset()
