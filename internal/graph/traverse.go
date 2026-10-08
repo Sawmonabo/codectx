@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -22,7 +21,6 @@ const (
 	reasonEdgeBudget    = "edge budget exhausted"
 	reasonVisitedBudget = "visited node budget exhausted"
 	reasonPageFull      = "page item limit reached"
-	reasonDependence    = "dependence units are still building"
 	// reasonDepth is the depth bound. Without it the loop falls out with a
 	// live frontier and Truncated=false, so a depth-limited answer reads as a
 	// complete one -- the one stop that would report nothing at all.
@@ -1088,9 +1086,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	maxItems, notice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
 	notices = appendNotice(notices, notice)
 
-	// The capability disclosure happens before the walk: a missing dependence
-	// edge must not read as a genuine absence of edges.
-	caps, deferred, err := e.completeness(ctx, kinds)
+	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
@@ -1269,9 +1265,6 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if reason == "" && state.DepthLimited {
 		reason = reasonDepth
 	}
-	if reason == "" && deferred {
-		reason = reasonDependence
-	}
 	// A continuation is offered for EVERY stop that left a frontier standing --
 	// a full page, a spent per-page visited or edge budget, a level the frontier
 	// byte ceiling spilled. All three are now per-page budgets, so the resumed
@@ -1333,76 +1326,9 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 // Adjacency.Capabilities port search reads it through (search.go:210), so the
 // graph family discloses the same rows `search` and `symbol` do rather than
 // reporting no capabilities at all.
-//
-// The deferred-dependence disclosure is folded INTO those rows, not appended to
-// them: a deferred row is one of the generation's own capability rows, enriched
-// here with the promotion's queue position. Appending would publish the row
-// twice and push a full report past model.MaxCapabilityStates, which the
-// answer's own Validate then rejects.
-//
-// deferred reports whether a request touching a dependence-only relation kind
-// found deferred units; that, and never the length of rows, is what makes an
-// answer truncated -- every generation carries capability rows, so a
-// length test would report every answer as incomplete.
-//
-// In report mode there is no promoter and the rows are disclosed without
-// promoting. A failed promotion never fails the query: the answer is still
-// correct, just still incomplete.
-func (e *Engine) completeness(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, bool, error) {
-	rows, err := e.adjacency.Capabilities(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	wanted := map[model.RelationKind]bool{}
-	for _, k := range kinds {
-		wanted[k] = true
-	}
-	touches := false
-	for _, k := range DependenceOnly() {
-		if wanted[k] {
-			touches = true
-			break
-		}
-	}
-	if !touches {
-		return rows, false, nil
-	}
-	deferred := false
-	for i, c := range rows {
-		if c.ProviderID != dependenceProviderID || c.Details["reason"] != reasonUnitsDeferred {
-			continue
-		}
-		deferred = true
-		if e.promoter == nil {
-			continue
-		}
-		p, err := e.promoter.Promote(ctx, dependenceProviderID, c.Scope)
-		if err != nil {
-			continue
-		}
-		// WithDetail clones the map, truncates the value and refuses to
-		// grow past MaxCapabilityDetails, so folding a queue position in
-		// can neither mutate the reader's row nor build a row that then
-		// fails its own Validate and fails the query it was disclosing.
-		row := c.WithDetail("units", strconv.Itoa(p.Units)).
-			WithDetail("position", strconv.Itoa(p.Position))
-		if p.Estimate > 0 {
-			// An unmeasured duration is reported as unmeasured, never invented.
-			row = row.WithDetail("estimate_ms", strconv.FormatInt(p.Estimate.Milliseconds(), 10))
-		}
-		rows[i] = row
-	}
-	return rows, deferred, nil
+func (e *Engine) completeness(ctx context.Context) ([]model.CapabilityState, error) {
+	return e.adjacency.Capabilities(ctx)
 }
-
-const (
-	// dependenceProviderID is the provider whose deferred units make a
-	// dependence-only answer incomplete.
-	dependenceProviderID = "dependence"
-	// reasonUnitsDeferred is the landed addDeferred spelling; no new capability
-	// state or diagnostic code is introduced for pending work.
-	reasonUnitsDeferred = "units_deferred"
-)
 
 // ascending sorts a set of surrogates and removes its duplicates. It is the
 // precondition every cumulative-set call has -- the page cache is walked

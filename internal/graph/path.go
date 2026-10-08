@@ -25,7 +25,6 @@ const (
 	pathReasonEdges    = "the edge budget was exhausted before the path search completed"
 	pathReasonDepth    = "the max-depth bound stopped the path search; the routes returned are the cheapest within that depth"
 	pathReasonRoutes   = "the route-enumeration budget was exhausted before every equal-cost route was collected"
-	pathReasonDeferred = "dependence units are still building"
 )
 
 // ShortestPath runs an EXTERNAL-MEMORY nonnegative integer-cost Dijkstra over
@@ -77,18 +76,12 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 	res = model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
 	// The same disclosure the traversal entries make, from the same place: a
-	// second implementation here would be a second shape for one contract --
-	// completeness returns the generation's capability rows with the deferred
-	// dependence ones enriched in place, and the bound flag, never the row
-	// count, is what truncates the answer.
-	caps, deferred, err := e.completeness(ctx, kinds)
+	// second implementation here would be a second shape for one contract.
+	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.PathResult{}, err
 	}
 	res.Meta.Completeness = caps
-	if deferred {
-		pathTruncate(&res.Meta, pathReasonDeferred)
-	}
 
 	// A zero-edge route cannot be expressed: RelationPath requires at least one
 	// relation. Reporting no route is honest; emitting a path that fails its own

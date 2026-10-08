@@ -35,14 +35,11 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		kinds = DefaultRelations()
 	}
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
-	caps, deferred, err := e.completeness(ctx, kinds)
+	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
 	meta.Completeness = caps
-	if deferred {
-		markTruncated(&meta, reasonDependence)
-	}
 
 	b := &budget{deadline: deadline, now: e.now}
 	maxVisited, visitedNotice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())

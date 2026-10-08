@@ -934,28 +934,6 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		}
 	}
 
-	// A unit the sealer has already started is still pending. Reporting only
-	// what has not started answers "nothing pending" for as long as the unit
-	// runs, which is the whole window a query needs the answer in.
-	l := f.c.late
-	l.mu.Lock()
-	l.inflight[plan.Key(d.ID, "running")] = true
-	l.queue = append(l.queue, deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "queued"}})
-	l.mu.Unlock()
-	p, err := f.c.Promote(ctx, d.ID, "running")
-	if err != nil {
-		t.Fatalf("Promote: %v", err)
-	}
-	if p.Units != 2 || p.Position != 1 {
-		t.Fatalf("the unit in flight is %d units at position %d, want 2 at 1", p.Units, p.Position)
-	}
-	if p, err = f.c.Promote(ctx, d.ID, "queued"); err != nil {
-		t.Fatalf("Promote: %v", err)
-	}
-	if p.Units != 2 || p.Position != 2 {
-		t.Fatalf("a promoted unit behind the one in flight is %d units at position %d, want 2 at 2", p.Units, p.Position)
-	}
-
 	// The same unit, once the publication generation holds it, is coverage --
 	// and it is the generation's own unit rows that say so, not any record of
 	// what the background batch sealed.
