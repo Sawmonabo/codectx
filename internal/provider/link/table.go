@@ -32,6 +32,11 @@ type Table struct {
 	// call references.
 	Sites  []Site  `json:"sites"`
 	Values []Value `json:"values,omitempty"`
+	// Dropped counts the worker's entries the parent could not join to a
+	// declaration or a call reference of the file, or whose ranges did not
+	// fit the pinned bytes. They are dropped, never fatal to the unit, and
+	// make the file's `calls` partial.
+	Dropped int `json:"dropped,omitempty"`
 }
 
 // Endpoint is a node of the structural provider as the parent resolved it:
@@ -112,7 +117,7 @@ func DecodeTable(b []byte) (*Table, error) {
 
 // Digest is the digest of what the linker's resolution reads of t: every
 // name, kind, shape, type fact, candidate and index, and the order of every
-// list, but no byte range, position or node identity. A structural node's
+// list, but no byte range, position, node identity or dropped count. A structural node's
 // identity is derived from its range, and an edit that shifts a range moves
 // neither a name nor a type, so two tables with one digest resolve every site
 // to the same declarations by index; only the ranges and identities the
