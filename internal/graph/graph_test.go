@@ -37,7 +37,7 @@ import (
 //	                DirectionBoth also admits a third route through the package
 //	                containment edges (n-a <-contains pkg-app -imports-> pkg-lib
 //	                -contains-> n-z, cost 14).
-//	dependence-only reads / data_flows_to edges alongside ordinary kinds
+//	dependence reads / data_flows_to edges alongside ordinary kinds
 //	two packages    pkg-app and pkg-lib, so a rollup has a distinct pair
 
 // fixtureID maps a readable fixture name to the 64-lowercase-hex id every
@@ -172,7 +172,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		{"n-a", model.RelCalls, "n-q"},
 		{"n-q", model.RelCalls, "n-z"},
 
-		// dependence-only kinds mixed in with ordinary ones
+		// dependence kinds mixed in with ordinary ones
 		{"n-a", model.RelReads, "n-var"},
 		{"n-b", model.RelWrites, "n-var"},
 		{"n-b", model.RelDataFlowsTo, "n-sink"},
@@ -261,7 +261,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 
 	// The generation's capability report, as PinnedReader.Capabilities returns
 	// it: one ordinary fresh row, and one deferred dependence row. An answer
-	// that traverses a dependence-only kind must disclose the deferred row, and
+	// must disclose the deferred row unchanged, and
 	// EVERY answer must carry the report itself -- a graph answer that dropped
 	// it would report "no capabilities" on a generation whose search answers
 	// report them from the same reader.
@@ -717,12 +717,14 @@ func TestGraphScenarios(t *testing.T) {
 				if !seen[fixtureNodeID("n-c")] {
 					t.Error("n-c is missing; it is reachable only through the cycle")
 				}
-				// The default impact allowlist includes reads and writes, so the
-				// deferred dependence row must be disclosed unchanged and the
-				// answer must not claim to be exhaustive.
-				if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDependence {
-					t.Errorf("meta = (%v, %q), want truncated with %q",
-						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
+				// The default impact allowlist includes reads and writes, which
+				// the structural provider publishes per file, so a deferred
+				// dependence row is disclosed unchanged but never marks the
+				// answer incomplete. Mutation: restore the four families to
+				// DependenceOnly, and the answer is falsely truncated.
+				if res.Meta.Truncated && res.Meta.TruncationReason == reasonDependence {
+					t.Errorf("meta = (%v, %q): a deferred dependence build marked an answer over the structural families incomplete",
+						res.Meta.Truncated, res.Meta.TruncationReason)
 				}
 				// The answer carries the generation's whole capability report,
 				// with the deferred row disclosed once inside it: dropping the
