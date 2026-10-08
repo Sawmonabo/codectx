@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"encoding/json"
 	"io/fs"
 	"os"
@@ -242,6 +243,18 @@ func parse(p *ts.Parser, src []byte) (*ts.Tree, int64) {
 	return tree, copies
 }
 
+// flatTree is the worker's tree access: tree flattened in language and
+// closed, so every callable is found and lowered from the flat array alone.
+func flatTree(t *testing.T, tree *ts.Tree, language string) *worker.Flat {
+	t.Helper()
+	flat, err := worker.Flatten(tree, language)
+	tree.Close()
+	if err != nil {
+		t.Fatalf("flatten: %v", err)
+	}
+	return flat
+}
+
 // passes runs the analysis passes the dependence core runs over g, in the
 // order TestFunctionAnalysis times them; the results live in a until its next
 // Begin. The forward dominator tree is not one of them: nothing downstream
@@ -278,8 +291,8 @@ func warmLowerings(t *testing.T, a *flow.Arena, s *worker.Scratch) {
 		if tree == nil {
 			t.Fatalf("%s: the parser produced no tree", in.path)
 		}
-		defer tree.Close()
-		if err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
+		flat := flatTree(t, tree, in.language.Name)
+		if err := l.Functions(flat.Root(), func(fn worker.Node) error {
 			passes(l.Lower(fn, in.src, a, s), a)
 			return nil
 		}); err != nil {
@@ -471,10 +484,9 @@ type functionRow struct {
 // separately, and the arena's bytes against the design's 96·N + 64 figure.
 // One Arena serves every function, as in a worker. Each function is lowered
 // and analysed once untimed before the timed run, so the timed run finds the
-// arena's backing already sized to it, as a worker's steady state does; a
-// function whose previous run used more than the arena's release threshold
-// has its backing dropped at Begin, and its timed run pays the fresh
-// allocation every such function pays in a worker. Native counting is
+// arena's backing already sized to it, as a worker's steady state does
+// within a file; the backing is released after each file, as the worker
+// releases it at the file boundary. Native counting is
 // paused: no figure here is native, and the table would only add to every
 // pass's time.
 func TestFunctionAnalysis(t *testing.T) {
@@ -494,10 +506,14 @@ func TestFunctionAnalysis(t *testing.T) {
 			t.Errorf("%s: the parser produced no tree", in.path)
 			return
 		}
-		defer tree.Close()
-		err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
+		tl, _ := worker.Grammar(in.language.Name)
+		flat := flatTree(t, tree, in.language.Name)
+		defer arena.Release()
+		defer scratch.Close()
+		err := l.Functions(flat.Root(), func(fn worker.Node) error {
 			row := functionRow{Row: "function", Origin: in.origin, Path: in.path, Language: in.language.Name,
-				Kind: fn.Kind(), StartByte: fn.StartByte(), EndByte: fn.EndByte(), StartLine: fn.StartPosition().Row + 1}
+				Kind: tl.NodeKindForId(fn.KindId()), StartByte: fn.StartByte(), EndByte: fn.EndByte(),
+				StartLine: uint(bytes.Count(in.src[:fn.StartByte()], []byte{'\n'})) + 1}
 			passes(l.Lower(fn, in.src, &arena, &scratch), &arena)
 			t0 := time.Now()
 			g := l.Lower(fn, in.src, &arena, &scratch)
@@ -536,8 +552,8 @@ func TestFunctionAnalysis(t *testing.T) {
 	})
 }
 
-// fileRow is one file end to end: parse, lower and analyse every callable,
-// close the tree.
+// fileRow is one file end to end: parse, flatten and close the tree, lower
+// and analyse every callable.
 type fileRow struct {
 	Row         string `json:"row"`
 	Origin      string `json:"origin"`
@@ -590,9 +606,9 @@ func TestFileAnalysis(t *testing.T) {
 		if tree == nil {
 			return false
 		}
-		defer tree.Close()
+		flat := flatTree(t, tree, in.language.Name)
 		row.Functions, row.Nodes, row.ArenaPeakBytes = 0, 0, 0
-		err := l.Functions(tree.RootNode(), func(fn *ts.Node) error {
+		err := l.Functions(flat.Root(), func(fn worker.Node) error {
 			g := l.Lower(fn, in.src, &arena, &scratch)
 			passes(g, &arena)
 			row.Functions++
@@ -635,6 +651,9 @@ func TestFileAnalysis(t *testing.T) {
 		} else {
 			row.WallNs = &ns
 		}
+		// The file boundary, as the worker takes it, before the next input.
+		arena.Release()
+		scratch.Close()
 		emit(t, row)
 	})
 }
