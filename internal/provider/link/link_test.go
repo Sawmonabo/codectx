@@ -230,10 +230,8 @@ func TestCallsArriveForEveryGrammar(t *testing.T) {
 			if res.State != model.RunSucceeded {
 				t.Fatalf("structural unit ran %s", res.State)
 			}
-			// The linker reads the tables of the units the generation selects.
-			if err := h.Store.AttachUnit(ctx, h.Gen, structID); err != nil {
-				t.Fatalf("AttachUnit: %v", err)
-			}
+			// Sealing attached the structural unit to the staging generation,
+			// which is where the linker reads its tables.
 			linker := link.New(link.StoreTables(h.Store))
 
 			plan, err := dependence.PlanUnits(ctx, h.View)
