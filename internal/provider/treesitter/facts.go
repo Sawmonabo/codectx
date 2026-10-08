@@ -173,7 +173,7 @@ func outputInvalid(msg string) *model.Error {
 // returns the facts in put order: every node before any relation, alias or
 // search document that references it.
 func (b *builder) build() error {
-	b.scope, b.modKey = ScopePrefix+b.fv.Path, "module:"+b.fv.Path
+	b.scope, b.modKey = lang.ScopePrefix+b.fv.Path, "module:"+b.fv.Path
 	// The file's two path-derived keys are bounded here, once, before any
 	// identity is claimed. A snapshot path may be model.MaxPathBytes long while
 	// a scope key stops at model.MaxScopeKeyBytes and a native key at

@@ -88,10 +88,19 @@ func (b BlobRecord) Validate() error {
 
 // UnitInput is one source file a unit read: the unit_inputs row. Executable is
 // part of the input because a mode change can alter analysis (Section 9.4).
+//
+// Digest is the digest of what the unit read of the file when that is a
+// table another unit derived from it rather than its bytes: for a linking
+// unit, the file's link tables as the structural unit published them. It is
+// empty for every input read as bytes. It records what a delta build
+// compares against its predecessor's, input by input, and is not part of
+// the unit's identity: the identity folds the content hash, from which the
+// derived table follows, so UnitInputHasher never reads it.
 type UnitInput struct {
 	FileID      FileID `json:"file_id"`
 	ContentHash string `json:"content_hash"`
 	Executable  bool   `json:"executable"`
+	Digest      string `json:"digest,omitempty"`
 }
 
 // Validate enforces the unit_inputs constraints.
@@ -101,6 +110,11 @@ func (i UnitInput) Validate() error {
 	}
 	if err := requireID("unit_input.content_hash", i.ContentHash); err != nil {
 		return err
+	}
+	if i.Digest != "" {
+		if err := requireID("unit_input.digest", i.Digest); err != nil {
+			return err
+		}
 	}
 	return nil
 }

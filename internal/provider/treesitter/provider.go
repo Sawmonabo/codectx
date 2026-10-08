@@ -52,10 +52,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// ScopePrefix is the unit scope this provider indexes: one file, as
-// "file:"+path. The coordinator plans one unit per supported file.
-const ScopePrefix = "file:"
-
 // fingerprint is the pinned grammar and query identity every worker must
 // report before it is trusted with a parse.
 var fingerprint = lang.Fingerprint()
@@ -385,7 +381,7 @@ func (p *Provider) OpenStage(ctx context.Context) (closeStage func() model.Stage
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 	p.enterStage(ctx)
 	defer p.leaveStage(ctx)
-	relPath, ok := strings.CutPrefix(req.Unit.ScopeKey, ScopePrefix)
+	relPath, ok := strings.CutPrefix(req.Unit.ScopeKey, lang.ScopePrefix)
 	if !ok || relPath == "" {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeArgumentInvalid, Message: "treesitter units are scoped to one file as \"file:<path>\"",
 			Details: map[string]string{"scope_key": bound(req.Unit.ScopeKey, 256)}}

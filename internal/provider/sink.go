@@ -237,6 +237,17 @@ type DeltaSink interface {
 	PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error
 }
 
+// StateSink is a sink that also stores one provider-owned artifact with the
+// unit, under a kind, sharing the unit's lifetime
+// (sqlite.UnitWriter.PutDeltaState): the structural provider's link tables
+// for the linking provider to read. A destination that does not implement it
+// cannot hold one, and a provider that must store an artifact refuses to run
+// without it rather than seal a unit that silently lacks it.
+type StateSink interface {
+	Sink
+	PutState(ctx context.Context, kind string, payload []byte) error
+}
+
 // keyed pairs one queued fact with the producer's delta keys, nil when the
 // producer supplied none. Facts are queued keyed so a batch sorts, flushes and
 // is accounted for exactly once whether or not the provider is incremental.
