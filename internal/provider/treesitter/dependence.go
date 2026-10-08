@@ -45,7 +45,8 @@ const (
 // and writes facts. A failed function publishes nothing; it is disclosed on
 // the file's dependence rows (capabilities). A variable is one node per
 // declaring identifier in the file: a closure's message that names a
-// variable an enclosing function declared names the same node.
+// variable an enclosing function declared names the same node, and an
+// identifier that is a declaration's name token names that declaration.
 func (b *builder) functions() error {
 	if len(b.ex.functions) == 0 {
 		return nil
@@ -53,40 +54,28 @@ func (b *builder) functions() error {
 	if b.ex.done.DependenceFailure != "" {
 		return outputInvalid("a file whose dependence pass failed also sent function messages")
 	}
+	vars, claims, err := b.variables()
+	if err != nil {
+		return err
+	}
 	byStart := b.declsByStart()
-	vars := map[wire.Span]model.NodeID{}
 	for i := range b.ex.functions {
 		f := &b.ex.functions[i]
-		if f.Span.End <= f.Span.Start {
-			return outputInvalid("a function span [" + strconv.Itoa(int(f.Span.Start)) + "," + strconv.Itoa(int(f.Span.End)) + ") is empty")
-		}
-		if _, err := b.rangeOf(f.Span.Start, f.Span.End); err != nil {
-			return err
-		}
 		if f.Failed {
 			continue
 		}
 		owner, ownerKey, ownerQualified := b.owner(byStart, f.Span)
 		ids := make([]model.NodeID, len(f.Vars))
 		for j, v := range f.Vars {
-			// A variable's identifier need not lie inside its function's
-			// span: a Java compact constructor's parameters are declared on
-			// the record header.
-			if v.End <= v.Start {
-				return outputInvalid("a variable range [" + strconv.Itoa(int(v.Start)) + "," + strconv.Itoa(int(v.End)) + ") is empty")
-			}
-			rng, err := b.rangeOf(v.Start, v.End)
-			if err != nil {
-				return err
-			}
-			id, seen := vars[v]
-			if !seen {
-				if id, err = b.variable(v, rng, ownerQualified); err != nil {
+			fv := vars[v]
+			if !fv.resolved {
+				if fv.id, err = b.variable(v, fv, claims, ownerQualified); err != nil {
 					return err
 				}
-				vars[v] = id
+				fv.resolved = true
+				vars[v] = fv
 			}
-			ids[j] = id
+			ids[j] = fv.id
 		}
 		nodes := make([]*model.SourceRange, len(f.Nodes))
 		for j, n := range f.Nodes {
@@ -159,21 +148,83 @@ func (b *builder) owner(byStart []int, s wire.Span) (model.NodeID, string, strin
 	return b.module.Node.ID, b.fv.Path, ""
 }
 
+// fileVar is one declaring identifier the file's analysed functions name:
+// the node it resolved to once resolved is set, its located range, and the
+// cross-provider declaration key over it, empty when over its bound.
+type fileVar struct {
+	id       model.NodeID
+	resolved bool
+	rng      *model.SourceRange
+	declKey  string
+}
+
+// variables validates every function message's span and every variable range
+// of the analysed ones, and answers each distinct declaring identifier. An
+// identifier that is a declaration's name token is resolved to that
+// declaration's node: the structural query already extracted it (a module
+// assignment, an ECMAScript declarator, a Go var_spec, a Python def's name in
+// its module), and it is one entity, not two. claims counts, per declaration
+// key, the minted identifiers that would carry it, so variable publishes no
+// alias that names two identities.
+func (b *builder) variables() (map[wire.Span]fileVar, map[string]int, error) {
+	vars := map[wire.Span]fileVar{}
+	claims := map[string]int{}
+	for i := range b.ex.functions {
+		f := &b.ex.functions[i]
+		// A function's span may be empty: an empty file's module or program
+		// is a callable whose root spans no byte.
+		if _, err := b.rangeOf(f.Span.Start, f.Span.End); err != nil {
+			return nil, nil, err
+		}
+		if f.Failed {
+			continue
+		}
+		for _, v := range f.Vars {
+			// A variable's identifier need not lie inside its function's
+			// span: a Java compact constructor's parameters are declared on
+			// the record header.
+			if v.End <= v.Start {
+				return nil, nil, outputInvalid("a variable range [" + strconv.Itoa(int(v.Start)) + "," + strconv.Itoa(int(v.End)) + ") is empty")
+			}
+			if _, seen := vars[v]; seen {
+				continue
+			}
+			rng, err := b.rangeOf(v.Start, v.End)
+			if err != nil {
+				return nil, nil, err
+			}
+			if d, ok := b.nameAt[v]; ok {
+				vars[v] = fileVar{id: b.decls[d].res.Node.ID, resolved: true}
+				continue
+			}
+			key := b.declKey(string(b.src[v.Start:v.End]), v.Start, v.End, rng)
+			vars[v] = fileVar{rng: rng, declKey: key}
+			if key != "" {
+				claims[key]++
+			}
+		}
+	}
+	return vars, claims, nil
+}
+
 // variable resolves and publishes the variable entity declared by the
 // identifier at v (docs/providers-treesitter.md, Variable entity). Its native
-// key and alias are the cross-provider declaration key over the identifier,
-// so another producer of the same declaration resolves to the same identity.
-// A key over its bound is omitted, never truncated: the variable is dropped
-// and counted, and it answers the empty id, which drops its facts with it.
-// A name or qualified name over its storage ceiling is cut and flagged, as a
-// declaration's is.
-func (b *builder) variable(v wire.Span, rng *model.SourceRange, ownerQualified string) (model.NodeID, error) {
-	name := string(b.src[v.Start:v.End])
-	key := b.declKey(name, v.Start, v.End, rng)
+// key is rangeKey "var:" over the identifier, which no other entity of the
+// file has. Its alias is the cross-provider declaration key over the
+// identifier, so another producer of the same declaration resolves to the
+// same identity, unless a declaration of the file or another identifier
+// carries the same key: that alias would name two identities, so it is
+// omitted and counted. A key over its bound is omitted, never truncated: a
+// native key that does not fit drops the variable and answers the empty id,
+// which drops its facts with it. A name or qualified name over its storage
+// ceiling is cut and flagged, as a declaration's is.
+func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, ownerQualified string) (model.NodeID, error) {
+	key := b.rangeKey("var:", v.Start, v.End)
 	if key == "" {
 		b.dropped[dependence]++
 		return "", nil
 	}
+	name := string(b.src[v.Start:v.End])
 	qualified := name
 	if ownerQualified != "" {
 		qualified = ownerQualified + b.lang.Separator + name
@@ -183,7 +234,7 @@ func (b *builder) variable(v wire.Span, rng *model.SourceRange, ownerQualified s
 	qualified = truncated.cut("qualified_name", qualified, model.MaxQualifiedNameBytes)
 	res, err := b.resolve(model.NodeCandidate{
 		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key, Kind: model.NodeVariable, Language: b.lang.Name,
-		Name: name, QualifiedName: qualified, FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: rng,
+		Name: name, QualifiedName: qualified, FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: fv.rng,
 	})
 	if err != nil {
 		return "", err
@@ -192,9 +243,13 @@ func (b *builder) variable(v wire.Span, rng *model.SourceRange, ownerQualified s
 	if len(truncated) > 0 {
 		meta = map[string]any{"truncated_fields": truncated}
 	}
-	b.putNode(dependence, res, rng, key, meta)
-	b.ambiguous(res, rng)
-	b.putAlias(b.scope, key, res.Node.ID)
+	b.putNode(dependence, res, fv.rng, key, meta)
+	b.ambiguous(res, fv.rng)
+	if fv.declKey == "" || claims[fv.declKey] > 1 || b.declKeys[fv.declKey] {
+		b.dropped[dependence]++
+	} else {
+		b.putAlias(b.scope, fv.declKey, res.Node.ID)
+	}
 	return res.Node.ID, nil
 }
 

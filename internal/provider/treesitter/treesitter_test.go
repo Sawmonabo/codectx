@@ -232,19 +232,23 @@ func wantFresh(t *testing.T, rows []model.CapabilityState) {
 // checkDependence indexes one language's dependence source through the
 // provider harness and asserts that the four families arrive between the
 // expected variable entities, at precision static_analysis, with every
-// capability row fresh.
+// capability row fresh, and that one declaration is one node.
 //
 // Failure modes: a parent that drops or misdecodes the worker's function
 // messages publishes none of the four families, so every consumer of them
 // answers empty for that language; one that mints variables under another
 // identity than the declaration key splits a variable from every other
 // producer's; one that labels the facts syntax under-reports what produced
-// them.
+// them; one that mints a variable beside the structural declaration of the
+// same identifier (an ECMAScript `let x`, a Python module's `def f`) leaves a
+// symbol search on a node with no dependence edges.
 //
 // Mutation: skip wire.KindFunction in the exchange's frame switch -> the
 // worker's frame is an unexpected kind and the unit fails; decode it but
 // publish nothing -> no data_flows_to p to x. Publish the four families at
-// the builder's structure family -> the precision check fails.
+// the builder's structure family -> the precision check fails. Drop the
+// declaration name-token lookup in builder.variables -> JavaScript's x and
+// Python's f each become a second node.
 func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	t.Helper()
 	files := map[string]string{file: src}
@@ -257,11 +261,15 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	}
 	wantFresh(t, result.Capabilities)
 	vars := map[string]model.NodeID{}
+	precision := map[string]model.Precision{}
 	var owner model.NodeID
 	for _, n := range cap.nodes {
 		switch {
-		case n.Node.Kind == model.NodeVariable && n.Evidence[0].Precision == model.PrecisionStaticAnalysis:
-			vars[n.Node.Name] = n.Node.ID
+		case n.Node.Kind == model.NodeVariable:
+			if prev, ok := vars[n.Node.Name]; ok && prev != n.Node.ID {
+				t.Fatalf("%s: two variable nodes named %s; nodes: %s", file, n.Node.Name, names(cap.nodes))
+			}
+			vars[n.Node.Name], precision[n.Node.Name] = n.Node.ID, n.Evidence[0].Precision
 			key := "decl:" + n.Node.Name + "@" + file + ":"
 			if !slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool {
 				return a.NodeID == n.Node.ID && a.ScopeKey == treesitter.ScopePrefix+file && strings.HasPrefix(a.NativeKey, key)
@@ -274,8 +282,18 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	}
 	for _, name := range []string{"p", "x", "y"} {
 		if vars[name] == "" {
-			t.Fatalf("%s: no static_analysis variable %s; nodes: %s", file, name, names(cap.nodes))
+			t.Fatalf("%s: no variable %s; nodes: %s", file, name, names(cap.nodes))
 		}
+	}
+	// A parameter is never a structural declaration, so its node is the one
+	// the dependence pass minted.
+	if precision["p"] != model.PrecisionStaticAnalysis {
+		t.Fatalf("%s: variable p at precision %s, want %s", file, precision["p"], model.PrecisionStaticAnalysis)
+	}
+	// f's binding name, which a module or program callable declares, is the
+	// function f itself.
+	if vars["f"] != "" {
+		t.Fatalf("%s: a variable node f beside the function f; nodes: %s", file, names(cap.nodes))
 	}
 	if owner == "" {
 		t.Fatalf("%s: no declaration f owns the variables; nodes: %s", file, names(cap.nodes))
@@ -301,6 +319,31 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 				t.Fatalf("%s: %s evidence at precision %s, want %s", file, w.kind, e.Precision, model.PrecisionStaticAnalysis)
 			}
 		}
+	}
+}
+
+// TestAnEmptyFileIndexes indexes a zero-byte file of every language whose
+// file root is a callable. Its root spans no byte, so the worker sends one
+// function message over the empty span [0,0).
+//
+// Failure mode: a parent that refuses an empty function span as a protocol
+// violation fails the unit, and the structural provider is Required, so one
+// empty __init__.py fails the whole generation.
+//
+// Mutation: refuse a function message whose span is empty in
+// builder.variables -> RunUnit fails for every row.
+func TestAnEmptyFileIndexes(t *testing.T) {
+	p := newProvider(t)
+	for _, file := range []string{"__init__.py", "empty.js", "empty.ts", "empty.tsx"} {
+		t.Run(file, func(t *testing.T) {
+			h := providertest.New(t, map[string]string{file: ""})
+			u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+			result, err := provider.RunUnit(context.Background(), p, u.Request, h.Begin(t, u, []string{file}), providertest.Limits, h.Pool)
+			if err != nil {
+				t.Fatalf("RunUnit(%s): %v", file, err)
+			}
+			wantFresh(t, result.Capabilities)
+		})
 	}
 }
 

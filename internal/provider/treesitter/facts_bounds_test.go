@@ -30,7 +30,7 @@ func TestOverlongDeclarationNamesAreTruncatedNotRefused(t *testing.T) {
 		byName: map[string][]int{},
 		ex: &extraction{decls: []wire.Decl{{
 			ID: 0, Parent: -1, Kind: "function", Name: "f", Qualified: qualified,
-			Start: 0, End: uint32(len(src)), SigEnd: 9,
+			Start: 0, End: uint32(len(src)), NameStart: 5, NameEnd: 6, SigEnd: 9,
 		}}},
 	}
 	if err := b.validateDecls(); err != nil {
@@ -133,8 +133,8 @@ func TestAFailedFunctionDegradesOnlyItsFilesDependenceRows(t *testing.T) {
 		cur:  source.NewCursor(src),
 		ex: &extraction{
 			decls: []wire.Decl{
-				{ID: 0, Parent: -1, Kind: "function", Name: "f", Qualified: "f", Start: 0, End: 33, SigEnd: 13},
-				{ID: 1, Parent: -1, Kind: "function", Name: "g", Qualified: "g", Start: 33, End: 44, SigEnd: 41},
+				{ID: 0, Parent: -1, Kind: "function", Name: "f", Qualified: "f", Start: 0, End: 33, NameStart: 5, NameEnd: 6, SigEnd: 13},
+				{ID: 1, Parent: -1, Kind: "function", Name: "g", Qualified: "g", Start: 33, End: 44, NameStart: 38, NameEnd: 39, SigEnd: 41},
 			},
 			functions: []wire.Function{
 				{
@@ -190,6 +190,81 @@ func TestAFailedFunctionDegradesOnlyItsFilesDependenceRows(t *testing.T) {
 		f := b.rels[model.NewRelationID(b.req.Binding.RepositoryID, ends[0], kind, ends[1])]
 		if f == nil || len(f.Evidence) == 0 || f.Evidence[0].Precision != model.PrecisionStaticAnalysis {
 			t.Fatalf("the analysed function's %s fact is missing or not static_analysis: %+v", kind, f)
+		}
+	}
+}
+
+// TestAVariableKeyNamesOneIdentity pins the variable identity rule
+// (docs/providers-treesitter.md, Variable entity) where the line-based
+// declaration key repeats: a one-line `func f(f int)` gives the function and
+// its parameter one key, and two closures' parameters x on one line share
+// one.
+//
+// Failure mode: an alias that names two identities lets another producer
+// that resolves the function by its declaration key adopt the parameter
+// instead, so a `calls` endpoint becomes a variable; a native key that
+// repeats merges distinct variables.
+//
+// Mutation: publish the declaration-key alias whatever else carries it in
+// builder.variable -> the function's key names the parameter too, and x's
+// key names both parameters. Key the variable's native key by its
+// declaration key -> the three variables do not have three native keys.
+// Stop counting the withheld alias -> the rows stay fresh.
+func TestAVariableKeyNamesOneIdentity(t *testing.T) {
+	src := []byte("func f(f int) { _ = f }\nvar a, b = func(x int) {}, func(x int) {}\n")
+	golang, ok := lang.Lookup("go")
+	if !ok {
+		t.Fatal("go is not pinned")
+	}
+	b := &builder{
+		ctx:  context.Background(),
+		req:  provider.UnitRequest{Unit: model.UnitSpec{ProviderID: lang.ProviderID}, Resolver: mintResolver{}},
+		fv:   model.FileVersion{ID: "file", Path: "a.go"},
+		lang: golang,
+		src:  src,
+		cur:  source.NewCursor(src),
+		ex: &extraction{
+			decls: []wire.Decl{{ID: 0, Parent: -1, Kind: "function", Name: "f", Qualified: "f", Start: 0, End: 23, NameStart: 5, NameEnd: 6, SigEnd: 14}},
+			functions: []wire.Function{
+				{Span: wire.Span{Start: 0, End: 23}, Vars: []wire.Span{{Start: 7, End: 8}}, Nodes: []wire.Span{{Start: 16, End: 21}},
+					Reads: []wire.Access{{Var: 0, Node: 0}}},
+				{Span: wire.Span{Start: 35, End: 49}, Vars: []wire.Span{{Start: 40, End: 41}}, Nodes: []wire.Span{{Start: 40, End: 41}},
+					Writes: []wire.Access{{Var: 0, Node: 0}}},
+				{Span: wire.Span{Start: 51, End: 65}, Vars: []wire.Span{{Start: 56, End: 57}}, Nodes: []wire.Span{{Start: 56, End: 57}},
+					Writes: []wire.Access{{Var: 0, Node: 0}}},
+			},
+		},
+	}
+	if err := b.build(); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	var fn model.NodeID
+	keys := map[string]bool{}
+	for _, n := range b.nodes {
+		switch n.Node.Kind {
+		case model.NodeFunction:
+			fn = n.Node.ID
+		case model.NodeVariable:
+			keys[n.Evidence[0].NativeKey] = true
+		}
+	}
+	if want := map[string]bool{"var:a.go:8-8": true, "var:a.go:41-41": true, "var:a.go:57-57": true}; !reflect.DeepEqual(keys, want) {
+		t.Fatalf("variable native keys = %v, want %v", keys, want)
+	}
+	byKey := map[string][]model.NodeID{}
+	for _, a := range b.aliases {
+		byKey[a.NativeKey] = append(byKey[a.NativeKey], a.NodeID)
+	}
+	if got := byKey["decl:f@a.go:1-1"]; len(got) != 1 || got[0] != fn {
+		t.Fatalf("decl:f@a.go:1-1 names %v, want the function %s alone", got, fn)
+	}
+	if got := byKey["decl:x@a.go:2-2"]; len(got) != 0 {
+		t.Fatalf("decl:x@a.go:2-2 names %v, want no alias for a key two parameters share", got)
+	}
+	structureRow := model.CapabilityState{ProviderID: lang.ProviderID, Capability: capabilityName, Scope: "file:a.go", State: model.CapabilityFresh}
+	for _, row := range b.capabilities(structureRow)[1:] {
+		if row.State != model.CapabilityPartial {
+			t.Fatalf("dependence row %+v, want partial for the withheld aliases", row)
 		}
 	}
 }

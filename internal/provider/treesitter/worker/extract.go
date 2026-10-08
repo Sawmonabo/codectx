@@ -501,7 +501,7 @@ func (e *extraction) emit(out *emitter) error {
 		}
 		parts = append(parts, d.name)
 		w := wire.Decl{ID: len(wireDecls), Parent: -1, Kind: d.kind, Name: d.name, Qualified: strings.Join(parts, e.l.Separator),
-			Start: uint32(start), End: uint32(end), SigEnd: uint32(end),
+			Start: uint32(start), End: uint32(end), NameStart: uint32(d.nameStart), NameEnd: uint32(d.nameEnd), SigEnd: uint32(end),
 			Exported: d.exported, Test: d.test, Prototype: d.prototype, Macro: d.macro, Impl: d.impl}
 		if d.parentIdx >= 0 {
 			w.Parent = d.parentIdx

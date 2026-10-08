@@ -156,6 +156,11 @@ type Decl struct {
 	Qualified string `json:"qualified"`
 	Start     uint32 `json:"start"`
 	End       uint32 `json:"end"`
+	// NameStart and NameEnd bound the declaration's name token alone, inside
+	// [Start, End). A variable the dependence pass declares at that token is
+	// this declaration, not a second entity.
+	NameStart uint32 `json:"name_start"`
+	NameEnd   uint32 `json:"name_end"`
 	SigEnd    uint32 `json:"sig_end"`
 	DocStart  uint32 `json:"doc_start"`
 	DocEnd    uint32 `json:"doc_end"`

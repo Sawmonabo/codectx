@@ -71,18 +71,26 @@ func (f family) precision() model.Precision {
 // it publishes is derived from the pinned bytes with source.Cursor; nothing
 // the worker said is copied without being checked against them.
 type builder struct {
-	ctx      context.Context
-	req      provider.UnitRequest
-	fv       model.FileVersion
-	lang     lang.Language
-	src      []byte
-	cur      *source.Cursor
-	ex       *extraction
-	scope    string
-	modKey   string
-	fileRng  *model.SourceRange
-	decls    []declFact
-	byName   map[string][]int
+	ctx     context.Context
+	req     provider.UnitRequest
+	fv      model.FileVersion
+	lang    lang.Language
+	src     []byte
+	cur     *source.Cursor
+	ex      *extraction
+	scope   string
+	modKey  string
+	fileRng *model.SourceRange
+	decls   []declFact
+	byName  map[string][]int
+	// nameAt is the first declaration, in declaration order, whose name
+	// token spans each range: a variable the dependence pass declares at that
+	// token is that declaration's node.
+	nameAt map[wire.Span]int
+	// declKeys holds every cross-provider declaration key a declaration of
+	// this file published as an alias, so a variable whose key repeats one
+	// publishes no alias that would name two identities.
+	declKeys map[string]bool
 	module   model.Resolution
 	nodes    []model.NodeFact
 	nodeAt   map[model.NodeID]int
@@ -188,6 +196,7 @@ func (b *builder) build() error {
 	b.nodeAt = map[model.NodeID]int{}
 	b.aliasSeen = map[model.NativeAlias]bool{}
 	b.byName = map[string][]int{}
+	b.declKeys = map[string]bool{}
 	var err error
 	if b.fileRng, err = b.rangeOf(0, uint32(len(b.src))); err != nil {
 		return err
@@ -228,6 +237,7 @@ func (b *builder) rangeOf(start, end uint32) (*model.SourceRange, error) {
 
 func (b *builder) validateDecls() error {
 	b.decls = make([]declFact, 0, len(b.ex.decls))
+	b.nameAt = make(map[wire.Span]int, len(b.ex.decls))
 	for i, d := range b.ex.decls {
 		kind, ok := declKinds[d.Kind]
 		if !ok {
@@ -253,6 +263,10 @@ func (b *builder) validateDecls() error {
 		if d.SigEnd < d.Start || d.SigEnd > d.End {
 			return outputInvalid("declaration signature end lies outside the declaration")
 		}
+		if d.NameEnd <= d.NameStart || d.NameStart < d.Start || d.NameEnd > d.End {
+			return outputInvalid("declaration name range [" + strconv.Itoa(int(d.NameStart)) + "," + strconv.Itoa(int(d.NameEnd)) +
+				") is empty or lies outside the declaration")
+		}
 		rng, err := b.rangeOf(d.Start, d.End)
 		if err != nil {
 			return err
@@ -268,6 +282,9 @@ func (b *builder) validateDecls() error {
 		// what rejects an offset inside a UTF-8 sequence, which would
 		// otherwise put a broken rune in a Signature or a Body.
 		if _, err := b.rangeOf(d.Start, d.SigEnd); err != nil {
+			return err
+		}
+		if _, err := b.rangeOf(d.NameStart, d.NameEnd); err != nil {
 			return err
 		}
 		f := declFact{Decl: d, kind: kind, rng: rng}
@@ -289,6 +306,10 @@ func (b *builder) validateDecls() error {
 		f.body = f.truncated.cut("body", searchBody(f.doc, f.sig), maxDocBytes)
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
+		name := wire.Span{Start: d.NameStart, End: d.NameEnd}
+		if _, ok := b.nameAt[name]; !ok {
+			b.nameAt[name] = i
+		}
 	}
 	return nil
 }
@@ -382,6 +403,7 @@ func (b *builder) resolveDecls() error {
 		}
 		if key := b.declKey(d.Name, d.Start, d.End, d.rng); key != "" {
 			b.putAlias(b.scope, key, res.Node.ID)
+			b.declKeys[key] = true
 		} else {
 			// The cross-provider key did not fit and was omitted rather than
 			// truncated. That is a record this file should have published and
@@ -705,8 +727,15 @@ func calleeResolution(r wire.Ref, targets []int) (string, int) {
 //
 // A key over MaxNativeKeyBytes is omitted rather than truncated, exactly as
 // declKey is, and the omission is counted by the caller.
-func (b *builder) callsiteKey(start, end uint32) string {
-	key := "callsite:" + b.fv.Path + ":" + strconv.FormatUint(uint64(start)+1, 10) + "-" + strconv.FormatUint(uint64(end), 10)
+func (b *builder) callsiteKey(start, end uint32) string { return b.rangeKey("callsite:", start, end) }
+
+// rangeKey is prefix + path + ":" + <first byte> + "-" + <last byte> over
+// the half-open byte range [start,end), one-based and inclusive as
+// callsiteKey spells it, or empty when it is over MaxNativeKeyBytes. With the
+// "var:" prefix it is a variable entity's native key: one declaring
+// identifier is one variable, so no other entity of the file has that key.
+func (b *builder) rangeKey(prefix string, start, end uint32) string {
+	key := prefix + b.fv.Path + ":" + strconv.FormatUint(uint64(start)+1, 10) + "-" + strconv.FormatUint(uint64(end), 10)
 	if len(key) > model.MaxNativeKeyBytes {
 		return ""
 	}

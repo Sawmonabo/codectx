@@ -316,26 +316,35 @@ The parent validates every range against the pinned bytes, as it does for every 
 | `reads` | the owning declaration | variable | the reading node | `use` |
 | `writes` | the owning declaration | variable | the defining node | `definition` or `may_definition` |
 
-- **Variable entity.** Each named variable becomes one `variable` node. Its name is the declaring identifier's text,
-  its range is that identifier's range, and its qualified name is the owning declaration's qualified name, the
-  language's separator, and the name (the name alone when the owner is the file's module). Its native key, under the
-  file's scope `file:<path>`, is the cross-provider declaration key
-  `decl:<name>@<path>:<first line>-<last line>` over the identifier's lines, which the provider also publishes as an
-  alias, so any other producer of the same declaration resolves to the same identity (ADR-0012 decision 4). A key over
-  the model's native-key bound is omitted, never truncated: the variable and its facts are dropped and counted.
+- **Variable entity.** Each named variable is one node, whichever functions' messages name it. When its declaring
+  identifier is a structural declaration's name token (a module or class assignment, an ECMAScript declarator, a Go
+  `var_spec`, a Python `def` or `class` name declared in its module or class), it is that declaration's node: the
+  wire carries every declaration's name range for this match, and no second node is minted. Otherwise it is a
+  `variable` node. Its name is the declaring identifier's text, its range is that identifier's range, and its
+  qualified name is the owning declaration's qualified name, the language's separator, and the name (the name alone
+  when the owner is the file's module). Its native key, under the file's scope `file:<path>`, is
+  `var:<path>:<first byte>-<last byte>` over the identifier, one-based and inclusive: one identifier is one
+  variable, so no other entity of the file has that key. Its alias is the cross-provider declaration key
+  `decl:<name>@<path>:<first line>-<last line>` over the identifier's lines, so any other producer of the same
+  declaration resolves to the same identity (ADR-0012 decision 4). That key is line based, so it can repeat: a
+  one-line `func f(f int)` gives the function and its parameter one key, and two same-name locals on one line share
+  one. A variable whose declaration key a declaration of the file or another of its variables also carries publishes
+  no alias, which would name two identities, and the omission is counted, so the four rows report partial. A key
+  over the model's native-key bound is omitted, never truncated: an omitted native key drops the variable and its
+  facts, an omitted alias is counted, and both make the rows partial.
 - **Owning declaration.** The owner of a function's `reads` and `writes`, and of its variables, is the innermost
   structural declaration of the same file whose range contains the callable's range; a callable no declaration
   contains is owned by the file's module node. A lambda or closure is therefore owned by the declaration that
   contains it.
 - **Endpoints.** Every endpoint of `control_depends_on` and `data_flows_to` is a variable entity. A call site is not
-  an endpoint, which is narrower than the previous publisher of these families, which anchored a call site to the
-  method it invokes: the callee is resolved by the linking provider that publishes `calls`, and a fact that reaches
-  only a call, a return or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no variable are not
-  tracked (see the shared contract in `internal/provider/treesitter/worker/lower.go`).
+  an endpoint: the callee is resolved by the linking provider that publishes `calls`, and a fact that reaches only a
+  call, a return or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no
+  variable are not tracked (see the shared contract in `internal/provider/treesitter/worker/lower.go`).
 - **Relation evidence.** Each occurrence is one evidence row: the node's range, the owning declaration's qualified
   name as its native key, and the detail above. The existing per-fact evidence clip applies.
-- **Precision.** Every evidence row of the four families, and of a variable node, is `static_analysis`
-  (ADR-0012 decision 8). Every other fact of the provider stays `syntax`.
+- **Precision.** Every evidence row of the four families, and of a variable node the pass mints, is
+  `static_analysis` (ADR-0012 decision 8). Every other fact of the provider stays `syntax`, a declaration that is
+  also a variable included.
 
 ### Capabilities
 
@@ -497,13 +506,16 @@ worker → parent   Hello{pid, fingerprint, languages}          once, first
 parent → worker   Request{language, path, source_bytes}
 parent → worker   Source<raw bytes>                            exactly source_bytes
 worker → parent   Decl* Import* Ref*                           facts, one record each
+                  Decl{id, parent, kind, name, qualified, start, end, name_start, name_end, sig_end, doc_start, doc_end, ...}
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
 worker → parent   Function*                                    KindFunction, one per callable, binary
 worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
-A `Ref` carries two ranges: `start`/`end` bound the whole reference
+A `Decl`'s `name_start`/`name_end` bound its name token inside `start`/`end`;
+a dependence variable declared at that token is the declaration's node
+(Variable entity). A `Ref` carries two ranges: `start`/`end` bound the whole reference
 expression (the call expression for a call), and `name_start`/`name_end`
 bound the callee identifier token alone. The alias is built from the second,
 because that is what a SCIP occurrence covers; the enclosing expression's
