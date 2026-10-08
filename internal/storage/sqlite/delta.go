@@ -712,12 +712,13 @@ func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string, 
 // work, and the page size is the bound Section 6 requires on the traversal.
 const unitInputsPage = 1000
 
-// UnitInputs streams the sealed unit's declared inputs in ascending FileID
-// order — the same order BeginUnit required when they were written — so a
-// caller can merge-join them against a fresh input stream without holding
-// either list. It refuses a unit that is not sealed: a building unit's
-// unit_inputs rows are still arriving, and a delta that diffed against a
-// partial set would name too few replaced buckets and carry a stale fact.
+// UnitInputs streams the sealed unit's declared inputs, each with the Digest
+// BeginUnit stored for it, in ascending FileID order — the same order
+// BeginUnit required when they were written — so a caller can merge-join them
+// against a fresh input stream without holding either list. It refuses a unit
+// that is not sealed: a building unit's unit_inputs rows are still arriving,
+// and a delta that diffed against a partial set would name too few replaced
+// buckets and carry a stale fact.
 //
 // The first failure ends the sequence: it is yielded with a zero UnitInput and
 // nothing follows it.
@@ -762,21 +763,25 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 			if err := s.read(ctx, func(tx *sql.Tx) error {
 				page = page[:0]
 				last = nil
-				rows, err := tx.QueryContext(ctx, `SELECT file_id, content_hash, executable FROM unit_inputs
+				rows, err := tx.QueryContext(ctx, `SELECT file_id, content_hash, executable, digest FROM unit_inputs
 					WHERE unit_id = ?1 AND file_id > ?2 ORDER BY file_id LIMIT ?3`, row, after, unitInputsPage)
 				if err != nil {
 					return wrap("unit_inputs", err)
 				}
 				defer rows.Close()
 				for rows.Next() {
-					var file, hash []byte
+					var file, hash, digest []byte
 					var executable int
-					if err := rows.Scan(&file, &hash, &executable); err != nil {
+					if err := rows.Scan(&file, &hash, &executable, &digest); err != nil {
 						return wrap("unit_inputs", err)
 					}
 					last = file
-					page = append(page, model.UnitInput{FileID: model.FileID(idHex(file)),
-						ContentHash: idHex(hash), Executable: executable == 1})
+					in := model.UnitInput{FileID: model.FileID(idHex(file)),
+						ContentHash: idHex(hash), Executable: executable == 1}
+					if digest != nil {
+						in.Digest = idHex(digest)
+					}
+					page = append(page, in)
 				}
 				return wrap("unit_inputs", rows.Err())
 			}); err != nil {
