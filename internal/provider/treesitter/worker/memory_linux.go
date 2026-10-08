@@ -15,6 +15,7 @@ import "C"
 
 import (
 	"os"
+	"runtime/debug"
 
 	"github.com/Sawmonabo/codectx/internal/residency"
 )
@@ -24,11 +25,22 @@ import (
 // kernel's resident figures and resettable peak. A C library without the arena
 // setting or the trim call reports the heap as not returned, so no need is
 // measured from a heap that kept the previous file's pages.
+//
+// The boundary returns the Go heap first: the file's flat array and its
+// dependence arena and lists are Go allocations sized to the file, and a
+// runtime that kept their pages would serve the next file's from them, so its
+// peak would not rise and its need would be censored as the C heap's would.
+// debug.FreeOSMemory collects them and returns the freed pages, which the
+// runtime's default on Linux advises away at once (MADV_DONTNEED), so the
+// resident set falls before the base is read.
 func nativeHost() host {
 	held := C.holdOneArena() == 1
 	return host{
-		read:       residency.Read,
-		returnHeap: func() bool { return held && C.trimHeap() == 1 },
+		read: residency.Read,
+		returnHeap: func() bool {
+			debug.FreeOSMemory()
+			return held && C.trimHeap() == 1
+		},
 		resetPeak: func() bool {
 			// Writing 5 to clear_refs resets the resident peak (VmHWM) to the
 			// current resident set.
