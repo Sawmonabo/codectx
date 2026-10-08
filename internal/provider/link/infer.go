@@ -143,6 +143,10 @@ const (
 	varParam  byte = 1 // parameter Index of the callable Decl in File
 	varResult byte = 2 // the value site Index of File returns
 	varField  byte = 3 // every field or property called Name
+	// varImport is a name an import binds: Name is the module path and
+	// the name the module declares, joined by a NUL. The exports join
+	// seeds it with the declaration the module exports under that name.
+	varImport byte = 4
 )
 
 // variable is one place values flow into.
@@ -250,7 +254,8 @@ type member struct {
 // super is one declared supertype of Class.
 type super struct{ Class, Super Ref }
 
-// export is a module-level declaration a module path makes importable.
+// export is a module-level callable or type declaration a module path makes
+// importable.
 type export struct {
 	Base, Name string
 	Decl       Ref
@@ -319,6 +324,9 @@ type round struct {
 	bindings   *pagination.ExternalSort[binding]
 	lookups    *pagination.ExternalSort[lookup]
 	exportReqs *pagination.ExternalSort[exportReq]
+	// imports are the imported names the round's file scan evaluated,
+	// whose variables the exports join seeds.
+	imports    *pagination.ExternalSort[exportReq]
 	constructs *pagination.ExternalSort[construct]
 	facts      *pagination.ExternalSort[fact]
 	edges      *pagination.ExternalSort[edge]
@@ -442,6 +450,10 @@ func (in *inference) newRound() (*round, error) {
 	if r.exportReqs, err = newSort(in, exportReqCodec); err != nil {
 		return nil, err
 	}
+	if r.imports, err = newSort(in, exportReqCodec); err != nil {
+		return nil, err
+	}
+	r.imports.WithFold(keepFirst[exportReq])
 	if r.constructs, err = newSort(in, constructCodec); err != nil {
 		return nil, err
 	}
@@ -486,7 +498,7 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 		return err
 	}
 	err = in.u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
-		f := &fileScan{in: in, file: file, t: t, python: t.Language == "python"}
+		f := &fileScan{in: in, r: r, file: file, t: t, python: t.Language == "python"}
 		in.python = in.python || f.python
 		return f.scan(ctx, r, watches, members, supers, exports, decls, args)
 	})
@@ -515,6 +527,7 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 // fileScan reads one member table.
 type fileScan struct {
 	in     *inference
+	r      *round
 	file   int32
 	t      *Table
 	python bool
@@ -536,7 +549,7 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 		if isType(d.Kind) {
 			in.types++
 		}
-		if d.Parent == -1 && (f.python || d.Exported) {
+		if d.Parent == -1 && (f.python || d.Exported) && (isType(d.Kind) || isCallable(d.Kind)) {
 			for _, b := range bases {
 				if err := exports.Add(export{Base: b, Name: d.Name, Decl: ref, Type: isType(d.Kind)}); err != nil {
 					return err
@@ -718,6 +731,23 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 	case wire.TypeField:
 		return yield(operand{IsVar: true, V: variable{Kind: varField, Name: ty.Name}})
 	case wire.TypeModule:
+		// An imported name (ECMAScript `spec#name`, Python `module.name`)
+		// denotes the declaration its module exports under that name. A
+		// Python dotted name may instead be a module (`import a.b`), so it
+		// denotes both; the one no member file declares joins nothing.
+		if spec, name, ok := importedName(ty.Name, f.python); ok {
+			if base, found := moduleBase(t.Path, spec, f.python); found {
+				if err := f.r.imports.Add(exportReq{Base: base, Name: name}); err != nil {
+					return err
+				}
+				if err := yield(operand{IsVar: true, V: importVar(base, name)}); err != nil {
+					return err
+				}
+			}
+			if !f.python {
+				return nil
+			}
+		}
 		if base, ok := moduleBase(t.Path, ty.Name, f.python); ok {
 			return yield(operand{X: value{Kind: valModule, Path: base}})
 		}
@@ -814,6 +844,9 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 	if err != nil {
 		return nil, err
 	}
+	if err := in.seedImports(r); err != nil {
+		return nil, err
+	}
 	cons, err := sorted(in, r.constructs)
 	if err != nil {
 		return nil, err
@@ -849,6 +882,37 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 		return nil, err
 	}
 	return in.propagate(r)
+}
+
+// seedImports gives each imported name's variable the declaration its
+// module exports under that name: a function value for a callable, and for
+// a type the type itself, so a call through it (`Foo.bar()`) binds the
+// method the type declares or inherits.
+func (in *inference) seedImports(r *round) error {
+	names, err := sorted(in, r.imports)
+	if err != nil {
+		return err
+	}
+	return join(names, in.exports, func(q exportReq, e export) int {
+		return cmp.Or(cmp.Compare(q.Base, e.Base), cmp.Compare(q.Name, e.Name))
+	},
+		func(q exportReq, es []export) error {
+			for _, e := range es {
+				kind := valFunction
+				if e.Type {
+					kind = valExact
+				}
+				if err := r.facts.Add(fact{V: importVar(q.Base, q.Name), X: value{Kind: kind, Ref: e.Decl}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+}
+
+// importVar is the variable of the name a module path exports.
+func importVar(base, name string) variable {
+	return variable{Kind: varImport, Name: base + "\x00" + name}
 }
 
 // resolveLookups answers each lookup by the methods its type declares, and
