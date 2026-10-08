@@ -1,6 +1,8 @@
 package treesitter
 
 import (
+	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -86,5 +88,108 @@ func TestEvidenceClipIsAttributedNotFoldedIntoDropped(t *testing.T) {
 	}
 	if !bounded {
 		t.Fatal("a file whose only bound was the evidence clip must still report partial")
+	}
+}
+
+// mintResolver mints every candidate's identity from its own fields, as the
+// resolver does for a unit with no completed dependency.
+type mintResolver struct{}
+
+func (mintResolver) Resolve(_ context.Context, c model.NodeCandidate) (model.Resolution, error) {
+	key := model.CanonicalNodeKey(c.ScopeKey, c.NativeKey, string(c.Kind), c.QualifiedName)
+	node := model.Node{ID: model.NewNodeID("", c.Kind, key), Kind: c.Kind, Language: c.Language, Name: c.Name,
+		QualifiedName: c.QualifiedName, FileID: c.FileID, ContentHash: c.ContentHash, Range: c.Range}
+	return model.Resolution{Node: node, CanonicalKey: key}, nil
+}
+
+// TestAFailedFunctionDegradesOnlyItsFilesDependenceRows pins decision 9's
+// failure scope: a function whose analysis the worker recovered from makes
+// the file's four dependence rows partial and discloses it, while the
+// structure row is untouched and every other function's facts are still
+// published.
+//
+// Failure modes: a failed function that fails the unit loses the file's
+// structural facts; one that reaches the structure row reports the file's
+// structure incomplete when it is not; one that drops the whole file's
+// dependence facts loses the functions that were analysed; one that is not
+// disclosed claims coverage the file does not have.
+//
+// Mutation: return an error from builder.functions for a Failed message ->
+// build fails. Skip the analysed functions once one has failed -> the
+// data_flows_to relation is missing. Leave the four rows fresh -> the state
+// check fails.
+func TestAFailedFunctionDegradesOnlyItsFilesDependenceRows(t *testing.T) {
+	src := []byte("func f(p int) {\n\tx := p\n\t_ = x\n}\nfunc g() {}\n")
+	golang, ok := lang.Lookup("go")
+	if !ok {
+		t.Fatal("go is not pinned")
+	}
+	b := &builder{
+		ctx:  context.Background(),
+		req:  provider.UnitRequest{Unit: model.UnitSpec{ProviderID: lang.ProviderID}, Resolver: mintResolver{}},
+		fv:   model.FileVersion{ID: "file", Path: "a.go"},
+		lang: golang,
+		src:  src,
+		cur:  source.NewCursor(src),
+		ex: &extraction{
+			decls: []wire.Decl{
+				{ID: 0, Parent: -1, Kind: "function", Name: "f", Qualified: "f", Start: 0, End: 33, SigEnd: 13},
+				{ID: 1, Parent: -1, Kind: "function", Name: "g", Qualified: "g", Start: 33, End: 44, SigEnd: 41},
+			},
+			functions: []wire.Function{
+				{
+					Span:   wire.Span{Start: 0, End: 33},
+					Vars:   []wire.Span{{Start: 7, End: 8}, {Start: 17, End: 18}}, // p, x
+					Nodes:  []wire.Span{{Start: 17, End: 23}},                     // x := p
+					Flows:  []wire.Pair{{From: 0, To: 1, Node: 0}},
+					Reads:  []wire.Access{{Var: 0, Node: 0}},
+					Writes: []wire.Access{{Var: 1, Node: 0}},
+				},
+				{Span: wire.Span{Start: 33, End: 44}, Failed: true, Cause: "index out of range"},
+			},
+		},
+	}
+	if err := b.build(); err != nil {
+		t.Fatalf("a failed function failed the unit: %v", err)
+	}
+	structureRow := model.CapabilityState{ProviderID: lang.ProviderID, Capability: capabilityName, Scope: "file:a.go", State: model.CapabilityFresh}
+	rows := b.capabilities(structureRow)
+	if len(rows) != len(capabilities) || !reflect.DeepEqual(rows[0], structureRow) {
+		t.Fatalf("rows = %+v, want the structure row unchanged and then the four dependence rows", rows)
+	}
+	for i, row := range rows[1:] {
+		if row.Capability != capabilities[i+1] || row.State != model.CapabilityPartial || row.DiagnosticCode != model.CodeCoverageIncomplete {
+			t.Fatalf("dependence row %+v, want %s partial with %s", row, capabilities[i+1], model.CodeCoverageIncomplete)
+		}
+		if got := row.Details[detailFailedFunctions]; got != "1 33-44" {
+			t.Fatalf("%s = %q, want the count and the failed function's range", detailFailedFunctions, got)
+		}
+		if got := row.Details[detailFailureCause]; got != "index out of range" {
+			t.Fatalf("%s = %q, want the recovered text", detailFailureCause, got)
+		}
+	}
+	vars := map[string]model.NodeID{}
+	var owner model.NodeID
+	for _, n := range b.nodes {
+		switch {
+		case n.Node.Kind == model.NodeVariable && n.Evidence[0].Precision == model.PrecisionStaticAnalysis:
+			vars[n.Node.Name] = n.Node.ID
+		case n.Node.Kind == model.NodeFunction && n.Node.Name == "f":
+			owner = n.Node.ID
+		}
+	}
+	if vars["p"] == "" || vars["x"] == "" || owner == "" {
+		t.Fatalf("the analysed function's variables or owner are missing: %v, owner %q", vars, owner)
+	}
+	want := map[model.RelationKind][2]model.NodeID{
+		model.RelDataFlowsTo: {vars["p"], vars["x"]},
+		model.RelReads:       {owner, vars["p"]},
+		model.RelWrites:      {owner, vars["x"]},
+	}
+	for kind, ends := range want {
+		f := b.rels[model.NewRelationID(b.req.Binding.RepositoryID, ends[0], kind, ends[1])]
+		if f == nil || len(f.Evidence) == 0 || f.Evidence[0].Precision != model.PrecisionStaticAnalysis {
+			t.Fatalf("the analysed function's %s fact is missing or not static_analysis: %+v", kind, f)
+		}
 	}
 }
