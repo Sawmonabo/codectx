@@ -31,7 +31,8 @@ language reference, plus one test pass, one review and one fix round over the in
 families move to the structural provider for every language at once, so decision 9's graduation set is not built.
 The engine's importer stops publishing those four families for every language in the same change, and the engine
 runs for `calls` only until the linking provider of decision 9 publishes them; it is then deleted. Decisions 1, 2, 4,
-5, 8 and 10 stand unchanged.
+5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
+but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
 
 ## Context
 

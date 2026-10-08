@@ -58,7 +58,8 @@ const (
 
 	// Only the definition and import roles are read. The read and write
 	// access roles exist in the format but are not mapped: `reads` and
-	// `writes` belong to the dependence provider (Section 11.6).
+	// `writes` belong to the structural provider
+	// (docs/providers-treesitter.md, Dependence facts).
 	roleDefinition = 0x1
 	roleImport     = 0x2
 

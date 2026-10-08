@@ -11,9 +11,8 @@ The four file-local dependence families, `control_depends_on`,
 `data_flows_to`, `reads` and `writes`, are not published here. The structural
 provider computes them in process for every language and publishes them per
 file, at `static_analysis` (docs/providers-treesitter.md, Dependence facts).
-The importer drops them for every language: it derives no control dependence,
-no def-use walk and no assignment reads or writes from the export, and so
-publishes no `may_refer_to` for an assignment target it could not resolve.
+The importer derives none of them from the export: no control dependence, no
+def-use walk and no assignment reads or writes.
 
 The analysis engine behind it is identified by its tool lock entry and its
 licence record. Everywhere the provider speaks — the provider id, capability
@@ -581,10 +580,9 @@ in the parse or in the export, and is never used for memory.
    rather than under a key of its own because a subdivided row already fills
    most of the bounded detail map a provider may contribute, and a key dropped
    at the budget would tell an operator nothing exactly when the row is
-   busiest. Control and
-   data dependence survive splitting almost intact; engine `calls` keep under
-   half of their resolved targets, so consumers that need calls should use the
-   syntax-plus-SCIP path, which never depended on the engine.
+   busiest. Engine `calls` keep under half of their resolved targets after a
+   split, so consumers that need calls should use the syntax-plus-SCIP path,
+   which never depended on the engine.
 5. If no part produces an honest result, the unit is `failed: engine`.
 
 ## `providers.dependence.enabled` and the coordinator
@@ -594,22 +592,22 @@ no notion of it.
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | nothing runs before the base generation is active; every dependence unit is then enqueued as low-priority background work under the resource governor. A query that needs a dependence fact promotes its units to the front of that queue and is answered with a typed `pending` capability until they seal. |
+| `auto` (default) | nothing runs before the base generation is active; every dependence unit is then enqueued as low-priority background work under the resource governor. Until a unit seals, its capability is `unavailable` with `CTX_PROVIDER_UNAVAILABLE` and the reason `units_deferred`, and every answer discloses that row. |
 | `true` | the index blocks on the dependence units. |
 | `false` | the provider never runs; its capabilities are `unavailable` with `CTX_PROVIDER_UNAVAILABLE` while the base generation stays `fresh`. |
 
-The `pending` payload the coordinator publishes while a unit has not sealed
-carries the capability and scope, the number of units the answer waits on, the
-promoted unit's position in the queue, and an estimate. It is a capability
-state, never a fact: a `pending` answer never returns a partial graph.
+The deferred row carries the capability, the workspace scope and the number of
+units still running. It is a capability state, never a fact. `calls` also has
+the structural path, so a deferred row marks no answer truncated: it is
+disclosed, and the answer is what the generation holds.
 
 A sealed dependence unit never mutates the active generation. The coordinator
 builds a new generation from the active generation's units plus the sealed
 unit, validates it, and activates it atomically through the same path a
 refresh uses (Section 13.1). Seals landing in one scheduler tick coalesce into
-one generation, and a `pending` answer becomes a real answer exactly at
-activation. A unit that is being refreshed after an edit answers `stale` with
-a provenance distance, not `pending`, and its previously sealed build is
+one generation, and the deferred row gives way to the unit's own rows exactly
+at activation. A unit that is being refreshed after an edit answers `stale` with
+a provenance distance, not the deferred row, and its previously sealed build is
 carried into the new generation until the fresh one replaces it (Section 13.3).
 
 ## Refresh and delta
@@ -626,9 +624,11 @@ has been open since 2026-03-08. Both issues are cited with their links in
 against them.
 
 What is wired today, exactly. Every import derives an engine-id-independent
-semantic key per fact (the fact label, its owning method's full name, its
-file, the operator it was lowered from, its target name, its ordered byte
-ranges and — for a relation — its two endpoints' published identities;
+semantic key per fact (the fact label `node:method`, `rel:calls` or
+`rel:may_refer_to`, its owning method's full name, its file, the operator
+`ambiguous` and the alternative identity it names for the `may_refer_to` edge
+of an ambiguous resolution, its ordered byte ranges and — for a relation — its
+two endpoints' published identities;
 `<clinit>`-owned facts use a digest of their endpoints' source text instead of
 their coordinates, because the Go frontend shuffles those between two parses
 of identical source). The endpoints are part of the key because a relation's
