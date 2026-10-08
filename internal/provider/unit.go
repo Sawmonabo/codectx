@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strconv"
@@ -36,6 +37,15 @@ func StoreUnit(store *sqlite.Store, w *sqlite.UnitWriter) UnitOutput {
 }
 
 func (u storeUnit) Seal(ctx context.Context) error { return u.store.SealUnit(ctx, u.UnitWriter) }
+
+// PutState stores the artifact as the unit's delta state of kind. It is a
+// row of the unit: Fail deletes it with the rest, so a discarded unit leaves
+// no artifact behind.
+func (u storeUnit) PutState(ctx context.Context, kind string, payload []byte) error {
+	return u.UnitWriter.PutDeltaState(ctx, kind, bytes.NewReader(payload))
+}
+
+var _ StateSink = storeUnit{}
 
 // RunUnit executes one assigned unit end to end: it runs the provider with a
 // batch sink over out, flushes what the provider emitted, and seals the unit

@@ -789,6 +789,35 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 	return &model.Error{Code: model.CodeInternal, Message: "batch sink received an unknown record type"}
 }
 
+// PutState stores one provider-owned artifact with the unit through the
+// destination, at once: it references no identity a queued batch could still
+// hold, so nothing has to be flushed before it. It is serialized with every
+// other write to the destination under the sink lock, and a failure latches
+// the sink and cancels the unit's producers like any failed write, so the
+// unit cannot seal without the artifact its provider meant to store.
+func (s *BatchSink) PutState(ctx context.Context, kind string, payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed != nil {
+		return s.failed
+	}
+	if s.discarded {
+		return invalid("the sink was discarded; the unit is finished")
+	}
+	dst, ok := s.dst.(StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal,
+			Message: "the sink destination does not store provider state; the " + kind + " artifact cannot be persisted"}
+	}
+	if err := dst.PutState(ctx, kind, payload); err != nil {
+		s.failLocked(err)
+		return err
+	}
+	return nil
+}
+
+var _ StateSink = (*BatchSink)(nil)
+
 // keyless is the refusal to write a keyed batch to a destination that cannot
 // record keys. Dropping them would seal a unit that looks complete and cannot
 // be delta-refreshed.
