@@ -24,8 +24,12 @@ package link
 import (
 	"context"
 	"io"
+	"os"
+	"strconv"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -80,8 +84,12 @@ type LinkOptions struct {
 	// table keeps its predecessor's digest; nil resolves in full.
 	Previous io.Reader
 	// State receives this unit's resolution state, which the build stores
-	// under ResolutionKind.
+	// under ResolutionKind; nil writes none.
 	State io.Writer
+	// Dir is where the unit's private scratch directory is made, the
+	// directory its sorted runs spill into; empty takes the system's
+	// temporary directory.
+	Dir string
 }
 
 // Provider is the linking provider.
@@ -115,6 +123,89 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 // (or re-emits opts.Previous), publishes `calls` and writes the resolution
 // state to opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
-	return model.ProviderResult{RunID: req.Run, State: model.RunFailed},
-		&model.Error{Code: model.CodeInternal, Message: "link: the linker core is not built"}
+	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
+	pu, err := planned(ctx, req)
+	if err != nil {
+		return failed, err
+	}
+	// The unit's sorted runs spill into a directory of its own, removed
+	// through the pace when the link ends.
+	dir, err := os.MkdirTemp(opts.Dir, "codectx-link-")
+	if err != nil {
+		return failed, internalErr("link scratch directory: " + err.Error())
+	}
+	defer paced.RemoveAll(dir)
+
+	members, err := sortMembers(ctx, req.Content, pu, dir)
+	if err != nil {
+		return failed, err
+	}
+	defer members.Close()
+	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir,
+		members: func(yield func(model.FileVersion) error) error { return members.Each(yield) }}
+
+	sorted, err := newBindingSort(dir, compareSiteTarget)
+	if err != nil {
+		return failed, err
+	}
+	defer sorted.Close()
+	sorted.WithFold(keepOne)
+	// A resolver may emit from any goroutine; the sort has one producer.
+	var mu sync.Mutex
+	emit := func(b Binding) error {
+		if _, err := encodeBinding(b); err != nil {
+			return err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return sorted.Add(b)
+	}
+	if opts.Previous != nil {
+		err = readState(opts.Previous, emit)
+	} else {
+		err = resolverFor(pu.Family)(ctx, u, emit)
+	}
+	if err != nil {
+		return failed, err
+	}
+	bindings, err := sorted.Sorted()
+	if err != nil {
+		return failed, err
+	}
+	defer bindings.Close()
+	if opts.State != nil {
+		if err := writeState(opts.State, bindings); err != nil {
+			return failed, err
+		}
+	}
+
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: members.Len()}
+	if err := pub.publish(bindings); err != nil {
+		failed.RecordsEmitted = pub.records
+		return failed, err
+	}
+	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
+		Capabilities: []model.CapabilityState{pub.capability()}}, nil
+}
+
+// capability is the unit's `calls` row: fresh when every member's table was
+// read whole and every site with a binding was published, and partial, with
+// what was left out counted, otherwise.
+func (p *publisher) capability() model.CapabilityState {
+	st := model.CapabilityState{ProviderID: ProviderID, Capability: string(model.RelCalls), Scope: p.req.Unit.ScopeKey,
+		State: model.CapabilityFresh}
+	if p.cov.untabled == 0 && p.cov.dropped == 0 && p.unkeyed == 0 {
+		return st
+	}
+	st.State, st.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
+	if p.cov.untabled > 0 {
+		st = st.WithDetail("members_without_table", strconv.FormatInt(p.cov.untabled, 10))
+	}
+	if p.cov.dropped > 0 {
+		st = st.WithDetail("dropped_table_entries", strconv.FormatInt(p.cov.dropped, 10))
+	}
+	if p.unkeyed > 0 {
+		st = st.WithDetail("unkeyed_ambiguous_sites", strconv.FormatInt(p.unkeyed, 10))
+	}
+	return st.WithDetail("members", strconv.FormatInt(p.members, 10))
 }
