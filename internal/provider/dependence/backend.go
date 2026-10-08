@@ -1,14 +1,13 @@
-// Package dependence is the Section 11.6 dependence provider: control
-// dependence, data dependence through captures and globals, reads, writes and
-// fallback call facts for the nine supported languages, produced by a managed
-// code-property-graph engine that runs one frontend-native project at a time.
+// Package dependence is the Section 11.6 dependence provider: call facts for
+// the nine supported languages, produced by a managed code-property-graph
+// engine that runs one frontend-native project at a time. Control dependence,
+// data flow, reads and writes are the structural provider's.
 //
 // The engine is a backend, not a product surface. Nothing outside the
 // dependence/graphengine subpackage, docs/providers-dependence.md and the tool lock
 // names it: the provider id is `dependence`, the configuration table is
-// `[providers.dependence]`, the capabilities are control_depends_on,
-// data_flows_to, reads, writes and calls, and the evidence details are cdg,
-// reaching_def, assignment and call. Swapping the engine is a change to one
+// `[providers.dependence]`, the capability is calls, and the evidence details
+// are call, call speculated and assignment. Swapping the engine is a change to one
 // subpackage.
 //
 // This package owns the parts of Section 11.6 that survive an engine swap:
@@ -110,9 +109,7 @@ type ExportRequest struct {
 }
 
 // Outcome is what the backend observed in neutral terms. Class is empty when
-// the step produced a usable result; SkippedMethods is orthogonal to it,
-// because a definition-cap skip degrades data_flows_to without failing the
-// unit.
+// the step produced a usable result.
 type Outcome struct {
 	Class FailureClass
 	// Pass and Exception name the failing analysis pass and the exception
@@ -120,13 +117,8 @@ type Outcome struct {
 	// a vocabulary this package interprets.
 	Pass      string
 	Exception string
-	// SkippedMethods are the fully qualified methods the engine declined to
-	// analyse for data flow because they exceed the definition cap, bounded by
-	// MaxReportedSkips; SkippedCount is the true total.
-	SkippedMethods []string
-	SkippedCount   int
-	ExitCode       int
-	Duration       time.Duration
+	ExitCode  int
+	Duration  time.Duration
 	// StderrBytes and PeakBytes are the analyzer tree's own metrics, recorded
 	// separately from the base index's accounting (Section 22). PeakBytes is
 	// the peak of the summed resident memory over the whole analyzer tree,

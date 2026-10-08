@@ -328,7 +328,7 @@ func stepOutcome(res process.Result, err error, private, roots []string) (depend
 // payload's own variables, the heap cap and the engine's log level are all of
 // it. The log level is pinned because the classifier reads the warnings the
 // engine emits at WARN, and a host environment that raised the level would
-// silence a definition-cap skip into a silent loss of data dependence.
+// silence a timed pass crash into an unclassified failure.
 func (b *Backend) run(ctx context.Context, e dependence.Engine, path string, args []string, dir string,
 	heapCap, reservation int64, timeout, stallTimeout time.Duration, progress []string) (process.Result, error) {
 

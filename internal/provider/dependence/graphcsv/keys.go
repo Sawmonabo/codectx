@@ -35,17 +35,15 @@ const keySep = "\x1f"
 // fixed width and sorts lexicographically:
 //
 //	keyAlgebraVersion   "1"
-//	label               the fact label: "node:method", "node:decl",
-//	                    "rel:calls", "rel:control_depends_on",
-//	                    "rel:data_flows_to", "rel:reads", "rel:writes",
+//	label               the fact label: "node:method", "rel:calls",
 //	                    "rel:may_refer_to"
 //	owner               the FULL_NAME of the method the fact belongs to (for a
 //	                    node, its own full name)
 //	file                the root-relative snapshot path, or "" when the fact
 //	                    has none
-//	operator            the operator METHOD_FULL_NAME a reads/writes fact was
-//	                    lowered from, or ""
-//	target              the syntactic name of the fact's target, or ""
+//	operator            "ambiguous" for the may_refer_to edge of an
+//	                    ambiguous resolution, or ""
+//	target              the alternative identity that edge names, or ""
 //	positional          the fact's ordered byte ranges, "start-end" joined
 //	                    with "|", in the order (from, to, occurrence)
 //	endpoints           for a relation, the published identities of its two

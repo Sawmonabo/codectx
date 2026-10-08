@@ -54,7 +54,7 @@ func envInt(t *testing.T, name string, fallback int) int {
 	return n
 }
 
-// syntheticExport writes an engine export of the shape the importer stages --
+// syntheticExport writes an engine export of the shape the engine writes --
 // methods with a parameter, a local, assignments whose right-hand sides call
 // other methods, identifiers bound to declarations by REF, a def-use chain
 // through the identifiers and a control-dependence chain through the

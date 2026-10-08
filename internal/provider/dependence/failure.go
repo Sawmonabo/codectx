@@ -8,18 +8,14 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// The capabilities this provider publishes. They are the product's relation
-// vocabulary (Section 9.2), never the engine's edge names.
-const (
-	CapabilityControlDependsOn = "control_depends_on"
-	CapabilityDataFlowsTo      = "data_flows_to"
-	CapabilityReads            = "reads"
-	CapabilityWrites           = "writes"
-	CapabilityCalls            = "calls"
-)
+// CapabilityCalls is the one capability this provider publishes, in the
+// product's relation vocabulary (Section 9.2), never the engine's edge name.
+// Control dependence, data flow, reads and writes are the structural
+// provider's, published per file.
+const CapabilityCalls = "calls"
 
 // Capabilities is the descriptor's capability list in its published order.
-var Capabilities = []string{CapabilityControlDependsOn, CapabilityDataFlowsTo, CapabilityReads, CapabilityWrites, CapabilityCalls}
+var Capabilities = []string{CapabilityCalls}
 
 // CapabilityUnsupportedLabels is the pseudo-capability under which a unit
 // reports export rows the importer recognised as real but did not map. It is
@@ -39,12 +35,6 @@ const detailUntrackedLabels = "untracked_labels"
 // the source files it handed the engine that the export carries no file node
 // for: the count, a space, and the first such path in path order.
 const detailUnanalysedFiles = "unanalysed_files"
-
-// MaxReportedSkips bounds the skipped-method names a result names one by one.
-// The count is always exact; the names are a sample when a unit skips more
-// than this, because a result list is bounded (Section 6) and a thousand
-// generated constant tables are not a useful report.
-const MaxReportedSkips = 32
 
 // FailureClass is the typed reason a unit did not produce an admissible
 // result. Section 11.6 requires each to be classified, never guessed: every
@@ -249,14 +239,9 @@ const (
 func reproducibleOnSight(o Outcome) bool { return o.Pass != "" && o.Exception != "" }
 
 // publication is everything a succeeded unit publishes about how complete it
-// is. A unit that ran whole and skipped nothing publishes five fresh rows and
-// no detail.
+// is. A unit that ran whole publishes one fresh row per capability and no
+// detail.
 type publication struct {
-	// Skipped are the methods the engine declined to analyse for data flow,
-	// and SkippedCount their exact number. They degrade data_flows_to only:
-	// control dependence, reads, writes and calls do not come from that pass.
-	Skipped      []string
-	SkippedCount int
 	// Subdivided names the unit that had to be split after a reproducible
 	// crash, with the backend failure that forced it. Every capability of a
 	// subdivided unit is partial: Section 11.6's honesty test is per
@@ -317,17 +302,17 @@ type publication struct {
 }
 
 // capabilities renders the publication as the result's capability list: the
-// five published capabilities at the unit's scope, each carrying the bounded
+// published capabilities at the unit's scope, each carrying the bounded
 // details of why it is not fresh, plus one unavailable row when the importer
 // met labels it does not map.
 //
-// The details are a fixed, small set of keys — a count of skipped methods and
-// their names, the subdivided unit and its backend failure, the count of
-// projects the planner could not admit — so a row's detail map is bounded by
-// this code rather than by the repository.
+// The details are a fixed, small set of keys — the subdivided unit and its
+// backend failure, the count of projects the planner could not admit, the
+// user-set thresholds crossed — so a row's detail map is bounded by this code
+// rather than by the repository.
 //
 // The particulars travel in CapabilityState.Details. They are not encoded into
-// extra capability rows whose name is the detail text: a row per skipped method
+// extra capability rows whose name is the detail text: a row per particular
 // grows the list with the repository, it spends the MaxCapabilityStates budget
 // on prose, and it claims a capability identity for something that is not a
 // capability.
@@ -335,16 +320,6 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 	out := make([]model.CapabilityState, 0, len(Capabilities)+1)
 	for _, c := range Capabilities {
 		row := model.CapabilityState{ProviderID: ProviderID, Capability: c, Scope: scopeKey, State: model.CapabilityFresh}
-		// A subdivided unit degrades every capability; skipped methods degrade
-		// only the pass they come from. Both can hold at once, and the row then
-		// carries both reasons.
-		if c == CapabilityDataFlowsTo && p.SkippedCount > 0 {
-			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
-			row = row.WithDetail("skipped_methods", strconv.Itoa(p.SkippedCount))
-			if names := p.skippedNames(); names != "" {
-				row = row.WithDetail("skipped_method_names", names)
-			}
-		}
 		// A file the engine was handed and did not read degrades every
 		// capability alike: no pass has a fact from it. The count and the
 		// first path travel in one value, "<count> <path>", because this row
@@ -441,33 +416,6 @@ func (p publication) truncatedFields() string {
 			b.WriteByte(',')
 		}
 		b.WriteString(pair)
-	}
-	return b.String()
-}
-
-// skippedNames is the sorted, deduplicated sample of skipped method names as
-// one detail value. Names are added whole: a value truncated mid-name would
-// name a method that does not exist.
-func (p publication) skippedNames() string {
-	names := slices.Clone(p.Skipped)
-	slices.Sort(names)
-	names = slices.Compact(names)
-	if len(names) > MaxReportedSkips {
-		names = names[:MaxReportedSkips]
-	}
-	var b strings.Builder
-	for _, n := range names {
-		sep := 0
-		if b.Len() > 0 {
-			sep = 1
-		}
-		if b.Len()+sep+len(n) > model.MaxDetailBytes {
-			break
-		}
-		if sep > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(n)
 	}
 	return b.String()
 }
