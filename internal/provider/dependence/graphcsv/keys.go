@@ -34,7 +34,7 @@ const keySep = "\x1f"
 // and hashed with SHA-256; the file stores the lowercase hex digest, which is
 // fixed width and sorts lexicographically:
 //
-//	keyAlgebraVersion   "1"
+//	keyAlgebraVersion   "2"
 //	label               the fact label: "node:method", "rel:calls",
 //	                    "rel:may_refer_to"
 //	owner               the FULL_NAME of the method the fact belongs to (for a
