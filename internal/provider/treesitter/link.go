@@ -1,0 +1,181 @@
+package treesitter
+
+import (
+	"cmp"
+	"slices"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+)
+
+// detailLinkFailure is the structure row's disclosure of a file whose link
+// pass failed in the worker (wire.Done.LinkFailure): the file stores no link
+// table, so the linking provider's `calls` for its unit is partial, while the
+// file's structural facts stand complete.
+const detailLinkFailure = "link_failure"
+
+// linkTable joins the worker's link tables to the declarations and call
+// references the builder validated and resolved, as the file's link.Table.
+// It runs after refs, once every declaration has its identity.
+//
+// An Export joins the declaration whose name token it names, a Site the call
+// reference whose callee token it names. Every call reference is a site, with
+// the reference's caller, range, callee and in-file candidates (targets). A
+// joined site takes the worker's shape, qualifier, signature and types; one
+// no Site joins takes its shape from the reference (a qualified call is a
+// member call, any other a bare one), keeps the reference's qualifier and
+// carries no recovered type. A
+// TypeResult names a worker site and is remapped to that site's index in
+// Table.Sites. An entry that joins nothing, joins what an earlier entry
+// already joined, names a range that does not fit the pinned bytes, or names
+// a site that joined nothing is dropped and counted in Table.Dropped, never
+// fatal: the table is the file's best account, and a non-zero count makes
+// the unit's `calls` partial.
+//
+// A file whose module has no identity (build gave up on an over-long path)
+// has no endpoint to link from and stores no table; neither does a file whose
+// dependence or link pass failed, and the worker sending link tables for one
+// is a protocol violation.
+func (b *builder) linkTable() error {
+	wl := b.ex.link
+	if wl == nil {
+		return nil
+	}
+	if b.ex.done.DependenceFailure != "" || b.ex.done.LinkFailure != "" {
+		return outputInvalid("a file whose dependence or link pass failed also sent link tables")
+	}
+	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Supertypes: wl.Supertypes,
+		Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
+			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
+
+	// siteAt maps each worker site to its index in t.Sites, -1 for one that
+	// joined no call reference; it is filled before any type is remapped,
+	// because a type may name a later site.
+	siteAt := make([]int32, len(wl.Sites))
+	byName := make(map[wire.Span]int, len(wl.Sites))
+	for i, s := range wl.Sites {
+		siteAt[i] = -1
+		if _, dup := byName[s.Name]; dup {
+			t.Dropped++
+			continue
+		}
+		byName[s.Name] = i
+	}
+	t.Sites = make([]link.Site, 0, len(b.ex.refs))
+	joined := make([]int, 0, len(b.ex.refs))
+	for _, r := range b.ex.refs {
+		if r.Kind != "call" {
+			continue
+		}
+		rng, err := b.rangeOf(r.Start, r.End)
+		if err != nil {
+			return err
+		}
+		s := link.Site{Caller: int32(r.Scope), Range: *rng, NameStart: r.NameStart, NameEnd: r.NameEnd, Callee: r.Name,
+			Shape: wire.ShapeBare, Qualifier: r.Qualifier, QualifierIsImport: r.QualifierIsImport}
+		if r.Qualified {
+			s.Shape = wire.ShapeMember
+		}
+		for _, c := range b.targets(r) {
+			s.Candidates = append(s.Candidates, int32(c))
+		}
+		w := -1
+		if i, ok := byName[wire.Span{Start: r.NameStart, End: r.NameEnd}]; ok && siteAt[i] < 0 {
+			// The first reference at a callee token claims the worker's site;
+			// a second reference at the same token keeps its own shape.
+			w, siteAt[i] = i, int32(len(t.Sites))
+			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, wl.Sites[i].Qualifier, wl.Sites[i].Signature
+		}
+		joined = append(joined, w)
+		t.Sites = append(t.Sites, s)
+	}
+	for _, i := range byName {
+		if siteAt[i] < 0 {
+			t.Dropped++
+		}
+	}
+	typ := func(x wire.Type) wire.Type {
+		if x.Kind != wire.TypeResult {
+			return x
+		}
+		if uint64(x.Index) < uint64(len(siteAt)) && siteAt[x.Index] >= 0 {
+			x.Index = uint32(siteAt[x.Index])
+			return x
+		}
+		t.Dropped++
+		return wire.Type{}
+	}
+	for i, w := range joined {
+		if w < 0 {
+			continue
+		}
+		ws := &wl.Sites[w]
+		t.Sites[i].Receiver = typ(ws.Receiver)
+		if len(ws.Args) > 0 {
+			t.Sites[i].Args = make([]wire.Type, len(ws.Args))
+			for j, a := range ws.Args {
+				t.Sites[i].Args[j] = typ(a)
+			}
+		}
+	}
+
+	t.Decls = make([]link.Decl, len(b.decls))
+	for i := range b.decls {
+		d := &b.decls[i]
+		t.Decls[i] = link.Decl{Endpoint: link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind,
+			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported}
+	}
+	for _, x := range wl.Exports {
+		i, ok := b.nameAt[x.Name]
+		if !ok || t.Decls[i].Described {
+			t.Dropped++
+			continue
+		}
+		d := &t.Decls[i]
+		d.Described, d.Receiver, d.Signature, d.Params, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Variadic
+		d.Static, d.Abstract, d.Returns = x.Static, x.Abstract, typ(x.Returns)
+	}
+
+	if len(wl.Values) > 0 {
+		byStart := b.declsByStart()
+		t.Values = make([]link.Value, 0, len(wl.Values))
+		for _, v := range wl.Values {
+			rng, err := b.rangeOf(v.At.Start, v.At.End)
+			if err != nil {
+				t.Dropped++
+				continue
+			}
+			t.Values = append(t.Values, link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)})
+		}
+	}
+	b.table = t
+	return nil
+}
+
+// enclosing is the index of the innermost declaration whose range contains
+// s, -1 for the module, by the search owner makes over the same order.
+func (b *builder) enclosing(byStart []int, s wire.Span) int32 {
+	n, _ := slices.BinarySearchFunc(byStart, s.Start+1, func(i int, start uint32) int { return cmp.Compare(b.decls[i].Start, start) })
+	for k := n - 1; k >= 0; k-- {
+		if b.decls[byStart[k]].End >= s.End {
+			return int32(byStart[k])
+		}
+	}
+	return -1
+}
+
+// storeTable stores the file's link table with the unit, under
+// link.TableKind, when the builder joined one.
+func (b *builder) storeTable(sink provider.StateSink) error {
+	if b.table == nil {
+		return nil
+	}
+	payload, err := b.table.Encode()
+	if err != nil {
+		return &model.Error{Code: model.CodeInternal, Message: "link table of " + bound(b.fv.Path, 256) + ": " + err.Error()}
+	}
+	b.table = nil
+	return sink.PutState(b.ctx, link.TableKind, payload)
+}

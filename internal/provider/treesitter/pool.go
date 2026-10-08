@@ -501,6 +501,9 @@ func (p *pool) leaveStage(ctx context.Context) {
 // on a span that already exists, and the total is the sum of its workers.
 func (p *pool) count(ctx context.Context, w *worker, ex *extraction) {
 	records := int64(len(ex.decls) + len(ex.imports) + len(ex.refs) + len(ex.functions))
+	if ex.link != nil {
+		records++
+	}
 	w.span.AddIn(1)
 	w.span.AddOut(records)
 	run := ledger.RunFromContext(ctx)
@@ -1112,15 +1115,17 @@ func (w *worker) stderrLine() string {
 }
 
 // extraction is one parsed file as the worker reported it: every record it
-// extracted, each reassembled whole from its frames, and one dependence
-// message per callable in the order the worker sent them. It is held for
-// this one file and released with it, which is what bounds the parent's heap
-// for a parse (see wire.ChunkBytes).
+// extracted, each reassembled whole from its frames, one dependence message
+// per callable in the order the worker sent them, and the file's link tables,
+// nil when the worker sent none. It is held for this one file and released
+// with it, which is what bounds the parent's heap for a parse (see
+// wire.ChunkBytes).
 type extraction struct {
 	decls     []wire.Decl
 	imports   []wire.Import
 	refs      []wire.Ref
 	functions []wire.Function
+	link      *wire.Link
 	done      wire.Done
 }
 
@@ -1207,11 +1212,25 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 		case wire.KindFunction:
 			// A message no writer of this protocol produces is a protocol
 			// break like any other undecodable frame: the worker is retired.
+			if ex.link != nil {
+				return nil, errors.New("worker sent a function message after the file's link tables")
+			}
 			f, err := wire.DecodeFunction(payload)
 			if err != nil {
 				return nil, err
 			}
 			ex.functions = append(ex.functions, f)
+		case wire.KindLink:
+			// One per file, after its function messages; anything else is a
+			// protocol break, as is an undecodable payload.
+			if ex.link != nil {
+				return nil, errors.New("worker sent a second link message for one file")
+			}
+			l, err := wire.DecodeLink(payload)
+			if err != nil {
+				return nil, err
+			}
+			ex.link = &l
 		case wire.KindDone:
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err

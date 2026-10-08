@@ -11,6 +11,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -101,6 +102,9 @@ type builder struct {
 	// repeats an identity does not publish the same alias row twice.
 	aliasSeen map[model.NativeAlias]bool
 	search    []model.SearchUnit
+	// table is the file's link table once linkTable has joined it, nil when
+	// the worker sent none; storeTable hands it to the sink.
+	table *link.Table
 	// dropped counts, per fact family, what this file's bounds kept out of
 	// the facts: calls past the callee-reference bound, declaration,
 	// call-site and variable keys over MaxNativeKeyBytes, and the facts of a
@@ -214,6 +218,9 @@ func (b *builder) build() error {
 		return err
 	}
 	if err := b.refs(); err != nil {
+		return err
+	}
+	if err := b.linkTable(); err != nil {
 		return err
 	}
 	return b.functions()
