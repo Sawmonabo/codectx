@@ -1240,7 +1240,8 @@ func (j *jsLower) imports(n Node) {
 		if c.KindId() != k.importClause {
 			continue
 		}
-		importClauseBindings(j.cur, c, &k.imports, func(local Node, typeOnly bool) {
+		j.cur.Reset(c)
+		importClauseBindings(j.cur, &k.imports, func(local Node, typeOnly bool) {
 			if !typeOnly {
 				j.importName(local)
 			}

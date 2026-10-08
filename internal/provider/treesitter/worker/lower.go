@@ -424,8 +424,8 @@ func (l *Lowering) Lower(fn Node, src []byte, a *flow.Arena, s *Scratch) *flow.G
 // counterpart of flow.Arena: the flat cursor every lowering walks with, the
 // scope chain every lowering resolves names through, and each language's
 // lowering state, whose lists keep their capacity from one
-// function to the next. The zero value is ready to use; Close drops the
-// cursor at the file boundary. It is not safe for concurrent use: one Scratch per worker, beside
+// function to the next. The zero value is ready to use; Close drops all of
+// it at the file boundary. It is not safe for concurrent use: one Scratch per worker, beside
 // its Arena.
 //
 // Each language's state is created on first use and, at the start of every
@@ -459,9 +459,11 @@ func (s *Scratch) cursor(fn Node) *Cursor {
 	return s.cur
 }
 
-// Close drops the cursor, so s holds no handle on the file's flat array
-// past the file boundary. s stays usable: the next Lower creates another.
-func (s *Scratch) Close() { s.cur = nil }
+// Close drops the cursor, the scope chain and every language's state, at
+// the file boundary: their lists hold handles on the file's flat array and
+// views of its source, and keeping their capacity would keep both alive into
+// the next file. s stays usable: the next Lower starts afresh.
+func (s *Scratch) Close() { *s = Scratch{} }
 
 // spanOf is n's byte range.
 func spanOf(n Node) flow.Span {

@@ -398,7 +398,8 @@ func (b *Builder) Var() int32 { return b.declare(Span{}) }
 // Named declares a variable bound to a name in the source, a parameter or a
 // local, whose declaring identifier spans decl, and returns its dense id.
 // The span is the variable's identity outside the function (Graph.Declared):
-// it is the identifier token alone, inside the function's span. An empty
+// it is the identifier token alone, inside the function's span or, for a
+// Java compact constructor's parameters, in its record's header. An empty
 // span, the zero-width identifier an error-recovered tree supplies for a
 // missing token, declares a variable with no name in the source, which
 // Graph.Declared reports as owned. A variable declared at several sites (a

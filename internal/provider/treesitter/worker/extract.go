@@ -269,16 +269,17 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		ids := e.g.importSyntax(e.l.Name)
 		for i := range clauses {
 			cur := clauses[i].Walk()
-			importClauseBindings(cur, &clauses[i], ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src)) })
+			importClauseBindings(cur, ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src)) })
 			cur.Close()
 		}
 	}
 }
 
 // importSyntax holds the kind and field ids an ECMAScript import clause is
-// read by, resolved once per grammar. The extraction and the JavaScript
-// lowering both walk a clause through importClauseBindings over this table,
-// so they bind the same names and compare integers rather than kind strings.
+// read by, resolved once per grammar. The extraction, over the native tree,
+// and the JavaScript lowering, over the flat array, both walk a clause
+// through importClauseBindings over this table, so they bind the same names
+// and compare integers rather than kind strings.
 type importSyntax struct {
 	identifier, namespaceImport, namedImports, importSpecifier uint16
 	// typeKw is the `type` token of a TypeScript type-only specifier; 0, which
@@ -302,18 +303,42 @@ func resolveImportSyntax(tl *ts.Language, language string) importSyntax {
 	}
 }
 
+// clauseNode is what importClauseBindings reads of a node: the native tree's
+// *ts.Node and the flat array's Node both answer it, and the zero value of
+// either is the null node.
+type clauseNode[N any] interface {
+	comparable
+	KindId() uint16
+	IsNamed() bool
+	IsExtra() bool
+	ChildByFieldId(id uint16) N
+	NamedChildCount() uint
+	NamedChild(i uint) N
+	ChildCount() uint
+	Child(i uint) N
+}
+
+// clauseCursor is what importClauseBindings asks of a cursor: the native tree
+// cursor and the flat array's Cursor both answer it.
+type clauseCursor[N any] interface {
+	Node() N
+	GotoFirstChild() bool
+	GotoNextSibling() bool
+	GotoParent() bool
+}
+
 // importClauseBindings calls bind with every local name an ECMAScript import
 // clause binds, in source order: the default binding, the namespace binding,
 // and each named specifier's alias, or its name when it has none. typeOnly
 // reports a TypeScript `type` specifier, which binds a name the compiler
 // erases. Every other child (punctuation, a comment between specifiers, an
 // error node) binds nothing, and a specifier whose local name is not an
-// identifier (a string name without an alias) binds nothing. The walk moves
-// cur, which it resets to clause, and allocates no list, so a statement
-// naming any number of specifiers costs time linear in their count; bind must
-// not move cur.
-func importClauseBindings(cur *ts.TreeCursor, clause *ts.Node, s *importSyntax, bind func(local *ts.Node, typeOnly bool)) {
-	cur.Reset(*clause)
+// identifier (a string name without an alias) binds nothing. cur must be
+// rooted at the clause (Walk or Reset); the walk moves it and allocates no
+// list, so a statement naming any number of specifiers costs time linear in
+// their count; bind must not move cur.
+func importClauseBindings[N clauseNode[N], C clauseCursor[N]](cur C, s *importSyntax, bind func(local N, typeOnly bool)) {
+	var null N
 	if !cur.GotoFirstChild() {
 		return
 	}
@@ -322,18 +347,23 @@ func importClauseBindings(cur *ts.TreeCursor, clause *ts.Node, s *importSyntax, 
 		case s.identifier:
 			bind(part, false)
 		case s.namespaceImport:
-			if id := firstNamed(part); id != nil && id.KindId() == s.identifier {
-				bind(id, false)
+			for i := range part.NamedChildCount() {
+				if id := part.NamedChild(i); !id.IsExtra() {
+					if id.KindId() == s.identifier {
+						bind(id, false)
+					}
+					break
+				}
 			}
 		case s.namedImports:
 			if cur.GotoFirstChild() {
 				for {
 					if spec := cur.Node(); spec.KindId() == s.importSpecifier {
 						local := spec.ChildByFieldId(s.fAlias)
-						if local == nil {
+						if local == null {
 							local = spec.ChildByFieldId(s.fName)
 						}
-						if local != nil && local.KindId() == s.identifier {
+						if local != null && local.KindId() == s.identifier {
 							bind(local, hasToken(spec, s.typeKw))
 						}
 					}
@@ -353,12 +383,13 @@ func importClauseBindings(cur *ts.TreeCursor, clause *ts.Node, s *importSyntax, 
 // hasToken reports whether one of n's direct children is the anonymous token
 // id; id 0 never matches. It indexes the children, which costs time quadratic
 // in their count, so it is for a node of a few children (a specifier).
-func hasToken(n *ts.Node, id uint16) bool {
+func hasToken[N clauseNode[N]](n N, id uint16) bool {
+	var null N
 	if id == 0 {
 		return false
 	}
 	for i := range n.ChildCount() {
-		if c := n.Child(i); c != nil && !c.IsNamed() && c.KindId() == id {
+		if c := n.Child(i); c != null && !c.IsNamed() && c.KindId() == id {
 			return true
 		}
 	}

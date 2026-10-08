@@ -369,10 +369,8 @@ type rsLower struct {
 	src []byte
 	k   *rsSyntax
 	cur *Cursor
-	// buf is a stack of child lists; kids pushes one and done pops it. bufTop
-	// is the most entries it has held while lowering the current callable.
-	buf    []Node
-	bufTop int
+	// buf is a stack of child lists; kids pushes one and done pops it.
+	buf []Node
 	// binds is the scope chain, innermost last.
 	binds *scope
 	// shadow is non-zero while walking a nested callable for its captures:
@@ -417,25 +415,20 @@ type rsLower struct {
 }
 
 // reset readies r, the worker's Rust state, to lower fn: every scalar is set
-// anew and every list truncated in place, keeping its capacity. buf is the
-// one list that holds nodes, each a handle on the file's flat array; detach
-// zeroes every entry it held, so the Scratch keeps no file's array reachable.
+// anew and every list truncated in place, keeping its capacity.
 func (r *rsLower) reset(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	r.l, r.b, r.src, r.k, r.cur, r.binds = l, b, src, rsSyntaxOf(), s.cursor(fn), &s.scope
 	r.buf, r.reads, r.writes, r.borrows = r.buf[:0], r.reads[:0], r.writes[:0], r.borrows[:0]
 	r.hs, r.ends, r.frames = r.hs[:0], r.ends[:0], r.frames[:0]
-	r.shadow, r.tries, r.sure, r.bufTop = 0, 0, 0, 0
+	r.shadow, r.tries, r.sure = 0, 0, 0
 	r.first, r.last, r.lastSpan, r.lastDef, r.lastVar, r.matched = -1, -1, flow.Span{}, false, -1, -1
 }
 
 // detach drops r's references to the function just lowered, so the
-// Scratch holds neither its source, its builder nor its flat array until the
-// next one: it zeroes buf's entries up to the most it held, which done's
-// truncation leaves in the backing store.
-func (r *rsLower) detach() {
-	clear(r.buf[:r.bufTop])
-	r.l, r.b, r.src, r.cur, r.binds = nil, nil, nil, nil, nil
-}
+// Scratch holds neither its source nor its builder until the next one; the
+// handles left in buf's backing store go with the Scratch at the file
+// boundary (Scratch.Close).
+func (r *rsLower) detach() { r.l, r.b, r.src, r.cur, r.binds = nil, nil, nil, nil, nil }
 
 // kids pushes n's named, non-extra children (comments are extras) onto buf
 // and returns the stack mark and the list; done(mark) pops them. A list stays
@@ -464,7 +457,6 @@ func (r *rsLower) children(n Node, named bool) (int, []Node) {
 			}
 		}
 	}
-	r.bufTop = max(r.bufTop, len(r.buf))
 	return start, r.buf[start:]
 }
 

@@ -274,7 +274,8 @@ sets `Done.DependenceFailure`. Neither kind of failure touches the file's struct
 ### Projection
 
 Inside one function, a variable is **named** when the lowering declared it with `flow.Builder.Named`: a parameter or
-a local, identified by its declaring identifier's byte range (`flow.Graph.Declared`). A variable the lowering owns
+a local, identified by its declaring identifier's byte range (`flow.Graph.Declared`). That range lies in the file and
+usually inside the function; a Java compact constructor's parameters are declared in its record's header. A variable the lowering owns
 (`flow.Builder.Var`: a result, an iteration value, a selector) is never published; facts pass through it.
 
 For a node `n`:
