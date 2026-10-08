@@ -337,6 +337,10 @@ func TestOneBindingIsOneNamedVariable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("flatten: %v", err)
 			}
+			// A recovered tree would not reach the construct the case pins.
+			if flat.Root().HasError() {
+				t.Fatalf("the %s source did not parse clean", c.language)
+			}
 			var fn Node
 			i := 0
 			if err := low.Functions(flat.Root(), func(n Node) error {
