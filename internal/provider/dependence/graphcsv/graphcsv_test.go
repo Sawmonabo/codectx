@@ -7,7 +7,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	arena "github.com/Sawmonabo/codectx/internal/scratch"
-	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // run drives one import through the production sink, resolver and seal path:
@@ -29,9 +27,6 @@ type counts struct {
 	alias  map[string]string // scope\x00native key -> node id
 	aliasN int               // alias records accepted, duplicates included
 	detail map[string]int
-	// relKey is the fact key list the import published for one relation,
-	// under edgeID(from, kind, to). Only a keyed put carries it.
-	relKey map[string][]string
 	// sig is the signature each published node carried, by node name, so a
 	// test can read what actually reached the sink rather than what the
 	// export held.
@@ -42,42 +37,12 @@ type counts struct {
 	// metadata each node carried, by node name.
 	id   map[string][]model.NodeID
 	meta map[string]string
-	// edges are the published edges themselves, so a test can ask which
-	// entities one names rather than only how many were published.
-	edges []model.Relation
 }
 
 func newCounts() counts {
 	return counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
+		alias: map[string]string{}, detail: map[string]int{},
 		sig: map[string]string{}, id: map[string][]model.NodeID{}, meta: map[string]string{}}
-}
-
-// has reports whether the edge from -> to of kind k was published, naming its
-// endpoints `<node kind>:<name>` as they were published.
-func (c counts) has(kind model.RelationKind, from, to string) bool {
-	for _, e := range c.edges {
-		if e.Kind == kind && slices.Contains(c.id[from], e.From) && slices.Contains(c.id[to], e.To) {
-			return true
-		}
-	}
-	return false
-}
-
-// names reports whether any edge of kind k has a node published under the given
-// `<kind>:<name>` at either end.
-func (c counts) names(kind model.RelationKind, node string) bool {
-	for _, e := range c.edges {
-		if e.Kind == kind && (slices.Contains(c.id[node], e.From) || slices.Contains(c.id[node], e.To)) {
-			return true
-		}
-	}
-	return false
-}
-
-// edgeID names one published edge independently of the run that published it.
-func edgeID(from model.NodeID, kind model.RelationKind, to model.NodeID) string {
-	return string(from) + "\x00" + string(kind) + "\x00" + string(to)
 }
 
 type recorder struct {
@@ -110,18 +75,12 @@ func (r recorder) PutRelations(ctx context.Context, f []model.RelationFact) erro
 	return r.PutKeyedRelations(ctx, f, nil)
 }
 
-// PutKeyedRelations is PutKeyedNodes for relation facts, and records each
-// edge's fact keys for TestRelationKeyTracksItsEndpoints.
+// PutKeyedRelations is PutKeyedNodes for relation facts.
 func (r recorder) PutKeyedRelations(ctx context.Context, f []model.RelationFact, keys [][]string) error {
-	for i, x := range f {
+	for _, x := range f {
 		r.c.rel[x.Relation.Kind]++
-		r.c.edges = append(r.c.edges, x.Relation)
 		for _, ev := range x.Evidence {
 			r.c.detail[ev.Detail]++
-		}
-		if i < len(keys) {
-			id := edgeID(x.Relation.From, x.Relation.Kind, x.Relation.To)
-			r.c.relKey[id] = append(r.c.relKey[id], keys[i]...)
 		}
 	}
 	if d, ok := r.Sink.(provider.DeltaSink); ok {
@@ -215,7 +174,7 @@ func TestImport(t *testing.T) {
 		// function they declare: their exports carry the CDG, REACHING_DEF and
 		// assignment rows the four families could be derived from. Their
 		// assertions are the shared ones after the table: the unit seals,
-		// every key is new, and none of the four families reaches the sink.
+		// every key is new, and no relation reaches the sink.
 		name: "c", src: "src/c", export: "c",
 	}, {
 		name: "go", src: "src/golang", export: "golang",
@@ -227,14 +186,8 @@ func TestImport(t *testing.T) {
 			// Failure mode: the export marks a callee it invented -- a method
 			// it emitted with no definition anywhere in the graph, so that an
 			// unresolved site still has a target -- and the import drops the
-			// mark, so a consumer of the callees answer cannot tell a guess
-			// from a real dependency. `__ecma.Array:` is the invented callee
-			// of this export.
-			if c.detail["call speculated"] == 0 {
-				t.Errorf("evidence details = %v; the call edge to an invented callee is indistinguishable from a real one", c.detail)
-			}
-			// A traversal answers with nodes and relations and never with the
-			// evidence behind them, so the node has to carry it too.
+			// mark, so its node cannot be told from a real dependency.
+			// `__ecma.Array:` is the invented callee of this export.
 			if !strings.Contains(c.meta["__ecma.Array:"], `"resolution":"speculated"`) {
 				t.Errorf("the invented callee's node metadata = %q, want a speculated resolution", c.meta["__ecma.Array:"])
 			}
@@ -255,29 +208,16 @@ func TestImport(t *testing.T) {
 			}
 		},
 	}, {
-		// Failure mode: calls silently publish nothing, so the one declared
-		// capability is empty while the export holds control dependence, data
-		// flow and assignments the import must leave to the structural
-		// provider (the loop below asserts none of them reached the sink).
-		// Also the forward-id case: every edges_* file sorts before every
-		// nodes_* file, so every relation here was staged before its
-		// endpoints' rows were read.
+		// The forward-id case: every edges_* file sorts before every nodes_*
+		// file, so every call edge here was staged before its endpoints' rows
+		// were read, and the unit still seals with no relation published.
 		name: "calls", src: "src/gofix", export: "gofix",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			wantRelations(t, c, model.RelCalls)
-			if c.detail["call"] == 0 {
-				t.Errorf("evidence details = %v; want call", c.detail)
-			}
-		},
 	}, {
 		// A method reached through a variable (`const f = helper; f(i)`): the
 		// export binds `f(i)` to an invented callee named `f`, never to
-		// `helper`, and the call edge must say exactly that.
+		// `helper`.
 		name: "javascript method reached through a value", src: "src/jsvalue", export: "jsvalue",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			if !c.has(model.RelCalls, "function:run", "function:f") || c.names(model.RelCalls, "function:helper") {
-				t.Errorf("the call through the value resolved to something other than the export's invented callee")
-			}
 			// Failure mode: this invented callee is the one the engine parks
 			// under the enclosing program rather than under its speculated
 			// namespace, so a marker read off that namespace publishes it as a
@@ -304,24 +244,18 @@ func TestImport(t *testing.T) {
 		},
 	}, {
 		// Same shape in Python, where the export binds the call site to
-		// nothing at all: no call may be fabricated for it.
+		// nothing at all.
 		name: "python method reached through a value", src: "src/pyvalue", export: "pyvalue",
-		check: func(t *testing.T, rep graphcsv.Report, c counts) {
-			if c.rel[model.RelCalls] != 0 {
-				t.Errorf("calls = %d; the export binds this call site to no callee at all", c.rel[model.RelCalls])
-			}
-		},
 	}, {
 		// Failure mode: a callee that lives in another unit is dropped as
-		// junk, losing the cross-unit call edge the reconciler binds by full
-		// name. The export is the same module parsed without its second
-		// package, so helper.Scale is a real IS_EXTERNAL stub.
+		// junk, losing the declaration the reconciler binds by full name. The
+		// export is the same module parsed without its second package, so
+		// helper.Scale is a real IS_EXTERNAL stub.
 		name: "external declaration kept and aliased", src: "src/goapp", export: "goapp",
 		check: func(t *testing.T, rep graphcsv.Report, c counts) {
 			if rep.ExternalMethods != 1 {
 				t.Errorf("external methods = %d, want 1", rep.ExternalMethods)
 			}
-			wantRelations(t, c, model.RelCalls)
 			if _, ok := c.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]; !ok {
 				t.Errorf("the external declaration was not aliased by full name; aliases = %v", keysOf(c.alias))
 			}
@@ -340,20 +274,17 @@ func TestImport(t *testing.T) {
 				t.Errorf("full import reported %d/%d changed and %d removed; every key is new against the absent set",
 					rep.Changed, rep.Keys.Count(), rep.Removed)
 			}
-			// Failure mode: the import publishes a family the structural
-			// provider owns, so storage holds two producers' facts for one
-			// relation and every consumer double-counts it. The language
-			// fixtures' exports carry the CDG, REACHING_DEF and assignment rows
-			// those families could be derived from, so each language is a case.
-			// Mutation that fails it: stage a non-calls projection in
-			// scratch.project -> Import refuses it as an unknown projection and
-			// the case fails; admit that kind in the emit's projection check as
-			// well -> its count here is non-zero.
-			for _, kind := range []model.RelationKind{model.RelControlDependsOn, model.RelDataFlowsTo,
-				model.RelReads, model.RelWrites} {
-				if c.rel[kind] != 0 {
-					t.Errorf("%d %s relations put to the sink; that family is the structural provider's", c.rel[kind], kind)
-				}
+			// Failure mode: the import publishes a relation, so storage holds
+			// two producers' facts for one relation and every consumer
+			// double-counts it: `calls` is the linking provider's, and control
+			// dependence, data flow, reads and writes the structural
+			// provider's. Every fixture's export carries call edges and the
+			// CDG, REACHING_DEF and assignment rows the other families could
+			// be derived from, so each language is a case.
+			// Mutation that fails it: restore the emitRelations call in Import
+			// -> the gofix case puts its `calls` edges to the sink.
+			if len(c.rel) != 0 {
+				t.Errorf("relations put to the sink: %v; the importer publishes no relation", c.rel)
 			}
 			if tc.check != nil {
 				tc.check(t, rep, c)
@@ -627,15 +558,6 @@ func copyExport(t *testing.T, src string, rewrite func(name string, data []byte)
 	return dst
 }
 
-func wantRelations(t *testing.T, c counts, kinds ...model.RelationKind) {
-	t.Helper()
-	for _, k := range kinds {
-		if c.rel[k] == 0 {
-			t.Errorf("no %s relation published; published %v", k, c.rel)
-		}
-	}
-}
-
 func sameFile(t *testing.T, a, b string) bool {
 	t.Helper()
 	x, err := os.ReadFile(a)
@@ -655,289 +577,6 @@ func keysOf(m map[string]string) []string {
 		out = append(out, strings.ReplaceAll(k, "\x00", " "))
 	}
 	return out
-}
-
-// TestRelationKeyTracksItsEndpoints guards the endpoints component of the
-// fact-key algebra (keys.go: keyAlgebraVersion "2").
-//
-// Failure mode: a relation's key is built only from the call site's own
-// coordinates — its owner, file, operator, target name and byte range — none
-// of which move when the *callee's declaration* moves. Editing above a callee
-// mints a new identity for it, but the call edge into it would keep its key,
-// the delta import would not re-emit the edge, and storage would carry the
-// previous row, whose `to` node id no longer exists in the unit. The unit then
-// fails to seal with dangling relation endpoints — or, worse, a later algebra
-// keeps it. Nothing else in the repository notices this component regressing.
-//
-// The export is the committed gofix export with one column run rewritten: the
-// callee `Scale` declared at helper.go:4-6 is moved to 5-7, exactly as a line
-// inserted above it would move it. The source tree is deliberately NOT
-// shifted: shifting it would also move every occurrence site inside helper.go
-// and change the positional component too, so the test would pass even with
-// the endpoints component removed. Moving only the declaration row leaves the
-// callee's identity as the single variable, which is the variable under test.
-func TestRelationKeyTracksItsEndpoints(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join("testdata", "src", "gofix")
-	basePath := filepath.Join(dir, "base")
-	_, base, _, err := run(t, src, filepath.Join("testdata", "gofix"),
-		graphcsv.Options{Language: "go", KeysPath: basePath})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-
-	moved := 0
-	export := copyExport(t, filepath.Join("testdata", "gofix"), func(name string, data []byte) []byte {
-		if name != "nodes_METHOD_data.csv" {
-			return data
-		}
-		// CODE is a multi-line quoted field, so the row is matched by its
-		// LINE_NUMBER,LINE_NUMBER_END,NAME column run, not by line surgery.
-		out := bytes.Replace(data, []byte(",false,4,6,Scale,"), []byte(",false,5,7,Scale,"), -1)
-		moved = bytes.Count(data, []byte(",false,4,6,Scale,"))
-		return out
-	})
-	if moved != 1 {
-		t.Fatalf("the callee declaration row was rewritten %d times, want exactly 1; the fixture's columns moved", moved)
-	}
-	mutRep, mut, state, err := run(t, src, export, graphcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "moved")})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	if state != model.UnitSealed {
-		t.Fatalf("unit state = %q, want sealed", state)
-	}
-
-	// Precondition: moving the declaration moves the callee's published
-	// identity, and nothing else. The workspace alias is the cross-run handle.
-	scaleBase := base.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]
-	scaleMut := mut.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/helper.Scale"]
-	runBase := base.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/app.Run"]
-	runMut := mut.alias[provider.ScopeWorkspace+"\x00"+graphcsv.ProviderID+":method:example.com/fix/app.Run"]
-	if scaleBase == "" || scaleMut == "" || runBase == "" || runMut == "" {
-		t.Fatalf("the fixture did not publish both declarations: Scale %q/%q, Run %q/%q", scaleBase, scaleMut, runBase, runMut)
-	}
-	if scaleBase == scaleMut {
-		t.Fatalf("the moved callee kept identity %s; the declaration range no longer decides a declaration's identity", scaleBase)
-	}
-	if runBase != runMut {
-		t.Fatalf("the caller's identity moved (%s -> %s); the fixture no longer isolates the callee", runBase, runMut)
-	}
-
-	// The call edge Run -> Scale. Its key must move with the callee.
-	edge := func(c counts, from, to string) []string {
-		t.Helper()
-		k := c.relKey[edgeID(model.NodeID(from), model.RelCalls, model.NodeID(to))]
-		if len(k) == 0 {
-			t.Fatalf("the call edge %s -> %s published no fact key; a keyed put carries one per edge", from, to)
-		}
-		return k
-	}
-	baseKeys, mutKeys := edge(base, runBase, scaleBase), edge(mut, runMut, scaleMut)
-	for _, k := range mutKeys {
-		if slices.Contains(baseKeys, k) {
-			t.Fatalf("the call edge into the moved callee kept fact key %s; storage would carry a row whose endpoint no longer exists", k)
-		}
-	}
-
-	// The leg storage consumes: the refresh must report those keys changed.
-	prev, err := graphcsv.LoadKeySet(basePath)
-	if err != nil {
-		t.Fatalf("LoadKeySet: %v", err)
-	}
-	var changed []string
-	if _, err := mutRep.Keys.Diff(prev, func(key string, removed bool) error {
-		if !removed {
-			changed = append(changed, key)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	for _, k := range mutKeys {
-		if !slices.Contains(changed, k) {
-			t.Fatalf("Diff did not report the call edge's key %s changed; the delta import would not re-emit the edge", k)
-		}
-	}
-
-	// And the leg where storage keeps the rows: the refresh inherits the base
-	// unit, so a key that failed to move becomes a dangling endpoint.
-	carryOver(t, src, filepath.Join("testdata", "gofix"), export, dir)
-}
-
-// carryOver is the leg storage actually consumes: both imports run over one
-// store, the base unit is sealed with its fact keys, and the refresh inherits
-// it minus everything the key diff names — which is what a delta build does in
-// production (internal/index/delta).
-//
-// The assertion is that the refreshed unit SEALS, and that it inherited
-// something. The base unit holds the call edge Run -> Scale declared at 4-6.
-// The refresh publishes Run -> Scale declared at 5-7 and never publishes the
-// old callee's node fact, so the base edge is carried if and only if its key
-// survived the diff. A carried relation whose `to` node the unit does not hold
-// is precisely what SealUnit refuses. Remove the endpoints component from
-// FactKey and this leg fails with "relation endpoints with no visible node
-// fact" — the import assertions above cannot see that, because they never let
-// storage keep a row.
-func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
-	t.Helper()
-	ctx := context.Background()
-	files, paths := readSource(t, src)
-	// The refresh must be a different unit: a unit cannot carry over from
-	// itself, and these two imports read byte-identical sources. One extra
-	// declared input is the smallest honest difference, and it declares no
-	// facts, so it changes nothing else.
-	const marker = "refresh.marker"
-	files[marker] = "refresh\n"
-	h := providertest.New(t, files)
-
-	baseKeys := filepath.Join(dir, "carry-base")
-	base, baseRep := imports(t, baseExport, graphcsv.Options{Language: "go", KeysPath: baseKeys})
-	baseUnit := h.Plan(t, base, "pkg:fixture", paths)
-	res, err := provider.RunUnit(ctx, base, baseUnit.Request, h.Begin(t, baseUnit, paths), providertest.Limits, h.Pool)
-	if err != nil {
-		t.Fatalf("base RunUnit: %v", err)
-	}
-	if err := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); err != nil {
-		t.Fatalf("CompleteProviderRun: %v", err)
-	}
-
-	prev, err := graphcsv.LoadKeySet(baseKeys)
-	if err != nil {
-		t.Fatalf("LoadKeySet: %v", err)
-	}
-	// A refresh is a new generation: one generation selects one unit per
-	// provider and scope, so the successor cannot be sealed beside the unit it
-	// carries over from.
-	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"), "refs/heads/providertest")
-	if err != nil {
-		t.Fatalf("BeginGeneration: %v", err)
-	}
-	h.Gen = gen
-
-	refresh, refreshRep := imports(t, mutExport, graphcsv.Options{Language: "go",
-		KeysPath: filepath.Join(dir, "carry-refresh"), PreviousKeys: prev})
-	refreshPaths := append(slices.Clone(paths), marker)
-	refreshUnit := h.Plan(t, refresh, "pkg:fixture", refreshPaths)
-	w, err := h.Store.BeginUnit(ctx, h.Gen, refreshUnit.Build, unitInputs(t, h, refreshPaths))
-	if err != nil {
-		t.Fatalf("BeginUnit: %v", err)
-	}
-
-	var stats sqlite.CarryOverStats
-	var delta graphcsv.Delta
-	var diffErr error
-	out := &carryOut{UnitWriter: w, store: h.Store, carry: func(ctx context.Context, w *sqlite.UnitWriter) error {
-		fresh := refreshRep.Keys
-		d, err := fresh.Diff(prev, nil)
-		if err != nil {
-			return err
-		}
-		delta = d
-		replaced := sqlite.Replaced{
-			// The unlocated bucket is dropped exactly when the emit was
-			// unfiltered, which is when a key was removed.
-			IndexLevel: d.Removed > 0,
-			Keys: func(yield func(string) bool) {
-				_, diffErr = fresh.Diff(prev, func(key string, removed bool) error {
-					yield(key)
-					return nil
-				})
-			},
-		}
-		if stats, err = w.CarryOver(ctx, baseUnit.Build.Spec.ID, replaced); err != nil {
-			return err
-		}
-		return diffErr
-	}}
-	res, err = provider.RunUnit(ctx, refresh, refreshUnit.Request, out, providertest.Limits, h.Pool)
-	if err != nil {
-		t.Fatalf("refresh RunUnit: %v; the refresh inherited a relation the fresh import no longer publishes", err)
-	}
-	if err := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); err != nil {
-		t.Fatalf("CompleteProviderRun: %v", err)
-	}
-	if state, _ := h.UnitState(t, refreshUnit.Build.Spec.ID); state != model.UnitSealed {
-		t.Fatalf("refreshed unit state = %q, want sealed", state)
-	}
-	if baseRep.Keys.Count() == 0 {
-		t.Fatal("the base unit published no fact keys; carry-over had nothing to diff")
-	}
-	// Moving the callee retires the keys of its declaration and of every edge
-	// into it, so this refresh emits unfiltered and republishes every relation
-	// that still exists. The carried set is therefore the complement: it must
-	// be empty, and the one row that would land in it is the stale edge whose
-	// endpoints moved. Strip the endpoints component from FactKey and this
-	// fires, one line before the seal refuses the dangling endpoint.
-	if delta.Removed == 0 {
-		t.Fatalf("the refresh removed no key (%+v); the fixture no longer retires the moved callee's keys", delta)
-	}
-	if stats.Relations != 0 {
-		t.Fatalf("the refresh inherited %d relations from a unit whose every surviving relation it republished; "+
-			"a relation whose endpoints moved kept its fact key", stats.Relations)
-	}
-}
-
-// imports is one provider whose whole index is a graphcsv import of export,
-// plus the report it produced. The report is read after RunUnit returns, or
-// inside the seal the caller wraps around it.
-func imports(t *testing.T, export string, opts graphcsv.Options) (provider.Provider, *graphcsv.Report) {
-	t.Helper()
-	projectRoot := t.TempDir()
-	rep := new(graphcsv.Report)
-	p := providertest.Func{
-		Desc: descriptor(),
-		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-			o := opts
-			o.UnitScopeKey, o.ProjectRoot = req.Unit.ScopeKey, projectRoot
-			o.Limits = providertest.Limits
-			o.Repository, o.Unit, o.Run, o.Content = req.Binding.RepositoryID, req.Unit, req.Run, req.Content
-			r, err := graphcsv.Import(ctx, export, req.Resolver, sink, o)
-			if err != nil {
-				return model.ProviderResult{}, err
-			}
-			*rep = r
-			return providertest.Succeeded(req, uint64(r.Nodes+r.Relations+r.Aliases), r.BytesRead), nil
-		},
-	}
-	return p, rep
-}
-
-// unitInputs streams the harness rows for paths in the ascending file order
-// BeginUnit requires.
-func unitInputs(t *testing.T, h *providertest.Harness, paths []string) func(yield func(model.UnitInput) error) error {
-	t.Helper()
-	ins := make([]model.UnitInput, 0, len(paths))
-	for _, p := range paths {
-		fv := h.File(t, p)
-		ins = append(ins, model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
-	}
-	slices.SortFunc(ins, func(a, b model.UnitInput) int { return strings.Compare(string(a.FileID), string(b.FileID)) })
-	return func(yield func(model.UnitInput) error) error {
-		for _, in := range ins {
-			if err := yield(in); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-// carryOut is provider.StoreUnit with a carry-over wedged in front of the
-// seal, the shape internal/index/delta builds a unit in. It embeds the
-// concrete writer so the sink still finds the keyed puts behind its
-// provider.DeltaSink assertion.
-type carryOut struct {
-	*sqlite.UnitWriter
-	store *sqlite.Store
-	carry func(ctx context.Context, w *sqlite.UnitWriter) error
-}
-
-func (o *carryOut) Seal(ctx context.Context) error {
-	if err := o.carry(ctx, o.UnitWriter); err != nil {
-		return err
-	}
-	return o.store.SealUnit(ctx, o.UnitWriter)
 }
 
 // TestStagedRowsOverAUserSetBoundImportsAndReports pins the one invariant of
