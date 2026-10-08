@@ -1,11 +1,13 @@
 # The `dependence` provider
 
-`internal/provider/dependence` supplies fallback call facts for the nine
-supported languages. It is the Section 11.6 provider: extraction-lazy, cached,
-governed per unit, and honest about every way an analysis can come back
-incomplete. It publishes `calls` only, and only until the package-scoped
-linking provider of ADR-0012 decision 9 publishes them; the provider and its
-engine are then deleted.
+`internal/provider/dependence` is the Section 11.6 provider: extraction-lazy,
+cached, governed per unit, and honest about every way an analysis can come
+back incomplete. It publishes no relation. `calls` is the package-scoped
+linking provider's (ADR-0012 decision 9, docs/providers-link.md), and the
+importer hands no relation to the sink (`Import` in
+`internal/provider/dependence/graphcsv/graphcsv.go`); it still publishes the
+unit's method nodes and their aliases. The provider and its engine are
+deleted next.
 
 The four file-local dependence families, `control_depends_on`,
 `data_flows_to`, `reads` and `writes`, are not published here. The structural
@@ -21,15 +23,15 @@ document — it is "the engine".
 
 ## What it publishes
 
-| Capability | Relation | Evidence detail |
-|---|---|---|
-| `calls` | `calls` | `call`, `call speculated` |
+No relation. The import still stages, projects and keys the export's call
+edges, so its key set and delta are the export's, but none reaches the sink.
+It publishes the unit's method nodes, at `static_analysis` with exact byte
+ranges, and their aliases. The descriptor, detection and every unit's
+capability rows still name `calls`
+(`dependence.Capabilities` in `internal/provider/dependence/failure.go`), which
+the provider no longer publishes.
 
-Every fact is `static_analysis` precision with exact byte ranges. The
-descriptor, detection and every unit's capability rows name `calls` alone
-(`dependence.Capabilities` in `internal/provider/dependence/failure.go`). An
-entity whose resolution is ambiguous still publishes its equally supported
-alternatives as `may_refer_to` edges from the chosen identity.
+The rest of this section describes the call edges the import projects and keys.
 
 Where a call site names a callee the engine could not find, the engine invents
 one: a method with no definition anywhere in the graph, emitted so the site has

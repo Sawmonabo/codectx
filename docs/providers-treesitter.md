@@ -362,6 +362,32 @@ reports one row per capability under its own scope:
 
 None of these fails the unit or changes the structure row.
 
+### Link tables
+
+The same walk builds each file's link tables for the linking provider (docs/providers-link.md), which publishes the
+cross-file `calls`. The worker's `linker` (`internal/provider/treesitter/worker/link.go`) is made per file for the
+file's language, is called once per analysed callable while its flow graph and def-use chains are valid, and then
+once for the file. Each language family fills its own `worker/link_<family>.go`. The tables are a `wire.Link`:
+- **exports**: the declarations a call may bind to, each keyed by its declaration's name token, with its receiver,
+  signature, parameter count, variadic, static and abstract flags, and returned type;
+- **supertypes**: every declared subtype relation of the file (extends, implements, embeds, `impl Trait for Type`);
+- **sites**: every call reference, keyed by its callee token, with its callee shape (bare, member, static, indirect,
+  constructor), qualifier, and the types the worker recovered inside the file for its receiver and arguments;
+- **values**: every function taken as a value and every value written to a field or property.
+
+Names and types are spelled as the source writes them, and `Export.Signature` and `Site.Signature` follow one
+normalisation rule, so equal strings join an indirect site to an address-taken function. The worker resolves nothing
+outside the file.
+
+The parent joins the tables to the declarations and call references it validated: every call reference becomes a
+site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,
+when none joins, from the reference itself, and with the declarations of this file its callee name can mean as its
+candidates. Each declaration and the module carry the node identity the unit resolved, so the linker publishes these
+nodes rather than minting its own. A wire entry that does not join, or whose range does not fit the pinned bytes, is
+dropped and counted in `Table.Dropped`, never fatal. The table is stored with the file's unit under `link.TableKind`
+through `provider.StateSink`, and the provider refuses to run on a sink that cannot store it. A file with a link
+failure stores no table and discloses `link_failure` on its structural capability rows.
+
 ### Reuse
 
 The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
@@ -509,7 +535,8 @@ worker → parent   Decl* Import* Ref*                           facts, one reco
                   Decl{id, parent, kind, name, qualified, start, end, name_start, name_end, sig_end, doc_start, doc_end, ...}
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
 worker → parent   Function*                                    KindFunction, one per callable, binary
-worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, memory}
+worker → parent   Link?                                        KindLink, once when the dependence pass ran, binary
+worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, link_failure?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
@@ -537,6 +564,14 @@ allocates and refuses an index past the list it names
 file's dependence pass failed outside every function, so no function message
 was sent; it never touches the file's structural facts. What the parent
 publishes from these is stated under Dependence facts.
+
+A `Link` message (`KindLink`, `wire.AppendLink` and `wire.DecodeLink` in
+`internal/provider/treesitter/wire/link.go`) is binary too: the file's link
+tables, sent once after its function messages and before `KindDone` whenever
+the dependence pass ran. `Done.LinkFailure` is set when a panic in the link
+tables' construction was recovered; no link message is then sent, and the
+file's structural and dependence facts are unaffected. What the parent stores
+from it is stated under Link tables.
 
 Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single

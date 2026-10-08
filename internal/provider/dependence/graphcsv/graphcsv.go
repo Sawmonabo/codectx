@@ -14,20 +14,19 @@
 // phase reads -- so its disk traffic is a small constant times the export's
 // bytes (ADR-0009).
 //
-// The import publishes one capability, calls: the methods of the unit and the
-// call edges between them, plus may_refer_to for a declaration the resolver
-// bound several ways. Control dependence, data flow, reads and writes are the
-// structural provider's, per file. Precision is static_analysis and every
-// evidence range is verified against the pinned snapshot bytes before it is
-// published.
+// The import publishes the methods of the unit and their aliases, and no
+// relation: `calls` is the linking provider's, and control dependence, data
+// flow, reads and writes are the structural provider's, per file. The call
+// edges are still projected and keyed, so the key set and its delta are those
+// of the export, but none reaches the sink. Precision is static_analysis and
+// every evidence range is verified against the pinned snapshot bytes before it
+// is published.
 //
 // Delta. The engine has no incremental mode, so a refreshed unit is a whole
 // re-parse and re-export; the storage update is the delta. Every published
-// fact carries an id-independent key (KeySet); an import handed the previous
-// run's key set publishes only the relations at least one of whose keys
-// changed, and only when no key was removed; a removal disables the filter
-// and the import re-publishes in full. It reports the keys the previous run
-// had and this one does not.
+// fact carries an id-independent key (KeySet), and node facts are published
+// whole on every run. It reports the keys the previous run had and this one
+// does not.
 //
 // The engine's name appears nowhere in this package: not in an identifier, a
 // native key, an evidence detail or an error message.
@@ -186,16 +185,15 @@ type Options struct {
 
 // Import phases, in order, as OnPhase reports them.
 const (
-	PhaseFilesStaged      = "files staged"
-	PhaseExportStaged     = "export staged"
-	PhaseProjected        = "entities and calls projected"
-	PhaseLocated          = "located"
-	PhaseIdentified       = "identified"
-	PhaseRelationsStaged  = "relations staged"
-	PhaseKeysSaved        = "keys saved"
-	PhaseNodesEmitted     = "nodes emitted"
-	PhaseAliasesEmitted   = "aliases emitted"
-	PhaseRelationsEmitted = "relations emitted"
+	PhaseFilesStaged     = "files staged"
+	PhaseExportStaged    = "export staged"
+	PhaseProjected       = "entities and calls projected"
+	PhaseLocated         = "located"
+	PhaseIdentified      = "identified"
+	PhaseRelationsStaged = "relations staged"
+	PhaseKeysSaved       = "keys saved"
+	PhaseNodesEmitted    = "nodes emitted"
+	PhaseAliasesEmitted  = "aliases emitted"
 )
 
 func (o Options) phase(name string) {
@@ -377,10 +375,6 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 		return rep, err
 	}
 	opts.phase(PhaseAliasesEmitted)
-	if err := e.emitRelations(ctx, deltaFilter(opts.PreviousKeys, delta)); err != nil {
-		return rep, err
-	}
-	opts.phase(PhaseRelationsEmitted)
 
 	rep.Nodes, rep.Relations, rep.Aliases = e.nodes, e.relations, e.aliases
 	rep.ExternalMethods, rep.DroppedMethods = e.external, e.dropped
