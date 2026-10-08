@@ -284,3 +284,85 @@ func TestMayDefinitionChainIsLinear(t *testing.T) {
 		})
 	}
 }
+
+// TestOneBindingIsOneNamedVariable pins which identifiers a lowering
+// declares with Builder.Named, the spans the parent mints one variable entity
+// from (docs/providers-treesitter.md, Variable entity).
+//
+// Failure modes: a lowering that declares one binding at two identifiers
+// publishes two variable entities for it, so a fact through one is missing
+// from the other; one that declares a selector publishes a variable named
+// `a.b` that names no binding.
+//
+// Mutation: declare every `:=` range target in goLower.rangeLoop, whatever
+// its kind -> the go case declares a.b. Declare a function declaration in
+// jsLower.predeclare whatever its var scope already binds -> each
+// javascript case declares f twice.
+func TestOneBindingIsOneNamedVariable(t *testing.T) {
+	var s Scratch
+	defer s.Close()
+	for _, c := range []struct {
+		name, language, src string
+		fn                  int
+		want                []string
+	}{
+		{"a selector range target declares nothing", "go",
+			"package p\n\nfunc f(s []int) {\n\tfor a.b := range s {\n\t}\n}\n", 0, []string{"s"}},
+		{"a var and a function declaration in a body are one binding", "javascript",
+			"function g() {\n  var f = 1;\n  function f() {}\n}\n", 1, []string{"f"}},
+		{"a var and a function declaration in a program are one binding", "javascript",
+			"var f = 1;\nfunction f() {}\n", 0, []string{"f"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tl, ok := Grammar(c.language)
+			if !ok {
+				t.Fatalf("no grammar for %q", c.language)
+			}
+			low, ok := LoweringFor(c.language)
+			if !ok {
+				t.Fatalf("no lowering for %q", c.language)
+			}
+			src := []byte(c.src)
+			p := ts.NewParser()
+			defer p.Close()
+			if err := p.SetLanguage(tl); err != nil {
+				t.Fatalf("set language: %v", err)
+			}
+			tree := p.Parse(src, nil)
+			if tree == nil {
+				t.Fatal("the parser produced no tree")
+			}
+			flat, err := Flatten(tree, c.language)
+			tree.Close()
+			if err != nil {
+				t.Fatalf("flatten: %v", err)
+			}
+			var fn Node
+			i := 0
+			if err := low.Functions(flat.Root(), func(n Node) error {
+				if i == c.fn {
+					fn = n
+				}
+				i++
+				return nil
+			}); err != nil {
+				t.Fatalf("functions: %v", err)
+			}
+			if fn.IsNull() {
+				t.Fatalf("callable %d not found (%d callables)", c.fn, i)
+			}
+			var a flow.Arena
+			g := low.Lower(fn, src, &a, &s)
+			var got []string
+			for v := range int32(g.Vars()) {
+				if span, named := g.Declared(v); named {
+					got = append(got, string(src[span.Start:span.End]))
+				}
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("named variables = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

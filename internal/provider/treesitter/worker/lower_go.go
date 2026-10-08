@@ -910,7 +910,9 @@ func (g *goLower) forStmt(s Node, labels []string) {
 // Uses x's reads and defines an iteration variable of its own that the head
 // and every key and value node, of every target form, Use, so each depends
 // on x as it was evaluated before the loop, never on a definition of x in
-// the body. A `_` target makes no node.
+// the body. A `_` target makes no node. Only an identifier is declared by
+// `:=`; any other target, which the compiler rejects there, is lowered as
+// the assignment `=` would make.
 func (g *goLower) rangeLoop(rc, body Node, labels []string) {
 	b, k := g.b, g.k
 	right := rc.ChildByFieldId(k.fRight)
@@ -933,7 +935,7 @@ func (g *goLower) rangeLoop(rc, body Node, labels []string) {
 			}
 			var id int32
 			switch {
-			case define:
+			case define && x.KindId() == k.identifier:
 				v := g.declare(x)
 				id = g.node(flow.Stmt, x)
 				b.Def(id, v)

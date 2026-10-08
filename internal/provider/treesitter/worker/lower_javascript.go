@@ -469,7 +469,7 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scrat
 			}
 		}
 		j.done(start)
-		j.block(fn)
+		j.block(fn, true)
 	case k.classBody:
 		j.classBody(fn)
 	default:
@@ -490,7 +490,7 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scrat
 		body := fn.ChildByFieldId(k.fBody)
 		if body.KindId() == k.statementBlock {
 			j.hoistVars(body)
-			j.block(body)
+			j.block(body, true)
 			return
 		}
 		j.reset()
@@ -516,7 +516,7 @@ func (j *jsLower) classBody(n Node) {
 			j.fnMark = mark
 			body := m.ChildByFieldId(k.fBody)
 			j.hoistVars(body)
-			j.block(body)
+			j.block(body, true)
 			j.binds.truncate(mark)
 		}
 	}
@@ -974,7 +974,7 @@ func (j *jsLower) namespace(n Node) {
 	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	j.hoistVars(body)
-	j.block(body)
+	j.block(body, true)
 	j.binds.truncate(mark)
 	j.fnMark = savedFn
 }
@@ -1074,11 +1074,14 @@ func (j *jsLower) close(saved int32) int32 {
 
 // block lowers a statement list in its own lexical scope: its lexical names
 // are bound from the start and its function declarations defined there.
-func (j *jsLower) block(n Node) {
+// varScope marks the top-level statement list of a var scope (a program, a
+// function body, a class static block, a namespace body), whose `var` names
+// are already hoisted into the bindings before it.
+func (j *jsLower) block(n Node, varScope bool) {
 	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
-		j.predeclare(list[i], mark)
+		j.predeclare(list[i], mark, varScope)
 	}
 	for i := range list {
 		j.hoistFunction(list[i])
@@ -1093,8 +1096,12 @@ func (j *jsLower) block(n Node) {
 // predeclare binds the block-scoped names statement n declares, in the block
 // whose bindings start at mark. An enum or a namespace whose name the block
 // already binds (an enum or namespace before it, or the class or function a
-// namespace merges with) merges into that variable.
-func (j *jsLower) predeclare(n Node, mark int) {
+// namespace merges with) merges into that variable. In a var scope's
+// top-level list (varScope), a function declaration is var-scoped (ECMA-262
+// FunctionDeclarationInstantiation and VarScopedDeclarations): a name a
+// parameter, a hoisted `var` or an earlier function declaration of that
+// scope already binds is the same binding, not a second variable.
+func (j *jsLower) predeclare(n Node, mark int, varScope bool) {
 	k := j.k
 	switch n.KindId() {
 	case k.lexicalDeclaration, k.usingDeclaration:
@@ -1103,11 +1110,15 @@ func (j *jsLower) predeclare(n Node, mark int) {
 			j.declarePattern(list[i].ChildByFieldId(k.fName), false)
 		}
 		j.done(start)
-	case k.classDeclaration, k.abstractClassDeclaration, k.functionDeclaration, k.generatorFunctionDeclaration:
+	case k.classDeclaration, k.abstractClassDeclaration:
 		j.declare(n.ChildByFieldId(k.fName))
+	case k.functionDeclaration, k.generatorFunctionDeclaration:
+		if name := n.ChildByFieldId(k.fName); !varScope || !j.boundSince(j.fnMark, name) {
+			j.declare(name)
+		}
 	case k.exportStatement:
 		if d := n.ChildByFieldId(k.fDeclaration); !d.IsNull() {
-			j.predeclare(d, mark)
+			j.predeclare(d, mark, varScope)
 		}
 	case k.enumDeclaration:
 		if name := n.ChildByFieldId(k.fName); !j.erased(n) && !j.boundSince(mark, name) {
@@ -1289,7 +1300,7 @@ func (j *jsLower) stmt(n Node) {
 	case k.classDeclaration, k.abstractClassDeclaration:
 		j.def(j.closure(n), j.lookup(n.ChildByFieldId(k.fName)))
 	case k.statementBlock:
-		j.block(n)
+		j.block(n, false)
 	case k.ifStatement:
 		j.ifStmt(n)
 	case k.forStatement:
@@ -1357,7 +1368,7 @@ func (j *jsLower) stmt(n Node) {
 // its names in that block, and a function declaration is hoisted within it.
 func (j *jsLower) sub(n Node) {
 	mark := j.binds.mark()
-	j.predeclare(n, mark)
+	j.predeclare(n, mark, false)
 	j.hoistFunction(n)
 	j.stmt(n)
 	j.binds.truncate(mark)
@@ -1509,7 +1520,7 @@ func (j *jsLower) forStmt(n Node, labels []string) {
 	mark := j.binds.mark()
 	switch init := n.ChildByFieldId(k.fInitializer); init.KindId() {
 	case k.lexicalDeclaration:
-		j.predeclare(init, mark)
+		j.predeclare(init, mark, false)
 		j.stmt(init)
 	case k.variableDeclaration:
 		j.stmt(init)
@@ -1614,7 +1625,7 @@ func (j *jsLower) switchStmt(n Node, labels []string) {
 	for c := range cases {
 		s, list := body(cases[c])
 		for i := range list {
-			j.predeclare(list[i], mark)
+			j.predeclare(list[i], mark, false)
 		}
 		j.done(s)
 	}
@@ -1687,7 +1698,7 @@ func (j *jsLower) tryStmt(n Node) {
 	if !handler.IsNull() {
 		cf = j.b.OpenCatch()
 	}
-	j.block(n.ChildByFieldId(k.fBody))
+	j.block(n.ChildByFieldId(k.fBody), false)
 	if !handler.IsNull() {
 		t := j.b.Push()
 		j.b.EnterHandler(cf, spanOf(handler.Child(0)))
@@ -1697,14 +1708,14 @@ func (j *jsLower) tryStmt(n Node) {
 			j.declarePattern(p, false)
 			j.bind(p, 0, 0)
 		}
-		j.block(handler.ChildByFieldId(k.fBody))
+		j.block(handler.ChildByFieldId(k.fBody), false)
 		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(t)
 	}
 	if !fin.IsNull() {
 		normal := j.b.EnterFinally(ff, spanOf(fin.Child(0)))
-		j.block(fin.ChildByFieldId(k.fBody))
+		j.block(fin.ChildByFieldId(k.fBody), false)
 		j.b.CloseFinally(ff, normal)
 	}
 }
@@ -2436,7 +2447,7 @@ func (j *jsLower) cap(n Node) {
 		mark := j.binds.mark()
 		start, list := j.kids(n)
 		for i := range list {
-			j.predeclare(list[i], mark)
+			j.predeclare(list[i], mark, false)
 		}
 		for i := range list {
 			j.cap(list[i])
@@ -2451,7 +2462,7 @@ func (j *jsLower) cap(n Node) {
 		for c := range cases {
 			s, list := j.kids(cases[c])
 			for i := range list {
-				j.predeclare(list[i], mark)
+				j.predeclare(list[i], mark, false)
 			}
 			j.done(s)
 		}
@@ -2461,7 +2472,7 @@ func (j *jsLower) cap(n Node) {
 	case k.forStatement:
 		mark := j.binds.mark()
 		if init := n.ChildByFieldId(k.fInitializer); init.KindId() == k.lexicalDeclaration {
-			j.predeclare(init, mark)
+			j.predeclare(init, mark, false)
 		}
 		j.children(n, false)
 		j.binds.truncate(mark)
