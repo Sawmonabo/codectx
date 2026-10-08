@@ -11,9 +11,9 @@ type host struct {
 	// read is one reading of the process's resident figures, each absent
 	// where the platform does not report it.
 	read func() residency.Reading
-	// returnHeap returns the C heap's freed pages to the kernel, and reports
-	// false where the C library offers no way to or the heap could not be
-	// held to one arena.
+	// returnHeap returns the Go heap's and the C heap's freed pages to the
+	// kernel, and reports false where the C library offers no way to or the
+	// C heap could not be held to one arena.
 	returnHeap func() bool
 	// resetPeak sets the kernel's resident peak back to the current resident
 	// set, and reports false where the write fails or the platform has no
@@ -26,13 +26,13 @@ type host struct {
 type meter struct {
 	host host
 	// from is the resident set the file in flight started from, recorded only
-	// when the boundary before it returned the C heap and reset the peak;
+	// when the boundary before it returned the heaps and reset the peak;
 	// otherwise nil, and the file's need is unavailable.
 	from *uint64
 }
 
 // boundary closes one file's measurement and opens the next: it reads the
-// peak the file reached, returns the freed C heap, resets the peak and reads
+// peak the file reached, returns the freed heaps, resets the peak and reads
 // the new base. The need is the peak less the base the file started from. It
 // is absent, never zero, where either reading is missing, where the previous
 // boundary could not return the heap or reset the peak (the peak then spans

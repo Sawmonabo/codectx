@@ -45,9 +45,10 @@
 //
 // One Arena per worker, used by one goroutine. Everything a Graph, an Edges,
 // a PostDom or a returned slice exposes is backed by the arena and is valid
-// only until the next Arena.Begin. A consumer copies out what it keeps before
-// starting the next function; a stale view is not detected, it silently reads
-// the next function's data.
+// only until the next Arena.Begin or Arena.Release. A consumer copies out
+// what it keeps before starting the next function; a stale view is not
+// detected, it silently reads the next function's data. The worker releases
+// the arena's backing at each file boundary (Arena.Release).
 //
 // # No caps
 //

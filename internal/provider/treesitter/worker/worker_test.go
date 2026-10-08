@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -108,6 +110,82 @@ func emittedDecl(t *testing.T, r io.Reader, name string) bool {
 		}
 		if d.Name == name {
 			return true
+		}
+	}
+}
+
+// TestPanickingFunctionDegradesOnlyItself protects decision 9's failure
+// scope: a defect in one callable's lowering must cost that callable's facts
+// alone, disclosed with its span and cause, never the worker, the file or the
+// callables after it. The lowering here panics for the second of three Go
+// functions and lowers the others as the real one does. Mutations that fail
+// it: removing the per-function recover (the panic escapes the pass), sending
+// the half-encoded message instead of the failed one, dropping the span or
+// the cause, or ending the walk at the first failure (the third function's
+// message is missing).
+func TestPanickingFunctionDegradesOnlyItself(t *testing.T) {
+	const src = "package p\n\nfunc a(x int) int {\n\ty := x + 1\n\treturn y\n}\n\n" +
+		"func b(x int) int {\n\treturn x\n}\n\nfunc c(x int) int {\n\tz := x * 2\n\treturn z\n}\n"
+	const cause = "a lowering defect in b"
+	p, err := NewParser("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	tree := Parse(p, []byte(src), nil)
+	if tree == nil {
+		t.Fatal("the parser produced no tree")
+	}
+	flat, err := Flatten(tree, "go")
+	tree.Close()
+	if err != nil {
+		t.Fatalf("flatten: %v", err)
+	}
+	goLower, _ := LoweringFor("go")
+	target := uint(strings.Index(src, "func b"))
+	failing := &Lowering{language: goLower.language, callables: goLower.callables, ambient: goLower.ambient,
+		lower: func(l *Lowering, b *flow.Builder, fn Node, text []byte, s *Scratch) {
+			if fn.StartByte() == target {
+				panic(cause)
+			}
+			goLower.lower(l, b, fn, text, s)
+		}}
+	failing.resolve()
+
+	var w state
+	defer w.release()
+	w.collect(failing, flat)
+	var out bytes.Buffer
+	if err := w.functions(&out, failing, []byte(src)); err != nil {
+		t.Fatal(err)
+	}
+	var got []wire.Function
+	for {
+		kind, payload, err := wire.ReadMessage(&out, 0)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || kind != wire.KindFunction {
+			t.Fatalf("message %d: kind %d, %v", len(got), kind, err)
+		}
+		f, err := wire.DecodeFunction(payload)
+		if err != nil {
+			t.Fatalf("message %d: %v", len(got), err)
+		}
+		got = append(got, f)
+	}
+	if len(got) != 3 {
+		t.Fatalf("%d function messages, want 3, one per callable", len(got))
+	}
+	end := uint32(strings.Index(src, "func c") - 2)
+	if f := got[1]; !f.Failed || f.Span != (wire.Span{Start: uint32(target), End: end}) || f.Cause != cause ||
+		len(f.Vars)+len(f.Reads)+len(f.Writes) != 0 {
+		t.Fatalf("the panicking function's message is %+v, want failed over [%d, %d) with cause %q and no facts",
+			f, target, end, cause)
+	}
+	for _, i := range []int{0, 2} {
+		if f := got[i]; f.Failed || len(f.Reads) == 0 || len(f.Writes) == 0 {
+			t.Fatalf("function %d lost its facts beside the failed one: %+v", i, f)
 		}
 	}
 }

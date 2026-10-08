@@ -12,14 +12,15 @@ package flow
 // least the request, so backing grows to the need of the functions seen.
 //
 // Lifetime: every slice, Graph, Edges and PostDom handed out is valid until
-// the next Begin, which reclaims all of it.
+// the next Begin, which reclaims all of it, or the next Release.
 //
-// Release rule, applied at Begin: if the previous function used more than
-// 1 MiB (Bytes + ScratchBytes), every backing array is dropped, so one large
-// function does not set the worker's footprint for the rest of the run.
-// Otherwise backing is kept; a previous function that spilled across several
+// Begin keeps the backing: a previous function that spilled across several
 // slabs has them consolidated into one slab of everything it was handed, so
-// a worker in steady state allocates nothing per function.
+// a worker in steady state allocates nothing per function. Release drops
+// every backing array; the worker calls it at each file boundary, so the
+// largest function of one file does not set the worker's footprint for the
+// files after it, and the next file's need is measured from a base that
+// holds none of it.
 type Arena struct {
 	// b is the one Builder, reset by every Begin.
 	b Builder
@@ -28,25 +29,24 @@ type Arena struct {
 	u64 slab[uint64]
 }
 
-// releaseBytes is the previous-function usage above which Begin drops every
-// backing array (Bytes + ScratchBytes).
-const releaseBytes = 1 << 20
-
-// Begin reclaims everything handed out since the previous Begin (applying the
-// release rule), starts one function spanning fn and returns its Builder.
-// The Builder starts with Entry (span fn) and Exit (span {fn.End, fn.End})
+// Begin reclaims everything handed out since the previous Begin, keeping the
+// backing, starts one function spanning fn and returns its Builder. The
+// Builder starts with Entry (span fn) and Exit (span {fn.End, fn.End})
 // created and the current fringe {Entry}; see Builder.
 func (a *Arena) Begin(fn Span) *Builder {
-	if a.Bytes()+a.ScratchBytes() > releaseBytes {
-		a.i32 = slab[int32]{}
-		a.u64 = slab[uint64]{}
-		a.b.release()
-	} else {
-		a.i32.recycle()
-		a.u64.recycle()
-	}
+	a.i32.recycle()
+	a.u64.recycle()
 	a.b.reset(a, fn)
 	return &a.b
+}
+
+// Release drops every backing array: both slabs and every builder scratch
+// list. Everything handed out before it is invalid after it, as after a
+// Begin. The arena stays usable, and the next Begin allocates afresh.
+func (a *Arena) Release() {
+	a.i32 = slab[int32]{}
+	a.u64 = slab[uint64]{}
+	a.b.release()
 }
 
 // Int32s returns n zeroed int32s from the slabs, counted in Bytes. The slice's

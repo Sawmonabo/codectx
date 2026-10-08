@@ -2,9 +2,13 @@
 // subprocess that owns every native object (parser, tree, query, query
 // cursor) and never touches storage, identities or the repository. The parent
 // streams one file at a time over stdin as framed bytes; the worker parses
-// it with the pinned grammar, runs the structural query pack and answers with
-// framed, language-neutral facts. It is started only through the shared
-// process runner, so its lifetime, environment and output are bounded there.
+// it with the pinned grammar and answers with framed, language-neutral facts
+// in one walk (ADR-0012 decision 1): the structural query pack runs over the
+// native tree, the tree is flattened and closed, and every callable is then
+// lowered and analysed from the flat array (package flow), one dependence
+// message per callable, as byte ranges and indices only. It is started only
+// through the shared process runner, so its lifetime, environment and output
+// are bounded there.
 //
 // Native lifecycle (go-tree-sitter v0.25.0: parser.go, tree.go, query.go,
 // node.go, tree_cursor.go, language.go, allocator.go):
@@ -32,6 +36,7 @@ import (
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -110,11 +115,27 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // state is the worker's native ownership: at most one parser and one compiled
 // query per language, created lazily and closed when the loop ends, and the
-// meter that reads the worker's memory at each file boundary.
+// meter that reads the worker's memory at each file boundary. Beside it is
+// the dependence pass's state, one of each for every function the worker
+// lowers: the flow arena, the lowering scratch and the pass's own lists, all
+// released at each file boundary (release).
 type state struct {
 	parsers map[string]*ts.Parser
 	queries map[string]*ts.Query
 	meter   meter
+	arena   flow.Arena
+	scratch Scratch
+	dep     depLists
+}
+
+// release drops the file's dependence memory at the file boundary: the
+// arena's backing, the scratch's cursor on the flat array, and the pass's
+// lists, so the boundary that follows returns them with the rest of the
+// file's heap.
+func (w *state) release() {
+	w.arena.Release()
+	w.scratch.Close()
+	w.dep = depLists{}
 }
 
 func (w *state) close() {
@@ -152,14 +173,15 @@ func (w *state) verify() error {
 }
 
 // serve answers one request. A per-file failure is an error frame and the
-// worker stays healthy; a write failure ends the loop. The tree is closed and
-// the file boundary taken before the answer is written, so the parent never
-// admits the next file against memory this one has not returned. An error
-// frame carries no reading, but its boundary is still taken so the next file
-// is measured from a fresh base.
+// worker stays healthy; a write failure ends the loop. The tree is closed,
+// the file's dependence memory released and the file boundary taken before
+// the answer is written, so the parent never admits the next file against
+// memory this one has not returned. An error frame carries no reading, but
+// its boundary is still taken so the next file is measured from a fresh base.
 func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	w.prepare(req)
 	done, fail, err := w.parse(out, req, src)
+	w.release()
 	mem := w.meter.boundary()
 	switch {
 	case err != nil:
@@ -175,11 +197,18 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 // path. It returns the file's Done, or the per-file failure to answer with,
 // or the write error that ends the loop.
 //
+// The structural facts are extracted from the kept native tree and sent
+// first. The tree is then flattened in the kept language and closed, and the
+// dependence pass sends one function message per callable from the flat
+// array (dependence). A tree that does not flatten, like any failure of the
+// pass outside every function, sends no function message and is disclosed
+// as Done.DependenceFailure; the structural facts stand either way.
+//
 // A request that names a fallback is a header's (ADR-0012 decision 10): a
 // parse with its language that has errors is followed by one parse with the
 // fallback, the parse with fewer error bytes is kept and the other closed
 // before extraction, and the choice is disclosed in Done. Every other file is
-// parsed once, whatever its errors.
+// parsed once, whatever its errors, and the kept parse is the one lowered.
 func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *wire.Error, error) {
 	if req.Fallback != "" {
 		if _, ok := lang.Lookup(req.Fallback); !ok || grammars[req.Fallback] == nil || req.Fallback == req.Language {
@@ -203,7 +232,17 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src}
 	err := ex.run(kept.query, root, em)
 	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header}
+	if err != nil {
+		kept.tree.Close()
+		return done, nil, err
+	}
+	flat, ferr := Flatten(kept.tree, kept.l.Name)
 	kept.tree.Close()
+	if ferr != nil {
+		done.DependenceFailure = ferr.Error()
+		return done, nil, nil
+	}
+	done.DependenceFailure, err = w.dependence(out, flat, kept.l.Name, src)
 	return done, nil, err
 }
 
