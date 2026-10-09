@@ -22,6 +22,7 @@
 (call_expression function: (field_expression value: (_) @call.qualifier field: (field_identifier) @call.name)) @call
 (call_expression function: (scoped_identifier path: (_) @call.qualifier name: (identifier) @call.name)) @call
 (call_expression function: (generic_function function: (identifier) @call.name)) @call
-(macro_invocation macro: (identifier) @call.name) @call
+; A macro invocation is not a call: its name is in the macro namespace,
+; which no function shares, and what it expands to is never parsed.
 
 (type_identifier) @ref.type
