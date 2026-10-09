@@ -16,10 +16,9 @@
 // flow-based type inference through assignments, parameters and returns,
 // field-based resolution and class-hierarchy analysis for the ECMAScript
 // family and Python. No whole-program points-to and no join on the callee
-// name alone. Bindings are sorted and published through runs that spill
-// through pagination.ExternalSort, and type and declaration questions are
-// point lookups into sorted index files on disk, so nothing the size of the
-// project is resident but one key per 32 KiB block of each index.
+// name alone. Bindings sort through runs that spill (pagination.ExternalSort)
+// and type questions are point lookups into sorted index files on disk, so
+// only one key per 32 KiB block of each index is resident.
 package link
 
 import (

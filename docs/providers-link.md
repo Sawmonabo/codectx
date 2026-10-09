@@ -184,9 +184,10 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 The `calls` row is published at the unit's scope:
 - `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
-- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:190-211`), when
+- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:188-208`), when
   a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
-  `table.go:43-47`), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
+  `table.go:49-53`; a callable whose analysis failed in the worker counts there, since its values and its sites'
+  recovered types are missing), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
   node to mint (`unkeyed_ambiguous_sites`). The row also counts the unit's `members`. A dropped entry is a worker
   entry the structural provider could not join to a declaration or a call reference of the file, or whose range did
   not fit the pinned bytes. None of these is fatal.
