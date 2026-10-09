@@ -2,7 +2,6 @@
 
 (namespace_definition name: (_) @name body: (_) @body) @def.namespace
 (class_specifier name: (_) @name body: (_) @body) @def.class
-(declaration_list (declaration declarator: (_) @declarator) @def.variable)
 (field_declaration_list (declaration declarator: (_) @declarator) @def.variable)
 (template_declaration (declaration declarator: (_) @declarator) @def.variable)
 ; A member function defined without a body: pure virtual, defaulted, deleted.
