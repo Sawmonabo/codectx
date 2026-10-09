@@ -29,8 +29,9 @@ func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error
 		return err
 	}
 	defer h.close()
-	// bySignature holds the address-taken functions (tag 0) and the
-	// indirect sites (tag 1) under their declared signatures.
+	// bySignature holds the address-taken functions (tag 0), the indirect
+	// sites (tag 1) and the abstract methods a Java call binds when no
+	// function joins it (tag 2) under their declared signatures.
 	bySignature, err := newEntrySort(u.dir)
 	if err != nil {
 		return err
@@ -67,7 +68,10 @@ func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error
 }
 
 // crossProduct joins each indirect site to every address-taken function of
-// its signature. Only one signature's functions are held at a time.
+// its signature, and binds a Java call of an abstract method to that method
+// (tag 2: the site, the method's Ref in Aux, the detail in Sig) only when
+// no function of its signature is taken as a value. Only one signature's
+// functions are held at a time.
 func crossProduct(bySignature *pagination.ExternalSort[entry], emit func(Binding) error) error {
 	run, err := bySignature.Sorted()
 	if err != nil {
@@ -80,11 +84,17 @@ func crossProduct(bySignature *pagination.ExternalSort[entry], emit func(Binding
 		if e.Key != sig {
 			sig, functions = e.Key, functions[:0]
 		}
-		if e.Tag == 0 {
+		switch e.Tag {
+		case 0:
 			if n := len(functions); n == 0 || functions[n-1] != e.Ref {
 				functions = append(functions, e.Ref)
 			}
 			return nil
+		case 2:
+			if len(functions) > 0 {
+				return nil
+			}
+			return emit(Binding{Site: e.Ref, Target: refOf(e.Aux), Detail: e.Sig})
 		}
 		for _, f := range functions {
 			if err := emit(Binding{Site: e.Ref, Target: f, Detail: DetailAddressTaken}); err != nil {
@@ -117,9 +127,18 @@ type returned struct {
 
 // site resolves site i and publishes its bindings; an indirect site with a
 // declared function type also joins bySignature.
+//
+// A Java call of an abstract method binds that declaration only when no
+// method reference of its signature does (crossProduct): a call runs a
+// body, and the abstract method is the target only when no body is known.
 func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) error {
 	ref := Ref{File: r.file, Index: i}
+	s := &r.t.Sites[i]
+	joins := r.fc.language == "java" && s.Shape == wire.ShapeMember && s.Receiver.Kind == wire.TypeNamed
 	return r.resolve(i, bySignature, func(e entry, detail string) error {
+		if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
+			return bySignature.Add(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
+		}
 		return r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail})
 	})
 }
