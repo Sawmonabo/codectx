@@ -86,6 +86,9 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, links, methodSets *paginat
 // under refKey(interface) + refKey(type); a pair that matches as many
 // distinct keys as the interface has is a subtype.
 func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSort[entry]) error {
+	if methodSets.Len() == 0 {
+		return nil
+	}
 	records, err := methodSets.Sorted()
 	if err != nil {
 		return err
