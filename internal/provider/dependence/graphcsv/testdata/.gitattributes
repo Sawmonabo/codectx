@@ -1,3 +1,0 @@
-# Engine exports are committed byte-for-byte as the tool wrote them (CRLF
-# records included); git must not normalize or whitespace-check them.
-* -text -whitespace

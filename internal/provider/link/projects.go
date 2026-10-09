@@ -22,12 +22,10 @@ package link
 // A plan holds one descriptor per project and no repository-sized list at all
 // (Section 6): membership is a predicate over the project root, the nested
 // roots the unit does not own, and its family's source languages, manifest
-// names and lock names (Unit.OwnsInput), and file counts and bytes are folded
-// in a streaming pass. The manifest half of the closure is that predicate and
+// names and lock names (Unit.OwnsInput), and file counts are folded in a
+// streaming pass. The manifest half of the closure is that predicate and
 // not a stored list of marker paths, so nothing here grows with the number of
-// directories holding a go.sum, and the closure answers for a path the live
-// manifest no longer holds -- a tombstoned lock file is still a member of the
-// unit that owns it, which a list built from live manifest rows cannot say.
+// directories holding a go.sum.
 
 import (
 	"context"
@@ -66,9 +64,9 @@ const (
 	FamilyRust Family = "rust"
 )
 
-// Families is every family in a fixed order, so a plan is a function of the
+// families is every family in a fixed order, so a plan is a function of the
 // repository alone.
-var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyPython, FamilyRust}
+var families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyPython, FamilyRust}
 
 // FamilyOf maps a language tag to the family whose project covers it, or an
 // empty family for a language the linking provider does not link.
@@ -103,11 +101,9 @@ type Unit struct {
 	// same family that this unit does not own. They are never members of this
 	// unit, so a nested module is linked once, by its own unit.
 	Excluded []string
-	// Files and Bytes are the unit's own source files and their byte count:
-	// the planner weighs a unit from Bytes, and a unit with no files is never
-	// scheduled.
+	// Files counts the unit's own source files; a unit with no files is never
+	// planned.
 	Files int64
-	Bytes int64
 }
 
 // markers names the manifest, lock and project files of a family. The first
@@ -134,17 +130,6 @@ var (
 	nestedFamilies = map[Family]bool{FamilyGo: true, FamilyJava: true}
 )
 
-// ProjectMarkers are the manifest files whose presence makes a directory a
-// project root of one family. It is the single source of that mapping: the
-// planner reads it here, and `codectx tools prefetch --for-repo` reads the
-// same table to decide which payloads a repository would ever need, rather
-// than carrying a second copy that drifts from the one that plans the units.
-//
-// The result is a copy: the table is package state and a caller must not be
-// able to reach into it. A family the linking provider does not link has no
-// markers and returns nil.
-func ProjectMarkers(f Family) []string { return slices.Clone(projectMarkers[f]) }
-
 // Plan is one snapshot's project units together with what could not be
 // planned as a unit of its own. A refused project is not a silent omission:
 // its files are members of the unit enclosing them, at a coarser boundary
@@ -152,14 +137,6 @@ func ProjectMarkers(f Family) []string { return slices.Clone(projectMarkers[f]) 
 type Plan struct {
 	// Units are the planned units, sorted by scope key.
 	Units []Unit
-	// Projects counts, per family, the projects the planner found -- before a
-	// scope key refuses one and before an empty unit is dropped, so it is the
-	// repository's project count and not the surviving unit count. Nothing
-	// bounds it: a plan holds one descriptor per project whatever the count,
-	// and a consumer that reports it against a threshold of its own never
-	// refuses a project for it (it holds one int per family, of which there
-	// are six).
-	Projects map[Family]int
 	// Unplanned counts, per family, the projects planFamily refused because
 	// their scope key does not fit model.MaxScopeKeyBytes. Their files are
 	// members of the unit that encloses them, so nothing is lost, but at a
@@ -172,7 +149,7 @@ type Plan struct {
 
 // PlanUnits derives every unit of the snapshot. It reads the manifest twice:
 // once to find project roots and the files of the C/C++ unit, once to fold
-// each unit's file count and byte total. Nothing repository-sized is retained.
+// each unit's file count. Nothing repository-sized is retained.
 func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	roots := map[Family]map[string]bool{}
 	present := map[Family]bool{}
@@ -185,7 +162,7 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 		if f := FamilyOf(srclang.Of(fv.Path)); f != "" {
 			present[f] = true
 		}
-		for _, f := range Families {
+		for _, f := range families {
 			if slices.Contains(projectMarkers[f], base) {
 				if roots[f] == nil {
 					roots[f] = map[string]bool{}
@@ -200,21 +177,12 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	}
 
 	plan := Plan{}
-	for _, f := range Families {
+	for _, f := range families {
 		if !present[f] {
 			continue
 		}
-		units, unplanned, projects, err := planFamily(f, roots[f])
-		if err != nil {
-			return Plan{}, err
-		}
+		units, unplanned := planFamily(f, roots[f])
 		plan.Units = append(plan.Units, units...)
-		if projects > 0 {
-			if plan.Projects == nil {
-				plan.Projects = map[Family]int{}
-			}
-			plan.Projects[f] = projects
-		}
 		if unplanned > 0 {
 			if plan.Unplanned == nil {
 				plan.Unplanned = map[Family]int{}
@@ -222,7 +190,7 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 			plan.Unplanned[f] = unplanned
 		}
 	}
-	if err := foldSizes(ctx, view, plan.Units); err != nil {
+	if err := foldFiles(ctx, view, plan.Units); err != nil {
 		return Plan{}, err
 	}
 	plan.Units = slices.DeleteFunc(plan.Units, func(u Unit) bool { return u.Files == 0 })
@@ -231,13 +199,12 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 }
 
 // planFamily turns one family's marker directories into unit descriptors and
-// reports how many projects it had to refuse, and how many projects the family
-// holds at all.
-func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
+// reports how many projects it had to refuse.
+func planFamily(f Family, roots map[string]bool) ([]Unit, int) {
 	if f == FamilyC {
 		// Header resolution spans the tree, so C and C++ are the one family
 		// whose unit is the repository itself.
-		return []Unit{{ScopeKey: provider.ScopeWorkspace, Family: f}}, 0, 1, nil
+		return []Unit{{ScopeKey: provider.ScopeWorkspace, Family: f}}, 0
 	}
 	dirs := make([]string, 0, len(roots))
 	for d := range roots {
@@ -271,9 +238,8 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	// How many projects one family holds is a property of the repository. A
 	// monorepo is planned whole: every project gets its own unit, because
 	// collapsing them into a coarser one would silently change which calls
-	// resolve, and refusing the plan would refuse the repository. The count
-	// travels out as Plan.Projects.
-	projects := len(dirs)
+	// resolve, and refusing the plan would refuse the repository.
+	//
 	// A project whose scope key does not fit is refused as a project, not as
 	// source. Refusing here is what keeps the failure in the planner: the unit
 	// would otherwise be admitted and fail at BeginUnit, where the scope key is
@@ -330,11 +296,11 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 		key, _ := scopeKey(f, "")
 		units = append(units, Unit{ScopeKey: key, Family: f, Excluded: kept})
 	}
-	return units, unplanned, projects, nil
+	return units, unplanned
 }
 
-// foldSizes counts each unit's own files and bytes in one streaming pass.
-func foldSizes(ctx context.Context, view model.SnapshotView, plan []Unit) error {
+// foldFiles counts each unit's own files in one streaming pass.
+func foldFiles(ctx context.Context, view model.SnapshotView, plan []Unit) error {
 	return view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		f := FamilyOf(srclang.Of(fv.Path))
 		if f == "" || fv.Status == model.FileDeleted {
@@ -343,7 +309,6 @@ func foldSizes(ctx context.Context, view model.SnapshotView, plan []Unit) error 
 		for i := range plan {
 			if plan[i].Family == f && plan[i].Contains(fv.Path) {
 				plan[i].Files++
-				plan[i].Bytes += fv.Size
 				return nil
 			}
 		}
@@ -371,13 +336,8 @@ func (u Unit) Contains(p string) bool {
 // inputs, which is exactly "any of these changing invalidates the unit".
 //
 // It is a predicate over the path and not a lookup in a stored list of marker
-// paths, for two reasons. It answers for a tombstone, which a list built from
-// live manifest rows cannot: a lock file the previous generation's unit
-// declared and this snapshot holds as deleted is still a member, so the scope
-// is ineligible for carry (Section 13.3) instead of being carried into a
-// generation where AttachCarried refuses it. And it holds nothing that grows
-// with the repository (Section 6): the C/C++ unit is the whole tree, so a
-// list would hold every Makefile in it.
+// paths, so it holds nothing that grows with the repository (Section 6): the
+// C/C++ unit is the whole tree, and a list would hold every Makefile in it.
 func (u Unit) OwnsInput(p string) bool {
 	if !u.Contains(p) {
 		return false
