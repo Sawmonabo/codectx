@@ -2,15 +2,14 @@
 
 ## Status
 
-Accepted, 2026-10-08, by the owner after the measurement below. Decisions 1 to 5 and 7 to 9 are settled. Three
-choices inside them wait on measurements that are running on the same export, and each names the result that decides
-it:
-- whether exact top-k pruning serves pages (decision 5);
+Accepted, 2026-10-08, by the owner after the measurement below. Two choices inside the decisions wait on
+measurements that are running on the same export, and each names the result that decides it:
 - whether the code-aware tokenizer replaces the plain one (decision 6);
 - whether document length is weighted per column (decision 2).
 
 This record replaces [ADR-0007](ADR-0007-lexical-first-page.md) in full. It replaces the lexical half of
-[ADR-0003](ADR-0003-storage-tier2.md) and amends [ADR-0001](ADR-0001-scale-posture.md) §2.4 (decision 5).
+[ADR-0003](ADR-0003-storage-tier2.md) and amends [ADR-0001](ADR-0001-scale-posture.md) §2.4: a ranked search serves its
+best results, not every match (decision 5).
 
 ## Context
 
@@ -192,22 +191,32 @@ and 50% hidden. All three routes give identical pages.
   1. deletes documents of units that no SQLite generation references;
   2. re-plans any unit whose documents never reached a commit, like any other unsealed unit.
 
-## Decision 5: a page is a bounded top-k after the cursor
+## Decision 5: a ranked search serves the best results, not every match
 
-Each page is answered by scoring every visible match and keeping a heap of one page. The heap keeps the best documents
-strictly after the cursor, ordered by (quantized score, content tie key). Memory per query is one page, whatever the
-match count and however deep the page. The hit count is exact, because every match is visited.
+A ranked search answers with the best-scoring results, a page at a time. It does not enumerate every matching
+document. The product's no-default-limit rule (ADR-0001 §1.1) governs the data an index produces: files, units, facts,
+rows and exact lookups are never dropped or truncated. A ranked list is a different thing. Its value is its head, and
+no search a person or an AI client runs needs the 253 589th-best match for `vendor`.
 
-This amends ADR-0001 §2.4. The ranked set is no longer spooled to disk. The tail is still complete: every later page
-is reachable by its cursor. The cursor depends on content only, not on document addresses, so it survives merges
-between pages.
+- **Top-k collection.** Page n is collected as the top 200·n by (quantized score, content tie key), with a heap of
+  that size. Page 1 holds 200 entries, whatever the match count.
+- **Pruning.** Block-max WAND, with BM25F upper bounds per block of the union postings, skips every document that
+  cannot enter the top k. It changes the work, never the results: the top k equal exhaustive scoring's top k. The
+  library's own pruning returned pages equal to exhaustive scoring, with 0 misses, on 2- and 11-segment indexes, at
+  about 0.5 ms a page whatever the page number. Our formula's pruned collector returned pages 1 to 3 identical to
+  exhaustive scoring on 2 436 of 2 436 query-page pairs on a fixture, at 1 and 4 search threads; its kubernetes run is
+  next. The library's pruned disjunction-max query is wrong in this release
+  (the fix is merged upstream but not released), so pruning is built for our formula and never borrowed from the
+  library's queries.
+- **Match count.** The count is exact when every match was visited, and otherwise a lower bound marked as one. That is
+  how the major engines report it.
+- **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
 
-**Pending: exact top-k pruning.** The candidate is block-max WAND, with BM25F upper bounds per block of the union
-postings. It skips documents that cannot enter the page, and so cuts CPU, never results. It counts hits in a separate
-pass. It is adopted only if its pages equal exhaustive scoring on all 30 queries and every quality query, and it is
-faster. The library's own pruning returned pages equal to exhaustive scoring, with 0 misses, on 2- and 11-segment
-indexes. Its pruned disjunction-max query is wrong in this release; the fix is merged upstream but not released. So
-pruning is built for our formula and never borrowed from the library's queries.
+The exact tier (path and symbol lookup) is not ranked and keeps returning every match.
+
+**Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
+reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds
+pruned). That is a price paid for depth no search uses. Rejected.
 
 ## Decision 6: tokenization
 
@@ -247,7 +256,7 @@ adopted one at a time and never switch on by default. Each uses an explicit limi
 | Per-unit lexical staging databases, packed lexical segments, their parts and generation tables | yes | the library's segments hold the postings |
 | Lexical compaction at activation | yes | about 2.1 GB of extra writes and 3 minutes per kubernetes run |
 | The Go posting and statistics readers, the document-frequency cache | yes | fast fields and per-unit totals answer them |
-| The full ranked-set spool before page 1 | yes | decision 5 |
+| The ranked-set sort and spool to disk | yes | decision 5 |
 | `search_units` text columns | yes | the library stores what it serves |
 
 What stays in SQLite:
@@ -260,7 +269,8 @@ The exact tier (path and symbol lookup) and the order "tiers first, then lexical
 ## Decision 9: what proves the change
 
 Tests that name their mutation:
-1. On a multi-language fixture, the collector's pages and hit counts equal the scorer they replace.
+1. On a multi-language fixture, the collector's top k equals exhaustive scoring by the formula it replaces, with and
+   without pruning.
 2. A generation with hidden units ranks exactly like an index of only its visible documents.
 3. A crash between the library commit and the SQLite activation recovers to the last activated generation, with
    nothing visible that it does not hold.
