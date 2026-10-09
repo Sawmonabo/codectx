@@ -723,7 +723,7 @@ same directory and under the same directory lock. It is what a run records
 about itself: how long each stage took, what it cost and what went through it
 ([diagnostics](diagnostics.md#the-run-ledger),
 [ADR-0011](adr/ADR-0011-run-ledger.md)). It holds `runs`, one row per run, and
-`spans`, one row per stage, unit or part of a unit, keyed to its run and to
+`spans`, one row per stage or unit, keyed to its run and to
 its parent span. A third table holds a single row: the ledger's own schema
 fingerprint, which is that file's alone and never mixed with the store's.
 
