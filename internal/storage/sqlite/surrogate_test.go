@@ -37,8 +37,8 @@ func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 	w := f.beginScope(gen, run, configHash, a, b)
 	f.fillFile(w, run, a)
 	f.fillFile(w, run, b)
-	from := f.putNode(w, run, "pkg/a.go", "Caller", &a, "key:caller")
-	to := f.putNode(w, run, "pkg/b.go", "Callee", &b, "key:callee")
+	from := f.putNode(w, run, "pkg/a.go", "Caller", &a)
+	to := f.putNode(w, run, "pkg/b.go", "Callee", &b)
 	f.putRelation(w, run, from, to, "key:edge", &a)
 	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: "pkg/a.go", NativeKey: "Caller", NodeID: from}}); err != nil {
 		t.Fatalf("PutAliases: %v", err)
@@ -77,8 +77,6 @@ func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 			JOIN scope_keys sk ON sk.id = na.scope_key_id JOIN native_keys nk ON nk.id = na.native_key_id
 			JOIN node_ids ni ON ni.id = na.node_id
 			WHERE na.unit_id = ?1 AND sk.key = 'pkg/a.go' AND nk.key = 'Caller' AND ni.canonical = ?2`, []any{unit, fromRaw}},
-		{"the delta key of a published fact", `SELECT count(*) FROM fact_keys fk JOIN node_ids ni ON ni.id = fk.node_id
-			WHERE fk.unit_id = ?1 AND ni.canonical = ?2 AND fk.fact_key = ?3`, []any{unit, fromRaw, model.H("fixture-fact-key", "key:caller")}},
 	} {
 		var n int64
 		if err := raw.QueryRow(c.query, c.args...).Scan(&n); err != nil {

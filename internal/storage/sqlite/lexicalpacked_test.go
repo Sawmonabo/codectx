@@ -233,7 +233,6 @@ func deltaChain(t *testing.T) (*fixture, model.GenerationID, model.GenerationID,
 	stats, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{
 		Files:  slices.Values([]model.FileID{a2.id}),
 		Scopes: slices.Values([]string{"file:" + a2.path}),
-		Keys:   slices.Values(keyList("key:node:" + a2.path)),
 	})
 	if err != nil {
 		t.Fatalf("CarryOver: %v", err)

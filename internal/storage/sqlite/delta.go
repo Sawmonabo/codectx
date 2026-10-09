@@ -30,24 +30,10 @@ import (
 // row, and re-indexes nothing. deleteUnit releases a posting only when no
 // surviving unit's row still names it, exactly as it releases a node id.
 //
-// Two retention granularities are supported because the two importers
-// have two:
-//
-//   - Per path. A fact's retention bucket is the FileID on its evidence:
-//     evidence with a FileID belongs to that path's bucket, evidence with none
-//     belongs to the unit's single index-level bucket. The SCIP importer's
-//     delta is per document, so its applier names the changed and removed
-//     paths.
-//   - Per fact key. The dependence importer's delta is per fact, and a
-//     cross-file edge can disappear while every file holding its evidence is
-//     unchanged, so a path bucket cannot express its removals. Its applier
-//     names the changed and removed keys, which storage matches against the
-//     fact_keys rows each producer supplied through
-//     PutKeyedNodes/PutKeyedRelations. A fact is backed by every key that
-//     produced it, and is dropped when ANY of them is replaced — the same
-//     condition the producer re-emits the whole fact on, so the fresh and
-//     carried sets partition exactly. Storage never derives or interprets a
-//     key.
+// A fact's retention bucket is the FileID on its evidence: evidence with a
+// FileID belongs to that path's bucket, evidence with none belongs to the
+// unit's single index-level bucket. The SCIP importer's delta is per
+// document, so its applier names the changed and removed paths.
 //
 // Aliases have neither evidence nor a file column, so they are excluded by
 // their scope key, which the applier already owns, and are otherwise carried
@@ -56,7 +42,7 @@ import (
 
 // deltaStatePart is the size of one stored part of a delta-state artifact.
 // An artifact is written and read as a sequence of parts so that a manifest
-// or key set the size of a large unit never sits whole in the process: the
+// the size of a large unit never sits whole in the process: the
 // producer streams it from the file it was built in, and a refresh streams it
 // back into one. A part is one row's blob, small enough to pass through the
 // engine's bind buffer and the writer's cache without spilling on its own.
@@ -64,19 +50,19 @@ const deltaStatePart = 1 << 20
 
 // Replaced names everything of the previous unit that the current import has
 // already re-emitted or that no longer exists. Everything else is carried.
-// Naming the complement rather than the survivors is deliberate: for both
-// importers the replaced set is a handful of entries against tens of
-// thousands of survivors.
+// Naming the complement rather than the survivors is deliberate: the
+// replaced set is a handful of entries against tens of thousands of
+// survivors.
 //
-// All three sets are streams, consumed once, and none is ever materialized
+// Both sets are streams, consumed once, and none is ever materialized
 // here: the replaced set is small for the refreshes that motivate a delta, but
 // a branch switch or a formatting pass names every document of the repository,
 // and Section 6 forbids holding that list in the Go heap. A producer that
 // cannot stream its set has a whole-repository list of its own, which is the
 // same defect one level up.
 //
-// A producer's stream may read the store — the dependence applier's Files is a
-// merge join against Store.UnitInputs — and it is drained from inside
+// A producer's stream may read the store — a merge join against
+// Store.UnitInputs, say — and it is drained from inside
 // CarryOver's ingestion call, on the single writer connection. Such a stream
 // sees the store as of the last commit: it takes a connection from the reader
 // pool (Options.ReadConnections) once per page of its own scan, and the
@@ -98,10 +84,6 @@ type Replaced struct {
 	// Scopes are the alias scope keys the import replaced or dropped. Each
 	// must be non-empty and within model.MaxScopeKeyBytes.
 	Scopes iter.Seq[string]
-	// Keys are the producer fact keys the import replaced or dropped.
-	// Each key must be a lowercase hex digest (model.ValidHexID); anything
-	// else is refused.
-	Keys iter.Seq[string]
 	// IndexLevel drops the previous unit's index-level bucket: the facts and
 	// evidence that name no file. Providers that republish every unlocated
 	// fact on every run set it; a provider that republishes them only for the
@@ -127,7 +109,7 @@ type CarryOverStats struct {
 // present, so the fresh import always wins over its predecessor.
 //
 // The whole body is one ingestion call on the single writer connection, and
-// draining Replaced's three streams happens inside it: a producer stream that
+// draining Replaced's two streams happens inside it: a producer stream that
 // reads the store runs nested in this call and on the reader pool, seeing the
 // last commit (see Replaced).
 //
@@ -153,23 +135,11 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 		if err != nil {
 			return err
 		}
-		keyed, err := w.stageReplaced(ctx, tx, replaced)
-		if err != nil {
+		if err := w.stageReplaced(ctx, tx, replaced); err != nil {
 			return err
 		}
 		if err := w.checkCarriedInputs(ctx, tx, prevRow); err != nil {
 			return err
-		}
-		if keyed > 0 {
-			var stored int64
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM fact_keys WHERE unit_id = ?1`, prevRow).Scan(&stored); err != nil {
-				return wrap("fact keys", err)
-			}
-			if stored == 0 {
-				return &model.Error{Code: model.CodeProviderOutputInvalid,
-					Message:     fmt.Sprintf("carry-over names %d replaced fact keys but unit %s stored none", keyed, prev),
-					Remediation: "the previous unit was written without keys; rebuild it in full before importing a key delta"}
-			}
 		}
 		return w.copyFacts(ctx, tx, prevRow, replaced.IndexLevel, &stats)
 	})
@@ -211,25 +181,23 @@ func (w *UnitWriter) previousUnitRow(ctx context.Context, tx *sql.Tx, prev model
 var carryTemp = []string{
 	`CREATE TEMP TABLE IF NOT EXISTS cx_carry_files(file_id BLOB PRIMARY KEY) WITHOUT ROWID`,
 	`CREATE TEMP TABLE IF NOT EXISTS cx_carry_scopes(scope_key TEXT PRIMARY KEY) WITHOUT ROWID`,
-	`CREATE TEMP TABLE IF NOT EXISTS cx_carry_keys(fact_key TEXT PRIMARY KEY) WITHOUT ROWID`,
 	`DELETE FROM cx_carry_files`,
 	`DELETE FROM cx_carry_scopes`,
-	`DELETE FROM cx_carry_keys`,
 }
 
-// stageReplaced drains the three replaced streams into the staging tables and
-// reports how many keys were staged. Each element is validated as it is
+// stageReplaced drains the two replaced streams into the staging tables.
+// Each element is validated as it is
 // staged, so nothing is held: the sets are the caller's streams, and the only
 // materialisation is the temp tables, which live in SQLite's own bounded
 // storage and are dropped with the connection.
-func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, replaced Replaced) (int64, error) {
+func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, replaced Replaced) error {
 	for _, q := range carryTemp {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return 0, wrap("carry-over staging", err)
+			return wrap("carry-over staging", err)
 		}
 	}
 	// check returns the bound value, not a bool: cx_carry_files is a BLOB
-	// column and the other two are TEXT, and binding the wrong Go type would
+	// column and cx_carry_scopes is TEXT, and binding the wrong Go type would
 	// store a value none of the survival predicates can match.
 	stage := func(table string, seq iter.Seq[string], check func(string) (any, error)) error {
 		if seq == nil {
@@ -257,27 +225,14 @@ func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, replaced Rep
 	if err := stage("cx_carry_files(file_id)", stringsOf(replaced.Files), func(f string) (any, error) {
 		return idBlob("replaced file_id", f)
 	}); err != nil {
-		return 0, err
+		return err
 	}
-	if err := stage("cx_carry_scopes(scope_key)", replaced.Scopes, func(scope string) (any, error) {
+	return stage("cx_carry_scopes(scope_key)", replaced.Scopes, func(scope string) (any, error) {
 		if scope == "" || len(scope) > model.MaxScopeKeyBytes {
 			return nil, invalid("a replaced scope key is empty or exceeds %d bytes", model.MaxScopeKeyBytes)
 		}
 		return scope, nil
-	}); err != nil {
-		return 0, err
-	}
-	var n int64
-	if err := stage("cx_carry_keys(fact_key)", replaced.Keys, func(key string) (any, error) {
-		if !model.ValidHexID(key) {
-			return nil, invalid("a replaced fact key is not a %d-character lowercase hex digest", model.IDHexLen)
-		}
-		n++
-		return key, nil
-	}); err != nil {
-		return 0, err
-	}
-	return n, nil
+	})
 }
 
 // stringsOf adapts a FileID stream to the one stageReplaced validates.
@@ -329,15 +284,6 @@ func (w *UnitWriter) checkCarriedInputs(ctx context.Context, tx *sql.Tx, prevRow
 const bucketSurvives = `((%[1]s.file_id IS NULL AND ?2 = 0)
 	OR (%[1]s.file_id IS NOT NULL AND %[1]s.file_id NOT IN (SELECT file_id FROM cx_carry_files)))`
 
-// keySurvives is the Section 11.4 fact-key predicate: a fact is carried unless
-// ANY of its keys was replaced. A fact with no keys has no fact_keys row, so
-// NOT EXISTS holds and only its retention bucket can replace it. Matching on
-// "any" rather than "all" is what makes the carried set the exact complement of
-// what the producer re-emitted: the emitter republishes a whole fact as soon as
-// one of its occurrence keys changes.
-const keySurvives = `NOT EXISTS (SELECT 1 FROM fact_keys fk WHERE fk.unit_id = ?1 AND fk.%[2]s = %[1]s.%[2]s
-	AND fk.fact_key IN (SELECT fact_key FROM cx_carry_keys))`
-
 func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, stats *CarryOverStats) error {
 	indexArg := boolInt(replaceIndexLevel)
 	exec := func(what, query string, args ...any) (int64, error) {
@@ -357,7 +303,6 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 			nf.file_id, nf.start_byte, nf.end_byte, nf.metadata_json
 		FROM node_facts nf WHERE nf.unit_id = ?1
 			AND `+fmt.Sprintf(bucketSurvives, "nf")+`
-			AND `+fmt.Sprintf(keySurvives, "nf", "node_id")+`
 		ON CONFLICT(unit_id, node_id) DO NOTHING`, prevRow, indexArg, w.rowID)
 	if err != nil {
 		return err
@@ -368,27 +313,12 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	// SealUnit requires every relation fact to keep evidence.
 	if n, err = exec("relation_facts", `INSERT INTO relation_facts(unit_id, relation_id)
 		SELECT ?3, rf.relation_id FROM relation_facts rf WHERE rf.unit_id = ?1
-			AND `+fmt.Sprintf(keySurvives, "rf", "relation_id")+`
 			AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = ?1 AND e.relation_id = rf.relation_id
 				AND `+fmt.Sprintf(bucketSurvives, "e")+`)
 		ON CONFLICT(unit_id, relation_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
 		return err
 	}
 	stats.Relations = n
-
-	// The keys of every fact that was carried come with it, or the successor
-	// would hold facts no later refresh could ever replace or remove: it would
-	// look like a unit its producer never keyed. Only the keys of facts this
-	// unit actually holds are copied, and a key the fresh import already
-	// recorded for the same fact yields.
-	if _, err = exec("fact_keys", `INSERT INTO fact_keys(unit_id, node_id, relation_id, fact_key)
-		SELECT ?3, fk.node_id, fk.relation_id, fk.fact_key FROM fact_keys fk WHERE fk.unit_id = ?1
-			AND fk.fact_key NOT IN (SELECT fact_key FROM cx_carry_keys)
-			AND ((fk.node_id IS NOT NULL AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = fk.node_id))
-			  OR (fk.relation_id IS NOT NULL AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.unit_id = ?3 AND rf.relation_id = fk.relation_id)))
-		ON CONFLICT DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
-		return err
-	}
 
 	// The replaced scope keys arrive as text and the alias rows carry scope
 	// surrogates, so the exclusion is resolved through scope_keys. A
@@ -726,10 +656,10 @@ const unitInputsPage = 1000
 // Each page is one read transaction on the reader pool, so the stream sees
 // the last commit and not the ingestion group in progress: the unit it reads
 // is a predecessor, sealed and committed before the run that reads it began.
-// The dependence delta applier walks this from inside UnitWriter.CarryOver's
-// ingestion call, which holds the group's connection, so those reads are
-// nested inside the writer's and compete for reader connections with the
-// rest of the process; see Replaced.
+// A Replaced stream that walks this from inside UnitWriter.CarryOver's
+// ingestion call, which holds the group's connection, nests its reads inside
+// the writer's and competes for reader connections with the rest of the
+// process; see Replaced.
 func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[model.UnitInput, error] {
 	return func(yield func(model.UnitInput, error) bool) {
 		fail := func(err error) { yield(model.UnitInput{}, err) }

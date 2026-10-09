@@ -49,7 +49,6 @@ sqlite3 -header -column -batch "file:$db?immutable=1" \
       UNION ALL SELECT 'relation_facts', count(*) FROM relation_facts
       UNION ALL SELECT 'native_aliases', count(*) FROM native_aliases
       UNION ALL SELECT 'evidence', count(*) FROM evidence
-      UNION ALL SELECT 'fact_keys', count(*) FROM fact_keys
       UNION ALL SELECT 'search_units', count(*) FROM search_units
       UNION ALL SELECT 'files', count(*) FROM files
       UNION ALL SELECT 'units', count(*) FROM units;"
