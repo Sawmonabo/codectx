@@ -85,9 +85,11 @@ import (
 // # Values
 //
 // Every value written to a property (`o.f = v`, an object literal's member,
-// a class field's initializer, a class's method under its own name) whose
-// type is recovered, and every function or imported value passed as an
-// argument, assigned, or placed in an array literal, is a Value. A function
+// a class field's initializer) whose type is recovered, and every function
+// or imported value passed as an argument, assigned, or placed in an array
+// literal, is a Value. A class's method is written to no property a value
+// is read from, so it is no Value: a call reaches it through its receiver's
+// type, never through its name alone. A function
 // is TypeFunction of its name as written: a function declaration's or
 // function-valued variable's name; a member's name qualified by what holds
 // it, `C.m` for a class's method or function-valued field and `o.m` for a
@@ -96,10 +98,10 @@ import (
 //
 // # Re-exports
 //
-// Each `export` statement that exports a name under a name of its own or
-// from another module is a Reexport: `export default x` and a default-
-// exported declaration, `export { a as b }`, `export { x } from "./m"`,
-// `export * from "./m"` and `export * as ns from "./m"`.
+// Each name an `export` statement exports is a Reexport: an exported
+// declaration's names as themselves, `export default x` and a default-
+// exported declaration, `export { a }` and `export { a as b }`, `export { x }
+// from "./m"`, `export * from "./m"` and `export * as ns from "./m"`.
 type javaScriptLinker struct {
 	language string
 	// k and x are the grammar's kind tables and l its lowering, resolved on
@@ -328,15 +330,13 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 				k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: string(textOf(k.src, n)), Type: v.t})
 			}
 		case kk.methodDefinition:
-			// An object literal's method and a class's method are functions
-			// written to the property they name; a constructor is no
-			// property's value.
-			if p := jsKindOf(n.Parent()); n != fn && (p == k.x.object || p == kk.classBody) {
+			// An object literal's method is a function written to the
+			// property it names.
+			if n != fn && jsKindOf(n.Parent()) == k.x.object {
 				if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == k.x.propertyIdentifier {
-					if text := string(textOf(k.src, name)); text != "constructor" || p == k.x.object {
-						k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: text,
-							Type: wire.Type{Kind: wire.TypeFunction, Name: qualify(k.receiverOf(n), text)}})
-					}
+					text := string(textOf(k.src, name))
+					k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: text,
+						Type: wire.Type{Kind: wire.TypeFunction, Name: qualify(k.receiverOf(n), text)}})
 				}
 			}
 		case kk.fieldDefinition, kk.publicFieldDefinition:
@@ -1168,6 +1168,11 @@ func (k *javaScriptLinker) reexports(out *wire.Link, n Node) {
 		}
 		return
 	}
+	if d := n.ChildByFieldId(kk.fDeclaration); !d.IsNull() {
+		// An exported declaration exports each name it declares as itself.
+		k.declaredNames(d, func(name string) { add(name, name, "") })
+		return
+	}
 	from := ""
 	if s := kindChild(n, x.str); !s.IsNull() {
 		from = k.unquote(s)
@@ -1195,6 +1200,29 @@ func (k *javaScriptLinker) reexports(out *wire.Link, n Node) {
 	}
 	if from != "" && !namespace && hasToken(n, x.star) {
 		add("*", "*", from)
+	}
+}
+
+// declaredNames calls yield with each name the exported declaration d
+// declares: its own name, each declarator's identifier of a variable
+// declaration, or the name of the declaration an ambient declaration wraps.
+func (k *javaScriptLinker) declaredNames(d Node, yield func(string)) {
+	kk := k.k
+	if name := d.ChildByFieldId(kk.fName); !name.IsNull() {
+		yield(string(textOf(k.src, name)))
+		return
+	}
+	for c := d.first(); !c.IsNull(); c = c.next() {
+		if !c.IsNamed() || c.IsExtra() {
+			continue
+		}
+		name := c.ChildByFieldId(kk.fName)
+		if c.KindId() == kk.variableDeclarator && jsKindOf(name) != kk.identifier {
+			continue
+		}
+		if !name.IsNull() {
+			yield(string(textOf(k.src, name)))
+		}
 	}
 }
 

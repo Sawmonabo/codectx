@@ -218,14 +218,17 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
 
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
   binding through imports and scopes. A bare name binds only the declarations its scope sees, those of the innermost
-  scope declaring it (`Table.Visible`), never a class member. A module's exports follow its `export` statements and
-  re-exports, closed over chains of re-exports (`export *` passes on every name but `default`), and a renamed or
-  default import reads the name it denotes. Member sites bind through receivers recovered by flow-based type
-  inference, then `hierarchy.dispatch`; a class object binds the method its class declares or inherits, never an
-  override. A construction binds the constructor the class declares or inherits. Field-based resolution binds a
-  member site to the functions written to the property it calls through, a class's methods included, only when no
-  value reached its receiver once the inference settled. Class-hierarchy analysis applies where `extends` declares
-  a subtype.
+  scope declaring it (`Table.Visible`), never a class member. A module's exports follow its `export` statements: a
+  declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
+  ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
+  re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
+  A renamed or default import reads the name it denotes. Member sites bind through receivers recovered by
+  flow-based type inference, then `hierarchy.dispatch`; a class object binds the method its class declares or
+  inherits, never an override. A class field holding a function is a member a call through the class binds. A
+  construction binds the constructor the class declares or inherits. Field-based resolution binds a member site to
+  the functions written to the property it calls through, only when no value reached its receiver once the
+  inference settled; a class's methods are written to no property, so they are reached only through a receiver's
+  type. Class-hierarchy analysis applies where `extends` declares a subtype.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor

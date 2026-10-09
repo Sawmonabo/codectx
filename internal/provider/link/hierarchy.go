@@ -76,15 +76,17 @@ const (
 	// keyTypeModule + a Rust module (rustModuleKey) + name: a type that module
 	// declares, which a `use` or a `module::T` path reaches.
 	keyTypeModule = "tm\x00"
-	// keyTypeExport + a module path without extension + name: a top-level
-	// type an ECMAScript module exports (under its own name or one an
-	// `export` statement gives it) or a Python module declares, which an
-	// import of that module reaches (moduleBases).
-	keyTypeExport = "te\x00"
-	// keyTypeReexport + a module path without extension + name: an
-	// ECMAScript module's re-export of the name Sig of the module whose path
-	// is Aux, name "*" for `export * from`.
-	keyTypeReexport = "tr\x00"
+	// keyExport + a module path without extension + name: what an
+	// ECMAScript module exports itself under that name (its own declaration,
+	// under its name or one an `export` statement gives it) or a Python
+	// module declares, which an import of that module reaches (moduleBases).
+	// Aux is its kind (exportType, exportFunc, exportModule); a module's Sig
+	// is that module's path.
+	keyExport = "te\x00"
+	// keyReexport + a module path without extension + name: an ECMAScript
+	// module's re-export of the name Sig of the module whose path is Aux,
+	// name "*" for `export * from`.
+	keyReexport = "tr\x00"
 	// keyFunc + family + scope + name: a free function visible under its
 	// simple name in that scope (Go's package, C's and C++'s one external
 	// linkage scope with the namespace in Aux, Rust's file), its signature
@@ -134,6 +136,21 @@ func isType(k model.NodeKind) bool { return slices.Contains(typeKinds, k) }
 func isCallable(k model.NodeKind) bool {
 	return k == model.NodeFunction || k == model.NodeMethod || k == model.NodeTest
 }
+
+// callable reports a declaration a call can reach: one of a callable kind,
+// or a field the worker describes as a function of a type (an ECMAScript
+// class field holding an arrow function or a function expression, which
+// `this.handler()` calls as it would a method).
+func callable(d *Decl) bool {
+	return isCallable(d.Kind) || d.Kind == model.NodeField && d.Described && d.Receiver != ""
+}
+
+// The kinds of an export (keyExport's Aux).
+const (
+	exportType   = "type"
+	exportFunc   = "func"
+	exportModule = "module"
+)
 
 // familyOf groups the languages whose files name each other's declarations:
 // a header is C or C++ by the repository's census, and the ECMAScript
@@ -388,11 +405,6 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 					keys = append(keys, keyTypeModule+m+"\x00"+d.Name)
 				}
 			}
-			if d.Parent < 0 && (fc.family == "python" || fc.family == "js" && d.Exported) {
-				for _, b := range bases {
-					keys = append(keys, keyTypeExport+b+"\x00"+d.Name)
-				}
-			}
 		case fc.family == "c" && d.Internal && isCallable(d.Kind) && d.Receiver == "":
 			if err := addInternal(s, t, d, internalEntry(ref, d, ns+"\x00"+t.Path)); err != nil {
 				return err
@@ -424,8 +436,8 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 			}
 		}
 	}
-	if fc.family == "js" {
-		return addTypeReexports(s, file, t, bases)
+	if len(bases) > 0 {
+		return addExports(s, file, t, bases, fc.family == "python")
 	}
 	return nil
 }
@@ -444,7 +456,7 @@ func internalEntry(ref Ref, d *Decl, aux string) entry {
 
 func declEntry(ref Ref, d *Decl) entry {
 	e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d)}
-	if d.Described && isCallable(d.Kind) {
+	if d.Described && callable(d) {
 		// A variable-arity parameter is counted in Params and may receive
 		// no argument.
 		fixed := d.Params
@@ -492,7 +504,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	fc := contextOf(file, t)
 	for i := range t.Decls {
 		d := &t.Decls[i]
-		if !isCallable(d.Kind) {
+		if !callable(d) {
 			continue
 		}
 		ref := Ref{File: file, Index: int32(i)}
@@ -885,40 +897,104 @@ func (h *hierarchy) moduleType(fc fileCtx, spec, name string, yield func(entry) 
 	if !ok {
 		return nil
 	}
-	return h.exportedType(base, name, map[string]bool{}, yield)
-}
-
-// exportedType yields the types the module whose path is base exports as
-// name: its own, else those a re-export of the name passes on, else those
-// an `export *` passes on (never `default`). seen holds the module names
-// already asked, so a cycle of re-exports ends.
-func (h *hierarchy) exportedType(base, name string, seen map[string]bool, yield func(entry) error) error {
-	key := base + "\x00" + name
-	if seen[key] {
-		return nil
-	}
-	seen[key] = true
-	found := false
-	err := h.decls.lookup(keyTypeExport+key, func(e entry) error {
-		found = true
+	return h.moduleExport(base, name, func(e entry) error {
+		if e.Aux != exportType {
+			return nil
+		}
 		return yield(e)
 	})
-	if err != nil || found {
-		return err
-	}
-	err = h.decls.lookup(keyTypeReexport+key, func(e entry) error { return h.exportedType(e.Aux, e.Sig, seen, yield) })
-	if err != nil || name == "default" {
-		return err
-	}
-	return h.decls.lookup(keyTypeReexport+base+"\x00*", func(e entry) error { return h.exportedType(e.Aux, name, seen, yield) })
 }
 
-// addTypeReexports adds what an ECMAScript file's `export` statements make
-// of its types and its re-exports, under each module path bases names the
-// file by: a module-level type a local export names, under the exported
-// name (`export default C`, `export { C as D }`), and a re-export of
-// another module's name, a local export of an import binding included.
-func addTypeReexports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string) error {
+// moduleExport yields what the module whose path is base exports as name
+// (resolveExport), nothing when the name resolves to nothing or ambiguously.
+func (h *hierarchy) moduleExport(base, name string, yield func(entry) error) error {
+	res, _, err := h.resolveExport(base, name, map[string]bool{})
+	if err != nil {
+		return err
+	}
+	for _, e := range res {
+		if err := yield(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveExport resolves the export name of the module whose path is base
+// as ECMA-262 §16.2.1.6.3 ResolveExport does: what the module exports itself
+// under the name; else what a re-export of the name resolves to in its
+// module; else, for any name but `default`, what the modules its `export *`
+// statements name resolve it to, when they agree, and ambiguous when two
+// resolve it to different exports. seen holds the module and name pairs
+// already asked along the resolution, so a cycle resolves to nothing. A
+// Python module exports its own declarations only.
+func (h *hierarchy) resolveExport(base, name string, seen map[string]bool) (res []entry, ambiguous bool, err error) {
+	key := base + "\x00" + name
+	if seen[key] {
+		return nil, false, nil
+	}
+	seen[key] = true
+	err = h.decls.lookup(keyExport+key, func(e entry) error {
+		res = append(res, e)
+		return nil
+	})
+	if err != nil || len(res) > 0 {
+		return res, false, err
+	}
+	indirect := false
+	err = h.decls.lookup(keyReexport+key, func(e entry) error {
+		indirect = true
+		r, amb, err := h.resolveExport(e.Aux, e.Sig, seen)
+		res, ambiguous = append(res, r...), ambiguous || amb
+		return err
+	})
+	if err != nil || indirect || name == "default" {
+		return res, ambiguous, err
+	}
+	err = h.decls.lookup(keyReexport+base+"\x00*", func(e entry) error {
+		if ambiguous {
+			return nil
+		}
+		r, amb, err := h.resolveExport(e.Aux, name, seen)
+		switch {
+		case err != nil:
+			return err
+		case amb:
+			ambiguous, res = true, nil
+		case len(r) == 0:
+		case res == nil:
+			res = r
+		case !sameExports(res, r):
+			ambiguous, res = true, nil
+		}
+		return nil
+	})
+	return res, ambiguous, err
+}
+
+// sameExports reports that a and b are one resolution: the same
+// declarations or module, in any order.
+func sameExports(a, b []entry) bool {
+	key := func(es []entry) []string {
+		out := make([]string, len(es))
+		for i, e := range es {
+			out[i] = refKey(e.Ref) + e.Aux + "\x00" + e.Sig
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+	return slices.Equal(key(a), key(b))
+}
+
+// addExports adds what a module exports itself and what it re-exports,
+// under each module path bases names its file by. A Python module exports
+// each module-level type and callable it declares. An ECMAScript module
+// exports a module-level declaration under its own name (exportedByName),
+// under the name a local `export` statement gives it (`export default C`,
+// `export { a as b }`), a module as a namespace (`export * as ns from`),
+// and re-exports another module's name (`export { x } from`, `export *
+// from`, a local export of an import binding).
+func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string, python bool) error {
 	add := func(prefix, name string, e entry) error {
 		for _, b := range bases {
 			e.Key = prefix + b + "\x00" + name
@@ -928,12 +1004,36 @@ func addTypeReexports(s *pagination.ExternalSort[entry], file int32, t *Table, b
 		}
 		return nil
 	}
+	decl := func(name string, i int) error {
+		d := &t.Decls[i]
+		e := declEntry(Ref{File: file, Index: int32(i)}, d)
+		e.Aux = exportFunc
+		if isType(d.Kind) {
+			e.Aux = exportType
+		}
+		return add(keyExport, name, e)
+	}
+	for i := range t.Decls {
+		d := &t.Decls[i]
+		if d.Parent >= 0 || !isType(d.Kind) && !isCallable(d.Kind) || !python && !exportedByName(t, i) {
+			continue
+		}
+		if err := decl(d.Name, i); err != nil {
+			return err
+		}
+	}
+	if python {
+		return nil
+	}
 	from := func(name, spec, original string) error {
 		target, ok := moduleBase(t.Path, spec, false)
-		if !ok || original == "*" && name != "*" {
+		switch {
+		case !ok:
 			return nil
+		case original == "*" && name != "*":
+			return add(keyExport, name, entry{Aux: exportModule, Sig: target})
 		}
-		return add(keyTypeReexport, name, entry{Aux: target, Sig: original})
+		return add(keyReexport, name, entry{Aux: target, Sig: original})
 	}
 	for _, x := range t.Reexports {
 		if x.From != "" {
@@ -942,12 +1042,17 @@ func addTypeReexports(s *pagination.ExternalSort[entry], file int32, t *Table, b
 			}
 			continue
 		}
+		if x.Name == x.Original {
+			// The declaration's own name: exportedByName decides it.
+			if slices.ContainsFunc(t.Decls, func(d Decl) bool { return d.Parent < 0 && d.Name == x.Name }) {
+				continue
+			}
+		}
 		local := false
 		for i := range t.Decls {
-			if d := &t.Decls[i]; d.Parent < 0 && d.Name == x.Original && isType(d.Kind) {
+			if d := &t.Decls[i]; d.Parent < 0 && d.Name == x.Original && (isType(d.Kind) || isCallable(d.Kind)) {
 				local = true
-				e := entry{Ref: Ref{File: file, Index: int32(i)}, Sig: d.Signature, Flags: flagsOf(d)}
-				if err := add(keyTypeExport, x.Name, e); err != nil {
+				if err := decl(x.Name, i); err != nil {
 					return err
 				}
 			}
@@ -969,6 +1074,29 @@ func addTypeReexports(s *pagination.ExternalSort[entry], file int32, t *Table, b
 		}
 	}
 	return nil
+}
+
+// exportedByName reports that ECMAScript declaration i of t is exported
+// under its own name: the structural provider marks it exported, and either
+// an `export` statement names it as itself (an exported declaration, `export
+// { a }`) or none renames it. A declaration only `export { a as b }` names
+// is exported as b alone.
+func exportedByName(t *Table, i int) bool {
+	d := &t.Decls[i]
+	if !d.Exported {
+		return false
+	}
+	renamed := false
+	for _, x := range t.Reexports {
+		if x.From != "" || x.Original != d.Name {
+			continue
+		}
+		if x.Name == d.Name {
+			return true
+		}
+		renamed = true
+	}
+	return !renamed
 }
 
 // importOriginal is the name the import of fc's file binding local to path p
