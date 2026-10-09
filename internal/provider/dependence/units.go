@@ -415,3 +415,66 @@ func nested(d string, dirs []string) []string {
 	}
 	return out
 }
+
+// PlanUnit plans the one unit scopeKey names, exactly as PlanUnits plans it,
+// from a single read of the manifest: the family's project roots are
+// collected, and every live source file of the family under the unit's root
+// is handed to candidate as it is read, before the unit's excluded nested
+// projects are known, so the caller keeps the ones Unit.Contains admits.
+// Files and Bytes are left zero. It reports false when the scope names no
+// project the snapshot plans: a key of no family, a root with no marker, or a
+// project refused or folded into an enclosing one.
+//
+// It is how one unit finds its members without a second planning of the
+// whole snapshot: PlanUnits reads the manifest twice for every family, and a
+// unit that only needs its own membership pays for none of that.
+func PlanUnit(ctx context.Context, view model.SnapshotView, scopeKey string, candidate func(model.FileVersion) error) (Unit, bool, error) {
+	f, root, ok := parseScopeKey(scopeKey)
+	if !ok {
+		return Unit{}, false, nil
+	}
+	roots := map[string]bool{}
+	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+		if fv.Status == model.FileDeleted {
+			return nil
+		}
+		dir, base := path.Split(fv.Path)
+		if slices.Contains(projectMarkers[f], base) {
+			roots[strings.TrimSuffix(dir, "/")] = true
+		}
+		if FamilyOf(lang.Of(fv.Path)) != f || !within(fv.Path, root) {
+			return nil
+		}
+		return candidate(fv)
+	})
+	if err != nil {
+		return Unit{}, false, err
+	}
+	units, _, _, err := planFamily(f, roots)
+	if err != nil {
+		return Unit{}, false, err
+	}
+	for _, u := range units {
+		if u.ScopeKey == scopeKey {
+			return u, true, nil
+		}
+	}
+	return Unit{}, false, nil
+}
+
+// parseScopeKey is the family and root a unit's scope key names (scopeKey),
+// and false for a key no unit carries.
+func parseScopeKey(key string) (Family, string, bool) {
+	if key == ScopeWorkspace {
+		return FamilyC, "", true
+	}
+	rest, ok := strings.CutPrefix(key, "pkg:")
+	if !ok {
+		return "", "", false
+	}
+	family, root, ok := strings.Cut(rest, ":")
+	if !ok || !slices.Contains(Families, Family(family)) || Family(family) == FamilyC {
+		return "", "", false
+	}
+	return Family(family), root, true
+}

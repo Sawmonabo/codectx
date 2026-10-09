@@ -16,9 +16,9 @@
 // flow-based type inference through assignments, parameters and returns,
 // field-based resolution and class-hierarchy analysis for the ECMAScript
 // family and Python. No whole-program points-to and no join on the callee
-// name alone. Every join is an ordered merge over sorted runs that spill
-// through pagination.ExternalSort, so nothing the size of the project is
-// resident.
+// name alone. Bindings sort through runs that spill (pagination.ExternalSort)
+// and type questions are point lookups into sorted index files on disk, so
+// only one key per 32 KiB block of each index is resident.
 package link
 
 import (
@@ -124,10 +124,6 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 // state to opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
-	pu, err := planned(ctx, req)
-	if err != nil {
-		return failed, err
-	}
 	// The unit's sorted runs spill into a directory of its own, removed
 	// through the pace when the link ends.
 	dir, err := os.MkdirTemp(opts.Dir, "codectx-link-")
@@ -136,13 +132,14 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer paced.RemoveAll(dir)
 
-	members, err := sortMembers(ctx, req.Content, pu, dir)
+	members, err := planMembers(ctx, req, dir)
 	if err != nil {
 		return failed, err
 	}
 	defer members.Close()
+	pu := members.unit
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
-		members: func(yield func(model.FileVersion) error) error { return members.Each(yield) }}
+		members: members.Each}
 
 	sorted, err := newBindingSort(dir, compareSiteTarget)
 	if err != nil {

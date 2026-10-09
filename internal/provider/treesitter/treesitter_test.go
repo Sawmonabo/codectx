@@ -359,6 +359,18 @@ type capture struct {
 	search   []model.SearchUnit
 }
 
+// PutState forwards the file's stored link table to the unit output. The
+// capture embeds provider.UnitOutput, which does not carry PutState, so
+// without it the batch sink finds no state destination and the provider's
+// refusal to seal a unit without its link table fails every run here.
+func (c *capture) PutState(ctx context.Context, kind string, payload []byte) error {
+	s, ok := c.UnitOutput.(provider.StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "the captured unit output does not store provider state"}
+	}
+	return s.PutState(ctx, kind, payload)
+}
+
 func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
 	c.search = append(c.search, docs...)
 	return c.UnitOutput.PutSearchUnits(ctx, docs)

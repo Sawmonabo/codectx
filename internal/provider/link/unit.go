@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"strings"
 
-	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -71,25 +70,6 @@ type Binding struct {
 // binds publishes nothing, and its structural call stands alone.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
-// planned is the dependence plan's unit the request names. Planning from the
-// pinned snapshot is what makes the members the ones the unit's inputs were
-// keyed on; a scope the plan does not hold is a disagreement with the
-// planner and fails rather than being guessed at.
-func planned(ctx context.Context, req provider.UnitRequest) (dependence.Unit, error) {
-	plan, err := dependence.PlanUnits(ctx, req.Content)
-	if err != nil {
-		return dependence.Unit{}, err
-	}
-	for _, pu := range plan.Units {
-		if pu.ScopeKey == req.Unit.ScopeKey {
-			return pu, nil
-		}
-	}
-	return dependence.Unit{}, &model.Error{Code: model.CodeArgumentInvalid,
-		Message: "the linking provider has no unit for this scope in this snapshot",
-		Details: map[string]string{"scope_key": req.Unit.ScopeKey}}
-}
-
 // resolverFor is the resolution of decision 2 for a unit's language family.
 func resolverFor(f dependence.Family) resolver {
 	switch f {
@@ -101,13 +81,44 @@ func resolverFor(f dependence.Family) resolver {
 	return resolveStatic
 }
 
-// sortMembers sorts the unit's member files into ascending FileID order: a
-// live source file of the unit's own family that the unit owns. Manifests
-// and lock files are inputs of the unit's closure but carry no table, so they
-// are not members. The manifest is served in path order and a FileID is a
-// digest, so the order is an external sort that spills rather than a list
-// held in the heap.
-func sortMembers(ctx context.Context, view model.SnapshotView, pu dependence.Unit, dir string) (*pagination.SortedRun[model.FileVersion], error) {
+// members is a unit's member files in ascending FileID order: each live
+// source file of the unit's own family that the unit owns. Manifests and lock
+// files are inputs of the unit's closure but carry no table, so they are not
+// members.
+type members struct {
+	unit dependence.Unit
+	// run holds every live file of the family under the unit's root, sorted,
+	// and Each keeps those the unit owns; n is how many it keeps.
+	run *pagination.SortedRun[model.FileVersion]
+	n   int64
+}
+
+// Each yields the members in ascending FileID order.
+func (m *members) Each(yield func(model.FileVersion) error) error {
+	return m.run.Each(func(fv model.FileVersion) error {
+		if !m.unit.Contains(fv.Path) {
+			return nil
+		}
+		return yield(fv)
+	})
+}
+
+// Len is the member count.
+func (m *members) Len() int64 { return m.n }
+
+// Close releases the sorted run.
+func (m *members) Close() error { return m.run.Close() }
+
+// planMembers is the unit the request names, planned from the pinned snapshot
+// as the planner planned it, with its members. Planning from the pinned
+// snapshot is what makes the members the ones the unit's inputs were keyed
+// on; a scope the plan does not hold, or one that owns no member, is a
+// disagreement with the planner and fails rather than being guessed at.
+//
+// The manifest is read once (dependence.PlanUnit). It is served in path order
+// and a FileID is a digest, so the order is an external sort that spills into
+// dir rather than a list held in the heap.
+func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*members, error) {
 	s, err := pagination.NewExternalSort(dir, 0,
 		func(fv model.FileVersion) ([]byte, error) { return json.Marshal(fv) },
 		func(b []byte) (model.FileVersion, error) {
@@ -120,16 +131,33 @@ func sortMembers(ctx context.Context, view model.SnapshotView, pu dependence.Uni
 		return nil, err
 	}
 	defer s.Close()
-	err = view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		if fv.Status == model.FileDeleted || !pu.OwnsInput(fv.Path) || dependence.FamilyOf(srclang.Of(fv.Path)) != pu.Family {
-			return nil
-		}
-		return s.Add(fv)
-	})
+	pu, ok, err := dependence.PlanUnit(ctx, req.Content, req.Unit.ScopeKey, s.Add)
 	if err != nil {
 		return nil, err
 	}
-	return s.Sorted()
+	run, err := s.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	m := &members{unit: pu, run: run}
+	if ok {
+		err = m.run.Each(func(fv model.FileVersion) error {
+			if pu.Contains(fv.Path) {
+				m.n++
+			}
+			return nil
+		})
+	}
+	if err != nil || m.n == 0 {
+		m.Close()
+		if err == nil {
+			err = &model.Error{Code: model.CodeArgumentInvalid,
+				Message: "the linking provider has no unit for this scope in this snapshot",
+				Details: map[string]string{"scope_key": req.Unit.ScopeKey}}
+		}
+		return nil, err
+	}
+	return m, nil
 }
 
 // coverage is what the unit's tables leave out: members with no table, whose

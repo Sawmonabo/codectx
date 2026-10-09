@@ -17,8 +17,10 @@
 // The import publishes the methods of the unit and their aliases, and no
 // relation: `calls` is the linking provider's, and control dependence, data
 // flow, reads and writes are the structural provider's, per file. The call
-// edges are still projected and keyed, so the key set and its delta are those
-// of the export, but none reaches the sink. Precision is static_analysis and
+// edges are projected only to be counted (Report.DerivedRows); no relation is
+// staged or keyed, so the key set holds node keys alone. A predecessor that
+// published relations therefore has every relation key removed from it, and a
+// refresh carries none of those rows over. Precision is static_analysis and
 // every evidence range is verified against the pinned snapshot bytes before it
 // is published.
 //
@@ -53,10 +55,7 @@ const ProviderID = "dependence"
 // neutral terms and are the only vocabulary published on an evidence row
 // (Section 11.6).
 const (
-	// detailAssignment is the detail of the may_refer_to edge from a method to
-	// an equally supported alternative identity.
-	detailAssignment = "assignment"
-	detailCall       = "call"
+	detailCall = "call"
 	// detailCallSpeculated is a call whose callee the export invented: a
 	// method with no definition in the graph, emitted so the site has a
 	// target. The edge is published, and says so.
@@ -185,15 +184,14 @@ type Options struct {
 
 // Import phases, in order, as OnPhase reports them.
 const (
-	PhaseFilesStaged     = "files staged"
-	PhaseExportStaged    = "export staged"
-	PhaseProjected       = "entities and calls projected"
-	PhaseLocated         = "located"
-	PhaseIdentified      = "identified"
-	PhaseRelationsStaged = "relations staged"
-	PhaseKeysSaved       = "keys saved"
-	PhaseNodesEmitted    = "nodes emitted"
-	PhaseAliasesEmitted  = "aliases emitted"
+	PhaseFilesStaged    = "files staged"
+	PhaseExportStaged   = "export staged"
+	PhaseProjected      = "entities and calls projected"
+	PhaseLocated        = "located"
+	PhaseIdentified     = "identified"
+	PhaseKeysSaved      = "keys saved"
+	PhaseNodesEmitted   = "nodes emitted"
+	PhaseAliasesEmitted = "aliases emitted"
 )
 
 func (o Options) phase(name string) {
@@ -230,7 +228,8 @@ func (o Options) validate() error {
 }
 
 // Report is what one import tells its caller. Nodes, Relations and Aliases
-// count the records handed to the sink; Changed, Unchanged and Removed
+// count the records handed to the sink, and Relations is zero: the import
+// hands it no relation. Changed, Unchanged and Removed
 // describe the delta against Options.PreviousKeys and are the whole key set
 // against the absent previous set.
 type Report struct {
@@ -350,10 +349,6 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 		return rep, err
 	}
 	opts.phase(PhaseIdentified)
-	if err := e.stageRelations(ctx); err != nil {
-		return rep, err
-	}
-	opts.phase(PhaseRelationsStaged)
 	keysPath := opts.KeysPath
 	if keysPath == "" {
 		keysPath = sc.defaultKeys
@@ -362,7 +357,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err != nil {
 		return rep, err
 	}
-	delta, err := sc.markDelta(ctx, fresh, opts.PreviousKeys)
+	delta, err := measureDelta(fresh, opts.PreviousKeys)
 	if err != nil {
 		return rep, err
 	}
@@ -376,7 +371,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	}
 	opts.phase(PhaseAliasesEmitted)
 
-	rep.Nodes, rep.Relations, rep.Aliases = e.nodes, e.relations, e.aliases
+	rep.Nodes, rep.Aliases = e.nodes, e.aliases
 	rep.ExternalMethods, rep.DroppedMethods = e.external, e.dropped
 	rep.UnlocatedFacts = e.noRange
 	rep.ClippedEvidence, rep.UnknownRows, rep.IgnoredFiles = e.clipped, sc.unknownN, sc.ignoredFiles
@@ -393,22 +388,6 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	}
 	return rep, nil
 }
-
-// deltaFilter reports whether this import may emit only the relations whose
-// keys the previous run did not publish.
-//
-// It may not when the previous run's key set lost a key. A removed key is a
-// digest: it cannot be mapped back to the relation it backed, and the relation
-// may still exist with its remaining occurrences — one of two identical calls
-// deleted, say, leaves the edge with an unchanged key and no changed one.
-// Storage drops that edge's previous row, because one of the keys it was
-// stored under is replaced, and a filtered emit would never republish it: the
-// edge would vanish from a delta-built unit that a full build still holds.
-// Emitting every relation is the sound over-approximation — an edge published
-// with its whole evidence list is byte-identical to what a full import writes
-// — and it costs import work, never correctness. Node facts are unaffected;
-// they are emitted whole on every run.
-func deltaFilter(prev KeySet, d Delta) bool { return !prev.Empty() && d.Removed == 0 }
 
 func internalErr(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
