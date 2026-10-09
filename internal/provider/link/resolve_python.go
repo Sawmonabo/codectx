@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -210,12 +211,20 @@ func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 
 // resolvePythonSite binds one site of tab, the table of site.File: what the
 // file and the inference answer is emitted here, and a module lookup is added
-// to keys for the merge.
+// to keys for the merge. Field-based resolution (a function written to the
+// field a member site calls through) answers a member site only when its
+// receiver's type bound nothing: a type that declares or inherits the method
+// decides the call, and one that does not leaves an instance attribute
+// (`self.cb = f; self.cb()`), which only the field can tell.
 func resolvePythonSite(ctx context.Context, h *hierarchy, t *types, site Ref, tab *Table,
 	keys *pagination.ExternalSort[pyRecord], emit func(Binding) error) error {
 	s := &tab.Sites[site.Index]
+	bound := false
 	bind := func(detail string) func(Ref) error {
-		return func(target Ref) error { return emit(Binding{Site: site, Target: target, Detail: detail}) }
+		return func(target Ref) error {
+			bound = true
+			return emit(Binding{Site: site, Target: target, Detail: detail})
+		}
 	}
 	if s.Receiver.Kind == wire.TypeModule {
 		// A name an import introduced: a module (`import a.b as m; m.f()`)
@@ -225,75 +234,324 @@ func resolvePythonSite(ctx context.Context, h *hierarchy, t *types, site Ref, ta
 	}
 	switch s.Shape {
 	case wire.ShapeBare, wire.ShapeConstructor:
-		for _, c := range s.Candidates {
-			if err := emit(Binding{Site: site, Target: Ref{File: site.File, Index: constructed(tab, c)}, Detail: DetailDirect}); err != nil {
+		for _, c := range visibleCandidates(tab, s) {
+			if err := bind(DetailDirect)(Ref{File: site.File, Index: constructed(tab, c)}); err != nil {
 				return err
 			}
 		}
 	case wire.ShapeStatic:
-		// `mod.f()` through an import, or `C.m()` through a class.
+		// `mod.f()` through an import, or `mod.C.m()` through a class of a
+		// module, which calls the method C declares or inherits.
 		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, keys); err != nil {
 			return err
 		}
-		if err := h.types(ctx, site.File, s.Qualifier, func(typ Ref) error {
-			return h.dispatch(ctx, typ, s.Callee, bind(DetailHierarchy))
-		}); err != nil {
-			return err
-		}
+		return h.types(ctx, site.File, s.Qualifier, func(typ Ref) error {
+			return h.declared(typ, s.Callee, entryRef(bind(DetailDirect)))
+		})
 	case wire.ShapeMember:
 		if err := resolvePythonReceiver(ctx, h, t, site, tab, s, bind); err != nil {
 			return err
 		}
 	}
-	if s.Shape == wire.ShapeStatic {
-		return nil
-	}
 	return t.functions(ctx, site, func(target Ref, detail string) error {
+		if detail == DetailField && s.Shape == wire.ShapeMember && bound {
+			return nil
+		}
 		return emit(Binding{Site: site, Target: target, Detail: detail})
 	})
 }
 
-// resolvePythonReceiver binds a member site by its receiver's types, each
-// dispatched in the class hierarchy: a receiver the file names (`self`,
-// `cls`, an annotation) by class-hierarchy analysis, one the inference
-// recovered (a parameter, another call's result, a field) by flow, and
-// `super()` by the bases of the enclosing class.
+// visibleCandidates are the in-file candidates of bare site s that its name
+// can denote where it is written: those of the innermost scope enclosing the
+// call that declares one (Table.Visible), or, in a class body's own code, a
+// def or class that body declares (the class namespace that code reads
+// first). A same-named declaration of another function, or a method, is not
+// what a bare name denotes.
+func visibleCandidates(tab *Table, s *Site) []int32 {
+	var out []int32
+	best := -1
+	for _, c := range s.Candidates {
+		if c < 0 || int(c) >= len(tab.Decls) {
+			continue
+		}
+		p := tab.Decls[c].Parent
+		inClassBody := p >= 0 && p == s.Caller && isType(tab.Decls[p].Kind)
+		if !inClassBody && !tab.Visible(c, s.Caller) {
+			continue
+		}
+		// depth is how many scopes out from the caller the candidate's
+		// scope is; the module is the outermost.
+		depth := 0
+		for i := s.Caller; i >= 0 && i != p && int(i) < len(tab.Decls); i = tab.Decls[i].Parent {
+			depth++
+		}
+		switch {
+		case best < 0 || depth < best:
+			best, out = depth, append(out[:0], c)
+		case depth == best:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// entryRef adapts a binder of Refs to the hierarchy's entries.
+func entryRef(bind func(Ref) error) func(entry) error {
+	return func(e entry) error { return bind(e.Ref) }
+}
+
+// resolvePythonReceiver binds a member site by its receiver's types: a
+// receiver the file names as an instance (`self`, an annotation) by
+// class-hierarchy analysis in method resolution order (dispatchPython), a
+// class object (`A.make()`, `cls.make()` of a classmethod's class written
+// as a class) by the method that class declares or inherits alone, one the
+// inference recovered (a parameter, another call's result, a field) by flow,
+// and `super()` by what follows the enclosing class in method resolution
+// order.
 func resolvePythonReceiver(ctx context.Context, h *hierarchy, t *types, site Ref, tab *Table, s *Site,
 	bind func(string) func(Ref) error) error {
 	switch s.Receiver.Kind {
 	case wire.TypeNamed:
 		return h.types(ctx, site.File, s.Receiver.Name, func(typ Ref) error {
-			return h.dispatch(ctx, typ, s.Callee, bind(DetailHierarchy))
+			return dispatchPython(ctx, h, typ, s.Callee, bind(DetailHierarchy))
+		})
+	case wire.TypeClass:
+		return h.types(ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+			return h.declared(typ, s.Callee, entryRef(bind(DetailDirect)))
 		})
 	case wire.TypeSuper:
 		return resolvePythonSuper(ctx, h, site, tab, s, bind(DetailHierarchy))
 	}
-	return t.receivers(ctx, site, func(typ Ref) error {
-		return h.dispatch(ctx, typ, s.Callee, bind(DetailFlow))
+	// The inference's receiver values: an instance dispatches, a class
+	// object (valExact) calls its own or inherited method.
+	return t.seek(site, func(r recv) error {
+		if r.Role != roleReceiver {
+			return nil
+		}
+		switch r.X.Kind {
+		case valInstance:
+			return dispatchPython(ctx, h, r.X.Ref, s.Callee, bind(DetailFlow))
+		case valExact:
+			return h.declared(r.X.Ref, s.Callee, entryRef(bind(DetailFlow)))
+		}
+		return nil
 	})
 }
 
-// resolvePythonSuper binds `super().m()` in class B: m as each base of B
-// declares or inherits it, and its overrides in their subtypes except the
-// one B declares, which follows B in no method resolution order.
-func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error) error {
-	class := enclosingClass(tab, s.Caller)
-	for _, st := range tab.Supertypes {
-		if st.Type != s.Receiver.Name {
-			continue
-		}
-		if err := h.types(ctx, site.File, st.Super, func(typ Ref) error {
-			return h.dispatch(ctx, typ, s.Callee, func(target Ref) error {
-				if class >= 0 && target.File == site.File && tab.Decls[target.Index].Parent == class {
-					return nil
-				}
-				return bind(target)
-			})
-		}); err != nil {
+// dispatchPython yields every method a call of method on an instance of the
+// Python class typ may run: for typ and each of its subtypes, the
+// declaration that type's method resolution order reaches first
+// (hierarchy.declared), each once. A method declared abstract is yielded
+// only when no type reaches one that is not.
+func dispatchPython(ctx context.Context, h *hierarchy, typ Ref, method string, yield func(Ref) error) error {
+	var concrete, abstract []Ref
+	seen := map[Ref]bool{}
+	err := pythonSubtypes(ctx, h, typ, func(sub Ref) error {
+		return h.declared(sub, method, func(e entry) error {
+			if seen[e.Ref] {
+				return nil
+			}
+			seen[e.Ref] = true
+			if e.Flags&flagAbstract != 0 {
+				abstract = append(abstract, e.Ref)
+			} else {
+				concrete = append(concrete, e.Ref)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if len(concrete) == 0 {
+		concrete = abstract
+	}
+	for _, m := range concrete {
+		if err := yield(m); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// pythonSubtypes yields typ and every class below it in the unit's
+// hierarchy, each once.
+func pythonSubtypes(ctx context.Context, h *hierarchy, typ Ref, yield func(Ref) error) error {
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		t := queue[0]
+		queue = queue[1:]
+		if err := yield(t); err != nil {
+			return err
+		}
+		err := h.links.lookup(keySub+refKey(t), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolvePythonSuper binds `super().m()` written in class B: for B and each
+// class below it, the instance's possible types, the first declaration of m
+// that type's method resolution order reaches after B. A class below B
+// precedes B in every such order, so no override below B is reached, while a
+// sibling base a subclass lists after B is (cooperative multiple
+// inheritance). A type whose bases admit no order reaches nothing; for B
+// itself the nearest declaration along each of its bases' paths answers.
+func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error) error {
+	class := enclosingClass(tab, s.Caller)
+	if class < 0 {
+		return nil
+	}
+	b := Ref{File: site.File, Index: class}
+	return pythonSubtypes(ctx, h, b, func(sub Ref) error {
+		order, err := h.pythonMRO(sub)
+		if err != nil {
+			return err
+		}
+		if order == nil {
+			if sub != b {
+				return nil
+			}
+			return h.links.lookup(keySuper+refKey(b), func(base entry) error {
+				return h.declared(base.Ref, s.Callee, entryRef(bind))
+			})
+		}
+		after := slices.Index(order, b) + 1
+		if after == 0 {
+			return nil
+		}
+		for _, t := range order[after:] {
+			found := false
+			err := h.methods(t, s.Callee, func(e entry) error {
+				found = true
+				return bind(e.Ref)
+			})
+			if err != nil || found {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// pythonMRO is the method resolution order of typ when typ is a Python
+// class: its C3 linearisation (the Python Language Reference §3.3 and "The
+// Python 2.3 Method Resolution Order"), typ first, over the bases the unit
+// declares in the order each class lists them. A base outside the unit
+// (`object`, a library class) has no declaration and no place in it. nil
+// when typ is no Python class, or when its bases admit no linearisation (a
+// cycle, or two bases each ordered before the other), where Python would
+// refuse to create the class and the caller reads the supertypes instead.
+func (h *hierarchy) pythonMRO(typ Ref) ([]Ref, error) {
+	language, err := h.fileLanguage(typ.File)
+	if err != nil || language != "python" {
+		return nil, err
+	}
+	memo := map[Ref][]Ref{}
+	active := map[Ref]bool{}
+	var linearise func(t Ref) ([]Ref, error)
+	linearise = func(t Ref) ([]Ref, error) {
+		if l, ok := memo[t]; ok {
+			return l, nil
+		}
+		if active[t] {
+			return nil, nil
+		}
+		active[t] = true
+		defer delete(active, t)
+		bases, err := h.bases(t)
+		if err != nil {
+			return nil, err
+		}
+		seqs := make([][]Ref, 0, len(bases)+1)
+		for _, b := range bases {
+			l, err := linearise(b)
+			if err != nil || l == nil {
+				return nil, err
+			}
+			seqs = append(seqs, l)
+		}
+		merged, ok := mergeC3(append(seqs, bases))
+		if !ok {
+			return nil, nil
+		}
+		memo[t] = append([]Ref{t}, merged...)
+		return memo[t], nil
+	}
+	return linearise(typ)
+}
+
+// bases are the direct supertypes of typ in the order its declaration lists
+// them (addBase), each once.
+func (h *hierarchy) bases(typ Ref) ([]Ref, error) {
+	var es []entry
+	if err := h.links.lookup(keySuper+refKey(typ), func(e entry) error {
+		es = append(es, e)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(es, func(a, b entry) int { return strings.Compare(a.Aux, b.Aux) })
+	out := make([]Ref, 0, len(es))
+	for _, e := range es {
+		if !slices.Contains(out, e.Ref) {
+			out = append(out, e.Ref)
+		}
+	}
+	return out, nil
+}
+
+// mergeC3 is C3's merge of seqs: repeatedly the first head of a sequence that
+// is in no sequence's tail, removed from every head; false when sequences
+// remain and every head is in some tail.
+func mergeC3(seqs [][]Ref) ([]Ref, bool) {
+	var out []Ref
+	for {
+		seqs = slices.DeleteFunc(seqs, func(s []Ref) bool { return len(s) == 0 })
+		if len(seqs) == 0 {
+			return out, true
+		}
+		var next Ref
+		ok := false
+		for _, s := range seqs {
+			inTail := slices.ContainsFunc(seqs, func(o []Ref) bool { return slices.Contains(o[1:], s[0]) })
+			if !inTail {
+				next, ok = s[0], true
+				break
+			}
+		}
+		if !ok {
+			return nil, false
+		}
+		out = append(out, next)
+		for i, s := range seqs {
+			if s[0] == next {
+				seqs[i] = s[1:]
+			}
+		}
+	}
+}
+
+// fileLanguage is the language of a member file, as the hierarchy indexed it.
+func (h *hierarchy) fileLanguage(file int32) (string, error) {
+	var language string
+	err := h.decls.lookup(keyFile+refKey(Ref{File: file}), func(e entry) error {
+		language, _, _ = strings.Cut(e.Aux, "\x00")
+		return nil
+	})
+	return language, err
 }
 
 // enclosingClass is the class declaration enclosing declaration i of tab, or
