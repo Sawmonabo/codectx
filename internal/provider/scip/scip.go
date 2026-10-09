@@ -654,7 +654,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	// over zero facts, which a consumer reads as an analysed absence. A full
 	// profile import that admitted nothing is therefore a typed failure, not a
 	// seal. A refresh is exempt: an unchanged snapshot legitimately emits no
-	// record. This mirrors the dependence provider's export liveness gate.
+	// record.
 	if im.profile != nil && opts.Previous == nil && rep.Result.RecordsEmitted == 0 {
 		// This is the one refusal raised after a completed run, so it is the one
 		// that holds a built manifest. The caller never receives this Report and

@@ -13,7 +13,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
 // TestSymbolFieldsAreBoundedAndTheCutIsRecorded protects the record field bounds
@@ -49,15 +48,15 @@ func TestSymbolFieldsAreBoundedAndTheCutIsRecorded(t *testing.T) {
 	}
 }
 
-// TestOneAllocationAdmitsEngineUnitsAndServersTogether protects ADR-0010
-// decision 5: engine runs, external indexers and language servers are admitted
+// TestOneAllocationAdmitsHeavyUnitsAndServersTogether protects ADR-0010
+// decision 5: external indexers' profile units and language servers are admitted
 // while the SUM of what they reserve fits the one machine-derived allocation.
 //
 // Failure mode, and the reason this test exists: when the language-server
 // manager keeps a running total of its own, that total and the heavy-unit
 // scheduler's are both bounded by the same allocation and nothing sums them.
 // One process then reserves twice the memory the machine was measured to have
-// -- engine units filling the allocation and a server admitted on top of them
+// -- heavy units filling the allocation and a server admitted on top of them
 // -- and the host it is running on freezes.
 //
 // The allocation here is 8 GiB and the two reservations are 6 GiB and 4 GiB,
@@ -67,8 +66,8 @@ func TestSymbolFieldsAreBoundedAndTheCutIsRecorded(t *testing.T) {
 // Mutation: give the manager its own total again -- add `used int64` to
 // Manager and admit in slot on `m.used == 0 || m.used+bytes <= allocation`
 // instead of reserving from the shared ledger -> the server is admitted while
-// the engine unit holds 6 GiB of the 8 GiB allocation.
-func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
+// the heavy unit holds 6 GiB of the 8 GiB allocation.
+func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 	const giB int64 = 1 << 30
 	led, err := admission.NewLedger(8*giB, 64<<30)
 	if err != nil {
@@ -86,11 +85,7 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 	// what the composition root builds.
 	sched := plan.NewScheduler(led)
 
-	sized := dependence.Reservation{HeapCapBytes: 6 * giB}
-	if sized.Bytes() != 6*giB {
-		t.Fatalf("the unit reserves %d bytes, want %d; this test's arithmetic no longer holds", sized.Bytes(), 6*giB)
-	}
-	unit := admission.Reservation{MemoryBytes: sized.Bytes()}
+	unit := admission.Reservation{MemoryBytes: 6 * giB}
 	releaseUnit, err := sched.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an idle allocation refused one 6 GiB unit: %v", err)
@@ -149,7 +144,7 @@ func TestOneAllocationAdmitsEngineUnitsAndServersTogether(t *testing.T) {
 // Failure modes. When the second open of a server queues a reservation of its
 // own while the first is still waiting for room, that reservation sits in the
 // ledger's first-in-first-out queue for room it will hand straight back, and
-// every engine unit behind it waits on it. And when the open that is reserving
+// every heavy unit behind it waits on it. And when the open that is reserving
 // gives up without waking the opens waiting on its entry, they hang.
 //
 // Mutations: publish the entry only after ReserveWith returns -> the second

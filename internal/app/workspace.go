@@ -182,7 +182,6 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		RunLedgerReader: runLedger{dir: s.dataDir},
 		Pool:            s.pool,
 		Watcher:         s.watcher,
-		States:          s.states,
 		// The supplied `--scip-index` path reaches the SCIP provider at
 		// composition time and is invisible to the coordinator that writes the
 		// generation row, so it is handed over here as well. The scope key is
