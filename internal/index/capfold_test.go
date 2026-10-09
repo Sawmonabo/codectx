@@ -46,7 +46,7 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 			State:          model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 	}
-	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout), 0)
+	big.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
 
 	bounded := big.finish(log)
 	seen := map[string]int{}
@@ -203,37 +203,34 @@ func (p coverageProvider) IndexUnit(context.Context, provider.UnitRequest, provi
 	return model.ProviderResult{}, nil
 }
 
-// TestCoverageReportsAFailedDeferredScopeAsPartial protects what `codectx
-// status` says after a late publication.
+// TestCoverageReportsAFailedScopeBesideAPublishedOneAsPartial protects what
+// `codectx status` says when one scope of a provider fails and another
+// publishes.
 //
-// Failure mode: one deferred unit of a provider fails while another scope of
-// it publishes, and every capability of that provider is reported `unavailable:
-// units_deferred` -- a repository whose control dependence, data dependence,
-// reads, writes and calls are all in the generation and queryable reads as a
-// provider nobody has heard from. A scope that failed is not a scope still
-// running: it is a failure, published as `partial` with that scope named,
-// because the other scopes' facts are there.
+// Failure mode: the capability is reported `failed` -- or `fresh` -- although
+// one scope's facts are in the generation and queryable and another scope is
+// a known failure. It is `partial` with the failed scope named.
 //
-// Mutation proof: in coveredProviders, drop the failedScopes case so a scope
-// that failed falls through to `deferred` again.
-func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
+// Mutation proof: in coverage, drop the coveredElsewhere call so the row stays
+// failed, or drop the addFailures call so the capability reads fresh.
+func TestCoverageReportsAFailedScopeBesideAPublishedOneAsPartial(t *testing.T) {
 	t.Parallel()
-	const id, capability = "dependence", "calls"
+	const id, capability = "link", "calls"
 	const sealedScope, failedScope = "pkg:javascript:app", "pkg:java:qa"
 
 	g := &generation{
 		caps: newCapabilityReport(),
 		sel: provider.Selection{Active: []provider.Provider{coverageProvider{desc: model.ProviderDescriptor{
 			ID: id, Version: "1", Capabilities: []string{capability}}}}},
-		published:    map[string]bool{id: true},
-		failedScopes: map[string]unitFailure{plan.Key(id, failedScope): {code: model.CodeProviderOutputInvalid}},
+		// The sealed scope is a member of this generation, which is what
+		// `published` records and what makes the surviving row partial rather
+		// than failed.
+		published: map[string]bool{id: true},
+		failures:  map[string]*providerFailures{id: oneFailure(failedScope, model.CodeProviderOutputInvalid)},
 	}
 	g.plan.Units = func(yield func(plan.Unit) error) error {
 		for _, scope := range []string{sealedScope, failedScope} {
-			// Only the failed scope is deferred: the other one is a member of
-			// this generation, which is what `published` records and what
-			// makes the surviving row partial rather than failed.
-			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope, Deferred: scope == failedScope}); err != nil {
+			if err := yield(plan.Unit{ProviderID: id, ScopeKey: scope}); err != nil {
 				return err
 			}
 		}
@@ -256,9 +253,6 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 	if row.DiagnosticCode != model.CodeProviderOutputInvalid {
 		t.Errorf("diagnostic code %q, want the failure's own", row.DiagnosticCode)
 	}
-	if row.Details["reason"] == "units_deferred" || row.UnitsRunning != 0 {
-		t.Errorf("a scope that failed was reported as still running (units_running=%d)", row.UnitsRunning)
-	}
 }
 
 // TestCoverageKeepsAProviderWithNoMemberFailed is the other half of the same
@@ -273,7 +267,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 // `published` (a member that exists).
 func TestCoverageKeepsAProviderWithNoMemberFailed(t *testing.T) {
 	t.Parallel()
-	const id, capability = "dependence", "calls"
+	const id, capability = "link", "calls"
 	const scope = "pkg:java:qa"
 
 	g := &generation{

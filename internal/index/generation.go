@@ -11,14 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -61,31 +59,15 @@ type generation struct {
 	// with CTX_VERSION_CONFLICT instead of being overwritten unseen.
 	prev model.GenerationID
 	gen  model.GenerationID
-	// builtRef is the ref this generation was opened under; the deferred work
-	// it enqueues publishes under the same one.
-	builtRef string
 
 	started time.Time
 	// ledgerRun is this pass's ledger run. It is opened before the capture, so
 	// a pass that fails before a generation exists is still a recorded run.
 	ledgerRun *ledger.Run
 	caps      *capabilityReport
-	// failedScopes holds, per plan key, the typed reason a DEFERRED unit did
-	// not seal -- every one the background queue this publication drains has
-	// recorded, not only the batch it is publishing. A deferred scope that
-	// failed is neither covered nor still running, and telling the three apart
-	// is what keeps a provider whose other scopes published from being
-	// reported as though none of them had; a failure from an earlier tick that
-	// was not carried here would be re-planned deferred and published as still
-	// running for ever. It is nil on the indexing path.
-	failedScopes map[string]unitFailure
 
-	// failures aggregates the units that failed, per provider. It is the
-	// indexing path's record of what did not seal, and a publication
-	// generation is seeded with the foreground generation's copy of it:
-	// those scopes are re-planned by the publication and still have nothing
-	// behind them, so losing them here would republish them as coverage and
-	// a provider whose every unit failed as `fresh`.
+	// failures aggregates the units that failed, per provider: the run's
+	// record of what did not seal.
 	//
 	// It is an aggregate and not a per-unit map because it outlives the run:
 	// a repository can fail thousands of scopes, and what the report needs is
@@ -109,15 +91,13 @@ type generation struct {
 	runsTotal   int64
 	reused      int64
 	built       int64
-	carried     int64
 	invalidated int64
 	parsed      int64
-	// planned, failed and subdivided are the run row's remaining totals.
-	// Nothing else counted them: the result publishes what this generation
-	// holds, and these are what it attempted and what it lost on the way.
-	planned    int64
-	failed     int64
-	subdivided int64
+	// planned and failed are the run row's remaining totals. Nothing else
+	// counted them: the result publishes what this generation holds, and
+	// these are what it attempted and what it lost on the way.
+	planned int64
+	failed  int64
 
 	// walked is how many of the plan's units the build walk reached, and
 	// walkDone says it reached all of them. Together they are where a run that
@@ -161,8 +141,8 @@ const maxFailedScopesNamed = 8
 //
 // THE COUNTING RULE, stated once for every surface that reports these figures:
 // a capability's planned total is every scope the plan assigned to its
-// provider for this generation -- the units it runs, the stale predecessors it
-// carries and the sealed units it reuses -- and its failed total is those of
+// provider for this generation -- the units it runs and the sealed units it
+// reuses -- and its failed total is those of
 // them that did not seal. How a scope is counted is plan.Plan.CountReused's
 // rule, which the run row's planned total follows too; the per-provider
 // figures are counted in coveredProviders and published in exactly one place,
@@ -255,7 +235,7 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 	if err != nil {
 		return model.IndexResult{}, err
 	}
-	g.gen, g.builtRef = gen, ref
+	g.gen = gen
 	g.ledgerRun.AttachGeneration(int64(gen))
 	res, err = g.publish(ctx)
 	if err != nil {
@@ -381,8 +361,7 @@ func (g *generation) forceSnapshotPaths(ctx context.Context, policy *workspace.P
 }
 
 // planUnits selects the providers and derives the plan. A full or rebuilding
-// run plans against no previous generation, so nothing is carried and no unit
-// imports a delta; a unit whose identity is nevertheless already sealed is
+// run plans against no previous generation, so no unit imports a delta; a unit whose identity is nevertheless already sealed is
 // still attached rather than rebuilt, because an immutable unit with the same
 // key is the same bytes by construction (see build).
 func (g *generation) planUnits(ctx context.Context) (err error) {
@@ -412,41 +391,12 @@ func (g *generation) planUnits(ctx context.Context) (err error) {
 		prev = 0
 	}
 	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev,
-		Config: c.opts.Config, TempDir: c.workDir, Machine: c.opts.Machine}
-	if prev != 0 {
-		in.CarriedPage = c.carriedPage(prev)
-	}
-	if c.opts.RunLedgerReader != nil {
-		// What this workspace has already measured its heavy units to cost.
-		// It is wired whatever the previous generation is -- unlike the carry
-		// pages, which are about one generation's rows -- because the ledger
-		// outlives generations: a rebuild starts from no previous generation
-		// and must still not under-reserve what the last run measured. The
-		// lookup is opened once for the plan and closed when it is built.
-		peaks, err := c.opts.RunLedgerReader.OpenPeaks(ctx)
-		if err != nil {
-			return err
-		}
-		if peaks != nil {
-			defer peaks.Close()
-			in.RecordedPeak = c.recordedPeak(peaks)
-		}
-	}
+		Config: c.opts.Config, TempDir: c.workDir}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return err
 	}
 	g.plan = p
-	if p.HeavyDerived {
-		// The plan named every heavy scope this repository now holds, so a
-		// learned peak for any other key is about a scope that is gone. Like
-		// the other ledger sweeps it never fails the run: the rows stay and
-		// the next plan retires them.
-		if err := c.opts.Ledger.RetirePeaks(ctx, string(c.repo), p.HeavyScopes); err != nil {
-			logTyped(c.log, "the learned peaks of scopes this repository no longer holds were not retired", err,
-				"component", component, "repository_id", string(c.repo))
-		}
-	}
 	// The reused scopes are the planned scopes the build walk never yields;
 	// the walk counts every other one as it reaches it, and the end-of-run
 	// account the ones it never reached.
@@ -463,11 +413,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	if err := g.attachReused(ctx); err != nil {
 		return model.IndexResult{}, err
 	}
-	if err := g.attachCarried(ctx); err != nil {
-		return model.IndexResult{}, err
-	}
-	deferred, err := g.build(ctx)
-	if err != nil {
+	if err := g.build(ctx); err != nil {
 		return model.IndexResult{}, err
 	}
 	if err := g.coverage(ctx); err != nil {
@@ -490,13 +436,9 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	g.report(nil)
 	g.c.retain(ctx)
 	g.c.collect(ctx)
-	// Deferred work is enqueued only after the base generation is published:
-	// Section 11.6 is explicit that nothing dependence-shaped runs before base
-	// readiness, and the background tick runs it even when no query ever asks.
-	g.c.late.enqueue(g, deferred)
 	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
-		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
+		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
 		Runs: runs, RunsOmitted: omitted, ProvidersDisabled: disabledProviders(g.c.opts.Config),
 		Passes: g.passes, PassesOmitted: g.passesTotal - int64(len(g.passes)),
@@ -508,68 +450,20 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 // an interface here and satisfied in the composition, so the one conversion
 // from a recorded span to a stage row stays where every other surface's
 // conversion is and this package never grows a second.
-//
-// OpenPeaks is the second thing this process asks of its own recorded
-// history, and the reason the interface is not named after one run: a lookup
-// of the largest process-tree peak this workspace has measured for a scope,
-// which is what stops the second index of a repository reserving less for a
-// unit than the first one watched it use. It is advisory and never a refusal:
-// an implementation with no ledger, or one that cannot open it, reports that
-// itself and answers a nil lookup, which the plan reads as no observation for
-// every scope. An error that does arrive is a broken supplier and fails the
-// plan.
-//
-// MarkedUnits is the third: the unit spans of the deferred runs that marked a
-// generation with a stage (ledger.Reader.MarkedUnits), which is how status in
-// any process reads the units a failed publication abandoned. A workspace with
-// no ledger answers none.
 type RunLedgerReader interface {
 	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
-	OpenPeaks(ctx context.Context) (PeakLookup, error)
-	MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
-		named int) ([]ledger.MarkedUnits, error)
-}
-
-// PeakLookup is one open reading of the learned peaks, held for the length of
-// one plan. *ledger.Reader is one.
-type PeakLookup interface {
-	RecordedPeak(ctx context.Context, repositoryID, scopeKey, familyPrefix string) (int64, bool, error)
-	Close() error
-}
-
-// recordedPeak binds a lookup to this coordinator's repository as the plan's
-// Inputs.RecordedPeak. A lookup that fails answers no observation and is not
-// asked again for the rest of the plan: the history is advisory, and the first
-// failure is logged once rather than once per heavy unit.
-func (c *Coordinator) recordedPeak(peaks PeakLookup) func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
-	failed := false
-	return func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
-		if failed {
-			return 0, false
-		}
-		peak, observed, err := peaks.RecordedPeak(ctx, string(c.repo), scopeKey, familyPrefix)
-		if err != nil {
-			failed = true
-			logTyped(c.log, "the learned peaks could not be read; heavy units are sized from the family estimates alone", err,
-				"component", component, "repository_id", string(c.repo))
-			return 0, false
-		}
-		return peak, observed
-	}
 }
 
 // attachRunLedger states on a result what the run that produced it just did:
 // the run row and its stages, read back from the ledger by that run's own id.
-// Both a pass and a deferred publication report through it, each with its own
-// run, which is the whole point of reading by id.
+// A pass reports through it with its own run.
 //
 // It reads after the finish, and behind a flush, because finishing a run only
 // moves in-memory state: the row turns terminal at the collector's next write,
 // so a read without the barrier would render a finished run as still running
 // and leave out the stages that ended last. And it reads BY ID, because the
-// latest run of this repository may be another run of this same process -- a
-// deferred publication is live while an index runs -- which would answer for
-// the run that asked.
+// latest run of this repository may be another run, which would answer for the
+// run that asked.
 //
 // A failed pass attaches nothing: its result is discarded by the caller, and
 // the run it recorded is read through the status surfaces like any other. A
@@ -608,36 +502,19 @@ func (g *generation) report(peak *uint64) {
 		FileCount:           int64(g.snap.FileCount),
 		SourceBytes:         int64(g.snap.SourceBytes),
 		UnitsPlanned:        g.planned,
-		UnitsSucceeded:      g.reused + g.carried + g.built,
+		UnitsSucceeded:      g.reused + g.built,
 		UnitsFailed:         g.failed,
-		UnitsSubdivided:     g.subdivided,
 		ProcessPeakRSSBytes: peak,
 	})
 }
 
-// endOutcome is how a run or a stage ended. A unit has a third ending and
-// spells it in unitOutcome.
+// endOutcome is how a run or a stage ended. A unit that never reached its
+// provider spells its ending in unitEnding.
 func endOutcome(err error) ledger.Outcome {
 	if err != nil {
 		return ledger.OutcomeFailed
 	}
 	return ledger.OutcomeOK
-}
-
-// unitOutcome tells a unit's three endings apart. A subdivided unit succeeded
-// in parts and is neither a plain success nor a failure, and reporting it as
-// either would hide the one full-build reason an operator acts on.
-func unitOutcome(res outcome, err error) ledger.Outcome {
-	switch {
-	case err != nil && absent(provider.CodeOf(err)):
-		return ledger.OutcomeUnavailable
-	case err != nil:
-		return ledger.OutcomeFailed
-	case res.subdivided:
-		return ledger.OutcomeSubdivided
-	default:
-		return ledger.OutcomeOK
-	}
 }
 
 // unitEnding is how a unit ended on a path that never reached its provider: a
@@ -685,10 +562,6 @@ func absent(code string) bool {
 	return false
 }
 
-// reasonDeferred is what a unit's row says when this run handed it to the
-// background sealer instead of running it.
-const reasonDeferred = "the unit is deferred to background work after activation"
-
 // notAdmitted is how a unit that never reached its work ends: the diagnostic
 // code that kept it out and the ledger's own reason. It waited in-process
 // beside other goroutines, so its CPU is the overlapped kind the process-wide
@@ -732,58 +605,23 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 	return nil
 }
 
-// attachCarried carries the stale predecessor of every refreshing deferred
-// scope into this generation (Section 13.3): the capability keeps
-// answering as `stale` with its provenance distance while the fresh unit is
-// built in the background, and is replaced at the next activation.
-func (g *generation) attachCarried(ctx context.Context) (err error) {
-	ctx, span := ledger.Start(ctx, stageAttachCarried, "")
-	defer func() {
-		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
-			ItemsIn: int64Ptr(int64(len(g.plan.Carry))), ItemsOut: &g.carried}, err)
-	}()
-	for _, carried := range g.plan.Carry {
-		err := g.c.opts.Store.AttachCarried(ctx, g.gen, carried.Unit,
-			sqlite.Carry{DistanceGenerations: carried.DistanceGenerations, DistanceFiles: carried.DistanceFiles})
-		if err != nil {
-			var typed *model.Error
-			if errors.As(err, &typed) && typed.Code == model.CodeSnapshotChanged {
-				// A predecessor whose inputs no longer exist is not carried.
-				// The planner refuses that case from the manifest; storage
-				// refuses it from the snapshot rows, which is the authority.
-				// The scope then simply has no member here.
-				continue
-			}
-			return err
-		}
-		g.carried++
-		for _, capability := range g.capabilitiesOf(carried.ProviderID) {
-			g.caps.addCarried(carried.ProviderID, capability, carried.ScopeKey,
-				carried.DistanceGenerations, carried.DistanceFiles)
-		}
-	}
-	return nil
-}
-
 // build runs every unit the plan did not reuse, provider by provider in
-// dependency order, and returns the deferred ones for the background tick. A
-// provider's units run concurrently; the next provider starts only when the
+// dependency order. A provider's units run concurrently; the next provider starts only when the
 // previous one's units are sealed and committed, because a unit resolves
 // against its declared dependencies as of the last commit and storage refuses
 // one whose dependency is not sealed there.
-func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
+func (g *generation) build(ctx context.Context) (err error) {
 	ctx, span := ledger.Start(ctx, stageBuild, "")
 	defer func() {
 		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &g.built}, err)
 	}()
-	// The units attached and carried before the build are committed first:
-	// a unit of the first provider that runs resolves its dependencies against
-	// the last commit, and a carried dependency sealed only in the open group
-	// would be refused there.
+	// The units attached before the build are committed first: a unit of the
+	// first provider that runs resolves its dependencies against the last
+	// commit, and a dependency sealed only in the open group would be refused
+	// there.
 	if err := g.c.opts.Store.Flush(ctx); err != nil {
-		return nil, err
+		return err
 	}
-	var deferred []plan.Unit
 	var group *unitGroup
 	current := ""
 	// The plan streams its units, so no provider's whole unit list is ever in
@@ -821,15 +659,6 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 		// runs is then a row that says so with its reason, instead of a
 		// capability reported unavailable that nothing can substantiate.
 		unitSpan := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
-		if u.Deferred {
-			// Not this run's work: it is queued for the background sealer,
-			// which records it under its own run. Leaving the row planned
-			// would have this run report it as never admitted.
-			unitSpan.End(ledger.OutcomeSkipped,
-				ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, Failure: reasonDeferred}, nil)
-			deferred = append(deferred, u)
-			return nil
-		}
 		if group == nil {
 			group = g.newUnitGroup(ctx, u.ProviderID)
 		}
@@ -848,19 +677,17 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 		if group != nil {
 			_ = group.wait()
 		}
-		return nil, walkErr
+		return walkErr
 	}
 	if group != nil {
-		if err = group.wait(); err != nil {
-			return nil, err
-		}
+		return group.wait()
 	}
-	return deferred, nil
+	return nil
 }
 
 // eachUnit walks the plan's units. A plan assembled by hand rather than by
 // plan.Build may carry no unit sequence at all, which is a plan that runs
-// nothing -- the late-seal work generation is exactly that.
+// nothing.
 func (g *generation) eachUnit(yield func(plan.Unit) error) error {
 	if g.plan.Units == nil {
 		return nil
@@ -1067,17 +894,16 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	if err != nil {
 		return err
 	}
-	var grant *unitGrant
 	if u.Heavy {
-		var admitErr error
-		if grant, admitErr = admitUnit(ctx, g.c.sched, u.Admission); admitErr != nil {
+		release, admitErr := g.c.sched.Admit(ctx, u.Admission)
+		if admitErr != nil {
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
 			// a provider that was never asked.
 			span.End(ledger.OutcomeUnavailable, notAdmitted(provider.CodeOf(admitErr)), nil)
 			return admitErr
 		}
-		defer grant.release()
+		defer release()
 	}
 	// A unit whose key is already sealed is the same bytes under the same
 	// configuration by construction, so it is attached rather than rebuilt.
@@ -1098,7 +924,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 		g.mu.Unlock()
 		return nil
 	}
-	out, runErr := g.run(ctx, u, spec, span, grant)
+	out, runErr := g.run(ctx, u, spec, span)
 	if runErr == nil {
 		g.record(u, out)
 		return nil
@@ -1113,9 +939,6 @@ type outcome struct {
 	result      model.ProviderResult
 	parsed      int64
 	invalidated bool
-	// subdivided reports the one full-build reason that is not an
-	// invalidation, which the run row counts separately from a failure.
-	subdivided bool
 	// span is the unit's own span. It is still open when the unit failed:
 	// the failure path ends it with the one typed reason it also writes to
 	// the provider-run row, so the two records of one failure cannot
@@ -1123,57 +946,9 @@ type outcome struct {
 	span *ledger.Span
 }
 
-// unitGrant is one heavy unit's admission while the unit runs: the grant it
-// holds now, and the scheduler it was taken from. It is owned by the one
-// goroutine that runs the unit and is not safe for concurrent use.
-type unitGrant struct {
-	sched *plan.Scheduler
-	// held returns the grant the unit holds now; it is a no-op once that
-	// grant has been returned and no other taken.
-	held func()
-}
-
-// admitUnit admits a heavy unit at its planned admission.
-func admitUnit(ctx context.Context, s *plan.Scheduler, r admission.Reservation) (*unitGrant, error) {
-	release, err := s.Admit(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return &unitGrant{sched: s, held: release}, nil
-}
-
-// readmit exchanges the unit's grant for one at r: the current grant is
-// returned first and then the whole of r is admitted through the same
-// scheduler. Holding the first grant while asking for the difference would
-// deadlock: the ledger admits a reservation larger than the allocation only
-// when it holds nothing, and an out-of-memory retry's reservation -- its cap
-// is the allocation, plus the family's resident memory -- is always larger.
-// The price is the unit's place: it re-enters the queue behind every waiter
-// that arrived while it ran, which strict first-in-first-out admission
-// requires of any reservation it has not yet granted. A cancelled or refused
-// re-admission leaves the unit holding nothing and returns the ledger's error.
-// Only a dependence unit is re-admitted, and it reserves memory alone, so the
-// retried reservation is admitted at the memory it weighs.
-func (g *unitGrant) readmit(ctx context.Context, r dependence.Reservation) error {
-	g.held()
-	g.held = func() {}
-	release, err := g.sched.Admit(ctx, admission.Reservation{MemoryBytes: r.Bytes()})
-	if err != nil {
-		return err
-	}
-	g.held = release
-	return nil
-}
-
-// release returns whichever grant the unit holds now.
-func (g *unitGrant) release() { g.held() }
-
 // run executes one unit through its delta applier when the provider has one,
-// and through the provider runtime otherwise. grant is the heavy unit's
-// admission, nil for a unit that is not heavy; its reservation and its
-// re-admission travel to the applier with the request.
-func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span,
-	grant *unitGrant) (res outcome, err error) {
+// and through the provider runtime otherwise.
+func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span) (res outcome, err error) {
 	c := g.c
 	// The unit's span was opened when the plan named it and begins here: the
 	// providers' own inner spans find it in the context they are handed and
@@ -1189,7 +964,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		if err != nil {
 			return
 		}
-		span.End(unitOutcome(res, nil),
+		span.End(ledger.OutcomeOK,
 			ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
 				ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
 	}()
@@ -1228,9 +1003,6 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		previous := g.plan.Previous[plan.Key(u.ProviderID, u.ScopeKey)]
 		req := delta.Request{Generation: g.gen, Previous: previous,
 			Build: build, Inputs: u.Inputs, Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
-		if grant != nil {
-			req.Reservation, req.Readmit = u.Reservation, grant.readmit
-		}
 		// The applier calls CompleteProviderRun itself, on both paths and
 		// under a context that survives cancellation; calling it again here
 		// would fail as "run is not running".
@@ -1243,7 +1015,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 			return outcome{result: out.Result}, err
 		}
 		return outcome{result: annotate(out), parsed: parsedBy(applier, u, out),
-			invalidated: previous != "" && !subdivided(out), subdivided: subdivided(out)}, nil
+			invalidated: previous != ""}, nil
 	}
 	// A file-invalidated unit has no delta applier and no recorded
 	// predecessor, so whether it replaced one is asked of the previous
@@ -1318,15 +1090,6 @@ func annotate(out delta.Result) model.ProviderResult {
 	return res
 }
 
-// subdivided reports the one full-build reason that is not an invalidation:
-// the provider subdivided the unit for a reproducible engine crash, so this
-// run publishes no whole-unit state to diff against although the predecessor
-// itself is healthy. The delta package states that a coordinator projecting
-// invalidation counts must read the reason rather than the Full flag.
-func subdivided(out delta.Result) bool {
-	return out.Full && out.FullReason == delta.FullSubdivided
-}
-
 // sourceBinding is how the unit is opened: a provider that can
 // prove its output is about the captured bytes answers for itself, and every
 // other provider reads only through the pinned view, which is verified by
@@ -1356,9 +1119,6 @@ func (g *generation) record(u plan.Unit, out outcome) {
 	defer g.mu.Unlock()
 	g.markPublished(u.ProviderID)
 	g.built++
-	if out.subdivided {
-		g.subdivided++
-	}
 	g.parsed += out.parsed
 	if out.invalidated {
 		g.invalidated++
@@ -1483,7 +1243,7 @@ func typedFailure(cause error) unitFailure {
 func (g *generation) coverage(ctx context.Context) (err error) {
 	_, span := ledger.Start(ctx, stageCoverage, "")
 	defer func() { span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err) }()
-	covered, deferred, failed, published, err := g.coveredProviders(ctx)
+	covered, failed, published, err := g.coveredProviders()
 	if err != nil {
 		return err
 	}
@@ -1496,7 +1256,7 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			// scopes is a known failure. It is recorded first so `reported`
 			// sees it.
 			if f, ok := failed[d.ID]; ok {
-				g.caps.addFailures(d.ID, capability, f, deferred[d.ID])
+				g.caps.addFailures(d.ID, capability, f)
 			}
 			// And a capability that did publish a scope is partial, not
 			// failed: the facts of that scope are in this generation and
@@ -1506,15 +1266,9 @@ func (g *generation) coverage(ctx context.Context) (err error) {
 			if published[d.ID] {
 				g.caps.coveredElsewhere(d.ID, capability)
 			}
-			switch {
-			// Deferred is a scope still running and nothing else: a provider
-			// with work in flight is not fresh coverage, whatever its other
-			// scopes did.
-			case deferred[d.ID] > 0:
-				g.caps.addDeferred(d.ID, capability, deferred[d.ID])
-			case covered[d.ID]:
+			if covered[d.ID] {
 				g.caps.addFresh(d.ID, capability)
-			default:
+			} else {
 				g.caps.addUnavailable(d.ID, capability)
 			}
 		}
@@ -1528,29 +1282,15 @@ type failedScope struct {
 	failure  unitFailure
 }
 
-// coveredProviders is the set of providers this generation actually holds a
-// member for -- a unit it ran, a unit it reused, or a stale unit it carried --
-// and, separately, the providers whose only work was deferred. A deferred unit
-// is not a member of this generation: it seals into a later publication, so
-// counting it as coverage would report a capability fresh while nothing had
-// been written for it, which is the false readiness Section 11.6 forbids.
-//
-// deferred is a COUNT per provider and not a flag: it is published on the
-// capability row, where it is the only way a process other than the one doing
-// the work learns that a scope of this capability is still being built. "One
-// scope outstanding" and "forty" are different reports of the same generation.
-// Which deferred scopes it excludes is decided by holdsFreshUnit, against the
-// generation's own unit rows: the count is an assertion about the whole
-// generation for every provider, so no in-process record of what one batch
-// sealed may be its authority.
+// coveredProviders is the set of providers this generation was planned a
+// member for -- a unit it ran or a unit it reused.
 //
 // published is the narrower question the partial state needs: the providers a
 // member was actually written or attached for. Coverage counts a planned unit,
 // because "available and produced no unit at all" is the degradation it exists
 // to catch; a failure row may only be softened by facts that exist.
-func (g *generation) coveredProviders(ctx context.Context) (covered map[string]bool, deferred map[string]int, failed map[string]*providerFailures, published map[string]bool, err error) {
+func (g *generation) coveredProviders() (covered map[string]bool, failed map[string]*providerFailures, published map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
-	deferred = make(map[string]int, len(g.sel.Active))
 	failed = make(map[string]*providerFailures, len(g.sel.Active))
 	published = make(map[string]bool, len(g.sel.Active))
 	g.mu.Lock()
@@ -1567,50 +1307,16 @@ func (g *generation) coveredProviders(ctx context.Context) (covered map[string]b
 		failed[id] = &clone
 	}
 	g.mu.Unlock()
-	record := func(u plan.Unit, f unitFailure) {
-		agg, ok := failed[u.ProviderID]
-		if !ok {
-			agg = &providerFailures{}
-			failed[u.ProviderID] = agg
-		}
-		agg.add(u.ScopeKey, f)
-	}
 	planned := make(map[string]int, len(g.sel.Active))
 	if err := g.eachUnit(func(u plan.Unit) error {
 		planned[u.ProviderID]++
-		if u.Deferred {
-			key := plan.Key(u.ProviderID, u.ScopeKey)
-			// The generation's own unit rows say which deferred scopes it
-			// already holds; of the rest, the ones this batch tried and
-			// could not seal are failures, and only what is left is still
-			// background work.
-			held, heldErr := g.holdsFreshUnit(ctx, u)
-			if heldErr != nil {
-				return heldErr
-			}
-			switch {
-			case held:
-				out[u.ProviderID] = true
-				published[u.ProviderID] = true
-			case g.failedScopes[key].code != "":
-				record(u, g.failedScopes[key])
-			default:
-				deferred[u.ProviderID]++
-			}
-			return nil
-		}
 		out[u.ProviderID] = true
 		return nil
 	}); err != nil {
-		return nil, nil, nil, nil, err
-	}
-	for _, c := range g.plan.Carry {
-		out[c.ProviderID] = true
-		published[c.ProviderID] = true
+		return nil, nil, nil, err
 	}
 	// A reused scope is a scope the plan assigned this provider that the walk
-	// above never yields, because it is sealed already. A carried scope needs
-	// no such addition: its deferred unit is in the walk.
+	// above never yields, because it is sealed already.
 	g.plan.CountReused(func(id string) {
 		out[id] = true
 		published[id] = true
@@ -1621,58 +1327,7 @@ func (g *generation) coveredProviders(ctx context.Context) (covered map[string]b
 	for id, agg := range failed {
 		agg.planned = planned[id]
 	}
-	return out, deferred, failed, published, nil
-}
-
-// holdsFreshUnit answers whether this generation already selects the unit the
-// plan derives for a deferred scope. It reads the generation's own
-// generation_units rows, so "this scope is no longer running" is settled by
-// the durable membership every process can see rather than by a record of
-// what one background batch happened to seal -- which is what makes
-// units_running an assertion about the whole generation, for every provider,
-// wherever it is published from.
-//
-// The test is against the scope's freshly planned unit and not against
-// membership alone: a scope whose rebuild is still running is a member too,
-// through the stale predecessor AttachCarried keeps for it, and reading that
-// row as coverage would publish a stale answer as a fresh one. Only deferred
-// scopes reach here, and they are the heavy units the planner gates, so the
-// lookups are bounded by that set and not by the repository.
-func (g *generation) holdsFreshUnit(ctx context.Context, u plan.Unit) (bool, error) {
-	if g.gen == 0 {
-		// A generation that has no row of its own selects no unit: the
-		// coverage projection is run over a plan before the generation is
-		// begun on no path, and asking storage about generation zero would
-		// be a malformed lookup rather than the empty answer it means.
-		return false, nil
-	}
-	spec, err := u.Spec(g.c.cfgHash)
-	if err != nil {
-		return false, err
-	}
-	selected, err := g.c.opts.Store.SelectedUnit(ctx, g.gen, u.ProviderID, u.ScopeKey)
-	if err != nil {
-		// "This generation selects no unit for the scope" is the ordinary
-		// answer for work still queued, not a fault; storage marks it with
-		// this detail, which is what tells it from a malformed argument under
-		// the same code.
-		var typed *model.Error
-		if errors.As(err, &typed) && typed.Details["reason"] == sqlite.ReasonNotFound {
-			return false, nil
-		}
-		return false, err
-	}
-	return selected == spec.ID, nil
-}
-
-// capabilitiesOf is one provider's declared capability list, empty when the
-// registry does not hold it.
-func (g *generation) capabilitiesOf(providerID string) []string {
-	p, ok := g.c.opts.Registry.Lookup(providerID)
-	if !ok {
-		return nil
-	}
-	return p.Descriptor().Capabilities
+	return out, failed, published, nil
 }
 
 // healthOf is Section 13.3's whole-generation health. An unavailable optional

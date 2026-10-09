@@ -13,7 +13,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
@@ -102,32 +101,28 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 				contains: func(model.FileVersion) bool { return true }})
 		}
 		return out, nil, nil
-	case dependence.ProviderID:
+	case link.ProviderID:
+		// The linking provider's units are its own planner's projects
+		// (link.PlanUnits), with their membership: a project's member files
+		// are what its calls resolve across. A unit declares its project's
+		// closure and nothing else -- the files of its own family it owns,
+		// plus the manifest and lock files it owns -- so a documentation edit
+		// or another language's source never rebuilds it (Section 13.1).
+		// link.Unit.OwnsInput is that closure; FamilyOf maps both "c" and
+		// "cpp" to one family inside it, so the C/C++ unit keeps both
+		// languages' sources. It runs no heavy child.
+		//
+		// A project the planner refused as a unit of its own is linked with
+		// the unit that encloses it, which loses no call, but it is still a
+		// boundary the plan drew coarser than the repository's own; it is
+		// counted per family so the degradation is never silent.
 		dp, err := link.PlanUnits(ctx, view)
 		if err != nil {
 			return nil, nil, err
 		}
 		out := make([]semantic, 0, len(dp.Units))
 		for _, u := range dp.Units {
-			// A dependence unit declares its semantic closure and nothing
-			// else -- the files of its own family that it owns, plus the
-			// manifest and lock files it owns (Section 11.6: "the unit's
-			// source file hashes, its manifest and lock files"). Every file
-			// under the root would fold a README, an image and another
-			// language's sources into the key of the heaviest unit in the
-			// product, so a documentation edit would reparse it; Section 13.1
-			// forbids exactly that.
-			//
-			// link.Unit.OwnsInput is that closure, and it is the same
-			// predicate the provider's own cache key folds, so a unit's
-			// planned identity and its graph cache key cannot drift apart. It
-			// answers for a tombstone as well as a live row, which is what
-			// lets a deleted member set semantic.removed and keep the scope
-			// out of Plan.Carry (Section 13.3). FamilyOf maps both "c" and
-			// "cpp" to one family inside it, so the whole-repository C/C++
-			// unit keeps both languages' sources.
-			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, heavy: true,
-				family: u.Family, bytes: u.Bytes,
+			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, family: u.Family,
 				contains: func(fv model.FileVersion) bool { return u.OwnsInput(fv.Path) }})
 		}
 		var unplanned map[string]int
@@ -138,24 +133,6 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			unplanned[unplannedProjects+string(f)] = n
 		}
 		return out, unplanned, nil
-	case link.ProviderID:
-		// The linking provider's units are its own planner's projects
-		// (link.PlanUnits), with their membership: a project's member files
-		// are what its calls resolve across. A project that
-		// planner refused as a unit of its own is linked with the unit that
-		// encloses it, which loses no call, so nothing is unplanned here; the
-		// refusal is the dependence provider's to count, and counting it again
-		// under the same key would double it. It runs no heavy child.
-		dp, err := link.PlanUnits(ctx, view)
-		if err != nil {
-			return nil, nil, err
-		}
-		out := make([]semantic, 0, len(dp.Units))
-		for _, u := range dp.Units {
-			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, family: u.Family,
-				contains: func(fv model.FileVersion) bool { return u.OwnsInput(fv.Path) }})
-		}
-		return out, nil, nil
 	}
 	return nil, nil, internalErr("the planner does not know which unit scopes provider " + d.ID + " builds")
 }
@@ -168,16 +145,13 @@ type semantic struct {
 	// allFiles marks a unit whose membership is the whole snapshot, so the
 	// planner can share one sorted input slice rather than copying it per unit.
 	allFiles bool
-	heavy    bool
-	family   link.Family
+	// family is the linking unit's language family, which decides its
+	// synthetic dependency keys (builder.linkKeys); empty for every other unit.
+	family link.Family
 	// admit is what an external-indexer profile unit reserves in both
 	// dimensions while it runs; it is set only for a profile scope, and zero
 	// for every other unit.
-	admit admission.Reservation
-	// bytes is the source byte count the provider's own planner folded for
-	// this unit, which is the figure the family heap estimate was measured
-	// against; the unit's declared inputs are a larger set.
-	bytes    int64
+	admit    admission.Reservation
 	version  string
 	contains func(model.FileVersion) bool
 	// dependencyKeys are the unit's synthetic dependency keys
@@ -185,12 +159,6 @@ type semantic struct {
 	dependencyKeys []string
 
 	inputs []model.UnitInput
-	// changed counts the member files whose content differs from the previous
-	// generation, and removed records that a member the previous generation
-	// indexed is now a tombstone -- which Section 13.3 makes ineligible for
-	// carry, because a carried unit must not answer about source that is gone.
-	changed int
-	removed bool
 }
 
 func internalErr(msg string) error {

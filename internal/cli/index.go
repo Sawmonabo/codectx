@@ -69,12 +69,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 		Long: "Captures an exact snapshot of the workspace, runs the providers whose " +
 			"units are not reusable, and publishes the result as one new generation " +
 			"after it validates. Unchanged units are reused rather than rebuilt, so a " +
-			"second run over an unchanged tree parses nothing.\n\n" +
-			"Work an optional provider defers past the base generation keeps running " +
-			"after that generation is active, and each batch that seals is published " +
-			"as a further generation before the command exits. Interrupting it keeps " +
-			"everything already published and reports how much is still queued; set " +
-			"providers.dependence.enabled = false to plan none of it.",
+			"second run over an unchanged tree parses nothing.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -159,7 +154,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 						}
 						return runWatch(ctx, cmd, build, args, ws)
 					}
-					return drainIndex(cmd, build, args, ws, result)
+					return finishIndex(cmd, build, args, result)
 				})
 		},
 	}
@@ -181,12 +176,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			"only: the refresh always re-reads the workspace and compares content " +
 			"hashes, so the answer comes from the captured bytes, never from a hint, " +
 			"a modification time or a Git status alone. Use --repo to point the " +
-			"command at a repository other than the current directory.\n\n" +
-			"Work an optional provider defers past this refresh's generation keeps " +
-			"running after that generation is active, and each batch that seals is " +
-			"published as a further generation before the command exits. Interrupting " +
-			"it keeps everything already published and reports how much is still " +
-			"queued; set providers.dependence.enabled = false to plan none of it.",
+			"command at a repository other than the current directory.",
 		Args:          cobra.ArbitraryArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -202,7 +192,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return drainIndex(cmd, build, args, ws, result)
+					return finishIndex(cmd, build, args, result)
 				})
 		},
 	}
@@ -357,9 +347,7 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			"reports its own watch as off, but it does list this watch among the " +
 			"watching processes, from the heartbeat this one publishes and " +
 			"refreshes, as `status --resources` and `doctor` also report it. " +
-			"Work an optional " +
-			"provider deferred keeps " +
-			"publishing for the whole session. The workspace is held for the " +
+			"The workspace is held for the " +
 			"beat that builds and given back when that beat ends, so a `codectx " +
 			"index` or `refresh` beside an idle watch runs; a beat that finds " +
 			"another process building is skipped and the next one starts from " +
@@ -440,74 +428,14 @@ func runWatch(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, ar
 	return writeText(out, "watch stopped after %d %s\n", refreshes, plural(int(refreshes), "refresh", "refreshes"))
 }
 
-// drainIndex publishes the generation a one-shot command has just produced and
-// then runs the deferred queue to empty, which is what makes
-// providers.dependence.enabled = "auto" its documented self in a one-shot run
-// (Section 11.6). Both one-shot building commands end here --
-// `codectx index` with the generation its Index call activated and `codectx
-// refresh` with the one its Refresh call activated -- because the lifetime that
-// makes the abandonment possible is the same in both: the process exits as soon
-// as that generation is active.
-//
-// Without this the coordinator is closed the moment that generation activates,
-// and every unit it deferred is abandoned unbuilt and unreported: the shipped
-// default silently produced no dependence fact at all. There is no new flag,
-// because "do not plan that work" already has a spelling:
-// providers.dependence.enabled = false.
-//
-// Section 18.2's one envelope still holds across the whole run: a --json
-// invocation reports that first generation and each publication on stderr and
-// emits its single envelope, carrying the last generation published, at the
-// end. An interruption is not a failure here -- the first generation is active
-// and every published generation stands -- so the command succeeds and says in
-// a warning how much work is still queued.
-func drainIndex(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace, base model.IndexResult) error {
-	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
-	machine := jsonRequested(cmd, args)
-	if err := emitIndexProgress(cmd, args, base); err != nil {
-		return err
+// finishIndex reports the generation a one-shot command has just published:
+// the one envelope for a --json invocation (Section 18.2), the human report
+// otherwise.
+func finishIndex(cmd *cobra.Command, build model.BuildInfo, args []string, result model.IndexResult) error {
+	if jsonRequested(cmd, args) {
+		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, commandName(cmd), result))
 	}
-	ctx, stop := context.WithCancel(cmd.Context())
-	defer stop()
-	latest := base
-	var writeErr error
-	drainErr := ws.Coordinator().Drain(ctx, func(result model.IndexResult) {
-		latest = result
-		if writeErr != nil {
-			return
-		}
-		w, line := out, humanRefreshLine(result)
-		if machine {
-			w, line = errOut, machineRefreshLine("published", result)
-		}
-		if err := writeText(w, "%s", line); err != nil {
-			writeErr = err
-			stop()
-		}
-	})
-	if writeErr != nil {
-		return writeErr
-	}
-	// A publication that failed abandoned its units, and the last result
-	// delivered still reports them running; the envelope states them failed
-	// with that publication's reason instead.
-	latest = ws.Coordinator().SettleAbandoned(latest)
-	var warnings []string
-	if pending := ws.Coordinator().Pending(); pending.Units > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d deferred %s not built; run `codectx watch` to finish them",
-			pending.Units, plural(pending.Units, "unit is", "units are")))
-	} else if drainErr != nil && !isCanceled(drainErr) {
-		warnings = append(warnings, "the deferred queue stopped early: "+diagnostic(drainErr))
-	}
-	if machine {
-		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), latest, warnings...))
-	}
-	for _, warning := range warnings {
-		if err := writeText(out, "warning     %s\n", warning); err != nil {
-			return err
-		}
-	}
-	return nil
+	return emitIndexProgress(cmd, args, result)
 }
 
 // isCanceled reports whether an error is the operator stopping the work, which
@@ -517,28 +445,16 @@ func isCanceled(err error) bool {
 	return errors.Is(err, context.Canceled) || (errors.As(err, &typed) && typed.Code == model.CodeCanceled)
 }
 
-// diagnostic is the product-authored text of a typed failure. Section 20.1
-// keeps source bodies, secrets, environment and raw analyzer output out of
-// ordinary output; a model.Error message is none of those, and a bare code
-// cannot tell an operator what happened.
-func diagnostic(err error) string {
-	var typed *model.Error
-	if errors.As(err, &typed) {
-		return typed.Code + ": " + typed.Message
-	}
-	return err.Error()
-}
-
 func humanRefreshLine(result model.IndexResult) string {
-	return fmt.Sprintf("%s  generation %d  %s  reused %d  built %d  carried %d  invalidated %d\n",
+	return fmt.Sprintf("%s  generation %d  %s  reused %d  built %d  invalidated %d\n",
 		result.CompletedAt.Format(time.RFC3339), result.Binding.GenerationID, result.Health,
-		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+		result.UnitsReused, result.UnitsBuilt, result.UnitsInvalidated)
 }
 
 func machineRefreshLine(event string, result model.IndexResult) string {
-	return fmt.Sprintf("%s generation=%d health=%s reused=%d built=%d carried=%d invalidated=%d\n",
+	return fmt.Sprintf("%s generation=%d health=%s reused=%d built=%d invalidated=%d\n",
 		event, result.Binding.GenerationID, result.Health,
-		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+		result.UnitsReused, result.UnitsBuilt, result.UnitsInvalidated)
 }
 
 // addRepoFlag declares `--repo` on one command. The flag name is the one
@@ -586,9 +502,8 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 // finishes late out of the single --json envelope.
 //
 // Only the stages of the run THIS command opened are printed. The rows arrive
-// from every run this process records -- a late seal tick's deferred run is
-// recorded while an index runs -- and its stages printed into this command's
-// output would be read as this command's work.
+// from every run this process records, and another run's stages printed into
+// this command's output would be read as this command's work.
 //
 // The run's id is looked up per row and never captured once. A subscription is
 // made before the run exists, so an id read at subscribe time is not there yet;
@@ -742,8 +657,8 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	var b strings.Builder
 	fmt.Fprintf(&b, "generation  %d\nsnapshot    %s\nhealth      %s (%s)\n",
 		result.Binding.GenerationID, result.Binding.SnapshotID, result.Health, result.Status)
-	fmt.Fprintf(&b, "units       %d reused, %d built, %d carried stale, %d invalidated\n",
-		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+	fmt.Fprintf(&b, "units       %d reused, %d built, %d invalidated\n",
+		result.UnitsReused, result.UnitsBuilt, result.UnitsInvalidated)
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeProvidersDisabled(&b, result.ProvidersDisabled)
@@ -797,9 +712,9 @@ func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []mode
 	if run == nil {
 		return
 	}
-	fmt.Fprintf(b, "run         %s in %s, %d planned, %d succeeded, %d failed, %d subdivided\n",
+	fmt.Fprintf(b, "run         %s in %s, %d planned, %d succeeded, %d failed\n",
 		run.Outcome, wallMetric(run.WallMS, run.Outcome == runOutcomeRunning, run.FinishedAt),
-		run.UnitsPlanned, run.UnitsSucceeded, run.UnitsFailed, run.UnitsSubdivided)
+		run.UnitsPlanned, run.UnitsSucceeded, run.UnitsFailed)
 	if run.EventsDropped > 0 {
 		fmt.Fprintf(b, "incomplete  %d accounting %s dropped; the stages below are not the whole run\n",
 			run.EventsDropped, plural(int(run.EventsDropped), "event was", "events were"))
@@ -1295,10 +1210,6 @@ func capabilityFigures(st model.CapabilityState) string {
 	}
 	if scope := st.Details[model.DetailScopeKey]; scope != "" {
 		parts = append(parts, "at "+scope)
-	}
-	if st.UnitsRunning > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s still building", st.UnitsRunning,
-			plural(st.UnitsRunning, "unit is", "units are")))
 	}
 	if st.DiagnosticCode != "" {
 		parts = append(parts, st.DiagnosticCode)

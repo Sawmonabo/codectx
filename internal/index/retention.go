@@ -29,8 +29,7 @@ import (
 // no snapshot filter, which deletes every snapshot no generation, lease or
 // session references -- and a foreground indexing run has exactly such a
 // window, between writing its capture and opening the generation that first
-// references it. The indexing path is already inside that lock; the background
-// publication takes it explicitly.
+// references it. The indexing path is already inside that lock.
 
 // retain sweeps the store to the configured policy. A retention failure never
 // fails the indexing run that just published: the generation is active, its
@@ -199,8 +198,8 @@ func (c *Coordinator) generationRetained(ctx context.Context, gen int64) (bool, 
 // the case that matters: it fails every pass identically, so the store grows
 // without bound while every generation publishes successfully.
 //
-// It is mutex-guarded because retain runs from two places (the publish path
-// and the late-seal tick) while Status reads from a caller's goroutine.
+// It is mutex-guarded because retain runs on the publish path while Status
+// reads from a caller's goroutine.
 type retentionState struct {
 	mu sync.Mutex
 	// failure is the rendered warning of the last sweep that did not finish,

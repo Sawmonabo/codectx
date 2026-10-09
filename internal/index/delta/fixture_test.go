@@ -9,13 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -32,6 +29,9 @@ import (
 // refresh cannot use — it needs a predecessor tree, an edited tree, a
 // generation per build and the database path to read back. This fixture is
 // that, over the same real store, CAS and snapshot view.
+
+// goScope is the scope key of the root Go module of the trees the tests build.
+const goScope = "pkg:go:"
 
 // fixture is one repository over one store.
 type fixture struct {
@@ -179,9 +179,7 @@ type build struct {
 
 // request derives the unit identity exactly as the coordinator does — inputs
 // folded in ascending FileID order, the unit key over the spec plus the
-// analysis configuration — and returns the delta request over it. A dependence
-// unit is heavy, so it also carries the reservation the coordinator hands it
-// (see reservation).
+// analysis configuration — and returns the delta request over it.
 func (f *fixture) request(p provider.Provider, b build) delta.Request {
 	f.t.Helper()
 	d := p.Descriptor()
@@ -229,35 +227,34 @@ func (f *fixture) request(p provider.Provider, b build) delta.Request {
 		},
 		WorkDir: filepath.Join(f.dir, "work", string(spec.ID)),
 	}
-	if d.ID == dependence.ProviderID {
-		req.Reservation, req.Readmit = f.reservation(b)
-	}
 	return req
 }
 
-// reservation sizes a dependence unit's one reservation as the planner does:
-// the provider's own unit plan for the tree names the scope's family and
-// source bytes, and the governor reserves for them on the machine the provider
-// was built with. newDependence passes no Machine, no floor and no footprint,
-// so the planner's figure and the one the provider's standalone form sizes
-// itself are the same reservation. The fixture runs no admission ledger, so
-// the re-admission is the standalone form's too: there is no grant to
-// exchange, and the stand-in engine never reports the out-of-memory exit that
-// would ask for one.
-func (f *fixture) reservation(b build) (dependence.Reservation, func(context.Context, dependence.Reservation) error) {
-	f.t.Helper()
-	units, err := link.PlanUnits(f.ctx, b.tree.view)
-	if err != nil {
-		f.t.Fatalf("PlanUnits: %v", err)
+// applyWithin runs one build and fails with its own message if the applier has
+// not returned within d. A refresh that waits on itself would otherwise be
+// reported by the package's timeout, which names no call and no reason.
+func applyWithin(t *testing.T, a delta.Applier, ctx context.Context, req delta.Request, d time.Duration) delta.Result {
+	t.Helper()
+	type outcome struct {
+		res delta.Result
+		err error
 	}
-	for _, u := range units.Units {
-		if u.ScopeKey == b.scopeKey {
-			res := dependence.NewGovernor(0, 0).Reserve(u.Family, u.Bytes, admission.Machine{})
-			return res, func(context.Context, dependence.Reservation) error { return nil }
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := a.Apply(ctx, req)
+		done <- outcome{res, err}
+	}()
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("Apply: %v", out.err)
 		}
+		return out.res
+	case <-time.After(d):
+		t.Fatalf("Apply did not return within %s: the refresh is waiting on the ingestion group its own "+
+			"carry-over holds", d)
+		return delta.Result{}
 	}
-	f.t.Fatalf("the project plan of the tree names no unit %q", b.scopeKey)
-	return dependence.Reservation{}, nil
 }
 
 // flush commits the ingestion group. A predecessor a refresh reads through the
