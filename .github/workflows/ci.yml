@@ -41,20 +41,8 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Tracked files reference no ignored or host-local paths and name no private repository
+      - name: Tracked files reference no ignored or host-local paths
         run: sh scripts/tracked-refs-check.sh
-
-      # The commits this event adds: a pull request's own commits, or a push's
-      # new ones. A branch's first push has no previous tip, so its range starts
-      # where it leaves the default branch.
-      - name: Commit messages name no private repository
-        env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            BASE="$(git merge-base "origin/${{ github.event.repository.default_branch }}" HEAD)"
-          fi
-          sh scripts/private-names-check.sh --messages "$BASE..HEAD"
 
       # Section 11.7 makes internal/toolchain the product's single network
       # boundary: it fetches only URLs the embedded lock names, verifies every

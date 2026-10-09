@@ -1,5 +1,5 @@
-# The one reader of tracked content for the guards (tracked-refs-check.sh and
-# private-names-check.sh), loaded by each with `require`.
+# The one reader of tracked content for tracked-refs-check.sh, loaded with
+# `require`.
 #
 # tracked_blobs($visit, $failure) reads every index entry's blob, never the
 # working tree: the index is what a commit records, and a working-tree read
