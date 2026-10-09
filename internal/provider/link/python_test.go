@@ -55,7 +55,8 @@ func pyMethod(q string, class int32) Decl { return pyDecl(model.NodeMethod, q, c
 //     binds the enclosing class's own override (drop the Parent filter in
 //     resolvePythonSuper → "super" fails);
 //   - flow: a receiver recovered through an assignment, a parameter or a
-//     return binds nothing (skip types.receivers → the three flow cases
+//     return binds nothing (dispatch only the receiver types the file
+//     names, never the ones inference recovers → the three flow cases
 //     fail);
 //   - field: a function stored on an attribute is not what the attribute's
 //     call binds (skip types.functions → "field-based" fails);

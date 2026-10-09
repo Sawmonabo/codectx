@@ -221,4 +221,42 @@ def run():
 		},
 		fails: "field-based binding beside a known receiver type binds `r.save()` to on_save as well",
 	},
+	{
+		name:   "cooperative-super",
+		anchor: "The Python Language Reference §3.3 (Data model); \"The Python 2.3 Method Resolution Order\" (C3 linearisation); the Python Library Reference, \"Built-in Functions: super\" (the next class after the enclosing one in the instance's method resolution order)",
+		files: map[string]string{
+			"coop.py": `class A:
+    def m(self):  # @am
+        pass
+
+
+class B(A):
+    def m(self):  # @bm
+        super().m()  # @bs
+
+
+class C(A):
+    def m(self):  # @cm
+        pass
+
+
+class D(B, C):  # @d
+    pass
+
+
+def run():
+    D().m()  # @r1
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. Both read B's `super().m()` by the
+		// instance's order: a B continues at A, a D (D, B, C, A) at C, a class that is not B's base.
+		want: []string{
+			"bs m -> am m",
+			"bs m -> cm m",
+			"r1 D -> d D",
+			"r1 m -> bm m",
+		},
+		fails: "`super()` resolved by B's own bases alone loses C.m; dispatched like `self.m()` it binds B.m itself",
+	},
 }
