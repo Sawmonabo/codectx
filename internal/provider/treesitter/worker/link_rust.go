@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"slices"
+	"strings"
 	"sync"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -18,7 +20,10 @@ import (
 // Type names are spelled as written with references, pointers, `dyn`,
 // `impl` and generic arguments removed (`&mut Foo<T>` is `Foo`), so a
 // receiver, an impl's self type and a supertype name the type declaration
-// itself; `Self` is spelled as the impl's self type, or the trait inside a
+// itself. A declared value type also loses a smart pointer around it
+// (unwrap: `Box<dyn Handler>` is Handler), since a method call reaches the
+// owned value through it; an impl's self type and a trait bound do not.
+// `Self` is spelled as the impl's self type, or the trait inside a
 // trait. A signature is spelled by the rule of wire.Export.Signature from
 // the type's tokens, comments and lifetimes left out and one space kept
 // only between two word tokens (`&mut Foo`), so a declaration's signature
@@ -39,20 +44,29 @@ type rustLinker struct {
 	// generics are the type parameters in scope, innermost last.
 	generics []rsGeneric
 	// fields maps a struct declared in the file and one of its fields,
-	// "struct\x00field", to the field's type name.
-	fields map[string]string
+	// "struct\x00field", to the field's declared type.
+	fields map[string]rsField
 	// buf is the scratch a type's text is spelled into.
 	buf []byte
+}
+
+// rsField is a struct field's declared type: the type its value carries
+// (unwrap) and whether a smart pointer owns that value.
+type rsField struct {
+	typ string
+	ptr bool
 }
 
 // rsOwner is one enclosing impl or trait: the name `Self` means.
 type rsOwner struct{ self string }
 
-// rsLocal is one binding: its name, the type its value carries, and the
+// rsLocal is one binding: its name, the type its value carries, whether it
+// is declared as a smart pointer owning a value of that type, and the
 // signature of its declared function type, if it has one.
 type rsLocal struct {
 	name string
 	typ  wire.Type
+	ptr  bool
 	sig  string
 }
 
@@ -75,7 +89,7 @@ func (k *rustLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byte)
 func (k *rustLinker) file(root Node, src []byte, out *wire.Link) {
 	k.k, k.src, k.out = rsLinkSyntaxOf(), src, out
 	k.owners, k.locals, k.generics, k.base = k.owners[:0], k.locals[:0], k.generics[:0], 0
-	k.fields = map[string]string{}
+	k.fields = map[string]rsField{}
 	k.structFields(root)
 	k.walk(root)
 	k.src, k.out, k.fields = nil, nil, nil
@@ -99,8 +113,9 @@ func (k *rustLinker) structFields(root Node) {
 					if fn.IsNull() || ft.IsNull() {
 						continue
 					}
-					if t := k.typeName(ft); t != "" {
-						k.fields[k.str(name)+"\x00"+k.str(fn)] = t
+					inner, ptr := k.unwrap(ft)
+					if t := k.typeName(inner); t != "" {
+						k.fields[k.str(name)+"\x00"+k.str(fn)] = rsField{typ: t, ptr: ptr}
 					}
 				}
 			}
@@ -246,8 +261,8 @@ func (k *rustLinker) walk(n Node) wire.Type {
 		recv := k.walk(n.ChildByFieldId(s.fValue))
 		f := k.kid(n, s.fField)
 		if recv.Kind == wire.TypeNamed && !f.IsNull() && f.KindId() == s.fieldIdentifier {
-			if t, ok := k.fields[recv.Name+"\x00"+view(textOf(k.src, f))]; ok {
-				return wire.Type{Kind: wire.TypeNamed, Name: t}
+			if fl, ok := k.fields[recv.Name+"\x00"+view(textOf(k.src, f))]; ok {
+				return wire.Type{Kind: wire.TypeNamed, Name: fl.typ}
 			}
 		}
 	default:
@@ -335,7 +350,8 @@ func (k *rustLinker) export(n Node) {
 	}
 	x.Signature = k.signature(ps, ret)
 	if !ret.IsNull() {
-		if t := k.typeName(ret); t != "" {
+		inner, _ := k.unwrap(ret)
+		if t := k.typeName(inner); t != "" {
 			x.Returns = wire.Type{Kind: wire.TypeNamed, Name: t}
 		}
 	}
@@ -594,24 +610,102 @@ func (k *rustLinker) param(p Node) {
 		k.bindAll(pat)
 		return
 	}
-	k.locals = append(k.locals, rsLocal{name: view(textOf(k.src, pat)), typ: k.declared(t), sig: k.fnSig(t)})
+	typ, ptr := k.declared(t)
+	k.locals = append(k.locals, rsLocal{name: view(textOf(k.src, pat)), typ: typ, ptr: ptr, sig: k.fnSig(t)})
 }
 
-// declared is the type a value of the declared type t carries: the type it
-// names, or the one trait a type parameter's bounds name.
-func (k *rustLinker) declared(t Node) wire.Type {
+// declared is the type a value of the declared type t carries (unwrap): the
+// type it names, or the one trait a type parameter's bounds name; and
+// whether a smart pointer owns that value.
+func (k *rustLinker) declared(t Node) (wire.Type, bool) {
+	t, ptr := k.unwrap(t)
+	if t.IsNull() {
+		return wire.Type{}, ptr
+	}
 	if t.KindId() == k.k.typeIdentifier {
 		if i := k.generic(view(textOf(k.src, t))); i >= 0 {
 			if g := k.generics[i]; g.bounds == 1 {
-				return wire.Type{Kind: wire.TypeNamed, Name: g.bound}
+				return wire.Type{Kind: wire.TypeNamed, Name: g.bound}, ptr
 			}
-			return wire.Type{}
+			return wire.Type{}, ptr
 		}
 	}
 	if name := k.typeName(t); name != "" {
-		return wire.Type{Kind: wire.TypeNamed, Name: name}
+		return wire.Type{Kind: wire.TypeNamed, Name: name}, ptr
 	}
-	return wire.Type{}
+	return wire.Type{}, ptr
+}
+
+// rsPointers are the standard library's smart pointers. A method call on
+// one reaches, by auto-dereference, the methods of the value it owns (the
+// Rust Reference's "Method-call expressions"), so a receiver declared as
+// one carries the owned value's type: `Box<dyn Handler>` is Handler.
+var rsPointers = []string{"Box", "Rc", "Arc", "Pin"}
+
+// rsPointerMethods are the methods every smart pointer of rsPointers
+// answers itself, through the standard traits it implements (Clone, Deref,
+// DerefMut, AsRef, AsMut, Borrow, BorrowMut, PartialEq, PartialOrd, Ord,
+// Hash, Debug, Display, Pointer, Any) and the blanket conversions
+// (Into, TryInto, ToOwned, ToString). The method-call lookup tries the
+// pointer's own type before it dereferences, so such a call on a pointer
+// is the pointer's method, never the owned value's.
+var rsPointerMethods = []string{"clone", "clone_from", "deref", "deref_mut", "as_ref", "as_mut", "borrow",
+	"borrow_mut", "eq", "ne", "partial_cmp", "lt", "le", "gt", "ge", "cmp", "max", "min", "clamp", "hash", "fmt",
+	"type_id", "into", "try_into", "to_owned", "to_string"}
+
+// unwrap is the type t declares a value of once references, raw pointers
+// and smart pointers (rsPointers) are removed (`&Rc<Foo>` is Foo), and
+// whether a smart pointer was removed.
+func (k *rustLinker) unwrap(t Node) (Node, bool) {
+	s := k.k
+	ptr := false
+	for !t.IsNull() {
+		switch t.KindId() {
+		case s.referenceType, s.pointerType:
+			t = t.ChildByFieldId(s.fType)
+			continue
+		case s.genericType:
+			args := k.kid(t, s.fTypeArguments)
+			name := k.typeName(t.ChildByFieldId(s.fType))
+			if i := strings.LastIndex(name, "::"); i >= 0 {
+				name = name[i+2:]
+			}
+			if !args.IsNull() && args.NamedChildCount() == 1 && slices.Contains(rsPointers, name) {
+				t, ptr = firstNamed(args), true
+				continue
+			}
+		}
+		return t, ptr
+	}
+	return t, ptr
+}
+
+// pointer reports that the receiver expression n holds a smart pointer
+// (rsPointers) by its declaration: a binding, or a field of a binding or of
+// `self`, declared as one.
+func (k *rustLinker) pointer(n Node) bool {
+	s := k.k
+	switch n.KindId() {
+	case s.identifier:
+		i := k.lookup(n)
+		return i >= 0 && k.locals[i].ptr
+	case s.fieldExpression:
+		v, f := n.ChildByFieldId(s.fValue), k.kid(n, s.fField)
+		if v.IsNull() || f.IsNull() || f.KindId() != s.fieldIdentifier {
+			return false
+		}
+		owner := ""
+		switch v.KindId() {
+		case s.self:
+			owner = k.self()
+		case s.identifier:
+			if i := k.lookup(v); i >= 0 && k.locals[i].typ.Kind == wire.TypeNamed {
+				owner = k.locals[i].typ.Name
+			}
+		}
+		return owner != "" && k.fields[owner+"\x00"+view(textOf(k.src, f))].ptr
+	}
+	return false
 }
 
 // fnSig is the signature of the function type a value of the declared type
@@ -665,9 +759,11 @@ func (k *rustLinker) let(n Node) {
 	}
 	l := rsLocal{name: view(textOf(k.src, pat)), typ: t}
 	if !declared.IsNull() {
-		if d := k.declared(declared); d.Kind != wire.TypeUnknown {
+		d, ptr := k.declared(declared)
+		if d.Kind != wire.TypeUnknown {
 			l.typ = d
 		}
+		l.ptr = ptr
 		l.sig = k.fnSig(declared)
 	}
 	k.locals = append(k.locals, l)
@@ -825,9 +921,14 @@ func (k *rustLinker) call(n Node) wire.Type {
 			k.walk(fn)
 		}
 	case fn.KindId() == s.fieldExpression:
-		recv := k.walk(fn.ChildByFieldId(s.fValue))
+		value := fn.ChildByFieldId(s.fValue)
+		recv := k.walk(value)
 		if f := k.kid(fn, s.fField); !f.IsNull() && f.KindId() == s.fieldIdentifier {
 			name, site.Shape, site.Receiver = f, wire.ShapeMember, recv
+			if !value.IsNull() && slices.Contains(rsPointerMethods, view(textOf(k.src, f))) && k.pointer(value) {
+				// The smart pointer's own method, which no table declares.
+				site.Receiver = wire.Type{}
+			}
 		}
 	case fn.KindId() == s.scopedIdentifier:
 		if f := fn.ChildByFieldId(s.fName); !f.IsNull() && f.KindId() == s.identifier {
