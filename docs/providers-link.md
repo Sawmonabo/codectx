@@ -22,8 +22,8 @@ InvalidationScope package
 Required          false
 ```
 
-`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:39-55`, and the descriptor is
-`Provider.Descriptor` (`provider.go:115-118`). The id is not `dependence`, which is never reused (decision 9). The
+`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:41-57`, and the descriptor is
+`Provider.Descriptor` (`provider.go:123-126`). The id is not `dependence`, which is never reused (decision 9). The
 provider is not required: a failed link degrades `calls` and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
@@ -35,7 +35,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `calls` | `calls` | caller → ambiguous callee node | `ambiguous` |
 | `calls` | `may_refer_to` | caller → each candidate of an ambiguous site | `ambiguous call target` |
 
-The details are the `Detail*` constants (`provider.go:59-80`). Each one names the technique that bound the site:
+The details are the `Detail*` constants (`provider.go:61-82`). Each one names the technique that bound the site:
 - `direct`: the callee names the declaration by its package, module, import or scope;
 - `hierarchy`: class-hierarchy analysis over the receiver's static type and its subtypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
@@ -89,6 +89,10 @@ A unit is one project of the repository, the scope `dependence.PlanUnits` derive
 (`internal/provider/dependence/units.go:136`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
 `units.go:359`). The planner is reused rather than copied.
 
+`Link` plans only its own unit, through `dependence.PlanUnit`, in one read of the manifest, and its members are the
+candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as file versions in FileID order
+(`LinkOptions.Members`), so it keeps its members of them and sorts nothing.
+
 The unit's inputs are its member files. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
@@ -129,7 +133,7 @@ The delta build reads each member's digest, one small read per member and no tab
 its predecessor's in FileID order, as one merge join against the predecessor unit's stored inputs
 (`internal/index/delta/link.go`). When membership and every digest are equal, it hands `Link` the predecessor's
 resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`) and the stream of members whose bytes
-changed (`LinkOptions.Edited`, `provider.go:82-102`). The state names each site and target by position (`Ref`,
+changed (`LinkOptions.Edited`, `provider.go:84-110`). The state names each site and target by position (`Ref`,
 `internal/provider/link/unit.go`) and holds the unit's coverage, so the linker resolves nothing. It republishes only
 the facts whose evidence lies in an edited member: the occurrences of its declarations that an edge names, and its
 sites' `calls`, `may_refer_to` and ambiguous callee nodes. Every other fact of the predecessor is carried over
@@ -196,7 +200,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 The `calls` row is published at the unit's scope:
 - `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
-- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:208-228`), when
+- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:238-258`), when
   a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
   `table.go:43-47`), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
   node to mint (`unkeyed_ambiguous_sites`). The row also counts the unit's `members`. A dropped entry is a worker

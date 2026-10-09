@@ -29,9 +29,11 @@ import (
 	"strconv"
 	"sync"
 
+	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -92,6 +94,12 @@ type LinkOptions struct {
 	// and takes the coverage from Previous: the build carries the
 	// predecessor's other facts over. Nil publishes every fact.
 	Edited func(yield func(model.FileID) error) error
+	// Members, when set, streams the unit's inputs as file versions in
+	// ascending FileID order, the members among them and possibly other
+	// inputs (a manifest); Link keeps the unit's members of them and does
+	// not sort the manifest for them. It must yield the same files on every
+	// walk. Nil finds the members in the pinned snapshot.
+	Members func(yield func(model.FileVersion) error) error
 	// State receives this unit's resolution state, which the build stores
 	// under ResolutionKind; nil writes none.
 	State io.Writer
@@ -149,13 +157,30 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer paced.RemoveAll(dir)
 
-	members, err := sortMembers(ctx, req.Content, pu, dir)
-	if err != nil {
-		return failed, err
+	var each func(yield func(model.FileVersion) error) error
+	var count int64
+	if opts.Members != nil {
+		each = func(yield func(model.FileVersion) error) error {
+			return opts.Members(func(fv model.FileVersion) error {
+				if !memberOf(pu, fv) {
+					return nil
+				}
+				return yield(fv)
+			})
+		}
+		if err := each(func(model.FileVersion) error { count++; return nil }); err != nil {
+			return failed, err
+		}
+	} else {
+		members, err := sortMembers(ctx, req.Content, pu, dir)
+		if err != nil {
+			return failed, err
+		}
+		defer members.Close()
+		each, count = members.Each, members.Len()
 	}
-	defer members.Close()
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
-		members: func(yield func(model.FileVersion) error) error { return members.Each(yield) }}
+		members: each}
 
 	sorted, err := newBindingSort(dir, compareSiteTarget)
 	if err != nil {
@@ -188,7 +213,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer bindings.Close()
 
-	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: members.Len(), edited: opts.Edited}
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: count, edited: opts.Edited}
 	if opts.Edited != nil {
 		pub.cov = inherited
 	}
@@ -203,6 +228,11 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
 		Capabilities: []model.CapabilityState{pub.capability()}}, nil
+}
+
+// memberOf reports that fv is a member of pu, as sortMembers selects them.
+func memberOf(pu dependence.Unit, fv model.FileVersion) bool {
+	return fv.Status != model.FileDeleted && pu.OwnsInput(fv.Path) && dependence.FamilyOf(srclang.Of(fv.Path)) == pu.Family
 }
 
 // capability is the unit's `calls` row: fresh when every member's table was

@@ -86,7 +86,18 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	}
 
 	b.index = func(ctx context.Context, ureq provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-		opts := link.LinkOptions{Dir: dir}
+		// The members are the unit's inputs, already in FileID order, read
+		// as the snapshot's file versions: Link keeps its members of them
+		// instead of sorting the manifest.
+		opts := link.LinkOptions{Dir: dir, Members: func(yield func(model.FileVersion) error) error {
+			return inputs(func(in model.UnitInput) error {
+				fv, err := a.store.SnapshotFile(ctx, req.Unit.Binding.SnapshotID, in.FileID)
+				if err != nil {
+					return err
+				}
+				return yield(fv)
+			})
+		}}
 		if req.Previous != "" && j.same() {
 			prev, reason, err := a.previous(ctx, req, dir)
 			if err != nil {
