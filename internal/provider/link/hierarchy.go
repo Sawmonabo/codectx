@@ -231,12 +231,12 @@ func qualifiedSuffixes(q, sep string, yield func(string)) {
 }
 
 // typeName is a type as written reduced to the declaration it names: no
-// pointer, reference, slice, mutability or trait-object marker, no
-// arguments of a generic.
+// enclosing parentheses (Go's `(*T)`), pointer, reference, slice, mutability
+// or trait-object marker, no arguments of a generic.
 func typeName(written string) string {
 	s := strings.TrimSpace(written)
 	for {
-		trimmed := strings.TrimLeft(s, "*&[] ")
+		trimmed := strings.TrimLeft(s, "(*&[] ")
 		for _, p := range []string{"mut ", "dyn ", "impl ", "const ", "struct ", "class ", "enum ", "union ", "typename "} {
 			trimmed = strings.TrimPrefix(trimmed, p)
 		}
@@ -248,7 +248,7 @@ func typeName(written string) string {
 	if i := strings.IndexAny(s, "<[("); i >= 0 {
 		s = s[:i]
 	}
-	return strings.TrimRight(s, "*& ")
+	return strings.TrimRight(s, "*&) ")
 }
 
 func refKey(r Ref) string {
