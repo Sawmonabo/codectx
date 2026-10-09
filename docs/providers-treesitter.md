@@ -383,7 +383,10 @@ The parent joins the tables to the declarations and call references it validated
 site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,
 when none joins, from the reference itself, and with the declarations of this file its callee name can mean as its
 candidates. Each declaration and the module carry the node identity the unit resolved, so the linker publishes these
-nodes rather than minting its own. A wire entry that does not join, or whose range does not fit the pinned bytes, is
+nodes rather than minting its own. The table also carries the file's package clause, one `link.Import` per name the
+file's import records introduce (a Rust use tree split per leaf, an import of every member of a path named
+`link.ImportAll`), each declaration's prototype flag, and, for ECMAScript, the declaration an `export default`
+statement declares (`internal/provider/treesitter/link.go`, `linkImports` and `exportsDefault`). A wire entry that does not join, or whose range does not fit the pinned bytes, is
 dropped and counted in `Table.Dropped`, never fatal. The table is stored with the file's unit under `link.TableKind`
 through `provider.StateSink`, and the provider refuses to run on a sink that cannot store it. A file with a link
 failure stores no table and discloses `link_failure` on its structural capability rows.
