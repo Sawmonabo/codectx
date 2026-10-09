@@ -69,8 +69,9 @@ const (
 	// an import of that module reaches (moduleBases).
 	keyTypeExport = "te\x00"
 	// keyFunc + family + scope + name: a free function visible under its
-	// simple name in that scope (Go's package, C's and C++'s one linkage
-	// scope with the namespace in Aux, Rust's file), its signature in Sig.
+	// simple name in that scope (Go's package, C's and C++'s one external
+	// linkage scope with the namespace in Aux, Rust's file), its signature
+	// in Sig.
 	keyFunc = "u\x00"
 	// keyFuncQualified + family + a qualified suffix of two or more
 	// components: a free function a qualified name reaches (`pkg.F`,
@@ -79,6 +80,13 @@ const (
 	// keyFuncModule + a Rust file module's name + name: a free function a
 	// `module::f` path reaches.
 	keyFuncModule = "um\x00"
+	// keyFuncInternal + scope + name, and + scope + each qualified suffix of
+	// two or more components: a C or C++ function with internal linkage,
+	// which no other translation unit names. The scope is its file's path,
+	// and, for a function a header declares, also "" (every file that
+	// includes the header, which no table says transitively); Aux is its
+	// namespace and its file's path, joined by a NUL.
+	keyFuncInternal = "ui\x00"
 	// keyMethod + refKey(type) + name: a method or constructor the type
 	// declares, its signature in Sig.
 	keyMethod = "m\x00"
@@ -342,6 +350,11 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 					keys = append(keys, keyTypeExport+b+"\x00"+d.Name)
 				}
 			}
+		case fc.family == "c" && d.Internal && isCallable(d.Kind) && d.Receiver == "":
+			if err := addInternal(s, t, d, entry{Ref: ref, Aux: ns + "\x00" + t.Path, Sig: d.Signature, Flags: flagsOf(d)}); err != nil {
+				return err
+			}
+			continue
 		case isCallable(d.Kind) && d.Receiver == "" && (d.Parent < 0 || !isType(t.Decls[d.Parent].Kind)):
 			prefix, qualifiedPrefix = keyFunc, keyFuncQualified
 			if fc.family == "rust" && d.Parent < 0 {

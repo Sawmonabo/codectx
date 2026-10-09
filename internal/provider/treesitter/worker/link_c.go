@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"strings"
 	"sync"
 
@@ -23,9 +24,13 @@ import (
 //     deleted), every prototype the structural extraction captures (a
 //     declaration at file scope, cLinkSyntax.fileScope: under the
 //     translation unit, a C++ namespace body or class body, through any
-//     preprocessor conditional arm or C++ template, and a C++ member
-//     declaration) and every function-like macro, keyed by the token the
-//     extraction names the declaration by.
+//     preprocessor conditional arm, linkage specification or C++ template,
+//     and a C++ member declaration) and every function-like macro, keyed by
+//     the token the extraction names the declaration by. Each says how many
+//     arguments fit it (cArity), whether a namespace-scope function has
+//     internal linkage (declared `static` anywhere in the file, or in an
+//     unnamed namespace) and whether a C++ member is virtual or final as its
+//     declaration says.
 //   - Supertypes: each base of a C++ class, struct or union.
 //   - Sites: every call the structural queries capture, keyed by its callee
 //     token: `f()` (bare, or indirect when f is a local, a parameter, a
@@ -33,7 +38,8 @@ import (
 //     `x.f()`/`x->f()` (member, or indirect through a data member: always in
 //     C, which has no member functions), `N::f()` (static), `f<T>()`
 //     (bare), `(*fp)()` (indirect through fp, bare when fp names a
-//     function) and `tbl[i]()` (always indirect, typed by the element type
+//     function), `(*x->f)()` and `(*x.f)()` (indirect through the data
+//     member f) and `tbl[i]()` (always indirect, typed by the element type
 //     tbl declares). A call is listed after the calls inside it, so the call an
 //     argument or a receiver is the result of has the lower index.
 //   - Values: every function taken as a value: `&f` and `&C::m`, and a name
@@ -81,6 +87,11 @@ type cLinker struct {
 	records    map[string]Node
 	namespaces map[string]bool
 	members    map[Node]map[string]cMember
+	// statics holds, under linkageKey, every namespace-scope function a
+	// declaration of the file declares `static`: every declaration of it
+	// has internal linkage, a later one without the specifier included
+	// (ISO C 6.2.2p5, [dcl.stc]).
+	statics map[string]bool
 
 	// names and locals are the scope chain of the walk, one local per
 	// binding; base is where the innermost callable's bindings begin.
@@ -126,7 +137,7 @@ func (k *cLinker) file(root Node, src []byte, out *wire.Link) {
 	*k = cLinker{language: k.language, s: cSyntaxOf(k.language), x: cLinkSyntaxOf(k.language), src: src, out: out,
 		functions: map[string]bool{}, objects: map[string]cDecl{}, others: map[string]bool{},
 		typedefs: map[string]cDecl{}, records: map[string]Node{}, namespaces: map[string]bool{},
-		members: map[Node]map[string]cMember{}, sites: map[uintptr]uint32{}}
+		members: map[Node]map[string]cMember{}, statics: map[string]bool{}, sites: map[uintptr]uint32{}}
 	k.declare(root)
 	k.classes = k.classes[:0]
 	k.walk(root)
@@ -144,6 +155,7 @@ func (k *cLinker) declare(n Node) {
 	case id == x.functionDefinition:
 		if c := k.chain(n.ChildByFieldId(s.fDeclarator)); !c.name.IsNull() {
 			k.functions[k.text(c.name)] = true
+			k.declareStatic(n, c)
 		}
 	case id == s.declaration || id == x.fieldDeclaration:
 		k.declarators(n, func(d Node) {
@@ -152,6 +164,9 @@ func (k *cLinker) declare(n Node) {
 			case c.name.IsNull():
 			case c.function:
 				k.functions[k.text(c.name)] = true
+				if id == s.declaration {
+					k.declareStatic(n, c)
+				}
 			case id == s.declaration && len(k.classes) == 0:
 				k.objects[k.text(c.name)] = cDecl{owner: n, decl: d}
 			}
@@ -198,6 +213,60 @@ func (k *cLinker) declare(n Node) {
 		}
 	}
 	k.declareChildren(n)
+}
+
+// declareStatic records the function chain c of the declaration owner
+// declares in statics when owner declares it `static` at namespace scope; a
+// `static` member of a class is a static member function, which has the
+// class's linkage.
+func (k *cLinker) declareStatic(owner Node, c cChain) {
+	if len(k.classes) == 0 && k.storage(owner, "static") {
+		if key, ok := k.linkageKey(owner, c); ok {
+			k.statics[key] = true
+		}
+	}
+}
+
+// linkageKey is the key a namespace-scope function the chain c of the
+// declaration owner declares is recorded under in statics: the namespace
+// it is a member of (its enclosing namespaces, then its qualifier) and its
+// name. ok is false for a member of a class (an out-of-class definition
+// `void A::f() {}`), whose linkage is its class's.
+func (k *cLinker) linkageKey(owner Node, c cChain) (string, bool) {
+	q := ""
+	if !c.scope.IsNull() {
+		q = k.qualifier(c.scope)
+		if !k.namespaces[q] {
+			return "", false
+		}
+	}
+	ns, _ := k.enclosingNamespaces(owner)
+	if ns != "" && q != "" {
+		ns += "::"
+	}
+	return ns + q + "\x00" + k.text(c.name), true
+}
+
+// enclosingNamespaces is the chain of namespaces enclosing n, innermost
+// last, and whether one of them is an unnamed namespace, whose members have
+// internal linkage ([basic.link]).
+func (k *cLinker) enclosingNamespaces(n Node) (chain string, unnamed bool) {
+	if k.x.namespaceDefinition == 0 {
+		return "", false
+	}
+	var names []string
+	for p := n.Parent(); !p.IsNull(); p = p.Parent() {
+		if p.KindId() != k.x.namespaceDefinition {
+			continue
+		}
+		if name := p.ChildByFieldId(k.s.fName); name.IsNull() {
+			unnamed = true
+		} else {
+			names = append(names, k.typeName(name))
+		}
+	}
+	slices.Reverse(names)
+	return strings.Join(names, "::"), unnamed
 }
 
 func (k *cLinker) declareChildren(n Node) {
@@ -432,16 +501,67 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 		return
 	}
 	e := wire.Export{Name: wireSpan(spanOf(c.name)), Receiver: receiver}
-	sig, n, variadic, typed := k.signature(owner, d, c.fn)
-	if typed {
+	sig, a := k.signature(owner, d, c.fn)
+	if a.typed {
 		e.Signature = sig
 	}
-	e.Params, e.Variadic = n, variadic
+	e.Params, e.Optional, e.Variadic = a.params, a.optional, a.variadic
+	// An empty parameter list outside a definition declares nothing about
+	// the parameters in C (ISO C 6.7.6.3p14): a call may pass any number.
+	if a.empty && !s.cpp && owner.KindId() != k.x.functionDefinition {
+		e.Variadic = true
+	}
 	structor := owner.ChildByFieldId(s.fType).IsNull() && c.name.KindId() != k.x.destructorName && c.name.KindId() != s.operatorCast
 	e.Static = receiver == "" || structor || k.storage(owner, "static")
 	e.Abstract = k.pure(owner, d)
+	if receiver != "" && s.cpp {
+		e.Virtual, e.Final = k.virtual(owner, c.fn, receiver)
+	} else if key, ok := k.linkageKey(owner, c); ok && len(k.classes) == 0 {
+		_, unnamed := k.enclosingNamespaces(owner)
+		e.Internal = unnamed || k.statics[key]
+	}
 	e.Returns = k.returns(owner, d, c.fn)
 	k.out.Exports = append(k.out.Exports, e)
+}
+
+// virtual reports whether the member function of the class receiver that
+// the function declarator fn of the declaration owner declares is virtual
+// (declared `virtual`, or with an `override` or `final` virt-specifier) and
+// whether it is final (declared `final`, or a member of a class declared
+// `final`), as this declaration says it. An out-of-class definition repeats
+// neither `virtual` nor a virt-specifier ([class.virtual]): its class's
+// declaration of the member carries them.
+func (k *cLinker) virtual(owner, fn Node, receiver string) (virtual, final bool) {
+	x := k.x
+	for c := owner.first(); !c.IsNull(); c = c.next() {
+		if c.KindId() == x.virtual && !c.IsNamed() {
+			virtual = true
+		}
+	}
+	for c := cFirst(fn); !c.IsNull(); c = c.next() {
+		if c.KindId() == x.virtualSpecifier && c.IsNamed() {
+			virtual = true
+			final = final || string(textOf(k.src, c)) == "final"
+		}
+	}
+	// The class body: the field declaration list an in-class member sits in
+	// (through templates and preprocessor arms), else the record the
+	// receiver names in the file.
+	body := owner.Parent()
+	for !body.IsNull() && body.KindId() != x.fieldDeclarationList && !k.record(body) && body.KindId() != x.translationUnit {
+		body = body.Parent()
+	}
+	if len(k.classes) == 0 || cKind(body) != x.fieldDeclarationList {
+		body = k.recordOf(receiver)
+	}
+	if !body.IsNull() {
+		for c := cFirst(body.Parent()); !c.IsNull(); c = c.next() {
+			if c.KindId() == x.virtualSpecifier && c.IsNamed() && string(textOf(k.src, c)) == "final" {
+				final = true
+			}
+		}
+	}
+	return virtual, final
 }
 
 // bodiless reports a C++ function definition that ends with a clause
@@ -491,7 +611,10 @@ func (k *cLinker) pure(owner, d Node) bool {
 }
 
 // macro appends the Export of a function-like macro: its parameter count,
-// and no types.
+// and no types. Every parameter is optional: an argument of a macro
+// invocation may be empty (`G()` passes G one empty argument, ISO C
+// 6.10.3p4), and an empty argument is no expression of the call's argument
+// list.
 func (k *cLinker) macro(n Node) {
 	name := n.ChildByFieldId(k.s.fName)
 	if name.IsNull() {
@@ -508,6 +631,7 @@ func (k *cLinker) macro(n Node) {
 			e.Variadic = true
 		}
 	}
+	e.Optional = e.Params
 	k.out.Exports = append(k.out.Exports, e)
 }
 
@@ -560,20 +684,8 @@ func (k *cLinker) call(n Node) {
 			site.Shape, site.Receiver, site.Signature = wire.ShapeIndirect, k.declType(d), k.funcSig(d, 0)
 		}
 	case s.fieldExpression:
-		field := lastNamed(callee)
-		if cKind(field) != s.fieldIdentifier {
+		if !k.fieldCall(&site, callee, true) {
 			return
-		}
-		site.Name = wireSpan(spanOf(field))
-		recv := k.recover(callee.ChildByFieldId(s.fArgument))
-		m, found := k.member(recv, textOf(k.src, field))
-		if !s.cpp || found && !m.fn {
-			site.Shape, site.Receiver = wire.ShapeIndirect, wire.Type{Kind: wire.TypeField, Name: string(textOf(k.src, field))}
-			if found {
-				site.Signature = k.funcSig(m.cDecl, 0)
-			}
-		} else {
-			site.Shape, site.Receiver = wire.ShapeMember, recv
 		}
 	case s.qualifiedIdentifier:
 		name, scope := callee.ChildByFieldId(s.fName), firstNamed(callee)
@@ -588,19 +700,24 @@ func (k *cLinker) call(n Node) {
 		}
 		site.Name, site.Shape = wireSpan(spanOf(name)), wire.ShapeBare
 	case k.x.paren:
-		// `(*fp)(x)`: the one pattern the queries capture, so no other
-		// parenthesized callee has a call reference to join.
+		// `(*fp)(x)` and `(*s->cb)(x)`: the patterns the queries capture, so
+		// no other parenthesized callee has a call reference to join.
 		deref := firstNamed(callee)
 		if cKind(deref) != s.pointerExpression || cKind(deref.ChildByFieldId(s.fOperator)) != s.star {
 			return
 		}
-		ptr := deref.ChildByFieldId(s.fArgument)
-		if cKind(ptr) != s.identifier {
+		switch ptr := deref.ChildByFieldId(s.fArgument); cKind(ptr) {
+		case s.identifier:
+			site.Name, site.Shape = wireSpan(spanOf(ptr)), wire.ShapeBare
+			if d, ok := k.object(textOf(k.src, ptr)); ok {
+				site.Shape, site.Receiver, site.Signature = wire.ShapeIndirect, k.declType(d), k.funcSig(d, 0)
+			}
+		case s.fieldExpression:
+			if !k.fieldCall(&site, ptr, false) {
+				return
+			}
+		default:
 			return
-		}
-		site.Name, site.Shape = wireSpan(spanOf(ptr)), wire.ShapeBare
-		if d, ok := k.object(textOf(k.src, ptr)); ok {
-			site.Shape, site.Receiver, site.Signature = wire.ShapeIndirect, k.declType(d), k.funcSig(d, 0)
 		}
 	case s.subscriptExpression:
 		// `tbl[i](x)` calls an element, never a function named tbl. funcSig
@@ -628,6 +745,31 @@ func (k *cLinker) call(n Node) {
 	}
 	k.sites[n.Id()] = uint32(len(k.out.Sites))
 	k.out.Sites = append(k.out.Sites, site)
+}
+
+// fieldCall fills site for a call through the field expression fe, `x.f()`
+// or `x->f()`, or, dereferenced, `(*x->f)()`: an indirect call through the
+// data member f, typed by its declaration when the receiver's record
+// declares it, or, when member allows it, a C++ call of the member function
+// f on the receiver. ok is false when fe names no field.
+func (k *cLinker) fieldCall(site *wire.Site, fe Node, member bool) (ok bool) {
+	s := k.s
+	field := lastNamed(fe)
+	if cKind(field) != s.fieldIdentifier {
+		return false
+	}
+	site.Name = wireSpan(spanOf(field))
+	recv := k.recover(fe.ChildByFieldId(s.fArgument))
+	m, found := k.member(recv, textOf(k.src, field))
+	if member && s.cpp && (!found || m.fn) {
+		site.Shape, site.Receiver = wire.ShapeMember, recv
+		return true
+	}
+	site.Shape, site.Receiver = wire.ShapeIndirect, wire.Type{Kind: wire.TypeField, Name: string(textOf(k.src, field))}
+	if found {
+		site.Signature = k.funcSig(m.cDecl, 0)
+	}
+	return true
 }
 
 // object is the declaration of the variable a called name names: a local,
@@ -927,8 +1069,7 @@ func (k *cLinker) funcSig(d cDecl, depth int) string {
 		top = top.ChildByFieldId(s.fDeclarator)
 	}
 	if c := k.chain(top); !c.fn.IsNull() {
-		sig, _, _, typed := k.signature(d.owner, top, c.fn)
-		if typed {
+		if sig, a := k.signature(d.owner, top, c.fn); a.typed {
 			return sig
 		}
 		return ""
@@ -957,13 +1098,24 @@ func (k *cLinker) funcSig(d cDecl, depth int) string {
 	return ""
 }
 
+// cArity is what a parameter list says of the calls that fit it: params
+// counts every parameter, `...` and a parameter pack included, as every
+// other family's worker counts its variadic parameter; optional counts the
+// trailing ones with a default argument, which a call may leave out;
+// variadic reports a final `...` or pack. typed is false for a parameter list of the old identifier form,
+// which declares no types; empty reports a list with nothing in it, `()`,
+// which `(void)` is not.
+type cArity struct {
+	params, optional       uint32
+	variadic, typed, empty bool
+}
+
 // signature is the Signature of the function declarator fn below the
 // declarator top of the declaration owner, by the rule of cLinker, with
-// its parameter count and variadic flag; typed is false for a parameter
-// list of the old identifier form, which declares no types.
-func (k *cLinker) signature(owner, top, fn Node) (sig string, n uint32, variadic, typed bool) {
+// its parameter list's arity.
+func (k *cLinker) signature(owner, top, fn Node) (string, cArity) {
 	b := append(k.buf[:0], '(')
-	b, n, variadic, typed = k.params(b, fn.ChildByFieldId(k.s.fParameters))
+	b, a := k.params(b, fn.ChildByFieldId(k.s.fParameters))
 	b = append(b, ")("...)
 	if r := k.trailing(fn); !r.IsNull() {
 		b = k.leaves(b, r, Node{})
@@ -973,7 +1125,7 @@ func (k *cLinker) signature(owner, top, fn Node) (sig string, n uint32, variadic
 	}
 	b = append(b, ')')
 	k.buf = b
-	return string(b), n, variadic, typed
+	return string(b), a
 }
 
 // trailing is the type descriptor of fn's trailing return type, or null.
@@ -989,10 +1141,11 @@ func (k *cLinker) trailing(fn Node) Node {
 	return Node{}
 }
 
-// params appends the parameter list ps's types, joined by ",", to b.
-func (k *cLinker) params(b []byte, ps Node) (_ []byte, n uint32, variadic, typed bool) {
+// params appends the parameter list ps's types, joined by ",", to b, and
+// reads its arity.
+func (k *cLinker) params(b []byte, ps Node) ([]byte, cArity) {
 	s, x := k.s, k.x
-	typed = true
+	a := cArity{typed: true, empty: true}
 	start := len(b)
 	var only Node
 	for c := cFirst(ps); !c.IsNull(); c = c.next() {
@@ -1002,27 +1155,31 @@ func (k *cLinker) params(b []byte, ps Node) (_ []byte, n uint32, variadic, typed
 		if c.IsExtra() || !ellipsis && !knr && !k.parameter(c) {
 			continue
 		}
-		if n > 0 {
+		if a.params > 0 {
 			b = append(b, ',')
 		}
+		a.empty = false
 		switch {
 		case ellipsis:
 			b = append(b, "..."...)
-			variadic = true
+			a.variadic = true
 		case knr:
-			typed = false
+			a.typed = false
 		default:
 			b = k.param(b, c)
-			variadic = variadic || id == x.variadicParameterDeclaration && id != 0
+			a.variadic = a.variadic || id == x.variadicParameterDeclaration && id != 0
+			if id == x.optionalParameterDeclaration && id != 0 {
+				a.optional++
+			}
 			only = c
 		}
-		n++
+		a.params++
 	}
 	// `(void)` declares no parameter (C17 6.7.6.3p10, [dcl.fct]p4).
-	if n == 1 && !only.IsNull() && only.ChildByFieldId(s.fDeclarator).IsNull() && string(b[start:]) == "void" {
-		b, n = b[:start], 0
+	if a.params == 1 && !only.IsNull() && only.ChildByFieldId(s.fDeclarator).IsNull() && string(b[start:]) == "void" {
+		b, a.params = b[:start], 0
 	}
-	return b, n, variadic, typed
+	return b, a
 }
 
 // param appends one parameter's type to b: its specifiers and declarator
@@ -1231,12 +1388,13 @@ func cFirst(n Node) Node {
 type cLinkSyntax struct {
 	translationUnit, functionDefinition, fieldDeclaration, fieldDeclarationList, typeDefinition,
 	structSpecifier, unionSpecifier, enumerator, preprocFunctionDef, preprocDef, parameterDeclaration,
-	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis uint16
+	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis,
+	linkageSpecification, declarationList uint16
 
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
-	namespaceDefinition, declarationList, aliasDeclaration, optionalParameterDeclaration,
-	variadicParameterDeclaration, abstractReferenceDeclarator, destructorName, pureVirtualClause uint16
+	namespaceDefinition, aliasDeclaration, optionalParameterDeclaration, variadicParameterDeclaration,
+	abstractReferenceDeclarator, destructorName, pureVirtualClause, virtualSpecifier, virtual uint16
 
 	// declaration is the declaration kind; object marks the declarators
 	// that make an object of their operand's type (pointer, array,
@@ -1254,11 +1412,13 @@ type cLinkSyntax struct {
 // fileScope reports whether a declaration whose nearest ancestor outside
 // every conditional (cLinkSyntax.conditional) has the kind id is at file
 // scope as the structural queries capture it: directly under the
-// translation unit, and in C++ also under a namespace or linkage body or a
-// class body. cRefine and cLinker.declaration both decide by it, so a
-// prototype the extraction declares is the one the linker exports.
+// translation unit, under a linkage specification (`extern "C" int f(void);`)
+// or its braced body, and in C++ also under a namespace body or a class
+// body. cRefine and cLinker.declaration both decide by it, so a prototype the
+// extraction declares is the one the linker exports.
 func (x *cLinkSyntax) fileScope(id uint16) bool {
-	return id == x.translationUnit || x.classSpecifier != 0 && (id == x.declarationList || id == x.fieldDeclarationList)
+	return id == x.translationUnit || id == x.linkageSpecification || id == x.declarationList ||
+		x.classSpecifier != 0 && id == x.fieldDeclarationList
 }
 
 // in reports whether id is marked in set.
@@ -1304,6 +1464,8 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 		abstractFunctionDeclarator: kind("abstract_function_declarator"),
 		paren:                      kind("parenthesized_expression"),
 		ellipsis:                   mustKind(tl, language, "...", false),
+		linkageSpecification:       kind("linkage_specification"),
+		declarationList:            kind("declaration_list"),
 		declaration:                kind("declaration"),
 		object:                     make([]bool, tl.NodeKindCount()),
 		conditional:                make([]bool, tl.NodeKindCount()),
@@ -1316,11 +1478,12 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 	if language == "cpp" {
 		x.classSpecifier, x.baseClassClause, x.templateType = kind("class_specifier"), kind("base_class_clause"), kind("template_type")
 		x.trailingReturnType, x.placeholderTypeSpecifier = kind("trailing_return_type"), kind("placeholder_type_specifier")
-		x.namespaceDefinition, x.declarationList, x.aliasDeclaration = kind("namespace_definition"), kind("declaration_list"), kind("alias_declaration")
+		x.namespaceDefinition, x.aliasDeclaration = kind("namespace_definition"), kind("alias_declaration")
 		x.optionalParameterDeclaration = kind("optional_parameter_declaration")
 		x.variadicParameterDeclaration = kind("variadic_parameter_declaration")
 		x.abstractReferenceDeclarator, x.destructorName = kind("abstract_reference_declarator"), kind("destructor_name")
 		x.pureVirtualClause = kind("pure_virtual_clause")
+		x.virtualSpecifier, x.virtual = kind("virtual_specifier"), mustKind(tl, language, "virtual", false)
 		x.object[kind("reference_declarator")] = true
 		x.conditional[kind("template_declaration")] = true
 		for _, name := range []string{"pure_virtual_clause", "default_method_clause", "delete_method_clause"} {
