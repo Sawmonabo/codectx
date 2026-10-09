@@ -227,13 +227,12 @@ func (o Options) validate() error {
 	return nil
 }
 
-// Report is what one import tells its caller. Nodes, Relations and Aliases
-// count the records handed to the sink, and Relations is zero: the import
-// hands it no relation. Changed, Unchanged and Removed
+// Report is what one import tells its caller. Nodes and Aliases count the
+// records handed to the sink; the import hands it no relation. Changed, Unchanged and Removed
 // describe the delta against Options.PreviousKeys and are the whole key set
 // against the absent previous set.
 type Report struct {
-	Nodes, Relations, Aliases int
+	Nodes, Aliases int
 	// UnknownLabels counts the rows of every export label this import does
 	// not map, by label, bounded at maxUnknownLabels distinct names.
 	UnknownLabels map[string]int

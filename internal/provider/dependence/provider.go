@@ -478,12 +478,12 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 	// source bytes are a different figure and are logged as source_bytes
 	// below; reporting them here would be a number no step of this run read.
 	result := model.ProviderResult{RunID: req.Run, State: model.RunSucceeded,
-		RecordsEmitted: uint64(report.Nodes + report.Relations + report.Aliases),
+		RecordsEmitted: uint64(report.Nodes + report.Aliases),
 		BytesProcessed: report.BytesRead,
 		Capabilities:   pub.capabilities(unit.ScopeKey)}
 	fields := []any{"component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
 		"scope", unit.ScopeKey, "family", string(unit.Family), "source_files", unit.Files, "source_bytes", unit.Bytes,
-		"nodes", report.Nodes, "relations", report.Relations, "aliases", report.Aliases,
+		"nodes", report.Nodes, "aliases", report.Aliases,
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
@@ -1229,7 +1229,6 @@ func childProjects(source string) ([]string, error) {
 // the whole unit at the next refresh.
 func merge(a, b ImportReport) ImportReport {
 	a.Nodes += b.Nodes
-	a.Relations += b.Relations
 	a.Aliases += b.Aliases
 	a.ExternalMethods += b.ExternalMethods
 	a.Changed += b.Changed

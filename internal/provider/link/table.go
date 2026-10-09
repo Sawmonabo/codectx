@@ -48,8 +48,9 @@ type Table struct {
 	Unions [][]wire.Type `json:"unions,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
-	// fit the pinned bytes. They are dropped, never fatal to the unit, and
-	// make the file's `calls` partial.
+	// fit the pinned bytes, and each callable whose analysis failed in the
+	// worker. They are dropped, never fatal to the unit, and make the file's
+	// `calls` partial.
 	Dropped int `json:"dropped,omitempty"`
 }
 

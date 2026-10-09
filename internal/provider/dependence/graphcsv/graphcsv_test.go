@@ -117,7 +117,7 @@ func run(t *testing.T, src, export string, opts graphcsv.Options) (graphcsv.Repo
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
 			}
-			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Relations+rep.Aliases), rep.BytesRead), nil
+			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Aliases), rep.BytesRead), nil
 		},
 	}
 	_, id, err := h.Run(t, p, "pkg:fixture", paths)
@@ -399,7 +399,7 @@ func TestImportConformsUnderPerPutFlush(t *testing.T) {
 			if err != nil {
 				return model.ProviderResult{}, err
 			}
-			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Relations+rep.Aliases), rep.BytesRead), nil
+			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Aliases), rep.BytesRead), nil
 		},
 	}
 	providertest.Conform(t, p, files, "pkg:fixture", paths)
@@ -526,9 +526,9 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	if !bounded.OverStagedRows {
 		t.Fatalf("an import of %d rows over max_staged_rows = 1 did not report crossing it", bounded.StagedRows)
 	}
-	if bounded.StagedRows != whole.StagedRows || bounded.Nodes != whole.Nodes || bounded.Relations != whole.Relations {
-		t.Fatalf("the bounded import published less than the unbounded one: rows %d/%d nodes %d/%d relations %d/%d",
-			bounded.StagedRows, whole.StagedRows, bounded.Nodes, whole.Nodes, bounded.Relations, whole.Relations)
+	if bounded.StagedRows != whole.StagedRows || bounded.Nodes != whole.Nodes {
+		t.Fatalf("the bounded import published less than the unbounded one: rows %d/%d nodes %d/%d",
+			bounded.StagedRows, whole.StagedRows, bounded.Nodes, whole.Nodes)
 	}
 }
 
@@ -537,8 +537,7 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 // or a projection query carrying a `LIMIT bound+1` that truncated it, would be
 // a refusal or a silent cut on a count that belongs to the analysed source. The
 // equality assertions below are what catch a truncation: a LIMIT under a bound
-// of 1 leaves the JavaScript fixture's other call occurrences and every
-// published relation behind them.
+// of 1 leaves the JavaScript fixture's other call occurrences behind.
 func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	src, export := filepath.Join("testdata", "src", "jssrc"), filepath.Join("testdata", "jssrc")
 	whole, _, _, err := run(t, src, export, graphcsv.Options{Language: "javascript"})
@@ -561,9 +560,9 @@ func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	if !bounded.OverDerivedRows {
 		t.Fatalf("an import of %d occurrences over max_derived_rows = 1 did not report crossing it", bounded.DerivedRows)
 	}
-	if bounded.DerivedRows != whole.DerivedRows || bounded.Relations != whole.Relations {
-		t.Fatalf("the bounded import published less than the unbounded one: derived %d/%d relations %d/%d",
-			bounded.DerivedRows, whole.DerivedRows, bounded.Relations, whole.Relations)
+	if bounded.DerivedRows != whole.DerivedRows {
+		t.Fatalf("the bounded import projected less than the unbounded one: derived %d/%d",
+			bounded.DerivedRows, whole.DerivedRows)
 	}
 }
 

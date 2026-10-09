@@ -194,7 +194,9 @@ const (
 	// and the package's Values write to that field.
 	TypeField TypeKind = 6
 	// TypeFunction is the function or method Name, as written, taken as a
-	// value.
+	// value. Index is the receiver parameters the value takes ahead of the
+	// callable's own: 1 for a Go method expression `T.M` (spelled "*T.M"
+	// for `(*T).M`), else 0.
 	TypeFunction TypeKind = 7
 	// TypeClass is the type Name itself as a value, not an instance of it: a
 	// class object (`A.make()` in Python, `C.m()` in ECMAScript). A call on

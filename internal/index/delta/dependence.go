@@ -136,9 +136,10 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			}
 			b.res.Delta = Stats{Changed: int64(d.Changed), Unchanged: int64(d.Unchanged), Removed: int64(d.Removed)}
 
-			// filtered mirrors graphcsv.deltaFilter over what this build
-			// actually passed: only then did the import leave the unchanged
-			// relations, and the facts that name no file, unpublished.
+			// filtered mirrors the import's filtered emit (PreviousKeys with
+			// nothing removed) over what this build actually passed: only
+			// then did the import leave the unchanged relations, and the
+			// facts that name no file, unpublished.
 			b.res.Filtered = supplied && d.Removed == 0
 			var filesErr error
 			// replacedSeen counts what the walk below actually produced, so

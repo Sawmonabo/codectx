@@ -363,7 +363,7 @@ func TestImportWritesAreProportionalToTheExport(t *testing.T) {
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
 			}
-			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Relations+rep.Aliases), rep.BytesRead), nil
+			return providertest.Succeeded(req, uint64(rep.Nodes+rep.Aliases), rep.BytesRead), nil
 		},
 	}
 	if _, _, err := h.Run(t, p, "pkg:fixture", paths); importErr != nil {
