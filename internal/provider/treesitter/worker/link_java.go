@@ -60,6 +60,9 @@ type javaBound struct {
 type javaFrame struct {
 	name  string
 	named bool
+	// super is the class a named class extends, as erased; empty when it
+	// names none.
+	super string
 }
 
 // javaMark is where the three scopes stood, the point restore returns to.
@@ -74,9 +77,10 @@ func (k *javaLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byte)
 
 // file appends the file's exports (every method and constructor), the
 // supertypes its type declarations name, its call sites (every method
-// invocation, and every creation whose type is a simple name, the call
-// references the structural query captures) and its values (every method
-// reference, and every lambda written to a field).
+// invocation, every creation and every explicit constructor invocation
+// that names a class, the call references the structural query captures)
+// and its values (every method reference, and every lambda written to a
+// field).
 func (k *javaLinker) file(root Node, src []byte, out *wire.Link) {
 	k.src, k.out = src, out
 	defer func() { k.src, k.out = nil, nil }()
@@ -141,6 +145,8 @@ func (k *javaLinker) visit(n Node) {
 		k.invocation(n)
 	case id == j.objectCreation:
 		k.creation(n)
+	case id == x.explicitConstructor:
+		k.constructorCall(n)
 	case id == j.enumConstant:
 		k.enumConstant(n)
 	case id == j.methodReference:
@@ -194,7 +200,7 @@ func (k *javaLinker) typeDecl(n Node) {
 	j, x := k.k, k.x
 	m := k.mark()
 	k.typeParams(n)
-	var name string
+	var name, super string
 	if nm := n.ChildByFieldId(j.fName); !nm.IsNull() {
 		name = string(k.text(nm))
 	}
@@ -202,6 +208,7 @@ func (k *javaLinker) typeDecl(n Node) {
 		switch c.KindId() {
 		case x.superclass:
 			k.supertypes(name, c)
+			super = k.erased(firstNamed(c))
 		case x.superInterfaces, x.extendsInterfaces:
 			for l := c.first(); !l.IsNull(); l = l.next() {
 				if l.KindId() == x.typeList {
@@ -213,7 +220,7 @@ func (k *javaLinker) typeDecl(n Node) {
 	if n.KindId() == j.recordDecl {
 		k.params(n.ChildByFieldId(j.fParameters), true)
 	}
-	k.frames = append(k.frames, javaFrame{name: name, named: true})
+	k.frames = append(k.frames, javaFrame{name: name, named: true, super: super})
 	k.members(n.ChildByFieldId(j.fBody))
 	k.children(n)
 	k.frames = k.frames[:len(k.frames)-1]
@@ -520,10 +527,12 @@ func (k *javaLinker) qualifier(obj Node) (string, bool) {
 // lookupVar reports whether a variable in scope binds the identifier name.
 func (k *javaLinker) lookupVar(name Node) bool { return k.vars.innermost(k.text(name)) >= 0 }
 
-// creation appends the site of a creation whose type is a simple name, the
-// call reference the structural query captures, after the sites of its
-// outer instance and arguments, then walks an anonymous class body with
-// the type it instantiates as its `this`.
+// creation appends the site of a creation, the call reference the
+// structural query captures, after the sites of its outer instance and
+// arguments, then walks an anonymous class body with the type it
+// instantiates as its `this`. Its callee token is the created type's last
+// simple name; a qualified or generic type is the Qualifier as erased
+// (`a.b.T` for `new a.b.T<X>()`).
 func (k *javaLinker) creation(n Node) {
 	j, x := k.k, k.x
 	var body Node
@@ -536,13 +545,64 @@ func (k *javaLinker) creation(n Node) {
 		}
 	}
 	t := x.child(n, x.fType)
-	if !t.IsNull() && t.KindId() == x.typeIdentifier {
-		k.addSite(n, wire.Site{Name: javaSpan(t), Shape: wire.ShapeConstructor,
-			Args: k.args(n.ChildByFieldId(j.fArguments))})
+	if name := k.createdName(t); !name.IsNull() {
+		s := wire.Site{Name: javaSpan(name), Shape: wire.ShapeConstructor, Args: k.args(n.ChildByFieldId(j.fArguments))}
+		if name != t {
+			s.Qualifier = k.erased(t)
+		}
+		k.addSite(n, s)
 	}
 	if !body.IsNull() {
 		k.anonymous(k.erased(t), body)
 	}
+}
+
+// createdName is the token a creation of the type t is called by, as the
+// structural query captures it: a simple type name itself, the last simple
+// name of a scoped one, and either below type arguments; null for any
+// other type.
+func (k *javaLinker) createdName(t Node) Node {
+	x := k.x
+	if t.IsNull() {
+		return Node{}
+	}
+	switch t.KindId() {
+	case x.typeIdentifier:
+		return t
+	case x.genericType:
+		if c := firstNamed(t); !c.IsNull() && (c.KindId() == x.typeIdentifier || c.KindId() == x.scopedTypeIdentifier) {
+			return k.createdName(c)
+		}
+	case x.scopedTypeIdentifier:
+		if last := lastNamed(t); !last.IsNull() && last.KindId() == x.typeIdentifier {
+			return last
+		}
+	}
+	return Node{}
+}
+
+// constructorCall appends the site of an explicit constructor invocation,
+// after the sites of its outer instance and arguments: `this(...)` creates
+// through a constructor of the enclosing class, `super(...)` through one of
+// the class it extends, which the site's Qualifier names. One with no
+// class to name (`super(...)` in a class that extends none, whose
+// superclass the file does not write) is no site.
+func (k *javaLinker) constructorCall(n Node) {
+	k.children(n)
+	ctor := k.x.child(n, k.x.fConstructor)
+	f := len(k.frames) - 1
+	if ctor.IsNull() || f < 0 || !k.frames[f].named {
+		return
+	}
+	q := k.frames[f].name
+	if ctor.KindId() == k.k.super {
+		q = k.frames[f].super
+	}
+	if q == "" {
+		return
+	}
+	k.addSite(n, wire.Site{Name: javaSpan(ctor), Shape: wire.ShapeConstructor, Qualifier: q,
+		Args: k.args(n.ChildByFieldId(k.k.fArguments))})
 }
 
 // enumConstant walks an enum constant's arguments, then its body, whose
@@ -954,9 +1014,9 @@ func javaSpan(n Node) wire.Span { return wireSpan(spanOf(n)) }
 type javaLinkSyntax struct {
 	typeIdentifier, scopedTypeIdentifier, genericType, annotatedType, voidType, superclass, superInterfaces,
 	extendsInterfaces, typeList, typeParameters, typeParameter, typeBound, modifiers, importDecl,
-	scopedIdentifier, asterisk uint16
+	scopedIdentifier, asterisk, explicitConstructor uint16
 
-	fType, fField, fDimensions uint16
+	fType, fField, fDimensions, fConstructor uint16
 
 	// types marks the type declaration kinds, scope the kinds whose
 	// declarations end with them, by kind id.
@@ -1022,7 +1082,9 @@ func javaLinkSyntaxOf() *javaLinkSyntax {
 		x.typeParameters, x.typeParameter = kind("type_parameters"), kind("type_parameter")
 		x.typeBound, x.modifiers, x.importDecl = kind("type_bound"), kind("modifiers"), kind("import_declaration")
 		x.scopedIdentifier, x.asterisk = kind("scoped_identifier"), kind("asterisk")
+		x.explicitConstructor = kind("explicit_constructor_invocation")
 		x.fType, x.fField, x.fDimensions = field("type"), field("field"), field("dimensions")
+		x.fConstructor = field("constructor")
 		x.types = make([]bool, tl.NodeKindCount())
 		for _, name := range []string{"class_declaration", "interface_declaration", "enum_declaration",
 			"record_declaration", "annotation_type_declaration"} {
