@@ -230,11 +230,10 @@ func (r *staticFile) shape(i int32, s *Site, bySignature *pagination.ExternalSor
 // fits reports that site s passes as many arguments as target e accepts
 // (wire.Export.Params). A Go method expression or a Rust path naming a
 // method (`T.M(t, x)`, `T::m(t, x)`) passes the receiver as its first
-// argument. A site the worker recovered no argument of (no Args) is not
-// filtered, since the table does not tell a call the worker did not
-// describe from one passing none.
+// argument. A site the worker sent no wire.Site for (not Described) is not
+// filtered: it carries no argument list.
 func (r *staticFile) fits(s *Site, e entry) bool {
-	if s.Args == nil {
+	if !s.Described {
 		return true
 	}
 	n := len(s.Args)

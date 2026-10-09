@@ -197,7 +197,7 @@ In every static family a site binds only a target its arguments fit: at least `P
 a `Variadic` one, whose last parameter may take none) and, unless `Variadic`, at most `Params` (`staticFile.fits`).
 A C or C++ definition takes `virtual`, `final` and default arguments from its prototypes of the same signature
 (`preferDefinitions`). A Go method expression or a Rust path naming a method passes
-its receiver as the first argument. A site with no recovered arguments is not filtered. A receiver that is
+its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
 another call's result (`TypeResult`) has the types that call's targets return, each read in its target's file
 (`staticFile.results`).
 

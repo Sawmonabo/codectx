@@ -157,6 +157,10 @@ type Site struct {
 	Receiver          wire.Type   `json:"receiver"`
 	Signature         string      `json:"signature,omitempty"`
 	Args              []wire.Type `json:"args,omitempty"`
+	// Described reports that the worker sent a wire.Site for the call, so
+	// Args is its whole argument list (empty for a call of no argument);
+	// a site no wire.Site joined carries no argument facts.
+	Described bool `json:"described,omitempty"`
 	// Candidates are the declarations of this file the callee name can
 	// mean, the structural provider's own in-file targets.
 	Candidates []int32 `json:"candidates,omitempty"`

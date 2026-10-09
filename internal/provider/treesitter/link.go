@@ -97,6 +97,7 @@ func (b *builder) linkTable() error {
 			// The first reference at a callee token claims the worker's site;
 			// a second reference at the same token keeps its own shape.
 			w, siteAt[i] = i, int32(len(t.Sites))
+			s.Described = true
 			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
 		}
 		joined = append(joined, w)
