@@ -32,17 +32,17 @@ import (
 // edited file's facts and reads only the tables that republication needs.
 // Any other build resolves in full, publishes every fact and carries nothing.
 type linkApplier struct {
-	store  *sqlite.Store
-	p      *link.Provider
-	tables link.Tables
-	limits provider.Limits
-	pool   *provider.Pool
+	store   *sqlite.Store
+	p       *link.Provider
+	digests link.Digests
+	limits  provider.Limits
+	pool    *provider.Pool
 }
 
 // NewLink binds the linking provider to the store its units are built in and
-// to the tables its members' structural units stored.
-func NewLink(store *sqlite.Store, p *link.Provider, tables link.Tables, limits provider.Limits, pool *provider.Pool) Applier {
-	return &linkApplier{store: store, p: p, tables: tables, limits: limits, pool: pool}
+// to the member digests its members' structural units stored.
+func NewLink(store *sqlite.Store, p *link.Provider, digests link.Digests, limits provider.Limits, pool *provider.Pool) Applier {
+	return &linkApplier{store: store, p: p, digests: digests, limits: limits, pool: pool}
 }
 
 func (a *linkApplier) Kind() string { return link.ResolutionKind }
@@ -54,8 +54,8 @@ func (a *linkApplier) Kind() string { return link.ResolutionKind }
 // members this unit no longer has. Result.Carried is what the inheriting path
 // carried over, and zero on the other.
 func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
-	if a.store == nil || a.p == nil || a.tables == nil {
-		return Result{}, invalid("the link delta applier needs a store, a provider and the stored tables")
+	if a.store == nil || a.p == nil || a.digests == nil {
+		return Result{}, invalid("the link delta applier needs a store, a provider and the stored digests")
 	}
 	if err := req.validate(); err != nil {
 		return Result{}, err
@@ -201,7 +201,7 @@ func (a *linkApplier) digested(ctx context.Context, req Request, j *digestJoin) 
 			if err != nil {
 				return err
 			}
-			if in.Digest, _, err = a.tables.Digest(ctx, req.Generation, fv); err != nil {
+			if in.Digest, _, err = a.digests.Digest(ctx, req.Generation, fv); err != nil {
 				return err
 			}
 			if err := j.match(in); err != nil {

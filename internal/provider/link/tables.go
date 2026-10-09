@@ -18,9 +18,13 @@ type Tables interface {
 	// a language with no lowering, or a file whose dependence or link pass
 	// failed (wire.Done discloses which).
 	Table(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (*Table, bool, error)
-	// Digest returns the MemberDigest that same unit stored beside the
-	// table, without reading or decoding the table, and false when it
-	// stored none.
+}
+
+// Digests reads the member digests the structural provider stored.
+type Digests interface {
+	// Digest returns the MemberDigest the structural unit generation gen
+	// selects for fv's file stored beside its table, without reading or
+	// decoding the table, and false when that unit stored none.
 	Digest(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (string, bool, error)
 }
 
@@ -45,13 +49,20 @@ func MemberDigest(t *Table) (string, error) {
 	return model.H(memberDigestDomain, d, strconv.Itoa(t.Dropped)), nil
 }
 
-// StoreTables reads tables from the store: the structural unit a generation
-// selects for a file's scope, then that unit's TableKind or DigestKind state.
-func StoreTables(s *sqlite.Store) Tables { return storeTables{s: s} }
+// StoreTables reads tables and digests from the store: the structural unit a
+// generation selects for a file's scope, then that unit's TableKind or
+// DigestKind state.
+func StoreTables(s *sqlite.Store) StoredTables { return StoredTables{s: s} }
 
-type storeTables struct{ s *sqlite.Store }
+// StoredTables are the Tables and Digests a store holds.
+type StoredTables struct{ s *sqlite.Store }
 
-func (st storeTables) Table(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (*Table, bool, error) {
+var (
+	_ Tables  = StoredTables{}
+	_ Digests = StoredTables{}
+)
+
+func (st StoredTables) Table(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (*Table, bool, error) {
 	buf, ok, err := st.state(ctx, gen, fv, TableKind)
 	if err != nil || !ok {
 		return nil, false, err
@@ -66,7 +77,7 @@ func (st storeTables) Table(ctx context.Context, gen model.GenerationID, fv mode
 	return t, true, nil
 }
 
-func (st storeTables) Digest(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (string, bool, error) {
+func (st StoredTables) Digest(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (string, bool, error) {
 	buf, ok, err := st.state(ctx, gen, fv, DigestKind)
 	if err != nil || !ok {
 		return "", false, err
@@ -79,7 +90,7 @@ func (st storeTables) Digest(ctx context.Context, gen model.GenerationID, fv mod
 
 // state reads the artifact of kind the structural unit gen selects for fv's
 // file stored, and false when that unit, or that artifact, is not there.
-func (st storeTables) state(ctx context.Context, gen model.GenerationID, fv model.FileVersion, kind string) ([]byte, bool, error) {
+func (st StoredTables) state(ctx context.Context, gen model.GenerationID, fv model.FileVersion, kind string) ([]byte, bool, error) {
 	unit, err := st.s.SelectedUnit(ctx, gen, lang.ProviderID, lang.ScopePrefix+fv.Path)
 	if notFound(err) {
 		return nil, false, nil

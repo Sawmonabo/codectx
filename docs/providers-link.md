@@ -93,7 +93,7 @@ The unit's inputs are its member files. The unit's identity is their content, as
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
 Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
-`internal/provider/link/tables.go:35-46`). The digest is outside the unit's identity: `UnitInputHasher` does not
+`internal/provider/link/tables.go:39-50`). The digest is outside the unit's identity: `UnitInputHasher` does not
 read it. It decides what a rebuild costs (the fast path below).
 
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
@@ -101,9 +101,9 @@ structural provider joins it to the declarations and call references it validate
 `link.Table` with the file's structural unit, under `link.TableKind`, and the table's member digest beside it, under
 `link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go:319-340`). It stores both through
 `provider.StateSink` (`internal/provider/sink.go:240-249`), so they share the unit's lifetime. The linker reads a
-table, or its digest alone, back through `link.Tables` (`tables.go:14-97`): the structural unit the generation
-selects for the file's scope, then that unit's state of the kind. A file with no lowering, or whose dependence or
-link pass failed, has neither.
+table back through `link.Tables`, and the delta build a digest alone through `link.Digests` (`tables.go:14-108`): the
+structural unit the generation selects for the file's scope, then that unit's state of the kind. A file with no
+lowering, or whose dependence or link pass failed, has neither.
 
 Besides the joined declarations, sites and values, the table carries what the resolvers read a name in
 (`internal/provider/link/table.go`, filled by `internal/provider/treesitter/link.go`):

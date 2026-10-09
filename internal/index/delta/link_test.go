@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 func TestLinkBodyEditRelinksNothing(t *testing.T) {
 	f := newFixture(t)
 	ts := f.structuralProvider()
-	tables := &countedTables{Tables: link.StoreTables(f.store), reads: map[string]int{}}
+	tables := &countedTables{StoredTables: link.StoreTables(f.store), reads: map[string]int{}}
 	lp := link.New(tables)
 	a := delta.NewLink(f.store, lp, tables, limits, f.pool)
 	paths := []string{"go.mod", "a.go", "b.go"}
@@ -124,7 +124,7 @@ func TestLinkBodyEditRelinksNothing(t *testing.T) {
 
 // countedTables counts the tables read, by path; digests are not counted.
 type countedTables struct {
-	link.Tables
+	link.StoredTables
 	mu    sync.Mutex
 	reads map[string]int
 }
@@ -133,7 +133,7 @@ func (c *countedTables) Table(ctx context.Context, gen model.GenerationID, fv mo
 	c.mu.Lock()
 	c.reads[fv.Path]++
 	c.mu.Unlock()
-	return c.Tables.Table(ctx, gen, fv)
+	return c.StoredTables.Table(ctx, gen, fv)
 }
 
 func (c *countedTables) read(path string) int {
