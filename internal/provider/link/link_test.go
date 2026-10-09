@@ -53,6 +53,8 @@ var linkCases = []struct {
 	// carries.
 	ambiguous [2]string
 }{
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "go", anchor: `The Go Programming Language Specification, "Calls", "Function types", "Interface types", "Method sets"`, files: map[string]string{"calls.go": `package p
 
 type Shape interface{ Area() int }
@@ -74,6 +76,8 @@ func indirect() int {
 	return f(1)
 }
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "Area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "java", anchor: `Java Language Specification §15.12.4.4 (Locate Method to Invoke), §9.8 (Functional Interfaces)`, files: map[string]string{"Calls.java": `interface Shape { int area(); }
 class Square implements Shape { public int area() { return 4; } }
 class Circle implements Shape { public int area() { return 3; } }
@@ -84,6 +88,8 @@ class Calls {
   int indirect(Op op) { return op.run(1); }
 }
 `}, indirect: [2]string{"indirect", "run"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "javascript", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.js": `class Square { area() { return 4; } }
 class Circle { area() { return 3; } }
 function seven(n) { return n + 7; }
@@ -97,6 +103,8 @@ function indirect() {
   return f(1);
 }
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "typescript", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.ts": `class Square { area(): number { return 4; } }
 class Circle { area(): number { return 3; } }
 function seven(n: number): number { return n + 7; }
@@ -110,6 +118,8 @@ function indirect(): number {
   return f(1);
 }
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "tsx", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.tsx": `class Square { area(): number { return 4; } }
 class Circle { area(): number { return 3; } }
 function seven(n: number): number { return n + 7; }
@@ -123,6 +133,8 @@ function indirect(): number {
   return f(1);
 }
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "python", anchor: `The Python Language Reference §6.3.4 (Calls), §3.3 (attribute lookup on a class)`, files: map[string]string{"calls.py": `class Square:
     def area(self):
         return 4
@@ -148,6 +160,8 @@ def indirect():
     f = seven
     return f(1)
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "rust", anchor: `The Rust Reference, "Call expressions" (function pointer types), "Method-call expressions", "Trait objects"`, files: map[string]string{
 		"Cargo.toml": "[package]\nname = \"calls\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
 		"src/lib.rs": `pub trait Shape {
@@ -179,6 +193,8 @@ pub fn indirect() -> i32 {
     f(1)
 }
 `}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "c", anchor: `ISO C §6.5.2.2 (Function calls through a pointer-to-function), §6.2.2 (Linkages of identifiers)`, files: map[string]string{"calls.c": `static int seven(int n) { return n + 7; }
 static int eight(int n) { return n + 8; }
 static long wide(long n) { return n; }
@@ -194,6 +210,8 @@ int indirect(void) {
   return (int)f(1);
 }
 `}, indirect: [2]string{"indirect", "wide"}, ambiguous: [2]string{"ambiguous", ""}},
+	// Derived twice from the source and the anchor, the second time blind (the source,
+	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "cpp", anchor: `ISO C++ [expr.call], [class.virtual]`, files: map[string]string{"calls.cpp": `struct Shape { virtual int area() = 0; };
 struct Square : Shape { int area() override { return 4; } };
 struct Circle : Shape { int area() override { return 3; } };
