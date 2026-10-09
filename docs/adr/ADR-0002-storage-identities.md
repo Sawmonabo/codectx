@@ -180,10 +180,10 @@ and the dictionaries miss the gate. ADR-0001 §2.8 records the published analogu
 and therefore determinism. It is recorded in ADR-0001 §2.8 as the next lever if the redesign
 misses, not as part of this one.
 
-**A separate `paths` intern table.** Refused: the only high-multiplicity path column is
-`search_units.path`, and the full-text index declares it as an external-content column [S11], so it
-must stay a TEXT column under that name or the path field leaves the full-text index. The other
-path column is 818 rows / 114 KiB on the fixture and is not an amplifier. The alternative was a
+**A separate `paths` intern table.** Refused: no high-multiplicity path column is stored here. A
+search document's path lives in the search index, whose sorted path dictionary already holds each
+distinct path once ([ADR-0013](ADR-0013-search-index.md), decisions 7 and 8). The one path column
+left is 818 rows / 114 KiB on the fixture and is not an amplifier. The alternative was a
 table with no writer.
 
 **Dropping the outgoing-relation lookup index.** Done, and it is a refusal of the *opposite* kind:
@@ -402,10 +402,6 @@ unnecessary and why two identity constraints already carry their own indexes.
 
 [S10] https://www.sqlite.org/partialindex.html — a partial index is usable only when the statement's
 `WHERE` clause implies the index predicate; why the partial `fact_keys` variant was rejected.
-
-[S11] https://www.sqlite.org/fts5.html#external_content_tables — external-content full-text tables
-and their `content_rowid` contract; why the search path column must stay TEXT under its own name
-and why the search row-id cursor has no canonical counterpart to carry.
 
 [S12] https://www.sqlite.org/queryplanner.html — the query planner and covering indexes; the frame
 for the call-site-driven index audit.

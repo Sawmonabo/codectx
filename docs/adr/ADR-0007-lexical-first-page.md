@@ -1,6 +1,6 @@
 # ADR-0007 — Lexical first page: packed term statistics at activation, rank before hydrate, heap-served first page
 
-**Status:** Accepted, 2026-09-15 · **Informs:** ADR-0001 §2 (the page is the unit of memory), ADR-0003 §2.1
+**Status:** Superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08 · **Informs:** ADR-0001 §2 (the page is the unit of memory), ADR-0003 §2.1
 (the lexical tier holds no second copy of the source), ADR-0005 (the packed-at-activation shape this
 record reuses) · **Inputs:** three search profiling rounds on the reference repository, whose
 measurements are reproduced in full in the measurement record at the end of this document.
