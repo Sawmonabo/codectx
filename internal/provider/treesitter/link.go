@@ -205,33 +205,41 @@ func isIdentByte(c byte) bool {
 // linkImports is the names the file's import records introduce, each with
 // the path it denotes (link.Import). The worker's record is one statement:
 // its path as written and the local names it binds. A Rust use tree is
-// split into one path per leaf; a Java on-demand import (`a.b.*`), a C++
-// using-directive (`using namespace a`) and an include introduce no single
-// name, which the statement's own bytes tell.
+// split into one path per leaf. An import of every member of a path (a Go
+// dot import, a Java on-demand import `a.b.*`, a C++ using-directive, a Rust
+// glob, a Python `from m import *`) is named link.ImportAll, which the
+// statement's own bytes tell; an import binding no name (an include, an
+// ECMAScript side-effect import) has an empty name.
 func (b *builder) linkImports() []link.Import {
 	var out []link.Import
 	for _, imp := range b.ex.imports {
-		text := strings.TrimSpace(string(b.src[imp.Start:imp.End]))
+		text := string(b.src[imp.Start:imp.End])
+		names := imp.Names
 		switch b.lang.Name {
 		case "rust":
 			rustUse("", imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p}) })
 			continue
-		case "java":
+		case "go":
+			if len(names) == 1 && names[0] == "." {
+				names = []string{link.ImportAll}
+			}
+		case "java", "python":
 			if strings.Contains(text, "*") {
-				out = append(out, link.Import{Path: imp.Path})
-				continue
+				names = []string{link.ImportAll}
 			}
 		case "c", "cpp":
-			// Only a using-declaration (`using a::b;`) binds a name.
-			if f := strings.Fields(text); len(f) < 2 || f[0] != "using" || f[1] == "namespace" || !strings.Contains(imp.Path, "::") {
-				out = append(out, link.Import{Path: imp.Path})
-				continue
+			switch f := strings.Fields(text); {
+			case len(f) > 2 && f[0] == "using" && f[1] == "namespace":
+				names = []string{link.ImportAll}
+			case len(f) < 2 || f[0] != "using":
+				// An include binds no name.
+				names = nil
 			}
 		}
-		if len(imp.Names) == 0 {
+		if len(names) == 0 {
 			out = append(out, link.Import{Path: imp.Path})
 		}
-		for _, n := range imp.Names {
+		for _, n := range names {
 			out = append(out, link.Import{Name: n, Path: imp.Path})
 		}
 	}
@@ -240,8 +248,8 @@ func (b *builder) linkImports() []link.Import {
 
 // rustUse yields every leaf of the Rust use tree p, written inside a list
 // whose path so far is prefix: the name it binds and the full path it names
-// (`a::{b, c as d}` binds b to a::b and d to a::c). A glob binds no single
-// name and yields the module it imports from with an empty name; `self` in a
+// (`a::{b, c as d}` binds b to a::b and d to a::c). A glob yields the module
+// it imports from as link.ImportAll; `self` in a
 // list binds the list's own path; `as _` binds nothing.
 func rustUse(prefix, p string, yield func(name, path string)) {
 	join := func(a, b string) string {
@@ -294,7 +302,7 @@ func rustUse(prefix, p string, yield func(name, path string)) {
 	}
 	switch leaf {
 	case "*":
-		yield("", join(prefix, strings.TrimSuffix(strings.TrimSuffix(p, "*"), "::")))
+		yield(link.ImportAll, join(prefix, strings.TrimSuffix(strings.TrimSuffix(p, "*"), "::")))
 	case "self":
 		if prefix != "" {
 			yield(prefix[strings.LastIndex(prefix, ":")+1:], prefix)

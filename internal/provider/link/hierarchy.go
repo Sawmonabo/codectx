@@ -40,9 +40,16 @@ type hierarchy struct {
 // name each other's declarations (familyOf). A refKey is a declaration's Ref
 // in eight bytes, so a type's methods, subtypes and supertypes sort together.
 const (
-	// keyFile + refKey(file, 0): the file's language (Aux) and its scopes
-	// (Sig, joined by "\n"), the context a name written in it is read in.
+	// keyFile + refKey(file, 0): the file's language and path (Aux, joined
+	// by a NUL) and its scopes (Sig, joined by "\n"), the context a name
+	// written in it is read in.
 	keyFile = "f\x00"
+	// keyImport + refKey(file, 0) + name: the path a name the file's imports
+	// introduce denotes (Aux), ImportAll for an import of every member.
+	keyImport = "i\x00"
+	// keyGoDir + directory: a Go package declared in that directory, its
+	// name in Aux, which an import path ending in the directory reaches.
+	keyGoDir = "g\x00"
 	// keyType + family + scope + name: a type declaration visible under its
 	// simple name in that scope. C and C++ types carry their namespace in
 	// Aux under the empty scope instead.
@@ -51,8 +58,16 @@ const (
 	// components: a type declaration a qualified name reaches.
 	keyTypeQualified = "tq\x00"
 	// keyTypeName + family + name: every type declaration of that simple
-	// name in the unit, read only when nothing in scope declares it.
+	// name in the unit, read only for a name no scope or import of the file
+	// can supply (typesIn).
 	keyTypeName = "tn\x00"
+	// keyTypeModule + a Rust file module's name + name: a top-level type a
+	// `use` or a `module::T` path reaches.
+	keyTypeModule = "tm\x00"
+	// keyTypeExport + a module path without extension + name: a top-level
+	// type an ECMAScript module exports or a Python module declares, which
+	// an import of that module reaches (moduleBases).
+	keyTypeExport = "te\x00"
 	// keyFunc + family + scope + name: a free function visible under its
 	// simple name in that scope (Go's package, C's and C++'s one linkage
 	// scope with the namespace in Aux, Rust's file), its signature in Sig.
@@ -77,7 +92,7 @@ const (
 const (
 	flagAbstract byte = 1 << iota
 	flagStatic
-	flagHeader
+	flagPrototype
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -111,40 +126,37 @@ func separatorOf(language string) string {
 
 // fileCtx is the context a name written in one member file is read in.
 type fileCtx struct {
-	language, family, sep string
+	file                        int32
+	language, family, sep, path string
 	// scopes are the scopes a simple name is visible in: Go's directory
 	// and package, Java's package, Rust's and every other language's file,
 	// and for C and C++ the namespaces the file declares in, "" first.
 	scopes []string
 }
 
-// contextOf is t's fileCtx.
-func contextOf(t *Table) fileCtx {
-	fc := fileCtx{language: t.Language, family: familyOf(t.Language), sep: separatorOf(t.Language)}
+// contextOf is t's fileCtx: Go's directory and package clause, Java's
+// package clause, the namespaces a C or C++ file declares in and those its
+// using-directives name, and every other language's file.
+func contextOf(file int32, t *Table) fileCtx {
+	fc := fileCtx{file: file, language: t.Language, family: familyOf(t.Language), sep: separatorOf(t.Language), path: t.Path}
 	switch fc.family {
 	case "go":
-		pkg := ""
-		for _, d := range t.Decls {
-			if p, _, ok := strings.Cut(d.Qualified, "."); ok && d.Qualified != d.Name {
-				pkg = p
-				break
-			}
-		}
-		fc.scopes = []string{path.Dir(t.Path) + "\x00" + pkg}
+		fc.scopes = []string{path.Dir(t.Path) + "\x00" + t.Package}
 	case "java":
-		pkg := ""
-		for i := range t.Decls {
-			if t.Decls[i].Parent < 0 {
-				pkg = namespaceOf(&t.Decls[i], ".")
-				break
-			}
-		}
-		fc.scopes = []string{pkg}
+		fc.scopes = []string{t.Package}
 	case "c":
 		fc.scopes = []string{""}
-		for i := range t.Decls {
-			if ns := namespaceOf(&t.Decls[i], fc.sep); ns != "" && !slices.Contains(fc.scopes, ns) {
+		add := func(ns string) {
+			if ns != "" && !slices.Contains(fc.scopes, ns) {
 				fc.scopes = append(fc.scopes, ns)
+			}
+		}
+		for i := range t.Decls {
+			add(namespaceOf(&t.Decls[i], fc.sep))
+		}
+		for _, imp := range t.Imports {
+			if imp.Name == ImportAll {
+				add(imp.Path)
 			}
 		}
 	default:
@@ -194,12 +206,6 @@ func rustModule(p string) string {
 	default:
 		return stem
 	}
-}
-
-// isHeader reports a path its language's grammar declares a header.
-func isHeader(language, p string) bool {
-	l, ok := lang.Lookup(language)
-	return ok && slices.Contains(l.Headers, strings.ToLower(path.Ext(p)))
 }
 
 // qualifiedSuffixes yields every suffix of q of two or more components.
@@ -296,11 +302,30 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 
 // addDecls adds t's file context, type declarations and free functions.
 func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
-	fc := contextOf(t)
-	if err := s.Add(entry{Key: keyFile + refKey(Ref{File: file}), Aux: t.Language, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
+	fc := contextOf(file, t)
+	fileKey := refKey(Ref{File: file})
+	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
 		return err
 	}
-	header := isHeader(t.Language, t.Path)
+	for _, imp := range t.Imports {
+		if imp.Name == "" {
+			continue
+		}
+		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Aux: imp.Path}); err != nil {
+			return err
+		}
+	}
+	if fc.family == "go" {
+		if err := s.Add(entry{Key: keyGoDir + path.Dir(t.Path), Aux: t.Package}); err != nil {
+			return err
+		}
+	}
+	// bases are the module paths an import names this file by, for the
+	// families whose imports name modules.
+	var bases []string
+	if fc.family == "js" || fc.family == "python" {
+		bases = moduleBases(t.Path, fc.family == "python")
+	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		ref := Ref{File: file, Index: int32(i)}
@@ -315,6 +340,14 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		case isType(d.Kind):
 			prefix, qualifiedPrefix = keyType, keyTypeQualified
 			keys = append(keys, keyTypeName+fc.family+"\x00"+d.Name)
+			if d.Parent < 0 && fc.family == "rust" {
+				keys = append(keys, keyTypeModule+rustModule(t.Path)+"\x00"+d.Name)
+			}
+			if d.Parent < 0 && (fc.family == "python" || fc.family == "js" && d.Exported) {
+				for _, b := range bases {
+					keys = append(keys, keyTypeExport+b+"\x00"+d.Name)
+				}
+			}
 		case isCallable(d.Kind) && d.Receiver == "" && (d.Parent < 0 || !isType(t.Decls[d.Parent].Kind)):
 			prefix, qualifiedPrefix = keyFunc, keyFuncQualified
 			if fc.family == "rust" && d.Parent < 0 {
@@ -325,7 +358,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 		keys = append(keys, prefix+fc.family+"\x00"+scope+"\x00"+d.Name)
 		qualifiedSuffixes(d.Qualified, fc.sep, func(q string) { keys = append(keys, qualifiedPrefix+fc.family+"\x00"+q) })
-		e := entry{Ref: ref, Aux: ns, Sig: d.Signature, Flags: flagsOf(d, header)}
+		e := entry{Ref: ref, Aux: ns, Sig: d.Signature, Flags: flagsOf(d)}
 		for _, k := range keys {
 			e.Key = k
 			if err := s.Add(e); err != nil {
@@ -336,7 +369,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 	return nil
 }
 
-func flagsOf(d *Decl, header bool) byte {
+func flagsOf(d *Decl) byte {
 	var f byte
 	if d.Abstract {
 		f |= flagAbstract
@@ -344,8 +377,8 @@ func flagsOf(d *Decl, header bool) byte {
 	if d.Static {
 		f |= flagStatic
 	}
-	if header {
-		f |= flagHeader
+	if d.Prototype {
+		f |= flagPrototype
 	}
 	return f
 }
@@ -353,15 +386,14 @@ func flagsOf(d *Decl, header bool) byte {
 // addLinks adds t's methods under the types that declare them, its declared
 // supertypes in both directions, and, for Go, its method-set entries.
 func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], file int32, t *Table) error {
-	fc := contextOf(t)
-	header := isHeader(t.Language, t.Path)
+	fc := contextOf(file, t)
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if !isCallable(d.Kind) {
 			continue
 		}
 		ref := Ref{File: file, Index: int32(i)}
-		e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d, header)}
+		e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d)}
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
 			if err := links.Add(e); err != nil {
@@ -497,7 +529,9 @@ func (h *hierarchy) types(ctx context.Context, file int32, name string, yield fu
 	var fc fileCtx
 	found := false
 	err := h.decls.lookup(keyFile+refKey(Ref{File: file}), func(e entry) error {
-		fc = fileCtx{language: e.Aux, family: familyOf(e.Aux), sep: separatorOf(e.Aux), scopes: strings.Split(e.Sig, "\n")}
+		language, p, _ := strings.Cut(e.Aux, "\x00")
+		fc = fileCtx{file: file, language: language, family: familyOf(language), sep: separatorOf(language), path: p,
+			scopes: strings.Split(e.Sig, "\n")}
 		found = true
 		return nil
 	})
@@ -508,16 +542,28 @@ func (h *hierarchy) types(ctx context.Context, file int32, name string, yield fu
 }
 
 // typesIn yields the type declarations name, as written in a file of
-// context fc, denotes: a qualified name the declarations whose qualified
-// name ends in it; a simple name the declarations of that name in one of
-// the file's scopes, and when none, every type of that name in the unit.
+// context fc, denotes.
+//
+// A simple name is read, in order, in the file's scopes; through the import
+// that introduces it (a Java single-type import, a C++ using-declaration, a
+// Rust `use`, an ECMAScript or Python import of the module declaring it),
+// which decides alone when there is one; and through the file's imports of
+// every member of a path. Only a name none of these can supply (the file has
+// no import naming it and no import of every member) falls back to every
+// type of that name in the unit.
+//
+// A qualified name whose first component an import introduces is read with
+// that component replaced by what it denotes: a Go package by its import
+// path, a Rust path by its module, an ECMAScript or Python module by its
+// path, a Java or C++ name by the import's qualified name. Any other
+// qualified name is the declarations whose qualified name ends in it.
 func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yield func(entry) error) error {
 	name := typeName(written)
 	if name == "" {
 		return nil
 	}
-	if strings.Contains(name, fc.sep) {
-		return h.decls.lookup(keyTypeQualified+fc.family+"\x00"+name, yield)
+	if head, rest, ok := strings.Cut(name, fc.sep); ok {
+		return h.qualifiedTypes(fc, name, head, rest, yield)
 	}
 	found := false
 	hit := func(e entry) error {
@@ -544,39 +590,177 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 	if found {
 		return nil
 	}
+	imported := false
+	err := h.imports(fc, name, func(p string) error {
+		imported = true
+		return h.importedType(fc, name, p, yield)
+	})
+	if err != nil || imported {
+		return err
+	}
+	all := false
+	err = h.imports(fc, ImportAll, func(p string) error {
+		all = true
+		return h.memberType(fc, p, name, hit)
+	})
+	if err != nil || found || all {
+		return err
+	}
 	return h.decls.lookup(keyTypeName+fc.family+"\x00"+name, yield)
 }
 
-// methods yields the methods typ itself declares named method. A C or C++
-// type's declaration in a header is not yielded when a translation unit
-// defines the same method of it: that is the definition the declaration
-// announces.
+// qualifiedTypes is typesIn for a qualified name, head its first component
+// and rest the others.
+func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield func(entry) error) error {
+	imported := false
+	err := h.imports(fc, head, func(p string) error {
+		imported = true
+		switch fc.family {
+		case "go":
+			return h.goPackages(p, func(scope string) error {
+				return h.decls.lookup(keyType+fc.family+"\x00"+scope+"\x00"+rest, yield)
+			})
+		case "js", "python":
+			// The import binds head to a module: `ns.C` of `import * as ns`,
+			// `m.C` of `import a.b as m`; Python's `import a.b` binds a, and
+			// a.b.C is then read as written.
+			module, last, _ := cutLast(name, fc.sep)
+			if fc.family == "python" && (p == head || strings.HasPrefix(p, head+".")) {
+				return h.moduleType(fc, module, last, yield)
+			}
+			if module != head {
+				if fc.family == "js" {
+					return nil
+				}
+				p += fc.sep + strings.TrimPrefix(module, head+fc.sep)
+			}
+			return h.moduleType(fc, p, last, yield)
+		}
+		return h.importedType(fc, "", p+fc.sep+rest, yield)
+	})
+	if err != nil || imported {
+		return err
+	}
+	if fc.family == "rust" {
+		module, last, _ := cutLast(name, fc.sep)
+		found := false
+		err := h.decls.lookup(keyTypeModule+rustPath(fc.path, module)+"\x00"+last, func(e entry) error {
+			found = true
+			return yield(e)
+		})
+		if err != nil || found {
+			return err
+		}
+	}
+	return h.decls.lookup(keyTypeQualified+fc.family+"\x00"+name, yield)
+}
+
+// importedType yields the type declarations the path p an import binds the
+// type name local to denotes. An ECMAScript or Python import's path is its
+// module, which declares the type under the name the import binds; an
+// import that renames it is read under the local name.
+func (h *hierarchy) importedType(fc fileCtx, local, p string, yield func(entry) error) error {
+	switch fc.family {
+	case "rust":
+		module, last, ok := cutLast(p, fc.sep)
+		if !ok {
+			return nil
+		}
+		return h.decls.lookup(keyTypeModule+rustPath(fc.path, module)+"\x00"+last, yield)
+	case "js", "python":
+		return h.moduleType(fc, p, local, yield)
+	case "go":
+		// A Go import binds a package, never a type.
+		return nil
+	}
+	return h.decls.lookup(keyTypeQualified+fc.family+"\x00"+p, yield)
+}
+
+// memberType yields the type declarations named name among the members an
+// import of every member of p reaches.
+func (h *hierarchy) memberType(fc fileCtx, p, name string, yield func(entry) error) error {
+	switch fc.family {
+	case "go":
+		return h.goPackages(p, func(scope string) error {
+			return h.decls.lookup(keyType+fc.family+"\x00"+scope+"\x00"+name, yield)
+		})
+	case "rust":
+		return h.decls.lookup(keyTypeModule+rustPath(fc.path, p)+"\x00"+name, yield)
+	case "js", "python":
+		return h.moduleType(fc, p, name, yield)
+	case "c":
+		// A using-directive's namespace is one of the file's scopes.
+		return nil
+	}
+	return h.decls.lookup(keyTypeQualified+fc.family+"\x00"+p+fc.sep+name, yield)
+}
+
+// moduleType yields the top-level type named name of the module an
+// ECMAScript or Python import spec written in fc's file names.
+func (h *hierarchy) moduleType(fc fileCtx, spec, name string, yield func(entry) error) error {
+	base, ok := moduleBase(fc.path, spec, fc.family == "python")
+	if !ok {
+		return nil
+	}
+	return h.decls.lookup(keyTypeExport+base+"\x00"+name, yield)
+}
+
+// imports yields the path each import of fc's file binding name denotes,
+// ImportAll naming the imports of every member.
+func (h *hierarchy) imports(fc fileCtx, name string, yield func(string) error) error {
+	return h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+name, func(e entry) error { return yield(e.Aux) })
+}
+
+// goPackages yields the scope (directory and package) of every Go package
+// in the unit a Go import path names: the packages of the longest suffix of
+// the path, at a component boundary, that is a directory of the unit.
+func (h *hierarchy) goPackages(importPath string, yield func(string) error) error {
+	for p := importPath; ; {
+		found := false
+		err := h.decls.lookup(keyGoDir+p, func(e entry) error {
+			found = true
+			return yield(p + "\x00" + e.Aux)
+		})
+		if err != nil || found {
+			return err
+		}
+		i := strings.IndexByte(p, '/')
+		if i < 0 {
+			return nil
+		}
+		p = p[i+1:]
+	}
+}
+
+// methods yields the methods typ itself declares named method. A C++
+// method's prototype is not yielded when a definition of the same method of
+// typ is declared: that is the definition the prototype announces.
 func (h *hierarchy) methods(typ Ref, method string, yield func(entry) error) error {
 	return preferDefinitions(func(f func(entry) error) error {
 		return h.links.lookup(keyMethod+refKey(typ)+method, f)
 	}, yield)
 }
 
-// preferDefinitions yields what each yields, without its header entries
-// when it yields any entry outside a header. Only the entries of one name in
-// one scope are held.
+// preferDefinitions yields what each yields, without its prototypes when
+// it yields any definition. Only the entries of one name in one scope are
+// held.
 func preferDefinitions(each func(func(entry) error) error, yield func(entry) error) error {
-	var headers, sources []entry
+	var prototypes, definitions []entry
 	err := each(func(e entry) error {
-		if e.Flags&flagHeader != 0 {
-			headers = append(headers, e)
+		if e.Flags&flagPrototype != 0 {
+			prototypes = append(prototypes, e)
 		} else {
-			sources = append(sources, e)
+			definitions = append(definitions, e)
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if len(sources) == 0 {
-		sources = headers
+	if len(definitions) == 0 {
+		definitions = prototypes
 	}
-	for _, e := range sources {
+	for _, e := range definitions {
 		if err := yield(e); err != nil {
 			return err
 		}

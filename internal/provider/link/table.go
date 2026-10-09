@@ -25,9 +25,9 @@ type Table struct {
 	// package name, Java's package), empty when the language has none.
 	Package string `json:"package,omitempty"`
 	// Imports are the names the file's imports introduce, in source order:
-	// one per local name, and one with an empty Name for an import that
-	// introduces no single name (a C include, a Java or Rust on-demand
-	// import, a C++ using-directive).
+	// one per local name, ImportAll for an import of every member of a
+	// path, and one with an empty Name for an import that binds no name (an
+	// include, a side-effect import).
 	Imports []Import `json:"imports,omitempty"`
 	// Module is the file's module node, the caller of a site outside every
 	// declaration.
@@ -48,17 +48,22 @@ type Table struct {
 }
 
 // Import is one name an import introduces into the file. Path is what the
-// name denotes as the language writes it: the import path of a Go package
-// (Name its local name, "." for a dot import, "_" for a blank one), the
-// qualified name of a Java type or static member, or for an on-demand
-// import the package or type whose members it imports; the `::` path a C++
-// using-declaration names, or for a using-directive the namespace; the
-// full `::` path of one leaf of a Rust use tree, or for a glob the module;
-// the module specifier of an ECMAScript or Python import as written.
+// name denotes as the language writes it: a Go package's import path (Name
+// its local name, "_" for a blank import); the qualified name of a Java type
+// or static member; the `::` path a C++ using-declaration names; the full
+// `::` path of one leaf of a Rust use tree; the module specifier of an
+// ECMAScript or Python import as written; an include's header. For an
+// ImportAll import it is the package, type, namespace or module whose
+// members it imports.
 type Import struct {
 	Name string `json:"name,omitempty"`
 	Path string `json:"path"`
 }
+
+// ImportAll is the Name of an import of every member of its Path: a Go dot
+// import, a Java on-demand import, a C++ using-directive, a Rust glob, a
+// Python `from m import *`.
+const ImportAll = "*"
 
 // Endpoint is a node of the structural provider as the parent resolved it:
 // what the linker publishes an occurrence of when a `calls` edge names it, so
