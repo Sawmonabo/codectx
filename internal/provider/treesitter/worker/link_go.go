@@ -846,13 +846,17 @@ func (x *goLink) exprType(e Node) wire.Type {
 		}
 		// A field of a type the file declares has the type its declaration
 		// says. Any other field of a known owner is spelled "Owner.field",
-		// which the linker reads through the owner's field declarations
-		// (its own or promoted) in any file; a field of an unknown owner
-		// is the field name alone.
-		if t := x.exprType(o); t.Kind == wire.TypeNamed {
+		// and a field of such a field "Owner.field.next", which the linker
+		// reads step by step through each owner's field declarations (its
+		// own or promoted) in any file; a field of an unknown owner is the
+		// field name alone.
+		switch t := x.exprType(o); {
+		case t.Kind == wire.TypeNamed:
 			if v, ok := x.types[t.Name][x.text(f)]; ok {
 				return v.typ
 			}
+			return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + x.text(f)}
+		case t.Kind == wire.TypeField && strings.Contains(t.Name, "."):
 			return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + x.text(f)}
 		}
 		return wire.Type{Kind: wire.TypeField, Name: x.text(f)}

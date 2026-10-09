@@ -201,8 +201,11 @@ const (
 	// and the package's Values write to that field. In Go, a field of a
 	// receiver whose type is known is spelled "Owner.field", Owner as
 	// written: the field a selector of that name denotes on Owner, its own or
-	// promoted, whose declared type (Export.Returns) types the value; a bare
-	// name is a field of an unknown owner and types nothing. ECMAScript and
+	// promoted, whose declared type (Export.Returns) types the value. A field
+	// of such a field is spelled "Owner.field.next", and so on, each step
+	// read on the type the step before it holds; Owner is two components
+	// when the first is an import (`pkg.T`). A bare name is a field of an
+	// unknown owner and types nothing. ECMAScript and
 	// Python send the bare field name.
 	TypeField TypeKind = 6
 	// TypeFunction is the function or method Name, as written, taken as a

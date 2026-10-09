@@ -48,23 +48,46 @@ func goMethodExpression(written, sig string) string {
 	return "(" + recv + "," + sig[1:]
 }
 
-// fieldGo yields the types a Go field receiver written "Owner.field" holds:
-// for each type Owner denotes in the file, the field a selector of that name
-// on it denotes, its own or promoted through embedding (keyGoField), and the
-// declarations its declared type names, read in the file that declares the
-// field. A field receiver with no owner binds nothing: a field name alone
-// names no type.
+// fieldGo yields the types a Go field receiver written "Owner.f1.f2…"
+// holds. Owner is the first component, or the first two when the first is a
+// name the file's imports bind (`pkg.T`). Each field is read on each type
+// the step before it holds: the field a selector of that name denotes on the
+// type, its own or promoted through embedding (keyGoField), whose declared
+// type is read in the file that declares the field. A step that reaches no
+// field or no declared type binds nothing; so does a field name alone, which
+// names no owner.
 func (r *staticFile) fieldGo(written string, yield func(Ref) error) error {
-	owner, field, ok := cutLast(written, ".")
-	if !ok {
+	parts := strings.Split(written, ".")
+	n := 1
+	if len(parts) > 2 {
+		err := r.h.imports(r.fc, parts[0], func(string) error {
+			n = 2
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if len(parts) <= n {
 		return nil
 	}
-	return r.h.typesIn(r.ctx, r.fc, owner, func(typ entry) error {
-		return r.h.links.lookup(keyGoField+refKey(typ.Ref)+field, func(f entry) error {
-			if f.Sig == "" {
-				return nil
+	return r.h.typesIn(r.ctx, r.fc, strings.Join(parts[:n], "."), func(typ entry) error {
+		return r.fieldPathGo(typ.Ref, parts[n:], yield)
+	})
+}
+
+// fieldPathGo yields the types the field path fields, read from a value of
+// the type typ, holds.
+func (r *staticFile) fieldPathGo(typ Ref, fields []string, yield func(Ref) error) error {
+	return r.h.links.lookup(keyGoField+refKey(typ)+fields[0], func(f entry) error {
+		if f.Sig == "" {
+			return nil
+		}
+		return r.h.types(r.ctx, f.Ref.File, f.Sig, func(next Ref) error {
+			if len(fields) == 1 {
+				return yield(next)
 			}
-			return r.h.types(r.ctx, f.Ref.File, f.Sig, yield)
+			return r.fieldPathGo(next, fields[1:], yield)
 		})
 	})
 }
