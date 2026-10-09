@@ -172,11 +172,6 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		// it, beside the language servers the manager admits against the same
 		// handle.
 		Admission: s.admission,
-		// The composition's reading of the host. The planner sizes every
-		// heavy unit's heap caps against it; the admission allocation starts
-		// from the same reading and is then re-derived before every admission
-		// on the ledger, counting the product's own residency.
-		Machine: s.machine,
 		// The read-only side of the same file, so a finished run states in its
 		// result what it did. It opens the ledger per call and never writes.
 		RunLedgerReader: runLedger{dir: s.dataDir},
@@ -195,13 +190,11 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		return nil, err
 	}
 	if err := s.openQueries(coord.Repository()); err != nil {
-		coord.Close()
 		s.Close()
 		return nil, err
 	}
 	status, err := coord.StatusReader(s.queryStore)
 	if err != nil {
-		coord.Close()
 		s.Close()
 		return nil, err
 	}
@@ -209,7 +202,6 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 	// The compiler is composed last because its graph factory is w.Query, so
 	// it cannot exist before the workspace it queries through.
 	if err := s.openCompiler(w.Query); err != nil {
-		coord.Close()
 		s.Close()
 		return nil, err
 	}
@@ -218,7 +210,6 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 	// wiring fact: a non-positive one is a composition defect that must fail
 	// here rather than on the first `codectx context ...` call.
 	if err := s.openWorkflow(); err != nil {
-		coord.Close()
 		s.Close()
 		return nil, err
 	}
@@ -357,21 +348,13 @@ func (w *Workspace) CompilePage(ctx context.Context, req model.ContextRequest, c
 	return w.s.compiler.CompilePage(ctx, req, cursor)
 }
 
-// Close releases the coordinator and then everything below it, in reverse.
-// Both halves run even when the first fails: the workspace lock must be
-// released whatever else went wrong.
+// Close releases everything the workspace composed, in reverse, the workspace
+// lock included.
 func (w *Workspace) Close() error {
 	if w == nil {
 		return nil
 	}
-	var first error
-	if w.coord != nil {
-		first = w.coord.Close()
-	}
-	if err := w.s.Close(); err != nil && first == nil {
-		first = err
-	}
-	return first
+	return w.s.Close()
 }
 
 // maxAmbiguousCandidates bounds the candidate list an ambiguous name is

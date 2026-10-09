@@ -451,7 +451,6 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	if err != nil {
 		return ledgerArmResult{}, err
 	}
-	defer c.Close()
 
 	started := time.Now()
 	if _, err := c.Index(ctx, model.IndexRequest{}); err != nil {

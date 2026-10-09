@@ -312,7 +312,6 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
 
 	started := time.Now()
 	cold, err := c.Index(ctx, model.IndexRequest{})
