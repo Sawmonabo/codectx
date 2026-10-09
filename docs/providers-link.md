@@ -85,9 +85,9 @@ A declaration the worker sent no type facts for is still a target by its name (`
 
 ## Units and inputs
 
-A unit is one project of the repository, the scope `dependence.PlanUnits` derives
-(`internal/provider/dependence/units.go:136`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
-`units.go:359`). The planner is reused rather than copied.
+A unit is one project of the repository, the scope `link.PlanUnits` derives
+(`internal/provider/link/projects.go:176`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
+`projects.go:381`). The planner is this provider's own.
 
 The unit's inputs are its member files. Each input records `model.UnitInput.Digest`, the digest of the link table
 the unit read for that file (`internal/model/storage.go:92-103`). The digest is outside the unit's identity:
