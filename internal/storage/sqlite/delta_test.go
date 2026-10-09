@@ -70,7 +70,6 @@ func TestCarryOverDrainsAStreamThatReadsTheStore(t *testing.T) {
 			}
 		},
 		Scopes: slices.Values([]string{"file:" + a2.path}),
-		Keys:   slices.Values(keyList("key:node:" + a2.path)),
 	}
 	type outcome struct {
 		stats store.CarryOverStats

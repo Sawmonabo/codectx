@@ -37,14 +37,15 @@ type (
 // noRef is the zero value of every ref type and is never a valid row id: the
 // schema pins CHECK(id > 0) on node_ids, relation_ids, scope_keys and
 // native_keys precisely so that zero can be read as "absent" without a
-// sentinel column. fact_keys relies on NULL rather than on this value.
+// sentinel column.
 const noRef = 0
 
 func (r nodeRef) valid() bool { return r > 0 }
 func (r relRef) valid() bool  { return r > 0 }
 
-// nullRef renders an optional ref for a nullable INTEGER column: fact_keys and
-// evidence each carry exactly one of node_id / relation_id, the other NULL.
+// nullNode and nullRelation render an optional ref for a nullable INTEGER
+// column: evidence carries exactly one of node_id / relation_id, the other
+// NULL.
 func nullNode(r nodeRef) any {
 	if !r.valid() {
 		return nil

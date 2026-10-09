@@ -57,8 +57,8 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	}
 	g := f.nodeFact(wa, run, a.path, "G", &a)
 	for _, fact := range []model.NodeFact{first, second, g} {
-		if err := wa.PutKeyedNodes(ctx, []model.NodeFact{fact}, [][]string{keyList(fact.Node.Name)}); err != nil {
-			t.Fatalf("PutKeyedNodes(%s %s): %v", fact.Node.Kind, fact.Node.Name, err)
+		if err := wa.PutNodes(ctx, []model.NodeFact{fact}); err != nil {
+			t.Fatalf("PutNodes(%s %s): %v", fact.Node.Kind, fact.Node.Name, err)
 		}
 	}
 	if err := wa.PutAliases(ctx, []model.NativeAlias{
@@ -85,8 +85,8 @@ func TestDependencyAliasesAnswersCommittedSealedDependenciesOnly(t *testing.T) {
 	// A second unit aliases F to its own identity and is committed building.
 	wb := f.begin(gen, run, b)
 	other := f.nodeFact(wb, run, b.path, "F", &b)
-	if err := wb.PutKeyedNodes(ctx, []model.NodeFact{other}, [][]string{keyList("b")}); err != nil {
-		t.Fatalf("PutKeyedNodes(unsealed): %v", err)
+	if err := wb.PutNodes(ctx, []model.NodeFact{other}); err != nil {
+		t.Fatalf("PutNodes(unsealed): %v", err)
 	}
 	if err := wb.PutAliases(ctx, []model.NativeAlias{{ScopeKey: a.path, NativeKey: "F", NodeID: other.Node.ID}}); err != nil {
 		t.Fatalf("PutAliases(unsealed): %v", err)

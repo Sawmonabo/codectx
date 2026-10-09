@@ -39,8 +39,8 @@ func TestManifestNodeIdsRoundTripCanonicalThroughSurrogates(t *testing.T) {
 	w := f.beginScope(gen, run, configHash, a, b)
 	f.fillFile(w, run, a)
 	f.fillFile(w, run, b)
-	first := f.putNode(w, run, "pkg/a.go", "Alpha", &a, "key:alpha")
-	second := f.putNode(w, run, "pkg/b.go", "Beta", &b, "key:beta")
+	first := f.putNode(w, run, "pkg/a.go", "Alpha", &a)
+	second := f.putNode(w, run, "pkg/b.go", "Beta", &b)
 	if err := f.s.SealUnit(f.ctx, w); err != nil {
 		t.Fatalf("SealUnit: %v", err)
 	}

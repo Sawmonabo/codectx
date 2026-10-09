@@ -292,7 +292,6 @@ func (f *fixture) raw() *sql.DB {
 var factColumns = []struct{ table, cols string }{
 	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
 	{"relation_facts", "relation_id"},
-	{"fact_keys", "coalesce(node_id, 0), coalesce(relation_id, 0), fact_key"},
 	{"native_aliases", "scope_key_id, native_key_id, node_id"},
 	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, token_count"},
 	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},

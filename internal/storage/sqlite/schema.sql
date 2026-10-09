@@ -213,27 +213,10 @@ CREATE TABLE relation_facts (
     relation_id INTEGER NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
--- fact_keys carries the producer's own id-independent delta keys for one fact
--- (Section 11.4). A fact is backed by every key that produced it, not by one:
--- a canonical edge is published once but is derived from N occurrences, each
--- with its own key, and a refresh re-emits the whole fact when any of them
--- changes. A carry-over therefore keeps a fact unless ANY of its keys is
--- replaced, which is the same condition the producer re-emits on, so the fresh
--- and carried sets partition exactly. A fact with no row here carries no key
--- and can only be replaced by its retention bucket.
-CREATE TABLE fact_keys (
-    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id INTEGER,
-    relation_id INTEGER,
-    fact_key TEXT NOT NULL,
-    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
-    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
-    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
-);
 -- evidence.id stays a PRIMARY KEY, refused by call site rather than by size.
--- units.go:748 and delta.go:437 upsert with ON CONFLICT(id) DO NOTHING, which
--- SQLite only accepts against a PRIMARY KEY or UNIQUE index, and delta.go:573
--- clips surplus evidence BY id value. The id is a pure function of the evidence
+-- insertEvidence and copyEvidence upsert with ON CONFLICT(id) DO NOTHING,
+-- which SQLite only accepts against a PRIMARY KEY or UNIQUE index, and
+-- clipEvidence clips surplus evidence BY id value. The id is a pure function of the evidence
 -- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
 -- an arbitrary surrogate, and the value reaches the wire as
 -- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
@@ -557,26 +540,6 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 -- reverse-traversal ("who calls X") path.
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
--- fact_keys uniqueness, re-specified for INTEGER node_id/relation_id.
--- The old expression index UNIQUE(unit_id, fact_key, coalesce(node_id, x''),
--- coalesce(relation_id, x'')) used an empty BLOB as the "absent" sentinel over
--- two columns that are now INTEGER. A coalesce(...,0) sentinel would work --
--- CHECK(id > 0) on node_ids/relation_ids makes 0 unreachable -- but a sentinel
--- is not needed at all. The table's CHECK guarantees exactly one of node_id /
--- relation_id is non-NULL, and SQLite treats NULLs in a UNIQUE index as
--- distinct, so UNIQUE(unit_id, node_id, fact_key) constrains exactly the
--- node-backed rows and never collides across the relation-backed ones (every
--- one of which carries node_id NULL). Two such indexes enforce precisely what
--- the sentinel expression enforced, over narrower keys, and -- ordered
--- (unit_id, <ref>, fact_key) -- each also subsumes the (unit_id, <ref>) probe
--- index it replaces (delta.go:318 keySurvives). Three indexes become two.
--- They are deliberately NOT partial: a partial index cannot serve the units
--- ON DELETE CASCADE (DELETE FROM fact_keys WHERE unit_id = ?), which would then
--- degrade to a table scan. EXPLAIN QUERY PLAN shows both: the cascade and
--- the (unit_id, <ref>) probe each SEARCH one of these indexes. The target-less ON CONFLICT DO NOTHING at units.go:840 and
--- delta.go:365 binds to any unique index, so it keeps working unchanged.
-CREATE UNIQUE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id, fact_key);
-CREATE UNIQUE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id, fact_key);
 CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);

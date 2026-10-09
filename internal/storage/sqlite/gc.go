@@ -386,7 +386,6 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 			AND NOT EXISTS (SELECT 1 FROM search_units s2 WHERE s2.doc_id = su.doc_id AND s2.unit_id <> ?1))`,
 		`DELETE FROM search_units WHERE unit_id = ?1`,
 		`DELETE FROM evidence WHERE unit_id = ?1`,
-		`DELETE FROM fact_keys WHERE unit_id = ?1`,
 		`DELETE FROM native_aliases WHERE unit_id = ?1`,
 		`DELETE FROM relation_facts WHERE unit_id = ?1`,
 		`DELETE FROM node_facts WHERE unit_id = ?1`,

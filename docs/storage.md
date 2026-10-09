@@ -21,7 +21,7 @@ reference site, in `canonical BLOB NOT NULL UNIQUE` under a
 `CHECK(length(canonical) = 32)`. Every
 other table references a node or a relation by that **integer** surrogate:
 `node_facts`, `relation_facts`, `relation_ids`' own two endpoints,
-`native_aliases`, `fact_keys`, `evidence`, `search_units` and
+`native_aliases`, `evidence`, `search_units` and
 `context_entries`. `node_ids.canonical_key` is a `BLOB` under a
 `CHECK(length(canonical_key) = 32)` — 32 bytes, not 64-character hex text, and
 unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
@@ -181,21 +181,20 @@ uncollectable in practice. The native-key pass carries a rows-examined budget
 as a safety bound: it defers, never skips, so a key a run does not reach is
 still unreferenced on the next one.
 
-## The two granularities
+## What a delta names
 
-`Replaced` expresses a delta at two granularities: a file and its alias
-scopes, or a single fact named by its producer's keys.
+`Replaced` expresses a delta per file: a changed or removed path and its alias
+scopes.
 
 | Producer | Delta unit | What the applier names |
 |---|---|---|
-| `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
-| a producer that keys its facts | one fact | `Replaced.Keys` (the changed and removed fact keys): the producer hands every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key). No shipped producer keys its facts. |
+| `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes); the applier sketch below is against the code as it stands |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
 survivors. For the SCIP importer that is a handful of entries against
 thousands: a one-file edit of this repository replaces 1 of 174 SCIP documents.
 
-All three sets are `iter.Seq` streams, consumed once and never materialized.
+Both sets are `iter.Seq` streams, consumed once and never materialized.
 The replaced set is small for the refreshes that motivate a delta, but a branch
 switch, a regenerated code tree or a first refresh after a formatting pass
 leaves *no* document unchanged, and the set is then every document in the
@@ -206,8 +205,8 @@ by the applier: it staged fewer entries than the applier named, so the
 applier checks its stream error *before* `CarryOver`'s own return.
 
 A producer's stream may itself read the store — an applier's `Files` may be a
-merge join against `Store.UnitInputs` — and `CarryOver` drains all
-three streams inside its own write transaction on the single writer
+merge join against `Store.UnitInputs` — and `CarryOver` drains both
+streams inside its own write transaction on the single writer
 connection. Such a stream therefore takes a reader-pool connection
 (`read_connections`; by default one per unit built at once plus one per
 query slot) once per page of its own scan while the write
@@ -216,8 +215,8 @@ deadlock, but a saturated reader pool stalls the carry-over and the open write
 transaction blocks every other writer in the process for the length of the
 walk. A producer whose stream reads the store keeps those reads bounded and
 proportional to the unit it replaces; the nesting is documented on `Replaced`,
-`CarryOver` and `UnitInputs` so a third producer does not discover it by
-measuring a stall.
+`CarryOver` and `UnitInputs` so a producer does not discover it by measuring a
+stall.
 
 ### The retention bucket
 
@@ -232,59 +231,10 @@ republishes every unlocated fact on every run sets it. The SCIP importer does
 it reparsed, so dropping that bucket would leave edges carried from untouched
 documents without endpoints, and the unit could not seal.
 
-### The fact keys
+### Repeated facts
 
-`fact_keys(unit_id, node_id, relation_id, fact_key)` holds the producer's own
-id-independent keys, supplied through `PutKeyedNodes` / `PutKeyedRelations`
-(`provider.DeltaSink`). Storage never derives or interprets one.
-
-A key is needed because a path bucket cannot express every removal. A
-cross-file edge can disappear while every file holding its evidence is
-unchanged — the edit was in the *callee's* file, the evidence is in the
-caller's — so only the producer can say the fact is gone. It cannot say so by
-fact identity either: a `RelationID` is derived from the resolved endpoints,
-which an edit changes, so the removed fact has no identity to name.
-
-**One fact is backed by every key that produced it, not by one.** A canonical
-edge is published once and derived from N occurrences, each with its own key,
-and the emitter re-emits the whole fact as soon as one of those keys changes.
-That is why the keys live in a side table and why `PutKeyedNodes` and
-`PutKeyedRelations` take `keys [][]string`, parallel to the facts: `keys[i]`
-is every key backing `facts[i]`, at least one, each in practice a lowercase hex
-digest — a convention the producers keep but that no model type enforces, which
-is why the column stays TEXT (see ADR-0002, Measurements),
-sorted and without duplicates.
-
-Folding a fact's keys into one was considered and rejected: `Replaced.Keys`
-must name the **previous** unit's keys, and the previous run's grouping of
-occurrence keys per fact is not recoverable from what a producer persists
-(a stored key set is a flat sorted file of bare digests). A folded key would
-also change whenever any occurrence moved, so every such fact would be
-reported replaced and re-added — defeating the delta in exactly the
-cross-file-edge case the key exists for.
-
-**Carry unless any key is replaced.** A fact is inherited unless ANY of its
-keys is in `Replaced.Keys`. That is the same condition the producer re-emits
-on, so the fresh and carried sets partition exactly: carrying on "some key
-survives" would keep a stale copy beside the fresh one, and dropping only on
-"every key replaced" would do the same. A carried fact carries its keys with
-it, or the successor would hold facts no later refresh could replace.
-
-Facts written with no keys have no `fact_keys` row and are never key-excluded;
-only their bucket can replace them. If the applier names replaced keys and the
-previous unit stored none, `CarryOver` refuses rather than silently carrying
-everything.
-
-A repeated fact identity is ordinary — two workers, or the fresh import and the carried predecessor — and its keys
-accumulate: the carried set is the union of the keys the fresh import
-published and the predecessor's keys that this refresh did not replace. In a
-conformant refresh that union is exactly the fresh set, because `Replaced.Keys`
-names the complement — every previous key the fresh run no longer emits — so a
-fact whose keys changed has its old keys named replaced by the same refresh
-that re-publishes it. A producer that changes a fact's keys without naming the
-old ones leaves the stale key attached, and a later refresh replacing that
-stale key drops a live fact; the contract, not the copy, is what rules that
-out. A repeat that describes a node **differently** from the row already
+A repeated fact identity is ordinary — two workers, or the fresh import and
+the carried predecessor. A repeat that describes a node **differently** from the row already
 written is refused (`CTX_PROVIDER_OUTPUT_INVALID`, naming the node and the
 first differing column): the insert yields to the row that is present, so the
 unit would otherwise silently keep whichever description arrived first, and,
