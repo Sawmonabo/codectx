@@ -105,7 +105,7 @@ read it. It decides what a rebuild costs (the fast path below).
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
 structural provider joins it to the declarations and call references it validated, and stores the result as a
 `link.Table` with the file's structural unit, under `link.TableKind`, and the table's member digest beside it, under
-`link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go:319-340`). It stores both through
+`link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go:266-287`). It stores both through
 `provider.StateSink` (`internal/provider/sink.go:240-249`), so they share the unit's lifetime. The linker reads a
 table back through `link.Tables`, and the delta build a digest alone through `link.Digests` (`tables.go:14-108`): the
 structural unit the generation selects for the file's scope, then that unit's state of the kind. A file with no
