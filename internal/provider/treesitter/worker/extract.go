@@ -46,17 +46,32 @@ type importRec struct {
 	span
 	path  string
 	names []string
+	// originals holds, parallel to names, the name each denotes in the
+	// imported module where the import renames it, else "" (wire.Import).
+	originals []string
 	// seen holds names, so a statement naming thousands of bindings (a
 	// generated barrel import) is deduplicated in linear time.
 	seen map[string]bool
 }
 
-// add appends one local name the statement binds, once.
-func (r *importRec) add(name string) {
+// add appends one local name the statement binds, once, with the name it
+// denotes in the imported module when the import renames it.
+func (r *importRec) add(name, original string) {
 	if name != "" && !r.seen[name] {
 		r.seen[name] = true
 		r.names = append(r.names, name)
+		r.originals = append(r.originals, original)
 	}
+}
+
+// renamed is originals when any name is renamed, else nil.
+func (r *importRec) renamed() []string {
+	for _, o := range r.originals {
+		if o != "" {
+			return r.originals
+		}
+	}
+	return nil
 }
 
 type refRec struct {
@@ -262,14 +277,20 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
 		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
 	}
+	// An aliased name's original (`from m import a as b`) is captured in
+	// the same match as its alias.
+	original := ""
+	if o := caps["import.original"]; len(o) > 0 {
+		original = o[0].Utf8Text(e.src)
+	}
 	for _, n := range caps["import.name"] {
-		rec.add(n.Utf8Text(e.src))
+		rec.add(n.Utf8Text(e.src), original)
 	}
 	if clauses := caps["import.clause"]; len(clauses) > 0 {
 		ids := e.g.importSyntax(e.l.Name)
 		for i := range clauses {
 			cur := clauses[i].Walk()
-			importClauseBindings(cur, ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src)) })
+			importClauseBindings(cur, ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src), "") })
 			cur.Close()
 		}
 	}
@@ -538,7 +559,8 @@ func (e *extraction) emit(out *emitter) error {
 		for _, n := range rec.names {
 			localNames[n] = true
 		}
-		if err := out.imp(wire.Import{Start: uint32(rec.start), End: uint32(rec.end), Path: rec.path, Names: rec.names}); err != nil {
+		if err := out.imp(wire.Import{Start: uint32(rec.start), End: uint32(rec.end), Path: rec.path, Names: rec.names,
+			Originals: rec.renamed()}); err != nil {
 			return err
 		}
 	}

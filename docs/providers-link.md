@@ -163,9 +163,17 @@ to every type of that name in the unit (`hierarchy.typesIn`).
   then `hierarchy.dispatch`. Field-based resolution binds a site to the functions written to the property it calls
   through. Class-hierarchy analysis applies where `extends` declares a subtype.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
-  `from … import` and modules. A call of a class is its construction and binds its `__init__` when declared.
-  Receivers come from flow-based type inference, then dispatch in method resolution order. Field-based resolution
-  covers attribute calls. `self` and `cls` are the enclosing class.
+  `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
+  innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
+  a function nested in another function. A call of a class is its construction and binds its `__init__` when
+  declared. An instance receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type
+  of a receiver two disagreeing definitions reach included) dispatches in method resolution order: for its class and
+  each subclass, the first declaration of the method along that class's C3 linearisation (`hierarchy.pythonMRO`, over
+  the bases in the order each class lists them). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
+  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
+  resolution (a function written to the attribute, or a method of that name, which the worker sends as its class's
+  attribute) answers an attribute call only when its receiver's type bound nothing.
 
 **Flow-based type inference** (`inferTypes`, `internal/provider/link/infer.go`) starts from the types the worker
 recovered inside each function (`wire.Type`, `wire/link.go:136-169`):

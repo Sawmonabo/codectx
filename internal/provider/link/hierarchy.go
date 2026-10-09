@@ -426,10 +426,10 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			return err
 		}
 	}
-	for _, st := range t.Supertypes {
+	for i, st := range t.Supertypes {
 		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
 			return h.typesIn(ctx, fc, st.Super, func(super entry) error {
-				return addSubtype(links, sub.Ref, super.Ref)
+				return addBase(links, sub.Ref, super.Ref, i)
 			})
 		})
 		if err != nil {
@@ -439,14 +439,35 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	return nil
 }
 
+// addSubtype records that sub is a direct subtype of super by a relation no
+// declaration of sub lists in an order (Go's method-set satisfaction).
 func addSubtype(links *pagination.ExternalSort[entry], sub, super Ref) error {
+	return addBase(links, sub, super, -1)
+}
+
+// addBase records that sub is a direct subtype of super, which sub's file
+// lists as its supertype row pos (-1 for none). A class's rows are listed in
+// the order its declaration names its bases, so the keySuper entry carries
+// pos (basePosition) and a lookup can read the bases as written, which
+// Python's method resolution order is computed from.
+func addBase(links *pagination.ExternalSort[entry], sub, super Ref, pos int) error {
 	if sub == super {
 		return nil
 	}
 	if err := links.Add(entry{Key: keySub + refKey(super), Ref: sub}); err != nil {
 		return err
 	}
-	return links.Add(entry{Key: keySuper + refKey(sub), Ref: super})
+	e := entry{Key: keySuper + refKey(sub), Ref: super}
+	if pos >= 0 {
+		e.Aux = basePosition(pos)
+	}
+	return links.Add(e)
+}
+
+// basePosition is a supertype row's position as a string that orders as the
+// position does.
+func basePosition(pos int) string {
+	return string(binary.BigEndian.AppendUint64(nil, uint64(pos)))
 }
 
 func refOf(k string) Ref {
@@ -678,9 +699,34 @@ func preferDefinitions(each func(func(entry) error) error, yield func(entry) err
 }
 
 // declared yields the declarations of method a call on typ reaches without
-// dispatch: typ's own, else the nearest along each supertype path, each
-// once.
+// dispatch: typ's own, else, for a Python class, the first declaration along
+// its method resolution order (pythonMRO), else the nearest along each
+// supertype path, each once.
 func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) error {
+	found := false
+	err := h.methods(typ, method, func(e entry) error {
+		found = true
+		return yield(e)
+	})
+	if err != nil || found {
+		return err
+	}
+	order, err := h.pythonMRO(typ)
+	if err != nil {
+		return err
+	}
+	if order != nil {
+		for _, t := range order[1:] {
+			err := h.methods(t, method, func(e entry) error {
+				found = true
+				return yield(e)
+			})
+			if err != nil || found {
+				return err
+			}
+		}
+		return nil
+	}
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
 	done := map[Ref]bool{}
@@ -688,16 +734,18 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 		t := queue[0]
 		queue = queue[1:]
 		found := false
-		err := h.methods(t, method, func(e entry) error {
-			found = true
-			if done[e.Ref] {
-				return nil
+		if t != typ {
+			err := h.methods(t, method, func(e entry) error {
+				found = true
+				if done[e.Ref] {
+					return nil
+				}
+				done[e.Ref] = true
+				return yield(e)
+			})
+			if err != nil {
+				return err
 			}
-			done[e.Ref] = true
-			return yield(e)
-		})
-		if err != nil {
-			return err
 		}
 		if found {
 			continue

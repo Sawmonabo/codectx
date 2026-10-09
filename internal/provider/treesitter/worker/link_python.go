@@ -3,6 +3,7 @@ package worker
 import (
 	"cmp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -43,7 +44,9 @@ import (
 //     TypeModule "m.f", the imported name spelled through its module so an
 //     alias is unwound (a relative module keeps its dots: ".b.f");
 //   - a def: TypeFunction of its name, where it is taken as a value;
-//   - a class named as a receiver: TypeNamed of the class.
+//   - a class named as a value or a receiver: TypeClass of the class, the
+//     class object itself, whose call of a method binds the method the
+//     class declares or inherits and never a subclass's override.
 //
 // A name that is not a variable of the callable (a free name of a nested
 // callable, a builtin) is read from the enclosing function, lambda and
@@ -55,8 +58,9 @@ import (
 // reads its free variables when it is called, so any of them may reach it.
 // An enclosing parameter's index means nothing to the closure, so a
 // recovered TypeParam is recorded as a value of unknown type. Where
-// the definitions reaching a read disagree the type is TypeUnknown; a
-// definition that recovers nothing does not count against one that does.
+// the definitions reaching a read disagree the type is a TypeUnion of every
+// type they recover (Link.Unions, never nested); a definition that recovers
+// nothing does not count against one that does.
 //
 // Shapes: a name callee is ShapeIndirect when it is a variable the callable,
 // an enclosing scope or the module assigns a value to (a parameter, an
@@ -66,6 +70,11 @@ import (
 // callee is ShapeStatic exactly when its object is an imported module (`mod.f()`,
 // `a.b.f()`), Qualifier the object as written and Receiver the module, and
 // ShapeMember otherwise, with the object's type as Receiver.
+//
+// Values: every function written to an attribute or to a name in a class
+// body, every def a class body declares (a method is the class's attribute
+// of its name, which field-based resolution reads), and every function
+// passed or assigned as a value.
 type pythonLinker struct {
 	k *pySyntax
 	// moduleNames are the names the module's own code binds, read once on
@@ -88,6 +97,10 @@ type pythonLinker struct {
 	// returns are the types the def whose name token starts at the key
 	// returns, recovered from its return statements.
 	returns map[uint32]wire.Type
+	// unions are the file's type sets a TypeUnion indexes, each sorted and
+	// distinct; unionAt finds a set's index by its members' spelling.
+	unions  [][]wire.Type
+	unionAt map[string]uint32
 
 	// The callable being read; every field below is reset per callable and
 	// holds nothing past function.
@@ -120,7 +133,7 @@ type pythonLinker struct {
 }
 
 func newPythonLinker() *pythonLinker {
-	return &pythonLinker{returns: map[uint32]wire.Type{}, names: map[string]int32{},
+	return &pythonLinker{returns: map[uint32]wire.Type{}, unionAt: map[string]uint32{}, names: map[string]int32{},
 		binds: map[flow.Span]pyBind{}, callAt: map[flow.Span]uint32{}, scopes: map[flow.Span]map[string]pyRead{},
 		globals: map[string]bool{}}
 }
@@ -177,7 +190,7 @@ func (k *pythonLinker) reach(r pyRead, p int32) pyRead {
 	if x.o == pyValue || x.o == pyUnknown || (x.o == pyFunction && !k.binds[k.g.Span(p)].expr.IsNull()) {
 		r.variable = true
 	}
-	r.val = join(r.val, x)
+	r.val = k.join(r.val, x)
 	return r
 }
 
@@ -196,16 +209,91 @@ type pyMemo struct {
 	val   pyVal
 }
 
-// join merges two recovered values: equal ones stay, an unknown one yields
-// to the other, and two that disagree are unknown.
-func join(a, b pyVal) pyVal {
+// join merges two recovered values: equal ones stay, one that recovers no
+// type yields to the other, and two that disagree are the union of every
+// type either recovers, a value of the file's unions.
+func (k *pythonLinker) join(a, b pyVal) pyVal {
 	switch {
 	case a.o == pyUnknown:
 		return b
 	case b.o == pyUnknown || a == b:
 		return a
 	}
-	return pyVal{}
+	members := k.members(a, nil)
+	n := len(members)
+	members = k.members(b, members)
+	slices.SortFunc(members, compareType)
+	members = slices.Compact(members)
+	switch {
+	case len(members) == 0:
+		return pyVal{}
+	case len(members) == 1 && n == 1:
+		return a
+	case len(members) == 1:
+		return b
+	}
+	return k.union(members)
+}
+
+// members appends the types v recovers to dst: a union's members, another
+// value's own type, and nothing for a value of unknown type.
+func (k *pythonLinker) members(v pyVal, dst []wire.Type) []wire.Type {
+	t := v.asValue()
+	switch t.Kind {
+	case wire.TypeUnknown:
+		return dst
+	case wire.TypeUnion:
+		return append(dst, k.unions[t.Index]...)
+	}
+	return append(dst, t)
+}
+
+// union is the value whose type is every one of members, sorted and
+// distinct, two or more and none a union: the file's union of them, added
+// on first use.
+func (k *pythonLinker) union(members []wire.Type) pyVal {
+	var key strings.Builder
+	for _, m := range members {
+		key.WriteByte(byte(m.Kind))
+		key.WriteString(strconv.FormatUint(uint64(m.Index), 10))
+		key.WriteByte(0)
+		key.WriteString(m.Name)
+		key.WriteByte(0)
+	}
+	i, ok := k.unionAt[key.String()]
+	if !ok {
+		i = uint32(len(k.unions))
+		k.unions = append(k.unions, slices.Clone(members))
+		k.unionAt[key.String()] = i
+	}
+	return pyVal{o: pyValue, t: wire.Type{Kind: wire.TypeUnion, Index: i}}
+}
+
+func compareType(a, b wire.Type) int {
+	return cmp.Or(cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Index, b.Index), strings.Compare(a.Name, b.Name))
+}
+
+// withoutParams is v without the TypeParam it recovers, alone or in a union:
+// what a nested callable reads of an enclosing callable's variable, to which
+// the enclosing callable's parameter indices mean nothing.
+func (k *pythonLinker) withoutParams(v pyVal) pyVal {
+	if v.o != pyValue {
+		return v
+	}
+	switch v.t.Kind {
+	case wire.TypeParam:
+		return pyVal{o: pyValue}
+	case wire.TypeUnion:
+		kept := slices.DeleteFunc(slices.Clone(k.unions[v.t.Index]), func(t wire.Type) bool { return t.Kind == wire.TypeParam })
+		switch len(kept) {
+		case 0:
+			return pyVal{o: pyValue}
+		case 1:
+			return pyVal{o: pyValue, t: kept[0]}
+		}
+		return k.union(kept)
+	}
+	return v
 }
 
 // asValue is v's type where it is passed, assigned or returned.
@@ -215,6 +303,8 @@ func (v pyVal) asValue() wire.Type {
 		return v.t
 	case pyFunction:
 		return wire.Type{Kind: wire.TypeFunction, Name: v.t.Name}
+	case pyClass:
+		return wire.Type{Kind: wire.TypeClass, Name: v.t.Name}
 	}
 	return wire.Type{}
 }
@@ -262,7 +352,7 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 	if fn.KindId() == kn.functionDefinition && fn.ChildByFieldId(kn.fReturnType).IsNull() {
 		var r pyVal
 		for _, e := range k.rets {
-			r = join(r, k.typeOf(e))
+			r = k.join(r, k.typeOf(e))
 		}
 		if t := r.asValue(); t.Kind != wire.TypeUnknown {
 			k.returns[uint32(fn.ChildByFieldId(kn.fName).StartByte())] = t
@@ -491,6 +581,7 @@ type pyParam struct {
 	receiver  bool
 	splat     bool // *args
 	keywords  bool // **kwargs
+	optional  bool // it has a default value
 }
 
 // eachParam calls f with every parameter of callable fn in order.
@@ -514,9 +605,10 @@ func (k *pythonLinker) eachParam(fn Node, f func(pyParam)) {
 			p.ann = x.ChildByFieldId(kn.fType)
 			x = firstNamed(x)
 		case kn.defaultParameter:
+			p.optional = true
 			x = x.ChildByFieldId(kn.fName)
 		case kn.typedDefaultParameter:
-			p.ann = x.ChildByFieldId(kn.fType)
+			p.ann, p.optional = x.ChildByFieldId(kn.fType), true
 			x = x.ChildByFieldId(kn.fName)
 		}
 		if x.IsNull() {
@@ -765,7 +857,7 @@ func (k *pythonLinker) site(c Node) wire.Site {
 		case pyModule:
 			s.Shape, s.Qualifier, s.Receiver = wire.ShapeStatic, string(textOf(k.src, obj)), v.t
 		case pyClass:
-			s.Shape, s.Receiver = wire.ShapeMember, wire.Type{Kind: wire.TypeNamed, Name: v.t.Name}
+			s.Shape, s.Receiver = wire.ShapeMember, v.asValue()
 		case pyFunction:
 			s.Shape = wire.ShapeMember
 		default:
@@ -879,10 +971,10 @@ func (k *pythonLinker) typeOf(e Node) pyVal {
 	case kn.await:
 		return k.typeOf(firstNamed(e))
 	case kn.booleanOperator:
-		return join(k.typeOf(e.ChildByFieldId(kn.fLeft)), k.typeOf(e.ChildByFieldId(kn.fRight)))
+		return k.join(k.typeOf(e.ChildByFieldId(kn.fLeft)), k.typeOf(e.ChildByFieldId(kn.fRight)))
 	case kn.conditionalExpression:
 		// `a if c else b`: the middle operand is the condition.
-		return join(k.typeOf(e.NamedChild(0)), k.typeOf(e.NamedChild(2)))
+		return k.join(k.typeOf(e.NamedChild(0)), k.typeOf(e.NamedChild(2)))
 	}
 	return pyVal{}
 }
@@ -934,9 +1026,7 @@ func (k *pythonLinker) recordScope(fn Node) {
 	scope := make(map[string]pyRead, len(k.names))
 	for name, v := range k.names {
 		r := reads[v]
-		if r.val.o == pyValue && r.val.t.Kind == wire.TypeParam {
-			r.val = pyVal{o: pyValue}
-		}
+		r.val = k.withoutParams(r.val)
 		scope[name] = r
 	}
 	k.scopes[spanOf(fn)] = scope
@@ -1103,26 +1193,39 @@ func (k *pythonLinker) file(root Node, src []byte, out *wire.Link) {
 	k.src = src
 	defer func() { k.src = nil }()
 	kn := k.k
-	var walk func(n Node)
-	walk = func(n Node) {
+	// prefix is the enclosing defs' and classes' names, each followed by a
+	// dot: what a declaration's qualified name starts with.
+	var walk func(n Node, prefix string)
+	walk = func(n Node, prefix string) {
 		for c := n.first(); !c.IsNull(); c = c.next() {
 			if !c.IsNamed() {
 				continue
 			}
+			inner := prefix
 			switch c.KindId() {
 			case kn.functionDefinition:
 				if x, ok := k.export(c); ok {
 					out.Exports = append(out.Exports, x)
 				}
+				name := c.ChildByFieldId(kn.fName)
+				if _, method := k.enclosingClass(c); method && !name.IsNull() && !k.property(c) {
+					// A method is its class's attribute of its name.
+					m := string(textOf(src, name))
+					k.values = append(k.values, wire.Value{At: wireSpan(spanOf(name)), Field: m,
+						Type: wire.Type{Kind: wire.TypeFunction, Name: prefix + m}})
+				}
+				inner = prefix + string(textOf(src, name)) + "."
 			case kn.classDefinition:
 				k.supertypes(c, out)
+				inner = prefix + string(textOf(src, c.ChildByFieldId(kn.fName))) + "."
 			}
-			walk(c)
+			walk(c, inner)
 		}
 	}
-	walk(root)
+	walk(root, "")
 	out.Sites = append(out.Sites, k.sites...)
 	out.Values = append(out.Values, k.values...)
+	out.Unions = append(out.Unions, k.unions...)
 }
 
 // export is def d's export.
@@ -1154,6 +1257,9 @@ func (k *pythonLinker) export(d Node) (wire.Export, bool) {
 			return
 		}
 		x.Params++
+		if p.optional {
+			x.Optional++
+		}
 		if p.ann.IsNull() {
 			typed = false
 		} else {
